@@ -3,9 +3,11 @@
 > **Code is law.** Every claim in this tree is verified against the source at
 > `crates/`. If it conflicts with the code, the code wins.
 
-> 🦀 *"OpenClaw had the claws. NousHermes had the reasoning. EdgeCrab had both —
+> 🦀 *"`hermes-agent` had the history. OpenClaw had the claws. EdgeCrab had both —
 > plus a security scanner, 65 tools, and a 15 MB binary that starts in 50 ms.
 > The bout was brief."*
+>
+> *(Note: `hermes-agent` is EdgeCrab's **Python** predecessor — `~/.hermes/`, `prompt_toolkit` TUI, ~80–150 MB. OpenClaw is a TypeScript/Node.js personal assistant — [github.com/openclaw](https://github.com/openclaw).)*
 
 EdgeCrab is a Rust-native AI agent: a single static binary that runs a
 ReAct tool loop, speaks to every major LLM provider, and serves three

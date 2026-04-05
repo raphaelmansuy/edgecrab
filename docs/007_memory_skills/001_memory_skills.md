@@ -1,61 +1,257 @@
-# Memory and Skills
+# Memory and Skills 🦀
 
-Verified against:
-- `crates/edgecrab-core/src/prompt_builder.rs`
-- `crates/edgecrab-tools/src/tools/memory.rs`
-- `crates/edgecrab-tools/src/tools/skills.rs`
-- `crates/edgecrab-tools/src/tools/honcho.rs`
+> **Verified against:** `crates/edgecrab-core/src/prompt_builder.rs` ·
+> `crates/edgecrab-tools/src/tools/memory.rs` ·
+> `crates/edgecrab-tools/src/tools/skills.rs` ·
+> `crates/edgecrab-tools/src/tools/honcho.rs`
 
-EdgeCrab has three related context systems:
+---
 
-- durable memory files
-- reusable skills
-- optional Honcho-backed profile/context tools
+## Why persistent memory matters
 
-## Memory
+Without memory, every session starts fresh. EdgeCrab used the same model but knew
+nothing about your project structure, code style preferences, or past decisions.
+Memory gives the agent durable context that survives across sessions.
 
-The prompt builder loads memory sections from the EdgeCrab home directory:
+Without skills, every time you want the agent to "follow our release checklist",
+you re-explain it. Skills encode reusable workflows in Markdown that the agent
+reads and executes.
 
-- `MEMORY.md`
-- `USER.md`
+🦀 *`hermes-agent` (EdgeCrab's predecessor) reset memory on every session
+unless you hand-edited its MEMORY.md before launch. OpenClaw ([TypeScript/Node.js](https://github.com/openclaw))
+persists session transcripts but has no automatic cross-session memory injection
+into the system prompt. EdgeCrab remembers — even when the crab goes to sleep.*
 
-These are intended for durable facts, not transient task progress. The builder also injects memory-specific guidance when the relevant tools are enabled.
+---
+
+## Three memory systems
+
+```
+  ┌────────────────────────────────────────────────────────────────┐
+  │  1. File-backed memory   (~/.edgecrab/memories/)               │
+  │     ■ Plain Markdown files                                     │
+  │     ■ Loaded into system prompt at session start               │
+  │     ■ Read/write via memory_read / memory_write tools          │
+  │     ■ Survives across all sessions                             │
+  │     ■ Injection-checked before loading                         │
+  └────────────────────────────────────────────────────────────────┘
+  ┌────────────────────────────────────────────────────────────────┐
+  │  2. Skills  (~/.edgecrab/skills/)                               │
+  │     ■ Directories with SKILL.md files                           │
+  │     ■ Listed in system prompt (summaries only)                  │
+  │     ■ Invoked by name: "use the git-release skill"             │
+  │     ■ Managed via skills_list / skill_manage / skills_hub      │
+  └────────────────────────────────────────────────────────────────┘
+  ┌────────────────────────────────────────────────────────────────┐
+  │  3. Honcho  (external service)                                  │
+  │     ■ User-level memory managed by Honcho API                  │
+  │     ■ Semantic search over past sessions                       │
+  │     ■ Requires HONCHO_APP_ID env var                           │
+  │     ■ Tools: honcho_conclude, honcho_search, honcho_profile    │
+  └────────────────────────────────────────────────────────────────┘
+```
+
+**Reference:** [Honcho docs](https://honcho.dev/docs)
+
+---
+
+## File-backed memory
+
+### Layout
+
+```
+  ~/.edgecrab/memories/             (default; varies with profile)
+    MEMORY.md                       ← primary memory file (always loaded)
+    USER.md                         ← user profile facts
+    <any-other>.md                  ← custom memory sections
+```
+
+All `.md` files in the memories directory are loaded. They are injected into the
+system prompt in alphabetical order, each in its own section:
+
+```
+  [memory:MEMORY.md]
+  (content of MEMORY.md)
+
+  [memory:USER.md]
+  (content of USER.md)
+```
+
+### Security gate
+
+Every memory file passes through `check_memory_content()` before loading:
+
+```
+  check_memory_content(content)
+    │
+    ├── check_injection(content)
+    │     ↳ blocks: "ignore previous", "you are now", etc.
+    │
+    ├── invisible unicode check
+    │     ↳ blocks: zero-width spaces, directional overrides
+    │
+    └── exfiltration patterns
+          ↳ blocks: curl with $SECRET, cat ~/.ssh/id_rsa, etc.
+```
+
+Files that fail the check are **skipped** with a warning — not loaded.
+
+### Writing memory from the agent
+
+```
+  memory_write tool:
+    path: "memories/my-project.md"
+    content: "## Project facts\n- Uses SQLite for persistence\n..."
+
+  → writes to ~/.edgecrab/memories/my-project.md
+  → content passes security check before persisting
+  → next session picks it up automatically
+```
+
+---
 
 ## Skills
 
-Skills live as directories containing `SKILL.md`. The skills system supports:
+### Layout
 
-- listing and viewing skills
-- create, edit, patch, and delete through `skill_manage`
-- category and description extraction from frontmatter
-- extra linked files through `read_files`
-- optional external skill directories from config
-
-## Prompt-time behavior
-
-```text
-session starts
-  -> memory sections loaded
-  -> skills summary loaded
-  -> tool-specific guidance injected
-  -> selected preloaded skills can be added to the session prompt
+```
+  ~/.edgecrab/skills/
+    git-release/
+      SKILL.md            ← required
+      release-steps.md    ← referenced via read_files frontmatter
+    python-test/
+      SKILL.md
+    my-custom-workflow/
+      SKILL.md
 ```
 
-## Safety behavior
+External skill directories can be added in config:
 
-- memory writes are scanned for injection patterns before persistence
-- skill mutations can invalidate the in-process skills prompt cache
-- missing external skill directories are skipped quietly
+```yaml
+# ~/.edgecrab/config.yaml
+skills:
+  extra_dirs:
+    - /Users/me/shared-skills/
+    - /work/team-skills/
+```
+
+### What loads at session start
+
+The `PromptBuilder` includes a **summary** (not full content) of all installed
+skills:
+
+```
+  Available skills:
+  - git-release: Automated git tag, changelog, and crates.io publish workflow
+  - python-test: Run pytest with coverage, lint, and type checking
+  - my-custom-workflow: Deploy to staging and run smoke tests
+```
+
+Full skill content is loaded on demand when the model invokes the skill
+(via `skill_view`) or when `preloaded_skills` config specifies it.
+
+### Viewing a skill
+
+```sh
+# List all skills
+edgecrab skills list
+
+# View a specific skill
+edgecrab skills view git-release
+
+# Search by keyword
+edgecrab skills search "deploy"
+
+# Install from hub
+edgecrab skills install docker-build
+```
+
+---
+
+## Skill runtime activation
+
+When a skill is invoked, the agent:
+1. Reads `SKILL.md` (full content)
+2. Loads any files listed in `read_files` frontmatter
+3. Follows the skill's instructions as part of its normal task loop
+
+Conditional activation (from frontmatter):
+
+```yaml
+# SKILL.md frontmatter
+required_tools: [terminal, write_file]
+required_toolsets: [coding]
+platforms: [cli, telegram]
+```
+
+If the required tools are not in the active toolset, the skill is hidden from
+the summary — it won't appear as a suggestion to the model.
+
+---
 
 ## Honcho integration
 
-The Honcho tools are separate from file-backed memory. They provide:
+Honcho is a separate cloud service providing user-level memory and personalisation:
 
-- `honcho_profile`
-- `honcho_context`
-- `honcho_search`
-- `honcho_list`
-- `honcho_remove`
-- `honcho_conclude`
+```
+  Session ends:
+    honcho_conclude → sends session summary to Honcho API
+                    → Honcho indexes it for future semantic search
 
-Use the file-backed memory system for prompt-injected durable notes and the Honcho tools for the external memory service integration.
+  New session:
+    honcho_context  → fetches relevant past experience from Honcho
+                    → injects into the agent's current context
+
+  Explicit search:
+    honcho_search("how did I solve the auth problem?")
+    → semantic search across all indexed past sessions
+```
+
+Honcho is completely optional. File-backed memory works without it.
+
+---
+
+## Tips
+
+> **Tip: Keep `MEMORY.md` concise.** It loads on every session and contributes tokens.
+> One-liners per fact are better than paragraphs:
+> ```markdown
+> - Project: edgecrab, Rust 2024, MSRV 1.85.0
+> - Test command: cargo test --workspace
+> - Deploy: cargo publish crates in dependency order
+> ```
+
+> **Tip: Use skills for multi-step workflows with failure modes.**
+> A skill that documents both the happy path AND common failure cases is
+> 10× more useful than one that only shows the success path.
+
+> **Tip: `--skill git-release` pre-loads a skill for a session without `/slash` invocation.**
+> ```sh
+> edgecrab --skill git-release "prepare the next minor release"
+> ```
+
+---
+
+## FAQ
+
+**Q: Do memory files affect all profiles?**
+No. Each profile has its own `memories/` directory. `~/.edgecrab/memories/` is
+the default profile's memory. `~/.edgecrab/profiles/work/memories/` is the
+`work` profile's memory.
+
+**Q: What happens if a memory file is corrupted or injection-checked?**
+It is skipped with a `tracing::warn!` log entry. The session continues normally
+without that memory section.
+
+**Q: Can the agent delete memory?**
+Yes, via `memory_write` with empty content or `skill_manage` with `delete` action.
+There is no auto-expiry.
+
+---
+
+## Cross-references
+
+- How memory loads into the prompt → [Prompt Builder](../003_agent_core/003_prompt_builder.md)
+- Security checks on memory content → [Security](../011_security/001_security.md)
+- Skill file format → [Creating Skills](./002_creating_skills.md)
+- Skills tools catalogue → [Tool Catalogue](../004_tools_system/002_tool_catalogue.md)

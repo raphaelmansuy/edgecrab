@@ -11,22 +11,38 @@
 EdgeCrab was forged in the heat of a hypothetical three-way battle:
 
 ```
-  ┌─────────────────┐   ┌─────────────────┐   ┌─────────────────┐
-  │   NousHermes    │   │    OpenClaw 🦞   │   │  EdgeCrab 🦀    │
-  │                 │   │                 │   │                 │
-  │  ■ deep reason  │   │  ■ tool use     │   │  ■ deep reason  │
-  │  ■ slow starts  │   │  ■ fast tools   │   │  ■ fast tools   │
-  │  ■ single model │   │  ■ no security  │   │  ■ 65 tools     │
-  │  ■ Python RT    │   │  ■ Python RT    │   │  ■ security     │
-  │                 │   │                 │   │  ■ Rust, 15 MB  │
-  └─────────────────┘   └─────────────────┘   └─────────────────┘
-         Round 1               Round 2           WINNER 🏆
-         Eliminated             KO'd in 50ms
+  ┌─────────────────────┐   ┌──────────────────────┐   ┌─────────────────┐
+  │     NousHermes      │   │    OpenClaw 🦞         │   │  EdgeCrab 🦀    │
+  │  (Nous Research     │   │  (open-source self-   │   │                 │
+  │   model fine-tune)  │   │   hosted assistant)   │   │                 │
+  │                     │   │                       │   │                 │
+  │  ■ enhanced reason  │   │  ■ tool use           │   │  ■ deep reason  │
+  │  ■ model weights    │   │  ■ TypeScript/Node.js  │   │  ■ fast tools   │
+  │  ■ stateless infer  │   │  ■ no built-in        │   │  ■ 65 tools     │
+  │  ■ Python inference │   │    security layer     │   │  ■ security     │
+  │    stack            │   │  ■ single-user        │   │  ■ Rust, 15 MB  │
+  │  ■ not an agent FW  │   │    desktop focus      │   │  ■ 18 platforms │
+  └─────────────────────┘   └──────────────────────┘   └─────────────────┘
+         Round 1                    Round 2                WINNER 🏆
+    (model, not a runtime)     (TypeScript, not Rust)    (all of the above)
 ```
 
-The design goal: take the deep reasoning of NousHermes and the tool-use power
-of OpenClaw, unify them in a single Rust binary, and ship security hardening
-that neither competitor bothered to implement.
+> **Fact note**: NousHermes ([NousResearch/Hermes-3-Llama-3.1-8B](https://huggingface.co/NousResearch/Hermes-3-Llama-3.1-8B)) is an LLM fine-tune series, not an agent framework. Its inference tooling is Python (HuggingFace Transformers / vLLM). OpenClaw ([github.com/openclaw](https://github.com/openclaw)) is a real TypeScript/Node.js personal AI assistant — not Python-based. The combat diagram above is an illustrative comparison of design philosophies, not an exhaustive feature audit. 🦀
+
+The design goal: take the enhanced reasoning capabilities of fine-tuned function-calling models
+(like Hermes), the tool-use patterns of personal assistant platforms (like OpenClaw), unify
+them in a single Rust binary, and ship security hardening and multi-platform delivery that
+neither category bothered to implement.
+
+## The predecessor: `hermes-agent`
+
+EdgeCrab is a Rust rewrite of `hermes-agent` — a Python agent (Python venv + Node.js, `prompt_toolkit` TUI, ~80–150 MB resident, 1–3 s startup) maintained by the same authors. EdgeCrab preserves the same configuration structure, memory format, and skills format so migration is a one-command import:
+
+```bash
+edgecrab migrate   # imports ~/.hermes/ → ~/.edgecrab/
+```
+
+See the [README migration table](../../README.md#migrating-from-hermes-agent) for what gets imported. The `edgecrab-migrate` crate handles config, sessions, memories, skills, and env vars.
 
 ## Why EdgeCrab exists
 
