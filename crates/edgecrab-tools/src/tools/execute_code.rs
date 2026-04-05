@@ -93,6 +93,7 @@ const MAX_TOOL_CALLS: usize = 50;
 ///                      file path, returns text; no side effects beyond local I/O
 ///   session_search  — read-only SQLite FTS5 query over past sessions; lets scripts
 ///                     retrieve context without pulling entire conversation into prompt
+#[cfg(unix)]
 const SANDBOX_ALLOWED_TOOLS: &[&str] = &[
     "web_search",
     "web_extract",
@@ -521,6 +522,7 @@ fn build_child_env(sock_path: &str, cwd: &std::path::Path) -> HashMap<String, St
     env
 }
 
+#[cfg(unix)]
 fn resolve_sandbox_tools(ctx: &ToolContext) -> Vec<&'static str> {
     let Some(registry) = ctx.tool_registry.as_ref() else {
         return SANDBOX_ALLOWED_TOOLS.to_vec();
@@ -1330,6 +1332,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn resolve_sandbox_tools_respects_disabled_toolsets() {
         let mut ctx = ToolContext::test_context();
