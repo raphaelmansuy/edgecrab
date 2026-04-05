@@ -1004,6 +1004,7 @@ fn detect_java_home_for_signal() -> Option<String> {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn parse_java_major(version_output: &str) -> Option<u32> {
     for line in version_output.lines() {
         if line.contains("version") {

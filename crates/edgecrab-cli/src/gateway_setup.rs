@@ -1375,6 +1375,7 @@ fn detect_signal_java_home() -> Option<String> {
 
 /// Parse the major Java version number from the output of `java -version`.
 /// Handles both modern (`21`, `23.0.1`) and legacy (`1.8.0_392`) version strings.
+#[cfg(target_os = "macos")]
 fn parse_java_major_version(version_output: &str) -> Option<u32> {
     for line in version_output.lines() {
         if line.contains("version") {

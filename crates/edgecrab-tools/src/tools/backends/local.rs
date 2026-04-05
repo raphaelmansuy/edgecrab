@@ -936,6 +936,7 @@ mod tests {
         assert!(s.contains("[exit code: 1]"));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn oneshot_respects_cwd() {
         use tempfile::TempDir;

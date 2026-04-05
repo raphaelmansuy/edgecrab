@@ -440,7 +440,10 @@ fn execute_fake_modal_direct_command(sandbox_root: &Path, command: &str) -> Fake
     // Use mutually exclusive logic to avoid double-replacement.
     let rewritten = if command.contains("/modal-sandbox") {
         // Tests that use /modal-sandbox as the remote cwd (CI-safe: never exists on host).
-        command.replace("/modal-sandbox", &sandbox_root.join("root").to_string_lossy())
+        command.replace(
+            "/modal-sandbox",
+            &sandbox_root.join("root").to_string_lossy(),
+        )
     } else {
         // Legacy tests that use /root as the remote cwd.
         command.replace("/root", &sandbox_root.join("root").to_string_lossy())
