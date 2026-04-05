@@ -7,9 +7,9 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-edgecrab-core = { path = "../edgecrab-core" }
-edgecrab-types = { path = "../edgecrab-types" }
-edgecrab-tools = { path = "../edgecrab-tools" }
+edgecrab-core = { path = "../edgecrab-core", version = "0.1.0" }
+edgecrab-types = { path = "../edgecrab-types", version = "0.1.0" }
+edgecrab-tools = { path = "../edgecrab-tools", version = "0.1.0" }
 tokio = { workspace = true }
 axum = { workspace = true }
 tracing = { workspace = true }

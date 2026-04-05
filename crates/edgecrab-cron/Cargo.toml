@@ -7,7 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-edgecrab-types = { path = "../edgecrab-types" }
+edgecrab-types = { path = "../edgecrab-types", version = "0.1.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yml = { workspace = true }
