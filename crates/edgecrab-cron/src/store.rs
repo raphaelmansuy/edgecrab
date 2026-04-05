@@ -395,12 +395,12 @@ fn atomic_write(path: &PathBuf, data: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn set_dir_permissions(path: &PathBuf) {
+fn set_dir_permissions(_path: &std::path::Path) {
     #[cfg(unix)]
     {
         use std::fs;
         use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
+        let _ = fs::set_permissions(_path, fs::Permissions::from_mode(0o700));
     }
 }
 
