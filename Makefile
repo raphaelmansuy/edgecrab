@@ -11,6 +11,7 @@
 #    make site-dev       # start Astro docs site in dev mode
 #    make site-build     # build Astro docs site for production
 #    make site-preview   # preview the production build locally
+#    make site-deploy    # trigger live GitHub Pages deployment
 # ==============================================================================
 
 .DEFAULT_GOAL := help
@@ -24,7 +25,7 @@
         publish-npm-cli publish-npm-cli-dry \
         publish-pypi-cli publish-pypi-cli-dry \
         publish-all \
-        site-dev site-build site-preview site-install \
+        site-dev site-build site-preview site-install site-deploy site-deploy-status \
         clean clean-all
 
 # ── Colours ────────────────────────────────────────────────────────────────────
@@ -242,6 +243,15 @@ site-build: ## Build Astro docs site for production (output: site/dist/)
 site-preview: site-build ## Build then preview the production site locally
 	$(call log,Previewing production build → http://localhost:4321)
 	@cd $(SITE_DIR) && pnpm preview
+
+site-deploy: ## Trigger GitHub Pages deployment via workflow_dispatch (pushes live to www.edgecrab.com)
+	$(call log,Triggering GitHub Pages deployment ...)
+	@GH_PAGER='' gh workflow run deploy-site.yml --ref main
+	$(call ok,Deployment triggered — monitor at: https://github.com/raphaelmansuy/edgecrab/actions/workflows/deploy-site.yml)
+
+site-deploy-status: ## Check the latest GitHub Pages deployment status
+	$(call log,Checking latest deployment status ...)
+	@GH_PAGER='' gh run list --workflow=deploy-site.yml --limit 3
 
 # ══════════════════════════════════════════════════════════════════════════════
 ## Clean
