@@ -1,0 +1,100 @@
+name: Release — npm CLI (edgecrab-cli)
+
+# Publishes the sdks/npm-cli package (a thin Node.js wrapper that downloads the
+# native binary from GitHub Releases at postinstall time) to the npm registry.
+#
+# Requires the GitHub Release binaries to be available BEFORE end-users run
+# `npm install edgecrab-cli`.  If this workflow runs before release-binaries.yml
+# finishes, the npm package will still be published correctly — the binary is
+# downloaded lazily at install time (postinstall hook), not at publish time.
+#
+# Secret required:
+#   NPM_TOKEN  (environment secret on the "npm" GitHub environment)
+
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Tag name to publish (e.g. v0.1.0)'
+        required: true
+        default: 'v0.1.0'
+
+permissions:
+  contents: write
+
+jobs:
+  publish-npm-cli:
+    name: Publish edgecrab-cli to npm
+    runs-on: ubuntu-latest
+    environment: npm
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Resolve version from tag
+        id: version
+        env:
+          INPUT_TAG_NAME: ${{ inputs.tag_name }}
+        run: |
+          TAG="${INPUT_TAG_NAME:-$GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          echo "tag=$TAG"       >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Sync package.json version
+        run: |
+          cd sdks/npm-cli
+          npm version "${{ steps.version.outputs.version }}" \
+            --no-git-tag-version \
+            --allow-same-version
+          echo "Publishing edgecrab-cli@${{ steps.version.outputs.version }}"
+
+      - name: Pack tarball (for GH Release attachment)
+        run: |
+          mkdir -p release-assets/npm-cli
+          cd sdks/npm-cli
+          npm pack --pack-destination "$GITHUB_WORKSPACE/release-assets/npm-cli"
+
+      - name: Ensure GitHub Release exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          gh release view "$TAG" --repo "${{ github.repository }}" \
+          || gh release create "$TAG" \
+               --repo "${{ github.repository }}" \
+               --title "EdgeCrab $TAG" \
+               --draft \
+               --generate-notes
+
+      - name: Upload npm tarball to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          gh release upload "$TAG" release-assets/npm-cli/*.tgz \
+            --repo "${{ github.repository }}" \
+            --clobber
+
+      - name: Publish to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          cd sdks/npm-cli
+          OUTPUT=$(npm publish --access public 2>&1) && echo "$OUTPUT" || {
+            echo "$OUTPUT"
+            if echo "$OUTPUT" | grep -Eq "cannot publish over the previously published versions|You cannot publish over the previously published version"; then
+              echo "edgecrab-cli already published at this version — skipping."
+            else
+              exit 1
+            fi
+          }

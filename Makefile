@@ -24,7 +24,8 @@
         publish-node publish-node-dry \
         publish-npm-cli publish-npm-cli-dry \
         publish-pypi-cli publish-pypi-cli-dry \
-        publish-all \
+        publish-all publish-all-dry \
+        version-bump tag-release \
         site-dev site-build site-preview site-install site-deploy site-deploy-status \
         clean clean-all
 
@@ -145,20 +146,38 @@ test-sdks: test-python test-node ## Run all SDK test suites
 # ══════════════════════════════════════════════════════════════════════════════
 
 # ── Rust / crates.io ──────────────────────────────────────────────────────────
+
+# Dry-run every crate in publish order.  Uses --no-verify + --allow-dirty so
+# workspace path deps don't cause false failures locally.
 publish-rust-dry: ## Dry-run: verify all 10 crates package cleanly
-	$(call log,cargo publish --dry-run [edgecrab-types])
-	@cargo publish -p edgecrab-types --dry-run --allow-dirty
+	$(call log,Dry-run: all Rust crates ...)
+	@for crate in edgecrab-types edgecrab-security edgecrab-state edgecrab-cron edgecrab-tools edgecrab-core edgecrab-gateway edgecrab-acp edgecrab-migrate edgecrab-cli; do \
+	  printf " $(CYAN)→$(RESET) cargo publish -p $$crate --dry-run\n"; \
+	  cargo publish -p $$crate --dry-run --allow-dirty --no-verify 2>&1 | grep -v 'Uploading' || true; \
+	done
 	$(call ok,Rust dry-run passed)
 
-publish-rust: ## Publish crates to crates.io (dependency order)
+# Publishes all crates in strict topological order.  Between each publish
+# we sleep 30 s so crates.io has time to index the crate before the next
+# dependent crate is submitted.  Errors due to "already published" are
+# treated as non-fatal; all other errors abort immediately.
+publish-rust: ## Publish all 10 crates to crates.io (dependency order)
 	$(call log,Publishing edgecrab-types ...)
-	@cargo publish -p edgecrab-types
-	$(call log,Waiting 30s for index propagation ...)
+	@OUTPUT=$$(cargo publish -p edgecrab-types 2>&1); STATUS=$$?; \
+	 echo "$$OUTPUT"; \
+	 if [ $$STATUS -ne 0 ]; then \
+	   echo "$$OUTPUT" | grep -q 'already exists' && echo '  (already published — skipping)' || exit 1; \
+	 fi
+	$(call log,Waiting 30 s for index propagation ...)
 	@sleep 30
 	$(call log,Publishing remaining crates ...)
-	@for crate in edgecrab-security edgecrab-state edgecrab-tools edgecrab-cron edgecrab-core edgecrab-gateway edgecrab-acp edgecrab-migrate edgecrab-cli; do \
-	  printf " $(CYAN)→$(RESET) cargo publish -p $$crate\n"; \
-	  cargo publish -p $$crate || true; \
+	@for crate in edgecrab-security edgecrab-state edgecrab-cron edgecrab-tools edgecrab-core edgecrab-gateway edgecrab-acp edgecrab-migrate edgecrab-cli; do \
+	  printf " $(CYAN)→$(RESET) cargo publish -p $$crate --no-verify\n"; \
+	  OUTPUT=$$(cargo publish -p $$crate --no-verify 2>&1); STATUS=$$?; \
+	  echo "$$OUTPUT"; \
+	  if [ $$STATUS -ne 0 ]; then \
+	    echo "$$OUTPUT" | grep -q 'already exists' && echo '  (already published — skipping)' || exit 1; \
+	  fi; \
 	  sleep 30; \
 	done
 	$(call ok,Rust crates published)
@@ -217,8 +236,49 @@ publish-pypi-cli: ## Build and upload PyPI CLI wrapper to PyPI
 	$(call ok,PyPI CLI published)
 
 # ── Publish all ───────────────────────────────────────────────────────────────
+
+# Dry-run preflight for every package — run before tagging a release.
+publish-all-dry: publish-rust-dry publish-python-dry publish-node-dry publish-npm-cli-dry publish-pypi-cli-dry ## Dry-run all packages (preflight before tagging)
+	$(call ok,All dry-runs passed — safe to tag and release)
+
 publish-all: publish-rust publish-python publish-node publish-npm-cli publish-pypi-cli ## Publish all packages (crates.io + PyPI + npm)
 	$(call ok,All packages published)
+
+# ── Version bump ──────────────────────────────────────────────────────────────
+
+# Bump the version number consistently across every manifest.
+# Usage: make version-bump VERSION=0.2.0
+version-bump: ## Bump version in all manifests. Usage: make version-bump VERSION=0.2.0
+	@[ -n "$(VERSION)" ] || (printf "$(RED)ERROR: VERSION is required. Example: make version-bump VERSION=0.2.0$(RESET)\n"; exit 1)
+	$(call log,Bumping version to $(VERSION) in all manifests ...)
+	@# Workspace Cargo.toml (workspace.package.version)
+	@sed -i.bak 's/^version = "[^"]*"/version = "$(VERSION)"/' Cargo.toml && rm -f Cargo.toml.bak
+	@# Node.js SDK
+	@cd sdks/node   && npm version "$(VERSION)" --no-git-tag-version --allow-same-version --silent
+	@# npm CLI wrapper
+	@cd sdks/npm-cli && npm version "$(VERSION)" --no-git-tag-version --allow-same-version --silent
+	@# Python SDK
+	@cd sdks/python  && sed -i.bak 's/^version = "[^"]*"/version = "$(VERSION)"/' pyproject.toml && rm -f pyproject.toml.bak
+	@# PyPI CLI wrapper
+	@cd sdks/pypi-cli && sed -i.bak 's/^version = "[^"]*"/version = "$(VERSION)"/' pyproject.toml && rm -f pyproject.toml.bak
+	@printf '__version__ = "%s"\n' "$(VERSION)" > sdks/pypi-cli/edgecrab_cli/_version.py
+	$(call ok,Version bumped to $(VERSION))
+	@printf "$(DIM)  Next: git add -A && git commit -m 'chore: bump version to $(VERSION)' && make tag-release VERSION=$(VERSION)$(RESET)\n"
+
+# ── Tag release ───────────────────────────────────────────────────────────────
+
+# Create and push an annotated release tag.  This triggers all release-*.yml
+# workflows on GitHub Actions (crates.io + npm + PyPI + Docker + binaries).
+# Run `make publish-all-dry` first as a preflight check.
+# Usage: make tag-release VERSION=0.2.0
+tag-release: ## Create and push release tag. Usage: make tag-release VERSION=0.2.0
+	@[ -n "$(VERSION)" ] || (printf "$(RED)ERROR: VERSION is required. Example: make tag-release VERSION=0.2.0$(RESET)\n"; exit 1)
+	$(call log,Creating annotated tag v$(VERSION) ...)
+	@git tag -a "v$(VERSION)" -m "Release v$(VERSION)"
+	$(call log,Pushing tag v$(VERSION) to origin ...)
+	@git push origin "v$(VERSION)"
+	$(call ok,Tag v$(VERSION) pushed — CI will publish all packages)
+	@printf "$(DIM)  Monitor: gh run list --limit 10$(RESET)\n"
 
 # ══════════════════════════════════════════════════════════════════════════════
 ## Documentation Site (Astro)

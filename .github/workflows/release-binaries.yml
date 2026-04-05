@@ -1,0 +1,164 @@
+name: Release — Native Binaries
+
+# Builds the edgecrab native binary for every supported platform, packages it
+# into the expected archive names, and uploads each archive to the GitHub
+# Release for that tag.
+#
+# The npm-cli and pypi-cli wrappers download these archives at install-time, so
+# this workflow MUST complete successfully before end-users can install the
+# CLI wrappers.
+#
+# Archive names — must match exactly what sdks/npm-cli/scripts/install.js and
+# sdks/pypi-cli/edgecrab_cli/_binary.py expect:
+#   edgecrab-x86_64-unknown-linux-gnu.tar.gz
+#   edgecrab-aarch64-unknown-linux-gnu.tar.gz
+#   edgecrab-x86_64-apple-darwin.tar.gz
+#   edgecrab-aarch64-apple-darwin.tar.gz
+#   edgecrab-x86_64-pc-windows-msvc.zip
+
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Tag name to attach binaries to (e.g. v0.1.0)'
+        required: true
+        default: 'v0.1.0'
+
+permissions:
+  contents: write
+
+jobs:
+  # ── Build each target platform ───────────────────────────────────────────────
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target:    x86_64-unknown-linux-gnu
+            os:        ubuntu-latest
+            archive:   edgecrab-x86_64-unknown-linux-gnu.tar.gz
+            use_cross: false
+
+          - target:    aarch64-unknown-linux-gnu
+            os:        ubuntu-latest
+            archive:   edgecrab-aarch64-unknown-linux-gnu.tar.gz
+            use_cross: true
+
+          - target:    x86_64-apple-darwin
+            os:        macos-13        # last Intel GitHub runner
+            archive:   edgecrab-x86_64-apple-darwin.tar.gz
+            use_cross: false
+
+          - target:    aarch64-apple-darwin
+            os:        macos-14        # Apple Silicon (M1)
+            archive:   edgecrab-aarch64-apple-darwin.tar.gz
+            use_cross: false
+
+          - target:    x86_64-pc-windows-msvc
+            os:        windows-latest
+            archive:   edgecrab-x86_64-pc-windows-msvc.zip
+            use_cross: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # cross is required for Linux aarch64 cross-compilation
+      - name: Install cross (Linux aarch64 only)
+        if: matrix.use_cross == true
+        run: cargo install cross --locked
+
+      # ── Compile ──────────────────────────────────────────────────────────────
+      - name: Build binary (cross)
+        if: matrix.use_cross == true
+        run: cross build --release --target ${{ matrix.target }} -p edgecrab-cli
+
+      - name: Build binary (native)
+        if: matrix.use_cross == false && runner.os != 'Windows'
+        run: cargo build --release --target ${{ matrix.target }} -p edgecrab-cli
+
+      - name: Build binary (Windows native)
+        if: matrix.use_cross == false && runner.os == 'Windows'
+        run: cargo build --release --target ${{ matrix.target }} -p edgecrab-cli
+        shell: pwsh
+
+      # ── Package ──────────────────────────────────────────────────────────────
+      - name: Package binary (Unix .tar.gz)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          cd "target/${{ matrix.target }}/release"
+          tar -czf "$GITHUB_WORKSPACE/${{ matrix.archive }}" edgecrab
+
+      - name: Package binary (Windows .zip)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $src = "target\${{ matrix.target }}\release\edgecrab.exe"
+          Compress-Archive -Path $src -DestinationPath "$env:GITHUB_WORKSPACE\${{ matrix.archive }}"
+
+      - name: Upload archive as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: ${{ matrix.archive }}
+          if-no-files-found: error
+
+  # ── Attach all archives to the GitHub Release ────────────────────────────────
+  upload:
+    name: Upload binaries to GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: release-assets/
+
+      - name: List downloaded assets
+        run: ls -lh release-assets/
+
+      - name: Resolve tag name
+        id: tag
+        env:
+          INPUT_TAG_NAME: ${{ inputs.tag_name }}
+        run: |
+          TAG="${INPUT_TAG_NAME:-$GITHUB_REF_NAME}"
+          echo "name=$TAG" >> "$GITHUB_OUTPUT"
+
+      # Create a stub release if release-rust.yml hasn't created it yet.
+      # softprops/action-gh-release in release-rust.yml will update it later.
+      - name: Ensure GitHub Release exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.tag.outputs.name }}"
+          gh release view "$TAG" --repo "${{ github.repository }}" \
+          || gh release create "$TAG" \
+               --repo "${{ github.repository }}" \
+               --title "EdgeCrab $TAG" \
+               --draft \
+               --generate-notes
+
+      - name: Upload binaries to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.tag.outputs.name }}"
+          gh release upload "$TAG" release-assets/* \
+            --repo "${{ github.repository }}" \
+            --clobber

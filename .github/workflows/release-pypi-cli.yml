@@ -1,0 +1,100 @@
+name: Release — PyPI CLI (edgecrab-cli)
+
+# Publishes the sdks/pypi-cli package (a pure-Python wrapper that downloads the
+# native binary from GitHub Releases on first use) to PyPI.
+#
+# Uses OIDC trusted publishing — no long-lived PyPI token is stored in GitHub
+# Secrets.  The "pypi" environment must be configured with a PyPI trusted
+# publisher entry pointing to this repository and this workflow file.
+#
+# The binary download happens lazily at runtime (on first `edgecrab` invocation),
+# not at pip-install time.  Therefore this workflow can run in parallel with
+# release-binaries.yml without risk of shipping a broken package.
+#
+# PyPI environment setup:
+#   pypi.org → Account Settings → Publishing → Add trusted publisher
+#     Owner:    raphaelmansuy
+#     Repo:     edgecrab
+#     Workflow: release-pypi-cli.yml
+#     Env:      pypi
+
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Tag name to publish (e.g. v0.1.0)'
+        required: true
+        default: 'v0.1.0'
+
+permissions:
+  id-token: write   # required for OIDC trusted publishing
+  contents: read
+
+jobs:
+  build:
+    name: Build edgecrab-cli wheels
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Resolve version from tag
+        id: version
+        env:
+          INPUT_TAG_NAME: ${{ inputs.tag_name }}
+        run: |
+          TAG="${INPUT_TAG_NAME:-$GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Publishing edgecrab-cli==$VERSION"
+
+      - name: Sync pyproject.toml version
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          cd sdks/pypi-cli
+          sed -i "s/^version = \".*\"/version = \"$VERSION\"/" pyproject.toml
+          # Also sync the _version.py that the binary downloader reads at runtime
+          printf '__version__ = "%s"\n' "$VERSION" > edgecrab_cli/_version.py
+
+      - name: Install build tool
+        run: pip install --upgrade build
+
+      - name: Build sdist and wheel
+        run: |
+          cd sdks/pypi-cli
+          python -m build --outdir dist/
+
+      - name: Upload dist as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pypi-cli-dist
+          path: sdks/pypi-cli/dist/
+          if-no-files-found: error
+
+  publish-pypi:
+    name: Publish edgecrab-cli to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+
+    steps:
+      - name: Download dist artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: pypi-cli-dist
+          path: dist/
+
+      - name: List dist contents
+        run: ls -lh dist/
+
+      - name: Publish to PyPI (OIDC)
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+          skip-existing: true
