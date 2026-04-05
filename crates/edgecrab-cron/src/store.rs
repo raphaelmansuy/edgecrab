@@ -9,7 +9,6 @@
 //! shared by both the CLI (`cron_cmd.rs`) and the LLM tool (`tools/cron.rs`).
 
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 use anyhow::{Context, bail};
@@ -381,6 +380,7 @@ fn atomic_write(path: &PathBuf, data: &str) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
         use std::fs;
+        use std::os::unix::fs::PermissionsExt;
         let _ = fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o600));
     }
     tmp.persist(path)
@@ -389,6 +389,7 @@ fn atomic_write(path: &PathBuf, data: &str) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
         use std::fs;
+        use std::os::unix::fs::PermissionsExt;
         let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
     }
     Ok(())
@@ -398,6 +399,7 @@ fn set_dir_permissions(path: &PathBuf) {
     #[cfg(unix)]
     {
         use std::fs;
+        use std::os::unix::fs::PermissionsExt;
         let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
     }
 }

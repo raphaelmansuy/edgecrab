@@ -658,19 +658,19 @@ async fn e2e_modal_backend_respects_working_directory_via_fake_http_api() {
         &mut ctx,
         &format!("e2e-modal-cwd-{}", uuid::Uuid::new_v4().simple()),
     );
-    ctx.cwd = PathBuf::from("/root");
+    ctx.cwd = PathBuf::from("/nonexistent/remote/home");
     unsafe { std::env::set_var("EDGECRAB_HOME", edgecrab_home.path()) };
     unsafe { std::env::set_var("EDGECRAB_MODAL_BASE_URL", &server.base_url) };
 
     TerminalTool
         .execute(
-            json!({"command": "mkdir -p /root/workspace && echo modal-probe >/root/workspace/probe.txt"}),
+            json!({"command": "mkdir -p /nonexistent/remote/home/workspace && echo modal-probe >/nonexistent/remote/home/workspace/probe.txt"}),
             &ctx,
         )
         .await
         .expect("seed remote workspace");
 
-    ctx.cwd = PathBuf::from("/root/workspace");
+    ctx.cwd = PathBuf::from("/nonexistent/remote/home/workspace");
     let result = TerminalTool
         .execute(json!({"command": "cat probe.txt"}), &ctx)
         .await
