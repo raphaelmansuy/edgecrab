@@ -36,7 +36,9 @@ use serde_json::json;
 
 use edgecrab_types::{ToolError, ToolSchema};
 
-use crate::registry::{ToolContext, ToolHandler, ToolRegistry};
+use crate::registry::{ToolContext, ToolHandler};
+#[cfg(unix)]
+use crate::registry::ToolRegistry;
 use crate::tools::backends::redact_output;
 
 /// Maximum execution time before we kill the subprocess (5 minutes like hermes).
@@ -829,10 +831,10 @@ async fn run_command_capture(
     })
 }
 
-fn configure_process_group(cmd: &mut tokio::process::Command) {
+fn configure_process_group(_cmd: &mut tokio::process::Command) {
     #[cfg(unix)]
     unsafe {
-        cmd.pre_exec(|| {
+        _cmd.pre_exec(|| {
             libc::setpgid(0, 0);
             Ok(())
         });
@@ -972,6 +974,7 @@ impl ToolHandler for ExecuteCodeToolReal {
             "python" | "python3" | "py" | ""
         );
         let timeout_secs = args.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS).min(600);
+        #[cfg(unix)]
         let sandbox_tools = resolve_sandbox_tools(ctx);
 
         let exec_start = std::time::Instant::now();
