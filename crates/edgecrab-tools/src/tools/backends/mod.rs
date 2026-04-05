@@ -18,6 +18,7 @@ pub mod docker;
 pub mod local;
 pub mod modal;
 pub mod singularity;
+#[cfg(unix)]
 pub mod ssh;
 
 use std::path::Path;
@@ -572,7 +573,13 @@ pub async fn build_backend(config: BackendConfig) -> Result<Box<dyn ExecutionBac
             config.task_id,
             config.docker,
         ))),
+        #[cfg(unix)]
         BackendKind::Ssh => Ok(Box::new(ssh::SshBackend::new(config.task_id, config.ssh))),
+        #[cfg(not(unix))]
+        BackendKind::Ssh => Err(ToolError::ExecutionFailed {
+            tool: "terminal".into(),
+            message: "SSH backend requires a Unix-like OS (not supported on Windows)".into(),
+        }),
         BackendKind::Modal => Ok(Box::new(modal::ModalBackend::new(
             config.task_id,
             config.modal,
