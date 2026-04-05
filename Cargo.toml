@@ -1,0 +1,108 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/edgecrab-types",
+    "crates/edgecrab-security",
+    "crates/edgecrab-state",
+    "crates/edgecrab-cron",
+    "crates/edgecrab-tools",
+    "crates/edgecrab-core",
+    "crates/edgecrab-cli",
+    "crates/edgecrab-gateway",
+    "crates/edgecrab-acp",
+    "crates/edgecrab-migrate",
+]
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85.0"
+license = "Apache-2.0"
+repository = "https://github.com/raphaelmansuy/edgecrab"
+authors = ["Raphael Mansuy"]
+
+[workspace.dependencies]
+# Shared across workspace — single version for consistency
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yml = "0.0.12"
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+uuid = { version = "1", features = ["v4"] }
+thiserror = "2"
+anyhow = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+futures = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+async-trait = "0.1"
+regex = "1"
+url = "2"
+
+# LLM backend
+edgequake-llm = "0.5.1"
+
+# Image processing (vision tool: resize/compress before base64 encoding)
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+# Database
+rusqlite = { version = "0.32", features = ["bundled", "functions"] }
+
+# CLI / TUI
+clap = { version = "4", features = ["derive"] }
+ratatui = "0.29"
+crossterm = "0.28"
+tui-textarea = "0.7"
+dialoguer = "0.12"
+unicode-width = "0.2"
+
+# HTTP
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "multipart"] }
+axum = "0.7"
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+
+# Security
+aho-corasick = "1"
+unicode-normalization = "0.1"
+strip-ansi-escapes = "0.2"
+secrecy = { version = "0.10", features = ["serde"] }
+
+# Crypto
+sha2 = "0.10"
+base64 = "0.22"
+cron = "0.12"
+urlencoding = "2"
+
+# Utilities
+dirs = "5"
+shellexpand = "3"
+dashmap = "6"
+inventory = "0.3"
+strsim = "0.11"
+shell-words = "1"
+similar = "2"
+notify = "7"
+rand = "0.9"
+tempfile = "3"
+which = "7"
+dotenvy = "0.15"
+mockall = "0.13"
+libc = "0.2"
+
+# Execution backends
+bollard = { version = "0.18", features = ["ssl"] }
+openssh = { version = "0.11", features = ["native-mux"] }
+
+# Testing
+proptest = "1"
+insta = "1"
+criterion = "0.5"
+tokio-test = "0.4"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+
+[patch.crates-io]
+edgequake-llm = { path = "../edgequake-llm" }

@@ -1,0 +1,32 @@
+[package]
+name = "edgecrab-core"
+description = "Agent core: conversation loop, prompt builder, context compression, model routing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+edgecrab-types = { path = "../edgecrab-types" }
+edgecrab-tools = { path = "../edgecrab-tools" }
+edgecrab-state = { path = "../edgecrab-state" }
+edgecrab-security = { path = "../edgecrab-security" }
+edgequake-llm = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yml = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+dirs = { workspace = true }
+dotenvy = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+mockall = { workspace = true }
+insta = { workspace = true }
+tempfile = { workspace = true }

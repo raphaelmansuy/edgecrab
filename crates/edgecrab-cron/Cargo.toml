@@ -1,0 +1,25 @@
+[package]
+name = "edgecrab-cron"
+description = "Shared cron scheduling library: schedule parsing, job storage, prompt scanning"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+edgecrab-types = { path = "../edgecrab-types" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yml = { workspace = true }
+chrono = { workspace = true }
+chrono-tz = { workspace = true }
+uuid = { workspace = true }
+anyhow = { workspace = true }
+regex = { workspace = true }
+cron = { workspace = true }
+dirs = { workspace = true }
+tracing = { workspace = true }
+tempfile = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

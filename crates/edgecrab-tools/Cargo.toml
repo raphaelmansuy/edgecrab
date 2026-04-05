@@ -1,0 +1,52 @@
+[package]
+name = "edgecrab-tools"
+description = "Tool registry, ToolHandler trait, and 50+ tool implementations"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+edgecrab-types = { path = "../edgecrab-types" }
+edgecrab-security = { path = "../edgecrab-security" }
+edgecrab-state = { path = "../edgecrab-state" }
+edgecrab-cron = { path = "../edgecrab-cron" }
+edgequake-llm = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yml = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+async-trait = { workspace = true }
+inventory = { workspace = true }
+strsim = { workspace = true }
+shell-words = { workspace = true }
+dashmap = { workspace = true }
+regex = { workspace = true }
+reqwest = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures = { workspace = true }
+strip-ansi-escapes = { workspace = true }
+tracing = { workspace = true }
+edgeparse-core = "0.2.3"
+uuid = { workspace = true }
+image = { workspace = true }
+url = { workspace = true }
+sha2 = { workspace = true }
+base64 = { workspace = true }
+cron = { workspace = true }
+chrono = { workspace = true }
+dirs = { workspace = true }
+which = { workspace = true }
+tempfile = { workspace = true }
+libc = { workspace = true }
+bollard = { workspace = true }
+openssh = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+mockall = { workspace = true }
+tempfile = { workspace = true }
+uuid = { workspace = true }
+serde_json = { workspace = true }
+edgecrab-types = { path = "../edgecrab-types" }

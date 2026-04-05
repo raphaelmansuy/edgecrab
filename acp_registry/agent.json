@@ -1,0 +1,41 @@
+{
+  "name": "edgecrab",
+  "description": "EdgeCrab — an ACP-compatible agent with file, terminal, and skill tools. Launched as a child process and communicates via JSON-RPC 2.0 over stdio.",
+  "version": "0.1.0",
+  "launch": {
+    "type": "command",
+    "command": "edgecrab acp"
+  },
+  "protocol": {
+    "transport": "stdio",
+    "format": "jsonrpc2"
+  },
+  "capabilities": {
+    "session": {
+      "fork": true,
+      "list": true
+    },
+    "approval": true,
+    "streaming": true
+  },
+  "editor_setup": {
+    "vscode": {
+      "setting": "acpClient.agents",
+      "example": [
+        {
+          "name": "edgecrab",
+          "registryDir": "/path/to/edgecrab/acp_registry"
+        }
+      ]
+    },
+    "zed": {
+      "setting": "acp.agents",
+      "example": [
+        {
+          "name": "edgecrab",
+          "registry_dir": "/path/to/edgecrab/acp_registry"
+        }
+      ]
+    }
+  }
+}

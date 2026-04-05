@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 180 32" fill="none" aria-label="EdgeCrab">
+  <!-- Crab icon -->
+  <g transform="translate(0, 4)">
+    <!-- Body -->
+    <ellipse cx="12" cy="12" rx="7" ry="5.5" fill="#FB923C"/>
+    <!-- Eyes -->
+    <circle cx="9" cy="9.5" r="1.2" fill="#1a1a1a"/>
+    <circle cx="15" cy="9.5" r="1.2" fill="#1a1a1a"/>
+    <circle cx="9.4" cy="9.5" r="0.5" fill="#fca5a5"/>
+    <circle cx="15.4" cy="9.5" r="0.5" fill="#fca5a5"/>
+    <!-- Left claw -->
+    <path d="M5 9 Q2 6 1.5 8 Q1 9.5 3 10.5 Q4 11 5 10.5" fill="#FB923C"/>
+    <path d="M1.5 8 Q0.5 6 1 7.5" stroke="#FB923C" stroke-width="0.8" fill="none"/>
+    <!-- Right claw -->
+    <path d="M19 9 Q22 6 22.5 8 Q23 9.5 21 10.5 Q20 11 19 10.5" fill="#FB923C"/>
+    <path d="M22.5 8 Q23.5 6 23 7.5" stroke="#FB923C" stroke-width="0.8" fill="none"/>
+    <!-- Left legs -->
+    <path d="M7 13 L5 15.5" stroke="#FB923C" stroke-width="1.2" stroke-linecap="round"/>
+    <path d="M8.5 14 L7 17" stroke="#FB923C" stroke-width="1.2" stroke-linecap="round"/>
+    <path d="M10 14.5 L9.5 17.5" stroke="#FB923C" stroke-width="1.2" stroke-linecap="round"/>
+    <!-- Right legs -->
+    <path d="M17 13 L19 15.5" stroke="#FB923C" stroke-width="1.2" stroke-linecap="round"/>
+    <path d="M15.5 14 L17 17" stroke="#FB923C" stroke-width="1.2" stroke-linecap="round"/>
+    <path d="M14 14.5 L14.5 17.5" stroke="#FB923C" stroke-width="1.2" stroke-linecap="round"/>
+  </g>
+  <!-- Wordmark -->
+  <text x="30" y="22" font-family="Inter, system-ui, sans-serif" font-weight="800" font-size="17" fill="#f9fafb" letter-spacing="-0.5">Edge<tspan fill="#FB923C">Crab</tspan></text>
+</svg>

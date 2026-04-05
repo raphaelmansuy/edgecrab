@@ -1,0 +1,149 @@
+---
+interface Column {
+  label: string;
+  highlight?: boolean;
+}
+
+interface Row {
+  feature: string;
+  values: string[];
+  highlight?: boolean;
+}
+
+interface Props {
+  title: string;
+  subtitle: string;
+  eyebrow?: string;
+  columns: Column[];
+  rows: Row[];
+}
+
+const { title, subtitle, eyebrow = 'Why EdgeCrab?', columns, rows } = Astro.props;
+---
+
+<section class="comparison-section" aria-labelledby="comparison-heading">
+  <div class="comparison-container">
+    <span class="section-eyebrow">{eyebrow}</span>
+    <h2 id="comparison-heading" class="section-title">{title}</h2>
+    <p class="section-subtitle">{subtitle}</p>
+
+    <div class="table-wrap">
+      <table class="comparison-table" role="table">
+        <thead>
+          <tr>
+            <th scope="col" class="col-feature">Feature</th>
+            {columns.map(col => (
+              <th scope="col" class:list={['col-value', { 'col-highlight': col.highlight }]}>{col.label}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map(row => (
+            <tr class:list={[{ 'row-highlight': row.highlight }]}>
+              <td class="cell-feature">{row.feature}</td>
+              {row.values.map((val, i) => (
+                <td class:list={['cell-value', { 'cell-highlight': columns[i]?.highlight }]}>
+                  {val.startsWith('✓') || val.startsWith('✗')
+                    ? <span class:list={['cell-badge', val.startsWith('✓') ? 'badge-win' : 'badge-na']}>{val}</span>
+                    : val}
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<style>
+  .comparison-section {
+    padding: 6rem 1.5rem;
+    background: var(--ep-section-alt-bg, #F9FAFB);
+    text-align: center;
+  }
+
+  .comparison-container {
+    max-width: 900px;
+    margin: 0 auto;
+  }
+
+  .section-eyebrow {
+    display: inline-block;
+    font-size: 0.8rem; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.1em; color: var(--sl-color-accent);
+    margin-bottom: 0.75rem; padding: 0.3rem 0.75rem;
+    background: rgba(234, 88, 12, 0.08); border-radius: 999px;
+  }
+
+  .section-title {
+    font-size: clamp(1.75rem, 4vw, 2.5rem); font-weight: 800;
+    margin-bottom: 0.75rem; color: var(--ep-text-primary, #111827);
+    letter-spacing: -0.02em;
+  }
+
+  .section-subtitle {
+    font-size: 1.1rem; color: var(--ep-text-secondary, #6B7280);
+    max-width: 560px; margin: 0 auto 3rem; line-height: 1.6;
+  }
+
+  .table-wrap {
+    overflow-x: auto;
+    border-radius: 0.875rem;
+    border: 1px solid var(--ep-card-border, #E5E7EB);
+    box-shadow: var(--ep-card-shadow);
+  }
+
+  .comparison-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.875rem;
+    background: var(--ep-card-bg, #fff);
+  }
+
+  .comparison-table thead tr {
+    background: var(--ep-section-alt-bg, #F9FAFB);
+    border-bottom: 1px solid var(--ep-card-border, #E5E7EB);
+  }
+
+  .comparison-table th {
+    padding: 0.875rem 1.25rem;
+    font-weight: 700; text-align: left;
+    color: var(--ep-text-primary, #111827);
+  }
+
+  .col-highlight { color: var(--sl-color-accent) !important; }
+
+  .comparison-table td {
+    padding: 0.75rem 1.25rem;
+    border-bottom: 1px solid var(--ep-card-border, #E5E7EB);
+    color: var(--ep-text-secondary, #4B5563);
+    text-align: left;
+  }
+
+  .comparison-table tbody tr:last-child td { border-bottom: none; }
+  .row-highlight { background: rgba(234, 88, 12, 0.03); }
+
+  .cell-feature { font-weight: 600; color: var(--ep-text-primary, #111827); }
+  .cell-highlight { font-weight: 500; color: var(--sl-color-accent); }
+
+  .cell-badge {
+    display: inline-block; padding: 0.2rem 0.6rem;
+    border-radius: 0.375rem; font-size: 0.8rem; font-weight: 600;
+  }
+
+  .badge-win {
+    background: rgba(234, 88, 12, 0.1);
+    color: var(--sl-color-accent);
+  }
+
+  .badge-na {
+    background: rgba(107, 114, 128, 0.1);
+    color: var(--ec-color-muted);
+  }
+
+  @media (max-width: 540px) {
+    .comparison-section { padding: 4rem 1rem; }
+    .comparison-table th, .comparison-table td { padding: 0.625rem 0.875rem; }
+  }
+</style>

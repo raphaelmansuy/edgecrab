@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "edgecrab-cli"
+version = "0.1.0"
+requires-python = ">=3.10"
+readme = "README.md"
+license = { text = "MIT" }
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Environment :: Console",
+]
+keywords = ["ai", "agent", "llm", "edgecrab", "coding-agent", "personal-assistant", "cli", "nous-hermes", "openclaw"]
+description = "EdgeCrab CLI — Super Powerful Personal Assistant inspired by NousHermes and OpenClaw. Single static binary, blazing-fast TUI, multi-provider LLM."
+dependencies = [
+    "httpx>=0.27.0,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0,<9",
+]
+
+[project.urls]
+Homepage = "https://www.edgecrab.com"
+Repository = "https://github.com/raphaelmansuy/edgecrab"
+Documentation = "https://www.edgecrab.com"
+
+[project.scripts]
+edgecrab = "edgecrab_cli._entry:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["edgecrab_cli*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

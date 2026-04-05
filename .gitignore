@@ -1,0 +1,70 @@
+# ── Rust build artefacts ─────────────────────────────────────────────────────
+/target/
+**/*.rs.bk
+
+# ── Editor / OS noise ────────────────────────────────────────────────────────
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+*.bak
+*~
+.idea/
+.vscode/settings.json
+.vscode/*.log
+
+# ── Local secrets — NEVER commit ─────────────────────────────────────────────
+.env
+.env.local
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+mcp-tokens/
+
+# ── Edgecrab runtime state (generated at run-time, not source) ───────────────
+.edgecrab/
+.agent/
+
+# ── Node.js dependencies (root + nested) ─────────────────────────────────────
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ── Documentation site build ─────────────────────────────────────────────────
+site/node_modules/
+site/dist/
+site/.astro/
+
+# ── SDK build artefacts ───────────────────────────────────────────────────────
+# Python
+sdks/python/dist/
+sdks/python/*.egg-info/
+sdks/python/.pytest_cache/
+__pycache__/
+*.pyc
+*.pyo
+.mypy_cache/
+
+# Node.js / npm-cli
+sdks/node/node_modules/
+sdks/node/dist/
+sdks/npm-cli/node_modules/
+sdks/npm-cli/dist/
+
+# ── Bridge / script dependencies ─────────────────────────────────────────────
+scripts/whatsapp-bridge/node_modules/
+scripts/whatsapp-bridge/.baileys-store/
+scripts/*/node_modules/
+
+# ── Test artefacts ────────────────────────────────────────────────────────────
+*.profraw
+lcov.info
+coverage/
+
+# ── Stray / one-off files ─────────────────────────────────────────────────────
+video_script.py
+*.profdata

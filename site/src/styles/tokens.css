@@ -1,0 +1,81 @@
+/* EdgeCrab Design Tokens — Light & Dark modes, WCAG 2.1 AA compliant
+ * Starlight semantic model: "white" = text foreground, "black" = page background. */
+
+/* ── Light Mode ───────────────────────────────────────────── */
+:root,
+:root[data-theme='light'] {
+  /* Orange/Rust accent */
+  --sl-color-accent-low: #FFF7ED;   /* orange-50  — tinted backgrounds */
+  --sl-color-accent: #EA580C;       /* orange-600 — links, buttons */
+  --sl-color-accent-high: #9A3412;  /* orange-800 — high-emphasis accent text */
+
+  /* Semantic gray scale (text → background) */
+  --sl-color-white: #111827;
+  --sl-color-gray-1: #1F2937;
+  --sl-color-gray-2: #374151;
+  --sl-color-gray-3: #6B7280;
+  --sl-color-gray-4: #9CA3AF;
+  --sl-color-gray-5: #D1D5DB;
+  --sl-color-gray-6: #F3F4F6;
+  --sl-color-gray-7: #F9FAFB;
+  --sl-color-black: #FFFFFF;
+
+  /* Custom brand tokens */
+  --ec-color-rust: #EA580C;
+  --ec-color-rust-light: #FED7AA;
+  --ec-color-crab: #DC2626;
+  --ec-color-teal: #0D9488;
+  --ec-color-muted: #6B7280;
+
+  /* Landing page */
+  --ep-hero-gradient: linear-gradient(135deg, #FFFBF7 0%, #FFF7ED 50%, #FFFBF7 100%);
+  --ep-card-bg: #FFFFFF;
+  --ep-card-border: #E5E7EB;
+  --ep-card-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
+  --ep-card-shadow-hover: 0 8px 25px rgba(234, 88, 12, 0.08), 0 2px 8px rgba(0, 0, 0, 0.04);
+  --ep-section-alt-bg: #F9FAFB;
+  --ep-code-bg: #F3F4F6;
+  --ep-text-primary: #111827;
+  --ep-text-secondary: #4B5563;
+
+  /* Font families */
+  --ep-font-sans: 'Inter', system-ui, -apple-system, sans-serif;
+  --ep-font-mono: 'JetBrains Mono', 'Fira Code', ui-monospace, monospace;
+}
+
+/* ── Dark Mode ────────────────────────────────────────────── */
+:root[data-theme='dark'] {
+  /* Orange/Rust accent (brighter for dark bg) */
+  --sl-color-accent-low: #431407;   /* orange-950 — tinted backgrounds */
+  --sl-color-accent: #FB923C;        /* orange-400 — links, buttons */
+  --sl-color-accent-high: #FED7AA;   /* orange-200 — high-emphasis accent text */
+
+  /* Semantic gray scale */
+  --sl-color-white: #f9fafb;
+  --sl-color-gray-1: #f3f4f6;
+  --sl-color-gray-2: #e5e7eb;
+  --sl-color-gray-3: #9ca3af;
+  --sl-color-gray-4: #6b7280;
+  --sl-color-gray-5: #374151;
+  --sl-color-gray-6: #1f2937;
+  --sl-color-gray-7: #111827;
+  --sl-color-black: #0c0a09;        /* stone-950 */
+
+  /* Custom brand tokens */
+  --ec-color-rust: #FB923C;
+  --ec-color-rust-light: #431407;
+  --ec-color-crab: #F87171;
+  --ec-color-teal: #2DD4BF;
+  --ec-color-muted: #9ca3af;
+
+  /* Landing page */
+  --ep-hero-gradient: linear-gradient(135deg, #0c0a09 0%, #1c0a00 50%, #0c0a09 100%);
+  --ep-card-bg: #1c1917;
+  --ep-card-border: #292524;
+  --ep-card-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
+  --ep-card-shadow-hover: 0 8px 25px rgba(251, 146, 60, 0.15), 0 2px 8px rgba(0, 0, 0, 0.3);
+  --ep-section-alt-bg: #111827;
+  --ep-code-bg: #1e1b18;
+  --ep-text-primary: #f9fafb;
+  --ep-text-secondary: #d1d5db;
+}

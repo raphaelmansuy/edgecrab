@@ -1,0 +1,48 @@
+[package]
+name = "edgecrab-cli"
+description = "Interactive TUI CLI for the EdgeCrab agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "edgecrab"
+path = "src/main.rs"
+
+[dependencies]
+edgecrab-core = { path = "../edgecrab-core" }
+edgecrab-types = { path = "../edgecrab-types" }
+edgecrab-state = { path = "../edgecrab-state" }
+edgecrab-tools = { path = "../edgecrab-tools" }
+edgecrab-cron = { path = "../edgecrab-cron" }
+edgecrab-acp = { path = "../edgecrab-acp" }
+edgecrab-gateway = { path = "../edgecrab-gateway" }
+edgecrab-migrate = { path = "../edgecrab-migrate" }
+edgequake-llm = { workspace = true }
+clap = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+tui-textarea = { workspace = true }
+dialoguer = { workspace = true }
+strsim = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_yml = { workspace = true }
+dirs = { workspace = true }
+chrono = { workspace = true }
+serde_json = { workspace = true }
+shellexpand = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+cron = { workspace = true }
+reqwest = { workspace = true }
+arboard = "3"
+unicode-width = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile = { workspace = true }

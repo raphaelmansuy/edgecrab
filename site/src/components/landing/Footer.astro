@@ -1,0 +1,182 @@
+---
+const base = import.meta.env.BASE_URL;
+const year = new Date().getFullYear();
+---
+
+<footer class="site-footer not-content" aria-label="Site footer">
+  <div class="footer-inner">
+
+    <!-- Brand column -->
+    <div class="footer-brand">
+      <a href={base} class="footer-logo" aria-label="EdgeCrab home">
+        <svg class="footer-logo-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none" aria-hidden="true" width="28" height="28">
+          <rect width="32" height="32" rx="6" fill="#EA580C"/>
+          <ellipse cx="16" cy="16" rx="7.5" ry="6" fill="#fff" opacity="0.9"/>
+          <circle cx="12.5" cy="13" r="1.6" fill="#EA580C"/>
+          <circle cx="19.5" cy="13" r="1.6" fill="#EA580C"/>
+          <path d="M8.5 12.5 Q6 10 5.5 12 Q5 13.5 7 14 Q8 14.2 8.5 13.5" fill="#EA580C"/>
+          <path d="M23.5 12.5 Q26 10 26.5 12 Q27 13.5 25 14 Q24 14.2 23.5 13.5" fill="#EA580C"/>
+          <path d="M11 19.5 L9.5 22" stroke="#EA580C" stroke-width="1.4" stroke-linecap="round"/>
+          <path d="M13 20 L12 23" stroke="#EA580C" stroke-width="1.4" stroke-linecap="round"/>
+          <path d="M21 19.5 L22.5 22" stroke="#EA580C" stroke-width="1.4" stroke-linecap="round"/>
+          <path d="M19 20 L20 23" stroke="#EA580C" stroke-width="1.4" stroke-linecap="round"/>
+        </svg>
+        <span class="footer-logo-text">Edge<span class="footer-logo-accent">Crab</span></span>
+      </a>
+      <p class="footer-tagline">
+        Rust-native autonomous coding agent.<br />
+        Single binary. Zero runtime deps.
+      </p>
+      <div class="footer-badges">
+        <a href="https://github.com/raphaelmansuy/edgecrab/blob/main/LICENSE" target="_blank" rel="noopener noreferrer" class="footer-badge">
+          Apache 2.0
+        </a>
+        <a href="https://crates.io/crates/edgecrab-cli" target="_blank" rel="noopener noreferrer" class="footer-badge footer-badge--accent">
+          crates.io
+        </a>
+        <a href="https://pypi.org/project/edgecrab-sdk/" target="_blank" rel="noopener noreferrer" class="footer-badge footer-badge--green">
+          PyPI
+        </a>
+      </div>
+    </div>
+
+    <!-- Link columns -->
+    <nav class="footer-columns" aria-label="Footer navigation">
+
+      <div class="footer-col">
+        <h3 class="footer-col-title">Product</h3>
+        <ul class="footer-col-links">
+          <li><a href={`${base}getting-started/quick-start/`}>Getting Started</a></li>
+          <li><a href={`${base}changelog/`}>Changelog</a></li>
+          <li><a href={`${base}contributing/`}>Contributing</a></li>
+        </ul>
+      </div>
+
+      <div class="footer-col">
+        <h3 class="footer-col-title">SDKs</h3>
+        <ul class="footer-col-links">
+          <li><a href="https://crates.io/crates/edgecrab-cli" target="_blank" rel="noopener noreferrer">crates.io (CLI)</a></li>
+          <li><a href="https://pypi.org/project/edgecrab-sdk/" target="_blank" rel="noopener noreferrer">Python SDK (PyPI)</a></li>
+          <li><a href="https://www.npmjs.com/package/edgecrab-sdk" target="_blank" rel="noopener noreferrer">Node.js SDK (npm)</a></li>
+          <li><a href="https://github.com/raphaelmansuy/edgecrab/pkgs/container/edgecrab" target="_blank" rel="noopener noreferrer">Docker (GHCR)</a></li>
+        </ul>
+      </div>
+
+      <div class="footer-col">
+        <h3 class="footer-col-title">Community</h3>
+        <ul class="footer-col-links">
+          <li><a href="https://github.com/raphaelmansuy/edgecrab" target="_blank" rel="noopener noreferrer">GitHub</a></li>
+          <li><a href="https://github.com/raphaelmansuy/edgecrab/issues" target="_blank" rel="noopener noreferrer">Issues</a></li>
+          <li><a href="https://github.com/raphaelmansuy/edgecrab/discussions" target="_blank" rel="noopener noreferrer">Discussions</a></li>
+          <li><a href="https://github.com/raphaelmansuy/edgecrab/releases" target="_blank" rel="noopener noreferrer">Releases</a></li>
+        </ul>
+      </div>
+
+      <div class="footer-col">
+        <h3 class="footer-col-title">Company</h3>
+        <ul class="footer-col-links">
+          <li><a href="https://elitizon.com/" target="_blank" rel="noopener noreferrer">Elitizon</a></li>
+          <li><a href="https://edgeparse.com/" target="_blank" rel="noopener noreferrer">EdgeParse</a></li>
+          <li><a href="https://edgequake.com/" target="_blank" rel="noopener noreferrer">EdgeQuake</a></li>
+          <li><a href="https://github.com/raphaelmansuy/edgecrab/blob/main/LICENSE" target="_blank" rel="noopener noreferrer">License</a></li>
+        </ul>
+      </div>
+
+    </nav>
+  </div>
+
+  <!-- Bottom bar -->
+  <div class="footer-bottom">
+    <p>
+      © {year} EdgeCrab · Built by
+      <a href="https://elitizon.com/" target="_blank" rel="noopener noreferrer">Elitizon</a>
+       · Apache 2.0
+    </p>
+  </div>
+</footer>
+
+<style>
+  .site-footer {
+    border-top: 1px solid var(--ep-card-border, #E5E7EB);
+    padding: 3.5rem 2rem 0;
+    background: var(--ep-card-bg, #fff);
+    font-size: 0.875rem;
+    color: var(--ec-color-muted, #6B7280);
+  }
+
+  .footer-inner {
+    max-width: 1200px; margin: 0 auto;
+    display: grid;
+    grid-template-columns: 260px 1fr;
+    gap: 3rem;
+  }
+
+  /* Brand */
+  .footer-logo {
+    display: inline-flex; align-items: center; gap: 0.5rem;
+    text-decoration: none; margin-bottom: 0.75rem;
+  }
+  .footer-logo-text { font-size: 1.1rem; font-weight: 800; color: var(--ep-text-primary); }
+  .footer-logo-accent { color: var(--sl-color-accent); }
+
+  .footer-tagline { line-height: 1.6; margin-bottom: 1rem; color: var(--ec-color-muted); }
+
+  .footer-badges { display: flex; flex-wrap: wrap; gap: 0.4rem; }
+
+  .footer-badge {
+    display: inline-block;
+    padding: 0.2rem 0.6rem;
+    border-radius: 0.375rem;
+    font-size: 0.75rem; font-weight: 600;
+    background: var(--ep-section-alt-bg);
+    border: 1px solid var(--ep-card-border);
+    color: var(--ep-text-secondary) !important;
+    text-decoration: none;
+    transition: border-color 150ms;
+  }
+  .footer-badge:hover { border-color: var(--sl-color-accent); color: var(--sl-color-accent) !important; }
+  .footer-badge--accent { background: rgba(234,88,12,0.08); border-color: rgba(234,88,12,0.2); color: var(--sl-color-accent) !important; }
+  .footer-badge--green { background: rgba(13,148,136,0.08); border-color: rgba(13,148,136,0.2); color: #0d9488 !important; }
+
+  /* Link columns */
+  .footer-columns {
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: 1.5rem;
+  }
+
+  .footer-col-title {
+    font-size: 0.75rem; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.08em; color: var(--ep-text-primary); margin-bottom: 0.75rem;
+  }
+
+  .footer-col-links {
+    list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 0.5rem;
+  }
+
+  .footer-col-links a {
+    color: var(--ec-color-muted) !important;
+    text-decoration: none;
+    transition: color 150ms;
+    font-size: 0.875rem;
+  }
+  .footer-col-links a:hover { color: var(--sl-color-accent) !important; }
+
+  /* Bottom bar */
+  .footer-bottom {
+    max-width: 1200px; margin: 2rem auto 0;
+    padding: 1.25rem 0;
+    border-top: 1px solid var(--ep-card-border);
+    font-size: 0.8rem; color: var(--ec-color-muted);
+  }
+  .footer-bottom a { color: var(--ec-color-muted) !important; text-decoration: none; }
+  .footer-bottom a:hover { color: var(--sl-color-accent) !important; }
+
+  @media (max-width: 900px) {
+    .footer-inner { grid-template-columns: 1fr; }
+    .footer-columns { grid-template-columns: repeat(2, 1fr); }
+  }
+
+  @media (max-width: 540px) {
+    .footer-columns { grid-template-columns: 1fr; }
+    .site-footer { padding: 2.5rem 1rem 0; }
+  }
+</style>

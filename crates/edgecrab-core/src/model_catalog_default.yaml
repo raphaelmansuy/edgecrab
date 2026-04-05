@@ -1,0 +1,580 @@
+# ─── EdgeCrab Model Catalog ─────────────────────────────────────────
+#
+# Single source of truth for all available models.
+# Compiled into the binary as the default; user can override with
+# ~/.edgecrab/models.yaml (same format, merged on top).
+#
+# Kept at parity with edgecode's hermes_cli/models.py
+#
+# Format:
+#   providers:
+#     <provider_id>:
+#       label: "Human Name"
+#       default_model: "model-name"        # optional
+#       models:
+#         - model: "model-name"
+#           context: 200000                 # tokens
+#           tier: standard                  # fast | standard | reasoning
+#           pricing:                        # optional, per million tokens
+#             input: 3.0
+#             output: 15.0
+#             cache_read: 0.3
+#             cache_write: 3.75
+
+providers:
+
+  # ─── Anthropic ────────────────────────────────────────────────────
+  anthropic:
+    label: "Anthropic"
+    default_model: "claude-opus-4.6"
+    models:
+      - model: "claude-opus-4.6"
+        context: 200000
+        tier: reasoning
+        pricing: { input: 15.0, output: 75.0, cache_read: 1.5, cache_write: 18.75 }
+      - model: "claude-sonnet-4.6"
+        context: 200000
+        tier: standard
+        pricing: { input: 3.0, output: 15.0, cache_read: 0.3, cache_write: 3.75 }
+      - model: "claude-3-5-haiku-latest"
+        context: 200000
+        tier: fast
+        pricing: { input: 0.8, output: 4.0, cache_read: 0.08, cache_write: 1.0 }
+      - model: "claude-3-5-sonnet-latest"
+        context: 200000
+        tier: standard
+        pricing: { input: 3.0, output: 15.0, cache_read: 0.3, cache_write: 3.75 }
+      - model: "claude-3-opus-latest"
+        context: 200000
+        tier: reasoning
+        pricing: { input: 15.0, output: 75.0, cache_read: 1.5, cache_write: 18.75 }
+      - model: "claude-haiku-4.5"
+        context: 200000
+        tier: fast
+        pricing: { input: 0.8, output: 4.0, cache_read: 0.08, cache_write: 1.0 }
+      - model: "claude-haiku-4.5-20251001"
+        context: 200000
+        tier: fast
+        pricing: { input: 0.8, output: 4.0, cache_read: 0.08, cache_write: 1.0 }
+      - model: "claude-opus-4.5"
+        context: 200000
+        tier: reasoning
+        pricing: { input: 15.0, output: 75.0, cache_read: 1.5, cache_write: 18.75 }
+      - model: "claude-opus-4.5-20251101"
+        context: 200000
+        tier: reasoning
+        pricing: { input: 15.0, output: 75.0, cache_read: 1.5, cache_write: 18.75 }
+      - model: "claude-sonnet-4.5"
+        context: 200000
+        tier: standard
+        pricing: { input: 3.0, output: 15.0, cache_read: 0.3, cache_write: 3.75 }
+      - model: "claude-sonnet-4.5-20250929"
+        context: 200000
+        tier: standard
+        pricing: { input: 3.0, output: 15.0, cache_read: 0.3, cache_write: 3.75 }
+
+  # ─── GitHub Copilot ──────────────────────────────────────────────
+  copilot:
+    label: "GitHub Copilot"
+    default_model: "gpt-5.4"
+    models:
+      - model: "claude-haiku-4.5"
+        context: 200000
+        tier: fast
+      - model: "claude-opus-4.5"
+        context: 200000
+        tier: standard
+      - model: "claude-opus-4.6"
+        context: 200000
+        tier: standard
+      - model: "claude-opus-4.6-fast"
+        context: 200000
+        tier: standard
+      - model: "claude-sonnet-4"
+        context: 216000
+        tier: standard
+      - model: "claude-sonnet-4.5"
+        context: 200000
+        tier: standard
+      - model: "claude-sonnet-4.6"
+        context: 200000
+        tier: standard
+      - model: "gemini-2.5-pro"
+        context: 128000
+        tier: reasoning
+      - model: "gemini-3-flash-preview"
+        context: 128000
+        tier: fast
+      - model: "gemini-3.1-pro-preview"
+        context: 128000
+        tier: reasoning
+      - model: "gpt-4.1"
+        context: 128000
+        tier: standard
+      - model: "gpt-4o"
+        context: 128000
+        tier: standard
+      - model: "gpt-5-mini"
+        context: 264000
+        tier: fast
+      - model: "gpt-5.2"
+        context: 264000
+        tier: standard
+      - model: "gpt-5.2-codex"
+        context: 400000
+        tier: standard
+      - model: "gpt-5.3-codex"
+        context: 400000
+        tier: standard
+      - model: "gpt-5.4"
+        context: 400000
+        tier: standard
+      - model: "gpt-5.4-mini"
+        context: 400000
+        tier: fast
+      - model: "raptor-mini"
+        context: 264000
+        tier: fast
+      - model: "goldeneye"
+        context: 264000
+        tier: standard
+      - model: "grok-code-fast-1"
+        context: 128000
+        tier: standard
+      - model: "oswe-vscode-prime"
+        context: 264000
+        tier: standard
+
+  # ─── OpenAI ──────────────────────────────────────────────────────
+  openai:
+    label: "OpenAI"
+    default_model: "gpt-5.4"
+    models:
+      - model: "gpt-3.5-turbo"
+        context: 16000
+        tier: fast
+        pricing: { input: 0.50, output: 1.50 }
+      - model: "gpt-4-turbo"
+        context: 128000
+        tier: standard
+        pricing: { input: 10.0, output: 30.0 }
+      - model: "gpt-4.1"
+        context: 128000
+        tier: standard
+        pricing: { input: 2.0, output: 8.0, cache_read: 0.5 }
+      - model: "gpt-4.1-mini"
+        context: 128000
+        tier: fast
+        pricing: { input: 0.40, output: 1.60, cache_read: 0.10 }
+      - model: "gpt-4.1-nano"
+        context: 128000
+        tier: fast
+        pricing: { input: 0.10, output: 0.40, cache_read: 0.025 }
+      - model: "gpt-4o"
+        context: 128000
+        tier: standard
+        pricing: { input: 2.50, output: 10.0, cache_read: 1.25 }
+      - model: "gpt-4o-mini"
+        context: 128000
+        tier: fast
+        pricing: { input: 0.15, output: 0.60, cache_read: 0.075 }
+      - model: "gpt-5"
+        context: 200000
+        tier: standard
+        pricing: { input: 3.0, output: 15.0, cache_read: 0.75 }
+      - model: "gpt-5-codex"
+        context: 200000
+        tier: standard
+        pricing: { input: 3.0, output: 15.0, cache_read: 0.75 }
+      - model: "gpt-5-mini"
+        context: 200000
+        tier: standard
+        pricing: { input: 0.80, output: 3.20, cache_read: 0.20 }
+      - model: "gpt-5-nano"
+        context: 128000
+        tier: fast
+        pricing: { input: 0.15, output: 0.60, cache_read: 0.04 }
+      - model: "gpt-5-pro"
+        context: 200000
+        tier: reasoning
+        pricing: { input: 10.0, output: 40.0, cache_read: 2.50 }
+      - model: "gpt-5.1"
+        context: 200000
+        tier: standard
+        pricing: { input: 3.0, output: 15.0, cache_read: 0.75 }
+      - model: "gpt-5.1-codex"
+        context: 200000
+        tier: standard
+        pricing: { input: 3.0, output: 15.0, cache_read: 0.75 }
+      - model: "gpt-5.1-codex-max"
+        context: 256000
+        tier: reasoning
+        pricing: { input: 10.0, output: 40.0, cache_read: 2.5 }
+      - model: "gpt-5.1-codex-mini"
+        context: 200000
+        tier: fast
+        pricing: { input: 0.80, output: 3.20, cache_read: 0.20 }
+      - model: "gpt-5.2"
+        context: 200000
+        tier: standard
+        pricing: { input: 3.0, output: 15.0, cache_read: 0.75 }
+      - model: "gpt-5.2-codex"
+        context: 200000
+        tier: standard
+        pricing: { input: 3.0, output: 15.0, cache_read: 0.75 }
+      - model: "gpt-5.2-pro"
+        context: 200000
+        tier: reasoning
+        pricing: { input: 10.0, output: 40.0, cache_read: 2.5 }
+      - model: "gpt-5.4"
+        context: 400000
+        tier: standard
+      - model: "gpt-5.4-mini"
+        context: 400000
+        tier: fast
+      - model: "gpt-5.4-pro"
+        context: 400000
+        tier: reasoning
+      - model: "gpt-5.4-nano"
+        context: 400000
+        tier: fast
+      - model: "o1"
+        context: 128000
+        tier: reasoning
+        pricing: { input: 15.0, output: 60.0, cache_read: 7.5 }
+      - model: "o1-mini"
+        context: 128000
+        tier: reasoning
+        pricing: { input: 3.0, output: 12.0, cache_read: 1.5 }
+      - model: "o3"
+        context: 200000
+        tier: reasoning
+        pricing: { input: 10.0, output: 40.0, cache_read: 2.5 }
+      - model: "o3-mini"
+        context: 128000
+        tier: reasoning
+        pricing: { input: 1.10, output: 4.40, cache_read: 0.55 }
+      - model: "o3-pro"
+        context: 200000
+        tier: reasoning
+        pricing: { input: 20.0, output: 80.0, cache_read: 5.0 }
+      - model: "o4-mini"
+        context: 200000
+        tier: reasoning
+        pricing: { input: 1.10, output: 4.40, cache_read: 0.55 }
+
+  # ─── Google ──────────────────────────────────────────────────────
+  # Uses Google AI Studio (GEMINI_API_KEY / GOOGLE_API_KEY).
+  google:
+    label: "Google"
+    default_model: "gemini-2.5-flash"
+    models:
+      - model: "gemini-2.5-pro"
+        context: 1000000
+        tier: reasoning
+        pricing: { input: 1.25, output: 10.0 }
+      - model: "gemini-2.5-flash"
+        context: 1000000
+        tier: fast
+        pricing: { input: 0.30, output: 2.50 }
+      - model: "gemini-2.5-flash-lite"
+        context: 1000000
+        tier: fast
+        pricing: { input: 0.10, output: 0.40 }
+      - model: "gemini-2.0-flash"
+        context: 1000000
+        tier: fast
+        pricing: { input: 0.15, output: 0.60 }
+      - model: "gemini-2.0-flash-lite"
+        context: 1000000
+        tier: fast
+        pricing: { input: 0.075, output: 0.30 }
+
+  # ─── Hugging Face ────────────────────────────────────────────────
+  huggingface:
+    label: "Hugging Face"
+    default_model: "Qwen/Qwen3.5-397B-A17B"
+    models:
+      - model: "Qwen/Qwen3.5-397B-A17B"
+        context: 1000000
+        tier: reasoning
+      - model: "Qwen/Qwen3.5-35B-A3B"
+        context: 1000000
+        tier: standard
+      - model: "deepseek-ai/DeepSeek-V3.2"
+        context: 128000
+        tier: standard
+      - model: "moonshotai/Kimi-K2.5"
+        context: 262000
+        tier: reasoning
+      - model: "MiniMaxAI/MiniMax-M2.5"
+        context: 204000
+        tier: standard
+      - model: "zai-org/GLM-5"
+        context: 128000
+        tier: reasoning
+      - model: "XiaomiMiMo/MiMo-V2-Flash"
+        context: 256000
+        tier: fast
+      - model: "moonshotai/Kimi-K2-Thinking"
+        context: 262000
+        tier: reasoning
+
+  # ─── Vertex AI ───────────────────────────────────────────────────
+  # GA models are available on any region (e.g. us-central1).
+  # Preview models marked (*global*) require GOOGLE_CLOUD_REGION=global;
+  # EdgeCrab sets this automatically when the model name starts with "gemini-3".
+  vertexai:
+    label: "Vertex AI"
+    default_model: "gemini-2.5-flash"
+    models:
+      # ── Gemini 2.x  (GA, regional + global) ──────────────────────
+      - model: "gemini-2.5-pro"
+        context: 1000000
+        tier: reasoning
+        pricing: { input: 1.25, output: 10.0 }
+      - model: "gemini-2.5-flash"
+        context: 1000000
+        tier: fast
+        pricing: { input: 0.30, output: 2.50 }
+      - model: "gemini-2.5-flash-lite"
+        context: 1000000
+        tier: fast
+        pricing: { input: 0.10, output: 0.40 }
+      - model: "gemini-2.0-flash"
+        context: 1000000
+        tier: fast
+        pricing: { input: 0.15, output: 0.60 }
+      - model: "gemini-2.0-flash-lite"
+        context: 1000000
+        tier: fast
+        pricing: { input: 0.075, output: 0.30 }
+      # ── Gemini 3.x  (Preview, *global endpoint only*) ────────────
+      # Requires GOOGLE_CLOUD_REGION=global (set automatically by EdgeCrab).
+      - model: "gemini-3-flash-preview"
+        context: 1048576
+        tier: fast
+        pricing: { input: 0.50, output: 3.0 }
+      - model: "gemini-3.1-pro-preview"
+        context: 1048576
+        tier: reasoning
+        pricing: { input: 2.0, output: 12.0 }
+      - model: "gemini-3.1-flash-lite-preview"
+        context: 1048576
+        tier: fast
+        pricing: { input: 0.25, output: 1.50 }
+
+  # ─── xAI ─────────────────────────────────────────────────────────
+  xai:
+    label: "xAI"
+    default_model: "grok-4.20-beta"
+    models:
+      - model: "grok-2-vision-1212"
+        context: 32000
+        tier: standard
+        pricing: { input: 2.0, output: 10.0 }
+      - model: "grok-3"
+        context: 131000
+        tier: standard
+        pricing: { input: 3.0, output: 15.0 }
+      - model: "grok-3-mini"
+        context: 131000
+        tier: fast
+        pricing: { input: 0.30, output: 0.50 }
+      - model: "grok-4"
+        context: 131000
+        tier: standard
+        pricing: { input: 3.0, output: 15.0 }
+      - model: "grok-4-latest"
+        context: 131000
+        tier: standard
+        pricing: { input: 3.0, output: 15.0 }
+      - model: "grok-4-1-fast"
+        context: 2000000
+        tier: fast
+        pricing: { input: 0.60, output: 2.40 }
+      - model: "grok-code-fast-1"
+        context: 131000
+        tier: fast
+        pricing: { input: 0.15, output: 0.60 }
+      - model: "grok-4.20-beta"
+        context: 2000000
+        tier: reasoning
+
+  # ─── Z.AI / GLM ─────────────────────────────────────────────────
+  zai:
+    label: "Z.AI Platform"
+    default_model: "glm-5"
+    models:
+      - model: "glm-5"
+        context: 128000
+        tier: reasoning
+      - model: "glm-5-turbo"
+        context: 128000
+        tier: fast
+      - model: "glm-4.5"
+        context: 128000
+        tier: reasoning
+        pricing: { input: 0.50, output: 2.0 }
+      - model: "glm-4.7"
+        context: 128000
+        tier: reasoning
+        pricing: { input: 0.50, output: 2.0 }
+      - model: "glm-4.7-flash"
+        context: 128000
+        tier: fast
+        pricing: { input: 0.10, output: 0.40 }
+
+  # ─── DeepSeek ────────────────────────────────────────────────────
+  deepseek:
+    label: "DeepSeek"
+    default_model: "deepseek-chat"
+    models:
+      - model: "deepseek-v3.2"
+        context: 128000
+        tier: standard
+      - model: "deepseek-chat"
+        context: 128000
+        tier: standard
+        pricing: { input: 0.14, output: 0.28 }
+      - model: "deepseek-reasoner"
+        context: 128000
+        tier: standard
+        pricing: { input: 0.55, output: 2.19 }
+
+  # ─── Mistral ─────────────────────────────────────────────────────
+  mistral:
+    label: "Mistral AI"
+    default_model: "mistral-large-latest"
+    models:
+      - model: "mistral-large-latest"
+        context: 128000
+        tier: standard
+        pricing: { input: 2.0, output: 6.0 }
+      - model: "mistral-small-latest"
+        context: 128000
+        tier: fast
+        pricing: { input: 0.20, output: 0.60 }
+      - model: "codestral-latest"
+        context: 256000
+        tier: standard
+        pricing: { input: 0.30, output: 0.90 }
+
+  # ─── Groq ────────────────────────────────────────────────────────
+  groq:
+    label: "Groq"
+    default_model: "llama-3.3-70b-versatile"
+    models:
+      - model: "llama-3.3-70b-versatile"
+        context: 131000
+        tier: standard
+        pricing: { input: 0.59, output: 0.79 }
+      - model: "mixtral-8x7b-32768"
+        context: 32000
+        tier: standard
+        pricing: { input: 0.24, output: 0.24 }
+
+  # ─── OpenRouter ──────────────────────────────────────────────────
+  openrouter:
+    label: "OpenRouter"
+    default_model: "openai/gpt-5.4"
+    models:
+      - model: "anthropic/claude-opus-4.6"
+        context: 1000000
+        tier: reasoning
+      - model: "anthropic/claude-sonnet-4.5"
+        context: 1000000
+        tier: standard
+      - model: "anthropic/claude-haiku-4.5"
+        context: 200000
+        tier: fast
+      - model: "openai/gpt-5.4"
+        context: 1000000
+        tier: standard
+      - model: "openai/gpt-5.4-pro"
+        context: 1000000
+        tier: reasoning
+      - model: "openai/gpt-5.4-nano"
+        context: 400000
+        tier: fast
+      - model: "openai/gpt-5.4-mini"
+        context: 400000
+        tier: fast
+      - model: "openai/gpt-5.3-codex"
+        context: 400000
+        tier: standard
+      - model: "google/gemini-2.5-pro"
+        context: 1000000
+        tier: standard
+      - model: "google/gemini-2.5-flash"
+        context: 1000000
+        tier: fast
+      - model: "x-ai/grok-4.20-beta"
+        context: 2000000
+        tier: standard
+      - model: "moonshotai/kimi-k2.5"
+        context: 262000
+        tier: standard
+      - model: "qwen/qwen3.5-plus-02-15"
+        context: 1000000
+        tier: standard
+      - model: "qwen/qwen3.5-35b-a3b"
+        context: 1000000
+        tier: fast
+      - model: "stepfun/step-3.5-flash"
+        context: 1000000
+        tier: fast
+      - model: "z-ai/glm-5"
+        context: 80000
+        tier: standard
+      - model: "z-ai/glm-5-turbo"
+        context: 80000
+        tier: fast
+      - model: "minimax/minimax-m2.7"
+        context: 204000
+        tier: fast
+      - model: "minimax/minimax-m2.5"
+        context: 204000
+        tier: fast
+      - model: "nvidia/nemotron-3-super-120b-a12b"
+        context: 262000
+        tier: standard
+      - model: "nvidia/nemotron-3-super-120b-a12b:free"
+        context: 262000
+        tier: standard
+      - model: "arcee-ai/trinity-large-preview:free"
+        context: 128000
+        tier: standard
+      - model: "xiaomi/mimo-v2-pro"
+        context: 1050000
+        tier: reasoning
+
+  # ─── Ollama (local) ──────────────────────────────────────────────
+  ollama:
+    label: "Ollama (local)"
+    default_model: "llama3.2"
+    models:
+      - model: "llama3.2"
+        context: 128000
+        tier: standard
+      - model: "codellama"
+        context: 16000
+        tier: standard
+      - model: "mistral"
+        context: 32000
+        tier: standard
+      - model: "phi3"
+        context: 128000
+        tier: fast
+      - model: "qwen2.5-coder"
+        context: 128000
+        tier: standard
+
+  # ─── LM Studio (local) ──────────────────────────────────────────
+  lmstudio:
+    label: "LM Studio (local)"
+    default_model: "default"
+    models:
+      - model: "default"
+        context: 128000
+        tier: standard

@@ -1,0 +1,376 @@
+---
+// Hero override for Starlight — EdgeCrab landing hero
+import heroImg from '../../assets/hero.jpeg';
+
+const base = import.meta.env.BASE_URL;
+const installCmd = 'npm install -g edgecrab-cli';
+---
+
+<section class="hero" aria-label="EdgeCrab introduction">
+  <div class="hero-bg-effects" aria-hidden="true">
+    <div class="hero-grid"></div>
+    <div class="hero-glow hero-glow-1"></div>
+    <div class="hero-glow hero-glow-2"></div>
+  </div>
+
+  <div class="hero-layout">
+    <div class="hero-content">
+      <div class="hero-eyebrow">
+        <span class="eyebrow-badge">🦀 SuperAgent</span>
+        <span class="eyebrow-text">Hermes Agent soul · OpenClaw vision · 11 LLM providers · learns &amp; improves</span>
+        <svg class="eyebrow-arrow" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg>
+      </div>
+
+      <h1 class="hero-title">
+        <span class="hero-line-1">Your SuperAgent</span>
+        <span class="hero-line-2">Built in <span class="hero-accent">Rust</span></span>
+      </h1>
+
+      <p class="hero-subtitle">
+        Personal + coding SuperAgent that grows with you. Powered by the soul of Hermes Agent and the vision of OpenClaw — delivered as a single 15&nbsp;MB Rust binary that starts in &lt;&nbsp;50&nbsp;ms.
+      </p>
+
+      <div class="hero-actions">
+        <a href={`${base}getting-started/quick-start/`} class="btn-primary">
+          Get Started
+          <svg class="btn-arrow" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
+        </a>
+        <a href="https://github.com/raphaelmansuy/edgecrab" target="_blank" rel="noopener noreferrer" class="btn-secondary">
+          <svg aria-hidden="true" width="18" height="18" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+          Star on GitHub
+        </a>
+      </div>
+
+      <div class="install-bar" role="group" aria-label="Install command">
+        <span class="install-prompt" aria-hidden="true">$</span>
+        <code>{installCmd}</code>
+        <button class="copy-btn" aria-label="Copy install command" data-copy={installCmd}>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+        </button>
+      </div>
+      <p class="install-alts">or: <code>pip install edgecrab-cli</code> &middot; <code>cargo install edgecrab-cli</code></p>
+
+      <div class="hero-metrics" aria-label="Key metrics">
+        <div class="metric">
+          <span class="metric-value">&lt;&nbsp;50</span>
+          <span class="metric-label">ms startup</span>
+        </div>
+        <div class="metric-sep" aria-hidden="true"></div>
+        <div class="metric">
+          <span class="metric-value">15</span><span class="metric-suffix">&nbsp;MB</span>
+          <span class="metric-label">binary size</span>
+        </div>
+        <div class="metric-sep" aria-hidden="true"></div>
+        <div class="metric">
+          <span class="metric-value" data-count="900">0</span><span class="metric-suffix">+</span>
+          <span class="metric-label">tests</span>
+        </div>
+        <div class="metric-sep" aria-hidden="true"></div>
+        <div class="metric">
+          <span class="metric-value" data-count="11">0</span>
+          <span class="metric-label">LLM providers</span>
+        </div>
+      </div>
+
+      <div class="hero-trust">
+        <span class="trust-label">Integrates with</span>
+        <div class="trust-logos">
+          <span class="trust-item">GitHub Copilot</span>
+          <span class="trust-dot"></span>
+          <span class="trust-item">OpenAI</span>
+          <span class="trust-dot"></span>
+          <span class="trust-item">Anthropic</span>
+          <span class="trust-dot"></span>
+          <span class="trust-item">Ollama</span>
+          <span class="trust-dot"></span>
+          <span class="trust-item">VS Code ACP</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="hero-image-wrap" aria-hidden="true">
+      <img
+        src={heroImg.src}
+        alt="EdgeCrab — the Rust-native personal assistant in action"
+        class="hero-image"
+        width={heroImg.width}
+        height={heroImg.height}
+        loading="eager"
+        decoding="async"
+      />
+    </div>
+  </div>
+</section>
+
+<script>
+  // Copy button
+  document.querySelectorAll('.copy-btn').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const text = (btn as HTMLElement).dataset.copy || '';
+      await navigator.clipboard.writeText(text);
+      btn.classList.add('copied');
+      setTimeout(() => btn.classList.remove('copied'), 2000);
+    });
+  });
+
+  // Animated counters
+  const metricEls = document.querySelectorAll('.metric-value[data-count]');
+  const animateCounter = (el: Element) => {
+    const target = parseInt((el as HTMLElement).dataset.count || '0', 10);
+    if (target === 0) { el.textContent = '0'; return; }
+    let current = 0;
+    const step = Math.max(1, Math.floor(target / 30));
+    const timer = setInterval(() => {
+      current = Math.min(current + step, target);
+      el.textContent = String(current);
+      if (current >= target) clearInterval(timer);
+    }, 40);
+  };
+
+  const observer = new IntersectionObserver(entries => {
+    entries.forEach(e => {
+      if (e.isIntersecting) { animateCounter(e.target); observer.unobserve(e.target); }
+    });
+  }, { threshold: 0.5 });
+  metricEls.forEach(el => observer.observe(el));
+</script>
+
+<style>
+  .hero {
+    position: relative;
+    overflow: hidden;
+    background: var(--ep-hero-gradient);
+    padding: 2.5rem 2rem 3rem;
+    display: flex;
+    align-items: center;
+  }
+
+  /* Background effects */
+  .hero-bg-effects { position: absolute; inset: 0; pointer-events: none; z-index: 0; }
+
+  .hero-grid {
+    position: absolute; inset: 0;
+    background-image:
+      linear-gradient(rgba(234, 88, 12, 0.04) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(234, 88, 12, 0.04) 1px, transparent 1px);
+    background-size: 48px 48px;
+    mask-image: radial-gradient(ellipse 80% 80% at 50% 50%, black 20%, transparent 100%);
+  }
+  :root[data-theme='dark'] .hero-grid {
+    background-image:
+      linear-gradient(rgba(251, 146, 60, 0.05) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(251, 146, 60, 0.05) 1px, transparent 1px);
+  }
+
+  .hero-glow {
+    position: absolute;
+    border-radius: 50%;
+    filter: blur(80px);
+    pointer-events: none;
+  }
+  .hero-glow-1 {
+    width: 500px; height: 500px;
+    top: -120px; left: -100px;
+    background: radial-gradient(circle, rgba(234, 88, 12, 0.12) 0%, transparent 70%);
+  }
+  .hero-glow-2 {
+    width: 400px; height: 400px;
+    bottom: -100px; right: -60px;
+    background: radial-gradient(circle, rgba(220, 38, 38, 0.08) 0%, transparent 70%);
+  }
+
+  /* Two-column layout */
+  .hero-layout {
+    position: relative; z-index: 1;
+    max-width: 1200px; margin: 0 auto; width: 100%;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 3rem;
+    align-items: center;
+  }
+
+  /* Hero image */
+  .hero-image-wrap {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .hero-image {
+    width: 100%;
+    max-width: 560px;
+    height: auto;
+    border-radius: 1rem;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.15);
+    border: 1px solid var(--ep-card-border, #E5E7EB);
+  }
+
+  /* Eyebrow pill */
+  .hero-eyebrow {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    background: rgba(234, 88, 12, 0.08);
+    border: 1px solid rgba(234, 88, 12, 0.2);
+    border-radius: 999px;
+    padding: 0.35rem 0.9rem;
+    margin-bottom: 1.25rem;
+    font-size: 0.8rem;
+    color: var(--sl-color-accent);
+  }
+  .eyebrow-badge { font-weight: 700; white-space: nowrap; }
+  .eyebrow-text { opacity: 0.85; }
+  .eyebrow-arrow { flex-shrink: 0; opacity: 0.6; }
+
+  /* Title */
+  .hero-title {
+    display: flex; flex-direction: column;
+    font-size: clamp(1.75rem, 4vw, 2.75rem);
+    font-weight: 900;
+    line-height: 1.05;
+    letter-spacing: -0.03em;
+    margin-bottom: 1.25rem;
+    color: var(--ep-text-primary, #111827);
+  }
+
+  .hero-accent {
+    background: linear-gradient(135deg, #EA580C 0%, #DC2626 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+
+  /* Subtitle */
+  .hero-subtitle {
+    font-size: clamp(1rem, 2vw, 1.125rem);
+    color: var(--ep-text-secondary, #4B5563);
+    line-height: 1.6;
+    max-width: 540px;
+    margin-bottom: 1.25rem;
+  }
+
+  /* CTA buttons */
+  .hero-actions {
+    display: flex; flex-wrap: wrap; gap: 0.75rem;
+    margin-bottom: 1.75rem;
+  }
+
+  .btn-primary {
+    display: inline-flex; align-items: center; gap: 0.5rem;
+    background: var(--sl-color-accent, #EA580C);
+    color: #fff !important;
+    padding: 0.7rem 1.4rem;
+    border-radius: 0.5rem;
+    font-weight: 600; font-size: 0.95rem;
+    text-decoration: none;
+    transition: opacity 150ms, transform 150ms;
+  }
+  .btn-primary:hover { opacity: 0.9; transform: translateY(-1px); }
+  .btn-primary:focus-visible { outline-color: var(--sl-color-accent); outline-offset: 3px; }
+
+  .btn-secondary {
+    display: inline-flex; align-items: center; gap: 0.5rem;
+    background: var(--ep-card-bg, #fff);
+    color: var(--ep-text-primary, #111827) !important;
+    border: 1px solid var(--ep-card-border, #E5E7EB);
+    padding: 0.7rem 1.4rem;
+    border-radius: 0.5rem;
+    font-weight: 600; font-size: 0.95rem;
+    text-decoration: none;
+    transition: border-color 150ms, box-shadow 150ms;
+  }
+  .btn-secondary:hover { border-color: var(--sl-color-accent); box-shadow: 0 0 0 3px rgba(234, 88, 12, 0.08); }
+
+  /* Install bar */
+  .install-bar {
+    display: inline-flex; align-items: center; gap: 0.5rem;
+    background: var(--ep-code-bg, #F3F4F6);
+    border: 1px solid var(--ep-card-border, #E5E7EB);
+    border-radius: 0.5rem;
+    padding: 0.6rem 1rem;
+    margin-bottom: 0.5rem;
+    font-family: var(--ep-font-mono);
+    font-size: 0.875rem;
+  }
+
+  .install-alts {
+    font-size: 0.78rem;
+    color: var(--ec-color-muted, #6B7280);
+    margin: 0 0 1.5rem;
+  }
+  .install-alts code {
+    font-family: var(--ep-font-mono);
+    font-size: 0.78rem;
+    background: var(--ep-code-bg, #F3F4F6);
+    padding: 0.1rem 0.35rem;
+    border-radius: 0.25rem;
+  }
+
+  .install-prompt { color: var(--sl-color-accent); font-weight: 700; }
+
+  .copy-btn {
+    display: flex; align-items: center;
+    background: none; border: none; cursor: pointer;
+    color: var(--ec-color-muted, #6B7280);
+    padding: 0.25rem; border-radius: 0.25rem;
+    transition: color 150ms;
+  }
+  .copy-btn:hover { color: var(--sl-color-accent); }
+  .copy-btn.copied { color: #16a34a; }
+
+  /* Metrics */
+  .hero-metrics {
+    display: flex; flex-wrap: wrap; gap: 0.5rem 1.5rem;
+    align-items: center;
+    margin-bottom: 1.5rem;
+  }
+
+  .metric { display: flex; flex-direction: column; align-items: flex-start; }
+  .metric-value {
+    font-size: 1.5rem; font-weight: 800;
+    color: var(--ep-text-primary, #111827);
+    line-height: 1;
+  }
+  .metric-suffix { font-size: 1rem; font-weight: 600; color: var(--ep-text-primary, #111827); }
+  .metric-label { font-size: 0.75rem; color: var(--ec-color-muted, #6B7280); margin-top: 0.1rem; }
+
+  .metric-sep {
+    width: 1px; height: 2rem;
+    background: var(--ep-card-border, #E5E7EB);
+  }
+
+  /* Trust bar */
+  .hero-trust {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem;
+    font-size: 0.8rem; color: var(--ec-color-muted, #6B7280);
+  }
+  .trust-label { font-weight: 500; }
+  .trust-logos { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; }
+  .trust-item { font-weight: 500; color: var(--ep-text-secondary, #4B5563); }
+  .trust-dot {
+    width: 3px; height: 3px; border-radius: 50%;
+    background: var(--ep-card-border, #D1D5DB);
+  }
+
+  /* Responsive */
+  @media (max-width: 900px) {
+    .hero-layout {
+      grid-template-columns: 1fr;
+    }
+    .hero-image-wrap {
+      order: -1;
+    }
+    .hero-image {
+      max-width: 400px;
+    }
+    .hero { padding: 3rem 1.5rem 4rem; min-height: auto; }
+  }
+
+  @media (max-width: 540px) {
+    .hero { padding: 2.5rem 1rem 3rem; }
+    .hero-title { font-size: 2.25rem; }
+    .hero-eyebrow { flex-wrap: wrap; }
+    .eyebrow-text { display: none; }
+    .hero-metrics { gap: 0.5rem 1rem; }
+  }
+</style>

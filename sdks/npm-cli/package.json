@@ -1,0 +1,39 @@
+{
+  "name": "edgecrab-cli",
+  "version": "0.1.0",
+  "description": "EdgeCrab — Super Powerful Personal Assistant inspired by NousHermes and OpenClaw. Single 15 MB static binary. Blazing-fast TUI, ReAct tool loop, multi-provider LLM.",
+  "license": "MIT",
+  "homepage": "https://www.edgecrab.com",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/raphaelmansuy/edgecrab.git",
+    "directory": "sdks/npm-cli"
+  },
+  "keywords": [
+    "ai",
+    "agent",
+    "llm",
+    "edgecrab",
+    "coding-agent",
+    "personal-assistant",
+    "cli",
+    "rust",
+    "nous-hermes",
+    "openclaw"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "bin": {
+    "edgecrab": "./bin/edgecrab.js"
+  },
+  "scripts": {
+    "postinstall": "node scripts/install.js"
+  },
+  "files": [
+    "bin/",
+    "scripts/",
+    "README.md"
+  ],
+  "dependencies": {}
+}

@@ -1,0 +1,82 @@
+name: Release — Node.js (npm)
+
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Tag name to publish (e.g. v0.1.0) — used for version sync'
+        required: true
+        default: 'v0.1.0'
+
+permissions:
+  contents: write
+
+jobs:
+  publish-npm:
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    environment: npm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Sync version from tag
+        env:
+          INPUT_TAG_NAME: ${{ inputs.tag_name }}
+        run: |
+          TAG_NAME="${INPUT_TAG_NAME:-$GITHUB_REF_NAME}"
+          VERSION="${TAG_NAME#v}"
+          cd sdks/node
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
+          echo "Publishing edgecrab-sdk@$VERSION"
+
+      - run: |
+          cd sdks/node
+          npm ci
+          npm run build
+
+      - name: Pack npm tarball
+        run: |
+          mkdir -p release-assets/node
+          cd sdks/node
+          npm pack --pack-destination "$GITHUB_WORKSPACE/release-assets/node"
+
+      - name: Ensure GitHub Release exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG_NAME: ${{ inputs.tag_name }}
+        run: |
+          TAG_NAME="${INPUT_TAG_NAME:-$GITHUB_REF_NAME}"
+          gh release view "$TAG_NAME" --repo "${{ github.repository }}" \
+          || gh release create "$TAG_NAME" \
+               --repo "${{ github.repository }}" \
+               --title "$TAG_NAME" \
+               --generate-notes
+
+      - name: Upload npm tarball to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG_NAME: ${{ inputs.tag_name }}
+        run: |
+          TAG_NAME="${INPUT_TAG_NAME:-$GITHUB_REF_NAME}"
+          gh release upload "$TAG_NAME" release-assets/node/*.tgz \
+            --repo "${{ github.repository }}" --clobber
+
+      - name: Publish to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          cd sdks/node
+          OUTPUT=$(npm publish --access public 2>&1) && echo "$OUTPUT" || {
+            echo "$OUTPUT"
+            if echo "$OUTPUT" | grep -Eq "cannot publish over the previously published versions|You cannot publish over the previously published version"; then
+              echo "edgecrab-sdk already published at this version — skipping."
+            else
+              exit 1
+            fi
+          }

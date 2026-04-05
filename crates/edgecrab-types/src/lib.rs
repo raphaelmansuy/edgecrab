@@ -1,0 +1,33 @@
+//! # edgecrab-types
+//!
+//! Shared types for the EdgeCrab agent ecosystem.
+//! This is the leaf crate — no internal dependencies.
+//!
+//! ```text
+//!   edgecrab-types  ←  (all other crates depend on this)
+//!     ├── message.rs    — Message, Role, Content, ContentPart
+//!     ├── tool.rs       — ToolCall, FunctionCall, ToolSchema
+//!     ├── usage.rs      — Usage, Cost, billing normalization
+//!     ├── config.rs     — ApiMode, Platform, constants
+//!     ├── trajectory.rs — Trajectory, reasoning extraction
+//!     └── error.rs      — AgentError, ToolError
+//! ```
+
+#![deny(clippy::unwrap_used)]
+
+pub mod config;
+pub mod error;
+pub mod message;
+pub mod tool;
+pub mod trajectory;
+pub mod usage;
+
+pub use config::{ApiMode, DEFAULT_MODEL, OPENROUTER_BASE_URL, Platform};
+pub use error::{AgentError, ToolError, ToolErrorRecord, ToolErrorResponse};
+pub use message::{Content, ContentPart, ImageUrl, Message, Role};
+pub use tool::{FunctionCall, ToolCall, ToolSchema};
+pub use trajectory::Trajectory;
+pub use usage::{Cost, Usage};
+
+/// Crate-level Result alias
+pub type Result<T> = std::result::Result<T, AgentError>;

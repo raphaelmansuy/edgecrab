@@ -1,0 +1,4 @@
+Actions: fetched official provider docs (GitHub Copilot, Gemini, Mistral, xAI, DeepSeek, OpenRouter), refreshed model catalog defaults and entries, updated setup default-model fallback/tests, built and tested, committed focused changes.
+Decisions: treated officially deprecated Gemini 2.0 models as removals from defaults, moved Copilot default to GPT-5.4, kept providers with blocked docs (OpenAI/Groq/Ollama/LM Studio) conservative where source access was restricted, and used edgecode parity only as secondary validation.
+Next steps: optionally run a scheduled quarterly catalog refresh and add a small script to lint model IDs against provider APIs when auth is available.
+Lessons/insights: Google SERP and several provider pages are bot-protected in this environment, so direct official docs endpoints and provider-maintained docs pages are the most reliable fetch targets.

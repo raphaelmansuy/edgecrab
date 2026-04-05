@@ -1,0 +1,22 @@
+[package]
+name = "edgecrab-migrate"
+description = "Migration tool: hermes-agent / OpenClaw → EdgeCrab config, sessions, skills"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+edgecrab-types = { path = "../edgecrab-types" }
+edgecrab-state = { path = "../edgecrab-state" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yml = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+dirs = { workspace = true }
+rusqlite = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile = { workspace = true }

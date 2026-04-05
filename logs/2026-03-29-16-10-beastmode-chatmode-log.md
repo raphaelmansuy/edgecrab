@@ -1,0 +1,4 @@
+Actions: traced startup model reset to schema mismatch between model.default and model.default_model; patched AppConfig parser to accept both keys; updated /model persistence writer to write canonical model.default plus legacy key; added regression test; built and tested; committed fix.
+Decisions: maintained backward compatibility instead of migrating files in-place, ensuring existing configs keep working without user intervention.
+Next steps: optionally add one-time config normalization command to rewrite model.default_model to model.default for cleaner config files.
+Lessons/insights: config key compatibility is critical when multiple codepaths write config; parser aliases are the safest protection against silent fallback-to-default behavior.

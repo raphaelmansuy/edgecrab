@@ -1,0 +1,776 @@
+//! # terminal — Execute shell commands
+//!
+//! WHY shell execution: The agent needs to compile, test, install, and
+//! run programs. This is the most powerful (and dangerous) tool — all
+//! security checks go through edgecrab-security's command scanner.
+//!
+//! ## Backend dispatch (gap/backend)
+//!
+//! Commands are dispatched through the pluggable backend system:
+//!   - Local (default)  — persistent shell + env-var blocklist (B-02, B-03)
+//!   - Docker           — bollard container per task (B-01a)
+//!   - SSH              — openssh ControlMaster channel (B-04)
+//!   - Modal            — Modal cloud sandbox REST API (B-01b)
+//!   - Daytona          — persistent cloud sandbox via Daytona SDK helper
+//!   - Singularity      — Apptainer/Singularity instance with persistent overlay
+//!
+//! The active backend is selected by `ctx.config.terminal_backend` which maps
+//! to `EDGECRAB_TERMINAL_BACKEND` env var or `config.yaml terminal.backend`.
+//!
+//! Backend instances are cached in a global `DashMap<task_id, Arc<dyn ExecutionBackend>>`
+//! so the persistent shell / Docker container / SSH session is reused across
+//! consecutive `execute()` calls within the same task.
+
+use async_trait::async_trait;
+use dashmap::DashMap;
+use serde::Deserialize;
+use serde_json::json;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
+
+use edgecrab_types::{ToolError, ToolSchema};
+
+use crate::registry::{ToolContext, ToolHandler};
+use crate::tools::backends::{BackendConfig, ExecutionBackend, build_backend, redact_output};
+use crate::tools::checkpoint::ensure_checkpoint;
+
+// ─── Global backend cache ─────────────────────────────────────────────
+
+/// One backend instance per task_id, cached across invocations.
+///
+/// WHY DashMap: multiple concurrent tool calls in the same task must share
+/// one backend (e.g. same persistent shell). DashMap gives lock-per-shard
+/// concurrency without holding a global mutex.
+struct BackendCacheEntry {
+    backend: Arc<dyn ExecutionBackend>,
+    last_used_epoch_secs: AtomicU64,
+}
+
+impl BackendCacheEntry {
+    fn new(backend: Arc<dyn ExecutionBackend>) -> Self {
+        Self {
+            backend,
+            last_used_epoch_secs: AtomicU64::new(now_epoch_secs()),
+        }
+    }
+
+    fn touch(&self) {
+        self.last_used_epoch_secs
+            .store(now_epoch_secs(), Ordering::Relaxed);
+    }
+
+    fn idle_for_secs(&self, now_epoch_secs: u64) -> u64 {
+        now_epoch_secs.saturating_sub(self.last_used_epoch_secs.load(Ordering::Relaxed))
+    }
+}
+
+fn backend_cache() -> &'static DashMap<String, Arc<BackendCacheEntry>> {
+    static CACHE: OnceLock<DashMap<String, Arc<BackendCacheEntry>>> = OnceLock::new();
+    CACHE.get_or_init(DashMap::new)
+}
+
+fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn prepare_backend_config(ctx: &ToolContext) -> BackendConfig {
+    let mut docker = ctx.config.terminal_docker.clone();
+
+    // Docker is the only backend that can safely expose the host workspace
+    // by bind-mounting it. If the operator did not configure a workspace
+    // mount, default to the task cwd so terminal and file tools see the same
+    // project tree.
+    if ctx.config.terminal_backend == crate::tools::backends::BackendKind::Docker
+        && docker.workspace_mount.is_none()
+    {
+        docker.workspace_mount = Some(crate::tools::backends::DockerWorkspaceMount {
+            host_path: ctx.cwd.to_string_lossy().into_owned(),
+            container_path: "/workspace".into(),
+            read_only: false,
+        });
+    }
+
+    BackendConfig {
+        kind: ctx.config.terminal_backend.clone(),
+        task_id: ctx.task_id.clone(),
+        docker,
+        ssh: ctx.config.terminal_ssh.clone(),
+        modal: ctx.config.terminal_modal.clone(),
+        daytona: ctx.config.terminal_daytona.clone(),
+        singularity: ctx.config.terminal_singularity.clone(),
+    }
+}
+
+fn validate_backend_workdir_visibility(
+    backend: &crate::tools::backends::BackendKind,
+    cwd: &str,
+) -> Result<(), ToolError> {
+    let cwd_path = std::path::Path::new(cwd);
+    if !cwd_path.is_absolute() {
+        return Ok(());
+    }
+
+    match backend {
+        crate::tools::backends::BackendKind::Modal
+        | crate::tools::backends::BackendKind::Daytona => {
+            if cwd_path.exists() {
+                return Err(ToolError::ExecutionFailed {
+                    tool: "terminal".into(),
+                    message: format!(
+                        "The {} backend cannot access host workspace path '{}'. Use the local or docker backend for local files, or sync the workspace into the remote sandbox first.",
+                        backend, cwd
+                    ),
+                });
+            }
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+fn terminal_result_header(
+    backend: &crate::tools::backends::BackendKind,
+    cwd: &str,
+    exit_code: i32,
+) -> String {
+    let status = if exit_code == 0 { "success" } else { "error" };
+    format!(
+        "[terminal_result status={status} backend={} cwd={} exit_code={exit_code}]",
+        backend, cwd
+    )
+}
+
+fn backend_idle_ttl() -> Duration {
+    std::env::var("EDGECRAB_TERMINAL_BACKEND_IDLE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_secs(300))
+}
+
+fn backend_cleanup_interval() -> Duration {
+    std::env::var("EDGECRAB_TERMINAL_BACKEND_SWEEP_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_secs(60))
+}
+
+fn last_cleanup_epoch_secs() -> &'static AtomicU64 {
+    static LAST_SWEEP: OnceLock<AtomicU64> = OnceLock::new();
+    LAST_SWEEP.get_or_init(|| AtomicU64::new(0))
+}
+
+/// Remove cached backends that have been idle longer than `max_idle`.
+///
+/// Safety rule: a backend is only eligible when the cache is the last owner.
+/// That prevents cleanup from racing an in-flight command that still holds an
+/// `Arc` clone outside the cache.
+pub async fn cleanup_inactive_backends(max_idle: Duration) -> usize {
+    let now = now_epoch_secs();
+    let max_idle_secs = max_idle.as_secs();
+    let mut stale = Vec::new();
+
+    backend_cache().retain(|task_id, entry| {
+        let idle_secs = entry.idle_for_secs(now);
+        let cache_is_last_owner = Arc::strong_count(&entry.backend) == 1;
+        let should_remove = idle_secs >= max_idle_secs && cache_is_last_owner;
+        if should_remove {
+            stale.push((
+                task_id.clone(),
+                entry.backend.clone(),
+                entry.backend.kind(),
+                idle_secs,
+            ));
+        }
+        !should_remove
+    });
+
+    for (task_id, backend, kind, idle_secs) in &stale {
+        tracing::info!(
+            task_id = %task_id,
+            kind = %kind,
+            idle_secs = *idle_secs,
+            "cleaning up inactive terminal backend"
+        );
+        let _ = backend.cleanup().await;
+    }
+
+    stale.len()
+}
+
+/// Remove and clean up all cached backends regardless of idle age.
+pub async fn cleanup_all_backends() -> usize {
+    let mut stale = Vec::new();
+    backend_cache().retain(|task_id, entry| {
+        stale.push((task_id.clone(), entry.backend.clone(), entry.backend.kind()));
+        false
+    });
+
+    for (task_id, backend, kind) in &stale {
+        tracing::info!(
+            task_id = %task_id,
+            kind = %kind,
+            "cleaning up terminal backend on shutdown"
+        );
+        let _ = backend.cleanup().await;
+    }
+
+    stale.len()
+}
+
+/// Remove and clean up the cached backend for a single task, if present.
+pub async fn cleanup_backend_for_task(task_id: &str) -> bool {
+    let Some((_, entry)) = backend_cache().remove(task_id) else {
+        return false;
+    };
+    tracing::info!(
+        task_id = %task_id,
+        kind = %entry.backend.kind(),
+        "cleaning up terminal backend for task"
+    );
+    let _ = entry.backend.cleanup().await;
+    true
+}
+
+async fn maybe_cleanup_inactive_backends() {
+    let now = now_epoch_secs();
+    let interval_secs = backend_cleanup_interval().as_secs();
+    let last = last_cleanup_epoch_secs().load(Ordering::Relaxed);
+    if now.saturating_sub(last) < interval_secs {
+        return;
+    }
+
+    last_cleanup_epoch_secs().store(now, Ordering::Relaxed);
+    let _ = cleanup_inactive_backends(backend_idle_ttl()).await;
+}
+
+/// Get or create a backend for the given task. Lazily initialised.
+///
+/// Fast path: return cached backend if healthy.
+/// Recovery path: evict dead backend, run its cleanup(), build a fresh one.
+///
+/// WHY health check: Docker containers, SSH sessions, and Modal sandboxes
+/// can die underneath the cache without the cache knowing.  Without the
+/// check, every subsequent `execute()` call on a dead cached entry would
+/// fail with an opaque error, and the dead entry would accumulate in cache
+/// forever.  `LocalBackend` always returns healthy — its `ensure_shell()`
+/// self-heals on every `execute()` call so no eviction is ever needed.
+pub(crate) async fn get_or_create_backend(
+    ctx: &ToolContext,
+) -> Result<Arc<dyn ExecutionBackend>, ToolError> {
+    maybe_cleanup_inactive_backends().await;
+    let cache = backend_cache();
+
+    // Fast path: backend already cached; skip build if healthy.
+    if let Some(existing) = cache.get(&ctx.task_id) {
+        let entry = existing.clone();
+        drop(existing); // Release DashMap shard lock before async call
+        entry.touch();
+        let backend = entry.backend.clone();
+        if backend.is_healthy().await {
+            return Ok(backend);
+        }
+        // Unhealthy — clean up gracefully, then evict and rebuild below.
+        tracing::warn!(
+            task_id = %ctx.task_id,
+            kind = %backend.kind(),
+            "cached backend is unhealthy; evicting and rebuilding"
+        );
+        let _ = backend.cleanup().await;
+        cache.remove(&ctx.task_id);
+    }
+
+    // Slow path: build a fresh backend and cache it.
+    let backend: Arc<dyn ExecutionBackend> =
+        Arc::from(build_backend(prepare_backend_config(ctx)).await?);
+    cache.insert(
+        ctx.task_id.clone(),
+        Arc::new(BackendCacheEntry::new(backend.clone())),
+    );
+    Ok(backend)
+}
+
+pub(crate) fn resolve_workdir(ctx: &ToolContext, workdir: Option<&str>) -> String {
+    match workdir {
+        Some(wd) => {
+            let p = std::path::Path::new(wd);
+            if p.is_absolute() {
+                wd.to_string()
+            } else {
+                ctx.cwd.join(p).to_string_lossy().into_owned()
+            }
+        }
+        None => ctx.cwd.to_string_lossy().into_owned(),
+    }
+}
+
+// ─── TerminalTool ─────────────────────────────────────────────────────
+
+pub struct TerminalTool;
+
+#[derive(Deserialize)]
+struct Args {
+    command: String,
+    #[serde(default = "default_timeout")]
+    timeout_seconds: u64,
+    /// Optional per-command working directory override.
+    ///
+    /// If relative, resolved against the task working directory (ctx.cwd).
+    /// If omitted, the task working directory is used.
+    workdir: Option<String>,
+}
+
+fn default_timeout() -> u64 {
+    120
+}
+
+#[async_trait]
+impl ToolHandler for TerminalTool {
+    fn name(&self) -> &'static str {
+        "terminal"
+    }
+
+    fn toolset(&self) -> &'static str {
+        "terminal"
+    }
+
+    fn emoji(&self) -> &'static str {
+        "💻"
+    }
+
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: "terminal".into(),
+            description: "Execute a shell command and return combined stdout+stderr output. \
+                          Commands run in a persistent bash shell, so state like environment \
+                          variables, `cd`, and shell functions persist across consecutive calls. \
+                          Use `workdir` to override the working directory for a single call. \
+                          For long-running processes (servers, watchers) use `run_process` instead. \
+                          The exit code is appended to the output as `exit code: N`; non-zero \
+                          means the command failed."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "Shell command to execute. Multi-line scripts are supported."
+                    },
+                    "timeout_seconds": {
+                        "type": "integer",
+                        "description": "Maximum seconds to wait for the command to finish (default: 120, max: 600)."
+                    },
+                    "workdir": {
+                        "type": "string",
+                        "description": "Override working directory for this command only. \
+                                        Absolute paths are used as-is; relative paths are \
+                                        resolved from the task working directory."
+                    }
+                },
+                "required": ["command"]
+            }),
+            strict: None,
+        }
+    }
+
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<String, ToolError> {
+        let args: Args = serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs {
+            tool: "terminal".into(),
+            message: e.to_string(),
+        })?;
+
+        // Auto-checkpoint before potentially destructive commands
+        if is_destructive_command(&args.command) {
+            ensure_checkpoint(
+                ctx,
+                &format!(
+                    "before terminal: {}",
+                    &args.command[..args.command.len().min(80)]
+                ),
+            );
+        }
+
+        // Security: scan command for dangerous patterns via Aho-Corasick scanner
+        if let Some(reasons) = crate::approval_runtime::command_approval_reasons(ctx, &args.command)
+        {
+            crate::approval_runtime::request_command_approval(ctx, &args.command, reasons).await?;
+        }
+
+        crate::command_interaction::guard_terminal_command(
+            &args.command,
+            &ctx.config.terminal_backend,
+        )?;
+
+        let timeout = Duration::from_secs(args.timeout_seconds.min(600)); // hard cap 10 min
+
+        // Resolve the working directory: per-command workdir overrides ctx.cwd.
+        let cwd = resolve_workdir(ctx, args.workdir.as_deref());
+        validate_backend_workdir_visibility(&ctx.config.terminal_backend, &cwd)?;
+
+        // Get or create backend for this task
+        let backend = get_or_create_backend(ctx).await?;
+
+        // Sudo transform: rewrite `sudo` → `sudo -S -p ''` when SUDO_PASSWORD
+        // is set so commands can run non-interactively.  Mirrors hermes-agent's
+        // `_transform_sudo_command()`.  The persistent shell cannot pipe an
+        // arbitrary stdin mid-execution, so we wrap the password delivery in a
+        // process-substitution heredoc that is invisible in /proc cmdline args.
+        let (effective_command, sudo_prefix) =
+            crate::tools::backends::transform_sudo(&args.command);
+        let final_command = if let Some(prefix) = sudo_prefix {
+            // Escape the password for use inside a single-quoted shell string.
+            // Using `printf '%s\n'` avoids `echo` which may interpret escape
+            // sequences on some systems.
+            let escaped = prefix.trim_end_matches('\n').replace('\'', "'\\''");
+            format!(
+                "{{ printf '%s\\n' '{}'; }} | {}",
+                escaped, effective_command
+            )
+        } else {
+            effective_command
+        };
+
+        // Execute via backend with up to 3 retries on transient infrastructure
+        // errors.  Mirrors hermes-agent terminal_tool.py retry logic: wait
+        // 2^attempt seconds between attempts (2 s, 4 s, 8 s).
+        const MAX_RETRIES: u32 = 3;
+        let mut attempt = 0u32;
+        let exec_output = loop {
+            let result = backend
+                .execute(&final_command, &cwd, timeout, ctx.cancel.clone())
+                .await;
+
+            // Check for retryable errors before consuming the value.
+            if let Err(ref e) = result {
+                if attempt < MAX_RETRIES && is_backend_retryable(e) {
+                    let wait = Duration::from_secs(1u64 << (attempt + 1)); // 2, 4, 8 s
+                    tracing::warn!(
+                        task_id = %ctx.task_id,
+                        attempt = attempt + 1,
+                        wait_secs = wait.as_secs(),
+                        error = %e,
+                        "terminal backend error; retrying",
+                    );
+                    attempt += 1;
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
+            }
+
+            match result {
+                Ok(out) => break out,
+                Err(e) => return Err(e),
+            }
+        };
+
+        crate::command_interaction::rewrite_terminal_exec_result(
+            &args.command,
+            &ctx.config.terminal_backend,
+            timeout,
+            &exec_output,
+        )?;
+
+        // Format output (includes stdout/stderr/exit-code)
+        let max_stdout = ctx.config.max_terminal_output;
+        let max_stderr = ctx.config.max_terminal_output / 4;
+        let mut result = exec_output.format(max_stdout, max_stderr);
+
+        // Strip ANSI escape codes for clean LLM consumption.
+        result = strip_ansi_escapes::strip_str(&result);
+
+        // Redact secrets and credentials before the output reaches the LLM.
+        // Mirrors hermes-agent terminal_tool.py: `redact_sensitive_text(output)`.
+        result = redact_output(&result);
+
+        let header =
+            terminal_result_header(&ctx.config.terminal_backend, &cwd, exec_output.exit_code);
+        result = if result.is_empty() {
+            header
+        } else {
+            format!("{header}\n{result}")
+        };
+
+        Ok(result)
+    }
+}
+
+/// Returns true if the command is likely to mutate files or history.
+/// These commands get an auto-checkpoint before execution.
+fn is_destructive_command(cmd: &str) -> bool {
+    const DESTRUCTIVE_PREFIXES: &[&str] = &[
+        "rm ",
+        "rm\t",
+        "rmdir ",
+        "mv ",
+        "mv\t",
+        "shred ",
+        "truncate ",
+        "git reset",
+        "git clean",
+        "git checkout",
+        "git restore",
+        "git rebase",
+        "git merge",
+        "git cherry-pick",
+        "git revert",
+        "sed -i",
+        "sed -i'",
+        "awk -i",
+    ];
+    let has_overwrite_redirect = cmd.contains(" > ")
+        || cmd.starts_with('>')
+        || cmd.contains("\t> ")
+        || (cmd.contains('>') && !cmd.contains(">>"));
+
+    let cmd_lower = cmd.to_lowercase();
+    DESTRUCTIVE_PREFIXES.iter().any(|p| {
+        cmd_lower.starts_with(p)
+            || cmd_lower.contains(&format!("; {p}"))
+            || cmd_lower.contains(&format!("&& {p}"))
+    }) || has_overwrite_redirect
+}
+
+/// Returns `true` if the backend error is worth retrying automatically.
+///
+/// Retryable: backend temporarily unavailable (Docker pulling, SSH reconnect).
+/// NOT retried: Timeout (same timeout → same result), PermissionDenied (security
+/// policy), InvalidArgs (model must fix schema), ExecutionFailed (legitimate
+/// non-zero exit — retrying won't change the result).
+fn is_backend_retryable(err: &ToolError) -> bool {
+    matches!(err, ToolError::Unavailable { .. } | ToolError::Other(_))
+}
+
+inventory::submit!(&TerminalTool as &dyn ToolHandler);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::registry::{ApprovalRequest, ApprovalResponse};
+    use edgecrab_types::ToolError;
+    use std::sync::atomic::AtomicUsize;
+    use tempfile::TempDir;
+    use tokio_util::sync::CancellationToken;
+
+    struct FakeBackend {
+        kind: crate::tools::backends::BackendKind,
+        cleanup_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ExecutionBackend for FakeBackend {
+        async fn execute(
+            &self,
+            _command: &str,
+            _cwd: &str,
+            _timeout: Duration,
+            _cancel: CancellationToken,
+        ) -> Result<crate::tools::backends::ExecOutput, ToolError> {
+            Ok(crate::tools::backends::ExecOutput {
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: 0,
+            })
+        }
+
+        async fn cleanup(&self) -> Result<(), ToolError> {
+            self.cleanup_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn kind(&self) -> crate::tools::backends::BackendKind {
+            self.kind.clone()
+        }
+    }
+
+    fn ctx_in(dir: &std::path::Path) -> ToolContext {
+        let mut ctx = ToolContext::test_context();
+        ctx.task_id = format!("terminal-test-{}", uuid::Uuid::new_v4().simple());
+        ctx.cwd = dir.to_path_buf();
+        ctx
+    }
+
+    #[tokio::test]
+    async fn terminal_echo() {
+        let dir = TempDir::new().expect("tmpdir");
+        let ctx = ctx_in(dir.path());
+
+        let result = TerminalTool
+            .execute(json!({"command": "echo hello world"}), &ctx)
+            .await
+            .expect("terminal");
+
+        assert!(result.contains("hello world"));
+        let _ = cleanup_backend_for_task(&ctx.task_id).await;
+    }
+
+    #[tokio::test]
+    async fn terminal_exit_code() {
+        let dir = TempDir::new().expect("tmpdir");
+        let ctx = ctx_in(dir.path());
+
+        let result = TerminalTool
+            .execute(json!({"command": "exit 42"}), &ctx)
+            .await
+            .expect("terminal");
+
+        assert!(result.contains("exit code: 42"));
+        let _ = cleanup_backend_for_task(&ctx.task_id).await;
+    }
+
+    #[tokio::test]
+    async fn terminal_cwd_respected() {
+        let dir = TempDir::new().expect("tmpdir");
+        std::fs::write(dir.path().join("marker.txt"), "found").expect("write");
+
+        let ctx = ctx_in(dir.path());
+        let result = TerminalTool
+            .execute(json!({"command": "cat marker.txt"}), &ctx)
+            .await
+            .expect("terminal");
+
+        assert!(result.contains("found"));
+        let _ = cleanup_backend_for_task(&ctx.task_id).await;
+    }
+
+    #[test]
+    fn prepare_backend_config_mounts_workspace_for_docker() {
+        let dir = TempDir::new().expect("tmpdir");
+        let mut ctx = ctx_in(dir.path());
+        ctx.config.terminal_backend = crate::tools::backends::BackendKind::Docker;
+
+        let cfg = prepare_backend_config(&ctx);
+        let mount = cfg
+            .docker
+            .workspace_mount
+            .as_ref()
+            .expect("docker workspace mount");
+        assert_eq!(mount.container_path, "/workspace");
+        assert_eq!(
+            std::path::Path::new(&mount.host_path),
+            dir.path(),
+            "task cwd should be the mounted host workspace"
+        );
+    }
+
+    #[test]
+    fn modal_backend_rejects_host_workspace_paths() {
+        let dir = TempDir::new().expect("tmpdir");
+        let err = validate_backend_workdir_visibility(
+            &crate::tools::backends::BackendKind::Modal,
+            &dir.path().to_string_lossy(),
+        )
+        .expect_err("modal should reject host cwd");
+        assert!(
+            err.to_string()
+                .contains("cannot access host workspace path")
+        );
+    }
+
+    #[test]
+    fn terminal_result_header_is_machine_readable() {
+        let header = terminal_result_header(
+            &crate::tools::backends::BackendKind::Docker,
+            "/workspace/demo",
+            0,
+        );
+        assert_eq!(
+            header,
+            "[terminal_result status=success backend=docker cwd=/workspace/demo exit_code=0]"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_requests_approval_for_dangerous_command() {
+        let dir = TempDir::new().expect("tmpdir");
+        let mut ctx = ctx_in(dir.path());
+        let (approval_tx, mut approval_rx) =
+            tokio::sync::mpsc::unbounded_channel::<ApprovalRequest>();
+        ctx.approval_tx = Some(approval_tx);
+
+        let approver = tokio::spawn(async move {
+            let request = approval_rx.recv().await.expect("approval request");
+            assert!(request.full_command.contains("rm -rf"));
+            let _ = request.response_tx.send(ApprovalResponse::Once);
+        });
+
+        let result = TerminalTool
+            .execute(json!({"command": "rm -rf /tmp/edgecrab-danger-test"}), &ctx)
+            .await
+            .expect("terminal");
+
+        approver.await.expect("approver task");
+        assert!(result.contains("exit code: 0"));
+        let _ = cleanup_backend_for_task(&ctx.task_id).await;
+    }
+
+    #[tokio::test]
+    async fn terminal_rejects_tty_ui_commands() {
+        let dir = TempDir::new().expect("tmpdir");
+        let ctx = ctx_in(dir.path());
+
+        let err = TerminalTool
+            .execute(json!({"command": "vim Cargo.toml"}), &ctx)
+            .await
+            .expect_err("tty ui should be rejected");
+
+        let ToolError::CapabilityDenied { message, code, .. } = err else {
+            panic!("expected capability denied");
+        };
+        assert_eq!(code, "non_interactive_terminal_required");
+        assert!(message.contains("interactive terminal UI"));
+    }
+
+    #[tokio::test]
+    async fn cleanup_inactive_backends_removes_idle_entries() {
+        let _ = cleanup_all_backends().await;
+        let cleanup_calls = Arc::new(AtomicUsize::new(0));
+        let backend: Arc<dyn ExecutionBackend> = Arc::new(FakeBackend {
+            kind: crate::tools::backends::BackendKind::Local,
+            cleanup_calls: cleanup_calls.clone(),
+        });
+        let entry = Arc::new(BackendCacheEntry::new(backend));
+        entry
+            .last_used_epoch_secs
+            .store(now_epoch_secs().saturating_sub(600), Ordering::Relaxed);
+        backend_cache().insert("idle-test".into(), entry);
+
+        let cleaned = cleanup_inactive_backends(Duration::from_secs(300)).await;
+        assert_eq!(cleaned, 1);
+        assert_eq!(cleanup_calls.load(Ordering::Relaxed), 1);
+        assert!(!backend_cache().contains_key("idle-test"));
+    }
+
+    #[tokio::test]
+    async fn cleanup_inactive_backends_preserves_in_use_entries() {
+        let _ = cleanup_all_backends().await;
+        let cleanup_calls = Arc::new(AtomicUsize::new(0));
+        let backend: Arc<dyn ExecutionBackend> = Arc::new(FakeBackend {
+            kind: crate::tools::backends::BackendKind::Local,
+            cleanup_calls: cleanup_calls.clone(),
+        });
+        let held_clone = backend.clone();
+        let entry = Arc::new(BackendCacheEntry::new(backend));
+        entry
+            .last_used_epoch_secs
+            .store(now_epoch_secs().saturating_sub(600), Ordering::Relaxed);
+        backend_cache().insert("busy-test".into(), entry);
+
+        let cleaned = cleanup_inactive_backends(Duration::from_secs(300)).await;
+        assert_eq!(cleaned, 0);
+        assert_eq!(cleanup_calls.load(Ordering::Relaxed), 0);
+        assert!(backend_cache().contains_key("busy-test"));
+
+        drop(held_clone);
+        let _ = cleanup_all_backends().await;
+    }
+}

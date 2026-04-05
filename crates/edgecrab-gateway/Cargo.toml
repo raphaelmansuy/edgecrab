@@ -1,0 +1,43 @@
+[package]
+name = "edgecrab-gateway"
+description = "Multi-platform messaging gateway for the EdgeCrab agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+edgecrab-core = { path = "../edgecrab-core" }
+edgecrab-types = { path = "../edgecrab-types" }
+edgecrab-state = { path = "../edgecrab-state" }
+edgecrab-tools = { path = "../edgecrab-tools" }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+axum = { workspace = true }
+dashmap = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yml = { workspace = true }
+reqwest = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+tokio-tungstenite = { workspace = true }
+regex = { workspace = true }
+dirs = { workspace = true }
+rand = { workspace = true }
+base64 = { workspace = true }
+sha2 = { workspace = true }
+urlencoding = { workspace = true }
+which = { workspace = true }
+async-stream = "0.3"
+lettre = "0.11"
+md5 = "0.7"
+
+[dev-dependencies]
+tokio = { workspace = true }
+tower = { version = "0.5", features = ["util"] }
+tempfile = { workspace = true }

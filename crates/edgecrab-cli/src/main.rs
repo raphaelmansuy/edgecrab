@@ -1,0 +1,1381 @@
+//! # edgecrab – AI-native terminal agent
+//!
+//! Binary entry-point. Routes to subcommands (setup, doctor, migrate, acp)
+//! or runs the interactive TUI / quiet mode when no subcommand is given.
+//!
+//! ```text
+//! edgecrab [OPTIONS] [PROMPT]  ← interactive TUI (default)
+//! edgecrab setup               ← first-run wizard
+//! edgecrab doctor              ← diagnostics
+//! edgecrab migrate [--dry-run] ← hermes → edgecrab
+//! edgecrab acp                 ← ACP stdio server for editors
+//! edgecrab version             ← detailed version info
+//! ```
+
+mod acp_setup;
+mod app;
+mod banner;
+mod cli_args;
+mod commands;
+mod cron_cmd;
+mod doctor;
+mod fuzzy_selector;
+mod gateway_catalog;
+mod gateway_cmd;
+mod gateway_setup;
+mod markdown_render;
+mod model_discovery;
+#[cfg(target_os = "macos")]
+mod permissions;
+mod plugins;
+mod plugins_cmd;
+mod profile;
+mod runtime;
+mod setup;
+mod skin_engine;
+mod status_cmd;
+mod theme;
+mod tool_display;
+mod vision_models;
+mod whatsapp_cmd;
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use anyhow::Context;
+use clap::Parser;
+use tokio_util::sync::CancellationToken;
+
+use app::App;
+use cli_args::{
+    AcpCommand, CliArgs, Command, ConfigCommand, CronCommand, GatewayCommand, McpCommand,
+    PluginsCommand, ProfileCommand, SessionCommand, SkillsCommand, ToolsCommand,
+};
+use edgecrab_core::config::McpServerConfig;
+use edgecrab_state::SessionDb;
+use edgecrab_tools::{ToolRegistry, resolve_alias};
+use runtime::{
+    build_agent, build_tool_registry, build_tool_registry_with_mcp_discovery, default_export_path,
+    load_runtime, open_state_db, render_markdown_export,
+};
+
+/// Create the LLM provider from the model string (or env defaults).
+///
+/// WHY try real provider first: In production the user has API keys set.
+/// Falls back to MockProvider for development/test so the CLI always starts.
+///
+/// ```text
+///   model contains "/"  → parse "provider/model", create explicitly
+///       ↓ no slash
+///   ProviderFactory::from_env()         ← try env-based auto-detect
+///       ↓ fails
+///   MockProvider                        ← fallback for dev/test
+/// ```
+pub(crate) fn create_provider(model: &str) -> Arc<dyn edgequake_llm::LLMProvider> {
+    // If model string contains provider/model, honour it explicitly first.
+    // This ensures "copilot/gpt-4.1-mini" always uses copilot even when
+    // OPENAI_API_KEY, ANTHROPIC_API_KEY etc. are also set.
+    if let Some((provider_name, model_name)) = model.split_once('/') {
+        // Map user-friendly provider aliases to edgequake-llm canonical names
+        let canonical = match provider_name {
+            "copilot" => "vscode-copilot",
+            other => other,
+        };
+        tracing::info!(
+            provider = canonical,
+            model = model_name,
+            "creating provider from model string"
+        );
+
+        // Special-case vscode-copilot: create_llm_provider always forces proxy mode
+        // (localhost:4141). Instead, build the provider directly so it uses the default
+        // direct mode (api.githubcopilot.com) and respects VSCODE_COPILOT_DIRECT env var.
+        if canonical == "vscode-copilot" {
+            match edgequake_llm::VsCodeCopilotProvider::new()
+                .model(model_name)
+                .with_vision(true) // Enable vision so copilot-vision-request header is sent
+                .build()
+            {
+                Ok(provider) => return Arc::new(provider),
+                Err(e) => {
+                    tracing::warn!(error = %e, model = model_name, "copilot direct mode failed, trying env auto-detect");
+                }
+            }
+        } else if canonical == "vertexai" {
+            // ── Hard VertexAI route ──────────────────────────────────────────────────
+            // The user explicitly said "vertexai/<model>".  We MUST NOT silently fall
+            // through to from_env() (which would pick up GEMINI_API_KEY and route to
+            // Google AI Studio instead) or to MockProvider.  Any failure is surfaced
+            // immediately with actionable guidance.
+            //
+            // Why "vertexai:" prefix: edgequake-llm's factory only calls
+            // GeminiProvider::from_env_vertex_ai() when the model string starts with
+            // "vertexai:".  split_once('/') strips that context, so we restore it here.
+            //
+            // Why auto-detect GOOGLE_CLOUD_PROJECT: `gcloud auth login` does NOT export
+            // it; from_env_vertex_ai() treats it as required.
+
+            if std::env::var("GOOGLE_CLOUD_PROJECT").is_err() {
+                match std::process::Command::new("gcloud")
+                    .args(["config", "get-value", "project"])
+                    .output()
+                {
+                    Ok(output) if output.status.success() => {
+                        let raw = String::from_utf8_lossy(&output.stdout);
+                        let project = raw.trim();
+                        if !project.is_empty() && project != "(unset)" {
+                            // SAFETY: called before the tokio worker pool is spawned;
+                            // no other thread reads env vars at this point.
+                            unsafe { std::env::set_var("GOOGLE_CLOUD_PROJECT", project) };
+                            tracing::info!(
+                                project,
+                                "auto-detected GOOGLE_CLOUD_PROJECT from gcloud config"
+                            );
+                        } else {
+                            eprintln!(
+                                "error: VertexAI requires a GCP project but gcloud returned \
+                                 empty/unset.\n  Fix: gcloud config set project <your-project-id>\n\
+                                        or: export GOOGLE_CLOUD_PROJECT=<your-project-id>"
+                            );
+                            std::process::exit(1);
+                        }
+                    }
+                    Ok(_) => {
+                        eprintln!(
+                            "error: gcloud exited with a non-zero status while detecting \
+                             GOOGLE_CLOUD_PROJECT.\n  Fix: export GOOGLE_CLOUD_PROJECT=<your-project-id>"
+                        );
+                        std::process::exit(1);
+                    }
+                    Err(_) => {
+                        eprintln!(
+                            "error: GOOGLE_CLOUD_PROJECT is not set and gcloud was not found \
+                             in PATH.\n  Fix: export GOOGLE_CLOUD_PROJECT=<your-project-id>\n\
+                                    or: install the Google Cloud SDK and run gcloud auth login"
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            }
+
+            let vertex_model = format!("vertexai:{model_name}");
+
+            // Gemini 3.x Preview models (gemini-3-flash-preview, gemini-3.1-pro-preview,
+            // gemini-3.1-flash-lite-preview, …) are ONLY available on the Vertex AI
+            // global endpoint.  The 2.x GA models work on regional endpoints like
+            // us-central1.  edgequake-llm reads GOOGLE_CLOUD_REGION to build the
+            // endpoint URL; auto-set it to "global" when the user hasn't set it
+            // and the model name indicates a Gemini 3 generation.
+            // Source: https://cloud.google.com/vertex-ai/generative-ai/docs/learn/locations
+            if model_name.starts_with("gemini-3") && std::env::var("GOOGLE_CLOUD_REGION").is_err() {
+                // SAFETY: single-threaded startup, no concurrent env reads.
+                unsafe { std::env::set_var("GOOGLE_CLOUD_REGION", "global") };
+                tracing::info!(
+                    model = model_name,
+                    "auto-set GOOGLE_CLOUD_REGION=global (Gemini 3.x is global-endpoint-only)"
+                );
+            }
+
+            match edgequake_llm::ProviderFactory::create_llm_provider(canonical, &vertex_model) {
+                Ok(provider) => return provider,
+                Err(e) => {
+                    eprintln!(
+                        "error: VertexAI provider failed for model '{model_name}': {e}\n\
+                         Fix:\n\
+                         \x20  • gcloud auth application-default login\n\
+                         \x20  • export GOOGLE_CLOUD_PROJECT=<your-project-id>\n\
+                         \x20  • edgecrab doctor    ← full diagnostics"
+                    );
+                    std::process::exit(1);
+                }
+            }
+        } else if let Ok(provider) =
+            edgequake_llm::ProviderFactory::create_llm_provider(canonical, model_name)
+        {
+            return provider;
+        } else {
+            tracing::warn!(
+                provider = canonical,
+                model = model_name,
+                "explicit provider failed, trying env auto-detect"
+            );
+        }
+    }
+
+    // Fallback: environment auto-detection (only reached when no "provider/model" slash
+    // syntax was used, or a non-vertexai explicit provider soft-failed).
+    if let Ok((llm, _embedding)) = edgequake_llm::ProviderFactory::from_env() {
+        return llm;
+    }
+
+    tracing::warn!("no provider configured, falling back to mock");
+    Arc::new(edgequake_llm::MockProvider::new())
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let args = CliArgs::parse();
+    let subcommand = args.command.clone();
+
+    // Initialize tracing
+    if args.debug {
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .init();
+    }
+
+    let manages_profiles = matches!(
+        subcommand,
+        Some(Command::Profile { .. }) | Some(Command::Completion { .. })
+    );
+    if args.profile.is_some() && args.config.is_some() && !manages_profiles {
+        anyhow::bail!("--profile and --config cannot be combined on runtime commands");
+    }
+    if args.config.is_none() && !manages_profiles {
+        profile::activate_profile(args.profile.as_deref())?;
+    }
+
+    // Route to subcommand if one was given
+    if let Some(cmd) = subcommand {
+        return run_subcommand(cmd, &args).await;
+    }
+
+    // ── Git worktree isolation (-w flag) ─────────────────────────────
+    // When -w is set, create a disposable worktree under .worktrees/ in the
+    // current repo root and cd into it. This mirrors `hermes -w`.
+    if args.worktree {
+        match setup_worktree() {
+            Ok(wt_path) => {
+                std::env::set_current_dir(&wt_path)
+                    .with_context(|| format!("failed to cd into worktree {}", wt_path.display()))?;
+                eprintln!("🌿 Running in isolated worktree: {}", wt_path.display());
+            }
+            Err(e) => {
+                eprintln!("⚠  Failed to create worktree ({e}), continuing in current directory.");
+            }
+        }
+    }
+
+    // ── Interactive / quiet mode ──────────────────────────────────────
+
+    let mut runtime = load_runtime(
+        args.config.as_deref(),
+        args.model.as_deref(),
+        args.toolset.as_deref(),
+    )?;
+
+    // Wire preloaded skills from -s flags into the runtime config
+    if !args.skills.is_empty() {
+        runtime.config.skills.preloaded = args.skills.clone();
+    }
+
+    let model = runtime.config.model.default_model.clone();
+    let provider = create_provider(&model);
+    let state_db = open_state_db(&runtime.state_db_path)?;
+    let tool_registry = build_tool_registry_with_mcp_discovery(&runtime.config).await;
+
+    // ── Resolve session from --session, --continue, or --resume ────
+    let resolved_session = resolve_session_flag(&args, &state_db)?;
+
+    let agent = build_agent(
+        &runtime,
+        provider,
+        state_db,
+        tool_registry,
+        edgecrab_types::Platform::Cli,
+        args.quiet,
+        resolved_session.clone(),
+    )?;
+    gateway_cmd::attach_gateway_sender_if_running(&agent, &runtime).await?;
+
+    if let Some(ref session_id) = resolved_session {
+        agent
+            .restore_session(session_id)
+            .await
+            .with_context(|| format!("failed to restore session '{session_id}'"))?;
+    }
+
+    // Quiet mode: send prompt, print response, exit
+    if args.quiet {
+        if let Some(prompt) = args.prompt_text() {
+            let response = agent.chat(&prompt).await?;
+            println!("{}", response);
+        } else {
+            eprintln!("edgecrab: no prompt provided in quiet mode. Use -q \"your prompt\"");
+            std::process::exit(1);
+        }
+        let _ = edgecrab_tools::tools::terminal::cleanup_all_backends().await;
+        return Ok(());
+    }
+
+    // Interactive TUI mode
+    let mut app = App::new();
+    app.set_agent(Arc::clone(&agent));
+
+    // Show banner
+    if !args.no_banner {
+        app.push_colorful_banner(&model);
+    }
+
+    app.set_model(&model);
+
+    if resolved_session.is_some() {
+        app.load_messages(agent.messages().await);
+    }
+
+    // Handle initial prompt — dispatch to agent via the streaming channel
+    if let Some(prompt) = args.prompt_text() {
+        // Simulate user typing the initial prompt into the TUI input.
+        // The process_input path handles agent dispatch via the mpsc channel.
+        app.dispatch_initial_prompt(prompt);
+    }
+
+    // ── Background cron scheduler ─────────────────────────────────────
+    // Tick due cron jobs while the TUI is open. Results are sent back to
+    // the TUI chat via cron_tui_tx so the user sees output without having
+    // to check ~/.edgecrab/cron/output/ manually.
+    //
+    // Timing: first tick fires after 5 seconds (fast enough for jobs created
+    // "just now"), then every 60 seconds thereafter.
+    let cron_tui_tx = app.cron_sender();
+    let cron_stop = CancellationToken::new();
+    let cron_stop_guard = cron_stop.clone();
+    let cron_args = args.clone();
+    tokio::spawn(async move {
+        // Short startup delay — TUI has fully rendered before first check.
+        // Using 5 s instead of 60 s so one-shot "fire now" jobs are visible quickly.
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+            _ = cron_stop_guard.cancelled() => return,
+        }
+        loop {
+            match cron_cmd::tick_due_jobs(&cron_args, false, None, Some(cron_tui_tx.clone())).await
+            {
+                Ok(n) if n > 0 => tracing::info!(jobs = n, "cron: ran due jobs"),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "cron background tick failed"),
+            }
+            // Wait 60 s before next check, but honour cancellation immediately.
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {}
+                _ = cron_stop_guard.cancelled() => break,
+            }
+        }
+        tracing::debug!("cron background scheduler stopped");
+    });
+
+    // Run TUI in a blocking task so the tokio runtime stays alive.
+    tokio::task::spawn_blocking(move || app::run_tui(&mut app)).await??;
+
+    // Stop the background cron scheduler when the TUI exits
+    cron_stop.cancel();
+    let _ = edgecrab_tools::tools::terminal::cleanup_all_backends().await;
+
+    Ok(())
+}
+
+/// Dispatch to a named subcommand.
+async fn run_subcommand(cmd: Command, args: &CliArgs) -> anyhow::Result<()> {
+    match cmd {
+        Command::Setup { section, force } => {
+            setup::run_with_options(section.as_deref(), force)?;
+        }
+
+        Command::Doctor => {
+            let all_ok = doctor::run(args.config.as_deref()).await?;
+            if !all_ok {
+                std::process::exit(1);
+            }
+        }
+
+        Command::Migrate { dry_run } => {
+            run_migrate(dry_run)?;
+        }
+
+        Command::Acp { command } => match command {
+            Some(AcpCommand::Init { workspace, force }) => {
+                acp_setup::run_init(workspace, force)?;
+            }
+            None => {
+                run_acp(args).await?;
+            }
+        },
+        Command::Version => {
+            run_version();
+        }
+
+        Command::Whatsapp => {
+            whatsapp_cmd::run(args)?;
+        }
+
+        Command::Status => {
+            status_cmd::run(args)?;
+        }
+
+        Command::Sessions { command } => {
+            run_sessions(command, args)?;
+        }
+
+        Command::Config { command } => {
+            run_config(command, args)?;
+        }
+
+        Command::Tools { command } => {
+            run_tools(command, args)?;
+        }
+
+        Command::Mcp { command } => {
+            run_mcp(command, args)?;
+        }
+
+        Command::Plugins { command } => {
+            run_plugins(command)?;
+        }
+
+        Command::Cron { command } => {
+            run_cron(command, args).await?;
+        }
+
+        Command::Gateway { command } => {
+            run_gateway(command, args).await?;
+        }
+
+        Command::Skills { command } => {
+            run_skills(command)?;
+        }
+
+        Command::Profile { command } => {
+            run_profile(command)?;
+        }
+
+        Command::Completion { shell } => {
+            profile::print_completion(&shell)?;
+        }
+    }
+    Ok(())
+}
+
+/// Run the Hermes → EdgeCrab migrator.
+///
+/// WHY separate fn: isolates edgecrab-migrate dependency linkage so
+/// the ACP/doctor paths don't transitively pull in migration code.
+fn run_migrate(dry_run: bool) -> anyhow::Result<()> {
+    use dirs::home_dir;
+    use edgecrab_migrate::hermes::HermesMigrator;
+
+    let hermes_home = home_dir()
+        .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?
+        .join(".hermes");
+    let edgecrab_home = home_dir()
+        .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?
+        .join(".edgecrab");
+
+    if !hermes_home.exists() {
+        println!(
+            "ℹ  No hermes-agent config found at: {}",
+            hermes_home.display()
+        );
+        println!("   Nothing to migrate.");
+        return Ok(());
+    }
+
+    if dry_run {
+        println!("🔍 Dry-run mode — no files will be written.\n");
+    } else {
+        println!("🚀 Migrating hermes-agent → EdgeCrab...\n");
+    }
+
+    println!("  Source:      {}", hermes_home.display());
+    println!("  Destination: {}\n", edgecrab_home.display());
+
+    // In dry-run mode we use a /tmp directory as destination so no files are
+    // actually written to the real edgecrab home.
+    let (effective_dest, tmp_path) = if dry_run {
+        let tmp = std::env::temp_dir().join(format!(
+            "edgecrab-migrate-dry-run-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&tmp)?;
+        (tmp.clone(), Some(tmp))
+    } else {
+        std::fs::create_dir_all(&edgecrab_home)?;
+        (edgecrab_home.clone(), None)
+    };
+
+    let migrator = HermesMigrator::new(hermes_home, effective_dest);
+    let report = migrator.migrate_all()?;
+
+    // Cleanup dry-run temp dir
+    if let Some(tmp) = tmp_path {
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // Print report
+    for item in &report.items {
+        use edgecrab_migrate::report::MigrationStatus;
+        let icon = match item.status {
+            MigrationStatus::Success => "✓",
+            MigrationStatus::Skipped => "⟳",
+            MigrationStatus::Failed => "✗",
+        };
+        println!("  {icon} {:12} — {}", item.name, item.detail);
+    }
+
+    let succeeded = report
+        .items
+        .iter()
+        .filter(|i| i.status == edgecrab_migrate::report::MigrationStatus::Success)
+        .count();
+    let failed = report
+        .items
+        .iter()
+        .filter(|i| i.status == edgecrab_migrate::report::MigrationStatus::Failed)
+        .count();
+
+    println!();
+    if failed == 0 {
+        if dry_run {
+            println!("✅ Dry-run complete. {succeeded} item(s) would be migrated.");
+            println!("   Run without --dry-run to apply.");
+        } else {
+            println!("✅ Migration complete. {succeeded} item(s) migrated.");
+            println!("   Run `edgecrab doctor` to verify the new configuration.");
+        }
+    } else {
+        println!("⚠  Migration completed with {failed} failure(s). Check output above.");
+    }
+
+    Ok(())
+}
+
+/// Start the ACP stdio server for editor integration.
+async fn run_acp(args: &CliArgs) -> anyhow::Result<()> {
+    use edgecrab_acp::server::AcpServer;
+
+    let runtime = load_runtime(
+        args.config.as_deref(),
+        args.model.as_deref(),
+        args.toolset.as_deref(),
+    )?;
+    let model_str = runtime.config.model.default_model.clone();
+    let provider = create_provider(&model_str);
+    let state_db = open_state_db(&runtime.state_db_path)?;
+    let tool_registry = build_tool_registry_with_mcp_discovery(&runtime.config).await;
+    let agent = build_agent(
+        &runtime,
+        provider,
+        state_db,
+        tool_registry,
+        edgecrab_types::Platform::Acp,
+        false,
+        None,
+    )?;
+    gateway_cmd::attach_gateway_sender_if_running(&agent, &runtime).await?;
+
+    let mut server = AcpServer::new();
+    server.set_agent(agent);
+    server.run().await?;
+    Ok(())
+}
+
+/// Print detailed version and provider information.
+fn run_version() {
+    let version = env!("CARGO_PKG_VERSION");
+    println!("EdgeCrab v{version}");
+    println!("Rust {}", env!("CARGO_PKG_RUST_VERSION", "unknown"));
+    println!();
+    println!("Supported providers (via edgequake-llm):");
+    let providers = [
+        ("copilot", "GitHub Copilot (GITHUB_TOKEN)"),
+        ("openai", "OpenAI (OPENAI_API_KEY)"),
+        ("anthropic", "Anthropic (ANTHROPIC_API_KEY)"),
+        ("gemini", "Google Gemini (GOOGLE_API_KEY)"),
+        ("openrouter", "OpenRouter (OPENROUTER_API_KEY)"),
+        ("xai", "xAI Grok (XAI_API_KEY)"),
+        ("mistral", "Mistral AI (MISTRAL_API_KEY)"),
+        ("ollama", "Ollama (local, no key)"),
+        ("lmstudio", "LMStudio (local, no key)"),
+        ("azure", "Azure OpenAI (AZURE_OPENAI_API_KEY)"),
+        ("bedrock", "AWS Bedrock (AWS_ACCESS_KEY_ID)"),
+        ("huggingface", "HuggingFace (HUGGINGFACE_API_KEY)"),
+    ];
+    for (id, desc) in providers {
+        println!("  {id:<14} — {desc}");
+    }
+    println!();
+    println!("Home:   {}", setup::edgecrab_home().display());
+    println!(
+        "Config: {}",
+        setup::edgecrab_home().join("config.yaml").display()
+    );
+    println!();
+    println!("Links:");
+    println!("  Docs:    https://github.com/raphaelmansuy/edgecrab");
+    println!("  Issues:  https://github.com/raphaelmansuy/edgecrab/issues");
+}
+
+fn run_sessions(command: SessionCommand, args: &CliArgs) -> anyhow::Result<()> {
+    let runtime = load_runtime(args.config.as_deref(), args.model.as_deref(), None)?;
+    let db = open_state_db(&runtime.state_db_path)?;
+
+    match command {
+        SessionCommand::List { limit, source } => {
+            let sessions = if let Some(ref src) = source {
+                db.list_sessions_by_source(src, limit)?
+            } else {
+                db.list_sessions(limit)?
+            };
+            if sessions.is_empty() {
+                println!("No persisted sessions.");
+                return Ok(());
+            }
+            // Check if any session has a title — use rich format if so
+            let has_titles = sessions.iter().any(|s| s.title.is_some());
+            if has_titles {
+                println!("{:<22} {:<14} {:<6} ID", "Title", "Last Active", "Src");
+                println!("{}", "─".repeat(70));
+            } else {
+                println!("{:<14} {:<6} ID", "Last Active", "Src");
+                println!("{}", "─".repeat(40));
+            }
+            for session in &sessions {
+                let last_active = format_timestamp(session.started_at);
+                let src = &session.source.chars().take(5).collect::<String>();
+                if has_titles {
+                    let title = session.title.as_deref().unwrap_or("—");
+                    let title_short: String = title.chars().take(21).collect();
+                    println!(
+                        "{:<22} {:<14} {:<6} {}",
+                        title_short,
+                        last_active,
+                        src,
+                        &session.id[..session.id.len().min(12)],
+                    );
+                } else {
+                    println!(
+                        "{:<14} {:<6} {}",
+                        last_active,
+                        src,
+                        &session.id[..session.id.len().min(12)],
+                    );
+                }
+            }
+        }
+        SessionCommand::Browse { query, limit } => {
+            if let Some(query) = query {
+                let results = db.search(&query, limit)?;
+                if results.is_empty() {
+                    println!("No sessions matched '{}'.", query);
+                    return Ok(());
+                }
+                for result in results {
+                    println!(
+                        "{}  {}  score={:.3}",
+                        &result.session_id[..result.session_id.len().min(12)],
+                        result.role,
+                        result.score,
+                    );
+                    println!("  {}", result.snippet);
+                }
+            } else {
+                let sessions = db.list_sessions(limit)?;
+                if sessions.is_empty() {
+                    println!("No persisted sessions.");
+                    return Ok(());
+                }
+                for session in sessions {
+                    println!(
+                        "{}  {}  model={}  msgs={}  started={}",
+                        &session.id[..session.id.len().min(12)],
+                        session.title.as_deref().unwrap_or("-"),
+                        session.model.as_deref().unwrap_or("?"),
+                        session.message_count,
+                        format_timestamp(session.started_at),
+                    );
+                }
+                println!(
+                    "Hint: use `edgecrab sessions browse --query <text>` to search message history."
+                );
+            }
+        }
+        SessionCommand::Export { id, output, format } => {
+            let session_id = resolve_session_id(&db, &id)?;
+            match format.as_str() {
+                "jsonl" => {
+                    let export = db
+                        .export_session_jsonl(&session_id)?
+                        .ok_or_else(|| anyhow::anyhow!("session not found: {session_id}"))?;
+                    let jsonl = serde_json::to_string(&export)
+                        .map_err(|e| anyhow::anyhow!("JSON serialization failed: {e}"))?;
+                    let out_path = output.map(PathBuf::from).unwrap_or_else(|| {
+                        default_export_path(
+                            "edgecrab-session",
+                            edgecrab_core::safe_truncate(&session_id, 8),
+                            "jsonl",
+                        )
+                    });
+                    std::fs::write(&out_path, jsonl)?;
+                    println!(
+                        "Exported {} to {} (JSONL)",
+                        edgecrab_core::safe_truncate(&session_id, 12),
+                        out_path.display()
+                    );
+                }
+                "markdown" | "md" => {
+                    let record = db
+                        .get_session(&session_id)?
+                        .ok_or_else(|| anyhow::anyhow!("session not found: {session_id}"))?;
+                    let messages = db.get_messages(&session_id)?;
+                    let out_path = output.map(PathBuf::from).unwrap_or_else(|| {
+                        default_export_path(
+                            "edgecrab-session",
+                            edgecrab_core::safe_truncate(&session_id, 8),
+                            "md",
+                        )
+                    });
+                    let markdown = render_markdown_export(
+                        &messages,
+                        record.model.as_deref().unwrap_or("unknown"),
+                        &session_id,
+                    );
+                    std::fs::write(&out_path, markdown)?;
+                    println!(
+                        "Exported {} to {}",
+                        &session_id[..session_id.len().min(12)],
+                        out_path.display()
+                    );
+                }
+                other => {
+                    anyhow::bail!("Unknown export format '{other}'. Use 'markdown' or 'jsonl'.")
+                }
+            }
+        }
+        SessionCommand::Delete { id } => {
+            let session_id = resolve_session_id(&db, &id)?;
+            db.delete_session(&session_id)?;
+            println!(
+                "Deleted session {}",
+                &session_id[..session_id.len().min(12)]
+            );
+        }
+        SessionCommand::Rename { id, title } => {
+            let session_id = resolve_session_id(&db, &id)?;
+            let new_title = title.join(" ");
+            if new_title.is_empty() {
+                anyhow::bail!("Usage: edgecrab sessions rename <id> <new title>");
+            }
+            db.update_session_title(&session_id, &new_title)?;
+            println!(
+                "Renamed {} → \"{}\"",
+                &session_id[..session_id.len().min(12)],
+                new_title
+            );
+        }
+        SessionCommand::Prune {
+            older_than,
+            source,
+            yes,
+        } => {
+            if !yes {
+                println!(
+                    "This will delete ended sessions older than {} days{}.",
+                    older_than,
+                    source
+                        .as_deref()
+                        .map(|s| format!(" (source: {s})"))
+                        .unwrap_or_default()
+                );
+                print!("Continue? [y/N] ");
+                use std::io::Write;
+                std::io::stdout().flush()?;
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input)?;
+                if !input.trim().eq_ignore_ascii_case("y") {
+                    println!("Aborted.");
+                    return Ok(());
+                }
+            }
+            let count = db.prune_sessions(older_than, source.as_deref())?;
+            println!("Pruned {count} session(s).");
+        }
+        SessionCommand::Stats => {
+            let stats = db.session_statistics()?;
+            println!("Total sessions: {}", stats.total_sessions);
+            println!("Total messages: {}", stats.total_messages);
+            for (source, count) in &stats.by_source {
+                println!("  {source}: {count} sessions");
+            }
+            let size_mb = stats.db_size_bytes as f64 / (1024.0 * 1024.0);
+            println!("Database size: {size_mb:.1} MB");
+        }
+    }
+
+    Ok(())
+}
+
+fn run_config(command: ConfigCommand, args: &CliArgs) -> anyhow::Result<()> {
+    let runtime = load_runtime(args.config.as_deref(), args.model.as_deref(), None)?;
+    match command {
+        ConfigCommand::Show => {
+            println!("{}", serde_yml::to_string(&runtime.config)?);
+        }
+        ConfigCommand::Edit => {
+            let editor = std::env::var("EDITOR")
+                .or_else(|_| std::env::var("VISUAL"))
+                .unwrap_or_else(|_| "vi".to_string());
+            let status = std::process::Command::new(&editor)
+                .arg(&runtime.config_path)
+                .status()
+                .with_context(|| format!("failed to launch editor: {editor}"))?;
+            if !status.success() {
+                anyhow::bail!("editor exited with status: {status}");
+            }
+        }
+        ConfigCommand::Path => {
+            println!("{}", runtime.config_path.display());
+        }
+        ConfigCommand::EnvPath => {
+            println!("{}", setup::edgecrab_home().join(".env").display());
+        }
+        ConfigCommand::Set { key, value } => {
+            let mut config = runtime.config;
+            set_config_value(&mut config, &key, &value)?;
+            config.save_to(&runtime.config_path)?;
+            println!("Updated {} in {}", key, runtime.config_path.display());
+        }
+    }
+    Ok(())
+}
+
+fn run_tools(command: ToolsCommand, args: &CliArgs) -> anyhow::Result<()> {
+    let runtime = load_runtime(args.config.as_deref(), args.model.as_deref(), None)?;
+    let registry = build_tool_registry();
+    match command {
+        ToolsCommand::List => {
+            for toolset in registry.toolset_names() {
+                let tools = registry.tools_in_toolset(toolset);
+                let enabled = toolset_enabled(&runtime.config, toolset);
+                println!(
+                    "[{}] {} ({} tools)",
+                    if enabled { "on" } else { "off" },
+                    toolset,
+                    tools.len()
+                );
+                println!("  {}", tools.join(", "));
+            }
+        }
+        ToolsCommand::Enable { name } => {
+            let mut config = runtime.config;
+            let changed = set_toolset_state(&mut config, registry.as_ref(), &name, true)?;
+            config.save_to(&runtime.config_path)?;
+            println!("Enabled: {}", changed.join(", "));
+        }
+        ToolsCommand::Disable { name } => {
+            let mut config = runtime.config;
+            let changed = set_toolset_state(&mut config, registry.as_ref(), &name, false)?;
+            config.save_to(&runtime.config_path)?;
+            println!("Disabled: {}", changed.join(", "));
+        }
+    }
+    Ok(())
+}
+
+fn run_mcp(command: McpCommand, args: &CliArgs) -> anyhow::Result<()> {
+    let runtime = load_runtime(args.config.as_deref(), args.model.as_deref(), None)?;
+    let mut config = runtime.config;
+    match command {
+        McpCommand::List => {
+            if config.mcp_servers.is_empty() {
+                println!("No MCP servers configured.");
+                return Ok(());
+            }
+            for (name, server) in &config.mcp_servers {
+                println!("{}  {} {}", name, server.command, server.args.join(" "));
+            }
+        }
+        McpCommand::Add {
+            name,
+            command,
+            args,
+        } => {
+            config.mcp_servers.insert(
+                name.clone(),
+                McpServerConfig {
+                    command,
+                    args,
+                    enabled: true,
+                    ..Default::default()
+                },
+            );
+            config.save_to(&runtime.config_path)?;
+            println!("Configured MCP server '{}'", name);
+        }
+        McpCommand::Remove { name } => {
+            if config.mcp_servers.remove(&name).is_some() {
+                config.save_to(&runtime.config_path)?;
+                println!("Removed MCP server '{}'", name);
+            } else {
+                anyhow::bail!("unknown MCP server '{}'", name);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_plugins(command: PluginsCommand) -> anyhow::Result<()> {
+    match command {
+        PluginsCommand::List => plugins_cmd::run(plugins_cmd::PluginAction::List)?,
+        PluginsCommand::Install { repo, name } => {
+            plugins_cmd::run(plugins_cmd::PluginAction::Install { repo, name })?
+        }
+        PluginsCommand::Update { name } => {
+            plugins_cmd::run(plugins_cmd::PluginAction::Update { name })?
+        }
+        PluginsCommand::Remove { name } => {
+            plugins_cmd::run(plugins_cmd::PluginAction::Remove { name })?
+        }
+    }
+    Ok(())
+}
+
+async fn run_gateway(command: GatewayCommand, args: &CliArgs) -> anyhow::Result<()> {
+    match command {
+        GatewayCommand::Configure { platform } => {
+            gateway_setup::run(args, platform.as_deref())?;
+            Ok(())
+        }
+        _ => {
+            let action = match command {
+                GatewayCommand::Start { foreground } => {
+                    gateway_cmd::GatewayAction::Start { foreground }
+                }
+                GatewayCommand::Stop => gateway_cmd::GatewayAction::Stop,
+                GatewayCommand::Restart => gateway_cmd::GatewayAction::Restart,
+                GatewayCommand::Status => gateway_cmd::GatewayAction::Status,
+                GatewayCommand::Configure { .. } => unreachable!(),
+            };
+            gateway_cmd::run(action, args).await
+        }
+    }
+}
+
+/// Manage skills from the CLI (`edgecrab skills list/view/search/install/remove`).
+///
+/// WHY: Mirrors `hermes skills` subcommand. Allows installing and browsing
+/// skill prompts without entering the TUI.
+fn run_skills(command: SkillsCommand) -> anyhow::Result<()> {
+    let skills_dir = edgecrab_core::edgecrab_home().join("skills");
+
+    match command {
+        SkillsCommand::List => {
+            if !skills_dir.exists() {
+                println!(
+                    "No skills installed. Skills directory: {}",
+                    skills_dir.display()
+                );
+                println!("Install with: edgecrab skills install <repo-or-path>");
+                return Ok(());
+            }
+            let entries = std::fs::read_dir(&skills_dir)?;
+            let mut skills: Vec<String> = entries
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().join("SKILL.md").is_file())
+                .filter_map(|e| e.file_name().into_string().ok())
+                .collect();
+            skills.sort();
+            if skills.is_empty() {
+                println!(
+                    "No skills found (no SKILL.md files in {}).",
+                    skills_dir.display()
+                );
+            } else {
+                println!("Installed skills ({}):", skills.len());
+                for name in &skills {
+                    println!("  {name}");
+                }
+            }
+        }
+
+        SkillsCommand::View { name } => {
+            // Block path traversal
+            if name.contains('/') || name.contains('\\') || name.contains("..") {
+                anyhow::bail!("Invalid skill name — must not contain path separators or '..'");
+            }
+            let skill_path = skills_dir.join(&name).join("SKILL.md");
+            if !skill_path.is_file() {
+                anyhow::bail!("Skill '{}' not found at {}", name, skill_path.display());
+            }
+            let content = std::fs::read_to_string(&skill_path)?;
+            println!("{}", content);
+        }
+
+        SkillsCommand::Search { query } => {
+            if !skills_dir.exists() {
+                println!("No skills directory found.");
+                return Ok(());
+            }
+            let q = query.to_lowercase();
+            let entries = std::fs::read_dir(&skills_dir)?;
+            let matches: Vec<String> = entries
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().join("SKILL.md").is_file())
+                .filter_map(|e| e.file_name().into_string().ok())
+                .filter(|name| name.to_lowercase().contains(&q))
+                .collect();
+            if matches.is_empty() {
+                println!("No skills matching '{}'.", query);
+            } else {
+                println!("Skills matching '{}' ({}):", query, matches.len());
+                for name in &matches {
+                    println!("  {name}");
+                }
+            }
+        }
+
+        SkillsCommand::Install { source, name } => {
+            // Derive skill name from source if not provided
+            let skill_name = name.unwrap_or_else(|| {
+                source
+                    .trim_end_matches('/')
+                    .split('/')
+                    .next_back()
+                    .unwrap_or("skill")
+                    .trim_end_matches(".git")
+                    .to_string()
+            });
+
+            // Block path traversal in derived name
+            if skill_name.contains('/') || skill_name.contains('\\') || skill_name.contains("..") {
+                anyhow::bail!(
+                    "Derived skill name '{}' is unsafe — provide --name",
+                    skill_name
+                );
+            }
+
+            let skill_dir = skills_dir.join(&skill_name);
+
+            // Local path install
+            let source_path = std::path::Path::new(&source);
+            if source_path.exists() {
+                let skill_md = source_path.join("SKILL.md");
+                if !skill_md.is_file() {
+                    anyhow::bail!("No SKILL.md found in {}", source_path.display());
+                }
+                std::fs::create_dir_all(&skill_dir)?;
+                std::fs::copy(&skill_md, skill_dir.join("SKILL.md"))?;
+                println!("Installed skill '{}' from local path.", skill_name);
+                return Ok(());
+            }
+
+            // Git clone install
+            println!("Cloning {} into {}...", source, skill_dir.display());
+            let status = std::process::Command::new("git")
+                .args(["clone", "--depth=1", &source, &skill_dir.to_string_lossy()])
+                .status()
+                .map_err(|e| anyhow::anyhow!("git not found: {e}"))?;
+            if !status.success() {
+                anyhow::bail!("git clone failed for '{}'", source);
+            }
+            // Verify SKILL.md exists in clone
+            if !skill_dir.join("SKILL.md").is_file() {
+                // Try one level deeper (common pattern: git repo root has SKILL.md)
+                println!("Warning: no SKILL.md at root of cloned repo.");
+            }
+            println!("Installed skill '{}'.", skill_name);
+        }
+
+        SkillsCommand::Remove { name } => {
+            if name.contains('/') || name.contains('\\') || name.contains("..") {
+                anyhow::bail!("Invalid skill name");
+            }
+            let skill_dir = skills_dir.join(&name);
+            if !skill_dir.exists() {
+                anyhow::bail!("Skill '{}' not found.", name);
+            }
+            std::fs::remove_dir_all(&skill_dir)?;
+            println!("Removed skill '{}'.", name);
+        }
+    }
+    Ok(())
+}
+
+async fn run_cron(command: CronCommand, args: &CliArgs) -> anyhow::Result<()> {
+    cron_cmd::run(command, args).await
+}
+
+/// Dispatch all `edgecrab profile <sub>` commands.
+///
+/// WHY separate fn: keeps run_subcommand() slim; ProfileManager owns all I/O.
+fn run_profile(command: ProfileCommand) -> anyhow::Result<()> {
+    let mgr = profile::ProfileManager::new();
+    match command {
+        ProfileCommand::List => mgr.list()?,
+        ProfileCommand::Use { name } => mgr.use_profile(&name)?,
+        ProfileCommand::Create {
+            name,
+            clone,
+            clone_all,
+            clone_from,
+        } => {
+            mgr.create(&name, clone, clone_all, clone_from.as_deref())?;
+        }
+        ProfileCommand::Delete { name, yes } => mgr.delete(&name, yes)?,
+        ProfileCommand::Show { name } => mgr.show(&name)?,
+        ProfileCommand::Alias {
+            name,
+            remove,
+            name_override,
+        } => {
+            mgr.alias(&name, remove, name_override.as_deref())?;
+        }
+        ProfileCommand::Rename { old_name, new_name } => mgr.rename(&old_name, &new_name)?,
+        ProfileCommand::Export { name, output } => mgr.export(&name, output.as_deref())?,
+        ProfileCommand::Import { archive, name } => mgr.import(&archive, name.as_deref())?,
+    }
+    Ok(())
+}
+
+/// Resolve a session ID from `--session`, `--continue`, or `--resume` flags.
+///
+/// Priority: `--session` > `--resume` > `--continue`.
+/// `--continue` with no value resumes the most recent CLI session.
+/// `--continue "title"` resolves by title (with lineage).
+/// `--resume <id-or-title>` resolves by ID prefix or title.
+fn resolve_session_flag(args: &CliArgs, db: &SessionDb) -> anyhow::Result<Option<String>> {
+    // --session takes precedence (exact ID)
+    if let Some(ref id) = args.session {
+        return Ok(Some(id.clone()));
+    }
+
+    // --resume resolves by ID prefix or title
+    if let Some(ref id_or_title) = args.resume {
+        match db.resolve_session(id_or_title)? {
+            Some(id) => return Ok(Some(id)),
+            None => anyhow::bail!("no session matching '{id_or_title}'"),
+        }
+    }
+
+    // --continue: no value → most recent CLI session; with value → title resolve
+    if let Some(ref maybe_title) = args.continue_session {
+        match maybe_title {
+            Some(title) => {
+                // Resolve by title (with lineage support)
+                match db.resolve_session(title)? {
+                    Some(id) => return Ok(Some(id)),
+                    None => anyhow::bail!("no session matching title '{title}'"),
+                }
+            }
+            None => {
+                // Most recent CLI session
+                let sessions = db.list_sessions_by_source("cli", 1)?;
+                match sessions.first() {
+                    Some(s) => return Ok(Some(s.id.clone())),
+                    None => anyhow::bail!("no previous CLI sessions found"),
+                }
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+fn resolve_session_id(db: &SessionDb, prefix: &str) -> anyhow::Result<String> {
+    // Try the new resolve_session which handles ID prefix + title + lineage
+    if let Some(id) = db.resolve_session(prefix)? {
+        return Ok(id);
+    }
+    anyhow::bail!("no session matching '{}'", prefix)
+}
+
+fn format_timestamp(ts: f64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp(ts as i64, 0)
+        .map(|dt| {
+            dt.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_else(|| "unknown".into())
+}
+
+fn parse_bool(value: &str) -> anyhow::Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => anyhow::bail!("expected boolean value, got '{}'", value),
+    }
+}
+
+fn parse_csv(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn set_config_value(
+    config: &mut edgecrab_core::AppConfig,
+    key: &str,
+    value: &str,
+) -> anyhow::Result<()> {
+    match key {
+        "model.default" => config.model.default_model = value.to_string(),
+        "model.max_iterations" => config.model.max_iterations = value.parse()?,
+        "model.temperature" => config.model.temperature = Some(value.parse()?),
+        "model.streaming" => {
+            let enabled = parse_bool(value)?;
+            config.model.streaming = enabled;
+            config.display.streaming = enabled;
+        }
+        "display.skin" => config.display.skin = value.to_string(),
+        "display.personality" => config.display.personality = value.to_string(),
+        "display.show_reasoning" => config.display.show_reasoning = parse_bool(value)?,
+        "display.streaming" => {
+            let enabled = parse_bool(value)?;
+            config.display.streaming = enabled;
+            config.model.streaming = enabled;
+        }
+        "memory.enabled" => config.memory.enabled = parse_bool(value)?,
+        "skills.enabled" => config.skills.enabled = parse_bool(value)?,
+        "timezone" => config.timezone = Some(value.to_string()),
+        "gateway.host" => config.gateway.host = value.to_string(),
+        "gateway.port" => config.gateway.port = value.parse()?,
+        "gateway.webhook_enabled" => config.gateway.webhook_enabled = parse_bool(value)?,
+        "gateway.enabled_platforms" => config.gateway.enabled_platforms = parse_csv(value),
+        "gateway.whatsapp.enabled" => config.gateway.whatsapp.enabled = parse_bool(value)?,
+        "gateway.whatsapp.mode" => config.gateway.whatsapp.mode = value.to_string(),
+        "gateway.whatsapp.allowed_users" => {
+            config.gateway.whatsapp.allowed_users = parse_csv(value)
+        }
+        "gateway.whatsapp.bridge_port" => config.gateway.whatsapp.bridge_port = value.parse()?,
+        "tools.enabled_toolsets" => config.tools.enabled_toolsets = Some(parse_csv(value)),
+        "tools.disabled_toolsets" => config.tools.disabled_toolsets = Some(parse_csv(value)),
+        _ => anyhow::bail!("unsupported config key '{}'", key),
+    }
+    Ok(())
+}
+
+fn toolset_enabled(config: &edgecrab_core::AppConfig, toolset: &str) -> bool {
+    let enabled = config.tools.enabled_toolsets.as_ref();
+    let disabled = config.tools.disabled_toolsets.as_ref();
+    let allowed = enabled
+        .map(|v| v.iter().any(|s| s == toolset))
+        .unwrap_or(true);
+    let blocked = disabled
+        .map(|v| v.iter().any(|s| s == toolset))
+        .unwrap_or(false);
+    allowed && !blocked
+}
+
+fn set_toolset_state(
+    config: &mut edgecrab_core::AppConfig,
+    registry: &ToolRegistry,
+    name: &str,
+    enabled: bool,
+) -> anyhow::Result<Vec<String>> {
+    let targets: Vec<String> = if let Some(alias) = resolve_alias(name) {
+        alias.iter().map(|s| s.to_string()).collect()
+    } else if registry.toolset_names().contains(&name) {
+        vec![name.to_string()]
+    } else {
+        anyhow::bail!("'{}' is not a known toolset or alias", name);
+    };
+
+    let disabled_sets = config.tools.disabled_toolsets.get_or_insert_with(Vec::new);
+    if enabled {
+        disabled_sets.retain(|s| !targets.contains(s));
+        if let Some(enabled_sets) = &mut config.tools.enabled_toolsets {
+            for target in &targets {
+                if !enabled_sets.contains(target) {
+                    enabled_sets.push(target.clone());
+                }
+            }
+        }
+    } else {
+        for target in &targets {
+            if !disabled_sets.contains(target) {
+                disabled_sets.push(target.clone());
+            }
+        }
+        if let Some(enabled_sets) = &mut config.tools.enabled_toolsets {
+            enabled_sets.retain(|s| !targets.contains(s));
+        }
+    }
+    Ok(targets)
+}
+
+// ── Git worktree helpers ───────────────────────────────────────────────
+
+/// Create a disposable git worktree under `.worktrees/<branch>` in the
+/// current repo root and return its path.
+///
+/// The branch name is derived from a short random hash so parallel
+/// invocations each get their own isolated workspace:
+///
+/// ```text
+///   .worktrees/
+///   ├── edgecrab-a1b2c3d4/   ← worktree for session 1
+///   └── edgecrab-e5f6g7h8/   ← worktree for session 2
+/// ```
+///
+/// Mirrors `hermes -w` which creates worktrees under `.worktrees/`.
+fn setup_worktree() -> anyhow::Result<PathBuf> {
+    // Verify git is available
+    let git_check = std::process::Command::new("git")
+        .arg("rev-parse")
+        .arg("--is-inside-work-tree")
+        .output();
+
+    match git_check {
+        Ok(out) if out.status.success() => {}
+        Ok(_) => anyhow::bail!("current directory is not inside a git repository"),
+        Err(e) => anyhow::bail!("git not found: {e}"),
+    }
+
+    // Find the repo root
+    let root_out = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()?;
+    let repo_root = PathBuf::from(String::from_utf8_lossy(&root_out.stdout).trim());
+
+    // Generate a short unique hash for the branch/worktree name
+    let hash = {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        format!("{:08x}", ts as u32 ^ (ts >> 32) as u32)
+    };
+
+    let branch_name = format!("edgecrab/edgecrab-{hash}");
+    let worktrees_dir = repo_root.join(".worktrees");
+    std::fs::create_dir_all(&worktrees_dir).with_context(|| {
+        format!(
+            "failed to create .worktrees/ dir in {}",
+            repo_root.display()
+        )
+    })?;
+
+    let wt_path = worktrees_dir.join(format!("edgecrab-{hash}"));
+
+    // Create the worktree with a new branch
+    let result = std::process::Command::new("git")
+        .args(["worktree", "add", "-b", &branch_name])
+        .arg(&wt_path)
+        .arg("HEAD")
+        .current_dir(&repo_root)
+        .output()?;
+
+    if !result.status.success() {
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        anyhow::bail!("git worktree add failed: {stderr}");
+    }
+
+    Ok(wt_path)
+}

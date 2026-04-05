@@ -1,0 +1,18 @@
+services:
+  edgecrab:
+    build: .
+    ports:
+      - "8642:8642"
+    environment:
+      - EDGECRAB_HOST=0.0.0.0
+      - EDGECRAB_PORT=8642
+      # Pass your LLM provider API key:
+      # - OPENAI_API_KEY=${OPENAI_API_KEY}
+      # - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      # - GITHUB_TOKEN=${GITHUB_TOKEN}
+    volumes:
+      - edgecrab-data:/home/edgecrab/.edgecrab
+    restart: unless-stopped
+
+volumes:
+  edgecrab-data:

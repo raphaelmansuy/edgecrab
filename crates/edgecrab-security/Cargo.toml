@@ -1,0 +1,24 @@
+[package]
+name = "edgecrab-security"
+description = "Security primitives: injection scanning, secret redaction, command approval, URL safety"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+edgecrab-types = { path = "../edgecrab-types" }
+regex = { workspace = true }
+aho-corasick = { workspace = true }
+unicode-normalization = { workspace = true }
+strip-ansi-escapes = { workspace = true }
+url = { workspace = true }
+secrecy = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile = { workspace = true }
