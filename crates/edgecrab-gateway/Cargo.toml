@@ -34,7 +34,7 @@ sha2 = { workspace = true }
 urlencoding = { workspace = true }
 which = { workspace = true }
 async-stream = "0.3"
-lettre = "0.11"
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "pool", "rustls-tls", "hostname", "builder"] }
 md5 = "0.7"
 
 [dev-dependencies]
