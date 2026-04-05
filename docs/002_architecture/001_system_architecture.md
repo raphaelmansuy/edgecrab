@@ -1,365 +1,287 @@
-# 002.001 — System Architecture
+# System Architecture
 
-> **Cross-refs**: [→ INDEX](../INDEX.md) | [→ 001.001 Overview](../001_overview/001_project_summary.md) | [→ 002.002 Crate Graph](002_crate_dependency_graph.md) | [→ 013.001 Libraries](../013_library_selection/001_library_selection.md)
+> **Verified against:** `Cargo.toml` · `crates/edgecrab-core/src/lib.rs` ·
+> `crates/edgecrab-tools/src/lib.rs` · `crates/edgecrab-cli/src/main.rs` ·
+> `crates/edgecrab-gateway/src/lib.rs` · `crates/edgecrab-acp/src/lib.rs`
 
-## 1. Layered Architecture
+---
 
-```
-+======================================================================+
-|                        USER INTERFACES                                |
-+======================================================================+
-|                                                                      |
-|  +------------------+  +-------------------+  +------------------+   |
-|  | Interactive TUI  |  | Messaging Gateway |  | ACP Server       |   |
-|  | (ratatui +       |  | (tokio async,     |  | (editor plugin)  |   |
-|  |  crossterm)      |  |  14 platforms)    |  |                  |   |
-|  |                  |  |                   |  | edgecrab-acp/    |   |
-|  | edgecrab-cli/    |  | edgecrab-gateway/ |  +------------------+   |
-|  +--------+---------+  +--------+----------+          |              |
-|           |                     |                     |              |
-+-----------+---------------------+---------------------+--------------+
-            |                     |                     |
-            v                     v                     v
-+======================================================================+
-|                        AGENT CORE                                     |
-+======================================================================+
-|                                                                      |
-|  +----------------------------------------------------------------+  |
-|  |                edgecrab-core (lib crate)                        |  |
-|  |                                                                |  |
-|  |  +----------------+ +------------------+ +------------------+  |  |
-|  |  | Agent struct   | | PromptBuilder    | | ContextCompressor|  |  |
-|  |  | (Send + Sync)  | | (system prompt   | | (async compress  |  |  |
-|  |  | run_conversa-  | |  pipeline)       | |  via aux LLM)   |  |  |
-|  |  | tion() async   | |                  | |                  |  |  |
-|  |  +----------------+ +------------------+ +------------------+  |  |
-|  |                                                                |  |
-|  |  +----------------+ +------------------+ +------------------+  |  |
-|  |  | ModelRouter    | | IterationBudget  | | CallbackRegistry |  |  |
-|  |  | (provider sel, | | (AtomicU32,      | | (trait objects    |  |  |
-|  |  |  fallback)     | |  compare_swap)   | |  for UI events)  |  |  |
-|  |  +----------------+ +------------------+ +------------------+  |  |
-|  |                                                                |  |
-|  |  [crate: edgequake-llm] — LLMProvider trait, 13 native providers     |
-|  [module: tool_call_parsers] — 12 model-specific parsers             |  |
-|  +----------------------------------------------------------------+  |
-|                                                                      |
-+==================================+===================================+
-                                   |
-                                   v
-+======================================================================+
-|                     TOOL ORCHESTRATION                                 |
-+======================================================================+
-|                                                                      |
-|  +----------------------------------------------------------------+  |
-|  |            edgecrab-tools (lib crate)                           |  |
-|  |                                                                |  |
-|  |  +-------------------+  +--------------------+                 |  |
-|  |  | ToolRegistry      |  | ToolsetResolver    |                 |  |
-|  |  | (inventory-based  |  | (compile-time +    |                 |  |
-|  |  |  + runtime reg.)  |  |  runtime groups)   |                 |  |
-|  |  +-------------------+  +--------------------+                 |  |
-|  |                                                                |  |
-|  |  trait ToolHandler: Send + Sync {                              |  |
-|  |      fn name() -> &'static str;                                |  |
-|  |      fn schema() -> ToolSchema;                                |  |
-|  |      async fn execute(&self, args: Value, ctx: &ToolContext)   |  |
-|  |          -> Result<ToolResult>;                                 |  |
-|  |  }                                                             |  |
-|  +----------------------------------------------------------------+  |
-|                                                                      |
-+======================================================================+
-                                   |
-                                   v
-+======================================================================+
-|                     TOOL IMPLEMENTATIONS                              |
-+======================================================================+
-|                                                                      |
-|  +----------+ +----------+ +----------+ +-----------+ +----------+   |
-|  | terminal | | file     | | web      | | browser   | | mcp      |   |
-|  +----------+ +----------+ +----------+ +-----------+ +----------+   |
-|  +----------+ +----------+ +----------+ +-----------+ +----------+   |
-|  | delegate | | code_exec| | memory   | | skills    | | session  |   |
-|  +----------+ +----------+ +----------+ +-----------+ +----------+   |
-|  +----------+ +----------+ +----------+ +-----------+ +----------+   |
-|  | vision   | | tts      | | todo     | | clarify   | | cron     |   |
-|  +----------+ +----------+ +----------+ +-----------+ +----------+   |
-|  +----------+ +----------+ +----------+ +-----------+ +----------+   |
-|  | honcho   | | homeassit| | send_msg | | image_gen | | MoA      |   |
-|  +----------+ +----------+ +----------+ +-----------+ +----------+   |
-|  +----------+ +----------+ +----------+ +-----------+ +----------+   |
-|  |voice_mode| |transcrip.| |rl_train  | |checkpoint | |fuzzy_mat.|   |
-|  +----------+ +----------+ +----------+ +-----------+ +----------+   |
-|                                                                      |
-+======================================================================+
-                                   |
-                                   v
-+======================================================================+
-|                     EXECUTION BACKENDS                                 |
-+======================================================================+
-|                                                                      |
-|  trait TerminalBackend: Send + Sync {                                |
-|      async fn execute(&self, cmd: &str, ctx: &ExecCtx)              |
-|          -> Result<ExecResult>;                                      |
-|      async fn create_file(&self, path: &str, content: &str)         |
-|          -> Result<()>;                                              |
-|      async fn cleanup(&self) -> Result<()>;                          |
-|  }                                                                   |
-|                                                                      |
-|  +-------+ +--------+ +------+ +-------+ +--------+ +-----------+   |
-|  | local | | docker | | ssh  | | modal | | daytona| | singularity|  |
-|  +-------+ +--------+ +------+ +-------+ +--------+ +-----------+   |
-|                                                                      |
-+======================================================================+
-                                   |
-                                   v
-+======================================================================+
-|                     PERSISTENCE & STATE                                |
-+======================================================================+
-|                                                                      |
-|  +----------------------------------------------------------------+  |
-|  |            edgecrab-state (lib crate)                           |  |
-|  |                                                                |  |
-|  |  +------------------+ +------------------+ +----------------+  |  |
-|  |  | SessionDb        | | ConfigManager    | | CronScheduler  |  |  |
-|  |  | (rusqlite+FTS5)  | | (serde_yaml)     | | (cron + tokio) |  |  |
-|  |  +------------------+ +------------------+ +----------------+  |  |
-|  |  +------------------+ +------------------+                     |  |
-|  |  | MemoryStore      | | SkillStore       |                     |  |
-|  |  | (MEMORY.md/USER) | | (SKILL.md FS)    |                     |  |
-|  |  +------------------+ +------------------+                     |  |
-|  +----------------------------------------------------------------+  |
-|                                                                      |
-|  +----------------------------------------------------------------+  |
-|  |            edgecrab-security (lib crate)                        |  |
-|  |                                                                |  |
-|  |  InjectionScanner | SecretRedactor | CommandApprover           |  |
-|  |  UrlSafetyChecker | PermissionEnforcer                         |  |
-|  +----------------------------------------------------------------+  |
-|                                                                      |
-+======================================================================+
-```
+## Why this architecture
 
-## 2. Component Interaction Flow
+The obvious alternative — each frontend embeds its own agent loop — produces
+N copies of the same prompt-assembly code, N approaches to tool dispatch, and
+N databases. When you fix a security gap or tune context compression it must be
+applied N times.
 
-### 2.1 CLI User Message Flow
+EdgeCrab inverts this by making `edgecrab-core::Agent` the single source of truth
+for all agent behaviour. Every frontend becomes a thin adapter that serialises
+user input into `Agent::chat()` calls and deserialises `ConversationResult` back
+into platform-native output.
+
+---
+
+## Layer diagram
 
 ```
-User types message in ratatui TUI
-        |
-        v
-+-------------------+
-| EdgeCrabCli       |    edgecrab-cli/src/app.rs
-| .process_input()  |
-+--------+----------+
-         |
-         | If slash command → dispatch via CommandRouter
-         | If message:
-         |   1. Parse @ context references (@file, @url, @diff, @staged, @folder, @git)
-         |   2. Expand references (inject file content, URL content, diff output)
-         |   3. Pass expanded message to Agent
-         v
-+-------------------+
-| Agent             |    edgecrab-core/src/agent.rs
-| .run_conversation |
-| (msg, ctx).await  |
-+--------+----------+
-         |
-         v
-+-------------------+     +--------------------+
-| PromptBuilder     |---->| SystemPrompt       |
-| .build(ctx).await |     | (skills, memory,   |
-|                   |     |  context files)     |
-+--------+----------+     +--------------------+
-         |
-         v
-+-------------------+
-| CONVERSATION LOOP |     [→ 003.002]
-| async stream      |
-+--------+----------+
-    |         ^
-    |         |
-    v         |
-+--------+ +----------+
-| LLM API| | Tool     |
-| (edge- | | dispatch |
-| quake- | | (tokio   |
-| llm)   | |  spawn)  |
-+--------+ +----------+
+  ╔══════════════════════════════════════════════════════════════════╗
+  ║  FRONTEND LAYER                                                  ║
+  ║                                                                  ║
+  ║  ┌─────────────────┐  ┌──────────────────┐  ┌───────────────┐  ║
+  ║  │  edgecrab-cli   │  │ edgecrab-gateway  │  │ edgecrab-acp  │  ║
+  ║  │                 │  │                  │  │               │  ║
+  ║  │ clap subcommands│  │ 18 platform       │  │ JSON-RPC 2.0  │  ║
+  ║  │ ratatui TUI     │  │ adapters          │  │ stdio server  │  ║
+  ║  │ 53 slash cmds   │  │ delivery router   │  │ VS Code / Zed │  ║
+  ║  │ setup wizard    │  │ hook registry     │  │ JetBrains     │  ║
+  ║  │ doctor          │  │ session fan-out   │  │               │  ║
+  ║  └────────┬────────┘  └────────┬─────────┘  └───────┬───────┘  ║
+  ╚═══════════╪════════════════════╪═══════════════════════╪════════╝
+              │                   │                       │
+              └───────────────────┼───────────────────────┘
+                                  │
+                    Agent::chat() / chat_streaming()
+                    Agent::run_conversation()
+                                  │
+  ╔═══════════════════════════════▼══════════════════════════════════╗
+  ║  CORE RUNTIME LAYER                                              ║
+  ║                                                                  ║
+  ║  ┌──────────────────────────────────────────────────────────┐   ║
+  ║  │  edgecrab-core                                           │   ║
+  ║  │                                                          │   ║
+  ║  │  Agent          AgentBuilder     PromptBuilder           │   ║
+  ║  │  execute_loop   compression      SmartRouter             │   ║
+  ║  │  IterationBudget AppConfig        ModelCatalog           │   ║
+  ║  └───────────────────┬──────────────────────────────────────┘   ║
+  ║                      │ uses                                      ║
+  ║  ┌───────────────────▼──────────┐  ┌────────────────────────┐   ║
+  ║  │  edgecrab-tools               │  │  edgecrab-state        │   ║
+  ║  │  ToolRegistry (65 tools)      │  │  SessionDb             │   ║
+  ║  │  ToolHandler trait            │  │  SQLite WAL + FTS5     │   ║
+  ║  │  ToolContext                  │  │  schema v6             │   ║
+  ║  │  ProcessTable                 │  └────────────────────────┘   ║
+  ║  │  toolset resolution           │                               ║
+  ║  └───────────────────┬──────────┘                               ║
+  ║                      │ uses                                      ║
+  ║  ┌───────────────────▼──────────┐  ┌────────────────────────┐   ║
+  ║  │  edgecrab-security            │  │  edgecrab-cron         │   ║
+  ║  │  CommandScanner               │  │  schedule parsing      │   ║
+  ║  │  path_jail                    │  │  CronStore             │   ║
+  ║  │  injection check              │  │  TickLock              │   ║
+  ║  │  ApprovalPolicy               │  └────────────────────────┘   ║
+  ║  └──────────────────────────────┘                               ║
+  ╚══════════════════════════════════════════════════════════════════╝
+              │
+  ╔═══════════▼══════════════════════════════════════════════════════╗
+  ║  TYPE FOUNDATION                                                 ║
+  ║                                                                  ║
+  ║  edgecrab-types                                                  ║
+  ║  Message · Role · Content · ToolCall · ToolSchema                ║
+  ║  AgentError · ToolError · Usage · Cost · Trajectory              ║
+  ║  Platform · ApiMode · DEFAULT_MODEL                              ║
+  ╚══════════════════════════════════════════════════════════════════╝
 ```
 
-### 2.2 Gateway Message Flow
+---
+
+## What each layer owns
+
+When deciding where new code should live, treat these ownership rules as constraints:
+
+### Foundation (`edgecrab-types`)
+Stable shared types. Every other crate imports this. **Never add runtime logic
+here.** Structs, enums, and their `impl` blocks only. `#![deny(clippy::unwrap_used)]`
+is enforced.
+
+### Security (`edgecrab-security`)
+Reusable, stateless policy checks. Functions and structures that answer
+"is this safe?" questions. Contains no agent logic, no LLM calls, no
+async runtime. Consumed by both `edgecrab-tools` and `edgecrab-core`.
+
+### Persistence (`edgecrab-state`)
+Owns the SQLite schema and all SQL. Nothing outside this crate executes
+raw SQL. Session records, messages, FTS5 index, analytics queries, and
+schema migrations all live here.
+
+### Schedule (`edgecrab-cron`)
+Schedule parsing and job storage shared by the cron CLI commands and
+the `manage_cron_jobs` tool. Isolated so neither CLI nor tools pulls in
+the other's dependencies for scheduling.
+
+### Tools (`edgecrab-tools`)
+Defines `ToolHandler`, `ToolRegistry`, `ToolContext`, and `ProcessTable`.
+All 65 tool implementations live here. Does **not** own the agent loop —
+sub-agent delegation is expressed through the `SubAgentRunner` trait so
+that `edgecrab-core` can implement it without creating a circular dependency.
+
+### Core runtime (`edgecrab-core`)
+Owns `Agent`, `AgentBuilder`, the conversation loop (`execute_loop`), context
+compression, smart model routing, and prompt assembly. This is the only crate
+that calls the LLM provider. Implements `SubAgentRunner` for `edgecrab-tools`.
+
+### Frontends (`edgecrab-cli`, `edgecrab-gateway`, `edgecrab-acp`)
+Thin adapters. They build an `Agent` via `AgentBuilder`, pipe user input to
+`Agent::chat()` or `Agent::chat_streaming()`, and render the result. They do
+not implement their own tool dispatch or prompt assembly.
+
+---
+
+## End-to-end request path (annotated)
 
 ```
-Platform event (Telegram WebHook / Discord WS / etc.)
-        |
-        v
-+-------------------+
-| PlatformAdapter   |    edgecrab-gateway/src/platforms/<name>.rs
-| (impl Adapter)    |
-+--------+----------+
-         |
-         v  (async channel)
-+-------------------+
-| GatewayRouter     |    edgecrab-gateway/src/router.rs
-| .handle(event)    |
-+--------+----------+
-         |
-         | Resolve session, check pairing
-         | Get/create Agent (Arc<Agent>)
-         v
-+-------------------+
-| Agent             |    edgecrab-core/src/agent.rs
-| .run_conversation |
-+--------+----------+
-         |
-         v  (StreamExt on response channel)
-+-------------------+
-| DeliveryRouter    |
-| .send(chunks)     |
-+-------------------+
+  Terminal / Telegram / VS Code
+          │
+          │ raw string "find all TODO comments"
+          ▼
+  ┌─────────────────────────────────────────┐
+  │  Frontend                               │
+  │  ■ resolves session key                 │
+  │  ■ looks up or creates GatewaySession   │
+  │  ■ invokes Agent::chat_streaming()      │
+  └───────────────────┬─────────────────────┘
+                      │
+                      ▼
+  ┌─────────────────────────────────────────┐
+  │  Agent::execute_loop()                  │
+  │                                         │
+  │  [expansion]                            │
+  │    expand_context_refs("@./src/")        │
+  │                                         │
+  │  [routing]                              │
+  │    classify_message() → TurnRoute       │
+  │    resolve_turn_route() → swap model    │
+  │                                         │
+  │  [prompt]                               │
+  │    PromptBuilder::build()               │
+  │    → load memory files                  │
+  │    → load skill summaries              │
+  │    → inject context files              │
+  │                                         │
+  │  [budget check]                         │
+  │    IterationBudget::try_consume()       │
+  │                                         │
+  │  [compression]                          │
+  │    check_compression_status()           │
+  │    maybe: compress_with_llm()           │
+  └───────────────────┬─────────────────────┘
+                      │
+                      ▼
+  ┌─────────────────────────────────────────┐
+  │  edgequake-llm provider call            │
+  │  (up to 3× retry with exponential       │
+  │   backoff: 500 ms base)                 │
+  └───────────────────┬─────────────────────┘
+                      │
+          ┌───────────┴──────────┐
+          │                      │
+          ▼ tool_calls           ▼ assistant text
+  ┌────────────────┐    ┌────────────────────┐
+  │  security gate │    │  emit StreamEvent  │
+  │  approval gate │    │  ::Done            │
+  │  ToolHandler   │    │                    │
+  │  ::execute()   │    │  persist session   │
+  │  emit events   │    │  to SQLite         │
+  │  loop ◄────────┘    └────────────────────┘
+  └────────────────┘
+          │ ConversationResult
+          ▼
+  ┌─────────────────────────────────────────┐
+  │  Frontend renders / delivers response    │
+  └─────────────────────────────────────────┘
 ```
 
-## 3. Three API Modes (via edgequake-llm)
+---
 
-EdgeCrab delegates all LLM communication to `edgequake-llm` which provides a unified
-`LLMProvider` trait. Three API mode variants are handled natively:
+## Design constraints visible in code
+
+These constraints are enforced today and changing them has ripple effects:
+
+| Constraint | Location | Implication |
+|---|---|---|
+| Prompt assembly is centralised | `PromptBuilder` in `edgecrab-core` | Callers may not hand-roll system prompts |
+| Tool dispatch is centralised | `ToolRegistry::dispatch()` | No inline tool execution in agent loop |
+| Session persistence is optional but standardised | `SessionDb` opt-in via `AgentBuilder::state_db()` | Tests can skip DB; gateway always enables it |
+| Frontends share config shape | `AgentConfig` and `AppConfig` | Config merging (`merge_cli`) works identically everywhere |
+| Long-running side effects use explicit handles | `ProcessTable`, `SessionManager`, `DeliveryRouter` | Simplifies graceful shutdown and test isolation |
+| Circular dep between tools↔core broken by trait | `SubAgentRunner` and `GatewaySender` traits in tools | Core implements; tools defines |
+
+---
+
+## Deployment topologies
+
+### Single process (most common)
 
 ```
-+====================================================================+
-|                     API MODE MAPPING                                |
-+====================================================================+
-|                                                                    |
-|  hermes-agent mode        edgequake-llm provider                   |
-|  ─────────────────        ──────────────────────                   |
-|  chat_completions    →    OpenAIProvider / OpenRouterProvider       |
-|                           OllamaProvider / LMStudioProvider         |
-|                           OpenAICompatProvider                      |
-|                                                                    |
-|  anthropic_messages  →    AnthropicProvider (native Messages API)   |
-|                                                                    |
-|  codex_responses     →    OpenAIProvider (Responses API mode)       |
-|                                                                    |
-+====================================================================+
+  ┌───────────────────────────────────┐
+  │  edgecrab (single binary)         │
+  │                                   │
+  │  CLI frontend + Agent + Gateway   │
+  │  all in-process                   │
+  └───────────────────────────────────┘
+          │
+          ▼
+  ~/.edgecrab/state.db   (SQLite, WAL)
+  ~/.edgecrab/config.yaml
 ```
 
-All providers implement `LLMProvider::chat_with_tools()` which handles:
-- Tool definition schemas
-- Streaming responses (enabled by default in CLI)
-- Multi-turn tool calling
-- Provider-specific message format conversion
-- Anthropic prompt caching (cache_control markers)
-- Auto-recovery from rejected tool_choice (retry without)
-- Eager fallback to backup model on rate-limit errors
-- Context length detection (models.dev, /v1/props, custom endpoint probing)
+### Managed / headless (EDGECRAB_MANAGED=1)
 
-## 4. Callback Architecture (Rust-native)
-
-```rust
-/// Callbacks are trait objects for UI integration.
-/// All callbacks must be Send + Sync for cross-thread safety.
-pub trait AgentCallbacks: Send + Sync {
-    fn on_tool_progress(&self, tool: &str, preview: &str) {}
-    fn on_thinking(&self, text: &str) {}
-    fn on_reasoning(&self, text: &str) {}
-    fn on_stream_delta(&self, delta: &str) {}
-    fn on_step(&self, step: &StepInfo) {}
-    fn on_status(&self, msg: &str) {}
-
-    /// Blocking callbacks (run on dedicated thread)
-    fn on_clarify(&self, question: &str, choices: &[String])
-        -> Option<String> { None }
-    fn on_approval(&self, cmd: &str, risk: RiskLevel)
-        -> ApprovalDecision { ApprovalDecision::Deny }
-}
+```
+  ┌─────────────────┐   JSON events   ┌──────────────────┐
+  │  Supervisor /   │ ──────────────► │  edgecrab process │
+  │  orchestrator   │ ◄────────────── │  (headless)       │
+  └─────────────────┘   stdout        └──────────────────┘
 ```
 
-Default no-op implementations allow headless/batch mode with zero callback overhead.
+### ACP (editor integration)
 
-### 4.1 Safe I/O Wrapper (hermes-agent `_SafeWriter` equivalent)
-
-hermes-agent wraps stdout/stderr in `_SafeWriter` to catch `OSError`/`ValueError` from broken
-pipes (systemd, Docker headless, thread teardown). EdgeCrab handles this via Rust's `Write` trait:
-
-```rust
-/// Transparent I/O wrapper that silently absorbs broken pipe errors.
-/// Used in headless/daemon mode where stdout may disconnect.
-pub struct SafeWriter<W: Write>(W);
-
-impl<W: Write> Write for SafeWriter<W> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match self.0.write(buf) {
-            Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(buf.len()),
-            other => other,
-        }
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        self.0.flush().or(Ok(()))
-    }
-}
+```
+  ┌─────────────────┐  JSON-RPC 2.0  ┌──────────────────┐
+  │  VS Code /      │ ──────────────► │  edgecrab acp     │
+  │  Zed / JetBrains│ ◄────────────── │  (stdio server)  │
+  └─────────────────┘                └──────────────────┘
 ```
 
-## 5. Compile-Time Feature Gates
+---
 
-```toml
-[features]
-default = ["cli", "local-backend"]
+## Tips
 
-# UI
-cli = ["ratatui", "crossterm", "clap"]
+> **Tip: Trace a feature by starting at the frontend.**
+> Find `Agent::chat` or `Agent::run_conversation` in the frontend crate, then follow
+> the call into `execute_loop` in `conversation.rs`. That single function is where
+> all non-trivial behaviour lives.
 
-# Gateway platforms (each adds ~50-200KB)
-telegram = ["teloxide"]
-discord = ["serenity"]
-slack = ["dep:reqwest"]
-whatsapp = ["dep:reqwest"]
-signal = ["dep:reqwest"]
-matrix = ["matrix-sdk"]
-mattermost = ["dep:reqwest"]
-homeassistant = ["dep:reqwest"]
-email = ["lettre", "mail-parser"]
-sms = ["dep:reqwest"]
-dingtalk = ["dep:reqwest"]
-webhook = ["dep:reqwest"]
-api-server = ["axum"]
+> **Tip: Tests should use `AgentBuilder` without `state_db()`.**
+> Omitting `state_db()` skips SQLite and makes unit tests fast. Use
+> `ToolContext::test_context()` for tool-level tests.
 
-# Terminal backends
-local-backend = []
-docker-backend = ["bollard"]
-ssh-backend = ["russh"]
-modal-backend = ["dep:reqwest"]
-daytona-backend = ["dep:reqwest"]
-singularity-backend = []
+> **Tip: Never import `edgecrab-core` from `edgecrab-tools`.**
+> The dependency graph is strictly `tools → types/security/state`. Breaking this
+> invariant creates a circular dependency.
 
-# Optional features
-mcp = ["mcp-rust-sdk"]
-acp = ["axum"]
-tts = ["dep:reqwest"]        # Edge TTS via HTTP
-voice = ["cpal"]
-rl = ["dep:reqwest"]         # Atropos integration
+---
 
-# RL environments (feature-gated for binary size)
-rl-swe = ["rl"]              # SWE-bench environment
-rl-web-research = ["rl"]     # FRAMES web research environment
-rl-opd = ["rl"]              # Agentic OPD environment
-rl-terminal-test = ["rl"]    # Terminal tool testing environment
-rl-tblite = ["rl"]           # TBLite terminal benchmark
-rl-terminalbench2 = ["rl"]   # TerminalBench 2 benchmark
-rl-yc-bench = ["rl"]         # YC Bench benchmark
+## FAQ
 
-# Tool-call parser support
-parsers = []                 # Hermes, DeepSeek V3/V3.1, GLM 4.5/4.7, Kimi K2, Llama, LongCat, Mistral, Qwen/Qwen3
-honcho = ["dep:reqwest"]
+**Q: Why is there a separate `edgecrab-cron` crate?**
+Both `edgecrab-cli` (the `cron` subcommand) and `edgecrab-tools` (the
+`manage_cron_jobs` tool) need schedule parsing and job storage. Factoring it out
+avoids pulling CLI dependencies into the tools crate.
 
-# Build variants
-all-platforms = ["telegram", "discord", "slack", "whatsapp", "signal",
-                 "matrix", "mattermost", "homeassistant", "email",
-                 "sms", "dingtalk", "webhook", "api-server"]
-all-backends = ["local-backend", "docker-backend", "ssh-backend",
-                "modal-backend", "daytona-backend", "singularity-backend"]
-full = ["cli", "all-platforms", "all-backends", "mcp", "acp",
-        "tts", "voice", "honcho"]
-```
+**Q: How does the gateway share an `Agent` with the CLI?**
+It doesn't. Each `edgecrab gateway start` spawns its own process. Session state
+is shared through the SQLite database on disk, not through a shared in-memory object.
 
-This means a minimal CLI-only build excludes all gateway platform code, reducing binary
-size by ~40% and compile time by ~60%.
+**Q: Can I embed `edgecrab-core` in my own Rust application?**
+Yes. `AgentBuilder::new(model)` is the entry point. You provide an `LLMProvider`
+and optionally a `ToolRegistry` and `SessionDb`. See
+[Agent Struct](../003_agent_core/001_agent_struct.md) for the full builder API.
+
+---
+
+## Cross-references
+
+- Dependency graph details → [Crate Dependency Graph](./002_crate_dependency_graph.md)
+- Concurrency model → [Concurrency Model](./003_concurrency_model.md)
+- Error propagation → [Error Handling](./004_error_handling.md)
+- The central `Agent` type → [Agent Struct](../003_agent_core/001_agent_struct.md)
+- Tool dispatch internals → [Tool Registry](../004_tools_system/001_tool_registry.md)

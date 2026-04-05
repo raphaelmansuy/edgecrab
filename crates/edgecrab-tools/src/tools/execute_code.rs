@@ -36,9 +36,9 @@ use serde_json::json;
 
 use edgecrab_types::{ToolError, ToolSchema};
 
-use crate::registry::{ToolContext, ToolHandler};
 #[cfg(unix)]
 use crate::registry::ToolRegistry;
+use crate::registry::{ToolContext, ToolHandler};
 use crate::tools::backends::redact_output;
 
 /// Maximum execution time before we kill the subprocess (5 minutes like hermes).

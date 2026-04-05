@@ -1,181 +1,46 @@
-# 002.003 — Concurrency Model
+# Concurrency Model
 
-> **Cross-refs**: [→ INDEX](../INDEX.md) | [→ 002.001 Architecture](001_system_architecture.md) | [→ 015.001 Roadblocks](../015_roadblocks/001_roadblocks.md)
+Verified against:
+- `crates/edgecrab-core/src/agent.rs`
+- `crates/edgecrab-core/src/conversation.rs`
+- `crates/edgecrab-tools/src/process_table.rs`
+- `crates/edgecrab-tools/src/tools/terminal.rs`
+- `crates/edgecrab-gateway/src/session.rs`
+- `crates/edgecrab-state/src/session_db.rs`
 
-## 1. Why Native Async
+EdgeCrab uses Tokio, but the interesting part is not "it is async." The interesting part is that each part of the runtime uses a different concurrency primitive for a specific reason, and those choices show up directly in the code shape.
 
-Python-based agent frameworks accumulate async/threading workarounds over time:
-- `_run_async()` bridges to call async from sync contexts
-- Persistent event loops to prevent "Event loop is closed" errors
-- Per-worker-thread loop storage for parallel delegation
-- `ThreadPoolExecutor` for CPU-bound tasks
-- Pipe-write error guards for subprocess output
+## Main primitives
 
-EdgeCrab **has none of these** because Rust's ownership model and Tokio's
-work-stealing async runtime handle all concurrency correctly by default.
+- `tokio::sync::RwLock` for hot-swappable agent state such as config, provider, gateway sender, and sessions.
+- `tokio_util::sync::CancellationToken` for cooperative cancellation of turns and long-running tools.
+- `DashMap` for high-contention registries such as process tables and gateway session maps.
+- `tokio::sync::mpsc` and `oneshot` for streaming events, clarify requests, and approvals.
+- `std::sync::Mutex` around SQLite and a few startup caches where async locking is unnecessary.
 
-## 2. Runtime: Tokio Multi-Threaded
+## Where concurrency is used
 
-```toml
-[dependencies]
-tokio = { version = "1", features = ["full"] }
+In plain terms, concurrency shows up in three places: multiple frontends, multiple sessions, and long-running tool work.
+
+```text
+frontends run concurrently
+  -> each session owns an Agent
+  -> each Agent may spawn tool work
+  -> gateway runs one adapter task per platform
+  -> process GC and stream consumers run in background tasks
 ```
 
-```rust
-#[tokio::main]
-async fn main() {
-    // Multi-threaded runtime with work-stealing scheduler
-    // Default: num_cpus threads
-    edgecrab_cli::run().await;
-}
-```
+## Important boundaries
 
-### Why Tokio over async-std
+These boundaries are easy to break by accident during refactors.
 
-| Criterion | Tokio | async-std |
-|-----------|-------|-----------|
-| Ecosystem | Dominant (axum, reqwest, tonic, teloxide) | Smaller |
-| Performance | Best-in-class work-stealing | Good |
-| edgequake-llm | Uses tokio internally | Would require compat layer |
-| Features | io-uring, tracing integration | Basic |
+- `Agent` snapshots config and provider at the start of a turn so `/model` changes do not mutate an in-flight conversation.
+- `ProcessTable` is session-scoped. Background processes are shared within one agent session, not globally across all agents.
+- `SessionDb` uses WAL plus jittered retry to tolerate concurrent readers and occasional writer contention.
+- Blocking filesystem-heavy work is explicitly moved to `spawn_blocking` where needed, such as recursive search and image shrinking.
 
-## 3. Send + Sync Guarantees
+## What to preserve when changing this code
 
-All core types enforce thread safety at compile time:
-
-```rust
-// Agent is Send + Sync — can be shared across threads
-pub struct Agent {
-    provider: Arc<dyn LLMProvider>,      // Arc<dyn Trait> is Send+Sync
-    tools: Arc<ToolRegistry>,             // Shared read-only tool registry
-    state: Arc<RwLock<AgentState>>,       // RwLock for mutable state
-    callbacks: Arc<dyn AgentCallbacks>,   // Callbacks must be Send+Sync
-    budget: Arc<IterationBudget>,         // Atomic iteration counter
-}
-
-// IterationBudget uses atomics — no mutex needed
-pub struct IterationBudget {
-    max_total: u32,
-    used: AtomicU32,
-}
-
-impl IterationBudget {
-    pub fn consume(&self) -> bool {
-        // CAS loop — lock-free
-        loop {
-            let current = self.used.load(Ordering::Acquire);
-            if current >= self.max_total { return false; }
-            if self.used.compare_exchange(
-                current, current + 1,
-                Ordering::Release, Ordering::Relaxed
-            ).is_ok() {
-                return true;
-            }
-        }
-    }
-}
-```
-
-## 4. Tool Execution Parallelism
-
-```
-hermes-agent (Python):                EdgeCrab (Rust):
-───────────────────────                ──────────────────
-ThreadPoolExecutor(1)                  tokio::spawn per tool
-  → asyncio.run() per call               → native async execution
-  → GIL prevents true parallel            → true parallel I/O
-  → _run_async() bridge                   → no bridge needed
-  → _worker_thread_local loops            → no loop management
-```
-
-### Parallel Tool Dispatch
-
-```rust
-// When LLM returns multiple tool calls, execute in parallel
-let results: Vec<ToolResult> = if tool_calls.len() > 1 && can_parallelize(&tool_calls) {
-    let futs = tool_calls.iter().map(|tc| {
-        let registry = self.tools.clone();
-        let ctx = tool_ctx.clone();
-        tokio::spawn(async move {
-            registry.dispatch(&tc.name, &tc.args, &ctx).await
-        })
-    });
-    futures::future::join_all(futs).await
-        .into_iter()
-        .map(|r| r.expect("tool task panicked"))
-        .collect()
-} else {
-    // Sequential execution for tools with side effects
-    let mut results = Vec::new();
-    for tc in &tool_calls {
-        results.push(self.tools.dispatch(&tc.name, &tc.args, &tool_ctx).await);
-    }
-    results
-};
-```
-
-## 5. Cancellation via CancellationToken
-
-EdgeCrab uses `tokio_util::sync::CancellationToken` for cooperative interrupt handling:
-
-```rust
-use tokio_util::sync::CancellationToken;
-
-pub struct Agent {
-    cancel: CancellationToken,
-    // ...
-}
-
-impl Agent {
-    pub async fn run_conversation(&self, msg: &str) -> Result<ConversationResult> {
-        loop {
-            tokio::select! {
-                response = self.call_llm(&messages) => {
-                    // Process response...
-                }
-                _ = self.cancel.cancelled() => {
-                    return Ok(ConversationResult::interrupted());
-                }
-            }
-        }
-    }
-
-    pub fn interrupt(&self) {
-        self.cancel.cancel();
-    }
-}
-```
-
-## 6. Structured Concurrency
-
-All spawned tasks are tracked via `JoinSet` or `TaskTracker`:
-
-```rust
-use tokio::task::JoinSet;
-
-// Gateway: track all platform adapter tasks
-let mut tasks = JoinSet::new();
-for adapter in adapters {
-    tasks.spawn(adapter.run(cancel.child_token()));
-}
-
-// Graceful shutdown: cancel all, then await completion
-cancel.cancel();
-while let Some(result) = tasks.join_next().await {
-    if let Err(e) = result {
-        tracing::error!("Adapter task panicked: {e}");
-    }
-}
-```
-
-## 7. No Unsafe Required
-
-The entire concurrency model uses safe Rust:
-- `Arc<T>` for shared ownership
-- `RwLock<T>` for mutable shared state (tokio::sync version for async)
-- `AtomicU32` / `AtomicBool` for lock-free counters
-- `mpsc` channels for message passing
-- `CancellationToken` for cooperative cancellation
-- `JoinSet` for structured task management
-
-Zero `unsafe` blocks in the concurrency layer.
+- Keep cancellation explicit. The code depends on cooperative checks, not forced task abortion.
+- Do not hold `DashMap` or mutex guards across `.await`.
+- Keep tool and gateway channels bounded or intentionally unbounded on purpose; the current code uses both depending on the interaction pattern.

@@ -1,127 +1,45 @@
-# 002.002 — Crate Dependency Graph
+# Crate Dependency Graph
 
-> **Cross-refs**: [→ INDEX](../INDEX.md) | [→ 002.001 Architecture](001_system_architecture.md)
+Verified against `cargo metadata --no-deps --format-version 1`.
 
-## 1. Workspace Crate DAG
+This page answers a practical question: "If I change this crate, which way does the coupling run?"
 
-```
-                             edgecrab-types
-                           (shared types, no deps)
-                                  ^
-                                  |
-              +-------------------+-------------------+
-              |                   |                   |
-        edgecrab-security   edgecrab-state      edgecrab-cron
-        (injection scan,    (SQLite, config,    (cron scheduler,
-         redaction)          memory, skills)     jobs.json)
-              ^                   ^                   ^
-              |                   |                   |
-              +--------+----------+----+              |
-                       |               |              |
-                 edgecrab-tools        |              |
-                 (registry, all        |              |
-                  tool impls)          |              |
-                       ^               |              |
-                       |               |              |
-                 edgecrab-core         |              |
-                 (Agent, loop,         |              |
-                  prompts,             |              |
-                  compression)         |              |
-                       ^               |              |
-                       |               |              |
-       +----------+----+-----+---------+------+-------+
-       |          |          |                |
- edgecrab-cli  edgecrab-  edgecrab-    edgecrab-
- (TUI, clap)   gateway    acp          migrate
-               (14 plat)  (editor)     (hermes/OC)
-```
+## Workspace dependency shape
 
-## 2. Crate Responsibilities
-
-| Crate | Type | Dependencies | Purpose |
-|-------|------|-------------|---------|
-| `edgecrab-types` | lib | serde, chrono | Shared types: Message, ToolSchema, ToolResult, Config types |
-| `edgecrab-security` | lib | types, regex, aho-corasick | Injection scanning, secret redaction, command approval, URL safety |
-| `edgecrab-state` | lib | types, rusqlite, serde_yaml | SessionDB (FTS5), ConfigManager, MemoryStore, SkillStore |
-| `edgecrab-cron` | lib | types, state, tokio-cron-scheduler | Cron job persistence (jobs.json), scheduler, gateway-triggered jobs |
-| `edgecrab-tools` | lib | types, security, state, edgequake-llm | ToolRegistry, ToolHandler trait, all 50+ tool implementations |
-| `edgecrab-core` | lib | types, tools, state, security, edgequake-llm | Agent struct, conversation loop, PromptBuilder, ContextCompressor, ModelRouter |
-| `edgecrab-cli` | bin | core, tools, state, ratatui, clap, crossterm | Interactive TUI, subcommands, skin engine, slash commands |
-| `edgecrab-gateway` | lib+bin | core, tools, state, cron, platform crates | GatewayRouter, 14 platform adapters, session management, delivery |
-| `edgecrab-acp` | lib+bin | core, tools, axum | ACP server for VS Code / Zed / JetBrains |
-| `edgecrab-migrate` | lib | state, serde_yaml, serde_json | hermes-agent / OpenClaw config + memory + skills migration |
-
-## 3. External Dependency Map
-
-```
+```text
 edgecrab-types
-  ├── serde (+ serde_json, serde_yaml)
-  ├── chrono
-  └── uuid
+  -> edgecrab-security
+  -> edgecrab-state
+  -> edgecrab-cron
 
-edgecrab-security
-  ├── edgecrab-types
-  ├── regex
-  ├── aho-corasick (multi-pattern scan)
-  └── unicode-segmentation
+edgecrab-security + edgecrab-state + edgecrab-cron + edgecrab-types
+  -> edgecrab-tools
 
-edgecrab-state
-  ├── edgecrab-types
-  ├── rusqlite { features = ["bundled", "functions"] }
-  ├── serde_yaml
-  ├── tokio (fs, sync)
-  └── cron (cron expression parsing)
+edgecrab-tools + edgecrab-state + edgecrab-security + edgecrab-types
+  -> edgecrab-core
 
-edgecrab-tools
-  ├── edgecrab-types
-  ├── edgecrab-security
-  ├── edgecrab-state
-  ├── edgequake-llm (LLM operations)
-  ├── tokio (process, net, fs)
-  ├── reqwest (HTTP client)
-  ├── scraper (HTML parsing)
-  ├── inventory (compile-time tool registration)
-  ├── bollard [docker-backend]
-  ├── russh [ssh-backend]
-  └── mcp-rust-sdk [mcp]
+edgecrab-core + edgecrab-tools + edgecrab-state + edgecrab-types
+  -> edgecrab-acp
+  -> edgecrab-gateway
 
-edgecrab-core
-  ├── edgecrab-types
-  ├── edgecrab-tools
-  ├── edgecrab-state
-  ├── edgecrab-security
-  ├── edgequake-llm
-  ├── tokio
-  └── tracing
+edgecrab-core + edgecrab-tools + edgecrab-state + edgecrab-gateway + edgecrab-acp + edgecrab-migrate
+  -> edgecrab-cli
 
-edgecrab-cli
-  ├── edgecrab-core
-  ├── ratatui
-  ├── crossterm
-  ├── clap { features = ["derive"] }
-  └── directories
-
-edgecrab-gateway
-  ├── edgecrab-core
-  ├── teloxide [telegram]
-  ├── serenity [discord]
-  └── axum [api-server]
+edgecrab-state + edgecrab-types
+  -> edgecrab-migrate
 ```
 
-## 4. Build Order
+## Why this matters
 
-```
-1. edgecrab-types      (leaf — no internal deps)
-2. edgecrab-security   (depends on types)
-3. edgecrab-state      (depends on types)
-4. edgecrab-cron       (depends on types, state)
-5. edgecrab-tools      (depends on types, security, state)
-6. edgecrab-core       (depends on types, tools, state, security)
-7. edgecrab-cli        (depends on core)           } These four
-8. edgecrab-gateway    (depends on core, cron)     } build in
-9. edgecrab-acp        (depends on core)           } parallel
-10. edgecrab-migrate   (depends on state)          }
-```
+The graph is not just trivia. It explains where shared types belong, why some abstractions are trait-based, and why the CLI ends up as the heaviest crate.
 
-Cargo builds crates 1-3 in parallel, then 4, then 5, then 6-9 in parallel.
-Typical clean build time target: <90s on M1 Mac, <180s on CI.
+- `edgecrab-types` stays reusable because it sits at the bottom.
+- `edgecrab-tools` depends on `edgecrab-core` only through traits and callbacks, not direct crate coupling.
+- `edgecrab-cli` is intentionally heavy: it is the composition root for most runtime features.
+- `edgecrab-acp` and `edgecrab-gateway` are peers that both reuse the same agent runtime.
+
+## Practical consequences
+
+- If a feature belongs in every frontend, it probably belongs in `edgecrab-core` or `edgecrab-tools`.
+- If a feature needs platform-specific delivery or chat lifecycle management, it belongs in `edgecrab-gateway`.
+- If a type is crossing crate boundaries repeatedly, move it to `edgecrab-types` instead of duplicating it.
