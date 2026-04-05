@@ -936,7 +936,12 @@ mod tests {
         let attachment = &attachments[0];
         let local_path = attachment.local_path.as_deref().expect("local path");
         assert!(std::path::Path::new(local_path).exists());
-        assert!(local_path.contains("gateway_media/discord"));
+        let p = std::path::Path::new(local_path);
+        assert!(
+            p.components().any(|c| c.as_os_str() == "gateway_media")
+                && p.components().any(|c| c.as_os_str() == "discord"),
+            "expected gateway_media/discord in {local_path}"
+        );
         assert_eq!(attachment.url.as_deref(), Some(image_url.as_str()));
 
         server.abort();

@@ -117,8 +117,15 @@ fn validate_backend_workdir_visibility(
     match backend {
         crate::tools::backends::BackendKind::Modal
         | crate::tools::backends::BackendKind::Daytona => {
-            // Remote backends have their own filesystem; the cwd is a path inside the
-            // remote sandbox, not the host. No host-existence check is performed.
+            if cwd_path.exists() {
+                return Err(ToolError::ExecutionFailed {
+                    tool: "terminal".into(),
+                    message: format!(
+                        "The {} backend cannot access host workspace path '{}'. Use the local or docker backend for local files, or sync the workspace into the remote sandbox first.",
+                        backend, cwd
+                    ),
+                });
+            }
         }
         _ => {}
     }

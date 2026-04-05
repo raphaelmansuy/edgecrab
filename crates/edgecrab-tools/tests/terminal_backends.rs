@@ -436,7 +436,15 @@ fn execute_fake_shell_command(cwd: &str, command: &str) -> FakeShellOutput {
 #[cfg(unix)]
 fn execute_fake_modal_direct_command(sandbox_root: &Path, command: &str) -> FakeShellOutput {
     std::fs::create_dir_all(sandbox_root.join("root")).expect("create fake modal direct root");
-    let rewritten = command.replace("/root", &sandbox_root.join("root").to_string_lossy());
+    // Rewrite sandbox-relative paths to the actual sandbox root on the host.
+    // Use mutually exclusive logic to avoid double-replacement.
+    let rewritten = if command.contains("/modal-sandbox") {
+        // Tests that use /modal-sandbox as the remote cwd (CI-safe: never exists on host).
+        command.replace("/modal-sandbox", &sandbox_root.join("root").to_string_lossy())
+    } else {
+        // Legacy tests that use /root as the remote cwd.
+        command.replace("/root", &sandbox_root.join("root").to_string_lossy())
+    };
     let output = std::process::Command::new("sh")
         .arg("-c")
         .arg(rewritten)
@@ -658,19 +666,19 @@ async fn e2e_modal_backend_respects_working_directory_via_fake_http_api() {
         &mut ctx,
         &format!("e2e-modal-cwd-{}", uuid::Uuid::new_v4().simple()),
     );
-    ctx.cwd = PathBuf::from("/root");
+    ctx.cwd = PathBuf::from("/modal-sandbox");
     unsafe { std::env::set_var("EDGECRAB_HOME", edgecrab_home.path()) };
     unsafe { std::env::set_var("EDGECRAB_MODAL_BASE_URL", &server.base_url) };
 
     TerminalTool
         .execute(
-            json!({"command": "mkdir -p /root/workspace && echo modal-probe >/root/workspace/probe.txt"}),
+            json!({"command": "mkdir -p /modal-sandbox/workspace && echo modal-probe >/modal-sandbox/workspace/probe.txt"}),
             &ctx,
         )
         .await
         .expect("seed remote workspace");
 
-    ctx.cwd = PathBuf::from("/root/workspace");
+    ctx.cwd = PathBuf::from("/modal-sandbox/workspace");
     let result = TerminalTool
         .execute(json!({"command": "cat probe.txt"}), &ctx)
         .await
