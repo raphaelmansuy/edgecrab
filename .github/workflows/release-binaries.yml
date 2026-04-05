@@ -49,7 +49,7 @@ jobs:
             use_cross: true
 
           - target:    x86_64-apple-darwin
-            os:        macos-13        # last Intel GitHub runner
+            os:        macos-14        # arm64 runner; cross-compiles Intel via Xcode SDK
             archive:   edgecrab-x86_64-apple-darwin.tar.gz
             use_cross: false
 
