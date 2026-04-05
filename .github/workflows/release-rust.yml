@@ -66,15 +66,7 @@ jobs:
       - name: Publish edgecrab-types
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: |
-          OUTPUT=$(cargo publish -p edgecrab-types 2>&1) && echo "$OUTPUT" || {
-            echo "$OUTPUT"
-            if echo "$OUTPUT" | grep -q "already exists on crates.io"; then
-              echo "edgecrab-types already published at this version — skipping."
-            else
-              exit 1
-            fi
-          }
+        run: publish_crate edgecrab-types
 
       - name: Wait for crates.io index (types)
         run: sleep 30
@@ -82,15 +74,7 @@ jobs:
       - name: Publish edgecrab-security
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: |
-          OUTPUT=$(cargo publish -p edgecrab-security 2>&1) && echo "$OUTPUT" || {
-            echo "$OUTPUT"
-            if echo "$OUTPUT" | grep -q "already exists on crates.io"; then
-              echo "edgecrab-security already published — skipping."
-            else
-              exit 1
-            fi
-          }
+        run: publish_crate edgecrab-security
 
       - name: Wait for crates.io index (security)
         run: sleep 30
@@ -98,15 +82,7 @@ jobs:
       - name: Publish edgecrab-state
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: |
-          OUTPUT=$(cargo publish -p edgecrab-state 2>&1) && echo "$OUTPUT" || {
-            echo "$OUTPUT"
-            if echo "$OUTPUT" | grep -q "already exists on crates.io"; then
-              echo "edgecrab-state already published — skipping."
-            else
-              exit 1
-            fi
-          }
+        run: publish_crate edgecrab-state
 
       - name: Wait for crates.io index (state)
         run: sleep 30
@@ -114,15 +90,7 @@ jobs:
       - name: Publish edgecrab-tools
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: |
-          OUTPUT=$(cargo publish -p edgecrab-tools --no-verify 2>&1) && echo "$OUTPUT" || {
-            echo "$OUTPUT"
-            if echo "$OUTPUT" | grep -q "already exists on crates.io"; then
-              echo "edgecrab-tools already published — skipping."
-            else
-              exit 1
-            fi
-          }
+        run: publish_crate edgecrab-tools --no-verify
 
       - name: Wait for crates.io index (tools)
         run: sleep 30
@@ -130,15 +98,7 @@ jobs:
       - name: Publish edgecrab-cron
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: |
-          OUTPUT=$(cargo publish -p edgecrab-cron --no-verify 2>&1) && echo "$OUTPUT" || {
-            echo "$OUTPUT"
-            if echo "$OUTPUT" | grep -q "already exists on crates.io"; then
-              echo "edgecrab-cron already published — skipping."
-            else
-              exit 1
-            fi
-          }
+        run: publish_crate edgecrab-cron --no-verify
 
       - name: Wait for crates.io index (cron)
         run: sleep 30
@@ -146,15 +106,7 @@ jobs:
       - name: Publish edgecrab-core
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: |
-          OUTPUT=$(cargo publish -p edgecrab-core --no-verify 2>&1) && echo "$OUTPUT" || {
-            echo "$OUTPUT"
-            if echo "$OUTPUT" | grep -q "already exists on crates.io"; then
-              echo "edgecrab-core already published — skipping."
-            else
-              exit 1
-            fi
-          }
+        run: publish_crate edgecrab-core --no-verify
 
       - name: Wait for crates.io index (core)
         run: sleep 30
@@ -162,15 +114,7 @@ jobs:
       - name: Publish edgecrab-gateway
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: |
-          OUTPUT=$(cargo publish -p edgecrab-gateway --no-verify 2>&1) && echo "$OUTPUT" || {
-            echo "$OUTPUT"
-            if echo "$OUTPUT" | grep -q "already exists on crates.io"; then
-              echo "edgecrab-gateway already published — skipping."
-            else
-              exit 1
-            fi
-          }
+        run: publish_crate edgecrab-gateway --no-verify
 
       - name: Wait for crates.io index (gateway)
         run: sleep 30
@@ -178,15 +122,7 @@ jobs:
       - name: Publish edgecrab-acp
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: |
-          OUTPUT=$(cargo publish -p edgecrab-acp --no-verify 2>&1) && echo "$OUTPUT" || {
-            echo "$OUTPUT"
-            if echo "$OUTPUT" | grep -q "already exists on crates.io"; then
-              echo "edgecrab-acp already published — skipping."
-            else
-              exit 1
-            fi
-          }
+        run: publish_crate edgecrab-acp --no-verify
 
       - name: Wait for crates.io index (acp)
         run: sleep 30
@@ -194,15 +130,7 @@ jobs:
       - name: Publish edgecrab-migrate
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: |
-          OUTPUT=$(cargo publish -p edgecrab-migrate --no-verify 2>&1) && echo "$OUTPUT" || {
-            echo "$OUTPUT"
-            if echo "$OUTPUT" | grep -q "already exists on crates.io"; then
-              echo "edgecrab-migrate already published — skipping."
-            else
-              exit 1
-            fi
-          }
+        run: publish_crate edgecrab-migrate --no-verify
 
       - name: Wait for crates.io index (migrate)
         run: sleep 30
@@ -210,15 +138,7 @@ jobs:
       - name: Publish edgecrab-cli
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: |
-          OUTPUT=$(cargo publish -p edgecrab-cli --no-verify 2>&1) && echo "$OUTPUT" || {
-            echo "$OUTPUT"
-            if echo "$OUTPUT" | grep -q "already exists on crates.io"; then
-              echo "edgecrab-cli already published — skipping."
-            else
-              exit 1
-            fi
-          }
+        run: publish_crate edgecrab-cli --no-verify
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
