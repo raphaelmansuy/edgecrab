@@ -1,444 +1,221 @@
-# 010.001 — Data Models
+# 🦀 Data Models
 
-> **Cross-refs**: [→ INDEX](../INDEX.md) | [→ 003.002 Conversation Loop](../003_agent_core/002_conversation_loop.md) | [→ 002.001 Architecture](../002_architecture/001_system_architecture.md)
-> **Source**: `edgecrab-types/src/message.rs`, `edgecrab-types/src/tool.rs`, `edgecrab-types/src/usage.rs` — verified against real implementation
+> **WHY**: Ten crates need to exchange messages, tool calls, usage metrics, and platform context without circular dependencies. `edgecrab-types` is the single-crate contract that makes this possible — import it anywhere without pulling in the runtime.
 
-## 1. Message Types
+**Source**: `crates/edgecrab-types/src/message.rs`, `tool.rs`, `usage.rs`, `config.rs`
+
+---
+
+## Crate Role
+
+```
+┌───────────────────────────┐
+│      edgecrab-types        │  ← no runtime deps; pure data + serde
+│                           │
+│  Message    ToolCall       │
+│  Content    ToolSchema     │
+│  Usage      Cost           │
+│  ApiMode    Platform       │
+└─────────────┬─────────────┘
+              │  imported by
+    ┌─────────┼─────────────────┐
+    ▼         ▼                 ▼
+edgecrab- edgecrab-   edgecrab-  edgecrab-
+  core      tools      state      gateway
+```
+
+**Rule**: if a type is needed in more than one crate, it belongs in `edgecrab-types`, not in a higher-level crate.
+
+---
+
+## Core Message Model
 
 ```rust
-// edgecrab-types/src/message.rs
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,
-    pub content: Option<Content>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_calls: Option<Vec<ToolCall>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_call_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,  // tool name for tool results
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reasoning: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub finish_reason: Option<String>,
+    pub content: Content,
+    pub tool_calls: Option<Vec<ToolCall>>,   // present on assistant turns
+    pub tool_call_id: Option<String>,         // present on tool-result turns
+    pub name: Option<String>,                 // tool name for tool-result turns
+    pub reasoning: Option<String>,            // chain-of-thought (extended thinking)
+    pub finish_reason: Option<String>,        // "stop" | "tool_calls" | "length" …
 }
+```
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+### Role Enum
+
+```rust
 pub enum Role {
     System,
     User,
     Assistant,
-    Tool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum Content {
-    Text(String),
-    Parts(Vec<ContentPart>),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum ContentPart {
-    #[serde(rename = "text")]
-    Text { text: String },
-    #[serde(rename = "image_url")]
-    ImageUrl { image_url: ImageUrl },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ImageUrl {
-    pub url: String,  // data:image/png;base64,... or https://...
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub detail: Option<String>,  // "low" | "high" | "auto"
-}
-
-impl Message {
-    pub fn user(text: &str) -> Self { ... }
-    pub fn assistant(text: &str) -> Self { ... }
-    pub fn tool_result(tool_call_id: &str, content: &str) -> Self { ... }
-    pub fn system(text: &str) -> Self { ... }
-    pub fn system_summary(text: String) -> Self { ... }
-
-    pub fn text_content(&self) -> String {
-        match &self.content {
-            Some(Content::Text(t)) => t.clone(),
-            Some(Content::Parts(parts)) => parts.iter()
-                .filter_map(|p| match p {
-                    ContentPart::Text { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n"),
-            None => String::new(),
-        }
-    }
+    Tool,   // carries the result of a ToolCall back to the model
 }
 ```
 
-## 2. Tool Call Types
+---
+
+## Content: Text and Multimodal
+
+```
+Content
+  ├── Text(String)              ← plain string, most turns
+  └── Parts(Vec<ContentPart>)  ← multimodal: text + images mixed
+
+ContentPart
+  ├── text   { text: String }
+  └── image_url { url: String, detail: Option<String> }
+```
+
+The same `Message` type handles both a simple `"What is 2+2?"` and a vision turn with annotated screenshots. Serialisation maps to the OpenAI content format, which `edgequake-llm` then translates for other provider APIs.
+
+---
+
+## Tool-Calling Types
 
 ```rust
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
-    pub id: String,
-    pub r#type: String,  // always "function"
+    pub id: String,                       // unique per call, echoed in tool result
+    pub r#type: String,                   // always "function" today
     pub function: FunctionCall,
+    pub thought_signature: Option<String>, // Gemini extended-thinking field
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FunctionCall {
+    pub name: String,            // matches ToolHandler::name()
+    pub arguments: String,       // JSON-encoded arguments string
+}
+
+pub struct ToolSchema {
     pub name: String,
-    pub arguments: String,  // JSON string
-}
-
-impl ToolCall {
-    pub fn parsed_args(&self) -> Result<serde_json::Value> {
-        Ok(serde_json::from_str(&self.function.arguments)?)
-    }
+    pub description: String,
+    pub parameters: serde_json::Value,  // JSON Schema object
+    pub strict: Option<bool>,           // OpenAI strict mode
 }
 ```
 
-## 3. Usage & Pricing
+`ToolSchema` is what the registry sends to the provider in the request. The provider returns a `ToolCall`; the registry executes it; the result comes back as a `Message { role: Role::Tool, … }`.
+
+---
+
+## Usage and Cost
 
 ```rust
-// edgecrab-types/src/usage.rs
-
-#[derive(Debug, Clone, Default)]
 pub struct Usage {
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub cache_read_tokens: u64,
-    pub cache_write_tokens: u64,
-    pub reasoning_tokens: u64,
-    pub total_tokens: u64,
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    pub total_tokens: u32,
+    // Extended fields for provider-specific breakdown
+    pub cache_read_tokens: Option<u32>,   // Anthropic prompt cache hits
+    pub cache_write_tokens: Option<u32>,  // Anthropic prompt cache misses
+    pub reasoning_tokens: Option<u32>,    // o1/extended-thinking tokens
 }
 
-#[derive(Debug, Clone, Default)]
 pub struct Cost {
-    pub input_cost: f64,
-    pub output_cost: f64,
-    pub cache_read_cost: f64,
-    pub cache_write_cost: f64,
-    pub total_cost: f64,
-}
-
-/// Normalize usage across different API response formats
-pub fn normalize_usage(raw: &serde_json::Value, api_mode: ApiMode) -> Usage {
-    match api_mode {
-        ApiMode::ChatCompletions => Usage {
-            input_tokens: raw["prompt_tokens"].as_u64().unwrap_or(0),
-            output_tokens: raw["completion_tokens"].as_u64().unwrap_or(0),
-            // OpenRouter includes cache info in prompt_tokens_details
-            cache_read_tokens: raw["prompt_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0),
-            ..Default::default()
-        },
-        ApiMode::AnthropicMessages => Usage {
-            input_tokens: raw["input_tokens"].as_u64().unwrap_or(0),
-            output_tokens: raw["output_tokens"].as_u64().unwrap_or(0),
-            cache_read_tokens: raw["cache_read_input_tokens"].as_u64().unwrap_or(0),
-            cache_write_tokens: raw["cache_creation_input_tokens"].as_u64().unwrap_or(0),
-            ..Default::default()
-        },
-        ApiMode::CodexResponses => Usage {
-            input_tokens: raw["input_tokens"].as_u64().unwrap_or(0),
-            output_tokens: raw["output_tokens"].as_u64().unwrap_or(0),
-            ..Default::default()
-        },
-    }
-}
-
-/// Calculate cost using edgequake-llm's CostTracker
-pub fn estimate_cost(usage: &Usage, model: &str) -> Cost {
-    // Delegate to edgequake-llm cost tracking
-    // Falls back to known pricing table
-    todo!()
+    pub input_usd: f64,
+    pub output_usd: f64,
+    pub total_usd: f64,
 }
 ```
 
-## 4. API Modes
+`Usage` normalises across three provider API shapes:
+
+| API | Provider | Notes |
+|---|---|---|
+| `ChatCompletions` | OpenAI, Mistral, many others | `usage.prompt_tokens` + `usage.completion_tokens` |
+| `AnthropicMessages` | Anthropic | adds cache read/write breakdown |
+| `CodexResponses` | OpenAI Responses API | includes reasoning token field |
+
+---
+
+## Runtime Enums
+
+### `ApiMode`
 
 ```rust
-#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ApiMode {
-    ChatCompletions,     // OpenAI / OpenRouter standard
-    AnthropicMessages,   // Direct Anthropic API
-    CodexResponses,      // OpenAI Codex Responses API
-}
-
-impl ApiMode {
-    /// Auto-detect from base URL
-    pub fn detect(base_url: &str, model: &str) -> Self {
-        if base_url.contains("api.anthropic.com") {
-            ApiMode::AnthropicMessages
-        } else if base_url.contains("api.openai.com") && model.contains("codex") {
-            ApiMode::CodexResponses
-        } else {
-            ApiMode::ChatCompletions
-        }
-    }
+    ChatCompletions,    // POST /v1/chat/completions
+    AnthropicMessages,  // POST /v1/messages
+    CodexResponses,     // POST /v1/responses
 }
 ```
 
-## 5. Trajectory Format
+The provider layer selects the API mode per model; the rest of the runtime doesn't need to know.
+
+### `Platform`
 
 ```rust
-// edgecrab-types/src/trajectory.rs
-
-#[derive(Serialize, Deserialize)]
-pub struct Trajectory {
-    pub session_id: String,
-    pub model: String,
-    pub timestamp: String,
-    pub messages: Vec<Message>,
-    pub metadata: TrajectoryMetadata,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct TrajectoryMetadata {
-    pub task_id: Option<String>,
-    pub total_tokens: u64,
-    pub total_cost: f64,
-    pub api_calls: u32,
-    pub tools_used: Vec<String>,
-    pub completed: bool,
-    pub duration_seconds: f64,
-}
-
-/// Save trajectory as JSONL (one JSON object per line)
-pub fn save_trajectory(path: &Path, trajectory: &Trajectory) -> Result<()> {
-    let json = serde_json::to_string(trajectory)?;
-    let mut file = std::fs::OpenOptions::new()
-        .create(true).append(true).open(path)?;
-    writeln!(file, "{}", json)?;
-    Ok(())
-}
-
-/// Convert <REASONING_SCRATCHPAD> tags to <think> tags (legacy format compat)
-pub fn convert_scratchpad_to_think(content: &str) -> String {
-    content.replace("<REASONING_SCRATCHPAD>", "<think>")
-           .replace("</REASONING_SCRATCHPAD>", "</think>")
-}
-
-/// Check if content has an opening <REASONING_SCRATCHPAD> without closing tag
-pub fn has_incomplete_scratchpad(content: &str) -> bool {
-    content.contains("<REASONING_SCRATCHPAD>") && !content.contains("</REASONING_SCRATCHPAD>")
+pub enum Platform {
+    Cli,
+    Telegram,
+    Discord,
+    Slack,
+    WhatsApp,
+    Signal,
+    Email,
+    Sms,
+    Matrix,
+    Mattermost,
+    DingTalk,
+    Feishu,
+    Wecom,
+    HomeAssistant,
+    Webhook,
+    ApiServer,
+    Acp,
+    Cron,
+    // … 18 variants total
 }
 ```
 
-## 6. Reasoning/Thinking Blocks
+`Platform` is stored with every session row (`source` column in `sessions`) and in `ToolContext` so tools can adapt their behaviour to the delivery channel.
 
-hermes-agent extracts reasoning from `<think>` tags and stores it in a separate field:
+---
 
-```rust
-/// Extract thinking blocks from assistant content
-pub fn extract_reasoning(content: &str) -> (String, Option<String>) {
-    let re = regex::Regex::new(r"(?s)<think>(.*?)</think>").unwrap();
-    let reasoning = re.captures(content).map(|c| c[1].trim().to_string());
-    let cleaned = re.replace_all(content, "").trim().to_string();
-    (cleaned, reasoning)
-}
+## Conversation Invariant
 
-/// Check if content after think block is empty (thinking exhaustion)
-pub fn has_content_after_think(content: &str) -> bool {
-    let re = regex::Regex::new(r"(?s)<think>.*?</think>").unwrap();
-    let after = re.replace_all(content, "").trim().to_string();
-    !after.is_empty()
-}
+The message history that is sent to the provider in each request must satisfy:
+
+```
+[System] [User] [Assistant?] ([User] [Assistant])* [User]
+                                                      ^
+                                                      current turn
 ```
 
-## 7. Anthropic Adapter Model (v0.4.0)
+Tool result messages (`Role::Tool`) are injected between the assistant tool-call turn and the next user turn. The agent loop in `conversation.rs` maintains this invariant; `edgecrab-types` provides the types but does not enforce the ordering.
 
-### 7.1 Thinking Budget Configuration
+---
 
-```rust
-/// Thinking budget by reasoning effort level
-const THINKING_BUDGET: &[(&str, u32)] = &[
-    ("xhigh", 32000),
-    ("high", 16000),
-    ("medium", 8000),
-    ("low", 4000),
-];
+## Serialisation Contract
 
-/// Map reasoning effort to Anthropic's native adaptive thinking levels
-const ADAPTIVE_EFFORT_MAP: &[(&str, &str)] = &[
-    ("xhigh", "max"),
-    ("high", "high"),
-    ("medium", "medium"),
-    ("low", "low"),
-    ("minimal", "low"),
-];
+All types derive `serde::Serialize` and `serde::Deserialize`. Field names follow `snake_case` in Rust and serialise to `snake_case` JSON — matching the OpenAI API wire format directly. The Anthropic adapter in `edgequake-llm` translates field names as needed.
 
-/// Only Claude 4.6+ supports adaptive thinking (not Claude 4.0/4.5)
-pub fn supports_adaptive_thinking(model: &str) -> bool {
-    let m = model.to_lowercase();
-    m.contains("4-6") || m.contains("4.6")
-}
+---
 
-/// Anthropic-specific beta headers (sent with ALL auth types)
-const COMMON_BETAS: &[&str] = &[
-    "interleaved-thinking-2025-05-14",
-    "fine-grained-tool-streaming-2025-05-14",
-];
+## Tips
 
-/// Per-model max output token limits (thinking tokens count toward limit!)
-/// Uses longest-prefix substring match so date-stamped IDs resolve correctly.
-const ANTHROPIC_OUTPUT_LIMITS: &[(&str, u32)] = &[
-    // Claude 4.6
-    ("claude-opus-4-6",    128_000),
-    ("claude-sonnet-4-6",   64_000),
-    // Claude 4.5
-    ("claude-opus-4-5",     64_000),
-    ("claude-sonnet-4-5",   64_000),
-    ("claude-haiku-4-5",    64_000),
-    // Claude 4
-    ("claude-opus-4",       32_000),
-    ("claude-sonnet-4",     64_000),
-    // Claude 3.7
-    ("claude-3-7-sonnet",  128_000),
-    // Claude 3.5
-    ("claude-3-5-sonnet",    8_192),
-    ("claude-3-5-haiku",     8_192),
-    // Claude 3
-    ("claude-3-opus",        4_096),
-    ("claude-3-sonnet",      4_096),
-    ("claude-3-haiku",       4_096),
-];
-/// Default for unknown future models
-const ANTHROPIC_DEFAULT_OUTPUT_LIMIT: u32 = 128_000;
+- **`arguments` is a JSON string, not an object** — `FunctionCall::arguments` is `String`, not `serde_json::Value`. Parse it with `serde_json::from_str` inside the tool handler; don't assume it's already structured.
+- **`reasoning` is model-facing only** — the `reasoning` field carries chain-of-thought tokens from extended-thinking models. It is stored in `state.db` but never displayed to end users by default.
+- **`thought_signature` is Gemini-specific** — don't populate it when talking to Anthropic or OpenAI models; it will be ignored.
 
-/// Get Anthropic max output tokens (longest-prefix substring match)
-pub fn get_anthropic_max_output(model: &str) -> u32 {
-    let m = model.to_lowercase();
-    ANTHROPIC_OUTPUT_LIMITS.iter()
-        .filter(|(key, _)| m.contains(key))
-        .max_by_key(|(key, _)| key.len())
-        .map_or(ANTHROPIC_DEFAULT_OUTPUT_LIMIT, |(_, v)| *v)
-}
-```
+---
 
-### 7.2 Claude Code OAuth Token Management
+## FAQ
 
-```rust
-pub struct ClaudeCodeCredentials {
-    pub access_token: String,
-    pub refresh_token: String,
-    pub expires_at_ms: u64,
-}
+**Q: Why is `arguments` a `String` rather than a `Value`?**
+A: The provider sends it as a JSON string. Parsing it twice (provider → types, types → tool) adds overhead with no benefit. Tools own the parse step.
 
-/// Token resolution chain:
-/// 1. ANTHROPIC_API_KEY env var
-/// 2. Claude Code OAuth credentials (~/.claude/credentials.json)
-/// 3. Claude managed key (~/.claude/.credentials.json)
-pub fn resolve_anthropic_token() -> Option<String> {
-    // Check env first
-    if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
-        if !key.is_empty() { return Some(key); }
-    }
-    // Try Claude Code OAuth with refresh
-    if let Some(creds) = read_claude_code_credentials() {
-        if is_claude_code_token_valid(&creds) {
-            return Some(creds.access_token);
-        }
-        // Attempt token refresh
-        if let Some(refreshed) = refresh_oauth_token(&creds) {
-            return Some(refreshed);
-        }
-    }
-    // Try managed key
-    read_claude_managed_key()
-}
+**Q: Where is the `ImageUrl` base64 variant?**
+A: `ContentPart::image_url.url` can be a `data:` URI containing base64, or an HTTPS URL. The `detail` hint (`"low"` / `"high"` / `"auto"`) controls vision API quality.
 
-pub fn is_oauth_token(key: &str) -> bool {
-    key.starts_with("sk-ant-oat-") // OAuth access token prefix
-}
-```
+**Q: Can I add a new field to `Message` without breaking the database?**
+A: The messages table stores the full JSON blob, so a new optional field deserialises fine for old rows (missing → `None`). Migrations are only needed for new top-level session columns.
 
-## 8. Billing Route & Cost Tracking (v0.4.0)
+---
 
-### 8.1 Canonical Usage
+## Cross-References
 
-```rust
-/// Normalized usage across all providers
-pub struct CanonicalUsage {
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub cache_read_tokens: u64,
-    pub cache_write_tokens: u64,
-    pub reasoning_tokens: u64,
-}
-
-impl CanonicalUsage {
-    pub fn prompt_tokens(&self) -> u64 {
-        self.input_tokens + self.cache_read_tokens + self.cache_write_tokens
-    }
-    pub fn total_tokens(&self) -> u64 {
-        self.prompt_tokens() + self.output_tokens + self.reasoning_tokens
-    }
-}
-```
-
-### 8.2 Billing Route Resolution
-
-```rust
-pub struct BillingRoute {
-    pub provider: String,
-    pub model: String,
-    pub base_url: String,
-    pub billing_mode: String,  // matches CostSource labels
-}
-```
-
-### 8.3 Pricing Entry & Cost Source
-
-```rust
-/// Per-model pricing snapshot (per million tokens)
-pub struct PricingEntry {
-    pub input_cost_per_million: Option<Decimal>,
-    pub output_cost_per_million: Option<Decimal>,
-    pub cache_read_cost_per_million: Option<Decimal>,
-    pub cache_write_cost_per_million: Option<Decimal>,
-    pub request_cost: Option<Decimal>,
-    pub source: CostSource,
-    pub source_url: Option<String>,
-    pub pricing_version: Option<String>,
-    pub fetched_at: Option<DateTime<Utc>>,
-}
-
-/// Where pricing data came from
-pub enum CostSource {
-    ProviderCostApi,          // provider reports actual cost
-    ProviderGenerationApi,    // cost from generation metadata
-    ProviderModelsApi,        // OpenRouter /models endpoint
-    OfficialDocsSnapshot,     // hardcoded from provider docs
-    UserOverride,             // user-configured pricing
-    CustomContract,           // enterprise contract pricing
-    None,
-}
-
-/// How confident we are in the cost figure
-pub enum CostStatus {
-    Actual,       // provider-reported actual cost
-    Estimated,    // computed from known pricing table
-    Included,     // subscription-included ($0)
-    Unknown,      // no pricing data available
-}
-```
-
-### 8.4 Cost Result
-
-```rust
-pub struct CostResult {
-    pub amount_usd: Option<Decimal>,
-    pub status: CostStatus,
-    pub source: CostSource,
-    pub label: String,
-    pub fetched_at: Option<DateTime<Utc>>,
-    pub pricing_version: Option<String>,
-    pub notes: Vec<String>,
-}
-```
-```
+- Session storage schema → [`009_config_state/002_session_storage.md`](../009_config_state/002_session_storage.md)
+- Tool dispatch (how `ToolCall` → execution) → [`004_tools_system/001_tool_registry.md`](../004_tools_system/001_tool_registry.md)
+- Context compression (acts on `Vec<Message>`) → [`003_agent_core/004_context_compression.md`](../003_agent_core/004_context_compression.md)
+- Gateway `IncomingMessage` → `Message` conversion → [`006_gateway/001_gateway_architecture.md`](../006_gateway/001_gateway_architecture.md)

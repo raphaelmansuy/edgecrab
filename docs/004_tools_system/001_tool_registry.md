@@ -1,360 +1,314 @@
-# 004.001 — Tool Registry
+# Tool Registry 🦀
 
-> **Cross-refs**: [→ INDEX](../INDEX.md) | [→ 002.001 Architecture](../002_architecture/001_system_architecture.md) | [→ 004.002 Tool Catalogue](002_tool_catalogue.md)
-> **Source**: `edgecrab-tools/src/registry.rs` — verified against real implementation
+> **Verified against:** `crates/edgecrab-tools/src/registry.rs` ·
+> `crates/edgecrab-tools/src/tools/mod.rs`
 
-## 1. Registry Design
+---
 
-hermes-agent uses a **runtime** Python decorator registry. EdgeCrab uses a **compile-time** registry via the `inventory` crate — inspired by [OpenClaw](https://github.com/openai/openai-claw) and [Nous Hermes](https://nousresearch.com):
+## Why the registry exists
 
-```
-┌──────────────────────────────────────────────────────────┐
-│                     ToolRegistry                         │
-│                                                          │
-│  inventory::iter ──→ HashMap<name, &dyn ToolHandler>     │
-│                                                          │
-│  dispatch("read_file", args, ctx)                        │
-│      │                                                   │
-│      ├── exact match? → handler.execute(args, ctx)       │
-│      │                                                   │
-│      └── no match? → fuzzy_match (strsim) → suggestion   │
-│                                                          │
-│  get_definitions(enabled, disabled, ctx)                  │
-│      → filter by toolset + availability + check_fn       │
-│      → Vec<ToolSchema> for LLM API call                  │
-└──────────────────────────────────────────────────────────┘
-```
+Without a registry, the agent loop needs to know about every tool: import it,
+call it, handle its errors. Adding a tool means editing the loop.
 
-**Key advantage over Python**: The linker guarantees all registered tools are present. No forgotten imports, no typos in registration calls. `cargo build` fails if a tool file is missing.
+The registry inverts this: tools declare themselves at compile time via
+`inventory::submit!`. The loop calls `ToolRegistry::dispatch(name, args, ctx)`
+and gets a result back — it has no idea which tool ran, how the tool works,
+or what crate the tool lives in.
 
-## 2. ToolHandler Trait
+🦀 *`hermes-agent` (Python) dispatched tools through a central handler dict —
+adding a tool meant editing the dispatch map. EdgeCrab's registry means a new
+tool is literally a new struct in a new file. The crab grows new claws without surgery.*
 
-Every tool implements this trait. 8 methods — 4 required, 4 with defaults:
+---
+
+## Registration: compile-time via `inventory`
 
 ```rust
-// edgecrab-tools/src/registry.rs
+// Any file in edgecrab-tools/src/tools/
+
+struct ReadFileTool;
 
 #[async_trait]
-pub trait ToolHandler: Send + Sync + 'static {
-    /// Unique tool name identifier (e.g., "read_file", "terminal")
-    fn name(&self) -> &'static str;
+impl ToolHandler for ReadFileTool {
+    fn name(&self)    -> &'static str { "read_file" }
+    fn toolset(&self) -> &'static str { "file" }
+    fn schema(&self)  -> ToolSchema   { /* JSON schema */ }
 
-    /// Toolset membership — for enable/disable filtering (e.g., "file", "web")
-    fn toolset(&self) -> &'static str;
-
-    /// OpenAI-format function schema sent to the LLM
-    fn schema(&self) -> ToolSchema;
-
-    /// Execute the tool with parsed JSON arguments
-    async fn execute(
-        &self,
-        args: serde_json::Value,
-        ctx: &ToolContext,
-    ) -> Result<String, ToolError>;
-
-    /// Startup availability check (env vars present, binary exists, etc.)
-    /// Called once at registry build time.
-    fn is_available(&self) -> bool { true }
-
-    /// Per-request gate (gateway running, specific token present, etc.)
-    /// Distinct from is_available: runs on EVERY dispatch.
-    fn check_fn(&self, _ctx: &ToolContext) -> bool { true }
-
-    /// Whether this tool is safe for parallel execution
-    fn parallel_safe(&self) -> bool { false }
-
-    /// Emoji displayed in TUI tool progress
-    fn emoji(&self) -> &'static str { "⚡" }
-}
-```
-
-### Two-Layer Gating
-
-```
-is_available()          ← called ONCE at startup (binary exists? env var set?)
-     │
-     └──→ tool included in registry
-              │
-check_fn(ctx) ← called on EVERY dispatch (gateway running? Honcho active?)
-     │
-     └──→ tool actually executes
-```
-
-Example: `ha_list_entities` uses `is_available()` to check `HASS_TOKEN` env var. `send_message` uses `check_fn()` to verify gateway is running at call time.
-
-## 3. Compile-Time Registration
-
-```rust
-// In each tool file (e.g. file_read.rs):
-inventory::submit! { &ReadFileTool as &dyn ToolHandler }
-
-// In registry.rs — collect all submitted handlers:
-inventory::collect!(&'static dyn ToolHandler);
-
-// At startup — build HashMap once:
-pub fn new() -> Self {
-    let mut tools = HashMap::new();
-    let mut toolset_index = HashMap::new();
-    for handler in inventory::iter::<&dyn ToolHandler> {
-        tools.insert(handler.name(), *handler);
-        toolset_index.entry(handler.toolset())
-            .or_default()
-            .push(handler.name());
+    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext)
+        -> Result<String, ToolError>
+    {
+        let path = args["path"].as_str()
+            .ok_or_else(|| ToolError::InvalidArgs { .. })?;
+        // ... read the file ...
+        Ok(content)
     }
-    Self { tools, toolset_index, dynamic_tools: HashMap::new() }
+}
+
+// This line registers ReadFileTool at binary startup — no list to maintain
+inventory::submit! { &ReadFileTool as &dyn ToolHandler }
+```
+
+`ToolRegistry::new()` iterates `inventory::iter::<&dyn ToolHandler>` and
+builds the internal `HashMap<name, handler>` automatically.
+
+**Reference:** [`inventory` crate](https://docs.rs/inventory/latest/inventory/)
+
+---
+
+## `ToolHandler` trait
+
+```rust
+#[async_trait]
+pub trait ToolHandler: Send + Sync + 'static {
+    // Required
+    fn name(&self)    -> &'static str;
+    fn toolset(&self) -> &'static str;
+    fn schema(&self)  -> ToolSchema;
+    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext)
+        -> Result<String, ToolError>;
+
+    // Optional — defaults shown
+    fn is_available(&self) -> bool { true }        // startup: docker present? API configured?
+    fn check_fn(&self, _ctx: &ToolContext) -> bool { true }  // per-request: platform allowed?
+    fn parallel_safe(&self) -> bool { false }       // can run concurrently with peer tools?
+    fn emoji(&self) -> &'static str { "⚡" }         // TUI display
 }
 ```
 
-## 4. ToolRegistry Struct & API
+`is_available()` is called once at registry build time. Tools that fail the
+check are still registered but excluded from schema lists sent to the LLM.
 
-```rust
-pub struct ToolRegistry {
-    /// name → handler lookup (static, compile-time registered)
-    tools: HashMap<&'static str, &'static dyn ToolHandler>,
-    /// toolset → [tool_names] for group operations
-    toolset_index: HashMap<&'static str, Vec<&'static str>>,
-    /// Dynamic tools registered at runtime (plugins, MCP)
-    dynamic_tools: HashMap<String, Box<dyn ToolHandler>>,
-}
-```
+`check_fn()` is called on every dispatch. Use for per-request conditions
+(e.g., `ha_*` tools check that `HA_URL` is configured at call time).
 
-### Key Methods
+---
 
-| Method | Signature | Purpose |
-|--------|-----------|---------|
-| `new()` | `→ Self` | Build from inventory (once at startup) |
-| `get_definitions()` | `(enabled, disabled, &ToolContext) → Vec<ToolSchema>` | Filtered schemas for LLM API call |
-| `dispatch()` | `(name, args, &ToolContext) → Result<String, ToolError>` | Execute tool by name (fuzzy fallback) |
-| `register_dynamic()` | `(Box<dyn ToolHandler>)` | Add runtime tool (MCP, plugins) |
-| `tool_names()` | `→ Vec<&str>` | All registered names (static + dynamic) |
-| `toolset_names()` | `→ Vec<&str>` | All toolset names |
-| `tools_in_toolset()` | `(toolset) → Vec<&str>` | Tools in a specific toolset |
-| `toolset_summary()` | `→ Vec<(String, usize)>` | Toolset → count pairs |
-| `is_parallel_safe()` | `(name) → bool` | Check parallel safety flag |
-
-### `get_definitions()` — Three-Context Filter
+## Dispatch path
 
 ```
-get_definitions(enabled, disabled, ctx)
-    ├── 1. is_available() ← startup check
-    ├── 2. check_fn(ctx)  ← runtime gate
-    ├── 3. enabled filter (whitelist — None means include all)
-    ├── 4. disabled filter (blacklist — None means exclude none)
-    └── chain static + dynamic → Vec<ToolSchema>
+  ToolRegistry::dispatch(name, args, ctx)
+        │
+        ├─ exact match in static tools?
+        │       │
+        │       ├─ toolset in active_toolsets? (No → CapabilityDenied)
+        │       ├─ check_fn(&ctx)?             (No → CapabilityDenied)
+        │       └─ handler.execute(args, ctx)
+        │
+        ├─ exact match in dynamic tools? (MCP, plugins)
+        │       └─ same gates as static
+        │
+        └─ no exact match
+                │
+                ▼
+          fuzzy_match(name)   [Levenshtein distance ≤ 3]
+                │
+                ├─ found:  ToolError::NotFound("Did you mean: <suggestion>?")
+                └─ not found: ToolError::NotFound(name)
 ```
 
-Note: Takes `&ToolContext` parameter — this is how runtime gating works. The doc's old version omitted `ctx` from the signature.
+**Reference:** [Levenshtein distance](https://en.wikipedia.org/wiki/Levenshtein_distance)
 
-### `dispatch()` — Fuzzy Fallback
+---
 
-On name mismatch, uses Levenshtein distance (strsim crate, threshold ≤ 3) to suggest the closest tool — helps the LLM self-correct typos:
+## `ToolContext` — the execution environment
 
-```rust
-Err(ToolError::NotFound(format!(
-    "Unknown tool '{}'. Did you mean '{}'?", name, suggestion
-)))
-```
-
-Dispatch checks both `tools` (static) and `dynamic_tools` maps. Also verifies `check_fn()` before execution — returns `ToolError::Unavailable` if gating fails.
-
-## 5. ToolContext — Shared Execution Context
-
-Passed to every tool's `execute()` method. **18 fields** — verified against source:
+Every tool receives a `ToolContext` reference. This is the complete picture of
+what a tool can access:
 
 ```rust
 pub struct ToolContext {
-    pub task_id: String,
-    pub cwd: PathBuf,
-    pub session_id: String,
-    pub user_task: Option<String>,
-    pub cancel: CancellationToken,
-    pub config: AppConfigRef,                   // Arc<RwLock<AppConfig>>
-    pub state_db: Option<Arc<SessionDb>>,
-    pub platform: Platform,
-    pub process_table: Option<Arc<ProcessTable>>,
-    pub provider: Option<Arc<dyn LLMProvider>>,
-    pub tool_registry: Option<Arc<ToolRegistry>>,
-    pub delegate_depth: u32,
+    pub task_id:          String,
+    pub cwd:              PathBuf,          // current working directory
+    pub session_id:       String,
+    pub user_task:        Option<String>,   // original user request (for delegation)
+    pub cancel:           CancellationToken,
+    pub config:           AppConfigRef,     // read-only config snapshot
+    pub state_db:         Option<Arc<SessionDb>>,
+    pub platform:         Platform,
+    pub process_table:    Option<Arc<ProcessTable>>,
+    pub provider:         Option<Arc<dyn LLMProvider>>,  // for generate_image, etc.
+    pub tool_registry:    Option<Arc<ToolRegistry>>,     // for mixture_of_agents
+    pub delegate_depth:   u32,              // max=2; prevents runaway recursion
     pub sub_agent_runner: Option<Arc<dyn SubAgentRunner>>,
-    pub clarify_tx: Option<UnboundedSender<ClarifyRequest>>,
+    pub clarify_tx:       Option<UnboundedSender<ClarifyRequest>>,   // ask user
+    pub approval_tx:      Option<UnboundedSender<ApprovalRequest>>,  // gate danger
     pub on_skills_changed: Option<Arc<dyn Fn() + Send + Sync>>,
-    pub gateway_sender: Option<Arc<dyn GatewaySender>>,
-    pub origin_chat: Option<(String, String)>,
+    pub gateway_sender:   Option<Arc<dyn GatewaySender>>,
+    pub origin_chat:      Option<(String, String)>,  // (platform, chat_id)
+    pub session_key:      Option<String>,
+    pub todo_store:       Option<Arc<TodoStore>>,
 }
 ```
 
-### Field Purpose Guide
+Tests use `ToolContext::test_context()` (compiled only with `#[cfg(test)]`).
 
-| Field | Type | Why |
-|-------|------|-----|
-| `task_id` | `String` | Unique per tool invocation |
-| `cwd` | `PathBuf` | Working directory — path jail root for file tools |
-| `session_id` | `String` | Stable per-conversation identifier |
-| `user_task` | `Option<String>` | Original task description (for sub-agent context) |
-| `cancel` | `CancellationToken` | Propagates Ctrl+C into tool execution |
-| `config` | `AppConfigRef` | Application config — `Arc<RwLock<AppConfig>>` (NOT `Arc<AppConfig>`) |
-| `state_db` | `Option<Arc<SessionDb>>` | Session database — None in tests |
-| `platform` | `Platform` | CLI vs gateway vs ACP — affects tool behavior |
-| `process_table` | `Option<Arc<ProcessTable>>` | Background process management — None in tests/ACP |
-| `provider` | `Option<Arc<dyn LLMProvider>>` | LLM for tools that call LLMs (vision, delegate) |
-| `tool_registry` | `Option<Arc<ToolRegistry>>` | For sub-agent delegation (delegate_task needs tools) |
-| `delegate_depth` | `u32` | 0=root, 1=child, 2+=blocked — prevents infinite recursion |
-| `sub_agent_runner` | `Option<Arc<dyn SubAgentRunner>>` | Breaks circular dep: tools crate → core crate |
-| `clarify_tx` | `Option<UnboundedSender<ClarifyRequest>>` | One-shot channel to TUI for user clarification |
-| `on_skills_changed` | `Option<Arc<dyn Fn()>>` | Callback to invalidate skills prompt cache |
-| `gateway_sender` | `Option<Arc<dyn GatewaySender>>` | Send messages to external platforms |
-| `origin_chat` | `Option<(String, String)>` | (platform, chat_id) for cron delivery routing |
+---
 
-> **Note**: There is NO `agent_ref: Weak<Agent>` field. The previous doc was wrong. Circular dependency is broken via `SubAgentRunner` trait + `sub_agent_runner` field.
+## Dynamic tools (MCP + plugins)
 
-## 6. SubAgentRunner Trait
-
-Breaks circular dependency between edgecrab-tools (defines) and edgecrab-core (implements):
+Static tools use `inventory` and are compiled in. Dynamic tools are registered
+at runtime:
 
 ```rust
+impl ToolRegistry {
+    pub fn register_dynamic(&mut self, handler: Box<dyn ToolHandler>)
+}
+```
+
+This is used by:
+- **MCP servers** — `mcp_list_tools` proxies remote tools as dynamic `ToolHandler` instances
+- **Plugins** — loaded from `~/.edgecrab/plugins/` at startup
+
+Dynamic tools participate in all the same dispatch logic (toolset filtering,
+approval gating, fuzzy matching) as static tools.
+
+---
+
+## `GatewaySender` and `SubAgentRunner` traits
+
+These two traits break the circular dependency (see
+[Crate Dependency Graph](../002_architecture/002_crate_dependency_graph.md)):
+
+```rust
+// Defined in edgecrab-tools/src/registry.rs
+// Implemented in edgecrab-gateway and edgecrab-core respectively
+
+#[async_trait]
+pub trait GatewaySender: Send + Sync + 'static {
+    async fn send_message(&self, platform, recipient, message) -> Result<(), String>;
+    async fn list_targets(&self) -> Result<Vec<String>, String>;
+}
+
 #[async_trait]
 pub trait SubAgentRunner: Send + Sync {
     async fn run_task(
         &self,
-        goal: &str,
-        system_prompt: &str,
+        goal: String,
+        system_prompt: Option<String>,
         enabled_toolsets: Vec<String>,
         max_iterations: u32,
         model_override: Option<String>,
+        parent_cancel: CancellationToken,
     ) -> Result<SubAgentResult, String>;
 }
-
-pub struct SubAgentResult {
-    pub summary: String,
-    pub api_calls: u32,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-}
 ```
 
-## 7. ClarifyRequest Channel
+---
 
-The `clarify` tool communicates with the TUI via an `mpsc` channel:
+## Writing a new tool — step by step
 
-```rust
-pub struct ClarifyRequest {
-    pub question: String,
-    /// One-shot channel — TUI sends user's answer back here
-    pub response_tx: tokio::sync::oneshot::Sender<String>,
-}
+```sh
+# 1. Create the file
+touch crates/edgecrab-tools/src/tools/my_tool.rs
+
+# 2. Implement ToolHandler (see template below)
+
+# 3. Add module declaration
+echo 'pub mod my_tool;' >> crates/edgecrab-tools/src/tools/mod.rs
+
+# 4. Add to a toolset in toolsets.rs (or create a new toolset entry)
+
+# 5. Add tool name to CORE_TOOLS or ACP_TOOLS in toolsets.rs if applicable
+
+# 6. cargo build -- verify it compiles and appears in tool list
+edgecrab tools list | grep my_tool
 ```
 
-```
-┌──────────┐   ClarifyRequest    ┌──────────┐
-│  clarify │ ───(mpsc::tx)────→  │   TUI    │
-│   tool   │                     │  layer   │
-│          │ ←─(oneshot::rx)───  │          │
-└──────────┘    user answer      └──────────┘
-```
-
-Only available in CLI/interactive mode (`clarify_tx` is `Some`). Gateway and ACP modes fall back to returning a `[CLARIFY]` marker in the tool result.
-
-## 8. GatewaySender Trait
-
-Allows tools to send messages to external platforms:
-
-```rust
-#[async_trait]
-pub trait GatewaySender: Send + Sync + 'static {
-    async fn send_message(
-        &self,
-        platform: &str,
-        recipient: &str,
-        message: &str,
-    ) -> Result<(), String>;
-
-    async fn list_targets(&self) -> Result<Vec<String>, String>;
-}
-```
-
-## 9. edgequake-llm Bridge
-
-Converts EdgeCrab's `ToolSchema` to edgequake-llm's `ToolDefinition` for API calls:
-
-```rust
-pub fn to_llm_definitions(schemas: &[ToolSchema]) -> Vec<edgequake_llm::ToolDefinition> {
-    schemas.iter().map(|s| {
-        edgequake_llm::ToolDefinition::function(&s.name, &s.description, s.parameters.clone())
-    }).collect()
-}
-```
-
-## 10. Adding a New Tool
-
-**Step 1:** Create `crates/edgecrab-tools/src/tools/my_tool.rs`:
+Minimal tool template:
 
 ```rust
 use async_trait::async_trait;
-use serde::Deserialize;
-use serde_json::json;
-use edgecrab_types::{ToolError, ToolSchema};
+use serde_json::Value;
+use edgecrab_types::{ToolSchema, ToolError};
 use crate::registry::{ToolContext, ToolHandler};
 
 pub struct MyTool;
 
-#[derive(Deserialize)]
-struct MyArgs {
-    param: String,
-}
-
 #[async_trait]
 impl ToolHandler for MyTool {
     fn name(&self)    -> &'static str { "my_tool" }
-    fn toolset(&self) -> &'static str { "my_toolset" }
-    fn emoji(&self)   -> &'static str { "🔧" }
+    fn toolset(&self) -> &'static str { "file" }       // or a new toolset name
 
-    fn schema(&self) -> ToolSchema {
+    fn schema(&self)  -> ToolSchema {
         ToolSchema {
             name: "my_tool".into(),
-            description: "Does X given Y.".into(),
-            parameters: json!({
+            description: "What this tool does and when to use it.".into(),
+            parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "param": { "type": "string", "description": "..." }
+                    "path": { "type": "string", "description": "File path" }
                 },
-                "required": ["param"]
+                "required": ["path"]
             }),
             strict: None,
         }
     }
 
-    async fn execute(
-        &self,
-        args: serde_json::Value,
-        _ctx: &ToolContext,
-    ) -> Result<String, ToolError> {
-        let args: MyArgs = serde_json::from_value(args)
-            .map_err(|e| ToolError::InvalidArgs {
-                tool: "my_tool".into(),
-                message: e.to_string(),
+    async fn execute(&self, args: Value, ctx: &ToolContext)
+        -> Result<String, ToolError>
+    {
+        let path = args["path"].as_str()
+            .ok_or_else(|| ToolError::InvalidArgs {
+                tool: self.name().into(),
+                message: "path is required".into(),
             })?;
-        Ok(json!({"result": args.param}).to_string())
+
+        // Check cancellation regularly if this might be slow
+        if ctx.cancel.is_cancelled() {
+            return Err(ToolError::ExecutionFailed {
+                tool: self.name().into(),
+                message: "cancelled".into(),
+            });
+        }
+
+        Ok(format!("processed {path}"))
     }
 }
 
-// Compile-time registration — linker guarantees this runs
 inventory::submit! { &MyTool as &dyn ToolHandler }
 ```
 
-**Step 2:** Add `pub mod my_tool;` to `crates/edgecrab-tools/src/tools/mod.rs`.
+---
 
-**Step 3:** (Optional) Add tool name to `CORE_TOOLS` in `toolsets.rs` and/or a toolset alias in `resolve_alias()`.
+## Tips
 
-No other files need changes. `cargo build` verifies registration.
+> **Tip: Write tool descriptions for the model, not for humans.**
+> The `description` field in `ToolSchema` is what the LLM reads to decide whether
+> to call your tool. Be explicit about *when* to use it and what it returns.
 
-## 11. Rust Advantage — Compile-Time Tool Registration
+> **Tip: Include the full input schema with `"required"` fields.**
+> Tools that accept optional parameters should handle missing keys gracefully
+> with defaults. The model may omit optional fields.
 
-| Aspect | hermes-agent (Python) | EdgeCrab (Rust) |
-|--------|----------------------|-----------------|
-| Registration | Runtime import, can fail silently | Compile-time via `inventory`, guaranteed |
-| Type safety | `dict` args, runtime typecheck | `serde_json::Value` + `Deserialize` |
-| Dispatch | `json.loads` + `handler(args)` | Zero-copy deserialization, typed dispatch |
-| Parallel safety | Runtime frozenset check | Trait method, compile-time knowable |
-| Discovery cost | O(n) imports at startup (~200ms) | Zero — linker resolves at build time |
-| Dead tool | Silently registered, never called | Compiler warns unused |
-| Dynamic tools | Python decorator | `register_dynamic()` for MCP/plugins |
+> **Tip: Use `check_fn()` for environment-dependent availability.**
+> If your tool needs an API key or a running service, check it in `check_fn()`.
+> This returns a capability-denied error with a helpful message rather than
+> silently producing a cryptic execution failure.
+
+---
+
+## FAQ
+
+**Q: How does the model know which tools are available?**
+`ToolRegistry::get_definitions(enabled, disabled, ctx)` returns a `Vec<ToolSchema>`
+filtered by active toolsets and `check_fn()`. This list is passed to the LLM
+provider as the `tools` parameter on every API call.
+
+**Q: Can a tool call another tool?**
+Not directly — tools should not import each other or call `ToolRegistry::dispatch`
+themselves. For sub-tasks, use `ctx.sub_agent_runner.run_task(...)` (the
+`delegate_task` tool wraps this) or spawn an isolated agent via `fork_isolated`.
+
+**Q: What is `MAX_CLARIFY_CHOICES = 4`?**
+The `clarify` tool sends a clarification request with up to 4 options to the user.
+The `Clarify` stream event carries a `oneshot::Sender<String>`; the frontend
+renders the options and sends the user's choice back.
+
+---
+
+## Cross-references
+
+- Tool catalogue (all 65 names) → [Tool Catalogue](./002_tool_catalogue.md)
+- Toolset composition and aliases → [Toolset Composition](./003_toolset_composition.md)
+- `ToolContext` and backends → [Tools Runtime](./004_tools_runtime.md)
+- Error payloads sent back to model → [Error Handling](../002_architecture/004_error_handling.md)

@@ -245,7 +245,7 @@ impl HttpMcpConnection {
 
 /// Either a stdio subprocess connection or an HTTP connection to an MCP server.
 enum McpConnectionKind {
-    Stdio(McpConnection),
+    Stdio(Box<McpConnection>),
     Http(HttpMcpConnection),
 }
 
@@ -497,7 +497,7 @@ async fn get_or_connect(server_name: &str, cfg: McpServerConfig) -> Result<(), T
     } else {
         // Stdio subprocess MCP server
         let conn = McpConnection::spawn(&cfg.command, &cfg.args, &cfg.envs).await?;
-        McpConnectionKind::Stdio(conn)
+        McpConnectionKind::Stdio(Box::new(conn))
     };
 
     pool.insert(server_name.to_string(), Mutex::new(kind));

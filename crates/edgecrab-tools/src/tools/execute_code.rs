@@ -36,7 +36,9 @@ use serde_json::json;
 
 use edgecrab_types::{ToolError, ToolSchema};
 
-use crate::registry::{ToolContext, ToolHandler, ToolRegistry};
+#[cfg(unix)]
+use crate::registry::ToolRegistry;
+use crate::registry::{ToolContext, ToolHandler};
 use crate::tools::backends::redact_output;
 
 /// Maximum execution time before we kill the subprocess (5 minutes like hermes).
@@ -47,6 +49,7 @@ const MAX_STDOUT_BYTES: usize = 50_000;
 /// Maximum stderr bytes (10KB like hermes).
 const MAX_STDERR_BYTES: usize = 10_000;
 /// Max tool calls per script execution.
+#[cfg(unix)]
 const MAX_TOOL_CALLS: usize = 50;
 
 /// Tools allowed inside the execute_code sandbox.
@@ -90,6 +93,7 @@ const MAX_TOOL_CALLS: usize = 50;
 ///                      file path, returns text; no side effects beyond local I/O
 ///   session_search  — read-only SQLite FTS5 query over past sessions; lets scripts
 ///                     retrieve context without pulling entire conversation into prompt
+#[cfg(unix)]
 const SANDBOX_ALLOWED_TOOLS: &[&str] = &[
     "web_search",
     "web_extract",
@@ -105,6 +109,7 @@ const SANDBOX_ALLOWED_TOOLS: &[&str] = &[
 ];
 
 /// Terminal parameters that must not be used from sandbox scripts.
+#[cfg(unix)]
 const TERMINAL_BLOCKED_PARAMS: &[&str] = &["background", "check_interval", "pty"];
 
 pub struct ExecuteCodeToolReal;
@@ -143,6 +148,7 @@ fn resolve_runtime(lang: &str) -> Option<(&'static str, &'static str)> {
 /// Generate the `edgecrab_tools.py` module that child scripts import.
 /// Each stub function sends an RPC request over a Unix domain socket
 /// back to the parent process, which dispatches through the ToolRegistry.
+#[cfg(unix)]
 fn generate_tools_module(available_tools: &[&str]) -> String {
     let mut stubs = String::new();
     let available_set: std::collections::HashSet<&str> = available_tools.iter().copied().collect();
@@ -516,6 +522,7 @@ fn build_child_env(sock_path: &str, cwd: &std::path::Path) -> HashMap<String, St
     env
 }
 
+#[cfg(unix)]
 fn resolve_sandbox_tools(ctx: &ToolContext) -> Vec<&'static str> {
     let Some(registry) = ctx.tool_registry.as_ref() else {
         return SANDBOX_ALLOWED_TOOLS.to_vec();
@@ -826,10 +833,10 @@ async fn run_command_capture(
     })
 }
 
-fn configure_process_group(cmd: &mut tokio::process::Command) {
+fn configure_process_group(_cmd: &mut tokio::process::Command) {
     #[cfg(unix)]
     unsafe {
-        cmd.pre_exec(|| {
+        _cmd.pre_exec(|| {
             libc::setpgid(0, 0);
             Ok(())
         });
@@ -969,6 +976,7 @@ impl ToolHandler for ExecuteCodeToolReal {
             "python" | "python3" | "py" | ""
         );
         let timeout_secs = args.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS).min(600);
+        #[cfg(unix)]
         let sandbox_tools = resolve_sandbox_tools(ctx);
 
         let exec_start = std::time::Instant::now();
@@ -1273,6 +1281,7 @@ mod tests {
         assert_eq!(result, "red normal");
     }
 
+    #[cfg(unix)]
     #[test]
     fn generate_tools_module_contains_stubs() {
         let module = generate_tools_module(&["web_search", "terminal"]);
@@ -1287,6 +1296,7 @@ mod tests {
         assert!(module.contains("not available in this execute_code session"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn generate_tools_module_uses_current_web_extract_signature() {
         let module = generate_tools_module(&["web_extract"]);
@@ -1296,6 +1306,7 @@ mod tests {
         assert!(module.contains(r#"args = {"url": url, "max_chars": max_chars, "render_js_fallback": render_js_fallback}"#));
     }
 
+    #[cfg(unix)]
     #[test]
     fn generate_tools_module_all_tools() {
         let module = generate_tools_module(SANDBOX_ALLOWED_TOOLS);
@@ -1321,6 +1332,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn resolve_sandbox_tools_respects_disabled_toolsets() {
         let mut ctx = ToolContext::test_context();

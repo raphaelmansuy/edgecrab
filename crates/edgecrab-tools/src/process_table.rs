@@ -428,12 +428,7 @@ impl ProcessTable {
     /// sends `SIGKILL` via `libc::kill()` on Unix when a PID is available,
     /// mirroring hermes-agent's `os.killpg(-pgid, signal.SIGKILL)` behaviour.
     pub async fn kill(&self, process_id: &str) -> bool {
-        if let Some(entry) = self.records.get(process_id) {
-            let pid = {
-                let rec = entry.value().lock().await;
-                rec.pid
-            };
-
+        if let Some(_entry) = self.records.get(process_id) {
             // Send SIGKILL to the process group so sh -c's children are also
             // killed. run_process spawns with .process_group(0), so pgid == pid.
             // Sending kill(-pgid, SIGKILL) kills every process in the group,
@@ -442,12 +437,18 @@ impl ProcessTable {
             // We also send a direct kill(pid, SIGKILL) as belt-and-suspenders
             // in case the process already moved its children to another group.
             #[cfg(unix)]
-            if let Some(pid) = pid {
-                unsafe {
-                    // Kill the whole process group first
-                    libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
-                    // Belt-and-suspenders: direct kill in case pgid differs
-                    libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            {
+                let pid = {
+                    let rec = _entry.value().lock().await;
+                    rec.pid
+                };
+                if let Some(pid) = pid {
+                    unsafe {
+                        // Kill the whole process group first
+                        libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+                        // Belt-and-suspenders: direct kill in case pgid differs
+                        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                    }
                 }
             }
 

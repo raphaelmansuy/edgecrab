@@ -1,317 +1,227 @@
-# 003.004 — Context Compression & Prompt Caching
+# Context Compression 🦀
 
-> **Cross-refs**: [→ INDEX](../INDEX.md) | [→ 003.002 Conversation Loop](002_conversation_loop.md) | [→ 003.003 Prompt Builder](003_prompt_builder.md)  
-> **Source**: `edgecrab-core/src/compression.rs` — verified against implementation  
-> **Parity**: hermes-agent `agent/context_compressor.py` v0.4.x
+> **Verified against:** `crates/edgecrab-core/src/compression.rs`
 
 ---
 
-## 1. Why Context Compression
+## Why compression exists
 
-Long conversations accumulate tokens until they exceed the model's context window. Hard truncation loses important early context (original goals, key decisions, file paths changed). EdgeCrab's compression pipeline summarises old messages while preserving recent ones verbatim.
+A 90-iteration agent working on a large codebase can generate 50,000+ tokens
+of conversation history. Most LLMs have context windows of 128,000–200,000
+tokens. Without intervention, long sessions either hit the provider's context
+limit (hard error) or silently drop early messages (loss of intent and prior decisions).
 
-```
-Before compression:
-  [system] [user1] [asst1] [tool1] ... [userN-5] ... [userN]
-  ├─ head ─┤                           └──── tail (recent) ───┘
+EdgeCrab uses a 5-pass pipeline to keep sessions alive without losing the
+information that matters.
 
-After compression:
-  [system] [user1] [asst1]  [SUMMARY_MSG]  [userN-5] ... [userN]
-  ├── head ──────────────┤  └─ LLM text ─┘  └──── tail kept ────┘
-```
-
----
-
-## 2. Six-Phase Compression Pipeline
-
-```
-compress_with_llm(messages, params, provider)
-│
-├── Phase 1: Prune tool outputs (cheap, no LLM)
-│       Replace large tool results (>200 chars) with PRUNED_TOOL_PLACEHOLDER.
-│       Often halves the prompt before any LLM work.
-│
-├── Phase 2: Boundary determination
-│       head_end = align_boundary_forward(PROTECT_FIRST_N=3)
-│       tail_token_budget = threshold_tokens × target_ratio (default 0.20)
-│       tail_start = find_tail_cut_by_tokens(head_end, tail_budget, protect_last_n)
-│       Both boundaries aligned to avoid splitting tool_call/tool_result groups.
-│
-├── Phase 3: Extract prior summary (iterative update)
-│       Search for a SUMMARY_PREFIX block in message history.
-│       When found → feed as "prior summary" for an UPDATE rather than
-│       re-summarising from scratch (cheaper, more coherent).
-│
-├── Phase 4: LLM summarization
-│       Prompt template: 8 sections (see §6).
-│       On LLM failure → build_summary() structural fallback (always succeeds).
-│
-├── Phase 5: Assemble
-│       result = head_messages + [summary_message] + tail_messages
-│
-└── Phase 6: Orphan sanitization
-        Remove tool results whose parent tool_call was summarised away.
-        Inject one-line stub results for tool_calls that lost their results.
-        → Always produces an API-compliant message list.
-```
+🦀 *`hermes-agent` (Python) raised an unhandled exception at the provider context limit.
+OpenClaw silently slices earlier tokens. EdgeCrab compresses intelligently and keeps fighting.*
 
 ---
 
-## 3. Constants
+## Defaults from source
 
 ```rust
-// edgecrab-core/src/compression.rs
+// compression.rs
+const DEFAULT_CONTEXT_WINDOW: usize = 128_000;
+const DEFAULT_THRESHOLD:      f64   = 0.50;    // compress at 50% full
+const DEFAULT_TARGET_RATIO:   f64   = 0.20;    // target 20% of window after
+const DEFAULT_PROTECT_LAST_N: usize = 20;      // always keep last 20 messages
+const PROTECT_FIRST_N:        usize = 3;       // always keep first 3 messages
+const PRESSURE_WARNING_PCT:   f64   = 0.85;    // warn at 85% of threshold
+```
 
+Key constants exported:
+```rust
 pub const SUMMARY_PREFIX: &str =
     "[CONTEXT COMPACTION] Earlier turns were summarised to reclaim context window space.\n\n";
 
-pub const PRUNED_TOOL_PLACEHOLDER: &str =
-    "[tool output pruned — reclaimed context window space]";
-
-const PROTECT_FIRST_N: usize = 3;       // always keep system + first exchange
-const MIN_SUMMARY_TOKENS: usize = 2_000;
-const SUMMARY_RATIO: f32 = 0.20;        // content_tokens × 0.20 → budget
-const SUMMARY_TOKENS_CEILING: usize = 12_000;
-const CHARS_PER_TOKEN: usize = 4;       // rough estimation without tokenizer
-const STUB_TOOL_RESULT: &str = "[Result from earlier conversation — see context summary above]";
+pub const PRUNED_TOOL_PLACEHOLDER: &str = "[tool output pruned for context efficiency]";
 ```
 
 ---
 
-## 4. CompressionParams
+## When compression fires
 
-```rust
-pub struct CompressionParams {
-    pub context_window: usize,   // default: 128_000 tokens
-    pub threshold: f32,          // compress when estimated ≥ window × threshold (default 0.50)
-    pub target_ratio: f32,       // tail_budget = threshold_tokens × target_ratio (default 0.20)
-    pub protect_last_n: usize,   // floor: always keep at least N recent messages (default 20)
-}
+```
+  After every LLM response:
+  check_compression_status(messages, params, context_window)
+        │
+        ├── Ok                         → nothing to do
+        │
+        ├── PressureWarning             → emit StreamEvent::ContextPressure
+        │    estimated > 85% of         to warn the user (no compression yet)
+        │    threshold×window
+        │
+        └── Compressed                 → run compress_with_llm() pipeline
+             estimated > threshold×window    (currently: > 50% of 128K = 64K)
 ```
 
-### Default values
-
-| Field | Default | Notes |
-|---|---|---|
-| `context_window` | 128 000 | API response `usage.prompt_tokens` gives exact count |
-| `threshold` | 0.50 | Compression fires at 50 % of context window |
-| `target_ratio` | 0.20 | Tail = 20 % of threshold_tokens |
-| `protect_last_n` | 20 | Floor: at least 20 recent messages always kept |
+Token estimation uses a fast character-count approximation (~4 chars/token)
+rather than a full tokeniser — fast enough for hot-path checks, accurate
+enough for triggering decisions.
 
 ---
 
-## 5. CompressionStatus — Pressure Warnings
-
-```rust
-pub enum CompressionStatus {
-    Ok,                 // below 85% of threshold
-    PressureWarning,    // between 85% and 100% of threshold → UI warning emitted
-    NeedsCompression,   // at or above threshold → compression fires
-}
-```
-
-`check_compression_status()` is called every iteration of the conversation loop:
+## The 5-pass compression pipeline
 
 ```
-estimated_tokens ≥ threshold_tokens              → NeedsCompression (compress now)
-estimated_tokens ≥ threshold_tokens × 0.85       → PressureWarning  (emit event once)
-otherwise                                        → Ok
-```
+  Input: full message history
 
-When `PressureWarning` fires, the conversation loop emits `StreamEvent::ContextPressure { estimated_tokens, threshold_tokens }` exactly once per pressure episode (suppressed on subsequent iterations until compression clears the warning level).
+  ┌────────────────────────────────────────────────────────────────┐
+  │  PASS 1 — Tool output pruning (no LLM, cheap)                  │
+  │                                                                │
+  │  For every tool_result message:                                │
+  │    if content.len() > LARGE_OUTPUT_THRESHOLD:                  │
+  │      replace with PRUNED_TOOL_PLACEHOLDER                      │
+  │      "[tool output pruned for context efficiency]"             │
+  │                                                                │
+  │  Typically removes 60-80% of tokens in long sessions           │
+  └────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+  ┌────────────────────────────────────────────────────────────────┐
+  │  PASS 2 — Boundary determination                               │
+  │                                                                │
+  │  Identify:                                                     │
+  │    protected_head   = messages[0..PROTECT_FIRST_N]   (3)       │
+  │    protected_tail   = messages[-protect_last_n..]    (20)      │
+  │    compression_zone = messages[3..-20]                         │
+  └────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+  ┌────────────────────────────────────────────────────────────────┐
+  │  PASS 3 — LLM summary of compression_zone                      │
+  │                                                                │
+  │  System prompt:                                                │
+  │    "Summarise the following conversation into 8 sections:      │
+  │     1. Goal   2. Constraints   3. Progress   4. Decisions      │
+  │     5. Files  6. Next Steps    7. Critical Context  8. Errors" │
+  │                                                                │
+  │  Result: one system message with SUMMARY_PREFIX prepended      │
+  └────────────────────────────────────────────────────────────────┘
+                              │
+                    ┌─────────┴──────────┐
+                    │ LLM failure?        │
+                    ▼ Yes                ▼ No (normal)
+  ┌──────────────────────┐   ┌───────────────────────────────────┐
+  │  PASS 4 — Structural  │   │  Insert SUMMARY_PREFIX message +  │
+  │  fallback summary    │   │  reassemble: head + summary +      │
+  │                      │   │  tail                              │
+  │  Generate summary    │   └───────────────────────────────────┘
+  │  from metadata +     │
+  │  message types only  │
+  │  (no LLM needed)     │
+  └──────────────────────┘
+                              │
+                              ▼
+  ┌────────────────────────────────────────────────────────────────┐
+  │  PASS 5 — Orphan sanitisation                                  │
+  │                                                                │
+  │  walk final message list:                                      │
+  │    │                                                           │
+  │    ├── orphaned tool_result (no matching tool_call)            │
+  │    │     → remove (would cause API error)                      │
+  │    │                                                           │
+  │    └── orphaned tool_call in assistant message                 │
+  │          → inject stub tool_result                             │
+  │            "[result not available after context compression]"  │
+  └────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
-## 6. Eight-Section Summary Template
+## The 8-section summary format
 
-All LLM-generated summaries use this exact Markdown structure (hermes-agent 0.4.x format):
+The LLM is instructed to produce this exact structure in Pass 3:
 
-```markdown
-## Goal
-[What the user is trying to accomplish]
-
-## Constraints & Preferences
-[User preferences, coding style, constraints, important decisions]
-
-## Progress
-### Done
-[Completed work — specific file paths, commands run, results obtained]
-### In Progress
-[Work currently underway]
-### Blocked
-[Any blockers or issues encountered]
-
-## Key Decisions
-[Important technical decisions and why they were made]
-
-## Relevant Files
-[Files read, modified, or created — with brief note on each]
-
-## Next Steps
-[What needs to happen next to continue the work]
-
-## Critical Context
-[Specific values, error messages, configuration details, or data that would be lost without explicit preservation]
-```
-
-On iterative compression (prior summary exists), the prompt asks the LLM to **UPDATE** rather than re-summarise — cheaper and more coherent.
-
-### Summary Token Budget
-
-```
-budget = content_tokens × 0.20
-ceiling = min(context_window × 0.05, 12_000)
-final_budget = max(2_000, min(budget, ceiling))
-```
-
-Example: 128 K context window → ceiling = `min(6_400, 12_000)` = **6 400 tokens**.
-
----
-
-## 7. Boundary Alignment
-
-Two functions ensure boundaries never split a `tool_call`/`tool_result` group:
-
-| Function | Purpose |
+| Section | Content |
 |---|---|
-| `align_boundary_forward(messages, idx)` | Slides head boundary forward past leading tool results |
-| `align_boundary_backward(messages, idx)` | Pulls tail boundary before a parent assistant-with-tool-calls |
-
-**Why**: An assistant message with `tool_calls` must always be followed by a tool result for each call_id. If compression splits this group, the API rejects the message list. Alignment guarantees the entire group (assistant + results) is either in the summarised region or in the tail.
-
----
-
-## 8. Orphan Sanitization
-
-After assembling `head + summary + tail`, `sanitize_orphan_pairs()` runs a final check:
-
-1. **Orphaned results** (result references a call_id that was summarised away) → **removed**.  
-2. **Orphaned calls** (assistant has tool_calls but result was dropped) → **stub result injected**:  
-   `"[Result from earlier conversation — see context summary above]"`
-
-This ensures the assembled list is always API-compliant regardless of where compression boundaries fall.
+| **Goal** | The user's original overall objective |
+| **Constraints** | Rules and limits established during the session |
+| **Progress** | What has been completed or confirmed |
+| **Decisions** | Key decisions made and the reasoning behind them |
+| **Files touched** | Files read, written, or modified |
+| **Next steps** | What was planned before compression |
+| **Critical context** | Any fact that must not be lost |
+| **Errors encountered** | Failures and how they were resolved |
 
 ---
 
-## 9. Prompt Caching (Anthropic)
+## Example: before and after
 
-EdgeCrab supports Anthropic's prompt caching via `CachePromptConfig`:
-
-```rust
-// conversation.rs — per-turn config
-let cache_cfg = if config.model_config.prompt_caching {
-    Some(CachePromptConfig::default())
-} else {
-    None
-};
-let chat_messages = build_chat_messages(
-    session.cached_system_prompt.as_deref(),
-    &session.messages,
-    cache_cfg.as_ref(),
-);
+**Before compression** (simplified):
+```
+  system:    "You are EdgeCrab..."  [5,000 tokens]
+  user:      "Refactor the auth module"
+  assistant: "I'll start by reading the files"
+  tool:      [read_file content: 8,000 tokens of source]
+  tool:      [read_file content: 6,000 tokens of source]
+  assistant: "I've read both files. Here's my plan..."
+  user:      "Proceed"
+  assistant: "Writing the refactored version..."
+  tool:      [write_file result]
+  ...  [60 more messages]
+  Total: ~95,000 tokens
 ```
 
-`apply_cache_control()` (edgequake-llm) pins `cache_control: {"type": "ephemeral"}` breakpoints on:
-- The system prompt (slot 1 — most stable, cheapest re-use)
-- The last assistant message (slot 2 — changes each turn)
-
-**Why stable system prompt matters**: The LLM-generated summary is injected as a `Message::system_summary()` (role=`system`), not prepended to the cached system prompt. This way the main system prompt (identity, tools, skills) stays entirely stable across turns and can always be cache-hit, even as the summary message changes.
-
----
-
-## 10. Token Estimation
-
-```rust
-pub fn estimate_tokens(messages: &[Message]) -> usize {
-    messages.iter()
-        .map(|m| (m.text_content().len() / 4) + 4)
-        .sum()
-}
+**After compression** (Pass 1 + 3):
 ```
-
-- ~4 chars/token (GPT/Claude heuristic — fast, no tokenizer dependency)  
-- 4-token overhead per message (role/metadata)  
-- Good enough for the compression threshold check; exact counts come from API response `usage` fields
-
----
-
-## 11. Before/After Example
-
-```
-Before (30 messages, estimated ~65 000 tokens > 50% threshold):
-  [system][user1][asst1][user2][asst2+tools][tool][tool]...[user28][asst29][user30]
-
-After compress_with_llm():
-  [system][user1][asst1]
-  [system_summary: "[CONTEXT COMPACTION] ... ## Goal\n... ## Progress\n..."]
-  [user28][asst29][user30]
-  ← 6 messages, roughly 8 000 tokens
+  system:    "You are EdgeCrab..."  [5,000 tokens]
+  system:    "[CONTEXT COMPACTION] Goal: Refactor auth module.
+              Progress: Read auth.rs and session.rs. Wrote
+              new auth.rs with JWT support.
+              Files touched: src/auth.rs, src/session.rs
+              ..."  [~800 tokens]
+  user:      [last 20 messages preserved]
+  ...
+  Total: ~15,000 tokens
 ```
 
 ---
 
-## 12. Configuration Reference
+## Tips
 
-```toml
-# ~/.edgecrab/config.toml (or CLI flags)
-[model]
-prompt_caching = true      # enable Anthropic cache_control breakpoints
+> **Tip: `StreamEvent::ContextPressure` is the early warning sign.**
+> When you see "context pressure" in the TUI, the next few iterations will
+> trigger compression. If you're mid-task, consider finishing the current
+> sub-task before the compression fires — it may lose some tool output detail.
 
-# CompressionParams are currently hardcoded to defaults.
-# Future: expose compression.threshold / compression.target_ratio in config.
-```
+> **Tip: `force_compress()` on `Agent` triggers compression immediately.**
+> Useful in tests or when you want to checkpoint a long session before
+> handing off to a sub-agent.
 
-See [→ 009 Config & State](../009_config_state/001_config_state.md) for full config schema.
+> **Tip: The `protect_last_n` default of 20 means the most recent 20 messages
+> are ALWAYS preserved verbatim.** Compression never truncates your immediate
+> context — only older history is summarised.
 
+---
 
-## 6. Compression Triggers
+## FAQ
 
-The conversation loop triggers compression in two phases:
+**Q: Does compression lose information?**
+Some detail is lost in the summary, but critical facts are preserved by the
+8-section format. The LLM is instructed to retain all decisions, errors, and
+file paths — this is more structured than `hermes-agent` or OpenClaw's naive truncation.
 
-```
-Phase 1 — Preflight (before main loop begins):
-  if needs_compression(messages, params):
-      compress_with_llm() up to 3 passes
+**Q: What if the LLM fails to produce a summary?**
+Pass 4 kicks in: a structural summary is generated from message type metadata
+(no content). This is lower quality but never crashes the session.
 
-Phase 2 — Mid-loop (after tool calls generate large output):
-  if needs_compression(messages, params):
-      compress_with_llm() once before next API call
-```
+**Q: How does compression affect tool call history integrity?**
+Pass 5 (orphan sanitisation) ensures the final message list is always valid.
+Orphaned `tool_result` messages (whose `tool_call` was pruned) are removed.
+Orphaned `tool_call` references get stub results inserted.
 
-## 7. Structural Fallback
+**Q: Can I disable compression?**
+Set `compression.enabled = false` in `~/.edgecrab/config.yaml`. The agent
+will hit the provider's context limit instead and get a hard `ContextLimit` error.
+Not recommended for long sessions.
 
-When the LLM summarization call fails, a stat-based summary is generated:
+---
 
-```
-[CONTEXT COMPACTION] <N> earlier messages summarized.
-  Turns: <user_count> user, <assistant_count> assistant
-  Tool calls made: <M>
+## Cross-references
 
-  Key excerpts:
-  [first 200 chars of earliest user message]
-  [first 200 chars of last assistant message before cutoff]
-```
-
-## 8. Iterative Updates
-
-Each new compression pass checks for an existing `SUMMARY_PREFIX` block in the messages. If found, it's included as prior context in the summarization prompt:
-
-```
-Summarization prompt structure:
-  "Prior summary: <existing summary>"
-  "New messages to integrate: <pruned old messages>"
-  "Produce an updated structured summary covering both."
-```
-
-Summaries **improve** with each subsequent compaction rather than restarting from scratch.
-
-## 9. Config Integration
-
-```yaml
-# config.yaml
-compression:
-  enabled: true
-  threshold: 0.50       # Compress at 50% of context window
-  protect_last_n: 20    # Always keep last 20 messages
-  summary_model: null   # Optional: use cheaper model for summaries
-```
+- Where compression is triggered in the loop → [Conversation Loop](./002_conversation_loop.md)
+- Token estimation and cost tracking → [Data Models](../010_data_models/001_data_models.md)
+- Session message format preserved through compression → [Session Storage](../009_config_state/002_session_storage.md)

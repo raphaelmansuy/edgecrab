@@ -15,57 +15,43 @@
 
 ![EdgeCrab — The Clash of the Crustaceans](assets/edgecrab-hero.jpeg)
 
-```text
-┌──────────────────────────────────────────────────────────────────────────┐
-│                         EdgeCrab Architecture                            │
-│                                                                          │
-│  ┌────────────────┐        ┌─────────────────────────────────────────┐  │
-│  │  edgecrab-cli  │        │             edgecrab-core               │  │
-│  │  ratatui  TUI  │──────▶ │  Agent ──▶ ReAct loop ──▶ tools/LLM    │  │
-│  │  subcommands: │        └─────────────────────────────────────────┘  │
-│  │  setup doctor │                         │                           │
-│  │  migrate  acp │        ┌────────────────┴────────────────────────┐  │
-│  └────────────────┘        │            edgecrab-tools               │  │
-│                            │  file · terminal · web · process ·      │  │
-│  ┌────────────────┐        │  memory · skills · sessions             │  │
-│  │ edgecrab-      │        └─────────────────────────────────────────┘  │
-│  │  gateway       │                         │                           │
-│  │  HTTP adapters │        ┌────────────────┴────────────────────────┐  │
-│  └────────────────┘        │          edgecrab-security              │  │
-│                            │  path-safety · SSRF · cmd-scan ·        │  │
-│  ┌────────────────┐        │  output-redaction                       │  │
-│  │  edgecrab-acp  │        └─────────────────────────────────────────┘  │
-│  │  JSON-RPC 2.0  │                                                     │
-│  │  stdio adapter │        ┌─────────────────────────────────────────┐  │
-│  └────────────────┘        │          edgecrab-state                 │  │
-│                            │  SQLite WAL · FTS5 session search       │  │
-│  ┌────────────────┐        └─────────────────────────────────────────┘  │
-│  │ edgecrab-      │                                                     │
-│  │  migrate       │  ◀──── import hermes-agent config/memories/skills  │
-│  └────────────────┘                                                     │
-└──────────────────────────────────────────────────────────────────────────┘
-```
+
+## Architecture
+
+![Architecture](./assets/edgecrab-archi.jpg)
 
 ---
 
 ## Table of Contents
 
-- [Why EdgeCrab?](#why-edgecrab)
-- [Release Channels](#release-channels)
-- [Quick Start (90 seconds)](#quick-start-90-seconds)
-- [Python SDK](#python-sdk)
-- [Node.js SDK](#nodejs-sdk)
-- [Provider Setup](#provider-setup)
-- [All CLI Commands](#all-cli-commands)
-- [Slash Commands (inside TUI)](#slash-commands-inside-tui)
-- [Migrating from hermes-agent](#migrating-from-hermes-agent)
-- [ACP / VS Code Copilot Integration](#acp--vs-code-copilot-integration)
-- [Theme Customization](#theme-customization)
-- [Security Model](#security-model)
-- [Testing](#testing)
-- [Project Structure](#project-structure)
-- [Contributing](#contributing)
-- [License](#license)
+- [EdgeCrab 🦀](#edgecrab-)
+  - [Architecture](#architecture)
+  - [Table of Contents](#table-of-contents)
+  - [Release Channels](#release-channels)
+  - [Why EdgeCrab?](#why-edgecrab)
+  - [Quick Start (90 seconds)](#quick-start-90-seconds)
+    - [Option A — npm (no Rust required)](#option-a--npm-no-rust-required)
+    - [Option B — pip (no Rust required)](#option-b--pip-no-rust-required)
+    - [Option C — cargo (compile from source)](#option-c--cargo-compile-from-source)
+    - [Option D — Build from source](#option-d--build-from-source)
+    - [Guided setup](#guided-setup)
+    - [3. Verify health](#3-verify-health)
+    - [4. Start chatting](#4-start-chatting)
+  - [Python SDK](#python-sdk)
+  - [Node.js SDK](#nodejs-sdk)
+  - [Provider Setup](#provider-setup)
+  - [All CLI Commands](#all-cli-commands)
+  - [Slash Commands (inside TUI)](#slash-commands-inside-tui)
+  - [Migrating from hermes-agent](#migrating-from-hermes-agent)
+  - [ACP / VS Code Copilot Integration](#acp--vs-code-copilot-integration)
+  - [Theme Customization](#theme-customization)
+  - [Security Model](#security-model)
+  - [Testing](#testing)
+  - [Docker](#docker)
+  - [Project Structure](#project-structure)
+  - [Requirements](#requirements)
+  - [Build](#build)
+  - [License](#license)
 
 ---
 
@@ -73,15 +59,15 @@
 
 Tagged releases publish every supported distribution target through GitHub Actions:
 
-| Channel | Artifact | Install / Pull |
-|---------|----------|----------------|
-| Rust crates | `edgecrab-types`, `edgecrab-core`, … `edgecrab-cli` (10 crates) | `cargo install edgecrab-cli` |
-| **npm CLI** | `edgecrab-cli` (binary wrapper — no Rust required) | `npm install -g edgecrab-cli` |
-| **pip CLI** | `edgecrab-cli` (binary wrapper — no Rust required) | `pip install edgecrab-cli` |
-| Python SDK | `edgecrab-sdk` wheels + sdist | `pip install edgecrab-sdk` |
-| Node.js SDK | `edgecrab-sdk` | `npm install edgecrab-sdk` |
-| Docker | GHCR multi-arch image | `docker pull ghcr.io/raphaelmansuy/edgecrab:latest` |
-| CLI binary | GitHub Release archives | [GitHub Releases](https://github.com/raphaelmansuy/edgecrab/releases) |
+| Channel     | Artifact                                                        | Install / Pull                                                        |
+| ----------- | --------------------------------------------------------------- | --------------------------------------------------------------------- |
+| Rust crates | `edgecrab-types`, `edgecrab-core`, … `edgecrab-cli` (10 crates) | `cargo install edgecrab-cli`                                          |
+| **npm CLI** | `edgecrab-cli` (binary wrapper — no Rust required)              | `npm install -g edgecrab-cli`                                         |
+| **pip CLI** | `edgecrab-cli` (binary wrapper — no Rust required)              | `pip install edgecrab-cli`                                            |
+| Python SDK  | `edgecrab-sdk` wheels + sdist                                   | `pip install edgecrab-sdk`                                            |
+| Node.js SDK | `edgecrab-sdk`                                                  | `npm install edgecrab-sdk`                                            |
+| Docker      | GHCR multi-arch image                                           | `docker pull ghcr.io/raphaelmansuy/edgecrab:latest`                   |
+| CLI binary  | GitHub Release archives                                         | [GitHub Releases](https://github.com/raphaelmansuy/edgecrab/releases) |
 
 Release automation: see `.github/workflows/` — `release-rust.yml`, `release-python.yml`, `release-node.yml`, `release-docker.yml`.
 
@@ -89,17 +75,17 @@ Release automation: see `.github/workflows/` — `release-rust.yml`, `release-py
 
 ## Why EdgeCrab?
 
-| Feature | EdgeCrab 🦀 | hermes-agent ☤ |
-|---------|------------|----------------|
-| Language | Rust (memory-safe, zero GC pauses) | Python |
-| Binary | Single static binary, no runtime deps | Python venv + Node.js |
-| Startup | < 50 ms | ~1–3 s |
-| Memory | ~15 MB resident | ~80–150 MB |
-| Security | Compiled-in: path safety, SSRF, command scanning | Runtime checks |
-| TUI | ratatui (GPU-composited, 60 fps capable) | prompt_toolkit |
-| ACP | Built-in JSON-RPC 2.0 stdio adapter | Optional |
-| Migrate | `edgecrab migrate` imports hermes state | N/A |
-| Tests | 1200+ tests (unit + integration) | — |
+| Feature  | EdgeCrab 🦀                                       | hermes-agent ☤        |
+| -------- | ------------------------------------------------ | --------------------- |
+| Language | Rust (memory-safe, zero GC pauses)               | Python                |
+| Binary   | Single static binary, no runtime deps            | Python venv + Node.js |
+| Startup  | < 50 ms                                          | ~1–3 s                |
+| Memory   | ~15 MB resident                                  | ~80–150 MB            |
+| Security | Compiled-in: path safety, SSRF, command scanning | Runtime checks        |
+| TUI      | ratatui (GPU-composited, 60 fps capable)         | prompt_toolkit        |
+| ACP      | Built-in JSON-RPC 2.0 stdio adapter              | Optional              |
+| Migrate  | `edgecrab migrate` imports hermes state          | N/A                   |
+| Tests    | 1200+ tests (unit + integration)                 | —                     |
 
 ---
 
@@ -260,22 +246,22 @@ Full docs: [sdks/node/README.md](sdks/node/README.md)
 
 EdgeCrab supports **14 LLM providers** out of the box (12 cloud + 2 local). Set the appropriate environment variable before running `edgecrab setup`:
 
-| Provider | Env Var | Notes |
-|----------|---------|-------|
-| `copilot` | `GITHUB_TOKEN` | VS Code Copilot — free with GitHub Copilot subscription |
-| `openai` | `OPENAI_API_KEY` | GPT-4.1, GPT-5, o3/o4 |
-| `anthropic` | `ANTHROPIC_API_KEY` | Claude Sonnet / Opus |
-| `google` | `GOOGLE_API_KEY` | Gemini 2.5 / 3.x |
-| `vertexai` | `GOOGLE_APPLICATION_CREDENTIALS` | Google Vertex AI |
-| `xai` | `XAI_API_KEY` | Grok 3 / 4 |
-| `deepseek` | `DEEPSEEK_API_KEY` | DeepSeek V3, R1 |
-| `mistral` | `MISTRAL_API_KEY` | Mistral Large / Small |
-| `groq` | `GROQ_API_KEY` | Llama 3.x, Gemma2 via Groq |
-| `huggingface` | `HUGGING_FACE_HUB_TOKEN` | Hugging Face Inference API |
-| `zai` | `ZAI_API_KEY` | Z.AI / GLM models |
-| `openrouter` | `OPENROUTER_API_KEY` | 600+ models via one endpoint |
-| `ollama` | *(none)* | Local — run `ollama serve` on port 11434 |
-| `lmstudio` | *(none)* | Local — run LM Studio on port 1234 |
+| Provider      | Env Var                          | Notes                                                   |
+| ------------- | -------------------------------- | ------------------------------------------------------- |
+| `copilot`     | `GITHUB_TOKEN`                   | VS Code Copilot — free with GitHub Copilot subscription |
+| `openai`      | `OPENAI_API_KEY`                 | GPT-4.1, GPT-5, o3/o4                                   |
+| `anthropic`   | `ANTHROPIC_API_KEY`              | Claude Sonnet / Opus                                    |
+| `google`      | `GOOGLE_API_KEY`                 | Gemini 2.5 / 3.x                                        |
+| `vertexai`    | `GOOGLE_APPLICATION_CREDENTIALS` | Google Vertex AI                                        |
+| `xai`         | `XAI_API_KEY`                    | Grok 3 / 4                                              |
+| `deepseek`    | `DEEPSEEK_API_KEY`               | DeepSeek V3, R1                                         |
+| `mistral`     | `MISTRAL_API_KEY`                | Mistral Large / Small                                   |
+| `groq`        | `GROQ_API_KEY`                   | Llama 3.x, Gemma2 via Groq                              |
+| `huggingface` | `HUGGING_FACE_HUB_TOKEN`         | Hugging Face Inference API                              |
+| `zai`         | `ZAI_API_KEY`                    | Z.AI / GLM models                                       |
+| `openrouter`  | `OPENROUTER_API_KEY`             | 600+ models via one endpoint                            |
+| `ollama`      | *(none)*                         | Local — run `ollama serve` on port 11434                |
+| `lmstudio`    | *(none)*                         | Local — run LM Studio on port 1234                      |
 
 Switch provider at any time with `--model`:
 
@@ -314,16 +300,16 @@ edgecrab --debug "…"              # Enable debug logging
 
 ## Slash Commands (inside TUI)
 
-| Command | Action |
-|---------|--------|
-| `/help` | List all slash commands |
-| `/model provider/model` | Hot-swap LLM without restart |
-| `/new` or `/session new` | Clear history, start fresh |
-| `/theme` | Reload theme from `~/.edgecrab/skin.yaml` |
-| `/tools` | List active toolsets and available tools |
-| `/doctor` | Run diagnostics inline |
-| `/clear` | Clear the output area |
-| `/exit` or `Ctrl-C` | Quit EdgeCrab |
+| Command                  | Action                                    |
+| ------------------------ | ----------------------------------------- |
+| `/help`                  | List all slash commands                   |
+| `/model provider/model`  | Hot-swap LLM without restart              |
+| `/new` or `/session new` | Clear history, start fresh                |
+| `/theme`                 | Reload theme from `~/.edgecrab/skin.yaml` |
+| `/tools`                 | List active toolsets and available tools  |
+| `/doctor`                | Run diagnostics inline                    |
+| `/clear`                 | Clear the output area                     |
+| `/exit` or `Ctrl-C`      | Quit EdgeCrab                             |
 
 ---
 
@@ -339,12 +325,12 @@ edgecrab migrate
 
 What gets imported:
 
-| Asset | Source | Destination |
-|-------|--------|-------------|
-| Config | `~/.hermes/config.yaml` | `~/.edgecrab/config.yaml` |
-| Memories | `~/.hermes/memories/` | `~/.edgecrab/memories/` |
-| Skills | `~/.hermes/skills/` | `~/.edgecrab/skills/` |
-| Env vars | `~/.hermes/.env` | `~/.edgecrab/.env` |
+| Asset    | Source                  | Destination               |
+| -------- | ----------------------- | ------------------------- |
+| Config   | `~/.hermes/config.yaml` | `~/.edgecrab/config.yaml` |
+| Memories | `~/.hermes/memories/`   | `~/.edgecrab/memories/`   |
+| Skills   | `~/.hermes/skills/`     | `~/.edgecrab/skills/`     |
+| Env vars | `~/.hermes/.env`        | `~/.edgecrab/.env`        |
 
 ---
 
@@ -386,13 +372,13 @@ tool_prefix:   "⚙"
 
 EdgeCrab applies defense-in-depth at every layer:
 
-| Layer | Protection |
-|-------|-----------|
-| File I/O | Path traversal prevention — all paths canonicalized and checked against allowed roots |
-| Web tools | SSRF guard — blocks private IP ranges (10.x, 192.168.x, 172.16.x, 127.x, ::1) |
-| Terminal tools | Command injection scanning — rejects shell metacharacters in arguments |
-| LLM output | Redaction pipeline — strips secrets/tokens before displaying or logging |
-| State DB | WAL mode SQLite with integrity checks |
+| Layer          | Protection                                                                            |
+| -------------- | ------------------------------------------------------------------------------------- |
+| File I/O       | Path traversal prevention — all paths canonicalized and checked against allowed roots |
+| Web tools      | SSRF guard — blocks private IP ranges (10.x, 192.168.x, 172.16.x, 127.x, ::1)         |
+| Terminal tools | Command injection scanning — rejects shell metacharacters in arguments                |
+| LLM output     | Redaction pipeline — strips secrets/tokens before displaying or logging               |
+| State DB       | WAL mode SQLite with integrity checks                                                 |
 
 ---
 
@@ -482,10 +468,10 @@ edgecrab/
 
 ## Requirements
 
-| Tool  | Version      |
-|-------|--------------|
-| Rust  | 1.85+        |
-| Cargo | (bundled)    |
+| Tool  | Version               |
+| ----- | --------------------- |
+| Rust  | 1.85+                 |
+| Cargo | (bundled)             |
 | OS    | macOS, Linux, Windows |
 
 ---

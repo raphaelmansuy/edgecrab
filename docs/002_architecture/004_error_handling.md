@@ -1,190 +1,308 @@
-# 002.004 — Error Handling Strategy
+# Error Handling 🦀
 
-> **Cross-refs**: [→ INDEX](../INDEX.md) | [→ 002.001 Architecture](001_system_architecture.md)
+> **Verified against:** `crates/edgecrab-types/src/error.rs` ·
+> `crates/edgecrab-core/src/conversation.rs` ·
+> `crates/edgecrab-tools/src/registry.rs`
 
-## 1. Strategy: thiserror for Libraries, anyhow for Binaries
+---
 
-| Crate Type | Error Library | Rationale |
-|-----------|--------------|-----------|
-| `edgecrab-types` | `thiserror` | Precise error variants, downstream can match |
-| `edgecrab-core` | `thiserror` | Library consumers need structured errors |
-| `edgecrab-tools` | `thiserror` | Tool errors carry retry strategy |
-| `edgecrab-state` | `thiserror` | Database errors distinguish transient vs permanent |
-| `edgecrab-security` | `thiserror` | Scan results are structured data, not errors |
-| `edgecrab-cli` | `anyhow` | Top-level binary, context-rich reporting |
-| `edgecrab-gateway` | `anyhow` | Top-level binary, context-rich reporting |
+## Why the error model is what it is
 
-## 2. Core Error Types
+`hermes-agent` — EdgeCrab's Python predecessor — surfaced failures through Python
+exceptions and string messages: easy to raise, impossible to branch on specific
+failure modes without `isinstance` checks or string parsing. Tool errors were
+formatted as plain text and passed back to the model, losing all structure.
+OpenClaw ([TypeScript/Node.js](https://github.com/openclaw)) surfaces tool
+failures as untyped JavaScript `Error` objects — the same limitation in a
+different runtime.
+
+EdgeCrab uses typed errors (`thiserror` enums) for two concrete reasons:
+
+1. **Callers can branch on the variant** — the agent loop treats `RateLimited`
+   differently from `BudgetExhausted` differently from `ToolExecution`. You
+   cannot do that with a stringly-typed error.
+
+2. **Tool failures become structured LLM input** — when a tool returns
+   `Err(ToolError)`, the loop does not propagate a Rust error. It serialises
+   the error into a JSON `ToolErrorResponse` and appends it to the
+   conversation history. The model reads it, understands what went wrong, and
+   adapts — rather than looping blindly.
+
+🦀 *This is EdgeCrab's decisive advantage in the tool-use bout:
+instead of surfacing an opaque error string when a claw misses, the crab tells
+itself exactly which variant failed and what angle to try next.*
+
+---
+
+## The two error enums
+
+### `AgentError` — agent / provider layer
 
 ```rust
 // edgecrab-types/src/error.rs
-#[derive(Debug, thiserror::Error)]
 pub enum AgentError {
-    #[error("LLM API error: {source}")]
-    Llm {
-        #[from]
-        source: edgequake_llm::LlmError,
-    },
-
-    #[error("Tool execution failed: {tool} — {message}")]
+    Llm(String),
     ToolExecution { tool: String, message: String },
-
-    #[error("Context limit exceeded: {used}/{limit} tokens")]
     ContextLimit { used: usize, limit: usize },
-
-    #[error("Budget exhausted: {used}/{max} iterations")]
     BudgetExhausted { used: u32, max: u32 },
-
-    #[error("Interrupted by user")]
     Interrupted,
-
-    #[error("Configuration error: {0}")]
     Config(String),
-
-    #[error("Database error: {0}")]
-    Database(#[from] rusqlite::Error),
-
-    #[error("IO error: {0}")]
+    Database(String),
     Io(#[from] std::io::Error),
-
-    #[error("Serialization error: {0}")]
     Serde(#[from] serde_json::Error),
-
-    #[error("Provider rate limited: retry after {retry_after_ms}ms")]
-    RateLimited {
-        provider: String,
-        retry_after_ms: u64,
-    },
-
-    #[error("Context compression failed: {0}")]
+    RateLimited { provider: String, retry_after_ms: u64 },
     CompressionFailed(String),
-
-    #[error("API refusal: {0}")]
     ApiRefusal(String),
-
-    #[error("Malformed tool call from LLM: {0}")]
     MalformedToolCall(String),
-
-    #[error("Plugin error in {plugin}: {message}")]
     Plugin { plugin: String, message: String },
-
-    #[error("Gateway delivery failed to {platform}: {message}")]
     GatewayDelivery { platform: String, message: String },
-
-    #[error("OAuth flow failed: {0}")]
-    OAuth(String),
-
-    #[error("Migration error: {0}")]
     Migration(String),
+    Security(String),
+    Validation(String),
 }
 
-// Tool errors carry retry strategy (mirrors edgequake-llm pattern)
-#[derive(Debug, thiserror::Error)]
+pub type Result<T> = std::result::Result<T, AgentError>;
+```
+
+### `ToolError` — tool execution layer
+
+```rust
 pub enum ToolError {
-    #[error("Unknown tool: {0}")]
-    UnknownTool(String),
-
-    #[error("Invalid arguments for {tool}: {message}")]
+    NotFound(String),
     InvalidArgs { tool: String, message: String },
-
-    #[error("Tool {tool} unavailable: {reason}")]
     Unavailable { tool: String, reason: String },
-
-    #[error("Execution timeout after {seconds}s: {tool}")]
     Timeout { tool: String, seconds: u64 },
-
-    #[error("Permission denied: {0}")]
     PermissionDenied(String),
-
-    #[error("{0}")]
+    ExecutionFailed { tool: String, message: String },
+    CapabilityDenied {
+        tool: String,
+        code: String,
+        message: String,
+        suppression_key: Option<String>,  // prevents infinite retry loops
+        suggested_tool: Option<String>,   // guides the model to a fallback
+        suggested_action: Option<String>, // human-readable next step
+    },
     Other(String),
 }
 ```
 
-## 3. Result Type Aliases
+---
 
-```rust
-// Crate-level Result aliases
-pub type Result<T> = std::result::Result<T, AgentError>;
-pub type ToolResult = std::result::Result<String, ToolError>;
+## `ToolError` → JSON payload → model input
+
+When `ToolHandler::execute()` returns `Err(ToolError)`, the execution path:
+
+```
+  tool returns  Err(ToolError::ExecutionFailed { tool: "write_file",
+                                                  message: "Read-only filesystem" })
+        │
+        ▼
+  ToolError::to_llm_payload()
+        │
+        ▼
+  ToolErrorResponse {
+      response_type:     "error",
+      category:          "execution",
+      code:              "execution_failed",
+      error:             "Read-only filesystem",
+      retryable:         true,
+      suppress_retry:    false,
+      suppression_key:   None,
+      tool:              Some("write_file"),
+      suggested_tool:    None,
+      suggested_action:  Some("Use a writable path under /tmp or the project root"),
+  }
+        │
+        ▼
+  serde_json::to_string(&response) → JSON string
+        │
+        ▼
+  Message::tool_result(tool_call_id, "write_file", json_string)
+        │
+        ▼
+  Appended to conversation history
+        │
+        ▼
+  LLM reads it on next iteration, adjusts its approach
 ```
 
-## 4. Error Conversion to LLM
+The model sees a structured JSON object — not a stack trace, not a panic,
+not silence.
 
-Tool errors must be converted to JSON strings for the LLM to understand:
+---
+
+## Retry and suppression logic
+
+`ToolError` has three classification methods the dispatcher uses before
+deciding what to do after a failure:
+
+```
+  ToolError::is_retryable()
+  ─────────────────────────────────────────────────────────────────────
+  ExecutionFailed, Timeout  → true   (transient; try again)
+  NotFound, PermissionDenied → false  (structural; retrying won't help)
+
+  ToolError::should_suppress_retry()
+  ─────────────────────────────────────────────────────────────────────
+  CapabilityDenied with suppression_key  → true
+  (don't feed back into the model loop — it clearly can't do this)
+
+  ToolError::suppression_key()
+  ─────────────────────────────────────────────────────────────────────
+  Stable string key used to deduplicate retry loops:
+    "execute_code:no_docker"  prevents the model from requesting
+    Docker-based code execution 5 times in a row when Docker is absent
+```
+
+---
+
+## `AgentError` recovery in the loop
+
+The conversation loop (`execute_loop`) handles each `AgentError` variant
+differently:
+
+```
+  execute_loop
+        │
+        ├── AgentError::RateLimited { retry_after_ms }
+        │       └── sleep(retry_after_ms) + exponential backoff
+        │           base=500ms, max retries=3
+        │
+        ├── AgentError::ContextLimit { used, limit }
+        │       └── trigger compression pipeline → retry API call
+        │
+        ├── AgentError::BudgetExhausted { used, max }
+        │       └── break loop
+        │           ConversationResult::budget_exhausted = true
+        │
+        ├── AgentError::Interrupted
+        │       └── break loop
+        │           ConversationResult::interrupted = true
+        │
+        ├── AgentError::MalformedToolCall
+        │       └── log warning + continue loop
+        │           (model issued bad JSON; give it another chance)
+        │
+        └── AgentError::Llm / AgentError::Serde
+                └── propagate to caller (unrecoverable turn failure)
+```
+
+---
+
+## Fuzzy match on `ToolError::NotFound`
+
+When the registry cannot find a tool by exact name, it applies Levenshtein
+distance ≤ 3 before giving up:
+
+```
+  model requests "write_fiel"  (typo)
+        │
+        ▼
+  registry.dispatch("write_fiel", ...)
+        │
+        ▼
+  exact match? No
+        │
+        ▼
+  fuzzy_match("write_fiel")
+        │
+        ▼
+  Levenshtein("write_fiel", "write_file") = 1  ≤ 3
+        │
+        ▼
+  ToolError::NotFound("write_fiel. Did you mean: write_file?")
+```
+
+The "Did you mean" hint is included in the `ToolErrorResponse` fed back to
+the model — it typically self-corrects in one additional step.
+
+**Reference:** [Levenshtein distance](https://en.wikipedia.org/wiki/Levenshtein_distance)
+
+---
+
+## `#[from]` implicit conversions
+
+`AgentError` derives `#[from]` for stdlib error types, enabling `?` syntax:
 
 ```rust
-impl ToolError {
-    pub fn to_llm_response(&self) -> String {
-        serde_json::json!({
-            "error": self.to_string(),
-            "retryable": self.is_retryable(),
-        }).to_string()
-    }
-
-    pub fn is_retryable(&self) -> bool {
-        matches!(self, ToolError::Timeout { .. } | ToolError::Unavailable { .. })
-    }
+fn read_config(path: &Path) -> crate::Result<AppConfig> {
+    let text = std::fs::read_to_string(path)?;  // io::Error → AgentError::Io
+    let cfg = serde_yaml::from_str(&text)
+        .map_err(|e| AgentError::Config(e.to_string()))?;
+    Ok(cfg)
 }
 ```
 
-## 5. Panic Policy
+---
 
-- **No panics in library crates.** All fallible operations return `Result`.
-- Binary crates may `unwrap()` only during startup (config load, argument parse).
-- Tool handlers catch panics via `std::panic::catch_unwind` at the dispatch boundary.
-- `#[deny(clippy::unwrap_used)]` enforced in library crates via clippy config.
+## `#![deny(clippy::unwrap_used)]`
 
-## 6. Edge-Case Error Recovery
+Enforced in `edgecrab-types` (the leaf all other crates import). No `.unwrap()`
+or `.expect()` outside of `#[cfg(test)]`. Compile fails if violated.
 
-These error scenarios arise in production LLM agent loops and **must** be handled:
+---
 
-| Scenario | Common failure mode | EdgeCrab handling |
-|----------|---------------------|-------------------|
-| Empty/null function args in tool calls | Return JSON parse error to model | `MalformedToolCall` variant, return error string to LLM |
-| API refusal responses (content policy) | Graceful handling | `ApiRefusal` variant, surface to user |
-| Stuck loop on malformed tool calls | Detection + skip | Timeout + error message to LLM |
-| Consecutive assistant message merge | Content type mismatch | Type-safe `MessageContent` enum |
-| compression_attempts unlimited resets | Counter per conversation | `AtomicU32` in `ConversationState` |
-| length_continue_retries stale state | Reset per truncation event | Scoped retry counter |
-| Compressor summary role violation | Consecutive-role constraint | Type-level role alternation enforcement |
-| Silent tool result loss in compression | Preserve tool_result markers | Compression preserves `ToolResult` messages |
-| None entry in tool_calls list | Filter before dispatch | `Option<ToolCall>` → filter_map |
-| Event loop already running (parallel tools) | Per-thread event loops | No event loops — native async |
-| Broken pipe in stdout (headless) | `_SafeWriter` wrapper | `SafeWriter<W: Write>` [→ 002.001#4.1] |
-| Stale memory overwrites by flush agent | File locking | `tokio::sync::Mutex` on memory file |
-| Provider token leaking to wrong endpoint | Provider-scoped credentials | Per-provider `ProviderCredential` type |
-| OAuth flag stale after refresh | Refresh token invalidation | Token lifecycle state machine |
-| Concurrent memory writes drop entries | File locking | `RwLock` on `MemoryStore` |
-| FTS5 hyphenated query breakage | Quote preservation | Proper SQLite FTS5 query escaping |
-| Session key case duplicates | Normalize keys | `SessionKey` newtype with forced lowercase |
-| Model-specific tool-call format | 12 custom parsers in `tool_call_parsers/` | `ToolCallParser` trait with `parse(raw: &str) -> Vec<ToolCall>` per model |
-| Codex Responses API tool format | Codex adapter in hermes-agent | `ResponsesApiAdapter` that normalizes to standard ToolCall |
-| Anthropic thinking/reasoning blocks | `scratchpad_to_think` conversion | `ThinkingBlock` enum in message types, transparent to tool dispatch |
+## Practical rule
 
-## 7. Tracing & Observability
+> **If the failure should be visible to the model as part of the conversation → `ToolError`.**
+> **If it should abort or short-circuit the conversation machinery → `AgentError`.**
+
+Do not return `AgentError` from a `ToolHandler`. Map it:
 
 ```rust
-// All errors are traced with structured context
-use tracing::{error, warn, instrument};
+// Wrong:
+async fn execute(...) -> Result<String, ToolError> {
+    do_something()?  // AgentError leaks through
+}
 
-#[instrument(skip(self, args), fields(tool = %name))]
-async fn dispatch(&self, name: &str, args: &Value, ctx: &ToolContext) -> ToolResult {
-    match self.registry.get(name) {
-        Some(handler) => {
-            match tokio::time::timeout(ctx.timeout, handler.execute(args, ctx)).await {
-                Ok(Ok(result)) => Ok(result),
-                Ok(Err(e)) => {
-                    warn!(tool = %name, error = %e, "Tool execution failed");
-                    Err(e)
-                }
-                Err(_) => {
-                    error!(tool = %name, timeout = ?ctx.timeout, "Tool execution timed out");
-                    Err(ToolError::Timeout { tool: name.to_string(), seconds: ctx.timeout.as_secs() })
-                }
-            }
-        }
-        None => Err(ToolError::UnknownTool(name.to_string())),
-    }
+// Right:
+async fn execute(...) -> Result<String, ToolError> {
+    do_something()
+        .map_err(|e| ToolError::ExecutionFailed {
+            tool: self.name().to_string(),
+            message: e.to_string(),
+        })
 }
 ```
+
+---
+
+## Tips
+
+> **Tip: Use `ToolError::capability_denied()` for soft "can't do this" situations.**
+> Set `.with_suggested_action()` and `.with_suppression_key()` to guide the
+> model away from infinite retry loops.
+
+> **Tip: `ToolErrorRecord` is stored in `ConversationResult::tool_errors`.**
+> After a session, you can inspect every tool failure including the full arguments
+> and the exact response sent back to the model. Useful for debugging agent behaviour.
+
+> **Tip: `AgentError::Security(String)` is used by `edgecrab-security` checks.**
+> If a path escapes the jail or a command matches a dangerous pattern, the check
+> returns `Err(AgentError::Security(...))` — the loop converts this into a
+> `ToolError::PermissionDenied` response visible to the model.
+
+---
+
+## FAQ
+
+**Q: What happens if a tool panics?**
+Tokio task panics do not crash the process. The conversation loop catches the
+failed join and synthesises a `ToolError::ExecutionFailed` response.
+
+**Q: Why is `Database(String)` a string, not `rusqlite::Error`?**
+Exposing `rusqlite::Error` in `edgecrab-types` would force all 10 crates to
+depend on `rusqlite`. The `edgecrab-state` crate converts the error to a string
+before crossing the crate boundary.
+
+**Q: Can the LLM see `AgentError` details?**
+No. Only `ToolError` serialised into `ToolErrorResponse` enters the conversation
+history. `AgentError` propagates to the frontend, which decides how to present it.
+
+---
+
+## Cross-references
+
+- Where errors are handled in the loop → [Conversation Loop](../003_agent_core/002_conversation_loop.md)
+- Tool dispatch producing `ToolError` → [Tool Registry](../004_tools_system/001_tool_registry.md)
+- Security errors (`AgentError::Security`) → [Security](../011_security/001_security.md)

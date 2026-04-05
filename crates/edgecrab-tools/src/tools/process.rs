@@ -180,8 +180,8 @@ async fn spawn_local_process(
     process_id: String,
 ) -> Result<String, ToolError> {
     let cwd_path = std::path::Path::new(cwd);
-    let child_result = TokioCommand::new("sh")
-        .arg("-c")
+    let mut cmd = TokioCommand::new("sh");
+    cmd.arg("-c")
         .arg(command)
         .current_dir(cwd_path)
         .env_clear()
@@ -189,9 +189,10 @@ async fn spawn_local_process(
         .env("PYTHONUNBUFFERED", "1")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .stdin(std::process::Stdio::piped())
-        .process_group(0)
-        .spawn();
+        .stdin(std::process::Stdio::piped());
+    #[cfg(unix)]
+    cmd.process_group(0);
+    let child_result = cmd.spawn();
 
     let mut child = match child_result {
         Ok(c) => c,

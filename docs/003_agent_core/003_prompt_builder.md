@@ -1,239 +1,270 @@
-# 003.003 — Prompt Builder
+# Prompt Builder 🦀
 
-> **Cross-refs**: [→ INDEX](../INDEX.md) | [→ 003.001 Agent Struct](001_agent_struct.md) | [→ 007 Memory & Skills](../007_memory_skills/001_memory_skills.md)  
-> **Source**: `edgecrab-core/src/prompt_builder.rs` — verified against real implementation  
-> **Parity**: hermes-agent `agent/prompt_builder.py` + `agent/prompt_caching.py`
+> **Verified against:** `crates/edgecrab-core/src/prompt_builder.rs`
 
-## 1. Prompt Assembly Pipeline
+---
 
-The system prompt is assembled from **~12 sources** in priority order. Built **once per session** and cached in `SessionState.cached_system_prompt` for Anthropic prompt caching stability.
+## Why a centralised prompt builder exists
+
+Hand-rolled system prompts are an antipattern in multi-frontend agents.
+If the CLI, gateway, and ACP server each assemble their own prompt strings,
+you get: three copies of the memory-injection logic, three places to update
+when you add a new guidance block, and three diverging prompt formats
+to debug.
+
+`PromptBuilder` is the single point of assembly. All frontends call it once
+at session start. The result is cached in `SessionState::cached_system_prompt`
+and reused for every subsequent API call — prompt construction is not free.
+
+---
+
+## Context files scanned (in order)
 
 ```
-PromptBuilder::new(platform)
-    .skip_context_files(skip)
-    .available_tools(tool_names)
-    .build(override_identity, cwd, memory_sections, skill_prompt)
-│
-├── Slot 1: Identity (FROZEN at session start — never changes)
-│       DEFAULT_IDENTITY (const) or global SOUL.md override
-│
-├── Slot 2: Platform hint (per-session, set at build)
-│       CLI / Telegram / Discord / Slack / Cron / etc.
-│
-├── Slot 3: Date/time stamp
-│       chrono::Local::now() — fresh each session
-│
-├── Slots 4-6: Context files (when skip_context_files=false)
-│       ── SOUL.md  (walk cwd→parent→~/.edgecrab; .SOUL.md takes priority)
-│       ── AGENTS.md  (project + ~/.edgecrab/AGENTS.md merged)
-│       ── .cursorrules / CLAUDE.md / .edgecrab.md / .hermes.md
-│       ── .cursor/rules/*.mdc  (Cursor IDE rules directory)
-│       ── All scanned for prompt injection before injection
-│       ── Truncated at CONTEXT_FILE_MAX_CHARS (20,000) via head/tail
-│
-├── Slot 7: Memory guidance + memory sections (gated on memory_write tool)
-│       MEMORY_GUIDANCE constant + pre-loaded ~/.edgecrab/memories/*.md sections
-│
-├── Slot 8: Session search guidance (gated on session_search tool)
-│       SESSION_SEARCH_GUIDANCE constant
-│
-├── Slot 9: Scheduling guidance (gated on manage_cron_jobs tool)
-│       SCHEDULING_GUIDANCE constant
-│
-├── Slot 10: Skills guidance + skill summary (gated on skill_manage tool)
-│        SKILLS_GUIDANCE constant + cached skill index (60s TTL)
-│
-├── Slot 11: Vision guidance (gated on vision_analyze tool)
-│        VISION_GUIDANCE constant — tool selection rules
-│
-└── Slot 12: Personality addon (optional, from config.display.personality)
+  Global identity:
+    ~/.edgecrab/SOUL.md          ← identity slot (never injected as generic context)
+
+  Project instructions (scanned in cwd):
+    .edgecrab.md                 ← primary project file
+    EDGECRAB.md
+    .hermes.md                   ← legacy compatibility
+    HERMES.md
+    AGENTS.md                    ← OpenAI Agents SDK standard
+    CLAUDE.md                    ← Anthropic Claude Code standard
+    .cursorrules                 ← Cursor compatibility
+    .cursor/rules/*.mdc          ← Cursor rule files
+
+  All project context files undergo injection checking before inclusion.
 ```
 
-### Memory Snapshot Freeze
+`SOUL.md` is treated specially as the persona/identity slot — it sets the
+agent's character. Project files (`AGENTS.md`, `CLAUDE.md`, `.edgecrab.md`)
+add project-specific instructions on top of the persona.
 
-Memory is loaded **once at session start** and frozen into the cached system prompt. Mid-session `memory_write` calls update `~/.edgecrab/memories/` on disk but do **not** mutate `cached_system_prompt` — this is by design:
+---
 
-- **Why freeze**: Modifying the system prompt mid-session invalidates Anthropic's prompt cache at the system-prompt breakpoint, causing a full re-computation. The Anthropic cache-read discount disappears.
-- **Consequence**: The agent's in-session memory writes take effect for **future sessions** only. The agent is told this explicitly in `MEMORY_GUIDANCE`.
+## Prompt assembly order
 
-### Context Files vs. API-Call-Time Layers
+```
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  Final system prompt                                             │
+  │                                                                  │
+  │  [1] SOUL.md content (if present)                                │
+  │       └── "You are EdgeCrab, a powerful coding assistant..."     │
+  │                                                                  │
+  │  [2] Platform hint                                               │
+  │       └── "You are running on platform: telegram"               │
+  │                                                                  │
+  │  [3] Timestamp                                                   │
+  │       └── "The current time is 2026-04-05 14:32 UTC"            │
+  │                                                                  │
+  │  [4] Context files (AGENTS.md, CLAUDE.md, .edgecrab.md, ...)     │
+  │       each injection-checked before inclusion                    │
+  │                                                                  │
+  │  [5] Memory guidance block (if memory tool enabled)              │
+  │       └── "When you learn something, write it to memory..."      │
+  │                                                                  │
+  │  [6] Memory content (from ~/.edgecrab/memories/)                 │
+  │       └── Contents of each memory section file                  │
+  │                                                                  │
+  │  [7] Session search guidance (if session tool enabled)           │
+  │                                                                  │
+  │  [8] Skills guidance (if skills tools enabled)                   │
+  │       └── How to invoke, install, create skills                  │
+  │                                                                  │
+  │  [9] Skills summary (from ~/.edgecrab/skills/ scan)              │
+  │       └── Brief description of each installed skill              │
+  │                                                                  │
+  │  [10] Tool-specific guidance blocks                              │
+  │        cron guidance (if manage_cron_jobs enabled)               │
+  │        messaging guidance (if send_message enabled)              │
+  │        image analysis guidance (if vision_analyze enabled)       │
+  └─────────────────────────────────────────────────────────────────┘
+```
 
-| Layer | When assembled | Frozen? |
-|---|---|---|
-| `cached_system_prompt` (all slots above) | First turn of session | ✅ Yes — never rebuilt |
-| Context compression summary | Every turn (if threshold exceeded) | ❌ No — changes each turn |
-| Prompt cache breakpoints | Every API call | ❌ No — applied in `build_chat_messages()` |
+---
 
-The compression summary is injected as a `Message::system_summary()` (role=`System`) into the **message list**, not into the cached system prompt. This keeps the cache-stable region stable while the summary evolves.
+## Skills summary caching
 
-## 2. PromptBuilder Struct
+The skills directory (`~/.edgecrab/skills/`) can contain thousands of files.
+Scanning it on every session start would noticeably slow startup. The builder
+uses an in-process `OnceLock`-based cache:
+
+```
+  First session:
+    scan ~/.edgecrab/skills/, read frontmatter
+    extract name + description per skill
+    cache the summary string
+    ↓
+  All subsequent sessions this process:
+    return cached string immediately (no disk I/O)
+
+  Explicit invalidation:
+    Agent::invalidate_system_prompt()
+    → next build() rescans the skills directory
+```
+
+---
+
+## Injection checking
+
+Before any external content (context files, memory files, skill files) enters
+the system prompt, it passes through:
+```sh
+edgecrab_security::injection::check_injection(content)
+```
+
+This scans for:
+- Prompt injection patterns: `"ignore previous instructions"`,
+  `"you are now"`, `"system prompt:"`, HTML comments `<!--`, etc.
+- Invisible Unicode characters (zero-width spaces, directional overrides)
+- Exfiltration patterns in memory: `curl`/`wget` with secret env vars,
+  `cat ~/.ssh/`, etc.
+
+Files that fail the check are **replaced** with a placeholder in the prompt
+rather than silently dropped or used as-is.
+
+🦀 *A rogue `AGENTS.md` containing injection instructions is a risk for any agent
+that loads context files without scanning them. EdgeCrab's prompt builder blocks
+it at the gate.*
+
+---
+
+## Conditional guidance blocks
+
+Guidance is only injected when the relevant tools are active. This prevents
+the system prompt from growing unbounded for minimal toolset configurations:
+
+| Guidance block | Injected when |
+|---|---|
+| Memory guidance | `memory_read` or `memory_write` in active toolset |
+| Session search guidance | `session_search` in active toolset |
+| Skills guidance | `skills_list` or `skill_manage` in active toolset |
+| Cron guidance | `manage_cron_jobs` in active toolset |
+| Messaging guidance | `send_message` in active toolset |
+| Image analysis guidance | `vision_analyze` in active toolset |
+
+---
+
+## Key public functions
 
 ```rust
-// edgecrab-core/src/prompt_builder.rs
-
-pub struct PromptBuilder {
+// Build the full system prompt for a session
+pub async fn build(
+    config: &AgentConfig,
+    tool_registry: Option<&ToolRegistry>,
+    cwd: &Path,
     platform: Platform,
-    skip_context_files: bool,
-    /// When Some, guidance snippets are only injected when their gate tool is present.
-    /// When None, all guidance is injected (backward compat / tests).
-    available_tools: Option<Vec<String>>,
-}
+) -> String
 
-impl PromptBuilder {
-    pub fn new(platform: Platform) -> Self { ... }
-    pub fn skip_context_files(mut self, skip: bool) -> Self { ... }
-    pub fn available_tools(mut self, tools: Vec<String>) -> Self { ... }
+// Extract the `name:` field from a skill file's YAML frontmatter
+pub fn extract_frontmatter_name(content: &str) -> Option<String>
 
-    /// Build the full system prompt — called once per session.
-    /// Result is cached in SessionState for Anthropic prefix caching.
-    pub fn build(
-        &self,
-        override_identity: Option<&str>,
-        cwd: Option<&Path>,
-        memory_sections: &[String],
-        skill_prompt: Option<&str>,
-    ) -> String { ... }
-}
+// Extract the `description:` field from skill frontmatter
+pub fn extract_skill_description(content: &str) -> Option<String>
+
+// Load all memory sections from ~/.edgecrab/memories/ (or profile dir)
+pub fn load_memory_sections(config: &AgentConfig) -> Vec<(String, String)>
+
+// Return pre-loaded skill names with brief descriptions (cached)
+pub fn load_preloaded_skills(config: &AgentConfig) -> String
+
+// Summarise skills directory for prompt injection
+pub fn load_skill_summary(config: &AgentConfig) -> String
 ```
 
-> **Tool-gated guidance**: Each guidance constant is only injected when its tool is available in the session. This saves tokens on configurations without those tools (e.g., ACP mode doesn't inject scheduling guidance).
+---
 
-## 3. Key Constants
-
-```rust
-const DEFAULT_IDENTITY: &str = "\
-You are EdgeCrab, an intelligent AI agent built with Rust for speed and safety. \
-You are helpful, knowledgeable, and direct. You assist users with a wide range of \
-tasks including answering questions, writing and debugging code, code review, \
-architecture design, analysing information, creative work, and executing actions \
-via your tools. You communicate clearly, admit uncertainty when appropriate, and \
-prioritise being genuinely useful over being verbose unless otherwise directed. \
-Be targeted and efficient in your exploration and investigations.";
-
-const CLI_HINT: &str = "\
-You are a CLI AI Agent. Use markdown formatting with code blocks where helpful. \
-ANSI colors are supported.";
-
-// Additional platform hints: TELEGRAM_HINT, DISCORD_HINT, WHATSAPP_HINT,
-// SLACK_HINT, SIGNAL_HINT, EMAIL_HINT, SMS_HINT, WEBHOOK_HINT, API_HINT, CRON_HINT
-```
-
-## 4. Context File Discovery
+## The caching rule
 
 ```
-SOUL.md (ordered, first-found wins):
-  1. <cwd>/.SOUL.md          (hidden file takes priority)
-  2. <cwd>/SOUL.md
-  3. <parent>/.SOUL.md       (walk up to /)
-  4. <parent>/SOUL.md
-  ... recursive until /
-  5. ~/.edgecrab/SOUL.md     (global fallback)
+  DO NOT rebuild the prompt mid-conversation unless you intend to.
 
-AGENTS.md (both merged if both exist):
-  1. <cwd>/AGENTS.md         (project-level)
-  2. ~/.edgecrab/AGENTS.md   (global agent instructions)
+  Calling Agent::invalidate_system_prompt() is the correct way to
+  trigger a rebuild. It sets cached_system_prompt = None; the next
+  execute_loop() call will rebuild.
 
-Other context files (cwd, first-found):
-  .cursorrules | CLAUDE.md | .edgecrab.md | .hermes.md | .cursor/rules/*.mdc
+  Rebuilding unnecessarily:
+    - Evicts Claude's system-prompt cache prefix (costs cache_write tokens)
+    - Reloads all memory and skill files (disk I/O)
+    - May change guidance mid-session if files changed
 ```
 
-### Context File Truncation
+---
 
-Files exceeding `CONTEXT_FILE_MAX_CHARS` (20,000) are truncated using a head/tail strategy:
+## Example: minimal and maximal prompts
 
-```rust
-const CONTEXT_FILE_MAX_CHARS: usize = 20_000;
-const TRUNCATION_HEAD_RATIO: f64 = 0.70;  // 70% head, 30% tail
+**Minimal** (`edgecrab --toolset safe "what is 2+2"`):
+```
+  SOUL.md content
+  Platform: cli
+  Timestamp: ...
+  (no context files found)
+  (memory tools absent → no memory block)
+  (skill tools absent → no skills block)
 ```
 
-### Injection Scanning
-
-All context files are scanned for prompt injection patterns before injection into the system prompt:
-
-```rust
-pub fn scan_for_injection(text: &str) -> Vec<InjectionThreat> {
-    // Checks for:
-    // - Text patterns: "ignore previous", "you are now", "new instructions:", etc.
-    // - Invisible Unicode characters (zero-width space, BOM, etc.)
-    // - Homoglyph characters (Cyrillic/Greek lookalikes for Latin)
-}
-
-pub enum ThreatSeverity { Low, Medium, High }
+**Maximal** (full gateway session with all tools):
+```
+  SOUL.md content
+  Platform: telegram
+  Timestamp: ...
+  .edgecrab.md project instructions
+  AGENTS.md additional context
+  Memory guidance
+  [memory file 1]: key facts from past sessions
+  [memory file 2]: code patterns
+  Session search guidance
+  Skills guidance
+  Skills summary: 12 installed skills
+  Cron scheduling guidance
+  Messaging guidance
+  Image analysis guidance
 ```
 
-Files that contain high-severity threats are replaced with `[BLOCKED: prompt injection detected in <filename>]`.
+---
 
-### YAML Frontmatter Stripping
+## Tips
 
-Context files containing YAML frontmatter (e.g., `---\ntitle: ...\n---\n`) are stripped before injection:
+> **Tip: Put project-specific instructions in `.edgecrab.md` at the repo root.**
+> This file is guaranteed to be picked up before `AGENTS.md` or `CLAUDE.md`.
+> It is ideal for code style rules, test commands, and architecture constraints.
 
-```rust
-pub fn strip_yaml_frontmatter(text: &str) -> &str { ... }
-```
+> **Tip: Memory files in `~/.edgecrab/memories/` survive across all sessions.**
+> Tools `memory_write` and `memory_read` operate on these files. Anything written
+> there will appear in the system prompt of every subsequent session on this machine.
 
-## 5. Skills Cache
+> **Tip: Test your context files with `edgecrab doctor`.**
+> Doctor scans for context files, checks for injection patterns, and reports which
+> files would be included in the system prompt for the current directory.
 
-Module-level in-memory cache avoids re-scanning `~/.edgecrab/skills/` on every session start:
+---
 
-```rust
-struct SkillsCacheEntry {
-    summary: Option<String>,
-    disabled_at_build: Vec<String>,
-    built_at: std::time::Instant,
-}
+## FAQ
 
-const SKILLS_CACHE_TTL: Duration = Duration::from_secs(60);
+**Q: Can I add my own guidance block?**
+Yes. Add a conditional block in `PromptBuilder::build()` keyed on whether
+a specific tool name is in `tool_registry.tool_names()`. The block is injected
+only when the tool is active.
 
-/// Invalidated after skill_manage mutations (create/edit/patch/delete)
-pub fn invalidate_skills_cache()
-```
+**Q: Does changing `SOUL.md` require restarting EdgeCrab?**
+No. Call `agent.invalidate_system_prompt()` (or `/refresh` in the TUI). The
+next turn will rebuild from the updated file.
 
-## 6. Standalone Loader Functions
+**Q: What happens if `SOUL.md` does not exist?**
+The builder skips the identity slot silently. The LLM uses its default
+persona. This is normal for quick one-shot invocations.
 
-```rust
-/// Load SOUL.md from global ~/.edgecrab/ directory
-pub fn load_global_soul(edgecrab_home: &Path) -> Option<String>
+**Q: Are memory files size-limited?**
+Not enforced in code, but large memory files contribute to the system prompt's
+token count. If context compression starts triggering frequently, consider
+trimming old memory entries.
 
-/// Load MEMORY.md and USER.md from memories/ subdirectory
-pub fn load_memory_sections(edgecrab_home: &Path) -> Vec<String>
+---
 
-/// Load full SKILL.md content for preloaded skills (via -S flag)
-pub fn load_preloaded_skills(edgecrab_home: &Path, skill_names: &[String]) -> String
+## Cross-references
 
-/// Load compact skill index for system prompt injection (60s cached)
-pub fn load_skill_summary(
-    edgecrab_home: &Path,
-    disabled_skills: &[String],
-    extra_skill_dirs: &[String],
-) -> Option<String>
-```
-
-## 7. Anthropic Prompt Caching Policy
-
-**CRITICAL — do not violate:**
-
-> The system prompt is built **once per session** and stored in `SessionState.cached_system_prompt`. Do **NOT** rebuild or mutate it mid-conversation — this invalidates Anthropic's prompt cache and dramatically increases costs.
-
-Cache control breakpoints are applied at API-call time (not build time), handled by `edgequake_llm::apply_cache_control()`:
-
-```
-System message    → always cacheable (stable prefix)
-Last user message → cache write point (for cache continuations)
-Other messages    → no cache control
-```
-
-## 8. Platform Hints
-
-| Platform | Key Guidance |
-|----------|-------------|
-| CLI | Full markdown, code blocks, ANSI colors |
-| Telegram | No markdown, max 4096 chars, MEDIA: prefix for files |
-| Discord | Max 2000 chars, MEDIA: prefix for attachments |
-| WhatsApp | No markdown, MEDIA: for native attachments |
-| Slack | Slack mrkdwn format, MEDIA: for uploads |
-| Signal | No markdown, MEDIA: for attachments |
-| Email | Plain text, subject threading, MEDIA: for attachments |
-| SMS | Plain text only, ~1600 char limit |
-| Webhook | JSON-friendly structured responses |
-| API | Markdown, structured for programmatic consumption |
-| Cron | Autonomous mode, no user interaction possible |
+- Memory files location and format → [Memory and Skills](../007_memory_skills/001_memory_skills.md)
+- Injection patterns checked → [Security](../011_security/001_security.md)
+- When the prompt is rebuilt → [Conversation Loop](./002_conversation_loop.md)
+- Skill file format → [Creating Skills](../007_memory_skills/002_creating_skills.md)

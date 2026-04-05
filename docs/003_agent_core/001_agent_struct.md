@@ -1,269 +1,278 @@
-# 003.001 — Agent Struct
+# Agent Struct 🦀
 
-> **Cross-refs**: [→ INDEX](../INDEX.md) | [→ 002.001 Architecture](../002_architecture/001_system_architecture.md) | [→ 003.002 Conversation Loop](002_conversation_loop.md)
-> **Source**: `edgecrab-core/src/agent.rs` — verified against real implementation
+> **Verified against:** `crates/edgecrab-core/src/agent.rs`
 
-## 1. Agent Struct
+---
 
-The `Agent` is the core execution unit. All mutable fields use `RwLock` or `Arc` for hot-swapping and concurrent access.
+## Why `Agent` is the shape it is
+
+Every design decision in the `Agent` struct answers the question:
+*"what survives across multiple turns of a conversation?"*
+
+- Config and provider are behind `RwLock` because the `/model` command
+  can swap them mid-session without ending the conversation.
+- `ProcessTable` and `TodoStore` are owned by the agent so that a
+  background process started in turn 3 is still trackable in turn 10.
+- `state_db` is optional because tests and cron runs should not require
+  a SQLite database to function.
+- `budget` uses an atomic because it is checked on every iteration and
+  must not become a contention bottleneck.
+
+---
+
+## Struct fields
 
 ```rust
-// edgecrab-core/src/agent.rs
-
+// crates/edgecrab-core/src/agent.rs
 pub struct Agent {
-    /// WHY RwLock: /model command swaps model name at runtime; all concurrent
-    /// reads during the loop are unblocked, writes are rare.
-    pub(crate) config: RwLock<AgentConfig>,
+    // Hot-swappable: the /model command writes these under a lock
+    pub(crate) config:          RwLock<AgentConfig>,
+    pub(crate) provider:        RwLock<Arc<dyn LLMProvider>>,
+    pub(crate) gateway_sender:  RwLock<Option<Arc<dyn GatewaySender>>>,
 
-    /// WHY RwLock: /model command swaps LLM provider; conversation loop
-    /// clones Arc at start, so in-flight conversations are unaffected.
-    pub(crate) provider: RwLock<Arc<dyn LLMProvider>>,
+    // Conversation history, token counters, cached system prompt
+    pub(crate) session:         RwLock<SessionState>,
 
-    pub(crate) state_db: Option<Arc<SessionDb>>,
-    pub(crate) tool_registry: Option<Arc<ToolRegistry>>,
+    // Optional — tests and cron can skip SQLite
+    pub(crate) state_db:        Option<Arc<SessionDb>>,
 
-    /// WHY on Agent: All tool invocations in the same session share the
-    /// process namespace. Agent lifetime == session lifetime.
-    pub(crate) process_table: Arc<ProcessTable>,
+    // Read-only after build(); safe to access without a lock
+    pub(crate) tool_registry:   Option<Arc<ToolRegistry>>,
 
-    pub(crate) session: RwLock<SessionState>,
-    pub(crate) budget: Arc<IterationBudget>,
+    // Background processes survive across multiple tool calls
+    pub(crate) process_table:   Arc<ProcessTable>,
 
-    /// WHY Mutex<CancellationToken>: Token is one-way latch (can't un-cancel).
-    /// Replaced with fresh token at each conversation start so Ctrl+C only
-    /// stops the current turn, not all future turns.
-    pub(crate) cancel: std::sync::Mutex<CancellationToken>,
+    // Lock-free iteration budget (AtomicU32 internally)
+    pub(crate) budget:          Arc<IterationBudget>,
+
+    // Per-turn cancellation (reset on new_session)
+    pub(crate) cancel:          Mutex<CancellationToken>,
+
+    // Background GC task lifetime — cancelled on Drop
+    pub(crate) gc_cancel:       CancellationToken,
+
+    // Session-scoped todo list shared with tools
+    pub(crate) todo_store:      Arc<TodoStore>,
 }
 ```
 
+---
+
+## `AgentConfig` key fields
+
 ```
-┌─────────────────────────────────────────────────────┐
-│                     Agent                           │
-│                                                     │
-│  config: RwLock<AgentConfig>     ◄── /model swap    │
-│  provider: RwLock<Arc<LLMProvider>>  ◄── /model     │
-│  state_db: Option<Arc<SessionDb>>                   │
-│  tool_registry: Option<Arc<ToolRegistry>>           │
-│  process_table: Arc<ProcessTable>                   │
-│  session: RwLock<SessionState>                      │
-│  budget: Arc<IterationBudget>                       │
-│  cancel: Mutex<CancellationToken>                   │
-│                                                     │
-│  ┌──────────────────────────────────────────────┐   │
-│  │  .chat("hi")        → simple String          │   │
-│  │  .run_conversation() → ConversationResult    │   │
-│  │  .interrupt()        → cancel current turn   │   │
-│  │  .set_model()        → hot-swap provider     │   │
-│  │  .new_session()      → reset for next conv   │   │
-│  └──────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────┘
+  ┌──────────────────────────────────────────────────────────┐
+  │  AgentConfig (default values from code)                  │
+  │                                                          │
+  │  model                  "anthropic/claude-opus-4.6"      │
+  │  max_iterations         90                               │
+  │  streaming              true                             │
+  │  platform               Platform::Cli                    │
+  │  delegation_enabled     true                             │
+  │  delegation_max_subagents  3                             │
+  │  delegation_max_iterations 50                            │
+  │  checkpoints_enabled    true                             │
+  │  checkpoints_max_snapshots 50                            │
+  │  terminal_backend       BackendKind::Local               │
+  │                                                          │
+  │  enabled_toolsets       Vec<String>  (empty = all)       │
+  │  disabled_toolsets      Vec<String>                      │
+  │  file_allowed_roots     Vec<PathBuf>                     │
+  │  path_restrictions      Vec<PathBuf>                     │
+  └──────────────────────────────────────────────────────────┘
 ```
 
-## 2. AgentConfig
+---
 
-Immutable per-agent configuration (subset of `AppConfig` relevant to the conversation loop):
+## `SessionState` — the mutable conversation
 
 ```rust
-#[derive(Debug, Clone)]
-pub struct AgentConfig {
-    pub model: String,                        // default: "anthropic/claude-opus-4.6"
-    pub max_iterations: u32,                  // default: 90
-    pub enabled_toolsets: Vec<String>,
-    pub disabled_toolsets: Vec<String>,
-    pub streaming: bool,                      // default: true
-    pub temperature: Option<f32>,
-    pub platform: Platform,                   // Cli | Telegram | Discord | ...
-    pub api_mode: ApiMode,
-    pub session_id: Option<String>,
-    pub quiet_mode: bool,
-    pub save_trajectories: bool,
-    pub skip_context_files: bool,
-    pub skip_memory: bool,
-    pub reasoning_effort: Option<String>,
-
-    /// Personality from config.display.personality → appended to system prompt
-    pub personality_addon: Option<String>,
-
-    /// Model config for routing (base_url, api_key_env, smart routing)
-    pub model_config: crate::config::ModelConfig,
-
-    /// Skills config — disabled skills, platform-specific disabled
-    pub skills_config: crate::config::SkillsConfig,
-
-    // Delegation runtime controls (from AppConfig.delegation)
-    pub delegation_enabled: bool,             // default: true
-    pub delegation_model: Option<String>,
-    pub delegation_provider: Option<String>,
-    pub delegation_max_subagents: u32,        // default: 3
-    pub delegation_max_iterations: u32,       // default: 50
-
-    /// Gateway origin — (platform_name, chat_id).
-    /// Enables cron jobs to target the correct delivery channel.
-    /// None for CLI / cron / test sessions.
-    pub origin_chat: Option<(String, String)>,
-
-    pub browser: crate::config::BrowserConfig,
-    pub checkpoints_enabled: bool,            // default: true
-    pub checkpoints_max_snapshots: u32,       // default: 50
-}
-```
-
-## 3. SessionState
-
-Per-conversation mutable state, protected by `RwLock`:
-
-```rust
-#[derive(Default)]
 pub struct SessionState {
-    /// Unique session identifier — set once at conversation start,
-    /// persisted to SQLite at loop end for session search/history.
-    pub session_id: Option<String>,
-    pub messages: Vec<Message>,
-    pub cached_system_prompt: Option<String>,
-    pub user_turn_count: u32,
-    pub api_call_count: u32,
-    pub session_input_tokens: u64,
-    pub session_output_tokens: u64,
+    pub session_id:                Option<String>,
+    pub messages:                  Vec<Message>,
+    pub cached_system_prompt:      Option<String>,
+    pub user_turn_count:           u32,
+    pub api_call_count:            u32,
+    pub session_input_tokens:      u64,
+    pub session_output_tokens:     u64,
     pub session_cache_read_tokens: u64,
     pub session_cache_write_tokens: u64,
-    pub session_reasoning_tokens: u64,
-    pub session_tool_call_count: u32,
+    pub session_reasoning_tokens:  u64,
+    pub session_tool_call_count:   u32,
 }
 ```
 
-> **Note**: Memory, todo, and honcho state are **not** stored in `SessionState`. Memory lives on disk (`~/.edgecrab/memories/`), todos are managed by the `manage_todo_list` tool, and honcho context is fetched per-turn via the HonchoClient.
+`cached_system_prompt` is the performance-critical field. `PromptBuilder`
+is called once per session (or when `invalidate_system_prompt()` is called
+explicitly). Between calls, the system prompt is reused verbatim.
 
-## 4. IterationBudget
+---
 
-Lock-free atomic iteration counter that prevents runaway tool loops:
+## `AgentBuilder` — constructing an `Agent`
 
 ```rust
-pub struct IterationBudget {
-    remaining: AtomicU32,
-    max: u32,
-}
+// Minimum viable builder:
+let agent = AgentBuilder::new("anthropic/claude-sonnet-4-20250514")
+    .provider(Arc::new(my_provider))
+    .build()?;
 
-impl IterationBudget {
-    pub fn new(max: u32) -> Self {
-        Self {
-            remaining: AtomicU32::new(max),
-            max,
-        }
-    }
-
-    /// Try to consume one iteration. Returns false when exhausted.
-    /// Uses CAS loop — no mutex contention on the hot path.
-    pub fn try_consume(&self) -> bool {
-        loop {
-            let current = self.remaining.load(Ordering::Relaxed);
-            if current == 0 {
-                return false;
-            }
-            if self.remaining
-                .compare_exchange_weak(
-                    current, current - 1,
-                    Ordering::Relaxed, Ordering::Relaxed,
-                )
-                .is_ok()
-            {
-                return true;
-            }
-        }
-    }
-
-    pub fn remaining(&self) -> u32 { ... }
-    pub fn max(&self) -> u32 { self.max }
-    pub fn used(&self) -> u32 { self.max - self.remaining() }
-    pub fn reset(&self) { self.remaining.store(self.max, Ordering::Relaxed); }
-}
+// Full builder for production gateway use:
+let agent = AgentBuilder::new(config.model.name.as_str())
+    .from_config(&app_config)
+    .provider(Arc::clone(&provider))
+    .state_db(Arc::clone(&session_db))
+    .tools(Arc::clone(&tool_registry))
+    .platform(Platform::Telegram)
+    .session_id(session_id.clone())
+    .origin_chat(platform_str, chat_id)
+    .streaming(true)
+    .build()?;
 ```
 
-## 5. Builder Pattern
+`build()` returns `Err(AgentError::Config("no provider set"))` if
+`.provider()` was never called — the only mandatory field.
+
+---
+
+## `IterationBudget`
+
+```
+  AgentConfig::max_iterations = 90  (default)
+        │
+        ▼
+  IterationBudget::new(90)
+    remaining = AtomicU32(90)
+        │
+  each iteration:
+        ▼
+  budget.try_consume()  → CAS decrement
+    ├── true  → continue loop
+    └── false → AgentError::BudgetExhausted { used: 90, max: 90 }
+                ConversationResult::budget_exhausted = true
+```
+
+---
+
+## `StreamEvent` — what frontends receive
+
+`Agent::chat_streaming()` sends these events over
+`tokio::sync::mpsc::UnboundedSender<StreamEvent>`:
+
+```
+  Client (TUI / gateway / ACP)               Agent task
+        │                                         │
+        │◄── StreamEvent::Token("Hello ")         │
+        │◄── StreamEvent::Reasoning("let me ...")  │  (thinking models)
+        │◄── StreamEvent::ToolExec { name, args } │
+        │◄── StreamEvent::ToolDone { name, dur.. }│
+        │◄── StreamEvent::ContextPressure { .. }  │  (compression warning)
+        │◄── StreamEvent::Clarify { question, tx }│  (agent asks user)
+        │◄── StreamEvent::Approval { command, tx }│  (dangerous shell cmd)
+        │◄── StreamEvent::Done                    │
+```
+
+`Clarify` and `Approval` carry a `oneshot::Sender<String>` (or
+`oneshot::Sender<ApprovalChoice>`) — the frontend sends the user's
+response back through the channel and the loop resumes.
+
+---
+
+## `ApprovalChoice`
 
 ```rust
-AgentBuilder::new("anthropic/claude-opus-4.6")
-    .provider(provider)          // Arc<dyn LLMProvider>
-    .tools(registry)             // Arc<ToolRegistry>
-    .state_db(db)                // Arc<SessionDb>
-    .config(cfg)                 // AgentConfig
-    .build()?  →  Agent
-```
-
-## 6. Public API
-
-```rust
-impl Agent {
-    /// Simple interface — returns final response string
-    pub async fn chat(&self, message: &str) -> Result<String>
-
-    /// Streaming interface — tokens sent via UnboundedSender<StreamEvent>
-    pub async fn chat_streaming(
-        &self,
-        message: &str,
-        tx: UnboundedSender<StreamEvent>,
-    ) -> Result<ConversationResult>
-
-    /// Full interface — returns structured ConversationResult.
-    /// Internally delegates to execute_loop() (see 003.002).
-    pub async fn run_conversation(
-        &self,
-        user_message: &str,
-        system_message: Option<&str>,
-        conversation_history: Option<Vec<Message>>,
-        task_id: Option<&str>,
-    ) -> Result<ConversationResult>
-
-    /// Cancel the current in-flight conversation (replaces cancel token)
-    pub fn interrupt(&self)
-
-    /// Reset session for a new conversation
-    pub async fn new_session(&self) -> Result<()>
-
-    /// Hot-swap the LLM model at runtime (from /model command)
-    pub async fn set_model(&self, model: &str, provider: Arc<dyn LLMProvider>)
+pub enum ApprovalChoice {
+    Once,     // approve just this execution
+    Session,  // approve all identical commands for this session
+    Always,   // add to permanent allowlist (~/.edgecrab/approval.json)
+    Deny,     // block the command; model sees a PermissionDenied error
 }
 ```
 
-## 7. ConversationResult
+---
 
-```rust
-pub struct ConversationResult {
-    pub final_response: String,
-    pub messages: Vec<Message>,
-    pub session_id: String,
-    pub api_calls: u32,
-    pub interrupted: bool,
-    pub model: String,
-    pub usage: Usage,
-    pub cost: Cost,
-}
+## Public API reference
+
+`Agent`'s most-used methods:
+
+| Method | What it does |
+|---|---|
+| `chat(&str)` | Single-turn, returns full response string |
+| `chat_in_cwd(&str, &Path)` | Single-turn with explicit working directory |
+| `chat_streaming(&str, tx)` | Streaming turn; sends `StreamEvent` to `tx` |
+| `run_conversation(user, sys, history)` | Supply your own history and system prompt |
+| `fork_isolated(opts)` | Clone agent with isolated session for sub-agent delegation |
+| `interrupt()` | Signal cooperative cancellation |
+| `new_session()` | Clear history and session ID, retain config and provider |
+| `swap_model(model, provider)` | Hot-swap model/provider without losing history |
+| `force_compress()` | Trigger compression immediately |
+| `undo_last_turn()` | Remove last assistant+user turn pair from history |
+| `restore_session(&str)` | Load session from SQLite into memory |
+| `session_snapshot()` | Copy current session for checkpointing |
+
+---
+
+## Lifecycle diagram
+
+```
+  AgentBuilder::build()
+        │
+        ▼
+  Agent created
+   ├── gc background task spawned (with gc_cancel)
+   │
+   ├── chat() / chat_streaming()
+   │       │
+   │       ▼
+   │   execute_loop()  [see Conversation Loop doc]
+   │       │
+   │       ▼
+   │   ConversationResult returned
+   │
+   ├── new_session()  → clear messages, reset session_id
+   │
+   └── Agent::drop()  → cancel gc_cancel → GC task stops
 ```
 
-## 8. Key Config Defaults
+---
 
-| Key | Default | Override |
-|-----|---------|----------|
-| `model` | `anthropic/claude-opus-4.6` | `--model` flag or config |
-| `max_iterations` | `90` | `config.model.max_iterations` |
-| `streaming` | `true` | `config.model.streaming` |
-| `platform` | `Platform::Cli` | Set by gateway per-platform |
-| `delegation_enabled` | `true` | `config.delegation.enabled` |
-| `delegation_max_subagents` | `3` | `config.delegation.max_subagents` |
-| `delegation_max_iterations` | `50` | `config.delegation.max_iterations` |
-| `checkpoints_enabled` | `true` | `config.checkpoints.enabled` |
-| `checkpoints_max_snapshots` | `50` | `config.checkpoints.max_snapshots` |
-| `skip_context_files` | `false` | `EDGECRAB_SKIP_CONTEXT_FILES` env |
-| `skip_memory` | `false` | `EDGECRAB_SKIP_MEMORY` env |
-| `save_trajectories` | `false` | `EDGECRAB_SAVE_TRAJECTORIES` env |
+## Tips
 
-## 9. Design Decisions
+> **Tip: `fork_isolated()` creates a sub-agent that shares the tool registry
+> and state_db but has its own message history and cancellation token.**
+> Use this for `delegate_task` — the sub-agent can run 50 iterations
+> independently and return a `SubAgentResult` to the parent.
 
-| Aspect | Python agent pattern | EdgeCrab |
-|--------|---------------------|----------|
-| Thread safety | Manual locks, fragile | `Send + Sync` enforced at compile time |
-| Iteration budget | `threading.Lock` | `AtomicU32` (lock-free CAS) |
-| Event loop | Workaround bridge functions | Native async, no bridges |
-| Builder | `__init__` with 50+ kwargs | Type-safe builder pattern |
-| Cancellation | `threading.Event` | `CancellationToken` (structured, replaceable) |
-| State isolation | Mixed mutable state | `RwLock<SessionState>` |
-| Model hot-swap | Restart required | `RwLock` on config + provider |
+> **Tip: Calling `invalidate_system_prompt()` forces the next turn to rebuild
+> from scratch.** Do this after `/memory` writes or skill installs so the new
+> content is reflected immediately.
+
+> **Tip: `session_snapshot()` returns a cloneable struct suitable for storing
+> as a checkpoint.** Pair with `restore_session()` to implement undo-like rollback.
+
+---
+
+## FAQ
+
+**Q: Is one `Agent` per user or one global `Agent`?**
+One per logical session. The gateway creates one `Agent` per `(platform, user_id)`
+pair. The CLI creates one per interactive session. They share the same
+`ToolRegistry` and `SessionDb` (behind `Arc`), but have independent conversation
+histories.
+
+**Q: Why is `state_db` optional?**
+Tests call `AgentBuilder::new(..).provider(..).build()` — no database needed.
+Cron runs typically also skip persistence. Only gateway and CLI sessions that
+need session history pass `.state_db()`.
+
+**Q: What does `Drop` do on `Agent`?**
+It cancels `gc_cancel`, which signals the background garbage-collection task
+(which prunes old process handles and expired session data) to stop gracefully.
+
+---
+
+## Cross-references
+
+- Conversation loop that `execute_loop()` implements → [Conversation Loop](./002_conversation_loop.md)
+- System prompt assembly → [Prompt Builder](./003_prompt_builder.md)
+- Concurrency details for `RwLock` usage → [Concurrency Model](../002_architecture/003_concurrency_model.md)
+- `ToolContext` passed to tools → [Tools Runtime](../004_tools_system/004_tools_runtime.md)

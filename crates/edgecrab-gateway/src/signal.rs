@@ -1122,7 +1122,12 @@ mod tests {
 
         let local_path = materialized.local_path.as_deref().expect("local path");
         assert!(std::path::Path::new(local_path).exists());
-        assert!(local_path.contains("gateway_media/signal"));
+        let p = std::path::Path::new(local_path);
+        assert!(
+            p.components().any(|c| c.as_os_str() == "gateway_media")
+                && p.components().any(|c| c.as_os_str() == "signal"),
+            "expected gateway_media/signal in {local_path}"
+        );
         assert_eq!(materialized.mime_type.as_deref(), Some("image/png"));
 
         server.abort();

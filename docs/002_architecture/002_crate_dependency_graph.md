@@ -1,127 +1,194 @@
-# 002.002 — Crate Dependency Graph
+# Crate Dependency Graph 🦀
 
-> **Cross-refs**: [→ INDEX](../INDEX.md) | [→ 002.001 Architecture](001_system_architecture.md)
+> **Verified against:** `Cargo.toml` (workspace) · each crate's `Cargo.toml`
 
-## 1. Workspace Crate DAG
+---
 
-```
-                             edgecrab-types
-                           (shared types, no deps)
-                                  ^
-                                  |
-              +-------------------+-------------------+
-              |                   |                   |
-        edgecrab-security   edgecrab-state      edgecrab-cron
-        (injection scan,    (SQLite, config,    (cron scheduler,
-         redaction)          memory, skills)     jobs.json)
-              ^                   ^                   ^
-              |                   |                   |
-              +--------+----------+----+              |
-                       |               |              |
-                 edgecrab-tools        |              |
-                 (registry, all        |              |
-                  tool impls)          |              |
-                       ^               |              |
-                       |               |              |
-                 edgecrab-core         |              |
-                 (Agent, loop,         |              |
-                  prompts,             |              |
-                  compression)         |              |
-                       ^               |              |
-                       |               |              |
-       +----------+----+-----+---------+------+-------+
-       |          |          |                |
- edgecrab-cli  edgecrab-  edgecrab-    edgecrab-
- (TUI, clap)   gateway    acp          migrate
-               (14 plat)  (editor)     (hermes/OC)
-```
+## Why the dependency graph matters
 
-## 2. Crate Responsibilities
+A dependency graph is not just bookkeeping — it is an enforced architectural
+constraint. If `edgecrab-tools` could freely import `edgecrab-core`, tools could
+spawn agents that spawn more agents in infinite recursion, and a change to the
+agent loop would require rebuilding *all* 10 crates. The DAG below shows the
+actual structure: every arrow is intentional, and violating it causes a compile
+error.
 
-| Crate | Type | Dependencies | Purpose |
-|-------|------|-------------|---------|
-| `edgecrab-types` | lib | serde, chrono | Shared types: Message, ToolSchema, ToolResult, Config types |
-| `edgecrab-security` | lib | types, regex, aho-corasick | Injection scanning, secret redaction, command approval, URL safety |
-| `edgecrab-state` | lib | types, rusqlite, serde_yaml | SessionDB (FTS5), ConfigManager, MemoryStore, SkillStore |
-| `edgecrab-cron` | lib | types, state, tokio-cron-scheduler | Cron job persistence (jobs.json), scheduler, gateway-triggered jobs |
-| `edgecrab-tools` | lib | types, security, state, edgequake-llm | ToolRegistry, ToolHandler trait, all 50+ tool implementations |
-| `edgecrab-core` | lib | types, tools, state, security, edgequake-llm | Agent struct, conversation loop, PromptBuilder, ContextCompressor, ModelRouter |
-| `edgecrab-cli` | bin | core, tools, state, ratatui, clap, crossterm | Interactive TUI, subcommands, skin engine, slash commands |
-| `edgecrab-gateway` | lib+bin | core, tools, state, cron, platform crates | GatewayRouter, 14 platform adapters, session management, delivery |
-| `edgecrab-acp` | lib+bin | core, tools, axum | ACP server for VS Code / Zed / JetBrains |
-| `edgecrab-migrate` | lib | state, serde_yaml, serde_json | hermes-agent / OpenClaw config + memory + skills migration |
+Understanding the graph answers: *"where does this new code go?"*
 
-## 3. External Dependency Map
+---
+
+## Full dependency graph
 
 ```
-edgecrab-types
-  ├── serde (+ serde_json, serde_yaml)
-  ├── chrono
-  └── uuid
-
-edgecrab-security
-  ├── edgecrab-types
-  ├── regex
-  ├── aho-corasick (multi-pattern scan)
-  └── unicode-segmentation
-
-edgecrab-state
-  ├── edgecrab-types
-  ├── rusqlite { features = ["bundled", "functions"] }
-  ├── serde_yaml
-  ├── tokio (fs, sync)
-  └── cron (cron expression parsing)
-
-edgecrab-tools
-  ├── edgecrab-types
-  ├── edgecrab-security
-  ├── edgecrab-state
-  ├── edgequake-llm (LLM operations)
-  ├── tokio (process, net, fs)
-  ├── reqwest (HTTP client)
-  ├── scraper (HTML parsing)
-  ├── inventory (compile-time tool registration)
-  ├── bollard [docker-backend]
-  ├── russh [ssh-backend]
-  └── mcp-rust-sdk [mcp]
-
-edgecrab-core
-  ├── edgecrab-types
-  ├── edgecrab-tools
-  ├── edgecrab-state
-  ├── edgecrab-security
-  ├── edgequake-llm
-  ├── tokio
-  └── tracing
-
-edgecrab-cli
-  ├── edgecrab-core
-  ├── ratatui
-  ├── crossterm
-  ├── clap { features = ["derive"] }
-  └── directories
-
-edgecrab-gateway
-  ├── edgecrab-core
-  ├── teloxide [telegram]
-  ├── serenity [discord]
-  └── axum [api-server]
+  edgecrab-cli ──────────────────────────────────────────────┐
+  (binary entry point — depends on everything)               │
+        │                                                     │
+        ├──► edgecrab-gateway ──────────────────────┐        │
+        │         │                                 │        │
+        ├──► edgecrab-acp ──────────────────┐       │        │
+        │                                  │       │        │
+        │                                  └──►  edgecrab-core ◄─┘
+        │                                              │
+        │                    ┌─────────────────────────┼──────────────┐
+        │                    │                         │              │
+        │                    ▼                         ▼              ▼
+        │            edgecrab-tools           edgecrab-state  edgecrab-security
+        │            (ToolRegistry, 65 tools) (SQLite WAL)    (CommandScanner)
+        │                    │                         │              │
+        │                    └─────────────────────────┼──────────────┘
+        │                                              │
+        │                                              ▼
+        │                                      edgecrab-types
+        │                                      (leaf — no internal deps)
+        │
+        ├──► edgecrab-cron ──────────────────────────► edgecrab-types
+        │    (also used by edgecrab-tools)
+        │
+        └──► edgecrab-migrate ─────────────────────────────────────────►
+             edgecrab-types, edgecrab-state
 ```
 
-## 4. Build Order
+---
+
+## Dependency table
+
+| Crate | Internal deps | Notes |
+|---|---|---|
+| `edgecrab-types` | _(none)_ | Leaf. Every crate imports this. `#![deny(clippy::unwrap_used)]` |
+| `edgecrab-security` | `edgecrab-types` | No async, no LLM calls. Stateless checks. |
+| `edgecrab-state` | `edgecrab-types` | Only crate that owns raw SQL. |
+| `edgecrab-cron` | `edgecrab-types` | Standalone schedule library. |
+| `edgecrab-tools` | `edgecrab-types`, `edgecrab-state`, `edgecrab-security` | Defines `SubAgentRunner` trait to avoid importing core. |
+| `edgecrab-core` | `edgecrab-types`, `edgecrab-tools`, `edgecrab-state`, `edgecrab-security` | Implements `SubAgentRunner`. Owns the agent loop. |
+| `edgecrab-acp` | `edgecrab-core`, `edgecrab-types` | Thin JSON-RPC 2.0 stdio wrapper. |
+| `edgecrab-gateway` | `edgecrab-core`, `edgecrab-tools`, `edgecrab-types`, `edgecrab-state`, `edgecrab-security`, `edgecrab-cron` | Widest import set; builds the full messaging stack. |
+| `edgecrab-cli` | all crates | Binary entry point; pulls everything. |
+| `edgecrab-migrate` | `edgecrab-types`, `edgecrab-state` | One-time migration helper. |
+
+---
+
+## Solving the tools ↔ core circular dependency
+
+Tools need to spawn sub-agents. Sub-agents live in `edgecrab-core`. The naive
+import creates a cycle:
 
 ```
-1. edgecrab-types      (leaf — no internal deps)
-2. edgecrab-security   (depends on types)
-3. edgecrab-state      (depends on types)
-4. edgecrab-cron       (depends on types, state)
-5. edgecrab-tools      (depends on types, security, state)
-6. edgecrab-core       (depends on types, tools, state, security)
-7. edgecrab-cli        (depends on core)           } These four
-8. edgecrab-gateway    (depends on core, cron)     } build in
-9. edgecrab-acp        (depends on core)           } parallel
-10. edgecrab-migrate   (depends on state)          }
+  edgecrab-core  ──► edgecrab-tools  ──►  edgecrab-core   ✗ CYCLE
 ```
 
-Cargo builds crates 1-3 in parallel, then 4, then 5, then 6-9 in parallel.
-Typical clean build time target: <90s on M1 Mac, <180s on CI.
+The solution is **trait-object inversion**:
+
+```
+  Step 1: edgecrab-tools defines the contract
+
+      pub trait SubAgentRunner: Send + Sync {
+          async fn run_task(&self, goal, ...) -> Result<SubAgentResult, String>;
+      }
+
+  Step 2: edgecrab-core implements it
+
+      impl SubAgentRunner for CoreSubAgentRunner { ... }
+
+  Step 3: Agent passes Arc<dyn SubAgentRunner> into ToolContext
+
+      ctx.sub_agent_runner.run_task("do X")  // tools never import core
+
+  Result:
+
+      edgecrab-tools ─► edgecrab-types   (SubAgentRunner trait)
+      edgecrab-core  ─► edgecrab-tools   (ToolRegistry, ToolHandler)
+                     implements SubAgentRunner
+                                       ✓ no cycle
+```
+
+The same pattern applies to `GatewaySender`:
+
+```
+  edgecrab-tools   defines   GatewaySender trait
+  edgecrab-gateway implements GatewaySender
+  edgecrab-core    holds     RwLock<Option<Arc<dyn GatewaySender>>>
+```
+
+🦀 *Think of the crab's claw (tools) as attached to the body (core) by tendons
+(trait objects). The claw can move independently — it does not need to import the
+entire nervous system to do its job.*
+
+---
+
+## Compile-time tool registration
+
+Tools do not appear in a hand-maintained list. The
+[`inventory`](https://docs.rs/inventory) crate enables compile-time plugin
+collection:
+
+```rust
+// In any tool file inside edgecrab-tools:
+inventory::submit! {
+    &ReadFileTool as &dyn ToolHandler
+}
+
+// ToolRegistry::new() in registry.rs:
+for handler in inventory::iter::<&dyn ToolHandler> {
+    tools.insert(handler.name(), *handler);
+}
+```
+
+**Adding a new tool:** implement `ToolHandler` + call `inventory::submit!` +
+recompile. No list, no match arm, no registration function to update.
+
+**Reference:** [`inventory` crate docs](https://docs.rs/inventory/latest/inventory/)
+
+---
+
+## Where to put new code
+
+| Scenario | Target crate |
+|---|---|
+| New shared type or enum | `edgecrab-types` |
+| New path / URL / command / injection check | `edgecrab-security` |
+| New SQL query or schema migration | `edgecrab-state` |
+| New cron schedule format | `edgecrab-cron` |
+| New tool | `edgecrab-tools` |
+| Loop behaviour, prompt strategy, compression | `edgecrab-core` |
+| New CLI subcommand or TUI feature | `edgecrab-cli` |
+| New messaging platform | `edgecrab-gateway` |
+| New editor protocol | `edgecrab-acp` |
+
+---
+
+## Tips
+
+> **Tip: Verify no core import crept into tools with `cargo tree`.**
+> ```sh
+> cargo tree -p edgecrab-tools | grep edgecrab-core
+> # Must print nothing
+> ```
+
+> **Tip: Keep `edgecrab-types` as lean as possible.**
+> Any dependency you add here propagates to all 10 crates. At time of writing the
+> only internal dep it allows is `edgequake-llm` for type bridging.
+
+> **Tip: `edgecrab-state` is the only crate allowed to run SQL.**
+> If you need a new query, add a method to `SessionDb` — do not add `rusqlite` to
+> another crate's `Cargo.toml`.
+
+---
+
+## FAQ
+
+**Q: Why does `edgecrab-gateway` depend on `edgecrab-cron`?**
+The gateway serves cron-triggered messages as a delivery target. The `Deliver::Platform`
+variant in `edgecrab-cron` names a gateway channel. The gateway resolves that name
+to an actual adapter and sends the cron output.
+
+**Q: Can I make a crate that depends on both `edgecrab-core` and `edgecrab-gateway`?**
+Yes — `edgecrab-cli` already does. These are not peers that conflict; they are
+layers that compose.
+
+---
+
+## Cross-references
+
+- System layers overview → [System Architecture](./001_system_architecture.md)
+- Concurrency details → [Concurrency Model](./003_concurrency_model.md)
+- Trait objects in tools → [Tool Registry](../004_tools_system/001_tool_registry.md)

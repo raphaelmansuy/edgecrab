@@ -1,346 +1,300 @@
-# 007.002 — Creating Skills
+# Creating Skills 🦀
 
-> **Cross-refs**: [→ INDEX](../INDEX.md) | [→ 007.001 Memory & Skills](./001_memory_skills.md) | [→ 003.003 Prompt Builder](../003_agent_core/003_prompt_builder.md) | [→ 009.001 Config & State](../009_config_state/001_config_state.md)
-> **Source**: `edgecrab-tools/src/tools/skills.rs`, `edgecrab-tools/src/tools/skills_hub.rs`
-> **Parity**: mirrors hermes-agent skill system
+> **Verified against:** `crates/edgecrab-tools/src/tools/skills.rs`
 
 ---
 
-## 1. What Skills Are
+## Why write a skill
 
-Skills are Markdown files that inject domain knowledge into the agent's context. Unlike memory (project-specific notes) or the system prompt (personality), skills are **loadable modules** that the agent explicitly activates.
+A skill is the cheapest form of agent customisation. Instead of modifying source
+code, you write a Markdown file that the agent reads at runtime. The agent then
+follows the skill's instructions as part of its normal response loop.
 
-```
-~/.edgecrab/skills/
-├── git-workflow/
-│   └── SKILL.md         ← active — flat layout
-│
-├── mlops/               ← category directory
-│   └── training/        ← nested category
-│       └── axolotl/     ← skill (nested up to N levels)
-│           ├── SKILL.md
-│           ├── references/
-│           │   └── hparams.md
-│           └── templates/
-│               └── config.yaml
-└── ...
-```
+A well-written skill encodes the difference between a generic agent and one that
+knows exactly how *your* project works.
 
-Skills are discovered by leaf directory name. `skill_view name: "axolotl"` finds `mlops/training/axolotl/SKILL.md` automatically.
+🦀 *Skills are EdgeCrab's muscle memory. The crab learns the right moves and
+executes them without you having to teach it every time.*
 
 ---
 
-## 2. SKILL.md File Format
+## Minimal structure
+
+```
+  ~/.edgecrab/skills/my-skill/
+    SKILL.md
+```
+
+One directory, one file. That is the complete requirement. The directory name
+becomes the default skill name if no `name:` frontmatter is present.
+
+---
+
+## SKILL.md format
 
 ```markdown
 ---
-name: Git Workflow
-description: Advanced git branching, bisect, and worktree workflows
-category: development
+name: my-skill               # Display name (optional; defaults to dir name)
+description: One-line summary for the skills list prompt injection
+category: devops             # Groups skills in skills_categories output
 version: 1.0.0
 license: MIT
+platforms:                   # Omit to show on all platforms
+  - cli
+  - telegram
+read_files:                  # Additional files loaded when skill is invoked
+  - ../config/release.yml
+required_tools:              # Skill hidden if these tools are absent
+  - terminal
+  - write_file
+required_toolsets:           # Skill hidden if these toolsets aren't active
+  - coding
+required_environment_variables:  # Hidden if these env vars aren't set
+  - GITHUB_TOKEN
+---
 
-# Platform restriction (omit to allow all platforms)
-platforms:
-  - darwin
-  - linux
+# My Skill
 
-# Additional files to auto-load with the skill body
+## When to use this skill
+(tell the model exactly when this skill is appropriate)
+
+## Prerequisites
+(what must be true before starting)
+
+## Workflow
+1. Step one
+2. Step two
+   - important note
+3. Step three
+
+## Common failures
+- **If X happens**: do Y instead
+- **Error "Z not found"**: check that W is configured
+
+## Example
+(a concrete example of the workflow in action)
+```
+
+---
+
+## Frontmatter fields reference
+
+| Field | Type | Effect |
+|---|---|---|
+| `name` | string | Display name in lists; defaults to directory name |
+| `description` | string | Injected into system prompt summary |
+| `category` | string | Groups in `skills_categories` output |
+| `version` | string | Displayed in skill view; no version enforcement |
+| `license` | string | Metadata only |
+| `platforms` | list | If set, skill hidden on other platforms |
+| `read_files` | list | Relative paths loaded alongside SKILL.md on invocation |
+| `required_tools` | list | Skill hidden if any listed tool is absent |
+| `required_toolsets` | list | Skill hidden if listed toolsets aren't active |
+| `required_environment_variables` | list | Skill hidden if env vars are unset |
+
+Frontmatter is **optional**. A `SKILL.md` with no frontmatter and just body
+text is a valid skill.
+
+---
+
+## Writing effective skill content
+
+### Do: state the trigger condition explicitly
+
+```markdown
+## When to use
+Use this skill when asked to create a new release, bump the version,
+publish to crates.io, or update the CHANGELOG.
+```
+
+Without this, the model may not activate the skill even when it's appropriate.
+
+### Do: show the exact commands
+
+```markdown
+## Steps
+1. `cargo test --workspace` — verify all tests pass
+2. `git tag v$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')`
+3. `git push --tags`
+4. Run `cargo publish` for each crate in dependency order
+```
+
+### Do: document failure paths
+
+```markdown
+## Failures
+- If `cargo publish` returns "crate already exists": increment patch version
+- If tests fail on integration tests: check `docker ps` — the test DB may be down
+```
+
+### Don't: write aspirational steps
+
+If a step requires a tool the model doesn't have or a service that isn't
+configured, note the prerequisite. Aspirational steps confuse the agent.
+
+---
+
+## Invoking a skill
+
+```sh
+# From CLI flag (pre-loads before the session starts)
+edgecrab --skill git-release "prepare the 1.2.0 release"
+
+# From within a session (slash command)
+/skills list
+/skills view git-release
+
+# The model can invoke a skill itself
+# (after reading the summary in the system prompt):
+"Use the git-release skill to create the patch release"
+```
+
+---
+
+## `read_files` — linked documents
+
+Skills can reference additional files loaded alongside the `SKILL.md`:
+
+```yaml
 read_files:
-  - references/commands.md
-  - templates/pr-template.md
-
-# Required credentials / env vars
-required_environment_variables:
-  - name: GITHUB_TOKEN
-    prompt: "Enter your GitHub personal access token"
-    help: "Create one at https://github.com/settings/tokens"
-    required_for: "full functionality"
-
-# Conditional activation (hide/show based on enabled toolsets)
-conditional_activation:
-  fallback_for_toolsets:
-    - git_native         # Hide this skill when the native git toolset is active
-  requires_tools:
-    - terminal           # Only show when terminal tool is available
----
-
-# Git Workflow
-
-This skill provides advanced git patterns including worktrees, bisect, and
-interactive rebase workflows optimized for large codebases.
-
-## Branching Strategy
-...
+  - ../shared/release-checklist.md   # relative to SKILL.md
+  - /absolute/path/to/runbook.md
 ```
 
-The YAML frontmatter is **optional** — a plain Markdown file works as a skill.
+These files are loaded when the skill is invoked (via `skill_view`) and their
+content is included in the skill body. Use this to keep the `SKILL.md` brief
+while referencing detailed runbooks.
 
 ---
 
-## 3. Frontmatter Reference
+## Installing from the skills hub
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `name` | string | directory name | Display name |
-| `description` | string | — | One-line description for `skills_list` |
-| `category` | string | `"uncategorized"` | Groups skills in `skills_list` output |
-| `version` | string | — | Semantic version |
-| `license` | string | — | License identifier |
-| `platforms` | list | all | Restrict to `darwin` / `linux` / `windows` |
-| `read_files` | list | — | Relative paths to auto-load with the skill |
-| `required_environment_variables` | list | — | Credential requirements checked on load |
-| `conditional_activation` | object | — | Fallback / requires rules (see §4) |
+```sh
+# Browse available skills
+edgecrab skills hub
 
-### `required_environment_variables` items
+# Install a skill by name
+edgecrab skills install docker-build
 
-| Sub-field | Required | Description |
-|-----------|----------|-------------|
-| `name` | yes | Environment variable name |
-| `prompt` | no | Human-readable prompt for credential setup |
-| `help` | no | URL or extra instructions |
-| `required_for` | no | `"full functionality"` or `"operation"` |
+# Installed to ~/.edgecrab/skills/docker-build/
+```
 
-When `required_for: "operation"`, a missing env var causes a load-time warning in the skill content and a prompt to the user to configure it.
+The hub is a curated collection of community-contributed skills.
+Local skills always take precedence over hub skills of the same name.
 
 ---
 
-## 4. Conditional Activation
+## Managing skills
 
-Skills can hide themselves based on what toolsets and tools are enabled, so fallback skills only appear when their primary alternative is absent.
+```sh
+# List all installed skills
+edgecrab skills list
 
-```yaml
-conditional_activation:
-  fallback_for_toolsets:
-    - web_native    # Hide this skill when web_native toolset is active
-  requires_toolsets:
-    - web           # Only show when the web toolset is enabled
-  fallback_for_tools:
-    - browser       # Hide when browser tool is available
-  requires_tools:
-    - terminal      # Only show when terminal is available
-```
+# View full content of a skill
+edgecrab skills view git-release
 
-| Rule | Behaviour |
-|------|-----------|
-| `fallback_for_toolsets` | **Hide** if any listed toolset is active |
-| `requires_toolsets` | **Hide** if none of the listed toolsets are active |
-| `fallback_for_tools` | **Hide** if any listed tool is available |
-| `requires_tools` | **Hide** if none of the listed tools are available |
+# Search by keyword
+edgecrab skills search "deploy"
 
-Conditions are OR within each group. All groups are AND with each other.
+# Remove a skill
+edgecrab skills remove old-skill
 
----
-
-## 5. Progressive Disclosure
-
-Skills use a three-tier loading model so large reference libraries don't flood the context on every load:
-
-```
-Tier 0: skills_categories               → category names + counts
-Tier 1: skills_list [category: "..."]   → skill names + descriptions
-Tier 2: skill_view name: "..."          → SKILL.md body + read_files
-Tier 3: skill_view name: "..." file_path: "references/api.md"  → one linked file
-```
-
-Supporting files in these standard subdirectories are automatically listed at tier 2 but not loaded:
-
-- `references/` — API docs, spec files, lookup tables
-- `templates/` — Output templates the agent can fill in
-- `scripts/` — Helper scripts the agent can run
-- `assets/` — Static assets (images, data files)
-
-The agent can load any tier-3 file on demand without re-loading the whole skill.
-
----
-
-## 6. Skill Management Tools
-
-### 6.1 `skill_manage` — create / edit / delete
-
-```json
-{
-  "action": "create",
-  "name": "docker-patterns",
-  "content": "# Docker Patterns\n\nMulti-stage builds and compose patterns...",
-  "category": "devops"
-}
-```
-
-| Action | Required fields | Effect |
-|--------|----------------|--------|
-| `create` | `name`, `content` | Creates `skills/<name>/SKILL.md`; fails if directory already exists |
-| `edit` | `name`, `content` | Overwrites existing `SKILL.md`; finds nested skills by leaf name |
-| `delete` | `name` | Removes `skills/<name>/` directory |
-| `list` | — | Lists all skill names (same as `skills_list`) |
-| `view` | `name` | Returns skill content (same as `skill_view`) |
-
-After any mutation (`create`, `edit`, `delete`), the skills prompt cache is automatically invalidated so the next `skills_list` call reflects the change.
-
-### 6.2 `skills_list` — discover available skills
-
-```json
-{
-  "category": "development"   // optional
-}
-```
-
-Returns a grouped list by category, filtered by:
-- Current platform (`darwin` / `linux` / `windows`)
-- `disabled_skills` from config
-- `conditional_activation` rules
-- External skill directories (merged, local takes precedence on duplicates)
-
-### 6.3 `skill_view` — load a skill
-
-```json
-{
-  "name": "git-workflow",
-  "file_path": "references/commands.md"   // optional — tier 3 access
-}
-```
-
-Loads `SKILL.md` body + all `read_files` at tier 2. Loads a single linked file when `file_path` is given.
-
-### 6.4 `skills_categories` — browse categories
-
-Returns category names with skill counts. Useful before calling `skills_list` with a category filter.
-
----
-
-## 7. Skill Discovery Algorithm
-
-```text
-discover_skills(roots: [local_dir, ...external_dirs])
-  │
-  └─ for each root:
-       walk directory tree
-         ├─ if leaf_dir/SKILL.md exists → it's a skill
-         │    parse_skill_frontmatter()
-         │    filter: platform, disabled_list, conditional_activation
-         │    deduplicate: first root wins on name collision
-         └─ else → recurse into subdirectory
-```
-
-Search priority: local skills directory (`~/.edgecrab/skills/`) beats external dirs. Within a root, a flat `skills/my-skill/SKILL.md` beats a nested `skills/category/my-skill/SKILL.md` if both exist (direct lookup is tried first).
-
-External directories are configured in `config.yaml`:
-
-```yaml
-skills:
-  external_dirs:
-    - ~/work/company-skills
-    - /opt/shared/edgecrab-skills
+# Install from a local directory path
+edgecrab skills install /path/to/my-skill
 ```
 
 ---
 
-## 8. Preloaded Skills
+## Example: complete skill
 
-Skills can be auto-loaded at session start (injected into the system prompt as cached blocks) without the agent needing to call `skill_view`:
-
-**CLI flag**:
-```bash
-edgecrab -S git-workflow -S docker-patterns
-```
-
-**Config file** (`~/.edgecrab/config.yaml`):
-```yaml
-skills:
-  preloaded:
-    - git-workflow
-    - docker-patterns
-```
-
-Preloaded skills are injected into the cached system prompt layer (slot 1) during `PromptBuilder::build()`. Because they sit in the cached portion of the prompt, they benefit from provider prompt caching (see [003.003 Prompt Builder](../003_agent_core/003_prompt_builder.md)).
-
+```markdown
+---
+name: rust-release
+description: Publish Rust workspace crates to crates.io in dependency order
+category: release
+version: 1.0.0
+required_tools: [terminal]
+required_environment_variables: [CARGO_REGISTRY_TOKEN]
 ---
 
-## 9. Example: Creating a Skill from Scratch
+# Rust Release
 
-```bash
-# Option 1: via the agent
-> skill_manage action=create name=docker-patterns \
-    content="# Docker Patterns\n..."
+## When to use
+When asked to publish, release, or bump the version of any crate in
+the edgecrab workspace.
 
-# Option 2: manual file creation
-mkdir -p ~/.edgecrab/skills/docker-patterns
-cat > ~/.edgecrab/skills/docker-patterns/SKILL.md << 'EOF'
----
-name: Docker Patterns
-description: Multi-stage builds, compose orchestration, and debugging
-category: devops
-platforms:
-  - darwin
-  - linux
-read_files:
-  - references/compose-snippets.md
----
+## Prerequisites
+- All tests pass: `cargo test --workspace`
+- `CARGO_REGISTRY_TOKEN` environment variable is set
+- Working directory is the workspace root
 
-# Docker Patterns
+## Publish order
+Respect the dependency graph. Publish leaf crates first:
 
-## Multi-Stage Builds
-...
-EOF
+1. edgecrab-types
+2. edgecrab-security
+3. edgecrab-state
+4. edgecrab-cron
+5. edgecrab-tools
+6. edgecrab-core
+7. edgecrab-gateway
+8. edgecrab-acp
+9. edgecrab-migrate
+10. edgecrab-cli
 
-mkdir -p ~/.edgecrab/skills/docker-patterns/references
-echo "# Compose Snippets" > ~/.edgecrab/skills/docker-patterns/references/compose-snippets.md
+Wait 30 seconds between each publish for crates.io to index.
+
+## Commands
+```sh
+cargo publish -p edgecrab-types
+sleep 30
+cargo publish -p edgecrab-security
+# ... continue
 ```
 
-Verify it's discoverable:
-
-```
-> skills_list category=devops
-→ ### devops
-  - **Docker Patterns**: Multi-stage builds, compose orchestration, and debugging
-```
-
-Load it:
-
-```
-> skill_view name=docker-patterns
-→ ## Skill: docker-patterns
-  ...
+## Failures
+- `crate already uploaded` → version already exists; bump the version in Cargo.toml
+- `401 Unauthorized` → check CARGO_REGISTRY_TOKEN is valid and not expired
 ```
 
 ---
 
-## 10. Disabled Skills
+## Tips
 
-Prevent a skill from appearing or loading without deleting it:
+> **Tip: One skill per workflow, not one skill per project.**
+> A `git-release` skill is reusable across projects. A `my-specific-project`
+> skill that embeds project-specific details is harder to maintain and share.
 
-```yaml
-# ~/.edgecrab/config.yaml
-skills:
-  disabled:
-    - old-skill-name
-    - another-skill
-```
+> **Tip: Test the skill interactively before saving.**
+> Run the workflow manually in a session, note every edge case, then write the
+> skill based on what actually happened — not what you hoped would happen.
 
-Disabled skills are excluded from `skills_list` and will return a `NotFound` error from `skill_view`.
-
----
-
-## 11. Security Considerations
-
-| Risk | Mitigation |
-|------|-----------|
-| Path traversal via skill name | `..` in name → `PermissionDenied` |
-| Path traversal via `file_path` | canonical path check verifies file stays within skill dir |
-| Absolute paths in `read_files` | filtered out silently |
-| Injection via frontmatter content | All skill content is read-only by the model — `skill_manage` mutations are gated by tool availability (see `edgecrab_security::check_injection()`) |
+> **Tip: Use `required_tools` to prevent the model from reading the skill
+> when the right tools aren't available.** A skill that requires `terminal`
+> but is shown in a `--toolset safe` session wastes prompt tokens and
+> confuses the model.
 
 ---
 
-## 12. Testing
+## FAQ
 
-```bash
-# Unit tests (skills tools)
-cargo test -p edgecrab-tools skill
+**Q: Can a skill call another skill?**
+Not directly — there is no skill-calling syntax. But the model can read a skill
+(via `skill_view`) and follow its instructions, which may include "follow the
+X workflow" referring to another skill. The model will then request that skill.
 
-# Specific test
-cargo test -p edgecrab-tools skill_view_strips_frontmatter
-cargo test -p edgecrab-tools find_skill_dir_nested
-```
+**Q: How should I version my skills?**
+`version` in frontmatter is purely informational. There is no enforcement.
+Use it for your own tracking; the runtime ignores it for activation purposes.
 
-All tests use `tempfile::TempDir` — no `~/.edgecrab` directory is touched during tests.
+**Q: Can skills be shared across team members?**
+Yes. Add the shared directory to `skills.extra_dirs` in each team member's
+`~/.edgecrab/config.yaml`. Or publish to the skills hub.
+
+---
+
+## Cross-references
+
+- Memory system overview → [Memory and Skills](./001_memory_skills.md)
+- Skills in the system prompt → [Prompt Builder](../003_agent_core/003_prompt_builder.md)
+- Skills tools (`skill_manage`, `skills_hub`) → [Tool Catalogue](../004_tools_system/002_tool_catalogue.md)

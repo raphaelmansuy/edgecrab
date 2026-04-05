@@ -497,7 +497,7 @@ impl ExecutionBackend for DockerBackend {
 
 // ─── Tests ───────────────────────────────────────────────────────────
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::tools::backends::DockerBackendConfig;

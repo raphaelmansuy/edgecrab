@@ -1,164 +1,250 @@
-# 013.001 — Library Selection
+# 🦀 Library Selection
 
-> **Cross-refs**: [→ INDEX](../INDEX.md) | [→ 002.002 Crate Dependency Graph](../002_architecture/002_crate_dependency_graph.md)
+> **WHY**: Every dependency is a trust relationship, a compile-time cost, and a future maintenance burden. The libraries listed here were chosen because they provide capabilities that would take thousands of lines of correct Rust to replicate — and because they are stable, widely-used, and actively maintained.
 
-## 1. Selection Criteria
+**Source**: workspace `Cargo.toml` and individual crate manifests.
 
-Each crate was evaluated against:
-1. **Maturity** — stable API, 1.0+ preferred, active maintenance
-2. **Ecosystem fit** — Tokio-native, serde-compatible
-3. **Downloads** — proxy for community trust (crates.io stats)
-4. **Minimal deps** — avoid dependency bloat
-5. **Feature gates** — optional compilation for binary size
+This page only covers libraries that materially shape the architecture. Transitive dependencies and minor utilities are omitted.
 
-## 2. Core Runtime & Async
+---
 
-| Crate | Version | Purpose | Rationale | Alternative Considered |
-|-------|---------|---------|-----------|----------------------|
-| `tokio` | 1.x | Async runtime | De facto standard, multi-threaded, mature | `async-std` (smaller ecosystem) |
-| `tokio-util` | 0.7 | Codecs, compat layers | Complements tokio | — |
-| `futures` | 0.3 | Future combinators | Standard futures utilities | — |
+## Runtime and Async
 
-## 3. LLM Integration
+### `tokio` — The Async Foundation
 
-| Crate | Version | Purpose | Rationale |
-|-------|---------|---------|-----------|
-| `edgequake-llm` | 0.3.x | LLM provider abstraction | **Required** — 13 native providers, trait-based, caching, rate limiting, cost tracking, OTel, BM25/RRF reranking, embeddings |
+```toml
+tokio = { version = "1", features = ["full"] }
+```
 
-## 4. Serialization & Data
+**Why**: The only production-grade async runtime for Rust with work-stealing, `io-uring` support, and a rich ecosystem. EdgeCrab uses the multi-thread runtime everywhere: CLI, gateway servers, tool execution, MCP clients, cron scheduler.
 
-| Crate | Version | Purpose | Rationale | Alternative Considered |
-|-------|---------|---------|-----------|----------------------|
-| `serde` | 1.x | Serialization framework | Universal standard | — |
-| `serde_json` | 1.x | JSON parsing | De facto standard | `simd-json` (faster but unsafe-heavy) |
-| `serde_yml` | 0.0.12 | YAML config parsing | Fork of deprecated `serde_yaml`; config files are YAML | `yaml-rust2` (lower-level), `serde_yaml` (deprecated, unmaintained) |
-| `toml` | 0.8 | TOML parsing (Cargo.toml) | For workspace config | — |
+**Shapes the architecture**: every `async fn` in EdgeCrab compiles against Tokio's executor model. The `#[tokio::main]` entry point in `edgecrab-cli` boots the multi-thread scheduler.
 
-## 5. HTTP & Networking
+- Reference: [tokio.rs](https://tokio.rs) | [docs.rs/tokio](https://docs.rs/tokio)
 
-| Crate | Version | Purpose | Rationale | Alternative Considered |
-|-------|---------|---------|-----------|----------------------|
-| `reqwest` | 0.12 | HTTP client | Tokio-native, rustls, multipart, streaming | `hyper` (too low-level) |
-| `axum` | 0.7 | HTTP server (API, webhooks) | Tokio-native, tower middleware, ergonomic | `actix-web` (different runtime), `warp` (less maintained) |
-| `tower` | 0.4 | Middleware for axum | Standard service middleware | — |
+### `tokio-util` — Cancellation and Helpers
 
-## 6. CLI & TUI
+```toml
+tokio-util = { version = "0.7", features = ["rt"] }
+```
 
-| Crate | Version | Purpose | Rationale | Alternative Considered |
-|-------|---------|---------|-----------|----------------------|
-| `clap` | 4.6 | CLI argument parsing | Derive macros, completions, 100M+ downloads | `structopt` (merged into clap) |
-| `ratatui` | 0.30 | Terminal UI framework | Active, rich widgets, crossterm backend | `tui` (archived, ratatui is the fork) |
-| `crossterm` | 0.28 | Terminal I/O backend | Cross-platform, raw mode, events | `termion` (Unix only) |
-| `arboard` | 3.x | Clipboard access | Native OS API, no subprocess | `copypasta` (less maintained) |
-| `dotenvy` | 0.15 | .env file loading | Drop-in replacement for dotenv | `dotenv` (unmaintained) |
+`CancellationToken` from `tokio-util` is the cooperative cancellation primitive used throughout the agent loop, gateway handlers, and tool execution. See [concurrency model](../002_architecture/003_concurrency_model.md).
 
-## 7. Database
+### `futures` — Stream and Combinator Utilities
 
-| Crate | Version | Purpose | Rationale | Alternative Considered |
-|-------|---------|---------|-----------|----------------------|
-| `rusqlite` | 0.39 | SQLite + FTS5 | Bundled SQLite, FTS5 support, WAL mode | `sqlx` (async but heavier, less FTS5 control) |
+Used for streaming LLM output (`Stream<Item = StreamEvent>`), async iteration, and combinator chains. The `futures::stream::StreamExt` trait is ubiquitous in the gateway and tool layers.
 
-## 8. Error Handling
+---
 
-| Crate | Version | Purpose | Rationale |
-|-------|---------|---------|-----------|
-| `thiserror` | 2.x | Derive Error for lib crates | Zero-overhead error derivation |
-| `anyhow` | 1.x | Dynamic errors for bin crates | Ergonomic context/backtrace |
+## Serialisation and Configuration
 
-## 9. Logging & Tracing
+### `serde` + `serde_json` + `serde_yml`
 
-| Crate | Version | Purpose | Rationale | Alternative Considered |
-|-------|---------|---------|-----------|----------------------|
-| `tracing` | 0.1 | Structured logging + spans | Async-aware, OpenTelemetry compat | `log` (no spans, no async) |
-| `tracing-subscriber` | 0.3 | Log output formatting | env_filter, json, pretty | — |
-| `tracing-opentelemetry` | 0.22 | OTel export | Matches edgequake-llm observability | — |
+```toml
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yml = "0.0.12"
+```
 
-## 10. Gateway Platform Adapters
+**Why**: `serde` is the de-facto Rust serialisation standard. Every public type in `edgecrab-types` derives `Serialize`/`Deserialize`. `serde_json` handles LLM API payloads and tool arguments. `serde_yml` handles `config.yaml` and skill frontmatter.
 
-| Crate | Version | Purpose | Feature Gate | Downloads |
-|-------|---------|---------|-------------|-----------|
-| `teloxide` | 0.17 | Telegram bot API | `telegram` | 966K |
-| `serenity` | 0.12.5 | Discord bot API | `discord` | 4.5M |
-| `slack-morphism` | 2.x | Slack API | `slack` | ~50K |
-| `matrix-sdk` | 0.7 | Matrix protocol | `matrix` | ~200K |
-| `lettre` | 0.11 | SMTP email sending | `email` | 10M+ |
-| `imap` | 3.x | IMAP email reading | `email` | ~500K |
+- Reference: [serde.rs](https://serde.rs)
 
-## 11. Terminal Backends
+---
 
-| Crate | Version | Purpose | Feature Gate | Downloads |
-|-------|---------|---------|-------------|-----------|
-| `bollard` | 0.20.2 | Docker API (async) | `docker-backend` | 25M |
-| `russh` | 0.46 | SSH client | `ssh-backend` | ~500K |
+## Agent and Provider Layer
 
-## 12. Security
+### `edgequake-llm` — Provider Abstraction
 
-| Crate | Version | Purpose | Rationale |
-|-------|---------|---------|-----------|
-| `regex` | 1.x | Pattern matching, injection scanning | Standard, blazing fast |
-| `aho-corasick` | 1.x | Multi-pattern string matching | O(n) for multiple patterns simultaneously |
-| `url` | 2.x | URL parsing + validation | RFC-compliant, SSRF checks |
+The internal provider crate wraps OpenAI ChatCompletions, Anthropic Messages, and the Codex Responses API behind a single async interface. EdgeCrab calls `edgequake-llm`; `edgequake-llm` handles auth, retries, API-mode translation, and streaming. This is what makes multi-provider support possible without scattering `if anthropic { … } else { … }` branches through the core runtime.
 
-## 13. Utilities
+---
 
-| Crate | Version | Purpose | Rationale |
-|-------|---------|---------|-----------|
-| `uuid` | 1.x | UUID generation (session IDs) | Standard |
-| `chrono` | 0.4 | Date/time handling | Feature-rich, tz support |
-| `dirs` | 5.x | OS directory paths | `~/.config`, `~/.local` |
-| `dashmap` | 6.x | Concurrent HashMap | Lock-free for session maps |
-| `inventory` | 0.3.22 | Compile-time plugin registration | dtolnay quality, 77M downloads |
-| `strsim` | 0.11 | String similarity (fuzzy match) | Levenshtein for tool name typos |
-| `strip-ansi-escapes` | 0.2 | Remove ANSI codes | Terminal output sanitization |
-| `unicode-width` | 0.2 | Correct character width | TUI column alignment |
-| `similar` | 2.x | Diff/patch algorithm | Unified diff for patch tool |
-| `notify` | 7.x | File system watcher | Skills sync, hot reload |
-| `libloading` | 0.8 | Dynamic library loading | Plugin system (.so/.dylib) |
-| `async-trait` | 0.1 | Async fn in traits | Until RPITIT stabilizes fully |
-| `secrecy` | 0.8 | Secret string wrapper (zeroize on drop) | Credential isolation, provider-scoped keys |
-| `rayon` | 1.x | Data-parallelism thread pool | RL environment tool execution |
-| `tree-sitter` | 0.26 | Incremental code parsing | Code analysis tools, syntax-aware search |
-| `chromiumoxide` | 0.9 | Chromium DevTools Protocol (async) | Browser tool (screenshot, DOM, evaluate). Tokio-native, async, actively maintained. | `headless_chrome` (sync, less maintained), `fantoccini` (WebDriver-only) |
-| `tiktoken-rs` | 0.6 | Token counting (BPE) | Context window budgeting, compression decisions |
-| `unicode-normalization` | 0.1 | Unicode NFKC normalization | Command normalization in approval system (bypass prevention) |
-| `rand` | 0.9 | Random number generation | WAL jitter retry, session ID generation |
-| `rust_decimal` | 1.x | Decimal arithmetic | Cost tracking (PricingEntry), billing precision |
+## Persistence and Search
 
-## 14. Build & Dev Tools
+### `rusqlite` — Embedded SQLite
 
-| Crate | Version | Purpose |
-|-------|---------|---------|
-| `cargo-audit` | — | Dependency vulnerability scanning |
-| `cargo-deny` | — | License + advisory checks |
-| `cargo-flamegraph` | — | Performance profiling |
-| `cargo-llvm-cov` | — | Code coverage |
-| `criterion` | 0.5 | Benchmarking |
-| `insta` | 1.x | Snapshot testing |
-| `mockall` | 0.12 | Mock generation for traits |
-| `proptest` | 1.x | Property-based testing |
-| `tokio-test` | — | Async test utilities |
+```toml
+rusqlite = { version = "0.31", features = ["bundled", "bundled-full"] }
+```
 
-## 15. Dependency Count Comparison
+**Why**: Zero external dependencies. The `bundled` feature compiles SQLite directly into the binary — no `libsqlite3` on the host required. `bundled-full` adds FTS5 support for full-text search over conversation history.
 
-| | hermes-agent (Python) | EdgeCrab (Rust) |
-|--------|----------------------|-----------------|
-| Direct dependencies | ~45 (requirements.txt) | ~35 (Cargo.toml across workspace) |
-| Transitive dependencies | ~200+ (pip freeze) | ~150 (cargo tree) |
-| Optional dependencies | ~15 (extras) | Feature-gated (compile-time) |
-| Binary size | ~150MB (venv) | ~15MB (release, stripped) |
-| Startup deps loaded | All | Only feature-gated ones |
+Shapes the architecture: the `edgecrab-state` crate owns all database access. WAL mode + jitter-retry writes make it safe for concurrent CLI and gateway usage on the same file.
 
-## 16. Crates NOT Selected (with rationale)
+- Reference: [docs.rs/rusqlite](https://docs.rs/rusqlite)
 
-| Crate | Considered For | Why Rejected |
-|-------|---------------|-------------|
-| `async-std` | Async runtime | Smaller ecosystem, less Tokio compat |
-| `actix-web` | HTTP server | Different runtime, less composable |
-| `sea-orm` | Database ORM | Too heavy for simple SQLite needs |
-| `diesel` | Database ORM | Sync-only, too heavy |
-| `tungstenite` | WebSocket | `axum` provides this built-in |
-| `prost` | Protobuf | Only needed if Honcho uses gRPC (HTTP fallback preferred) |
-| `native-tls` | TLS | `rustls` preferred (pure Rust, no OpenSSL) |
-| `chrono-tz` | Timezone DB | `chrono` built-in tz sufficient |
-| `serde_yaml` | YAML parsing | Deprecated and unmaintained (dtolnay); replaced by `serde_yml` fork |
-| `headless_chrome` | Chromium CDP | Synchronous, less maintained; `chromiumoxide` is async/tokio-native |
+---
+
+## CLI and TUI
+
+### `clap` — Argument Parsing
+
+```toml
+clap = { version = "4", features = ["derive"] }
+```
+
+EdgeCrab's entire subcommand tree (`run`, `chat`, `gateway`, `version`, `skills`, `memory`…) is declared with `clap`'s derive macros. Completions, help text, and validation come for free.
+
+- Reference: [docs.rs/clap](https://docs.rs/clap)
+
+### `ratatui` + `crossterm` — Terminal UI
+
+```toml
+ratatui = "0.27"
+crossterm = "0.27"
+```
+
+The interactive TUI mode (chat pane, tool output pane, status bar) is built on `ratatui`. `crossterm` provides the cross-platform terminal backend (raw mode, event loop, ANSI sequences).
+
+- Reference: [ratatui.rs](https://ratatui.rs)
+
+### `tui-textarea` — Multi-line Input
+
+Provides the multi-line text input widget used in TUI chat mode. Handles Unicode, multi-byte characters, and vim-style keybindings.
+
+---
+
+## HTTP and Servers
+
+### `reqwest` — HTTP Client
+
+```toml
+reqwest = { version = "0.12", features = ["json", "stream"] }
+```
+
+Used for all outbound HTTP: LLM provider calls (via `edgequake-llm`), URL-fetch tool, web search tool. The `stream` feature enables async streaming of large responses.
+
+### `axum` — HTTP Server
+
+```toml
+axum = "0.7"
+```
+
+Powers the ACP server (`edgecrab-acp`) and the webhook/API-server gateway adapter. Chosen for its Tokio-native design, tower middleware compatibility, and ergonomic router API.
+
+- Reference: [docs.rs/axum](https://docs.rs/axum)
+
+### `tokio-tungstenite` — WebSocket
+
+WebSocket support for gateway adapters (Discord gateway, Slack RTM, Matrix C-S API) and the ACP streaming protocol.
+
+---
+
+## Tool Registration
+
+### `inventory` — Compile-Time Plugin Registration
+
+```toml
+inventory = "0.3"
+```
+
+**Why this is architecturally significant**: `inventory` uses linker sections to collect `inventory::submit!` items across all crates into a single global registry — without any central list. Each tool registers itself:
+
+```rust
+inventory::submit! { &ReadFileTool as &dyn ToolHandler }
+```
+
+At startup, `ToolRegistry::collect()` iterates all submitted items. Adding a new tool requires zero changes outside the tool's own file. This is how EdgeCrab reaches 65 tools without a monolithic dispatch table.
+
+- Reference: [docs.rs/inventory](https://docs.rs/inventory) | [dtolnay/inventory](https://github.com/dtolnay/inventory)
+
+---
+
+## Concurrency Utilities
+
+### `dashmap` — Concurrent HashMap
+
+```toml
+dashmap = "6"
+```
+
+`DashMap` provides a sharded concurrent `HashMap` with fine-grained locking. Used for the process table (running tool subprocesses), MCP client registry, and other hot-path concurrent maps. Eliminates `Mutex<HashMap<…>>` anti-patterns.
+
+- Reference: [docs.rs/dashmap](https://docs.rs/dashmap)
+
+---
+
+## Execution Backends
+
+### `bollard` — Docker API Client
+
+```toml
+bollard = "0.17"
+```
+
+The Docker execution backend communicates with the Docker daemon via `bollard`. Used to create ephemeral containers for tool execution, mount workspaces, and stream stdout/stderr back to the agent.
+
+- Reference: [docs.rs/bollard](https://docs.rs/bollard)
+
+### `openssh` — SSH Client (Unix only)
+
+```toml
+[target.'cfg(unix)'.dependencies]
+openssh = "0.10"
+```
+
+The SSH execution backend uses `openssh` to forward tool execution to remote machines. Gated to `cfg(unix)` — not available on Windows builds.
+
+---
+
+## Security and Text Handling
+
+### `regex` + `aho-corasick` — Pattern Matching
+
+```toml
+regex = "1"
+aho-corasick = "1"
+```
+
+`aho-corasick` is the fast multi-pattern engine in `CommandScanner` — O(n) on input length regardless of pattern count. `regex` handles context-sensitive secondary scans and the redaction pattern matching. Both are used in `edgecrab-security`.
+
+- Reference: [docs.rs/aho-corasick](https://docs.rs/aho-corasick) | [Aho-Corasick algorithm](https://en.wikipedia.org/wiki/Aho%E2%80%93Corasick_algorithm)
+
+### `unicode-normalization` — NFC Normalisation
+
+Required by the injection detection module to canonicalise Unicode before pattern matching. Without NFC normalisation, homoglyph and decomposed-character injection attacks bypass string equality checks.
+
+### `strip-ansi-escapes` — Clean Terminal Output
+
+Strips ANSI colour/formatting escape sequences from shell command output before it is stored or displayed in contexts that don't support colour (logs, non-TUI gateway adapters).
+
+### `secrecy` — Secret Zeroisation
+
+```toml
+secrecy = "0.8"
+```
+
+Wraps sensitive values (`Secret<String>`) with a `Drop` implementation that zeroes the memory on deallocation. Used for API keys and credentials held in memory during a session.
+
+- Reference: [docs.rs/secrecy](https://docs.rs/secrecy)
+
+---
+
+## Library Selection Principles
+
+| Principle | Application |
+|---|---|
+| **Bundled over system** | `rusqlite bundled` — no host library required |
+| **Tokio-native** | `axum`, `reqwest`, `tokio-tungstenite` — no thread-blocking I/O |
+| **Zero-cost compile-time** | `inventory`, `serde derive` — no runtime reflection |
+| **cfg-gating for platform libs** | `openssh` only on Unix — clean Windows builds |
+| **Security-conscious** | `secrecy` for credentials, `aho-corasick` for fast pattern matching |
+
+---
+
+## Tips
+
+- **Don't add a crate for one function** — if you need a single algorithm, implement it. `inventory` and `dashmap` are load-bearing; a JSON pretty-printer is not.
+- **Check `cfg(unix)` before adding OS-specific deps** — `bollard` works on Linux/macOS/Windows (Docker for Windows); `openssh` does not. Follow the existing pattern.
+- **`serde_yml` not `serde_yaml`** — the workspace uses the `serde_yml` fork (maintained, no `unsafe` YAML parser). Don't introduce the old `serde_yaml` crate.
+
+---
+
+## Cross-References
+
+- `inventory` registration detail → [`002_architecture/002_crate_dependency_graph.md`](../002_architecture/002_crate_dependency_graph.md)
+- `DashMap` in concurrency model → [`002_architecture/003_concurrency_model.md`](../002_architecture/003_concurrency_model.md)
+- `CancellationToken` usage → [`002_architecture/003_concurrency_model.md`](../002_architecture/003_concurrency_model.md)
+- `rusqlite` WAL detail → [`009_config_state/002_session_storage.md`](../009_config_state/002_session_storage.md)
+- Security primitives (`aho-corasick`, `regex`) → [`011_security/001_security.md`](../011_security/001_security.md)
