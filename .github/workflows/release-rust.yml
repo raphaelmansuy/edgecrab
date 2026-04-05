@@ -16,6 +16,39 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
+      # publish_crate <crate> [--no-verify]
+      # Retries up to 15 times with a 660 s gap on 429 (new-account rate limit
+      # is 1 new crate per 10 minutes after a burst of 5).
+      - name: Install publish helper
+        run: |
+          cat > /usr/local/bin/publish_crate << 'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          CRATE="$1"; shift
+          FLAGS="${*:-}"
+          MAX_RETRIES=15
+          RETRY_WAIT=660   # 11 minutes — clears the 10-minute new-crate window
+
+          for attempt in $(seq 1 $MAX_RETRIES); do
+            OUTPUT=$(cargo publish -p "$CRATE" $FLAGS 2>&1) && echo "$OUTPUT" && exit 0 || true
+            echo "$OUTPUT"
+            if echo "$OUTPUT" | grep -q "already exists on crates.io"; then
+              echo "$CRATE already published — skipping."
+              exit 0
+            fi
+            if echo "$OUTPUT" | grep -q "429\|Too Many Requests\|rate limit"; then
+              echo "Rate limited. Waiting ${RETRY_WAIT}s before retry $((attempt+1))/$MAX_RETRIES ..."
+              sleep $RETRY_WAIT
+              continue
+            fi
+            echo "Unexpected error publishing $CRATE — aborting."
+            exit 1
+          done
+          echo "All retries exhausted for $CRATE"
+          exit 1
+          EOF
+          chmod +x /usr/local/bin/publish_crate
+
       - name: Verify version consistency
         run: |
           TAG_VERSION="${GITHUB_REF_NAME#v}"
