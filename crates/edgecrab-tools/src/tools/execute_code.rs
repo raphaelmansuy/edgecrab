@@ -47,6 +47,7 @@ const MAX_STDOUT_BYTES: usize = 50_000;
 /// Maximum stderr bytes (10KB like hermes).
 const MAX_STDERR_BYTES: usize = 10_000;
 /// Max tool calls per script execution.
+#[cfg(unix)]
 const MAX_TOOL_CALLS: usize = 50;
 
 /// Tools allowed inside the execute_code sandbox.
@@ -105,6 +106,7 @@ const SANDBOX_ALLOWED_TOOLS: &[&str] = &[
 ];
 
 /// Terminal parameters that must not be used from sandbox scripts.
+#[cfg(unix)]
 const TERMINAL_BLOCKED_PARAMS: &[&str] = &["background", "check_interval", "pty"];
 
 pub struct ExecuteCodeToolReal;
@@ -143,6 +145,7 @@ fn resolve_runtime(lang: &str) -> Option<(&'static str, &'static str)> {
 /// Generate the `edgecrab_tools.py` module that child scripts import.
 /// Each stub function sends an RPC request over a Unix domain socket
 /// back to the parent process, which dispatches through the ToolRegistry.
+#[cfg(unix)]
 fn generate_tools_module(available_tools: &[&str]) -> String {
     let mut stubs = String::new();
     let available_set: std::collections::HashSet<&str> = available_tools.iter().copied().collect();
@@ -1273,6 +1276,7 @@ mod tests {
         assert_eq!(result, "red normal");
     }
 
+    #[cfg(unix)]
     #[test]
     fn generate_tools_module_contains_stubs() {
         let module = generate_tools_module(&["web_search", "terminal"]);
@@ -1287,6 +1291,7 @@ mod tests {
         assert!(module.contains("not available in this execute_code session"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn generate_tools_module_uses_current_web_extract_signature() {
         let module = generate_tools_module(&["web_extract"]);
@@ -1296,6 +1301,7 @@ mod tests {
         assert!(module.contains(r#"args = {"url": url, "max_chars": max_chars, "render_js_fallback": render_js_fallback}"#));
     }
 
+    #[cfg(unix)]
     #[test]
     fn generate_tools_module_all_tools() {
         let module = generate_tools_module(SANDBOX_ALLOWED_TOOLS);
