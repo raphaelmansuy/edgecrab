@@ -21,7 +21,9 @@ const { execSync } = require('node:child_process');
 const { createGunzip } = require('node:zlib');
 
 // ─── Config ──────────────────────────────────────────────────────────────────
-const VERSION = require('../package.json').version;
+// BINARY_VERSION controls which GitHub Release tag is used to download binaries.
+// Decoupled from the package version so the wrapper can be patched independently.
+const BINARY_VERSION = '0.1.0';
 const REPO    = 'raphaelmansuy/edgecrab';
 const BINARY  = process.platform === 'win32' ? 'edgecrab.exe' : 'edgecrab';
 const BIN_DIR = path.join(__dirname, '..', 'bin');
@@ -45,7 +47,7 @@ if (!archive) {
   process.exit(0); // non-fatal — SDK still works
 }
 
-const url = `https://github.com/${REPO}/releases/download/v${VERSION}/${archive}`;
+const url = `https://github.com/${REPO}/releases/download/v${BINARY_VERSION}/${archive}`;
 
 // Skip download in CI if binary already exists (cache hit)
 if (fs.existsSync(DEST)) {

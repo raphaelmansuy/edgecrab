@@ -23,6 +23,10 @@ import httpx
 from edgecrab_cli._version import __version__
 
 REPO = "raphaelmansuy/edgecrab"
+# BINARY_VERSION controls which GitHub Release tag is used for binary downloads.
+# It is intentionally decoupled from __version__ so the package can be patched
+# independently of binary releases.
+BINARY_VERSION = "0.1.0"
 
 # ── Platform → asset name mapping ────────────────────────────────────────────
 _PLATFORM_MAP: dict[tuple[str, str], str] = {
@@ -103,9 +107,10 @@ def ensure_binary() -> Path:
         return dest
 
     asset = _asset_name()
-    url = f"https://github.com/{REPO}/releases/download/v{__version__}/{asset}"
+    url = f"https://github.com/{REPO}/releases/download/v{BINARY_VERSION}/{asset}"
 
-    with tempfile.NamedTemporaryFile(suffix=Path(asset).suffix + (".gz" if ".tar." in asset else ""), delete=False) as tmp:
+    tmp_suffix = ".tar.gz" if asset.endswith(".tar.gz") else ".zip"
+    with tempfile.NamedTemporaryFile(suffix=tmp_suffix, delete=False) as tmp:
         tmp_path = Path(tmp.name)
 
     try:
