@@ -587,6 +587,35 @@ impl SignalAdapter {
         Ok(())
     }
 
+    async fn send_attachment(
+        &self,
+        target: &SignalTarget,
+        path: &str,
+        caption: Option<&str>,
+    ) -> anyhow::Result<()> {
+        if !std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file()) {
+            anyhow::bail!("Signal attachment path does not exist: {path}");
+        }
+
+        let params = match target {
+            SignalTarget::Group(group_id) => serde_json::json!({
+                "account": self.account,
+                "groupId": group_id,
+                "message": caption.unwrap_or_default(),
+                "attachments": [path],
+            }),
+            SignalTarget::Direct(recipient) => serde_json::json!({
+                "account": self.account,
+                "recipient": [recipient],
+                "message": caption.unwrap_or_default(),
+                "attachments": [path],
+            }),
+        };
+
+        self.rpc("send", params).await?;
+        Ok(())
+    }
+
     async fn rpc(
         &self,
         method: &'static str,
@@ -923,6 +952,34 @@ impl PlatformAdapter for SignalAdapter {
     fn supports_files(&self) -> bool {
         true // Signal supports file attachments
     }
+
+    async fn send_photo(
+        &self,
+        path: &str,
+        caption: Option<&str>,
+        metadata: &MessageMetadata,
+    ) -> anyhow::Result<()> {
+        let raw_target = metadata
+            .channel_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Signal photo send requires channel_id"))?;
+        let target = normalize_signal_target(raw_target)?;
+        self.send_attachment(&target, path, caption).await
+    }
+
+    async fn send_document(
+        &self,
+        path: &str,
+        caption: Option<&str>,
+        metadata: &MessageMetadata,
+    ) -> anyhow::Result<()> {
+        let raw_target = metadata
+            .channel_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Signal document send requires channel_id"))?;
+        let target = normalize_signal_target(raw_target)?;
+        self.send_attachment(&target, path, caption).await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1129,6 +1186,60 @@ mod tests {
             "expected gateway_media/signal in {local_path}"
         );
         assert_eq!(materialized.mime_type.as_deref(), Some("image/png"));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn send_document_uses_signal_rpc_attachment_payload() {
+        let captured = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let captured_state = Arc::clone(&captured);
+        let app = Router::new().route(
+            "/api/v1/rpc",
+            post(move |Json(body): Json<Value>| {
+                let captured = Arc::clone(&captured_state);
+                async move {
+                    captured.lock().expect("lock").push(body);
+                    Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": { "timestamp": 1 }
+                    }))
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+
+        let adapter = test_signal_adapter(format!("http://{addr}"));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("report.pdf");
+        std::fs::write(&path, b"edgecrab").expect("write");
+        let metadata = MessageMetadata {
+            channel_id: Some("+15557654321".into()),
+            ..Default::default()
+        };
+
+        adapter
+            .send_document(path.to_string_lossy().as_ref(), Some("report"), &metadata)
+            .await
+            .expect("send document");
+
+        let requests = captured.lock().expect("lock");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["method"], "send");
+        assert_eq!(requests[0]["params"]["message"], "report");
+        assert_eq!(requests[0]["params"]["recipient"][0], "+15557654321");
+        assert_eq!(
+            requests[0]["params"]["attachments"][0],
+            path.to_string_lossy().as_ref()
+        );
 
         server.abort();
     }

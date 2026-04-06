@@ -42,6 +42,7 @@ cron = { workspace = true }
 reqwest = { workspace = true }
 arboard = "3"
 unicode-width = { workspace = true }
+similar = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

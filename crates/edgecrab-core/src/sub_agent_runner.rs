@@ -14,7 +14,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use edgecrab_tools::registry::ToolRegistry;
+use edgecrab_tools::registry::{DelegationEvent, SubAgentRunRequest, ToolRegistry};
 use edgecrab_tools::{SubAgentResult, SubAgentRunner};
 use edgecrab_types::Platform;
 use edgequake_llm::{LLMProvider, ProviderFactory, VsCodeCopilotProvider};
@@ -55,15 +55,18 @@ impl CoreSubAgentRunner {
 
 #[async_trait]
 impl SubAgentRunner for CoreSubAgentRunner {
-    async fn run_task(
-        &self,
-        goal: &str,
-        system_prompt: &str,
-        enabled_toolsets: Vec<String>,
-        max_iterations: u32,
-        model_override: Option<String>,
-        parent_cancel: tokio_util::sync::CancellationToken,
-    ) -> Result<SubAgentResult, String> {
+    async fn run_task(&self, request: SubAgentRunRequest) -> Result<SubAgentResult, String> {
+        let SubAgentRunRequest {
+            goal,
+            system_prompt,
+            enabled_toolsets,
+            max_iterations,
+            model_override,
+            parent_cancel,
+            progress_tx,
+            task_index,
+            task_count,
+        } = request;
         let (child_provider, child_model) =
             self.resolve_child_provider_and_model(model_override.as_deref())?;
 
@@ -105,10 +108,51 @@ impl SubAgentRunner for CoreSubAgentRunner {
         // Run the full conversation loop with the focused system prompt.
         // The child gets its own execute_loop: tool dispatch, compression,
         // retry, budget — everything the parent has.
+        let (child_event_tx, mut child_event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let progress_forwarder = if let Some(progress_tx) = progress_tx {
+            Some(tokio::spawn(async move {
+                while let Some(event) = child_event_rx.recv().await {
+                    match event {
+                        crate::StreamEvent::Reasoning(text) => {
+                            if !text.trim().is_empty() {
+                                let _ = progress_tx.send(DelegationEvent::Thinking {
+                                    task_index,
+                                    task_count,
+                                    text,
+                                });
+                            }
+                        }
+                        crate::StreamEvent::ToolExec { name, args_json } => {
+                            let _ = progress_tx.send(DelegationEvent::ToolCalled {
+                                task_index,
+                                task_count,
+                                tool_name: name,
+                                args_json,
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+            }))
+        } else {
+            drop(child_event_rx);
+            None
+        };
+
         let result = child
-            .run_conversation(goal, Some(system_prompt), None)
+            .execute_loop(
+                &goal,
+                Some(&system_prompt),
+                None,
+                Some(&child_event_tx),
+                None,
+            )
             .await;
         cancel_watch.abort();
+        drop(child_event_tx);
+        if let Some(forwarder) = progress_forwarder {
+            let _ = forwarder.await;
+        }
         let result = result.map_err(|e| format!("Child agent execution failed: {e}"))?;
 
         Ok(SubAgentResult {
@@ -116,6 +160,9 @@ impl SubAgentRunner for CoreSubAgentRunner {
             api_calls: result.api_calls,
             input_tokens: result.usage.input_tokens,
             output_tokens: result.usage.output_tokens,
+            cache_read_tokens: result.usage.cache_read_tokens,
+            cache_write_tokens: result.usage.cache_write_tokens,
+            reasoning_tokens: result.usage.reasoning_tokens,
             model: Some(result.model),
             interrupted: result.interrupted,
             budget_exhausted: result.budget_exhausted,

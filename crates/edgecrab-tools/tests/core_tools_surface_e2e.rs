@@ -38,6 +38,7 @@ async fn browser_advantage_tools_dispatch_through_registry_with_edge_case_valida
         tool_registry: None,
         delegate_depth: 0,
         sub_agent_runner: None,
+        delegation_event_tx: None,
         clarify_tx: None,
         approval_tx: None,
         on_skills_changed: None,

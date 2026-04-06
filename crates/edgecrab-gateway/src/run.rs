@@ -13,6 +13,7 @@
 //! ```
 
 use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -21,6 +22,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use edgecrab_tools::tools::vision::VisionAnalyzeTool;
 use edgecrab_tools::{AppConfigRef, ToolContext, ToolHandler};
+use futures::FutureExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -33,6 +35,7 @@ use crate::platform::{IncomingMessage, PlatformAdapter};
 use crate::session::{SessionKey, SessionManager};
 use crate::webhook::WebhookPayload;
 use edgecrab_core::{Agent, IsolatedAgentOptions};
+use edgecrab_types::Role;
 
 /// Deterministic gateway-side image pre-analysis prompt.
 ///
@@ -239,6 +242,7 @@ async fn build_effective_text(agent: &Agent, msg: &IncomingMessage) -> String {
             tool_registry: None,
             delegate_depth: 0,
             sub_agent_runner: None,
+            delegation_event_tx: None,
             clarify_tx: None,
             approval_tx: None,
             on_skills_changed: None,
@@ -275,6 +279,34 @@ async fn build_effective_text(agent: &Agent, msg: &IncomingMessage) -> String {
     )
 }
 
+fn background_gateway_arg_preview(args_json: &str) -> String {
+    const PRIORITY: &[&str] = &[
+        "query", "url", "path", "command", "goal", "prompt", "text", "content",
+    ];
+
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(args_json) else {
+        return String::new();
+    };
+    let Some(obj) = value.as_object() else {
+        return String::new();
+    };
+    for key in PRIORITY {
+        if let Some(text) = obj.get(*key).and_then(|v| v.as_str()) {
+            return edgecrab_core::safe_truncate(text, 48).to_string();
+        }
+    }
+    String::new()
+}
+
+fn background_gateway_tool_label(name: &str, args_json: &str) -> String {
+    let preview = background_gateway_arg_preview(args_json);
+    if preview.is_empty() {
+        name.to_string()
+    } else {
+        format!("{name}: {preview}")
+    }
+}
+
 async fn deliver_text_and_media(
     delivery: &DeliveryRouter,
     adapter: Option<Arc<dyn PlatformAdapter>>,
@@ -283,11 +315,16 @@ async fn deliver_text_and_media(
     metadata: &crate::platform::MessageMetadata,
 ) -> anyhow::Result<usize> {
     let (cleaned, media_refs) = crate::platform::extract_media_from_response(response);
-
-    let text_result = delivery
-        .deliver(&cleaned, platform, metadata)
-        .await
-        .map(|_| cleaned.len())?;
+    let text_result = if let Some(text) =
+        crate::platform::response_text_after_media_extraction(response, &cleaned, &media_refs)
+    {
+        delivery
+            .deliver(&text, platform, metadata)
+            .await
+            .map(|_| text.len())?
+    } else {
+        0
+    };
 
     if !media_refs.is_empty() {
         if let Some(adapter) = adapter {
@@ -329,6 +366,35 @@ fn message_origin_recipient(msg: &IncomingMessage) -> String {
         .as_deref()
         .or(msg.metadata.thread_id.as_deref());
     delivery_recipient(chat_id, thread_id)
+}
+
+fn extract_stream_fallback_response(
+    messages: &[edgecrab_types::Message],
+    baseline_len: usize,
+) -> Option<String> {
+    messages
+        .iter()
+        .skip(baseline_len)
+        .rev()
+        .find(|message| message.role == Role::Assistant)
+        .or_else(|| {
+            messages
+                .iter()
+                .rev()
+                .find(|message| message.role == Role::Assistant)
+        })
+        .map(|message| message.text_content())
+        .filter(|text| !text.trim().is_empty())
+}
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        message
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.as_str()
+    } else {
+        "unknown panic payload"
+    }
 }
 
 /// Shared gateway state, passed to axum handlers via State extractor.
@@ -953,6 +1019,7 @@ impl Gateway {
                                     let preview_for_spawn = preview.clone();
 
                                     tokio::spawn(async move {
+                                        const BG_SUBAGENT_BATCH_SIZE: usize = 5;
                                         let background_agent = match agent
                                             .fork_isolated(IsolatedAgentOptions {
                                                 session_id: Some(task_id_for_spawn.clone()),
@@ -980,27 +1047,245 @@ impl Gateway {
                                             }
                                         };
 
-                                        let response = match background_agent
-                                            .chat_with_origin(
-                                                &effective_text,
-                                                &platform_name,
-                                                &origin_chat_id_clone,
-                                            )
-                                            .await
-                                        {
-                                            Ok(text) => {
-                                                let body = if text.trim().is_empty() {
+                                        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+                                        let stream_task = tokio::spawn({
+                                            let effective_text = effective_text.clone();
+                                            let platform_name = platform_name.clone();
+                                            let origin_chat_id_clone = origin_chat_id_clone.clone();
+                                            async move {
+                                                background_agent
+                                                    .chat_streaming_with_origin(
+                                                        &effective_text,
+                                                        &platform_name,
+                                                        &origin_chat_id_clone,
+                                                        event_tx,
+                                                    )
+                                                    .await
+                                            }
+                                        });
+
+                                        let mut response = String::new();
+                                        let mut stream_error: Option<String> = None;
+                                        let mut last_tool: Option<String> = None;
+                                        let mut subagent_batches: HashMap<usize, Vec<String>> = HashMap::new();
+
+                                        while let Some(event) = event_rx.recv().await {
+                                            match event {
+                                                edgecrab_core::StreamEvent::Token(text) => {
+                                                    response.push_str(&text);
+                                                }
+                                                edgecrab_core::StreamEvent::ToolExec { name, args_json } => {
+                                                    let label = background_gateway_tool_label(&name, &args_json);
+                                                    if last_tool.as_deref() != Some(label.as_str()) {
+                                                        last_tool = Some(label.clone());
+                                                        if let Some(adapter) = adapter.as_ref() {
+                                                            let _ = adapter
+                                                                .send_status(
+                                                                    &format!(
+                                                                        "🔧 {} {}",
+                                                                        task_id_for_spawn, label
+                                                                    ),
+                                                                    &metadata,
+                                                                )
+                                                                .await;
+                                                        }
+                                                    }
+                                                }
+                                                edgecrab_core::StreamEvent::ToolDone {
+                                                    name,
+                                                    result_preview,
+                                                    duration_ms,
+                                                    is_error,
+                                                    ..
+                                                } => {
+                                                    if is_error {
+                                                        if let Some(adapter) = adapter.as_ref() {
+                                                            let _ = adapter
+                                                                .send_status(
+                                                                    &format!(
+                                                                        "❌ {} {} failed in {:.1}s",
+                                                                        task_id_for_spawn,
+                                                                        name,
+                                                                        duration_ms as f64 / 1000.0
+                                                                    ),
+                                                                    &metadata,
+                                                                )
+                                                                .await;
+                                                        }
+                                                    } else if result_preview.as_deref().is_some_and(|preview| {
+                                                        crate::event_processor::should_surface_tool_completion(
+                                                            &name, preview,
+                                                        )
+                                                    }) {
+                                                        if let Some(adapter) = adapter.as_ref() {
+                                                            let _ = adapter
+                                                                .send_status(
+                                                                    &format!(
+                                                                        "✅ {} {}",
+                                                                        task_id_for_spawn,
+                                                                        result_preview
+                                                                            .as_deref()
+                                                                            .unwrap_or_default()
+                                                                    ),
+                                                                    &metadata,
+                                                                )
+                                                                .await;
+                                                        }
+                                                    }
+                                                }
+                                                edgecrab_core::StreamEvent::SubAgentStart {
+                                                    task_index,
+                                                    task_count,
+                                                    goal,
+                                                } => {
+                                                    if let Some(adapter) = adapter.as_ref() {
+                                                        let _ = adapter
+                                                            .send_status(
+                                                                &format!(
+                                                                    "🔀 {} [{}/{}] {}",
+                                                                    task_id_for_spawn,
+                                                                    task_index + 1,
+                                                                    task_count,
+                                                                    edgecrab_core::safe_truncate(&goal, 72)
+                                                                ),
+                                                                &metadata,
+                                                            )
+                                                            .await;
+                                                    }
+                                                }
+                                                edgecrab_core::StreamEvent::SubAgentReasoning {
+                                                    task_index,
+                                                    task_count,
+                                                    text,
+                                                } => {
+                                                    if let Some(adapter) = adapter.as_ref() {
+                                                        let _ = adapter
+                                                            .send_status(
+                                                                &format!(
+                                                                    "💭 {} [{}/{}] {}",
+                                                                    task_id_for_spawn,
+                                                                    task_index + 1,
+                                                                    task_count,
+                                                                    edgecrab_core::safe_truncate(&text, 72)
+                                                                ),
+                                                                &metadata,
+                                                            )
+                                                            .await;
+                                                    }
+                                                }
+                                                edgecrab_core::StreamEvent::SubAgentToolExec {
+                                                    task_index,
+                                                    task_count,
+                                                    name,
+                                                    ..
+                                                } => {
+                                                    let batch = subagent_batches.entry(task_index).or_default();
+                                                    batch.push(name);
+                                                    if batch.len() >= BG_SUBAGENT_BATCH_SIZE {
+                                                        let summary = batch.join(", ");
+                                                        batch.clear();
+                                                        if let Some(adapter) = adapter.as_ref() {
+                                                            let _ = adapter
+                                                                .send_status(
+                                                                    &format!(
+                                                                        "🔀 {} [{}/{}] {}",
+                                                                        task_id_for_spawn,
+                                                                        task_index + 1,
+                                                                        task_count,
+                                                                        summary
+                                                                    ),
+                                                                    &metadata,
+                                                                )
+                                                                .await;
+                                                        }
+                                                    }
+                                                }
+                                                edgecrab_core::StreamEvent::SubAgentFinish {
+                                                    task_index,
+                                                    task_count,
+                                                    status,
+                                                    duration_ms,
+                                                    ..
+                                                } => {
+                                                    if let Some(batch) = subagent_batches.get_mut(&task_index) {
+                                                        if !batch.is_empty() {
+                                                            let summary = batch.join(", ");
+                                                            batch.clear();
+                                                            if let Some(adapter) = adapter.as_ref() {
+                                                                let _ = adapter
+                                                                    .send_status(
+                                                                        &format!(
+                                                                            "🔀 {} [{}/{}] {}",
+                                                                            task_id_for_spawn,
+                                                                            task_index + 1,
+                                                                            task_count,
+                                                                            summary
+                                                                        ),
+                                                                        &metadata,
+                                                                    )
+                                                                    .await;
+                                                            }
+                                                        }
+                                                    }
+                                                    if let Some(adapter) = adapter.as_ref() {
+                                                        let _ = adapter
+                                                            .send_status(
+                                                                &format!(
+                                                                    "{} {} [{}/{}] {} in {:.1}s",
+                                                                    if status == "completed" { "✅" } else { "❌" },
+                                                                    task_id_for_spawn,
+                                                                    task_index + 1,
+                                                                    task_count,
+                                                                    status,
+                                                                    duration_ms as f64 / 1000.0
+                                                                ),
+                                                                &metadata,
+                                                            )
+                                                            .await;
+                                                    }
+                                                }
+                                                edgecrab_core::StreamEvent::Approval { response_tx, .. } => {
+                                                    let _ = response_tx.send(edgecrab_core::ApprovalChoice::Deny);
+                                                }
+                                                edgecrab_core::StreamEvent::Clarify { response_tx, .. } => {
+                                                    let _ = response_tx.send(String::new());
+                                                }
+                                                edgecrab_core::StreamEvent::SecretRequest { response_tx, .. } => {
+                                                    let _ = response_tx.send(String::new());
+                                                }
+                                                edgecrab_core::StreamEvent::Error(err) => {
+                                                    stream_error = Some(err);
+                                                }
+                                                edgecrab_core::StreamEvent::Done => break,
+                                                _ => {}
+                                            }
+                                        }
+
+                                        let response = match stream_task.await {
+                                            Ok(Ok(())) if stream_error.is_none() => {
+                                                let body = if response.trim().is_empty() {
                                                     "(No response generated)".to_string()
                                                 } else {
-                                                    text
+                                                    response
                                                 };
                                                 format!(
                                                     "✅ Background task complete\nPrompt: \"{preview_for_spawn}\"\n\n{body}"
                                                 )
                                             }
-                                            Err(e) => {
+                                            Ok(Ok(())) => {
+                                                format!(
+                                                    "❌ Background task {task_id_for_spawn} failed: {}",
+                                                    stream_error.unwrap_or_else(|| "background task failed".into())
+                                                )
+                                            }
+                                            Ok(Err(e)) => {
                                                 format!(
                                                     "❌ Background task {task_id_for_spawn} failed: {e}"
+                                                )
+                                            }
+                                            Err(e) => {
+                                                format!(
+                                                    "❌ Background task {task_id_for_spawn} failed: background join error: {e}"
                                                 )
                                             }
                                         };
@@ -1220,48 +1505,41 @@ impl Gateway {
                         drop(task_cancel);
 
                         tokio::spawn(async move {
-                            // Resolve the origin chat_id: prefer channel_id (group/channel),
-                            // fall back to user_id (DM).  This is what deliver='origin' uses
-                            // to route cron job output back to the correct chat.
-                            let origin_chat_id = message_origin_recipient(&msg_clone);
-                            let platform_name = msg_clone.platform.to_string();
+                            let task_outcome = AssertUnwindSafe(async {
+                                // Resolve the origin chat_id: prefer channel_id (group/channel),
+                                // fall back to user_id (DM).  This is what deliver='origin' uses
+                                // to route cron job output back to the correct chat.
+                                let origin_chat_id = message_origin_recipient(&msg_clone);
+                                let platform_name = msg_clone.platform.to_string();
 
-                            // Enrich the prompt with image attachment instructions.
-                            // WHY here: This is the single gateway dispatch point covering
-                            // ALL platforms (WhatsApp, Telegram, Slack, Signal, …). Injecting
-                            // the *** ATTACHED IMAGES *** block here means every platform
-                            // triggers the VISION_GUIDANCE rules in the system prompt,
-                            // identical to the CLI pending_images path in app.rs.
-                            let effective_text = build_effective_text(&agent, &msg_clone).await;
+                                // Enrich the prompt with image attachment instructions.
+                                // WHY here: This is the single gateway dispatch point covering
+                                // ALL platforms (WhatsApp, Telegram, Slack, Signal, …). Injecting
+                                // the *** ATTACHED IMAGES *** block here means every platform
+                                // triggers the VISION_GUIDANCE rules in the system prompt,
+                                // identical to the CLI pending_images path in app.rs.
+                                let effective_text = build_effective_text(&agent, &msg_clone).await;
 
-                            // NOTE: chat_streaming_with_origin() handles origin context
-                            // internally, so we do NOT pre-set it here.
-
-                            let response_result = match origin_adapter {
-                                // ── Interactive gateway path ─────────────────────────────
-                                // Use the event bridge whenever the originating platform
-                                // has an adapter, even if progressive token delivery is
-                                // disabled. This keeps approvals and clarify on one path.
-                                Some(adapter_arc) => {
-                                    dispatch_streaming_arc(
-                                        &agent,
-                                        &effective_text,
-                                        &platform_name,
-                                        &origin_chat_id,
-                                        adapter_arc,
-                                        msg_clone.metadata.clone(),
-                                        streaming_cfg,
-                                        hook_registry_for_spawn,
-                                        interaction_broker.clone(),
-                                        task_session_key.clone(),
-                                    )
-                                    .await
-                                }
-                                // ── Non-streaming fallback ────────────────────────────────
-                                // No adapter is available, so we cannot surface pending
-                                // interactions through the gateway event bridge.
-                                None => {
-                                    match agent
+                                // NOTE: chat_streaming_with_origin() handles origin context
+                                // internally, so we do NOT pre-set it here.
+                                let response_result = match origin_adapter {
+                                    Some(adapter_arc) => {
+                                        dispatch_streaming_arc(
+                                            &agent,
+                                            &effective_text,
+                                            msg_clone.platform,
+                                            &platform_name,
+                                            &origin_chat_id,
+                                            adapter_arc,
+                                            msg_clone.metadata.clone(),
+                                            streaming_cfg,
+                                            hook_registry_for_spawn,
+                                            interaction_broker.clone(),
+                                            task_session_key.clone(),
+                                        )
+                                        .await
+                                    }
+                                    None => match agent
                                         .chat_with_origin(
                                             &effective_text,
                                             &platform_name,
@@ -1278,30 +1556,42 @@ impl Gateway {
                                         )
                                         .await,
                                         Err(e) => Err(anyhow::anyhow!("{}", e)),
+                                    },
+                                };
+
+                                match response_result {
+                                    Ok(response_len) => {
+                                        tracing::info!(
+                                            platform = ?msg_clone.platform,
+                                            user = %msg_clone.user_id,
+                                            response_len,
+                                            "agent response delivered"
+                                        );
+                                        hooks.emit(
+                                            "agent:done",
+                                            &HookContext::new("agent:done")
+                                                .with_user(&msg_clone.user_id),
+                                        )
+                                        .await;
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            error = %e,
+                                            platform = ?msg_clone.platform,
+                                            "agent dispatch failed"
+                                        );
                                     }
                                 }
-                            };
+                            })
+                            .catch_unwind()
+                            .await;
 
-                            match response_result {
-                                Ok(response_len) => {
-                                    tracing::info!(
-                                        platform = ?msg_clone.platform,
-                                        user = %msg_clone.user_id,
-                                        response_len,
-                                        "agent response delivered"
-                                    );
-                                    hooks.emit(
-                                        "agent:done",
-                                        &HookContext::new("agent:done").with_user(&msg_clone.user_id),
-                                    ).await;
-                                }
-                                Err(e) => {
-                                    tracing::error!(
-                                        error = %e,
-                                        platform = ?msg_clone.platform,
-                                        "agent dispatch failed"
-                                    );
-                                }
+                            if let Err(panic_payload) = task_outcome {
+                                tracing::error!(
+                                    session = %task_session_key,
+                                    panic = %panic_payload_message(&*panic_payload),
+                                    "gateway session task panicked"
+                                );
                             }
 
                             // Release the session guard.
@@ -1355,6 +1645,7 @@ impl Gateway {
 async fn dispatch_streaming_arc(
     agent: &Agent,
     message: &str,
+    platform: edgecrab_types::Platform,
     platform_name: &str,
     origin_chat_id: &str,
     adapter: Arc<dyn PlatformAdapter>,
@@ -1364,6 +1655,8 @@ async fn dispatch_streaming_arc(
     interaction_broker: Arc<InteractionBroker>,
     session_key: String,
 ) -> anyhow::Result<usize> {
+    let baseline_len = agent.messages().await.len();
+    let fallback_adapter = Arc::clone(&adapter);
     let (processor, event_tx, consumer) = GatewayEventProcessor::new(
         adapter,
         metadata.clone(),
@@ -1389,7 +1682,22 @@ async fn dispatch_streaming_arc(
     if already_sent.load(std::sync::atomic::Ordering::Relaxed) {
         return Ok(0);
     }
-    Ok(0)
+
+    let final_messages = agent.messages().await;
+    if let Some(response) = extract_stream_fallback_response(&final_messages, baseline_len) {
+        let mut delivery = DeliveryRouter::new();
+        delivery.register(Arc::clone(&fallback_adapter));
+        return deliver_text_and_media(
+            &delivery,
+            Some(fallback_adapter),
+            &response,
+            platform,
+            &metadata,
+        )
+        .await;
+    }
+
+    anyhow::bail!("gateway streaming completed without delivering a response")
 }
 
 /// Build the axum router with health and webhook endpoints.
@@ -1425,6 +1733,82 @@ async fn webhook_incoming(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use std::sync::Mutex;
+    use tokio::sync::mpsc;
+
+    #[derive(Default)]
+    struct RecordingAdapter {
+        sent: Mutex<Vec<String>>,
+        photos: Mutex<Vec<String>>,
+        documents: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl PlatformAdapter for RecordingAdapter {
+        fn platform(&self) -> edgecrab_types::Platform {
+            edgecrab_types::Platform::Webhook
+        }
+
+        async fn start(&self, _tx: mpsc::Sender<IncomingMessage>) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn send(&self, msg: crate::platform::OutgoingMessage) -> anyhow::Result<()> {
+            self.sent.lock().expect("sent lock").push(msg.text);
+            Ok(())
+        }
+
+        fn format_response(
+            &self,
+            text: &str,
+            _metadata: &crate::platform::MessageMetadata,
+        ) -> String {
+            text.to_string()
+        }
+
+        fn max_message_length(&self) -> usize {
+            4096
+        }
+
+        fn supports_markdown(&self) -> bool {
+            false
+        }
+
+        fn supports_images(&self) -> bool {
+            true
+        }
+
+        fn supports_files(&self) -> bool {
+            true
+        }
+
+        async fn send_photo(
+            &self,
+            path: &str,
+            _caption: Option<&str>,
+            _metadata: &crate::platform::MessageMetadata,
+        ) -> anyhow::Result<()> {
+            self.photos
+                .lock()
+                .expect("photos lock")
+                .push(path.to_string());
+            Ok(())
+        }
+
+        async fn send_document(
+            &self,
+            path: &str,
+            _caption: Option<&str>,
+            _metadata: &crate::platform::MessageMetadata,
+        ) -> anyhow::Result<()> {
+            self.documents
+                .lock()
+                .expect("documents lock")
+                .push(path.to_string());
+            Ok(())
+        }
+    }
 
     #[test]
     fn gateway_construction() {
@@ -1497,6 +1881,21 @@ mod tests {
 
         assert!(rendered.starts_with("*** ATTACHED IMAGES ***"));
         assert!(rendered.contains("unavailable"));
+    }
+
+    #[test]
+    fn background_gateway_tool_label_prefers_meaningful_arg_preview() {
+        let label = background_gateway_tool_label(
+            "terminal",
+            r#"{"command":"cargo test -p edgecrab-core"}"#,
+        );
+        assert!(label.contains("terminal:"));
+        assert!(label.contains("cargo test"));
+    }
+
+    #[test]
+    fn background_gateway_arg_preview_handles_invalid_json() {
+        assert!(background_gateway_arg_preview("{not-json").is_empty());
     }
 
     #[tokio::test]
@@ -1722,5 +2121,53 @@ mod tests {
         let choices = vec!["red".to_string(), "blue".to_string()];
         assert_eq!(parse_clarify_answer("2", &choices), "blue");
         assert_eq!(parse_clarify_answer(" custom ", &choices), "custom");
+    }
+
+    #[test]
+    fn extract_stream_fallback_response_prefers_new_assistant_turn() {
+        let messages = vec![
+            edgecrab_types::Message::user("old user"),
+            edgecrab_types::Message::assistant("old answer"),
+            edgecrab_types::Message::user("new user"),
+            edgecrab_types::Message::assistant("new answer"),
+        ];
+
+        let response = extract_stream_fallback_response(&messages, 2).expect("response");
+        assert_eq!(response, "new answer");
+    }
+
+    #[test]
+    fn extract_stream_fallback_response_falls_back_to_last_assistant() {
+        let messages = vec![
+            edgecrab_types::Message::user("old user"),
+            edgecrab_types::Message::assistant("old answer"),
+        ];
+
+        let response = extract_stream_fallback_response(&messages, 99).expect("response");
+        assert_eq!(response, "old answer");
+    }
+
+    #[tokio::test]
+    async fn deliver_text_and_media_sends_media_only_responses_when_adapter_available() {
+        let adapter = Arc::new(RecordingAdapter::default());
+        let mut delivery = DeliveryRouter::new();
+        delivery.register(adapter.clone());
+
+        let sent = deliver_text_and_media(
+            &delivery,
+            Some(adapter.clone()),
+            "MEDIA:/tmp/report.pdf",
+            edgecrab_types::Platform::Webhook,
+            &crate::platform::MessageMetadata::default(),
+        )
+        .await
+        .expect("delivery succeeds");
+
+        assert_eq!(sent, 0);
+        assert!(adapter.sent.lock().expect("sent lock").is_empty());
+        assert_eq!(
+            adapter.documents.lock().expect("documents lock").as_slice(),
+            &["/tmp/report.pdf".to_string()]
+        );
     }
 }

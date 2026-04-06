@@ -1489,6 +1489,7 @@ async fn execute_remote(
                 tool_registry: ctx.tool_registry.clone(),
                 delegate_depth: ctx.delegate_depth,
                 sub_agent_runner: ctx.sub_agent_runner.clone(),
+                delegation_event_tx: ctx.delegation_event_tx.clone(),
                 clarify_tx: None,
                 approval_tx: None,
                 on_skills_changed: ctx.on_skills_changed.clone(),
@@ -1728,6 +1729,7 @@ impl ToolHandler for ExecuteCodeToolReal {
                     tool_registry: ctx.tool_registry.clone(),
                     delegate_depth: ctx.delegate_depth,
                     sub_agent_runner: ctx.sub_agent_runner.clone(),
+                    delegation_event_tx: ctx.delegation_event_tx.clone(),
                     clarify_tx: None,  // No interactive clarify in sandbox
                     approval_tx: None, // No interactive approvals in sandbox
                     on_skills_changed: ctx.on_skills_changed.clone(),

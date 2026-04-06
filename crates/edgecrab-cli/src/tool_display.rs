@@ -220,11 +220,13 @@ pub fn extract_tool_preview(_tool_name: &str, args_json: &str) -> String {
 pub fn build_tool_done_line(
     tool_name: &str,
     args_json: &str,
+    result_preview: Option<&str>,
     duration_ms: u64,
     is_error: bool,
     emoji_overrides: &std::collections::HashMap<String, String>,
 ) -> Vec<Span<'static>> {
     let preview = extract_tool_preview(tool_name, args_json);
+    let result_preview = result_preview.unwrap_or("").trim();
 
     let dur = if duration_ms >= 1000 {
         format!("{:.1}s", duration_ms as f64 / 1000.0)
@@ -249,6 +251,11 @@ pub fn build_tool_done_line(
     } else {
         format!(" {preview}")
     };
+    let result_part = if result_preview.is_empty() {
+        String::new()
+    } else {
+        format!("  {}", unicode_trunc(result_preview, 54))
+    };
 
     let bar_style = Style::default()
         .fg(Color::Rgb(60, 60, 72))
@@ -266,6 +273,11 @@ pub fn build_tool_done_line(
     let preview_style = Style::default()
         .fg(Color::Rgb(110, 120, 140))
         .add_modifier(Modifier::DIM);
+    let result_style = if is_error {
+        Style::default().fg(Color::Rgb(235, 170, 170))
+    } else {
+        Style::default().fg(Color::Rgb(150, 210, 170))
+    };
     let dur_style = Style::default()
         .fg(Color::Rgb(90, 95, 115))
         .add_modifier(Modifier::DIM);
@@ -275,6 +287,7 @@ pub fn build_tool_done_line(
         Span::styled(emoji.to_string(), emoji_style),
         Span::styled(format!(" {name_padded}"), name_style),
         Span::styled(preview_part, preview_style),
+        Span::styled(result_part, result_style),
         Span::styled(format!("  {dur}"), dur_style),
     ]
 }
@@ -319,6 +332,55 @@ pub fn build_tool_running_line(
         Span::styled(format!(" {name_padded}"), name_style),
         Span::styled(preview_part, preview_style),
         Span::styled("  ···".to_string(), running_style),
+    ]
+}
+
+/// Build a compact delegated-child progress line for the transcript.
+pub fn build_subagent_event_line(
+    task_index: usize,
+    task_count: usize,
+    label: &str,
+    detail: &str,
+    tone: &str,
+) -> Vec<Span<'static>> {
+    let badge = format!("[{}/{}]", task_index + 1, task_count);
+    let (icon, icon_style, detail_style) = match tone {
+        "success" => (
+            "✅",
+            Style::default().fg(Color::Rgb(104, 196, 129)),
+            Style::default().fg(Color::Rgb(170, 210, 180)),
+        ),
+        "error" => (
+            "❌",
+            Style::default().fg(Color::Rgb(239, 83, 80)),
+            Style::default().fg(Color::Rgb(235, 170, 170)),
+        ),
+        _ => (
+            "🔀",
+            Style::default().fg(Color::Rgb(95, 170, 255)),
+            Style::default().fg(Color::Rgb(170, 190, 220)),
+        ),
+    };
+
+    vec![
+        Span::styled(
+            "  │ ",
+            Style::default()
+                .fg(Color::Rgb(55, 60, 70))
+                .add_modifier(Modifier::DIM),
+        ),
+        Span::styled(format!("{icon} "), icon_style),
+        Span::styled(
+            format!("{} ", unicode_pad_right(&badge, 6)),
+            Style::default()
+                .fg(Color::Rgb(120, 130, 150))
+                .add_modifier(Modifier::DIM),
+        ),
+        Span::styled(
+            unicode_pad_right(&unicode_trunc(label, 28), 28),
+            Style::default().fg(Color::Rgb(210, 220, 235)),
+        ),
+        Span::styled(unicode_trunc(detail, 56), detail_style),
     ]
 }
 
@@ -524,6 +586,24 @@ mod tests {
         let preview = tool_status_preview("web_search", args);
         assert!(preview.contains("web search"), "should contain human name");
         assert!(preview.contains("hello"), "should contain query value");
+    }
+
+    #[test]
+    fn test_build_tool_done_line_includes_result_preview() {
+        let spans = build_tool_done_line(
+            "write_file",
+            r#"{"path":"src/main.rs"}"#,
+            Some("Wrote 42 bytes to 'src/main.rs'"),
+            250,
+            false,
+            &std::collections::HashMap::new(),
+        );
+        let joined = spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(joined.contains("path: src/main.rs"));
+        assert!(joined.contains("Wrote 42 bytes"));
     }
 
     #[test]

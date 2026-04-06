@@ -17,6 +17,7 @@
 //! - Max message length: **4000** characters
 
 use std::env;
+use std::path::Path;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -70,6 +71,101 @@ impl MatrixAdapter {
     fn api_url(&self, path: &str) -> String {
         format!("{}/_matrix/client/v3{}", self.homeserver, path)
     }
+
+    fn media_upload_url(&self, file_name: &str) -> String {
+        format!(
+            "{}/_matrix/media/v3/upload?filename={}",
+            self.homeserver,
+            urlencoding::encode(file_name)
+        )
+    }
+
+    async fn upload_media(&self, path: &str) -> anyhow::Result<(String, String, u64)> {
+        let file_name = Path::new(path)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| anyhow::anyhow!("Matrix media path has no file name: {path}"))?
+            .to_string();
+        let bytes = std::fs::read(path)
+            .map_err(|error| anyhow::anyhow!("Matrix cannot read {path}: {error}"))?;
+        let content_type = matrix_content_type(&file_name);
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(self.media_upload_url(&file_name))
+            .header("Authorization", self.auth_header())
+            .header("Content-Type", content_type)
+            .body(bytes.clone())
+            .timeout(Duration::from_secs(60))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Matrix media upload error {status}: {text}");
+        }
+
+        let json: serde_json::Value = resp.json().await?;
+        let content_uri = json["content_uri"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Matrix media upload response missing content_uri"))?;
+        Ok((
+            content_uri.to_string(),
+            content_type.to_string(),
+            bytes.len() as u64,
+        ))
+    }
+
+    async fn send_media_message(
+        &self,
+        room_id: &str,
+        path: &str,
+        caption: Option<&str>,
+        msgtype: &str,
+    ) -> anyhow::Result<()> {
+        let file_name = Path::new(path)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| anyhow::anyhow!("Matrix media path has no file name: {path}"))?;
+        let (content_uri, content_type, size) = self.upload_media(path).await?;
+        let txn_id = uuid::Uuid::new_v4().to_string();
+        let encoded_room = percent_encode_room_id(room_id);
+        let url = format!(
+            "{}/rooms/{}/send/m.room.message/{}",
+            self.api_url(""),
+            encoded_room,
+            txn_id
+        );
+
+        let body = serde_json::json!({
+            "msgtype": msgtype,
+            "body": caption.unwrap_or(file_name),
+            "filename": file_name,
+            "url": content_uri,
+            "info": {
+                "mimetype": content_type,
+                "size": size,
+            }
+        });
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .put(&url)
+            .header("Authorization", self.auth_header())
+            .json(&body)
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Matrix media send error {status}: {text}");
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -87,6 +183,48 @@ struct SyncRooms {
 struct MatrixMessageBody {
     msgtype: String,
     body: String,
+}
+
+fn percent_encode_room_id(room_id: &str) -> String {
+    room_id
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                format!("{}", b as char)
+            }
+            _ => format!("%{:02X}", b),
+        })
+        .collect::<String>()
+}
+
+fn matrix_content_type(file_name: &str) -> &'static str {
+    match Path::new(file_name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "bmp" => "image/bmp",
+        "pdf" => "application/pdf",
+        "txt" => "text/plain",
+        "md" => "text/markdown",
+        "csv" => "text/csv",
+        "json" => "application/json",
+        "zip" => "application/zip",
+        "doc" => "application/msword",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xls" => "application/vnd.ms-excel",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "ppt" => "application/vnd.ms-powerpoint",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        _ => "application/octet-stream",
+    }
 }
 
 #[async_trait]
@@ -180,16 +318,7 @@ impl PlatformAdapter for MatrixAdapter {
             .ok_or_else(|| anyhow::anyhow!("No Matrix room_id"))?;
 
         let txn_id = uuid::Uuid::new_v4().to_string();
-        // Percent-encode the room ID (e.g. !abc:matrix.org → %21abc%3Amatrix.org)
-        let encoded_room = room_id
-            .bytes()
-            .map(|b| match b {
-                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                    format!("{}", b as char)
-                }
-                _ => format!("%{:02X}", b),
-            })
-            .collect::<String>();
+        let encoded_room = percent_encode_room_id(room_id);
         let url = format!(
             "{}/rooms/{}/send/m.room.message/{}",
             self.api_url(""),
@@ -240,6 +369,34 @@ impl PlatformAdapter for MatrixAdapter {
 
     fn supports_files(&self) -> bool {
         true
+    }
+
+    async fn send_photo(
+        &self,
+        path: &str,
+        caption: Option<&str>,
+        metadata: &MessageMetadata,
+    ) -> anyhow::Result<()> {
+        let room_id = metadata
+            .channel_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("No Matrix room_id"))?;
+        self.send_media_message(room_id, path, caption, "m.image")
+            .await
+    }
+
+    async fn send_document(
+        &self,
+        path: &str,
+        caption: Option<&str>,
+        metadata: &MessageMetadata,
+    ) -> anyhow::Result<()> {
+        let room_id = metadata
+            .channel_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("No Matrix room_id"))?;
+        self.send_media_message(room_id, path, caption, "m.file")
+            .await
     }
 }
 

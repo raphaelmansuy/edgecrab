@@ -184,93 +184,116 @@ impl GatewayStreamConsumer {
                 || (accumulated.len() >= self.config.buffer_threshold);
 
             if should_flush && !accumulated.is_empty() && edit_supported {
-                // Overflow: accumulated text exceeds the platform limit —
-                // finalise the current bubble and open a new one.
-                while accumulated.len() > safe_limit {
-                    let split_at = accumulated[..safe_limit]
-                        .rfind('\n')
-                        .filter(|&p| p > safe_limit / 2)
-                        .unwrap_or(safe_limit);
-                    let chunk: String = accumulated.drain(..split_at).collect();
+                let (preview_cleaned, preview_media_refs) =
+                    crate::platform::extract_media_from_response(&accumulated);
+                let preview_text = crate::platform::response_text_after_media_extraction(
+                    &accumulated,
+                    &preview_cleaned,
+                    &preview_media_refs,
+                );
+                if preview_media_refs.is_empty() {
+                    // Overflow: accumulated text exceeds the platform limit —
+                    // finalise the current bubble and open a new one.
+                    while accumulated.len() > safe_limit {
+                        let split_at = accumulated[..safe_limit]
+                            .rfind('\n')
+                            .filter(|&p| p > safe_limit / 2)
+                            .unwrap_or(safe_limit);
+                        let chunk: String = accumulated.drain(..split_at).collect();
 
-                    if let Some(ref mid) = message_id {
-                        if let Err(e) = self.adapter.edit_message(mid, &self.metadata, &chunk).await
-                        {
-                            tracing::debug!(error = %e, "edit overflow chunk failed; disabling editing");
-                            edit_supported = false;
-                            break;
-                        }
-                    } else {
-                        match self
-                            .adapter
-                            .send_and_get_id(OutgoingMessage {
-                                text: chunk,
-                                metadata: self.metadata.clone(),
-                            })
-                            .await
-                        {
-                            Ok(_id) => {
-                                // Chunk delivered as its own bubble; continue loop.
-                            }
-                            Err(e) => {
-                                tracing::debug!(error = %e, "initial send for overflow failed");
+                        if let Some(ref mid) = message_id {
+                            if let Err(e) =
+                                self.adapter.edit_message(mid, &self.metadata, &chunk).await
+                            {
+                                tracing::debug!(error = %e, "edit overflow chunk failed; disabling editing");
                                 edit_supported = false;
                                 break;
                             }
+                        } else {
+                            match self
+                                .adapter
+                                .send_and_get_id(OutgoingMessage {
+                                    text: chunk,
+                                    metadata: self.metadata.clone(),
+                                })
+                                .await
+                            {
+                                Ok(_id) => {
+                                    // Chunk delivered as its own bubble; continue loop.
+                                }
+                                Err(e) => {
+                                    tracing::debug!(error = %e, "initial send for overflow failed");
+                                    edit_supported = false;
+                                    break;
+                                }
+                            }
                         }
+                        // After this overflow chunk, start fresh (new bubble next flush).
+                        message_id = None;
+                        self.already_sent.store(false, Ordering::Relaxed);
                     }
-                    // After this overflow chunk, start fresh (new bubble next flush).
-                    message_id = None;
-                    self.already_sent.store(false, Ordering::Relaxed);
+                } else if preview_text.is_none() && !got_done {
+                    continue;
                 }
 
                 if !edit_supported {
                     break;
                 }
 
-                let display = if got_done {
+                let display_base = if preview_media_refs.is_empty() {
                     accumulated.clone()
                 } else {
-                    format!("{}{}", accumulated, self.config.cursor)
+                    preview_text.unwrap_or_default()
                 };
+                if display_base.is_empty() && !got_done {
+                    last_edit_time = Instant::now();
+                    continue;
+                }
+                if !display_base.is_empty() {
+                    let display = if got_done {
+                        display_base
+                    } else {
+                        format!("{}{}", display_base, self.config.cursor)
+                    };
 
-                if let Some(ref mid) = message_id {
-                    // Skip the API call when text hasn't changed (saves quota).
-                    if display == self.last_sent_text {
-                        // nothing to do — identical content
+                    if let Some(ref mid) = message_id {
+                        // Skip the API call when text hasn't changed (saves quota).
+                        if display == self.last_sent_text {
+                            // nothing to do — identical content
+                        } else {
+                            match self
+                                .adapter
+                                .edit_message(mid, &self.metadata, &display)
+                                .await
+                            {
+                                Ok(_) => {
+                                    self.already_sent.store(true, Ordering::Relaxed);
+                                    self.last_sent_text = display;
+                                }
+                                Err(e) => {
+                                    tracing::debug!(error = %e, "editMessageText failed; disabling editing");
+                                    edit_supported = false;
+                                }
+                            }
+                        }
                     } else {
                         match self
                             .adapter
-                            .edit_message(mid, &self.metadata, &display)
+                            .send_and_get_id(OutgoingMessage {
+                                text: display.clone(),
+                                metadata: self.metadata.clone(),
+                            })
                             .await
                         {
-                            Ok(_) => {
+                            Ok(id) => {
                                 self.already_sent.store(true, Ordering::Relaxed);
                                 self.last_sent_text = display;
+                                message_id = id;
                             }
                             Err(e) => {
-                                tracing::debug!(error = %e, "editMessageText failed; disabling editing");
+                                tracing::debug!(error = %e, "initial send failed; disabling editing");
                                 edit_supported = false;
                             }
-                        }
-                    }
-                } else {
-                    match self
-                        .adapter
-                        .send_and_get_id(OutgoingMessage {
-                            text: display.clone(),
-                            metadata: self.metadata.clone(),
-                        })
-                        .await
-                    {
-                        Ok(id) => {
-                            self.already_sent.store(true, Ordering::Relaxed);
-                            self.last_sent_text = display;
-                            message_id = id;
-                        }
-                        Err(e) => {
-                            tracing::debug!(error = %e, "initial send failed; disabling editing");
-                            edit_supported = false;
                         }
                     }
                 }
@@ -285,21 +308,23 @@ impl GatewayStreamConsumer {
                 if edit_supported {
                     let (cleaned, media_refs) =
                         crate::platform::extract_media_from_response(&accumulated);
-                    let final_text = if cleaned.is_empty() {
-                        accumulated.clone()
-                    } else {
-                        cleaned
-                    };
-                    if let (Some(mid), false) = (&message_id, final_text.is_empty()) {
+                    let final_text = crate::platform::response_text_after_media_extraction(
+                        &accumulated,
+                        &cleaned,
+                        &media_refs,
+                    );
+                    if let (Some(mid), Some(final_text)) = (&message_id, final_text.as_deref()) {
                         if final_text != self.last_sent_text {
                             let _ = self
                                 .adapter
-                                .edit_message(mid, &self.metadata, &final_text)
+                                .edit_message(mid, &self.metadata, final_text)
                                 .await;
                         }
-                    } else if message_id.is_none() && !final_text.is_empty() {
+                    } else if message_id.is_none() {
                         // Nothing was sent yet (stream completed in one shot)
-                        self.send_final(&final_text).await;
+                        if let Some(final_text) = final_text.as_deref() {
+                            self.send_final(final_text).await;
+                        }
                     }
                     self.send_media_attachments(&media_refs).await;
                     return; // delivered
@@ -312,12 +337,13 @@ impl GatewayStreamConsumer {
         // Extract and deliver media before sending the final text.
         if !accumulated.is_empty() {
             let (cleaned, media_refs) = crate::platform::extract_media_from_response(&accumulated);
-            let final_text = if cleaned.is_empty() {
-                &accumulated
-            } else {
-                &cleaned
-            };
-            self.send_final(final_text).await;
+            if let Some(final_text) = crate::platform::response_text_after_media_extraction(
+                &accumulated,
+                &cleaned,
+                &media_refs,
+            ) {
+                self.send_final(&final_text).await;
+            }
             self.send_media_attachments(&media_refs).await;
         }
     }
@@ -345,12 +371,13 @@ impl GatewayStreamConsumer {
                     // Extract and strip media tags before delivery.
                     let (cleaned, media_refs) =
                         crate::platform::extract_media_from_response(&accumulated);
-                    let final_text = if cleaned.is_empty() {
-                        &accumulated
-                    } else {
-                        &cleaned
-                    };
-                    self.send_chunks(final_text, safe_limit).await;
+                    if let Some(final_text) = crate::platform::response_text_after_media_extraction(
+                        &accumulated,
+                        &cleaned,
+                        &media_refs,
+                    ) {
+                        self.send_chunks(&final_text, safe_limit).await;
+                    }
                     self.send_media_attachments(&media_refs).await;
                 }
                 return;
@@ -523,6 +550,7 @@ mod tests {
         sends: Mutex<Vec<String>>,
         edits: Mutex<Vec<String>>,
         send_ids: Mutex<Vec<String>>,
+        documents: Mutex<Vec<String>>,
     }
 
     impl RecordingAdapter {
@@ -531,6 +559,7 @@ mod tests {
                 sends: Mutex::new(Vec::new()),
                 edits: Mutex::new(Vec::new()),
                 send_ids: Mutex::new(Vec::new()),
+                documents: Mutex::new(Vec::new()),
             })
         }
     }
@@ -591,6 +620,16 @@ mod tests {
             self.send_ids.lock().await.push(msg.text);
             Ok(Some("msg-1".into()))
         }
+
+        async fn send_document(
+            &self,
+            path: &str,
+            _caption: Option<&str>,
+            _metadata: &MessageMetadata,
+        ) -> anyhow::Result<()> {
+            self.documents.lock().await.push(path.to_string());
+            Ok(())
+        }
     }
 
     #[tokio::test]
@@ -614,5 +653,33 @@ mod tests {
         assert_eq!(adapter.sends.lock().await.as_slice(), ["hello world"]);
         assert!(adapter.send_ids.lock().await.is_empty());
         assert!(adapter.edits.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn media_only_stream_sends_document_without_literal_media_text() {
+        let adapter = RecordingAdapter::new();
+        let consumer = GatewayStreamConsumer::new(
+            adapter.clone(),
+            MessageMetadata::default(),
+            StreamConsumerConfig::default(),
+        );
+        let delta_tx = consumer.delta_sender();
+        let task = tokio::spawn(consumer.run());
+
+        delta_tx
+            .send(StreamItem::Delta("MEDIA:/tmp/report.pdf".into()))
+            .await
+            .expect("delta");
+        delta_tx.send(StreamItem::Done).await.expect("done");
+
+        task.await.expect("consumer task");
+
+        assert!(adapter.sends.lock().await.is_empty());
+        assert!(adapter.send_ids.lock().await.is_empty());
+        assert!(adapter.edits.lock().await.is_empty());
+        assert_eq!(
+            adapter.documents.lock().await.as_slice(),
+            ["/tmp/report.pdf"]
+        );
     }
 }

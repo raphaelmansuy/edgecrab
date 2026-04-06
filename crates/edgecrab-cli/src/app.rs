@@ -52,12 +52,14 @@ use tui_textarea::{CursorMove, TextArea};
 use unicode_width::UnicodeWidthStr;
 
 use crate::commands::{CommandRegistry, CommandResult};
+use crate::edit_diff::{LocalEditSnapshot, capture_local_edit_snapshot, render_edit_diff_lines};
 use crate::fuzzy_selector::{FuzzyItem, FuzzySelector};
 use crate::markdown_render;
 use crate::model_discovery::{self, DiscoverySource};
 use crate::theme::{SkinConfig, Theme};
 use crate::tool_display::{
-    build_tool_done_line, build_tool_running_line, tool_action_verb, tool_icon, tool_status_preview,
+    build_subagent_event_line, build_tool_done_line, build_tool_running_line, tool_action_verb,
+    tool_icon, tool_status_preview,
 };
 use crate::vision_models::{
     available_vision_model_options_with_dynamic, canonical_provider, current_model_supports_vision,
@@ -74,6 +76,27 @@ fn progressive_keyboard_flags() -> KeyboardEnhancementFlags {
         | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
         | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
         | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+}
+
+fn format_context_pressure_notice(estimated_tokens: usize, threshold_tokens: usize) -> String {
+    let ratio = if threshold_tokens == 0 {
+        0.0
+    } else {
+        (estimated_tokens as f32 / threshold_tokens as f32).clamp(0.0, 1.0)
+    };
+    let percent = (ratio * 100.0).round() as usize;
+    let width = 16usize;
+    let filled = ((ratio * width as f32).round() as usize).min(width);
+    let bar = format!("{}{}", "▰".repeat(filled), "▱".repeat(width - filled));
+    format!(
+        "⚠ Context {bar} {percent}% to compression ({estimated_tokens}/{threshold_tokens} tokens)"
+    )
+}
+
+fn context_usage_ratio(tokens: u64, context_window: Option<u64>) -> Option<f64> {
+    context_window
+        .filter(|&cw| cw > 0)
+        .map(|cw| (tokens as f64 / cw as f64).clamp(0.0, 1.0))
 }
 
 /// Recursively copy a directory tree from `src` to `dst`.
@@ -819,6 +842,10 @@ pub struct App {
     /// `12.4k / 200k (9%)` watermark in the status bar so the user can see
     /// context pressure at a glance. `None` when the model is not in the catalog.
     context_window: Option<u64>,
+    /// Prompt-side context tokens shown in the status bar.
+    ///
+    /// This excludes completion-only tokens and includes cache hits/writes so
+    /// the indicator tracks compression pressure rather than response length.
     total_tokens: u64,
     session_cost: f64,
     /// Agent for LLM dispatch
@@ -831,6 +858,12 @@ pub struct App {
     response_tx: mpsc::UnboundedSender<AgentResponse>,
     /// Monotonic counter for isolated `/background` sessions in this TUI run.
     background_task_seq: u64,
+    /// Monotonic sequence for live progress updates rendered in the UI.
+    progress_seq: u64,
+    /// Active isolated `/background` sessions keyed by task ID.
+    background_tasks_active: std::collections::HashMap<String, BackgroundTaskStatus>,
+    /// Active delegated child tasks for the foreground agent turn.
+    active_subagents: std::collections::HashMap<usize, ActiveSubagentStatus>,
     /// Channel for cron job completion notifications from the background ticker.
     /// The background cron task sends formatted strings; the TUI drains them in
     /// `check_responses()` and displays them as assistant-style output lines.
@@ -962,16 +995,24 @@ pub struct App {
     /// styled duration/result, so the placeholder is replaced without a
     /// disruptive layout shift.  FIFO order matches tool-dispatch ordering and
     /// handles sequential multi-tool turns without any per-tool book-keeping.
-    pending_tool_line_idxs: std::collections::VecDeque<usize>,
+    pending_tool_lines: std::collections::VecDeque<PendingToolLine>,
     /// File-based hook registry — loaded from ~/.edgecrab/hooks/ at startup.
     /// Receives tool:pre/post, llm:pre/post, and cli:start/end events.
     hook_registry: std::sync::Arc<edgecrab_gateway::hooks::HookRegistry>,
+}
+
+#[derive(Debug)]
+struct PendingToolLine {
+    line_idx: usize,
+    edit_snapshot: Option<LocalEditSnapshot>,
 }
 
 /// Events from the agent background task → TUI event loop.
 enum AgentResponse {
     /// A partial streamed token — append to current streaming line.
     Token(String),
+    /// A non-token runtime notice to show as a system line.
+    Notice(String),
     /// A reasoning / think-mode delta or full reasoning block.
     Reasoning(String),
     /// A tool execution has started — show tool name + preview in status bar.
@@ -980,8 +1021,34 @@ enum AgentResponse {
     ToolDone {
         name: String,
         args_json: String,
+        result_preview: Option<String>,
         duration_ms: u64,
         is_error: bool,
+    },
+    SubAgentStart {
+        task_index: usize,
+        task_count: usize,
+        goal: String,
+    },
+    SubAgentReasoning {
+        task_index: usize,
+        task_count: usize,
+        text: String,
+    },
+    SubAgentToolExec {
+        task_index: usize,
+        task_count: usize,
+        name: String,
+        args_json: String,
+    },
+    SubAgentFinish {
+        task_index: usize,
+        task_count: usize,
+        status: String,
+        duration_ms: u64,
+        summary: String,
+        api_calls: u32,
+        model: Option<String>,
     },
     /// Streaming complete — mark processing done.
     Done,
@@ -1016,12 +1083,114 @@ enum AgentResponse {
         prompt_preview: String,
         response: String,
     },
+    /// A background session reported progress.
+    BackgroundPromptProgress { task_id: String, text: String },
     /// An isolated `/background` session failed.
     BackgroundPromptFailed {
         task_num: u64,
         task_id: String,
         error: String,
     },
+}
+
+#[derive(Clone, Debug)]
+struct BackgroundTaskStatus {
+    preview: String,
+    last_progress: Option<String>,
+    last_seq: u64,
+}
+
+#[derive(Clone, Debug)]
+struct ActiveSubagentStatus {
+    task_index: usize,
+    task_count: usize,
+    goal: String,
+    last_detail: Option<String>,
+    last_seq: u64,
+}
+
+fn background_progress_text(task_num: u64, event: &edgecrab_core::StreamEvent) -> Option<String> {
+    match event {
+        edgecrab_core::StreamEvent::ToolExec { name, args_json } => Some(format!(
+            "↳ bg#{task_num} {}",
+            tool_status_preview(name, args_json)
+        )),
+        edgecrab_core::StreamEvent::SubAgentStart {
+            task_index,
+            task_count,
+            goal,
+        } => Some(format!(
+            "↳ bg#{task_num} [{}/{}] delegate: {}",
+            task_index + 1,
+            task_count,
+            edgecrab_core::safe_truncate(goal, 72)
+        )),
+        edgecrab_core::StreamEvent::SubAgentReasoning {
+            task_index,
+            task_count,
+            text,
+        } => Some(format!(
+            "↳ bg#{task_num} [{}/{}] thinking: {}",
+            task_index + 1,
+            task_count,
+            edgecrab_core::safe_truncate(text.trim(), 72)
+        )),
+        edgecrab_core::StreamEvent::SubAgentToolExec {
+            task_index,
+            task_count,
+            name,
+            args_json,
+        } => Some(format!(
+            "↳ bg#{task_num} [{}/{}] {}",
+            task_index + 1,
+            task_count,
+            tool_status_preview(name, args_json)
+        )),
+        edgecrab_core::StreamEvent::SubAgentFinish {
+            task_index,
+            task_count,
+            status,
+            duration_ms,
+            ..
+        } => Some(format!(
+            "↳ bg#{task_num} [{}/{}] {} in {:.1}s",
+            task_index + 1,
+            task_count,
+            status,
+            *duration_ms as f64 / 1000.0
+        )),
+        _ => None,
+    }
+}
+
+fn format_background_status_summary(
+    active: &std::collections::HashMap<String, BackgroundTaskStatus>,
+) -> Option<String> {
+    let current = active.values().max_by_key(|status| status.last_seq)?;
+    let detail = current
+        .last_progress
+        .as_deref()
+        .filter(|text| !text.trim().is_empty())
+        .unwrap_or(&current.preview);
+    Some(edgecrab_core::safe_truncate(detail, 58).to_string())
+}
+
+fn format_subagent_status_summary(
+    active: &std::collections::HashMap<usize, ActiveSubagentStatus>,
+) -> Option<String> {
+    let current = active.values().max_by_key(|status| status.last_seq)?;
+    let detail = current
+        .last_detail
+        .as_deref()
+        .filter(|text| !text.trim().is_empty())
+        .map(|text| edgecrab_core::safe_truncate(text, 52).to_string())
+        .unwrap_or_else(|| edgecrab_core::safe_truncate(&current.goal, 52).to_string());
+    Some(format!(
+        "[{}/{}] {}",
+        current.task_index + 1,
+        current.task_count,
+        detail
+    ))
 }
 
 impl App {
@@ -1085,6 +1254,9 @@ impl App {
             response_rx,
             response_tx,
             background_task_seq: 0,
+            progress_seq: 0,
+            background_tasks_active: std::collections::HashMap::new(),
+            active_subagents: std::collections::HashMap::new(),
             cron_rx,
             cron_tx,
             is_processing: false,
@@ -1150,7 +1322,7 @@ impl App {
             pending_images: Vec::new(),
             in_flight_tool_count: 0,
             turn_stream_tokens: 0,
-            pending_tool_line_idxs: std::collections::VecDeque::new(),
+            pending_tool_lines: std::collections::VecDeque::new(),
             hook_registry: {
                 let mut r = edgecrab_gateway::hooks::HookRegistry::new();
                 r.discover_and_load();
@@ -1290,7 +1462,7 @@ impl App {
         // tokens to be silently dropped or appended at wrong positions.
         self.streaming_line = None;
         self.reasoning_line = None;
-        self.pending_tool_line_idxs.clear();
+        self.pending_tool_lines.clear();
         // Request a full terminal repaint.  ratatui's diff-based renderer
         // normally skips unchanged cells; if any out-of-band bytes reached the
         // alternate screen (e.g. tracing::warn! from a background task) those
@@ -3250,6 +3422,7 @@ impl App {
         self.reasoning_line = None;
         // Reset per-turn streaming counters.
         self.in_flight_tool_count = 0;
+        self.active_subagents.clear();
         self.turn_stream_tokens = 0;
         // Reset the response accumulator for the new turn (voice mode uses it).
         self.last_agent_response_text.clear();
@@ -3306,14 +3479,70 @@ impl App {
                     StreamEvent::ToolDone {
                         name,
                         args_json,
+                        result_preview,
                         duration_ms,
                         is_error,
                     } => {
                         let _ = tx.send(AgentResponse::ToolDone {
                             name,
                             args_json,
+                            result_preview,
                             duration_ms,
                             is_error,
+                        });
+                    }
+                    StreamEvent::SubAgentStart {
+                        task_index,
+                        task_count,
+                        goal,
+                    } => {
+                        let _ = tx.send(AgentResponse::SubAgentStart {
+                            task_index,
+                            task_count,
+                            goal,
+                        });
+                    }
+                    StreamEvent::SubAgentReasoning {
+                        task_index,
+                        task_count,
+                        text,
+                    } => {
+                        let _ = tx.send(AgentResponse::SubAgentReasoning {
+                            task_index,
+                            task_count,
+                            text,
+                        });
+                    }
+                    StreamEvent::SubAgentToolExec {
+                        task_index,
+                        task_count,
+                        name,
+                        args_json,
+                    } => {
+                        let _ = tx.send(AgentResponse::SubAgentToolExec {
+                            task_index,
+                            task_count,
+                            name,
+                            args_json,
+                        });
+                    }
+                    StreamEvent::SubAgentFinish {
+                        task_index,
+                        task_count,
+                        status,
+                        duration_ms,
+                        summary,
+                        api_calls,
+                        model,
+                    } => {
+                        let _ = tx.send(AgentResponse::SubAgentFinish {
+                            task_index,
+                            task_count,
+                            status,
+                            duration_ms,
+                            summary,
+                            api_calls,
+                            model,
                         });
                     }
                     StreamEvent::Done => {
@@ -3382,14 +3611,10 @@ impl App {
                     }
 
                     StreamEvent::ContextPressure { estimated_tokens, threshold_tokens } => {
-                        // Context is approaching the compression threshold.
-                        // Send a system message to the TUI rather than calling
-                        // tracing::warn!() which writes to stderr and corrupts
-                        // the alternate screen while the TUI is running.
-                        let msg = format!(
-                            "[context pressure] {estimated_tokens} / {threshold_tokens} tokens used — compressing…"
-                        );
-                        let _ = tx.send(AgentResponse::Token(format!("\n{msg}")));
+                        let _ = tx.send(AgentResponse::Notice(format_context_pressure_notice(
+                            estimated_tokens,
+                            threshold_tokens,
+                        )));
                     }
                 }
             }
@@ -3513,11 +3738,17 @@ impl App {
                     };
                     self.needs_redraw = true;
                     self.rt_handle.spawn(async move {
+                        let before_messages = agent.messages().await;
+                        let before_count = before_messages.len();
+                        let before_tokens =
+                            edgecrab_core::compression::estimate_tokens(&before_messages);
                         agent.force_compress().await;
-                        let snap = agent.session_snapshot().await;
+                        let after_messages = agent.messages().await;
+                        let after_count = after_messages.len();
+                        let after_tokens =
+                            edgecrab_core::compression::estimate_tokens(&after_messages);
                         let msg = format!(
-                            "Compression done. {} messages remaining.",
-                            snap.message_count
+                            "Compression done: {before_count} → {after_count} messages (~{before_tokens} → ~{after_tokens} tokens)."
                         );
                         let _ = tx.send(AgentResponse::BgOp(BackgroundOpResult::CompressDone {
                             msg,
@@ -3769,6 +4000,10 @@ impl App {
                     self.last_agent_response_text.push_str(&text);
                     self.needs_redraw = true;
                 }
+                AgentResponse::Notice(text) => {
+                    self.push_output(text, OutputRole::System);
+                    self.needs_redraw = true;
+                }
                 AgentResponse::Reasoning(text) => {
                     if self.show_reasoning && !text.trim().is_empty() {
                         if let Some(idx) = self.reasoning_line {
@@ -3823,6 +4058,7 @@ impl App {
                     // scrollable transcript to see that work is happening, and
                     // ToolDone later upgrades it in-place with timing/result
                     // info (no layout shift).
+                    let edit_snapshot = capture_local_edit_snapshot(&name, &args_json);
                     let running_spans =
                         build_tool_running_line(&name, &args_json, &self.theme.tool_emojis);
                     let line_idx = self.output.len();
@@ -3832,7 +4068,10 @@ impl App {
                         prebuilt_spans: Some(running_spans),
                         rendered: None,
                     });
-                    self.pending_tool_line_idxs.push_back(line_idx);
+                    self.pending_tool_lines.push_back(PendingToolLine {
+                        line_idx,
+                        edit_snapshot,
+                    });
                     if self.at_bottom {
                         self.scroll_offset = 0;
                     }
@@ -3841,6 +4080,7 @@ impl App {
                 AgentResponse::ToolDone {
                     name,
                     args_json,
+                    result_preview,
                     duration_ms,
                     is_error,
                 } => {
@@ -3848,6 +4088,7 @@ impl App {
                     let spans = build_tool_done_line(
                         &name,
                         &args_json,
+                        result_preview.as_deref(),
                         duration_ms,
                         is_error,
                         &self.theme.tool_emojis,
@@ -3858,10 +4099,11 @@ impl App {
                     // second line for the same tool call — the layout stays stable
                     // (no shift), and the cyan "···" naturally becomes the gold
                     // timing string without any visual flash.
-                    if let Some(idx) = self.pending_tool_line_idxs.pop_front() {
-                        if idx < self.output.len() {
-                            self.output[idx].prebuilt_spans = Some(spans);
-                            self.output[idx].rendered = None; // invalidate cache
+                    let pending = self.pending_tool_lines.pop_front();
+                    if let Some(PendingToolLine { line_idx, .. }) = pending.as_ref() {
+                        if *line_idx < self.output.len() {
+                            self.output[*line_idx].prebuilt_spans = Some(spans);
+                            self.output[*line_idx].rendered = None; // invalidate cache
                         } else {
                             // Index out of range — fall back to append (shouldn't happen).
                             self.push_output_spans(spans, OutputRole::Tool);
@@ -3870,6 +4112,18 @@ impl App {
                         // No pending placeholder (e.g. streaming disabled, or the
                         // tool fired before the feature was introduced) — append.
                         self.push_output_spans(spans, OutputRole::Tool);
+                    }
+                    if let Some(diff_lines) = render_edit_diff_lines(
+                        &name,
+                        &args_json,
+                        is_error,
+                        pending
+                            .as_ref()
+                            .and_then(|entry| entry.edit_snapshot.as_ref()),
+                    ) {
+                        for line in diff_lines {
+                            self.push_output_spans(line, OutputRole::Tool);
+                        }
                     }
                     // Decrement the in-flight counter. Only transition back to
                     // Thinking when ALL parallel tools have completed; otherwise
@@ -3883,14 +4137,141 @@ impl App {
                     }
                     self.needs_redraw = true;
                 }
+                AgentResponse::SubAgentStart {
+                    task_index,
+                    task_count,
+                    goal,
+                } => {
+                    self.progress_seq = self.progress_seq.saturating_add(1);
+                    self.active_subagents.insert(
+                        task_index,
+                        ActiveSubagentStatus {
+                            task_index,
+                            task_count,
+                            goal: goal.clone(),
+                            last_detail: None,
+                            last_seq: self.progress_seq,
+                        },
+                    );
+                    self.streaming_line = None;
+                    self.output.push(OutputLine {
+                        text: String::new(),
+                        role: OutputRole::Tool,
+                        prebuilt_spans: Some(build_subagent_event_line(
+                            task_index, task_count, "subagent", &goal, "running",
+                        )),
+                        rendered: None,
+                    });
+                    if self.at_bottom {
+                        self.scroll_offset = 0;
+                    }
+                    self.needs_redraw = true;
+                }
+                AgentResponse::SubAgentReasoning {
+                    task_index,
+                    task_count: _task_count,
+                    text,
+                } => {
+                    self.progress_seq = self.progress_seq.saturating_add(1);
+                    if let Some(status) = self.active_subagents.get_mut(&task_index) {
+                        status.last_detail = Some(format!(
+                            "thinking: {}",
+                            edgecrab_core::safe_truncate(text.trim(), 72)
+                        ));
+                        status.last_seq = self.progress_seq;
+                    }
+                    self.needs_redraw = true;
+                }
+                AgentResponse::SubAgentToolExec {
+                    task_index,
+                    task_count,
+                    name,
+                    args_json,
+                } => {
+                    self.progress_seq = self.progress_seq.saturating_add(1);
+                    self.streaming_line = None;
+                    let preview = crate::tool_display::extract_tool_preview(&name, &args_json);
+                    let detail = if preview.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{name}  {preview}")
+                    };
+                    if let Some(status) = self.active_subagents.get_mut(&task_index) {
+                        status.last_detail = Some(detail.clone());
+                        status.last_seq = self.progress_seq;
+                    }
+                    self.output.push(OutputLine {
+                        text: String::new(),
+                        role: OutputRole::Tool,
+                        prebuilt_spans: Some(build_subagent_event_line(
+                            task_index, task_count, "tool", &detail, "running",
+                        )),
+                        rendered: None,
+                    });
+                    if self.at_bottom {
+                        self.scroll_offset = 0;
+                    }
+                    self.needs_redraw = true;
+                }
+                AgentResponse::SubAgentFinish {
+                    task_index,
+                    task_count,
+                    status,
+                    duration_ms,
+                    summary,
+                    api_calls,
+                    model,
+                } => {
+                    self.active_subagents.remove(&task_index);
+                    self.streaming_line = None;
+                    let mut parts = vec![
+                        format!("{} in {:.1}s", status, duration_ms as f64 / 1000.0),
+                        format!("api {api_calls}"),
+                    ];
+                    if let Some(model) = model.filter(|m| !m.is_empty()) {
+                        parts.push(model);
+                    }
+                    if !summary.trim().is_empty() {
+                        parts.push(
+                            summary
+                                .lines()
+                                .next()
+                                .unwrap_or_default()
+                                .trim()
+                                .to_string(),
+                        );
+                    }
+                    let tone = if status == "completed" {
+                        "success"
+                    } else {
+                        "error"
+                    };
+                    self.output.push(OutputLine {
+                        text: String::new(),
+                        role: OutputRole::Tool,
+                        prebuilt_spans: Some(build_subagent_event_line(
+                            task_index,
+                            task_count,
+                            "subagent",
+                            &parts.join("  "),
+                            tone,
+                        )),
+                        rendered: None,
+                    });
+                    if self.at_bottom {
+                        self.scroll_offset = 0;
+                    }
+                    self.needs_redraw = true;
+                }
                 AgentResponse::Done => {
                     self.is_processing = false;
                     self.streaming_line = None;
                     self.reasoning_line = None;
                     // Reset per-turn streaming counters for next turn.
                     self.in_flight_tool_count = 0;
+                    self.active_subagents.clear();
                     self.turn_stream_tokens = 0;
-                    self.pending_tool_line_idxs.clear();
+                    self.pending_tool_lines.clear();
                     self.display_state = DisplayState::Idle;
                     self.last_response_time = Some(Instant::now());
                     self.turn_count += 1;
@@ -3926,8 +4307,9 @@ impl App {
                     self.streaming_line = None;
                     self.reasoning_line = None;
                     self.in_flight_tool_count = 0;
+                    self.active_subagents.clear();
                     self.turn_stream_tokens = 0;
-                    self.pending_tool_line_idxs.clear();
+                    self.pending_tool_lines.clear();
                     self.display_state = DisplayState::Idle;
                     self.push_output(err, OutputRole::Error);
                     self.needs_redraw = true;
@@ -4057,6 +4439,7 @@ impl App {
                     prompt_preview,
                     response,
                 } => {
+                    self.background_tasks_active.remove(&task_id);
                     let body = if response.trim().is_empty() {
                         "(No response generated)".to_string()
                     } else {
@@ -4069,11 +4452,20 @@ impl App {
                         OutputRole::Assistant,
                     );
                 }
+                AgentResponse::BackgroundPromptProgress { task_id, text, .. } => {
+                    if let Some(status) = self.background_tasks_active.get_mut(&task_id) {
+                        self.progress_seq = self.progress_seq.saturating_add(1);
+                        status.last_progress = Some(text.clone());
+                        status.last_seq = self.progress_seq;
+                        self.push_output(text, OutputRole::System);
+                    }
+                }
                 AgentResponse::BackgroundPromptFailed {
                     task_num,
                     task_id,
                     error,
                 } => {
+                    self.background_tasks_active.remove(&task_id);
                     self.push_output(
                         format!(
                             "Background task #{task_num} failed\nTask ID: {task_id}\nError: {error}"
@@ -4099,7 +4491,7 @@ impl App {
             let snap = self
                 .rt_handle
                 .block_on(async { agent.session_snapshot().await });
-            self.total_tokens = snap.input_tokens + snap.output_tokens;
+            self.total_tokens = snap.prompt_tokens();
             self.model_name = snap.model;
             self.update_context_window();
 
@@ -4559,7 +4951,7 @@ impl App {
             cost_line,
         );
         self.push_output(text, OutputRole::System);
-        self.total_tokens = total;
+        self.total_tokens = snap.prompt_tokens();
         if let Some(usd) = cost_result.amount_usd {
             self.session_cost = usd;
         }
@@ -4897,10 +5289,11 @@ impl App {
             Ok((messages, snap)) => {
                 // Show conversation recap before loading
                 let recap = build_session_recap(&messages);
+                let prompt_tokens = snap.prompt_tokens();
                 self.load_messages(messages);
                 self.model_name = snap.model;
                 self.update_context_window();
-                self.total_tokens = snap.input_tokens + snap.output_tokens;
+                self.total_tokens = prompt_tokens;
                 if !recap.is_empty() {
                     self.push_output(recap, OutputRole::System);
                 }
@@ -4989,6 +5382,15 @@ impl App {
         } else {
             ""
         };
+        self.progress_seq = self.progress_seq.saturating_add(1);
+        self.background_tasks_active.insert(
+            task_id.clone(),
+            BackgroundTaskStatus {
+                preview: preview.clone(),
+                last_progress: None,
+                last_seq: self.progress_seq,
+            },
+        );
         self.push_output(
             format!(
                 "🔄 Background task #{task_num} started: \"{preview}{preview_suffix}\"\nTask ID: {task_id}"
@@ -5015,20 +5417,74 @@ impl App {
                 }
             };
 
-            match background_agent.chat(&prompt).await {
-                Ok(resp) => {
+            let (event_tx, mut event_rx) =
+                tokio::sync::mpsc::unbounded_channel::<edgecrab_core::StreamEvent>();
+            let prompt_for_stream = prompt.clone();
+            let stream_task = tokio::spawn(async move {
+                background_agent
+                    .chat_streaming(&prompt_for_stream, event_tx)
+                    .await
+            });
+
+            let mut response = String::new();
+            let mut stream_error: Option<String> = None;
+            let mut last_progress: Option<String> = None;
+            while let Some(event) = event_rx.recv().await {
+                if let Some(text) = background_progress_text(task_num, &event) {
+                    if last_progress.as_deref() != Some(text.as_str()) {
+                        let _ = tx.send(AgentResponse::BackgroundPromptProgress {
+                            task_id: task_id.clone(),
+                            text: text.clone(),
+                        });
+                        last_progress = Some(text);
+                    }
+                }
+
+                match event {
+                    edgecrab_core::StreamEvent::Token(text) => response.push_str(&text),
+                    edgecrab_core::StreamEvent::Error(err) => stream_error = Some(err),
+                    edgecrab_core::StreamEvent::Done => break,
+                    edgecrab_core::StreamEvent::Approval { response_tx, .. } => {
+                        let _ = response_tx.send(edgecrab_core::ApprovalChoice::Deny);
+                    }
+                    edgecrab_core::StreamEvent::SecretRequest { response_tx, .. } => {
+                        let _ = response_tx.send(String::new());
+                    }
+                    edgecrab_core::StreamEvent::Clarify { response_tx, .. } => {
+                        let _ = response_tx.send(String::new());
+                    }
+                    _ => {}
+                }
+            }
+
+            match stream_task.await {
+                Ok(Ok(())) if stream_error.is_none() => {
                     let _ = tx.send(AgentResponse::BackgroundPromptComplete {
                         task_num,
                         task_id,
                         prompt_preview: preview,
-                        response: resp,
+                        response,
+                    });
+                }
+                Ok(Ok(())) => {
+                    let _ = tx.send(AgentResponse::BackgroundPromptFailed {
+                        task_num,
+                        task_id,
+                        error: stream_error.unwrap_or_else(|| "background task failed".into()),
+                    });
+                }
+                Ok(Err(e)) => {
+                    let _ = tx.send(AgentResponse::BackgroundPromptFailed {
+                        task_num,
+                        task_id,
+                        error: e.to_string(),
                     });
                 }
                 Err(e) => {
                     let _ = tx.send(AgentResponse::BackgroundPromptFailed {
                         task_num,
                         task_id,
-                        error: e.to_string(),
+                        error: format!("background task join error: {e}"),
                     });
                 }
             }
@@ -7404,8 +7860,7 @@ impl App {
         // Color: green → yellow → red at 50% / 80% of context window.
         let ctx_pct = self
             .context_window
-            .filter(|&cw| cw > 0)
-            .map(|cw| self.total_tokens as f64 / cw as f64);
+            .and_then(|cw| context_usage_ratio(self.total_tokens, Some(cw)));
         let token_style = if ctx_pct.is_some_and(|p| p > 0.80) || self.total_tokens > 100_000 {
             Style::default().fg(Color::Red)
         } else if ctx_pct.is_some_and(|p| p > 0.50) || self.total_tokens > 50_000 {
@@ -7437,6 +7892,48 @@ impl App {
             format!(" ${:.4}", self.session_cost),
             cost_style,
         ));
+        if !self.active_subagents.is_empty() {
+            left_spans.push(Span::styled(
+                " │ ",
+                Style::default().fg(Color::Rgb(50, 50, 65)),
+            ));
+            left_spans.push(Span::styled(
+                format!(" DG {} ", self.active_subagents.len()),
+                Style::default()
+                    .fg(Color::Rgb(10, 24, 38))
+                    .bg(Color::Rgb(95, 170, 255))
+                    .add_modifier(Modifier::BOLD),
+            ));
+            if let Some(summary) = format_subagent_status_summary(&self.active_subagents) {
+                left_spans.push(Span::styled(
+                    format!(" {summary} "),
+                    Style::default()
+                        .fg(Color::Rgb(165, 205, 245))
+                        .add_modifier(Modifier::DIM),
+                ));
+            }
+        }
+        if !self.background_tasks_active.is_empty() {
+            left_spans.push(Span::styled(
+                " │ ",
+                Style::default().fg(Color::Rgb(50, 50, 65)),
+            ));
+            left_spans.push(Span::styled(
+                format!(" BG {} ", self.background_tasks_active.len()),
+                Style::default()
+                    .fg(Color::Rgb(20, 20, 28))
+                    .bg(Color::Rgb(110, 180, 255))
+                    .add_modifier(Modifier::BOLD),
+            ));
+            if let Some(summary) = format_background_status_summary(&self.background_tasks_active) {
+                left_spans.push(Span::styled(
+                    format!(" {summary} "),
+                    Style::default()
+                        .fg(Color::Rgb(180, 220, 255))
+                        .add_modifier(Modifier::DIM),
+                ));
+            }
+        }
 
         // Right side: keyboard hints + turn counter
         let mut right_spans = Vec::new();
@@ -8881,6 +9378,110 @@ mod tests {
                 .iter()
                 .any(|line| line.text.contains("EdgeCrab (background #1)"))
         );
+        assert!(app.background_tasks_active.is_empty());
+    }
+
+    #[test]
+    fn background_progress_text_formats_tool_events() {
+        let event = edgecrab_core::StreamEvent::ToolExec {
+            name: "terminal".into(),
+            args_json: r#"{"command":"cargo test -p edgecrab-core"}"#.into(),
+        };
+        let text = background_progress_text(2, &event).expect("progress text");
+        assert!(text.contains("bg#2"));
+        assert!(text.contains("terminal"));
+    }
+
+    #[test]
+    fn background_progress_text_formats_subagent_completion() {
+        let event = edgecrab_core::StreamEvent::SubAgentFinish {
+            task_index: 1,
+            task_count: 3,
+            status: "completed".into(),
+            duration_ms: 2500,
+            summary: "done".into(),
+            api_calls: 2,
+            model: Some("mock/model".into()),
+        };
+        let text = background_progress_text(4, &event).expect("progress text");
+        assert!(text.contains("bg#4"));
+        assert!(text.contains("[2/3]"));
+        assert!(text.contains("completed in 2.5s"));
+    }
+
+    #[test]
+    fn background_status_summary_prefers_latest_progress() {
+        let mut tasks = std::collections::HashMap::new();
+        tasks.insert(
+            "bg-1".into(),
+            BackgroundTaskStatus {
+                preview: "first task".into(),
+                last_progress: Some("↳ bg#1 terminal: cargo test".into()),
+                last_seq: 1,
+            },
+        );
+        tasks.insert(
+            "bg-2".into(),
+            BackgroundTaskStatus {
+                preview: "second task".into(),
+                last_progress: Some("↳ bg#2 [1/2] terminal: rg delegate".into()),
+                last_seq: 2,
+            },
+        );
+
+        let summary = format_background_status_summary(&tasks).expect("summary");
+        assert!(summary.contains("bg#2"));
+        assert!(summary.contains("delegate"));
+    }
+
+    #[test]
+    fn subagent_status_summary_prefers_latest_tool_detail() {
+        let mut tasks = std::collections::HashMap::new();
+        tasks.insert(
+            0,
+            ActiveSubagentStatus {
+                task_index: 0,
+                task_count: 3,
+                goal: "inspect repo".into(),
+                last_detail: Some("terminal  command: cargo test".into()),
+                last_seq: 4,
+            },
+        );
+        tasks.insert(
+            1,
+            ActiveSubagentStatus {
+                task_index: 1,
+                task_count: 3,
+                goal: "audit gateway".into(),
+                last_detail: Some("file_search  query: delegate_task".into()),
+                last_seq: 7,
+            },
+        );
+
+        let summary = format_subagent_status_summary(&tasks).expect("summary");
+        assert!(summary.contains("[2/3]"));
+        assert!(summary.contains("delegate_task"));
+    }
+
+    #[test]
+    fn background_progress_text_formats_subagent_reasoning() {
+        let event = edgecrab_core::StreamEvent::SubAgentReasoning {
+            task_index: 0,
+            task_count: 2,
+            text: "searching the workspace for delegation regressions".into(),
+        };
+        let text = background_progress_text(3, &event).expect("progress text");
+        assert!(text.contains("bg#3"));
+        assert!(text.contains("[1/2]"));
+        assert!(text.contains("thinking"));
+    }
+
+    #[test]
+    fn context_usage_ratio_clamps_at_one_hundred_percent() {
+        assert_eq!(context_usage_ratio(210_000, Some(200_000)), Some(1.0));
+        assert_eq!(context_usage_ratio(100_000, Some(200_000)), Some(0.5));
+        assert_eq!(context_usage_ratio(100, Some(0)), None);
+        assert_eq!(context_usage_ratio(100, None), None);
     }
 
     #[tokio::test]

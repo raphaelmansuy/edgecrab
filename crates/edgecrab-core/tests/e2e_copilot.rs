@@ -102,6 +102,10 @@ async fn e2e_agent_streaming_with_copilot() {
             StreamEvent::Token(text) => accumulated.push_str(&text),
             StreamEvent::ToolExec { .. } => {} // tool progress events — just ignore in this test
             StreamEvent::ToolDone { .. } => {} // tool completion events — just ignore in this test
+            StreamEvent::SubAgentStart { .. } => {} // delegated progress — not relevant here
+            StreamEvent::SubAgentReasoning { .. } => {} // delegated progress — not relevant here
+            StreamEvent::SubAgentToolExec { .. } => {} // delegated progress — not relevant here
+            StreamEvent::SubAgentFinish { .. } => {} // delegated progress — not relevant here
             StreamEvent::Done => {
                 got_done = true;
                 break;

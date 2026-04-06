@@ -862,6 +862,16 @@ pub struct SessionSnapshot {
     pub budget_max: u32,
 }
 
+impl SessionSnapshot {
+    pub fn prompt_tokens(&self) -> u64 {
+        self.input_tokens + self.cache_read_tokens + self.cache_write_tokens
+    }
+
+    pub fn total_tokens(&self) -> u64 {
+        self.prompt_tokens() + self.output_tokens + self.reasoning_tokens
+    }
+}
+
 /// Risk-graduated approval choices surfaced by `StreamEvent::Approval`.
 ///
 /// - `Once`    — approve this specific invocation only.
@@ -900,10 +910,41 @@ pub enum StreamEvent {
         name: String,
         /// Raw JSON arguments string (for preview extraction in the TUI)
         args_json: String,
+        /// Short machine-generated summary of the tool outcome.
+        result_preview: Option<String>,
         /// Elapsed milliseconds
         duration_ms: u64,
         /// Whether the result looks like an error
         is_error: bool,
+    },
+    /// A delegated child agent has started.
+    SubAgentStart {
+        task_index: usize,
+        task_count: usize,
+        goal: String,
+    },
+    /// A delegated child agent surfaced intermediate reasoning text.
+    SubAgentReasoning {
+        task_index: usize,
+        task_count: usize,
+        text: String,
+    },
+    /// A delegated child agent called a tool.
+    SubAgentToolExec {
+        task_index: usize,
+        task_count: usize,
+        name: String,
+        args_json: String,
+    },
+    /// A delegated child agent has finished.
+    SubAgentFinish {
+        task_index: usize,
+        task_count: usize,
+        status: String,
+        duration_ms: u64,
+        summary: String,
+        api_calls: u32,
+        model: Option<String>,
     },
     /// The response is complete.
     Done,
@@ -987,6 +1028,54 @@ impl std::fmt::Debug for StreamEvent {
             } => {
                 write!(f, "ToolDone({name:?}, {duration_ms}ms, err={is_error})")
             }
+            Self::SubAgentStart {
+                task_index,
+                task_count,
+                goal,
+            } => write!(
+                f,
+                "SubAgentStart({}/{}, {:?})",
+                task_index + 1,
+                task_count,
+                goal
+            ),
+            Self::SubAgentReasoning {
+                task_index,
+                task_count,
+                text,
+            } => write!(
+                f,
+                "SubAgentReasoning({}/{}, {:?})",
+                task_index + 1,
+                task_count,
+                text
+            ),
+            Self::SubAgentToolExec {
+                task_index,
+                task_count,
+                name,
+                ..
+            } => write!(
+                f,
+                "SubAgentToolExec({}/{}, {:?})",
+                task_index + 1,
+                task_count,
+                name
+            ),
+            Self::SubAgentFinish {
+                task_index,
+                task_count,
+                status,
+                duration_ms,
+                ..
+            } => write!(
+                f,
+                "SubAgentFinish({}/{}, {:?}, {}ms)",
+                task_index + 1,
+                task_count,
+                status,
+                duration_ms
+            ),
             Self::Done => write!(f, "Done"),
             Self::Error(e) => write!(f, "Error({e:?})"),
             Self::Clarify {
@@ -1683,5 +1772,26 @@ mod tests {
 
         agent.set_personality_addon(None).await;
         assert!(agent.system_prompt().await.is_none());
+    }
+
+    #[test]
+    fn session_snapshot_prompt_tokens_include_cache_buckets() {
+        let snap = SessionSnapshot {
+            session_id: None,
+            model: "mock/model".into(),
+            message_count: 0,
+            user_turn_count: 0,
+            api_call_count: 0,
+            input_tokens: 3,
+            output_tokens: 10,
+            cache_read_tokens: 15_000,
+            cache_write_tokens: 2_000,
+            reasoning_tokens: 7,
+            budget_remaining: 0,
+            budget_max: 0,
+        };
+
+        assert_eq!(snap.prompt_tokens(), 17_003);
+        assert_eq!(snap.total_tokens(), 17_020);
     }
 }

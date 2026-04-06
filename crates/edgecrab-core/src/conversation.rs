@@ -43,7 +43,8 @@ use std::time::Duration;
 
 use edgecrab_tools::config_ref::AppConfigRef;
 use edgecrab_tools::registry::{
-    ApprovalRequest, ApprovalResponse, ToolContext, ToolRegistry, to_llm_definitions,
+    ApprovalRequest, ApprovalResponse, DelegationEvent, ToolContext, ToolRegistry,
+    to_llm_definitions,
 };
 use edgecrab_types::trajectory::{
     TrajectoryMetadata, convert_scratchpad_to_think, save_trajectory,
@@ -96,6 +97,7 @@ fn build_tool_context(
     provider: Option<Arc<dyn edgequake_llm::LLMProvider>>,
     tool_registry: Option<Arc<ToolRegistry>>,
     sub_agent_runner: Option<Arc<dyn edgecrab_tools::SubAgentRunner>>,
+    delegation_event_tx: Option<tokio::sync::mpsc::UnboundedSender<DelegationEvent>>,
     clarify_tx: Option<
         tokio::sync::mpsc::UnboundedSender<edgecrab_tools::registry::ClarifyRequest>,
     >,
@@ -122,6 +124,7 @@ fn build_tool_context(
         tool_registry,
         delegate_depth: 0,
         sub_agent_runner,
+        delegation_event_tx,
         clarify_tx,
         approval_tx,
         // Wires the skills prompt-cache invalidation hook into every
@@ -153,6 +156,8 @@ enum LoopAction {
     Done(String),
 }
 
+const MAX_DELEGATE_TASK_CALLS_PER_TURN: usize = 3;
+
 /// Shared context passed to `process_response` and `dispatch_single_tool`.
 ///
 /// WHY: Both functions previously took 8 parameters, tripping the
@@ -170,6 +175,7 @@ struct DispatchContext<'a> {
     gateway_sender: Option<Arc<dyn edgecrab_tools::registry::GatewaySender>>,
     sub_agent_runner: Option<Arc<dyn edgecrab_tools::SubAgentRunner>>,
     event_tx: Option<&'a tokio::sync::mpsc::UnboundedSender<crate::StreamEvent>>,
+    delegation_event_tx: Option<tokio::sync::mpsc::UnboundedSender<DelegationEvent>>,
     /// Channel for interactive clarify requests (None in batch/gateway modes).
     clarify_tx:
         Option<tokio::sync::mpsc::UnboundedSender<edgecrab_tools::registry::ClarifyRequest>>,
@@ -330,6 +336,7 @@ impl Agent {
                 &self.process_table,
                 Some(provider.clone()),
                 self.tool_registry.clone(),
+                None,
                 None,
                 None, // clarify_tx not needed for schema resolution
                 None, // approval_tx not needed for schema resolution
@@ -648,6 +655,8 @@ impl Agent {
             tokio::sync::mpsc::unbounded_channel::<edgecrab_tools::registry::ClarifyRequest>();
         let (approval_req_tx, mut approval_req_rx) =
             tokio::sync::mpsc::unbounded_channel::<ApprovalRequest>();
+        let (delegation_req_tx, mut delegation_req_rx) =
+            tokio::sync::mpsc::unbounded_channel::<DelegationEvent>();
 
         // Only wire the forwarder when we have a streaming event channel.
         if let Some(ev_tx) = event_tx {
@@ -683,11 +692,78 @@ impl Agent {
                     let _ = req.response_tx.send(mapped);
                 }
             });
+
+            let delegation_ev_tx = ev_tx.clone();
+            tokio::spawn(async move {
+                while let Some(req) = delegation_req_rx.recv().await {
+                    match req {
+                        DelegationEvent::TaskStarted {
+                            task_index,
+                            task_count,
+                            goal,
+                        } => {
+                            let _ = delegation_ev_tx.send(crate::StreamEvent::SubAgentStart {
+                                task_index,
+                                task_count,
+                                goal,
+                            });
+                        }
+                        DelegationEvent::Thinking {
+                            task_index,
+                            task_count,
+                            text,
+                        } => {
+                            let _ = delegation_ev_tx.send(crate::StreamEvent::SubAgentReasoning {
+                                task_index,
+                                task_count,
+                                text,
+                            });
+                        }
+                        DelegationEvent::ToolCalled {
+                            task_index,
+                            task_count,
+                            tool_name,
+                            args_json,
+                        } => {
+                            let _ = delegation_ev_tx.send(crate::StreamEvent::SubAgentToolExec {
+                                task_index,
+                                task_count,
+                                name: tool_name,
+                                args_json,
+                            });
+                        }
+                        DelegationEvent::TaskFinished {
+                            task_index,
+                            task_count,
+                            status,
+                            duration_ms,
+                            summary,
+                            api_calls,
+                            model,
+                        } => {
+                            let _ = delegation_ev_tx.send(crate::StreamEvent::SubAgentFinish {
+                                task_index,
+                                task_count,
+                                status,
+                                duration_ms,
+                                summary,
+                                api_calls,
+                                model,
+                            });
+                        }
+                    }
+                }
+            });
         }
         // In non-streaming paths (gateway, tests) just drop the receiver —
         // the tool will fall back to returning the [CLARIFY] marker.
         let clarify_tx_for_dispatch = Some(clarify_req_tx);
         let approval_tx_for_dispatch = Some(approval_req_tx);
+        let delegation_tx_for_dispatch = if event_tx.is_some() {
+            Some(delegation_req_tx)
+        } else {
+            None
+        };
         let turn_started_at = std::time::Instant::now();
 
         // Resolve a stable session_id early — BEFORE the main tool-dispatch loop.
@@ -828,6 +904,7 @@ impl Agent {
                     &self.process_table,
                     Some(effective_provider.clone()),
                     self.tool_registry.clone(),
+                    None,
                     None,
                     None,
                     None,
@@ -1023,6 +1100,7 @@ impl Agent {
                 gateway_sender: self.gateway_sender.read().await.clone(),
                 sub_agent_runner: sub_agent_runner.clone(),
                 event_tx,
+                delegation_event_tx: delegation_tx_for_dispatch.clone(),
                 clarify_tx: clarify_tx_for_dispatch.clone(),
                 approval_tx: approval_tx_for_dispatch.clone(),
                 origin_chat: config.origin_chat.clone(),
@@ -1458,6 +1536,7 @@ fn emit_tool_done(
     tx: Option<&tokio::sync::mpsc::UnboundedSender<crate::StreamEvent>>,
     name: &str,
     args_json: &str,
+    tool_result: &str,
     duration_ms: u64,
     is_error: bool,
 ) {
@@ -1465,10 +1544,67 @@ fn emit_tool_done(
         let _ = tx.send(crate::StreamEvent::ToolDone {
             name: name.to_string(),
             args_json: args_json.to_string(),
+            result_preview: summarize_tool_result_preview(name, tool_result, is_error),
             duration_ms,
             is_error,
         });
     }
+}
+
+fn summarize_tool_result_preview(name: &str, tool_result: &str, is_error: bool) -> Option<String> {
+    fn first_nonempty_line(text: &str) -> Option<String> {
+        text.lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(ToOwned::to_owned)
+    }
+
+    fn truncate(text: &str, limit: usize) -> String {
+        crate::safe_truncate(text, limit).to_string()
+    }
+
+    if is_error {
+        let line = extract_tool_error_text(tool_result);
+        let line = if line.trim().is_empty() {
+            first_nonempty_line(tool_result)?
+        } else {
+            line
+        };
+        return Some(truncate(&line, 88));
+    }
+
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(tool_result) {
+        if let Some(obj) = value.as_object() {
+            for key in ["summary", "message", "status", "result", "path"] {
+                if let Some(text) = obj.get(key).and_then(|v| v.as_str()) {
+                    let text = text.trim();
+                    if !text.is_empty() {
+                        return Some(truncate(text, 88));
+                    }
+                }
+            }
+        }
+    }
+
+    if name == "terminal" {
+        let mut lines = tool_result.lines();
+        let _header = lines.next();
+        let body = lines
+            .map(str::trim)
+            .find(|line| !line.is_empty() && !line.starts_with("exit code:"));
+        if let Some(body) = body {
+            return Some(truncate(body, 88));
+        }
+        if let Some(exit_line) = tool_result
+            .lines()
+            .map(str::trim)
+            .find(|line| line.starts_with("exit code:"))
+        {
+            return Some(truncate(exit_line, 88));
+        }
+    }
+
+    first_nonempty_line(tool_result).map(|line| truncate(&line, 88))
 }
 
 #[derive(Default)]
@@ -2010,11 +2146,19 @@ async fn process_response(
 ) -> Result<LoopAction, AgentError> {
     // Check for tool calls
     if response.has_tool_calls() {
+        let max_delegate_calls = match dctx.app_config_ref.delegation_max_subagents {
+            0 => MAX_DELEGATE_TASK_CALLS_PER_TURN,
+            configured => configured
+                .min(MAX_DELEGATE_TASK_CALLS_PER_TURN as u32)
+                .max(1) as usize,
+        };
+        let effective_tool_calls =
+            cap_delegate_task_calls(&response.tool_calls, max_delegate_calls);
+
         // Convert LLM tool calls → our internal ToolCall type and store
         // on the assistant message so build_chat_messages() can reconstruct
         // the assistant_with_tools ChatMessage later.
-        let our_tool_calls: Vec<edgecrab_types::ToolCall> = response
-            .tool_calls
+        let our_tool_calls: Vec<edgecrab_types::ToolCall> = effective_tool_calls
             .iter()
             .map(edgecrab_types::ToolCall::from_llm)
             .collect();
@@ -2025,7 +2169,7 @@ async fn process_response(
             assistant_msg.reasoning = Some(thinking.clone());
         }
         session.messages.push(assistant_msg);
-        session.session_tool_call_count += response.tool_calls.len() as u32;
+        session.session_tool_call_count += effective_tool_calls.len() as u32;
 
         // Partition tools into parallel-safe and sequential
         let mut parallel_tasks = tokio::task::JoinSet::new();
@@ -2035,7 +2179,7 @@ async fn process_response(
         // tool_calls with no matching tool_results and the next API call fails.
         let mut parallel_submitted: Vec<(String, String)> = Vec::new();
 
-        for tc in &response.tool_calls {
+        for tc in &effective_tool_calls {
             let is_parallel = dctx
                 .registry
                 .as_ref()
@@ -2088,6 +2232,7 @@ async fn process_response(
                         gateway_sender,
                         sub_agent_runner: sar,
                         event_tx: None, // ToolExec event already sent before dispatch
+                        delegation_event_tx: None,
                         clarify_tx: clarify,
                         approval_tx: approval,
                         origin_chat: origin,
@@ -2112,7 +2257,14 @@ async fn process_response(
             match join_result {
                 Ok((tc_id, tc_name, args_json, tool_result, duration_ms)) => {
                     let is_error = is_tool_error(&tool_result);
-                    emit_tool_done(dctx.event_tx, &tc_name, &args_json, duration_ms, is_error);
+                    emit_tool_done(
+                        dctx.event_tx,
+                        &tc_name,
+                        &args_json,
+                        &tool_result,
+                        duration_ms,
+                        is_error,
+                    );
                     if is_error {
                         remember_tool_suppression(
                             &dctx.capability_suppressions,
@@ -2172,6 +2324,7 @@ async fn process_response(
                 dctx.event_tx,
                 &tc.function.name,
                 &tc.function.arguments,
+                &tool_result,
                 duration_ms,
                 is_error,
             );
@@ -2209,6 +2362,39 @@ async fn process_response(
     }
     session.messages.push(msg);
     Ok(LoopAction::Done(text))
+}
+
+fn cap_delegate_task_calls(
+    tool_calls: &[edgequake_llm::ToolCall],
+    max_delegate_calls: usize,
+) -> Vec<edgequake_llm::ToolCall> {
+    let delegate_count = tool_calls
+        .iter()
+        .filter(|tc| tc.function.name == "delegate_task")
+        .count();
+    if delegate_count <= max_delegate_calls {
+        return tool_calls.to_vec();
+    }
+
+    let mut kept_delegates = 0usize;
+    let mut truncated = Vec::with_capacity(tool_calls.len());
+    for tc in tool_calls {
+        if tc.function.name == "delegate_task" {
+            if kept_delegates < max_delegate_calls {
+                truncated.push(tc.clone());
+                kept_delegates += 1;
+            }
+        } else {
+            truncated.push(tc.clone());
+        }
+    }
+
+    tracing::warn!(
+        delegate_count,
+        max_delegate_calls,
+        "truncated excess delegate_task tool calls in a single turn"
+    );
+    truncated
 }
 
 /// Dispatch a single tool call through the registry.
@@ -2257,6 +2443,7 @@ async fn dispatch_single_tool(name: &str, args_json: &str, dctx: &DispatchContex
         dctx.provider.clone(),
         dctx.registry.cloned(), // Pass registry so execute_code can dispatch RPC tool calls
         dctx.sub_agent_runner.clone(),
+        dctx.delegation_event_tx.clone(),
         dctx.clarify_tx.clone(),
         dctx.approval_tx.clone(),
         dctx.gateway_sender.clone(),
@@ -2423,7 +2610,8 @@ async fn run_learning_reflection_bg(ctx: BackgroundReflectionCtx) {
         provider: Some(Arc::clone(&ctx.provider)),
         gateway_sender: ctx.gateway_sender.clone(),
         sub_agent_runner: ctx.sub_agent_runner.clone(),
-        event_tx: None,    // background — no TUI event channel
+        event_tx: None, // background — no TUI event channel
+        delegation_event_tx: None,
         clarify_tx: None,  // background — no interactive Q&A
         approval_tx: None, // background — no interactive approvals
         origin_chat: ctx.origin_chat.clone(),
@@ -2558,7 +2746,7 @@ mod tests {
     use async_trait::async_trait;
     use edgecrab_tools::{ProcessTable, ToolRegistry};
     use edgequake_llm::traits::StreamUsage;
-    use edgequake_llm::{ChatMessage, CompletionOptions, ToolChoice, ToolDefinition};
+    use edgequake_llm::{ChatMessage, CompletionOptions, FunctionCall, ToolChoice, ToolDefinition};
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -2724,6 +2912,43 @@ mod tests {
         );
         assert_eq!(response.thinking_tokens, Some(3));
         assert_eq!(response.finish_reason.as_deref(), Some("stop"));
+    }
+
+    #[test]
+    fn cap_delegate_task_calls_truncates_excess_and_preserves_other_calls() {
+        let delegate = |id: &str| edgequake_llm::ToolCall {
+            id: id.into(),
+            call_type: "function".into(),
+            function: FunctionCall {
+                name: "delegate_task".into(),
+                arguments: "{}".into(),
+            },
+            thought_signature: None,
+        };
+        let terminal = edgequake_llm::ToolCall {
+            id: "tool-terminal".into(),
+            call_type: "function".into(),
+            function: FunctionCall {
+                name: "terminal".into(),
+                arguments: r#"{"command":"pwd"}"#.into(),
+            },
+            thought_signature: None,
+        };
+
+        let tool_calls = vec![
+            delegate("delegate-1"),
+            terminal.clone(),
+            delegate("delegate-2"),
+            delegate("delegate-3"),
+            delegate("delegate-4"),
+        ];
+
+        let capped = cap_delegate_task_calls(&tool_calls, 3);
+        assert_eq!(capped.len(), 4);
+        assert_eq!(capped[0].id, "delegate-1");
+        assert_eq!(capped[1].id, "tool-terminal");
+        assert_eq!(capped[2].id, "delegate-2");
+        assert_eq!(capped[3].id, "delegate-3");
     }
 
     #[tokio::test]
@@ -3235,6 +3460,28 @@ mod tests {
         assert_eq!(messages.len(), 2, "None-id tool result should be removed");
     }
 
+    #[test]
+    fn summarize_tool_result_preview_prefers_terminal_body() {
+        let preview = summarize_tool_result_preview(
+            "terminal",
+            "[terminal_result status=success backend=local cwd=/tmp exit_code=0]\nhello world\n",
+            false,
+        )
+        .expect("preview");
+        assert_eq!(preview, "hello world");
+    }
+
+    #[test]
+    fn summarize_tool_result_preview_extracts_error_text() {
+        let preview = summarize_tool_result_preview(
+            "terminal",
+            "Tool error: permission denied while executing command",
+            true,
+        )
+        .expect("preview");
+        assert!(preview.contains("permission denied"));
+    }
+
     // ── build_chat_messages edge cases ───────────────────────────────────
 
     #[test]
@@ -3286,6 +3533,7 @@ mod tests {
             gateway_sender: None,
             sub_agent_runner: None,
             event_tx: None,
+            delegation_event_tx: None,
             clarify_tx: None,
             approval_tx: None,
             origin_chat: None,

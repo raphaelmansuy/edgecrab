@@ -15,6 +15,8 @@
 
 use async_trait::async_trait;
 use edgecrab_types::Platform;
+use regex::Regex;
+use std::sync::OnceLock;
 use tokio::sync::mpsc;
 
 /// A normalized attachment kind across messaging platforms.
@@ -393,7 +395,7 @@ impl MediaRef {
     }
 }
 
-/// Parse `[MEDIA:path]` and `[IMAGE:path]` tags embedded in a response string.
+/// Parse media/file references embedded in a response string.
 ///
 /// Returns `(cleaned_text, Vec<MediaRef>)` where `cleaned_text` is the response
 /// with all media tags removed and `Vec<MediaRef>` contains the extracted refs.
@@ -406,59 +408,277 @@ impl MediaRef {
 /// - `[MEDIA:/path/to/file.pdf]`
 /// - `[IMAGE:/path/to/photo.png]`
 /// - `[FILE:/path/to/report.txt]`
+/// - `MEDIA:/path/to/file.pdf`
+/// - `IMAGE:"/path/with spaces/photo.png"`
 pub fn extract_media_from_response(text: &str) -> (String, Vec<MediaRef>) {
+    let (cleaned, mut refs) = extract_bracketed_media_from_response(text);
+    let (cleaned, raw_refs) = extract_raw_media_from_response(&cleaned);
+    refs.extend(raw_refs);
+    let (cleaned, local_refs) = extract_local_files_from_response(&cleaned);
+    refs.extend(local_refs);
+    dedupe_media_refs(&mut refs);
+    (normalize_media_cleaned_text(&cleaned), refs)
+}
+
+pub fn response_text_after_media_extraction(
+    original: &str,
+    cleaned: &str,
+    media_refs: &[MediaRef],
+) -> Option<String> {
+    let cleaned = cleaned.trim();
+    if !cleaned.is_empty() {
+        return Some(cleaned.to_string());
+    }
+    if media_refs.is_empty() {
+        let original = original.trim();
+        if !original.is_empty() {
+            return Some(original.to_string());
+        }
+    }
+    None
+}
+
+fn extract_bracketed_media_from_response(text: &str) -> (String, Vec<MediaRef>) {
     let mut refs = Vec::new();
-    // Pattern: [TAG:path] where TAG is MEDIA|IMAGE|FILE (case-insensitive)
-    // The path runs until the closing `]`.
     let mut cleaned = String::with_capacity(text.len());
     let mut remaining = text;
 
     while let Some(open) = remaining.find('[') {
         let after_bracket = &remaining[open + 1..];
+        let prefix_end = parse_media_prefix(after_bracket);
 
-        // Check for one of the recognised tag prefixes.
-        let prefix_end = after_bracket
-            .strip_prefix("MEDIA:")
-            .or_else(|| after_bracket.strip_prefix("media:"))
-            .map(|rest| ("MEDIA", rest))
-            .or_else(|| {
-                after_bracket
-                    .strip_prefix("IMAGE:")
-                    .or_else(|| after_bracket.strip_prefix("image:"))
-                    .map(|rest| ("IMAGE", rest))
-            })
-            .or_else(|| {
-                after_bracket
-                    .strip_prefix("FILE:")
-                    .or_else(|| after_bracket.strip_prefix("file:"))
-                    .map(|rest| ("FILE", rest))
-            });
-
-        if let Some((_tag, rest)) = prefix_end {
+        if let Some((prefix_len, _tag)) = prefix_end {
+            let rest = &after_bracket[prefix_len..];
             if let Some(close) = rest.find(']') {
                 let path = rest[..close].trim().to_string();
-                let is_image = MediaRef::detect_image(&path);
-                refs.push(MediaRef { path, is_image });
-
-                // Append text before the tag, skip the tag itself.
+                if !path.is_empty() {
+                    refs.push(MediaRef {
+                        is_image: MediaRef::detect_image(&path),
+                        path,
+                    });
+                }
                 cleaned.push_str(&remaining[..open]);
-                // Consume up to and including the closing `]`.
                 let consumed = open + 1 + after_bracket.len() - rest.len() + close + 1;
                 remaining = &remaining[consumed..];
                 continue;
             }
         }
 
-        // Not a recognised tag — include the `[` literally and advance.
         cleaned.push_str(&remaining[..open + 1]);
         remaining = &remaining[open + 1..];
     }
 
     cleaned.push_str(remaining);
-    // Remove double-blank-lines left by stripped tags.
-    let cleaned = cleaned.replace("\n\n\n", "\n\n").trim().to_string();
+    (cleaned, refs)
+}
+
+fn extract_raw_media_from_response(text: &str) -> (String, Vec<MediaRef>) {
+    let mut refs = Vec::new();
+    let mut cleaned = String::with_capacity(text.len());
+    let mut index = 0usize;
+
+    while index < text.len() {
+        let remaining = &text[index..];
+        if let Some((prefix_len, tag)) = parse_media_prefix(remaining) {
+            let prev_char = text[..index].chars().next_back();
+            if is_media_boundary(prev_char) {
+                let after_prefix = &remaining[prefix_len..];
+                if let Some((path, consumed, suffix)) = parse_raw_media_path(after_prefix) {
+                    refs.push(MediaRef {
+                        is_image: tag == "IMAGE" || MediaRef::detect_image(&path),
+                        path,
+                    });
+                    cleaned.push_str(&suffix);
+                    index += prefix_len + consumed;
+                    continue;
+                }
+            }
+        }
+
+        if let Some(ch) = remaining.chars().next() {
+            cleaned.push(ch);
+            index += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
 
     (cleaned, refs)
+}
+
+fn parse_media_prefix(input: &str) -> Option<(usize, &'static str)> {
+    for (prefix, tag) in [("MEDIA:", "MEDIA"), ("IMAGE:", "IMAGE"), ("FILE:", "FILE")] {
+        if input
+            .get(..prefix.len())
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix))
+        {
+            return Some((prefix.len(), tag));
+        }
+    }
+    None
+}
+
+fn is_media_boundary(prev_char: Option<char>) -> bool {
+    prev_char
+        .is_none_or(|ch| ch.is_whitespace() || matches!(ch, '(' | '[' | '{' | '<' | '"' | '\''))
+}
+
+fn parse_raw_media_path(input: &str) -> Option<(String, usize, String)> {
+    let mut chars = input.char_indices();
+    let (_, first) = chars.next()?;
+
+    if matches!(first, '"' | '\'') {
+        let quote = first;
+        let mut closing = None;
+        for (idx, ch) in chars {
+            if ch == quote {
+                closing = Some(idx);
+                break;
+            }
+        }
+        let closing = closing?;
+        let path = input[1..closing].trim().to_string();
+        if path.is_empty() {
+            return None;
+        }
+        return Some((path, closing + quote.len_utf8(), String::new()));
+    }
+
+    let end = input
+        .char_indices()
+        .find(|(_, ch)| ch.is_whitespace())
+        .map(|(idx, _)| idx)
+        .unwrap_or(input.len());
+    if end == 0 {
+        return None;
+    }
+
+    let token = &input[..end];
+    let trimmed_end = token.trim_end_matches(['.', ',', ';', '!', '?']).len();
+    let path = token[..trimmed_end].trim().to_string();
+    if path.is_empty() {
+        return None;
+    }
+
+    Some((path, end, token[trimmed_end..].to_string()))
+}
+
+fn normalize_media_cleaned_text(text: &str) -> String {
+    text.replace("\n\n\n", "\n\n").trim().to_string()
+}
+
+fn dedupe_media_refs(refs: &mut Vec<MediaRef>) {
+    let mut unique = Vec::with_capacity(refs.len());
+    for media_ref in refs.drain(..) {
+        if unique
+            .iter()
+            .any(|existing: &MediaRef| existing.path == media_ref.path)
+        {
+            continue;
+        }
+        unique.push(media_ref);
+    }
+    *refs = unique;
+}
+
+fn extract_local_files_from_response(text: &str) -> (String, Vec<MediaRef>) {
+    let mut refs = Vec::new();
+    let mut cleaned = text.to_string();
+    let mut raw_matches = Vec::new();
+
+    for capture in local_file_regex().captures_iter(text) {
+        let Some(matched) = capture.get(0) else {
+            continue;
+        };
+        if !is_media_boundary(text[..matched.start()].chars().next_back()) {
+            continue;
+        }
+        if span_inside_code_block(text, matched.start()) {
+            continue;
+        }
+
+        let raw = matched.as_str();
+        let expanded = if let Some(rest) = raw.strip_prefix("~/") {
+            match dirs::home_dir() {
+                Some(home) => home.join(rest).to_string_lossy().to_string(),
+                None => continue,
+            }
+        } else {
+            raw.to_string()
+        };
+
+        if !std::fs::metadata(&expanded).is_ok_and(|metadata| metadata.is_file()) {
+            continue;
+        }
+
+        refs.push(MediaRef {
+            is_image: MediaRef::detect_image(&expanded),
+            path: expanded,
+        });
+        raw_matches.push(raw.to_string());
+    }
+
+    for raw in raw_matches {
+        cleaned = cleaned.replace(&raw, "");
+    }
+
+    (normalize_media_cleaned_text(&cleaned), refs)
+}
+
+fn local_file_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(
+            r"(?ix)
+            (?:~/|/)
+            (?:[\w.\-]+/)*
+            [\w.\-]+\.
+            (?:png|jpe?g|gif|webp|svg|bmp|heic|heif|
+               mp4|mov|avi|mkv|webm|3gp|
+               ogg|opus|mp3|wav|m4a|aac|
+               pdf|txt|md|csv|json|zip|docx?|xlsx?|pptx?)
+            \b",
+        )
+        .expect("valid local file regex")
+    })
+}
+
+fn span_inside_code_block(text: &str, position: usize) -> bool {
+    fenced_code_spans(text)
+        .into_iter()
+        .chain(inline_code_spans(text))
+        .any(|(start, end)| start <= position && position < end)
+}
+
+fn fenced_code_spans(text: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut search_start = 0usize;
+    while let Some(open_rel) = text[search_start..].find("```") {
+        let open = search_start + open_rel;
+        let after_open = open + 3;
+        let Some(close_rel) = text[after_open..].find("```") else {
+            break;
+        };
+        let close = after_open + close_rel + 3;
+        spans.push((open, close));
+        search_start = close;
+    }
+    spans
+}
+
+fn inline_code_spans(text: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut current = None;
+    for (index, ch) in text.char_indices() {
+        if ch == '`' {
+            if let Some(start) = current.take() {
+                spans.push((start, index + ch.len_utf8()));
+            } else {
+                current = Some(index);
+            }
+        }
+    }
+    spans
 }
 
 #[cfg(test)]
@@ -713,6 +933,79 @@ mod tests {
         let (_, refs) = extract_media_from_response(text);
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].path, "/tmp/photo.jpg");
+    }
+
+    #[test]
+    fn extract_media_raw_file_tag() {
+        let text = "Send this now: MEDIA:/tmp/report.pdf";
+        let (cleaned, refs) = extract_media_from_response(text);
+        assert_eq!(cleaned, "Send this now:");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].path, "/tmp/report.pdf");
+        assert!(!refs[0].is_image);
+    }
+
+    #[test]
+    fn extract_media_raw_quoted_image_tag_preserves_punctuation() {
+        let text = "Attached IMAGE:\"/tmp/chart final.png\".";
+        let (cleaned, refs) = extract_media_from_response(text);
+        assert_eq!(cleaned, "Attached .");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].path, "/tmp/chart final.png");
+        assert!(refs[0].is_image);
+    }
+
+    #[test]
+    fn response_text_after_media_extraction_omits_pure_media_messages() {
+        let (cleaned, refs) = extract_media_from_response("MEDIA:/tmp/report.pdf");
+        let text = response_text_after_media_extraction("MEDIA:/tmp/report.pdf", &cleaned, &refs);
+        assert!(text.is_none());
+        assert_eq!(refs.len(), 1);
+    }
+
+    #[test]
+    fn extract_media_detects_existing_bare_local_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("report.pdf");
+        std::fs::write(&path, b"edgecrab").expect("write");
+        let input = format!("Please send {}", path.display());
+
+        let (cleaned, refs) = extract_media_from_response(&input);
+
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].path, path.to_string_lossy());
+        assert!(!refs[0].is_image);
+        assert_eq!(cleaned, "Please send");
+    }
+
+    #[test]
+    fn extract_media_handles_unicode_without_panicking() {
+        let input = "Raphaël! (◕‿◕)★ I'm here and ready — how can I help?";
+        let (cleaned, refs) = extract_media_from_response(input);
+        assert_eq!(cleaned, input);
+        assert!(refs.is_empty());
+    }
+
+    #[test]
+    fn extract_media_handles_unicode_before_raw_tag() {
+        let input = "Raphaël — here you go ★ MEDIA:/tmp/report.pdf";
+        let (cleaned, refs) = extract_media_from_response(input);
+        assert_eq!(cleaned, "Raphaël — here you go ★");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].path, "/tmp/report.pdf");
+    }
+
+    #[test]
+    fn extract_media_ignores_local_paths_inside_code_blocks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("report.pdf");
+        std::fs::write(&path, b"edgecrab").expect("write");
+        let input = format!("```sh\ncat {}\n```", path.display());
+
+        let (cleaned, refs) = extract_media_from_response(&input);
+
+        assert!(refs.is_empty());
+        assert_eq!(cleaned, input);
     }
 
     #[test]

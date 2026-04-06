@@ -89,10 +89,62 @@ pub struct SubAgentResult {
     pub api_calls: u32,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub reasoning_tokens: u64,
     pub model: Option<String>,
     pub interrupted: bool,
     pub budget_exhausted: bool,
     pub messages: Vec<Message>,
+}
+
+/// Typed progress notifications emitted while delegated child agents run.
+///
+/// WHY a shared enum: `delegate_task` lives in edgecrab-tools, while the
+/// streaming/UI layers live in edgecrab-core, CLI, and gateway. A typed event
+/// contract keeps delegation observability explicit and reusable without
+/// coupling tools to any specific UI implementation.
+#[derive(Debug, Clone)]
+pub enum DelegationEvent {
+    TaskStarted {
+        task_index: usize,
+        task_count: usize,
+        goal: String,
+    },
+    Thinking {
+        task_index: usize,
+        task_count: usize,
+        text: String,
+    },
+    ToolCalled {
+        task_index: usize,
+        task_count: usize,
+        tool_name: String,
+        args_json: String,
+    },
+    TaskFinished {
+        task_index: usize,
+        task_count: usize,
+        status: String,
+        duration_ms: u64,
+        summary: String,
+        api_calls: u32,
+        model: Option<String>,
+    },
+}
+
+/// Immutable input required to run a delegated child task.
+#[derive(Debug, Clone)]
+pub struct SubAgentRunRequest {
+    pub goal: String,
+    pub system_prompt: String,
+    pub enabled_toolsets: Vec<String>,
+    pub max_iterations: u32,
+    pub model_override: Option<String>,
+    pub parent_cancel: CancellationToken,
+    pub progress_tx: Option<tokio::sync::mpsc::UnboundedSender<DelegationEvent>>,
+    pub task_index: usize,
+    pub task_count: usize,
 }
 
 /// Trait for running sub-agent tasks with full tool execution.
@@ -104,15 +156,7 @@ pub struct SubAgentResult {
 #[async_trait]
 pub trait SubAgentRunner: Send + Sync {
     /// Run a sub-agent task with full execute_loop and tool access.
-    async fn run_task(
-        &self,
-        goal: &str,
-        system_prompt: &str,
-        enabled_toolsets: Vec<String>,
-        max_iterations: u32,
-        model_override: Option<String>,
-        parent_cancel: CancellationToken,
-    ) -> Result<SubAgentResult, String>;
+    async fn run_task(&self, request: SubAgentRunRequest) -> Result<SubAgentResult, String>;
 }
 
 // ─── ToolHandler trait ────────────────────────────────────────────────
@@ -205,6 +249,8 @@ pub struct ToolContext {
     /// WHY Option + trait object: Breaks circular dependency between
     /// edgecrab-tools (defines trait) and edgecrab-core (implements it).
     pub sub_agent_runner: Option<Arc<dyn SubAgentRunner>>,
+    /// Optional channel used by `delegate_task` to report child-agent progress.
+    pub delegation_event_tx: Option<tokio::sync::mpsc::UnboundedSender<DelegationEvent>>,
     /// Optional channel to request user clarification.
     /// WHY Option: Only CLI/interactive mode provides this. Gateway and
     /// ACP modes fall back to returning the [CLARIFY] marker.
@@ -282,6 +328,7 @@ impl ToolContext {
             tool_registry: None,
             delegate_depth: 0,
             sub_agent_runner: None,
+            delegation_event_tx: None,
             clarify_tx: None,
             approval_tx: None,
             on_skills_changed: None,

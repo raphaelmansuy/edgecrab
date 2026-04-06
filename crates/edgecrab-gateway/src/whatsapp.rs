@@ -113,6 +113,10 @@ impl WhatsappAdapterConfig {
     pub fn send_url(&self) -> String {
         format!("{}/send", self.bridge_url())
     }
+
+    pub fn send_media_url(&self) -> String {
+        format!("{}/send-media", self.bridge_url())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -140,6 +144,20 @@ struct SendRequest<'a> {
     #[serde(rename = "chatId")]
     chat_id: &'a str,
     message: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct SendMediaRequest<'a> {
+    #[serde(rename = "chatId")]
+    chat_id: &'a str,
+    #[serde(rename = "filePath")]
+    file_path: &'a str,
+    #[serde(rename = "mediaType")]
+    media_type: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    caption: Option<&'a str>,
+    #[serde(rename = "fileName", skip_serializing_if = "Option::is_none")]
+    file_name: Option<&'a str>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -425,6 +443,67 @@ impl WhatsAppAdapter {
         }
         Ok(())
     }
+
+    async fn send_bridge_media(
+        &self,
+        chat_id: &str,
+        file_path: &str,
+        media_type: &str,
+        caption: Option<&str>,
+        file_name: Option<&str>,
+    ) -> Result<(), BridgeSendFailure> {
+        let body = SendMediaRequest {
+            chat_id,
+            file_path,
+            media_type,
+            caption,
+            file_name,
+        };
+        let response = self
+            .client
+            .post(self.config.send_media_url())
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| BridgeSendFailure {
+                detail: format!(
+                    "failed to contact the local media relay ({}): {error}",
+                    self.config.send_media_url()
+                ),
+            })?;
+
+        let status = response.status();
+        let raw_body = response.text().await.map_err(|error| BridgeSendFailure {
+            detail: format!(
+                "failed to read the local media relay response ({}): {error}",
+                self.config.send_media_url()
+            ),
+        })?;
+
+        if !status.is_success() {
+            let detail = parse_bridge_error(&raw_body).unwrap_or_else(|| {
+                status
+                    .canonical_reason()
+                    .unwrap_or("unknown error")
+                    .to_string()
+            });
+            return Err(BridgeSendFailure { detail });
+        }
+
+        let payload =
+            serde_json::from_str::<SendResponse>(&raw_body).map_err(|error| BridgeSendFailure {
+                detail: format!(
+                    "invalid response from the local media relay ({}): {error}",
+                    self.config.send_media_url()
+                ),
+            })?;
+        if !payload.success {
+            return Err(BridgeSendFailure {
+                detail: payload.error.unwrap_or_else(|| "unknown error".into()),
+            });
+        }
+        Ok(())
+    }
 }
 
 fn normalize_outbound_chat_id(chat_id: &str) -> String {
@@ -636,6 +715,71 @@ impl PlatformAdapter for WhatsAppAdapter {
     fn supports_files(&self) -> bool {
         true
     }
+
+    async fn send_photo(
+        &self,
+        path: &str,
+        caption: Option<&str>,
+        metadata: &MessageMetadata,
+    ) -> anyhow::Result<()> {
+        if !std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file()) {
+            anyhow::bail!("WhatsApp photo path does not exist: {path}");
+        }
+
+        let original_chat_id = metadata
+            .channel_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("WhatsApp photo delivery requires channel_id"))?;
+        let normalized_chat_id = normalize_outbound_chat_id(original_chat_id);
+        if normalized_chat_id.is_empty() {
+            anyhow::bail!("WhatsApp photo delivery requires a non-empty channel_id");
+        }
+
+        self.send_bridge_media(&normalized_chat_id, path, "image", caption, None)
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "WhatsApp bridge media send failed for '{}' (normalized to '{}'): {}",
+                    original_chat_id,
+                    normalized_chat_id,
+                    error
+                )
+            })
+    }
+
+    async fn send_document(
+        &self,
+        path: &str,
+        caption: Option<&str>,
+        metadata: &MessageMetadata,
+    ) -> anyhow::Result<()> {
+        if !std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file()) {
+            anyhow::bail!("WhatsApp document path does not exist: {path}");
+        }
+
+        let original_chat_id = metadata
+            .channel_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("WhatsApp document delivery requires channel_id"))?;
+        let normalized_chat_id = normalize_outbound_chat_id(original_chat_id);
+        if normalized_chat_id.is_empty() {
+            anyhow::bail!("WhatsApp document delivery requires a non-empty channel_id");
+        }
+
+        let file_name = std::path::Path::new(path)
+            .file_name()
+            .and_then(|value| value.to_str());
+        self.send_bridge_media(&normalized_chat_id, path, "document", caption, file_name)
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "WhatsApp bridge media send failed for '{}' (normalized to '{}'): {}",
+                    original_chat_id,
+                    normalized_chat_id,
+                    error
+                )
+            })
+    }
 }
 
 fn has_node() -> bool {
@@ -773,6 +917,9 @@ fn ensure_dependencies(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{Json, Router, routing::post};
+    use serde_json::{Value, json};
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn config_from_gateway_config() {
@@ -975,5 +1122,56 @@ mod tests {
             normalize_outbound_chat_id("33614251689:s.whatsapp.net"),
             "33614251689@s.whatsapp.net"
         );
+    }
+
+    #[tokio::test]
+    async fn send_document_uses_bridge_media_endpoint() {
+        let captured = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let captured_state = Arc::clone(&captured);
+        let app = Router::new().route(
+            "/send-media",
+            post(move |Json(body): Json<Value>| {
+                let captured = Arc::clone(&captured_state);
+                async move {
+                    captured.lock().expect("lock").push(body);
+                    Json(json!({ "success": true }))
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+
+        let adapter = WhatsAppAdapter::new(WhatsappAdapterConfig {
+            bridge_url: Some(format!("http://{addr}")),
+            ..Default::default()
+        })
+        .expect("adapter");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("report.pdf");
+        std::fs::write(&path, b"edgecrab").expect("write");
+        let metadata = MessageMetadata {
+            channel_id: Some("+33614251689".into()),
+            ..Default::default()
+        };
+
+        adapter
+            .send_document(path.to_string_lossy().as_ref(), Some("report"), &metadata)
+            .await
+            .expect("send document");
+
+        let requests = captured.lock().expect("lock");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["chatId"], "33614251689@s.whatsapp.net");
+        assert_eq!(requests[0]["mediaType"], "document");
+        assert_eq!(requests[0]["caption"], "report");
+        assert_eq!(requests[0]["filePath"], path.to_string_lossy().as_ref());
+
+        server.abort();
     }
 }

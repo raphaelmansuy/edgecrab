@@ -41,6 +41,7 @@
 //! - **Dependency Inversion**: depends on the `PlatformAdapter` trait, not any
 //!   concrete adapter.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use edgecrab_core::StreamEvent;
@@ -52,6 +53,21 @@ use crate::hooks::{HookContext, HookRegistry};
 use crate::interactions::{InteractionBroker, PendingInteractionKind, PendingInteractionView};
 use crate::platform::{MessageMetadata, PlatformAdapter};
 use crate::stream_consumer::{GatewayStreamConsumer, StreamConsumerConfig, StreamItem};
+
+fn format_context_pressure_status(estimated_tokens: usize, threshold_tokens: usize) -> String {
+    let ratio = if threshold_tokens == 0 {
+        0.0
+    } else {
+        (estimated_tokens as f32 / threshold_tokens as f32).clamp(0.0, 1.0)
+    };
+    let percent = (ratio * 100.0).round() as usize;
+    let width = 12usize;
+    let filled = ((ratio * width as f32).round() as usize).min(width);
+    let bar = format!("{}{}", "▰".repeat(filled), "▱".repeat(width - filled));
+    format!(
+        "⚠️ Context {bar} {percent}% to compression ({estimated_tokens}/{threshold_tokens} tokens)."
+    )
+}
 
 fn format_pending_interaction(view: &PendingInteractionView) -> String {
     match &view.kind {
@@ -186,6 +202,7 @@ impl GatewayEventProcessor {
     /// The keepalive is cancelled immediately when the first token arrives (the
     /// stream consumer's live edit takes over as the visual progress indicator).
     pub async fn run(mut self) {
+        const SUBAGENT_BATCH_SIZE: usize = 5;
         // ── Typing indicator keepalive ────────────────────────────────────
         // Spawn a background task that refreshes the typing indicator every
         // 4s while the agent is thinking (before the first token).
@@ -216,6 +233,8 @@ impl GatewayEventProcessor {
             };
         }
 
+        let mut subagent_batches: HashMap<usize, Vec<String>> = HashMap::new();
+
         while let Some(event) = self.event_rx.recv().await {
             match event {
                 StreamEvent::Reasoning(text) => {
@@ -233,21 +252,141 @@ impl GatewayEventProcessor {
                     }
                 }
 
+                StreamEvent::SubAgentReasoning {
+                    task_index,
+                    task_count,
+                    text,
+                } => {
+                    if self.cfg.show_reasoning && !text.trim().is_empty() {
+                        let status = format!(
+                            "💭 [{}/{}] {}",
+                            task_index + 1,
+                            task_count,
+                            text.chars().take(180).collect::<String>()
+                        );
+                        self.send_status(&status).await;
+                    }
+                }
+
                 StreamEvent::ToolDone {
                     name,
+                    result_preview,
                     duration_ms,
                     is_error,
                     ..
                 } => {
-                    // Tool completions are logged but not surfaced to the user
-                    // by default — they would be too noisy.  Only log them for
-                    // debugging purposes.
+                    if self.cfg.tool_progress
+                        && !is_error
+                        && result_preview
+                            .as_deref()
+                            .is_some_and(|preview| should_surface_tool_completion(&name, preview))
+                    {
+                        self.send_status(&format!(
+                            "✅ {} {}",
+                            name,
+                            result_preview.as_deref().unwrap_or_default()
+                        ))
+                        .await;
+                    }
+                    if self.cfg.tool_progress && is_error {
+                        self.send_status(&format!(
+                            "❌ {} failed in {:.1}s{}",
+                            name,
+                            duration_ms as f64 / 1000.0,
+                            result_preview
+                                .as_deref()
+                                .filter(|preview| !preview.trim().is_empty())
+                                .map(|preview| format!(": {preview}"))
+                                .unwrap_or_default()
+                        ))
+                        .await;
+                    }
+                    // Successful tool completions are logged but not surfaced
+                    // by default — they would be too noisy.
                     tracing::debug!(
                         tool = %name,
                         duration_ms,
                         is_error,
                         "tool done"
                     );
+                }
+
+                StreamEvent::SubAgentStart {
+                    task_index,
+                    task_count,
+                    goal,
+                } => {
+                    let goal = goal.chars().take(72).collect::<String>();
+                    let status = format!(
+                        "🔀 [{}/{}] Starting delegated task: {}",
+                        task_index + 1,
+                        task_count,
+                        goal
+                    );
+                    self.send_status(&status).await;
+                }
+
+                StreamEvent::SubAgentToolExec {
+                    task_index,
+                    task_count,
+                    name,
+                    ..
+                } => {
+                    let batch = subagent_batches.entry(task_index).or_default();
+                    batch.push(name);
+                    if batch.len() >= SUBAGENT_BATCH_SIZE {
+                        let summary = batch.join(", ");
+                        batch.clear();
+                        let status = format!("🔀 [{}/{}] {}", task_index + 1, task_count, summary);
+                        self.send_status(&status).await;
+                    }
+                }
+
+                StreamEvent::SubAgentFinish {
+                    task_index,
+                    task_count,
+                    status,
+                    duration_ms,
+                    summary,
+                    ..
+                } => {
+                    if let Some(batch) = subagent_batches.get_mut(&task_index) {
+                        if !batch.is_empty() {
+                            let buffered = batch.join(", ");
+                            batch.clear();
+                            let status_line =
+                                format!("🔀 [{}/{}] {}", task_index + 1, task_count, buffered);
+                            self.send_status(&status_line).await;
+                        }
+                    }
+                    let summary = summary
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .chars()
+                        .take(96)
+                        .collect::<String>();
+                    let status_text = if summary.trim().is_empty() {
+                        format!(
+                            "{} [{}/{}] {} in {:.1}s",
+                            if status == "completed" { "✅" } else { "❌" },
+                            task_index + 1,
+                            task_count,
+                            status,
+                            duration_ms as f64 / 1000.0
+                        )
+                    } else {
+                        format!(
+                            "{} [{}/{}] {} in {:.1}s: {}",
+                            if status == "completed" { "✅" } else { "❌" },
+                            task_index + 1,
+                            task_count,
+                            status,
+                            duration_ms as f64 / 1000.0,
+                            summary
+                        )
+                    };
+                    self.send_status(&status_text).await;
                 }
 
                 StreamEvent::Token(text) => {
@@ -260,6 +399,7 @@ impl GatewayEventProcessor {
 
                 StreamEvent::Done => {
                     cancel_typing!();
+                    subagent_batches.clear();
                     // Signal the consumer to flush and exit.
                     let _ = self.delta_tx.send(StreamItem::Done).await;
                     break;
@@ -267,6 +407,7 @@ impl GatewayEventProcessor {
 
                 StreamEvent::Error(msg) => {
                     cancel_typing!();
+                    subagent_batches.clear();
                     tracing::error!(error = %msg, "agent streaming error");
                     // Send an error message to the user.
                     let err_text = format!("⚠️ An error occurred: {}", msg);
@@ -313,13 +454,16 @@ impl GatewayEventProcessor {
                     estimated_tokens,
                     threshold_tokens,
                 } => {
-                    // Log a warning when context is approaching the compression threshold.
-                    // No user-facing message required — the agent will compress automatically.
                     tracing::warn!(
                         estimated_tokens,
                         threshold_tokens,
                         "context pressure: approaching compression threshold"
                     );
+                    self.send_status(&format_context_pressure_status(
+                        estimated_tokens,
+                        threshold_tokens,
+                    ))
+                    .await;
                 }
 
                 StreamEvent::Approval {
@@ -366,6 +510,7 @@ impl GatewayEventProcessor {
         // In the latter case we must still signal the consumer.
         // The cancel_typing! macro is idempotent, so calling it here is safe.
         cancel_typing!();
+        let _ = self.delta_tx.send(StreamItem::Done).await;
         let _ = typing_task.await;
     }
 
@@ -376,6 +521,21 @@ impl GatewayEventProcessor {
             tracing::debug!(error = %e, "gateway event processor: send_status failed");
         }
     }
+}
+
+pub(crate) fn should_surface_tool_completion(name: &str, preview: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    let p = preview.to_ascii_lowercase();
+    n.contains("write")
+        || n.contains("patch")
+        || n.contains("delete")
+        || n.contains("move")
+        || n.contains("rename")
+        || n.contains("create")
+        || p.contains("wrote ")
+        || p.contains("patched ")
+        || p.contains("deleted ")
+        || p.contains("moved ")
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────
@@ -496,7 +656,7 @@ mod tests {
         let metadata = MessageMetadata::default();
         let cfg = GatewayStreamingConfig {
             tool_progress: true,
-            show_reasoning: false,
+            show_reasoning: true,
             ..Default::default()
         };
         let hooks = std::sync::Arc::new(crate::hooks::HookRegistry::new());
@@ -578,6 +738,220 @@ mod tests {
                 "unexpected tool status in output: {msg}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn processor_reports_subagent_progress_and_completion() {
+        let adapter = DumbAdapter::new();
+        let metadata = MessageMetadata::default();
+        let cfg = GatewayStreamingConfig {
+            tool_progress: true,
+            show_reasoning: false,
+            ..Default::default()
+        };
+        let hooks = std::sync::Arc::new(crate::hooks::HookRegistry::new());
+        let broker = InteractionBroker::new();
+
+        let (processor, event_tx, consumer) = GatewayEventProcessor::new(
+            adapter.clone(),
+            metadata,
+            cfg,
+            hooks,
+            broker,
+            "webhook:test".into(),
+        );
+        let consumer_task = tokio::spawn(consumer.run());
+        let processor_task = tokio::spawn(processor.run());
+
+        event_tx
+            .send(StreamEvent::SubAgentStart {
+                task_index: 0,
+                task_count: 2,
+                goal: "inspect delegation".into(),
+            })
+            .unwrap();
+        event_tx
+            .send(StreamEvent::SubAgentReasoning {
+                task_index: 0,
+                task_count: 2,
+                text: "scoping the repo".into(),
+            })
+            .unwrap();
+        for tool_name in [
+            "file_search",
+            "terminal",
+            "read_file",
+            "terminal",
+            "terminal",
+        ] {
+            event_tx
+                .send(StreamEvent::SubAgentToolExec {
+                    task_index: 0,
+                    task_count: 2,
+                    name: tool_name.into(),
+                    args_json: "{}".into(),
+                })
+                .unwrap();
+        }
+        event_tx
+            .send(StreamEvent::SubAgentFinish {
+                task_index: 0,
+                task_count: 2,
+                status: "completed".into(),
+                duration_ms: 2_300,
+                summary: "delegation audited".into(),
+                api_calls: 2,
+                model: Some("mock/model".into()),
+            })
+            .unwrap();
+        event_tx.send(StreamEvent::Done).unwrap();
+        drop(event_tx);
+
+        consumer_task.await.unwrap();
+        processor_task.await.unwrap();
+
+        let joined = adapter.drain().await.join("\n");
+        assert!(joined.contains("Starting delegated task"));
+        assert!(joined.contains("file_search, terminal, read_file, terminal, terminal"));
+        assert!(joined.contains("completed in 2.3s"));
+        assert!(joined.contains("delegation audited"));
+    }
+
+    #[tokio::test]
+    async fn processor_surfaces_subagent_reasoning_when_enabled() {
+        let adapter = DumbAdapter::new();
+        let metadata = MessageMetadata::default();
+        let cfg = GatewayStreamingConfig {
+            tool_progress: true,
+            show_reasoning: true,
+            ..Default::default()
+        };
+        let hooks = std::sync::Arc::new(crate::hooks::HookRegistry::new());
+        let broker = InteractionBroker::new();
+
+        let (processor, event_tx, consumer) = GatewayEventProcessor::new(
+            adapter.clone(),
+            metadata,
+            cfg,
+            hooks,
+            broker,
+            "webhook:test".into(),
+        );
+        let consumer_task = tokio::spawn(consumer.run());
+        let processor_task = tokio::spawn(processor.run());
+
+        event_tx
+            .send(StreamEvent::SubAgentReasoning {
+                task_index: 1,
+                task_count: 3,
+                text: "scoping the repo".into(),
+            })
+            .unwrap();
+        event_tx.send(StreamEvent::Done).unwrap();
+        drop(event_tx);
+
+        consumer_task.await.unwrap();
+        processor_task.await.unwrap();
+
+        let joined = adapter.drain().await.join("\n");
+        assert!(joined.contains("[2/3]"));
+        assert!(joined.contains("scoping the repo"));
+    }
+
+    #[tokio::test]
+    async fn processor_reports_tool_errors_when_progress_enabled() {
+        let adapter = DumbAdapter::new();
+        let metadata = MessageMetadata::default();
+        let cfg = GatewayStreamingConfig {
+            tool_progress: true,
+            show_reasoning: false,
+            ..Default::default()
+        };
+        let hooks = std::sync::Arc::new(crate::hooks::HookRegistry::new());
+        let broker = InteractionBroker::new();
+
+        let (processor, event_tx, consumer) = GatewayEventProcessor::new(
+            adapter.clone(),
+            metadata,
+            cfg,
+            hooks,
+            broker,
+            "webhook:test".into(),
+        );
+        let consumer_task = tokio::spawn(consumer.run());
+        let processor_task = tokio::spawn(processor.run());
+
+        event_tx
+            .send(StreamEvent::ToolDone {
+                name: "terminal".into(),
+                args_json: "{}".into(),
+                result_preview: Some("permission denied".into()),
+                duration_ms: 1_500,
+                is_error: true,
+            })
+            .unwrap();
+        event_tx.send(StreamEvent::Done).unwrap();
+        drop(event_tx);
+
+        consumer_task.await.unwrap();
+        processor_task.await.unwrap();
+
+        let joined = adapter.drain().await.join("\n");
+        assert!(joined.contains("terminal failed in 1.5s: permission denied"));
+    }
+
+    #[tokio::test]
+    async fn processor_surfaces_context_pressure_as_status() {
+        let adapter = DumbAdapter::new();
+        let metadata = MessageMetadata::default();
+        let cfg = GatewayStreamingConfig::default();
+        let hooks = std::sync::Arc::new(crate::hooks::HookRegistry::new());
+        let broker = InteractionBroker::new();
+
+        let (processor, event_tx, consumer) = GatewayEventProcessor::new(
+            adapter.clone(),
+            metadata,
+            cfg,
+            hooks,
+            broker,
+            "webhook:test".into(),
+        );
+        let consumer_task = tokio::spawn(consumer.run());
+        let processor_task = tokio::spawn(processor.run());
+
+        event_tx
+            .send(StreamEvent::ContextPressure {
+                estimated_tokens: 27_000,
+                threshold_tokens: 32_000,
+            })
+            .unwrap();
+        event_tx.send(StreamEvent::Token("done".into())).unwrap();
+        event_tx.send(StreamEvent::Done).unwrap();
+        drop(event_tx);
+
+        consumer_task.await.unwrap();
+        processor_task.await.unwrap();
+
+        let joined = adapter.drain().await.join("\n");
+        assert!(joined.contains("Context"));
+        assert!(joined.contains("compression"));
+        assert!(joined.contains("27000/32000"));
+    }
+
+    #[test]
+    fn surfaces_file_edit_completions_but_not_generic_searches() {
+        assert!(should_surface_tool_completion(
+            "write_file",
+            "Wrote 42 bytes to 'src/main.rs'"
+        ));
+        assert!(should_surface_tool_completion(
+            "apply_patch",
+            "Patched 'src/lib.rs': 2 replacement(s)"
+        ));
+        assert!(!should_surface_tool_completion(
+            "web_search",
+            "Found 10 results"
+        ));
     }
 
     #[tokio::test]
