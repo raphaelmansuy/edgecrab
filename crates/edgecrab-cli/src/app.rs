@@ -998,6 +998,9 @@ fn persist_display_preferences(
 
 // ─── Spinner frames (braille rotation) ──────────────────────────────
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const VOICE_LISTEN_FRAMES: &[&str] = &[".  ", ".. ", "...", " ..", "  .", "   "];
+const VOICE_RECORD_FRAMES: &[&str] = &["*  ", "** ", "***", " **", "  *", "   "];
+const VOICE_PLAYBACK_FRAMES: &[&str] = &[">  ", ">> ", ">>>", " >>", "  >", "   "];
 
 /// Fixed display-column width for the thinking verb in the status bar.
 /// Padding to this width prevents horizontal jitter as words rotate during animation.
@@ -1044,6 +1047,130 @@ fn unicode_pad_right(s: &str, target_display_cols: usize) -> String {
         return s.to_string();
     }
     format!("{}{}", s, " ".repeat(target_display_cols - w))
+}
+
+fn phase_face(faces: &[String], idx: usize) -> &str {
+    if faces.is_empty() {
+        ""
+    } else {
+        faces[idx % faces.len()].as_str()
+    }
+}
+
+fn phase_wings(wings: &[[String; 2]], idx: usize) -> (&str, &str) {
+    if wings.is_empty() {
+        ("", "")
+    } else {
+        let wing = &wings[idx % wings.len()];
+        (wing[0].as_str(), wing[1].as_str())
+    }
+}
+
+fn format_phase_status(
+    spinner: &str,
+    verb: &str,
+    face: &str,
+    wings: (&str, &str),
+    elapsed_secs: u64,
+    early_label: &str,
+    long_label: &str,
+) -> String {
+    let verb_padded = unicode_pad_right(verb, VERB_DISPLAY_PAD);
+    let core = if face.is_empty() {
+        format!("{spinner} {verb_padded}")
+    } else {
+        format!("{spinner} {face} {verb_padded}")
+    };
+    let (left_wing, right_wing) = wings;
+    if elapsed_secs > 10 {
+        format!("{left_wing}{core} {long_label} {elapsed_secs}s  ^C=stop{right_wing}")
+    } else if elapsed_secs > 3 {
+        format!("{left_wing}{core} {long_label} {elapsed_secs}s{right_wing}")
+    } else if elapsed_secs > 1 {
+        format!("{left_wing}{core} {early_label}{right_wing}")
+    } else {
+        format!("{left_wing}{core}{right_wing}")
+    }
+}
+
+fn format_waiting_first_token_status(
+    theme: &Theme,
+    frame_idx: usize,
+    verb_idx: usize,
+    face_idx: usize,
+    elapsed_secs: u64,
+) -> String {
+    let spinner = SPINNER_FRAMES[frame_idx % SPINNER_FRAMES.len()];
+    let verb = if theme.waiting_verbs.is_empty() {
+        "awaiting"
+    } else {
+        &theme.waiting_verbs[verb_idx % theme.waiting_verbs.len()]
+    };
+    let face = phase_face(&theme.kaomoji_waiting, face_idx);
+    let wings = phase_wings(&theme.spinner_wings, face_idx);
+    format_phase_status(
+        spinner,
+        verb,
+        face,
+        wings,
+        elapsed_secs,
+        "first token",
+        "waiting for first token",
+    )
+}
+
+fn format_thinking_status(
+    theme: &Theme,
+    frame_idx: usize,
+    verb_idx: usize,
+    face_idx: usize,
+    elapsed_secs: u64,
+) -> String {
+    let spinner = SPINNER_FRAMES[frame_idx % SPINNER_FRAMES.len()];
+    let verb = if theme.thinking_verbs.is_empty() {
+        "thinking"
+    } else {
+        &theme.thinking_verbs[verb_idx % theme.thinking_verbs.len()]
+    };
+    let face = phase_face(&theme.kaomoji_thinking, face_idx);
+    let wings = phase_wings(&theme.spinner_wings, face_idx);
+    format_phase_status(
+        spinner,
+        verb,
+        face,
+        wings,
+        elapsed_secs,
+        "thinking",
+        "thinking",
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VoicePresenceState {
+    Recording { elapsed_secs: u64, continuous: bool },
+    Speaking,
+    Listening,
+}
+
+fn format_voice_presence_badge(state: VoicePresenceState, frame_idx: usize) -> String {
+    match state {
+        VoicePresenceState::Recording {
+            elapsed_secs,
+            continuous,
+        } => {
+            let meter = VOICE_RECORD_FRAMES[frame_idx % VOICE_RECORD_FRAMES.len()];
+            let label = if continuous { "TALK" } else { "REC" };
+            format!(" {label} {meter} {elapsed_secs}s ")
+        }
+        VoicePresenceState::Speaking => {
+            let meter = VOICE_PLAYBACK_FRAMES[frame_idx % VOICE_PLAYBACK_FRAMES.len()];
+            format!(" SPEAK {meter} ")
+        }
+        VoicePresenceState::Listening => {
+            let meter = VOICE_LISTEN_FRAMES[frame_idx % VOICE_LISTEN_FRAMES.len()];
+            format!(" LISTEN {meter} ")
+        }
+    }
 }
 
 /// Truncate `s` to at most `max_cols` display columns (unicode-safe).
@@ -1118,6 +1245,10 @@ pub enum OutputRole {
 #[derive(Clone)]
 enum DisplayState {
     Idle,
+    AwaitingFirstToken {
+        frame: usize,
+        started: Instant,
+    },
     Thinking {
         frame: usize,
         started: Instant,
@@ -1836,6 +1967,8 @@ pub struct App {
     voice_no_speech_count: u8,
     /// True while audio is being spoken back locally.
     voice_playback_active: bool,
+    /// Animation cursor for microphone / listening / speaking presence badges.
+    voice_presence_frame_idx: usize,
     /// File-based hook registry — loaded from ~/.edgecrab/hooks/ at startup.
     /// Receives tool:pre/post, llm:pre/post, and cli:start/end events.
     hook_registry: std::sync::Arc<edgecrab_gateway::hooks::HookRegistry>,
@@ -2200,6 +2333,7 @@ impl App {
             voice_hallucination_filter: runtime_config.voice.hallucination_filter,
             voice_no_speech_count: 0,
             voice_playback_active: false,
+            voice_presence_frame_idx: 0,
             hook_registry: {
                 let mut r = edgecrab_gateway::hooks::HookRegistry::new();
                 r.discover_and_load();
@@ -4382,7 +4516,7 @@ impl App {
             );
             // The agent task is now unblocked and will resume processing;
             // is_processing is still true so the spinner stays active.
-            self.display_state = DisplayState::Thinking {
+            self.display_state = DisplayState::AwaitingFirstToken {
                 frame: 0,
                 started: Instant::now(),
             };
@@ -4457,7 +4591,7 @@ impl App {
         self.turn_stream_tokens = 0;
         // Reset the response accumulator for the new turn (voice mode uses it).
         self.last_agent_response_text.clear();
-        self.display_state = DisplayState::Thinking {
+        self.display_state = DisplayState::AwaitingFirstToken {
             frame: 0,
             started: Instant::now(),
         };
@@ -5001,7 +5135,9 @@ impl App {
                     if self.streaming_enabled
                         && matches!(
                             self.display_state,
-                            DisplayState::Thinking { .. } | DisplayState::ToolExec { .. }
+                            DisplayState::AwaitingFirstToken { .. }
+                                | DisplayState::Thinking { .. }
+                                | DisplayState::ToolExec { .. }
                         )
                     {
                         // WHY turn_stream_tokens: initialise from the running total so
@@ -5052,6 +5188,12 @@ impl App {
                     self.needs_redraw = true;
                 }
                 AgentResponse::Reasoning(text) => {
+                    if matches!(self.display_state, DisplayState::AwaitingFirstToken { .. }) {
+                        self.display_state = DisplayState::Thinking {
+                            frame: 0,
+                            started: Instant::now(),
+                        };
+                    }
                     if self.show_reasoning && !text.trim().is_empty() {
                         if let Some(idx) = self.reasoning_line {
                             if idx < self.output.len() {
@@ -5177,7 +5319,7 @@ impl App {
                     // stay in ToolExec state so the status bar stays accurate.
                     self.in_flight_tool_count = self.in_flight_tool_count.saturating_sub(1);
                     if self.in_flight_tool_count == 0 {
-                        self.display_state = DisplayState::Thinking {
+                        self.display_state = DisplayState::AwaitingFirstToken {
                             frame: 0,
                             started: Instant::now(),
                         };
@@ -5695,7 +5837,7 @@ impl App {
                 if let Some(tx) = self.approval_pending_tx.take() {
                     let _ = tx.send(choice);
                 }
-                self.display_state = DisplayState::Thinking {
+                self.display_state = DisplayState::AwaitingFirstToken {
                     frame: 0,
                     started: std::time::Instant::now(),
                 };
@@ -5750,7 +5892,7 @@ impl App {
                 if let Some(tx) = self.secret_pending_tx.take() {
                     let _ = tx.send(secret);
                 }
-                self.display_state = DisplayState::Thinking {
+                self.display_state = DisplayState::AwaitingFirstToken {
                     frame: 0,
                     started: std::time::Instant::now(),
                 };
@@ -5773,31 +5915,49 @@ impl App {
     /// Advance spinner frame (called on every tick).
     fn tick_spinner(&mut self) {
         self.poll_voice_recording_completion();
+        let mut animated = false;
         let advance_verb = match &mut self.display_state {
+            DisplayState::AwaitingFirstToken { frame, .. } => {
+                *frame = (*frame + 1) % SPINNER_FRAMES.len();
+                animated = true;
+                *frame == 0
+            }
             DisplayState::Thinking { frame, .. } => {
                 *frame = (*frame + 1) % SPINNER_FRAMES.len();
+                animated = true;
                 // Advance thinking verb on each full braille rotation
                 *frame == 0
             }
             DisplayState::Streaming { .. } => {
                 // Token streaming — redraw handled by check_responses
-                return;
+                false
             }
             DisplayState::ToolExec { frame, .. } => {
                 *frame = (*frame + 1) % SPINNER_FRAMES.len();
+                animated = true;
                 false
             }
             DisplayState::BgOp { frame, .. } => {
                 *frame = (*frame + 1) % SPINNER_FRAMES.len();
+                animated = true;
                 false
             }
             DisplayState::Idle
             | DisplayState::WaitingForClarify
             | DisplayState::WaitingForApproval { .. }
-            | DisplayState::SecretCapture { .. } => {
-                return; // Nothing to animate — don't force redraw
-            }
+            | DisplayState::SecretCapture { .. } => false,
         };
+        if self.voice_recording.is_some()
+            || self.voice_playback_active
+            || self.voice_continuous_active
+        {
+            self.voice_presence_frame_idx =
+                self.voice_presence_frame_idx.wrapping_add(1) % VOICE_RECORD_FRAMES.len();
+            animated = true;
+        }
+        if !animated {
+            return;
+        }
         if advance_verb {
             self.thinking_verb_idx = self.thinking_verb_idx.wrapping_add(1);
             // Advance kaomoji face every 3 verb changes (slower rotation)
@@ -5806,6 +5966,22 @@ impl App {
             }
         }
         self.needs_redraw = true;
+    }
+
+    fn voice_presence_state(&self) -> Option<VoicePresenceState> {
+        if let Some(recording) = &self.voice_recording {
+            return Some(VoicePresenceState::Recording {
+                elapsed_secs: recording.started_at.elapsed().as_secs(),
+                continuous: recording.continuous_session,
+            });
+        }
+        if self.voice_playback_active {
+            return Some(VoicePresenceState::Speaking);
+        }
+        if self.voice_continuous_active {
+            return Some(VoicePresenceState::Listening);
+        }
+        None
     }
 
     // ────────────────────────────────────────────────────────────────
@@ -9995,52 +10171,27 @@ impl App {
 
         // ── Spinner / state indicator ────────────────────────────────
         match &self.display_state {
+            DisplayState::AwaitingFirstToken { frame: f, started } => {
+                let msg = format_waiting_first_token_status(
+                    &self.theme,
+                    *f,
+                    self.thinking_verb_idx,
+                    self.kaomoji_frame_idx,
+                    started.elapsed().as_secs(),
+                );
+                left_spans.push(Span::styled(
+                    format!(" {msg} "),
+                    Style::default().fg(Color::Rgb(255, 210, 120)),
+                ));
+            }
             DisplayState::Thinking { frame: f, started } => {
-                let elapsed = started.elapsed().as_secs();
-                let spinner = SPINNER_FRAMES[*f % SPINNER_FRAMES.len()];
-
-                // Rotate through skin-configurable thinking verbs
-                let verb = if !self.theme.thinking_verbs.is_empty() {
-                    &self.theme.thinking_verbs
-                        [self.thinking_verb_idx % self.theme.thinking_verbs.len()]
-                } else {
-                    "thinking"
-                };
-
-                // Kaomoji face — rotates slower than the verb
-                let face = if !self.theme.kaomoji_thinking.is_empty() {
-                    let idx = self.kaomoji_frame_idx % self.theme.kaomoji_thinking.len();
-                    self.theme.kaomoji_thinking[idx].as_str()
-                } else {
-                    ""
-                };
-
-                // Spinner wings (skin-configurable decorations around spinner)
-                let (left_wing, right_wing) = if !self.theme.spinner_wings.is_empty() {
-                    let idx = self.kaomoji_frame_idx % self.theme.spinner_wings.len();
-                    let wing = &self.theme.spinner_wings[idx];
-                    (wing[0].as_str(), wing[1].as_str())
-                } else {
-                    ("", "")
-                };
-
-                // Pad verb to VERB_DISPLAY_PAD cols so the status-bar right
-                // section (model, tokens, cost) stays at a stable column as
-                // the verb animates through words of different lengths.
-                let verb_padded = unicode_pad_right(verb, VERB_DISPLAY_PAD);
-                let core = if face.is_empty() {
-                    format!("{spinner} {verb_padded}")
-                } else {
-                    format!("{spinner} {face} {verb_padded}")
-                };
-
-                let msg = if elapsed > 10 {
-                    format!("{left_wing}{core} {elapsed}s  ^C=stop{right_wing}")
-                } else if elapsed > 3 {
-                    format!("{left_wing}{core} {elapsed}s{right_wing}")
-                } else {
-                    format!("{left_wing}{core}{right_wing}")
-                };
+                let msg = format_thinking_status(
+                    &self.theme,
+                    *f,
+                    self.thinking_verb_idx,
+                    self.kaomoji_frame_idx,
+                    started.elapsed().as_secs(),
+                );
                 left_spans.push(Span::styled(
                     format!(" {msg} "),
                     Style::default().fg(Color::Rgb(255, 220, 80)),
@@ -10211,29 +10362,28 @@ impl App {
             format!(" ${:.4}", self.session_cost),
             cost_style,
         ));
-        if let Some(recording) = &self.voice_recording {
+        if let Some(presence) = self.voice_presence_state() {
             left_spans.push(Span::styled(
                 " │ ",
                 Style::default().fg(Color::Rgb(50, 50, 65)),
             ));
-            left_spans.push(Span::styled(
-                format!(" REC {:.0}s ", recording.started_at.elapsed().as_secs_f64()),
-                Style::default()
+            let style = match presence {
+                VoicePresenceState::Recording { .. } => Style::default()
                     .fg(Color::Rgb(30, 20, 20))
                     .bg(Color::Rgb(240, 110, 90))
                     .add_modifier(Modifier::BOLD),
-            ));
-        } else if self.voice_continuous_active {
-            left_spans.push(Span::styled(
-                " │ ",
-                Style::default().fg(Color::Rgb(50, 50, 65)),
-            ));
-            left_spans.push(Span::styled(
-                " LISTEN ",
-                Style::default()
+                VoicePresenceState::Speaking => Style::default()
+                    .fg(Color::Rgb(10, 24, 38))
+                    .bg(Color::Rgb(120, 210, 255))
+                    .add_modifier(Modifier::BOLD),
+                VoicePresenceState::Listening => Style::default()
                     .fg(Color::Rgb(18, 32, 26))
                     .bg(Color::Rgb(120, 225, 165))
                     .add_modifier(Modifier::BOLD),
+            };
+            left_spans.push(Span::styled(
+                format_voice_presence_badge(presence, self.voice_presence_frame_idx),
+                style,
             ));
         }
         if !self.active_subagents.is_empty() {
@@ -12213,6 +12363,33 @@ mod tests {
     }
 
     #[test]
+    fn waiting_first_token_status_surfaces_the_right_message() {
+        let theme = Theme::default();
+        let early = format_waiting_first_token_status(&theme, 0, 0, 0, 2);
+        let long = format_waiting_first_token_status(&theme, 0, 0, 0, 12);
+        assert!(early.contains("first token"));
+        assert!(long.contains("waiting for first token"));
+        assert!(long.contains("^C=stop"));
+    }
+
+    #[test]
+    fn voice_presence_badges_cover_recording_and_playback_modes() {
+        let recording = format_voice_presence_badge(
+            VoicePresenceState::Recording {
+                elapsed_secs: 5,
+                continuous: true,
+            },
+            2,
+        );
+        let speaking = format_voice_presence_badge(VoicePresenceState::Speaking, 2);
+        let listening = format_voice_presence_badge(VoicePresenceState::Listening, 2);
+        assert!(recording.contains("TALK"));
+        assert!(recording.contains("5s"));
+        assert!(speaking.contains("SPEAK"));
+        assert!(listening.contains("LISTEN"));
+    }
+
+    #[test]
     fn persist_voice_preferences_round_trip() {
         let _guard = crate::gateway_catalog::TEST_ENV_LOCK
             .lock()
@@ -12264,6 +12441,20 @@ mod tests {
                 .iter()
                 .any(|l| l.text.contains("explain this code"))
         );
+    }
+
+    #[tokio::test]
+    async fn first_token_transitions_awaiting_state_to_streaming() {
+        let mut app = App::new();
+        app.display_state = DisplayState::AwaitingFirstToken {
+            frame: 0,
+            started: Instant::now(),
+        };
+        app.response_tx
+            .send(AgentResponse::Token("hello".into()))
+            .expect("send token");
+        app.check_responses();
+        assert!(matches!(app.display_state, DisplayState::Streaming { .. }));
     }
 
     #[tokio::test]

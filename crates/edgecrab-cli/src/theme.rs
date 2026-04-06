@@ -37,9 +37,15 @@ use std::collections::HashMap;
 /// thinking_verbs:
 ///   - "pondering"
 ///   - "crunching"
+/// waiting_verbs:
+///   - "dispatching"
+///   - "awaiting"
 /// kaomoji_thinking:
 ///   - "(｡◕‿◕｡)"
 ///   - "(⌐■_■)"
+/// kaomoji_waiting:
+///   - "(・・ )"
+///   - "( ._.)"
 /// kaomoji_success:
 ///   - "✧(≗ᴗ≗)✧"
 ///   - "(ﾉ◕ヮ◕)ﾉ*:･ﾟ✧"
@@ -73,9 +79,13 @@ pub struct SkinConfig {
     pub goodbye_msg: Option<String>,
 
     // ── Spinner / kaomoji ─────────────────────────────────────────────
+    /// Waiting verbs shown before the first token arrives.
+    pub waiting_verbs: Option<Vec<String>>,
     /// Thinking verb list — overrides the hardcoded THINKING_VERBS array.
     /// Rotates in the status bar while the agent reasons.
     pub thinking_verbs: Option<Vec<String>>,
+    /// Kaomoji faces shown while waiting for the first token.
+    pub kaomoji_waiting: Option<Vec<String>>,
     /// Kaomoji faces shown alongside the thinking verb in the status bar.
     /// Each face rotates every full spinner revolution.
     pub kaomoji_thinking: Option<Vec<String>>,
@@ -162,8 +172,12 @@ pub struct Theme {
     pub goodbye_msg: String,
 
     // ── Spinner / kaomoji ─────────────────────────────────────────────
+    /// Waiting verbs that rotate before the first token arrives.
+    pub waiting_verbs: Vec<String>,
     /// Thinking verbs that rotate in the status bar while the agent reasons
     pub thinking_verbs: Vec<String>,
+    /// Kaomoji faces shown while waiting for the first token
+    pub kaomoji_waiting: Vec<String>,
     /// Kaomoji faces shown alongside the thinking verb
     pub kaomoji_thinking: Vec<String>,
     /// Kaomoji faces shown on successful tool completion
@@ -185,6 +199,17 @@ impl Default for Theme {
 }
 
 // ── Default pools (used when skin.yaml doesn't override) ──────────────
+
+/// Default waiting verbs — rotated while the request has been sent but no
+/// reasoning or response token has arrived yet.
+pub const DEFAULT_WAITING_VERBS: &[&str] = &[
+    "dispatching",
+    "awaiting",
+    "warming",
+    "negotiating",
+    "priming",
+    "connecting",
+];
 
 /// Default thinking verbs — rotated in the status bar while the agent reasons.
 pub const DEFAULT_THINKING_VERBS: &[&str] = &[
@@ -209,6 +234,13 @@ pub const DEFAULT_THINKING_VERBS: &[&str] = &[
     "calibrating",
     "optimizing",
 ];
+
+/// Default kaomoji faces for the pre-first-token waiting state — full Unicode.
+pub const DEFAULT_KAOMOJI_WAITING: &[&str] =
+    &["(・・ )", "( •.•)", "(°_°)", "(¬_¬ )", "(・・;)", "( ˙-˙ )"];
+
+/// ASCII-safe waiting kaomoji for limited terminal fonts.
+pub const SAFE_KAOMOJI_WAITING: &[&str] = &["(._.)", "(o_o)", "(-_-)", "(.. )", "( ? )", "(>_<)"];
 
 /// Default kaomoji faces for the thinking state — full Unicode (requires CJK/IPA font).
 ///
@@ -410,6 +442,18 @@ impl Theme {
         // terminal capability detection so kaomoji never display as "???".
         let rich_unicode = terminal_supports_extended_unicode();
 
+        let waiting_verbs: Vec<String> = skin
+            .waiting_verbs
+            .as_ref()
+            .filter(|v| !v.is_empty())
+            .cloned()
+            .unwrap_or_else(|| {
+                DEFAULT_WAITING_VERBS
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect()
+            });
+
         let thinking_verbs: Vec<String> = skin
             .thinking_verbs
             .as_ref()
@@ -420,6 +464,22 @@ impl Theme {
                     .iter()
                     .map(|s| s.to_string())
                     .collect()
+            });
+
+        let kaomoji_waiting: Vec<String> = skin
+            .kaomoji_waiting
+            .as_ref()
+            .filter(|v| !v.is_empty())
+            .cloned()
+            .unwrap_or_else(|| {
+                if rich_unicode {
+                    DEFAULT_KAOMOJI_WAITING
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect()
+                } else {
+                    SAFE_KAOMOJI_WAITING.iter().map(|s| s.to_string()).collect()
+                }
             });
 
         let kaomoji_thinking: Vec<String> = skin
@@ -513,7 +573,9 @@ impl Theme {
                 .goodbye_msg
                 .clone()
                 .unwrap_or_else(|| "Goodbye! 🦀  See you next time.".to_string()),
+            waiting_verbs,
             thinking_verbs,
+            kaomoji_waiting,
             kaomoji_thinking,
             kaomoji_success,
             kaomoji_error,
@@ -584,10 +646,24 @@ mod tests {
     #[test]
     fn theme_has_default_kaomoji_pools() {
         let theme = Theme::default();
+        assert!(!theme.waiting_verbs.is_empty());
+        assert!(!theme.kaomoji_waiting.is_empty());
         assert!(!theme.kaomoji_thinking.is_empty());
         assert!(!theme.kaomoji_success.is_empty());
         assert!(!theme.kaomoji_error.is_empty());
         assert!(!theme.thinking_verbs.is_empty());
+    }
+
+    #[test]
+    fn skin_can_override_waiting_animation() {
+        let skin = SkinConfig {
+            waiting_verbs: Some(vec!["handshaking".into(), "queueing".into()]),
+            kaomoji_waiting: Some(vec!["(wait)".into(), "(hold)".into()]),
+            ..Default::default()
+        };
+        let theme = Theme::from_skin(&skin);
+        assert_eq!(theme.waiting_verbs, vec!["handshaking", "queueing"]);
+        assert_eq!(theme.kaomoji_waiting, vec!["(wait)", "(hold)"]);
     }
 
     #[test]
