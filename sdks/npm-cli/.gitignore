@@ -1,0 +1,5 @@
+node_modules/
+# Downloaded platform binary (installed by postinstall script, not committed)
+bin/edgecrab
+bin/edgecrab.exe
+bin/edgecrab-*

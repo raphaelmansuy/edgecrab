@@ -173,6 +173,40 @@ make publish-all   # Rust + Python + Node + npm-cli + pypi-cli
 
 ---
 
+## Local publish (no registry — development only)
+
+Use these targets to build and install the Python wheels and npm packages **directly on your workstation** without pushing to any registry. Ideal for testing SDK changes end-to-end before tagging a release.
+
+### All local packages at once
+
+```bash
+make publish-local
+# Runs: publish-python-local + publish-node-local + publish-npm-cli-local + publish-pypi-cli-local
+```
+
+### Individual local targets
+
+| Target | What it does |
+|---|---|
+| `make publish-python-local` | Builds `edgecrab-sdk` wheel → `pip install --force-reinstall` |
+| `make publish-node-local` | Builds `edgecrab-sdk` TypeScript → `npm link --force` |
+| `make publish-npm-cli-local` | `npm link` for the `edgecrab-cli` npm wrapper |
+| `make publish-pypi-cli-local` | Builds `edgecrab-cli` wheel → `pip install --force-reinstall` |
+
+After running `publish-local`, verify:
+
+```bash
+# Python
+pip show edgecrab-sdk edgecrab-cli
+
+# npm (link makes packages available globally)
+npm list -g --depth=0 | grep edgecrab
+```
+
+> **Note:** `npm link` installs packages into your global node prefix (managed by your Node version manager, e.g. fnm/nvm). Both `edgecrab-sdk` and `edgecrab-cli` expose a binary named `edgecrab`, so `publish-node-local` uses `--force` to overwrite the bin symlink if it already exists from `publish-npm-cli-local`.
+
+---
+
 ## CI/CD architecture
 
 ### Workflow inventory
@@ -305,6 +339,11 @@ GH_PAGER='' gh run list --limit 10
 
 # Verify
 cargo search edgecrab-cli && npm view edgecrab-cli version && pip index versions edgecrab-cli
+
+# Local install (no registry — dev/testing)
+make publish-local                  # all Python + npm packages
+make publish-python-local           # Python SDK only
+make publish-npm-cli-local          # npm CLI wrapper only
 
 # Manual workstation publish (no tag/CI)
 make publish-rust && make publish-python && make publish-node
