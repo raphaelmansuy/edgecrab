@@ -387,6 +387,10 @@ mod tests {
         assert_eq!(resolved, target);
     }
 
+    // virtual_tmp_root maps Unix-style /tmp/... paths to a sandboxed root.
+    // On Windows, /tmp/... is not an absolute path (no drive letter), so this
+    // feature is Unix-only. Gate all three tests accordingly.
+    #[cfg(unix)]
     #[test]
     fn absolute_tmp_is_mapped_into_virtual_tmp_root_for_writes() {
         let workspace = tempfile::tempdir().expect("workspace");
@@ -408,6 +412,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn absolute_tmp_is_mapped_into_virtual_tmp_root_for_reads() {
         let workspace = tempfile::tempdir().expect("workspace");
@@ -424,6 +429,7 @@ mod tests {
         assert_eq!(resolved, mapped.canonicalize().expect("canon mapped"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn virtual_tmp_cannot_escape_its_root() {
         let workspace = tempfile::tempdir().expect("workspace");
