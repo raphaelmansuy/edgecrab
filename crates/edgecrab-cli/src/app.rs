@@ -29,7 +29,7 @@
 //! - Input line highlighting (cyan for valid commands, red for invalid)
 //! - Fish-style ghost text from input history
 
-use std::io::{self, Write};
+use std::io::{self, BufRead, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -120,6 +120,32 @@ enum AudioRecorderBackend {
     FfmpegPulse,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VoiceRecordingStopMode {
+    Manual,
+    AutoSilence,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VoiceRecordingFinishReason {
+    ManualStop,
+    AutoSilence,
+    RecorderExited,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct VoiceRecordingProfile {
+    stop_mode: VoiceRecordingStopMode,
+    silence_threshold_db: f32,
+    silence_duration_ms: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct VoiceTranscriptMeta {
+    capture_duration_secs: f64,
+    continuous_session: bool,
+}
+
 const AUDIO_PLAYER_CANDIDATES: &[AudioPlayerSpec] = &[
     AudioPlayerSpec {
         program: "afplay",
@@ -155,6 +181,96 @@ fn describe_audio_recorder(backend: AudioRecorderBackend) -> &'static str {
         AudioRecorderBackend::Rec => "rec",
         AudioRecorderBackend::FfmpegPulse => "ffmpeg-pulse",
     }
+}
+
+fn recorder_supports_auto_silence_stop(backend: AudioRecorderBackend) -> bool {
+    matches!(
+        backend,
+        AudioRecorderBackend::FfmpegAvFoundation
+            | AudioRecorderBackend::FfmpegPulse
+            | AudioRecorderBackend::Rec
+    )
+}
+
+fn recorder_auto_silence_support_message(backend: AudioRecorderBackend) -> &'static str {
+    match backend {
+        AudioRecorderBackend::FfmpegAvFoundation => "supported via ffmpeg silencedetect",
+        AudioRecorderBackend::FfmpegPulse => "supported via ffmpeg silencedetect",
+        AudioRecorderBackend::Rec => "supported via SoX silence effect",
+        AudioRecorderBackend::Arecord => {
+            "not supported by arecord alone; install `rec` or `ffmpeg` for hands-free continuous capture"
+        }
+        AudioRecorderBackend::FfmpegDShow => {
+            "not supported reliably on Windows ffmpeg dshow; use push-to-talk/manual stop"
+        }
+    }
+}
+
+fn format_silencedetect_threshold(threshold_db: f32) -> String {
+    let value = if threshold_db.is_finite() {
+        threshold_db
+    } else {
+        -40.0
+    };
+    format!("{value:.1}dB")
+}
+
+fn parse_ffmpeg_silence_start(line: &str) -> Option<f64> {
+    let idx = line.find("silence_start:")?;
+    let value = line[(idx + "silence_start:".len())..].trim();
+    value.parse::<f64>().ok()
+}
+
+fn line_mentions_ffmpeg_silence_end(line: &str) -> bool {
+    line.contains("silence_end:")
+}
+
+fn should_stop_ffmpeg_on_silence(
+    line: &str,
+    heard_speech: bool,
+    min_post_speech_secs: f64,
+) -> bool {
+    let Some(silence_start) = parse_ffmpeg_silence_start(line) else {
+        return false;
+    };
+    heard_speech || silence_start >= min_post_speech_secs
+}
+
+#[cfg(unix)]
+fn interrupt_process_id(pid: u32) -> bool {
+    if let Ok(pid) = i32::try_from(pid) {
+        // SIGINT lets ffmpeg/arecord finalize WAV headers before exit.
+        unsafe {
+            libc::kill(pid, libc::SIGINT);
+        }
+        return true;
+    }
+    false
+}
+
+#[cfg(not(unix))]
+fn interrupt_process_id(_pid: u32) -> bool {
+    false
+}
+
+fn spawn_ffmpeg_silence_monitor(pid: u32, stderr: std::process::ChildStderr) {
+    std::thread::spawn(move || {
+        let reader = io::BufReader::new(stderr);
+        let mut heard_speech = false;
+        for line in reader.lines() {
+            let Ok(line) = line else {
+                break;
+            };
+            if line_mentions_ffmpeg_silence_end(&line) {
+                heard_speech = true;
+                continue;
+            }
+            if should_stop_ffmpeg_on_silence(&line, heard_speech, 0.35) {
+                let _ = interrupt_process_id(pid);
+                break;
+            }
+        }
+    });
 }
 
 fn select_audio_player_with<F>(mut exists: F) -> Option<AudioPlayerSpec>
@@ -197,7 +313,10 @@ fn preferred_audio_recorder() -> Option<AudioRecorderBackend> {
     select_audio_recorder_with(|program| which::which(program).is_ok())
 }
 
-fn voice_recording_ready(input_device: Option<&str>) -> Result<AudioRecorderBackend, String> {
+fn voice_recording_ready(
+    input_device: Option<&str>,
+    stop_mode: VoiceRecordingStopMode,
+) -> Result<AudioRecorderBackend, String> {
     if !TranscribeAudioTool.is_available() {
         return Err(
             "No speech-to-text backend available. Install local `whisper`, or configure `GROQ_API_KEY` / `OPENAI_API_KEY`."
@@ -216,12 +335,22 @@ fn voice_recording_ready(input_device: Option<&str>) -> Result<AudioRecorderBack
                 .into(),
         );
     }
+    if matches!(stop_mode, VoiceRecordingStopMode::AutoSilence)
+        && !recorder_supports_auto_silence_stop(backend)
+    {
+        return Err(format!(
+            "Continuous voice capture is unavailable with {}: {}.",
+            describe_audio_recorder(backend),
+            recorder_auto_silence_support_message(backend)
+        ));
+    }
     Ok(backend)
 }
 
 fn spawn_audio_recorder(
     path: &std::path::Path,
     input_device: Option<&str>,
+    profile: VoiceRecordingProfile,
 ) -> anyhow::Result<(std::process::Child, AudioRecorderBackend)> {
     let backend =
         preferred_audio_recorder().ok_or_else(|| anyhow::anyhow!("no supported recorder found"))?;
@@ -242,6 +371,16 @@ fn spawn_audio_recorder(
                 "16000",
                 "-y",
             ]);
+            if matches!(profile.stop_mode, VoiceRecordingStopMode::AutoSilence) {
+                command.args([
+                    "-af",
+                    &format!(
+                        "silencedetect=n={}:d={:.2}",
+                        format_silencedetect_threshold(profile.silence_threshold_db),
+                        profile.silence_duration_ms as f64 / 1000.0
+                    ),
+                ]);
+            }
             command
         }
         AudioRecorderBackend::FfmpegDShow => {
@@ -270,6 +409,17 @@ fn spawn_audio_recorder(
         AudioRecorderBackend::Rec => {
             let mut command = std::process::Command::new("rec");
             command.args(["-q", "-c", "1", "-r", "16000"]);
+            if matches!(profile.stop_mode, VoiceRecordingStopMode::AutoSilence) {
+                let threshold = format!("{:.1}d", profile.silence_threshold_db);
+                let duration = format!("{:.2}", profile.silence_duration_ms as f64 / 1000.0);
+                command.arg("silence");
+                command.arg("1");
+                command.arg("0.10");
+                command.arg(&threshold);
+                command.arg("1");
+                command.arg(&duration);
+                command.arg(&threshold);
+            }
             command
         }
         AudioRecorderBackend::FfmpegPulse => {
@@ -288,26 +438,45 @@ fn spawn_audio_recorder(
                 "16000",
                 "-y",
             ]);
+            if matches!(profile.stop_mode, VoiceRecordingStopMode::AutoSilence) {
+                command.args([
+                    "-af",
+                    &format!(
+                        "silencedetect=n={}:d={:.2}",
+                        format_silencedetect_threshold(profile.silence_threshold_db),
+                        profile.silence_duration_ms as f64 / 1000.0
+                    ),
+                ]);
+            }
             command
         }
     };
     command.arg(path);
     command.stdin(std::process::Stdio::null());
     command.stdout(std::process::Stdio::null());
-    command.stderr(std::process::Stdio::null());
-    let child = command.spawn()?;
+    let use_ffmpeg_monitor = matches!(
+        (backend, profile.stop_mode),
+        (
+            AudioRecorderBackend::FfmpegAvFoundation | AudioRecorderBackend::FfmpegPulse,
+            VoiceRecordingStopMode::AutoSilence
+        )
+    );
+    command.stderr(if use_ffmpeg_monitor {
+        std::process::Stdio::piped()
+    } else {
+        std::process::Stdio::null()
+    });
+    let mut child = command.spawn()?;
+    if use_ffmpeg_monitor {
+        if let Some(stderr) = child.stderr.take() {
+            spawn_ffmpeg_silence_monitor(child.id(), stderr);
+        }
+    }
     Ok((child, backend))
 }
 
 fn stop_audio_recorder(child: &mut std::process::Child) -> anyhow::Result<()> {
-    #[cfg(unix)]
-    {
-        if let Ok(pid) = i32::try_from(child.id()) {
-            // SIGINT lets ffmpeg/arecord finalize WAV headers before exit.
-            unsafe {
-                libc::kill(pid, libc::SIGINT);
-            }
-        }
+    if interrupt_process_id(child.id()) {
         for _ in 0..20 {
             if child.try_wait()?.is_some() {
                 return Ok(());
@@ -329,6 +498,29 @@ fn terminal_bell(count: usize) {
         let _ = stdout.write_all(b"\x07");
     }
     let _ = stdout.flush();
+}
+
+fn normalize_voice_transcript(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn is_probable_voice_hallucination(text: &str, capture_duration_secs: f64) -> bool {
+    if capture_duration_secs > 1.75 {
+        return false;
+    }
+    let normalized = normalize_voice_transcript(text).to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "thank you"
+            | "thanks for watching"
+            | "thanks for watching."
+            | "thank you for watching"
+            | "thank you for watching."
+            | "you"
+            | "music"
+            | "[music]"
+            | "(music)"
+    )
 }
 
 fn key_matches_binding(key: &event::KeyEvent, binding: &str) -> bool {
@@ -569,6 +761,25 @@ fn write_config_root(config_path: &std::path::Path, root: &serde_yml::Value) -> 
     Ok(())
 }
 
+fn update_voice_config_in_config_root<F>(mutator: F) -> anyhow::Result<()>
+where
+    F: FnOnce(&mut serde_yml::Mapping),
+{
+    let (config_path, mut root) = load_config_root_for_edit()?;
+
+    if let serde_yml::Value::Mapping(ref mut map) = root {
+        let voice_key = serde_yml::Value::String("voice".into());
+        let voice_section = map
+            .entry(voice_key)
+            .or_insert_with(|| serde_yml::Value::Mapping(Default::default()));
+        if let serde_yml::Value::Mapping(voice_map) = voice_section {
+            mutator(voice_map);
+        }
+    }
+
+    write_config_root(&config_path, &root)
+}
+
 /// Persist the user's model choice to ~/.edgecrab/config.yaml.
 fn persist_model_to_config(model: &str) -> anyhow::Result<()> {
     let (config_path, mut root) = load_config_root_for_edit()?;
@@ -699,20 +910,42 @@ fn persist_image_generation_to_config(
 
 /// Persist the CLI voice-mode default to ~/.edgecrab/config.yaml.
 fn persist_voice_enabled_to_config(enabled: bool) -> anyhow::Result<()> {
-    let (config_path, mut root) = load_config_root_for_edit()?;
-
-    if let serde_yml::Value::Mapping(ref mut map) = root {
-        let voice_key = serde_yml::Value::String("voice".into());
+    update_voice_config_in_config_root(|voice_map| {
         let enabled_key = serde_yml::Value::String("enabled".into());
-        let voice_section = map
-            .entry(voice_key)
-            .or_insert_with(|| serde_yml::Value::Mapping(Default::default()));
-        if let serde_yml::Value::Mapping(voice_map) = voice_section {
-            voice_map.insert(enabled_key, serde_yml::Value::Bool(enabled));
-        }
-    }
+        voice_map.insert(enabled_key, serde_yml::Value::Bool(enabled));
+    })
+}
 
-    write_config_root(&config_path, &root)
+fn persist_voice_preferences_to_config(
+    continuous: Option<bool>,
+    hallucination_filter: Option<bool>,
+    input_device: Option<Option<&str>>,
+) -> anyhow::Result<()> {
+    update_voice_config_in_config_root(|voice_map| {
+        if let Some(continuous) = continuous {
+            voice_map.insert(
+                serde_yml::Value::String("continuous".into()),
+                serde_yml::Value::Bool(continuous),
+            );
+        }
+        if let Some(enabled) = hallucination_filter {
+            voice_map.insert(
+                serde_yml::Value::String("hallucination_filter".into()),
+                serde_yml::Value::Bool(enabled),
+            );
+        }
+        if let Some(input_device) = input_device {
+            let input_key = serde_yml::Value::String("input_device".into());
+            if let Some(input_device) = input_device.filter(|value| !value.trim().is_empty()) {
+                voice_map.insert(
+                    input_key,
+                    serde_yml::Value::String(input_device.to_string()),
+                );
+            } else {
+                voice_map.remove(&input_key);
+            }
+        }
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1473,6 +1706,16 @@ pub struct App {
     voice_push_to_talk_key: String,
     /// Optional recorder input-device override for cross-platform microphone capture.
     voice_input_device: Option<String>,
+    /// Persisted default for hands-free continuous voice capture.
+    voice_continuous_default: bool,
+    /// Current continuous voice loop state for this session.
+    voice_continuous_active: bool,
+    /// Conservative filter for short, known-bad STT hallucinations.
+    voice_hallucination_filter: bool,
+    /// Consecutive empty/hallucinated voice captures in the current continuous loop.
+    voice_no_speech_count: u8,
+    /// True while audio is being spoken back locally.
+    voice_playback_active: bool,
     /// File-based hook registry — loaded from ~/.edgecrab/hooks/ at startup.
     /// Receives tool:pre/post, llm:pre/post, and cli:start/end events.
     hook_registry: std::sync::Arc<edgecrab_gateway::hooks::HookRegistry>,
@@ -1490,6 +1733,8 @@ struct VoiceRecordingSession {
     submit_to_agent: bool,
     backend: AudioRecorderBackend,
     started_at: Instant,
+    profile: VoiceRecordingProfile,
+    continuous_session: bool,
 }
 
 /// Events from the agent background task → TUI event loop.
@@ -1567,7 +1812,15 @@ enum AgentResponse {
     VoiceTranscript {
         transcript: String,
         submit_to_agent: bool,
+        meta: Option<VoiceTranscriptMeta>,
     },
+    /// A local microphone capture failed after recording completed.
+    VoiceCaptureFailed {
+        error: String,
+        continuous_session: bool,
+    },
+    /// Local voice playback finished, so continuous capture can safely resume.
+    VoicePlaybackFinished,
     /// An isolated `/background` session finished successfully.
     BackgroundPromptComplete {
         task_num: u64,
@@ -1821,6 +2074,11 @@ impl App {
             voice_recording: None,
             voice_push_to_talk_key: runtime_config.voice.push_to_talk_key,
             voice_input_device: runtime_config.voice.input_device,
+            voice_continuous_default: runtime_config.voice.continuous,
+            voice_continuous_active: false,
+            voice_hallucination_filter: runtime_config.voice.hallucination_filter,
+            voice_no_speech_count: 0,
+            voice_playback_active: false,
             hook_registry: {
                 let mut r = edgecrab_gateway::hooks::HookRegistry::new();
                 r.discover_and_load();
@@ -2449,6 +2707,16 @@ impl App {
                 ("on", "Enable TTS — agent responses are read aloud"),
                 ("off", "Disable TTS"),
                 ("status", "Show current voice mode"),
+                (
+                    "continuous on",
+                    "Enable hands-free continuous voice capture",
+                ),
+                ("continuous off", "Disable continuous voice capture"),
+                ("stop", "Stop the active voice recording or continuous loop"),
+                (
+                    "doctor",
+                    "Show recorder, permissions, and platform guidance",
+                ),
                 (
                     "record",
                     "Start or stop microphone capture and transcribe it",
@@ -4900,6 +5168,11 @@ impl App {
                     if self.voice_mode_enabled && !response_text.is_empty() {
                         self.spawn_direct_tts(response_text, false);
                     }
+                    if self.voice_continuous_active && !self.voice_playback_active {
+                        self.maybe_restart_continuous_voice_session(
+                            "Response finished. Listening again for continuous voice...",
+                        );
+                    }
 
                     if let Some(next) = self.prompt_queue.first().cloned() {
                         self.prompt_queue.remove(0);
@@ -4916,6 +5189,9 @@ impl App {
                     self.pending_tool_lines.clear();
                     self.display_state = DisplayState::Idle;
                     self.push_output(err, OutputRole::Error);
+                    if self.voice_continuous_active {
+                        self.stop_continuous_voice_session(false);
+                    }
                     self.needs_redraw = true;
                 }
                 AgentResponse::Clarify {
@@ -5040,22 +5316,68 @@ impl App {
                 AgentResponse::VoiceTranscript {
                     transcript,
                     submit_to_agent,
+                    meta,
                 } => {
+                    let transcript = normalize_voice_transcript(&transcript);
+                    let filtered = meta.is_some_and(|meta| {
+                        self.voice_hallucination_filter
+                            && is_probable_voice_hallucination(
+                                &transcript,
+                                meta.capture_duration_secs,
+                            )
+                    });
                     if transcript.trim().is_empty() {
                         self.push_output(
                             "Transcription completed, but no speech was detected.",
                             OutputRole::System,
                         );
+                        self.note_empty_voice_capture();
+                    } else if filtered {
+                        self.push_output(
+                            format!(
+                                "Filtered probable STT hallucination from a short capture:\n{}",
+                                transcript
+                            ),
+                            OutputRole::System,
+                        );
+                        self.note_empty_voice_capture();
                     } else if submit_to_agent {
+                        self.voice_no_speech_count = 0;
                         self.push_output(
                             format!("Voice reply transcript:\n{transcript}"),
                             OutputRole::System,
                         );
                         self.process_input(&transcript);
                     } else {
+                        self.voice_no_speech_count = 0;
                         self.push_output(
                             format!("Voice transcript:\n{transcript}"),
                             OutputRole::System,
+                        );
+                    }
+                    self.needs_redraw = true;
+                }
+                AgentResponse::VoiceCaptureFailed {
+                    error,
+                    continuous_session,
+                } => {
+                    if continuous_session {
+                        self.voice_continuous_active = false;
+                        self.voice_no_speech_count = 0;
+                        self.push_output(
+                            format!("{error}\nContinuous voice stopped to avoid a restart loop."),
+                            OutputRole::Error,
+                        );
+                    } else {
+                        self.push_output(error, OutputRole::Error);
+                    }
+                    self.needs_redraw = true;
+                }
+                AgentResponse::VoicePlaybackFinished => {
+                    self.voice_playback_active = false;
+                    if self.voice_continuous_active && !self.is_processing {
+                        self.maybe_restart_continuous_voice_session(
+                            "Spoken reply finished. Listening again for continuous voice...",
                         );
                     }
                     self.needs_redraw = true;
@@ -5284,6 +5606,7 @@ impl App {
 
     /// Advance spinner frame (called on every tick).
     fn tick_spinner(&mut self) {
+        self.poll_voice_recording_completion();
         let advance_verb = match &mut self.display_state {
             DisplayState::Thinking { frame, .. } => {
                 *frame = (*frame + 1) % SPINNER_FRAMES.len();
@@ -7257,6 +7580,7 @@ impl App {
     }
 
     fn spawn_direct_tts(&mut self, text: String, announce: bool) {
+        self.voice_playback_active = true;
         let tx = self.response_tx.clone();
         let ctx = self.direct_media_tool_context();
         self.rt_handle.spawn(async move {
@@ -7298,6 +7622,7 @@ impl App {
                     let _ = tx.send(AgentResponse::Error(format!("TTS error: {error}")));
                 }
             }
+            let _ = tx.send(AgentResponse::VoicePlaybackFinished);
         });
     }
 
@@ -7317,12 +7642,14 @@ impl App {
                     let _ = tx.send(AgentResponse::VoiceTranscript {
                         transcript,
                         submit_to_agent,
+                        meta: None,
                     });
                 }
                 Err(error) => {
-                    let _ = tx.send(AgentResponse::Error(format!(
-                        "Transcription error: {error}"
-                    )));
+                    let _ = tx.send(AgentResponse::VoiceCaptureFailed {
+                        error: format!("Transcription error: {error}"),
+                        continuous_session: false,
+                    });
                 }
             }
         });
@@ -7333,6 +7660,7 @@ impl App {
         file_path: String,
         submit_to_agent: bool,
         cleanup_after: bool,
+        meta: VoiceTranscriptMeta,
     ) {
         let tx = self.response_tx.clone();
         let ctx = self.direct_media_tool_context();
@@ -7353,28 +7681,225 @@ impl App {
                     let _ = tx.send(AgentResponse::VoiceTranscript {
                         transcript,
                         submit_to_agent,
+                        meta: Some(meta),
                     });
                 }
                 Err(error) => {
-                    let _ = tx.send(AgentResponse::Error(format!(
-                        "Transcription error: {error}"
-                    )));
+                    let _ = tx.send(AgentResponse::VoiceCaptureFailed {
+                        error: format!("Transcription error: {error}"),
+                        continuous_session: meta.continuous_session,
+                    });
                 }
             }
         });
     }
 
-    fn start_voice_recording(&mut self, submit_to_agent: bool) {
-        let backend = match voice_recording_ready(self.voice_input_device.as_deref()) {
-            Ok(backend) => backend,
-            Err(reason) => {
+    fn voice_recording_profile(&self, submit_to_agent: bool) -> VoiceRecordingProfile {
+        let runtime_config = self.load_runtime_config();
+        let stop_mode = if submit_to_agent && self.voice_continuous_active {
+            VoiceRecordingStopMode::AutoSilence
+        } else {
+            VoiceRecordingStopMode::Manual
+        };
+        VoiceRecordingProfile {
+            stop_mode,
+            silence_threshold_db: runtime_config.stt.silence_threshold,
+            silence_duration_ms: runtime_config.stt.silence_duration_ms,
+        }
+    }
+
+    fn begin_continuous_voice_session(&mut self, persist_default: bool) {
+        let profile = self.voice_recording_profile(true);
+        if let Err(reason) =
+            voice_recording_ready(self.voice_input_device.as_deref(), profile.stop_mode)
+        {
+            self.push_output(
+                format!("Continuous voice unavailable: {reason}"),
+                OutputRole::Error,
+            );
+            return;
+        }
+        self.voice_continuous_active = true;
+        self.voice_no_speech_count = 0;
+        if persist_default {
+            self.voice_continuous_default = true;
+            if let Err(error) = persist_voice_preferences_to_config(Some(true), None, None) {
                 self.push_output(
-                    format!("Voice recording unavailable: {reason}"),
+                    format!(
+                        "Continuous voice enabled for this session, but config save failed: {error}"
+                    ),
                     OutputRole::Error,
                 );
+            }
+        }
+        if self.voice_recording.is_some() {
+            self.push_output(
+                "Continuous voice is armed. Current capture will continue until it stops.",
+                OutputRole::System,
+            );
+            return;
+        }
+        if self.is_processing {
+            self.push_output(
+                "Continuous voice is armed. Recording will start after the current response finishes.",
+                OutputRole::System,
+            );
+            return;
+        }
+        if self.voice_playback_active {
+            self.push_output(
+                "Continuous voice is armed. Recording will resume after spoken playback finishes.",
+                OutputRole::System,
+            );
+            return;
+        }
+        self.start_voice_recording(true);
+    }
+
+    fn stop_continuous_voice_session(&mut self, persist_default: bool) {
+        self.voice_continuous_active = false;
+        self.voice_no_speech_count = 0;
+        if persist_default {
+            self.voice_continuous_default = false;
+            if let Err(error) = persist_voice_preferences_to_config(Some(false), None, None) {
+                self.push_output(
+                    format!("Continuous voice disabled for this session, but config save failed: {error}"),
+                    OutputRole::Error,
+                );
+            }
+        }
+    }
+
+    fn maybe_restart_continuous_voice_session(&mut self, reason: &str) {
+        if !self.voice_continuous_active
+            || self.voice_recording.is_some()
+            || self.is_processing
+            || self.voice_playback_active
+        {
+            return;
+        }
+        self.push_output(reason.to_string(), OutputRole::System);
+        self.start_voice_recording(true);
+    }
+
+    fn note_empty_voice_capture(&mut self) {
+        if !self.voice_continuous_active {
+            return;
+        }
+        self.voice_no_speech_count = self.voice_no_speech_count.saturating_add(1);
+        if self.voice_no_speech_count >= 3 {
+            self.voice_continuous_active = false;
+            self.voice_no_speech_count = 0;
+            self.push_output(
+                "Continuous voice stopped after 3 empty captures. Run `/voice continuous on` to resume.",
+                OutputRole::System,
+            );
+            return;
+        }
+        self.maybe_restart_continuous_voice_session(
+            "No clear speech detected. Listening again for continuous voice...",
+        );
+    }
+
+    fn complete_voice_recording(
+        &mut self,
+        mut recording: VoiceRecordingSession,
+        reason: VoiceRecordingFinishReason,
+    ) {
+        let duration = recording.started_at.elapsed();
+        let should_stop_child = !matches!(
+            reason,
+            VoiceRecordingFinishReason::AutoSilence | VoiceRecordingFinishReason::RecorderExited
+        );
+
+        if should_stop_child {
+            terminal_bell(2);
+            if let Err(error) = stop_audio_recorder(&mut recording.child) {
+                self.push_output(
+                    format!("Failed to stop voice recording cleanly: {error}"),
+                    OutputRole::Error,
+                );
+                let _ = std::fs::remove_file(&recording.output_path);
                 return;
             }
+        }
+
+        let metadata = std::fs::metadata(&recording.output_path).ok();
+        let size = metadata.as_ref().map(|meta| meta.len()).unwrap_or(0);
+        if size == 0 {
+            self.push_output(
+                "Voice recording captured no audio. Check microphone permissions and input device.",
+                OutputRole::Error,
+            );
+            let _ = std::fs::remove_file(&recording.output_path);
+            self.note_empty_voice_capture();
+            return;
+        }
+
+        let summary = match reason {
+            VoiceRecordingFinishReason::ManualStop => "Voice recording saved",
+            VoiceRecordingFinishReason::AutoSilence => "Voice recording auto-stopped after silence",
+            VoiceRecordingFinishReason::RecorderExited => "Voice recording finished",
         };
+        self.push_output(
+            format!(
+                "{summary} ({:.1}s, {} bytes) via {}. Transcribing...",
+                duration.as_secs_f64(),
+                size,
+                describe_audio_recorder(recording.backend)
+            ),
+            OutputRole::System,
+        );
+        self.spawn_direct_transcription_with_cleanup(
+            recording.output_path.display().to_string(),
+            recording.submit_to_agent,
+            true,
+            VoiceTranscriptMeta {
+                capture_duration_secs: duration.as_secs_f64(),
+                continuous_session: recording.continuous_session,
+            },
+        );
+    }
+
+    fn poll_voice_recording_completion(&mut self) {
+        let exited = self
+            .voice_recording
+            .as_mut()
+            .and_then(|recording| recording.child.try_wait().ok())
+            .flatten()
+            .is_some();
+        if !exited {
+            return;
+        }
+        if let Some(recording) = self.voice_recording.take() {
+            let reason = if matches!(
+                recording.profile.stop_mode,
+                VoiceRecordingStopMode::AutoSilence
+            ) {
+                VoiceRecordingFinishReason::AutoSilence
+            } else {
+                VoiceRecordingFinishReason::RecorderExited
+            };
+            self.complete_voice_recording(recording, reason);
+        }
+    }
+
+    fn start_voice_recording(&mut self, submit_to_agent: bool) {
+        let profile = self.voice_recording_profile(submit_to_agent);
+        let backend =
+            match voice_recording_ready(self.voice_input_device.as_deref(), profile.stop_mode) {
+                Ok(backend) => backend,
+                Err(reason) => {
+                    if matches!(profile.stop_mode, VoiceRecordingStopMode::AutoSilence) {
+                        self.voice_continuous_active = false;
+                    }
+                    self.push_output(
+                        format!("Voice recording unavailable: {reason}"),
+                        OutputRole::Error,
+                    );
+                    return;
+                }
+            };
 
         let recordings_dir = std::env::temp_dir().join("edgecrab_voice");
         if let Err(error) = std::fs::create_dir_all(&recordings_dir) {
@@ -7389,7 +7914,7 @@ impl App {
             chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f")
         ));
 
-        match spawn_audio_recorder(&output_path, self.voice_input_device.as_deref()) {
+        match spawn_audio_recorder(&output_path, self.voice_input_device.as_deref(), profile) {
             Ok((child, actual_backend)) => {
                 terminal_bell(1);
                 self.voice_recording = Some(VoiceRecordingSession {
@@ -7398,22 +7923,34 @@ impl App {
                     submit_to_agent,
                     backend: actual_backend,
                     started_at: Instant::now(),
+                    profile,
+                    continuous_session: submit_to_agent && self.voice_continuous_active,
                 });
-                let action = if submit_to_agent {
+                let action = if submit_to_agent && self.voice_continuous_active {
+                    "recording continuous voice reply"
+                } else if submit_to_agent {
                     "recording voice reply"
                 } else {
                     "recording voice note"
                 };
+                let stop_hint = if matches!(profile.stop_mode, VoiceRecordingStopMode::AutoSilence)
+                {
+                    "Auto-stops on silence."
+                } else {
+                    "Press the voice key again to stop."
+                };
                 self.push_output(
                     format!(
-                        "{action} via {}. Press {} again to stop.",
+                        "{action} via {}. {stop_hint}",
                         describe_audio_recorder(actual_backend),
-                        self.voice_push_to_talk_key
                     ),
                     OutputRole::System,
                 );
             }
             Err(error) => {
+                if matches!(profile.stop_mode, VoiceRecordingStopMode::AutoSilence) {
+                    self.voice_continuous_active = false;
+                }
                 let _ = std::fs::remove_file(&output_path);
                 self.push_output(
                     format!(
@@ -7427,47 +7964,11 @@ impl App {
     }
 
     fn stop_voice_recording(&mut self) {
-        let Some(mut recording) = self.voice_recording.take() else {
+        let Some(recording) = self.voice_recording.take() else {
             self.push_output("Voice recording is not active.", OutputRole::System);
             return;
         };
-
-        let duration = recording.started_at.elapsed();
-        terminal_bell(2);
-        if let Err(error) = stop_audio_recorder(&mut recording.child) {
-            self.push_output(
-                format!("Failed to stop voice recording cleanly: {error}"),
-                OutputRole::Error,
-            );
-            let _ = std::fs::remove_file(&recording.output_path);
-            return;
-        }
-
-        let metadata = std::fs::metadata(&recording.output_path).ok();
-        let size = metadata.as_ref().map(|meta| meta.len()).unwrap_or(0);
-        if size == 0 {
-            self.push_output(
-                "Voice recording captured no audio. Check microphone permissions and input device.",
-                OutputRole::Error,
-            );
-            let _ = std::fs::remove_file(&recording.output_path);
-            return;
-        }
-
-        self.push_output(
-            format!(
-                "Voice recording saved ({:.1}s, {} bytes) via {}. Transcribing...",
-                duration.as_secs_f64(),
-                size,
-                describe_audio_recorder(recording.backend)
-            ),
-            OutputRole::System,
-        );
-        self.spawn_direct_transcription_with_cleanup(
-            recording.output_path.display().to_string(),
-            recording.submit_to_agent,
-            true,
-        );
+        self.complete_voice_recording(recording, VoiceRecordingFinishReason::ManualStop);
     }
 
     fn abort_voice_recording(&mut self, reason: &str) {
@@ -7481,8 +7982,15 @@ impl App {
 
     fn toggle_voice_recording(&mut self, submit_to_agent: bool) {
         if self.voice_recording.is_some() {
+            if self.voice_continuous_active {
+                self.stop_continuous_voice_session(false);
+            }
             self.stop_voice_recording();
         } else {
+            if submit_to_agent {
+                self.voice_continuous_active = self.voice_continuous_default;
+                self.voice_no_speech_count = 0;
+            }
             self.start_voice_recording(submit_to_agent);
         }
     }
@@ -8211,7 +8719,117 @@ impl App {
                 self.toggle_voice_recording(true);
                 return;
             }
+            "stop" => {
+                self.stop_continuous_voice_session(false);
+                if self.voice_recording.is_some() {
+                    self.stop_voice_recording();
+                } else {
+                    self.push_output("Voice capture is already idle.", OutputRole::System);
+                }
+                return;
+            }
+            "doctor" => {
+                let recorder = preferred_audio_recorder();
+                let recorder_text = recorder
+                    .map(describe_audio_recorder)
+                    .unwrap_or("unavailable");
+                let auto_stop = recorder
+                    .map(recorder_auto_silence_support_message)
+                    .unwrap_or("no supported recorder installed");
+                let input_device =
+                    self.voice_input_device
+                        .as_deref()
+                        .unwrap_or(if cfg!(target_os = "windows") {
+                            "not configured"
+                        } else {
+                            "default"
+                        });
+                let permission_hint = if cfg!(target_os = "macos") {
+                    "macOS: grant microphone access to your terminal app in System Settings > Privacy & Security > Microphone."
+                } else if cfg!(target_os = "windows") {
+                    "Windows: enable microphone access in Settings > Privacy & security > Microphone and set `voice.input_device` to an ffmpeg dshow device name."
+                } else {
+                    "Linux: confirm your user can access PulseAudio/PipeWire/ALSA input devices and that the selected recorder exists on PATH."
+                };
+                self.push_output(
+                    format!(
+                        "Voice doctor\n\
+                         TTS: {}\n\
+                         STT: {}\n\
+                         Recorder: {recorder_text}\n\
+                         Recorder input: {input_device}\n\
+                         Continuous capture: {auto_stop}\n\
+                         Playback: {}\n\
+                         {permission_hint}",
+                        if TextToSpeechTool.is_available() {
+                            "available"
+                        } else {
+                            "unavailable"
+                        },
+                        if TranscribeAudioTool.is_available() {
+                            "available"
+                        } else {
+                            "unavailable"
+                        },
+                        preferred_audio_player()
+                            .map(|player| player.program)
+                            .unwrap_or("unavailable"),
+                    ),
+                    OutputRole::System,
+                );
+                return;
+            }
             _ => {}
+        }
+
+        if let Some(subcommand) = trimmed
+            .strip_prefix("continuous ")
+            .or_else(|| trimmed.strip_prefix("continuous\t"))
+        {
+            match subcommand.trim() {
+                "on" => {
+                    self.begin_continuous_voice_session(true);
+                }
+                "off" => {
+                    self.stop_continuous_voice_session(true);
+                    if self.voice_recording.is_some() {
+                        self.abort_voice_recording("Continuous voice disabled.");
+                    } else {
+                        self.push_output(
+                            "Continuous voice disabled for future captures.",
+                            OutputRole::System,
+                        );
+                    }
+                }
+                "status" | "" => {
+                    self.push_output(
+                        format!(
+                            "Continuous voice default: {}\nCurrent session: {}\nHallucination filter: {}",
+                            if self.voice_continuous_default {
+                                "ON"
+                            } else {
+                                "OFF"
+                            },
+                            if self.voice_continuous_active {
+                                "ACTIVE"
+                            } else {
+                                "idle"
+                            },
+                            if self.voice_hallucination_filter {
+                                "ON"
+                            } else {
+                                "OFF"
+                            }
+                        ),
+                        OutputRole::System,
+                    );
+                }
+                other => self.push_output(
+                    format!("Usage: /voice continuous <on|off|status> (got `{other}`)"),
+                    OutputRole::System,
+                ),
+            }
+            return;
         }
 
         match trimmed {
@@ -8289,6 +8907,9 @@ impl App {
                 let recorder = preferred_audio_recorder()
                     .map(describe_audio_recorder)
                     .unwrap_or("unavailable");
+                let auto_stop_support = preferred_audio_recorder()
+                    .map(recorder_auto_silence_support_message)
+                    .unwrap_or("no supported recorder installed");
                 let input_device =
                     self.voice_input_device
                         .as_deref()
@@ -8312,6 +8933,13 @@ impl App {
                 } else {
                     "idle"
                 };
+                let continuous_state = if self.voice_continuous_active {
+                    "active"
+                } else if self.voice_continuous_default {
+                    "armed by default"
+                } else {
+                    "off"
+                };
                 self.push_output(
                     format!(
                         "Voice mode: {status}\n\
@@ -8319,13 +8947,20 @@ impl App {
                          TTS backend: {tts_status}\n\
                          STT backend: {stt_status}\n\
                          Playback: {playback}\n\
+                         Playback active: {}\n\
                          Recorder: {recorder}\n\
+                         Continuous capture: {continuous_state}\n\
+                         Continuous backend support: {auto_stop_support}\n\
+                         Hallucination filter: {}\n\
                          Recorder input: {input_device}\n\
                          Push-to-talk key: {push_to_talk_key} ({recording_state})\n\
                          /voice on           — enable spoken readback\n\
                          /voice tts          — alias for always-on spoken readback\n\
                          /voice off          — disable TTS readback\n\
                          /voice status       — show voice mode state\n\
+                         /voice continuous on|off|status — manage hands-free voice capture\n\
+                         /voice stop         — stop the active recording or loop\n\
+                         /voice doctor       — show recorder + permission diagnostics\n\
                          /voice record       — record audio and transcribe it\n\
                          /voice talk         — record audio and submit transcript\n\
                          /voice tts <text>   — speak text immediately\n\
@@ -8333,6 +8968,12 @@ impl App {
                          /voice reply <audio-file>      — transcribe and submit it as your next prompt",
                         runtime_config.tts.provider,
                         runtime_config.tts.voice,
+                        if self.voice_playback_active { "yes" } else { "no" },
+                        if self.voice_hallucination_filter {
+                            "ON"
+                        } else {
+                            "OFF"
+                        },
                         push_to_talk_key = self.voice_push_to_talk_key,
                     ),
                     OutputRole::System,
@@ -8340,7 +8981,7 @@ impl App {
             }
             _ => {
                 self.push_output(
-                    "Usage: /voice <on|off|tts|status|record|talk|tts <text>|transcribe <file>|reply <file>>",
+                    "Usage: /voice <on|off|tts|status|continuous <on|off|status>|stop|doctor|record|talk|tts <text>|transcribe <file>|reply <file>>",
                     OutputRole::System,
                 );
             }
@@ -9360,6 +10001,18 @@ impl App {
                 Style::default()
                     .fg(Color::Rgb(30, 20, 20))
                     .bg(Color::Rgb(240, 110, 90))
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else if self.voice_continuous_active {
+            left_spans.push(Span::styled(
+                " │ ",
+                Style::default().fg(Color::Rgb(50, 50, 65)),
+            ));
+            left_spans.push(Span::styled(
+                " LISTEN ",
+                Style::default()
+                    .fg(Color::Rgb(18, 32, 26))
+                    .bg(Color::Rgb(120, 225, 165))
                     .add_modifier(Modifier::BOLD),
             ));
         }
@@ -11209,6 +11862,87 @@ mod tests {
             Some(AudioRecorderBackend::Arecord)
         };
         assert_eq!(recorder, expected);
+    }
+
+    #[test]
+    fn recorder_support_messages_match_backend_capabilities() {
+        assert!(recorder_supports_auto_silence_stop(
+            AudioRecorderBackend::FfmpegAvFoundation
+        ));
+        assert!(recorder_supports_auto_silence_stop(
+            AudioRecorderBackend::Rec
+        ));
+        assert!(!recorder_supports_auto_silence_stop(
+            AudioRecorderBackend::FfmpegDShow
+        ));
+        assert!(
+            recorder_auto_silence_support_message(AudioRecorderBackend::FfmpegDShow)
+                .contains("Windows")
+        );
+    }
+
+    #[test]
+    fn ffmpeg_silence_parser_detects_post_speech_stop_conditions() {
+        assert_eq!(
+            parse_ffmpeg_silence_start("[silencedetect] silence_start: 0.000"),
+            Some(0.0)
+        );
+        assert!(line_mentions_ffmpeg_silence_end(
+            "[silencedetect] silence_end: 1.23 | silence_duration: 0.45"
+        ));
+        assert!(!should_stop_ffmpeg_on_silence(
+            "[silencedetect] silence_start: 0.000",
+            false,
+            0.35
+        ));
+        assert!(should_stop_ffmpeg_on_silence(
+            "[silencedetect] silence_start: 1.420",
+            false,
+            0.35
+        ));
+        assert!(should_stop_ffmpeg_on_silence(
+            "[silencedetect] silence_start: 0.100",
+            true,
+            0.35
+        ));
+    }
+
+    #[test]
+    fn voice_hallucination_filter_is_conservative() {
+        assert_eq!(
+            normalize_voice_transcript("  thanks   for   watching  "),
+            "thanks for watching"
+        );
+        assert!(is_probable_voice_hallucination("thanks for watching", 0.9));
+        assert!(!is_probable_voice_hallucination(
+            "thanks for watching the logs and open src/main.rs",
+            0.9
+        ));
+        assert!(!is_probable_voice_hallucination("thank you", 2.5));
+    }
+
+    #[test]
+    fn persist_voice_preferences_round_trip() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+        persist_voice_enabled_to_config(true).expect("persist enabled");
+        persist_voice_preferences_to_config(Some(true), Some(false), Some(Some("Mic 1")))
+            .expect("persist voice prefs");
+
+        let cfg = edgecrab_core::AppConfig::load().expect("load config");
+        assert!(cfg.voice.enabled);
+        assert!(cfg.voice.continuous);
+        assert!(!cfg.voice.hallucination_filter);
+        assert_eq!(cfg.voice.input_device.as_deref(), Some("Mic 1"));
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
     }
 
     #[test]

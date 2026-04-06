@@ -883,7 +883,7 @@ impl CommandRegistry {
         self.register(Command {
             name: "voice",
             aliases: &["tts"],
-            description: "Voice tools: spoken readback, mic recording, transcription, and push-to-talk",
+            description: "Voice tools: spoken readback, mic recording, continuous capture, and transcription",
             handler: |args| CommandResult::VoiceMode(args.trim().to_string()),
         });
 
@@ -996,10 +996,10 @@ fn help_text() -> String {
            /sethome [channel]    — Set home channel for notifications\n\
            /update               — Check for EdgeCrab updates\n\
          \n\
-         Scheduling & Media:\n\
-           /cron [subcommand]    — Manage scheduled tasks\n\
-           /voice [subcommand]   — Voice tools: TTS, record, talk, transcribe\n\
-           /browser [sub]        — Chrome CDP: connect, disconnect, status, tabs, recording on|off\n\
+        Scheduling & Media:\n\
+          /cron [subcommand]    — Manage scheduled tasks\n\
+          /voice [subcommand]   — Voice tools: TTS, record, talk, continuous, doctor\n\
+          /browser [sub]        — Chrome CDP: connect, disconnect, status, tabs, recording on|off\n\
          \n\
          Appearance:\n\
            /theme, /skin [name]  — Switch skin preset (or list available)\n\
