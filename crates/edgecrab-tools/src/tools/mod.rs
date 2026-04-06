@@ -41,6 +41,7 @@ pub mod honcho;
 pub mod mcp_client;
 pub mod memory;
 pub mod mixture_of_agents;
+pub mod pdf_to_markdown;
 pub mod process;
 pub mod session_search;
 pub mod skills;

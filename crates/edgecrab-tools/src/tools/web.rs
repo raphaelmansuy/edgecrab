@@ -42,20 +42,18 @@
 //! - `BRAVE_API_KEY=BSA...` (free tier: https://api.search.brave.com/app/keys)
 
 use async_trait::async_trait;
-use edgeparse_core::api::config::{ImageOutput, OutputFormat, ProcessingConfig};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{HashSet, VecDeque};
-use std::io::Write;
 use std::sync::OnceLock;
-use tempfile::NamedTempFile;
 
 use edgecrab_types::{ToolError, ToolSchema};
 use reqwest::Url;
 
 use crate::registry::{ToolContext, ToolHandler};
 use crate::tools::browser::{browser_is_available, render_page_text};
+use crate::tools::pdf_to_markdown::{extract_pdf_markdown_from_bytes, looks_like_pdf};
 
 // ─── HTML stripping ────────────────────────────────────────────
 
@@ -260,39 +258,7 @@ fn is_pdf_response(url: &Url, content_type: &str, bytes: &[u8]) -> bool {
         || content_type
             .to_ascii_lowercase()
             .contains("application/pdf")
-        || bytes.starts_with(b"%PDF-")
-}
-
-fn edgeparse_config() -> ProcessingConfig {
-    ProcessingConfig {
-        formats: vec![OutputFormat::Markdown],
-        image_output: ImageOutput::Off,
-        ..ProcessingConfig::default()
-    }
-}
-
-fn extract_pdf_markdown(bytes: &[u8], tool: &str) -> Result<String, ToolError> {
-    let mut file = NamedTempFile::new().map_err(|e| ToolError::ExecutionFailed {
-        tool: tool.into(),
-        message: format!("Failed to create temporary PDF file: {e}"),
-    })?;
-    file.write_all(bytes)
-        .map_err(|e| ToolError::ExecutionFailed {
-            tool: tool.into(),
-            message: format!("Failed to write PDF bytes: {e}"),
-        })?;
-
-    let doc = edgeparse_core::convert(file.path(), &edgeparse_config()).map_err(|e| {
-        ToolError::ExecutionFailed {
-            tool: tool.into(),
-            message: format!("EdgeParse PDF extraction failed: {e}"),
-        }
-    })?;
-
-    edgeparse_core::output::markdown::to_markdown(&doc).map_err(|e| ToolError::ExecutionFailed {
-        tool: tool.into(),
-        message: format!("EdgeParse markdown rendering failed: {e}"),
-    })
+        || looks_like_pdf(bytes)
 }
 
 #[derive(Serialize)]
@@ -497,7 +463,7 @@ fn extract_pdf_document(
     max_chars: usize,
     tool: &str,
 ) -> Result<ExtractedDocument, ToolError> {
-    let markdown = extract_pdf_markdown(body, tool)?;
+    let markdown = extract_pdf_markdown_from_bytes(body, "document.pdf", tool)?;
     let (content, truncated) = truncate_chars(markdown, max_chars);
     Ok(ExtractedDocument {
         url: final_url.to_string(),

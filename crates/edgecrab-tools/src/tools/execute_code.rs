@@ -8,7 +8,7 @@
 //! ```text
 //!   execute_code(code)
 //!       │
-//!       ├── generate edgecrab_tools.py (RPC stubs for 7 tools)
+//!       ├── generate edgecrab_tools.py (RPC stubs for approved sandbox tools)
 //!       ├── start Unix domain socket RPC listener
 //!       ├── spawn child:  python3 script.py
 //!       │       └── script calls edgecrab_tools.web_search() etc.
@@ -88,6 +88,7 @@ const MAX_TOOL_CALLS: usize = 50;
 ///   web_crawl       — read-only; multi-page superset of web_extract; without it
 ///                     scripts must loop web_extract manually with ad-hoc link parsing
 ///   read_file       — read-only; core file I/O
+///   pdf_to_markdown — read-only PDF parsing via EdgeParse; useful for local document analysis
 ///   write_file      — write; already powerful but script output must go somewhere
 ///   search_files    — read-only; structural grep
 ///   patch           — targeted in-place edit; idempotent when re-run with same args
@@ -106,6 +107,7 @@ const SANDBOX_ALLOWED_TOOLS: &[&str] = &[
     "web_extract",
     "web_crawl",
     "read_file",
+    "pdf_to_markdown",
     "write_file",
     "search_files",
     "patch",
@@ -221,6 +223,19 @@ def web_crawl(url: str, instructions: str = None, max_pages: int = 8, max_depth:
 def read_file(path: str, offset: int = 1, limit: int = 500):
     """Read a file (1-indexed lines). Returns dict with "content" and "total_lines"."""
     return _call("read_file", {"path": path, "offset": offset, "limit": limit})
+"#
+            }
+            "pdf_to_markdown" => {
+                r#"
+def pdf_to_markdown(path: str, output_path: str = None, max_chars: int = 20000):
+    """Convert a local PDF file to Markdown using EdgeParse.
+    This is fast structural PDF parsing, not OCR.
+    Returns {"success", "path", "output_path", "extractor", "parsing_mode", "content_format", "truncated", "total_chars", "markdown"}.
+    """
+    args = {"path": path, "max_chars": max_chars}
+    if output_path is not None:
+        args["output_path"] = output_path
+    return _call("pdf_to_markdown", args)
 "#
             }
             "write_file" => {
@@ -1399,6 +1414,8 @@ fn build_description() -> String {
          Crawl multiple linked pages from a start URL. Returns {\"success\", \"backend\", \"pages_visited\", \"results\": [{\"url\", \"title\", \"depth\", \"content\", \"extractor\", \"content_type\", \"content_format\"}, ...]}\n\
        read_file(path: str, offset: int = 1, limit: int = 500) -> dict\n\
          Lines are 1-indexed. Returns {\"content\": \"...\", \"total_lines\": N}\n\
+       pdf_to_markdown(path: str, output_path: str = None, max_chars: int = 20000) -> dict\n\
+         Convert a local PDF into Markdown using EdgeParse. Fast structural parsing only, not OCR.\n\
        write_file(path: str, content: str) -> dict\n\
          Always overwrites the entire file.\n\
        search_files(pattern: str, target=\"content\", path=\".\", file_glob=None, limit=50) -> dict\n\

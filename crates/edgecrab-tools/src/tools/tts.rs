@@ -19,9 +19,11 @@
 //! Provider can be forced via `tts.provider` in config.yaml or auto-detected.
 
 use async_trait::async_trait;
+use regex::Regex;
 use serde::Deserialize;
 use serde_json::json;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use edgecrab_types::{ToolError, ToolSchema};
 
@@ -128,6 +130,102 @@ pub fn extract_audio_path_from_tts_output(output: &str) -> Option<String> {
         .map(str::trim)
         .filter(|path| !path.is_empty())
         .map(str::to_string)
+}
+
+fn code_block_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"(?s)```.*?```").expect("valid code block regex"))
+}
+
+fn markdown_link_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"\[([^\]]+)\]\([^)]+\)").expect("valid markdown link regex"))
+}
+
+fn url_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"https?://\S+").expect("valid url regex"))
+}
+
+fn inline_code_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"`([^`]+)`").expect("valid inline code regex"))
+}
+
+fn bold_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"(\*\*|__)(.+?)(\*\*|__)").expect("valid bold regex"))
+}
+
+fn italic_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"(\*|_)(.+?)(\*|_)").expect("valid italic regex"))
+}
+
+fn header_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"(?m)^\s{0,3}#+\s*").expect("valid header regex"))
+}
+
+fn list_item_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"(?m)^\s*[-*+]\s+").expect("valid list item regex"))
+}
+
+fn hr_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"(?m)^\s*[-*_]{3,}\s*$").expect("valid hr regex"))
+}
+
+fn media_tag_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(r"(?m)^\s*(\[\[audio_as_voice\]\]|MEDIA:\S+)\s*$").expect("valid media regex")
+    })
+}
+
+fn blank_line_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"\n{3,}").expect("valid blank line regex"))
+}
+
+fn inline_space_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"[ \t]{2,}").expect("valid inline space regex"))
+}
+
+fn strip_markdown_for_tts(text: &str) -> String {
+    let text = code_block_regex().replace_all(text, " ");
+    let text = markdown_link_regex().replace_all(&text, "$1");
+    let text = url_regex().replace_all(&text, "");
+    let text = media_tag_regex().replace_all(&text, "");
+    let text = bold_regex().replace_all(&text, "$2");
+    let text = italic_regex().replace_all(&text, "$2");
+    let text = inline_code_regex().replace_all(&text, "$1");
+    let text = header_regex().replace_all(&text, "");
+    let text = list_item_regex().replace_all(&text, "");
+    let text = hr_regex().replace_all(&text, "");
+    let text = blank_line_regex().replace_all(&text, "\n\n");
+    inline_space_regex()
+        .replace_all(&text, " ")
+        .trim()
+        .to_string()
+}
+
+fn truncate_chars(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    text.chars().take(limit).collect()
+}
+
+pub fn sanitize_text_for_tts(text: &str, max_chars: usize) -> Option<String> {
+    let cleaned = strip_markdown_for_tts(text);
+    let cleaned = truncate_chars(&cleaned, max_chars);
+    if cleaned.trim().is_empty() || !cleaned.chars().any(char::is_alphanumeric) {
+        return None;
+    }
+    Some(cleaned)
 }
 
 /// Generate speech using edge-tts subprocess.
@@ -571,6 +669,34 @@ mod tests {
     fn default_voices_are_not_empty() {
         assert!(!DEFAULT_EDGE_TTS_VOICE.is_empty());
         assert!(!DEFAULT_OPENAI_VOICE.is_empty());
+    }
+
+    #[test]
+    fn sanitize_text_for_tts_strips_markdown_and_links() {
+        assert_eq!(
+            sanitize_text_for_tts("## Title\n**bold** [docs](https://example.com)", 4000),
+            Some("Title\nbold docs".into())
+        );
+    }
+
+    #[test]
+    fn sanitize_text_for_tts_skips_markup_only_payloads() {
+        assert_eq!(
+            sanitize_text_for_tts("```rust\nfn main() {}\n```\nMEDIA:/tmp/reply.mp3", 4000),
+            None
+        );
+    }
+
+    #[test]
+    fn sanitize_text_for_tts_truncates_after_cleanup() {
+        let input = format!("**{}**", "a".repeat(5000));
+        assert_eq!(
+            sanitize_text_for_tts(&input, 4000)
+                .expect("sanitized text")
+                .chars()
+                .count(),
+            4000
+        );
     }
 
     #[test]

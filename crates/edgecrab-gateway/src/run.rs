@@ -607,10 +607,9 @@ async fn maybe_send_voice_reply(
     else {
         return;
     };
-    let text = edgecrab_core::safe_truncate(text.trim(), 4000).to_string();
-    if text.is_empty() {
+    let Some(text) = edgecrab_tools::tools::tts::sanitize_text_for_tts(text.trim(), 4000) else {
         return;
-    }
+    };
 
     let (tts, _, _) = agent.media_config().await;
     let ctx = ToolContext {

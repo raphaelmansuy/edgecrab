@@ -46,6 +46,8 @@ pub enum CommandResult {
     ModelSelector,
     /// Activate the interactive vision-model selector overlay.
     VisionModelSelector,
+    /// Activate the interactive image-model selector overlay.
+    ImageModelSelector,
     /// Show the current auxiliary vision-model routing state.
     ShowVisionModel,
     /// Update the auxiliary vision-model routing state.
@@ -344,10 +346,15 @@ impl CommandRegistry {
         self.register(Command {
             name: "image_model",
             aliases: &["image-model"],
-            description: "Show, list, or set the default image-generation backend (/image_model, /image_model list, /image_model gemini/gemini-2.5-flash-image)",
+            description: "Open, show, or set the default image-generation backend (/image_model, /image_model status, /image_model gemini/gemini-2.5-flash-image)",
             handler: |args| {
                 let trimmed = args.trim();
-                if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("status") {
+                if trimmed.is_empty()
+                    || trimmed.eq_ignore_ascii_case("open")
+                    || trimmed.eq_ignore_ascii_case("list")
+                {
+                    CommandResult::ImageModelSelector
+                } else if trimmed.eq_ignore_ascii_case("status") {
                     CommandResult::ShowImageModel
                 } else {
                     CommandResult::SetImageModel(trimmed.to_string())
@@ -943,7 +950,7 @@ fn help_text() -> String {
          Model:\n\
           /model [name]         — Show or switch model\n\
           /vision_model [spec]  — Open, show, or set dedicated vision model\n\
-          /image_model [spec]   — Show, list, or set default image generation model\n\
+          /image_model [spec]   — Open, show, or set default image generation model\n\
           /provider             — List available providers\n\
           /reasoning [mode]     — Set reasoning effort or think mode\n\
           /stream [mode]        — Toggle live token streaming\n\
@@ -1157,6 +1164,24 @@ mod tests {
         let reg = CommandRegistry::new();
         assert!(matches!(
             reg.dispatch("/image_model"),
+            Some(CommandResult::ImageModelSelector)
+        ));
+    }
+
+    #[test]
+    fn dispatch_image_model_list_opens_selector() {
+        let reg = CommandRegistry::new();
+        assert!(matches!(
+            reg.dispatch("/image_model list"),
+            Some(CommandResult::ImageModelSelector)
+        ));
+    }
+
+    #[test]
+    fn dispatch_image_model_status_shows_status() {
+        let reg = CommandRegistry::new();
+        assert!(matches!(
+            reg.dispatch("/image_model status"),
             Some(CommandResult::ShowImageModel)
         ));
     }

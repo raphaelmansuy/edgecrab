@@ -70,7 +70,7 @@ use edgecrab_core::ModelCatalog;
 use edgecrab_core::{Agent, IsolatedAgentOptions};
 use edgecrab_tools::registry::ToolHandler;
 use edgecrab_tools::tools::transcribe::TranscribeAudioTool;
-use edgecrab_tools::tools::tts::TextToSpeechTool;
+use edgecrab_tools::tools::tts::{TextToSpeechTool, sanitize_text_for_tts};
 use edgecrab_tools::{AppConfigRef, ToolContext};
 use edgequake_llm::{ProviderFactory, VsCodeCopilotProvider};
 use tokio_util::sync::CancellationToken;
@@ -1319,7 +1319,9 @@ struct McpPresetEntry {
     install_preset_id: Option<String>,
     title: String,
     source: String,
+    action_label: String,
     detail: String,
+    search_text: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1333,10 +1335,44 @@ impl FuzzyItem for McpPresetEntry {
         &self.title
     }
     fn secondary(&self) -> &str {
-        &self.detail
+        &self.search_text
     }
     fn tag(&self) -> &str {
         &self.source
+    }
+}
+
+impl McpPresetEntry {
+    fn default_command(&self) -> String {
+        match self.kind {
+            McpEntryKind::CatalogEntry => {
+                if self.action_label == "install" {
+                    self.install_command()
+                        .unwrap_or_else(|| self.view_command())
+                } else {
+                    self.view_command()
+                }
+            }
+            McpEntryKind::ConfiguredServer => self.test_command(),
+        }
+    }
+
+    fn install_command(&self) -> Option<String> {
+        self.install_preset_id
+            .as_deref()
+            .map(|preset_id| format!("install {preset_id}"))
+    }
+
+    fn test_command(&self) -> String {
+        format!("test {}", self.id)
+    }
+
+    fn view_command(&self) -> String {
+        format!("view {}", self.id)
+    }
+
+    fn remove_command(&self) -> Option<String> {
+        (self.kind == McpEntryKind::ConfiguredServer).then(|| format!("remove {}", self.id))
     }
 }
 
@@ -1363,6 +1399,119 @@ fn format_mcp_transport(server: &edgecrab_tools::tools::mcp_client::ConfiguredMc
     rendered
 }
 
+fn build_configured_mcp_entry(
+    server: &edgecrab_tools::tools::mcp_client::ConfiguredMcpServer,
+) -> McpPresetEntry {
+    let transport = format_mcp_transport(server);
+    let mut detail = format!("{} | installed", transport);
+    if server.token_from_store {
+        detail.push_str(" | token-store");
+    } else if server.token_from_config {
+        detail.push_str(" | config-token");
+    }
+    if let Some(path) = &server.cwd {
+        detail.push_str(&format!(" | cwd={}", path.display()));
+    }
+    let search_text = format!(
+        "{} {} {} {} {} {} {}",
+        server.name,
+        transport,
+        server
+            .cwd
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default(),
+        server.include.join(" "),
+        server.exclude.join(" "),
+        if server.token_from_store {
+            "token store"
+        } else if server.token_from_config {
+            "config token"
+        } else {
+            ""
+        },
+        detail
+    );
+    McpPresetEntry {
+        id: server.name.clone(),
+        kind: McpEntryKind::ConfiguredServer,
+        install_preset_id: None,
+        title: server.name.clone(),
+        source: "configured".into(),
+        action_label: "test".into(),
+        detail,
+        search_text,
+    }
+}
+
+fn build_catalog_mcp_entry(
+    entry: &crate::mcp_catalog::OfficialCatalogEntry,
+    configured_names: &std::collections::HashSet<&str>,
+) -> McpPresetEntry {
+    let preset = entry
+        .installable_preset_id
+        .as_deref()
+        .and_then(crate::mcp_catalog::find_preset);
+    let install_state = if entry
+        .installable_preset_id
+        .as_deref()
+        .is_some_and(|preset_id| configured_names.contains(preset_id))
+    {
+        "already-installed"
+    } else if entry.installable_preset_id.is_some() {
+        "ready-to-install"
+    } else {
+        "catalog-only"
+    };
+    let action_label = if install_state == "ready-to-install" {
+        "install".to_string()
+    } else {
+        "view".to_string()
+    };
+    let detail = match preset {
+        Some(preset) if !preset.required_env.is_empty() => format!(
+            "{} | {} | pkg={} | env={} | {}",
+            entry.description,
+            install_state,
+            preset.package_name,
+            preset.required_env.join(","),
+            entry.source_url
+        ),
+        Some(preset) => format!(
+            "{} | {} | pkg={} | {}",
+            entry.description, install_state, preset.package_name, entry.source_url
+        ),
+        None => format!(
+            "{} | {} | {}",
+            entry.description, install_state, entry.source_url
+        ),
+    };
+    let search_text = format!(
+        "{} {} {} {} {} {} {} {} {}",
+        entry.id,
+        entry.display_name,
+        entry.description,
+        entry.source_url,
+        entry.homepage,
+        entry.tags.join(" "),
+        preset.map(|preset| preset.package_name).unwrap_or_default(),
+        preset.map(|preset| preset.command).unwrap_or_default(),
+        preset
+            .map(|preset| preset.required_env.join(" "))
+            .unwrap_or_default()
+    );
+    McpPresetEntry {
+        id: entry.id.clone(),
+        kind: McpEntryKind::CatalogEntry,
+        install_preset_id: entry.installable_preset_id.clone(),
+        title: format!("{}  {}", entry.id, entry.display_name),
+        source: mcp_catalog_source_label(entry).into(),
+        action_label,
+        detail,
+        search_text,
+    }
+}
+
 fn build_mcp_selector_entries_from(
     configured: &[edgecrab_tools::tools::mcp_client::ConfiguredMcpServer],
     official_entries: &[crate::mcp_catalog::OfficialCatalogEntry],
@@ -1372,53 +1521,22 @@ fn build_mcp_selector_entries_from(
         .map(|server| server.name.as_str())
         .collect();
 
-    let mut entries: Vec<McpPresetEntry> = configured
-        .iter()
-        .map(|server| {
-            let mut detail = format!("{} | installed", format_mcp_transport(server));
-            if server.token_from_store {
-                detail.push_str(" | token-store");
-            } else if server.token_from_config {
-                detail.push_str(" | config-token");
-            }
-            if let Some(path) = &server.cwd {
-                detail.push_str(&format!(" | cwd={}", path.display()));
-            }
-            McpPresetEntry {
-                id: server.name.clone(),
-                kind: McpEntryKind::ConfiguredServer,
-                install_preset_id: None,
-                title: server.name.clone(),
-                source: "configured".into(),
-                detail,
-            }
-        })
-        .collect();
+    let mut configured_entries: Vec<McpPresetEntry> =
+        configured.iter().map(build_configured_mcp_entry).collect();
+    configured_entries.sort_by(|left, right| left.title.cmp(&right.title));
 
-    entries.extend(official_entries.iter().map(|entry| {
-        let install_state = if entry
-            .installable_preset_id
-            .as_deref()
-            .is_some_and(|preset_id| configured_names.contains(preset_id))
-        {
-            "already-installed"
-        } else if entry.installable_preset_id.is_some() {
-            "ready-to-install"
-        } else {
-            "catalog-only"
-        };
-        McpPresetEntry {
-            id: entry.id.clone(),
-            kind: McpEntryKind::CatalogEntry,
-            install_preset_id: entry.installable_preset_id.clone(),
-            title: format!("{}  {}", entry.id, entry.display_name),
-            source: mcp_catalog_source_label(entry).into(),
-            detail: format!(
-                "{} | {} | {}",
-                entry.description, install_state, entry.source_url
-            ),
-        }
-    }));
+    let mut catalog_entries: Vec<McpPresetEntry> = official_entries
+        .iter()
+        .map(|entry| build_catalog_mcp_entry(entry, &configured_names))
+        .collect();
+    catalog_entries.sort_by(|left, right| {
+        left.source
+            .cmp(&right.source)
+            .then_with(|| left.title.cmp(&right.title))
+    });
+
+    let mut entries = configured_entries;
+    entries.extend(catalog_entries);
 
     entries
 }
@@ -1605,6 +1723,8 @@ pub struct App {
     model_selector: FuzzySelector<ModelEntry>,
     /// Vision-model selector overlay (activated by `/vision_model`)
     vision_model_selector: FuzzySelector<ModelEntry>,
+    /// Image-model selector overlay (activated by `/image_model`)
+    image_model_selector: FuzzySelector<ModelEntry>,
     /// Official MCP preset selector overlay (activated by `/mcp` with no args).
     mcp_selector: FuzzySelector<McpPresetEntry>,
     /// Skill browser overlay (activated by `/skills` with no args)
@@ -2042,6 +2162,7 @@ impl App {
                 ms
             },
             vision_model_selector: FuzzySelector::new(),
+            image_model_selector: FuzzySelector::new(),
             mcp_selector: FuzzySelector::new(),
             skill_selector: FuzzySelector::new(),
             session_browser: FuzzySelector::new(),
@@ -2797,7 +2918,8 @@ impl App {
             ],
             "image_model" | "image-model" => &[
                 ("status", "Show the current image-generation default"),
-                ("list", "List supported image providers and models"),
+                ("list", "Open the image-model selector"),
+                ("default", "Reset to the built-in default image model"),
                 (
                     "gemini/gemini-2.5-flash-image",
                     "Use the default cheap Gemini image model",
@@ -3679,6 +3801,7 @@ impl App {
                 self.completion.active = false;
                 self.model_selector.active = false;
                 self.vision_model_selector.active = false;
+                self.image_model_selector.active = false;
                 self.mcp_selector.active = false;
                 self.skill_selector.active = false;
                 self.needs_redraw = true;
@@ -3950,6 +4073,38 @@ impl App {
             return;
         }
 
+        if self.image_model_selector.active {
+            match key.code {
+                KeyCode::Esc => {
+                    self.image_model_selector.active = false;
+                }
+                KeyCode::Enter => {
+                    if let Some(model) = self
+                        .image_model_selector
+                        .current()
+                        .map(|entry| entry.display.clone())
+                    {
+                        self.image_model_selector.active = false;
+                        self.handle_set_image_model(model);
+                    }
+                }
+                KeyCode::Up => self.image_model_selector.move_up(),
+                KeyCode::Down => self.image_model_selector.move_down(),
+                KeyCode::PageUp => self.image_model_selector.page_up(),
+                KeyCode::PageDown => self.image_model_selector.page_down(),
+                KeyCode::Backspace => self.image_model_selector.pop_char(),
+                KeyCode::Char(c)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    self.image_model_selector.push_char(c);
+                }
+                _ => {}
+            }
+            return;
+        }
+
         // MCP selector overlay active — mirrors /model UX while keeping
         // installs controlled. Catalog-only entries open detail view instead.
         if self.mcp_selector.active {
@@ -3959,22 +4114,14 @@ impl App {
                 }
                 KeyCode::Enter => {
                     if let Some(entry) = self.mcp_selector.current() {
-                        let command = match entry.kind {
-                            McpEntryKind::CatalogEntry => entry
-                                .install_preset_id
-                                .as_deref()
-                                .map(|preset_id| format!("install {preset_id}"))
-                                .unwrap_or_else(|| format!("view {}", entry.id)),
-                            McpEntryKind::ConfiguredServer => format!("test {}", entry.id),
-                        };
+                        let command = entry.default_command();
                         self.mcp_selector.active = false;
                         self.handle_mcp_command(command);
                     }
                 }
                 KeyCode::Delete => {
                     if let Some(entry) = self.mcp_selector.current() {
-                        if entry.kind == McpEntryKind::ConfiguredServer {
-                            let command = format!("remove {}", entry.id);
+                        if let Some(command) = entry.remove_command() {
                             self.mcp_selector.active = false;
                             self.handle_mcp_command(command);
                         }
@@ -3987,15 +4134,31 @@ impl App {
                 KeyCode::Backspace => self.mcp_selector.pop_char(),
                 KeyCode::Char('v') | KeyCode::Char('V') => {
                     if let Some(entry) = self.mcp_selector.current() {
-                        let command = format!("view {}", entry.id);
+                        let command = entry.view_command();
                         self.mcp_selector.active = false;
                         self.handle_mcp_command(command);
                     }
                 }
-                KeyCode::Char('d') | KeyCode::Char('D') => {
+                KeyCode::Char('i') | KeyCode::Char('I') => {
+                    if let Some(entry) = self.mcp_selector.current() {
+                        if let Some(command) = entry.install_command() {
+                            self.mcp_selector.active = false;
+                            self.handle_mcp_command(command);
+                        }
+                    }
+                }
+                KeyCode::Char('t') | KeyCode::Char('T') => {
                     if let Some(entry) = self.mcp_selector.current() {
                         if entry.kind == McpEntryKind::ConfiguredServer {
-                            let command = format!("remove {}", entry.id);
+                            let command = entry.test_command();
+                            self.mcp_selector.active = false;
+                            self.handle_mcp_command(command);
+                        }
+                    }
+                }
+                KeyCode::Char('d') | KeyCode::Char('D') => {
+                    if let Some(entry) = self.mcp_selector.current() {
+                        if let Some(command) = entry.remove_command() {
                             self.mcp_selector.active = false;
                             self.handle_mcp_command(command);
                         }
@@ -4521,6 +4684,9 @@ impl App {
             }
             CommandResult::VisionModelSelector => {
                 self.open_vision_model_selector();
+            }
+            CommandResult::ImageModelSelector => {
+                self.open_image_model_selector();
             }
             CommandResult::ShowVisionModel => {
                 self.handle_show_vision_model();
@@ -5840,9 +6006,12 @@ impl App {
         let text = format!(
             "Image generation routing:\n\
              Default backend: {}/{}\n\
+             Built-in default: {}\n\
              Storage:         persisted in config.yaml under image_generation\n\
-             Usage:           /image_model list | /image_model <provider>/<model> | /image_model default",
-            image_generation.provider, image_generation.model
+             Usage:           /image_model | /image_model status | /image_model <provider>/<model> | /image_model default",
+            image_generation.provider,
+            image_generation.model,
+            cli_image_models::default_selection_spec(),
         );
         self.push_output(text, OutputRole::System);
     }
@@ -5853,16 +6022,8 @@ impl App {
         };
 
         let trimmed = spec.trim();
-        if trimmed.eq_ignore_ascii_case("list") {
-            let options = cli_image_models::available_image_model_options();
-            let mut text = String::from("Supported image models:\n");
-            for option in options {
-                text.push_str(&format!(
-                    "  {}  - {}\n",
-                    option.selection_spec, option.detail
-                ));
-            }
-            self.push_output(text.trim_end().to_string(), OutputRole::System);
+        if trimmed.eq_ignore_ascii_case("list") || trimmed.eq_ignore_ascii_case("open") {
+            self.open_image_model_selector();
             return;
         }
 
@@ -5930,6 +6091,50 @@ impl App {
                 OutputRole::Error,
             ),
         }
+    }
+
+    fn open_image_model_selector(&mut self) {
+        let current_spec = self
+            .agent
+            .as_ref()
+            .map(|agent| {
+                let (_, _, image_generation) = self.rt_handle.block_on(agent.media_config());
+                format!(
+                    "{}/{}",
+                    image_generation.provider.trim(),
+                    image_generation.model.trim()
+                )
+            })
+            .filter(|spec| spec != "/")
+            .unwrap_or_else(cli_image_models::default_selection_spec);
+        let default_spec = cli_image_models::default_selection_spec();
+
+        let mut entries = vec![ModelEntry {
+            display: "default".to_string(),
+            provider: "policy".to_string(),
+            model_name: "default".to_string(),
+            detail: format!("Reset to the built-in default image backend ({default_spec})"),
+        }];
+        entries.extend(
+            cli_image_models::available_image_model_options()
+                .into_iter()
+                .map(|option| {
+                    let mut detail = option.detail;
+                    if option.selection_spec == default_spec {
+                        detail.push_str(" | built-in default");
+                    }
+                    ModelEntry {
+                        display: option.selection_spec,
+                        provider: option.provider,
+                        model_name: option.model,
+                        detail,
+                    }
+                }),
+        );
+
+        self.image_model_selector.set_items(entries);
+        self.image_model_selector
+            .activate_with_primary(&current_spec);
     }
 
     fn handle_show_status(&mut self) {
@@ -7580,6 +7785,16 @@ impl App {
     }
 
     fn spawn_direct_tts(&mut self, text: String, announce: bool) {
+        let Some(text) = sanitize_text_for_tts(&text, 4000) else {
+            if announce {
+                self.push_output(
+                    "Nothing speakable remained after stripping markdown and media tags."
+                        .to_string(),
+                    OutputRole::System,
+                );
+            }
+            return;
+        };
         self.voice_playback_active = true;
         let tx = self.response_tx.clone();
         let ctx = self.direct_media_tool_context();
@@ -9540,6 +9755,11 @@ impl App {
             self.render_vision_model_selector(frame, frame.area());
         }
 
+        // Image-model selector overlay (full screen)
+        if self.image_model_selector.active {
+            self.render_image_model_selector(frame, frame.area());
+        }
+
         // MCP selector overlay (full screen, same family as /model)
         if self.mcp_selector.active {
             self.render_mcp_selector(frame, frame.area());
@@ -10348,6 +10568,17 @@ impl App {
         );
     }
 
+    fn render_image_model_selector(&self, frame: &mut Frame, area: Rect) {
+        self.render_model_like_selector(
+            frame,
+            area,
+            &self.image_model_selector,
+            "Select Image Model",
+            "Type to filter image-generation backends... (Esc to cancel)",
+            "image backends",
+        );
+    }
+
     fn render_mcp_selector(&self, frame: &mut Frame, area: Rect) {
         frame.render_widget(Clear, area);
 
@@ -10361,7 +10592,7 @@ impl App {
             .split(area);
 
         let search_text = if self.mcp_selector.query.is_empty() {
-            "Search configured servers + official MCP catalog... (Enter install/test/view, v view, d remove, Esc cancel)".to_string()
+            "Search official MCP catalog + configured servers... (Enter default action, i install, t test, v view, d remove, Esc cancel)".to_string()
         } else {
             self.mcp_selector.query.clone()
         };
@@ -10414,8 +10645,16 @@ impl App {
                 } else {
                     Style::default().fg(Color::Rgb(100, 120, 120))
                 };
+                let action_style = if is_selected {
+                    Style::default()
+                        .bg(Color::Rgb(40, 56, 58))
+                        .fg(Color::Rgb(210, 240, 175))
+                } else {
+                    Style::default().fg(Color::Rgb(135, 165, 110))
+                };
                 ListItem::new(Line::from(vec![
-                    Span::styled(format!("  {:<10}", entry.source), source_style),
+                    Span::styled(format!("  {:<12}", entry.source), source_style),
+                    Span::styled(format!("{:<9}", entry.action_label), action_style),
                     Span::styled(entry.title.clone(), row_style),
                     Span::raw("  "),
                     Span::styled(entry.detail.clone(), source_style),
@@ -10432,7 +10671,11 @@ impl App {
             Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("browse  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Enter ", Style::default().fg(Color::Rgb(110, 220, 210))),
-            Span::styled("install/test  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("default action  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("i ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("install  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("t ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("test  ", Style::default().fg(Color::DarkGray)),
             Span::styled("v ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("view  ", Style::default().fg(Color::DarkGray)),
             Span::styled("d ", Style::default().fg(Color::Rgb(110, 220, 210))),
@@ -11737,6 +11980,28 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn image_model_selector_opens_with_default_reset_and_inventory() {
+        let mut app = App::new();
+
+        app.open_image_model_selector();
+
+        assert!(app.image_model_selector.active);
+        assert_eq!(
+            app.image_model_selector
+                .items
+                .first()
+                .map(|entry| entry.display.as_str()),
+            Some("default")
+        );
+        assert!(
+            app.image_model_selector
+                .items
+                .iter()
+                .any(|entry| entry.display == "gemini/gemini-2.5-flash-image")
+        );
+    }
+
     #[test]
     fn mcp_selector_builder_merges_configured_and_official_entries() {
         let configured = vec![edgecrab_tools::tools::mcp_client::ConfiguredMcpServer {
@@ -11782,6 +12047,32 @@ mod tests {
             entries
                 .iter()
                 .any(|entry| entry.kind == McpEntryKind::CatalogEntry && entry.id == "git")
+        );
+    }
+
+    #[test]
+    fn mcp_selector_search_matches_preset_package_and_env_metadata() {
+        let entries = build_mcp_selector_entries_from(
+            &[],
+            &[crate::mcp_catalog::OfficialCatalogEntry {
+                id: "github".into(),
+                display_name: "GitHub".into(),
+                description: "Official GitHub server.".into(),
+                source_url: "https://github.com/github/github-mcp-server".into(),
+                homepage: "https://modelcontextprotocol.io".into(),
+                tags: vec!["official".into(), "integration".into(), "github".into()],
+                installable_preset_id: Some("github".into()),
+            }],
+        );
+        let mut selector = FuzzySelector::new();
+        selector.set_items(entries);
+        selector.query = "GITHUB_PERSONAL_ACCESS_TOKEN".into();
+        selector.update_filter();
+
+        assert_eq!(selector.filtered.len(), 1);
+        assert_eq!(
+            selector.current().map(|entry| entry.id.as_str()),
+            Some("github")
         );
     }
 
