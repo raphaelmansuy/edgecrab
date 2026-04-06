@@ -46,6 +46,8 @@ use tracing::info;
 
 use edgecrab_types::ToolError;
 
+use crate::execution_tmp::{BACKEND_TMP_ROOT, wrap_command_with_tmp_env};
+
 use super::{BackendKind, ExecOutput, ExecutionBackend, SshBackendConfig};
 
 // ─── SshState ─────────────────────────────────────────────────────────
@@ -112,6 +114,7 @@ impl SshState {
         } else {
             command.to_string()
         };
+        let full_cmd = wrap_command_with_tmp_env(&full_cmd, BACKEND_TMP_ROOT);
 
         let exec_fut = async {
             let mut remote_cmd = self.session.command("sh");
@@ -174,7 +177,7 @@ fn shell_escape(s: &str) -> String {
 pub struct SshBackend {
     config: SshBackendConfig,
     task_id: String,
-    state: TokioMutex<Option<SshState>>,
+    state: TokioMutex<Option<Arc<SshState>>>,
 }
 
 impl SshBackend {
@@ -186,7 +189,7 @@ impl SshBackend {
         }
     }
 
-    async fn ensure_state(&self) -> Result<(), ToolError> {
+    async fn ensure_state(&self) -> Result<Arc<SshState>, ToolError> {
         let mut guard = self.state.lock().await;
         let needs_init = guard
             .as_ref()
@@ -194,9 +197,12 @@ impl SshBackend {
             .unwrap_or(true);
 
         if needs_init {
-            *guard = Some(SshState::new(&self.config, &self.task_id).await?);
+            *guard = Some(Arc::new(SshState::new(&self.config, &self.task_id).await?));
         }
-        Ok(())
+        guard.clone().ok_or_else(|| ToolError::ExecutionFailed {
+            tool: "terminal".into(),
+            message: "SSH state missing after init — this is a bug".into(),
+        })
     }
 }
 
@@ -209,28 +215,42 @@ impl ExecutionBackend for SshBackend {
         timeout: Duration,
         cancel: CancellationToken,
     ) -> Result<ExecOutput, ToolError> {
-        self.ensure_state().await?;
-        let guard = self.state.lock().await;
-        if let Some(state) = &*guard {
-            state.exec(command, cwd, timeout, cancel).await
-        } else {
-            Err(ToolError::ExecutionFailed {
-                tool: "terminal".into(),
-                message: "SSH state missing after init — this is a bug".into(),
-            })
-        }
+        let state = self.ensure_state().await?;
+        state.exec(command, cwd, timeout, cancel).await
+    }
+
+    async fn execute_oneshot(
+        &self,
+        command: &str,
+        cwd: &str,
+        timeout: Duration,
+        cancel: CancellationToken,
+    ) -> Result<ExecOutput, ToolError> {
+        let state = self.ensure_state().await?;
+        state.exec(command, cwd, timeout, cancel).await
     }
 
     async fn cleanup(&self) -> Result<(), ToolError> {
         let mut guard = self.state.lock().await;
         if let Some(state) = guard.take() {
-            state.close().await;
+            if let Ok(state) = Arc::try_unwrap(state) {
+                state.close().await;
+            } else {
+                tracing::warn!(
+                    task_id = %self.task_id,
+                    "SSH backend cleanup deferred because commands are still holding the session"
+                );
+            }
         }
         Ok(())
     }
 
     fn kind(&self) -> BackendKind {
         BackendKind::Ssh
+    }
+
+    fn supports_remote_execute_code(&self) -> bool {
+        true
     }
 
     async fn is_healthy(&self) -> bool {

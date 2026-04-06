@@ -65,6 +65,8 @@ use tracing::{debug, info, warn};
 
 use edgecrab_types::ToolError;
 
+use crate::execution_tmp::{ensure_default_shared_tmp_dir, temp_env_pairs};
+
 use super::local::safe_env;
 use super::{BackendKind, DockerBackendConfig, DockerWorkspaceMount, ExecOutput, ExecutionBackend};
 
@@ -168,13 +170,20 @@ impl DockerState {
             })?;
 
         let container_name = format!("edgecrab-{task_id}");
+        let shared_tmp_root = ensure_default_shared_tmp_dir()?;
 
         // Build env list (filtered via blocklist)
         let safe_envs: Vec<String> = safe_env()
+            .filter(|(k, _)| !matches!(k.as_str(), "TMPDIR" | "TMP" | "TEMP" | "EDGECRAB_TMPDIR"))
             .map(|(k, v)| format!("{k}={v}"))
             .chain(std::iter::once(format!("EDGECRAB_TASK_ID={task_id}")))
             .chain(std::iter::once("TERM=dumb".into()))
             .chain(std::iter::once("LC_ALL=C.UTF-8".into()))
+            .chain(
+                temp_env_pairs("/tmp")
+                    .into_iter()
+                    .map(|(k, v)| format!("{k}={v}")),
+            )
             .collect();
 
         // Build mounts
@@ -191,9 +200,17 @@ impl DockerState {
             });
         }
 
-        // tmpfs at /tmp
+        // Bind the shared EdgeCrab temp root so `/tmp` matches file-tool `/tmp`.
         mounts.push(Mount {
             target: Some("/tmp".into()),
+            source: Some(shared_tmp_root.to_string_lossy().into_owned()),
+            typ: Some(MountTypeEnum::BIND),
+            read_only: Some(false),
+            ..Default::default()
+        });
+
+        mounts.push(Mount {
+            target: Some("/var/tmp".into()),
             typ: Some(MountTypeEnum::TMPFS),
             tmpfs_options: Some(bollard::models::MountTmpfsOptions {
                 size_bytes: Some(128 * 1024 * 1024), // 128 MB
@@ -412,7 +429,7 @@ impl DockerState {
 pub struct DockerBackend {
     config: DockerBackendConfig,
     task_id: String,
-    state: TokioMutex<Option<DockerState>>,
+    state: TokioMutex<Option<Arc<DockerState>>>,
     workspace_binding: Option<WorkspaceMountBinding>,
 }
 
@@ -430,16 +447,21 @@ impl DockerBackend {
         }
     }
 
-    async fn ensure_state(&self) -> Result<(), ToolError> {
+    async fn ensure_state(&self) -> Result<Arc<DockerState>, ToolError> {
         let mut guard = self.state.lock().await;
         let needs_init = match &*guard {
             None => true,
             Some(s) => s.dead.load(Ordering::Relaxed),
         };
         if needs_init {
-            *guard = Some(DockerState::new(&self.config, &self.task_id).await?);
+            *guard = Some(Arc::new(
+                DockerState::new(&self.config, &self.task_id).await?,
+            ));
         }
-        Ok(())
+        guard.clone().ok_or_else(|| ToolError::ExecutionFailed {
+            tool: "terminal".into(),
+            message: "Docker state not available after init — this is a bug".into(),
+        })
     }
 }
 
@@ -452,38 +474,62 @@ impl ExecutionBackend for DockerBackend {
         timeout: Duration,
         cancel: CancellationToken,
     ) -> Result<ExecOutput, ToolError> {
-        self.ensure_state().await?;
-        let guard = self.state.lock().await;
-        if let Some(state) = &*guard {
-            let effective_command = if let Some(binding) = &self.workspace_binding {
-                let mapped_cwd = binding.map_host_path(cwd)?;
-                if mapped_cwd == binding.container_root {
-                    command.to_string()
-                } else {
-                    format!("cd {:?} && {}", mapped_cwd, command)
-                }
-            } else {
+        let state = self.ensure_state().await?;
+        let effective_command = if let Some(binding) = &self.workspace_binding {
+            let mapped_cwd = binding.map_host_path(cwd)?;
+            if mapped_cwd == binding.container_root {
                 command.to_string()
-            };
-            state.exec(&effective_command, timeout, cancel).await
+            } else {
+                format!("cd {:?} && {}", mapped_cwd, command)
+            }
         } else {
-            Err(ToolError::ExecutionFailed {
-                tool: "terminal".into(),
-                message: "Docker state not available after init — this is a bug".into(),
-            })
-        }
+            command.to_string()
+        };
+        state.exec(&effective_command, timeout, cancel).await
+    }
+
+    async fn execute_oneshot(
+        &self,
+        command: &str,
+        cwd: &str,
+        timeout: Duration,
+        cancel: CancellationToken,
+    ) -> Result<ExecOutput, ToolError> {
+        let state = self.ensure_state().await?;
+        let effective_command = if let Some(binding) = &self.workspace_binding {
+            let mapped_cwd = binding.map_host_path(cwd)?;
+            if mapped_cwd == binding.container_root {
+                command.to_string()
+            } else {
+                format!("cd {:?} && {}", mapped_cwd, command)
+            }
+        } else {
+            command.to_string()
+        };
+        state.exec(&effective_command, timeout, cancel).await
     }
 
     async fn cleanup(&self) -> Result<(), ToolError> {
         let mut guard = self.state.lock().await;
         if let Some(state) = guard.take() {
-            state.remove().await;
+            if let Ok(state) = Arc::try_unwrap(state) {
+                state.remove().await;
+            } else {
+                warn!(
+                    task_id = %self.task_id,
+                    "Docker backend cleanup deferred because commands are still holding the container"
+                );
+            }
         }
         Ok(())
     }
 
     fn kind(&self) -> BackendKind {
         BackendKind::Docker
+    }
+
+    fn supports_remote_execute_code(&self) -> bool {
+        true
     }
 
     async fn is_healthy(&self) -> bool {
@@ -624,6 +670,40 @@ mod tests {
         };
         assert!(out.stdout.contains("out"));
         assert!(out.stderr.contains("err"));
+        b.cleanup().await.expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn docker_backend_tmp_is_shared_with_host_temp_root() {
+        if !docker_ready().await {
+            eprintln!("SKIP: Docker daemon not available");
+            return;
+        }
+        let b = DockerBackend::new("test-docker-tmp", default_config());
+        let marker = uuid::Uuid::new_v4().simple().to_string();
+        let Some(out) = try_exec(
+            &b,
+            &format!(
+                "python3 - <<'PY'\nimport os, tempfile\nopen('/tmp/{marker}.txt', 'w').write('tmp')\nprint(os.environ['EDGECRAB_TMPDIR'])\nprint(tempfile.gettempdir())\nPY"
+            ),
+        )
+        .await
+        else {
+            return;
+        };
+        let lines: Vec<&str> = out.stdout.lines().collect();
+        assert!(
+            lines.len() >= 2,
+            "expected tempdir lines, got: {}",
+            out.stdout
+        );
+        assert_eq!(lines[0], "/tmp");
+        assert_eq!(lines[1], "/tmp");
+        let shared = crate::execution_tmp::default_shared_tmp_dir().join(format!("{marker}.txt"));
+        assert!(
+            shared.exists(),
+            "docker /tmp file must land in shared host temp root"
+        );
         b.cleanup().await.expect("cleanup");
     }
 }

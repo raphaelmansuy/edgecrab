@@ -22,88 +22,19 @@
 //! consecutive `execute()` calls within the same task.
 
 use async_trait::async_trait;
-use dashmap::DashMap;
 use serde::Deserialize;
 use serde_json::json;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use edgecrab_types::{ToolError, ToolSchema};
 
+use crate::describe_execution_filesystem;
 use crate::registry::{ToolContext, ToolHandler};
-use crate::tools::backends::{BackendConfig, ExecutionBackend, build_backend, redact_output};
+use crate::tools::backend_pool::{get_or_create_backend, resolve_workdir};
+#[cfg(test)]
+use crate::tools::backends::ExecutionBackend;
+use crate::tools::backends::redact_output;
 use crate::tools::checkpoint::ensure_checkpoint;
-
-// ─── Global backend cache ─────────────────────────────────────────────
-
-/// One backend instance per task_id, cached across invocations.
-///
-/// WHY DashMap: multiple concurrent tool calls in the same task must share
-/// one backend (e.g. same persistent shell). DashMap gives lock-per-shard
-/// concurrency without holding a global mutex.
-struct BackendCacheEntry {
-    backend: Arc<dyn ExecutionBackend>,
-    last_used_epoch_secs: AtomicU64,
-}
-
-impl BackendCacheEntry {
-    fn new(backend: Arc<dyn ExecutionBackend>) -> Self {
-        Self {
-            backend,
-            last_used_epoch_secs: AtomicU64::new(now_epoch_secs()),
-        }
-    }
-
-    fn touch(&self) {
-        self.last_used_epoch_secs
-            .store(now_epoch_secs(), Ordering::Relaxed);
-    }
-
-    fn idle_for_secs(&self, now_epoch_secs: u64) -> u64 {
-        now_epoch_secs.saturating_sub(self.last_used_epoch_secs.load(Ordering::Relaxed))
-    }
-}
-
-fn backend_cache() -> &'static DashMap<String, Arc<BackendCacheEntry>> {
-    static CACHE: OnceLock<DashMap<String, Arc<BackendCacheEntry>>> = OnceLock::new();
-    CACHE.get_or_init(DashMap::new)
-}
-
-fn now_epoch_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-fn prepare_backend_config(ctx: &ToolContext) -> BackendConfig {
-    let mut docker = ctx.config.terminal_docker.clone();
-
-    // Docker is the only backend that can safely expose the host workspace
-    // by bind-mounting it. If the operator did not configure a workspace
-    // mount, default to the task cwd so terminal and file tools see the same
-    // project tree.
-    if ctx.config.terminal_backend == crate::tools::backends::BackendKind::Docker
-        && docker.workspace_mount.is_none()
-    {
-        docker.workspace_mount = Some(crate::tools::backends::DockerWorkspaceMount {
-            host_path: ctx.cwd.to_string_lossy().into_owned(),
-            container_path: "/workspace".into(),
-            read_only: false,
-        });
-    }
-
-    BackendConfig {
-        kind: ctx.config.terminal_backend.clone(),
-        task_id: ctx.task_id.clone(),
-        docker,
-        ssh: ctx.config.terminal_ssh.clone(),
-        modal: ctx.config.terminal_modal.clone(),
-        daytona: ctx.config.terminal_daytona.clone(),
-        singularity: ctx.config.terminal_singularity.clone(),
-    }
-}
 
 fn validate_backend_workdir_visibility(
     backend: &crate::tools::backends::BackendKind,
@@ -118,11 +49,17 @@ fn validate_backend_workdir_visibility(
         crate::tools::backends::BackendKind::Modal
         | crate::tools::backends::BackendKind::Daytona => {
             if cwd_path.exists() {
+                let cfg = crate::config_ref::AppConfigRef {
+                    terminal_backend: backend.clone(),
+                    ..Default::default()
+                };
+                let fs = describe_execution_filesystem(&cfg, cwd_path);
+                let allowed_roots = fs.file_roots_display();
                 return Err(ToolError::ExecutionFailed {
                     tool: "terminal".into(),
                     message: format!(
-                        "The {} backend cannot access host workspace path '{}'. Use the local or docker backend for local files, or sync the workspace into the remote sandbox first.",
-                        backend, cwd
+                        "The {} backend cannot access host workspace path '{}'. File tools in this session are rooted at {}. Use the local or docker backend for local files, or sync the workspace into the remote sandbox first.",
+                        backend, cwd, allowed_roots
                     ),
                 });
             }
@@ -145,169 +82,16 @@ fn terminal_result_header(
     )
 }
 
-fn backend_idle_ttl() -> Duration {
-    std::env::var("EDGECRAB_TERMINAL_BACKEND_IDLE_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(Duration::from_secs)
-        .unwrap_or_else(|| Duration::from_secs(300))
-}
-
-fn backend_cleanup_interval() -> Duration {
-    std::env::var("EDGECRAB_TERMINAL_BACKEND_SWEEP_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(Duration::from_secs)
-        .unwrap_or_else(|| Duration::from_secs(60))
-}
-
-fn last_cleanup_epoch_secs() -> &'static AtomicU64 {
-    static LAST_SWEEP: OnceLock<AtomicU64> = OnceLock::new();
-    LAST_SWEEP.get_or_init(|| AtomicU64::new(0))
-}
-
-/// Remove cached backends that have been idle longer than `max_idle`.
-///
-/// Safety rule: a backend is only eligible when the cache is the last owner.
-/// That prevents cleanup from racing an in-flight command that still holds an
-/// `Arc` clone outside the cache.
-pub async fn cleanup_inactive_backends(max_idle: Duration) -> usize {
-    let now = now_epoch_secs();
-    let max_idle_secs = max_idle.as_secs();
-    let mut stale = Vec::new();
-
-    backend_cache().retain(|task_id, entry| {
-        let idle_secs = entry.idle_for_secs(now);
-        let cache_is_last_owner = Arc::strong_count(&entry.backend) == 1;
-        let should_remove = idle_secs >= max_idle_secs && cache_is_last_owner;
-        if should_remove {
-            stale.push((
-                task_id.clone(),
-                entry.backend.clone(),
-                entry.backend.kind(),
-                idle_secs,
-            ));
-        }
-        !should_remove
-    });
-
-    for (task_id, backend, kind, idle_secs) in &stale {
-        tracing::info!(
-            task_id = %task_id,
-            kind = %kind,
-            idle_secs = *idle_secs,
-            "cleaning up inactive terminal backend"
-        );
-        let _ = backend.cleanup().await;
-    }
-
-    stale.len()
-}
-
-/// Remove and clean up all cached backends regardless of idle age.
 pub async fn cleanup_all_backends() -> usize {
-    let mut stale = Vec::new();
-    backend_cache().retain(|task_id, entry| {
-        stale.push((task_id.clone(), entry.backend.clone(), entry.backend.kind()));
-        false
-    });
-
-    for (task_id, backend, kind) in &stale {
-        tracing::info!(
-            task_id = %task_id,
-            kind = %kind,
-            "cleaning up terminal backend on shutdown"
-        );
-        let _ = backend.cleanup().await;
-    }
-
-    stale.len()
+    crate::tools::backend_pool::cleanup_all_backends().await
 }
 
-/// Remove and clean up the cached backend for a single task, if present.
 pub async fn cleanup_backend_for_task(task_id: &str) -> bool {
-    let Some((_, entry)) = backend_cache().remove(task_id) else {
-        return false;
-    };
-    tracing::info!(
-        task_id = %task_id,
-        kind = %entry.backend.kind(),
-        "cleaning up terminal backend for task"
-    );
-    let _ = entry.backend.cleanup().await;
-    true
+    crate::tools::backend_pool::cleanup_backend_for_task(task_id).await
 }
 
-async fn maybe_cleanup_inactive_backends() {
-    let now = now_epoch_secs();
-    let interval_secs = backend_cleanup_interval().as_secs();
-    let last = last_cleanup_epoch_secs().load(Ordering::Relaxed);
-    if now.saturating_sub(last) < interval_secs {
-        return;
-    }
-
-    last_cleanup_epoch_secs().store(now, Ordering::Relaxed);
-    let _ = cleanup_inactive_backends(backend_idle_ttl()).await;
-}
-
-/// Get or create a backend for the given task. Lazily initialised.
-///
-/// Fast path: return cached backend if healthy.
-/// Recovery path: evict dead backend, run its cleanup(), build a fresh one.
-///
-/// WHY health check: Docker containers, SSH sessions, and Modal sandboxes
-/// can die underneath the cache without the cache knowing.  Without the
-/// check, every subsequent `execute()` call on a dead cached entry would
-/// fail with an opaque error, and the dead entry would accumulate in cache
-/// forever.  `LocalBackend` always returns healthy — its `ensure_shell()`
-/// self-heals on every `execute()` call so no eviction is ever needed.
-pub(crate) async fn get_or_create_backend(
-    ctx: &ToolContext,
-) -> Result<Arc<dyn ExecutionBackend>, ToolError> {
-    maybe_cleanup_inactive_backends().await;
-    let cache = backend_cache();
-
-    // Fast path: backend already cached; skip build if healthy.
-    if let Some(existing) = cache.get(&ctx.task_id) {
-        let entry = existing.clone();
-        drop(existing); // Release DashMap shard lock before async call
-        entry.touch();
-        let backend = entry.backend.clone();
-        if backend.is_healthy().await {
-            return Ok(backend);
-        }
-        // Unhealthy — clean up gracefully, then evict and rebuild below.
-        tracing::warn!(
-            task_id = %ctx.task_id,
-            kind = %backend.kind(),
-            "cached backend is unhealthy; evicting and rebuilding"
-        );
-        let _ = backend.cleanup().await;
-        cache.remove(&ctx.task_id);
-    }
-
-    // Slow path: build a fresh backend and cache it.
-    let backend: Arc<dyn ExecutionBackend> =
-        Arc::from(build_backend(prepare_backend_config(ctx)).await?);
-    cache.insert(
-        ctx.task_id.clone(),
-        Arc::new(BackendCacheEntry::new(backend.clone())),
-    );
-    Ok(backend)
-}
-
-pub(crate) fn resolve_workdir(ctx: &ToolContext, workdir: Option<&str>) -> String {
-    match workdir {
-        Some(wd) => {
-            let p = std::path::Path::new(wd);
-            if p.is_absolute() {
-                wd.to_string()
-            } else {
-                ctx.cwd.join(p).to_string_lossy().into_owned()
-            }
-        }
-        None => ctx.cwd.to_string_lossy().into_owned(),
-    }
+pub async fn cleanup_inactive_backends(max_idle: Duration) -> usize {
+    crate::tools::backend_pool::cleanup_inactive_backends(max_idle).await
 }
 
 // ─── TerminalTool ─────────────────────────────────────────────────────
@@ -556,10 +340,16 @@ inventory::submit!(&TerminalTool as &dyn ToolHandler);
 mod tests {
     use super::*;
     use crate::registry::{ApprovalRequest, ApprovalResponse};
+    use crate::tools::backend_pool::{
+        BackendCacheEntry, backend_cache, now_epoch_secs, prepare_backend_config,
+    };
     use edgecrab_types::ToolError;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
+
+    static TERMINAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     struct FakeBackend {
         kind: crate::tools::backends::BackendKind,
@@ -600,7 +390,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn terminal_echo() {
+        let _guard = TERMINAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = TempDir::new().expect("tmpdir");
         let ctx = ctx_in(dir.path());
 
@@ -614,7 +406,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn terminal_exit_code() {
+        let _guard = TERMINAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = TempDir::new().expect("tmpdir");
         let ctx = ctx_in(dir.path());
 
@@ -628,7 +422,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn terminal_cwd_respected() {
+        let _guard = TERMINAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = TempDir::new().expect("tmpdir");
         std::fs::write(dir.path().join("marker.txt"), "found").expect("write");
 
@@ -644,6 +440,7 @@ mod tests {
 
     #[test]
     fn prepare_backend_config_mounts_workspace_for_docker() {
+        let _guard = TERMINAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = TempDir::new().expect("tmpdir");
         let mut ctx = ctx_in(dir.path());
         ctx.config.terminal_backend = crate::tools::backends::BackendKind::Docker;
@@ -664,6 +461,7 @@ mod tests {
 
     #[test]
     fn modal_backend_rejects_host_workspace_paths() {
+        let _guard = TERMINAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = TempDir::new().expect("tmpdir");
         let err = validate_backend_workdir_visibility(
             &crate::tools::backends::BackendKind::Modal,
@@ -674,10 +472,15 @@ mod tests {
             err.to_string()
                 .contains("cannot access host workspace path")
         );
+        assert!(
+            err.to_string()
+                .contains("File tools in this session are rooted at")
+        );
     }
 
     #[test]
     fn terminal_result_header_is_machine_readable() {
+        let _guard = TERMINAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let header = terminal_result_header(
             &crate::tools::backends::BackendKind::Docker,
             "/workspace/demo",
@@ -690,7 +493,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn terminal_requests_approval_for_dangerous_command() {
+        let _guard = TERMINAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = TempDir::new().expect("tmpdir");
         let mut ctx = ctx_in(dir.path());
         let (approval_tx, mut approval_rx) =
@@ -714,7 +519,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn terminal_rejects_tty_ui_commands() {
+        let _guard = TERMINAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = TempDir::new().expect("tmpdir");
         let ctx = ctx_in(dir.path());
 
@@ -731,7 +538,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn cleanup_inactive_backends_removes_idle_entries() {
+        let _guard = TERMINAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _ = cleanup_all_backends().await;
         let cleanup_calls = Arc::new(AtomicUsize::new(0));
         let backend: Arc<dyn ExecutionBackend> = Arc::new(FakeBackend {
@@ -751,7 +560,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn cleanup_inactive_backends_preserves_in_use_entries() {
+        let _guard = TERMINAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _ = cleanup_all_backends().await;
         let cleanup_calls = Arc::new(AtomicUsize::new(0));
         let backend: Arc<dyn ExecutionBackend> = Arc::new(FakeBackend {

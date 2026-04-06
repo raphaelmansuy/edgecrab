@@ -407,8 +407,24 @@ impl Agent {
                 // Project-level SOUL.md files are loaded separately as context file sections
                 // by discover_context_files(), allowing per-project tuning on top.
                 let global_soul = load_global_soul(&home);
+                let has_filesystem_sensitive_tools = tool_names_for_prompt.iter().any(|name| {
+                    matches!(
+                        name.as_str(),
+                        "read_file"
+                            | "write_file"
+                            | "patch"
+                            | "search_files"
+                            | "terminal"
+                            | "execute_code"
+                    )
+                });
+                let execution_guidance = has_filesystem_sensitive_tools.then(|| {
+                    edgecrab_tools::describe_execution_filesystem(&app_config_ref, &cwd)
+                        .render_prompt_block()
+                });
                 PromptBuilder::new(config.platform)
                     .skip_context_files(config.skip_context_files)
+                    .execution_environment_guidance(execution_guidance)
                     .available_tools(tool_names_for_prompt)
                     .build(
                         global_soul.as_deref(), // global SOUL.md is identity override

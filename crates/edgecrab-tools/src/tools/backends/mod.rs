@@ -281,9 +281,23 @@ pub trait ExecutionBackend: Send + Sync {
         cancel: CancellationToken,
     ) -> Result<ExecOutput, ToolError>;
 
+    async fn execute_oneshot(
+        &self,
+        command: &str,
+        cwd: &str,
+        timeout: Duration,
+        cancel: CancellationToken,
+    ) -> Result<ExecOutput, ToolError> {
+        self.execute(command, cwd, timeout, cancel).await
+    }
+
     async fn cleanup(&self) -> Result<(), ToolError>;
 
     fn kind(&self) -> BackendKind;
+
+    fn supports_remote_execute_code(&self) -> bool {
+        false
+    }
 
     /// Returns `true` if the backend is still alive and usable.
     ///

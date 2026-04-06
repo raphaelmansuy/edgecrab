@@ -306,6 +306,26 @@ mod tests {
         assert!(result.contains("No matches"));
     }
 
+    #[tokio::test]
+    async fn search_absolute_tmp_uses_edgecrab_temp_root() {
+        let dir = TempDir::new().expect("workspace");
+        let edgecrab_home = TempDir::new().expect("edgecrab_home");
+        let mapped = edgecrab_home.path().join("tmp/files/logs/run.txt");
+        std::fs::create_dir_all(mapped.parent().expect("tmp parent")).expect("create tmp parent");
+        std::fs::write(&mapped, "needle\n").expect("write mapped tmp");
+
+        let mut ctx = ctx_in(dir.path());
+        ctx.config.edgecrab_home = edgecrab_home.path().to_path_buf();
+
+        let result = SearchFilesTool
+            .execute(json!({"pattern": "needle", "path": "/tmp"}), &ctx)
+            .await
+            .expect("search virtual tmp");
+
+        assert!(result.contains("run.txt"));
+        assert!(result.contains("needle"));
+    }
+
     #[test]
     fn simple_glob_works() {
         assert!(simple_glob_match("*.rs", "main.rs"));

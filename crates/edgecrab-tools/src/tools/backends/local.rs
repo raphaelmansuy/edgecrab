@@ -44,6 +44,8 @@ use tracing::{debug, warn};
 
 use edgecrab_types::ToolError;
 
+use crate::execution_tmp::{ensure_default_shared_tmp_dir, temp_env_pairs};
+
 use super::{BackendKind, ExecOutput, ExecutionBackend};
 
 // ─── Env-var blocklist (B-03) ─────────────────────────────────────────
@@ -283,6 +285,8 @@ struct PersistentShell {
 
 impl PersistentShell {
     async fn spawn(task_id: &str) -> Result<Self, ToolError> {
+        let tmp_root = ensure_default_shared_tmp_dir()?;
+
         // WHY bash: POSIX sh treats `exit` as a special built-in that cannot
         // be overridden by shell functions. Bash (without --posix) respects
         // function overrides for special built-ins, allowing us to redefine
@@ -306,6 +310,7 @@ impl PersistentShell {
             .stderr(std::process::Stdio::null())
             .env_clear()
             .envs(safe_env())
+            .envs(temp_env_pairs(&tmp_root.to_string_lossy()))
             .env("TERM", "dumb")
             .env("LC_ALL", "C.UTF-8")
             .env("PATH", subprocess_path())
@@ -544,6 +549,7 @@ impl LocalBackend {
         timeout: Duration,
         cancel: CancellationToken,
     ) -> Result<ExecOutput, ToolError> {
+        let tmp_root = ensure_default_shared_tmp_dir()?;
         let cwd_path = std::path::Path::new(cwd);
         let stall_deadline =
             crate::command_interaction::macos_prompt_stall_timeout(command, &BackendKind::Local)
@@ -558,6 +564,7 @@ impl LocalBackend {
             .current_dir(cwd_path)
             .env_clear()
             .envs(safe_env())
+            .envs(temp_env_pairs(&tmp_root.to_string_lossy()))
             .env("TERM", "dumb")
             .env("LC_ALL", "C.UTF-8")
             .env("PATH", subprocess_path())
@@ -837,6 +844,32 @@ mod tests {
         assert!(out.stdout.contains('b'));
         assert!(out.stdout.contains('c'));
         assert_eq!(out.exit_code, 0);
+    }
+
+    #[tokio::test]
+    async fn local_backend_exports_shared_tmpdir() {
+        let b = LocalBackend::new("test-tmpdir");
+        let out = b
+            .execute(
+                "python3 -c \"import os,tempfile; print(os.environ['EDGECRAB_TMPDIR']); print(tempfile.gettempdir())\"",
+                "/tmp",
+                Duration::from_secs(5),
+                cancel(),
+            )
+            .await
+            .expect("execute");
+        let lines: Vec<&str> = out.stdout.lines().collect();
+        assert!(
+            lines.len() >= 2,
+            "expected tempdir lines, got: {}",
+            out.stdout
+        );
+        assert_eq!(lines[0], lines[1], "tempfile must honor EDGECRAB_TMPDIR");
+        assert!(
+            lines[0].ends_with("/tmp/files"),
+            "shared temp root must end with the EdgeCrab temp layout, got: {}",
+            lines[0]
+        );
     }
 
     #[tokio::test]

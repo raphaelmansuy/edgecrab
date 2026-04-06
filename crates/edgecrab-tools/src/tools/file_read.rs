@@ -554,4 +554,26 @@ mod tests {
 
         assert_eq!(result, "shared");
     }
+
+    #[tokio::test]
+    async fn read_file_maps_absolute_tmp_into_edgecrab_temp_root() {
+        let dir = TempDir::new().expect("workspace");
+        let edgecrab_home = TempDir::new().expect("edgecrab_home");
+        let mapped = edgecrab_home.path().join("tmp/files/summary.md");
+        std::fs::create_dir_all(mapped.parent().expect("tmp parent")).expect("create tmp parent");
+        std::fs::write(&mapped, "tmp contents").expect("write mapped tmp");
+
+        let mut ctx = ctx_in(dir.path());
+        ctx.config.edgecrab_home = edgecrab_home.path().to_path_buf();
+
+        let result = ReadFileTool
+            .execute(
+                json!({"path": "/tmp/summary.md", "line_numbers": false}),
+                &ctx,
+            )
+            .await
+            .expect("read virtual tmp");
+
+        assert_eq!(result, "tmp contents");
+    }
 }

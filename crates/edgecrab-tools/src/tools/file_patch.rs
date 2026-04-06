@@ -819,6 +819,33 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn patch_maps_absolute_tmp_into_edgecrab_temp_root() {
+        let dir = TempDir::new().expect("workspace");
+        let edgecrab_home = TempDir::new().expect("edgecrab_home");
+        let mapped = edgecrab_home.path().join("tmp/files/summary.md");
+        std::fs::create_dir_all(mapped.parent().expect("tmp parent")).expect("create tmp parent");
+        std::fs::write(&mapped, "old value\n").expect("write mapped tmp");
+
+        let mut ctx = ctx_in(dir.path());
+        ctx.config.edgecrab_home = edgecrab_home.path().to_path_buf();
+
+        PatchTool
+            .execute(
+                json!({
+                    "path": "/tmp/summary.md",
+                    "old_string": "old value",
+                    "new_string": "new value"
+                }),
+                &ctx,
+            )
+            .await
+            .expect("patch virtual tmp");
+
+        let content = std::fs::read_to_string(&mapped).expect("read mapped tmp");
+        assert!(content.contains("new value"));
+    }
+
     // ─── V4A parse / apply unit tests ────────────────────────────────────
 
     #[test]
@@ -1069,5 +1096,23 @@ mod tests {
         let b_after = std::fs::read_to_string(dir.path().join("b.txt")).expect("read b");
         assert_eq!(a_after, "old\n", "a.txt must be rolled back");
         assert_eq!(b_after, "keep\n", "b.txt must remain unchanged");
+    }
+
+    #[tokio::test]
+    async fn apply_patch_add_file_maps_absolute_tmp_into_edgecrab_temp_root() {
+        let dir = TempDir::new().expect("workspace");
+        let edgecrab_home = TempDir::new().expect("edgecrab_home");
+        let mut ctx = ctx_in(dir.path());
+        ctx.config.edgecrab_home = edgecrab_home.path().to_path_buf();
+
+        let patch = "*** Begin Patch\n*** Add File: /tmp/generated.txt\n+generated\n*** End Patch";
+        ApplyPatchTool
+            .execute(json!({ "patch": patch }), &ctx)
+            .await
+            .expect("apply_patch virtual tmp add");
+
+        let content = std::fs::read_to_string(edgecrab_home.path().join("tmp/files/generated.txt"))
+            .expect("read mapped tmp file");
+        assert_eq!(content, "generated");
     }
 }

@@ -47,8 +47,8 @@ use edgecrab_types::{ToolError, ToolSchema};
 
 use crate::process_table::ProcessTable;
 use crate::registry::{ToolContext, ToolHandler};
+use crate::tools::backend_pool::{get_or_create_backend, resolve_workdir};
 use crate::tools::backends::{BackendKind, ExecutionBackend, shell_quote};
-use crate::tools::terminal::{get_or_create_backend, resolve_workdir};
 
 /// Shell startup warnings to strip from the first output line.
 ///

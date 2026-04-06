@@ -1322,7 +1322,15 @@ esac
         .await
         .expect("execute");
     assert!(
-        result.contains("singularity:echo hello-singularity"),
+        result.contains("singularity:mkdir -p '/tmp/edgecrab-tmp'"),
+        "got: {result}"
+    );
+    assert!(
+        result.contains("EDGECRAB_TMPDIR='/tmp/edgecrab-tmp'"),
+        "got: {result}"
+    );
+    assert!(
+        result.contains("&& echo hello-singularity"),
         "got: {result}"
     );
 

@@ -6,6 +6,7 @@
 
 use std::path::PathBuf;
 
+use crate::execution_tmp::shared_tmp_dir;
 use crate::tools::backends::{
     BackendKind, DaytonaBackendConfig, DockerBackendConfig, ModalBackendConfig,
     SingularityBackendConfig, SshBackendConfig,
@@ -23,6 +24,10 @@ fn resolve_edgecrab_home() -> PathBuf {
     std::env::var("EDGECRAB_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
+            if cfg!(test) {
+                return std::env::temp_dir()
+                    .join(format!("edgecrab-test-home-{}", std::process::id()));
+            }
             dirs::home_dir()
                 .unwrap_or_else(|| PathBuf::from("."))
                 .join(".edgecrab")
@@ -191,7 +196,11 @@ impl AppConfigRef {
 
     /// Build the effective file path policy for a session workspace.
     pub fn file_path_policy(&self, cwd: &std::path::Path) -> PathPolicy {
+        let file_tools_tmp_dir = self.file_tools_tmp_dir();
+        let _ = std::fs::create_dir_all(&file_tools_tmp_dir);
+
         PathPolicy::new(cwd.to_path_buf())
+            .with_virtual_tmp_root(file_tools_tmp_dir)
             .with_allowed_roots(self.file_allowed_roots.clone())
             .with_denied_roots(self.path_restrictions.clone())
     }
@@ -228,5 +237,14 @@ impl AppConfigRef {
     /// sub-directories are covered without per-platform changes.
     pub fn gateway_media_dir(&self) -> std::path::PathBuf {
         self.edgecrab_home.join("gateway_media")
+    }
+
+    /// Dedicated temp root for file tools.
+    ///
+    /// WHY not host `/tmp`: global temp directories are shared, nondeterministic,
+    /// and can expose unrelated process files. File tools get an EdgeCrab-owned
+    /// temp tree with stable semantics instead.
+    pub fn file_tools_tmp_dir(&self) -> std::path::PathBuf {
+        shared_tmp_dir(&self.edgecrab_home)
     }
 }

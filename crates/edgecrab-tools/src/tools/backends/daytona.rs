@@ -16,6 +16,8 @@ use tokio_util::sync::CancellationToken;
 
 use edgecrab_types::ToolError;
 
+use crate::execution_tmp::BACKEND_TMP_ROOT;
+
 use super::{BackendKind, DaytonaBackendConfig, ExecOutput, ExecutionBackend};
 
 const DAYTONA_HELPER: &str = r#"
@@ -99,8 +101,16 @@ try:
         command = os.environ["EDGECRAB_DAYTONA_COMMAND"]
         cwd = os.environ.get("EDGECRAB_DAYTONA_CWD") or None
         timeout = max(1, int(os.environ.get("EDGECRAB_DAYTONA_TIMEOUT", "60")))
+        tmpdir = os.environ.get("EDGECRAB_DAYTONA_TMPDIR", "/tmp/edgecrab-tmp")
         sandbox = ensure_sandbox()
-        wrapped = f"timeout {timeout} sh -c {shlex.quote(command)}"
+        wrapped = (
+            f"mkdir -p {shlex.quote(tmpdir)} && "
+            f"EDGECRAB_TMPDIR={shlex.quote(tmpdir)} "
+            f"TMPDIR={shlex.quote(tmpdir)} "
+            f"TMP={shlex.quote(tmpdir)} "
+            f"TEMP={shlex.quote(tmpdir)} "
+            f"timeout {timeout} sh -c {shlex.quote(command)}"
+        )
         response = sandbox.process.exec(wrapped, cwd=cwd)
         emit({
             "ok": True,
@@ -168,6 +178,7 @@ async fn run_helper(
         "EDGECRAB_DAYTONA_TIMEOUT",
         timeout.as_secs().max(1).to_string(),
     );
+    helper.env("EDGECRAB_DAYTONA_TMPDIR", BACKEND_TMP_ROOT);
 
     let fut = helper.output();
     tokio::pin!(fut);
@@ -274,6 +285,16 @@ impl ExecutionBackend for DaytonaBackend {
         })
     }
 
+    async fn execute_oneshot(
+        &self,
+        command: &str,
+        cwd: &str,
+        timeout: Duration,
+        cancel: CancellationToken,
+    ) -> Result<ExecOutput, ToolError> {
+        self.execute(command, cwd, timeout, cancel).await
+    }
+
     async fn cleanup(&self) -> Result<(), ToolError> {
         let _guard = self.cleanup_lock.lock().await;
         if self.dead.swap(true, Ordering::Relaxed) {
@@ -304,6 +325,10 @@ impl ExecutionBackend for DaytonaBackend {
 
     fn kind(&self) -> BackendKind {
         BackendKind::Daytona
+    }
+
+    fn supports_remote_execute_code(&self) -> bool {
+        true
     }
 
     async fn is_healthy(&self) -> bool {

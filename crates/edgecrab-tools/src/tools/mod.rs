@@ -24,6 +24,7 @@
 //! ```
 
 pub mod advanced;
+pub mod backend_pool;
 pub mod backends;
 pub mod browser;
 pub mod checkpoint;

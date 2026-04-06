@@ -447,6 +447,7 @@ pub fn truncate_context_file(text: &str) -> Cow<'_, str> {
 pub struct PromptBuilder {
     platform: Platform,
     skip_context_files: bool,
+    execution_environment_guidance: Option<String>,
     /// Optional list of tool names available in this session.
     /// When `None`, all guidance is injected (backward compat / tests).
     /// When `Some`, each guidance snippet is only injected when its gate tool is present.
@@ -458,12 +459,18 @@ impl PromptBuilder {
         Self {
             platform,
             skip_context_files: false,
+            execution_environment_guidance: None,
             available_tools: None,
         }
     }
 
     pub fn skip_context_files(mut self, skip: bool) -> Self {
         self.skip_context_files = skip;
+        self
+    }
+
+    pub fn execution_environment_guidance(mut self, guidance: Option<String>) -> Self {
+        self.execution_environment_guidance = guidance.filter(|s| !s.trim().is_empty());
         self
     }
 
@@ -516,7 +523,12 @@ impl PromptBuilder {
             chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z")
         )));
 
-        // 4-6. Context files (SOUL.md, AGENTS.md, .cursorrules, etc.)
+        // 4. Execution environment guidance
+        if let Some(ref guidance) = self.execution_environment_guidance {
+            sections.push(Cow::Borrowed(guidance.as_str()));
+        }
+
+        // 5-7. Context files (SOUL.md, AGENTS.md, .cursorrules, etc.)
         if !self.skip_context_files {
             if let Some(dir) = cwd {
                 let context_files = discover_context_files(dir);
@@ -566,7 +578,7 @@ impl PromptBuilder {
             }
         }
 
-        // 7. Memory guidance + sections — only when memory tool is available
+        // 8. Memory guidance + sections — only when memory tool is available
         if !memory_sections.is_empty() {
             if self.has_tool("memory_write") {
                 sections.push(Cow::Borrowed(MEMORY_GUIDANCE));
@@ -576,28 +588,28 @@ impl PromptBuilder {
             }
         }
 
-        // 8. Session search guidance — only when session_search tool is present
+        // 9. Session search guidance — only when session_search tool is present
         if self.has_tool("session_search") {
             sections.push(Cow::Borrowed(SESSION_SEARCH_GUIDANCE));
         }
 
-        // 9. Skills guidance — only when skill_manage tool is present
+        // 10. Skills guidance — only when skill_manage tool is present
         if self.has_tool("skill_manage") {
             sections.push(Cow::Borrowed(SKILLS_GUIDANCE));
         }
 
-        // 10. Scheduling guidance — only for interactive sessions (not cron) and
+        // 11. Scheduling guidance — only for interactive sessions (not cron) and
         //     when manage_cron_jobs is available.
         if self.platform != Platform::Cron && self.has_tool("manage_cron_jobs") {
             sections.push(Cow::Borrowed(SCHEDULING_GUIDANCE));
         }
 
-        // 11. Cross-platform delivery guidance — only when send_message is present.
+        // 12. Cross-platform delivery guidance — only when send_message is present.
         if self.has_tool("send_message") {
             sections.push(Cow::Borrowed(MESSAGE_DELIVERY_GUIDANCE));
         }
 
-        // 12. Vision tool disambiguation — only when vision_analyze is present.
+        // 13. Vision tool disambiguation — only when vision_analyze is present.
         // WHY: Smaller local models (qwen3, llama3) reliably pick browser_vision over
         // vision_analyze when local image files are attached, because browser_vision
         // appears earlier in the tool list. Schema descriptions alone are insufficient;
@@ -606,7 +618,7 @@ impl PromptBuilder {
             sections.push(Cow::Borrowed(VISION_GUIDANCE));
         }
 
-        // 13. Skills prompt (available skill descriptions)
+        // 14. Skills prompt (available skill descriptions)
         if let Some(sp) = skill_prompt {
             if !sp.is_empty() {
                 sections.push(Cow::Borrowed(sp));
@@ -1531,6 +1543,16 @@ mod tests {
         let builder = PromptBuilder::new(Platform::Cli);
         let prompt = builder.build(None, None, &[], None);
         assert!(prompt.contains("ANSI colors"));
+    }
+
+    #[test]
+    fn execution_environment_guidance_is_included() {
+        let builder = PromptBuilder::new(Platform::Cli).execution_environment_guidance(Some(
+            "## Execution Filesystem\n\nworkspace info".into(),
+        ));
+        let prompt = builder.build(None, None, &[], None);
+        assert!(prompt.contains("## Execution Filesystem"));
+        assert!(prompt.contains("workspace info"));
     }
 
     #[test]

@@ -58,6 +58,10 @@ mod tests {
         PathPolicy::new(dir.to_path_buf())
     }
 
+    fn policy_with_virtual_tmp(dir: &Path, virtual_tmp: &Path) -> PathPolicy {
+        PathPolicy::new(dir.to_path_buf()).with_virtual_tmp_root(virtual_tmp.to_path_buf())
+    }
+
     #[test]
     fn jail_read_allows_existing_file() {
         let dir = TempDir::new().expect("tmpdir");
@@ -201,5 +205,42 @@ mod tests {
             result.is_ok(),
             "Telegram gateway_media path must be trusted"
         );
+    }
+
+    #[test]
+    fn jail_write_maps_absolute_tmp_into_virtual_tmp_root() {
+        let dir = TempDir::new().expect("workspace");
+        let virtual_tmp = TempDir::new().expect("virtual tmp");
+
+        let resolved = jail_write_path(
+            "/tmp/out.txt",
+            &policy_with_virtual_tmp(dir.path(), virtual_tmp.path()),
+        )
+        .expect("map /tmp write");
+
+        assert_eq!(
+            resolved,
+            virtual_tmp
+                .path()
+                .canonicalize()
+                .expect("canon virtual tmp")
+                .join("out.txt")
+        );
+    }
+
+    #[test]
+    fn jail_read_maps_absolute_tmp_into_virtual_tmp_root() {
+        let dir = TempDir::new().expect("workspace");
+        let virtual_tmp = TempDir::new().expect("virtual tmp");
+        let mapped = virtual_tmp.path().join("summary.md");
+        std::fs::write(&mapped, "hello").expect("write mapped tmp file");
+
+        let resolved = jail_read_path(
+            "/tmp/summary.md",
+            &policy_with_virtual_tmp(dir.path(), virtual_tmp.path()),
+        )
+        .expect("map /tmp read");
+
+        assert_eq!(resolved, mapped.canonicalize().expect("canon mapped"));
     }
 }
