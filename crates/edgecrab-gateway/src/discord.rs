@@ -38,6 +38,7 @@ use crate::platform::{
     IncomingMessage, MessageAttachment, MessageAttachmentKind, MessageMetadata, OutgoingMessage,
     PlatformAdapter,
 };
+use crate::voice_delivery::prepare_voice_attachment;
 
 /// Maximum message length for Discord messages.
 const MAX_MESSAGE_LENGTH: usize = 2000;
@@ -364,6 +365,11 @@ impl DiscordAdapter {
             Some("jpg" | "jpeg") => "image/jpeg",
             Some("gif") => "image/gif",
             Some("webp") => "image/webp",
+            Some("ogg" | "opus") => "audio/ogg",
+            Some("mp3") => "audio/mpeg",
+            Some("wav") => "audio/wav",
+            Some("m4a") => "audio/mp4",
+            Some("aac") => "audio/aac",
             Some("pdf") => "application/pdf",
             _ => "application/octet-stream",
         };
@@ -826,6 +832,93 @@ impl PlatformAdapter for DiscordAdapter {
             .ok_or_else(|| anyhow::anyhow!("Discord send_document requires channel_id"))?;
 
         self.send_file_attachment(channel_id, path, caption).await
+    }
+
+    async fn send_voice(
+        &self,
+        path: &str,
+        caption: Option<&str>,
+        metadata: &crate::platform::MessageMetadata,
+    ) -> anyhow::Result<()> {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+        let channel_id = metadata
+            .channel_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Discord send_voice requires channel_id"))?;
+
+        let prepared = prepare_voice_attachment(path, Platform::Discord).await?;
+        let result = async {
+            let file_bytes = tokio::fs::read(&prepared.path).await.map_err(|e| {
+                anyhow::anyhow!(
+                    "Discord send_voice: cannot read {}: {}",
+                    prepared.path.display(),
+                    e
+                )
+            })?;
+
+            if prepared.is_native_voice_note {
+                let waveform_b64 = STANDARD.encode([128u8; 256]);
+                let payload_json = serde_json::json!({
+                    "content": caption.unwrap_or(""),
+                    "flags": 8192,
+                    "attachments": [{
+                        "id": "0",
+                        "filename": "voice-message.ogg",
+                        "duration_secs": prepared.duration_secs.unwrap_or(5.0),
+                        "waveform": waveform_b64,
+                    }]
+                });
+                let form = reqwest::multipart::Form::new()
+                    .part(
+                        "files[0]",
+                        reqwest::multipart::Part::bytes(file_bytes)
+                            .file_name("voice-message.ogg")
+                            .mime_str(prepared.mime)?,
+                    )
+                    .part(
+                        "payload_json",
+                        reqwest::multipart::Part::text(payload_json.to_string())
+                            .mime_str("application/json")?,
+                    );
+                let url = format!("{}/channels/{}/messages", DISCORD_API_BASE, channel_id);
+                let resp = self
+                    .client
+                    .post(&url)
+                    .header("Authorization", format!("Bot {}", self.token))
+                    .multipart(form)
+                    .send()
+                    .await?;
+                if resp.status().is_success() {
+                    Ok(())
+                } else {
+                    let status = resp.status();
+                    let body_text = resp.text().await.unwrap_or_default();
+                    debug!(
+                        status = %status,
+                        body = body_text,
+                        "Discord native voice-message upload failed; falling back to regular attachment"
+                    );
+                    self.send_file_attachment(
+                        channel_id,
+                        prepared.path.to_string_lossy().as_ref(),
+                        caption,
+                    )
+                    .await
+                }
+            } else {
+                self.send_file_attachment(
+                    channel_id,
+                    prepared.path.to_string_lossy().as_ref(),
+                    caption,
+                )
+                .await
+            }
+        }
+        .await;
+
+        prepared.cleanup().await;
+        result
     }
 }
 

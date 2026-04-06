@@ -37,6 +37,7 @@ use crate::platform::{
     IncomingMessage, MessageAttachment, MessageAttachmentKind, MessageMetadata, OutgoingMessage,
     PlatformAdapter,
 };
+use crate::voice_delivery::prepare_voice_attachment;
 
 /// Maximum message length for Telegram messages.
 const MAX_MESSAGE_LENGTH: usize = 4096;
@@ -1152,50 +1153,48 @@ impl PlatformAdapter for TelegramAdapter {
             .as_deref()
             .and_then(|t| t.parse::<i64>().ok());
 
-        let file_bytes = tokio::fs::read(path)
-            .await
-            .map_err(|e| anyhow::anyhow!("send_voice: cannot read {}: {}", path, e))?;
+        let prepared = prepare_voice_attachment(path, Platform::Telegram).await?;
+        let result = async {
+            let file_bytes = tokio::fs::read(&prepared.path).await.map_err(|e| {
+                anyhow::anyhow!("send_voice: cannot read {}: {}", prepared.path.display(), e)
+            })?;
+            let endpoint = if prepared.is_native_voice_note {
+                "sendVoice"
+            } else {
+                "sendAudio"
+            };
+            let field = if prepared.is_native_voice_note {
+                "voice"
+            } else {
+                "audio"
+            };
 
-        let file_name = std::path::Path::new(path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("audio")
-            .to_string();
-        let is_voice_note = matches!(
-            std::path::Path::new(path)
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .map(|ext| ext.to_ascii_lowercase())
-                .as_deref(),
-            Some("ogg" | "opus")
-        );
-        let endpoint = if is_voice_note {
-            "sendVoice"
-        } else {
-            "sendAudio"
-        };
-        let field = if is_voice_note { "voice" } else { "audio" };
+            let url = self.api_url(endpoint);
+            let mut form = reqwest::multipart::Form::new()
+                .text("chat_id", chat_id.to_string())
+                .part(
+                    field,
+                    reqwest::multipart::Part::bytes(file_bytes)
+                        .file_name(prepared.file_name.clone())
+                        .mime_str(prepared.mime)?,
+                );
+            if let Some(c) = caption {
+                form = form.text("caption", c.to_string());
+            }
+            if let Some(tid) = thread_id {
+                form = form.text("message_thread_id", tid.to_string());
+            }
 
-        let url = self.api_url(endpoint);
-        let mut form = reqwest::multipart::Form::new()
-            .text("chat_id", chat_id.to_string())
-            .part(
-                field,
-                reqwest::multipart::Part::bytes(file_bytes).file_name(file_name),
-            );
-        if let Some(c) = caption {
-            form = form.text("caption", c.to_string());
+            let resp = self.client.post(&url).multipart(form).send().await?;
+            if !resp.status().is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                anyhow::bail!("Telegram {endpoint} failed: {}", body);
+            }
+            Ok(())
         }
-        if let Some(tid) = thread_id {
-            form = form.text("message_thread_id", tid.to_string());
-        }
-
-        let resp = self.client.post(&url).multipart(form).send().await?;
-        if !resp.status().is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Telegram {endpoint} failed: {}", body);
-        }
-        Ok(())
+        .await;
+        prepared.cleanup().await;
+        result
     }
 }
 

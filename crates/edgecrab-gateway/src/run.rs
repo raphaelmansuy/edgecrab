@@ -36,6 +36,7 @@ use crate::hooks::{HookContext, HookRegistry};
 use crate::interactions::{InteractionBroker, PendingInteractionKind};
 use crate::platform::{IncomingMessage, PlatformAdapter};
 use crate::session::{SessionKey, SessionManager};
+use crate::voice_delivery::voice_delivery_doctor;
 use crate::webhook::WebhookPayload;
 use edgecrab_core::{Agent, IsolatedAgentOptions};
 use edgecrab_types::Role;
@@ -157,7 +158,7 @@ const HELP_TEXT: &str = "\
 /retry   - Retry your last message
 /status  - Show whether an agent is currently running
 /usage   - Show session stats
-/voice   - Control spoken replies: off, on, tts, status
+/voice   - Control spoken replies: off, on, tts, status, doctor
 /background - Run a prompt in a separate background session
 /hooks   - List loaded event hooks
 /approve - Approve the oldest pending command request
@@ -852,12 +853,16 @@ impl Gateway {
                 let mode = self.voice_mode_for(chat_key).await;
                 format!(
                     "Voice mode: {}\n\
+                     Platform delivery: {}\n\
                      /voice on   - speak replies only for voice-originating messages\n\
                      /voice tts  - speak replies for all messages\n\
-                     /voice off  - disable spoken replies",
-                    mode.label()
+                     /voice off  - disable spoken replies\n\
+                     /voice doctor - show platform voice delivery diagnostics",
+                    mode.label(),
+                    msg.platform
                 )
             }
+            "doctor" => voice_delivery_doctor(msg.platform),
             "" => {
                 let current = self.voice_mode_for(chat_key).await;
                 let next = if current == GatewayVoiceMode::Off {
@@ -871,7 +876,7 @@ impl Gateway {
                 }
             }
             _ => {
-                "Usage: /voice [on|off|tts|status]\n\
+                "Usage: /voice [on|off|tts|status|doctor]\n\
                  `on` speaks replies to voice messages only. `tts` speaks every reply."
                     .into()
             }
