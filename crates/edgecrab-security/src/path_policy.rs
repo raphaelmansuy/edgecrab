@@ -25,6 +25,7 @@ pub struct PathPolicy {
     workspace_root: PathBuf,
     allowed_roots: Vec<PathBuf>,
     denied_roots: Vec<PathBuf>,
+    virtual_tmp_root: Option<PathBuf>,
 }
 
 impl PathPolicy {
@@ -33,6 +34,7 @@ impl PathPolicy {
             workspace_root,
             allowed_roots: Vec::new(),
             denied_roots: Vec::new(),
+            virtual_tmp_root: None,
         }
     }
 
@@ -46,17 +48,38 @@ impl PathPolicy {
         self
     }
 
+    pub fn with_virtual_tmp_root(mut self, virtual_tmp_root: PathBuf) -> Self {
+        self.virtual_tmp_root = Some(virtual_tmp_root);
+        self
+    }
+
     pub fn resolve_read_path(
         &self,
         path: &Path,
         extra_roots: &[&Path],
     ) -> Result<PathBuf, PathPolicyError> {
         let workspace_root = self.canonical_workspace_root()?;
-        let allowed_roots = self.canonical_allowed_roots(&workspace_root, extra_roots)?;
+        let virtual_tmp_root = self.canonical_virtual_tmp_root()?;
+        let allowed_roots = self.canonical_allowed_roots(
+            &workspace_root,
+            extra_roots,
+            virtual_tmp_root.as_deref(),
+        )?;
         let denied_roots = self.canonical_denied_roots(&workspace_root)?;
-        let candidate = resolve_candidate(path, &workspace_root);
+        // Bypass virtual-tmp remapping for paths explicitly under a configured
+        // allowed root — admin intent takes precedence over sandbox redirection.
+        let effective_tmp = virtual_tmp_root
+            .as_deref()
+            .filter(|_| !self.is_under_allowed_root(path));
+        let candidate = resolve_candidate(path, &workspace_root, effective_tmp);
 
-        if !path.is_absolute() {
+        // Traversal guard: reject relative paths that escape the workspace root.
+        // Exception: when effective_tmp is active, /tmp/... paths have already
+        // been remapped into the virtual_tmp sandbox. On Windows, /tmp/... is
+        // not absolute (no drive letter), so the guard would fire incorrectly.
+        // The `ensure_allowed` call below enforces the real permission boundary
+        // regardless of path absoluteness.
+        if !is_unix_tmp_candidate(path, effective_tmp) && !path.is_absolute() {
             let normalized = normalize_path(&candidate);
             if !normalized.starts_with(&workspace_root) {
                 return Err(PathPolicyError::PermissionDenied(
@@ -80,12 +103,22 @@ impl PathPolicy {
         create_dirs: bool,
     ) -> Result<PathBuf, PathPolicyError> {
         let workspace_root = self.canonical_workspace_root()?;
-        let allowed_roots = self.canonical_allowed_roots(&workspace_root, &[])?;
+        let virtual_tmp_root = self.canonical_virtual_tmp_root()?;
+        let allowed_roots =
+            self.canonical_allowed_roots(&workspace_root, &[], virtual_tmp_root.as_deref())?;
         let denied_roots = self.canonical_denied_roots(&workspace_root)?;
-        let candidate = resolve_candidate(path, &workspace_root);
+        // Bypass virtual-tmp remapping for paths explicitly under a configured
+        // allowed root — admin intent takes precedence over sandbox redirection.
+        let effective_tmp = virtual_tmp_root
+            .as_deref()
+            .filter(|_| !self.is_under_allowed_root(path));
+        let candidate = resolve_candidate(path, &workspace_root, effective_tmp);
         let normalized = normalize_path(&candidate);
 
-        if !path.is_absolute() && !normalized.starts_with(&workspace_root) {
+        if !is_unix_tmp_candidate(path, effective_tmp)
+            && !path.is_absolute()
+            && !normalized.starts_with(&workspace_root)
+        {
             return Err(PathPolicyError::PermissionDenied(
                 "Path traversal detected: relative path escapes the workspace root".into(),
             ));
@@ -125,15 +158,25 @@ impl PathPolicy {
         })
     }
 
+    /// Returns true if `path` starts with any of the explicitly configured
+    /// `allowed_roots`. Uses uncanonicalized comparison — sufficient for the
+    /// virtual-tmp bypass since both sides come from the same TempDir API or
+    /// from user config (which is expected to use real paths).
+    fn is_under_allowed_root(&self, path: &Path) -> bool {
+        path.is_absolute() && self.allowed_roots.iter().any(|r| path.starts_with(r))
+    }
+
     fn canonical_allowed_roots(
         &self,
         workspace_root: &Path,
         extra_roots: &[&Path],
+        virtual_tmp_root: Option<&Path>,
     ) -> Result<Vec<PathBuf>, PathPolicyError> {
         let mut roots = Vec::new();
         let mut seen = BTreeSet::new();
 
         for root in std::iter::once(workspace_root.to_path_buf())
+            .chain(virtual_tmp_root.into_iter().map(Path::to_path_buf))
             .chain(
                 self.allowed_roots
                     .iter()
@@ -153,6 +196,20 @@ impl PathPolicy {
         }
 
         Ok(roots)
+    }
+
+    fn canonical_virtual_tmp_root(&self) -> Result<Option<PathBuf>, PathPolicyError> {
+        self.virtual_tmp_root
+            .as_ref()
+            .map(|root| {
+                root.canonicalize().map_err(|e| {
+                    PathPolicyError::InvalidRoot(format!(
+                        "Cannot resolve virtual tmp root '{}': {e}",
+                        root.display()
+                    ))
+                })
+            })
+            .transpose()
     }
 
     fn canonical_denied_roots(
@@ -216,12 +273,26 @@ impl PathPolicy {
     }
 }
 
-fn resolve_candidate(path: &Path, workspace_root: &Path) -> PathBuf {
+fn resolve_candidate(
+    path: &Path,
+    workspace_root: &Path,
+    virtual_tmp_root: Option<&Path>,
+) -> PathBuf {
+    if let Some(mapped) = map_virtual_tmp_path(path, virtual_tmp_root) {
+        return mapped;
+    }
+
     if path.is_absolute() {
         path.to_path_buf()
     } else {
         workspace_root.join(path)
     }
+}
+
+fn map_virtual_tmp_path(path: &Path, virtual_tmp_root: Option<&Path>) -> Option<PathBuf> {
+    let tmp_root = virtual_tmp_root?;
+    let suffix = path.strip_prefix(Path::new("/tmp")).ok()?;
+    Some(normalize_path(&tmp_root.join(suffix)))
 }
 
 fn resolve_root(root: &Path, workspace_root: &Path) -> PathBuf {
@@ -244,6 +315,17 @@ fn normalize_path(path: &Path) -> PathBuf {
         }
     }
     result
+}
+
+/// Returns true when `path` uses the Unix `/tmp` convention AND `effective_tmp`
+/// is active (i.e. the path will be remapped into the sandbox).
+///
+/// WHY this matters on Windows: `/tmp/…` paths lack a drive letter so
+/// `Path::is_absolute()` returns `false`, causing the traversal guard to fire
+/// incorrectly. The downstream `ensure_allowed` call still enforces the real
+/// permission boundary regardless, so bypassing the early guard is safe.
+fn is_unix_tmp_candidate(path: &Path, effective_tmp: Option<&Path>) -> bool {
+    effective_tmp.is_some() && path.starts_with(Path::new("/tmp"))
 }
 
 #[cfg(test)]
@@ -323,6 +405,63 @@ mod tests {
             .expect("write path should be allowed");
 
         assert_eq!(resolved, target);
+    }
+
+    // virtual_tmp_root maps Unix-style /tmp/... paths to a sandboxed root.
+    // On Windows, /tmp/... is not an absolute path (no drive letter), so this
+    // feature is Unix-only. Gate all three tests accordingly.
+    #[cfg(unix)]
+    #[test]
+    fn absolute_tmp_is_mapped_into_virtual_tmp_root_for_writes() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let virtual_tmp = tempfile::tempdir().expect("virtual_tmp");
+        let policy = PathPolicy::new(workspace.path().to_path_buf())
+            .with_virtual_tmp_root(virtual_tmp.path().to_path_buf());
+
+        let resolved = policy
+            .resolve_write_path(Path::new("/tmp/out.txt"), false)
+            .expect("virtual tmp write");
+
+        assert_eq!(
+            resolved,
+            virtual_tmp
+                .path()
+                .canonicalize()
+                .expect("canon virtual tmp")
+                .join("out.txt")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn absolute_tmp_is_mapped_into_virtual_tmp_root_for_reads() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let virtual_tmp = tempfile::tempdir().expect("virtual_tmp");
+        let mapped = virtual_tmp.path().join("note.txt");
+        std::fs::write(&mapped, "hello").expect("write virtual tmp file");
+
+        let policy = PathPolicy::new(workspace.path().to_path_buf())
+            .with_virtual_tmp_root(virtual_tmp.path().to_path_buf());
+        let resolved = policy
+            .resolve_read_path(Path::new("/tmp/note.txt"), &[])
+            .expect("virtual tmp read");
+
+        assert_eq!(resolved, mapped.canonicalize().expect("canon mapped"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn virtual_tmp_cannot_escape_its_root() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let virtual_tmp = tempfile::tempdir().expect("virtual_tmp");
+        let policy = PathPolicy::new(workspace.path().to_path_buf())
+            .with_virtual_tmp_root(virtual_tmp.path().to_path_buf());
+
+        let err = policy
+            .resolve_write_path(Path::new("/tmp/../../escape.txt"), false)
+            .expect_err("virtual tmp traversal should fail");
+
+        assert!(matches!(err, PathPolicyError::PermissionDenied(_)));
     }
 
     #[cfg(unix)]

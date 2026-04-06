@@ -7,10 +7,13 @@
 
 use ratatui::style::{Color, Style};
 
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// Full ASCII art banner shown at startup.
 /// Pure box-drawing characters — safe across all terminal emulators.
 #[allow(dead_code)]
-pub const BANNER: &str = "\
+pub const BANNER: &str = concat!(
+    "\
 ╔══════════════════════════════════════════════════════════════╗\n\
 ║                                                              ║\n\
 ║  ███████╗██████╗  ██████╗ ███████╗ ██████╗██████╗  ██╗      ║\n\
@@ -20,14 +23,21 @@ pub const BANNER: &str = "\
 ║  ███████╗██████╔╝╚██████╔╝███████╗╚██████╗██║  ██║ ███████╗ ║\n\
 ║  ╚══════╝╚═════╝  ╚═════╝ ╚══════╝ ╚═════╝╚═╝  ╚═╝╚══════╝ ║\n\
 ║                                                              ║\n\
-║  AI-native terminal agent                     v0.1.0-dev    ║\n\
+║  AI-native terminal agent                     v",
+    env!("CARGO_PKG_VERSION"),
+    "    ║\n\
 ║  /help  commands   /model  switch model                      ║\n\
 ║                                                              ║\n\
-╚══════════════════════════════════════════════════════════════╝";
+╚══════════════════════════════════════════════════════════════╝"
+);
 
 /// Short one-line banner for minimal/pipe mode.
 #[allow(dead_code)]
-pub const BANNER_SHORT: &str = "EdgeCrab v0.1.0-dev | AI-native terminal agent";
+pub const BANNER_SHORT: &str = concat!(
+    "EdgeCrab v",
+    env!("CARGO_PKG_VERSION"),
+    " | AI-native terminal agent"
+);
 
 /// Style for the banner border.
 #[allow(dead_code)]
@@ -57,7 +67,7 @@ mod tests {
 
     #[test]
     fn short_banner_has_version() {
-        assert!(BANNER_SHORT.contains("v0.1.0"));
+        assert!(BANNER_SHORT.contains(VERSION));
     }
 
     #[test]

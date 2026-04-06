@@ -24,12 +24,15 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::Mutex;
 
+use crate::config_ref::resolve_edgecrab_home;
 use crate::registry::{ToolContext, ToolHandler};
 
 // ─── HTTP MCP token storage ──────────────────────────────────────────────────
@@ -58,11 +61,7 @@ fn sanitize_server_name(name: &str) -> String {
 }
 
 fn mcp_tokens_dir() -> Option<std::path::PathBuf> {
-    std::env::var("EDGECRAB_HOME")
-        .ok()
-        .map(std::path::PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|h| h.join(".edgecrab")))
-        .map(|home| home.join(MCP_TOKENS_DIR))
+    Some(resolve_edgecrab_home().join(MCP_TOKENS_DIR))
 }
 
 /// Read a Bearer token from the token store for a given server.
@@ -301,6 +300,7 @@ impl McpConnection {
     async fn spawn(
         command: &str,
         args: &[String],
+        cwd: Option<&std::path::Path>,
         envs: &std::collections::HashMap<String, String>,
     ) -> Result<Self, ToolError> {
         let mut cmd = tokio::process::Command::new(command);
@@ -308,6 +308,9 @@ impl McpConnection {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null());
+        if let Some(cwd) = cwd {
+            cmd.current_dir(cwd);
+        }
         if !envs.is_empty() {
             cmd.envs(envs);
         }
@@ -467,6 +470,7 @@ struct McpServerConfig {
     /// Command for stdio-based servers.
     command: String,
     args: Vec<String>,
+    cwd: Option<PathBuf>,
     envs: std::collections::HashMap<String, String>,
     /// Per-call tool invocation timeout in seconds (default: 30).
     timeout: Option<u64>,
@@ -496,7 +500,8 @@ async fn get_or_connect(server_name: &str, cfg: McpServerConfig) -> Result<(), T
         McpConnectionKind::Http(http)
     } else {
         // Stdio subprocess MCP server
-        let conn = McpConnection::spawn(&cfg.command, &cfg.args, &cfg.envs).await?;
+        let conn =
+            McpConnection::spawn(&cfg.command, &cfg.args, cfg.cwd.as_deref(), &cfg.envs).await?;
         McpConnectionKind::Stdio(Box::new(conn))
     };
 
@@ -504,21 +509,9 @@ async fn get_or_connect(server_name: &str, cfg: McpServerConfig) -> Result<(), T
     Ok(())
 }
 
-/// Parse MCP configuration from the context.
-///
-/// Expects a JSON config at `~/.edgecrab/mcp.json` with the format:
-/// ```json
-/// {
-///   "mcpServers": {
-///     "server_name": {
-///       "command": "npx",
-///       "args": ["-y", "@some/mcp-server"]
-///     }
-///   }
-/// }
-/// ```
+/// Legacy MCP config path used for compatibility imports.
 fn mcp_config_path() -> Option<std::path::PathBuf> {
-    dirs::home_dir().map(|h| h.join(".edgecrab").join("mcp.json"))
+    Some(resolve_edgecrab_home().join("mcp.json"))
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -594,11 +587,81 @@ impl Default for YamlMcpServer {
 }
 
 fn yaml_config_path() -> Option<std::path::PathBuf> {
-    std::env::var("EDGECRAB_HOME")
-        .ok()
-        .map(std::path::PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|h| h.join(".edgecrab")))
-        .map(|home| home.join("config.yaml"))
+    Some(resolve_edgecrab_home().join("config.yaml"))
+}
+
+fn parse_string_array(value: Option<&serde_json::Value>) -> Vec<String> {
+    value
+        .and_then(|a| a.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_string_map(value: Option<&serde_json::Value>) -> HashMap<String, String> {
+    value
+        .and_then(|obj| obj.as_object())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_configured_server(name: &str, server_config: &serde_json::Value) -> ConfiguredMcpServer {
+    let token_from_store = read_mcp_token(name).is_some();
+    ConfiguredMcpServer {
+        name: name.to_string(),
+        url: server_config
+            .get("url")
+            .and_then(|u| u.as_str())
+            .map(String::from),
+        bearer_token: server_config
+            .get("bearer_token")
+            .and_then(|t| t.as_str())
+            .map(String::from),
+        command: server_config
+            .get("command")
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_string(),
+        args: parse_string_array(server_config.get("args")),
+        cwd: server_config
+            .get("cwd")
+            .and_then(|c| c.as_str())
+            .map(PathBuf::from),
+        env: parse_string_map(server_config.get("env")),
+        headers: parse_string_map(server_config.get("headers")),
+        timeout: server_config.get("timeout").and_then(|t| t.as_u64()),
+        connect_timeout: server_config
+            .get("connect_timeout")
+            .and_then(|t| t.as_u64()),
+        include: parse_string_array(server_config.get("tools").and_then(|t| t.get("include"))),
+        exclude: parse_string_array(server_config.get("tools").and_then(|t| t.get("exclude"))),
+        token_from_config: server_config
+            .get("bearer_token")
+            .and_then(|t| t.as_str())
+            .is_some(),
+        token_from_store,
+    }
+}
+
+fn to_runtime_server_config(server: &ConfiguredMcpServer) -> McpServerConfig {
+    McpServerConfig {
+        url: server.url.clone(),
+        bearer_token: server.bearer_token.clone(),
+        headers: server.headers.clone(),
+        command: server.command.clone(),
+        args: server.args.clone(),
+        cwd: server.cwd.clone(),
+        envs: server.env.clone(),
+        timeout: server.timeout,
+        connect_timeout: server.connect_timeout,
+    }
 }
 
 // ─── Tool filtering ──────────────────────────────────────────────────────────
@@ -705,26 +768,92 @@ fn load_mcp_config() -> Result<serde_json::Value, ToolError> {
         }
     }
 
-    let path = mcp_config_path().ok_or_else(|| ToolError::Unavailable {
-        tool: "mcp_client".into(),
-        reason: "Cannot determine home directory for MCP config".into(),
-    })?;
-
-    if !path.is_file() {
-        return Err(ToolError::Unavailable {
+    if let Some(path) = mcp_config_path().filter(|path| path.is_file()) {
+        let content = std::fs::read_to_string(&path).map_err(|e| ToolError::ExecutionFailed {
             tool: "mcp_client".into(),
-            reason: format!("MCP config not found at {}", path.display()),
+            message: format!("Failed to read MCP config: {e}"),
+        })?;
+
+        return serde_json::from_str(&content).map_err(|e| ToolError::ExecutionFailed {
+            tool: "mcp_client".into(),
+            message: format!("Invalid MCP config JSON: {e}"),
         });
     }
 
-    let content = std::fs::read_to_string(&path).map_err(|e| ToolError::ExecutionFailed {
-        tool: "mcp_client".into(),
-        message: format!("Failed to read MCP config: {e}"),
-    })?;
+    Ok(json!({ "mcpServers": {} }))
+}
 
-    serde_json::from_str(&content).map_err(|e| ToolError::ExecutionFailed {
-        tool: "mcp_client".into(),
-        message: format!("Invalid MCP config JSON: {e}"),
+pub fn configured_servers() -> Result<Vec<ConfiguredMcpServer>, ToolError> {
+    let config = load_mcp_config()?;
+    let servers = config
+        .get("mcpServers")
+        .and_then(|s| s.as_object())
+        .ok_or_else(|| ToolError::ExecutionFailed {
+            tool: "mcp_client".into(),
+            message: "MCP config missing 'mcpServers' object".into(),
+        })?;
+
+    let mut parsed: Vec<ConfiguredMcpServer> = servers
+        .iter()
+        .map(|(name, value)| parse_configured_server(name, value))
+        .collect();
+    parsed.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(parsed)
+}
+
+pub async fn probe_configured_server(server_name: &str) -> Result<McpProbeResult, ToolError> {
+    let server = configured_servers()?
+        .into_iter()
+        .find(|server| server.name == server_name)
+        .ok_or_else(|| ToolError::InvalidArgs {
+            tool: "mcp_client".into(),
+            message: format!("Unknown MCP server '{server_name}'"),
+        })?;
+
+    get_or_connect(server_name, to_runtime_server_config(&server)).await?;
+
+    let pool = connections();
+    let conn_mutex = pool
+        .get(server_name)
+        .ok_or_else(|| ToolError::ExecutionFailed {
+            tool: "mcp_client".into(),
+            message: format!("Connection to '{server_name}' not found after connect"),
+        })?;
+
+    let mut conn = conn_mutex.value().lock().await;
+    let result = conn.rpc_call("tools/list", json!({})).await?;
+    let tools: Vec<(String, String)> = result
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .map(|tools| {
+            let filtered = apply_tool_filter(tools, &server.include, &server.exclude);
+            filtered
+                .iter()
+                .map(|tool| {
+                    (
+                        tool.get("name")
+                            .and_then(|n| n.as_str())
+                            .unwrap_or("unknown")
+                            .to_string(),
+                        tool.get("description")
+                            .and_then(|d| d.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok(McpProbeResult {
+        server_name: server.name,
+        transport: if server.url.is_some() {
+            "http".into()
+        } else {
+            "stdio".into()
+        },
+        tool_count: tools.len(),
+        tools,
     })
 }
 
@@ -791,20 +920,10 @@ impl ToolHandler for McpListToolsTool {
             message: e.to_string(),
         })?;
 
-        let config = load_mcp_config()?;
-        let servers = config
-            .get("mcpServers")
-            .and_then(|s| s.as_object())
-            .ok_or_else(|| ToolError::ExecutionFailed {
-                tool: "mcp_list_tools".into(),
-                message: "MCP config missing 'mcpServers' object".into(),
-            })?;
-
         let mut all_tools = Vec::new();
-
-        for (name, server_config) in servers {
+        for server in configured_servers()? {
             if let Some(ref filter) = args.server {
-                if name != filter {
+                if &server.name != filter {
                     continue;
                 }
             }
@@ -813,76 +932,15 @@ impl ToolHandler for McpListToolsTool {
                 return Err(ToolError::Other("Cancelled".into()));
             }
 
-            let command = server_config
-                .get("command")
-                .and_then(|c| c.as_str())
-                .unwrap_or("")
-                .to_string();
-
-            let url = server_config
-                .get("url")
-                .and_then(|u| u.as_str())
-                .map(String::from);
-
-            let bearer_token = server_config
-                .get("bearer_token")
-                .and_then(|t| t.as_str())
-                .map(String::from);
-
-            let cmd_args: Vec<String> = server_config
-                .get("args")
-                .and_then(|a| a.as_array())
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            // Extract env vars from config so they reach the subprocess
-            let cmd_envs: std::collections::HashMap<String, String> = server_config
-                .get("env")
-                .and_then(|e| e.as_object())
-                .map(|obj| {
-                    obj.iter()
-                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            get_or_connect(
-                name,
-                McpServerConfig {
-                    url,
-                    bearer_token,
-                    headers: server_config
-                        .get("headers")
-                        .and_then(|h| h.as_object())
-                        .map(|obj| {
-                            obj.iter()
-                                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                                .collect()
-                        })
-                        .unwrap_or_default(),
-                    command,
-                    args: cmd_args,
-                    envs: cmd_envs,
-                    timeout: server_config.get("timeout").and_then(|t| t.as_u64()),
-                    connect_timeout: server_config
-                        .get("connect_timeout")
-                        .and_then(|t| t.as_u64()),
-                },
-            )
-            .await?;
+            get_or_connect(&server.name, to_runtime_server_config(&server)).await?;
 
             let pool = connections();
-            if let Some(conn_mutex) = pool.get(name) {
+            if let Some(conn_mutex) = pool.get(&server.name) {
                 let mut conn = conn_mutex.value().lock().await;
                 let result = conn.rpc_call("tools/list", json!({})).await?;
 
                 if let Some(raw_tools) = result.get("tools").and_then(|t| t.as_array()) {
-                    let (include, exclude) = extract_tool_filter(server_config);
-                    let filtered = apply_tool_filter(raw_tools, &include, &exclude);
+                    let filtered = apply_tool_filter(raw_tools, &server.include, &server.exclude);
                     for tool in &filtered {
                         let tool_name = tool
                             .get("name")
@@ -892,7 +950,7 @@ impl ToolHandler for McpListToolsTool {
                             .get("description")
                             .and_then(|d| d.as_str())
                             .unwrap_or("");
-                        all_tools.push(format!("[{name}] {tool_name}: {tool_desc}"));
+                        all_tools.push(format!("[{}] {tool_name}: {tool_desc}", server.name));
                     }
                 }
             }
@@ -1059,6 +1117,10 @@ impl ToolHandler for McpCallToolTool {
                     .unwrap_or_default(),
                 command,
                 args: cmd_args,
+                cwd: server_config
+                    .get("cwd")
+                    .and_then(|c| c.as_str())
+                    .map(PathBuf::from),
                 envs: cmd_envs,
                 timeout: server_config.get("timeout").and_then(|t| t.as_u64()),
                 connect_timeout: server_config
@@ -1147,6 +1209,32 @@ inventory::submit!(&McpCallToolTool as &dyn ToolHandler);
 /// on the next `mcp_list_tools` / `mcp_call_tool` invocation.
 pub fn reload_mcp_connections() {
     connections().clear();
+}
+
+#[derive(Debug, Clone)]
+pub struct ConfiguredMcpServer {
+    pub name: String,
+    pub url: Option<String>,
+    pub bearer_token: Option<String>,
+    pub command: String,
+    pub args: Vec<String>,
+    pub cwd: Option<PathBuf>,
+    pub env: HashMap<String, String>,
+    pub headers: HashMap<String, String>,
+    pub timeout: Option<u64>,
+    pub connect_timeout: Option<u64>,
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
+    pub token_from_config: bool,
+    pub token_from_store: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct McpProbeResult {
+    pub server_name: String,
+    pub transport: String,
+    pub tool_count: usize,
+    pub tools: Vec<(String, String)>,
 }
 
 // ─── Dynamic prefixed MCP tools (mcp_<server>_<tool>) ────────────────────────
@@ -1411,6 +1499,10 @@ pub async fn discover_and_register_mcp_tools(registry: &mut crate::registry::Too
                 headers,
                 command,
                 args: cmd_args,
+                cwd: server_config
+                    .get("cwd")
+                    .and_then(|c| c.as_str())
+                    .map(PathBuf::from),
                 envs: cmd_envs,
                 timeout,
                 connect_timeout,
@@ -1888,80 +1980,15 @@ async fn ensure_server_connected(server_name: &str) -> Result<(), ToolError> {
     if connections().contains_key(server_name) {
         return Ok(());
     }
-
-    let config = load_mcp_config()?;
-    let servers = config
-        .get("mcpServers")
-        .and_then(|s| s.as_object())
-        .ok_or_else(|| ToolError::ExecutionFailed {
-            tool: "mcp_client".into(),
-            message: "MCP config missing 'mcpServers' object".into(),
-        })?;
-
-    let server_config = servers
-        .get(server_name)
+    let server = configured_servers()?
+        .into_iter()
+        .find(|server| server.name == server_name)
         .ok_or_else(|| ToolError::InvalidArgs {
             tool: "mcp_client".into(),
             message: format!("Unknown MCP server '{server_name}'"),
         })?;
 
-    let command = server_config
-        .get("command")
-        .and_then(|c| c.as_str())
-        .unwrap_or("")
-        .to_string();
-    let url = server_config
-        .get("url")
-        .and_then(|u| u.as_str())
-        .map(String::from);
-    let bearer_token = server_config
-        .get("bearer_token")
-        .and_then(|t| t.as_str())
-        .map(String::from);
-    let cmd_args: Vec<String> = server_config
-        .get("args")
-        .and_then(|a| a.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-    let cmd_envs: std::collections::HashMap<String, String> = server_config
-        .get("env")
-        .and_then(|e| e.as_object())
-        .map(|obj| {
-            obj.iter()
-                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                .collect()
-        })
-        .unwrap_or_default();
-    let headers: std::collections::HashMap<String, String> = server_config
-        .get("headers")
-        .and_then(|h| h.as_object())
-        .map(|obj| {
-            obj.iter()
-                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    get_or_connect(
-        server_name,
-        McpServerConfig {
-            url,
-            bearer_token,
-            headers,
-            command,
-            args: cmd_args,
-            envs: cmd_envs,
-            timeout: server_config.get("timeout").and_then(|t| t.as_u64()),
-            connect_timeout: server_config
-                .get("connect_timeout")
-                .and_then(|t| t.as_u64()),
-        },
-    )
-    .await
+    get_or_connect(server_name, to_runtime_server_config(&server)).await
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────
@@ -1969,6 +1996,9 @@ async fn ensure_server_connected(server_name: &str) -> Result<(), ToolError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static EDGECRAB_HOME_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn mcp_list_tools_schema_valid() {
@@ -2004,7 +2034,6 @@ mod tests {
     fn mcp_config_path_has_expected_suffix() {
         if let Some(path) = mcp_config_path() {
             assert!(path.ends_with("mcp.json"));
-            assert!(path.to_string_lossy().contains(".edgecrab"));
         }
     }
 
@@ -2023,13 +2052,22 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[tokio::test]
-    async fn mcp_list_tools_invalid_args() {
+    #[test]
+    fn mcp_list_tools_invalid_args() {
+        let _guard = EDGECRAB_HOME_LOCK.lock().expect("lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        // SAFETY: protected by EDGECRAB_HOME_LOCK.
+        unsafe { std::env::set_var("EDGECRAB_HOME", dir.path()) };
         let ctx = ToolContext::test_context();
-        // Passing a non-object should still parse (empty args are fine)
-        let result = McpListToolsTool.execute(json!({}), &ctx).await;
-        // Will fail because config file doesn't exist in test, which is expected
-        assert!(result.is_err());
+        // Empty args are fine; no config should now behave as an empty catalog
+        // rather than a hard legacy-path failure.
+        let result = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(async { McpListToolsTool.execute(json!({}), &ctx).await });
+        // SAFETY: protected by EDGECRAB_HOME_LOCK.
+        unsafe { std::env::remove_var("EDGECRAB_HOME") };
+        let output = result.expect("empty MCP config should be tolerated");
+        assert!(output.contains("No MCP tools discovered"));
     }
 
     #[tokio::test]
@@ -2135,5 +2173,40 @@ mod tests {
                 schema.name
             );
         }
+    }
+
+    #[test]
+    fn mcp_config_path_respects_edgecrab_home() {
+        let _guard = EDGECRAB_HOME_LOCK.lock().expect("lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        // SAFETY: protected by EDGECRAB_HOME_LOCK.
+        unsafe { std::env::set_var("EDGECRAB_HOME", dir.path()) };
+        let path = mcp_config_path().expect("mcp path");
+        // SAFETY: protected by EDGECRAB_HOME_LOCK.
+        unsafe { std::env::remove_var("EDGECRAB_HOME") };
+        assert_eq!(path, dir.path().join("mcp.json"));
+    }
+
+    #[test]
+    fn configured_servers_reads_yaml_and_preserves_cwd() {
+        let _guard = EDGECRAB_HOME_LOCK.lock().expect("lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("config.yaml"),
+            "mcp_servers:\n  filesystem:\n    command: npx\n    args: ['-y', '@modelcontextprotocol/server-filesystem', '/tmp']\n    cwd: /tmp\n    enabled: true\n",
+        )
+        .expect("config");
+        // SAFETY: protected by EDGECRAB_HOME_LOCK.
+        unsafe { std::env::set_var("EDGECRAB_HOME", dir.path()) };
+        let servers = configured_servers().expect("servers");
+        // SAFETY: protected by EDGECRAB_HOME_LOCK.
+        unsafe { std::env::remove_var("EDGECRAB_HOME") };
+
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, "filesystem");
+        assert_eq!(
+            servers[0].cwd.as_deref(),
+            Some(std::path::Path::new("/tmp"))
+        );
     }
 }

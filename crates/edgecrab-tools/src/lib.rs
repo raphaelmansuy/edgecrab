@@ -18,6 +18,8 @@
 mod approval_runtime;
 mod command_interaction;
 pub mod config_ref;
+pub mod execution_fs;
+pub mod execution_tmp;
 pub mod fuzzy_match;
 #[cfg(target_os = "macos")]
 pub mod macos_permissions;
@@ -47,6 +49,7 @@ pub(crate) fn safe_truncate(s: &str, max_bytes: usize) -> &str {
 }
 
 pub use config_ref::AppConfigRef;
+pub use execution_fs::{ExecutionFilesystemView, describe_execution_filesystem};
 pub use process_table::ProcessTable;
 pub use registry::{
     SubAgentResult, SubAgentRunner, ToolContext, ToolHandler, ToolRegistry, to_llm_definitions,

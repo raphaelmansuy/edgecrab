@@ -46,8 +46,22 @@ cargo install edgecrab-cli
 
 ```bash
 edgecrab version
-# EdgeCrab 0.1.0  (rustc 1.85.0, 2025-02-20)
-#   providers: copilot openai anthropic gemini xai deepseek huggingface zai openrouter ollama lmstudio
+# EdgeCrab v0.1.0
+# Rust 1.85.0
+#
+# Supported providers (via edgequake-llm):
+#   copilot        — GitHub Copilot (GITHUB_TOKEN)
+#   openai         — OpenAI (OPENAI_API_KEY)
+#   anthropic      — Anthropic (ANTHROPIC_API_KEY)
+#   gemini         — Google Gemini (GOOGLE_API_KEY)
+#   openrouter     — OpenRouter (OPENROUTER_API_KEY)
+#   xai            — xAI Grok (XAI_API_KEY)
+#   mistral        — Mistral AI (MISTRAL_API_KEY)
+#   ollama         — Ollama (local, no key)
+#   lmstudio       — LMStudio (local, no key)
+#   azure          — Azure OpenAI (AZURE_OPENAI_API_KEY)
+#   bedrock        — AWS Bedrock (AWS_ACCESS_KEY_ID)
+#   huggingface    — HuggingFace (HUGGINGFACE_API_KEY)
 ```
 
 ---
@@ -60,7 +74,7 @@ edgecrab [GLOBAL FLAGS] [PROMPT]   -- interactive TUI (default)
   +-- setup [section] [--force]    -- first-run wizard
   +-- doctor                       -- environment diagnostics
   +-- migrate [--dry-run]          -- import from hermes-agent
-  +-- acp                          -- ACP stdio server (VS Code)
+  +-- acp [init]                   -- ACP stdio server / VS Code onboarding
   +-- version                      -- build info + provider list
   +-- status                       -- runtime status summary
   +-- whatsapp                     -- pair WhatsApp bridge
@@ -69,6 +83,10 @@ edgecrab [GLOBAL FLAGS] [PROMPT]   -- interactive TUI (default)
   +-- sessions <sub>               -- session history
   +-- config   <sub>               -- config.yaml management
   +-- tools    <sub>               -- tool/toolset inspection
+  +-- mcp      <sub>               -- MCP server management
+  +-- plugins  <sub>               -- plugin management
+  +-- skills   <sub>               -- skill management
+  +-- cron     <sub>               -- scheduled prompts
   +-- gateway  <sub>               -- messaging gateway daemon
   +-- completion <shell>           -- shell tab-completion script
 ```
@@ -183,30 +201,15 @@ silently overwritten.
 
 ---
 
-## `edgecrab acp`
-
-Start an ACP JSON-RPC 2.0 stdio server for editor integration.
-
-```bash
-edgecrab acp
-```
-
-Reads requests from stdin, writes responses to stdout. Used by the VS
-Code GitHub Copilot extension and any ACP-compatible runner. See
-[ACP Integration](/integrations/acp/) for configuration and manifest
-details.
-
----
-
 ## `edgecrab version`
 
 Print build info and supported providers.
 
 ```bash
 edgecrab version
-# EdgeCrab 0.1.0  (rustc 1.85.0, 2025-02-20, git a1b2c3d)
-#   providers: copilot openai anthropic gemini xai deepseek
-#              huggingface zai openrouter ollama lmstudio
+# EdgeCrab v0.1.0  (rustc 1.85.0, git a1b2c3d)
+# Rust 1.85.0
+# ...providers listed as above...
 
 edgecrab --version   # identical output
 ```
@@ -271,13 +274,21 @@ directory under `~/.edgecrab/profiles/<name>/` (config, memories,
 skills, sessions).
 
 ```bash
-edgecrab profile list                        # List all profiles
-edgecrab profile create <name>               # Create a new profile
-edgecrab profile create <name> --clone       # Clone current profile
-edgecrab profile use <name>                  # Switch sticky default profile
-edgecrab profile show [name]                 # Show profile metadata
-edgecrab profile path [name]                 # Print profile home directory
-edgecrab profile delete <name>              # Delete a profile (requires confirm)
+edgecrab profile list                              # List all profiles
+edgecrab profile create <name>                     # Create a new profile
+edgecrab profile create <name> --clone             # Clone current profile (config, .env, SOUL.md)
+edgecrab profile create <name> --clone-all         # Clone everything including memories/sessions
+edgecrab profile create <name> --clone-from other  # Clone from a specific profile
+edgecrab profile use <name>                        # Switch sticky default profile
+edgecrab profile show <name>                       # Show profile details (dir, model, disk usage)
+edgecrab profile alias <name>                      # Generate a shell wrapper alias
+edgecrab profile alias <name> --name myalias       # Alias with a custom name
+edgecrab profile alias <name> --remove             # Remove the shell alias
+edgecrab profile rename <old> <new>                # Rename a profile
+edgecrab profile export <name>                     # Export profile as tar.gz archive
+edgecrab profile export <name> -o ./backup.tar.gz  # Export to a specific path
+edgecrab profile import ./backup.tar.gz            # Import a profile archive
+edgecrab profile delete <name>                     # Delete a profile (requires confirm or -y)
 ```
 
 Running `edgecrab -p <name> "prompt"` overrides the sticky profile
@@ -290,13 +301,14 @@ for a single invocation without changing the default.
 Manage conversation history stored in the SQLite state database.
 
 ```bash
-edgecrab sessions list                       # List recent sessions (newest first)
-edgecrab sessions show <id>                  # Show messages in a session
-edgecrab sessions search <query>             # Full-text search via FTS5
-edgecrab sessions delete <id>               # Delete a session
-edgecrab sessions rename <id> <new-title>    # Rename a session
-edgecrab sessions export <id> [format]      # Export: markdown, json, or text
-edgecrab sessions prune --older-than 30     # Delete sessions older than N days
+edgecrab sessions list                            # List recent sessions (newest first)
+edgecrab sessions browse                          # Browse sessions interactively
+edgecrab sessions browse --query <term>           # Full-text search via FTS5
+edgecrab sessions delete <id>                     # Delete a session
+edgecrab sessions rename <id> <new-title>         # Rename a session
+edgecrab sessions export <id> [--format jsonl]    # Export: markdown (default) or jsonl
+edgecrab sessions prune --older-than 30           # Delete sessions older than N days
+edgecrab sessions stats                           # Show session statistics (counts, DB size)
 ```
 
 ---
@@ -312,7 +324,6 @@ edgecrab config edit                         # Open in $EDITOR
 edgecrab config set <key> <value>            # Set a config key (dotted path)
 edgecrab config path                         # Print path to config.yaml
 edgecrab config env-path                     # Print path to .env
-edgecrab config edit-soul                    # Open SOUL.md in $EDITOR
 ```
 
 Key path examples: `model.default_model`, `tools.enabled_toolsets`,
@@ -326,9 +337,75 @@ Inspect registered tools and toolset composition. Useful for debugging
 toolset configuration.
 
 ```bash
-edgecrab tools list                          # List all registered tools
-edgecrab tools show <name>                   # Show tool schema and description
-edgecrab tools toolsets                      # List toolset aliases and expansions
+edgecrab tools list                          # List all registered tools and toolsets
+edgecrab tools enable <toolset>              # Enable a toolset in config.yaml
+edgecrab tools disable <toolset>             # Disable a toolset in config.yaml
+```
+
+---
+
+## `edgecrab mcp`
+
+Manage external MCP (Model Context Protocol) servers. Includes a curated preset catalogue for one-command server setup.
+
+```bash
+edgecrab mcp list                         # List configured MCP servers
+edgecrab mcp search                       # Browse the curated MCP preset catalogue
+edgecrab mcp search github                # Search presets matching "github"
+edgecrab mcp view <preset>                # Show details for a curated preset
+edgecrab mcp install <preset>             # Install a preset into config.yaml
+edgecrab mcp install filesystem --path /tmp  # Install with path override
+edgecrab mcp test                         # Probe all configured servers (connectivity + tool count)
+edgecrab mcp test <name>                  # Probe a specific server
+edgecrab mcp add <name> <cmd> [args...]   # Add a custom MCP server by command
+edgecrab mcp remove <name>                # Remove a configured MCP server
+```
+
+---
+
+## `edgecrab plugins`
+
+Manage installed plugins.
+
+```bash
+edgecrab plugins list              # List discovered plugins
+edgecrab plugins install <repo>    # Install a plugin from a git repository
+edgecrab plugins update <name>     # Update an installed plugin
+edgecrab plugins remove <name>     # Remove an installed plugin
+```
+
+---
+
+## `edgecrab skills`
+
+Manage agent skills stored in `~/.edgecrab/skills/`.
+
+```bash
+edgecrab skills list                              # List all installed skills
+edgecrab skills view <name>                       # Print a skill's SKILL.md
+edgecrab skills search <query>                    # Search skills by name
+edgecrab skills install <path-or-repo>            # Install from a local path or GitHub URL
+edgecrab skills install official/<cat>/<skill>    # Install from the official catalogue
+edgecrab skills remove <name>                     # Remove an installed skill
+```
+
+---
+
+## `edgecrab cron`
+
+Manage scheduled prompts.
+
+```bash
+edgecrab cron list                              # List scheduled jobs
+edgecrab cron status                            # Show scheduler status
+edgecrab cron create "0 9 * * *" "daily brief" # Create a cron job (cron expr + prompt)
+edgecrab cron create --name daily "0 9 * * *" "brief" --skill reporter
+edgecrab cron edit <id> --schedule "0 8 * * *" # Edit a scheduled job
+edgecrab cron run <id>                          # Run a job immediately
+edgecrab cron pause <id>                        # Pause a job
+edgecrab cron resume <id>                       # Resume a paused job
+edgecrab cron remove <id>                       # Delete a scheduled job
+edgecrab cron tick                              # Fire all due jobs once and exit
 ```
 
 ---
@@ -342,9 +419,8 @@ messaging platforms.
 edgecrab gateway start                       # Start gateway daemon (background)
 edgecrab gateway start --foreground          # Start gateway in foreground (logs to stdout)
 edgecrab gateway stop                        # Stop gateway daemon
-edgecrab gateway status                      # Show daemon + per-platform status
-edgecrab gateway logs                        # Follow live gateway logs
 edgecrab gateway restart                     # Stop then start
+edgecrab gateway status                      # Show daemon + per-platform status
 edgecrab gateway configure                   # Interactive platform setup wizard
 edgecrab gateway configure telegram          # Configure a specific platform
 ```
@@ -352,12 +428,6 @@ edgecrab gateway configure telegram          # Configure a specific platform
 Platforms are enabled and configured via environment variables or `config.yaml` gateway section —
 not via `gateway start` flags. See [User Guide → Messaging](/user-guide/messaging/) for per-platform
 setup.
-
----
-
-## `edgecrab migrate`
-
-Re-listed here for clarity — see full entry above.
 
 ---
 
@@ -376,7 +446,7 @@ Re-listed here for clarity — see full entry above.
 
 - **`edgecrab -q "prompt" | your-tool`**: The `--quiet` flag suppresses the TUI and prints only the final response. Combine with pipes for scripting and CI.
 - **`edgecrab --debug 2>&1 | grep edgecrab_core`**: Filter debug logs to the agent loop only, cutting out the noise from other crates.
-- **`edgecrab sessions search "my query"`**: FTS5 full-text search across all conversation history — faster than scrolling session lists.
+- **`edgecrab sessions browse --query "my query"`**: FTS5 full-text search across all conversation history — faster than scrolling session lists.
 - **`edgecrab config set key value`** avoids opening the YAML editor for single-value changes.
 - **`edgecrab completion zsh >> ~/.zshrc`** adds tab-completion for all subcommands and flags.
 - **Worktrees for risky refactors**: `edgecrab -w "refactor auth module"` creates a git worktree so changes don't land on the current branch until you're ready.

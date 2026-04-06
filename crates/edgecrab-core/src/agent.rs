@@ -144,8 +144,16 @@ pub struct AgentConfig {
     pub terminal_modal: edgecrab_tools::tools::backends::ModalBackendConfig,
     pub terminal_daytona: edgecrab_tools::tools::backends::DaytonaBackendConfig,
     pub terminal_singularity: edgecrab_tools::tools::backends::SingularityBackendConfig,
+    /// Context-compression policy copied from AppConfig at session start.
+    pub compression: crate::config::CompressionConfig,
     /// Auxiliary side-task routing (vision, compression, other helper calls).
     pub auxiliary: crate::config::AuxiliaryConfig,
+    /// Voice output configuration projected from AppConfig.
+    pub tts: crate::config::TtsConfig,
+    /// Voice input configuration projected from AppConfig.
+    pub stt: crate::config::SttConfig,
+    /// Default image generation provider/model projected from AppConfig.
+    pub image_generation: crate::config::ImageGenerationConfig,
     /// Env-var names allowed to pass through the subprocess security blocklist.
     ///
     /// Populated from `terminal.env_passthrough` in config.yaml and applied
@@ -194,7 +202,11 @@ impl Default for AgentConfig {
             terminal_daytona: edgecrab_tools::tools::backends::DaytonaBackendConfig::default(),
             terminal_singularity:
                 edgecrab_tools::tools::backends::SingularityBackendConfig::default(),
+            compression: crate::config::CompressionConfig::default(),
             auxiliary: crate::config::AuxiliaryConfig::default(),
+            tts: crate::config::TtsConfig::default(),
+            stt: crate::config::SttConfig::default(),
+            image_generation: crate::config::ImageGenerationConfig::default(),
             terminal_env_passthrough: Vec::new(),
             file_allowed_roots: Vec::new(),
             path_restrictions: Vec::new(),
@@ -217,6 +229,11 @@ pub struct SessionState {
     pub session_cache_read_tokens: u64,
     pub session_cache_write_tokens: u64,
     pub session_reasoning_tokens: u64,
+    /// Prompt-side tokens from the most recent model call.
+    ///
+    /// This tracks current context pressure. Session token counters above track
+    /// cumulative spend across the whole conversation.
+    pub last_prompt_tokens: u64,
     pub session_tool_call_count: u32,
 }
 
@@ -610,6 +627,7 @@ impl Agent {
             cache_read_tokens: session.session_cache_read_tokens,
             cache_write_tokens: session.session_cache_write_tokens,
             reasoning_tokens: session.session_reasoning_tokens,
+            last_prompt_tokens: session.last_prompt_tokens,
             budget_remaining: self.budget.remaining(),
             budget_max: self.budget.max(),
         }
@@ -691,8 +709,12 @@ impl Agent {
     /// Force context compression on the next turn.
     pub async fn force_compress(&self) {
         let provider = self.provider.read().await.clone();
+        let config = self.config.read().await.clone();
         let mut session = self.session.write().await;
-        let params = crate::compression::CompressionParams::default();
+        let params = crate::compression::CompressionParams::from_model_config(
+            &config.model,
+            &config.compression,
+        );
         session.messages =
             crate::compression::compress_with_llm(&session.messages, &params, &provider).await;
     }
@@ -720,7 +742,7 @@ impl Agent {
         {
             let mut session = self.session.write().await;
             session.session_id = Some(record.id.clone());
-            session.cached_system_prompt = None;
+            session.cached_system_prompt = record.system_prompt.clone();
             session.user_turn_count = messages
                 .iter()
                 .filter(|m| matches!(m.role, edgecrab_types::Role::User))
@@ -731,6 +753,7 @@ impl Agent {
             session.session_cache_read_tokens = record.cache_read_tokens.max(0) as u64;
             session.session_cache_write_tokens = record.cache_write_tokens.max(0) as u64;
             session.session_reasoning_tokens = record.reasoning_tokens.max(0) as u64;
+            session.last_prompt_tokens = 0;
             session.messages = messages;
         }
 
@@ -805,6 +828,22 @@ impl Agent {
         self.config.read().await.auxiliary.clone()
     }
 
+    /// Return the current voice/media configuration used by direct tools.
+    pub async fn media_config(
+        &self,
+    ) -> (
+        crate::config::TtsConfig,
+        crate::config::SttConfig,
+        crate::config::ImageGenerationConfig,
+    ) {
+        let config = self.config.read().await;
+        (
+            config.tts.clone(),
+            config.stt.clone(),
+            config.image_generation.clone(),
+        )
+    }
+
     /// List all registered tool names.
     pub async fn tool_names(&self) -> Vec<String> {
         match &self.tool_registry {
@@ -843,6 +882,15 @@ impl Agent {
         let mut config = self.config.write().await;
         config.auxiliary = auxiliary;
     }
+
+    /// Update the default image generation routing for future turns.
+    pub async fn set_image_generation_config(
+        &self,
+        image_generation: crate::config::ImageGenerationConfig,
+    ) {
+        let mut config = self.config.write().await;
+        config.image_generation = image_generation;
+    }
 }
 
 /// Read-only snapshot of current session state for display.
@@ -858,8 +906,27 @@ pub struct SessionSnapshot {
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
     pub reasoning_tokens: u64,
+    pub last_prompt_tokens: u64,
     pub budget_remaining: u32,
     pub budget_max: u32,
+}
+
+impl SessionSnapshot {
+    pub fn prompt_tokens(&self) -> u64 {
+        self.input_tokens + self.cache_read_tokens + self.cache_write_tokens
+    }
+
+    pub fn total_tokens(&self) -> u64 {
+        self.prompt_tokens() + self.output_tokens + self.reasoning_tokens
+    }
+
+    pub fn context_pressure_tokens(&self) -> u64 {
+        if self.last_prompt_tokens > 0 {
+            self.last_prompt_tokens
+        } else {
+            self.prompt_tokens()
+        }
+    }
 }
 
 /// Risk-graduated approval choices surfaced by `StreamEvent::Approval`.
@@ -900,10 +967,41 @@ pub enum StreamEvent {
         name: String,
         /// Raw JSON arguments string (for preview extraction in the TUI)
         args_json: String,
+        /// Short machine-generated summary of the tool outcome.
+        result_preview: Option<String>,
         /// Elapsed milliseconds
         duration_ms: u64,
         /// Whether the result looks like an error
         is_error: bool,
+    },
+    /// A delegated child agent has started.
+    SubAgentStart {
+        task_index: usize,
+        task_count: usize,
+        goal: String,
+    },
+    /// A delegated child agent surfaced intermediate reasoning text.
+    SubAgentReasoning {
+        task_index: usize,
+        task_count: usize,
+        text: String,
+    },
+    /// A delegated child agent called a tool.
+    SubAgentToolExec {
+        task_index: usize,
+        task_count: usize,
+        name: String,
+        args_json: String,
+    },
+    /// A delegated child agent has finished.
+    SubAgentFinish {
+        task_index: usize,
+        task_count: usize,
+        status: String,
+        duration_ms: u64,
+        summary: String,
+        api_calls: u32,
+        model: Option<String>,
     },
     /// The response is complete.
     Done,
@@ -987,6 +1085,54 @@ impl std::fmt::Debug for StreamEvent {
             } => {
                 write!(f, "ToolDone({name:?}, {duration_ms}ms, err={is_error})")
             }
+            Self::SubAgentStart {
+                task_index,
+                task_count,
+                goal,
+            } => write!(
+                f,
+                "SubAgentStart({}/{}, {:?})",
+                task_index + 1,
+                task_count,
+                goal
+            ),
+            Self::SubAgentReasoning {
+                task_index,
+                task_count,
+                text,
+            } => write!(
+                f,
+                "SubAgentReasoning({}/{}, {:?})",
+                task_index + 1,
+                task_count,
+                text
+            ),
+            Self::SubAgentToolExec {
+                task_index,
+                task_count,
+                name,
+                ..
+            } => write!(
+                f,
+                "SubAgentToolExec({}/{}, {:?})",
+                task_index + 1,
+                task_count,
+                name
+            ),
+            Self::SubAgentFinish {
+                task_index,
+                task_count,
+                status,
+                duration_ms,
+                ..
+            } => write!(
+                f,
+                "SubAgentFinish({}/{}, {:?}, {}ms)",
+                task_index + 1,
+                task_count,
+                status,
+                duration_ms
+            ),
             Self::Done => write!(f, "Done"),
             Self::Error(e) => write!(f, "Error({e:?})"),
             Self::Clarify {
@@ -1100,7 +1246,11 @@ impl AgentBuilder {
                 terminal_modal: config.terminal.modal.clone(),
                 terminal_daytona: config.terminal.daytona.clone(),
                 terminal_singularity: config.terminal.singularity.clone(),
+                compression: config.compression.clone(),
                 auxiliary: config.auxiliary.clone(),
+                tts: config.tts.clone(),
+                stt: config.stt.clone(),
+                image_generation: config.image_generation.clone(),
                 terminal_env_passthrough: config.terminal.env_passthrough.clone(),
                 file_allowed_roots: config.tools.file.allowed_roots.clone(),
                 path_restrictions: config.security.path_restrictions.clone(),
@@ -1683,5 +1833,73 @@ mod tests {
 
         agent.set_personality_addon(None).await;
         assert!(agent.system_prompt().await.is_none());
+    }
+
+    #[test]
+    fn session_snapshot_prompt_tokens_include_cache_buckets() {
+        let snap = SessionSnapshot {
+            session_id: None,
+            model: "mock/model".into(),
+            message_count: 0,
+            user_turn_count: 0,
+            api_call_count: 0,
+            input_tokens: 3,
+            output_tokens: 10,
+            cache_read_tokens: 15_000,
+            cache_write_tokens: 2_000,
+            reasoning_tokens: 7,
+            last_prompt_tokens: 1_234,
+            budget_remaining: 0,
+            budget_max: 0,
+        };
+
+        assert_eq!(snap.prompt_tokens(), 17_003);
+        assert_eq!(snap.total_tokens(), 17_020);
+        assert_eq!(snap.context_pressure_tokens(), 1_234);
+    }
+
+    #[tokio::test]
+    async fn restore_session_reuses_persisted_system_prompt() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(SessionDb::open(&tmp.path().join("sessions.db")).expect("db"));
+        let provider: Arc<dyn LLMProvider> = Arc::new(edgequake_llm::MockProvider::new());
+        let session = edgecrab_state::SessionRecord {
+            id: "restore-me".into(),
+            source: "cli".into(),
+            user_id: None,
+            model: Some("mock/model".into()),
+            system_prompt: Some("Persisted system prompt".into()),
+            parent_session_id: None,
+            started_at: 1.0,
+            ended_at: Some(2.0),
+            end_reason: None,
+            message_count: 2,
+            tool_call_count: 0,
+            input_tokens: 10,
+            output_tokens: 4,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
+            estimated_cost_usd: None,
+            title: Some("restore".into()),
+        };
+        db.save_session(&session).expect("save session");
+        db.save_message("restore-me", &Message::user("hello"), 1.0)
+            .expect("save user");
+        db.save_message("restore-me", &Message::assistant("hi"), 2.0)
+            .expect("save assistant");
+
+        let agent = AgentBuilder::new("mock/model")
+            .provider(provider)
+            .state_db(db)
+            .build()
+            .expect("build agent");
+
+        let restored = agent.restore_session("restore-me").await.expect("restore");
+        assert_eq!(restored, 2);
+        assert_eq!(
+            agent.system_prompt().await.as_deref(),
+            Some("Persisted system prompt")
+        );
     }
 }

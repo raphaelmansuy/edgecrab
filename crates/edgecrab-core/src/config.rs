@@ -52,6 +52,7 @@ pub struct AppConfig {
     pub timezone: Option<String>,
     pub tts: TtsConfig,
     pub stt: SttConfig,
+    pub image_generation: ImageGenerationConfig,
     pub voice: VoiceConfig,
     pub honcho: HonchoConfig,
     pub auxiliary: AuxiliaryConfig,
@@ -1446,6 +1447,35 @@ impl Default for SttConfig {
     }
 }
 
+/// Image generation configuration.
+///
+/// Keeps the default image backend/model persistent in the same way `/model`
+/// persists the primary chat model and `/vision_model` persists the auxiliary
+/// vision override.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ImageGenerationConfig {
+    /// Preferred provider for `generate_image`.
+    ///
+    /// Supported values: `auto`, `gemini`, `vertexai`, `imagen`, `fal`,
+    /// `openai`.
+    pub provider: String,
+    /// Preferred provider-native image model.
+    ///
+    /// Default is the cheapest broadly useful Gemini image model exposed by
+    /// `edgequake-llm`.
+    pub model: String,
+}
+
+impl Default for ImageGenerationConfig {
+    fn default() -> Self {
+        Self {
+            provider: "gemini".into(),
+            model: "gemini-2.5-flash-image".into(),
+        }
+    }
+}
+
 /// Voice mode configuration.
 ///
 /// Controls push-to-talk, continuous mode, and hallucination filtering.
@@ -1456,6 +1486,11 @@ pub struct VoiceConfig {
     pub enabled: bool,
     /// Key binding for push-to-talk (default: Ctrl+B).
     pub push_to_talk_key: String,
+    /// Optional recorder input device override.
+    ///
+    /// For ffmpeg-based backends this is passed through as the raw device spec.
+    /// Windows microphone capture is only considered reliable when this is set.
+    pub input_device: Option<String>,
     /// Continuous listening mode (no key press required).
     pub continuous: bool,
     /// Filter hallucinated transcriptions.
@@ -1467,6 +1502,7 @@ impl Default for VoiceConfig {
         Self {
             enabled: false,
             push_to_talk_key: "ctrl+b".into(),
+            input_device: None,
             continuous: false,
             hallucination_filter: true,
         }

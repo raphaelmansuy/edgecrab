@@ -29,7 +29,7 @@
 //! - Input line highlighting (cyan for valid commands, red for invalid)
 //! - Fish-style ghost text from input history
 
-use std::io::{self, Write};
+use std::io::{self, BufRead, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -52,12 +52,15 @@ use tui_textarea::{CursorMove, TextArea};
 use unicode_width::UnicodeWidthStr;
 
 use crate::commands::{CommandRegistry, CommandResult};
+use crate::edit_diff::{LocalEditSnapshot, capture_local_edit_snapshot, render_edit_diff_lines};
 use crate::fuzzy_selector::{FuzzyItem, FuzzySelector};
+use crate::image_models as cli_image_models;
 use crate::markdown_render;
 use crate::model_discovery::{self, DiscoverySource};
 use crate::theme::{SkinConfig, Theme};
 use crate::tool_display::{
-    build_tool_done_line, build_tool_running_line, tool_action_verb, tool_icon, tool_status_preview,
+    build_subagent_event_line, build_tool_done_line, build_tool_running_line, tool_action_verb,
+    tool_icon, tool_status_preview,
 };
 use crate::vision_models::{
     available_vision_model_options_with_dynamic, canonical_provider, current_model_supports_vision,
@@ -65,7 +68,12 @@ use crate::vision_models::{
 };
 use edgecrab_core::ModelCatalog;
 use edgecrab_core::{Agent, IsolatedAgentOptions};
+use edgecrab_tools::registry::ToolHandler;
+use edgecrab_tools::tools::transcribe::TranscribeAudioTool;
+use edgecrab_tools::tools::tts::{TextToSpeechTool, sanitize_text_for_tts};
+use edgecrab_tools::{AppConfigRef, ToolContext};
 use edgequake_llm::{ProviderFactory, VsCodeCopilotProvider};
+use tokio_util::sync::CancellationToken;
 
 const KEYBOARD_PROTOCOL_WARMUP: Duration = Duration::from_millis(25);
 
@@ -74,6 +82,517 @@ fn progressive_keyboard_flags() -> KeyboardEnhancementFlags {
         | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
         | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
         | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+}
+
+fn format_context_pressure_notice(estimated_tokens: usize, threshold_tokens: usize) -> String {
+    let ratio = if threshold_tokens == 0 {
+        0.0
+    } else {
+        (estimated_tokens as f32 / threshold_tokens as f32).clamp(0.0, 1.0)
+    };
+    let percent = (ratio * 100.0).round() as usize;
+    let width = 16usize;
+    let filled = ((ratio * width as f32).round() as usize).min(width);
+    let bar = format!("{}{}", "▰".repeat(filled), "▱".repeat(width - filled));
+    format!(
+        "⚠ Context {bar} {percent}% to compression ({estimated_tokens}/{threshold_tokens} tokens)"
+    )
+}
+
+fn context_usage_ratio(tokens: u64, context_window: Option<u64>) -> Option<f64> {
+    context_window
+        .filter(|&cw| cw > 0)
+        .map(|cw| (tokens as f64 / cw as f64).clamp(0.0, 1.0))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AudioPlayerSpec {
+    program: &'static str,
+    args: &'static [&'static str],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AudioRecorderBackend {
+    FfmpegAvFoundation,
+    FfmpegDShow,
+    Arecord,
+    Rec,
+    FfmpegPulse,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VoiceRecordingStopMode {
+    Manual,
+    AutoSilence,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VoiceRecordingFinishReason {
+    ManualStop,
+    AutoSilence,
+    RecorderExited,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct VoiceRecordingProfile {
+    stop_mode: VoiceRecordingStopMode,
+    silence_threshold_db: f32,
+    silence_duration_ms: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct VoiceTranscriptMeta {
+    capture_duration_secs: f64,
+    continuous_session: bool,
+}
+
+const AUDIO_PLAYER_CANDIDATES: &[AudioPlayerSpec] = &[
+    AudioPlayerSpec {
+        program: "afplay",
+        args: &[],
+    },
+    AudioPlayerSpec {
+        program: "ffplay",
+        args: &["-nodisp", "-autoexit", "-loglevel", "error"],
+    },
+    AudioPlayerSpec {
+        program: "mpv",
+        args: &["--no-terminal", "--really-quiet"],
+    },
+    AudioPlayerSpec {
+        program: "paplay",
+        args: &[],
+    },
+    AudioPlayerSpec {
+        program: "aplay",
+        args: &[],
+    },
+    AudioPlayerSpec {
+        program: "play",
+        args: &["-q"],
+    },
+];
+
+fn describe_audio_recorder(backend: AudioRecorderBackend) -> &'static str {
+    match backend {
+        AudioRecorderBackend::FfmpegAvFoundation => "ffmpeg-avfoundation",
+        AudioRecorderBackend::FfmpegDShow => "ffmpeg-dshow",
+        AudioRecorderBackend::Arecord => "arecord",
+        AudioRecorderBackend::Rec => "rec",
+        AudioRecorderBackend::FfmpegPulse => "ffmpeg-pulse",
+    }
+}
+
+fn recorder_supports_auto_silence_stop(backend: AudioRecorderBackend) -> bool {
+    matches!(
+        backend,
+        AudioRecorderBackend::FfmpegAvFoundation
+            | AudioRecorderBackend::FfmpegPulse
+            | AudioRecorderBackend::Rec
+    )
+}
+
+fn recorder_auto_silence_support_message(backend: AudioRecorderBackend) -> &'static str {
+    match backend {
+        AudioRecorderBackend::FfmpegAvFoundation => "supported via ffmpeg silencedetect",
+        AudioRecorderBackend::FfmpegPulse => "supported via ffmpeg silencedetect",
+        AudioRecorderBackend::Rec => "supported via SoX silence effect",
+        AudioRecorderBackend::Arecord => {
+            "not supported by arecord alone; install `rec` or `ffmpeg` for hands-free continuous capture"
+        }
+        AudioRecorderBackend::FfmpegDShow => {
+            "not supported reliably on Windows ffmpeg dshow; use push-to-talk/manual stop"
+        }
+    }
+}
+
+fn format_silencedetect_threshold(threshold_db: f32) -> String {
+    let value = if threshold_db.is_finite() {
+        threshold_db
+    } else {
+        -40.0
+    };
+    format!("{value:.1}dB")
+}
+
+fn parse_ffmpeg_silence_start(line: &str) -> Option<f64> {
+    let idx = line.find("silence_start:")?;
+    let value = line[(idx + "silence_start:".len())..].trim();
+    value.parse::<f64>().ok()
+}
+
+fn line_mentions_ffmpeg_silence_end(line: &str) -> bool {
+    line.contains("silence_end:")
+}
+
+fn should_stop_ffmpeg_on_silence(
+    line: &str,
+    heard_speech: bool,
+    min_post_speech_secs: f64,
+) -> bool {
+    let Some(silence_start) = parse_ffmpeg_silence_start(line) else {
+        return false;
+    };
+    heard_speech || silence_start >= min_post_speech_secs
+}
+
+#[cfg(unix)]
+fn interrupt_process_id(pid: u32) -> bool {
+    if let Ok(pid) = i32::try_from(pid) {
+        // SIGINT lets ffmpeg/arecord finalize WAV headers before exit.
+        unsafe {
+            libc::kill(pid, libc::SIGINT);
+        }
+        return true;
+    }
+    false
+}
+
+#[cfg(not(unix))]
+fn interrupt_process_id(_pid: u32) -> bool {
+    false
+}
+
+fn spawn_ffmpeg_silence_monitor(pid: u32, stderr: std::process::ChildStderr) {
+    std::thread::spawn(move || {
+        let reader = io::BufReader::new(stderr);
+        let mut heard_speech = false;
+        for line in reader.lines() {
+            let Ok(line) = line else {
+                break;
+            };
+            if line_mentions_ffmpeg_silence_end(&line) {
+                heard_speech = true;
+                continue;
+            }
+            if should_stop_ffmpeg_on_silence(&line, heard_speech, 0.35) {
+                let _ = interrupt_process_id(pid);
+                break;
+            }
+        }
+    });
+}
+
+fn select_audio_player_with<F>(mut exists: F) -> Option<AudioPlayerSpec>
+where
+    F: FnMut(&str) -> bool,
+{
+    AUDIO_PLAYER_CANDIDATES
+        .iter()
+        .copied()
+        .find(|candidate| exists(candidate.program))
+}
+
+fn preferred_audio_player() -> Option<AudioPlayerSpec> {
+    select_audio_player_with(|program| which::which(program).is_ok())
+}
+
+fn select_audio_recorder_with<F>(mut exists: F) -> Option<AudioRecorderBackend>
+where
+    F: FnMut(&str) -> bool,
+{
+    if cfg!(target_os = "macos") && exists("ffmpeg") {
+        return Some(AudioRecorderBackend::FfmpegAvFoundation);
+    }
+    if cfg!(target_os = "windows") && exists("ffmpeg") {
+        return Some(AudioRecorderBackend::FfmpegDShow);
+    }
+    if exists("arecord") {
+        return Some(AudioRecorderBackend::Arecord);
+    }
+    if exists("rec") {
+        return Some(AudioRecorderBackend::Rec);
+    }
+    if exists("ffmpeg") {
+        return Some(AudioRecorderBackend::FfmpegPulse);
+    }
+    None
+}
+
+fn preferred_audio_recorder() -> Option<AudioRecorderBackend> {
+    select_audio_recorder_with(|program| which::which(program).is_ok())
+}
+
+fn voice_recording_ready(
+    input_device: Option<&str>,
+    stop_mode: VoiceRecordingStopMode,
+) -> Result<AudioRecorderBackend, String> {
+    if !TranscribeAudioTool.is_available() {
+        return Err(
+            "No speech-to-text backend available. Install local `whisper`, or configure `GROQ_API_KEY` / `OPENAI_API_KEY`."
+                .into(),
+        );
+    }
+
+    let backend = preferred_audio_recorder().ok_or_else(|| {
+        String::from(
+            "No supported microphone recorder found. Install one of: `ffmpeg`, `arecord`, or `rec`.",
+        )
+    })?;
+    if matches!(backend, AudioRecorderBackend::FfmpegDShow) && input_device.is_none() {
+        return Err(
+            "Windows microphone capture requires `voice.input_device` in config.yaml (ffmpeg dshow device name)."
+                .into(),
+        );
+    }
+    if matches!(stop_mode, VoiceRecordingStopMode::AutoSilence)
+        && !recorder_supports_auto_silence_stop(backend)
+    {
+        return Err(format!(
+            "Continuous voice capture is unavailable with {}: {}.",
+            describe_audio_recorder(backend),
+            recorder_auto_silence_support_message(backend)
+        ));
+    }
+    Ok(backend)
+}
+
+fn spawn_audio_recorder(
+    path: &std::path::Path,
+    input_device: Option<&str>,
+    profile: VoiceRecordingProfile,
+) -> anyhow::Result<(std::process::Child, AudioRecorderBackend)> {
+    let backend =
+        preferred_audio_recorder().ok_or_else(|| anyhow::anyhow!("no supported recorder found"))?;
+    let mut command = match backend {
+        AudioRecorderBackend::FfmpegAvFoundation => {
+            let mut command = std::process::Command::new("ffmpeg");
+            command.args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "avfoundation",
+                "-i",
+                input_device.unwrap_or(":default"),
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-y",
+            ]);
+            if matches!(profile.stop_mode, VoiceRecordingStopMode::AutoSilence) {
+                command.args([
+                    "-af",
+                    &format!(
+                        "silencedetect=n={}:d={:.2}",
+                        format_silencedetect_threshold(profile.silence_threshold_db),
+                        profile.silence_duration_ms as f64 / 1000.0
+                    ),
+                ]);
+            }
+            command
+        }
+        AudioRecorderBackend::FfmpegDShow => {
+            let mut command = std::process::Command::new("ffmpeg");
+            command.args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "dshow",
+                "-i",
+                input_device.unwrap_or("audio=default"),
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-y",
+            ]);
+            command
+        }
+        AudioRecorderBackend::Arecord => {
+            let mut command = std::process::Command::new("arecord");
+            command.args(["-q", "-f", "S16_LE", "-r", "16000", "-c", "1"]);
+            command
+        }
+        AudioRecorderBackend::Rec => {
+            let mut command = std::process::Command::new("rec");
+            command.args(["-q", "-c", "1", "-r", "16000"]);
+            if matches!(profile.stop_mode, VoiceRecordingStopMode::AutoSilence) {
+                let threshold = format!("{:.1}d", profile.silence_threshold_db);
+                let duration = format!("{:.2}", profile.silence_duration_ms as f64 / 1000.0);
+                command.arg("silence");
+                command.arg("1");
+                command.arg("0.10");
+                command.arg(&threshold);
+                command.arg("1");
+                command.arg(&duration);
+                command.arg(&threshold);
+            }
+            command
+        }
+        AudioRecorderBackend::FfmpegPulse => {
+            let mut command = std::process::Command::new("ffmpeg");
+            command.args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "pulse",
+                "-i",
+                "default",
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-y",
+            ]);
+            if matches!(profile.stop_mode, VoiceRecordingStopMode::AutoSilence) {
+                command.args([
+                    "-af",
+                    &format!(
+                        "silencedetect=n={}:d={:.2}",
+                        format_silencedetect_threshold(profile.silence_threshold_db),
+                        profile.silence_duration_ms as f64 / 1000.0
+                    ),
+                ]);
+            }
+            command
+        }
+    };
+    command.arg(path);
+    command.stdin(std::process::Stdio::null());
+    command.stdout(std::process::Stdio::null());
+    let use_ffmpeg_monitor = matches!(
+        (backend, profile.stop_mode),
+        (
+            AudioRecorderBackend::FfmpegAvFoundation | AudioRecorderBackend::FfmpegPulse,
+            VoiceRecordingStopMode::AutoSilence
+        )
+    );
+    command.stderr(if use_ffmpeg_monitor {
+        std::process::Stdio::piped()
+    } else {
+        std::process::Stdio::null()
+    });
+    let mut child = command.spawn()?;
+    if use_ffmpeg_monitor {
+        if let Some(stderr) = child.stderr.take() {
+            spawn_ffmpeg_silence_monitor(child.id(), stderr);
+        }
+    }
+    Ok((child, backend))
+}
+
+fn stop_audio_recorder(child: &mut std::process::Child) -> anyhow::Result<()> {
+    if interrupt_process_id(child.id()) {
+        for _ in 0..20 {
+            if child.try_wait()?.is_some() {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    if child.try_wait()?.is_none() {
+        child.kill()?;
+        let _ = child.wait()?;
+    }
+    Ok(())
+}
+
+fn terminal_bell(count: usize) {
+    let mut stdout = io::stdout();
+    for _ in 0..count {
+        let _ = stdout.write_all(b"\x07");
+    }
+    let _ = stdout.flush();
+}
+
+fn normalize_voice_transcript(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn is_probable_voice_hallucination(text: &str, capture_duration_secs: f64) -> bool {
+    if capture_duration_secs > 1.75 {
+        return false;
+    }
+    let normalized = normalize_voice_transcript(text).to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "thank you"
+            | "thanks for watching"
+            | "thanks for watching."
+            | "thank you for watching"
+            | "thank you for watching."
+            | "you"
+            | "music"
+            | "[music]"
+            | "(music)"
+    )
+}
+
+fn key_matches_binding(key: &event::KeyEvent, binding: &str) -> bool {
+    let normalized = binding.trim().to_ascii_lowercase().replace(' ', "");
+    if normalized.is_empty() {
+        return false;
+    }
+
+    let parts: Vec<&str> = normalized
+        .split('+')
+        .filter(|part| !part.is_empty())
+        .collect();
+    if parts.is_empty() {
+        return false;
+    }
+
+    let mut expected_modifiers = KeyModifiers::NONE;
+    for modifier in &parts[..parts.len().saturating_sub(1)] {
+        match *modifier {
+            "ctrl" | "control" => expected_modifiers |= KeyModifiers::CONTROL,
+            "alt" | "option" => expected_modifiers |= KeyModifiers::ALT,
+            "shift" => expected_modifiers |= KeyModifiers::SHIFT,
+            _ => return false,
+        }
+    }
+
+    let code_matches = match parts[parts.len() - 1] {
+        "enter" | "return" => key.code == KeyCode::Enter,
+        "esc" | "escape" => key.code == KeyCode::Esc,
+        "tab" => key.code == KeyCode::Tab,
+        "backspace" => key.code == KeyCode::Backspace,
+        "space" => key.code == KeyCode::Char(' '),
+        token if token.starts_with('f') => token[1..]
+            .parse::<u8>()
+            .ok()
+            .is_some_and(|function| key.code == KeyCode::F(function)),
+        token if token.len() == 1 => {
+            let expected = token.chars().next().unwrap_or_default();
+            matches!(key.code, KeyCode::Char(actual) if actual.to_ascii_lowercase() == expected)
+        }
+        _ => false,
+    };
+
+    code_matches && key.modifiers == expected_modifiers
+}
+
+fn voice_readback_ready() -> Result<AudioPlayerSpec, String> {
+    if !TextToSpeechTool.is_available() {
+        return Err(
+            "No TTS backend available. Install `edge-tts`, set `OPENAI_API_KEY`, or configure ElevenLabs credentials."
+                .into(),
+        );
+    }
+
+    preferred_audio_player().ok_or_else(|| {
+        "No supported local audio player found. Install one of: `afplay`, `ffplay`, `mpv`, `paplay`, `aplay`, or `play`."
+            .into()
+    })
+}
+
+async fn play_audio_file(path: &std::path::Path) -> anyhow::Result<&'static str> {
+    let player = preferred_audio_player()
+        .ok_or_else(|| anyhow::anyhow!("no supported local audio player found"))?;
+    let status = tokio::process::Command::new(player.program)
+        .args(player.args)
+        .arg(path)
+        .status()
+        .await?;
+    if !status.success() {
+        anyhow::bail!("{} exited with status {}", player.program, status);
+    }
+    Ok(player.program)
 }
 
 /// Recursively copy a directory tree from `src` to `dst`.
@@ -242,6 +761,25 @@ fn write_config_root(config_path: &std::path::Path, root: &serde_yml::Value) -> 
     Ok(())
 }
 
+fn update_voice_config_in_config_root<F>(mutator: F) -> anyhow::Result<()>
+where
+    F: FnOnce(&mut serde_yml::Mapping),
+{
+    let (config_path, mut root) = load_config_root_for_edit()?;
+
+    if let serde_yml::Value::Mapping(ref mut map) = root {
+        let voice_key = serde_yml::Value::String("voice".into());
+        let voice_section = map
+            .entry(voice_key)
+            .or_insert_with(|| serde_yml::Value::Mapping(Default::default()));
+        if let serde_yml::Value::Mapping(voice_map) = voice_section {
+            mutator(voice_map);
+        }
+    }
+
+    write_config_root(&config_path, &root)
+}
+
 /// Persist the user's model choice to ~/.edgecrab/config.yaml.
 fn persist_model_to_config(model: &str) -> anyhow::Result<()> {
     let (config_path, mut root) = load_config_root_for_edit()?;
@@ -341,6 +879,75 @@ fn persist_vision_model_to_config(
     write_config_root(&config_path, &root)
 }
 
+/// Persist the default image-generation routing to ~/.edgecrab/config.yaml.
+fn persist_image_generation_to_config(
+    image_generation: &edgecrab_core::config::ImageGenerationConfig,
+) -> anyhow::Result<()> {
+    let (config_path, mut root) = load_config_root_for_edit()?;
+
+    if let serde_yml::Value::Mapping(ref mut map) = root {
+        let section_key = serde_yml::Value::String("image_generation".into());
+        let provider_key = serde_yml::Value::String("provider".into());
+        let model_key = serde_yml::Value::String("model".into());
+
+        let section = map
+            .entry(section_key)
+            .or_insert_with(|| serde_yml::Value::Mapping(Default::default()));
+        if let serde_yml::Value::Mapping(image_map) = section {
+            image_map.insert(
+                provider_key,
+                serde_yml::Value::String(image_generation.provider.clone()),
+            );
+            image_map.insert(
+                model_key,
+                serde_yml::Value::String(image_generation.model.clone()),
+            );
+        }
+    }
+
+    write_config_root(&config_path, &root)
+}
+
+/// Persist the CLI voice-mode default to ~/.edgecrab/config.yaml.
+fn persist_voice_enabled_to_config(enabled: bool) -> anyhow::Result<()> {
+    update_voice_config_in_config_root(|voice_map| {
+        let enabled_key = serde_yml::Value::String("enabled".into());
+        voice_map.insert(enabled_key, serde_yml::Value::Bool(enabled));
+    })
+}
+
+fn persist_voice_preferences_to_config(
+    continuous: Option<bool>,
+    hallucination_filter: Option<bool>,
+    input_device: Option<Option<&str>>,
+) -> anyhow::Result<()> {
+    update_voice_config_in_config_root(|voice_map| {
+        if let Some(continuous) = continuous {
+            voice_map.insert(
+                serde_yml::Value::String("continuous".into()),
+                serde_yml::Value::Bool(continuous),
+            );
+        }
+        if let Some(enabled) = hallucination_filter {
+            voice_map.insert(
+                serde_yml::Value::String("hallucination_filter".into()),
+                serde_yml::Value::Bool(enabled),
+            );
+        }
+        if let Some(input_device) = input_device {
+            let input_key = serde_yml::Value::String("input_device".into());
+            if let Some(input_device) = input_device.filter(|value| !value.trim().is_empty()) {
+                voice_map.insert(
+                    input_key,
+                    serde_yml::Value::String(input_device.to_string()),
+                );
+            } else {
+                voice_map.remove(&input_key);
+            }
+        }
+    })
+}
+
 #[derive(Debug, Clone, Copy)]
 struct DisplayPreferences {
     show_reasoning: bool,
@@ -366,6 +973,12 @@ fn load_display_preferences() -> DisplayPreferences {
         .unwrap_or_default()
 }
 
+fn load_voice_mode_enabled() -> bool {
+    edgecrab_core::AppConfig::load()
+        .map(|cfg| cfg.voice.enabled)
+        .unwrap_or(false)
+}
+
 /// Persist display preferences to `config.yaml`.
 fn persist_display_preferences(
     show_reasoning: Option<bool>,
@@ -385,6 +998,9 @@ fn persist_display_preferences(
 
 // ─── Spinner frames (braille rotation) ──────────────────────────────
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const VOICE_LISTEN_FRAMES: &[&str] = &[".  ", ".. ", "...", " ..", "  .", "   "];
+const VOICE_RECORD_FRAMES: &[&str] = &["*  ", "** ", "***", " **", "  *", "   "];
+const VOICE_PLAYBACK_FRAMES: &[&str] = &[">  ", ">> ", ">>>", " >>", "  >", "   "];
 
 /// Fixed display-column width for the thinking verb in the status bar.
 /// Padding to this width prevents horizontal jitter as words rotate during animation.
@@ -431,6 +1047,130 @@ fn unicode_pad_right(s: &str, target_display_cols: usize) -> String {
         return s.to_string();
     }
     format!("{}{}", s, " ".repeat(target_display_cols - w))
+}
+
+fn phase_face(faces: &[String], idx: usize) -> &str {
+    if faces.is_empty() {
+        ""
+    } else {
+        faces[idx % faces.len()].as_str()
+    }
+}
+
+fn phase_wings(wings: &[[String; 2]], idx: usize) -> (&str, &str) {
+    if wings.is_empty() {
+        ("", "")
+    } else {
+        let wing = &wings[idx % wings.len()];
+        (wing[0].as_str(), wing[1].as_str())
+    }
+}
+
+fn format_phase_status(
+    spinner: &str,
+    verb: &str,
+    face: &str,
+    wings: (&str, &str),
+    elapsed_secs: u64,
+    early_label: &str,
+    long_label: &str,
+) -> String {
+    let verb_padded = unicode_pad_right(verb, VERB_DISPLAY_PAD);
+    let core = if face.is_empty() {
+        format!("{spinner} {verb_padded}")
+    } else {
+        format!("{spinner} {face} {verb_padded}")
+    };
+    let (left_wing, right_wing) = wings;
+    if elapsed_secs > 10 {
+        format!("{left_wing}{core} {long_label} {elapsed_secs}s  ^C=stop{right_wing}")
+    } else if elapsed_secs > 3 {
+        format!("{left_wing}{core} {long_label} {elapsed_secs}s{right_wing}")
+    } else if elapsed_secs > 1 {
+        format!("{left_wing}{core} {early_label}{right_wing}")
+    } else {
+        format!("{left_wing}{core}{right_wing}")
+    }
+}
+
+fn format_waiting_first_token_status(
+    theme: &Theme,
+    frame_idx: usize,
+    verb_idx: usize,
+    face_idx: usize,
+    elapsed_secs: u64,
+) -> String {
+    let spinner = SPINNER_FRAMES[frame_idx % SPINNER_FRAMES.len()];
+    let verb = if theme.waiting_verbs.is_empty() {
+        "awaiting"
+    } else {
+        &theme.waiting_verbs[verb_idx % theme.waiting_verbs.len()]
+    };
+    let face = phase_face(&theme.kaomoji_waiting, face_idx);
+    let wings = phase_wings(&theme.spinner_wings, face_idx);
+    format_phase_status(
+        spinner,
+        verb,
+        face,
+        wings,
+        elapsed_secs,
+        "first token",
+        "waiting for first token",
+    )
+}
+
+fn format_thinking_status(
+    theme: &Theme,
+    frame_idx: usize,
+    verb_idx: usize,
+    face_idx: usize,
+    elapsed_secs: u64,
+) -> String {
+    let spinner = SPINNER_FRAMES[frame_idx % SPINNER_FRAMES.len()];
+    let verb = if theme.thinking_verbs.is_empty() {
+        "thinking"
+    } else {
+        &theme.thinking_verbs[verb_idx % theme.thinking_verbs.len()]
+    };
+    let face = phase_face(&theme.kaomoji_thinking, face_idx);
+    let wings = phase_wings(&theme.spinner_wings, face_idx);
+    format_phase_status(
+        spinner,
+        verb,
+        face,
+        wings,
+        elapsed_secs,
+        "thinking",
+        "thinking",
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VoicePresenceState {
+    Recording { elapsed_secs: u64, continuous: bool },
+    Speaking,
+    Listening,
+}
+
+fn format_voice_presence_badge(state: VoicePresenceState, frame_idx: usize) -> String {
+    match state {
+        VoicePresenceState::Recording {
+            elapsed_secs,
+            continuous,
+        } => {
+            let meter = VOICE_RECORD_FRAMES[frame_idx % VOICE_RECORD_FRAMES.len()];
+            let label = if continuous { "TALK" } else { "REC" };
+            format!(" {label} {meter} {elapsed_secs}s ")
+        }
+        VoicePresenceState::Speaking => {
+            let meter = VOICE_PLAYBACK_FRAMES[frame_idx % VOICE_PLAYBACK_FRAMES.len()];
+            format!(" SPEAK {meter} ")
+        }
+        VoicePresenceState::Listening => {
+            let meter = VOICE_LISTEN_FRAMES[frame_idx % VOICE_LISTEN_FRAMES.len()];
+            format!(" LISTEN {meter} ")
+        }
+    }
 }
 
 /// Truncate `s` to at most `max_cols` display columns (unicode-safe).
@@ -505,6 +1245,10 @@ pub enum OutputRole {
 #[derive(Clone)]
 enum DisplayState {
     Idle,
+    AwaitingFirstToken {
+        frame: usize,
+        started: Instant,
+    },
     Thinking {
         frame: usize,
         started: Instant,
@@ -698,6 +1442,236 @@ impl FuzzyItem for SkillEntry {
     }
 }
 
+/// A single MCP preset entry for the MCP browser overlay.
+#[derive(Clone)]
+struct McpPresetEntry {
+    id: String,
+    kind: McpEntryKind,
+    install_preset_id: Option<String>,
+    title: String,
+    source: String,
+    action_label: String,
+    detail: String,
+    search_text: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum McpEntryKind {
+    CatalogEntry,
+    ConfiguredServer,
+}
+
+impl FuzzyItem for McpPresetEntry {
+    fn primary(&self) -> &str {
+        &self.title
+    }
+    fn secondary(&self) -> &str {
+        &self.search_text
+    }
+    fn tag(&self) -> &str {
+        &self.source
+    }
+}
+
+impl McpPresetEntry {
+    fn default_command(&self) -> String {
+        match self.kind {
+            McpEntryKind::CatalogEntry => {
+                if self.action_label == "install" {
+                    self.install_command()
+                        .unwrap_or_else(|| self.view_command())
+                } else {
+                    self.view_command()
+                }
+            }
+            McpEntryKind::ConfiguredServer => self.test_command(),
+        }
+    }
+
+    fn install_command(&self) -> Option<String> {
+        self.install_preset_id
+            .as_deref()
+            .map(|preset_id| format!("install {preset_id}"))
+    }
+
+    fn test_command(&self) -> String {
+        format!("test {}", self.id)
+    }
+
+    fn view_command(&self) -> String {
+        format!("view {}", self.id)
+    }
+
+    fn remove_command(&self) -> Option<String> {
+        (self.kind == McpEntryKind::ConfiguredServer).then(|| format!("remove {}", self.id))
+    }
+}
+
+fn mcp_catalog_source_label(entry: &crate::mcp_catalog::OfficialCatalogEntry) -> &'static str {
+    if entry.tags.iter().any(|tag| tag == "archived") {
+        return "official-arch";
+    }
+    if entry.tags.iter().any(|tag| tag == "integration") {
+        return "official-app";
+    }
+    "official-ref"
+}
+
+fn format_mcp_transport(server: &edgecrab_tools::tools::mcp_client::ConfiguredMcpServer) -> String {
+    if let Some(url) = &server.url {
+        return format!("http {url}");
+    }
+
+    let mut rendered = server.command.clone();
+    if !server.args.is_empty() {
+        rendered.push(' ');
+        rendered.push_str(&server.args.join(" "));
+    }
+    rendered
+}
+
+fn build_configured_mcp_entry(
+    server: &edgecrab_tools::tools::mcp_client::ConfiguredMcpServer,
+) -> McpPresetEntry {
+    let transport = format_mcp_transport(server);
+    let mut detail = format!("{} | installed", transport);
+    if server.token_from_store {
+        detail.push_str(" | token-store");
+    } else if server.token_from_config {
+        detail.push_str(" | config-token");
+    }
+    if let Some(path) = &server.cwd {
+        detail.push_str(&format!(" | cwd={}", path.display()));
+    }
+    let search_text = format!(
+        "{} {} {} {} {} {} {}",
+        server.name,
+        transport,
+        server
+            .cwd
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default(),
+        server.include.join(" "),
+        server.exclude.join(" "),
+        if server.token_from_store {
+            "token store"
+        } else if server.token_from_config {
+            "config token"
+        } else {
+            ""
+        },
+        detail
+    );
+    McpPresetEntry {
+        id: server.name.clone(),
+        kind: McpEntryKind::ConfiguredServer,
+        install_preset_id: None,
+        title: server.name.clone(),
+        source: "configured".into(),
+        action_label: "test".into(),
+        detail,
+        search_text,
+    }
+}
+
+fn build_catalog_mcp_entry(
+    entry: &crate::mcp_catalog::OfficialCatalogEntry,
+    configured_names: &std::collections::HashSet<&str>,
+) -> McpPresetEntry {
+    let preset = entry
+        .installable_preset_id
+        .as_deref()
+        .and_then(crate::mcp_catalog::find_preset);
+    let install_state = if entry
+        .installable_preset_id
+        .as_deref()
+        .is_some_and(|preset_id| configured_names.contains(preset_id))
+    {
+        "already-installed"
+    } else if entry.installable_preset_id.is_some() {
+        "ready-to-install"
+    } else {
+        "catalog-only"
+    };
+    let action_label = if install_state == "ready-to-install" {
+        "install".to_string()
+    } else {
+        "view".to_string()
+    };
+    let detail = match preset {
+        Some(preset) if !preset.required_env.is_empty() => format!(
+            "{} | {} | pkg={} | env={} | {}",
+            entry.description,
+            install_state,
+            preset.package_name,
+            preset.required_env.join(","),
+            entry.source_url
+        ),
+        Some(preset) => format!(
+            "{} | {} | pkg={} | {}",
+            entry.description, install_state, preset.package_name, entry.source_url
+        ),
+        None => format!(
+            "{} | {} | {}",
+            entry.description, install_state, entry.source_url
+        ),
+    };
+    let search_text = format!(
+        "{} {} {} {} {} {} {} {} {}",
+        entry.id,
+        entry.display_name,
+        entry.description,
+        entry.source_url,
+        entry.homepage,
+        entry.tags.join(" "),
+        preset.map(|preset| preset.package_name).unwrap_or_default(),
+        preset.map(|preset| preset.command).unwrap_or_default(),
+        preset
+            .map(|preset| preset.required_env.join(" "))
+            .unwrap_or_default()
+    );
+    McpPresetEntry {
+        id: entry.id.clone(),
+        kind: McpEntryKind::CatalogEntry,
+        install_preset_id: entry.installable_preset_id.clone(),
+        title: format!("{}  {}", entry.id, entry.display_name),
+        source: mcp_catalog_source_label(entry).into(),
+        action_label,
+        detail,
+        search_text,
+    }
+}
+
+fn build_mcp_selector_entries_from(
+    configured: &[edgecrab_tools::tools::mcp_client::ConfiguredMcpServer],
+    official_entries: &[crate::mcp_catalog::OfficialCatalogEntry],
+) -> Vec<McpPresetEntry> {
+    let configured_names: std::collections::HashSet<&str> = configured
+        .iter()
+        .map(|server| server.name.as_str())
+        .collect();
+
+    let mut configured_entries: Vec<McpPresetEntry> =
+        configured.iter().map(build_configured_mcp_entry).collect();
+    configured_entries.sort_by(|left, right| left.title.cmp(&right.title));
+
+    let mut catalog_entries: Vec<McpPresetEntry> = official_entries
+        .iter()
+        .map(|entry| build_catalog_mcp_entry(entry, &configured_names))
+        .collect();
+    catalog_entries.sort_by(|left, right| {
+        left.source
+            .cmp(&right.source)
+            .then_with(|| left.title.cmp(&right.title))
+    });
+
+    let mut entries = configured_entries;
+    entries.extend(catalog_entries);
+
+    entries
+}
+
 /// A single entry for the session browser overlay.
 /// Wraps [`edgecrab_state::SessionSummary`] with pre-formatted strings so that
 /// `FuzzyItem` filtering works without re-formatting on every keystroke.
@@ -819,6 +1793,10 @@ pub struct App {
     /// `12.4k / 200k (9%)` watermark in the status bar so the user can see
     /// context pressure at a glance. `None` when the model is not in the catalog.
     context_window: Option<u64>,
+    /// Current prompt-pressure tokens shown in the status bar.
+    ///
+    /// This tracks the latest prompt sent to the model rather than cumulative
+    /// session spend, so the indicator reflects current context pressure.
     total_tokens: u64,
     session_cost: f64,
     /// Agent for LLM dispatch
@@ -831,6 +1809,12 @@ pub struct App {
     response_tx: mpsc::UnboundedSender<AgentResponse>,
     /// Monotonic counter for isolated `/background` sessions in this TUI run.
     background_task_seq: u64,
+    /// Monotonic sequence for live progress updates rendered in the UI.
+    progress_seq: u64,
+    /// Active isolated `/background` sessions keyed by task ID.
+    background_tasks_active: std::collections::HashMap<String, BackgroundTaskStatus>,
+    /// Active delegated child tasks for the foreground agent turn.
+    active_subagents: std::collections::HashMap<usize, ActiveSubagentStatus>,
     /// Channel for cron job completion notifications from the background ticker.
     /// The background cron task sends formatted strings; the TUI drains them in
     /// `check_responses()` and displays them as assistant-style output lines.
@@ -870,6 +1854,10 @@ pub struct App {
     model_selector: FuzzySelector<ModelEntry>,
     /// Vision-model selector overlay (activated by `/vision_model`)
     vision_model_selector: FuzzySelector<ModelEntry>,
+    /// Image-model selector overlay (activated by `/image_model`)
+    image_model_selector: FuzzySelector<ModelEntry>,
+    /// Official MCP preset selector overlay (activated by `/mcp` with no args).
+    mcp_selector: FuzzySelector<McpPresetEntry>,
     /// Skill browser overlay (activated by `/skills` with no args)
     skill_selector: FuzzySelector<SkillEntry>,
     /// Session browser overlay (activated by F5 or `/session` with no args)
@@ -962,16 +1950,54 @@ pub struct App {
     /// styled duration/result, so the placeholder is replaced without a
     /// disruptive layout shift.  FIFO order matches tool-dispatch ordering and
     /// handles sequential multi-tool turns without any per-tool book-keeping.
-    pending_tool_line_idxs: std::collections::VecDeque<usize>,
+    pending_tool_lines: std::collections::VecDeque<PendingToolLine>,
+    /// Active local microphone recording session for push-to-talk voice input.
+    voice_recording: Option<VoiceRecordingSession>,
+    /// Configured push-to-talk key binding loaded from config.yaml.
+    voice_push_to_talk_key: String,
+    /// Optional recorder input-device override for cross-platform microphone capture.
+    voice_input_device: Option<String>,
+    /// Persisted default for hands-free continuous voice capture.
+    voice_continuous_default: bool,
+    /// Current continuous voice loop state for this session.
+    voice_continuous_active: bool,
+    /// Conservative filter for short, known-bad STT hallucinations.
+    voice_hallucination_filter: bool,
+    /// Consecutive empty/hallucinated voice captures in the current continuous loop.
+    voice_no_speech_count: u8,
+    /// True while audio is being spoken back locally.
+    voice_playback_active: bool,
+    /// Animation cursor for microphone / listening / speaking presence badges.
+    voice_presence_frame_idx: usize,
     /// File-based hook registry — loaded from ~/.edgecrab/hooks/ at startup.
     /// Receives tool:pre/post, llm:pre/post, and cli:start/end events.
     hook_registry: std::sync::Arc<edgecrab_gateway::hooks::HookRegistry>,
+}
+
+#[derive(Debug)]
+struct PendingToolLine {
+    line_idx: usize,
+    edit_snapshot: Option<LocalEditSnapshot>,
+}
+
+struct VoiceRecordingSession {
+    child: std::process::Child,
+    output_path: std::path::PathBuf,
+    submit_to_agent: bool,
+    backend: AudioRecorderBackend,
+    started_at: Instant,
+    profile: VoiceRecordingProfile,
+    continuous_session: bool,
 }
 
 /// Events from the agent background task → TUI event loop.
 enum AgentResponse {
     /// A partial streamed token — append to current streaming line.
     Token(String),
+    /// A non-token runtime notice to show as a system line.
+    Notice(String),
+    /// Deterministic direct-tool output from the TUI (for voice commands).
+    DirectToolOutput(String),
     /// A reasoning / think-mode delta or full reasoning block.
     Reasoning(String),
     /// A tool execution has started — show tool name + preview in status bar.
@@ -980,8 +2006,34 @@ enum AgentResponse {
     ToolDone {
         name: String,
         args_json: String,
+        result_preview: Option<String>,
         duration_ms: u64,
         is_error: bool,
+    },
+    SubAgentStart {
+        task_index: usize,
+        task_count: usize,
+        goal: String,
+    },
+    SubAgentReasoning {
+        task_index: usize,
+        task_count: usize,
+        text: String,
+    },
+    SubAgentToolExec {
+        task_index: usize,
+        task_count: usize,
+        name: String,
+        args_json: String,
+    },
+    SubAgentFinish {
+        task_index: usize,
+        task_count: usize,
+        status: String,
+        duration_ms: u64,
+        summary: String,
+        api_calls: u32,
+        model: Option<String>,
     },
     /// Streaming complete — mark processing done.
     Done,
@@ -1009,6 +2061,19 @@ enum AgentResponse {
     },
     /// A background operation (model discovery, compress, swap) completed.
     BgOp(BackgroundOpResult),
+    /// A completed local voice transcription, optionally submitted as a prompt.
+    VoiceTranscript {
+        transcript: String,
+        submit_to_agent: bool,
+        meta: Option<VoiceTranscriptMeta>,
+    },
+    /// A local microphone capture failed after recording completed.
+    VoiceCaptureFailed {
+        error: String,
+        continuous_session: bool,
+    },
+    /// Local voice playback finished, so continuous capture can safely resume.
+    VoicePlaybackFinished,
     /// An isolated `/background` session finished successfully.
     BackgroundPromptComplete {
         task_num: u64,
@@ -1016,12 +2081,114 @@ enum AgentResponse {
         prompt_preview: String,
         response: String,
     },
+    /// A background session reported progress.
+    BackgroundPromptProgress { task_id: String, text: String },
     /// An isolated `/background` session failed.
     BackgroundPromptFailed {
         task_num: u64,
         task_id: String,
         error: String,
     },
+}
+
+#[derive(Clone, Debug)]
+struct BackgroundTaskStatus {
+    preview: String,
+    last_progress: Option<String>,
+    last_seq: u64,
+}
+
+#[derive(Clone, Debug)]
+struct ActiveSubagentStatus {
+    task_index: usize,
+    task_count: usize,
+    goal: String,
+    last_detail: Option<String>,
+    last_seq: u64,
+}
+
+fn background_progress_text(task_num: u64, event: &edgecrab_core::StreamEvent) -> Option<String> {
+    match event {
+        edgecrab_core::StreamEvent::ToolExec { name, args_json } => Some(format!(
+            "↳ bg#{task_num} {}",
+            tool_status_preview(name, args_json)
+        )),
+        edgecrab_core::StreamEvent::SubAgentStart {
+            task_index,
+            task_count,
+            goal,
+        } => Some(format!(
+            "↳ bg#{task_num} [{}/{}] delegate: {}",
+            task_index + 1,
+            task_count,
+            edgecrab_core::safe_truncate(goal, 72)
+        )),
+        edgecrab_core::StreamEvent::SubAgentReasoning {
+            task_index,
+            task_count,
+            text,
+        } => Some(format!(
+            "↳ bg#{task_num} [{}/{}] thinking: {}",
+            task_index + 1,
+            task_count,
+            edgecrab_core::safe_truncate(text.trim(), 72)
+        )),
+        edgecrab_core::StreamEvent::SubAgentToolExec {
+            task_index,
+            task_count,
+            name,
+            args_json,
+        } => Some(format!(
+            "↳ bg#{task_num} [{}/{}] {}",
+            task_index + 1,
+            task_count,
+            tool_status_preview(name, args_json)
+        )),
+        edgecrab_core::StreamEvent::SubAgentFinish {
+            task_index,
+            task_count,
+            status,
+            duration_ms,
+            ..
+        } => Some(format!(
+            "↳ bg#{task_num} [{}/{}] {} in {:.1}s",
+            task_index + 1,
+            task_count,
+            status,
+            *duration_ms as f64 / 1000.0
+        )),
+        _ => None,
+    }
+}
+
+fn format_background_status_summary(
+    active: &std::collections::HashMap<String, BackgroundTaskStatus>,
+) -> Option<String> {
+    let current = active.values().max_by_key(|status| status.last_seq)?;
+    let detail = current
+        .last_progress
+        .as_deref()
+        .filter(|text| !text.trim().is_empty())
+        .unwrap_or(&current.preview);
+    Some(edgecrab_core::safe_truncate(detail, 58).to_string())
+}
+
+fn format_subagent_status_summary(
+    active: &std::collections::HashMap<usize, ActiveSubagentStatus>,
+) -> Option<String> {
+    let current = active.values().max_by_key(|status| status.last_seq)?;
+    let detail = current
+        .last_detail
+        .as_deref()
+        .filter(|text| !text.trim().is_empty())
+        .map(|text| edgecrab_core::safe_truncate(text, 52).to_string())
+        .unwrap_or_else(|| edgecrab_core::safe_truncate(&current.goal, 52).to_string());
+    Some(format!(
+        "[{}/{}] {}",
+        current.task_index + 1,
+        current.task_count,
+        detail
+    ))
 }
 
 impl App {
@@ -1066,6 +2233,8 @@ impl App {
                 .add_modifier(Modifier::ITALIC),
         );
 
+        let runtime_config = edgecrab_core::AppConfig::load().unwrap_or_default();
+
         let mut app = Self {
             textarea,
             editor_mode: InputEditorMode::Inline,
@@ -1085,6 +2254,9 @@ impl App {
             response_rx,
             response_tx,
             background_task_seq: 0,
+            progress_seq: 0,
+            background_tasks_active: std::collections::HashMap::new(),
+            active_subagents: std::collections::HashMap::new(),
             cron_rx,
             cron_tx,
             is_processing: false,
@@ -1123,6 +2295,8 @@ impl App {
                 ms
             },
             vision_model_selector: FuzzySelector::new(),
+            image_model_selector: FuzzySelector::new(),
+            mcp_selector: FuzzySelector::new(),
             skill_selector: FuzzySelector::new(),
             session_browser: FuzzySelector::new(),
             skin_browser: FuzzySelector::new(),
@@ -1143,14 +2317,23 @@ impl App {
             mouse_capture_enabled: true, // scroll wheel on by default; F6 to switch
             pending_mouse_capture: None,
             last_left_click: None,
-            voice_mode_enabled: false,
+            voice_mode_enabled: load_voice_mode_enabled() && voice_readback_ready().is_ok(),
             last_agent_response_text: String::new(),
             session_personality: None,
             session_skin: None,
             pending_images: Vec::new(),
             in_flight_tool_count: 0,
             turn_stream_tokens: 0,
-            pending_tool_line_idxs: std::collections::VecDeque::new(),
+            pending_tool_lines: std::collections::VecDeque::new(),
+            voice_recording: None,
+            voice_push_to_talk_key: runtime_config.voice.push_to_talk_key,
+            voice_input_device: runtime_config.voice.input_device,
+            voice_continuous_default: runtime_config.voice.continuous,
+            voice_continuous_active: false,
+            voice_hallucination_filter: runtime_config.voice.hallucination_filter,
+            voice_no_speech_count: 0,
+            voice_playback_active: false,
+            voice_presence_frame_idx: 0,
             hook_registry: {
                 let mut r = edgecrab_gateway::hooks::HookRegistry::new();
                 r.discover_and_load();
@@ -1290,7 +2473,7 @@ impl App {
         // tokens to be silently dropped or appended at wrong positions.
         self.streaming_line = None;
         self.reasoning_line = None;
-        self.pending_tool_line_idxs.clear();
+        self.pending_tool_lines.clear();
         // Request a full terminal repaint.  ratatui's diff-based renderer
         // normally skips unchanged cells; if any out-of-band bytes reached the
         // alternate screen (e.g. tracing::warn! from a background task) those
@@ -1384,7 +2567,9 @@ impl App {
         self.push_output_spans(
             vec![
                 Span::styled("     ", Style::default()),
-                Span::styled("Model  ", label_style),
+                Span::styled("Version  ", label_style),
+                Span::styled(format!("v{}", crate::banner::VERSION), value_style),
+                Span::styled("   Model  ", label_style),
                 Span::styled(model_display, value_style),
             ],
             OutputRole::System,
@@ -1777,6 +2962,24 @@ impl App {
                 ("on", "Enable TTS — agent responses are read aloud"),
                 ("off", "Disable TTS"),
                 ("status", "Show current voice mode"),
+                (
+                    "continuous on",
+                    "Enable hands-free continuous voice capture",
+                ),
+                ("continuous off", "Disable continuous voice capture"),
+                ("stop", "Stop the active voice recording or continuous loop"),
+                (
+                    "doctor",
+                    "Show recorder, permissions, and platform guidance",
+                ),
+                (
+                    "record",
+                    "Start or stop microphone capture and transcribe it",
+                ),
+                ("talk", "Start or stop push-to-talk capture and submit it"),
+                ("tts", "Speak text immediately or enable auto-TTS"),
+                ("transcribe", "Transcribe a local audio file"),
+                ("reply", "Transcribe a local audio file and submit it"),
             ],
             // ── Mouse capture ──────────────────────────────────────────────────
             "mouse" => &[
@@ -1812,6 +3015,15 @@ impl App {
                 ("remove", "Delete a token: remove <server-id>"),
                 ("list", "List stored server tokens"),
             ],
+            "mcp" => &[
+                ("list", "List configured MCP servers"),
+                ("refresh", "Refresh the official MCP catalog cache"),
+                ("search", "Search configured servers + official MCP catalog"),
+                ("view", "Show details for a preset"),
+                ("install", "Install a controlled MCP preset"),
+                ("test", "Probe a configured MCP server"),
+                ("remove", "Remove a configured MCP server"),
+            ],
             // ── Personality ───────────────────────────────────────────────────
             "personality" | "persona" => &[],
             // ── Appearance / skin ─────────────────────────────────────────────
@@ -1837,6 +3049,19 @@ impl App {
                 ("auto", "Use the current chat model when vision-capable"),
                 ("openai/gpt-4o", "Route image analysis to a dedicated model"),
                 ("copilot/gpt-5.4", "Use Copilot's multimodal backend"),
+            ],
+            "image_model" | "image-model" => &[
+                ("status", "Show the current image-generation default"),
+                ("list", "Open the image-model selector"),
+                ("default", "Reset to the built-in default image model"),
+                (
+                    "gemini/gemini-2.5-flash-image",
+                    "Use the default cheap Gemini image model",
+                ),
+                (
+                    "imagen/imagen-4.0-fast-generate-001",
+                    "Use Vertex Imagen fast",
+                ),
             ],
             // All other commands accept free-form arguments; fall through.
             _ => &[],
@@ -2710,6 +3935,8 @@ impl App {
                 self.completion.active = false;
                 self.model_selector.active = false;
                 self.vision_model_selector.active = false;
+                self.image_model_selector.active = false;
+                self.mcp_selector.active = false;
                 self.skill_selector.active = false;
                 self.needs_redraw = true;
                 let now = Instant::now();
@@ -2737,6 +3964,11 @@ impl App {
 
         self.needs_redraw = true;
 
+        if key_matches_binding(&key, &self.voice_push_to_talk_key) {
+            self.toggle_voice_recording(true);
+            return;
+        }
+
         // Global shortcuts first — these work regardless of any overlay
         match (key.modifiers, key.code) {
             // Ctrl+C — clear input → cancel agent → exit  (standard readline behaviour)
@@ -2748,6 +3980,8 @@ impl App {
                     self.completion.active = false;
                     self.history_pos = self.input_history.len();
                     self.push_output("^C", OutputRole::System);
+                } else if self.voice_recording.is_some() {
+                    self.abort_voice_recording("^C  (voice recording cancelled)");
                 } else if self.is_processing {
                     // Agent is running: interrupt it
                     if let Some(ref agent) = self.agent {
@@ -2973,6 +4207,109 @@ impl App {
             return;
         }
 
+        if self.image_model_selector.active {
+            match key.code {
+                KeyCode::Esc => {
+                    self.image_model_selector.active = false;
+                }
+                KeyCode::Enter => {
+                    if let Some(model) = self
+                        .image_model_selector
+                        .current()
+                        .map(|entry| entry.display.clone())
+                    {
+                        self.image_model_selector.active = false;
+                        self.handle_set_image_model(model);
+                    }
+                }
+                KeyCode::Up => self.image_model_selector.move_up(),
+                KeyCode::Down => self.image_model_selector.move_down(),
+                KeyCode::PageUp => self.image_model_selector.page_up(),
+                KeyCode::PageDown => self.image_model_selector.page_down(),
+                KeyCode::Backspace => self.image_model_selector.pop_char(),
+                KeyCode::Char(c)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    self.image_model_selector.push_char(c);
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // MCP selector overlay active — mirrors /model UX while keeping
+        // installs controlled. Catalog-only entries open detail view instead.
+        if self.mcp_selector.active {
+            match key.code {
+                KeyCode::Esc => {
+                    self.mcp_selector.active = false;
+                }
+                KeyCode::Enter => {
+                    if let Some(entry) = self.mcp_selector.current() {
+                        let command = entry.default_command();
+                        self.mcp_selector.active = false;
+                        self.handle_mcp_command(command);
+                    }
+                }
+                KeyCode::Delete => {
+                    if let Some(entry) = self.mcp_selector.current() {
+                        if let Some(command) = entry.remove_command() {
+                            self.mcp_selector.active = false;
+                            self.handle_mcp_command(command);
+                        }
+                    }
+                }
+                KeyCode::Up => self.mcp_selector.move_up(),
+                KeyCode::Down => self.mcp_selector.move_down(),
+                KeyCode::PageUp => self.mcp_selector.page_up(),
+                KeyCode::PageDown => self.mcp_selector.page_down(),
+                KeyCode::Backspace => self.mcp_selector.pop_char(),
+                KeyCode::Char('v') | KeyCode::Char('V') => {
+                    if let Some(entry) = self.mcp_selector.current() {
+                        let command = entry.view_command();
+                        self.mcp_selector.active = false;
+                        self.handle_mcp_command(command);
+                    }
+                }
+                KeyCode::Char('i') | KeyCode::Char('I') => {
+                    if let Some(entry) = self.mcp_selector.current() {
+                        if let Some(command) = entry.install_command() {
+                            self.mcp_selector.active = false;
+                            self.handle_mcp_command(command);
+                        }
+                    }
+                }
+                KeyCode::Char('t') | KeyCode::Char('T') => {
+                    if let Some(entry) = self.mcp_selector.current() {
+                        if entry.kind == McpEntryKind::ConfiguredServer {
+                            let command = entry.test_command();
+                            self.mcp_selector.active = false;
+                            self.handle_mcp_command(command);
+                        }
+                    }
+                }
+                KeyCode::Char('d') | KeyCode::Char('D') => {
+                    if let Some(entry) = self.mcp_selector.current() {
+                        if let Some(command) = entry.remove_command() {
+                            self.mcp_selector.active = false;
+                            self.handle_mcp_command(command);
+                        }
+                    }
+                }
+                KeyCode::Char(c)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    self.mcp_selector.push_char(c);
+                }
+                _ => {}
+            }
+            return;
+        }
+
         // Skill selector overlay active — same key scheme as model selector
         if self.skill_selector.active {
             match key.code {
@@ -3179,7 +4516,7 @@ impl App {
             );
             // The agent task is now unblocked and will resume processing;
             // is_processing is still true so the spinner stays active.
-            self.display_state = DisplayState::Thinking {
+            self.display_state = DisplayState::AwaitingFirstToken {
                 frame: 0,
                 started: Instant::now(),
             };
@@ -3250,10 +4587,11 @@ impl App {
         self.reasoning_line = None;
         // Reset per-turn streaming counters.
         self.in_flight_tool_count = 0;
+        self.active_subagents.clear();
         self.turn_stream_tokens = 0;
         // Reset the response accumulator for the new turn (voice mode uses it).
         self.last_agent_response_text.clear();
-        self.display_state = DisplayState::Thinking {
+        self.display_state = DisplayState::AwaitingFirstToken {
             frame: 0,
             started: Instant::now(),
         };
@@ -3306,14 +4644,70 @@ impl App {
                     StreamEvent::ToolDone {
                         name,
                         args_json,
+                        result_preview,
                         duration_ms,
                         is_error,
                     } => {
                         let _ = tx.send(AgentResponse::ToolDone {
                             name,
                             args_json,
+                            result_preview,
                             duration_ms,
                             is_error,
+                        });
+                    }
+                    StreamEvent::SubAgentStart {
+                        task_index,
+                        task_count,
+                        goal,
+                    } => {
+                        let _ = tx.send(AgentResponse::SubAgentStart {
+                            task_index,
+                            task_count,
+                            goal,
+                        });
+                    }
+                    StreamEvent::SubAgentReasoning {
+                        task_index,
+                        task_count,
+                        text,
+                    } => {
+                        let _ = tx.send(AgentResponse::SubAgentReasoning {
+                            task_index,
+                            task_count,
+                            text,
+                        });
+                    }
+                    StreamEvent::SubAgentToolExec {
+                        task_index,
+                        task_count,
+                        name,
+                        args_json,
+                    } => {
+                        let _ = tx.send(AgentResponse::SubAgentToolExec {
+                            task_index,
+                            task_count,
+                            name,
+                            args_json,
+                        });
+                    }
+                    StreamEvent::SubAgentFinish {
+                        task_index,
+                        task_count,
+                        status,
+                        duration_ms,
+                        summary,
+                        api_calls,
+                        model,
+                    } => {
+                        let _ = tx.send(AgentResponse::SubAgentFinish {
+                            task_index,
+                            task_count,
+                            status,
+                            duration_ms,
+                            summary,
+                            api_calls,
+                            model,
                         });
                     }
                     StreamEvent::Done => {
@@ -3382,14 +4776,10 @@ impl App {
                     }
 
                     StreamEvent::ContextPressure { estimated_tokens, threshold_tokens } => {
-                        // Context is approaching the compression threshold.
-                        // Send a system message to the TUI rather than calling
-                        // tracing::warn!() which writes to stderr and corrupts
-                        // the alternate screen while the TUI is running.
-                        let msg = format!(
-                            "[context pressure] {estimated_tokens} / {threshold_tokens} tokens used — compressing…"
-                        );
-                        let _ = tx.send(AgentResponse::Token(format!("\n{msg}")));
+                        let _ = tx.send(AgentResponse::Notice(format_context_pressure_notice(
+                            estimated_tokens,
+                            threshold_tokens,
+                        )));
                     }
                 }
             }
@@ -3429,11 +4819,23 @@ impl App {
             CommandResult::VisionModelSelector => {
                 self.open_vision_model_selector();
             }
+            CommandResult::ImageModelSelector => {
+                self.open_image_model_selector();
+            }
             CommandResult::ShowVisionModel => {
                 self.handle_show_vision_model();
             }
             CommandResult::SetVisionModel(spec) => {
                 self.handle_set_vision_model(spec);
+            }
+            CommandResult::ShowImageModel => {
+                self.handle_show_image_model();
+            }
+            CommandResult::SetImageModel(spec) => {
+                self.handle_set_image_model(spec);
+            }
+            CommandResult::ShowMcp(args) => {
+                self.handle_mcp_command(args);
             }
             CommandResult::SessionNew => {
                 if let Some(ref agent) = self.agent {
@@ -3513,11 +4915,17 @@ impl App {
                     };
                     self.needs_redraw = true;
                     self.rt_handle.spawn(async move {
+                        let before_messages = agent.messages().await;
+                        let before_count = before_messages.len();
+                        let before_tokens =
+                            edgecrab_core::compression::estimate_tokens(&before_messages);
                         agent.force_compress().await;
-                        let snap = agent.session_snapshot().await;
+                        let after_messages = agent.messages().await;
+                        let after_count = after_messages.len();
+                        let after_tokens =
+                            edgecrab_core::compression::estimate_tokens(&after_messages);
                         let msg = format!(
-                            "Compression done. {} messages remaining.",
-                            snap.message_count
+                            "Compression done: {before_count} → {after_count} messages (~{before_tokens} → ~{after_tokens} tokens)."
                         );
                         let _ = tx.send(AgentResponse::BgOp(BackgroundOpResult::CompressDone {
                             msg,
@@ -3727,7 +5135,9 @@ impl App {
                     if self.streaming_enabled
                         && matches!(
                             self.display_state,
-                            DisplayState::Thinking { .. } | DisplayState::ToolExec { .. }
+                            DisplayState::AwaitingFirstToken { .. }
+                                | DisplayState::Thinking { .. }
+                                | DisplayState::ToolExec { .. }
                         )
                     {
                         // WHY turn_stream_tokens: initialise from the running total so
@@ -3769,7 +5179,21 @@ impl App {
                     self.last_agent_response_text.push_str(&text);
                     self.needs_redraw = true;
                 }
+                AgentResponse::Notice(text) => {
+                    self.push_output(text, OutputRole::System);
+                    self.needs_redraw = true;
+                }
+                AgentResponse::DirectToolOutput(text) => {
+                    self.push_output(text, OutputRole::System);
+                    self.needs_redraw = true;
+                }
                 AgentResponse::Reasoning(text) => {
+                    if matches!(self.display_state, DisplayState::AwaitingFirstToken { .. }) {
+                        self.display_state = DisplayState::Thinking {
+                            frame: 0,
+                            started: Instant::now(),
+                        };
+                    }
                     if self.show_reasoning && !text.trim().is_empty() {
                         if let Some(idx) = self.reasoning_line {
                             if idx < self.output.len() {
@@ -3823,6 +5247,7 @@ impl App {
                     // scrollable transcript to see that work is happening, and
                     // ToolDone later upgrades it in-place with timing/result
                     // info (no layout shift).
+                    let edit_snapshot = capture_local_edit_snapshot(&name, &args_json);
                     let running_spans =
                         build_tool_running_line(&name, &args_json, &self.theme.tool_emojis);
                     let line_idx = self.output.len();
@@ -3832,7 +5257,10 @@ impl App {
                         prebuilt_spans: Some(running_spans),
                         rendered: None,
                     });
-                    self.pending_tool_line_idxs.push_back(line_idx);
+                    self.pending_tool_lines.push_back(PendingToolLine {
+                        line_idx,
+                        edit_snapshot,
+                    });
                     if self.at_bottom {
                         self.scroll_offset = 0;
                     }
@@ -3841,6 +5269,7 @@ impl App {
                 AgentResponse::ToolDone {
                     name,
                     args_json,
+                    result_preview,
                     duration_ms,
                     is_error,
                 } => {
@@ -3848,6 +5277,7 @@ impl App {
                     let spans = build_tool_done_line(
                         &name,
                         &args_json,
+                        result_preview.as_deref(),
                         duration_ms,
                         is_error,
                         &self.theme.tool_emojis,
@@ -3858,10 +5288,11 @@ impl App {
                     // second line for the same tool call — the layout stays stable
                     // (no shift), and the cyan "···" naturally becomes the gold
                     // timing string without any visual flash.
-                    if let Some(idx) = self.pending_tool_line_idxs.pop_front() {
-                        if idx < self.output.len() {
-                            self.output[idx].prebuilt_spans = Some(spans);
-                            self.output[idx].rendered = None; // invalidate cache
+                    let pending = self.pending_tool_lines.pop_front();
+                    if let Some(PendingToolLine { line_idx, .. }) = pending.as_ref() {
+                        if *line_idx < self.output.len() {
+                            self.output[*line_idx].prebuilt_spans = Some(spans);
+                            self.output[*line_idx].rendered = None; // invalidate cache
                         } else {
                             // Index out of range — fall back to append (shouldn't happen).
                             self.push_output_spans(spans, OutputRole::Tool);
@@ -3871,15 +5302,153 @@ impl App {
                         // tool fired before the feature was introduced) — append.
                         self.push_output_spans(spans, OutputRole::Tool);
                     }
+                    if let Some(diff_lines) = render_edit_diff_lines(
+                        &name,
+                        &args_json,
+                        is_error,
+                        pending
+                            .as_ref()
+                            .and_then(|entry| entry.edit_snapshot.as_ref()),
+                    ) {
+                        for line in diff_lines {
+                            self.push_output_spans(line, OutputRole::Tool);
+                        }
+                    }
                     // Decrement the in-flight counter. Only transition back to
                     // Thinking when ALL parallel tools have completed; otherwise
                     // stay in ToolExec state so the status bar stays accurate.
                     self.in_flight_tool_count = self.in_flight_tool_count.saturating_sub(1);
                     if self.in_flight_tool_count == 0 {
-                        self.display_state = DisplayState::Thinking {
+                        self.display_state = DisplayState::AwaitingFirstToken {
                             frame: 0,
                             started: Instant::now(),
                         };
+                    }
+                    self.needs_redraw = true;
+                }
+                AgentResponse::SubAgentStart {
+                    task_index,
+                    task_count,
+                    goal,
+                } => {
+                    self.progress_seq = self.progress_seq.saturating_add(1);
+                    self.active_subagents.insert(
+                        task_index,
+                        ActiveSubagentStatus {
+                            task_index,
+                            task_count,
+                            goal: goal.clone(),
+                            last_detail: None,
+                            last_seq: self.progress_seq,
+                        },
+                    );
+                    self.streaming_line = None;
+                    self.output.push(OutputLine {
+                        text: String::new(),
+                        role: OutputRole::Tool,
+                        prebuilt_spans: Some(build_subagent_event_line(
+                            task_index, task_count, "subagent", &goal, "running",
+                        )),
+                        rendered: None,
+                    });
+                    if self.at_bottom {
+                        self.scroll_offset = 0;
+                    }
+                    self.needs_redraw = true;
+                }
+                AgentResponse::SubAgentReasoning {
+                    task_index,
+                    task_count: _task_count,
+                    text,
+                } => {
+                    self.progress_seq = self.progress_seq.saturating_add(1);
+                    if let Some(status) = self.active_subagents.get_mut(&task_index) {
+                        status.last_detail = Some(format!(
+                            "thinking: {}",
+                            edgecrab_core::safe_truncate(text.trim(), 72)
+                        ));
+                        status.last_seq = self.progress_seq;
+                    }
+                    self.needs_redraw = true;
+                }
+                AgentResponse::SubAgentToolExec {
+                    task_index,
+                    task_count,
+                    name,
+                    args_json,
+                } => {
+                    self.progress_seq = self.progress_seq.saturating_add(1);
+                    self.streaming_line = None;
+                    let preview = crate::tool_display::extract_tool_preview(&name, &args_json);
+                    let detail = if preview.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{name}  {preview}")
+                    };
+                    if let Some(status) = self.active_subagents.get_mut(&task_index) {
+                        status.last_detail = Some(detail.clone());
+                        status.last_seq = self.progress_seq;
+                    }
+                    self.output.push(OutputLine {
+                        text: String::new(),
+                        role: OutputRole::Tool,
+                        prebuilt_spans: Some(build_subagent_event_line(
+                            task_index, task_count, "tool", &detail, "running",
+                        )),
+                        rendered: None,
+                    });
+                    if self.at_bottom {
+                        self.scroll_offset = 0;
+                    }
+                    self.needs_redraw = true;
+                }
+                AgentResponse::SubAgentFinish {
+                    task_index,
+                    task_count,
+                    status,
+                    duration_ms,
+                    summary,
+                    api_calls,
+                    model,
+                } => {
+                    self.active_subagents.remove(&task_index);
+                    self.streaming_line = None;
+                    let mut parts = vec![
+                        format!("{} in {:.1}s", status, duration_ms as f64 / 1000.0),
+                        format!("api {api_calls}"),
+                    ];
+                    if let Some(model) = model.filter(|m| !m.is_empty()) {
+                        parts.push(model);
+                    }
+                    if !summary.trim().is_empty() {
+                        parts.push(
+                            summary
+                                .lines()
+                                .next()
+                                .unwrap_or_default()
+                                .trim()
+                                .to_string(),
+                        );
+                    }
+                    let tone = if status == "completed" {
+                        "success"
+                    } else {
+                        "error"
+                    };
+                    self.output.push(OutputLine {
+                        text: String::new(),
+                        role: OutputRole::Tool,
+                        prebuilt_spans: Some(build_subagent_event_line(
+                            task_index,
+                            task_count,
+                            "subagent",
+                            &parts.join("  "),
+                            tone,
+                        )),
+                        rendered: None,
+                    });
+                    if self.at_bottom {
+                        self.scroll_offset = 0;
                     }
                     self.needs_redraw = true;
                 }
@@ -3889,8 +5458,9 @@ impl App {
                     self.reasoning_line = None;
                     // Reset per-turn streaming counters for next turn.
                     self.in_flight_tool_count = 0;
+                    self.active_subagents.clear();
                     self.turn_stream_tokens = 0;
-                    self.pending_tool_line_idxs.clear();
+                    self.pending_tool_lines.clear();
                     self.display_state = DisplayState::Idle;
                     self.last_response_time = Some(Instant::now());
                     self.turn_count += 1;
@@ -3899,21 +5469,17 @@ impl App {
                     // Auto-update status bar tokens/cost from agent
                     self.auto_update_status();
 
-                    // Voice mode: speak the response via TTS after each turn.
-                    // WHY background task: TTS is async and we don't want to
-                    // block the event loop or show a fake "processing" state.
-                    // Mirrors hermes-agent's voice_mode readback pattern.
+                    // Voice mode: speak the response via direct TTS after each
+                    // turn. This avoids routing a deterministic action back
+                    // through the model and removes a major source of flakiness.
                     let response_text = std::mem::take(&mut self.last_agent_response_text);
                     if self.voice_mode_enabled && !response_text.is_empty() {
-                        if let Some(agent) = self.agent.clone() {
-                            let tts_prompt = format!(
-                                "Please call the text_to_speech tool to read the following aloud: \
-                                 {response_text}"
-                            );
-                            self.rt_handle.spawn(async move {
-                                let _ = agent.chat(&tts_prompt).await;
-                            });
-                        }
+                        self.spawn_direct_tts(response_text, false);
+                    }
+                    if self.voice_continuous_active && !self.voice_playback_active {
+                        self.maybe_restart_continuous_voice_session(
+                            "Response finished. Listening again for continuous voice...",
+                        );
                     }
 
                     if let Some(next) = self.prompt_queue.first().cloned() {
@@ -3926,10 +5492,14 @@ impl App {
                     self.streaming_line = None;
                     self.reasoning_line = None;
                     self.in_flight_tool_count = 0;
+                    self.active_subagents.clear();
                     self.turn_stream_tokens = 0;
-                    self.pending_tool_line_idxs.clear();
+                    self.pending_tool_lines.clear();
                     self.display_state = DisplayState::Idle;
                     self.push_output(err, OutputRole::Error);
+                    if self.voice_continuous_active {
+                        self.stop_continuous_voice_session(false);
+                    }
                     self.needs_redraw = true;
                 }
                 AgentResponse::Clarify {
@@ -4051,12 +5621,82 @@ impl App {
                         }
                     }
                 }
+                AgentResponse::VoiceTranscript {
+                    transcript,
+                    submit_to_agent,
+                    meta,
+                } => {
+                    let transcript = normalize_voice_transcript(&transcript);
+                    let filtered = meta.is_some_and(|meta| {
+                        self.voice_hallucination_filter
+                            && is_probable_voice_hallucination(
+                                &transcript,
+                                meta.capture_duration_secs,
+                            )
+                    });
+                    if transcript.trim().is_empty() {
+                        self.push_output(
+                            "Transcription completed, but no speech was detected.",
+                            OutputRole::System,
+                        );
+                        self.note_empty_voice_capture();
+                    } else if filtered {
+                        self.push_output(
+                            format!(
+                                "Filtered probable STT hallucination from a short capture:\n{}",
+                                transcript
+                            ),
+                            OutputRole::System,
+                        );
+                        self.note_empty_voice_capture();
+                    } else if submit_to_agent {
+                        self.voice_no_speech_count = 0;
+                        self.push_output(
+                            format!("Voice reply transcript:\n{transcript}"),
+                            OutputRole::System,
+                        );
+                        self.process_input(&transcript);
+                    } else {
+                        self.voice_no_speech_count = 0;
+                        self.push_output(
+                            format!("Voice transcript:\n{transcript}"),
+                            OutputRole::System,
+                        );
+                    }
+                    self.needs_redraw = true;
+                }
+                AgentResponse::VoiceCaptureFailed {
+                    error,
+                    continuous_session,
+                } => {
+                    if continuous_session {
+                        self.voice_continuous_active = false;
+                        self.voice_no_speech_count = 0;
+                        self.push_output(
+                            format!("{error}\nContinuous voice stopped to avoid a restart loop."),
+                            OutputRole::Error,
+                        );
+                    } else {
+                        self.push_output(error, OutputRole::Error);
+                    }
+                    self.needs_redraw = true;
+                }
+                AgentResponse::VoicePlaybackFinished => {
+                    self.voice_playback_active = false;
+                    if self.voice_continuous_active && !self.is_processing {
+                        self.maybe_restart_continuous_voice_session(
+                            "Spoken reply finished. Listening again for continuous voice...",
+                        );
+                    }
+                    self.needs_redraw = true;
+                }
                 AgentResponse::BackgroundPromptComplete {
                     task_num,
                     task_id,
                     prompt_preview,
                     response,
                 } => {
+                    self.background_tasks_active.remove(&task_id);
                     let body = if response.trim().is_empty() {
                         "(No response generated)".to_string()
                     } else {
@@ -4069,11 +5709,20 @@ impl App {
                         OutputRole::Assistant,
                     );
                 }
+                AgentResponse::BackgroundPromptProgress { task_id, text, .. } => {
+                    if let Some(status) = self.background_tasks_active.get_mut(&task_id) {
+                        self.progress_seq = self.progress_seq.saturating_add(1);
+                        status.last_progress = Some(text.clone());
+                        status.last_seq = self.progress_seq;
+                        self.push_output(text, OutputRole::System);
+                    }
+                }
                 AgentResponse::BackgroundPromptFailed {
                     task_num,
                     task_id,
                     error,
                 } => {
+                    self.background_tasks_active.remove(&task_id);
                     self.push_output(
                         format!(
                             "Background task #{task_num} failed\nTask ID: {task_id}\nError: {error}"
@@ -4099,7 +5748,7 @@ impl App {
             let snap = self
                 .rt_handle
                 .block_on(async { agent.session_snapshot().await });
-            self.total_tokens = snap.input_tokens + snap.output_tokens;
+            self.total_tokens = snap.context_pressure_tokens();
             self.model_name = snap.model;
             self.update_context_window();
 
@@ -4188,7 +5837,7 @@ impl App {
                 if let Some(tx) = self.approval_pending_tx.take() {
                     let _ = tx.send(choice);
                 }
-                self.display_state = DisplayState::Thinking {
+                self.display_state = DisplayState::AwaitingFirstToken {
                     frame: 0,
                     started: std::time::Instant::now(),
                 };
@@ -4243,7 +5892,7 @@ impl App {
                 if let Some(tx) = self.secret_pending_tx.take() {
                     let _ = tx.send(secret);
                 }
-                self.display_state = DisplayState::Thinking {
+                self.display_state = DisplayState::AwaitingFirstToken {
                     frame: 0,
                     started: std::time::Instant::now(),
                 };
@@ -4265,31 +5914,50 @@ impl App {
 
     /// Advance spinner frame (called on every tick).
     fn tick_spinner(&mut self) {
+        self.poll_voice_recording_completion();
+        let mut animated = false;
         let advance_verb = match &mut self.display_state {
+            DisplayState::AwaitingFirstToken { frame, .. } => {
+                *frame = (*frame + 1) % SPINNER_FRAMES.len();
+                animated = true;
+                *frame == 0
+            }
             DisplayState::Thinking { frame, .. } => {
                 *frame = (*frame + 1) % SPINNER_FRAMES.len();
+                animated = true;
                 // Advance thinking verb on each full braille rotation
                 *frame == 0
             }
             DisplayState::Streaming { .. } => {
                 // Token streaming — redraw handled by check_responses
-                return;
+                false
             }
             DisplayState::ToolExec { frame, .. } => {
                 *frame = (*frame + 1) % SPINNER_FRAMES.len();
+                animated = true;
                 false
             }
             DisplayState::BgOp { frame, .. } => {
                 *frame = (*frame + 1) % SPINNER_FRAMES.len();
+                animated = true;
                 false
             }
             DisplayState::Idle
             | DisplayState::WaitingForClarify
             | DisplayState::WaitingForApproval { .. }
-            | DisplayState::SecretCapture { .. } => {
-                return; // Nothing to animate — don't force redraw
-            }
+            | DisplayState::SecretCapture { .. } => false,
         };
+        if self.voice_recording.is_some()
+            || self.voice_playback_active
+            || self.voice_continuous_active
+        {
+            self.voice_presence_frame_idx =
+                self.voice_presence_frame_idx.wrapping_add(1) % VOICE_RECORD_FRAMES.len();
+            animated = true;
+        }
+        if !animated {
+            return;
+        }
         if advance_verb {
             self.thinking_verb_idx = self.thinking_verb_idx.wrapping_add(1);
             // Advance kaomoji face every 3 verb changes (slower rotation)
@@ -4298,6 +5966,22 @@ impl App {
             }
         }
         self.needs_redraw = true;
+    }
+
+    fn voice_presence_state(&self) -> Option<VoicePresenceState> {
+        if let Some(recording) = &self.voice_recording {
+            return Some(VoicePresenceState::Recording {
+                elapsed_secs: recording.started_at.elapsed().as_secs(),
+                continuous: recording.continuous_session,
+            });
+        }
+        if self.voice_playback_active {
+            return Some(VoicePresenceState::Speaking);
+        }
+        if self.voice_continuous_active {
+            return Some(VoicePresenceState::Listening);
+        }
+        None
     }
 
     // ────────────────────────────────────────────────────────────────
@@ -4489,12 +6173,153 @@ impl App {
         }
     }
 
+    fn handle_show_image_model(&mut self) {
+        let Some(agent) = self.require_agent() else {
+            return;
+        };
+
+        let (_, _, image_generation) = self.rt_handle.block_on(agent.media_config());
+        let text = format!(
+            "Image generation routing:\n\
+             Default backend: {}/{}\n\
+             Built-in default: {}\n\
+             Storage:         persisted in config.yaml under image_generation\n\
+             Usage:           /image_model | /image_model status | /image_model <provider>/<model> | /image_model default",
+            image_generation.provider,
+            image_generation.model,
+            cli_image_models::default_selection_spec(),
+        );
+        self.push_output(text, OutputRole::System);
+    }
+
+    fn handle_set_image_model(&mut self, spec: String) {
+        let Some(agent) = self.require_agent() else {
+            return;
+        };
+
+        let trimmed = spec.trim();
+        if trimmed.eq_ignore_ascii_case("list") || trimmed.eq_ignore_ascii_case("open") {
+            self.open_image_model_selector();
+            return;
+        }
+
+        if trimmed.eq_ignore_ascii_case("default")
+            || trimmed.eq_ignore_ascii_case("reset")
+            || trimmed.eq_ignore_ascii_case("auto")
+        {
+            let image_generation = edgecrab_core::config::ImageGenerationConfig::default();
+            let agent_clone = Arc::clone(&agent);
+            self.rt_handle.block_on(async move {
+                agent_clone
+                    .set_image_generation_config(image_generation.clone())
+                    .await;
+            });
+            match persist_image_generation_to_config(
+                &edgecrab_core::config::ImageGenerationConfig::default(),
+            ) {
+                Ok(()) => self.push_output(
+                    format!(
+                        "Image generation reset to default: {}",
+                        cli_image_models::default_selection_spec()
+                    ),
+                    OutputRole::System,
+                ),
+                Err(err) => self.push_output(
+                    format!("Image model updated for this session, but config save failed: {err}"),
+                    OutputRole::Error,
+                ),
+            }
+            return;
+        }
+
+        let Some((provider, model)) = cli_image_models::parse_selection_spec(trimmed) else {
+            self.push_output(
+                format!(
+                    "Invalid format: use 'provider/model-name', 'list', or 'default'. Got: '{trimmed}'"
+                ),
+                OutputRole::Error,
+            );
+            return;
+        };
+
+        let image_generation = edgecrab_core::config::ImageGenerationConfig {
+            provider: provider.clone(),
+            model: model.clone(),
+        };
+        let agent_clone = Arc::clone(&agent);
+        self.rt_handle.block_on(async move {
+            agent_clone
+                .set_image_generation_config(image_generation.clone())
+                .await;
+        });
+        match persist_image_generation_to_config(&edgecrab_core::config::ImageGenerationConfig {
+            provider: provider.clone(),
+            model: model.clone(),
+        }) {
+            Ok(()) => self.push_output(
+                format!(
+                    "Default image model set to {provider}/{model}. Future generate_image calls will use it unless the tool call overrides provider/model."
+                ),
+                OutputRole::System,
+            ),
+            Err(err) => self.push_output(
+                format!("Image model updated for this session, but config save failed: {err}"),
+                OutputRole::Error,
+            ),
+        }
+    }
+
+    fn open_image_model_selector(&mut self) {
+        let current_spec = self
+            .agent
+            .as_ref()
+            .map(|agent| {
+                let (_, _, image_generation) = self.rt_handle.block_on(agent.media_config());
+                format!(
+                    "{}/{}",
+                    image_generation.provider.trim(),
+                    image_generation.model.trim()
+                )
+            })
+            .filter(|spec| spec != "/")
+            .unwrap_or_else(cli_image_models::default_selection_spec);
+        let default_spec = cli_image_models::default_selection_spec();
+
+        let mut entries = vec![ModelEntry {
+            display: "default".to_string(),
+            provider: "policy".to_string(),
+            model_name: "default".to_string(),
+            detail: format!("Reset to the built-in default image backend ({default_spec})"),
+        }];
+        entries.extend(
+            cli_image_models::available_image_model_options()
+                .into_iter()
+                .map(|option| {
+                    let mut detail = option.detail;
+                    if option.selection_spec == default_spec {
+                        detail.push_str(" | built-in default");
+                    }
+                    ModelEntry {
+                        display: option.selection_spec,
+                        provider: option.provider,
+                        model_name: option.model,
+                        detail,
+                    }
+                }),
+        );
+
+        self.image_model_selector.set_items(entries);
+        self.image_model_selector
+            .activate_with_primary(&current_spec);
+    }
+
     fn handle_show_status(&mut self) {
         let Some(agent) = self.require_agent() else {
             return;
         };
         let snap = self.agent_snapshot(&agent);
         let auxiliary = self.rt_handle.block_on(agent.auxiliary_config());
+        let (_, _, image_generation) = self.rt_handle.block_on(agent.media_config());
         let vision_routing = match (auxiliary.provider.as_deref(), auxiliary.model.as_deref()) {
             (Some(provider), Some(model)) => format!("{provider}/{model}"),
             _ => "auto".to_string(),
@@ -4504,6 +6329,7 @@ impl App {
              Session ID:  {}\n\
              Model:       {}\n\
              Vision:      {}\n\
+             Image:       {}/{}\n\
              Messages:    {}\n\
              User turns:  {}\n\
              API calls:   {}\n\
@@ -4511,6 +6337,8 @@ impl App {
             snap.session_id.as_deref().unwrap_or("(none)"),
             snap.model,
             vision_routing,
+            image_generation.provider,
+            image_generation.model,
             snap.message_count,
             snap.user_turn_count,
             snap.api_call_count,
@@ -4525,7 +6353,6 @@ impl App {
             return;
         };
         let snap = self.agent_snapshot(&agent);
-        let total = snap.input_tokens + snap.output_tokens;
         let usage = edgecrab_core::CanonicalUsage {
             input_tokens: snap.input_tokens,
             output_tokens: snap.output_tokens,
@@ -4540,6 +6367,7 @@ impl App {
         };
         let text = format!(
             "Token usage & cost:\n\
+             Current prompt:      {}\n\
              Input tokens:       {}\n\
              Output tokens:      {}\n\
              Cache read tokens:  {}\n\
@@ -4549,17 +6377,18 @@ impl App {
              API calls:          {}\n\
              \n\
              Estimated cost: {}",
+            snap.context_pressure_tokens(),
             snap.input_tokens,
             snap.output_tokens,
             snap.cache_read_tokens,
             snap.cache_write_tokens,
             snap.reasoning_tokens,
-            total,
+            snap.total_tokens(),
             snap.api_call_count,
             cost_line,
         );
         self.push_output(text, OutputRole::System);
-        self.total_tokens = total;
+        self.total_tokens = snap.context_pressure_tokens();
         if let Some(usd) = cost_result.amount_usd {
             self.session_cost = usd;
         }
@@ -4763,6 +6592,29 @@ impl App {
         }
     }
 
+    fn open_mcp_selector(&mut self, initial_query: Option<&str>, refresh_catalog: bool) -> usize {
+        let configured =
+            edgecrab_tools::tools::mcp_client::configured_servers().unwrap_or_default();
+        let official_entries = if refresh_catalog {
+            self.rt_handle
+                .block_on(crate::mcp_catalog::load_official_catalog(true))
+        } else {
+            crate::mcp_catalog::load_official_catalog_cached()
+        };
+        let entries = build_mcp_selector_entries_from(&configured, &official_entries);
+        self.mcp_selector.set_items(entries);
+        self.mcp_selector.active = true;
+        if let Some(query) = initial_query
+            .map(str::trim)
+            .filter(|query| !query.is_empty())
+        {
+            self.mcp_selector.query = query.to_string();
+            self.mcp_selector.update_filter();
+        }
+        self.needs_redraw = true;
+        self.mcp_selector.filtered.len()
+    }
+
     fn handle_session_list(&mut self) {
         let Some(agent) = self.require_agent() else {
             return;
@@ -4897,10 +6749,11 @@ impl App {
             Ok((messages, snap)) => {
                 // Show conversation recap before loading
                 let recap = build_session_recap(&messages);
+                let prompt_tokens = snap.context_pressure_tokens();
                 self.load_messages(messages);
                 self.model_name = snap.model;
                 self.update_context_window();
-                self.total_tokens = snap.input_tokens + snap.output_tokens;
+                self.total_tokens = prompt_tokens;
                 if !recap.is_empty() {
                     self.push_output(recap, OutputRole::System);
                 }
@@ -4989,6 +6842,15 @@ impl App {
         } else {
             ""
         };
+        self.progress_seq = self.progress_seq.saturating_add(1);
+        self.background_tasks_active.insert(
+            task_id.clone(),
+            BackgroundTaskStatus {
+                preview: preview.clone(),
+                last_progress: None,
+                last_seq: self.progress_seq,
+            },
+        );
         self.push_output(
             format!(
                 "🔄 Background task #{task_num} started: \"{preview}{preview_suffix}\"\nTask ID: {task_id}"
@@ -5015,20 +6877,74 @@ impl App {
                 }
             };
 
-            match background_agent.chat(&prompt).await {
-                Ok(resp) => {
+            let (event_tx, mut event_rx) =
+                tokio::sync::mpsc::unbounded_channel::<edgecrab_core::StreamEvent>();
+            let prompt_for_stream = prompt.clone();
+            let stream_task = tokio::spawn(async move {
+                background_agent
+                    .chat_streaming(&prompt_for_stream, event_tx)
+                    .await
+            });
+
+            let mut response = String::new();
+            let mut stream_error: Option<String> = None;
+            let mut last_progress: Option<String> = None;
+            while let Some(event) = event_rx.recv().await {
+                if let Some(text) = background_progress_text(task_num, &event) {
+                    if last_progress.as_deref() != Some(text.as_str()) {
+                        let _ = tx.send(AgentResponse::BackgroundPromptProgress {
+                            task_id: task_id.clone(),
+                            text: text.clone(),
+                        });
+                        last_progress = Some(text);
+                    }
+                }
+
+                match event {
+                    edgecrab_core::StreamEvent::Token(text) => response.push_str(&text),
+                    edgecrab_core::StreamEvent::Error(err) => stream_error = Some(err),
+                    edgecrab_core::StreamEvent::Done => break,
+                    edgecrab_core::StreamEvent::Approval { response_tx, .. } => {
+                        let _ = response_tx.send(edgecrab_core::ApprovalChoice::Deny);
+                    }
+                    edgecrab_core::StreamEvent::SecretRequest { response_tx, .. } => {
+                        let _ = response_tx.send(String::new());
+                    }
+                    edgecrab_core::StreamEvent::Clarify { response_tx, .. } => {
+                        let _ = response_tx.send(String::new());
+                    }
+                    _ => {}
+                }
+            }
+
+            match stream_task.await {
+                Ok(Ok(())) if stream_error.is_none() => {
                     let _ = tx.send(AgentResponse::BackgroundPromptComplete {
                         task_num,
                         task_id,
                         prompt_preview: preview,
-                        response: resp,
+                        response,
+                    });
+                }
+                Ok(Ok(())) => {
+                    let _ = tx.send(AgentResponse::BackgroundPromptFailed {
+                        task_num,
+                        task_id,
+                        error: stream_error.unwrap_or_else(|| "background task failed".into()),
+                    });
+                }
+                Ok(Err(e)) => {
+                    let _ = tx.send(AgentResponse::BackgroundPromptFailed {
+                        task_num,
+                        task_id,
+                        error: e.to_string(),
                     });
                 }
                 Err(e) => {
                     let _ = tx.send(AgentResponse::BackgroundPromptFailed {
                         task_num,
                         task_id,
-                        error: e.to_string(),
+                        error: format!("background task join error: {e}"),
                     });
                 }
             }
@@ -6003,6 +7919,473 @@ impl App {
         edgecrab_core::AppConfig::load_from(&config_path).unwrap_or_default()
     }
 
+    fn direct_media_tool_context(&self) -> ToolContext {
+        let config = self.load_runtime_config();
+        ToolContext {
+            task_id: "cli-voice-tool".into(),
+            cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            session_id: "cli-voice-tool".into(),
+            user_task: None,
+            cancel: CancellationToken::new(),
+            config: AppConfigRef {
+                edgecrab_home: edgecrab_core::edgecrab_home(),
+                tts_provider: Some(config.tts.provider),
+                tts_voice: Some(config.tts.voice),
+                tts_rate: config.tts.rate,
+                tts_model: config.tts.model,
+                tts_elevenlabs_voice_id: config.tts.elevenlabs_voice_id,
+                tts_elevenlabs_model_id: config.tts.elevenlabs_model_id,
+                tts_elevenlabs_api_key_env: Some(config.tts.elevenlabs_api_key_env),
+                stt_provider: Some(config.stt.provider),
+                stt_whisper_model: Some(config.stt.whisper_model),
+                image_provider: Some(config.image_generation.provider),
+                image_model: Some(config.image_generation.model),
+                ..Default::default()
+            },
+            state_db: None,
+            platform: edgecrab_types::Platform::Cli,
+            process_table: None,
+            provider: None,
+            tool_registry: None,
+            delegate_depth: 0,
+            sub_agent_runner: None,
+            delegation_event_tx: None,
+            clarify_tx: None,
+            approval_tx: None,
+            on_skills_changed: None,
+            gateway_sender: None,
+            origin_chat: None,
+            session_key: None,
+            todo_store: None,
+        }
+    }
+
+    fn spawn_direct_tts(&mut self, text: String, announce: bool) {
+        let Some(text) = sanitize_text_for_tts(&text, 4000) else {
+            if announce {
+                self.push_output(
+                    "Nothing speakable remained after stripping markdown and media tags."
+                        .to_string(),
+                    OutputRole::System,
+                );
+            }
+            return;
+        };
+        self.voice_playback_active = true;
+        let tx = self.response_tx.clone();
+        let ctx = self.direct_media_tool_context();
+        self.rt_handle.spawn(async move {
+            match TextToSpeechTool
+                .execute(serde_json::json!({ "text": text }), &ctx)
+                .await
+            {
+                Ok(output) => {
+                    let Some(audio_path) =
+                        edgecrab_tools::tools::tts::extract_audio_path_from_tts_output(&output)
+                    else {
+                        let _ = tx.send(AgentResponse::Error(
+                            "TTS generated output without a playable audio path.".into(),
+                        ));
+                        return;
+                    };
+
+                    let audio_path_buf = std::path::PathBuf::from(&audio_path);
+                    match play_audio_file(&audio_path_buf).await {
+                        Ok(player) => {
+                            if announce {
+                                let _ = tx.send(AgentResponse::DirectToolOutput(format!(
+                                    "Voice playback via `{player}`.\n{output}"
+                                )));
+                            }
+                            let temp_tts_dir = std::env::temp_dir().join("edgecrab_tts");
+                            if audio_path_buf.starts_with(&temp_tts_dir) {
+                                let _ = tokio::fs::remove_file(&audio_path_buf).await;
+                            }
+                        }
+                        Err(error) => {
+                            let _ = tx.send(AgentResponse::Error(format!(
+                                "Voice playback failed: {error}\nGenerated audio: {audio_path}"
+                            )));
+                        }
+                    }
+                }
+                Err(error) => {
+                    let _ = tx.send(AgentResponse::Error(format!("TTS error: {error}")));
+                }
+            }
+            let _ = tx.send(AgentResponse::VoicePlaybackFinished);
+        });
+    }
+
+    fn spawn_direct_transcription(&mut self, file_path: String, submit_to_agent: bool) {
+        let tx = self.response_tx.clone();
+        let ctx = self.direct_media_tool_context();
+        self.rt_handle.spawn(async move {
+            match TranscribeAudioTool
+                .execute(serde_json::json!({ "file_path": file_path }), &ctx)
+                .await
+            {
+                Ok(output) => {
+                    let transcript = output
+                        .split_once('\n')
+                        .map(|(_, text)| text.trim().to_string())
+                        .unwrap_or_else(|| output.trim().to_string());
+                    let _ = tx.send(AgentResponse::VoiceTranscript {
+                        transcript,
+                        submit_to_agent,
+                        meta: None,
+                    });
+                }
+                Err(error) => {
+                    let _ = tx.send(AgentResponse::VoiceCaptureFailed {
+                        error: format!("Transcription error: {error}"),
+                        continuous_session: false,
+                    });
+                }
+            }
+        });
+    }
+
+    fn spawn_direct_transcription_with_cleanup(
+        &mut self,
+        file_path: String,
+        submit_to_agent: bool,
+        cleanup_after: bool,
+        meta: VoiceTranscriptMeta,
+    ) {
+        let tx = self.response_tx.clone();
+        let ctx = self.direct_media_tool_context();
+        self.rt_handle.spawn(async move {
+            let result = TranscribeAudioTool
+                .execute(serde_json::json!({ "file_path": file_path }), &ctx)
+                .await;
+            if cleanup_after {
+                let _ = tokio::fs::remove_file(&file_path).await;
+            }
+
+            match result {
+                Ok(output) => {
+                    let transcript = output
+                        .split_once('\n')
+                        .map(|(_, text)| text.trim().to_string())
+                        .unwrap_or_else(|| output.trim().to_string());
+                    let _ = tx.send(AgentResponse::VoiceTranscript {
+                        transcript,
+                        submit_to_agent,
+                        meta: Some(meta),
+                    });
+                }
+                Err(error) => {
+                    let _ = tx.send(AgentResponse::VoiceCaptureFailed {
+                        error: format!("Transcription error: {error}"),
+                        continuous_session: meta.continuous_session,
+                    });
+                }
+            }
+        });
+    }
+
+    fn voice_recording_profile(&self, submit_to_agent: bool) -> VoiceRecordingProfile {
+        let runtime_config = self.load_runtime_config();
+        let stop_mode = if submit_to_agent && self.voice_continuous_active {
+            VoiceRecordingStopMode::AutoSilence
+        } else {
+            VoiceRecordingStopMode::Manual
+        };
+        VoiceRecordingProfile {
+            stop_mode,
+            silence_threshold_db: runtime_config.stt.silence_threshold,
+            silence_duration_ms: runtime_config.stt.silence_duration_ms,
+        }
+    }
+
+    fn begin_continuous_voice_session(&mut self, persist_default: bool) {
+        let profile = self.voice_recording_profile(true);
+        if let Err(reason) =
+            voice_recording_ready(self.voice_input_device.as_deref(), profile.stop_mode)
+        {
+            self.push_output(
+                format!("Continuous voice unavailable: {reason}"),
+                OutputRole::Error,
+            );
+            return;
+        }
+        self.voice_continuous_active = true;
+        self.voice_no_speech_count = 0;
+        if persist_default {
+            self.voice_continuous_default = true;
+            if let Err(error) = persist_voice_preferences_to_config(Some(true), None, None) {
+                self.push_output(
+                    format!(
+                        "Continuous voice enabled for this session, but config save failed: {error}"
+                    ),
+                    OutputRole::Error,
+                );
+            }
+        }
+        if self.voice_recording.is_some() {
+            self.push_output(
+                "Continuous voice is armed. Current capture will continue until it stops.",
+                OutputRole::System,
+            );
+            return;
+        }
+        if self.is_processing {
+            self.push_output(
+                "Continuous voice is armed. Recording will start after the current response finishes.",
+                OutputRole::System,
+            );
+            return;
+        }
+        if self.voice_playback_active {
+            self.push_output(
+                "Continuous voice is armed. Recording will resume after spoken playback finishes.",
+                OutputRole::System,
+            );
+            return;
+        }
+        self.start_voice_recording(true);
+    }
+
+    fn stop_continuous_voice_session(&mut self, persist_default: bool) {
+        self.voice_continuous_active = false;
+        self.voice_no_speech_count = 0;
+        if persist_default {
+            self.voice_continuous_default = false;
+            if let Err(error) = persist_voice_preferences_to_config(Some(false), None, None) {
+                self.push_output(
+                    format!("Continuous voice disabled for this session, but config save failed: {error}"),
+                    OutputRole::Error,
+                );
+            }
+        }
+    }
+
+    fn maybe_restart_continuous_voice_session(&mut self, reason: &str) {
+        if !self.voice_continuous_active
+            || self.voice_recording.is_some()
+            || self.is_processing
+            || self.voice_playback_active
+        {
+            return;
+        }
+        self.push_output(reason.to_string(), OutputRole::System);
+        self.start_voice_recording(true);
+    }
+
+    fn note_empty_voice_capture(&mut self) {
+        if !self.voice_continuous_active {
+            return;
+        }
+        self.voice_no_speech_count = self.voice_no_speech_count.saturating_add(1);
+        if self.voice_no_speech_count >= 3 {
+            self.voice_continuous_active = false;
+            self.voice_no_speech_count = 0;
+            self.push_output(
+                "Continuous voice stopped after 3 empty captures. Run `/voice continuous on` to resume.",
+                OutputRole::System,
+            );
+            return;
+        }
+        self.maybe_restart_continuous_voice_session(
+            "No clear speech detected. Listening again for continuous voice...",
+        );
+    }
+
+    fn complete_voice_recording(
+        &mut self,
+        mut recording: VoiceRecordingSession,
+        reason: VoiceRecordingFinishReason,
+    ) {
+        let duration = recording.started_at.elapsed();
+        let should_stop_child = !matches!(
+            reason,
+            VoiceRecordingFinishReason::AutoSilence | VoiceRecordingFinishReason::RecorderExited
+        );
+
+        if should_stop_child {
+            terminal_bell(2);
+            if let Err(error) = stop_audio_recorder(&mut recording.child) {
+                self.push_output(
+                    format!("Failed to stop voice recording cleanly: {error}"),
+                    OutputRole::Error,
+                );
+                let _ = std::fs::remove_file(&recording.output_path);
+                return;
+            }
+        }
+
+        let metadata = std::fs::metadata(&recording.output_path).ok();
+        let size = metadata.as_ref().map(|meta| meta.len()).unwrap_or(0);
+        if size == 0 {
+            self.push_output(
+                "Voice recording captured no audio. Check microphone permissions and input device.",
+                OutputRole::Error,
+            );
+            let _ = std::fs::remove_file(&recording.output_path);
+            self.note_empty_voice_capture();
+            return;
+        }
+
+        let summary = match reason {
+            VoiceRecordingFinishReason::ManualStop => "Voice recording saved",
+            VoiceRecordingFinishReason::AutoSilence => "Voice recording auto-stopped after silence",
+            VoiceRecordingFinishReason::RecorderExited => "Voice recording finished",
+        };
+        self.push_output(
+            format!(
+                "{summary} ({:.1}s, {} bytes) via {}. Transcribing...",
+                duration.as_secs_f64(),
+                size,
+                describe_audio_recorder(recording.backend)
+            ),
+            OutputRole::System,
+        );
+        self.spawn_direct_transcription_with_cleanup(
+            recording.output_path.display().to_string(),
+            recording.submit_to_agent,
+            true,
+            VoiceTranscriptMeta {
+                capture_duration_secs: duration.as_secs_f64(),
+                continuous_session: recording.continuous_session,
+            },
+        );
+    }
+
+    fn poll_voice_recording_completion(&mut self) {
+        let exited = self
+            .voice_recording
+            .as_mut()
+            .and_then(|recording| recording.child.try_wait().ok())
+            .flatten()
+            .is_some();
+        if !exited {
+            return;
+        }
+        if let Some(recording) = self.voice_recording.take() {
+            let reason = if matches!(
+                recording.profile.stop_mode,
+                VoiceRecordingStopMode::AutoSilence
+            ) {
+                VoiceRecordingFinishReason::AutoSilence
+            } else {
+                VoiceRecordingFinishReason::RecorderExited
+            };
+            self.complete_voice_recording(recording, reason);
+        }
+    }
+
+    fn start_voice_recording(&mut self, submit_to_agent: bool) {
+        let profile = self.voice_recording_profile(submit_to_agent);
+        let backend =
+            match voice_recording_ready(self.voice_input_device.as_deref(), profile.stop_mode) {
+                Ok(backend) => backend,
+                Err(reason) => {
+                    if matches!(profile.stop_mode, VoiceRecordingStopMode::AutoSilence) {
+                        self.voice_continuous_active = false;
+                    }
+                    self.push_output(
+                        format!("Voice recording unavailable: {reason}"),
+                        OutputRole::Error,
+                    );
+                    return;
+                }
+            };
+
+        let recordings_dir = std::env::temp_dir().join("edgecrab_voice");
+        if let Err(error) = std::fs::create_dir_all(&recordings_dir) {
+            self.push_output(
+                format!("Failed to create voice temp directory: {error}"),
+                OutputRole::Error,
+            );
+            return;
+        }
+        let output_path = recordings_dir.join(format!(
+            "recording_{}.wav",
+            chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f")
+        ));
+
+        match spawn_audio_recorder(&output_path, self.voice_input_device.as_deref(), profile) {
+            Ok((child, actual_backend)) => {
+                terminal_bell(1);
+                self.voice_recording = Some(VoiceRecordingSession {
+                    child,
+                    output_path: output_path.clone(),
+                    submit_to_agent,
+                    backend: actual_backend,
+                    started_at: Instant::now(),
+                    profile,
+                    continuous_session: submit_to_agent && self.voice_continuous_active,
+                });
+                let action = if submit_to_agent && self.voice_continuous_active {
+                    "recording continuous voice reply"
+                } else if submit_to_agent {
+                    "recording voice reply"
+                } else {
+                    "recording voice note"
+                };
+                let stop_hint = if matches!(profile.stop_mode, VoiceRecordingStopMode::AutoSilence)
+                {
+                    "Auto-stops on silence."
+                } else {
+                    "Press the voice key again to stop."
+                };
+                self.push_output(
+                    format!(
+                        "{action} via {}. {stop_hint}",
+                        describe_audio_recorder(actual_backend),
+                    ),
+                    OutputRole::System,
+                );
+            }
+            Err(error) => {
+                if matches!(profile.stop_mode, VoiceRecordingStopMode::AutoSilence) {
+                    self.voice_continuous_active = false;
+                }
+                let _ = std::fs::remove_file(&output_path);
+                self.push_output(
+                    format!(
+                        "Failed to start microphone recorder ({}): {error}",
+                        describe_audio_recorder(backend)
+                    ),
+                    OutputRole::Error,
+                );
+            }
+        }
+    }
+
+    fn stop_voice_recording(&mut self) {
+        let Some(recording) = self.voice_recording.take() else {
+            self.push_output("Voice recording is not active.", OutputRole::System);
+            return;
+        };
+        self.complete_voice_recording(recording, VoiceRecordingFinishReason::ManualStop);
+    }
+
+    fn abort_voice_recording(&mut self, reason: &str) {
+        let Some(mut recording) = self.voice_recording.take() else {
+            return;
+        };
+        let _ = stop_audio_recorder(&mut recording.child);
+        let _ = std::fs::remove_file(&recording.output_path);
+        self.push_output(reason.to_string(), OutputRole::System);
+    }
+
+    fn toggle_voice_recording(&mut self, submit_to_agent: bool) {
+        if self.voice_recording.is_some() {
+            if self.voice_continuous_active {
+                self.stop_continuous_voice_session(false);
+            }
+            self.stop_voice_recording();
+        } else {
+            if submit_to_agent {
+                self.voice_continuous_active = self.voice_continuous_default;
+                self.voice_no_speech_count = 0;
+            }
+            self.start_voice_recording(submit_to_agent);
+        }
+    }
+
     fn personality_arg_hints(&self) -> Vec<(String, String)> {
         let mut hints = vec![
             (
@@ -6111,7 +8494,6 @@ impl App {
             .block_on(async { agent.session_snapshot().await });
 
         // ── Current session ────────────────────────────────────────────
-        let total_tokens = snap.input_tokens + snap.output_tokens;
         let cost = edgecrab_core::pricing::estimate_cost(
             &edgecrab_core::pricing::CanonicalUsage {
                 input_tokens: snap.input_tokens,
@@ -6127,9 +8509,13 @@ impl App {
         text.push_str(&format!("  User turns:     {}\n", snap.user_turn_count));
         text.push_str(&format!("  Messages:       {}\n", snap.message_count));
         text.push_str(&format!("  API calls:      {}\n", snap.api_call_count));
+        text.push_str(&format!(
+            "  Current prompt: {}\n",
+            snap.context_pressure_tokens()
+        ));
         text.push_str(&format!("  Input tokens:   {}\n", snap.input_tokens));
         text.push_str(&format!("  Output tokens:  {}\n", snap.output_tokens));
-        text.push_str(&format!("  Total tokens:   {total_tokens}\n"));
+        text.push_str(&format!("  Total tokens:   {}\n", snap.total_tokens()));
         if snap.cache_read_tokens > 0 {
             text.push_str(&format!("  Cache hit:      {}\n", snap.cache_read_tokens));
         }
@@ -6155,7 +8541,10 @@ impl App {
                     text.push_str(&format!("  Sessions:       {}\n", ov.total_sessions));
                     text.push_str(&format!("  Messages:       {}\n", ov.total_messages));
                     text.push_str(&format!("  Tool calls:     {}\n", ov.total_tool_calls));
-                    let hist_total = ov.total_input_tokens + ov.total_output_tokens;
+                    let hist_total = ov.total_input_tokens
+                        + ov.total_output_tokens
+                        + ov.total_cache_read_tokens
+                        + ov.total_cache_write_tokens;
                     text.push_str(&format!("  Total tokens:   {hist_total}\n"));
                     if ov.total_cache_read_tokens > 0 {
                         text.push_str(&format!(
@@ -6357,9 +8746,279 @@ impl App {
         edgecrab_tools::tools::mcp_client::reload_mcp_connections();
         self.push_output(
             "MCP server connections cleared.  They will be re-established on the next tool call.\n\
-             (Configured via ~/.edgecrab/mcp.json or the mcp_servers section in config.yaml)",
+             (Configured via the mcp_servers section in ~/.edgecrab/config.yaml; legacy ~/.edgecrab/mcp.json is fallback-only.)",
             OutputRole::System,
         );
+    }
+
+    fn handle_mcp_command(&mut self, args: String) {
+        let trimmed = args.trim();
+        if trimmed.is_empty() {
+            self.open_mcp_selector(None, false);
+            return;
+        }
+        if trimmed.eq_ignore_ascii_case("help") {
+            self.push_output(
+                "Usage: /mcp            (browse configured servers + official MCP catalog)\n\
+                 /mcp list\n\
+                 /mcp refresh\n\
+                 /mcp search [query]\n\
+                 /mcp view <preset-or-server>\n\
+                 /mcp install <preset> [name=<server-name>] [path=<directory>]\n\
+                 /mcp test [server-name]\n\
+                 /mcp remove <server-name>",
+                OutputRole::System,
+            );
+            return;
+        }
+
+        let parts: Vec<&str> = trimmed.split_whitespace().collect();
+        match parts.first().copied().unwrap_or_default() {
+            "list" => match edgecrab_tools::tools::mcp_client::configured_servers() {
+                Ok(servers) if !servers.is_empty() => {
+                    let mut lines = Vec::new();
+                    lines.push("Configured MCP servers:".to_string());
+                    for server in servers {
+                        let transport = if let Some(url) = &server.url {
+                            format!("http {url}")
+                        } else {
+                            let mut rendered = server.command;
+                            if !server.args.is_empty() {
+                                rendered.push(' ');
+                                rendered.push_str(&server.args.join(" "));
+                            }
+                            rendered
+                        };
+                        lines.push(format!("- {}  {}", server.name, transport));
+                    }
+                    self.push_output(lines.join("\n"), OutputRole::System);
+                }
+                Ok(_) => self.push_output("No MCP servers configured.", OutputRole::System),
+                Err(err) => self.push_output(
+                    format!("Failed to read MCP configuration: {err}"),
+                    OutputRole::Error,
+                ),
+            },
+            "refresh" => {
+                match self
+                    .rt_handle
+                    .block_on(crate::mcp_catalog::refresh_official_catalog())
+                {
+                    Ok(entries) => self.push_output(
+                        format!(
+                            "Refreshed official MCP catalog ({} entries).",
+                            entries.len()
+                        ),
+                        OutputRole::System,
+                    ),
+                    Err(err) => self.push_output(
+                        format!("Failed to refresh official MCP catalog: {err}"),
+                        OutputRole::Error,
+                    ),
+                }
+            }
+            "search" => {
+                let query = parts.get(1).copied();
+                if self.open_mcp_selector(query, true) == 0 {
+                    self.mcp_selector.active = false;
+                    self.push_output("No MCP entries matched.", OutputRole::System);
+                }
+            }
+            "view" => {
+                let Some(preset_name) = parts.get(1).copied() else {
+                    self.push_output("Usage: /mcp view <preset-or-server>", OutputRole::System);
+                    return;
+                };
+                if let Some(preset) = crate::mcp_catalog::find_preset(preset_name) {
+                    let mut lines = vec![
+                        format!("Preset: {}", preset.id),
+                        format!("Name:   {}", preset.display_name),
+                        format!("Why:    {}", preset.description),
+                        format!("Pkg:    {}", preset.package_name),
+                        format!("Source: {}", preset.source_url),
+                        format!("Docs:   {}", preset.homepage),
+                        format!("Cmd:    {} {}", preset.command, preset.args.join(" ")),
+                        format!("Tags:   {}", preset.tags.join(", ")),
+                    ];
+                    if !preset.required_env.is_empty() {
+                        lines.push(format!("Env:    {}", preset.required_env.join(", ")));
+                    }
+                    lines.push(format!("Notes:  {}", preset.notes));
+                    self.push_output(lines.join("\n"), OutputRole::System);
+                    return;
+                }
+                if let Some(entry) = self.rt_handle.block_on(
+                    crate::mcp_catalog::find_official_catalog_entry_with_refresh(preset_name),
+                ) {
+                    self.push_output(
+                        crate::mcp_catalog::render_official_catalog_entry(&entry),
+                        OutputRole::System,
+                    );
+                    return;
+                }
+                match edgecrab_tools::tools::mcp_client::configured_servers() {
+                    Ok(servers) => {
+                        let Some(server) = servers
+                            .into_iter()
+                            .find(|server| server.name == preset_name)
+                        else {
+                            self.push_output(
+                                format!("Unknown MCP preset or configured server '{preset_name}'."),
+                                OutputRole::Error,
+                            );
+                            return;
+                        };
+                        let mut lines = vec![
+                            format!("Server: {}", server.name),
+                            format!("Transport: {}", format_mcp_transport(&server)),
+                        ];
+                        if let Some(path) = &server.cwd {
+                            lines.push(format!("Cwd: {}", path.display()));
+                        }
+                        if !server.include.is_empty() {
+                            lines.push(format!("Include: {}", server.include.join(", ")));
+                        }
+                        if !server.exclude.is_empty() {
+                            lines.push(format!("Exclude: {}", server.exclude.join(", ")));
+                        }
+                        if server.token_from_store {
+                            lines.push("Auth: token store".into());
+                        } else if server.token_from_config {
+                            lines.push("Auth: config bearer_token".into());
+                        }
+                        self.push_output(lines.join("\n"), OutputRole::System);
+                    }
+                    Err(err) => self.push_output(
+                        format!("Failed to read MCP configuration: {err}"),
+                        OutputRole::Error,
+                    ),
+                }
+            }
+            "install" => {
+                let Some(preset_name) = parts.get(1).copied() else {
+                    self.push_output(
+                        "Usage: /mcp install <preset> [name=<server-name>] [path=<directory>]",
+                        OutputRole::System,
+                    );
+                    return;
+                };
+                let name = parts
+                    .iter()
+                    .skip(2)
+                    .find_map(|part| part.strip_prefix("name="));
+                let path = parts
+                    .iter()
+                    .skip(2)
+                    .find_map(|part| part.strip_prefix("path="));
+                let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                let mut config = self.load_runtime_config();
+                match crate::mcp_catalog::install_preset(
+                    &mut config,
+                    preset_name,
+                    name,
+                    path.map(std::path::Path::new),
+                    &cwd,
+                ) {
+                    Ok(installed) => match config.save() {
+                        Ok(()) => {
+                            edgecrab_tools::tools::mcp_client::reload_mcp_connections();
+                            let mut message =
+                                format!("Configured MCP server '{}'.", installed.name);
+                            if !installed.missing_env.is_empty() {
+                                message.push_str(&format!(
+                                    "\nMissing env vars: {}",
+                                    installed.missing_env.join(", ")
+                                ));
+                            }
+                            message.push_str(&format!(
+                                "\nRun `/mcp test {}` to verify connectivity.",
+                                installed.name
+                            ));
+                            self.push_output(message, OutputRole::System);
+                        }
+                        Err(err) => self.push_output(
+                            format!(
+                                "Preset installed for this session, but config save failed: {err}"
+                            ),
+                            OutputRole::Error,
+                        ),
+                    },
+                    Err(err) => {
+                        self.push_output(format!("MCP install failed: {err}"), OutputRole::Error)
+                    }
+                }
+            }
+            "test" => {
+                let name = parts.get(1).map(|value| (*value).to_string());
+                let tx = self.response_tx.clone();
+                self.rt_handle.spawn(async move {
+                    let targets = if let Some(name) = name {
+                        vec![name]
+                    } else {
+                        match edgecrab_tools::tools::mcp_client::configured_servers() {
+                            Ok(servers) => servers.into_iter().map(|server| server.name).collect(),
+                            Err(err) => {
+                                let _ = tx.send(AgentResponse::Notice(format!(
+                                    "Failed to read MCP configuration: {err}"
+                                )));
+                                return;
+                            }
+                        }
+                    };
+                    if targets.is_empty() {
+                        let _ = tx.send(AgentResponse::Notice("No MCP servers configured.".into()));
+                        return;
+                    }
+                    for target in targets {
+                        match edgecrab_tools::tools::mcp_client::probe_configured_server(&target)
+                            .await
+                        {
+                            Ok(result) => {
+                                let _ = tx.send(AgentResponse::Notice(format!(
+                                    "{}  ok  transport={} tools={}",
+                                    result.server_name, result.transport, result.tool_count
+                                )));
+                            }
+                            Err(err) => {
+                                let _ = tx.send(AgentResponse::Notice(format!(
+                                    "{}  fail  {}",
+                                    target, err
+                                )));
+                            }
+                        }
+                    }
+                });
+            }
+            "remove" | "uninstall" | "rm" => {
+                let Some(name) = parts.get(1).copied() else {
+                    self.push_output("Usage: /mcp remove <server-name>", OutputRole::System);
+                    return;
+                };
+                let mut config = self.load_runtime_config();
+                if config.mcp_servers.remove(name).is_none() {
+                    self.push_output(format!("Unknown MCP server '{name}'."), OutputRole::Error);
+                    return;
+                }
+                match config.save() {
+                    Ok(()) => {
+                        edgecrab_tools::tools::mcp_client::remove_mcp_token(name);
+                        edgecrab_tools::tools::mcp_client::reload_mcp_connections();
+                        self.push_output(
+                            format!("Removed MCP server '{name}'."),
+                            OutputRole::System,
+                        );
+                    }
+                    Err(err) => self.push_output(
+                        format!("Failed to save config after removing MCP server: {err}"),
+                        OutputRole::Error,
+                    ),
+                }
+            }
+            other => self.push_output(
+                format!("Unknown /mcp action '{other}'. Use `/mcp help`."),
+                OutputRole::Error,
+            ),
+        }
     }
 
     // ─── Voice Mode ─────────────────────────────────────────────────
@@ -6369,77 +9028,351 @@ impl App {
     // after each turn.  This provides audio feedback without blocking
     // the streaming UI.
     //
-    // Unlike hermes (which uses sounddevice for push-to-talk recording),
-    // EdgeCrab's voice mode is currently TTS-only.  Push-to-talk requires
-    // platform audio capture (cpal) and is tracked as a future enhancement.
+    // EdgeCrab now supports deterministic local microphone capture in the TUI
+    // using controlled recorder backends plus the existing STT/TTS tools.
 
     fn handle_voice_mode(&mut self, args: String) {
         let trimmed = args.trim();
+        let runtime_config = self.load_runtime_config();
         // Check for "/voice tts <text>" — immediate TTS of arbitrary text
         if let Some(text) = trimmed
             .strip_prefix("tts ")
             .or_else(|| trimmed.strip_prefix("tts\t"))
         {
+            let player = match voice_readback_ready() {
+                Ok(player) => player,
+                Err(reason) => {
+                    self.push_output(format!("Voice unavailable: {reason}"), OutputRole::Error);
+                    return;
+                }
+            };
             let text = text.trim();
             if text.is_empty() {
                 self.push_output("Usage: /voice tts <text to speak>", OutputRole::System);
                 return;
             }
-            let Some(agent) = self.require_agent() else {
-                return;
-            };
-            let tx = self.response_tx.clone();
             let text_owned = text.to_string();
             self.push_output(
-                format!("Speaking: {}", &text_owned[..text_owned.len().min(80)]),
+                format!(
+                    "Speaking via {}: {}",
+                    player.program,
+                    edgecrab_core::safe_truncate(&text_owned, 80)
+                ),
                 OutputRole::System,
             );
-            self.rt_handle.spawn(async move {
-                let tts_prompt = format!(
-                    "Please use the text_to_speech tool to speak the following text aloud: {}",
-                    text_owned
+            self.spawn_direct_tts(text_owned, true);
+            return;
+        }
+
+        if let Some(file_path) = trimmed
+            .strip_prefix("transcribe ")
+            .or_else(|| trimmed.strip_prefix("transcribe\t"))
+        {
+            let file_path = file_path.trim();
+            if file_path.is_empty() {
+                self.push_output(
+                    "Usage: /voice transcribe <audio-file-path>",
+                    OutputRole::System,
                 );
-                match agent.chat(&tts_prompt).await {
-                    Ok(resp) => {
-                        let _ = tx.send(AgentResponse::Token(resp));
-                        let _ = tx.send(AgentResponse::Done);
-                    }
-                    Err(e) => {
-                        let _ = tx.send(AgentResponse::Error(format!("TTS error: {e}")));
+                return;
+            }
+            self.push_output(
+                format!("Transcribing audio: {}", file_path),
+                OutputRole::System,
+            );
+            self.spawn_direct_transcription(file_path.to_string(), false);
+            return;
+        }
+
+        if let Some(file_path) = trimmed
+            .strip_prefix("reply ")
+            .or_else(|| trimmed.strip_prefix("reply\t"))
+        {
+            let file_path = file_path.trim();
+            if file_path.is_empty() {
+                self.push_output("Usage: /voice reply <audio-file-path>", OutputRole::System);
+                return;
+            }
+            self.push_output(
+                format!("Transcribing and submitting audio reply: {}", file_path),
+                OutputRole::System,
+            );
+            self.spawn_direct_transcription(file_path.to_string(), true);
+            return;
+        }
+
+        match trimmed {
+            "record" => {
+                self.toggle_voice_recording(false);
+                return;
+            }
+            "talk" => {
+                self.toggle_voice_recording(true);
+                return;
+            }
+            "stop" => {
+                self.stop_continuous_voice_session(false);
+                if self.voice_recording.is_some() {
+                    self.stop_voice_recording();
+                } else {
+                    self.push_output("Voice capture is already idle.", OutputRole::System);
+                }
+                return;
+            }
+            "doctor" => {
+                let recorder = preferred_audio_recorder();
+                let recorder_text = recorder
+                    .map(describe_audio_recorder)
+                    .unwrap_or("unavailable");
+                let auto_stop = recorder
+                    .map(recorder_auto_silence_support_message)
+                    .unwrap_or("no supported recorder installed");
+                let input_device =
+                    self.voice_input_device
+                        .as_deref()
+                        .unwrap_or(if cfg!(target_os = "windows") {
+                            "not configured"
+                        } else {
+                            "default"
+                        });
+                let permission_hint = if cfg!(target_os = "macos") {
+                    "macOS: grant microphone access to your terminal app in System Settings > Privacy & Security > Microphone."
+                } else if cfg!(target_os = "windows") {
+                    "Windows: enable microphone access in Settings > Privacy & security > Microphone and set `voice.input_device` to an ffmpeg dshow device name."
+                } else {
+                    "Linux: confirm your user can access PulseAudio/PipeWire/ALSA input devices and that the selected recorder exists on PATH."
+                };
+                self.push_output(
+                    format!(
+                        "Voice doctor\n\
+                         TTS: {}\n\
+                         STT: {}\n\
+                         Recorder: {recorder_text}\n\
+                         Recorder input: {input_device}\n\
+                         Continuous capture: {auto_stop}\n\
+                         Playback: {}\n\
+                         {permission_hint}",
+                        if TextToSpeechTool.is_available() {
+                            "available"
+                        } else {
+                            "unavailable"
+                        },
+                        if TranscribeAudioTool.is_available() {
+                            "available"
+                        } else {
+                            "unavailable"
+                        },
+                        preferred_audio_player()
+                            .map(|player| player.program)
+                            .unwrap_or("unavailable"),
+                    ),
+                    OutputRole::System,
+                );
+                return;
+            }
+            _ => {}
+        }
+
+        if let Some(subcommand) = trimmed
+            .strip_prefix("continuous ")
+            .or_else(|| trimmed.strip_prefix("continuous\t"))
+        {
+            match subcommand.trim() {
+                "on" => {
+                    self.begin_continuous_voice_session(true);
+                }
+                "off" => {
+                    self.stop_continuous_voice_session(true);
+                    if self.voice_recording.is_some() {
+                        self.abort_voice_recording("Continuous voice disabled.");
+                    } else {
+                        self.push_output(
+                            "Continuous voice disabled for future captures.",
+                            OutputRole::System,
+                        );
                     }
                 }
-            });
+                "status" | "" => {
+                    self.push_output(
+                        format!(
+                            "Continuous voice default: {}\nCurrent session: {}\nHallucination filter: {}",
+                            if self.voice_continuous_default {
+                                "ON"
+                            } else {
+                                "OFF"
+                            },
+                            if self.voice_continuous_active {
+                                "ACTIVE"
+                            } else {
+                                "idle"
+                            },
+                            if self.voice_hallucination_filter {
+                                "ON"
+                            } else {
+                                "OFF"
+                            }
+                        ),
+                        OutputRole::System,
+                    );
+                }
+                other => self.push_output(
+                    format!("Usage: /voice continuous <on|off|status> (got `{other}`)"),
+                    OutputRole::System,
+                ),
+            }
             return;
         }
 
         match trimmed {
             "on" => {
+                let player = match voice_readback_ready() {
+                    Ok(player) => player,
+                    Err(reason) => {
+                        self.push_output(
+                            format!("Voice mode remains OFF: {reason}"),
+                            OutputRole::Error,
+                        );
+                        return;
+                    }
+                };
                 self.voice_mode_enabled = true;
+                let persisted = persist_voice_enabled_to_config(true).is_ok();
                 self.push_output(
-                    "Voice mode: ON — agent responses will be read aloud via TTS.\n\
-                     (Requires TTS_PROVIDER or OPENAI_API_KEY for text_to_speech tool.)",
+                    format!(
+                        "Voice mode: ON — agent responses will be read aloud via TTS.\n\
+                         Backend: {}  Voice: {}\n\
+                         Playback: {}\n\
+                         Persistent default: {}",
+                        runtime_config.tts.provider,
+                        runtime_config.tts.voice,
+                        player.program,
+                        if persisted { "saved" } else { "not saved" }
+                    ),
+                    OutputRole::System,
+                );
+            }
+            "tts" => {
+                let player = match voice_readback_ready() {
+                    Ok(player) => player,
+                    Err(reason) => {
+                        self.push_output(
+                            format!("Auto-TTS remains OFF: {reason}"),
+                            OutputRole::Error,
+                        );
+                        return;
+                    }
+                };
+                self.voice_mode_enabled = true;
+                let persisted = persist_voice_enabled_to_config(true).is_ok();
+                self.push_output(
+                    format!(
+                        "Auto-TTS enabled.\n\
+                         All assistant replies will be spoken in this CLI session.\n\
+                         Backend: {}  Voice: {}\n\
+                         Playback: {}\n\
+                         Persistent default: {}",
+                        runtime_config.tts.provider,
+                        runtime_config.tts.voice,
+                        player.program,
+                        if persisted { "saved" } else { "not saved" }
+                    ),
                     OutputRole::System,
                 );
             }
             "off" => {
                 self.voice_mode_enabled = false;
-                self.push_output("Voice mode: OFF", OutputRole::System);
+                let persisted = persist_voice_enabled_to_config(false).is_ok();
+                self.push_output(
+                    format!(
+                        "Voice mode: OFF\nPersistent default: {}",
+                        if persisted { "saved" } else { "not saved" }
+                    ),
+                    OutputRole::System,
+                );
             }
             "status" | "" => {
                 let status = if self.voice_mode_enabled { "ON" } else { "OFF" };
+                let playback = preferred_audio_player()
+                    .map(|player| player.program.to_string())
+                    .unwrap_or_else(|| "unavailable".into());
+                let recorder = preferred_audio_recorder()
+                    .map(describe_audio_recorder)
+                    .unwrap_or("unavailable");
+                let auto_stop_support = preferred_audio_recorder()
+                    .map(recorder_auto_silence_support_message)
+                    .unwrap_or("no supported recorder installed");
+                let input_device =
+                    self.voice_input_device
+                        .as_deref()
+                        .unwrap_or(if cfg!(target_os = "windows") {
+                            "not configured"
+                        } else {
+                            "default"
+                        });
+                let tts_status = if TextToSpeechTool.is_available() {
+                    "available"
+                } else {
+                    "unavailable"
+                };
+                let stt_status = if TranscribeAudioTool.is_available() {
+                    "available"
+                } else {
+                    "unavailable"
+                };
+                let recording_state = if self.voice_recording.is_some() {
+                    "recording"
+                } else {
+                    "idle"
+                };
+                let continuous_state = if self.voice_continuous_active {
+                    "active"
+                } else if self.voice_continuous_default {
+                    "armed by default"
+                } else {
+                    "off"
+                };
                 self.push_output(
                     format!(
                         "Voice mode: {status}\n\
-                         /voice on           — enable TTS readback\n\
+                         Default backend: {}  Voice: {}\n\
+                         TTS backend: {tts_status}\n\
+                         STT backend: {stt_status}\n\
+                         Playback: {playback}\n\
+                         Playback active: {}\n\
+                         Recorder: {recorder}\n\
+                         Continuous capture: {continuous_state}\n\
+                         Continuous backend support: {auto_stop_support}\n\
+                         Hallucination filter: {}\n\
+                         Recorder input: {input_device}\n\
+                         Push-to-talk key: {push_to_talk_key} ({recording_state})\n\
+                         /voice on           — enable spoken readback\n\
+                         /voice tts          — alias for always-on spoken readback\n\
                          /voice off          — disable TTS readback\n\
-                         /voice tts <text>   — speak text immediately"
+                         /voice status       — show voice mode state\n\
+                         /voice continuous on|off|status — manage hands-free voice capture\n\
+                         /voice stop         — stop the active recording or loop\n\
+                         /voice doctor       — show recorder + permission diagnostics\n\
+                         /voice record       — record audio and transcribe it\n\
+                         /voice talk         — record audio and submit transcript\n\
+                         /voice tts <text>   — speak text immediately\n\
+                         /voice transcribe <audio-file> — transcribe a local audio file\n\
+                         /voice reply <audio-file>      — transcribe and submit it as your next prompt",
+                        runtime_config.tts.provider,
+                        runtime_config.tts.voice,
+                        if self.voice_playback_active { "yes" } else { "no" },
+                        if self.voice_hallucination_filter {
+                            "ON"
+                        } else {
+                            "OFF"
+                        },
+                        push_to_talk_key = self.voice_push_to_talk_key,
                     ),
                     OutputRole::System,
                 );
             }
             _ => {
                 self.push_output(
-                    "Usage: /voice <on|off|status|tts <text>>",
+                    "Usage: /voice <on|off|tts|status|continuous <on|off|status>|stop|doctor|record|talk|tts <text>|transcribe <file>|reply <file>>",
                     OutputRole::System,
                 );
             }
@@ -6998,6 +9931,16 @@ impl App {
             self.render_vision_model_selector(frame, frame.area());
         }
 
+        // Image-model selector overlay (full screen)
+        if self.image_model_selector.active {
+            self.render_image_model_selector(frame, frame.area());
+        }
+
+        // MCP selector overlay (full screen, same family as /model)
+        if self.mcp_selector.active {
+            self.render_mcp_selector(frame, frame.area());
+        }
+
         // Skill selector overlay (full screen, takes precedence over model selector)
         if self.skill_selector.active {
             self.render_skill_selector(frame, frame.area());
@@ -7217,55 +10160,38 @@ impl App {
             "│",
             Style::default().fg(Color::Rgb(50, 50, 65)),
         ));
+        left_spans.push(Span::styled(
+            format!(" v{} ", crate::banner::VERSION),
+            Style::default().fg(Color::Rgb(120, 130, 150)),
+        ));
+        left_spans.push(Span::styled(
+            "│",
+            Style::default().fg(Color::Rgb(50, 50, 65)),
+        ));
 
         // ── Spinner / state indicator ────────────────────────────────
         match &self.display_state {
+            DisplayState::AwaitingFirstToken { frame: f, started } => {
+                let msg = format_waiting_first_token_status(
+                    &self.theme,
+                    *f,
+                    self.thinking_verb_idx,
+                    self.kaomoji_frame_idx,
+                    started.elapsed().as_secs(),
+                );
+                left_spans.push(Span::styled(
+                    format!(" {msg} "),
+                    Style::default().fg(Color::Rgb(255, 210, 120)),
+                ));
+            }
             DisplayState::Thinking { frame: f, started } => {
-                let elapsed = started.elapsed().as_secs();
-                let spinner = SPINNER_FRAMES[*f % SPINNER_FRAMES.len()];
-
-                // Rotate through skin-configurable thinking verbs
-                let verb = if !self.theme.thinking_verbs.is_empty() {
-                    &self.theme.thinking_verbs
-                        [self.thinking_verb_idx % self.theme.thinking_verbs.len()]
-                } else {
-                    "thinking"
-                };
-
-                // Kaomoji face — rotates slower than the verb
-                let face = if !self.theme.kaomoji_thinking.is_empty() {
-                    let idx = self.kaomoji_frame_idx % self.theme.kaomoji_thinking.len();
-                    self.theme.kaomoji_thinking[idx].as_str()
-                } else {
-                    ""
-                };
-
-                // Spinner wings (skin-configurable decorations around spinner)
-                let (left_wing, right_wing) = if !self.theme.spinner_wings.is_empty() {
-                    let idx = self.kaomoji_frame_idx % self.theme.spinner_wings.len();
-                    let wing = &self.theme.spinner_wings[idx];
-                    (wing[0].as_str(), wing[1].as_str())
-                } else {
-                    ("", "")
-                };
-
-                // Pad verb to VERB_DISPLAY_PAD cols so the status-bar right
-                // section (model, tokens, cost) stays at a stable column as
-                // the verb animates through words of different lengths.
-                let verb_padded = unicode_pad_right(verb, VERB_DISPLAY_PAD);
-                let core = if face.is_empty() {
-                    format!("{spinner} {verb_padded}")
-                } else {
-                    format!("{spinner} {face} {verb_padded}")
-                };
-
-                let msg = if elapsed > 10 {
-                    format!("{left_wing}{core} {elapsed}s  ^C=stop{right_wing}")
-                } else if elapsed > 3 {
-                    format!("{left_wing}{core} {elapsed}s{right_wing}")
-                } else {
-                    format!("{left_wing}{core}{right_wing}")
-                };
+                let msg = format_thinking_status(
+                    &self.theme,
+                    *f,
+                    self.thinking_verb_idx,
+                    self.kaomoji_frame_idx,
+                    started.elapsed().as_secs(),
+                );
                 left_spans.push(Span::styled(
                     format!(" {msg} "),
                     Style::default().fg(Color::Rgb(255, 220, 80)),
@@ -7404,8 +10330,7 @@ impl App {
         // Color: green → yellow → red at 50% / 80% of context window.
         let ctx_pct = self
             .context_window
-            .filter(|&cw| cw > 0)
-            .map(|cw| self.total_tokens as f64 / cw as f64);
+            .and_then(|cw| context_usage_ratio(self.total_tokens, Some(cw)));
         let token_style = if ctx_pct.is_some_and(|p| p > 0.80) || self.total_tokens > 100_000 {
             Style::default().fg(Color::Red)
         } else if ctx_pct.is_some_and(|p| p > 0.50) || self.total_tokens > 50_000 {
@@ -7437,6 +10362,72 @@ impl App {
             format!(" ${:.4}", self.session_cost),
             cost_style,
         ));
+        if let Some(presence) = self.voice_presence_state() {
+            left_spans.push(Span::styled(
+                " │ ",
+                Style::default().fg(Color::Rgb(50, 50, 65)),
+            ));
+            let style = match presence {
+                VoicePresenceState::Recording { .. } => Style::default()
+                    .fg(Color::Rgb(30, 20, 20))
+                    .bg(Color::Rgb(240, 110, 90))
+                    .add_modifier(Modifier::BOLD),
+                VoicePresenceState::Speaking => Style::default()
+                    .fg(Color::Rgb(10, 24, 38))
+                    .bg(Color::Rgb(120, 210, 255))
+                    .add_modifier(Modifier::BOLD),
+                VoicePresenceState::Listening => Style::default()
+                    .fg(Color::Rgb(18, 32, 26))
+                    .bg(Color::Rgb(120, 225, 165))
+                    .add_modifier(Modifier::BOLD),
+            };
+            left_spans.push(Span::styled(
+                format_voice_presence_badge(presence, self.voice_presence_frame_idx),
+                style,
+            ));
+        }
+        if !self.active_subagents.is_empty() {
+            left_spans.push(Span::styled(
+                " │ ",
+                Style::default().fg(Color::Rgb(50, 50, 65)),
+            ));
+            left_spans.push(Span::styled(
+                format!(" DG {} ", self.active_subagents.len()),
+                Style::default()
+                    .fg(Color::Rgb(10, 24, 38))
+                    .bg(Color::Rgb(95, 170, 255))
+                    .add_modifier(Modifier::BOLD),
+            ));
+            if let Some(summary) = format_subagent_status_summary(&self.active_subagents) {
+                left_spans.push(Span::styled(
+                    format!(" {summary} "),
+                    Style::default()
+                        .fg(Color::Rgb(165, 205, 245))
+                        .add_modifier(Modifier::DIM),
+                ));
+            }
+        }
+        if !self.background_tasks_active.is_empty() {
+            left_spans.push(Span::styled(
+                " │ ",
+                Style::default().fg(Color::Rgb(50, 50, 65)),
+            ));
+            left_spans.push(Span::styled(
+                format!(" BG {} ", self.background_tasks_active.len()),
+                Style::default()
+                    .fg(Color::Rgb(20, 20, 28))
+                    .bg(Color::Rgb(110, 180, 255))
+                    .add_modifier(Modifier::BOLD),
+            ));
+            if let Some(summary) = format_background_status_summary(&self.background_tasks_active) {
+                left_spans.push(Span::styled(
+                    format!(" {summary} "),
+                    Style::default()
+                        .fg(Color::Rgb(180, 220, 255))
+                        .add_modifier(Modifier::DIM),
+                ));
+            }
+        }
 
         // Right side: keyboard hints + turn counter
         let mut right_spans = Vec::new();
@@ -7536,10 +10527,16 @@ impl App {
                         .add_modifier(Modifier::BOLD),
                 ));
             } else {
+                let voice_hint = if self.voice_push_to_talk_key.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {}=voice ", self.voice_push_to_talk_key.to_uppercase())
+                };
                 right_spans.push(Span::styled(
                     format!(
-                        " F6=select  F1=help  {}  F2=model  F3=skills  F7=vision  Tab=complete  ^C=cancel ",
-                        self.inline_compose_hint()
+                        " F6=select  F1=help  {}  F2=model  F3=skills  F7=vision{} Tab=complete  ^C=cancel ",
+                        self.inline_compose_hint(),
+                        voice_hint
                     ),
                     Style::default().fg(Color::Rgb(70, 75, 95)),
                 ));
@@ -7719,6 +10716,128 @@ impl App {
             "Type to filter vision backends... (Esc to cancel)",
             "options",
         );
+    }
+
+    fn render_image_model_selector(&self, frame: &mut Frame, area: Rect) {
+        self.render_model_like_selector(
+            frame,
+            area,
+            &self.image_model_selector,
+            "Select Image Model",
+            "Type to filter image-generation backends... (Esc to cancel)",
+            "image backends",
+        );
+    }
+
+    fn render_mcp_selector(&self, frame: &mut Frame, area: Rect) {
+        frame.render_widget(Clear, area);
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ])
+            .split(area);
+
+        let search_text = if self.mcp_selector.query.is_empty() {
+            "Search official MCP catalog + configured servers... (Enter default action, i install, t test, v view, d remove, Esc cancel)".to_string()
+        } else {
+            self.mcp_selector.query.clone()
+        };
+        let search_style = if self.mcp_selector.query.is_empty() {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let search = Paragraph::new(Line::from(vec![
+            Span::styled("  ⛓ ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled(search_text, search_style),
+        ]))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Rgb(110, 220, 210)))
+                .title(" Official MCP Catalog "),
+        );
+        frame.render_widget(search, chunks[0]);
+
+        let max_visible = chunks[1].height as usize;
+        let filtered = &self.mcp_selector.filtered;
+        let selected = self.mcp_selector.selected;
+        let scroll_start = if selected >= max_visible {
+            selected - max_visible + 1
+        } else {
+            0
+        };
+
+        let items: Vec<ListItem> = filtered
+            .iter()
+            .skip(scroll_start)
+            .take(max_visible)
+            .enumerate()
+            .map(|(vis_idx, &preset_idx)| {
+                let entry = &self.mcp_selector.items[preset_idx];
+                let is_selected = vis_idx + scroll_start == selected;
+                let row_style = if is_selected {
+                    Style::default()
+                        .bg(Color::Rgb(40, 56, 58))
+                        .fg(Color::Rgb(110, 220, 210))
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Rgb(210, 220, 220))
+                };
+                let source_style = if is_selected {
+                    Style::default()
+                        .bg(Color::Rgb(40, 56, 58))
+                        .fg(Color::Rgb(145, 170, 170))
+                } else {
+                    Style::default().fg(Color::Rgb(100, 120, 120))
+                };
+                let action_style = if is_selected {
+                    Style::default()
+                        .bg(Color::Rgb(40, 56, 58))
+                        .fg(Color::Rgb(210, 240, 175))
+                } else {
+                    Style::default().fg(Color::Rgb(135, 165, 110))
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!("  {:<12}", entry.source), source_style),
+                    Span::styled(format!("{:<9}", entry.action_label), action_style),
+                    Span::styled(entry.title.clone(), row_style),
+                    Span::raw("  "),
+                    Span::styled(entry.detail.clone(), source_style),
+                ]))
+            })
+            .collect();
+
+        frame.render_widget(
+            List::new(items).style(Style::default().bg(Color::Rgb(18, 24, 26))),
+            chunks[1],
+        );
+
+        let help = Paragraph::new(Line::from(vec![
+            Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("browse  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Enter ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("default action  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("i ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("install  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("t ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("test  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("v ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("view  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("d ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("remove  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Esc ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("cancel  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{} entries", filtered.len()),
+                Style::default().fg(Color::Rgb(100, 120, 120)),
+            ),
+        ]));
+        frame.render_widget(help, chunks[2]);
     }
 
     /// Render the full-screen skill browser overlay.
@@ -8692,6 +11811,9 @@ fn event_loop(
         }
 
         if app.should_exit() {
+            if app.voice_recording.is_some() {
+                app.abort_voice_recording("Voice recording cancelled during exit.");
+            }
             return Ok(());
         }
     }
@@ -8881,6 +12003,110 @@ mod tests {
                 .iter()
                 .any(|line| line.text.contains("EdgeCrab (background #1)"))
         );
+        assert!(app.background_tasks_active.is_empty());
+    }
+
+    #[test]
+    fn background_progress_text_formats_tool_events() {
+        let event = edgecrab_core::StreamEvent::ToolExec {
+            name: "terminal".into(),
+            args_json: r#"{"command":"cargo test -p edgecrab-core"}"#.into(),
+        };
+        let text = background_progress_text(2, &event).expect("progress text");
+        assert!(text.contains("bg#2"));
+        assert!(text.contains("terminal"));
+    }
+
+    #[test]
+    fn background_progress_text_formats_subagent_completion() {
+        let event = edgecrab_core::StreamEvent::SubAgentFinish {
+            task_index: 1,
+            task_count: 3,
+            status: "completed".into(),
+            duration_ms: 2500,
+            summary: "done".into(),
+            api_calls: 2,
+            model: Some("mock/model".into()),
+        };
+        let text = background_progress_text(4, &event).expect("progress text");
+        assert!(text.contains("bg#4"));
+        assert!(text.contains("[2/3]"));
+        assert!(text.contains("completed in 2.5s"));
+    }
+
+    #[test]
+    fn background_status_summary_prefers_latest_progress() {
+        let mut tasks = std::collections::HashMap::new();
+        tasks.insert(
+            "bg-1".into(),
+            BackgroundTaskStatus {
+                preview: "first task".into(),
+                last_progress: Some("↳ bg#1 terminal: cargo test".into()),
+                last_seq: 1,
+            },
+        );
+        tasks.insert(
+            "bg-2".into(),
+            BackgroundTaskStatus {
+                preview: "second task".into(),
+                last_progress: Some("↳ bg#2 [1/2] terminal: rg delegate".into()),
+                last_seq: 2,
+            },
+        );
+
+        let summary = format_background_status_summary(&tasks).expect("summary");
+        assert!(summary.contains("bg#2"));
+        assert!(summary.contains("delegate"));
+    }
+
+    #[test]
+    fn subagent_status_summary_prefers_latest_tool_detail() {
+        let mut tasks = std::collections::HashMap::new();
+        tasks.insert(
+            0,
+            ActiveSubagentStatus {
+                task_index: 0,
+                task_count: 3,
+                goal: "inspect repo".into(),
+                last_detail: Some("terminal  command: cargo test".into()),
+                last_seq: 4,
+            },
+        );
+        tasks.insert(
+            1,
+            ActiveSubagentStatus {
+                task_index: 1,
+                task_count: 3,
+                goal: "audit gateway".into(),
+                last_detail: Some("file_search  query: delegate_task".into()),
+                last_seq: 7,
+            },
+        );
+
+        let summary = format_subagent_status_summary(&tasks).expect("summary");
+        assert!(summary.contains("[2/3]"));
+        assert!(summary.contains("delegate_task"));
+    }
+
+    #[test]
+    fn background_progress_text_formats_subagent_reasoning() {
+        let event = edgecrab_core::StreamEvent::SubAgentReasoning {
+            task_index: 0,
+            task_count: 2,
+            text: "searching the workspace for delegation regressions".into(),
+        };
+        let text = background_progress_text(3, &event).expect("progress text");
+        assert!(text.contains("bg#3"));
+        assert!(text.contains("[1/2]"));
+        assert!(text.contains("thinking"));
+    }
+
+    #[test]
+    fn context_usage_ratio_clamps_at_one_hundred_percent() {
+        assert_eq!(context_usage_ratio(210_000, Some(200_000)), Some(1.0));
+        assert_eq!(context_usage_ratio(100_000, Some(200_000)), Some(0.5));
+        assert_eq!(context_usage_ratio(100, Some(0)), None);
+        assert_eq!(context_usage_ratio(100, None), None);
     }
 
     #[tokio::test]
@@ -8905,6 +12131,308 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn image_model_selector_opens_with_default_reset_and_inventory() {
+        let mut app = App::new();
+
+        app.open_image_model_selector();
+
+        assert!(app.image_model_selector.active);
+        assert_eq!(
+            app.image_model_selector
+                .items
+                .first()
+                .map(|entry| entry.display.as_str()),
+            Some("default")
+        );
+        assert!(
+            app.image_model_selector
+                .items
+                .iter()
+                .any(|entry| entry.display == "gemini/gemini-2.5-flash-image")
+        );
+    }
+
+    #[test]
+    fn mcp_selector_builder_merges_configured_and_official_entries() {
+        let configured = vec![edgecrab_tools::tools::mcp_client::ConfiguredMcpServer {
+            name: "local-git".into(),
+            url: None,
+            bearer_token: None,
+            command: "uvx".into(),
+            args: vec![
+                "mcp-server-git".into(),
+                "--repository".into(),
+                "/tmp/repo".into(),
+            ],
+            cwd: Some(std::path::PathBuf::from("/tmp/repo")),
+            env: std::collections::HashMap::new(),
+            headers: std::collections::HashMap::new(),
+            timeout: None,
+            connect_timeout: None,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            token_from_config: false,
+            token_from_store: false,
+        }];
+
+        let entries = build_mcp_selector_entries_from(
+            &configured,
+            &[crate::mcp_catalog::OfficialCatalogEntry {
+                id: "git".into(),
+                display_name: "Git".into(),
+                description: "Official git server.".into(),
+                source_url: "https://github.com/modelcontextprotocol/servers/tree/main/src/git"
+                    .into(),
+                homepage: "https://github.com/modelcontextprotocol/servers/tree/main/src/git"
+                    .into(),
+                tags: vec!["official".into(), "reference".into()],
+                installable_preset_id: Some("git".into()),
+            }],
+        );
+
+        assert!(entries.iter().any(|entry| {
+            entry.kind == McpEntryKind::ConfiguredServer && entry.id == "local-git"
+        }));
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.kind == McpEntryKind::CatalogEntry && entry.id == "git")
+        );
+    }
+
+    #[test]
+    fn mcp_selector_search_matches_preset_package_and_env_metadata() {
+        let entries = build_mcp_selector_entries_from(
+            &[],
+            &[crate::mcp_catalog::OfficialCatalogEntry {
+                id: "github".into(),
+                display_name: "GitHub".into(),
+                description: "Official GitHub server.".into(),
+                source_url: "https://github.com/github/github-mcp-server".into(),
+                homepage: "https://modelcontextprotocol.io".into(),
+                tags: vec!["official".into(), "integration".into(), "github".into()],
+                installable_preset_id: Some("github".into()),
+            }],
+        );
+        let mut selector = FuzzySelector::new();
+        selector.set_items(entries);
+        selector.query = "GITHUB_PERSONAL_ACCESS_TOKEN".into();
+        selector.update_filter();
+
+        assert_eq!(selector.filtered.len(), 1);
+        assert_eq!(
+            selector.current().map(|entry| entry.id.as_str()),
+            Some("github")
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_command_without_args_opens_selector_overlay() {
+        let mut app = App::new();
+
+        app.handle_mcp_command(String::new());
+
+        assert!(app.mcp_selector.active);
+        assert!(!app.mcp_selector.filtered.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mcp_search_filters_official_snapshot_entries() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+        let cache_dir = dir.path().join("cache");
+        std::fs::create_dir_all(&cache_dir).expect("cache dir");
+        std::fs::write(
+            cache_dir.join("mcp_official_catalog.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "fetched_at_epoch_secs": 1,
+                "entries": [{
+                    "id": "time",
+                    "display_name": "Time",
+                    "description": "Timezone conversion capabilities.",
+                    "source_url": "https://github.com/modelcontextprotocol/servers/tree/main/src/time",
+                    "homepage": "https://github.com/modelcontextprotocol/servers/tree/main/src/time",
+                    "tags": ["official", "reference"],
+                    "installable_preset_id": "time"
+                }]
+            }))
+            .expect("json"),
+        )
+        .expect("write cache");
+
+        let mut app = App::new();
+
+        app.open_mcp_selector(Some("timezone"), false);
+
+        assert!(app.mcp_selector.active);
+        let visible: Vec<&str> = app
+            .mcp_selector
+            .filtered
+            .iter()
+            .map(|idx| app.mcp_selector.items[*idx].title.as_str())
+            .collect();
+        assert!(
+            visible.iter().any(|title| title.contains("Time")),
+            "expected the official time preset in filtered entries, got: {visible:?}"
+        );
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[test]
+    fn select_audio_player_prefers_first_available_candidate() {
+        let player = select_audio_player_with(|program| matches!(program, "mpv" | "ffplay"));
+        assert_eq!(player.map(|player| player.program), Some("ffplay"));
+    }
+
+    #[test]
+    fn select_audio_recorder_prefers_linux_native_recorders_before_ffmpeg() {
+        let recorder =
+            select_audio_recorder_with(|program| matches!(program, "ffmpeg" | "arecord"));
+        let expected = if cfg!(target_os = "macos") {
+            Some(AudioRecorderBackend::FfmpegAvFoundation)
+        } else if cfg!(target_os = "windows") {
+            Some(AudioRecorderBackend::FfmpegDShow)
+        } else {
+            Some(AudioRecorderBackend::Arecord)
+        };
+        assert_eq!(recorder, expected);
+    }
+
+    #[test]
+    fn recorder_support_messages_match_backend_capabilities() {
+        assert!(recorder_supports_auto_silence_stop(
+            AudioRecorderBackend::FfmpegAvFoundation
+        ));
+        assert!(recorder_supports_auto_silence_stop(
+            AudioRecorderBackend::Rec
+        ));
+        assert!(!recorder_supports_auto_silence_stop(
+            AudioRecorderBackend::FfmpegDShow
+        ));
+        assert!(
+            recorder_auto_silence_support_message(AudioRecorderBackend::FfmpegDShow)
+                .contains("Windows")
+        );
+    }
+
+    #[test]
+    fn ffmpeg_silence_parser_detects_post_speech_stop_conditions() {
+        assert_eq!(
+            parse_ffmpeg_silence_start("[silencedetect] silence_start: 0.000"),
+            Some(0.0)
+        );
+        assert!(line_mentions_ffmpeg_silence_end(
+            "[silencedetect] silence_end: 1.23 | silence_duration: 0.45"
+        ));
+        assert!(!should_stop_ffmpeg_on_silence(
+            "[silencedetect] silence_start: 0.000",
+            false,
+            0.35
+        ));
+        assert!(should_stop_ffmpeg_on_silence(
+            "[silencedetect] silence_start: 1.420",
+            false,
+            0.35
+        ));
+        assert!(should_stop_ffmpeg_on_silence(
+            "[silencedetect] silence_start: 0.100",
+            true,
+            0.35
+        ));
+    }
+
+    #[test]
+    fn voice_hallucination_filter_is_conservative() {
+        assert_eq!(
+            normalize_voice_transcript("  thanks   for   watching  "),
+            "thanks for watching"
+        );
+        assert!(is_probable_voice_hallucination("thanks for watching", 0.9));
+        assert!(!is_probable_voice_hallucination(
+            "thanks for watching the logs and open src/main.rs",
+            0.9
+        ));
+        assert!(!is_probable_voice_hallucination("thank you", 2.5));
+    }
+
+    #[test]
+    fn waiting_first_token_status_surfaces_the_right_message() {
+        let theme = Theme::default();
+        let early = format_waiting_first_token_status(&theme, 0, 0, 0, 2);
+        let long = format_waiting_first_token_status(&theme, 0, 0, 0, 12);
+        assert!(early.contains("first token"));
+        assert!(long.contains("waiting for first token"));
+        assert!(long.contains("^C=stop"));
+    }
+
+    #[test]
+    fn voice_presence_badges_cover_recording_and_playback_modes() {
+        let recording = format_voice_presence_badge(
+            VoicePresenceState::Recording {
+                elapsed_secs: 5,
+                continuous: true,
+            },
+            2,
+        );
+        let speaking = format_voice_presence_badge(VoicePresenceState::Speaking, 2);
+        let listening = format_voice_presence_badge(VoicePresenceState::Listening, 2);
+        assert!(recording.contains("TALK"));
+        assert!(recording.contains("5s"));
+        assert!(speaking.contains("SPEAK"));
+        assert!(listening.contains("LISTEN"));
+    }
+
+    #[test]
+    fn persist_voice_preferences_round_trip() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+        persist_voice_enabled_to_config(true).expect("persist enabled");
+        persist_voice_preferences_to_config(Some(true), Some(false), Some(Some("Mic 1")))
+            .expect("persist voice prefs");
+
+        let cfg = edgecrab_core::AppConfig::load().expect("load config");
+        assert!(cfg.voice.enabled);
+        assert!(cfg.voice.continuous);
+        assert!(!cfg.voice.hallucination_filter);
+        assert_eq!(cfg.voice.input_device.as_deref(), Some("Mic 1"));
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[test]
+    fn key_binding_match_supports_case_and_spacing_normalization() {
+        let key = event::KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL);
+        assert!(key_matches_binding(&key, " Ctrl + B "));
+    }
+
+    #[test]
+    fn key_binding_match_rejects_wrong_modifier_or_unknown_binding() {
+        let key = event::KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL);
+        assert!(!key_matches_binding(&key, "alt+b"));
+        assert!(!key_matches_binding(&key, "hyper+b"));
+    }
+
+    #[test]
+    fn key_binding_match_supports_function_keys() {
+        let key = event::KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE);
+        assert!(key_matches_binding(&key, "f6"));
+    }
+
+    #[tokio::test]
     async fn app_regular_input() {
         let mut app = App::new();
         app.process_input("explain this code");
@@ -8913,6 +12441,20 @@ mod tests {
                 .iter()
                 .any(|l| l.text.contains("explain this code"))
         );
+    }
+
+    #[tokio::test]
+    async fn first_token_transitions_awaiting_state_to_streaming() {
+        let mut app = App::new();
+        app.display_state = DisplayState::AwaitingFirstToken {
+            frame: 0,
+            started: Instant::now(),
+        };
+        app.response_tx
+            .send(AgentResponse::Token("hello".into()))
+            .expect("send token");
+        app.check_responses();
+        assert!(matches!(app.display_state, DisplayState::Streaming { .. }));
     }
 
     #[tokio::test]

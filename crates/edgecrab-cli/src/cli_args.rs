@@ -339,6 +339,34 @@ pub enum ToolsCommand {
 pub enum McpCommand {
     /// List configured MCP servers
     List,
+    /// Refresh the cached official MCP catalog from upstream
+    Refresh,
+    /// Search the curated MCP preset catalog
+    Search {
+        /// Optional search query; omit to list all cached official entries
+        query: Option<String>,
+    },
+    /// Show details for a controlled preset or official catalog entry
+    View {
+        /// Preset name from `edgecrab mcp search`
+        preset: String,
+    },
+    /// Install a controlled MCP preset into config.yaml
+    Install {
+        /// Preset name from `edgecrab mcp search`
+        preset: String,
+        /// Override the configured server name
+        #[arg(long)]
+        name: Option<String>,
+        /// Override the workspace/path argument for path-scoped presets
+        #[arg(long)]
+        path: Option<String>,
+    },
+    /// Probe a configured MCP server by connecting and listing tools
+    Test {
+        /// Configured MCP server name; omit to test all configured servers
+        name: Option<String>,
+    },
     /// Add or update an MCP server
     Add {
         name: String,
@@ -347,6 +375,7 @@ pub enum McpCommand {
         args: Vec<String>,
     },
     /// Remove an MCP server
+    #[command(visible_aliases = ["uninstall", "rm"])]
     Remove { name: String },
 }
 
@@ -790,6 +819,29 @@ mod tests {
             args.command,
             Some(Command::Mcp {
                 command: McpCommand::Add { .. }
+            })
+        ));
+    }
+
+    #[test]
+    fn parse_mcp_search_subcommand() {
+        let args = CliArgs::parse_from(["edgecrab", "mcp", "search", "github"]);
+        assert!(matches!(
+            args.command,
+            Some(Command::Mcp {
+                command: McpCommand::Search { .. }
+            })
+        ));
+    }
+
+    #[test]
+    fn parse_mcp_install_subcommand() {
+        let args =
+            CliArgs::parse_from(["edgecrab", "mcp", "install", "filesystem", "--path", "/tmp"]);
+        assert!(matches!(
+            args.command,
+            Some(Command::Mcp {
+                command: McpCommand::Install { .. }
             })
         ));
     }

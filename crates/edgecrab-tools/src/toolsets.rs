@@ -35,6 +35,7 @@ pub const CORE_TOOLS: &[&str] = &[
     "write_file",
     "patch",
     "search_files",
+    "pdf_to_markdown",
     // Skills
     "skills_list",
     "skills_categories",
@@ -121,6 +122,7 @@ pub const ACP_TOOLS: &[&str] = &[
     "write_file",
     "patch",
     "search_files",
+    "pdf_to_markdown",
     "skills_list",
     "skills_categories",
     "skill_view",

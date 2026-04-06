@@ -31,6 +31,7 @@ use axum::extract::Json;
 use axum::routing::post;
 use edgecrab_types::Platform;
 use lettre::message::Mailbox;
+use lettre::message::{Attachment, MultiPart, SinglePart, header};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Message, SmtpTransport, Transport};
 use serde::Deserialize;
@@ -258,6 +259,90 @@ impl EmailAdapter {
 
         Ok(())
     }
+
+    async fn send_generic_smtp_with_attachment(
+        &self,
+        to: &str,
+        subject: &str,
+        body: &str,
+        file_path: &str,
+    ) -> anyhow::Result<()> {
+        let smtp_host = self
+            .smtp_host
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("EMAIL_SMTP_HOST required for generic_smtp"))?;
+        let smtp_port = self.smtp_port;
+        let smtp_username = self
+            .smtp_username
+            .clone()
+            .unwrap_or_else(|| self.from_address.clone());
+        let smtp_password = self
+            .smtp_password
+            .clone()
+            .unwrap_or_else(|| self.api_key.clone());
+        let from_address = normalize_email_address(&self.from_address)?;
+        let to_address = normalize_email_address(to)?;
+        let sanitized_subject = sanitize_email_subject(subject);
+        let body = body.to_string();
+        let file_path = file_path.to_string();
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let path = std::path::Path::new(&file_path);
+            let file_name = path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .ok_or_else(|| anyhow::anyhow!("attachment path has no file name: {file_path}"))?
+                .to_string();
+            let bytes = std::fs::read(path)?;
+            let content_type = email_attachment_content_type(&file_name);
+            let from_mailbox: Mailbox = from_address.parse()?;
+            let to_mailbox: Mailbox = to_address.parse()?;
+            let attachment = Attachment::new(file_name).body(bytes, content_type);
+            let multipart = MultiPart::mixed()
+                .singlepart(SinglePart::plain(body))
+                .singlepart(attachment);
+            let message = Message::builder()
+                .from(from_mailbox)
+                .to(to_mailbox)
+                .subject(sanitized_subject)
+                .multipart(multipart)?;
+
+            let credentials = Credentials::new(smtp_username, smtp_password);
+            let mailer = SmtpTransport::builder_dangerous(&smtp_host)
+                .port(smtp_port)
+                .credentials(credentials)
+                .build();
+            mailer.send(&message)?;
+            Ok(())
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("generic SMTP send task failed: {error}"))??;
+
+        Ok(())
+    }
+}
+
+fn email_attachment_content_type(file_name: &str) -> header::ContentType {
+    let mime = match std::path::Path::new(file_name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "pdf" => "application/pdf",
+        "txt" => "text/plain",
+        "md" => "text/markdown",
+        "csv" => "text/csv",
+        "json" => "application/json",
+        "zip" => "application/zip",
+        _ => "application/octet-stream",
+    };
+    mime.parse().expect("valid content type")
 }
 
 fn normalize_email_address(value: &str) -> anyhow::Result<String> {
@@ -423,7 +508,52 @@ impl PlatformAdapter for EmailAdapter {
     }
 
     fn supports_files(&self) -> bool {
-        true
+        matches!(self.provider, EmailProvider::GenericSmtp)
+    }
+
+    async fn send_document(
+        &self,
+        path: &str,
+        caption: Option<&str>,
+        metadata: &MessageMetadata,
+    ) -> anyhow::Result<()> {
+        let to = metadata
+            .channel_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("No recipient email address"))?;
+        let to = normalize_email_address(to)?;
+        let subject = metadata.thread_id.as_deref().unwrap_or("EdgeCrab Response");
+
+        match self.provider {
+            EmailProvider::GenericSmtp => {
+                self.send_generic_smtp_with_attachment(
+                    &to,
+                    subject,
+                    caption.unwrap_or_default(),
+                    path,
+                )
+                .await?
+            }
+            EmailProvider::SendGrid | EmailProvider::Mailgun => {
+                let file_name = std::path::Path::new(path)
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or(path);
+                let body = match caption {
+                    Some(caption) if !caption.trim().is_empty() => {
+                        format!("{caption}\n\nAttachment: {file_name} ({path})")
+                    }
+                    _ => format!("Attachment: {file_name} ({path})"),
+                };
+                match self.provider {
+                    EmailProvider::SendGrid => self.send_sendgrid(&to, subject, &body).await?,
+                    EmailProvider::Mailgun => self.send_mailgun(&to, subject, &body).await?,
+                    EmailProvider::GenericSmtp => unreachable!(),
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -472,5 +602,36 @@ mod tests {
             std::env::remove_var("EMAIL_SMTP_HOST");
             std::env::remove_var("EMAIL_SMTP_PASSWORD");
         }
+    }
+
+    #[test]
+    fn only_generic_smtp_claims_native_file_support() {
+        let smtp = EmailAdapter {
+            provider: EmailProvider::GenericSmtp,
+            api_key: String::new(),
+            from_address: "bot@example.com".into(),
+            domain: None,
+            smtp_host: Some("smtp.example.com".into()),
+            smtp_port: 587,
+            smtp_username: None,
+            smtp_password: Some("secret".into()),
+            webhook_port: 8093,
+            allowed_senders: Vec::new(),
+        };
+        let sendgrid = EmailAdapter {
+            provider: EmailProvider::SendGrid,
+            api_key: "secret".into(),
+            from_address: "bot@example.com".into(),
+            domain: None,
+            smtp_host: None,
+            smtp_port: 587,
+            smtp_username: None,
+            smtp_password: None,
+            webhook_port: 8093,
+            allowed_senders: Vec::new(),
+        };
+
+        assert!(smtp.supports_files());
+        assert!(!sendgrid.supports_files());
     }
 }

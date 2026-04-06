@@ -18,7 +18,7 @@ sidebar:
 
 ```bash
 # Clone
-git clone https://github.com/NousResearch/edgecrab
+git clone https://github.com/raphaelmansuy/edgecrab
 cd edgecrab
 
 # Debug build (fast compile)
@@ -72,6 +72,8 @@ Before working on a feature, read the crate that owns it:
 
 ## Adding a Tool
 
+Tools are registered at **compile time** via the `inventory` crate — zero runtime startup cost.
+
 1. Create `crates/edgecrab-tools/src/tools/your_tool.rs`
 2. Implement the `Tool` trait:
    ```rust
@@ -79,17 +81,22 @@ Before working on a feature, read the crate that owns it:
 
    impl Tool for YourTool {
        fn name(&self) -> &'static str { "your_tool" }
-       fn description(&self) -> &'static str { "..." }
-       fn parameters(&self) -> serde_json::Value { /* JSON schema */ }
+       fn description(&self) -> &'static str { "What this tool does" }
+       fn parameters(&self) -> serde_json::Value { /* JSON Schema object */ }
        async fn call(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult { ... }
    }
    ```
-3. Register in `crates/edgecrab-tools/src/registry.rs`:
+3. Register with `inventory::submit!` at the bottom of the file:
    ```rust
-   registry.register(Arc::new(YourTool));
+   inventory::submit! {
+       // The exact wrapper type is defined in edgecrab-tools/src/registry.rs
+       ToolRegistration::new(YourTool)
+   }
    ```
 4. Add to the appropriate toolset in `toolsets.rs`
 5. Add tests in `crates/edgecrab-tools/tests/`
+
+> **Note:** Commands issued by tools are checked by `CommandScanner` before execution. Tools that shell out must pass their command through the scanner — see existing terminal tools for examples.
 
 ---
 

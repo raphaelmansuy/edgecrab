@@ -182,7 +182,7 @@ edgecrab sessions list | grep "important-project" | awk '{print $1}' | \
   xargs -I{} edgecrab sessions export {} --format markdown > archived-sessions.md
 ```
 
-**Use search as your second brain.** Solved a bug 6 months ago? `edgecrab sessions search "tokio spawn blocking panic"` retrieves the exact context, solution, and code changes.
+**Use search as your second brain.** Solved a bug 6 months ago? `edgecrab sessions browse --query "tokio spawn blocking panic"` retrieves the exact context, solution, and code changes.
 
 **Compress context at the threshold.** If sessions get very long (100+ messages), enable compression to keep costs manageable:
 ```yaml
@@ -205,7 +205,7 @@ No — session deletion is permanent. The FTS5 index is also updated. Always exp
 
 **Q: Sessions list shows duplicate names. Is that a bug?**
 
-No — names are not unique. Multiple sessions can share the same name. The ID is the unique identifier. Use `edgecrab sessions search` or `edgecrab sessions list` with the ID to differentiate.
+No — names are not unique. Multiple sessions can share the same name. The ID is the unique identifier. Use `edgecrab sessions browse --query` or `edgecrab sessions list` with the ID to differentiate.
 
 **Q: I want to continue exactly where I left off in a closed session.**
 
@@ -218,7 +218,7 @@ edgecrab --session abc123            # exact session ID
 **Q: How do I find a session from 3 weeks ago about a specific bug?**
 
 ```bash
-edgecrab sessions search "segfault in connection pool"
+edgecrab sessions browse --query "segfault in connection pool"
 edgecrab sessions list --limit 100   # all recent sessions
 ```
 FTS5 search is significantly faster than browsing the list manually.

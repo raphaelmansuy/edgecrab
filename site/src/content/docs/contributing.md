@@ -5,7 +5,20 @@ sidebar:
   order: 3
 ---
 
-We welcome contributions of all sizes! Please read this guide before opening a PR.
+We welcome contributions of all sizes. This page covers the basics — see [Developer: Contributing](/developer/contributing/) for the complete technical guide including how to add tools and gateways.
+
+---
+
+## Quick Start
+
+```bash
+git clone https://github.com/raphaelmansuy/edgecrab
+cd edgecrab
+cargo build          # builds all 10 crates
+cargo test --workspace   # 324 tests
+cargo clippy --workspace -- -D warnings
+cargo fmt --all
+```
 
 ---
 
@@ -13,20 +26,7 @@ We welcome contributions of all sizes! Please read this guide before opening a P
 
 1. Search [existing issues](https://github.com/raphaelmansuy/edgecrab/issues) first.
 2. Include: OS, Rust version (`rustc --version`), EdgeCrab version (`edgecrab --version`), and reproduction steps.
-3. For security vulnerabilities, email `security@elitizon.com` — do not open a public issue.
-
----
-
-## Development Setup
-
-```bash
-git clone https://github.com/raphaelmansuy/edgecrab
-cd edgecrab
-cargo build          # Build all crates
-cargo test           # Run all tests
-cargo clippy -- -D warnings
-cargo fmt --all
-```
+3. For security vulnerabilities, use [GitHub Security Advisories](https://github.com/raphaelmansuy/edgecrab/security/advisories/new) — do not open a public issue.
 
 ---
 
@@ -37,7 +37,7 @@ cargo fmt --all
 ```bash
 cd sdks/python
 pip install -e ".[dev]"
-pytest tests/ -v
+pytest tests/ -v     # 54 tests
 ```
 
 ### Node.js SDK
@@ -46,27 +46,80 @@ pytest tests/ -v
 cd sdks/node
 npm ci
 npm run build
-npm test
+npm test             # 24 tests
 ```
+
+---
+
+## What to Work On
+
+| Area | Where |
+|------|-------|
+| New tool | `crates/edgecrab-tools/src/tools/` — implement `Tool` trait, register with `inventory::submit!` |
+| New gateway | `crates/edgecrab-gateway/src/` — implement `PlatformAdapter` trait |
+| Config option | `crates/edgecrab-core/src/config.rs` — add field + `Default` + env override |
+| Slash command | `crates/edgecrab-cli/src/commands.rs` |
+| Security rule | `crates/edgecrab-security/src/` |
+| Bug fix | Identify the crate from the error, write a failing test, then fix |
+
+---
+
+## Adding a Gateway Platform
+
+Gateways connect EdgeCrab to messaging platforms. Each adapter implements the `PlatformAdapter` trait:
+
+```rust
+// crates/edgecrab-gateway/src/your_platform.rs
+
+pub struct YourPlatformAdapter { /* env var config */ }
+
+#[async_trait]
+impl PlatformAdapter for YourPlatformAdapter {
+    async fn run(
+        &self,
+        tx: mpsc::Sender<IncomingMessage>,
+        rx: broadcast::Receiver<OutgoingMessage>,
+    ) -> Result<()> {
+        // 1. Connect to the platform API
+        // 2. Forward incoming messages to `tx`
+        // 3. Send outgoing messages from `rx`
+    }
+
+    fn platform(&self) -> Platform { Platform::YourPlatform }
+    fn supports_markdown(&self) -> bool { true }
+    fn supports_images(&self) -> bool { false }
+    fn max_message_length(&self) -> usize { 4096 }
+}
+```
+
+Then register in `gateway_catalog.rs` and add the `Platform::YourPlatform` variant to `edgecrab-types/src/config.rs`.
 
 ---
 
 ## Coding Guidelines
 
 - Follow `cargo fmt` conventions (enforced by CI).
-- Zero clippy warnings — run `cargo clippy -- -D warnings` locally.
-- Every new public API must have a doc comment.
-- New tools in `edgecrab-tools` must pass through `CommandScanner` before execution.
+- Zero clippy warnings — run `cargo clippy --workspace -- -D warnings` locally.
+- Every new public API must have a doc comment (`///`).
+- New tools must pass through `CommandScanner` before any shell execution.
+- No `unwrap()` in tool or gateway code — use `?` and typed errors.
 - Security-sensitive changes require an entry in `CHANGELOG.md`.
 
 ---
 
 ## Pull Requests
 
-1. Fork the repo and create a branch: `git checkout -b feat/my-feature`.
+1. Fork the repo and create a branch: `git checkout -b feat/my-feature`
 2. Write tests for new functionality.
-3. Ensure `cargo test` and `cargo clippy -- -D warnings` both pass.
+3. Ensure `cargo test --workspace` and `cargo clippy --workspace -- -D warnings` both pass.
 4. Open a PR against `main` with a clear title and description.
+5. PRs that add dependencies are reviewed for binary size impact.
+
+---
+
+## Dependency Policy
+
+EdgeCrab's binary size (~15 MB stripped) and startup time (< 50 ms) are tracked metrics. New dependencies are evaluated carefully — open an issue before adding one. Prefer the existing ecosystem (`tokio`, `axum`, `reqwest`, `serde_json`, `rusqlite`) over new crates that overlap.
 
 ---
 

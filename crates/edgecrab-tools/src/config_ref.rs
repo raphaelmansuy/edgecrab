@@ -6,6 +6,7 @@
 
 use std::path::PathBuf;
 
+use crate::execution_tmp::shared_tmp_dir;
 use crate::tools::backends::{
     BackendKind, DaytonaBackendConfig, DockerBackendConfig, ModalBackendConfig,
     SingularityBackendConfig, SshBackendConfig,
@@ -19,10 +20,14 @@ use edgecrab_security::path_policy::PathPolicy;
 ///   2. `~/.edgecrab`
 ///
 /// Duplicated from edgecrab-core/config.rs to avoid a circular crate dep.
-fn resolve_edgecrab_home() -> PathBuf {
+pub fn resolve_edgecrab_home() -> PathBuf {
     std::env::var("EDGECRAB_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
+            if cfg!(test) {
+                return std::env::temp_dir()
+                    .join(format!("edgecrab-test-home-{}", std::process::id()));
+            }
             dirs::home_dir()
                 .unwrap_or_else(|| PathBuf::from("."))
                 .join(".edgecrab")
@@ -135,6 +140,28 @@ pub struct AppConfigRef {
     pub auxiliary_base_url: Option<String>,
     /// Optional API-key environment variable for the auxiliary provider.
     pub auxiliary_api_key_env: Option<String>,
+    /// Preferred text-to-speech provider from config (`tts.provider`).
+    pub tts_provider: Option<String>,
+    /// Preferred text-to-speech voice from config (`tts.voice`).
+    pub tts_voice: Option<String>,
+    /// Optional Edge TTS rate override from config (`tts.rate`).
+    pub tts_rate: Option<String>,
+    /// Optional provider-specific TTS model (`tts.model`).
+    pub tts_model: Option<String>,
+    /// Optional ElevenLabs voice id from config (`tts.elevenlabs_voice_id`).
+    pub tts_elevenlabs_voice_id: Option<String>,
+    /// Optional ElevenLabs model id from config (`tts.elevenlabs_model_id`).
+    pub tts_elevenlabs_model_id: Option<String>,
+    /// Environment variable name for ElevenLabs credentials.
+    pub tts_elevenlabs_api_key_env: Option<String>,
+    /// Preferred speech-to-text provider from config (`stt.provider`).
+    pub stt_provider: Option<String>,
+    /// Preferred local Whisper model from config (`stt.whisper_model`).
+    pub stt_whisper_model: Option<String>,
+    /// Preferred image-generation provider from config (`image_generation.provider`).
+    pub image_provider: Option<String>,
+    /// Preferred image-generation model from config (`image_generation.model`).
+    pub image_model: Option<String>,
 }
 
 impl Default for AppConfigRef {
@@ -174,6 +201,17 @@ impl Default for AppConfigRef {
             auxiliary_model: None,
             auxiliary_base_url: None,
             auxiliary_api_key_env: None,
+            tts_provider: None,
+            tts_voice: None,
+            tts_rate: None,
+            tts_model: None,
+            tts_elevenlabs_voice_id: None,
+            tts_elevenlabs_model_id: None,
+            tts_elevenlabs_api_key_env: None,
+            stt_provider: None,
+            stt_whisper_model: None,
+            image_provider: None,
+            image_model: None,
         }
     }
 }
@@ -191,7 +229,11 @@ impl AppConfigRef {
 
     /// Build the effective file path policy for a session workspace.
     pub fn file_path_policy(&self, cwd: &std::path::Path) -> PathPolicy {
+        let file_tools_tmp_dir = self.file_tools_tmp_dir();
+        let _ = std::fs::create_dir_all(&file_tools_tmp_dir);
+
         PathPolicy::new(cwd.to_path_buf())
+            .with_virtual_tmp_root(file_tools_tmp_dir)
             .with_allowed_roots(self.file_allowed_roots.clone())
             .with_denied_roots(self.path_restrictions.clone())
     }
@@ -228,5 +270,14 @@ impl AppConfigRef {
     /// sub-directories are covered without per-platform changes.
     pub fn gateway_media_dir(&self) -> std::path::PathBuf {
         self.edgecrab_home.join("gateway_media")
+    }
+
+    /// Dedicated temp root for file tools.
+    ///
+    /// WHY not host `/tmp`: global temp directories are shared, nondeterministic,
+    /// and can expose unrelated process files. File tools get an EdgeCrab-owned
+    /// temp tree with stable semantics instead.
+    pub fn file_tools_tmp_dir(&self) -> std::path::PathBuf {
+        shared_tmp_dir(&self.edgecrab_home)
     }
 }

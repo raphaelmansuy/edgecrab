@@ -566,6 +566,7 @@ fn make_ctx(dir: &Path) -> ToolContext {
         tool_registry: None,
         delegate_depth: 0,
         sub_agent_runner: None,
+        delegation_event_tx: None,
         clarify_tx: None,
         approval_tx: None,
         on_skills_changed: None,
@@ -1322,7 +1323,15 @@ esac
         .await
         .expect("execute");
     assert!(
-        result.contains("singularity:echo hello-singularity"),
+        result.contains("singularity:mkdir -p '/tmp/edgecrab-tmp'"),
+        "got: {result}"
+    );
+    assert!(
+        result.contains("EDGECRAB_TMPDIR='/tmp/edgecrab-tmp'"),
+        "got: {result}"
+    );
+    assert!(
+        result.contains("&& echo hello-singularity"),
         "got: {result}"
     );
 

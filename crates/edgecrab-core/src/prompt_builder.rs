@@ -447,6 +447,7 @@ pub fn truncate_context_file(text: &str) -> Cow<'_, str> {
 pub struct PromptBuilder {
     platform: Platform,
     skip_context_files: bool,
+    execution_environment_guidance: Option<String>,
     /// Optional list of tool names available in this session.
     /// When `None`, all guidance is injected (backward compat / tests).
     /// When `Some`, each guidance snippet is only injected when its gate tool is present.
@@ -458,12 +459,18 @@ impl PromptBuilder {
         Self {
             platform,
             skip_context_files: false,
+            execution_environment_guidance: None,
             available_tools: None,
         }
     }
 
     pub fn skip_context_files(mut self, skip: bool) -> Self {
         self.skip_context_files = skip;
+        self
+    }
+
+    pub fn execution_environment_guidance(mut self, guidance: Option<String>) -> Self {
+        self.execution_environment_guidance = guidance.filter(|s| !s.trim().is_empty());
         self
     }
 
@@ -516,7 +523,12 @@ impl PromptBuilder {
             chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z")
         )));
 
-        // 4-6. Context files (SOUL.md, AGENTS.md, .cursorrules, etc.)
+        // 4. Execution environment guidance
+        if let Some(ref guidance) = self.execution_environment_guidance {
+            sections.push(Cow::Borrowed(guidance.as_str()));
+        }
+
+        // 5-7. Context files (SOUL.md, AGENTS.md, .cursorrules, etc.)
         if !self.skip_context_files {
             if let Some(dir) = cwd {
                 let context_files = discover_context_files(dir);
@@ -566,7 +578,7 @@ impl PromptBuilder {
             }
         }
 
-        // 7. Memory guidance + sections — only when memory tool is available
+        // 8. Memory guidance + sections — only when memory tool is available
         if !memory_sections.is_empty() {
             if self.has_tool("memory_write") {
                 sections.push(Cow::Borrowed(MEMORY_GUIDANCE));
@@ -576,28 +588,28 @@ impl PromptBuilder {
             }
         }
 
-        // 8. Session search guidance — only when session_search tool is present
+        // 9. Session search guidance — only when session_search tool is present
         if self.has_tool("session_search") {
             sections.push(Cow::Borrowed(SESSION_SEARCH_GUIDANCE));
         }
 
-        // 9. Skills guidance — only when skill_manage tool is present
+        // 10. Skills guidance — only when skill_manage tool is present
         if self.has_tool("skill_manage") {
             sections.push(Cow::Borrowed(SKILLS_GUIDANCE));
         }
 
-        // 10. Scheduling guidance — only for interactive sessions (not cron) and
+        // 11. Scheduling guidance — only for interactive sessions (not cron) and
         //     when manage_cron_jobs is available.
         if self.platform != Platform::Cron && self.has_tool("manage_cron_jobs") {
             sections.push(Cow::Borrowed(SCHEDULING_GUIDANCE));
         }
 
-        // 11. Cross-platform delivery guidance — only when send_message is present.
+        // 12. Cross-platform delivery guidance — only when send_message is present.
         if self.has_tool("send_message") {
             sections.push(Cow::Borrowed(MESSAGE_DELIVERY_GUIDANCE));
         }
 
-        // 12. Vision tool disambiguation — only when vision_analyze is present.
+        // 13. Vision tool disambiguation — only when vision_analyze is present.
         // WHY: Smaller local models (qwen3, llama3) reliably pick browser_vision over
         // vision_analyze when local image files are attached, because browser_vision
         // appears earlier in the tool list. Schema descriptions alone are insufficient;
@@ -606,7 +618,7 @@ impl PromptBuilder {
             sections.push(Cow::Borrowed(VISION_GUIDANCE));
         }
 
-        // 13. Skills prompt (available skill descriptions)
+        // 14. Skills prompt (available skill descriptions)
         if let Some(sp) = skill_prompt {
             if !sp.is_empty() {
                 sections.push(Cow::Borrowed(sp));
@@ -1459,30 +1471,35 @@ fn skill_should_show(
     available_tools: Option<&[String]>,
     available_toolsets: Option<&[String]>,
 ) -> bool {
-    let at = available_tools.unwrap_or(&[]);
-    let ats = available_toolsets.unwrap_or(&[]);
-
     // fallback_for: hide when the primary tool/toolset IS available
-    for t in &conditions.fallback_for_tools {
-        if at.iter().any(|a| a == t) {
-            return false;
+    if let Some(at) = available_tools {
+        for t in &conditions.fallback_for_tools {
+            if at.iter().any(|a| a == t) {
+                return false;
+            }
         }
     }
-    for ts in &conditions.fallback_for_toolsets {
-        if ats.iter().any(|a| a == ts) {
-            return false;
+    if let Some(ats) = available_toolsets {
+        for ts in &conditions.fallback_for_toolsets {
+            if ats.iter().any(|a| a == ts) {
+                return false;
+            }
         }
     }
 
-    // requires: hide when a required tool/toolset is NOT available
-    for t in &conditions.requires_tools {
-        if !at.is_empty() && !at.iter().any(|a| a == t) {
-            return false;
+    // requires: if availability is known, hide when a required tool/toolset is absent.
+    if let Some(at) = available_tools {
+        for t in &conditions.requires_tools {
+            if !at.iter().any(|a| a == t) {
+                return false;
+            }
         }
     }
-    for ts in &conditions.requires_toolsets {
-        if !ats.is_empty() && !ats.iter().any(|a| a == ts) {
-            return false;
+    if let Some(ats) = available_toolsets {
+        for ts in &conditions.requires_toolsets {
+            if !ats.iter().any(|a| a == ts) {
+                return false;
+            }
         }
     }
 
@@ -1531,6 +1548,16 @@ mod tests {
         let builder = PromptBuilder::new(Platform::Cli);
         let prompt = builder.build(None, None, &[], None);
         assert!(prompt.contains("ANSI colors"));
+    }
+
+    #[test]
+    fn execution_environment_guidance_is_included() {
+        let builder = PromptBuilder::new(Platform::Cli).execution_environment_guidance(Some(
+            "## Execution Filesystem\n\nworkspace info".into(),
+        ));
+        let prompt = builder.build(None, None, &[], None);
+        assert!(prompt.contains("## Execution Filesystem"));
+        assert!(prompt.contains("workspace info"));
     }
 
     #[test]
@@ -1955,6 +1982,52 @@ mod tests {
         assert!(summary.contains("skill-y"), "skill-y should appear");
     }
 
+    #[test]
+    fn load_skill_summary_hides_requires_tools_when_tool_list_is_known_empty() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("skills").join("terminal-only");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("SKILL.md"),
+            "---\nrequires_tools: [terminal]\ndescription: Terminal helper\n---\n",
+        )
+        .expect("write");
+
+        let summary = load_skill_summary(tmp.path(), &[], Some(&[]), None);
+        assert!(
+            summary.is_none(),
+            "no skills should remain when the only skill requires an unavailable tool"
+        );
+    }
+
+    #[test]
+    fn load_skill_summary_filters_by_available_toolsets() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("skills").join("browser-helper");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("SKILL.md"),
+            "---\nrequires_toolsets: [browser]\ndescription: Browser helper\n---\n",
+        )
+        .expect("write");
+
+        let file_only = ["file".to_string()];
+        let browser_only = ["browser".to_string()];
+
+        let hidden = load_skill_summary(tmp.path(), &[], None, Some(&file_only));
+        let visible =
+            load_skill_summary(tmp.path(), &[], None, Some(&browser_only)).expect("Some visible");
+
+        assert!(
+            hidden.is_none(),
+            "skills gated on unavailable toolsets must be fully omitted"
+        );
+        assert!(
+            visible.contains("browser-helper"),
+            "skills gated on available toolsets must be shown"
+        );
+    }
+
     // ── Skills cache tests ─────────────────────────────────────────────
 
     #[test]
@@ -2100,6 +2173,38 @@ mod tests {
         assert!(
             !prompt.contains("NEVER call browser_vision"),
             "vision guidance must NOT appear when vision_analyze is not in tool list"
+        );
+    }
+
+    #[test]
+    fn skill_conditions_hide_requires_when_known_toolset_is_empty() {
+        let conditions = SkillConditions {
+            requires_tools: vec!["terminal".to_string()],
+            ..Default::default()
+        };
+        assert!(
+            !skill_should_show(&conditions, Some(&[]), None),
+            "requires_tools must hide skills when tool availability is known and empty"
+        );
+        assert!(
+            skill_should_show(&conditions, None, None),
+            "requires_tools must remain permissive when tool availability is unknown"
+        );
+    }
+
+    #[test]
+    fn skill_conditions_hide_requires_when_known_toolset_missing() {
+        let conditions = SkillConditions {
+            requires_toolsets: vec!["browser".to_string()],
+            ..Default::default()
+        };
+        assert!(
+            !skill_should_show(
+                &conditions,
+                None,
+                Some(&["file".to_string(), "terminal".to_string()])
+            ),
+            "requires_toolsets must hide skills when the required toolset is absent"
         );
     }
 }

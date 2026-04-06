@@ -204,6 +204,6 @@ Yes, as long as `edgecrab` is installed on the remote host and is in `$PATH` as 
 
 ## See Also
 
-- [Security Model](/features/security/) — same rules apply in ACP mode
+- [Security Model](/user-guide/security/) — same rules apply in ACP mode
 - [Skills System](/features/skills/) — project-specific skill files loaded automatically
 - [Configuration Reference](/reference/configuration/) — tune model, iterations, and toolsets

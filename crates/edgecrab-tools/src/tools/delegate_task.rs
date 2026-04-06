@@ -25,7 +25,7 @@ use serde_json::json;
 
 use edgecrab_types::{Content, Message, Role, ToolError, ToolSchema};
 
-use crate::registry::{ToolContext, ToolHandler};
+use crate::registry::{DelegationEvent, SubAgentRunRequest, ToolContext, ToolHandler};
 
 /// Maximum delegation depth: parent(0) → child(1) → grandchild rejected(2)
 const MAX_DEPTH: u32 = 2;
@@ -199,16 +199,27 @@ fn build_tool_trace(messages: &[Message]) -> Vec<serde_json::Value> {
     tool_trace
 }
 
-/// Run a single child task using the SubAgentRunner.
-async fn run_child_task(
+struct ChildTaskRequest {
     task_index: usize,
+    task_count: usize,
     goal: String,
     context: Option<String>,
     toolsets: Option<Vec<String>>,
-    parent_ctx: &ToolContext,
     max_iterations: u32,
     model_override: Option<String>,
-) -> serde_json::Value {
+}
+
+/// Run a single child task using the SubAgentRunner.
+async fn run_child_task(parent_ctx: &ToolContext, request: ChildTaskRequest) -> serde_json::Value {
+    let ChildTaskRequest {
+        task_index,
+        task_count,
+        goal,
+        context,
+        toolsets,
+        max_iterations,
+        model_override,
+    } = request;
     let start = std::time::Instant::now();
 
     // We need a sub_agent_runner to spawn a real sub-agent
@@ -226,6 +237,13 @@ async fn run_child_task(
     };
 
     let system_prompt = build_child_system_prompt(&goal, context.as_deref());
+    if let Some(tx) = &parent_ctx.delegation_event_tx {
+        let _ = tx.send(DelegationEvent::TaskStarted {
+            task_index,
+            task_count,
+            goal: goal.clone(),
+        });
+    }
 
     // Child toolsets: use requested ones or fall back to defaults
     // Parent active toolset info is populated by edgecrab-core in ToolContext.
@@ -235,14 +253,17 @@ async fn run_child_task(
     );
 
     match runner
-        .run_task(
-            &goal,
-            &system_prompt,
-            child_toolsets,
+        .run_task(SubAgentRunRequest {
+            goal: goal.clone(),
+            system_prompt,
+            enabled_toolsets: child_toolsets,
             max_iterations,
             model_override,
-            parent_ctx.cancel.clone(),
-        )
+            parent_cancel: parent_ctx.cancel.clone(),
+            progress_tx: parent_ctx.delegation_event_tx.clone(),
+            task_index,
+            task_count,
+        })
         .await
     {
         Ok(result) => {
@@ -255,6 +276,18 @@ async fn run_child_task(
             } else {
                 "failed"
             };
+            let duration_ms = start.elapsed().as_millis() as u64;
+            if let Some(tx) = &parent_ctx.delegation_event_tx {
+                let _ = tx.send(DelegationEvent::TaskFinished {
+                    task_index,
+                    task_count,
+                    status: status.to_string(),
+                    duration_ms,
+                    summary: summary.clone(),
+                    api_calls: result.api_calls,
+                    model: result.model.clone(),
+                });
+            }
 
             let exit_reason = if result.interrupted {
                 "interrupted"
@@ -281,11 +314,33 @@ async fn run_child_task(
                 "tokens": {
                     "input": result.input_tokens,
                     "output": result.output_tokens,
+                    "cache_read": result.cache_read_tokens,
+                    "cache_write": result.cache_write_tokens,
+                    "reasoning": result.reasoning_tokens,
+                    "prompt": result.input_tokens
+                        + result.cache_read_tokens
+                        + result.cache_write_tokens,
+                    "total": result.input_tokens
+                        + result.cache_read_tokens
+                        + result.cache_write_tokens
+                        + result.output_tokens
+                        + result.reasoning_tokens,
                 },
                 "tool_trace": tool_trace,
             })
         }
         Err(e) => {
+            if let Some(tx) = &parent_ctx.delegation_event_tx {
+                let _ = tx.send(DelegationEvent::TaskFinished {
+                    task_index,
+                    task_count,
+                    status: "error".to_string(),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    summary: String::new(),
+                    api_calls: 0,
+                    model: None,
+                });
+            }
             json!({
                 "task_index": task_index,
                 "status": "error",
@@ -461,18 +516,22 @@ impl ToolHandler for DelegateTaskToolReal {
         };
 
         let overall_start = std::time::Instant::now();
+        let task_count = task_list.len();
 
         if task_list.len() == 1 {
             // Single task — run directly (no spawn overhead)
             let t = &task_list[0];
             let result = run_child_task(
-                0,
-                t.goal.clone(),
-                t.context.clone(),
-                t.toolsets.clone(),
                 ctx,
-                max_iter,
-                model_override.clone(),
+                ChildTaskRequest {
+                    task_index: 0,
+                    task_count,
+                    goal: t.goal.clone(),
+                    context: t.context.clone(),
+                    toolsets: t.toolsets.clone(),
+                    max_iterations: max_iter,
+                    model_override: model_override.clone(),
+                },
             )
             .await;
 
@@ -506,6 +565,7 @@ impl ToolHandler for DelegateTaskToolReal {
                     tool_registry: None,
                     delegate_depth: ctx.delegate_depth + 1,
                     sub_agent_runner: runner,
+                    delegation_event_tx: ctx.delegation_event_tx.clone(),
                     clarify_tx: None, // sub-agents don't propagate interactive clarify
                     approval_tx: None, // sub-agents don't propagate approvals
                     on_skills_changed: None, // sub-agents don't invalidate parent cache
@@ -522,13 +582,16 @@ impl ToolHandler for DelegateTaskToolReal {
 
                 handles.push(tokio::spawn(async move {
                     run_child_task(
-                        i,
-                        goal,
-                        context,
-                        toolsets,
                         &child_ctx,
-                        max_iter,
-                        model_override.clone(),
+                        ChildTaskRequest {
+                            task_index: i,
+                            task_count,
+                            goal,
+                            context,
+                            toolsets,
+                            max_iterations: max_iter,
+                            model_override,
+                        },
                     )
                     .await
                 }));
@@ -568,7 +631,7 @@ mod tests {
 
     use async_trait::async_trait;
 
-    use crate::registry::{SubAgentResult, SubAgentRunner};
+    use crate::registry::{SubAgentResult, SubAgentRunRequest, SubAgentRunner};
 
     #[derive(Default, Clone)]
     struct RecordedCall {
@@ -583,28 +646,23 @@ mod tests {
 
     #[async_trait]
     impl SubAgentRunner for RecordingRunner {
-        async fn run_task(
-            &self,
-            _goal: &str,
-            _system_prompt: &str,
-            enabled_toolsets: Vec<String>,
-            max_iterations: u32,
-            model_override: Option<String>,
-            _parent_cancel: tokio_util::sync::CancellationToken,
-        ) -> Result<SubAgentResult, String> {
+        async fn run_task(&self, request: SubAgentRunRequest) -> Result<SubAgentResult, String> {
             self.calls
                 .lock()
                 .expect("recording mutex poisoned")
                 .push(RecordedCall {
-                    enabled_toolsets,
-                    max_iterations,
-                    model_override,
+                    enabled_toolsets: request.enabled_toolsets,
+                    max_iterations: request.max_iterations,
+                    model_override: request.model_override,
                 });
             Ok(SubAgentResult {
                 summary: "ok".into(),
                 api_calls: 1,
                 input_tokens: 10,
                 output_tokens: 5,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                reasoning_tokens: 0,
                 model: Some("mock/model".into()),
                 interrupted: false,
                 budget_exhausted: false,
@@ -810,18 +868,16 @@ mod tests {
         impl SubAgentRunner for ObservabilityRunner {
             async fn run_task(
                 &self,
-                _goal: &str,
-                _system_prompt: &str,
-                _enabled_toolsets: Vec<String>,
-                _max_iterations: u32,
-                _model_override: Option<String>,
-                _parent_cancel: tokio_util::sync::CancellationToken,
+                _request: SubAgentRunRequest,
             ) -> Result<SubAgentResult, String> {
                 Ok(SubAgentResult {
                     summary: "done".into(),
                     api_calls: 2,
                     input_tokens: 42,
                     output_tokens: 7,
+                    cache_read_tokens: 11,
+                    cache_write_tokens: 3,
+                    reasoning_tokens: 5,
                     model: Some("test/model".into()),
                     interrupted: false,
                     budget_exhausted: false,
@@ -859,6 +915,11 @@ mod tests {
         assert_eq!(entry["exit_reason"], "completed");
         assert_eq!(entry["tokens"]["input"], 42);
         assert_eq!(entry["tokens"]["output"], 7);
+        assert_eq!(entry["tokens"]["cache_read"], 11);
+        assert_eq!(entry["tokens"]["cache_write"], 3);
+        assert_eq!(entry["tokens"]["reasoning"], 5);
+        assert_eq!(entry["tokens"]["prompt"], 56);
+        assert_eq!(entry["tokens"]["total"], 68);
         assert_eq!(entry["tool_trace"][0]["tool"], "terminal");
         assert_eq!(entry["tool_trace"][0]["status"], "ok");
     }
@@ -881,5 +942,97 @@ mod tests {
             .expect_err("empty batch goal should fail");
 
         assert!(err.to_string().contains("Task 1"));
+    }
+
+    #[tokio::test]
+    async fn delegate_emits_progress_events() {
+        #[derive(Clone)]
+        struct ProgressRunner;
+
+        #[async_trait]
+        impl SubAgentRunner for ProgressRunner {
+            async fn run_task(
+                &self,
+                request: SubAgentRunRequest,
+            ) -> Result<SubAgentResult, String> {
+                if let Some(tx) = request.progress_tx {
+                    let _ = tx.send(DelegationEvent::ToolCalled {
+                        task_index: request.task_index,
+                        task_count: request.task_count,
+                        tool_name: "terminal".into(),
+                        args_json: r#"{"command":"pwd"}"#.into(),
+                    });
+                }
+                Ok(SubAgentResult {
+                    summary: "done".into(),
+                    api_calls: 1,
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                    reasoning_tokens: 0,
+                    model: Some("mock/model".into()),
+                    interrupted: false,
+                    budget_exhausted: false,
+                    messages: Vec::new(),
+                })
+            }
+        }
+
+        let tool = DelegateTaskToolReal;
+        let mut ctx = ToolContext::test_context();
+        let (progress_tx, mut progress_rx) =
+            tokio::sync::mpsc::unbounded_channel::<DelegationEvent>();
+        ctx.delegation_event_tx = Some(progress_tx);
+        ctx.sub_agent_runner = Some(Arc::new(ProgressRunner));
+
+        tool.execute(json!({ "goal": "inspect repo" }), &ctx)
+            .await
+            .expect("delegate_task should succeed");
+
+        let first = progress_rx.recv().await.expect("start event");
+        let second = progress_rx.recv().await.expect("tool event");
+        let third = progress_rx.recv().await.expect("finish event");
+
+        match first {
+            DelegationEvent::TaskStarted {
+                task_index,
+                task_count,
+                goal,
+            } => {
+                assert_eq!(task_index, 0);
+                assert_eq!(task_count, 1);
+                assert_eq!(goal, "inspect repo");
+            }
+            other => panic!("unexpected first event: {other:?}"),
+        }
+
+        match second {
+            DelegationEvent::ToolCalled {
+                task_index,
+                task_count,
+                tool_name,
+                ..
+            } => {
+                assert_eq!(task_index, 0);
+                assert_eq!(task_count, 1);
+                assert_eq!(tool_name, "terminal");
+            }
+            other => panic!("unexpected second event: {other:?}"),
+        }
+
+        match third {
+            DelegationEvent::TaskFinished {
+                task_index,
+                task_count,
+                status,
+                ..
+            } => {
+                assert_eq!(task_index, 0);
+                assert_eq!(task_count, 1);
+                assert_eq!(status, "completed");
+            }
+            other => panic!("unexpected third event: {other:?}"),
+        }
     }
 }

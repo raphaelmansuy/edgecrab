@@ -258,4 +258,4 @@ Use a self-signed cert with Nginx, or use Tailscale HTTPS which gives a `*.ts.ne
 
 - [Docker Compose file](/docker-compose.yml) in the repository root
 - [Environment Variables](/reference/environment-variables/) — all `EDGECRAB_*` deployment variables
-- [Security Model](/features/security/) — what the agent can and can't do on your server
+- [Security Model](/user-guide/security/) — what the agent can and can't do on your server

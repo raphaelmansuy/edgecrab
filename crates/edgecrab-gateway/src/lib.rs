@@ -49,6 +49,7 @@ pub mod slack;
 pub mod sms;
 pub mod stream_consumer;
 pub mod telegram;
+pub mod voice_delivery;
 pub mod webhook;
 pub mod wecom;
 pub mod whatsapp;

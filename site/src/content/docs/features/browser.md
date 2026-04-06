@@ -36,16 +36,18 @@ If no browser binary is found and `CDP_URL` is not set, browser tools return a s
 |------|-------------|
 | `browser_navigate` | Navigate to a URL; waits for page load |
 | `browser_snapshot` | Capture the accessibility tree (text-based page view) |
-| `browser_screenshot` | Take a viewport or full-page screenshot as base64 PNG |
 | `browser_click` | Click an element by CSS selector, text, or coordinate |
 | `browser_type` | Type text into the focused or specified input element |
 | `browser_scroll` | Scroll the page by pixels or to an element |
-| `browser_console` | Return buffered `console.log`/`warn`/`error` messages |
-| `browser_back` | Navigate back in browser history |
 | `browser_press` | Press a keyboard key (e.g. `Enter`, `Tab`, `Escape`) |
+| `browser_back` | Navigate back in browser history |
 | `browser_close` | Close the browser and release the CDP connection |
+| `browser_console` | Return buffered `console.log`/`warn`/`error` messages |
 | `browser_get_images` | Return all images visible on the page as base64 |
 | `browser_vision` | Take a screenshot and analyze it with the vision model |
+| `browser_wait_for` | Wait for a selector or text to appear before proceeding |
+| `browser_select` | Select an option from a `<select>` dropdown element |
+| `browser_hover` | Hover over an element to trigger tooltip/hover states |
 
 ---
 
@@ -95,15 +97,14 @@ Browser tools are included in the `core` and `research` toolset aliases.
 
 Agent workflow:
 1. `browser_navigate("https://crates.io")` — navigates to the page
-2. `browser_screenshot()` — captures a PNG
-3. `browser_vision({screenshot})` — analyzes with vision model
-4. Returns: "The featured crates this week are..."
+2. `browser_vision({})` — takes a screenshot internally and analyzes with vision model
+3. Returns: "The featured crates this week are..."
 
 ---
 
 ## Vision Analysis
 
-`browser_vision` combines `browser_screenshot` with visual model analysis in one call:
+`browser_vision` takes a screenshot of the current page internally and analyzes it with the configured vision model — in a single tool call:
 
 ```
 ❯ Is the login button visible on the current page?
@@ -137,7 +138,7 @@ tools:
 
 ## Pro Tips
 
-**Use `browser_snapshot` before `browser_screenshot`.** The accessibility tree snapshot is 10-100× smaller than a screenshot and contains the same text content. Use `browser_screenshot` + `browser_vision` only when you need to analyze visual layout.
+**Use `browser_snapshot` before `browser_vision`.** The accessibility tree snapshot is 10-100× smaller than a full image and contains the same text content. Use `browser_vision` only when you need to analyze visual layout, colors, or non-text elements.
 
 **Record sessions for debugging.** Enable `browser.record_sessions: true` before running a browser-heavy task. The WebM recording in `~/.edgecrab/browser_recordings/` is invaluable for debugging what went wrong.
 

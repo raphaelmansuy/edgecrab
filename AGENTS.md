@@ -554,6 +554,7 @@ edgecrab migrate              # live migration
 - **DO NOT rebuild the system prompt mid-conversation.** Cache-breaking forces Anthropic to re-process the prompt on every turn. Only rebuild on explicit `/compress` or at session start.
 - **DO NOT use `unwrap()` in tool handlers.** Return `ToolError` variants instead — the agent loop handles them gracefully and reports to the model.
 - **DO NOT issue network requests without SSRF check.** Always call `is_safe_url()` before any `reqwest` call in tool code.
+- **DO NOT slice Rust strings by raw byte offsets unless you have already proved the index is a char boundary.** Prefer `get(..)`, `char_indices()`, or helper functions like `safe_char_start()` for prefix scanning and truncation. Gateway/user text is frequently Unicode and byte slicing will panic in production.
 - **DO NOT hardcode `~/.edgecrab/` in tests.** Use `TempDir` and set `EDGECRAB_HOME` to the temp dir path.
 - **DO NOT store secrets (API keys, tokens) in the model output or logs.** The redaction pipeline catches most, but tool code should not log secret-bearing values.
 - **DO NOT share ToolContext state across concurrent agent instances.** Each `Agent` has its own `ProcessTable` and `ToolContext` — do not share them.

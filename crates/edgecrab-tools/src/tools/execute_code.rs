@@ -8,7 +8,7 @@
 //! ```text
 //!   execute_code(code)
 //!       │
-//!       ├── generate edgecrab_tools.py (RPC stubs for 7 tools)
+//!       ├── generate edgecrab_tools.py (RPC stubs for approved sandbox tools)
 //!       ├── start Unix domain socket RPC listener
 //!       ├── spawn child:  python3 script.py
 //!       │       └── script calls edgecrab_tools.web_search() etc.
@@ -31,14 +31,25 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+#[cfg(unix)]
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STD};
 use serde::Deserialize;
 use serde_json::json;
 
 use edgecrab_types::{ToolError, ToolSchema};
 
 #[cfg(unix)]
+use crate::describe_execution_filesystem;
+#[cfg(unix)]
+use crate::execution_tmp::{BACKEND_TMP_ROOT, wrap_command_with_tmp_env};
+use crate::execution_tmp::{ensure_default_shared_tmp_dir, temp_env_pairs};
+#[cfg(unix)]
 use crate::registry::ToolRegistry;
 use crate::registry::{ToolContext, ToolHandler};
+#[cfg(unix)]
+use crate::tools::backend_pool::get_or_create_backend;
+#[cfg(unix)]
+use crate::tools::backends;
 use crate::tools::backends::redact_output;
 
 /// Maximum execution time before we kill the subprocess (5 minutes like hermes).
@@ -81,6 +92,7 @@ const MAX_TOOL_CALLS: usize = 50;
 ///   web_crawl       — read-only; multi-page superset of web_extract; without it
 ///                     scripts must loop web_extract manually with ad-hoc link parsing
 ///   read_file       — read-only; core file I/O
+///   pdf_to_markdown — read-only PDF parsing via EdgeParse; useful for local document analysis
 ///   write_file      — write; already powerful but script output must go somewhere
 ///   search_files    — read-only; structural grep
 ///   patch           — targeted in-place edit; idempotent when re-run with same args
@@ -99,6 +111,7 @@ const SANDBOX_ALLOWED_TOOLS: &[&str] = &[
     "web_extract",
     "web_crawl",
     "read_file",
+    "pdf_to_markdown",
     "write_file",
     "search_files",
     "patch",
@@ -145,11 +158,18 @@ fn resolve_runtime(lang: &str) -> Option<(&'static str, &'static str)> {
 
 // ─── RPC stub generator ─────────────────────────────────────────────
 
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RpcTransport {
+    Uds,
+    File,
+}
+
 /// Generate the `edgecrab_tools.py` module that child scripts import.
 /// Each stub function sends an RPC request over a Unix domain socket
 /// back to the parent process, which dispatches through the ToolRegistry.
 #[cfg(unix)]
-fn generate_tools_module(available_tools: &[&str]) -> String {
+fn generate_tools_module(available_tools: &[&str], transport: RpcTransport) -> String {
     let mut stubs = String::new();
     let available_set: std::collections::HashSet<&str> = available_tools.iter().copied().collect();
 
@@ -207,6 +227,19 @@ def web_crawl(url: str, instructions: str = None, max_pages: int = 8, max_depth:
 def read_file(path: str, offset: int = 1, limit: int = 500):
     """Read a file (1-indexed lines). Returns dict with "content" and "total_lines"."""
     return _call("read_file", {"path": path, "offset": offset, "limit": limit})
+"#
+            }
+            "pdf_to_markdown" => {
+                r#"
+def pdf_to_markdown(path: str, output_path: str = None, max_chars: int = 20000):
+    """Convert a local PDF file to Markdown using EdgeParse.
+    This is fast structural PDF parsing, not OCR.
+    Returns {"success", "path", "output_path", "extractor", "parsing_mode", "content_format", "truncated", "total_chars", "markdown"}.
+    """
+    args = {"path": path, "max_chars": max_chars}
+    if output_path is not None:
+        args["output_path"] = output_path
+    return _call("pdf_to_markdown", args)
 "#
             }
             "write_file" => {
@@ -280,12 +313,12 @@ def session_search(query: str, limit: int = 10):
         stubs.push_str(stub);
     }
 
-    format!(
-        r#""""Auto-generated EdgeCrab tools RPC stubs."""
+    let header = match transport {
+        RpcTransport::Uds => {
+            r#""""Auto-generated EdgeCrab tools RPC stubs."""
 import json, os, socket, shlex, time
 
 _sock = None
-AVAILABLE_TOOLS = {available_tools:?}
 
 
 # ---------------------------------------------------------------------------
@@ -302,7 +335,7 @@ def json_parse(text: str):
 def shell_quote(s: str) -> str:
     """Shell-escape a string for safe interpolation into commands.
     Use this when inserting dynamic content into terminal() commands:
-        terminal(f"echo {{shell_quote(user_input)}}")
+        terminal(f"echo {shell_quote(user_input)}")
     """
     return shlex.quote(s)
 
@@ -335,7 +368,7 @@ def _connect():
 def _call(tool_name, args):
     """Send a tool call to the parent process and return the parsed result."""
     conn = _connect()
-    request = json.dumps({{"tool": tool_name, "args": args}}) + "\n"
+    request = json.dumps({"tool": tool_name, "args": args}) + "\n"
     conn.sendall(request.encode())
     buf = b""
     while True:
@@ -353,10 +386,92 @@ def _call(tool_name, args):
         except (json.JSONDecodeError, TypeError):
             return result
     return result
-
-{stubs}
 "#
-    )
+        }
+        RpcTransport::File => {
+            r#""""Auto-generated EdgeCrab tools RPC stubs (file transport)."""
+import json, os, shlex, time
+
+_seq = 0
+_RPC_DIR = os.environ.get("EDGECRAB_RPC_DIR", "/tmp/edgecrab_rpc")
+
+
+# ---------------------------------------------------------------------------
+# Convenience helpers (avoid common scripting pitfalls)
+# ---------------------------------------------------------------------------
+
+def json_parse(text: str):
+    """Parse JSON tolerant of control characters (strict=False).
+    Use this instead of json.loads() when parsing output from terminal()
+    or web_extract() that may contain raw tabs/newlines in strings."""
+    return json.loads(text, strict=False)
+
+
+def shell_quote(s: str) -> str:
+    """Shell-escape a string for safe interpolation into commands.
+    Use this when inserting dynamic content into terminal() commands:
+        terminal(f"echo {shell_quote(user_input)}")
+    """
+    return shlex.quote(s)
+
+
+def retry(fn, max_attempts=3, delay=2):
+    """Retry a function up to max_attempts times with exponential backoff.
+    Use for transient failures (network errors, API rate limits):
+        result = retry(lambda: terminal("gh issue list ..."))
+    """
+    last_err = None
+    for attempt in range(max_attempts):
+        try:
+            return fn()
+        except Exception as e:
+            last_err = e
+            if attempt < max_attempts - 1:
+                time.sleep(delay * (2 ** attempt))
+    raise last_err
+
+
+def _call(tool_name, args):
+    """Send a tool call to the parent process and wait for a response file."""
+    global _seq
+    _seq += 1
+    seq_str = f"{_seq:06d}"
+    req_file = os.path.join(_RPC_DIR, f"req_{seq_str}")
+    res_file = os.path.join(_RPC_DIR, f"res_{seq_str}")
+
+    tmp = req_file + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"tool": tool_name, "args": args, "seq": _seq}, f)
+    os.rename(tmp, req_file)
+
+    deadline = time.monotonic() + 300
+    poll_interval = 0.05
+    while not os.path.exists(res_file):
+        if time.monotonic() > deadline:
+            raise RuntimeError(f"RPC timeout: no response for {tool_name} after 300s")
+        time.sleep(poll_interval)
+        poll_interval = min(poll_interval * 1.2, 0.25)
+
+    with open(res_file) as f:
+        raw = f.read()
+
+    try:
+        os.unlink(res_file)
+    except OSError:
+        pass
+
+    result = json.loads(raw)
+    if isinstance(result, str):
+        try:
+            return json.loads(result)
+        except (json.JSONDecodeError, TypeError):
+            return result
+    return result
+"#
+        }
+    };
+
+    format!("{header}\nAVAILABLE_TOOLS = {available_tools:?}\n\n{stubs}\n")
 }
 
 // ─── RPC server (runs in a tokio task) ──────────────────────────────
@@ -446,7 +561,218 @@ async fn rpc_server_loop(
             Err(e) => json!({"error": e.to_string()}).to_string(),
         };
 
-        let _ = writer.write_all(format!("{}\n", result).as_bytes()).await;
+        let _ = writer
+            .write_all(format!("{}\n", rpc_response_payload(result)).as_bytes())
+            .await;
+    }
+}
+
+#[cfg(unix)]
+fn rpc_response_payload(result: String) -> String {
+    if serde_json::from_str::<serde_json::Value>(&result).is_ok() {
+        result
+    } else {
+        json!(result).to_string()
+    }
+}
+
+#[cfg(unix)]
+fn maybe_rewrite_terminal_args(
+    tool_name: &str,
+    tool_args: &mut serde_json::Value,
+    default_remote_workdir: Option<&str>,
+) {
+    if tool_name != "terminal" {
+        return;
+    }
+
+    let Some(obj) = tool_args.as_object_mut() else {
+        return;
+    };
+
+    for param in TERMINAL_BLOCKED_PARAMS {
+        obj.remove(*param);
+    }
+
+    if let Some(workdir) = default_remote_workdir {
+        let has_workdir = obj
+            .get("workdir")
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| !value.is_empty());
+        if !has_workdir {
+            if let Some(command) = obj.get("command").and_then(|value| value.as_str()) {
+                obj.insert(
+                    "command".into(),
+                    json!(format!(
+                        "cd {} && {}",
+                        backends::shell_quote(workdir),
+                        command
+                    )),
+                );
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+struct RemoteRpcLoop {
+    backend: Arc<dyn backends::ExecutionBackend>,
+    registry: Arc<ToolRegistry>,
+    ctx: ToolContext,
+    rpc_dir: String,
+    tool_call_counter: Arc<std::sync::atomic::AtomicUsize>,
+    allowed_tools: Arc<Vec<String>>,
+    stop: tokio_util::sync::CancellationToken,
+    terminal_default_workdir: Option<String>,
+}
+
+#[cfg(unix)]
+async fn remote_rpc_poll_loop(loop_ctx: RemoteRpcLoop) {
+    while !loop_ctx.stop.is_cancelled() {
+        let pending = match loop_ctx
+            .backend
+            .execute_oneshot(
+                &format!(
+                    "ls -1 {} 2>/dev/null | grep '^req_' || true",
+                    backends::shell_quote(&loop_ctx.rpc_dir)
+                ),
+                ".",
+                Duration::from_secs(10),
+                loop_ctx.stop.clone(),
+            )
+            .await
+        {
+            Ok(output) if output.exit_code == 0 => output
+                .stdout
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty() && !line.ends_with(".tmp"))
+                .map(|line| format!("{}/{}", loop_ctx.rpc_dir, line))
+                .collect::<Vec<_>>(),
+            Ok(_) => Vec::new(),
+            Err(_) => Vec::new(),
+        };
+
+        if pending.is_empty() {
+            tokio::select! {
+                _ = loop_ctx.stop.cancelled() => break,
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+            }
+            continue;
+        }
+
+        for req_file in pending {
+            if loop_ctx.stop.is_cancelled() {
+                break;
+            }
+
+            let read = match loop_ctx
+                .backend
+                .execute_oneshot(
+                    &format!("cat {}", backends::shell_quote(&req_file)),
+                    ".",
+                    Duration::from_secs(10),
+                    loop_ctx.stop.clone(),
+                )
+                .await
+            {
+                Ok(output) if output.exit_code == 0 => output.stdout,
+                _ => {
+                    let _ = loop_ctx
+                        .backend
+                        .execute_oneshot(
+                            &format!("rm -f {}", backends::shell_quote(&req_file)),
+                            ".",
+                            Duration::from_secs(5),
+                            tokio_util::sync::CancellationToken::new(),
+                        )
+                        .await;
+                    continue;
+                }
+            };
+
+            let request: serde_json::Value = match serde_json::from_str(read.trim()) {
+                Ok(value) => value,
+                Err(_) => {
+                    let _ = loop_ctx
+                        .backend
+                        .execute_oneshot(
+                            &format!("rm -f {}", backends::shell_quote(&req_file)),
+                            ".",
+                            Duration::from_secs(5),
+                            tokio_util::sync::CancellationToken::new(),
+                        )
+                        .await;
+                    continue;
+                }
+            };
+
+            let tool_name = request
+                .get("tool")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let seq = request
+                .get("seq")
+                .and_then(|v| v.as_u64())
+                .unwrap_or_default();
+            let mut tool_args = request.get("args").cloned().unwrap_or(json!({}));
+            maybe_rewrite_terminal_args(
+                &tool_name,
+                &mut tool_args,
+                loop_ctx.terminal_default_workdir.as_deref(),
+            );
+
+            let result = if !loop_ctx.allowed_tools.contains(&tool_name) {
+                let available = loop_ctx.allowed_tools.join(", ");
+                json!({
+                    "error": format!(
+                        "Tool '{}' is not available in execute_code. Available: {}",
+                        tool_name, available
+                    )
+                })
+                .to_string()
+            } else if loop_ctx
+                .tool_call_counter
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                >= MAX_TOOL_CALLS
+            {
+                json!({
+                    "error": format!(
+                        "Tool call limit reached ({}). No more tool calls allowed.",
+                        MAX_TOOL_CALLS
+                    )
+                })
+                .to_string()
+            } else {
+                match loop_ctx
+                    .registry
+                    .dispatch(&tool_name, tool_args, &loop_ctx.ctx)
+                    .await
+                {
+                    Ok(output) => output,
+                    Err(e) => json!({"error": e.to_string()}).to_string(),
+                }
+            };
+
+            let res_file = format!("{}/res_{seq:06}", loop_ctx.rpc_dir);
+            let _ = write_remote_file(
+                &*loop_ctx.backend,
+                &res_file,
+                &rpc_response_payload(result),
+                loop_ctx.stop.clone(),
+            )
+            .await;
+            let _ = loop_ctx
+                .backend
+                .execute_oneshot(
+                    &format!("rm -f {}", backends::shell_quote(&req_file)),
+                    ".",
+                    Duration::from_secs(5),
+                    tokio_util::sync::CancellationToken::new(),
+                )
+                .await;
+        }
     }
 }
 
@@ -486,6 +812,8 @@ const SECRET_SUBSTRINGS: &[&str] = &[
 /// Strips API keys/tokens/secrets, keeps safe system vars.
 fn build_child_env(sock_path: &str, cwd: &std::path::Path) -> HashMap<String, String> {
     let mut env = HashMap::new();
+    let tmp_root = ensure_default_shared_tmp_dir()
+        .unwrap_or_else(|_| crate::execution_tmp::default_shared_tmp_dir());
 
     for (k, v) in std::env::vars() {
         let upper = k.to_uppercase();
@@ -503,6 +831,9 @@ fn build_child_env(sock_path: &str, cwd: &std::path::Path) -> HashMap<String, St
 
     env.insert("EDGECRAB_RPC_SOCKET".into(), sock_path.into());
     env.insert("PYTHONDONTWRITEBYTECODE".into(), "1".into());
+    for (k, v) in temp_env_pairs(&tmp_root.to_string_lossy()) {
+        env.insert(k, v);
+    }
 
     // Inject timezone if configured
     if let Ok(tz) = std::env::var("EDGECRAB_TIMEZONE") {
@@ -523,13 +854,236 @@ fn build_child_env(sock_path: &str, cwd: &std::path::Path) -> HashMap<String, St
 }
 
 #[cfg(unix)]
+async fn write_remote_file(
+    backend: &dyn backends::ExecutionBackend,
+    path: &str,
+    content: &str,
+    cancel: tokio_util::sync::CancellationToken,
+) -> Result<(), ToolError> {
+    let encoded = BASE64_STD.encode(content.as_bytes());
+    let scratch_path = format!("{path}.b64");
+    let parent = std::path::Path::new(path)
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| ".".into());
+
+    backend
+        .execute_oneshot(
+            &format!(
+                "mkdir -p {} && : > {}",
+                backends::shell_quote(&parent),
+                backends::shell_quote(&scratch_path)
+            ),
+            ".",
+            Duration::from_secs(10),
+            cancel.clone(),
+        )
+        .await?;
+
+    const CHUNK_BYTES: usize = 24_576;
+    for chunk in encoded.as_bytes().chunks(CHUNK_BYTES) {
+        let chunk = std::str::from_utf8(chunk).map_err(|e| ToolError::ExecutionFailed {
+            tool: "execute_code".into(),
+            message: format!("Internal base64 encoding error: {e}"),
+        })?;
+        backend
+            .execute_oneshot(
+                &format!(
+                    "printf '%s' {} >> {}",
+                    backends::shell_quote(chunk),
+                    backends::shell_quote(&scratch_path)
+                ),
+                ".",
+                Duration::from_secs(30),
+                cancel.clone(),
+            )
+            .await?;
+    }
+
+    let decode = backend
+        .execute_oneshot(
+            &format!(
+                "(base64 -d < {} > {} || base64 -D -i {} -o {}) && rm -f {}",
+                backends::shell_quote(&scratch_path),
+                backends::shell_quote(path),
+                backends::shell_quote(&scratch_path),
+                backends::shell_quote(path),
+                backends::shell_quote(&scratch_path)
+            ),
+            ".",
+            Duration::from_secs(30),
+            cancel,
+        )
+        .await?;
+
+    if decode.exit_code != 0 {
+        return Err(ToolError::ExecutionFailed {
+            tool: "execute_code".into(),
+            message: format!(
+                "Failed to materialize remote file {}: {}",
+                path,
+                decode.format(4_000, 2_000)
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn prepare_remote_sandbox(
+    backend: &dyn backends::ExecutionBackend,
+    sandbox_id: &str,
+    cancel: tokio_util::sync::CancellationToken,
+) -> Result<String, ToolError> {
+    let command = format!(
+        "tmp_root=\"${{TMPDIR:-/tmp}}\"; dir=\"$tmp_root/edgecrab_exec_{}\"; mkdir -p \"$dir/rpc\" && printf '%s' \"$dir\"",
+        sandbox_id
+    );
+    let output = backend
+        .execute_oneshot(&command, ".", Duration::from_secs(15), cancel)
+        .await?;
+    if output.exit_code != 0 {
+        return Err(ToolError::ExecutionFailed {
+            tool: "execute_code".into(),
+            message: format!(
+                "Failed to prepare remote sandbox directory: {}",
+                output.format(4_000, 2_000)
+            ),
+        });
+    }
+
+    let path = output.stdout.trim().to_string();
+    if path.is_empty() {
+        return Err(ToolError::ExecutionFailed {
+            tool: "execute_code".into(),
+            message: "Remote backend returned an empty sandbox directory path.".into(),
+        });
+    }
+    Ok(path)
+}
+
+#[cfg(unix)]
+fn remote_command_for_runtime(
+    runtime: &str,
+    script_name: &str,
+    rpc_dir: Option<&str>,
+    tmp_root: &str,
+) -> String {
+    let env_prefix = if let Some(rpc_dir) = rpc_dir {
+        let mut out = format!(
+            "EDGECRAB_RPC_DIR={} PYTHONDONTWRITEBYTECODE=1",
+            backends::shell_quote(rpc_dir)
+        );
+        if let Ok(tz) = std::env::var("EDGECRAB_TIMEZONE") {
+            if !tz.trim().is_empty() {
+                out.push(' ');
+                out.push_str("TZ=");
+                out.push_str(&backends::shell_quote(tz.trim()));
+            }
+        }
+        out
+    } else {
+        String::new()
+    };
+
+    let command = match runtime {
+        "rustc_run" => format!(
+            "rustc {} -o script_bin && ./script_bin",
+            backends::shell_quote(script_name)
+        ),
+        value if value.contains(' ') => {
+            let prefix = if env_prefix.is_empty() {
+                String::new()
+            } else {
+                format!("{env_prefix} ")
+            };
+            format!("{prefix}{value} {}", backends::shell_quote(script_name))
+        }
+        value => {
+            let prefix = if env_prefix.is_empty() {
+                String::new()
+            } else {
+                format!("{env_prefix} ")
+            };
+            format!("{prefix}{value} {}", backends::shell_quote(script_name))
+        }
+    };
+
+    wrap_command_with_tmp_env(&command, tmp_root)
+}
+
+#[cfg(unix)]
+fn process_outcome_from_exit(exit_code: i32) -> ProcessOutcome {
+    match exit_code {
+        124 => ProcessOutcome::TimedOut,
+        130 => ProcessOutcome::Cancelled,
+        code => ProcessOutcome::Completed(code),
+    }
+}
+
+fn render_execute_code_result(
+    stdout: String,
+    stderr: String,
+    outcome: ProcessOutcome,
+    tool_calls_made: usize,
+    duration: f64,
+    timeout_secs: u64,
+) -> String {
+    match outcome {
+        ProcessOutcome::Completed(exit) => {
+            let status = if exit == 0 { "success" } else { "error" };
+            let mut result = json!({
+                "status": status,
+                "output": stdout,
+                "tool_calls_made": tool_calls_made,
+                "duration_seconds": (duration * 100.0).round() / 100.0,
+            });
+
+            if exit != 0 {
+                if !stderr.is_empty() {
+                    result["error"] = json!(stderr);
+                    result["output"] = json!(format!("{stdout}\n--- stderr ---\n{stderr}"));
+                } else {
+                    result["error"] = json!(format!("Script exited with code {exit}"));
+                }
+            }
+
+            result.to_string()
+        }
+        ProcessOutcome::TimedOut => json!({
+            "status": "timeout",
+            "error": format!("Script timed out after {timeout_secs}s and was killed."),
+            "output": if stderr.is_empty() { stdout } else { format!("{stdout}\n--- stderr ---\n{stderr}") },
+            "tool_calls_made": tool_calls_made,
+            "duration_seconds": (duration * 100.0).round() / 100.0,
+        })
+        .to_string(),
+        ProcessOutcome::Cancelled => json!({
+            "status": "interrupted",
+            "error": "Execution interrupted by cancellation.",
+            "output": format!("{stdout}\n[execution interrupted — user sent a new message]"),
+            "tool_calls_made": tool_calls_made,
+            "duration_seconds": (duration * 100.0).round() / 100.0,
+        })
+        .to_string(),
+    }
+}
+
+#[cfg(unix)]
 fn resolve_sandbox_tools(ctx: &ToolContext) -> Vec<&'static str> {
+    let fs = describe_execution_filesystem(&ctx.config, &ctx.cwd);
+    let allow_terminal = fs.execute_code_terminal_is_safe();
     let Some(registry) = ctx.tool_registry.as_ref() else {
-        return SANDBOX_ALLOWED_TOOLS.to_vec();
+        return Vec::new();
     };
 
     let mut resolved = Vec::new();
     for &tool_name in SANDBOX_ALLOWED_TOOLS {
+        if tool_name == "terminal" && !allow_terminal {
+            continue;
+        }
         let Some(toolset) = registry.toolset_for_tool(tool_name) else {
             continue;
         };
@@ -863,6 +1417,8 @@ fn build_description() -> String {
          Crawl multiple linked pages from a start URL. Returns {\"success\", \"backend\", \"pages_visited\", \"results\": [{\"url\", \"title\", \"depth\", \"content\", \"extractor\", \"content_type\", \"content_format\"}, ...]}\n\
        read_file(path: str, offset: int = 1, limit: int = 500) -> dict\n\
          Lines are 1-indexed. Returns {\"content\": \"...\", \"total_lines\": N}\n\
+       pdf_to_markdown(path: str, output_path: str = None, max_chars: int = 20000) -> dict\n\
+         Convert a local PDF into Markdown using EdgeParse. Fast structural parsing only, not OCR.\n\
        write_file(path: str, content: str) -> dict\n\
          Always overwrites the entire file.\n\
        search_files(pattern: str, target=\"content\", path=\".\", file_glob=None, limit=50) -> dict\n\
@@ -879,6 +1435,10 @@ fn build_description() -> String {
          Full-text search over past sessions. Returns {\"results\": [...]}\n\n\
      Limits: 5-minute timeout, 50KB stdout cap, max 50 tool calls per script. \
      terminal() is foreground-only (no background or pty).\n\n\
+     Filesystem rule: direct script file I/O never enforces EdgeCrab's file-tool path jail. \
+     In local mode it sees host paths directly; in non-local terminal backends it runs inside that backend and shares the backend filesystem with `terminal()`. \
+     Temp-aware code should prefer `os.environ['EDGECRAB_TMPDIR']` (also exported as `TMPDIR`, `TMP`, and `TEMP`) instead of hard-coding `/tmp`. \
+     Prefer read_file/write_file/patch/search_files when you need workspace-root and path-restriction enforcement on host files.\n\n\
      Print your final result to stdout. Use Python stdlib (json, re, math, csv, \
      datetime, collections, etc.) for processing between tool calls.\n\n\
      Also available (no import needed — built into edgecrab_tools):\n\
@@ -891,6 +1451,149 @@ fn build_description() -> String {
      session's enabled toolsets; unavailable helper functions raise a clear \
      runtime error inside the sandbox."
         .to_string()
+}
+
+#[cfg(unix)]
+async fn execute_remote(
+    ctx: &ToolContext,
+    runtime: &str,
+    ext: &str,
+    code: &str,
+    timeout_secs: u64,
+    is_python: bool,
+    sandbox_tools: &[&'static str],
+) -> Result<String, ToolError> {
+    let backend = get_or_create_backend(ctx).await?;
+    if !backend.supports_remote_execute_code() {
+        return Err(ToolError::Unavailable {
+            tool: "execute_code".into(),
+            reason: format!(
+                "Remote execute_code is not supported by the {} backend.",
+                backend.kind()
+            ),
+        });
+    }
+
+    let exec_start = std::time::Instant::now();
+    let sandbox_dir = prepare_remote_sandbox(
+        &*backend,
+        &uuid::Uuid::new_v4().simple().to_string()[..12],
+        ctx.cancel.clone(),
+    )
+    .await?;
+    let script_name = format!("script{ext}");
+    let script_path = format!("{sandbox_dir}/{script_name}");
+    write_remote_file(&*backend, &script_path, code, ctx.cancel.clone()).await?;
+
+    let tool_call_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut rpc_task = None;
+    let rpc_stop = tokio_util::sync::CancellationToken::new();
+
+    if is_python {
+        let tools_path = format!("{sandbox_dir}/edgecrab_tools.py");
+        let tools_src = generate_tools_module(sandbox_tools, RpcTransport::File);
+        write_remote_file(&*backend, &tools_path, &tools_src, ctx.cancel.clone()).await?;
+
+        if let Some(registry) = ctx.tool_registry.clone() {
+            let rpc_ctx = ToolContext {
+                task_id: ctx.task_id.clone(),
+                cwd: ctx.cwd.clone(),
+                session_id: ctx.session_id.clone(),
+                user_task: ctx.user_task.clone(),
+                cancel: ctx.cancel.clone(),
+                config: ctx.config.clone(),
+                state_db: ctx.state_db.clone(),
+                platform: ctx.platform,
+                process_table: ctx.process_table.clone(),
+                provider: ctx.provider.clone(),
+                tool_registry: ctx.tool_registry.clone(),
+                delegate_depth: ctx.delegate_depth,
+                sub_agent_runner: ctx.sub_agent_runner.clone(),
+                delegation_event_tx: ctx.delegation_event_tx.clone(),
+                clarify_tx: None,
+                approval_tx: None,
+                on_skills_changed: ctx.on_skills_changed.clone(),
+                gateway_sender: ctx.gateway_sender.clone(),
+                origin_chat: ctx.origin_chat.clone(),
+                session_key: ctx.session_key.clone(),
+                todo_store: ctx.todo_store.clone(),
+            };
+            let rpc_dir = format!("{sandbox_dir}/rpc");
+            let allowed = Arc::new(sandbox_tools.iter().map(|tool| tool.to_string()).collect());
+            let poll_backend = backend.clone();
+            let poll_stop = rpc_stop.clone();
+            let poll_counter = tool_call_counter.clone();
+            let poll_workdir = sandbox_dir.clone();
+            rpc_task = Some(tokio::spawn(async move {
+                remote_rpc_poll_loop(RemoteRpcLoop {
+                    backend: poll_backend,
+                    registry,
+                    ctx: rpc_ctx,
+                    rpc_dir,
+                    tool_call_counter: poll_counter,
+                    allowed_tools: allowed,
+                    stop: poll_stop,
+                    terminal_default_workdir: Some(poll_workdir),
+                })
+                .await;
+            }));
+        }
+    }
+
+    let rpc_dir = format!("{sandbox_dir}/rpc");
+    let remote_command = format!(
+        "cd {} && {}",
+        backends::shell_quote(&sandbox_dir),
+        remote_command_for_runtime(
+            runtime,
+            &script_name,
+            is_python.then_some(rpc_dir.as_str()),
+            BACKEND_TMP_ROOT,
+        )
+    );
+
+    let output = backend
+        .execute(
+            &remote_command,
+            ".",
+            Duration::from_secs(timeout_secs),
+            ctx.cancel.clone(),
+        )
+        .await?;
+
+    rpc_stop.cancel();
+    if let Some(task) = rpc_task {
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    let _ = backend
+        .execute_oneshot(
+            &format!("rm -rf {}", backends::shell_quote(&sandbox_dir)),
+            ".",
+            Duration::from_secs(15),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+
+    let stdout = strip_ansi(&redact_output(&head_tail_truncate(
+        &output.stdout,
+        MAX_STDOUT_BYTES,
+    )));
+    let stderr = strip_ansi(&redact_output(crate::safe_truncate(
+        &output.stderr,
+        MAX_STDERR_BYTES,
+    )));
+    let tool_calls_made = tool_call_counter.load(std::sync::atomic::Ordering::Relaxed);
+    let duration = exec_start.elapsed().as_secs_f64();
+
+    Ok(render_execute_code_result(
+        stdout,
+        stderr,
+        process_outcome_from_exit(output.exit_code),
+        tool_calls_made,
+        duration,
+        timeout_secs,
+    ))
 }
 
 // ─── Tool implementation ─────────────────────────────────────────────
@@ -981,6 +1684,20 @@ impl ToolHandler for ExecuteCodeToolReal {
 
         let exec_start = std::time::Instant::now();
 
+        #[cfg(unix)]
+        if ctx.config.terminal_backend != backends::BackendKind::Local {
+            return execute_remote(
+                ctx,
+                runtime,
+                ext,
+                &args.code,
+                timeout_secs,
+                is_python,
+                &sandbox_tools,
+            )
+            .await;
+        }
+
         // Write code to a temp file
         let temp_dir = tempfile::tempdir().map_err(|e| ToolError::ExecutionFailed {
             tool: "execute_code".into(),
@@ -998,7 +1715,7 @@ impl ToolHandler for ExecuteCodeToolReal {
             let sock_path = format!("/tmp/edgecrab_rpc_{}.sock", uuid::Uuid::new_v4());
 
             // Generate tool stubs module
-            let tools_src = generate_tools_module(&sandbox_tools);
+            let tools_src = generate_tools_module(&sandbox_tools, RpcTransport::Uds);
             let tools_path = temp_dir.path().join("edgecrab_tools.py");
             std::fs::write(&tools_path, &tools_src).map_err(|e| ToolError::ExecutionFailed {
                 tool: "execute_code".into(),
@@ -1032,6 +1749,7 @@ impl ToolHandler for ExecuteCodeToolReal {
                     tool_registry: ctx.tool_registry.clone(),
                     delegate_depth: ctx.delegate_depth,
                     sub_agent_runner: ctx.sub_agent_runner.clone(),
+                    delegation_event_tx: ctx.delegation_event_tx.clone(),
                     clarify_tx: None,  // No interactive clarify in sandbox
                     approval_tx: None, // No interactive approvals in sandbox
                     on_skills_changed: ctx.on_skills_changed.clone(),
@@ -1171,45 +1889,14 @@ impl ToolHandler for ExecuteCodeToolReal {
 
         let stdout = strip_ansi(&redact_output(&run_result.stdout));
         let stderr = strip_ansi(&redact_output(&run_result.stderr));
-
-        match run_result.outcome {
-            ProcessOutcome::Completed(exit) => {
-                let status = if exit == 0 { "success" } else { "error" };
-                let mut result = json!({
-                    "status": status,
-                    "output": stdout,
-                    "tool_calls_made": tool_calls_made,
-                    "duration_seconds": (duration * 100.0).round() / 100.0,
-                });
-
-                if exit != 0 {
-                    if !stderr.is_empty() {
-                        result["error"] = json!(stderr);
-                        result["output"] = json!(format!("{stdout}\n--- stderr ---\n{stderr}"));
-                    } else {
-                        result["error"] = json!(format!("Script exited with code {exit}"));
-                    }
-                }
-
-                Ok(result.to_string())
-            }
-            ProcessOutcome::TimedOut => Ok(json!({
-                "status": "timeout",
-                "error": format!("Script timed out after {timeout_secs}s and was killed."),
-                "output": if stderr.is_empty() { stdout } else { format!("{stdout}\n--- stderr ---\n{stderr}") },
-                "tool_calls_made": tool_calls_made,
-                "duration_seconds": (duration * 100.0).round() / 100.0,
-            })
-            .to_string()),
-            ProcessOutcome::Cancelled => Ok(json!({
-                "status": "interrupted",
-                "error": "Execution interrupted by cancellation.",
-                "output": format!("{stdout}\n[execution interrupted — user sent a new message]"),
-                "tool_calls_made": tool_calls_made,
-                "duration_seconds": (duration * 100.0).round() / 100.0,
-            })
-            .to_string()),
-        }
+        Ok(render_execute_code_result(
+            stdout,
+            stderr,
+            run_result.outcome,
+            tool_calls_made,
+            duration,
+            timeout_secs,
+        ))
     }
 }
 
@@ -1218,6 +1905,12 @@ inventory::submit!(&ExecuteCodeToolReal as &dyn ToolHandler);
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use crate::tools::backend_pool::cleanup_backend_for_task;
+    #[cfg(unix)]
+    use crate::tools::backends::singularity::SINGULARITY_TEST_ENV_LOCK;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
 
     #[test]
@@ -1284,7 +1977,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn generate_tools_module_contains_stubs() {
-        let module = generate_tools_module(&["web_search", "terminal"]);
+        let module = generate_tools_module(&["web_search", "terminal"], RpcTransport::Uds);
         assert!(module.contains("def web_search("));
         assert!(module.contains("max_results: int = 5"));
         assert!(module.contains("backend: str = None"));
@@ -1299,7 +1992,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn generate_tools_module_uses_current_web_extract_signature() {
-        let module = generate_tools_module(&["web_extract"]);
+        let module = generate_tools_module(&["web_extract"], RpcTransport::Uds);
         assert!(module.contains(
             "def web_extract(url: str, max_chars: int = 8000, backend: str = None, render_js_fallback: bool = True):"
         ));
@@ -1309,13 +2002,22 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn generate_tools_module_all_tools() {
-        let module = generate_tools_module(SANDBOX_ALLOWED_TOOLS);
+        let module = generate_tools_module(SANDBOX_ALLOWED_TOOLS, RpcTransport::Uds);
         for tool in SANDBOX_ALLOWED_TOOLS {
             assert!(
                 module.contains(&format!("def {tool}(")),
                 "missing stub for {tool}"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generate_tools_module_file_transport_uses_rpc_dir() {
+        let module = generate_tools_module(&["terminal"], RpcTransport::File);
+        assert!(module.contains("EDGECRAB_RPC_DIR"));
+        assert!(module.contains("req_"));
+        assert!(module.contains("res_"));
     }
 
     #[test]
@@ -1330,6 +2032,21 @@ mod tests {
             env.get("PYTHONDONTWRITEBYTECODE").map(|s| s.as_str()),
             Some("1")
         );
+        assert_eq!(
+            env.get("EDGECRAB_TMPDIR"),
+            env.get("TMPDIR"),
+            "child env must align EDGECRAB_TMPDIR and TMPDIR"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_command_for_runtime_exports_backend_tmpdir() {
+        let command =
+            remote_command_for_runtime("python3", "script.py", Some("/tmp/rpc"), BACKEND_TMP_ROOT);
+        assert!(command.contains("EDGECRAB_TMPDIR='/tmp/edgecrab-tmp'"));
+        assert!(command.contains("TMPDIR='/tmp/edgecrab-tmp'"));
+        assert!(command.contains("python3 'script.py'"));
     }
 
     #[cfg(unix)]
@@ -1342,6 +2059,18 @@ mod tests {
         let tools = resolve_sandbox_tools(&ctx);
         assert!(!tools.contains(&"web_search"));
         assert!(!tools.contains(&"terminal"));
+        assert!(tools.contains(&"read_file"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_sandbox_tools_keeps_terminal_for_remote_backends() {
+        let mut ctx = ToolContext::test_context();
+        ctx.tool_registry = Some(Arc::new(ToolRegistry::new()));
+        ctx.config.terminal_backend = crate::tools::backends::BackendKind::Modal;
+
+        let tools = resolve_sandbox_tools(&ctx);
+        assert!(tools.contains(&"terminal"));
         assert!(tools.contains(&"read_file"));
     }
 
@@ -1358,6 +2087,12 @@ mod tests {
         assert!(desc.contains("vision_analyze"));
         assert!(desc.contains("terminal"));
         assert!(desc.contains("edgecrab_tools"));
+        assert!(
+            desc.contains("direct script file I/O never enforces EdgeCrab's file-tool path jail")
+        );
+        assert!(desc.contains(
+            "runs inside that backend and shares the backend filesystem with `terminal()`"
+        ));
     }
 
     #[tokio::test]
@@ -1497,5 +2232,85 @@ mod tests {
         assert_eq!(tool.name(), "execute_code");
         assert_eq!(tool.toolset(), "code_execution");
         assert_eq!(tool.emoji(), "🐍");
+    }
+
+    #[cfg(unix)]
+    fn write_fake_singularity_runtime(dir: &tempfile::TempDir, body: &str) -> std::path::PathBuf {
+        let path = dir.path().join("fake-apptainer");
+        std::fs::write(&path, body).expect("write fake runtime");
+        let mut perms = std::fs::metadata(&path).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).expect("chmod");
+        path
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn execute_code_remote_terminal_shares_backend_workdir() {
+        let _guard = SINGULARITY_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let fake = write_fake_singularity_runtime(
+            &dir,
+            r#"#!/bin/sh
+set -eu
+case "${1:-}" in
+  version)
+    echo "apptainer 1.0.0"
+    ;;
+  instance)
+    exit 0
+    ;;
+  exec)
+    workdir="."
+    last=""
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --pwd)
+          workdir="$2"
+          shift 2
+          ;;
+        *)
+          last="$1"
+          shift
+          ;;
+      esac
+    done
+    mkdir -p "$workdir"
+    cd "$workdir"
+    exec sh -c "$last"
+    ;;
+esac
+"#,
+        );
+
+        unsafe {
+            std::env::set_var("EDGECRAB_SINGULARITY_BIN", &fake);
+        }
+
+        let mut ctx = ToolContext::test_context();
+        ctx.cwd = dir.path().to_path_buf();
+        ctx.task_id = format!("exec-remote-{}", uuid::Uuid::new_v4().simple());
+        ctx.config.terminal_backend = backends::BackendKind::Singularity;
+        ctx.tool_registry = Some(Arc::new(ToolRegistry::new()));
+
+        let tool = ExecuteCodeToolReal;
+        let result = tool
+            .execute(
+                json!({
+                    "code": "from edgecrab_tools import terminal\nwith open('note.txt', 'w') as fh:\n    fh.write('backend-note')\nprint(terminal('cat note.txt'))\n"
+                }),
+                &ctx,
+            )
+            .await
+            .expect("remote execute_code");
+
+        assert!(result.contains("backend-note"), "got: {result}");
+        let _ = cleanup_backend_for_task(&ctx.task_id).await;
+        unsafe {
+            std::env::remove_var("EDGECRAB_SINGULARITY_BIN");
+        }
     }
 }

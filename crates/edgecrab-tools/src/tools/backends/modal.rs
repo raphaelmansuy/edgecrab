@@ -55,6 +55,8 @@ use tracing::{info, warn};
 
 use edgecrab_types::ToolError;
 
+use crate::execution_tmp::{BACKEND_TMP_ROOT, temp_env_pairs, wrap_command_with_tmp_env};
+
 use super::local::safe_env;
 use super::{
     BackendKind, ExecOutput, ExecutionBackend, ModalBackendConfig, ModalTransportMode, shell_quote,
@@ -612,6 +614,7 @@ impl DirectModalState {
                 "EDGECRAB_HOME".into(),
                 DEFAULT_REMOTE_EDGECRAB_HOME.into(),
             )))
+            .chain(temp_env_pairs(BACKEND_TMP_ROOT))
             .collect();
 
         let restored_snapshot = cfg
@@ -692,6 +695,7 @@ impl DirectModalState {
         } else {
             command.to_string()
         };
+        let full_command = wrap_command_with_tmp_env(&full_command, BACKEND_TMP_ROOT);
 
         let payload = RunCommandRequest {
             command: vec!["sh".into(), "-c".into(), full_command],
@@ -1153,7 +1157,7 @@ impl ManagedModalState {
 pub struct ModalBackend {
     config: ModalBackendConfig,
     task_id: String,
-    state: TokioMutex<Option<ModalState>>,
+    state: TokioMutex<Option<Arc<ModalState>>>,
 }
 
 impl ModalBackend {
@@ -1165,26 +1169,29 @@ impl ModalBackend {
         }
     }
 
-    async fn ensure_state(&self) -> Result<(), ToolError> {
+    async fn ensure_state(&self) -> Result<Arc<ModalState>, ToolError> {
         let mut guard = self.state.lock().await;
         let needs_init = guard
             .as_ref()
-            .map(|s| match s {
+            .map(|s| match s.as_ref() {
                 ModalState::Direct(state) => state.dead.load(Ordering::Relaxed),
                 ModalState::Managed(state) => state.dead.load(Ordering::Relaxed),
             })
             .unwrap_or(true);
         if needs_init {
-            *guard = Some(match resolve_transport(&self.config)? {
+            *guard = Some(Arc::new(match resolve_transport(&self.config)? {
                 ModalTransportSelection::Direct => {
                     ModalState::Direct(DirectModalState::new(&self.config, &self.task_id).await?)
                 }
                 ModalTransportSelection::Managed(gateway) => ModalState::Managed(
                     ManagedModalState::new(&self.config, &self.task_id, gateway).await?,
                 ),
-            });
+            }));
         }
-        Ok(())
+        guard.clone().ok_or_else(|| ToolError::ExecutionFailed {
+            tool: "terminal".into(),
+            message: "Modal state missing after init — this is a bug".into(),
+        })
     }
 }
 
@@ -1197,29 +1204,40 @@ impl ExecutionBackend for ModalBackend {
         timeout: Duration,
         cancel: CancellationToken,
     ) -> Result<ExecOutput, ToolError> {
-        self.ensure_state().await?;
-        let guard = self.state.lock().await;
-        if let Some(state) = &*guard {
-            match state {
-                ModalState::Direct(state) => state.exec(command, cwd, timeout, cancel).await,
-                ModalState::Managed(state) => {
-                    state.execute_once(command, cwd, timeout, cancel).await
-                }
-            }
-        } else {
-            Err(ToolError::ExecutionFailed {
-                tool: "terminal".into(),
-                message: "Modal state missing after init — this is a bug".into(),
-            })
+        let state = self.ensure_state().await?;
+        match state.as_ref() {
+            ModalState::Direct(state) => state.exec(command, cwd, timeout, cancel).await,
+            ModalState::Managed(state) => state.execute_once(command, cwd, timeout, cancel).await,
+        }
+    }
+
+    async fn execute_oneshot(
+        &self,
+        command: &str,
+        cwd: &str,
+        timeout: Duration,
+        cancel: CancellationToken,
+    ) -> Result<ExecOutput, ToolError> {
+        let state = self.ensure_state().await?;
+        match state.as_ref() {
+            ModalState::Direct(state) => state.exec(command, cwd, timeout, cancel).await,
+            ModalState::Managed(state) => state.execute_once(command, cwd, timeout, cancel).await,
         }
     }
 
     async fn cleanup(&self) -> Result<(), ToolError> {
         let mut guard = self.state.lock().await;
         if let Some(state) = guard.take() {
-            match state {
-                ModalState::Direct(state) => state.terminate().await,
-                ModalState::Managed(state) => state.terminate().await,
+            if let Ok(state) = Arc::try_unwrap(state) {
+                match state {
+                    ModalState::Direct(state) => state.terminate().await,
+                    ModalState::Managed(state) => state.terminate().await,
+                }
+            } else {
+                warn!(
+                    task_id = %self.task_id,
+                    "Modal backend cleanup deferred because commands are still holding the sandbox"
+                );
             }
         }
         Ok(())
@@ -1229,9 +1247,13 @@ impl ExecutionBackend for ModalBackend {
         BackendKind::Modal
     }
 
+    fn supports_remote_execute_code(&self) -> bool {
+        true
+    }
+
     async fn is_healthy(&self) -> bool {
         let guard = self.state.lock().await;
-        match guard.as_ref() {
+        match guard.as_ref().map(Arc::as_ref) {
             Some(ModalState::Direct(state)) => !state.dead.load(Ordering::Relaxed),
             Some(ModalState::Managed(state)) => !state.dead.load(Ordering::Relaxed),
             None => false,

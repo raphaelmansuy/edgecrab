@@ -36,7 +36,7 @@ A full-featured terminal UI with:
 
 See [TUI Interface](/features/tui/)
 
-### 13+ LLM Providers
+### 14 LLM Providers
 
 Switch provider and model without restarting:
 
@@ -77,23 +77,25 @@ Built-in browser control via Chrome DevTools Protocol (CDP):
 
 See [Browser Automation](/features/browser/)
 
-### Multi-Platform Messaging Gateway
+### 15 Messaging Gateways
 
-Run EdgeCrab as a persistent bot on 10 platforms:
+Run EdgeCrab as a persistent bot on 15 platforms:
 - Telegram, Discord, Slack, Signal, WhatsApp
 - Matrix, Mattermost, DingTalk, SMS, Email
+- Home Assistant, Webhook, API Server, Feishu/Lark, WeCom
 
 See [Messaging Gateway](/user-guide/messaging/)
 
 ### Security
 
-Built-in defense in depth (6 layers):
+Built-in defense in depth (7 layers):
 - Path traversal prevention (`SanitizedPath` compile-time type)
-- SSRF guard with DNS-rebinding protection
-- Aho-Corasick command scanner (8 danger categories, 38 patterns)
-- Prompt injection detection
+- SSRF guard with private-IP blocklist (`SafeUrl` compile-time type)
+- Aho-Corasick command scanner (8 danger categories)
+- Prompt injection detection in context files
+- Code execution sandbox (API keys stripped from child env)
+- Skills threat scanner (23 patterns — exfiltration, injection, persistence)
 - Output redaction (API keys, tokens)
-- Approval policy (off / smart / manual)
 
 See [Security Model](/user-guide/security/)
 
@@ -176,16 +178,18 @@ reachable, these tools are silently absent from the tool list.
 |------|-------------|
 | `browser_navigate` | Navigate to a URL |
 | `browser_snapshot` | Get page accessibility tree as text |
-| `browser_screenshot` | Take a screenshot |
 | `browser_click` | Click an element |
 | `browser_type` | Type text into an input |
 | `browser_scroll` | Scroll the page |
-| `browser_console` | Capture browser console logs |
-| `browser_back` | Navigate back |
 | `browser_press` | Press a keyboard key |
+| `browser_back` | Navigate back |
 | `browser_close` | Close the browser |
+| `browser_console` | Capture browser console logs |
 | `browser_get_images` | Get images from the page |
-| `browser_vision` | Analyze page screenshot with vision model |
+| `browser_vision` | Take screenshot and analyze with vision model |
+| `browser_wait_for` | Wait for element/text to appear |
+| `browser_select` | Select a dropdown option |
+| `browser_hover` | Hover to trigger tooltips/states |
 
 ### Memory Tools (`memory`)
 
@@ -297,7 +301,7 @@ Only available in gateway sessions (Telegram, Discord, Slack, etc.):
 - [Memory](/features/memory/) — Persistent memory and Honcho user modeling
 - [Browser Automation](/features/browser/) — Browser automation with CDP
 - [SQLite State and Search](/features/state/) — Session persistence and FTS5 search
-- [Security Model](/user-guide/security/) — 6-layer defense stack
+- [Security Model](/user-guide/security/) — 7-layer defense stack
 
 ---
 
@@ -341,8 +345,8 @@ Yes. Use `--model ollama/llama3.3` (local Ollama) and `--toolset file,terminal,m
 
 **Q: How many tools can be active at once?**
 
-All registered tools (60+) can be active simultaneously. The LLM receives tool schemas in the system prompt. Limiting toolsets to what's needed keeps the system prompt shorter and the LLM more focused.
+All 74 registered tools can be active simultaneously. The LLM receives tool schemas in the system prompt. Limiting toolsets to what's needed keeps the system prompt shorter and the LLM more focused.
 
 **Q: Edge case: Can the agent call the same tool infinitely?**
 
-No. `tools.max_loop_depth` (default: 20) limits total tool calls per user turn. The LLM also receives tool results that typically converge toward an answer. Infinite loops in practice are extremely rare and always bounded by the depth limit.
+No. `model.max_iterations` (default: 90) limits total tool calls per session. The LLM also receives tool results that typically converge toward an answer. If the budget is exhausted, EdgeCrab reports to the user.

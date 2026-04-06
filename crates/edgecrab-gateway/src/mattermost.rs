@@ -16,6 +16,7 @@
 //! - Max message length: **4000** characters
 
 use std::env;
+use std::path::Path;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -87,6 +88,77 @@ impl MattermostAdapter {
 
         let json: serde_json::Value = resp.json().await?;
         Ok(json["id"].as_str().unwrap_or("").to_string())
+    }
+
+    async fn upload_file(&self, channel_id: &str, path: &str) -> anyhow::Result<String> {
+        let file_name = Path::new(path)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| anyhow::anyhow!("Mattermost media path has no file name: {path}"))?;
+        let bytes = std::fs::read(path)
+            .map_err(|error| anyhow::anyhow!("Mattermost cannot read {path}: {error}"))?;
+        let part = reqwest::multipart::Part::bytes(bytes).file_name(file_name.to_string());
+        let form = reqwest::multipart::Form::new()
+            .text("channel_id", channel_id.to_string())
+            .part("files", part);
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("{}/api/v4/files", self.base_url))
+            .header("Authorization", format!("Bearer {}", self.token))
+            .multipart(form)
+            .timeout(Duration::from_secs(60))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Mattermost file upload error {status}: {text}");
+        }
+
+        let json: serde_json::Value = resp.json().await?;
+        let file_id = json["file_infos"]
+            .as_array()
+            .and_then(|infos| infos.first())
+            .and_then(|info| info["id"].as_str())
+            .ok_or_else(|| anyhow::anyhow!("Mattermost upload response missing file id"))?;
+        Ok(file_id.to_string())
+    }
+
+    async fn send_file_post(
+        &self,
+        channel_id: &str,
+        path: &str,
+        caption: Option<&str>,
+        thread_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let file_id = self.upload_file(channel_id, path).await?;
+        let mut body = serde_json::json!({
+            "channel_id": channel_id,
+            "message": caption.unwrap_or_default(),
+            "file_ids": [file_id],
+        });
+        if let Some(root_id) = thread_id {
+            body["root_id"] = serde_json::json!(root_id);
+        }
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("{}/api/v4/posts", self.base_url))
+            .header("Authorization", format!("Bearer {}", self.token))
+            .json(&body)
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Mattermost media post error {status}: {text}");
+        }
+
+        Ok(())
     }
 }
 
@@ -234,6 +306,34 @@ impl PlatformAdapter for MattermostAdapter {
 
     fn supports_files(&self) -> bool {
         true
+    }
+
+    async fn send_photo(
+        &self,
+        path: &str,
+        caption: Option<&str>,
+        metadata: &MessageMetadata,
+    ) -> anyhow::Result<()> {
+        let channel_id = metadata
+            .channel_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("No Mattermost channel_id"))?;
+        self.send_file_post(channel_id, path, caption, metadata.thread_id.as_deref())
+            .await
+    }
+
+    async fn send_document(
+        &self,
+        path: &str,
+        caption: Option<&str>,
+        metadata: &MessageMetadata,
+    ) -> anyhow::Result<()> {
+        let channel_id = metadata
+            .channel_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("No Mattermost channel_id"))?;
+        self.send_file_post(channel_id, path, caption, metadata.thread_id.as_deref())
+            .await
     }
 }
 

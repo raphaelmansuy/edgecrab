@@ -20,6 +20,8 @@ use tracing::info;
 
 use edgecrab_types::ToolError;
 
+use crate::execution_tmp::{BACKEND_TMP_ROOT, wrap_command_with_tmp_env};
+
 use super::{
     BackendKind, ExecOutput, ExecutionBackend, SingularityBackendConfig, ensure_dir,
     sandbox_root_dir, sanitize_resource_name, shell_quote,
@@ -168,6 +170,7 @@ impl SingularityState {
             exec_command = format!("cd {} && {}", shell_quote(&workdir), exec_command);
             workdir = "/tmp".into();
         }
+        exec_command = wrap_command_with_tmp_env(&exec_command, BACKEND_TMP_ROOT);
 
         let mut cmd = Command::new(&self.executable);
         cmd.arg("exec")
@@ -222,7 +225,7 @@ impl SingularityState {
 pub struct SingularityBackend {
     config: SingularityBackendConfig,
     task_id: String,
-    state: TokioMutex<Option<SingularityState>>,
+    state: TokioMutex<Option<Arc<SingularityState>>>,
 }
 
 impl SingularityBackend {
@@ -234,16 +237,21 @@ impl SingularityBackend {
         }
     }
 
-    async fn ensure_state(&self) -> Result<(), ToolError> {
+    async fn ensure_state(&self) -> Result<Arc<SingularityState>, ToolError> {
         let mut guard = self.state.lock().await;
         let needs_init = guard
             .as_ref()
             .map(|s| s.dead.load(Ordering::Relaxed))
             .unwrap_or(true);
         if needs_init {
-            *guard = Some(SingularityState::new(&self.config, &self.task_id).await?);
+            *guard = Some(Arc::new(
+                SingularityState::new(&self.config, &self.task_id).await?,
+            ));
         }
-        Ok(())
+        guard.clone().ok_or_else(|| ToolError::ExecutionFailed {
+            tool: "terminal".into(),
+            message: "Singularity state missing after init".into(),
+        })
     }
 }
 
@@ -256,28 +264,42 @@ impl ExecutionBackend for SingularityBackend {
         timeout: Duration,
         cancel: CancellationToken,
     ) -> Result<ExecOutput, ToolError> {
-        self.ensure_state().await?;
-        let guard = self.state.lock().await;
-        if let Some(state) = &*guard {
-            state.exec(command, cwd, timeout, cancel).await
-        } else {
-            Err(ToolError::ExecutionFailed {
-                tool: "terminal".into(),
-                message: "Singularity state missing after init".into(),
-            })
-        }
+        let state = self.ensure_state().await?;
+        state.exec(command, cwd, timeout, cancel).await
+    }
+
+    async fn execute_oneshot(
+        &self,
+        command: &str,
+        cwd: &str,
+        timeout: Duration,
+        cancel: CancellationToken,
+    ) -> Result<ExecOutput, ToolError> {
+        let state = self.ensure_state().await?;
+        state.exec(command, cwd, timeout, cancel).await
     }
 
     async fn cleanup(&self) -> Result<(), ToolError> {
         let mut guard = self.state.lock().await;
         if let Some(state) = guard.take() {
-            state.stop().await;
+            if let Ok(state) = Arc::try_unwrap(state) {
+                state.stop().await;
+            } else {
+                tracing::warn!(
+                    task_id = %self.task_id,
+                    "Singularity backend cleanup deferred because commands are still holding the instance"
+                );
+            }
         }
         Ok(())
     }
 
     fn kind(&self) -> BackendKind {
         BackendKind::Singularity
+    }
+
+    fn supports_remote_execute_code(&self) -> bool {
+        true
     }
 
     async fn is_healthy(&self) -> bool {
@@ -288,6 +310,9 @@ impl ExecutionBackend for SingularityBackend {
         }
     }
 }
+
+#[cfg(test)]
+pub(crate) static SINGULARITY_TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 mod tests {
@@ -305,12 +330,12 @@ mod tests {
         path
     }
 
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn missing_runtime_is_actionable() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = SINGULARITY_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::set_var("EDGECRAB_SINGULARITY_BIN", "/definitely/missing/apptainer") };
         let err = SingularityState::new(&SingularityBackendConfig::default(), "missing")
             .await
@@ -324,7 +349,9 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn fake_runtime_executes_and_cleans_up() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = SINGULARITY_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().expect("tempdir");
         let log = dir.path().join("runtime.log");
         let fake = write_fake_runtime(
@@ -343,9 +370,11 @@ case "${1:-}" in
     echo "exec:$*" >> "$log"
     last=""
     for arg in "$@"; do last="$arg"; done
-    if [ "$last" = "exit 7" ]; then
+    case "$last" in
+      *"&& exit 7")
       exit 7
-    fi
+      ;;
+    esac
     printf 'sg:%s\n' "$last"
     ;;
   *)
@@ -371,7 +400,15 @@ esac
             .await
             .expect("execute");
         assert!(
-            out.stdout.contains("sg:echo hello-singularity"),
+            out.stdout.contains("sg:mkdir -p '/tmp/edgecrab-tmp'"),
+            "got: {out:?}"
+        );
+        assert!(
+            out.stdout.contains("EDGECRAB_TMPDIR='/tmp/edgecrab-tmp'"),
+            "got: {out:?}"
+        );
+        assert!(
+            out.stdout.contains("&& echo hello-singularity"),
             "got: {out:?}"
         );
 
@@ -401,7 +438,9 @@ esac
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn fake_runtime_timeout_returns_124() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = SINGULARITY_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().expect("tempdir");
         let fake = write_fake_runtime(
             &dir,

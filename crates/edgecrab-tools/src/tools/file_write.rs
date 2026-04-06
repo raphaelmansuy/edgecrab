@@ -196,4 +196,24 @@ mod tests {
 
         assert!(matches!(result, Err(ToolError::PermissionDenied(_))));
     }
+
+    #[tokio::test]
+    async fn write_file_maps_absolute_tmp_into_edgecrab_temp_root() {
+        let dir = TempDir::new().expect("workspace");
+        let edgecrab_home = TempDir::new().expect("edgecrab_home");
+        let mut ctx = ctx_in(dir.path());
+        ctx.config.edgecrab_home = edgecrab_home.path().to_path_buf();
+
+        WriteFileTool
+            .execute(
+                json!({"path": "/tmp/summary.md", "content": "hello tmp"}),
+                &ctx,
+            )
+            .await
+            .expect("write virtual tmp");
+
+        let content = std::fs::read_to_string(edgecrab_home.path().join("tmp/files/summary.md"))
+            .expect("read mapped tmp file");
+        assert_eq!(content, "hello tmp");
+    }
 }

@@ -45,7 +45,7 @@ const agent = new Agent({
   model: 'openai/gpt-4o',                    // provider/model string
   systemPrompt: 'You are a Rust expert.',    // optional system prompt
   apiKey: process.env.OPENAI_API_KEY,        // optional; falls back to env var
-  maxLoopDepth: 20,                          // max ReAct iterations (default: 20)
+  maxIterations: 90,                         // max ReAct iterations (default: 90)
   toolsets: ['file', 'web'],                 // enable specific toolsets
   sessionName: 'my-project',                // named session (persisted)
   baseUrl: undefined,                        // custom OpenAI-compatible endpoint

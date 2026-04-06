@@ -1,0 +1,257 @@
+---
+interface Metric {
+  label: string;
+  unit: string;
+  bars: {
+    name: string;
+    value: number;      // display value
+    max: number;        // scale denominator (100% of bar)
+    formatted: string;  // human-readable label on bar
+    win?: boolean;      // orange accent
+    caveat?: boolean;   // dimmed grey with note marker
+  }[];
+  lowerIsBetter?: boolean;
+  note?: string;        // footnote for caveat bars
+}
+
+interface Props {
+  eyebrow?: string;
+  title: string;
+  subtitle: string;
+  metrics: Metric[];
+  caveatText?: string;
+}
+
+const {
+  eyebrow = 'Benchmarks',
+  title,
+  subtitle,
+  metrics,
+  caveatText,
+} = Astro.props;
+---
+
+<section class="benchmark-section" aria-labelledby="bench-heading">
+  <div class="bench-container">
+    <span class="section-eyebrow">{eyebrow}</span>
+    <h2 id="bench-heading" class="section-title">{title}</h2>
+    <p class="section-subtitle">{subtitle}</p>
+
+    <div class="metrics-grid">
+      {metrics.map((metric) => (
+        <div class="metric-card">
+          <div class="metric-header">
+            <span class="metric-label">{metric.label}</span>
+            <span class="metric-unit">{metric.lowerIsBetter ? '↓ lower is better' : '↑ higher is better'}</span>
+          </div>
+          <div class="bars">
+            {metric.bars.map((bar, i) => {
+              const pct = Math.min(100, Math.round((bar.value / bar.max) * 100));
+              return (
+                <div class="bar-row">
+                  <span class="bar-name">{bar.name}</span>
+                  <div class="bar-track">
+                    <div
+                      class:list={['bar-fill', { 'bar-win': bar.win, 'bar-caveat': bar.caveat }]}
+                      style={`--pct: ${pct}%; --delay: ${i * 0.12}s`}
+                      role="meter"
+                      aria-label={`${bar.name}: ${bar.formatted}`}
+                      aria-valuenow={bar.value}
+                      aria-valuemin={0}
+                      aria-valuemax={bar.max}
+                    />
+                  </div>
+                  <span class:list={['bar-value', { 'bar-value-win': bar.win, 'bar-value-dim': bar.caveat }]}>
+                    {bar.formatted}
+                    {bar.caveat && <sup>*</sup>}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+          {metric.note && <p class="metric-note"><sup>*</sup> {metric.note}</p>}
+        </div>
+      ))}
+    </div>
+
+    {caveatText && (
+      <div class="caveat-box" role="note">
+        <span class="caveat-icon" aria-hidden="true">ℹ</span>
+        <p set:html={caveatText} />
+      </div>
+    )}
+  </div>
+</section>
+
+<style>
+  .benchmark-section {
+    padding: 6rem 1.5rem;
+    background: var(--sl-color-bg);
+    text-align: center;
+  }
+
+  .bench-container {
+    max-width: 900px;
+    margin: 0 auto;
+  }
+
+  .section-eyebrow {
+    display: inline-block;
+    font-size: 0.8rem; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.1em; color: var(--sl-color-accent);
+    margin-bottom: 0.75rem; padding: 0.3rem 0.75rem;
+    background: rgba(234, 88, 12, 0.08); border-radius: 999px;
+  }
+
+  .section-title {
+    font-size: clamp(1.75rem, 4vw, 2.5rem); font-weight: 800;
+    margin-bottom: 0.75rem; color: var(--ep-text-primary, #111827);
+    letter-spacing: -0.02em;
+  }
+
+  .section-subtitle {
+    font-size: 1.1rem; color: var(--ep-text-secondary, #6B7280);
+    max-width: 600px; margin: 0 auto 3rem; line-height: 1.6;
+  }
+
+  /* ── Grid ── */
+  .metrics-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 1.5rem;
+    margin-bottom: 2rem;
+    text-align: left;
+  }
+
+  @media (max-width: 680px) {
+    .metrics-grid { grid-template-columns: 1fr; }
+  }
+
+  /* ── Card ── */
+  .metric-card {
+    background: var(--ep-card-bg, #fff);
+    border: 1px solid var(--ep-card-border, #E5E7EB);
+    border-radius: 0.875rem;
+    padding: 1.5rem 1.75rem;
+    box-shadow: var(--ep-card-shadow);
+  }
+
+  .metric-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    margin-bottom: 1.25rem;
+  }
+
+  .metric-label {
+    font-size: 0.95rem; font-weight: 700;
+    color: var(--ep-text-primary, #111827);
+  }
+
+  .metric-unit {
+    font-size: 0.7rem; font-weight: 500; text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--ep-text-secondary, #6B7280);
+  }
+
+  /* ── Bars ── */
+  .bars { display: flex; flex-direction: column; gap: 0.875rem; }
+
+  .bar-row {
+    display: grid;
+    grid-template-columns: 6.5rem 1fr 5rem;
+    align-items: center;
+    gap: 0.625rem;
+  }
+
+  .bar-name {
+    font-size: 0.8rem; font-weight: 600;
+    color: var(--ep-text-secondary, #4B5563);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+
+  .bar-track {
+    height: 0.75rem;
+    background: var(--ep-section-alt-bg, #F3F4F6);
+    border-radius: 999px;
+    overflow: hidden;
+  }
+
+  .bar-fill {
+    height: 100%;
+    width: var(--pct, 0%);
+    border-radius: 999px;
+    background: var(--ep-text-secondary, #9CA3AF);
+    transition: width 0.95s cubic-bezier(0.34, 1.56, 0.64, 1) var(--delay, 0s);
+  }
+
+  .bar-fill.bar-win {
+    background: linear-gradient(90deg, #EA580C, #F97316);
+  }
+
+  .bar-fill.bar-caveat {
+    background: var(--ep-text-secondary, #9CA3AF);
+    opacity: 0.65;
+  }
+
+  .bar-value {
+    font-size: 0.8rem; font-weight: 700;
+    color: var(--ep-text-secondary, #6B7280);
+    text-align: right; white-space: nowrap;
+  }
+
+  .bar-value-win { color: var(--sl-color-accent); }
+  .bar-value-dim { opacity: 0.7; }
+
+  /* ── Footnote ── */
+  .metric-note {
+    margin-top: 0.875rem;
+    font-size: 0.75rem; font-style: italic;
+    color: var(--ep-text-secondary, #6B7280);
+    line-height: 1.5;
+  }
+
+  /* ── Honest caveat box ── */
+  .caveat-box {
+    display: flex; align-items: flex-start; gap: 0.875rem;
+    background: rgba(234, 88, 12, 0.05);
+    border: 1px solid rgba(234, 88, 12, 0.2);
+    border-radius: 0.75rem;
+    padding: 1rem 1.25rem;
+    text-align: left;
+    max-width: 680px;
+    margin: 0 auto;
+  }
+
+  .caveat-icon {
+    font-size: 1.1rem; line-height: 1.5;
+    color: var(--sl-color-accent);
+    flex-shrink: 0;
+  }
+
+  .caveat-box p {
+    font-size: 0.875rem; line-height: 1.6;
+    color: var(--ep-text-secondary, #4B5563);
+    margin: 0;
+  }
+
+  /* ── Dark mode ── */
+  [data-theme='dark'] .metric-card {
+    background: var(--ep-card-bg, #1F2937);
+    border-color: var(--ep-card-border, #374151);
+  }
+
+  [data-theme='dark'] .bar-track {
+    background: rgba(255, 255, 255, 0.06);
+  }
+
+  [data-theme='dark'] .caveat-box {
+    background: rgba(251, 146, 60, 0.07);
+    border-color: rgba(251, 146, 60, 0.25);
+  }
+
+  @media (max-width: 540px) {
+    .benchmark-section { padding: 4rem 1rem; }
+    .bar-row { grid-template-columns: 5rem 1fr 4.5rem; gap: 0.5rem; }
+  }
+</style>

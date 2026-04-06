@@ -11,6 +11,8 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value, json};
 
 const VSCODE_SETTINGS_KEY: &str = "acpClient.agents";
+const ACP_AGENT_DISPLAY_NAME: &str = "EdgeCrab";
+const ACP_AGENT_COMMAND: &str = "edgecrab";
 
 pub fn run_init(workspace: Option<PathBuf>, force: bool) -> Result<()> {
     let workspace = resolve_workspace(workspace)?;
@@ -24,7 +26,9 @@ pub fn run_init(workspace: Option<PathBuf>, force: bool) -> Result<()> {
     println!("Next steps:");
     println!("1. Install a VS Code ACP client extension if you have not already.");
     println!("2. Open this workspace in VS Code and reload the window.");
-    println!("3. Pick `edgecrab` in the ACP agent list, then start asking for code changes.");
+    println!(
+        "3. Pick `{ACP_AGENT_DISPLAY_NAME}` in the ACP agent list, then start asking for code changes."
+    );
     println!();
     println!("Capabilities exposed in ACP mode:");
     println!("- Streaming responses and multi-turn sessions");
@@ -35,7 +39,7 @@ pub fn run_init(workspace: Option<PathBuf>, force: bool) -> Result<()> {
     if plan.path_hint_needed {
         println!();
         println!(
-            "Note: the generated manifest launches `edgecrab acp`, so VS Code must be able to resolve `edgecrab` on PATH."
+            "Note: the generated manifest launches `{ACP_AGENT_COMMAND} acp`, so VS Code must be able to resolve `{ACP_AGENT_COMMAND}` on PATH."
         );
     }
 
@@ -111,18 +115,18 @@ fn init_workspace(workspace: &Path, force: bool) -> Result<InitPlan> {
     Ok(InitPlan {
         registry_manifest: manifest_path,
         settings_path,
-        path_hint_needed: !command_on_path("edgecrab"),
+        path_hint_needed: !command_on_path(ACP_AGENT_COMMAND),
     })
 }
 
 fn build_manifest() -> Value {
     json!({
-        "name": "edgecrab",
+        "name": ACP_AGENT_DISPLAY_NAME,
         "description": "EdgeCrab — an ACP-compatible agent with file, terminal, and skill tools. Launched as a child process and communicates via JSON-RPC 2.0 over stdio.",
         "version": env!("CARGO_PKG_VERSION"),
         "launch": {
             "type": "command",
-            "command": "edgecrab acp"
+            "command": format!("{ACP_AGENT_COMMAND} acp")
         },
         "protocol": {
             "transport": "stdio",
@@ -141,7 +145,7 @@ fn build_manifest() -> Value {
                 "setting": VSCODE_SETTINGS_KEY,
                 "example": [
                     {
-                        "name": "edgecrab",
+                        "name": ACP_AGENT_DISPLAY_NAME,
                         "registryDir": "/path/to/workspace/.edgecrab/acp_registry"
                     }
                 ]
@@ -182,7 +186,7 @@ fn upsert_vscode_agent(mut settings: Value, registry_dir: &Path) -> Value {
         .expect("settings JSON must be an object before upsert");
 
     let entry = json!({
-        "name": "edgecrab",
+        "name": ACP_AGENT_DISPLAY_NAME,
         "registryDir": registry_dir.to_string_lossy(),
     });
 
@@ -196,10 +200,10 @@ fn upsert_vscode_agent(mut settings: Value, registry_dir: &Path) -> Value {
     };
 
     existing_agents.retain(|agent| {
-        agent
-            .get("name")
-            .and_then(Value::as_str)
-            .is_none_or(|name| name != "edgecrab")
+        !matches!(
+            agent.get("name").and_then(Value::as_str),
+            Some("edgecrab" | "EdgeCrab")
+        )
     });
     existing_agents.push(entry);
 
@@ -234,6 +238,7 @@ mod tests {
             &fs::read_to_string(&result.registry_manifest).expect("manifest text"),
         )
         .expect("manifest json");
+        assert_eq!(manifest["name"], ACP_AGENT_DISPLAY_NAME);
         assert_eq!(manifest["launch"]["command"], "edgecrab acp");
 
         let settings: Value = serde_json::from_str(
@@ -244,7 +249,7 @@ mod tests {
             .as_array()
             .expect("acpClient.agents array");
         assert_eq!(agents.len(), 1);
-        assert_eq!(agents[0]["name"], "edgecrab");
+        assert_eq!(agents[0]["name"], ACP_AGENT_DISPLAY_NAME);
         assert_eq!(
             agents[0]["registryDir"],
             workspace
@@ -267,7 +272,8 @@ mod tests {
   "editor.formatOnSave": true,
   "acpClient.agents": [
     {"name": "existing", "registryDir": "/tmp/existing"},
-    {"name": "edgecrab", "registryDir": "/tmp/old"}
+    {"name": "edgecrab", "registryDir": "/tmp/old"},
+    {"name": "EdgeCrab", "registryDir": "/tmp/older"}
   ]
 }
 "#,
@@ -289,7 +295,7 @@ mod tests {
         assert_eq!(
             agents
                 .iter()
-                .filter(|agent| agent["name"] == "edgecrab")
+                .filter(|agent| agent["name"] == ACP_AGENT_DISPLAY_NAME)
                 .count(),
             1
         );

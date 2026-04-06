@@ -24,6 +24,7 @@ use edgecrab_core::Agent;
 
 /// The EdgeCrab ACP agent version.
 const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+const ACP_AGENT_NAME: &str = "EdgeCrab";
 
 /// ACP server that reads JSON-RPC requests from stdin and writes responses to stdout.
 pub struct AcpServer {
@@ -126,7 +127,7 @@ impl AcpServer {
         let result = InitializeResult {
             protocol_version: ACP_PROTOCOL_VERSION,
             agent_info: AgentInfo {
-                name: "edgecrab".to_string(),
+                name: ACP_AGENT_NAME.to_string(),
                 version: AGENT_VERSION.to_string(),
             },
             agent_capabilities: AgentCapabilities {
@@ -489,7 +490,7 @@ mod tests {
         let resp = server.handle_initialize(Some(serde_json::json!(1)));
         assert!(resp.result.is_some());
         let result = resp.result.expect("result");
-        assert_eq!(result["agent_info"]["name"], "edgecrab");
+        assert_eq!(result["agent_info"]["name"], ACP_AGENT_NAME);
         assert_eq!(result["protocol_version"], ACP_PROTOCOL_VERSION);
     }
 

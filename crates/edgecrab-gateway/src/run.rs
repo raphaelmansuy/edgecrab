@@ -13,14 +13,19 @@
 //! ```
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::panic::AssertUnwindSafe;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::extract::State;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use edgecrab_tools::tools::transcribe::TranscribeAudioTool;
+use edgecrab_tools::tools::tts::TextToSpeechTool;
 use edgecrab_tools::tools::vision::VisionAnalyzeTool;
 use edgecrab_tools::{AppConfigRef, ToolContext, ToolHandler};
+use futures::FutureExt;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -31,8 +36,10 @@ use crate::hooks::{HookContext, HookRegistry};
 use crate::interactions::{InteractionBroker, PendingInteractionKind};
 use crate::platform::{IncomingMessage, PlatformAdapter};
 use crate::session::{SessionKey, SessionManager};
+use crate::voice_delivery::voice_delivery_doctor;
 use crate::webhook::WebhookPayload;
 use edgecrab_core::{Agent, IsolatedAgentOptions};
+use edgecrab_types::Role;
 
 /// Deterministic gateway-side image pre-analysis prompt.
 ///
@@ -52,6 +59,93 @@ numbers, code, UI elements, objects, people, colors, layout, and notable context
 /// every attachment path in the injected context, but pre-analyze only the
 /// first few images so single-image and small-batch UX stays reliable.
 const MAX_GATEWAY_EAGER_IMAGE_ANALYSES: usize = 4;
+const MAX_GATEWAY_EAGER_AUDIO_TRANSCRIPTS: usize = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum GatewayVoiceMode {
+    Off,
+    VoiceOnly,
+    All,
+}
+
+impl GatewayVoiceMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off (text only)",
+            Self::VoiceOnly => "On (voice reply to voice messages)",
+            Self::All => "TTS (voice reply to all messages)",
+        }
+    }
+}
+
+fn gateway_voice_mode_path() -> PathBuf {
+    edgecrab_core::edgecrab_home().join("gateway_voice_mode.json")
+}
+
+fn load_gateway_voice_modes_from(path: &Path) -> HashMap<String, GatewayVoiceMode> {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return HashMap::new();
+    };
+    let Ok(raw) = serde_json::from_str::<HashMap<String, String>>(&content) else {
+        return HashMap::new();
+    };
+
+    raw.into_iter()
+        .filter_map(|(chat_id, mode)| {
+            let parsed = match mode.as_str() {
+                "off" => GatewayVoiceMode::Off,
+                "voice_only" => GatewayVoiceMode::VoiceOnly,
+                "all" => GatewayVoiceMode::All,
+                _ => return None,
+            };
+            Some((chat_id, parsed))
+        })
+        .collect()
+}
+
+fn save_gateway_voice_modes_to(
+    path: &Path,
+    modes: &HashMap<String, GatewayVoiceMode>,
+) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let raw: HashMap<&str, &str> = modes
+        .iter()
+        .map(|(chat_id, mode)| {
+            let mode = match mode {
+                GatewayVoiceMode::Off => "off",
+                GatewayVoiceMode::VoiceOnly => "voice_only",
+                GatewayVoiceMode::All => "all",
+            };
+            (chat_id.as_str(), mode)
+        })
+        .collect();
+    std::fs::write(path, serde_json::to_vec_pretty(&raw)?)?;
+    Ok(())
+}
+
+fn incoming_message_is_voice_origin(msg: &IncomingMessage) -> bool {
+    let has_voice_note = msg
+        .metadata
+        .attachments
+        .iter()
+        .any(|attachment| attachment.kind == crate::platform::MessageAttachmentKind::Voice);
+    if has_voice_note {
+        return true;
+    }
+
+    // Some bridges only classify note-style inbound audio as `Audio`.
+    let has_audio = msg.metadata.attachments.iter().any(|attachment| {
+        matches!(
+            attachment.kind,
+            crate::platform::MessageAttachmentKind::Audio
+                | crate::platform::MessageAttachmentKind::Voice
+        )
+    });
+    has_audio && msg.text.trim().is_empty()
+}
 
 /// Help text shown when a user sends /help to the gateway.
 const HELP_TEXT: &str = "\
@@ -64,6 +158,7 @@ const HELP_TEXT: &str = "\
 /retry   - Retry your last message
 /status  - Show whether an agent is currently running
 /usage   - Show session stats
+/voice   - Control spoken replies: off, on, tts, status, doctor
 /background - Run a prompt in a separate background session
 /hooks   - List loaded event hooks
 /approve - Approve the oldest pending command request
@@ -133,6 +228,23 @@ fn image_attachment_sources(msg: &IncomingMessage) -> Vec<String> {
         .collect()
 }
 
+fn audio_attachment_sources(msg: &IncomingMessage) -> Vec<String> {
+    msg.metadata
+        .attachments
+        .iter()
+        .filter(|attachment| {
+            matches!(
+                attachment.kind,
+                crate::platform::MessageAttachmentKind::Audio
+                    | crate::platform::MessageAttachmentKind::Voice
+            )
+        })
+        .filter_map(|attachment| attachment.local_path.as_deref())
+        .filter(|path| !path.trim().is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 fn render_gateway_image_context(
     user_text: &str,
     image_sources: &[String],
@@ -198,12 +310,14 @@ fn render_gateway_image_context(
 
 async fn build_effective_text(agent: &Agent, msg: &IncomingMessage) -> String {
     let image_sources = image_attachment_sources(msg);
-    if image_sources.is_empty() {
+    let audio_sources = audio_attachment_sources(msg);
+    if image_sources.is_empty() && audio_sources.is_empty() {
         return msg.text.clone();
     }
 
     let provider = agent.provider_handle().await;
     let auxiliary = agent.auxiliary_config().await;
+    let (_, stt, _) = agent.media_config().await;
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let session_key = format!(
         "gateway-image-preanalysis-{}",
@@ -215,9 +329,12 @@ async fn build_effective_text(agent: &Agent, msg: &IncomingMessage) -> String {
         auxiliary_model: auxiliary.model,
         auxiliary_base_url: auxiliary.base_url,
         auxiliary_api_key_env: auxiliary.api_key_env,
+        stt_provider: Some(stt.provider),
+        stt_whisper_model: Some(stt.whisper_model),
         ..Default::default()
     };
 
+    let mut effective_text = msg.text.clone();
     let mut analyses = Vec::new();
     let mut failures = Vec::new();
     for (idx, source) in image_sources
@@ -239,6 +356,7 @@ async fn build_effective_text(agent: &Agent, msg: &IncomingMessage) -> String {
             tool_registry: None,
             delegate_depth: 0,
             sub_agent_runner: None,
+            delegation_event_tx: None,
             clarify_tx: None,
             approval_tx: None,
             on_skills_changed: None,
@@ -264,15 +382,157 @@ async fn build_effective_text(agent: &Agent, msg: &IncomingMessage) -> String {
         }
     }
 
-    render_gateway_image_context(
-        &msg.text,
-        &image_sources,
-        &analyses,
-        &failures,
-        image_sources
-            .len()
-            .saturating_sub(MAX_GATEWAY_EAGER_IMAGE_ANALYSES),
-    )
+    if !image_sources.is_empty() {
+        effective_text = render_gateway_image_context(
+            &effective_text,
+            &image_sources,
+            &analyses,
+            &failures,
+            image_sources
+                .len()
+                .saturating_sub(MAX_GATEWAY_EAGER_IMAGE_ANALYSES),
+        );
+    }
+
+    let mut transcripts = Vec::new();
+    let mut transcription_failures = Vec::new();
+    for (idx, source) in audio_sources
+        .iter()
+        .take(MAX_GATEWAY_EAGER_AUDIO_TRANSCRIPTS)
+        .enumerate()
+    {
+        let ctx = ToolContext {
+            task_id: format!("gateway-audio-pretranscribe-{}", idx + 1),
+            cwd: cwd.clone(),
+            session_id: session_key.clone(),
+            user_task: None,
+            cancel: CancellationToken::new(),
+            config: config.clone(),
+            state_db: None,
+            platform: msg.platform,
+            process_table: None,
+            provider: None,
+            tool_registry: None,
+            delegate_depth: 0,
+            sub_agent_runner: None,
+            delegation_event_tx: None,
+            clarify_tx: None,
+            approval_tx: None,
+            on_skills_changed: None,
+            gateway_sender: None,
+            origin_chat: None,
+            session_key: Some(session_key.clone()),
+            todo_store: None,
+        };
+
+        match TranscribeAudioTool
+            .execute(serde_json::json!({ "file_path": source }), &ctx)
+            .await
+        {
+            Ok(transcript) => transcripts.push(transcript),
+            Err(error) => {
+                transcription_failures.push(format!("Audio {} ({source}): {error}", idx + 1))
+            }
+        }
+    }
+
+    if !audio_sources.is_empty() {
+        effective_text = render_gateway_audio_context(
+            &effective_text,
+            &audio_sources,
+            &transcripts,
+            &transcription_failures,
+            audio_sources
+                .len()
+                .saturating_sub(MAX_GATEWAY_EAGER_AUDIO_TRANSCRIPTS),
+        );
+    }
+
+    effective_text
+}
+
+fn render_gateway_audio_context(
+    user_text: &str,
+    audio_sources: &[String],
+    transcripts: &[String],
+    transcription_failures: &[String],
+    skipped_count: usize,
+) -> String {
+    if audio_sources.is_empty() {
+        return user_text.to_string();
+    }
+
+    let mut lines = Vec::new();
+    lines.push("*** ATTACHED AUDIO ***".to_string());
+    lines.push(format!(
+        "The user attached {} audio file(s) or voice note(s).",
+        audio_sources.len()
+    ));
+    lines.push("Audio sources:".to_string());
+    for (idx, source) in audio_sources.iter().enumerate() {
+        lines.push(format!("- Audio {}: {}", idx + 1, source));
+    }
+    if !transcripts.is_empty() {
+        lines.push(
+            "Gateway transcription already ran before this turn. Use it as primary context."
+                .to_string(),
+        );
+        for (idx, transcript) in transcripts.iter().enumerate() {
+            lines.push(format!("Transcript {}:\n{}", idx + 1, transcript));
+        }
+    }
+    if !transcription_failures.is_empty() {
+        lines.push(
+            "Some audio attachments could not be transcribed automatically. If \
+             `transcribe_audio` is available in this session and you need more detail, \
+             you may call it on one of the local audio paths above."
+                .to_string(),
+        );
+        for failure in transcription_failures {
+            lines.push(format!("- {}", failure));
+        }
+    }
+    if skipped_count > 0 {
+        lines.push(format!(
+            "{skipped_count} additional audio attachment(s) were not pre-transcribed to keep latency bounded."
+        ));
+    }
+    lines.push("*** END ATTACHED AUDIO ***".to_string());
+
+    let block = lines.join("\n");
+    if user_text.trim().is_empty() {
+        block
+    } else {
+        format!("{user_text}\n\n{block}")
+    }
+}
+
+fn background_gateway_arg_preview(args_json: &str) -> String {
+    const PRIORITY: &[&str] = &[
+        "query", "url", "path", "command", "goal", "prompt", "text", "content",
+    ];
+
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(args_json) else {
+        return String::new();
+    };
+    let Some(obj) = value.as_object() else {
+        return String::new();
+    };
+    for key in PRIORITY {
+        if let Some(text) = obj.get(*key).and_then(|v| v.as_str()) {
+            return edgecrab_core::safe_truncate(text, 48).to_string();
+        }
+    }
+    String::new()
+}
+
+fn background_gateway_tool_label(name: &str, args_json: &str) -> String {
+    let preview = background_gateway_arg_preview(args_json);
+    if preview.is_empty() {
+        name.to_string()
+    } else {
+        format!("{name}: {preview}")
+    }
 }
 
 async fn deliver_text_and_media(
@@ -283,17 +543,24 @@ async fn deliver_text_and_media(
     metadata: &crate::platform::MessageMetadata,
 ) -> anyhow::Result<usize> {
     let (cleaned, media_refs) = crate::platform::extract_media_from_response(response);
-
-    let text_result = delivery
-        .deliver(&cleaned, platform, metadata)
-        .await
-        .map(|_| cleaned.len())?;
+    let text_result = if let Some(text) =
+        crate::platform::response_text_after_media_extraction(response, &cleaned, &media_refs)
+    {
+        delivery
+            .deliver(&text, platform, metadata)
+            .await
+            .map(|_| text.len())?
+    } else {
+        0
+    };
 
     if !media_refs.is_empty() {
         if let Some(adapter) = adapter {
             for mref in &media_refs {
                 let result = if mref.is_image {
                     adapter.send_photo(&mref.path, None, metadata).await
+                } else if crate::platform::MediaRef::detect_audio(&mref.path) {
+                    adapter.send_voice(&mref.path, None, metadata).await
                 } else {
                     adapter.send_document(&mref.path, None, metadata).await
                 };
@@ -309,6 +576,106 @@ async fn deliver_text_and_media(
     }
 
     Ok(text_result)
+}
+
+async fn maybe_send_voice_reply(
+    agent: &Agent,
+    adapter: Option<Arc<dyn PlatformAdapter>>,
+    msg: &IncomingMessage,
+    response: &str,
+    mode: GatewayVoiceMode,
+) {
+    let Some(adapter) = adapter else {
+        return;
+    };
+    if mode == GatewayVoiceMode::Off {
+        return;
+    }
+    if mode == GatewayVoiceMode::VoiceOnly && !incoming_message_is_voice_origin(msg) {
+        return;
+    }
+
+    let (cleaned, media_refs) = crate::platform::extract_media_from_response(response);
+    if media_refs
+        .iter()
+        .any(|media_ref| crate::platform::MediaRef::detect_audio(&media_ref.path))
+    {
+        return;
+    }
+    let Some(text) =
+        crate::platform::response_text_after_media_extraction(response, &cleaned, &media_refs)
+    else {
+        return;
+    };
+    let Some(text) = edgecrab_tools::tools::tts::sanitize_text_for_tts(text.trim(), 4000) else {
+        return;
+    };
+
+    let (tts, _, _) = agent.media_config().await;
+    let ctx = ToolContext {
+        task_id: "gateway-auto-tts".into(),
+        cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        session_id: format!("gateway-auto-tts-{}", message_origin_recipient(msg)),
+        user_task: None,
+        cancel: CancellationToken::new(),
+        config: AppConfigRef {
+            edgecrab_home: edgecrab_core::edgecrab_home(),
+            tts_provider: Some(tts.provider),
+            tts_voice: Some(tts.voice),
+            tts_rate: tts.rate,
+            tts_model: tts.model,
+            tts_elevenlabs_voice_id: tts.elevenlabs_voice_id,
+            tts_elevenlabs_model_id: tts.elevenlabs_model_id,
+            tts_elevenlabs_api_key_env: Some(tts.elevenlabs_api_key_env),
+            ..Default::default()
+        },
+        state_db: None,
+        platform: msg.platform,
+        process_table: None,
+        provider: None,
+        tool_registry: None,
+        delegate_depth: 0,
+        sub_agent_runner: None,
+        delegation_event_tx: None,
+        clarify_tx: None,
+        approval_tx: None,
+        on_skills_changed: None,
+        gateway_sender: None,
+        origin_chat: None,
+        session_key: Some(message_origin_recipient(msg)),
+        todo_store: None,
+    };
+
+    let result = match TextToSpeechTool
+        .execute(serde_json::json!({ "text": text }), &ctx)
+        .await
+    {
+        Ok(output) => output,
+        Err(error) => {
+            tracing::warn!(platform = ?msg.platform, error = %error, "gateway auto TTS failed");
+            return;
+        }
+    };
+
+    let Some(audio_path) = edgecrab_tools::tools::tts::extract_audio_path_from_tts_output(&result)
+    else {
+        tracing::warn!("gateway auto TTS returned no usable audio path");
+        return;
+    };
+
+    if let Err(error) = adapter.send_voice(&audio_path, None, &msg.metadata).await {
+        tracing::warn!(
+            platform = ?msg.platform,
+            path = %audio_path,
+            error = %error,
+            "gateway auto voice delivery failed"
+        );
+    }
+
+    let temp_tts_dir = std::env::temp_dir().join("edgecrab_tts");
+    if Path::new(&audio_path).starts_with(&temp_tts_dir) {
+        let _ = tokio::fs::remove_file(&audio_path).await;
+    }
 }
 
 fn delivery_recipient(chat_id: &str, thread_id: Option<&str>) -> String {
@@ -329,6 +696,35 @@ fn message_origin_recipient(msg: &IncomingMessage) -> String {
         .as_deref()
         .or(msg.metadata.thread_id.as_deref());
     delivery_recipient(chat_id, thread_id)
+}
+
+fn extract_stream_fallback_response(
+    messages: &[edgecrab_types::Message],
+    baseline_len: usize,
+) -> Option<String> {
+    messages
+        .iter()
+        .skip(baseline_len)
+        .rev()
+        .find(|message| message.role == Role::Assistant)
+        .or_else(|| {
+            messages
+                .iter()
+                .rev()
+                .find(|message| message.role == Role::Assistant)
+        })
+        .map(|message| message.text_content())
+        .filter(|text| !text.trim().is_empty())
+}
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        message
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.as_str()
+    } else {
+        "unknown panic payload"
+    }
 }
 
 /// Shared gateway state, passed to axum handlers via State extractor.
@@ -367,6 +763,9 @@ pub struct Gateway {
     last_messages: Arc<tokio::sync::Mutex<HashMap<String, String>>>,
     /// Pending approval / clarify interactions keyed by gateway session.
     interaction_broker: Arc<InteractionBroker>,
+    /// Per-chat persisted voice reply mode, mirroring Hermes gateway semantics.
+    voice_modes: Arc<tokio::sync::Mutex<HashMap<String, GatewayVoiceMode>>>,
+    voice_mode_path: PathBuf,
 }
 
 impl Gateway {
@@ -389,6 +788,10 @@ impl Gateway {
             pending_messages: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             last_messages: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             interaction_broker: InteractionBroker::new(),
+            voice_modes: Arc::new(tokio::sync::Mutex::new(load_gateway_voice_modes_from(
+                &gateway_voice_mode_path(),
+            ))),
+            voice_mode_path: gateway_voice_mode_path(),
         }
     }
 
@@ -410,6 +813,73 @@ impl Gateway {
     /// Set the delivery router.
     pub fn set_delivery(&mut self, router: DeliveryRouter) {
         self.delivery_router = Arc::new(router);
+    }
+
+    async fn set_voice_mode(&self, chat_key: &str, mode: GatewayVoiceMode) -> anyhow::Result<()> {
+        let snapshot = {
+            let mut voice_modes = self.voice_modes.lock().await;
+            voice_modes.insert(chat_key.to_string(), mode);
+            voice_modes.clone()
+        };
+        save_gateway_voice_modes_to(&self.voice_mode_path, &snapshot)
+    }
+
+    async fn voice_mode_for(&self, chat_key: &str) -> GatewayVoiceMode {
+        self.voice_modes
+            .lock()
+            .await
+            .get(chat_key)
+            .copied()
+            .unwrap_or(GatewayVoiceMode::Off)
+    }
+
+    async fn handle_voice_command(&self, msg: &IncomingMessage, chat_key: &str) -> String {
+        let args = msg.get_command_args().trim().to_ascii_lowercase();
+        match args.as_str() {
+            "on" | "enable" => match self.set_voice_mode(chat_key, GatewayVoiceMode::VoiceOnly).await {
+                Ok(()) => "Voice mode enabled.\nI'll reply with audio when you send a voice message.\nUse /voice tts to get spoken replies for every message.".into(),
+                Err(error) => format!("Failed to persist voice mode: {error}"),
+            },
+            "tts" => match self.set_voice_mode(chat_key, GatewayVoiceMode::All).await {
+                Ok(()) => "Auto-TTS enabled.\nAll replies in this chat will include an audio response when TTS is available.".into(),
+                Err(error) => format!("Failed to persist voice mode: {error}"),
+            },
+            "off" | "disable" => match self.set_voice_mode(chat_key, GatewayVoiceMode::Off).await {
+                Ok(()) => "Voice mode disabled. Text-only replies.".into(),
+                Err(error) => format!("Failed to persist voice mode: {error}"),
+            },
+            "status" => {
+                let mode = self.voice_mode_for(chat_key).await;
+                format!(
+                    "Voice mode: {}\n\
+                     Platform delivery: {}\n\
+                     /voice on   - speak replies only for voice-originating messages\n\
+                     /voice tts  - speak replies for all messages\n\
+                     /voice off  - disable spoken replies\n\
+                     /voice doctor - show platform voice delivery diagnostics",
+                    mode.label(),
+                    msg.platform
+                )
+            }
+            "doctor" => voice_delivery_doctor(msg.platform),
+            "" => {
+                let current = self.voice_mode_for(chat_key).await;
+                let next = if current == GatewayVoiceMode::Off {
+                    GatewayVoiceMode::VoiceOnly
+                } else {
+                    GatewayVoiceMode::Off
+                };
+                match self.set_voice_mode(chat_key, next).await {
+                    Ok(()) => format!("Voice mode: {}", next.label()),
+                    Err(error) => format!("Failed to persist voice mode: {error}"),
+                }
+            }
+            _ => {
+                "Usage: /voice [on|off|tts|status|doctor]\n\
+                 `on` speaks replies to voice messages only. `tts` speaks every reply."
+                    .into()
+            }
+        }
     }
 
     /// Returns `true` if the user is authorized to use the gateway.
@@ -922,6 +1392,9 @@ impl Gateway {
                                      • Total active sessions: {total_sessions}"
                                 ))
                             }
+                            "voice" => {
+                                Some(self.handle_voice_command(&msg, &origin_chat_id).await)
+                            }
                             "background" | "bg" => {
                                 let prompt = msg.get_command_args().trim().to_string();
                                 if prompt.is_empty() {
@@ -953,6 +1426,7 @@ impl Gateway {
                                     let preview_for_spawn = preview.clone();
 
                                     tokio::spawn(async move {
+                                        const BG_SUBAGENT_BATCH_SIZE: usize = 5;
                                         let background_agent = match agent
                                             .fork_isolated(IsolatedAgentOptions {
                                                 session_id: Some(task_id_for_spawn.clone()),
@@ -980,27 +1454,245 @@ impl Gateway {
                                             }
                                         };
 
-                                        let response = match background_agent
-                                            .chat_with_origin(
-                                                &effective_text,
-                                                &platform_name,
-                                                &origin_chat_id_clone,
-                                            )
-                                            .await
-                                        {
-                                            Ok(text) => {
-                                                let body = if text.trim().is_empty() {
+                                        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+                                        let stream_task = tokio::spawn({
+                                            let effective_text = effective_text.clone();
+                                            let platform_name = platform_name.clone();
+                                            let origin_chat_id_clone = origin_chat_id_clone.clone();
+                                            async move {
+                                                background_agent
+                                                    .chat_streaming_with_origin(
+                                                        &effective_text,
+                                                        &platform_name,
+                                                        &origin_chat_id_clone,
+                                                        event_tx,
+                                                    )
+                                                    .await
+                                            }
+                                        });
+
+                                        let mut response = String::new();
+                                        let mut stream_error: Option<String> = None;
+                                        let mut last_tool: Option<String> = None;
+                                        let mut subagent_batches: HashMap<usize, Vec<String>> = HashMap::new();
+
+                                        while let Some(event) = event_rx.recv().await {
+                                            match event {
+                                                edgecrab_core::StreamEvent::Token(text) => {
+                                                    response.push_str(&text);
+                                                }
+                                                edgecrab_core::StreamEvent::ToolExec { name, args_json } => {
+                                                    let label = background_gateway_tool_label(&name, &args_json);
+                                                    if last_tool.as_deref() != Some(label.as_str()) {
+                                                        last_tool = Some(label.clone());
+                                                        if let Some(adapter) = adapter.as_ref() {
+                                                            let _ = adapter
+                                                                .send_status(
+                                                                    &format!(
+                                                                        "🔧 {} {}",
+                                                                        task_id_for_spawn, label
+                                                                    ),
+                                                                    &metadata,
+                                                                )
+                                                                .await;
+                                                        }
+                                                    }
+                                                }
+                                                edgecrab_core::StreamEvent::ToolDone {
+                                                    name,
+                                                    result_preview,
+                                                    duration_ms,
+                                                    is_error,
+                                                    ..
+                                                } => {
+                                                    if is_error {
+                                                        if let Some(adapter) = adapter.as_ref() {
+                                                            let _ = adapter
+                                                                .send_status(
+                                                                    &format!(
+                                                                        "❌ {} {} failed in {:.1}s",
+                                                                        task_id_for_spawn,
+                                                                        name,
+                                                                        duration_ms as f64 / 1000.0
+                                                                    ),
+                                                                    &metadata,
+                                                                )
+                                                                .await;
+                                                        }
+                                                    } else if result_preview.as_deref().is_some_and(|preview| {
+                                                        crate::event_processor::should_surface_tool_completion(
+                                                            &name, preview,
+                                                        )
+                                                    }) {
+                                                        if let Some(adapter) = adapter.as_ref() {
+                                                            let _ = adapter
+                                                                .send_status(
+                                                                    &format!(
+                                                                        "✅ {} {}",
+                                                                        task_id_for_spawn,
+                                                                        result_preview
+                                                                            .as_deref()
+                                                                            .unwrap_or_default()
+                                                                    ),
+                                                                    &metadata,
+                                                                )
+                                                                .await;
+                                                        }
+                                                    }
+                                                }
+                                                edgecrab_core::StreamEvent::SubAgentStart {
+                                                    task_index,
+                                                    task_count,
+                                                    goal,
+                                                } => {
+                                                    if let Some(adapter) = adapter.as_ref() {
+                                                        let _ = adapter
+                                                            .send_status(
+                                                                &format!(
+                                                                    "🔀 {} [{}/{}] {}",
+                                                                    task_id_for_spawn,
+                                                                    task_index + 1,
+                                                                    task_count,
+                                                                    edgecrab_core::safe_truncate(&goal, 72)
+                                                                ),
+                                                                &metadata,
+                                                            )
+                                                            .await;
+                                                    }
+                                                }
+                                                edgecrab_core::StreamEvent::SubAgentReasoning {
+                                                    task_index,
+                                                    task_count,
+                                                    text,
+                                                } => {
+                                                    if let Some(adapter) = adapter.as_ref() {
+                                                        let _ = adapter
+                                                            .send_status(
+                                                                &format!(
+                                                                    "💭 {} [{}/{}] {}",
+                                                                    task_id_for_spawn,
+                                                                    task_index + 1,
+                                                                    task_count,
+                                                                    edgecrab_core::safe_truncate(&text, 72)
+                                                                ),
+                                                                &metadata,
+                                                            )
+                                                            .await;
+                                                    }
+                                                }
+                                                edgecrab_core::StreamEvent::SubAgentToolExec {
+                                                    task_index,
+                                                    task_count,
+                                                    name,
+                                                    ..
+                                                } => {
+                                                    let batch = subagent_batches.entry(task_index).or_default();
+                                                    batch.push(name);
+                                                    if batch.len() >= BG_SUBAGENT_BATCH_SIZE {
+                                                        let summary = batch.join(", ");
+                                                        batch.clear();
+                                                        if let Some(adapter) = adapter.as_ref() {
+                                                            let _ = adapter
+                                                                .send_status(
+                                                                    &format!(
+                                                                        "🔀 {} [{}/{}] {}",
+                                                                        task_id_for_spawn,
+                                                                        task_index + 1,
+                                                                        task_count,
+                                                                        summary
+                                                                    ),
+                                                                    &metadata,
+                                                                )
+                                                                .await;
+                                                        }
+                                                    }
+                                                }
+                                                edgecrab_core::StreamEvent::SubAgentFinish {
+                                                    task_index,
+                                                    task_count,
+                                                    status,
+                                                    duration_ms,
+                                                    ..
+                                                } => {
+                                                    if let Some(batch) = subagent_batches.get_mut(&task_index) {
+                                                        if !batch.is_empty() {
+                                                            let summary = batch.join(", ");
+                                                            batch.clear();
+                                                            if let Some(adapter) = adapter.as_ref() {
+                                                                let _ = adapter
+                                                                    .send_status(
+                                                                        &format!(
+                                                                            "🔀 {} [{}/{}] {}",
+                                                                            task_id_for_spawn,
+                                                                            task_index + 1,
+                                                                            task_count,
+                                                                            summary
+                                                                        ),
+                                                                        &metadata,
+                                                                    )
+                                                                    .await;
+                                                            }
+                                                        }
+                                                    }
+                                                    if let Some(adapter) = adapter.as_ref() {
+                                                        let _ = adapter
+                                                            .send_status(
+                                                                &format!(
+                                                                    "{} {} [{}/{}] {} in {:.1}s",
+                                                                    if status == "completed" { "✅" } else { "❌" },
+                                                                    task_id_for_spawn,
+                                                                    task_index + 1,
+                                                                    task_count,
+                                                                    status,
+                                                                    duration_ms as f64 / 1000.0
+                                                                ),
+                                                                &metadata,
+                                                            )
+                                                            .await;
+                                                    }
+                                                }
+                                                edgecrab_core::StreamEvent::Approval { response_tx, .. } => {
+                                                    let _ = response_tx.send(edgecrab_core::ApprovalChoice::Deny);
+                                                }
+                                                edgecrab_core::StreamEvent::Clarify { response_tx, .. } => {
+                                                    let _ = response_tx.send(String::new());
+                                                }
+                                                edgecrab_core::StreamEvent::SecretRequest { response_tx, .. } => {
+                                                    let _ = response_tx.send(String::new());
+                                                }
+                                                edgecrab_core::StreamEvent::Error(err) => {
+                                                    stream_error = Some(err);
+                                                }
+                                                edgecrab_core::StreamEvent::Done => break,
+                                                _ => {}
+                                            }
+                                        }
+
+                                        let response = match stream_task.await {
+                                            Ok(Ok(())) if stream_error.is_none() => {
+                                                let body = if response.trim().is_empty() {
                                                     "(No response generated)".to_string()
                                                 } else {
-                                                    text
+                                                    response
                                                 };
                                                 format!(
                                                     "✅ Background task complete\nPrompt: \"{preview_for_spawn}\"\n\n{body}"
                                                 )
                                             }
-                                            Err(e) => {
+                                            Ok(Ok(())) => {
+                                                format!(
+                                                    "❌ Background task {task_id_for_spawn} failed: {}",
+                                                    stream_error.unwrap_or_else(|| "background task failed".into())
+                                                )
+                                            }
+                                            Ok(Err(e)) => {
                                                 format!(
                                                     "❌ Background task {task_id_for_spawn} failed: {e}"
+                                                )
+                                            }
+                                            Err(e) => {
+                                                format!(
+                                                    "❌ Background task {task_id_for_spawn} failed: background join error: {e}"
                                                 )
                                             }
                                         };
@@ -1211,6 +1903,7 @@ impl Gateway {
                         let running_sessions = self.running_sessions.clone();
                         let pending_messages = self.pending_messages.clone();
                         let task_session_key = session_key.clone();
+                        let gateway_voice_mode = self.voice_mode_for(&origin_chat_id_for_key).await;
                         // Clone the sender so the task can re-dispatch the pending message.
                         let msg_tx = tx.clone();
                         let hook_registry_for_spawn = self.hook_registry.clone();
@@ -1220,48 +1913,42 @@ impl Gateway {
                         drop(task_cancel);
 
                         tokio::spawn(async move {
-                            // Resolve the origin chat_id: prefer channel_id (group/channel),
-                            // fall back to user_id (DM).  This is what deliver='origin' uses
-                            // to route cron job output back to the correct chat.
-                            let origin_chat_id = message_origin_recipient(&msg_clone);
-                            let platform_name = msg_clone.platform.to_string();
+                            let task_outcome = AssertUnwindSafe(async {
+                                // Resolve the origin chat_id: prefer channel_id (group/channel),
+                                // fall back to user_id (DM).  This is what deliver='origin' uses
+                                // to route cron job output back to the correct chat.
+                                let origin_chat_id = message_origin_recipient(&msg_clone);
+                                let platform_name = msg_clone.platform.to_string();
 
-                            // Enrich the prompt with image attachment instructions.
-                            // WHY here: This is the single gateway dispatch point covering
-                            // ALL platforms (WhatsApp, Telegram, Slack, Signal, …). Injecting
-                            // the *** ATTACHED IMAGES *** block here means every platform
-                            // triggers the VISION_GUIDANCE rules in the system prompt,
-                            // identical to the CLI pending_images path in app.rs.
-                            let effective_text = build_effective_text(&agent, &msg_clone).await;
+                                // Enrich the prompt with image attachment instructions.
+                                // WHY here: This is the single gateway dispatch point covering
+                                // ALL platforms (WhatsApp, Telegram, Slack, Signal, …). Injecting
+                                // the *** ATTACHED IMAGES *** block here means every platform
+                                // triggers the VISION_GUIDANCE rules in the system prompt,
+                                // identical to the CLI pending_images path in app.rs.
+                                let effective_text = build_effective_text(&agent, &msg_clone).await;
 
-                            // NOTE: chat_streaming_with_origin() handles origin context
-                            // internally, so we do NOT pre-set it here.
-
-                            let response_result = match origin_adapter {
-                                // ── Interactive gateway path ─────────────────────────────
-                                // Use the event bridge whenever the originating platform
-                                // has an adapter, even if progressive token delivery is
-                                // disabled. This keeps approvals and clarify on one path.
-                                Some(adapter_arc) => {
-                                    dispatch_streaming_arc(
-                                        &agent,
-                                        &effective_text,
-                                        &platform_name,
-                                        &origin_chat_id,
-                                        adapter_arc,
-                                        msg_clone.metadata.clone(),
-                                        streaming_cfg,
-                                        hook_registry_for_spawn,
-                                        interaction_broker.clone(),
-                                        task_session_key.clone(),
-                                    )
-                                    .await
-                                }
-                                // ── Non-streaming fallback ────────────────────────────────
-                                // No adapter is available, so we cannot surface pending
-                                // interactions through the gateway event bridge.
-                                None => {
-                                    match agent
+                                // NOTE: chat_streaming_with_origin() handles origin context
+                                // internally, so we do NOT pre-set it here.
+                                let voice_adapter = origin_adapter.clone();
+                                let response_result = match origin_adapter {
+                                    Some(adapter_arc) => {
+                                        dispatch_streaming_arc(
+                                            &agent,
+                                            &effective_text,
+                                            msg_clone.platform,
+                                            &platform_name,
+                                            &origin_chat_id,
+                                            adapter_arc,
+                                            msg_clone.metadata.clone(),
+                                            streaming_cfg,
+                                            hook_registry_for_spawn,
+                                            interaction_broker.clone(),
+                                            task_session_key.clone(),
+                                        )
+                                        .await
+                                    }
+                                    None => match agent
                                         .chat_with_origin(
                                             &effective_text,
                                             &platform_name,
@@ -1278,30 +1965,60 @@ impl Gateway {
                                         )
                                         .await,
                                         Err(e) => Err(anyhow::anyhow!("{}", e)),
+                                    },
+                                };
+
+                                match response_result {
+                                    Ok(response_len) => {
+                                        let response_text = agent
+                                            .messages()
+                                            .await
+                                            .iter()
+                                            .rev()
+                                            .find(|message| message.role == Role::Assistant)
+                                            .map(|message| message.text_content())
+                                            .filter(|text| !text.trim().is_empty());
+                                        if let Some(response_text) = response_text {
+                                            maybe_send_voice_reply(
+                                                &agent,
+                                                voice_adapter,
+                                                &msg_clone,
+                                                &response_text,
+                                                gateway_voice_mode,
+                                            )
+                                            .await;
+                                        }
+                                        tracing::info!(
+                                            platform = ?msg_clone.platform,
+                                            user = %msg_clone.user_id,
+                                            response_len,
+                                            "agent response delivered"
+                                        );
+                                        hooks.emit(
+                                            "agent:done",
+                                            &HookContext::new("agent:done")
+                                                .with_user(&msg_clone.user_id),
+                                        )
+                                        .await;
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            error = %e,
+                                            platform = ?msg_clone.platform,
+                                            "agent dispatch failed"
+                                        );
                                     }
                                 }
-                            };
+                            })
+                            .catch_unwind()
+                            .await;
 
-                            match response_result {
-                                Ok(response_len) => {
-                                    tracing::info!(
-                                        platform = ?msg_clone.platform,
-                                        user = %msg_clone.user_id,
-                                        response_len,
-                                        "agent response delivered"
-                                    );
-                                    hooks.emit(
-                                        "agent:done",
-                                        &HookContext::new("agent:done").with_user(&msg_clone.user_id),
-                                    ).await;
-                                }
-                                Err(e) => {
-                                    tracing::error!(
-                                        error = %e,
-                                        platform = ?msg_clone.platform,
-                                        "agent dispatch failed"
-                                    );
-                                }
+                            if let Err(panic_payload) = task_outcome {
+                                tracing::error!(
+                                    session = %task_session_key,
+                                    panic = %panic_payload_message(&*panic_payload),
+                                    "gateway session task panicked"
+                                );
                             }
 
                             // Release the session guard.
@@ -1355,6 +2072,7 @@ impl Gateway {
 async fn dispatch_streaming_arc(
     agent: &Agent,
     message: &str,
+    platform: edgecrab_types::Platform,
     platform_name: &str,
     origin_chat_id: &str,
     adapter: Arc<dyn PlatformAdapter>,
@@ -1364,6 +2082,8 @@ async fn dispatch_streaming_arc(
     interaction_broker: Arc<InteractionBroker>,
     session_key: String,
 ) -> anyhow::Result<usize> {
+    let baseline_len = agent.messages().await.len();
+    let fallback_adapter = Arc::clone(&adapter);
     let (processor, event_tx, consumer) = GatewayEventProcessor::new(
         adapter,
         metadata.clone(),
@@ -1389,7 +2109,22 @@ async fn dispatch_streaming_arc(
     if already_sent.load(std::sync::atomic::Ordering::Relaxed) {
         return Ok(0);
     }
-    Ok(0)
+
+    let final_messages = agent.messages().await;
+    if let Some(response) = extract_stream_fallback_response(&final_messages, baseline_len) {
+        let mut delivery = DeliveryRouter::new();
+        delivery.register(Arc::clone(&fallback_adapter));
+        return deliver_text_and_media(
+            &delivery,
+            Some(fallback_adapter),
+            &response,
+            platform,
+            &metadata,
+        )
+        .await;
+    }
+
+    anyhow::bail!("gateway streaming completed without delivering a response")
 }
 
 /// Build the axum router with health and webhook endpoints.
@@ -1425,6 +2160,96 @@ async fn webhook_incoming(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use std::sync::Mutex;
+    use tokio::sync::mpsc;
+
+    #[derive(Default)]
+    struct RecordingAdapter {
+        sent: Mutex<Vec<String>>,
+        photos: Mutex<Vec<String>>,
+        documents: Mutex<Vec<String>>,
+        voices: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl PlatformAdapter for RecordingAdapter {
+        fn platform(&self) -> edgecrab_types::Platform {
+            edgecrab_types::Platform::Webhook
+        }
+
+        async fn start(&self, _tx: mpsc::Sender<IncomingMessage>) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn send(&self, msg: crate::platform::OutgoingMessage) -> anyhow::Result<()> {
+            self.sent.lock().expect("sent lock").push(msg.text);
+            Ok(())
+        }
+
+        fn format_response(
+            &self,
+            text: &str,
+            _metadata: &crate::platform::MessageMetadata,
+        ) -> String {
+            text.to_string()
+        }
+
+        fn max_message_length(&self) -> usize {
+            4096
+        }
+
+        fn supports_markdown(&self) -> bool {
+            false
+        }
+
+        fn supports_images(&self) -> bool {
+            true
+        }
+
+        fn supports_files(&self) -> bool {
+            true
+        }
+
+        async fn send_photo(
+            &self,
+            path: &str,
+            _caption: Option<&str>,
+            _metadata: &crate::platform::MessageMetadata,
+        ) -> anyhow::Result<()> {
+            self.photos
+                .lock()
+                .expect("photos lock")
+                .push(path.to_string());
+            Ok(())
+        }
+
+        async fn send_document(
+            &self,
+            path: &str,
+            _caption: Option<&str>,
+            _metadata: &crate::platform::MessageMetadata,
+        ) -> anyhow::Result<()> {
+            self.documents
+                .lock()
+                .expect("documents lock")
+                .push(path.to_string());
+            Ok(())
+        }
+
+        async fn send_voice(
+            &self,
+            path: &str,
+            _caption: Option<&str>,
+            _metadata: &crate::platform::MessageMetadata,
+        ) -> anyhow::Result<()> {
+            self.voices
+                .lock()
+                .expect("voices lock")
+                .push(path.to_string());
+            Ok(())
+        }
+    }
 
     #[test]
     fn gateway_construction() {
@@ -1465,6 +2290,129 @@ mod tests {
     }
 
     #[test]
+    fn audio_attachment_sources_only_return_local_audio_and_voice_paths() {
+        let msg = IncomingMessage {
+            platform: edgecrab_types::Platform::Signal,
+            user_id: "u1".into(),
+            channel_id: None,
+            text: "transcribe".into(),
+            thread_id: None,
+            metadata: crate::platform::MessageMetadata {
+                attachments: vec![
+                    crate::platform::MessageAttachment {
+                        kind: crate::platform::MessageAttachmentKind::Voice,
+                        local_path: Some("/tmp/voice.ogg".into()),
+                        ..Default::default()
+                    },
+                    crate::platform::MessageAttachment {
+                        kind: crate::platform::MessageAttachmentKind::Audio,
+                        local_path: Some("/tmp/audio.mp3".into()),
+                        ..Default::default()
+                    },
+                    crate::platform::MessageAttachment {
+                        kind: crate::platform::MessageAttachmentKind::Document,
+                        local_path: Some("/tmp/report.pdf".into()),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+        };
+
+        let sources = audio_attachment_sources(&msg);
+        assert_eq!(sources, vec!["/tmp/voice.ogg", "/tmp/audio.mp3"]);
+    }
+
+    #[test]
+    fn incoming_message_is_voice_origin_for_voice_note() {
+        let msg = IncomingMessage {
+            platform: edgecrab_types::Platform::Telegram,
+            user_id: "u1".into(),
+            channel_id: Some("chat".into()),
+            text: String::new(),
+            thread_id: None,
+            metadata: crate::platform::MessageMetadata {
+                attachments: vec![crate::platform::MessageAttachment {
+                    kind: crate::platform::MessageAttachmentKind::Voice,
+                    local_path: Some("/tmp/voice.ogg".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        };
+
+        assert!(incoming_message_is_voice_origin(&msg));
+    }
+
+    #[test]
+    fn incoming_message_is_voice_origin_for_empty_text_audio() {
+        let msg = IncomingMessage {
+            platform: edgecrab_types::Platform::Whatsapp,
+            user_id: "u1".into(),
+            channel_id: Some("chat".into()),
+            text: String::new(),
+            thread_id: None,
+            metadata: crate::platform::MessageMetadata {
+                attachments: vec![crate::platform::MessageAttachment {
+                    kind: crate::platform::MessageAttachmentKind::Audio,
+                    local_path: Some("/tmp/audio.ogg".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        };
+
+        assert!(incoming_message_is_voice_origin(&msg));
+    }
+
+    #[test]
+    fn load_gateway_voice_modes_filters_invalid_values() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("gateway_voice_mode.json");
+        std::fs::write(
+            &path,
+            r#"{"chat-a":"voice_only","chat-b":"all","chat-c":"broken"}"#,
+        )
+        .expect("write");
+
+        let loaded = load_gateway_voice_modes_from(&path);
+        assert_eq!(loaded.get("chat-a"), Some(&GatewayVoiceMode::VoiceOnly));
+        assert_eq!(loaded.get("chat-b"), Some(&GatewayVoiceMode::All));
+        assert!(!loaded.contains_key("chat-c"));
+    }
+
+    #[test]
+    fn save_gateway_voice_modes_round_trips() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("gateway_voice_mode.json");
+        let modes = HashMap::from([
+            ("chat-a".to_string(), GatewayVoiceMode::Off),
+            ("chat-b".to_string(), GatewayVoiceMode::All),
+        ]);
+
+        save_gateway_voice_modes_to(&path, &modes).expect("save");
+        let loaded = load_gateway_voice_modes_from(&path);
+
+        assert_eq!(loaded, modes);
+    }
+
+    #[test]
+    fn extract_audio_path_from_tts_output_supports_media_and_legacy_output() {
+        assert_eq!(
+            edgecrab_tools::tools::tts::extract_audio_path_from_tts_output(
+                "Generated audio.\nMEDIA:/tmp/reply.mp3"
+            ),
+            Some("/tmp/reply.mp3".into())
+        );
+        assert_eq!(
+            edgecrab_tools::tools::tts::extract_audio_path_from_tts_output(
+                "Audio saved to: /tmp/reply.mp3"
+            ),
+            Some("/tmp/reply.mp3".into())
+        );
+    }
+
+    #[test]
     fn render_gateway_image_context_includes_preanalysis_without_forcing_tool_call() {
         let rendered = render_gateway_image_context(
             "Describe this",
@@ -1497,6 +2445,36 @@ mod tests {
 
         assert!(rendered.starts_with("*** ATTACHED IMAGES ***"));
         assert!(rendered.contains("unavailable"));
+    }
+
+    #[test]
+    fn render_gateway_audio_context_includes_transcripts() {
+        let rendered = render_gateway_audio_context(
+            "Reply to this",
+            &[String::from("/tmp/voice.ogg")],
+            &[String::from("Transcript (via local):\nhello from voice")],
+            &[],
+            0,
+        );
+
+        assert!(rendered.contains("ATTACHED AUDIO"));
+        assert!(rendered.contains("/tmp/voice.ogg"));
+        assert!(rendered.contains("hello from voice"));
+    }
+
+    #[test]
+    fn background_gateway_tool_label_prefers_meaningful_arg_preview() {
+        let label = background_gateway_tool_label(
+            "terminal",
+            r#"{"command":"cargo test -p edgecrab-core"}"#,
+        );
+        assert!(label.contains("terminal:"));
+        assert!(label.contains("cargo test"));
+    }
+
+    #[test]
+    fn background_gateway_arg_preview_handles_invalid_json() {
+        assert!(background_gateway_arg_preview("{not-json").is_empty());
     }
 
     #[tokio::test]
@@ -1688,6 +2666,7 @@ mod tests {
             "/retry",
             "/status",
             "/usage",
+            "/voice",
             "/background",
             "/approve",
             "/deny",
@@ -1722,5 +2701,77 @@ mod tests {
         let choices = vec!["red".to_string(), "blue".to_string()];
         assert_eq!(parse_clarify_answer("2", &choices), "blue");
         assert_eq!(parse_clarify_answer(" custom ", &choices), "custom");
+    }
+
+    #[test]
+    fn extract_stream_fallback_response_prefers_new_assistant_turn() {
+        let messages = vec![
+            edgecrab_types::Message::user("old user"),
+            edgecrab_types::Message::assistant("old answer"),
+            edgecrab_types::Message::user("new user"),
+            edgecrab_types::Message::assistant("new answer"),
+        ];
+
+        let response = extract_stream_fallback_response(&messages, 2).expect("response");
+        assert_eq!(response, "new answer");
+    }
+
+    #[test]
+    fn extract_stream_fallback_response_falls_back_to_last_assistant() {
+        let messages = vec![
+            edgecrab_types::Message::user("old user"),
+            edgecrab_types::Message::assistant("old answer"),
+        ];
+
+        let response = extract_stream_fallback_response(&messages, 99).expect("response");
+        assert_eq!(response, "old answer");
+    }
+
+    #[tokio::test]
+    async fn deliver_text_and_media_sends_media_only_responses_when_adapter_available() {
+        let adapter = Arc::new(RecordingAdapter::default());
+        let mut delivery = DeliveryRouter::new();
+        delivery.register(adapter.clone());
+
+        let sent = deliver_text_and_media(
+            &delivery,
+            Some(adapter.clone()),
+            "MEDIA:/tmp/report.pdf",
+            edgecrab_types::Platform::Webhook,
+            &crate::platform::MessageMetadata::default(),
+        )
+        .await
+        .expect("delivery succeeds");
+
+        assert_eq!(sent, 0);
+        assert!(adapter.sent.lock().expect("sent lock").is_empty());
+        assert_eq!(
+            adapter.documents.lock().expect("documents lock").as_slice(),
+            &["/tmp/report.pdf".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn deliver_text_and_media_routes_audio_to_send_voice() {
+        let adapter = Arc::new(RecordingAdapter::default());
+        let mut delivery = DeliveryRouter::new();
+        delivery.register(adapter.clone());
+
+        let sent = deliver_text_and_media(
+            &delivery,
+            Some(adapter.clone()),
+            "MEDIA:/tmp/reply.mp3",
+            edgecrab_types::Platform::Webhook,
+            &crate::platform::MessageMetadata::default(),
+        )
+        .await
+        .expect("delivery succeeds");
+
+        assert_eq!(sent, 0);
+        assert!(adapter.sent.lock().expect("sent lock").is_empty());
+        assert_eq!(
+            adapter.voices.lock().expect("voices lock").as_slice(),
+            &["/tmp/reply.mp3".to_string()]
+        );
     }
 }

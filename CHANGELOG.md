@@ -5,13 +5,40 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
-## [Unreleased] — Phase 5: Integration & Polish
+## [Unreleased]
+
+---
+
+## [0.1.0] — 2026-04-06
+
+_First public release. Phase 5: Integration & Polish._
 
 ### Added
 
+#### Voice & TUI
+- **Voice capture** — microphone input with real-time waveform display in the TUI. Dependency alerts guide users through system requirements (portaudio, sox, etc.).
+- **Voice playback** — gateway voice delivery with cross-platform audio. `/voice` command toggles voice mode.
+- **TUI MCP management** — `/mcp` workflow for searching, installing, and testing MCP presets directly from the TUI without leaving the session.
+- **Improved TUI waiting UX** — animated spinner with contextual status messages during long operations.
+- **Streaming presence indicators** — token-level streaming display keeps the cursor live while the model responds.
+
+#### Media & Documents
+- **EdgeParse PDF conversion** (`edgecrab-tools`) — `EdgeParseTool` extracts text from PDF files; powered by `pdf-extract` crate.
+- **Media UX improvements** — image display in TUI via ratatui image widgets; `browser_get_images` results render inline.
+
+#### MCP Integration
+- **Curated MCP catalog** — 50+ pre-vetted MCP presets bundled. `edgecrab mcp search <query>` filters by capability. `edgecrab mcp install` clones and wires presets in one command.
+- **EdgeCrab ACP identity** (`edgecrab-acp`) — Agent Communication Protocol implementation enabling multi-agent coordination over HTTP/WebSocket.
+
+#### Agent & Core
+- **Agent observability** — structured span events for each ReAct iteration, tool call, and provider exchange. Compatible with OpenTelemetry collectors.
+- **Skill provisioning** — guarded installs verify checksum and sandboxed execution before adding a new skill to the agent's tool inventory.
+- **Prompt pipeline pressure relief** — adaptive token budget management prevents context overflow in long sessions without triggering LLM compression unnecessarily.
+- **File execution hardening** — `RunFileTool` validates script shebangs, enforces 5-minute timeout, caps stdout at 50 KB, strips API keys before spawn.
+
 #### SDKs & CI/CD
-- **Python SDK** (`sdks/python/`) — `edgecrab-sdk` on PyPI. Sync/async clients, Agent/AsyncAgent with conversation history, streaming, CLI (`edgecrab chat/models/health`). 54 tests.
-- **Node.js SDK** (`sdks/node/`) — `edgecrab-sdk` on npm. TypeScript-first with Agent, streaming (async generator), CLI. CJS + ESM dual build. 24 tests.
+- **Python SDK** (`sdks/python/`) — `edgecrab-sdk` on PyPI. Sync/async clients, Agent/AsyncAgent with conversation history, streaming, CLI (`edgecrab chat/models/health`). 85 tests.
+- **Node.js SDK** (`sdks/node/`) — `edgecrab-sdk` on npm. TypeScript-first with Agent, streaming (async generator), CLI. CJS + ESM dual build. 39 tests.
 - **CI workflow** (`.github/workflows/ci.yml`) — Rust build/test/clippy/fmt on ubuntu/macos/windows matrix, Python SDK tests, Node.js SDK tests, cargo-audit security scan.
 - **Release workflows** — `release-rust.yml` (10 crates to crates.io in dependency order), `release-python.yml` (wheels + sdist to PyPI), `release-node.yml` (npm publish with pack + GitHub Release upload), `release-docker.yml` (multi-arch Docker image to GHCR).
 - **Makefile** — `make build`, `make ci`, `make test-sdks`, `make publish-all`, colored help output.
@@ -37,13 +64,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **Session management** — `/session new` and `/new` call `agent.new_session()` and clear the output area.
 - **Theme reload** — `/theme` reloads `~/.edgecrab/skin.yaml` without restart.
 - **Streaming display** — TUI background task uses `Agent::chat_streaming()`. Tokens arrive via `AgentResponse::Token(text)` and are appended to the current streaming line in `check_responses()`. `AgentResponse::Done` finalizes the line.
-- **`CommandResult::ModelSwitch(String)`**, **`SessionNew`**, **`ReloadTheme`** — new variants dispatched from slash-command handlers to the app event loop.
 - **6 new theme tests**: `parse_hex_valid`, `parse_hex_no_hash`, `parse_hex_invalid`, `skin_config_color_override`, `skin_config_custom_symbols`, `theme_load_falls_back_on_missing_file`.
 
 #### `edgecrab-types`
 - **`ToolError::ExecutionFailed { tool: String, message: String }`** — new error variant for runtime tool failures (e.g. process spawn errors).
 
-#### Tests
+#### E2E Tests
 - **3 new E2E tests** in `crates/edgecrab-core/tests/e2e_copilot.rs`:
   - `e2e_agent_chat_with_copilot_gpt4_mini` — full round-trip via VS Code Copilot
   - `e2e_agent_streaming_with_copilot` — streaming tokens via `chat_streaming()`
@@ -62,6 +88,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - `block_on(async move { unit_expr })` changed to drop spurious `let _ =` to satisfy `clippy::let_unit_value`.
 
 ### Stats
-- Tests: **306 passing** (up from 294 at Phase 4 completion)
+- Rust tests: **1629 passing**, 0 failed, 8 ignored — `cargo test --workspace`
+- Python SDK: **85 passing** — `pytest sdks/python/tests/`
+- Node.js SDK: **39 passing** — `npm test` in `sdks/node/`
+- **Total: 1753 tests across all packages**
 - Clippy: **0 warnings** with `-D warnings`
 - Build time: ~5s (debug), clean cache
+- Binary size: **15 MB** static, < 50 ms cold start

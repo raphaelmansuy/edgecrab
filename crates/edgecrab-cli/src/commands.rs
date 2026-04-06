@@ -8,10 +8,10 @@
 //!
 //! ```text
 //!   Navigation    /help /quit /clear /new /status /version
-//!   Model         /model /vision_model /provider /reasoning /stream
+//!   Model         /model /vision_model /image_model /provider /reasoning /stream
 //!   Session       /session /retry /undo /stop /history /save /export /title /resume
 //!   Config        /config /prompt /verbose /personality /statusbar
-//!   Tools         /tools /toolsets /reload-mcp /plugins
+//!   Tools         /tools /toolsets /mcp /reload-mcp /plugins
 //!   Memory        /memory
 //!   Analysis      /cost /usage /compress /insights
 //!   Appearance    /theme /paste
@@ -46,10 +46,16 @@ pub enum CommandResult {
     ModelSelector,
     /// Activate the interactive vision-model selector overlay.
     VisionModelSelector,
+    /// Activate the interactive image-model selector overlay.
+    ImageModelSelector,
     /// Show the current auxiliary vision-model routing state.
     ShowVisionModel,
     /// Update the auxiliary vision-model routing state.
     SetVisionModel(String),
+    /// Show the current image-generation routing state.
+    ShowImageModel,
+    /// Update the default image-generation routing state.
+    SetImageModel(String),
     /// Start a fresh session (app clears messages + session state)
     SessionNew,
     /// Load a theme from YAML skin file and redraw
@@ -104,6 +110,8 @@ pub enum CommandResult {
     Deny,
     /// Show/manage skills
     ShowSkills(String),
+    /// Show/manage MCP servers and presets
+    ShowMcp(String),
     /// Activate the interactive skill selector overlay
     SkillSelector,
     /// Show registered tools (dynamic from ToolRegistry)
@@ -144,7 +152,7 @@ pub enum CommandResult {
     RollbackCheckpoint(String),
     /// Drop all active MCP server connections and re-connect on next tool call.
     ReloadMcp,
-    /// Toggle voice mode — TTS readback of agent responses (on/off/status).
+    /// Toggle voice mode — TTS readback of agent responses (on/off/tts/status).
     VoiceMode(String),
     /// Manage MCP OAuth Bearer tokens (set/remove/list).
     McpToken(String),
@@ -331,6 +339,25 @@ impl CommandRegistry {
                     CommandResult::ShowVisionModel
                 } else {
                     CommandResult::SetVisionModel(trimmed.to_string())
+                }
+            },
+        });
+
+        self.register(Command {
+            name: "image_model",
+            aliases: &["image-model"],
+            description: "Open, show, or set the default image-generation backend (/image_model, /image_model status, /image_model gemini/gemini-2.5-flash-image)",
+            handler: |args| {
+                let trimmed = args.trim();
+                if trimmed.is_empty()
+                    || trimmed.eq_ignore_ascii_case("open")
+                    || trimmed.eq_ignore_ascii_case("list")
+                {
+                    CommandResult::ImageModelSelector
+                } else if trimmed.eq_ignore_ascii_case("status") {
+                    CommandResult::ShowImageModel
+                } else {
+                    CommandResult::SetImageModel(trimmed.to_string())
                 }
             },
         });
@@ -728,9 +755,16 @@ impl CommandRegistry {
 
         self.register(Command {
             name: "reload-mcp",
-            aliases: &["mcp"],
+            aliases: &["mcp-reload"],
             description: "Reload MCP server connections",
             handler: |_| CommandResult::ReloadMcp,
+        });
+
+        self.register(Command {
+            name: "mcp",
+            aliases: &[],
+            description: "List, search, install, test, or remove MCP servers (/mcp help)",
+            handler: |args| CommandResult::ShowMcp(args.trim().to_string()),
         });
 
         self.register(Command {
@@ -856,7 +890,7 @@ impl CommandRegistry {
         self.register(Command {
             name: "voice",
             aliases: &["tts"],
-            description: "Toggle voice/TTS mode (on/off/status) — TTS readback of agent responses",
+            description: "Voice tools: spoken readback, mic recording, continuous capture, and transcription",
             handler: |args| CommandResult::VoiceMode(args.trim().to_string()),
         });
 
@@ -916,6 +950,7 @@ fn help_text() -> String {
          Model:\n\
           /model [name]         — Show or switch model\n\
           /vision_model [spec]  — Open, show, or set dedicated vision model\n\
+          /image_model [spec]   — Open, show, or set default image generation model\n\
           /provider             — List available providers\n\
           /reasoning [mode]     — Set reasoning effort or think mode\n\
           /stream [mode]        — Toggle live token streaming\n\
@@ -942,6 +977,7 @@ fn help_text() -> String {
          Tools:\n\
            /tools                — List registered tools\n\
            /toolsets             — List available toolsets\n\
+           /mcp [args]           — Search, install, test, or remove MCP servers\n\
            /reload-mcp           — Reload MCP server connections\n\
            /plugins              — List installed plugins\n\
          \n\
@@ -967,10 +1003,10 @@ fn help_text() -> String {
            /sethome [channel]    — Set home channel for notifications\n\
            /update               — Check for EdgeCrab updates\n\
          \n\
-         Scheduling & Media:\n\
-           /cron [subcommand]    — Manage scheduled tasks\n\
-           /voice [on|off]       — Toggle voice/TTS mode\n\
-           /browser [sub]        — Chrome CDP: connect, disconnect, status, tabs, recording on|off\n\
+        Scheduling & Media:\n\
+          /cron [subcommand]    — Manage scheduled tasks\n\
+          /voice [subcommand]   — Voice tools: TTS, record, talk, continuous, doctor\n\
+          /browser [sub]        — Chrome CDP: connect, disconnect, status, tabs, recording on|off\n\
          \n\
          Appearance:\n\
            /theme, /skin [name]  — Switch skin preset (or list available)\n\
@@ -1121,6 +1157,53 @@ mod tests {
             reg.dispatch("/vision_model status"),
             Some(CommandResult::ShowVisionModel)
         ));
+    }
+
+    #[test]
+    fn dispatch_image_model_empty_shows_status() {
+        let reg = CommandRegistry::new();
+        assert!(matches!(
+            reg.dispatch("/image_model"),
+            Some(CommandResult::ImageModelSelector)
+        ));
+    }
+
+    #[test]
+    fn dispatch_image_model_list_opens_selector() {
+        let reg = CommandRegistry::new();
+        assert!(matches!(
+            reg.dispatch("/image_model list"),
+            Some(CommandResult::ImageModelSelector)
+        ));
+    }
+
+    #[test]
+    fn dispatch_image_model_status_shows_status() {
+        let reg = CommandRegistry::new();
+        assert!(matches!(
+            reg.dispatch("/image_model status"),
+            Some(CommandResult::ShowImageModel)
+        ));
+    }
+
+    #[test]
+    fn dispatch_image_model_with_name_updates_override() {
+        let reg = CommandRegistry::new();
+        match reg.dispatch("/image_model gemini/gemini-2.5-flash-image") {
+            Some(CommandResult::SetImageModel(model)) => {
+                assert_eq!(model, "gemini/gemini-2.5-flash-image")
+            }
+            _ => panic!("expected image model override"),
+        }
+    }
+
+    #[test]
+    fn dispatch_mcp_passes_args_through() {
+        let reg = CommandRegistry::new();
+        match reg.dispatch("/mcp search github") {
+            Some(CommandResult::ShowMcp(args)) => assert_eq!(args, "search github"),
+            _ => panic!("expected mcp command"),
+        }
     }
 
     #[test]

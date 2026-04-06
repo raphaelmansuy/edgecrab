@@ -18,7 +18,10 @@ use std::time::Duration;
 
 use edgecrab_types::Platform;
 
-use crate::platform::{MessageMetadata, OutgoingMessage, PlatformAdapter};
+use crate::platform::{
+    MediaRef, MessageMetadata, OutgoingMessage, PlatformAdapter, extract_media_from_response,
+    response_text_after_media_extraction,
+};
 
 /// Routes formatted responses to the correct platform adapter.
 pub struct DeliveryRouter {
@@ -39,8 +42,16 @@ impl DeliveryRouter {
 
     /// Deliver a response to the specified platform.
     ///
-    /// Formats the response using the platform adapter, splits if too
-    /// long, and sends each chunk with a small delay to avoid rate limits.
+    /// Extracts any `MEDIA:/path` references first: image paths are sent via
+    /// `send_photo`, audio via `send_voice`, other files via `send_document`.
+    /// The remaining text (if any) is formatted, split to fit the platform's
+    /// message length limit, and sent as plain text chunks.
+    ///
+    /// WHY media-aware here: the DeliveryRouter is the single dispatch point for
+    /// all outbound messages — both gateway agent replies (run.rs) and the
+    /// `send_message` tool (via GatewaySenderBridge). Centralising MEDIA:
+    /// extraction here ensures neither path silently sends a raw file path as
+    /// text.
     pub async fn deliver(
         &self,
         response: &str,
@@ -52,30 +63,52 @@ impl DeliveryRouter {
             .get(&platform)
             .ok_or_else(|| anyhow::anyhow!("No adapter registered for {:?}", platform))?;
 
-        let formatted = adapter.format_response(response, metadata);
-        let max_len = adapter.max_message_length();
+        let (cleaned, media_refs) = extract_media_from_response(response);
 
-        if formatted.len() > max_len {
-            let chunks = split_message(&formatted, max_len);
-            for (i, chunk) in chunks.iter().enumerate() {
+        // Send text portion (skip if the response was entirely media)
+        if let Some(text) = response_text_after_media_extraction(response, &cleaned, &media_refs) {
+            let formatted = adapter.format_response(&text, metadata);
+            let max_len = adapter.max_message_length();
+
+            if formatted.len() > max_len {
+                let chunks = split_message(&formatted, max_len);
+                for (i, chunk) in chunks.iter().enumerate() {
+                    adapter
+                        .send(OutgoingMessage {
+                            text: chunk.clone(),
+                            metadata: metadata.clone(),
+                        })
+                        .await?;
+                    if i < chunks.len() - 1 {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+            } else {
                 adapter
                     .send(OutgoingMessage {
-                        text: chunk.clone(),
+                        text: formatted,
                         metadata: metadata.clone(),
                     })
                     .await?;
-                // Rate-limit between chunks (skip after last)
-                if i < chunks.len() - 1 {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
             }
-        } else {
-            adapter
-                .send(OutgoingMessage {
-                    text: formatted,
-                    metadata: metadata.clone(),
-                })
-                .await?;
+        }
+
+        // Send media attachments
+        for mref in &media_refs {
+            let result = if mref.is_image {
+                adapter.send_photo(&mref.path, None, metadata).await
+            } else if MediaRef::detect_audio(&mref.path) {
+                adapter.send_voice(&mref.path, None, metadata).await
+            } else {
+                adapter.send_document(&mref.path, None, metadata).await
+            };
+            if let Err(e) = result {
+                tracing::warn!(
+                    path = %mref.path,
+                    error = %e,
+                    "media delivery failed — falling back to path in text"
+                );
+            }
         }
 
         Ok(())
