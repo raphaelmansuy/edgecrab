@@ -73,7 +73,13 @@ impl PathPolicy {
             .filter(|_| !self.is_under_allowed_root(path));
         let candidate = resolve_candidate(path, &workspace_root, effective_tmp);
 
-        if !path.is_absolute() {
+        // Traversal guard: reject relative paths that escape the workspace root.
+        // Exception: when effective_tmp is active, /tmp/... paths have already
+        // been remapped into the virtual_tmp sandbox. On Windows, /tmp/... is
+        // not absolute (no drive letter), so the guard would fire incorrectly.
+        // The `ensure_allowed` call below enforces the real permission boundary
+        // regardless of path absoluteness.
+        if !is_unix_tmp_candidate(path, effective_tmp) && !path.is_absolute() {
             let normalized = normalize_path(&candidate);
             if !normalized.starts_with(&workspace_root) {
                 return Err(PathPolicyError::PermissionDenied(
@@ -109,7 +115,10 @@ impl PathPolicy {
         let candidate = resolve_candidate(path, &workspace_root, effective_tmp);
         let normalized = normalize_path(&candidate);
 
-        if !path.is_absolute() && !normalized.starts_with(&workspace_root) {
+        if !is_unix_tmp_candidate(path, effective_tmp)
+            && !path.is_absolute()
+            && !normalized.starts_with(&workspace_root)
+        {
             return Err(PathPolicyError::PermissionDenied(
                 "Path traversal detected: relative path escapes the workspace root".into(),
             ));
@@ -306,6 +315,17 @@ fn normalize_path(path: &Path) -> PathBuf {
         }
     }
     result
+}
+
+/// Returns true when `path` uses the Unix `/tmp` convention AND `effective_tmp`
+/// is active (i.e. the path will be remapped into the sandbox).
+///
+/// WHY this matters on Windows: `/tmp/…` paths lack a drive letter so
+/// `Path::is_absolute()` returns `false`, causing the traversal guard to fire
+/// incorrectly. The downstream `ensure_allowed` call still enforces the real
+/// permission boundary regardless, so bypassing the early guard is safe.
+fn is_unix_tmp_candidate(path: &Path, effective_tmp: Option<&Path>) -> bool {
+    effective_tmp.is_some() && path.starts_with(Path::new("/tmp"))
 }
 
 #[cfg(test)]
