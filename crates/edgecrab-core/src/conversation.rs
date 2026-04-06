@@ -1074,6 +1074,8 @@ impl Agent {
             if let Some(reasoning_tokens) = response.thinking_tokens {
                 session.session_reasoning_tokens += reasoning_tokens as u64;
             }
+            session.last_prompt_tokens =
+                response.prompt_tokens as u64 + response.cache_hit_tokens.unwrap_or(0) as u64;
 
             // Empty response nudge: if the LLM returned no content and no
             // tool calls, inject a "please continue" prompt and retry.

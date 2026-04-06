@@ -217,6 +217,11 @@ pub struct SessionState {
     pub session_cache_read_tokens: u64,
     pub session_cache_write_tokens: u64,
     pub session_reasoning_tokens: u64,
+    /// Prompt-side tokens from the most recent model call.
+    ///
+    /// This tracks current context pressure. Session token counters above track
+    /// cumulative spend across the whole conversation.
+    pub last_prompt_tokens: u64,
     pub session_tool_call_count: u32,
 }
 
@@ -610,6 +615,7 @@ impl Agent {
             cache_read_tokens: session.session_cache_read_tokens,
             cache_write_tokens: session.session_cache_write_tokens,
             reasoning_tokens: session.session_reasoning_tokens,
+            last_prompt_tokens: session.last_prompt_tokens,
             budget_remaining: self.budget.remaining(),
             budget_max: self.budget.max(),
         }
@@ -731,6 +737,7 @@ impl Agent {
             session.session_cache_read_tokens = record.cache_read_tokens.max(0) as u64;
             session.session_cache_write_tokens = record.cache_write_tokens.max(0) as u64;
             session.session_reasoning_tokens = record.reasoning_tokens.max(0) as u64;
+            session.last_prompt_tokens = 0;
             session.messages = messages;
         }
 
@@ -858,6 +865,7 @@ pub struct SessionSnapshot {
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
     pub reasoning_tokens: u64,
+    pub last_prompt_tokens: u64,
     pub budget_remaining: u32,
     pub budget_max: u32,
 }
@@ -869,6 +877,14 @@ impl SessionSnapshot {
 
     pub fn total_tokens(&self) -> u64 {
         self.prompt_tokens() + self.output_tokens + self.reasoning_tokens
+    }
+
+    pub fn context_pressure_tokens(&self) -> u64 {
+        if self.last_prompt_tokens > 0 {
+            self.last_prompt_tokens
+        } else {
+            self.prompt_tokens()
+        }
     }
 }
 
@@ -1787,11 +1803,13 @@ mod tests {
             cache_read_tokens: 15_000,
             cache_write_tokens: 2_000,
             reasoning_tokens: 7,
+            last_prompt_tokens: 1_234,
             budget_remaining: 0,
             budget_max: 0,
         };
 
         assert_eq!(snap.prompt_tokens(), 17_003);
         assert_eq!(snap.total_tokens(), 17_020);
+        assert_eq!(snap.context_pressure_tokens(), 1_234);
     }
 }

@@ -1,33 +1,34 @@
 ---
 title: LLM Provider Overview
-description: All 11 LLM providers supported by EdgeCrab — GitHub Copilot, OpenAI, Anthropic, Google Gemini, xAI, DeepSeek, Hugging Face, Z.AI, OpenRouter, Ollama, and LM Studio.
+description: All 14 LLM providers supported by EdgeCrab — GitHub Copilot, OpenAI, Anthropic, Google Gemini, Vertex AI, xAI Grok, DeepSeek, Mistral, Groq, Hugging Face, Z.AI, OpenRouter, Ollama, and LM Studio.
 sidebar:
   order: 1
 ---
 
-EdgeCrab supports 11 LLM providers out of the box. Auto-detection finds the right provider from your environment variables — or switch at any time with `--model` or `/model` inside the TUI.
-
-The provider list and detection priority come directly from `crates/edgecrab-cli/src/setup.rs` (`PROVIDER_ENV_MAP`).
+EdgeCrab supports **14 LLM providers** out of the box (12 cloud, 2 local). Over 200 models compiled in, with user override via `~/.edgecrab/models.yaml`. Auto-detection finds the right provider from your environment variables — or switch at any time with `--model` or `/model` inside the TUI.
 
 ---
 
 ## Provider Quick Reference
 
-| Priority | Provider | Env var | Best for | Notes |
-|----------|----------|---------|----------|-------|
-| 1 | `copilot` | `GITHUB_TOKEN` | Free tier, coding | Requires GitHub Copilot subscription |
-| 2 | `openai` | `OPENAI_API_KEY` | General purpose | GPT-4.1, GPT-5, o3/o4 |
-| 3 | `anthropic` | `ANTHROPIC_API_KEY` | Long context, coding | Claude 4.5 / 4.6 |
-| 4 | `gemini` | `GOOGLE_API_KEY` | Multimodal, long context | Gemini 2.5 / 3.x |
-| 5 | `xai` | `XAI_API_KEY` | Fast reasoning | Grok 3 / 4 |
-| 6 | `deepseek` | `DEEPSEEK_API_KEY` | Code, cost-effective | DeepSeek V3, R1 |
-| 7 | `huggingface` | `HUGGING_FACE_HUB_TOKEN` | Open models | Hugging Face Inference API |
-| 8 | `zai` | `ZAI_API_KEY` | GLM models | Z.AI / GLM 4.5–5 |
-| 9 | `openrouter` | `OPENROUTER_API_KEY` | 600+ models | Single endpoint for many providers |
-| — | `ollama` | *(none)* | Offline / local | Requires `ollama serve` on port 11434 |
-| — | `lmstudio` | *(none)* | Offline / local | Requires LM Studio server on port 1234 |
+| Priority | Provider | Env var | Notable Models |
+|----------|----------|---------|----------------|
+| 1 | `copilot` | `GITHUB_TOKEN` | GPT-4.1-mini, GPT-4.1 — free with GitHub Copilot |
+| 2 | `openai` | `OPENAI_API_KEY` | GPT-4.1, GPT-5, o3, o4-mini |
+| 3 | `anthropic` | `ANTHROPIC_API_KEY` | Claude Opus 4.6, Sonnet 4.6, Haiku 4.5 |
+| 4 | `google` | `GOOGLE_API_KEY` | Gemini 2.5 Pro, Gemini 2.5 Flash |
+| 5 | `vertexai` | `GOOGLE_APPLICATION_CREDENTIALS` | Gemini via Google Cloud |
+| 6 | `xai` | `XAI_API_KEY` | Grok 3, Grok 4 |
+| 7 | `deepseek` | `DEEPSEEK_API_KEY` | DeepSeek V3, DeepSeek R1 |
+| 8 | `mistral` | `MISTRAL_API_KEY` | Mistral Large, Mistral Small |
+| 9 | `groq` | `GROQ_API_KEY` | Llama 3.3 70B, Gemma2 (blazing fast inference) |
+| 10 | `huggingface` | `HUGGING_FACE_HUB_TOKEN` | Any HF Inference API model |
+| 11 | `zai` | `ZAI_API_KEY` | Z.AI / GLM series |
+| 12 | `openrouter` | `OPENROUTER_API_KEY` | 600+ models via one endpoint |
+| — | `ollama` | *(none)* | Any model — `ollama serve` on port 11434 |
+| — | `lmstudio` | *(none)* | Any model — LM Studio on port 1234 |
 
-> **Auto-detection order**: EdgeCrab checks env vars in priority order (1–9). The first matching key sets the default provider. Local providers (ollama, lmstudio) are available regardless.
+> **Auto-detection order**: EdgeCrab checks env vars in priority order (1–12). The first matching key sets the default provider. Local providers (ollama, lmstudio) are available regardless.
 
 ---
 
@@ -112,7 +113,7 @@ anthropic/claude-sonnet-4-5   # Balanced
 anthropic/claude-haiku-3-5    # Fast, lightweight
 ```
 
-### Google Gemini (`gemini`)
+### Google Gemini (`google`)
 
 ```bash
 GOOGLE_API_KEY=AIza...
@@ -122,9 +123,20 @@ GOOGLE_API_KEY=AIza...
 
 Models:
 ```
-gemini/gemini-2.5-flash        # Fast, capable
-gemini/gemini-2.5-pro          # Long context
+google/gemini-2.5-flash        # Fast, capable
+google/gemini-2.5-pro          # Long context, advanced reasoning
 ```
+
+### Vertex AI (`vertexai`)
+
+Access Gemini models via Google Cloud with enterprise billing and data residency.
+
+```bash
+GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json
+# or: use Application Default Credentials (gcloud auth application-default login)
+```
+
+Models: same as `google` provider, routed through Vertex AI API endpoint.
 
 ### xAI (`xai`)
 
@@ -149,7 +161,37 @@ DEEPSEEK_API_KEY=...
 Models:
 ```
 deepseek/deepseek-chat         # V3 — general purpose
-deepseek/deepseek-reasoner     # R1 — reasoning
+deepseek/deepseek-reasoner     # R1 — advanced reasoning
+```
+
+### Mistral (`mistral`)
+
+European-headquartered provider with strong multilingual support and GDPR data residency options.
+
+```bash
+MISTRAL_API_KEY=...
+```
+
+Models:
+```
+mistral/mistral-large-latest   # Most capable
+mistral/mistral-small-latest   # Fast, cost-effective
+mistral/codestral-latest       # Code-focused
+```
+
+### Groq (`groq`)
+
+Ultra-fast inference via custom LPU chips. Lowest latency of any cloud provider.
+
+```bash
+GROQ_API_KEY=...
+```
+
+Models:
+```
+groq/llama-3.3-70b-versatile   # Best balance of speed + quality
+groq/llama-3.1-8b-instant      # Extremely fast, lightweight
+groq/gemma2-9b-it              # Google Gemma2 via Groq
 ```
 
 ### Hugging Face (`huggingface`)
@@ -264,22 +306,25 @@ If the primary provider returns an error (rate limit, outage), EdgeCrab retries 
 
 | Task | Recommended |
 |------|-------------|
-| Large refactor (100+ files) | `anthropic/claude-opus-4-5` |
-| Quick one-file fix | `openai/gpt-4.1-mini` or `deepseek/deepseek-chat` |
-| Reasoning / complex logic | `deepseek/deepseek-reasoner` or `xai/grok-3` |
+| Large refactor (100+ files) | `anthropic/claude-opus-4-6` |
+| Quick one-file fix | `groq/llama-3.3-70b-versatile` or `openai/gpt-4.1-mini` |
+| Reasoning / complex logic | `deepseek/deepseek-reasoner` or `openai/o3` |
 | Offline / air-gapped | `ollama/llama3.3` or `ollama/codestral` |
 | Maximum model variety | `openrouter/...` (600+ models) |
-| Budget-conscious | `deepseek/deepseek-coder-v2` |
-| Reasoning-heavy | `openai/o3` |
+| Budget-conscious | `deepseek/deepseek-chat` or `groq/llama-3.1-8b-instant` |
+| Lowest latency | `groq/llama-3.3-70b-versatile` (LPU hardware) |
 | European data residency | `mistral/mistral-large-latest` |
+| Code generation | `deepseek/deepseek-chat` or `mistral/codestral-latest` |
 
 ---
 
 ## Pro Tips
 
-- **Use `/model` in the TUI to experiment**: type `/model deepseek/deepseek-reasoner` mid-session to switch models without losing conversation history.
+- **Use `/model` in the TUI to experiment**: type `/model groq/llama-3.3-70b-versatile` mid-session to switch models without losing conversation history.
+- **Groq for speed-sensitive tasks**: Groq's LPU chips deliver 300+ tokens/second — ideal for quick iterations and interactive use where waiting 5 seconds per response breaks flow.
 - **OpenRouter for prototyping**: a single `OPENROUTER_API_KEY` unlocks 600+ models. Iterate fast across different providers before committing to one API key.
 - **DeepSeek R1 for hard reasoning**: `deepseek/deepseek-reasoner` matches o3-class reasoning at a fraction of the cost. Ideal for algorithm design and complex debugging.
+- **Mistral for European compliance**: data stays in EU datacenters. Use `mistral/codestral-latest` for code tasks with GDPR requirements.
 - **`edgecrab doctor`** shows which providers are configured and their latency. Run it after adding a new key to verify the key works.
 - **Fallback chain protects long runs**: configure `fallback_providers` in `config.yaml` so that a rate-limit spike doesn't kill a multi-hour refactor.
 

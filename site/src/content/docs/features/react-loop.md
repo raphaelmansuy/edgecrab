@@ -73,19 +73,19 @@ The tool result is inserted into the conversation as a `tool` role message.
 
 ## Recursion Safety
 
-The loop has a configurable maximum depth to prevent infinite loops or runaway LLM behavior:
+The loop has a configurable maximum iteration budget to prevent infinite loops or runaway LLM behavior:
 
 ```yaml
 # config.yaml
-tools:
-  max_loop_depth: 20   # Default: 20 iterations per user turn
+model:
+  max_iterations: 90   # Default: 90 iterations per session
 ```
 
 If the loop hits the limit, EdgeCrab reports to the user instead of silently stopping:
 
 ```
-⚠  Max loop depth (20) reached. The agent may not have completed the task.
-   Try increasing `tools.max_loop_depth` or breaking the task into smaller steps.
+⚠  Max iterations (90) reached. The agent may not have completed the task.
+   Try increasing `model.max_iterations` or breaking the task into smaller steps.
 ```
 
 ---
@@ -211,10 +211,10 @@ Simple tasks (fix a typo, explain a function): 1-3 iterations.
 Medium tasks (add a feature, write tests): 5-15 iterations.
 Complex tasks (refactor a module, debug a subtle bug): 15-30 iterations.
 
-If the default `max_loop_depth: 20` feels too low, increase it:
+If the default `max_iterations: 90` feels too low, increase it:
 ```yaml
-tools:
-  max_loop_depth: 40
+model:
+  max_iterations: 120
 ```
 
 **Q: Can the agent run multiple tasks in parallel?**
@@ -242,6 +242,6 @@ No. It reads files on demand using `file_read` and `file_search` tools. This mak
 
 - [Tools](/features/tools/) — Complete list of all available tools
 - [Security Model](/user-guide/security/) — How tool calls are checked before execution
-- [Configuration](/user-guide/configuration/) — `tools.max_loop_depth` and other loop settings
+- [Configuration](/user-guide/configuration/) — `model.max_iterations` and other loop settings
 - [TUI Interface](/features/tui/) — How tool calls are displayed in the terminal UI
 - [Skills](/features/skills/) — Pre-loaded procedures that guide the ReAct loop

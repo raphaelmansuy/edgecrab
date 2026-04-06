@@ -1,12 +1,12 @@
 ---
 title: EdgeCrab — Your Super Powerful Personal Assistant
-description: EdgeCrab is a Super Powerful Personal Assistant — not a coding agent. Inherits the user-alignment soul of NousHermes and the always-on presence of OpenClaw, delivered as a single 15 MB Rust binary. Starts in < 50 ms. Install via npm, pip, or cargo.
+description: EdgeCrab is a SuperAgent — personal assistant and coding agent in one. Carries the soul of Nous Hermes Agent and the presence of OpenClaw, compressed into a single 15 MB Rust binary. Starts in < 50 ms. 14 LLM providers. 15 messaging gateways. 30+ tools. Install via npm, pip, or cargo.
 template: splash
 hero:
   title: |
     Not a Coding Agent. Your <span class="font-black text-transparent bg-clip-text bg-gradient-to-b from-orange-600 to-red-600">Personal Assistant</span>, Built in Rust.
   tagline: |
-    The user-alignment soul of NousHermes. The always-on presence of OpenClaw. Zero runtime deps. One 15 MB binary that starts in &lt; 50 ms — on your laptop, your server, or the edge.
+    The user-alignment soul of Nous Hermes. The always-on presence of OpenClaw. 14 LLM providers. 15 messaging gateways. 30+ tools. One 15 MB binary that starts in &lt; 50 ms — on your laptop, your server, or the edge.
   actions:
     - text: Get Started
       link: /getting-started/quick-start/
@@ -24,54 +24,94 @@ import ComparisonSection from '../../components/landing/ComparisonSection.astro'
 
 <FeatureGrid
   title="Two Great Traditions. One Rust Binary."
-  subtitle="EdgeCrab is a SuperAgent — personal assistant and coding agent in one. It inherits Hermes Agent's ethos of deeply personal, steerable AI reasoning and OpenClaw's vision of an always-on assistant living in your tools and channels. Delivered as a single 15 MB static binary: no Python venv, no Node.js, no warmup — 70× lighter than OpenClaw, 1000× faster to start on edge hardware."
+  subtitle="EdgeCrab synthesises Hermes Agent's ethos of autonomous learning, persistent memory, and user-first alignment with OpenClaw's vision of an always-on assistant living in your channels. Delivered as a 15 MB static Rust binary: no Python venv, no Node.js runtime, < 50 ms cold start."
   features={[
     {
       icon: 'terminal',
-      title: 'Blazing-Fast ratatui TUI',
-      description: 'GPU-composited, 60 fps capable terminal UI built with ratatui. Streaming output, slash commands, session management, and full keyboard navigation.',
+      title: 'ratatui TUI — 60 fps Capable',
+      description: 'Full-screen terminal UI with streaming output, ghost-text completion, fuzzy slash-command search, multi-line input, approval dialogs, and mouse scroll. Built with ratatui — GPU-composited, silky smooth.',
     },
     {
       icon: 'refresh',
       title: 'ReAct Tool Loop',
-      description: 'Autonomous Reason + Act loop executes file, terminal, web search, memory, process, and skill tools. Recursion-safe with configurable depth limits.',
+      description: 'Autonomous Reason → Act → Observe loop runs up to 90 iterations. Executes 30+ tools, fires learning reflection after ≥5 tool calls, and auto-compresses context at 50% threshold.',
     },
     {
       icon: 'globe',
-      title: 'Multi-Provider LLM',
-      description: 'GitHub Copilot, OpenAI, Anthropic, Google Gemini, xAI Grok, DeepSeek, Hugging Face, Z.AI, OpenRouter, Ollama, LM Studio — hot-swappable via /model command.',
+      title: '14 LLM Providers',
+      description: 'GitHub Copilot, OpenAI, Anthropic, Google Gemini, xAI Grok, DeepSeek, Mistral, Groq, HuggingFace, Z.AI, OpenRouter, Ollama, LM Studio, VertexAI — hot-swappable mid-session via /model.',
     },
     {
       icon: 'layers',
-      title: 'ACP Protocol',
-      description: 'Built-in JSON-RPC 2.0 stdio adapter for the Agent Communication Protocol. Registers as a VS Code Copilot agent or any ACP-compatible runner.',
-    },
-    {
-      icon: 'shield',
-      title: 'Built-in Security',
-      description: 'Compiled-in path safety, SSRF protection, command scanning, and output redaction. No runtime patches required — security is a first-class citizen.',
+      title: '15 Messaging Gateways',
+      description: 'Telegram, Discord, Slack, WhatsApp, Signal, Matrix, Mattermost, DingTalk, SMS, Email, Home Assistant, Webhook, API Server, Feishu/Lark, WeCom — streaming delivery with 300ms edit intervals.',
     },
     {
       icon: 'cpu',
-      title: 'Single Static Binary',
-      description: '15 MB binary. < 50 ms cold startup. ~15 MB resident memory. No Python venv, no Node.js, no JVM. Runs anywhere Rust runs.',
+      title: 'Sub-agent Delegation',
+      description: 'Fork up to 3 parallel sub-agents for complex tasks. Each child inherits provider + tool registry but has its own session state, budget, and cancellation token. Max depth: 2 levels.',
     },
     {
       icon: 'box',
-      title: 'Python & Node.js SDKs',
-      description: 'Async-first Python SDK (edgecrab-sdk on PyPI) and TypeScript-first Node.js SDK (edgecrab-sdk on npm). Both ship with streaming and CLI.',
+      title: 'Sandboxed Code Execution',
+      description: 'Run Python, JS, Bash, Ruby, Perl, or Rust in an isolated subprocess. Scripts can call 7 tools via Unix socket RPC. API keys stripped. 5-min timeout. 50 KB output cap.',
     },
     {
       icon: 'zap',
-      title: 'SQLite State & FTS5 Search',
-      description: 'WAL-mode SQLite for session persistence. FTS5 full-text search across all session history. Migrate from hermes-agent with a single command.',
+      title: 'Mixture of Agents',
+      description: 'Run a single prompt through Claude Opus 4.6, Gemini 2.5 Pro, GPT-4.1, and DeepSeek R1 in parallel, then synthesize a consensus answer. Maximum intelligence for hard problems.',
+    },
+    {
+      icon: 'shield',
+      title: 'Compiled-in Security',
+      description: '7 independent security layers: path jail (SanitizedPath type), SSRF guard (SafeUrl type), command scan, prompt injection detection, code sandbox env stripping, skills threat scanner, output redaction.',
+    },
+    {
+      icon: 'terminal',
+      title: '6 Terminal Backends',
+      description: 'Plug in Local (default), Docker container, SSH ControlMaster, Modal cloud sandbox, Daytona cloud dev box, or Singularity/Apptainer HPC overlay. Switch with one config line.',
+    },
+    {
+      icon: 'refresh',
+      title: 'Persistent Memory & Learning',
+      description: 'Three-layer memory: MEMORY.md files, SQLite FTS5 session history (instant full-text search), and cross-session Honcho user model. Auto-learning reflection fires after ≥5 tool calls.',
+    },
+    {
+      icon: 'layers',
+      title: 'Skills Library',
+      description: 'Reusable agent procedures as markdown files. Browse the public hub, install in one command, preload per session with -S. The agent creates new skills autonomously during learning reflection.',
+    },
+    {
+      icon: 'globe',
+      title: 'Full MCP Client',
+      description: 'Built-in Model Context Protocol client — connect any MCP server and its tools appear in the registry automatically. Hot-reload with /reload-mcp. Stdio, SSE, and HTTP transports.',
+    },
+    {
+      icon: 'cpu',
+      title: 'Cron Scheduling',
+      description: 'Schedule recurring tasks with standard cron syntax. The agent can schedule its own follow-ups. Deliver proactive summaries to your Telegram at 9am every weekday.',
+    },
+    {
+      icon: 'box',
+      title: 'Checkpoints & Rollback',
+      description: 'Filesystem snapshots before every destructive operation. Restore any checkpoint with /rollback. Up to 50 snapshots per session. Never lose work from an agent mistake again.',
+    },
+    {
+      icon: 'zap',
+      title: 'Profiles & Worktrees',
+      description: 'Switch contexts with edgecrab profile use work/homelab/research. Isolate risky experiments in git worktrees with -w. Each profile has its own keys, model, memory, and toolsets.',
+    },
+    {
+      icon: 'shield',
+      title: 'ACP / VS Code Copilot',
+      description: 'Built-in JSON-RPC 2.0 stdio adapter for Agent Communication Protocol. Registers as a VS Code Copilot agent, Zed agent, or any ACP-compatible runner. No plugin required.',
     },
   ]}
 />
 
 <QuickStart
-  title="Three Ways to Install — Pick Yours"
-  subtitle="npm (no Rust required) · pip (no Rust required) · cargo (compile or grab a release binary). All three install the same native binary. Your Super Powerful Personal Assistant is live in under 90 seconds."
+  title="Four Ways to Install — Pick Yours"
+  subtitle="npm · pip · cargo · Docker — all install the same native static binary. No Python venv. No Node.js runtime for the agent itself. Your SuperAgent is live in under 90 seconds."
   tabs={[
     {
       label: 'npm',
@@ -82,45 +122,50 @@ npm install -g edgecrab-cli
 # Run setup wizard (detects API keys, writes config)
 edgecrab setup
 
-# Verify health
-edgecrab doctor
-
-# Start chatting
-edgecrab
-edgecrab "summarise the git log for today"`,
-    },
-    {
-      label: 'pip',
-      lang: 'bash',
-      code: `# Install via pip — no Rust required
-pip install edgecrab-cli
-
-# Run setup wizard (detects API keys, writes config)
-edgecrab setup
-
-# Verify health
-edgecrab doctor
-
-# Start chatting
-edgecrab
-edgecrab "summarise the git log for today"`,
-    },
-    {
-      label: 'Cargo',
-      lang: 'bash',
-      code: `# Install from crates.io
-cargo install edgecrab-cli
-
-# Run setup wizard (detects API keys, writes config)
-edgecrab setup
-
-# Verify health
+# Verify health (checks keys, provider ping, binary size)
 edgecrab doctor
 
 # Start chatting
 edgecrab
 edgecrab "summarise the git log for today"
-edgecrab --model openai/gpt-4o "explain this codebase"`,
+edgecrab --model anthropic/claude-opus-4-6 "review this codebase"`,
+    },
+    {
+      label: 'pip',
+      lang: 'bash',
+      code: `# Install via pip — no Rust required
+# Use pipx for an isolated install (recommended)
+pipx install edgecrab-cli
+# or: pip install edgecrab-cli
+
+# Run setup wizard
+edgecrab setup
+
+# Verify health
+edgecrab doctor
+
+# Start chatting
+edgecrab
+edgecrab "count lines in src/**/*.rs"
+edgecrab --model ollama/llama3.3 "work completely offline"`,
+    },
+    {
+      label: 'Cargo',
+      lang: 'bash',
+      code: `# Compile and install from crates.io (requires Rust 1.85+)
+cargo install edgecrab-cli
+
+# Run setup wizard
+edgecrab setup
+
+# Verify health
+edgecrab doctor
+
+# Start chatting
+edgecrab
+edgecrab "explain this codebase" --model openai/gpt-4o
+edgecrab -w "explore that risky refactor" # isolated git worktree
+edgecrab -S git-workflow "review this PR" # preload a skill`,
     },
     {
       label: 'Python SDK',
@@ -129,7 +174,8 @@ edgecrab --model openai/gpt-4o "explain this codebase"`,
 
 from edgecrab import Agent
 
-agent = Agent(model="anthropic/claude-sonnet-4-20250514")
+# Simple chat
+agent = Agent(model="anthropic/claude-opus-4-6")
 reply = agent.chat("Explain Rust ownership in 3 sentences")
 print(reply)
 
@@ -138,19 +184,20 @@ import asyncio
 from edgecrab import AsyncAgent
 
 async def main():
-    agent = AsyncAgent(model="copilot/gpt-4.1-mini")
+    agent = AsyncAgent(model="openai/gpt-4o")
     async for token in agent.stream("Write a Rust hello-world"):
         print(token, end="", flush=True)
 
 asyncio.run(main())`,
     },
     {
-      label: 'Node.js SDK',
+      label: 'Node SDK',
       lang: 'typescript',
       code: `npm install edgecrab-sdk
 
 import { Agent } from "edgecrab-sdk";
 
+// Simple chat
 const agent = new Agent({ model: "openai/gpt-4o" });
 const reply = await agent.chat("Review this TypeScript code");
 console.log(reply);
@@ -158,29 +205,35 @@ console.log(reply);
 // Streaming
 for await (const token of agent.stream("Write a README")) {
   process.stdout.write(token);
-}`,
+}
+
+// npx CLI
+// npx edgecrab-sdk chat "Hello!"
+// npx edgecrab-sdk models`,
     },
     {
       label: 'Docker',
       lang: 'bash',
-      code: `# Pull pre-built multi-arch image
+      code: `# Pull pre-built multi-arch image (linux/amd64 + linux/arm64)
 docker pull ghcr.io/raphaelmansuy/edgecrab:latest
 
-# Run gateway server
-docker run -p 8080:8080 \\
-  -e OPENAI_API_KEY=sk-... \\
-  ghcr.io/raphaelmansuy/edgecrab:latest \\
-  edgecrab gateway --bind 0.0.0.0:8080
+# Run gateway server (15 messaging platforms)
+docker run -p 8642:8642 \\
+  -e ANTHROPIC_API_KEY=sk-ant-... \\
+  -e TELEGRAM_BOT_TOKEN=123456:... \\
+  -v "$HOME/.edgecrab:/root/.edgecrab" \\
+  ghcr.io/raphaelmansuy/edgecrab:latest
 
-# Or use docker-compose
-docker compose up`,
+# Or with docker-compose (full gateway stack)
+docker compose up -d
+docker compose logs -f`,
     },
   ]}
 />
 
 <ComparisonSection
   title="The DNA of EdgeCrab"
-  subtitle="EdgeCrab is not a fork of either project. It synthesises what made each great — Hermes Agent's soul of autonomous learning + OpenClaw's messaging vision — then compresses it into a Rust binary that runs anywhere."
+  subtitle="EdgeCrab is not a fork of either project. It absorbs what made each great — Hermes Agent's soul of autonomous learning and OpenClaw's messaging vision — then reforges it in Rust as a single binary that runs anywhere."
   eyebrow="Inspired By"
   columns={[
     { label: 'Hermes Agent 🧠' },
@@ -191,18 +244,18 @@ docker compose up`,
     {
       feature: 'What it is',
       values: [
-        'Autonomous agent (Python, MIT) — 40+ tools, grows with you',
+        'Autonomous agent (Python) — 40+ tools, learns and grows',
         'Personal assistant platform (TypeScript) — 24+ channels',
-        'SuperAgent — 62 built-in tools, personal + coding, learns & improves (Rust)',
+        '✓ SuperAgent — 30+ tools + 15 gateways + learns autonomously (Rust)',
       ],
       highlight: true,
     },
     {
-      feature: 'Core idea',
+      feature: 'Core soul',
       values: [
-        'Lives on your server, remembers what it learns, gets more capable over time',
-        'Always-on assistant living in your channels & tools',
-        '✓ Synthesises both: Hermes soul (reasoning + memory) + OpenClaw vision (channels)',
+        '✓ Lives on your server, remembers what it learns, improves over time',
+        '✓ Always-on presence in your channels and tools',
+        '✓ Both: Hermes soul (memory + learning) + OpenClaw presence (15 gateways)',
       ],
     },
     {
@@ -218,25 +271,25 @@ docker compose up`,
       feature: 'Deep reasoning',
       values: [
         '✓ Multi-turn + subagent delegation + parallel batch workers',
-        'Via LLM API calls',
-        '✓ ReAct loop + Mixture-of-Agents (4 frontier models in parallel)',
+        'Via LLM API calls only',
+        '✓ ReAct loop (90 iterations) + MoA (4 frontier models in parallel)',
       ],
     },
     {
       feature: 'Coding agent',
       values: [
-        '✓ Terminal, file, browser & execute_code (Docker / SSH / Modal / Singularity)',
-        'Partial — via shell/git tools',
-        '✓ ReAct + file / terminal / browser / execute_code (Docker, SSH, Modal, local)',
+        '✓ Terminal, file, browser + execute_code (Docker / SSH / Modal / Singularity)',
+        'Partial — basic shell/git tools',
+        '✓ ReAct + file + terminal + browser + execute_code (6 backends)',
       ],
       highlight: true,
     },
     {
       feature: 'Memory & learning',
       values: [
-        '✓ Persistent memory + auto-generated skills + Honcho user model',
-        'Partial — session memory',
-        '✓ SQLite FTS5 sessions + Honcho cross-session user model + skill hub',
+        '✓ Persistent memory + auto-skills + Honcho cross-session model',
+        'Partial — in-session memory only',
+        '✓ MEMORY.md + SQLite FTS5 sessions + Honcho + auto learning reflection',
       ],
     },
     {
@@ -244,58 +297,75 @@ docker compose up`,
       values: [
         '✓ 7 platforms: Telegram, Discord, Slack, WhatsApp, Signal, Email, CLI',
         '✓ 24+ channels: WhatsApp, Telegram, Slack, Discord, Matrix, IRC…',
-        '✓ 11 gateways: Telegram, Discord, Slack, WhatsApp, Signal, Matrix, Email, Mattermost, SMS, DingTalk, HA + ACP / VS Code',
+        '✓ 15 gateways: Telegram, Discord, Slack, WhatsApp, Signal, Matrix, Mattermost, DingTalk, Email, SMS, HA, Webhook, API, Feishu, WeCom',
       ],
       highlight: true,
+    },
+    {
+      feature: 'Sub-agents',
+      values: [
+        '✓ Subagent delegation + parallel batch workers',
+        '✗ Not supported',
+        '✓ Up to 3 parallel sub-agents, depth limited to 2 levels',
+      ],
     },
     {
       feature: 'Smart home',
       values: [
         '✗ Not supported',
         '✗ Not supported',
-        '✓ Home Assistant — list entities, get state, list & call services',
+        '✓ Home Assistant — states, call services, trigger automations, history',
       ],
+      highlight: true,
     },
     {
       feature: 'MCP support',
       values: [
-        '✓ Full MCP client (optional dep — mcp_tool.py, ~1050 lines)',
-        '✗ Not documented',
-        '✓ Built-in MCP client — tools, resources & prompts (JSON-RPC 2.0)',
+        '✓ Full MCP client (mcp_tool.py, ~1050 lines)',
+        '✗ Not supported',
+        '✓ Built-in MCP client — JSON-RPC 2.0, stdio + HTTP + SSE transports',
       ],
-      highlight: true,
     },
     {
       feature: 'Install method',
       values: [
         'curl | bash (Python + uv managed)',
-        'npm install  (Node.js required)',
-        '✓ npm · pip · cargo — pick yours',
+        'npm install (Node.js runtime required)',
+        '✓ npm · pip · cargo · Docker — pick yours',
       ],
+      highlight: true,
     },
     {
       feature: 'Runtime footprint',
       values: [
-        'Python runtime · uv managed',
+        'Python runtime · uv · ~80–150 MB RAM',
         'Node.js runtime · > 1 GB RAM',
-        '✓ Rust binary · ~15 MB RAM',
+        '✓ Single Rust binary · ~15 MB RAM · no runtime deps',
       ],
-      highlight: true,
     },
     {
       feature: 'Cold startup',
       values: [
         '~1–3 s (Python + uv)',
-        '> 500 s on 0.8 GHz edge hardware',
-        '✓ < 50 ms everywhere',
+        '> 500 ms on 0.8 GHz edge hardware',
+        '✓ < 50 ms everywhere — including edge hardware',
       ],
+      highlight: true,
     },
     {
       feature: 'Security',
       values: [
         '✓ 5 sandboxing backends (Docker, SSH, Modal, Singularity, local)',
         'Runtime patches',
-        '✓ Compiled-in (path jail, SSRF, cmd scan, secret redact) + Docker / SSH / Modal backends',
+        '✓ 7 compiled-in layers (type-level path jail + SSRF + cmd scan + sandbox + more)',
+      ],
+    },
+    {
+      feature: 'LLM providers',
+      values: [
+        '11 cloud providers',
+        'Via OpenAI-compatible APIs',
+        '✓ 14 built-in (12 cloud + 2 local) + Azure + Bedrock',
       ],
       highlight: true,
     },
@@ -304,7 +374,7 @@ docker compose up`,
 
 <CtaSection
   title="From the Soul of Hermes to the Speed of Rust"
-  subtitle="EdgeCrab is open source, Apache 2.0. Your SuperAgent — personal + coding, grows with you. Install via npm, pip, or cargo in seconds. Runs anywhere on macOS, Linux, and Windows."
+  subtitle="EdgeCrab is open source, Apache 2.0. Your SuperAgent — personal + coding, learns and grows with you. Install via npm, pip, or cargo in 90 seconds. Runs anywhere: macOS, Linux, Windows, edge hardware."
   installCmd="npm install -g edgecrab-cli"
   primaryHref="/getting-started/quick-start/"
   primaryText="Get Started Free"

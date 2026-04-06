@@ -24,7 +24,7 @@ edgecrab/
     edgecrab-tools/       -- tool registry, toolsets, all tool impls
     edgecrab-core/        -- agent loop, config, context, LLM client
     edgecrab-cli/         -- ratatui TUI, CLI args, commands, themes
-    edgecrab-gateway/     -- messaging adapters (10 platforms)
+    edgecrab-gateway/     -- messaging adapters (15 platforms)
     edgecrab-acp/         -- ACP JSON-RPC 2.0 stdio adapter
     edgecrab-migrate/     -- schema migrations + one-shot migrate CLI
 ```
@@ -126,7 +126,7 @@ SQLite WAL-mode session database:
 - `LlmClient` — unified OpenAI-compatible HTTP client with streaming,
   prompt caching, and retry logic
 - `CompressionEngine` — context window summarisation when threshold hit
-- Provider setup: detect API keys, build `ModelConfig` for 11 providers (9 cloud + 2 local)
+- Provider setup: detect API keys, build `ModelConfig` for 14 providers (12 cloud + 2 local)
 
 ### `edgecrab-cli`
 
@@ -146,15 +146,19 @@ Platform        Source file          Env vars needed
 ------------------------------------------------------
 Telegram        telegram.rs          TELEGRAM_BOT_TOKEN
 Discord         discord.rs           DISCORD_BOT_TOKEN
-Slack           slack.rs             SLACK_BOT_TOKEN
+Slack           slack.rs             SLACK_BOT_TOKEN + SLACK_APP_TOKEN
 Signal          signal.rs            SIGNAL_HTTP_URL + SIGNAL_ACCOUNT
-WhatsApp        whatsapp.rs          WHATSAPP_ENABLED (bridge)
-Matrix          matrix.rs            MATRIX_HOMESERVER + MATRIX_TOKEN
+WhatsApp        whatsapp.rs          QR pairing wizard (edgecrab whatsapp)
+Matrix          matrix.rs            MATRIX_HOMESERVER + MATRIX_ACCESS_TOKEN
 Mattermost      mattermost.rs        MATTERMOST_URL + MATTERMOST_TOKEN
-DingTalk        dingtalk.rs          DINGTALK_WEBHOOK
-SMS             sms.rs               (provider-specific)
-Email           email.rs             SMTP / IMAP credentials
-Home Assistant  homeassistant.rs     HA_URL + HA_TOKEN
+DingTalk        dingtalk.rs          DINGTALK_APP_KEY + DINGTALK_APP_SECRET
+SMS             sms.rs               TWILIO_ACCOUNT_SID + TWILIO_AUTH_TOKEN
+Email           email.rs             EMAIL_PROVIDER + EMAIL_FROM + EMAIL_API_KEY
+Home Assistant  homeassistant.rs     HASS_URL + HASS_TOKEN
+Webhook         webhook.rs           (any HTTP caller)
+API Server      api_server.rs        API_SERVER_PORT (optional)
+Feishu/Lark     feishu.rs            FEISHU_APP_ID + FEISHU_APP_SECRET
+WeCom           wecom.rs             WECOM_CORP_ID + WECOM_SECRET
 ```
 
 Platform adapters:
@@ -234,7 +238,7 @@ Session saved to SQLite (WAL commit)
 **1. Single binary.** Everything compiles into one statically-linked
 executable. No Python venv, no Node.js, no shared libraries except
 the OS. Browser tools require Chrome — that is the only soft
-dependency. Cold start: ~38 ms.
+dependency. Cold start: < 50 ms.
 
 **2. Security at the type level.** `SanitizedPath` and `SafeUrl` are
 distinct Rust types in `edgecrab-types`. Functions that touch the
@@ -251,7 +255,7 @@ exist. Toolsets own which tools are active per session. Policy changes
 never require touching tool implementations.
 
 **5. No Python.** EdgeCrab is a ground-up Rust rewrite of hermes-agent.
-Result: 38 ms cold start (vs 1.2 s), 14 MB resident (vs 87 MB), no GC
+Result: < 50 ms cold start (vs 1–3 s), ~15 MB resident (vs ~80–150 MB), no GC
 pauses, no venv to manage.
 
 **6. Config resolution order.** `AppConfig::default()` → `config.yaml`
@@ -279,7 +283,7 @@ Each crate maps to a distinct responsibility with a clear interface. The benefit
 **Why SQLite instead of a file-based session store?**
 FTS5 full-text search, WAL-mode concurrent access, and atomic transactions. Session search across thousands of messages is instant without an external search service.
 
-**Why is the binary 38 MB instead of smaller?**
+**Why is the binary ~15 MB instead of smaller?**
 Static linking embeds all dependencies (TLS, SQLite, the Aho-Corasick scanner, etc.) into a single executable. No dynamic library dependencies means the binary runs on any Linux distro without managing shared libraries.
 
 **How do I find which crate owns a given feature?**

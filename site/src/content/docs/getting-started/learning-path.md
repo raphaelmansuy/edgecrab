@@ -129,7 +129,7 @@ EdgeCrab Docs
 |   \-- SQLite State & Search  <- session persistence & FTS5
 |
 +-- LLM Providers
-|   +-- Provider Overview      <- all 11 providers
+|   +-- Provider Overview      <- all 14 providers
 |   \-- Local Models           <- Ollama & LM Studio
 |
 +-- Integrations
@@ -160,7 +160,7 @@ EdgeCrab Docs
 |---------|-----|
 | `edgecrab: command not found` | Add `~/.cargo/bin` to PATH; re-run `source ~/.zshrc` |
 | Doctor shows provider error | Add key to `~/.edgecrab/.env`, not just the shell |
-| Agent loop exceeds depth | Increase `tools.max_loop_depth` in config, or break task into steps |
+| Agent loop exceeds budget | Increase `model.max_iterations` in config, or break task into steps |
 | Model says context is too long | Enable `compression.enabled: true` or reduce `session.max_context_tokens` |
 | Messaging gateway not receiving | Check `edgecrab gateway status`; verify env vars set correctly |
 | Skills not loading | Ensure skill is a *directory* with `SKILL.md` inside, not a bare `.md` file |

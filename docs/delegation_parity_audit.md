@@ -52,5 +52,5 @@ This audit compares `edgecrab` against Hermes on four first-principles concerns:
 ## Remaining gaps vs Hermes
 
 - `edgequake-llm` still does not expose cache-write tokens on the normalized streaming response contract, so session accounting can only show cache-write tokens when the upstream provider path supplies them through higher layers.
-- EdgeCrab still does not persist an explicit “last prompt tokens” scalar the way Hermes does. The TUI now computes equivalent prompt pressure from session buckets, but the persistence model could still be tighter.
+- EdgeCrab now tracks an explicit in-process `last_prompt_tokens` scalar for live context-pressure display, but it still does not persist that value across session restore the way Hermes does.
 - Delegated reasoning is currently a live status signal, not a full transcript artifact. This is the right default for UX, but Hermes has more battle-tested history around tuning that noise floor.

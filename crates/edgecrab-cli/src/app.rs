@@ -842,10 +842,10 @@ pub struct App {
     /// `12.4k / 200k (9%)` watermark in the status bar so the user can see
     /// context pressure at a glance. `None` when the model is not in the catalog.
     context_window: Option<u64>,
-    /// Prompt-side context tokens shown in the status bar.
+    /// Current prompt-pressure tokens shown in the status bar.
     ///
-    /// This excludes completion-only tokens and includes cache hits/writes so
-    /// the indicator tracks compression pressure rather than response length.
+    /// This tracks the latest prompt sent to the model rather than cumulative
+    /// session spend, so the indicator reflects current context pressure.
     total_tokens: u64,
     session_cost: f64,
     /// Agent for LLM dispatch
@@ -4491,7 +4491,7 @@ impl App {
             let snap = self
                 .rt_handle
                 .block_on(async { agent.session_snapshot().await });
-            self.total_tokens = snap.prompt_tokens();
+            self.total_tokens = snap.context_pressure_tokens();
             self.model_name = snap.model;
             self.update_context_window();
 
@@ -4917,7 +4917,6 @@ impl App {
             return;
         };
         let snap = self.agent_snapshot(&agent);
-        let total = snap.input_tokens + snap.output_tokens;
         let usage = edgecrab_core::CanonicalUsage {
             input_tokens: snap.input_tokens,
             output_tokens: snap.output_tokens,
@@ -4932,6 +4931,7 @@ impl App {
         };
         let text = format!(
             "Token usage & cost:\n\
+             Current prompt:      {}\n\
              Input tokens:       {}\n\
              Output tokens:      {}\n\
              Cache read tokens:  {}\n\
@@ -4941,17 +4941,18 @@ impl App {
              API calls:          {}\n\
              \n\
              Estimated cost: {}",
+            snap.context_pressure_tokens(),
             snap.input_tokens,
             snap.output_tokens,
             snap.cache_read_tokens,
             snap.cache_write_tokens,
             snap.reasoning_tokens,
-            total,
+            snap.total_tokens(),
             snap.api_call_count,
             cost_line,
         );
         self.push_output(text, OutputRole::System);
-        self.total_tokens = snap.prompt_tokens();
+        self.total_tokens = snap.context_pressure_tokens();
         if let Some(usd) = cost_result.amount_usd {
             self.session_cost = usd;
         }
@@ -5289,7 +5290,7 @@ impl App {
             Ok((messages, snap)) => {
                 // Show conversation recap before loading
                 let recap = build_session_recap(&messages);
-                let prompt_tokens = snap.prompt_tokens();
+                let prompt_tokens = snap.context_pressure_tokens();
                 self.load_messages(messages);
                 self.model_name = snap.model;
                 self.update_context_window();
@@ -6567,7 +6568,6 @@ impl App {
             .block_on(async { agent.session_snapshot().await });
 
         // ── Current session ────────────────────────────────────────────
-        let total_tokens = snap.input_tokens + snap.output_tokens;
         let cost = edgecrab_core::pricing::estimate_cost(
             &edgecrab_core::pricing::CanonicalUsage {
                 input_tokens: snap.input_tokens,
@@ -6583,9 +6583,13 @@ impl App {
         text.push_str(&format!("  User turns:     {}\n", snap.user_turn_count));
         text.push_str(&format!("  Messages:       {}\n", snap.message_count));
         text.push_str(&format!("  API calls:      {}\n", snap.api_call_count));
+        text.push_str(&format!(
+            "  Current prompt: {}\n",
+            snap.context_pressure_tokens()
+        ));
         text.push_str(&format!("  Input tokens:   {}\n", snap.input_tokens));
         text.push_str(&format!("  Output tokens:  {}\n", snap.output_tokens));
-        text.push_str(&format!("  Total tokens:   {total_tokens}\n"));
+        text.push_str(&format!("  Total tokens:   {}\n", snap.total_tokens()));
         if snap.cache_read_tokens > 0 {
             text.push_str(&format!("  Cache hit:      {}\n", snap.cache_read_tokens));
         }
@@ -6611,7 +6615,10 @@ impl App {
                     text.push_str(&format!("  Sessions:       {}\n", ov.total_sessions));
                     text.push_str(&format!("  Messages:       {}\n", ov.total_messages));
                     text.push_str(&format!("  Tool calls:     {}\n", ov.total_tool_calls));
-                    let hist_total = ov.total_input_tokens + ov.total_output_tokens;
+                    let hist_total = ov.total_input_tokens
+                        + ov.total_output_tokens
+                        + ov.total_cache_read_tokens
+                        + ov.total_cache_write_tokens;
                     text.push_str(&format!("  Total tokens:   {hist_total}\n"));
                     if ov.total_cache_read_tokens > 0 {
                         text.push_str(&format!(

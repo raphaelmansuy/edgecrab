@@ -101,7 +101,7 @@ Provider [1]: 1
 ✓ Created ~/.edgecrab/skills/
 ```
 
-Supported providers: `copilot` · `openai` · `anthropic` · `gemini` · `xai` · `deepseek` · `huggingface` · `zai` · `openrouter` · `ollama` · `lmstudio`. See [Provider Overview](/providers/overview/).
+Supported providers: `copilot` · `openai` · `anthropic` · `google` (Gemini) · `vertexai` · `xai` (Grok) · `deepseek` · `mistral` · `groq` · `huggingface` · `zai` · `openrouter` · `ollama` · `lmstudio`. See [Provider Overview](/providers/overview/).
 
 :::note[Already have hermes-agent config?]
 Run `edgecrab migrate` to import your existing config, memories, and skills in one step.
@@ -323,7 +323,7 @@ done
 
 **Q: The agent keeps exceeding the context window.**
 
-Reduce `tools.max_loop_depth` or increase `session.max_context_tokens`. For large codebases, use [Worktrees](/user-guide/worktrees/) to scope each session or preload only the relevant [Skills](/features/skills/).
+Reduce `model.max_iterations` or break the prompt into smaller steps. For large codebases, use [Worktrees](/user-guide/worktrees/) to scope each session or preload only the relevant [Skills](/features/skills/).
 
 **Q: Where are my conversation logs stored?**
 
