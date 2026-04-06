@@ -3,7 +3,7 @@
 > **"Your SuperAgent — built in Rust."**
 
 [![License](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/Rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/Rust-1.86%2B-orange.svg)](https://www.rust-lang.org/)
 [![crates.io](https://img.shields.io/crates/v/edgecrab-cli.svg)](https://crates.io/crates/edgecrab-cli)
 [![PyPI](https://img.shields.io/pypi/v/edgecrab-cli.svg)](https://pypi.org/project/edgecrab-cli/)
 [![npm](https://img.shields.io/npm/v/edgecrab-cli.svg)](https://www.npmjs.com/package/edgecrab-cli)
@@ -30,7 +30,7 @@ hermes-agent soul  +  OpenClaw vision  =  EdgeCrab
 | Memory              | ~15 MB resident                | ~80–150 MB       |
 | LLM providers       | 14 built-in (+ Azure, Bedrock) | varies           |
 | Messaging platforms | 15 gateways                    | 7 platforms      |
-| Tests               | 1200+ passing                  | —                |
+| Tests               | 1629 passing (Rust)            | —                |
 | Migrate from hermes | `edgecrab migrate`             | N/A              |
 
 ![EdgeCrab — The Clash of the Crustaceans](assets/edgecrab-hero.jpeg)
@@ -52,7 +52,7 @@ hermes-agent soul  +  OpenClaw vision  =  EdgeCrab
     - [First Prompts](#first-prompts)
   - [What EdgeCrab Can Do](#what-edgecrab-can-do)
     - [ReAct Tool Loop](#react-tool-loop)
-    - [30+ Built-in Tools](#30-built-in-tools)
+    - [74 Built-in Tools](#74-built-in-tools)
       - [File Tools (`file` toolset)](#file-tools-file-toolset)
       - [Terminal Tools (`terminal` toolset)](#terminal-tools-terminal-toolset)
       - [Web Tools (`web` toolset)](#web-tools-web-toolset)
@@ -203,7 +203,7 @@ EdgeCrab uses a **Reason → Act → Observe** loop (ReAct pattern) implemented 
 
 The budget default is **90 iterations** (`max_iterations` in config). Increase it for long autonomous tasks.
 
-### 30+ Built-in Tools
+### 74 Built-in Tools
 
 Tools are registered at compile time via the `inventory` crate — zero startup cost. The `ToolRegistry` dispatches by exact name with fuzzy (Levenshtein ≤3) fallback suggestions.
 
@@ -909,7 +909,7 @@ edgecrab-types      (shared types — no deps on other crates)
 edgecrab-security   (path safety, SSRF, cmd scan — types only)
 edgecrab-cron       (standalone cron store + schedule parser)
        ↑
-edgecrab-tools      (ToolRegistry + 30+ tool implementations)
+edgecrab-tools      (ToolRegistry + 74 tool implementations)
 edgecrab-state      (SQLite WAL + FTS5 session store)
        ↑
 edgecrab-core       (Agent, ReAct loop, prompt builder, compression)
@@ -923,7 +923,7 @@ edgecrab-cli    edgecrab-gateway    edgecrab-acp    edgecrab-migrate
 | `edgecrab-security` | Path jail, SSRF, command scan, redaction, approval engine                                                                    |
 | `edgecrab-state`    | SQLite WAL + FTS5 session storage (`~/.edgecrab/state.db`)                                                                   |
 | `edgecrab-cron`     | Cron expression parser, job store (`~/.edgecrab/cron/`)                                                                      |
-| `edgecrab-tools`    | `ToolRegistry`, `ToolHandler` trait, `ToolContext`, all 30+ tools                                                            |
+| `edgecrab-tools`    | `ToolRegistry`, `ToolHandler` trait, `ToolContext`, all 74 tools                                                             |
 | `edgecrab-core`     | `Agent`, `AgentBuilder`, `execute_loop()`, `PromptBuilder`, compression, routing, 200+ model catalog                         |
 | `edgecrab-cli`      | ratatui TUI, 42 slash commands, all CLI subcommands, skin engine, profiles                                                   |
 | `edgecrab-gateway`  | axum HTTP + 15 platform adapters, streaming delivery, `MEDIA://` protocol                                                    |
@@ -1169,7 +1169,7 @@ cargo fmt --check
 cargo doc --no-deps --open
 ```
 
-Current: **1200+ tests passing** (unit + integration). The codebase has a zero-clippy-warnings policy enforced in CI.
+Current: **1629 tests passing** (unit + integration). The codebase has a zero-clippy-warnings policy enforced in CI.
 
 > **Note:** 8 gap-audit tests in `edgecrab-cli` require the hermes-agent source tree at `../hermes-agent/`. Skip them when developing standalone: `cargo test --workspace --exclude edgecrab-cli`
 
@@ -1184,7 +1184,7 @@ edgecrab/
 │   ├── edgecrab-security/      Path jail, SSRF, cmd scanner, injection, redact
 │   ├── edgecrab-state/         SQLite WAL + FTS5 session store
 │   ├── edgecrab-cron/          Cron parser, job store, scheduler
-│   ├── edgecrab-tools/         ToolRegistry + all 30+ tool implementations
+│   ├── edgecrab-tools/         ToolRegistry + all 74 tool implementations
 │   │   └── tools/
 │   │       ├── file.rs         read_file, write_file, patch_file, search_files
 │   │       ├── terminal.rs     terminal, manage_process
@@ -1225,7 +1225,7 @@ edgecrab/
 
 | Tool  | Version               |
 | ----- | --------------------- |
-| Rust  | 1.85+                 |
+| Rust  | 1.86+                 |
 | Cargo | bundled with Rust     |
 | OS    | macOS, Linux, Windows |
 
