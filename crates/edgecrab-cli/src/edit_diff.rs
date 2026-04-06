@@ -157,8 +157,15 @@ fn resolve_preview_write_path(
     }
 
     let mut allowed_roots = vec![cwd.clone()];
-    if let Ok(root) = config.file_tools_tmp_dir().canonicalize() {
+    // Always permit file_tools_tmp_dir as a preview target even if the
+    // directory has not been created yet (canonicalize would fail on a
+    // non-existent path). The starts_with comparison below uses the same
+    // non-canonical base as `candidate`, so no canonicalization is needed.
+    let tmp_dir = config.file_tools_tmp_dir();
+    if let Ok(root) = tmp_dir.canonicalize() {
         allowed_roots.push(root);
+    } else {
+        allowed_roots.push(tmp_dir);
     }
     for root in &config.file_allowed_roots {
         let resolved = if root.is_absolute() {
@@ -252,10 +259,13 @@ fn diff_from_snapshot(snapshot: &LocalEditSnapshot) -> Option<String> {
 
 fn display_diff_path(path: &Path, cwd: &Path) -> String {
     let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
-    path.strip_prefix(&cwd)
+    let s = path
+        .strip_prefix(&cwd)
         .unwrap_or(path)
         .display()
-        .to_string()
+        .to_string();
+    // Normalize to forward slashes for consistent cross-platform display.
+    s.replace('\\', "/")
 }
 
 fn normalize_path(path: &Path) -> PathBuf {
@@ -498,10 +508,7 @@ mod tests {
 
         assert_eq!(paths.len(), 1);
         assert!(
-            paths[0]
-                .display()
-                .to_string()
-                .ends_with("/tmp/files/report.md"),
+            paths[0].ends_with("tmp/files/report.md"),
             "tmp preview path should target EdgeCrab tmp/files mirror: {}",
             paths[0].display()
         );

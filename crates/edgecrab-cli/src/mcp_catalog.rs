@@ -670,7 +670,15 @@ fn render_arg(arg: &str, resolved_path: Option<&Path>) -> String {
 }
 
 fn normalize_install_path(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    // Windows: canonicalize() returns \\?\-prefixed extended-length paths.
+    // Strip the prefix so stored cwds and rendered args are plain paths that
+    // external commands and test assertions can compare without special-casing.
+    #[cfg(windows)]
+    if let Some(stripped) = canonical.to_string_lossy().strip_prefix(r"\\?\") {
+        return PathBuf::from(stripped.to_string());
+    }
+    canonical
 }
 
 #[cfg(test)]
@@ -769,13 +777,16 @@ mod tests {
             .mcp_servers
             .get("filesystem")
             .expect("filesystem preset");
-        assert!(
-            server
-                .args
-                .iter()
-                .any(|arg| arg.contains(&dir.path().display().to_string()))
-        );
+        // Use normalize_install_path for comparison so that the match is against
+        // the same canonical (\\?\ -stripped on Windows) representation that
+        // render_arg stores in the args list.
         let expected = normalize_install_path(dir.path());
+        let expected_str = expected.display().to_string();
+        assert!(
+            server.args.iter().any(|arg| arg.contains(&expected_str)),
+            "no arg contains expected path {expected_str}; got: {:?}",
+            server.args
+        );
         assert_eq!(server.cwd.as_deref(), Some(expected.as_path()));
     }
 
