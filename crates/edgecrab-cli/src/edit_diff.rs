@@ -163,15 +163,20 @@ fn resolve_preview_write_path(
     }
 
     let mut allowed_roots = vec![cwd.clone()];
-    // Always permit file_tools_tmp_dir as a preview target even if the
-    // directory has not been created yet (canonicalize would fail on a
-    // non-existent path). The starts_with comparison below uses the same
-    // non-canonical base as `candidate`, so no canonicalization is needed.
+    // Add both the raw path and the canonicalized path for file_tools_tmp_dir.
+    // WHY both: normalize_path() produces non-UNC paths (no \\?\ prefix), while
+    // canonicalize() on Windows returns \\?\-prefixed paths. starts_with() is
+    // component-based so these two forms never compare as equal; having both
+    // ensures candidates from either code path are accepted. The directory is
+    // created by file_path_policy() earlier in this function so canonicalize
+    // usually succeeds, but we push the raw path unconditionally for the
+    // case where it doesn't exist yet.
     let tmp_dir = config.file_tools_tmp_dir();
+    allowed_roots.push(tmp_dir.clone());
     if let Ok(root) = tmp_dir.canonicalize() {
-        allowed_roots.push(root);
-    } else {
-        allowed_roots.push(tmp_dir);
+        if root != tmp_dir {
+            allowed_roots.push(root);
+        }
     }
     for root in &config.file_allowed_roots {
         let resolved = if root.is_absolute() {
