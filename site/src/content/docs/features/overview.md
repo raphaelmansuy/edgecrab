@@ -178,16 +178,18 @@ reachable, these tools are silently absent from the tool list.
 |------|-------------|
 | `browser_navigate` | Navigate to a URL |
 | `browser_snapshot` | Get page accessibility tree as text |
-| `browser_screenshot` | Take a screenshot |
 | `browser_click` | Click an element |
 | `browser_type` | Type text into an input |
 | `browser_scroll` | Scroll the page |
-| `browser_console` | Capture browser console logs |
-| `browser_back` | Navigate back |
 | `browser_press` | Press a keyboard key |
+| `browser_back` | Navigate back |
 | `browser_close` | Close the browser |
+| `browser_console` | Capture browser console logs |
 | `browser_get_images` | Get images from the page |
-| `browser_vision` | Analyze page screenshot with vision model |
+| `browser_vision` | Take screenshot and analyze with vision model |
+| `browser_wait_for` | Wait for element/text to appear |
+| `browser_select` | Select a dropdown option |
+| `browser_hover` | Hover to trigger tooltips/states |
 
 ### Memory Tools (`memory`)
 
@@ -299,7 +301,7 @@ Only available in gateway sessions (Telegram, Discord, Slack, etc.):
 - [Memory](/features/memory/) — Persistent memory and Honcho user modeling
 - [Browser Automation](/features/browser/) — Browser automation with CDP
 - [SQLite State and Search](/features/state/) — Session persistence and FTS5 search
-- [Security Model](/user-guide/security/) — 6-layer defense stack
+- [Security Model](/user-guide/security/) — 7-layer defense stack
 
 ---
 
@@ -343,7 +345,7 @@ Yes. Use `--model ollama/llama3.3` (local Ollama) and `--toolset file,terminal,m
 
 **Q: How many tools can be active at once?**
 
-All registered tools (30+) can be active simultaneously. The LLM receives tool schemas in the system prompt. Limiting toolsets to what's needed keeps the system prompt shorter and the LLM more focused.
+All 74 registered tools can be active simultaneously. The LLM receives tool schemas in the system prompt. Limiting toolsets to what's needed keeps the system prompt shorter and the LLM more focused.
 
 **Q: Edge case: Can the agent call the same tool infinitely?**
 

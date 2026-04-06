@@ -38,7 +38,7 @@ agent = Agent(
     model="openai/gpt-4o",              # provider/model string
     system_prompt="You are a Rust expert.",  # optional system prompt
     api_key="sk-...",                   # optional; falls back to env var
-    max_loop_depth=20,                  # max ReAct iterations (default: 20)
+    max_iterations=90,                  # max ReAct iterations (default: 90)
     toolsets=["file", "web"],           # enable specific toolsets
     session_name="my-project",          # named session (persisted)
     base_url=None,                      # custom API endpoint (OpenAI-compatible)
@@ -226,7 +226,7 @@ See [sdks/python/README.md](https://github.com/raphaelmansuy/edgecrab/blob/main/
 - **Use `session_name` for long-running projects**: Named sessions persist their history in `~/.edgecrab/state.db`, so you pick up where you left off even after restarting Python.
 - **Use `stream_events` over `stream` when you need tool visibility**: It surfaces `ToolCallEvent` and `ToolResultEvent` so you can log or display exactly what the agent is doing.
 - **Gate file tools tightly in production**: Pass `toolsets=['web']` to limit the agent to web-only tools when running in an untrusted pipeline.
-- **Set short `max_loop_depth` for unit tests**: `max_loop_depth=3` makes tests fast and deterministic by forcing early completion.
+- **Set short `max_iterations` for unit tests**: `max_iterations=3` makes tests fast and deterministic by forcing early completion.
 - **Errors are typed**: Catch `ToolError` (security rejection, tool failure) and `ProviderError` (API quota, model error) separately for clean error handling.
 
 ---

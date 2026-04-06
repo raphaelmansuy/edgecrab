@@ -295,4 +295,4 @@ Higher `max_iterations` allows longer tool-call chains, which can increase cost 
 
 - [Environment Variables](/reference/environment-variables/) — env override reference
 - [CLI Commands](/reference/cli-commands/) — CLI flags that override config at runtime
-- [Security Model](/features/security/) — `security.*` config keys explained
+- [Security Model](/user-guide/security/) — `security.*` config keys explained

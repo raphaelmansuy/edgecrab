@@ -1,12 +1,12 @@
 ---
 title: Security Model
-description: EdgeCrab's defense-in-depth security architecture. Path traversal prevention, SSRF guards, Aho-Corasick command scanning, output redaction, and safe defaults. Grounded in crates/edgecrab-security/.
+description: EdgeCrab's defense-in-depth security architecture. Path traversal prevention, SSRF guards, Aho-Corasick command scanning, code sandbox env-stripping, output redaction, and safe defaults. 7 independent layers grounded in crates/edgecrab-security/ and crates/edgecrab-tools/.
 sidebar:
   order: 5
 ---
 
 Security is compiled into EdgeCrab — not runtime configuration switches.
-Every tool execution passes through a 6-layer defense stack before any
+Every tool execution passes through a **7-layer** defense stack before any
 file is read, any command is run, or any URL is fetched.
 
 ---
@@ -168,6 +168,21 @@ execution. Three modes:
 In gateway platforms (Telegram, Discord), approval appears as inline
 buttons. In the TUI, `/approve` and `/deny` slash commands confirm or
 reject pending actions.
+
+---
+
+## Layer 7 — Code Sandbox Isolation (`execute_code`)
+
+The `execute_code` tool runs user-supplied Python, JavaScript, Bash, Ruby, Perl, or Rust
+scripts inside an isolated subprocess. Two protections apply before the subprocess starts:
+
+**API key stripping:** All `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, and other known credential env vars are removed from the subprocess environment. Scripts cannot exfiltrate your API keys by reading environment variables.
+
+**7-tool RPC over Unix socket:** The sandbox can only interact with the outside world through exactly 7 whitelisted tool RPCs via a Unix domain socket (`/tmp/edgecrab-sandbox-*.sock`). It cannot make arbitrary HTTP calls or execute shell commands outside the RPC surface.
+
+**Timeout + output cap:** Maximum 5 minutes of execution; stdout is capped at 50 KB.
+
+This layer lives in `crates/edgecrab-tools/src/tools/execute_code.rs`, not in `edgecrab-security`, but is a compiled-in constraint applied at every `execute_code` invocation.
 
 ---
 

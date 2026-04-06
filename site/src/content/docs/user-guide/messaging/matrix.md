@@ -5,9 +5,9 @@ sidebar:
   order: 6
 ---
 
-The Matrix adapter connects to any Matrix homeserver using the Client-Server REST API. It uses long-poll sync for receiving messages and REST for sending replies.
+The Matrix adapter connects to any Matrix homeserver using the Client-Server REST API (`/_matrix/client/v3`). It uses long-poll sync (30-second timeout) for receiving messages and REST for sending replies.
 
-**Max message length**: 4000 characters (auto-chunked for longer messages).
+**Max message length**: 4000 characters — longer responses are auto-chunked.
 
 ---
 
@@ -34,7 +34,7 @@ The Matrix adapter connects to any Matrix homeserver using the Client-Server RES
 
 ### 1. Create a Bot Account
 
-Using the Matrix client API or any Matrix client, register a dedicated bot account. Retrieve its access token:
+Register a dedicated bot account, then retrieve its access token:
 
 ```bash
 curl -X POST https://matrix.org/_matrix/client/v3/login \
@@ -42,6 +42,8 @@ curl -X POST https://matrix.org/_matrix/client/v3/login \
   -d '{"type":"m.login.password","user":"edgecrab-bot","password":"<password>"}'
 # Returns: {"access_token": "syt_xxx..."}
 ```
+
+Or in Element Web: **Settings → Help & About → Access Token** (scroll to the bottom).
 
 ### 2. Set Environment Variables
 
@@ -77,6 +79,13 @@ Matrix adapter settings are read from environment variables only — there is no
 
 ---
 
+## Supported Media Types
+
+The Matrix adapter supports these file types for upload and receive:
+`png`, `jpg/jpeg`, `gif`, `webp`, `svg`, `bmp`, `pdf`, `txt`, `md`, `csv`, `json`, `zip`, `doc`, `docx`, `xls`, `xlsx`, `ppt`, `pptx`. Any other type falls back to `application/octet-stream`.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
@@ -84,5 +93,41 @@ Matrix adapter settings are read from environment variables only — there is no
 | Bot doesn't join room | Not invited | `/invite @botname:server` in the room |
 | Auth errors | Token expired | Re-authenticate and update `MATRIX_ACCESS_TOKEN` |
 | Bot sees old messages | Sync from past | Bot only processes messages after startup |
+| Responses truncated | Message > 4000 chars | EdgeCrab auto-chunks — check all reply segments |
+| File upload fails | Media server issue | Verify `MATRIX_HOMESERVER` allows media uploads |
 
-See [Messaging Gateway](/user-guide/messaging/) for gateway-level config.\n\n---\n\n## Pro Tips\n\n- **Use a dedicated bot account** rather than your personal Matrix account. A separate account has a distinct display name, making it obvious in rooms which messages are from the agent.\n- **Long-lived access tokens vs. passwords:** Prefer using long-lived tokens from `/_matrix/client/v3/login` rather than embedding passwords. Tokens don't reveal your password if leaked and can be invalidated individually.\n- **Room-per-project pattern:** Create a separate Matrix room for each project or context (e.g. `#my-app-dev:matrix.org`). EdgeCrab maintains one session per room, so each project has independent memory and history.\n- **E2E encryption rooms:** The current Matrix adapter does not support encrypted rooms (e2e). Create rooms without encryption (`m.room.join_rules: public` or invite-only without encryption) for the bot.\n- **Verify the bot's device:** For rooms with other members, you may be prompted to verify the bot's Matrix device. Either verify it or disable E2E encryption for the room.\n\n---\n\n## FAQ\n\n**Q: Can I use a matrix.org account or do I need my own homeserver?**  \nYou can use any Matrix homeserver including matrix.org, element.io, or your own Synapse/Dendrite server. The adapter only needs the `MATRIX_HOMESERVER` URL and an access token.\n\n**Q: How do I get a long-lived access token without using curl?**  \nIn Element Web: *Settings \u2192 Help & About \u2192 Access Token* (scroll to bottom of the page). Copy the token shown there.\n\n**Q: The bot joins a room but doesn't respond to messages.**  \nCheck `MATRIX_ALLOWED_USERS`. If set, only those Matrix user IDs can trigger responses. Also verify the bot account has joined the room (not just been invited).\n\n**Q: Can the bot be in multiple rooms at once?**  \nYes \u2014 invite the bot to as many rooms as you want. It maintains separate sessions per room.\n\n**Q: Does EdgeCrab support Matrix reactions or threads?**  \nNot currently. EdgeCrab sends plain text replies (auto-chunked if >4000 chars) and does not interpret reaction events.\n\n---\n\n## See Also\n\n- [Messaging Gateway Overview](/user-guide/messaging/) \u2014 Multi-platform routing\n- [Security Model](/user-guide/security/) \u2014 Access control and allowed users\n- [Sessions](/user-guide/sessions/) \u2014 One session per room
+---
+
+## Pro Tips
+
+- **Use a dedicated bot account** — gives it a distinct display name so it's obvious in rooms.
+- **Long-lived access tokens** — use tokens from `/_matrix/client/v3/login` rather than embedding passwords. Tokens can be invalidated individually without exposing your password.
+- **Room-per-project pattern** — EdgeCrab maintains one session per room, so each project gets independent memory and history. Create `#app-dev:matrix.org`, `#ops:matrix.org`, etc.
+- **E2E encryption rooms** — The current adapter does not support end-to-end encrypted rooms. Create rooms without encryption enabled.
+
+---
+
+## FAQ
+
+**Q: Can I use matrix.org or do I need my own homeserver?**
+Any Matrix homeserver works — matrix.org, element.io, or your own Synapse/Dendrite. Only `MATRIX_HOMESERVER` and an access token are needed.
+
+**Q: The bot joins a room but doesn't respond.**
+Check `MATRIX_ALLOWED_USERS`. If set, only listed Matrix user IDs can trigger responses. Also verify the bot has actually joined (accepted the invite), not just been invited.
+
+**Q: Can the bot be in multiple rooms at once?**
+Yes — invite the bot to as many rooms as you want. It maintains separate sessions per room.
+
+**Q: Does EdgeCrab support Matrix reactions or threads?**
+Not currently. EdgeCrab sends plain text replies (auto-chunked at 4000 chars) and does not interpret reaction or thread events.
+
+**Q: How long before the bot reconnects after a network drop?**
+The adapter uses a 30-second sync timeout. If the homeserver doesn't respond, it retries with exponential backoff: 5s → 10s → 20s → … → 120s cap.
+
+---
+
+## See Also
+
+- [Messaging Gateway Overview](/user-guide/messaging/) — Multi-platform routing
+- [Security Model](/user-guide/security/) — Access control and allowed users
+- [Sessions](/user-guide/sessions/) — One session per room

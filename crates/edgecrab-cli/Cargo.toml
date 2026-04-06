@@ -43,6 +43,7 @@ reqwest = { workspace = true }
 arboard = "3"
 unicode-width = { workspace = true }
 similar = { workspace = true }
+which = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

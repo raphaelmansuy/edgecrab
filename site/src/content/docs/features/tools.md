@@ -1,11 +1,11 @@
 ---
 title: Tools & Toolsets
-description: All 60+ EdgeCrab tools organized into toolsets, custom groups, toolset aliases, and runtime gating. Grounded in crates/edgecrab-tools/src/toolsets.rs and the tool registry.
+description: All 74 EdgeCrab tools organized into toolsets, custom groups, toolset aliases, and runtime gating. Grounded in crates/edgecrab-tools/src/registry.rs and the tool registry.
 sidebar:
   order: 4
 ---
 
-Tools are the atomic actions EdgeCrab can perform. They are organized into **toolsets** (named groups) and activated via **aliases** in config or CLI.
+Tools are the atomic actions EdgeCrab can perform. **74 tools** are registered at compile time via `inventory::submit!`. They are organized into **toolsets** (named groups) and activated via **aliases** in config or CLI.
 
 ---
 
@@ -70,7 +70,8 @@ Then use `--toolset my-research` on the CLI.
 |------|-------------|
 | `read_file` | Read file contents with optional `start_line`/`end_line` range |
 | `write_file` | Write or overwrite a file (creates parent dirs automatically) |
-| `patch` | Apply a unified diff patch to a file |
+| `patch` | Generate a unified diff patch for review |
+| `apply_patch` | Apply a unified diff patch to a file |
 | `search_files` | Regex or glob search across a directory tree |
 
 ### `terminal` — Process Management
@@ -96,16 +97,18 @@ Then use `--toolset my-research` on the CLI.
 |------|-------------|
 | `browser_navigate` | Navigate to a URL in a CDP-connected Chrome instance |
 | `browser_snapshot` | Get page accessibility tree as structured text |
-| `browser_screenshot` | Take a full-page or viewport screenshot |
 | `browser_click` | Click an element by CSS selector or text |
 | `browser_type` | Type text into a focused input |
 | `browser_scroll` | Scroll the page in any direction |
-| `browser_console` | Return buffered console.log/warn/error messages |
-| `browser_back` | Navigate back in browser history |
 | `browser_press` | Press a keyboard key (Enter, Tab, Escape, etc.) |
+| `browser_back` | Navigate back in browser history |
 | `browser_close` | Close the browser and release CDP connection |
+| `browser_console` | Return buffered console.log/warn/error messages |
 | `browser_get_images` | Return base64-encoded images currently visible |
 | `browser_vision` | Screenshot + analyze with vision model |
+| `browser_wait_for` | Wait for a selector or text to appear on the page |
+| `browser_select` | Select an option in a dropdown element |
+| `browser_hover` | Hover over an element to trigger tooltip/hover states |
 
 ### `memory` — Persistent Memory
 | Tool | Description |
@@ -133,6 +136,17 @@ Then use `--toolset my-research` on the CLI.
 |------|-------------|
 | `manage_todo_list` | Create and manage a todo list for the current task |
 | `clarify` | Ask the user a clarifying question before proceeding |
+| `send_message` | Send a message to the current gateway channel |
+
+### `homeassistant` — Smart Home
+| Tool | Description |
+|------|-------------|
+| `ha_list_entities` | List all Home Assistant entities with their states |
+| `ha_get_state` | Get the current state of a specific entity |
+| `ha_list_services` | List available HA services for a domain |
+| `ha_call_service` | Call a Home Assistant service (e.g. turn on a light) |
+
+> Available only when `HA_URL` and `HA_TOKEN` environment variables are set.
 
 ### `scheduling` — Cron Jobs
 | Tool | Description |
@@ -148,7 +162,7 @@ Then use `--toolset my-research` on the CLI.
 ### `code_execution` — Sandboxed Execution
 | Tool | Description |
 |------|-------------|
-| `execute_code` | Execute Python, Node.js, or Bash code in an isolated sandbox |
+| `execute_code` | Execute Python, JavaScript, Bash, Ruby, Perl, or Rust code in an isolated sandbox with 7-tool RPC over Unix socket, 5-min timeout, and API keys stripped from the environment |
 
 ### `session` — History Search
 | Tool | Description |
@@ -261,7 +275,7 @@ Or define a custom group in `config.yaml` with exactly the tools you need.
 
 Watch the `⚙` tool call indicators in the TUI. For a complete log, use:
 ```bash
-edgecrab sessions show <id>
+edgecrab sessions export <id> --format jsonl
 ```
 This shows every tool call and result from the full session history.
 

@@ -88,6 +88,96 @@ All `EDGECRAB_*` variables are applied via `apply_env_overrides()` in `config.rs
 
 ---
 
+## Matrix Variables
+
+| Variable | Type | Description |
+|----------|------|-------------|
+| `MATRIX_HOMESERVER` | string | **Required.** Homeserver URL (e.g. `https://matrix.org`) |
+| `MATRIX_ACCESS_TOKEN` | string | **Required.** Long-lived access token |
+| `MATRIX_USER_ID` | string | Full user ID (e.g. `@edgecrab:matrix.org`) |
+| `MATRIX_ALLOWED_USERS` | csv | Comma-separated Matrix user IDs |
+
+---
+
+## Mattermost Variables
+
+| Variable | Type | Description |
+|----------|------|-------------|
+| `MATTERMOST_URL` | string | **Required.** Server URL (e.g. `https://chat.example.com`) |
+| `MATTERMOST_TOKEN` | string | **Required.** Bot or personal access token |
+| `MATTERMOST_ALLOWED_USERS` | csv | Comma-separated Mattermost user IDs |
+
+---
+
+## DingTalk Variables
+
+| Variable | Type | Description |
+|----------|------|-------------|
+| `DINGTALK_APP_KEY` | string | **Required.** DingTalk app AppKey |
+| `DINGTALK_APP_SECRET` | string | **Required.** DingTalk app AppSecret |
+| `DINGTALK_ROBOT_CODE` | string | Robot code if using multiple robots |
+| `DINGTALK_WEBHOOK_PORT` | integer | Inbound webhook port |
+
+---
+
+## SMS (Twilio) Variables
+
+| Variable | Type | Description |
+|----------|------|-------------|
+| `TWILIO_ACCOUNT_SID` | string | **Required.** Twilio Account SID |
+| `TWILIO_AUTH_TOKEN` | string | **Required.** Twilio Auth Token |
+| `TWILIO_PHONE_NUMBER` | string | **Required.** Your number in E.164 format (e.g. `+15551234567`) |
+| `SMS_WEBHOOK_PORT` | integer | Local webhook port (default: `8082`) |
+| `SMS_ALLOWED_USERS` | csv | Comma-separated allowed phone numbers (E.164) |
+
+---
+
+## Email Variables
+
+| Variable | Type | Description |
+|----------|------|-------------|
+| `EMAIL_PROVIDER` | string | **Required.** One of: `sendgrid`, `mailgun`, `generic_smtp` |
+| `EMAIL_API_KEY` | string | Required for SendGrid/Mailgun; optional for SMTP |
+| `EMAIL_FROM` | string | **Required.** Sender address (e.g. `bot@example.com`) |
+| `EMAIL_DOMAIN` | string | Required for Mailgun (e.g. `mg.example.com`) |
+| `EMAIL_SMTP_HOST` | string | Required for `generic_smtp` |
+| `EMAIL_SMTP_PORT` | integer | SMTP port (default: `587`) |
+| `EMAIL_SMTP_USERNAME` | string | SMTP username (defaults to `EMAIL_FROM`) |
+| `EMAIL_SMTP_PASSWORD` | string | SMTP password (fallback to `EMAIL_API_KEY`) |
+| `EMAIL_WEBHOOK_PORT` | integer | Inbound webhook port (default: `8093`) |
+| `EMAIL_ALLOWED` | csv | Comma-separated allowed sender addresses |
+
+---
+
+## Feishu / Lark Variables
+
+| Variable | Type | Description |
+|----------|------|-------------|
+| `FEISHU_APP_ID` | string | **Required.** Feishu/Lark app ID |
+| `FEISHU_APP_SECRET` | string | **Required.** Feishu/Lark app secret |
+| `FEISHU_WEBHOOK_PORT` | integer | Inbound webhook port |
+| `FEISHU_WEBHOOK_HOST` | string | Webhook bind host (default: `0.0.0.0`) |
+| `FEISHU_WEBHOOK_PATH` | string | Webhook path (default: `/feishu/webhook`) |
+| `FEISHU_BASE_URL` | string | Override Feishu API base URL |
+| `FEISHU_VERIFICATION_TOKEN` | string | Webhook verification token |
+| `FEISHU_ENCRYPT_KEY` | string | Webhook payload encryption key |
+| `FEISHU_BOT_OPEN_ID` | string | Bot's open ID (used to filter out own messages) |
+| `FEISHU_BOT_USER_ID` | string | Bot's user ID (alternative to `FEISHU_BOT_OPEN_ID`) |
+| `FEISHU_BOT_NAME` | string | Bot's display name (alternative identity filter) |
+| `FEISHU_GROUP_POLICY` | string | Group chat message policy |
+
+---
+
+## WeCom Variables
+
+| Variable | Type | Description |
+|----------|------|-------------|
+| `WECOM_BOT_ID` | string | **Required.** WeCom bot corp ID |
+| `WECOM_SECRET` | string | **Required.** WeCom bot secret |
+| `WECOM_WEBSOCKET_URL` | string | Override WeCom WebSocket URL |
+
+---
+
 ## TTS / STT Variables
 
 | Variable | Type | Description |
@@ -108,13 +198,16 @@ These are not `EDGECRAB_*` variables — they are standard API key env vars dete
 | `ANTHROPIC_API_KEY` | Anthropic |
 | `OPENAI_API_KEY` | OpenAI |
 | `GOOGLE_API_KEY` | Google Gemini |
+| `GOOGLE_APPLICATION_CREDENTIALS` | Vertex AI (path to service account JSON) |
 | `XAI_API_KEY` | xAI Grok |
 | `DEEPSEEK_API_KEY` | DeepSeek |
+| `MISTRAL_API_KEY` | Mistral AI |
+| `GROQ_API_KEY` | Groq (LPU inference) |
 | `HUGGING_FACE_HUB_TOKEN` | HuggingFace |
-| `ZAI_API_KEY` | ZAI |
+| `ZAI_API_KEY` | Z.AI |
 | `GITHUB_TOKEN` | GitHub Copilot |
 
-Ollama and LM Studio require no API key.
+Ollama and LM Studio require no API key (local inference only).
 
 ---
 

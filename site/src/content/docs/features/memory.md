@@ -186,7 +186,7 @@ Or manually edit `~/.edgecrab/memories/`. There's no automatic pruning.
 
 **Q: I accidentally deleted an important memory. How do I recover it?**
 
-If you keep `~/.edgecrab/` under version control or have a backup, restore from there. Otherwise, the session history in `state.db` is preserved — search it with `edgecrab sessions search "keyword"` and reconstruct what was lost.
+If you keep `~/.edgecrab/` under version control or have a backup, restore from there. Otherwise, the session history in `state.db` is preserved — search it with `edgecrab sessions browse --query "keyword"` and reconstruct what was lost.
 
 ---
 

@@ -295,4 +295,4 @@ See the Crate Responsibilities table above, or search: `grep -rn "fn my_function
 
 - [Contributing](/developer/contributing/) — build, test, and PR process
 - [Configuration Reference](/reference/configuration/) — `AppConfig` fields and defaults
-- [Security Model](/features/security/) — runtime security layers in detail
+- [Security Model](/user-guide/security/) — runtime security layers in detail

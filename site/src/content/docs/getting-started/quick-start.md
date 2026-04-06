@@ -327,5 +327,5 @@ Reduce `model.max_iterations` or break the prompt into smaller steps. For large 
 
 **Q: Where are my conversation logs stored?**
 
-In `~/.edgecrab/state.db` (SQLite). Browse them with `edgecrab sessions list` and search with `edgecrab sessions search "auth bug"`.
+In `~/.edgecrab/state.db` (SQLite). Browse them with `edgecrab sessions list` and search with `edgecrab sessions browse --query "auth bug"`.
 

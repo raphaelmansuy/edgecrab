@@ -100,11 +100,12 @@ Output:
 ```bash
 edgecrab sessions list                    # List all sessions
 edgecrab sessions list --limit 20         # Show most recent 20
-edgecrab sessions show my-project         # Show messages in a session
+edgecrab sessions browse                  # Browse and search sessions interactively
+edgecrab sessions browse --query <term>   # Full-text search across session history
 edgecrab sessions delete my-project       # Delete a session (irreversible)
-edgecrab sessions prune --older-than 90d  # Delete sessions older than 90 days
-edgecrab sessions prune --keep-last 50    # Keep only the 50 most recent
-edgecrab sessions export my-project > session.json   # Export to JSON
+edgecrab sessions prune --older-than 90   # Delete sessions older than 90 days
+edgecrab sessions export my-project       # Export session to Markdown
+edgecrab sessions export my-project --format jsonl  # Export to JSONL with tool calls
 ```
 
 ---
@@ -181,7 +182,7 @@ All messages are kept in memory for the duration of the session and discarded on
 
 ## Pro Tips
 
-**Search before asking.** If you've worked on a topic before, `edgecrab sessions search "authentication jwt"` returns the exact conversation where you solved it. Faster than re-asking the agent.
+**Search before asking.** If you've worked on a topic before, `edgecrab sessions browse --query "authentication jwt"` returns the exact conversation where you solved it. Faster than re-asking the agent.
 
 **Export important sessions.** Before pruning old sessions, export the ones worth keeping:
 ```bash

@@ -25,6 +25,7 @@ mod gateway_catalog;
 mod gateway_cmd;
 mod gateway_setup;
 mod markdown_render;
+mod mcp_catalog;
 mod model_discovery;
 #[cfg(target_os = "macos")]
 mod permissions;
@@ -430,7 +431,7 @@ async fn run_subcommand(cmd: Command, args: &CliArgs) -> anyhow::Result<()> {
         }
 
         Command::Mcp { command } => {
-            run_mcp(command, args)?;
+            run_mcp(command, args).await?;
         }
 
         Command::Plugins { command } => {
@@ -885,17 +886,119 @@ fn run_tools(command: ToolsCommand, args: &CliArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_mcp(command: McpCommand, args: &CliArgs) -> anyhow::Result<()> {
+async fn run_mcp(command: McpCommand, args: &CliArgs) -> anyhow::Result<()> {
     let runtime = load_runtime(args.config.as_deref(), args.model.as_deref(), None)?;
     let mut config = runtime.config;
     match command {
-        McpCommand::List => {
-            if config.mcp_servers.is_empty() {
+        McpCommand::List => match edgecrab_tools::tools::mcp_client::configured_servers() {
+            Ok(servers) if !servers.is_empty() => {
+                for server in servers {
+                    let transport = if let Some(url) = &server.url {
+                        format!("http {url}")
+                    } else {
+                        let mut rendered = server.command;
+                        if !server.args.is_empty() {
+                            rendered.push(' ');
+                            rendered.push_str(&server.args.join(" "));
+                        }
+                        rendered
+                    };
+                    println!("{}  {}", server.name, transport);
+                }
+            }
+            Ok(_) => {
+                println!("No MCP servers configured.");
+            }
+            Err(_) if config.mcp_servers.is_empty() => {
+                println!("No MCP servers configured.");
+            }
+            Err(e) => return Err(anyhow::anyhow!(e.to_string())),
+        },
+        McpCommand::Search { query } => {
+            let results = mcp_catalog::search_presets(query.as_deref());
+            if results.is_empty() {
+                println!("No curated MCP presets matched.");
+                return Ok(());
+            }
+            for preset in results {
+                println!(
+                    "{} — {} [{}]",
+                    preset.id,
+                    preset.description,
+                    preset.tags.join(", ")
+                );
+            }
+        }
+        McpCommand::View { preset } => {
+            let preset = mcp_catalog::find_preset(&preset)
+                .ok_or_else(|| anyhow::anyhow!("unknown MCP preset '{}'", preset))?;
+            println!("Preset: {}", preset.id);
+            println!("Name:   {}", preset.display_name);
+            println!("Why:    {}", preset.description);
+            println!("Cmd:    {} {}", preset.command, preset.args.join(" "));
+            println!("Tags:   {}", preset.tags.join(", "));
+            if !preset.required_env.is_empty() {
+                println!("Env:    {}", preset.required_env.join(", "));
+            }
+            println!("Notes:  {}", preset.notes);
+        }
+        McpCommand::Install { preset, name, path } => {
+            let cwd = std::env::current_dir().context("cannot determine current directory")?;
+            let installed = mcp_catalog::install_preset(
+                &mut config,
+                &preset,
+                name.as_deref(),
+                path.as_deref().map(std::path::Path::new),
+                &cwd,
+            )?;
+            config.save_to(&runtime.config_path)?;
+            println!("Configured MCP server '{}'.", installed.name);
+            if !installed.missing_env.is_empty() {
+                println!(
+                    "Warning: missing environment variables: {}",
+                    installed.missing_env.join(", ")
+                );
+            }
+            println!(
+                "Run `edgecrab mcp test {}` to verify connectivity.",
+                installed.name
+            );
+        }
+        McpCommand::Test { name } => {
+            let targets = if let Some(name) = name {
+                vec![name]
+            } else {
+                edgecrab_tools::tools::mcp_client::configured_servers()
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?
+                    .into_iter()
+                    .map(|server| server.name)
+                    .collect::<Vec<_>>()
+            };
+
+            if targets.is_empty() {
                 println!("No MCP servers configured.");
                 return Ok(());
             }
-            for (name, server) in &config.mcp_servers {
-                println!("{}  {} {}", name, server.command, server.args.join(" "));
+
+            for target in targets {
+                match edgecrab_tools::tools::mcp_client::probe_configured_server(&target).await {
+                    Ok(result) => {
+                        println!(
+                            "{}  ok  transport={} tools={}",
+                            result.server_name, result.transport, result.tool_count
+                        );
+                        for (tool_name, description) in result.tools.iter().take(5) {
+                            if description.is_empty() {
+                                println!("  - {}", tool_name);
+                            } else {
+                                println!("  - {} — {}", tool_name, description);
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        println!("{}  fail  {}", target, err);
+                    }
+                }
             }
         }
         McpCommand::Add {

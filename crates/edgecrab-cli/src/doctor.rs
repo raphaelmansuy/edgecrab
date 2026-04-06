@@ -81,6 +81,7 @@ pub async fn run(config_override: Option<&str>) -> anyhow::Result<bool> {
     checks.push(check_state_dir(&context.home));
     checks.push(check_memories(&context.home));
     checks.push(check_skills(&context.home));
+    checks.extend(check_mcp_servers());
     checks.extend(check_provider_keys());
     checks.push(check_vertexai_adc());
     #[cfg(target_os = "macos")]
@@ -246,6 +247,67 @@ fn count_installed_skills(root: &Path) -> usize {
     }
 
     count
+}
+
+fn check_mcp_servers() -> Vec<Check> {
+    let servers = match edgecrab_tools::tools::mcp_client::configured_servers() {
+        Ok(servers) => servers,
+        Err(edgecrab_types::ToolError::Unavailable { .. }) => {
+            return vec![Check::warn("MCP", "no MCP servers configured")];
+        }
+        Err(err) => {
+            return vec![Check::fail("MCP", format!("configuration error: {err}"))];
+        }
+    };
+
+    if servers.is_empty() {
+        return vec![Check::warn("MCP", "no MCP servers configured")];
+    }
+
+    let mut checks = Vec::new();
+    checks.push(Check::pass(
+        "MCP",
+        format!("{} configured server(s)", servers.len()),
+    ));
+
+    for server in servers {
+        let label = format!("MCP {}", server.name);
+        if let Some(url) = &server.url {
+            let token_ok = server.token_from_config || server.token_from_store;
+            let detail = if token_ok {
+                format!("HTTP {} (auth configured)", url)
+            } else {
+                format!("HTTP {} (no auth token configured)", url)
+            };
+            checks.push(if token_ok {
+                Check::pass(&label, detail)
+            } else {
+                Check::warn(&label, detail)
+            });
+            continue;
+        }
+
+        if server.command.trim().is_empty() {
+            checks.push(Check::fail(&label, "stdio server missing command"));
+            continue;
+        }
+
+        match which::which(&server.command) {
+            Ok(path) => {
+                let mut detail = format!("{} found at {}", server.command, path.display());
+                if let Some(cwd) = &server.cwd {
+                    detail.push_str(&format!(" | cwd={}", cwd.display()));
+                }
+                checks.push(Check::pass(&label, detail));
+            }
+            Err(_) => checks.push(Check::fail(
+                &label,
+                format!("command '{}' not found on PATH", server.command),
+            )),
+        }
+    }
+
+    checks
 }
 
 /// Check VertexAI Application Default Credentials (ADC) and project setup.
@@ -681,6 +743,42 @@ mod tests {
         // runs without panic — we can't guarantee env state in CI)
         let checks = check_provider_keys();
         assert!(!checks.is_empty());
+    }
+
+    #[test]
+    fn check_mcp_servers_warns_when_absent() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let tmp = TempDir::new().expect("tmp");
+        // SAFETY: protected by TEST_ENV_LOCK.
+        unsafe { std::env::set_var("EDGECRAB_HOME", tmp.path()) };
+        let checks = check_mcp_servers();
+        // SAFETY: protected by TEST_ENV_LOCK.
+        unsafe { std::env::remove_var("EDGECRAB_HOME") };
+
+        assert_eq!(checks[0].status, CheckStatus::Warn);
+    }
+
+    #[test]
+    fn check_mcp_servers_reports_configured_stdio_server() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let tmp = TempDir::new().expect("tmp");
+        std::fs::write(
+            tmp.path().join("config.yaml"),
+            "mcp_servers:\n  fetch:\n    command: sh\n    args: ['-c', 'exit 0']\n    enabled: true\n",
+        )
+        .expect("write config");
+        // SAFETY: protected by TEST_ENV_LOCK.
+        unsafe { std::env::set_var("EDGECRAB_HOME", tmp.path()) };
+        let checks = check_mcp_servers();
+        // SAFETY: protected by TEST_ENV_LOCK.
+        unsafe { std::env::remove_var("EDGECRAB_HOME") };
+
+        assert!(checks.iter().any(|check| check.label == "MCP"));
+        assert!(checks.iter().any(|check| check.label == "MCP fetch"));
     }
 
     #[cfg(target_os = "macos")]

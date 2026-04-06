@@ -50,10 +50,12 @@ MCP          /mcp-token
 
 | Command | Description |
 |---------|-------------|
-| `/model [name]` | Show current model or switch (e.g. `/model anthropic/claude-opus-4`) |
+| `/model [name]` | Show current model or switch (e.g. `/model anthropic/claude-opus-4.6`) |
+| `/models [provider]` | List models; `/models <provider>` queries live, `/models refresh` refreshes cache |
+| `/vision_model [spec]` | Open vision model selector, or set/show the dedicated vision backend |
 | `/provider` | List available providers |
-| `/reasoning [level]` | Set reasoning effort: `off`, `low`, `medium`, `high` — or `show`/`hide` for think-block visibility |
-| `/stream [on\|off\|toggle\|status]` | Toggle live token streaming |
+| `/reasoning [level]` | Set reasoning effort: `off`, `low`, `medium`, `high` — or `show`/`hide` for think-block visibility (alias: `/think`) |
+| `/stream [on\|off\|toggle\|status]` | Toggle live token streaming (alias: `/streaming`) |
 
 ---
 
@@ -80,12 +82,12 @@ MCP          /mcp-token
 
 | Command | Description |
 |---------|-------------|
-| `/config [key] [value]` | Read or set configuration values live (dotted key path) |
+| `/config` | Show config file paths and `EDGECRAB_HOME` directory |
 | `/prompt` | Show the full assembled system prompt for this session |
 | `/verbose` | Cycle tool verbosity: `off` → `new` → `all` → `verbose` |
 | `/personality [name]` | Show active personality or switch preset mid-session |
 | `/skin [name]` | Switch skin preset (alias: `/theme`) |
-| `/statusbar [on\|off]` | Toggle the status bar visibility |
+| `/statusbar` | Toggle the status bar visibility |
 
 ---
 
