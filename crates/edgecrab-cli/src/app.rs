@@ -111,6 +111,15 @@ struct AudioPlayerSpec {
     args: &'static [&'static str],
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AudioRecorderBackend {
+    FfmpegAvFoundation,
+    FfmpegDShow,
+    Arecord,
+    Rec,
+    FfmpegPulse,
+}
+
 const AUDIO_PLAYER_CANDIDATES: &[AudioPlayerSpec] = &[
     AudioPlayerSpec {
         program: "afplay",
@@ -138,6 +147,16 @@ const AUDIO_PLAYER_CANDIDATES: &[AudioPlayerSpec] = &[
     },
 ];
 
+fn describe_audio_recorder(backend: AudioRecorderBackend) -> &'static str {
+    match backend {
+        AudioRecorderBackend::FfmpegAvFoundation => "ffmpeg-avfoundation",
+        AudioRecorderBackend::FfmpegDShow => "ffmpeg-dshow",
+        AudioRecorderBackend::Arecord => "arecord",
+        AudioRecorderBackend::Rec => "rec",
+        AudioRecorderBackend::FfmpegPulse => "ffmpeg-pulse",
+    }
+}
+
 fn select_audio_player_with<F>(mut exists: F) -> Option<AudioPlayerSpec>
 where
     F: FnMut(&str) -> bool,
@@ -150,6 +169,210 @@ where
 
 fn preferred_audio_player() -> Option<AudioPlayerSpec> {
     select_audio_player_with(|program| which::which(program).is_ok())
+}
+
+fn select_audio_recorder_with<F>(mut exists: F) -> Option<AudioRecorderBackend>
+where
+    F: FnMut(&str) -> bool,
+{
+    if cfg!(target_os = "macos") && exists("ffmpeg") {
+        return Some(AudioRecorderBackend::FfmpegAvFoundation);
+    }
+    if cfg!(target_os = "windows") && exists("ffmpeg") {
+        return Some(AudioRecorderBackend::FfmpegDShow);
+    }
+    if exists("arecord") {
+        return Some(AudioRecorderBackend::Arecord);
+    }
+    if exists("rec") {
+        return Some(AudioRecorderBackend::Rec);
+    }
+    if exists("ffmpeg") {
+        return Some(AudioRecorderBackend::FfmpegPulse);
+    }
+    None
+}
+
+fn preferred_audio_recorder() -> Option<AudioRecorderBackend> {
+    select_audio_recorder_with(|program| which::which(program).is_ok())
+}
+
+fn voice_recording_ready(input_device: Option<&str>) -> Result<AudioRecorderBackend, String> {
+    if !TranscribeAudioTool.is_available() {
+        return Err(
+            "No speech-to-text backend available. Install local `whisper`, or configure `GROQ_API_KEY` / `OPENAI_API_KEY`."
+                .into(),
+        );
+    }
+
+    let backend = preferred_audio_recorder().ok_or_else(|| {
+        String::from(
+            "No supported microphone recorder found. Install one of: `ffmpeg`, `arecord`, or `rec`.",
+        )
+    })?;
+    if matches!(backend, AudioRecorderBackend::FfmpegDShow) && input_device.is_none() {
+        return Err(
+            "Windows microphone capture requires `voice.input_device` in config.yaml (ffmpeg dshow device name)."
+                .into(),
+        );
+    }
+    Ok(backend)
+}
+
+fn spawn_audio_recorder(
+    path: &std::path::Path,
+    input_device: Option<&str>,
+) -> anyhow::Result<(std::process::Child, AudioRecorderBackend)> {
+    let backend =
+        preferred_audio_recorder().ok_or_else(|| anyhow::anyhow!("no supported recorder found"))?;
+    let mut command = match backend {
+        AudioRecorderBackend::FfmpegAvFoundation => {
+            let mut command = std::process::Command::new("ffmpeg");
+            command.args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "avfoundation",
+                "-i",
+                input_device.unwrap_or(":default"),
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-y",
+            ]);
+            command
+        }
+        AudioRecorderBackend::FfmpegDShow => {
+            let mut command = std::process::Command::new("ffmpeg");
+            command.args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "dshow",
+                "-i",
+                input_device.unwrap_or("audio=default"),
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-y",
+            ]);
+            command
+        }
+        AudioRecorderBackend::Arecord => {
+            let mut command = std::process::Command::new("arecord");
+            command.args(["-q", "-f", "S16_LE", "-r", "16000", "-c", "1"]);
+            command
+        }
+        AudioRecorderBackend::Rec => {
+            let mut command = std::process::Command::new("rec");
+            command.args(["-q", "-c", "1", "-r", "16000"]);
+            command
+        }
+        AudioRecorderBackend::FfmpegPulse => {
+            let mut command = std::process::Command::new("ffmpeg");
+            command.args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "pulse",
+                "-i",
+                "default",
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-y",
+            ]);
+            command
+        }
+    };
+    command.arg(path);
+    command.stdin(std::process::Stdio::null());
+    command.stdout(std::process::Stdio::null());
+    command.stderr(std::process::Stdio::null());
+    let child = command.spawn()?;
+    Ok((child, backend))
+}
+
+fn stop_audio_recorder(child: &mut std::process::Child) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        if let Ok(pid) = i32::try_from(child.id()) {
+            // SIGINT lets ffmpeg/arecord finalize WAV headers before exit.
+            unsafe {
+                libc::kill(pid, libc::SIGINT);
+            }
+        }
+        for _ in 0..20 {
+            if child.try_wait()?.is_some() {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    if child.try_wait()?.is_none() {
+        child.kill()?;
+        let _ = child.wait()?;
+    }
+    Ok(())
+}
+
+fn terminal_bell(count: usize) {
+    let mut stdout = io::stdout();
+    for _ in 0..count {
+        let _ = stdout.write_all(b"\x07");
+    }
+    let _ = stdout.flush();
+}
+
+fn key_matches_binding(key: &event::KeyEvent, binding: &str) -> bool {
+    let normalized = binding.trim().to_ascii_lowercase().replace(' ', "");
+    if normalized.is_empty() {
+        return false;
+    }
+
+    let parts: Vec<&str> = normalized
+        .split('+')
+        .filter(|part| !part.is_empty())
+        .collect();
+    if parts.is_empty() {
+        return false;
+    }
+
+    let mut expected_modifiers = KeyModifiers::NONE;
+    for modifier in &parts[..parts.len().saturating_sub(1)] {
+        match *modifier {
+            "ctrl" | "control" => expected_modifiers |= KeyModifiers::CONTROL,
+            "alt" | "option" => expected_modifiers |= KeyModifiers::ALT,
+            "shift" => expected_modifiers |= KeyModifiers::SHIFT,
+            _ => return false,
+        }
+    }
+
+    let code_matches = match parts[parts.len() - 1] {
+        "enter" | "return" => key.code == KeyCode::Enter,
+        "esc" | "escape" => key.code == KeyCode::Esc,
+        "tab" => key.code == KeyCode::Tab,
+        "backspace" => key.code == KeyCode::Backspace,
+        "space" => key.code == KeyCode::Char(' '),
+        token if token.starts_with('f') => token[1..]
+            .parse::<u8>()
+            .ok()
+            .is_some_and(|function| key.code == KeyCode::F(function)),
+        token if token.len() == 1 => {
+            let expected = token.chars().next().unwrap_or_default();
+            matches!(key.code, KeyCode::Char(actual) if actual.to_ascii_lowercase() == expected)
+        }
+        _ => false,
+    };
+
+    code_matches && key.modifiers == expected_modifiers
 }
 
 fn voice_readback_ready() -> Result<AudioPlayerSpec, String> {
@@ -1244,6 +1467,12 @@ pub struct App {
     /// disruptive layout shift.  FIFO order matches tool-dispatch ordering and
     /// handles sequential multi-tool turns without any per-tool book-keeping.
     pending_tool_lines: std::collections::VecDeque<PendingToolLine>,
+    /// Active local microphone recording session for push-to-talk voice input.
+    voice_recording: Option<VoiceRecordingSession>,
+    /// Configured push-to-talk key binding loaded from config.yaml.
+    voice_push_to_talk_key: String,
+    /// Optional recorder input-device override for cross-platform microphone capture.
+    voice_input_device: Option<String>,
     /// File-based hook registry — loaded from ~/.edgecrab/hooks/ at startup.
     /// Receives tool:pre/post, llm:pre/post, and cli:start/end events.
     hook_registry: std::sync::Arc<edgecrab_gateway::hooks::HookRegistry>,
@@ -1253,6 +1482,14 @@ pub struct App {
 struct PendingToolLine {
     line_idx: usize,
     edit_snapshot: Option<LocalEditSnapshot>,
+}
+
+struct VoiceRecordingSession {
+    child: std::process::Child,
+    output_path: std::path::PathBuf,
+    submit_to_agent: bool,
+    backend: AudioRecorderBackend,
+    started_at: Instant,
 }
 
 /// Events from the agent background task → TUI event loop.
@@ -1490,6 +1727,8 @@ impl App {
                 .add_modifier(Modifier::ITALIC),
         );
 
+        let runtime_config = edgecrab_core::AppConfig::load().unwrap_or_default();
+
         let mut app = Self {
             textarea,
             editor_mode: InputEditorMode::Inline,
@@ -1579,6 +1818,9 @@ impl App {
             in_flight_tool_count: 0,
             turn_stream_tokens: 0,
             pending_tool_lines: std::collections::VecDeque::new(),
+            voice_recording: None,
+            voice_push_to_talk_key: runtime_config.voice.push_to_talk_key,
+            voice_input_device: runtime_config.voice.input_device,
             hook_registry: {
                 let mut r = edgecrab_gateway::hooks::HookRegistry::new();
                 r.discover_and_load();
@@ -2207,6 +2449,14 @@ impl App {
                 ("on", "Enable TTS — agent responses are read aloud"),
                 ("off", "Disable TTS"),
                 ("status", "Show current voice mode"),
+                (
+                    "record",
+                    "Start or stop microphone capture and transcribe it",
+                ),
+                ("talk", "Start or stop push-to-talk capture and submit it"),
+                ("tts", "Speak text immediately or enable auto-TTS"),
+                ("transcribe", "Transcribe a local audio file"),
+                ("reply", "Transcribe a local audio file and submit it"),
             ],
             // ── Mouse capture ──────────────────────────────────────────────────
             "mouse" => &[
@@ -3189,6 +3439,11 @@ impl App {
 
         self.needs_redraw = true;
 
+        if key_matches_binding(&key, &self.voice_push_to_talk_key) {
+            self.toggle_voice_recording(true);
+            return;
+        }
+
         // Global shortcuts first — these work regardless of any overlay
         match (key.modifiers, key.code) {
             // Ctrl+C — clear input → cancel agent → exit  (standard readline behaviour)
@@ -3200,6 +3455,8 @@ impl App {
                     self.completion.active = false;
                     self.history_pos = self.input_history.len();
                     self.push_output("^C", OutputRole::System);
+                } else if self.voice_recording.is_some() {
+                    self.abort_voice_recording("^C  (voice recording cancelled)");
                 } else if self.is_processing {
                     // Agent is running: interrupt it
                     if let Some(ref agent) = self.agent {
@@ -7071,6 +7328,165 @@ impl App {
         });
     }
 
+    fn spawn_direct_transcription_with_cleanup(
+        &mut self,
+        file_path: String,
+        submit_to_agent: bool,
+        cleanup_after: bool,
+    ) {
+        let tx = self.response_tx.clone();
+        let ctx = self.direct_media_tool_context();
+        self.rt_handle.spawn(async move {
+            let result = TranscribeAudioTool
+                .execute(serde_json::json!({ "file_path": file_path }), &ctx)
+                .await;
+            if cleanup_after {
+                let _ = tokio::fs::remove_file(&file_path).await;
+            }
+
+            match result {
+                Ok(output) => {
+                    let transcript = output
+                        .split_once('\n')
+                        .map(|(_, text)| text.trim().to_string())
+                        .unwrap_or_else(|| output.trim().to_string());
+                    let _ = tx.send(AgentResponse::VoiceTranscript {
+                        transcript,
+                        submit_to_agent,
+                    });
+                }
+                Err(error) => {
+                    let _ = tx.send(AgentResponse::Error(format!(
+                        "Transcription error: {error}"
+                    )));
+                }
+            }
+        });
+    }
+
+    fn start_voice_recording(&mut self, submit_to_agent: bool) {
+        let backend = match voice_recording_ready(self.voice_input_device.as_deref()) {
+            Ok(backend) => backend,
+            Err(reason) => {
+                self.push_output(
+                    format!("Voice recording unavailable: {reason}"),
+                    OutputRole::Error,
+                );
+                return;
+            }
+        };
+
+        let recordings_dir = std::env::temp_dir().join("edgecrab_voice");
+        if let Err(error) = std::fs::create_dir_all(&recordings_dir) {
+            self.push_output(
+                format!("Failed to create voice temp directory: {error}"),
+                OutputRole::Error,
+            );
+            return;
+        }
+        let output_path = recordings_dir.join(format!(
+            "recording_{}.wav",
+            chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f")
+        ));
+
+        match spawn_audio_recorder(&output_path, self.voice_input_device.as_deref()) {
+            Ok((child, actual_backend)) => {
+                terminal_bell(1);
+                self.voice_recording = Some(VoiceRecordingSession {
+                    child,
+                    output_path: output_path.clone(),
+                    submit_to_agent,
+                    backend: actual_backend,
+                    started_at: Instant::now(),
+                });
+                let action = if submit_to_agent {
+                    "recording voice reply"
+                } else {
+                    "recording voice note"
+                };
+                self.push_output(
+                    format!(
+                        "{action} via {}. Press {} again to stop.",
+                        describe_audio_recorder(actual_backend),
+                        self.voice_push_to_talk_key
+                    ),
+                    OutputRole::System,
+                );
+            }
+            Err(error) => {
+                let _ = std::fs::remove_file(&output_path);
+                self.push_output(
+                    format!(
+                        "Failed to start microphone recorder ({}): {error}",
+                        describe_audio_recorder(backend)
+                    ),
+                    OutputRole::Error,
+                );
+            }
+        }
+    }
+
+    fn stop_voice_recording(&mut self) {
+        let Some(mut recording) = self.voice_recording.take() else {
+            self.push_output("Voice recording is not active.", OutputRole::System);
+            return;
+        };
+
+        let duration = recording.started_at.elapsed();
+        terminal_bell(2);
+        if let Err(error) = stop_audio_recorder(&mut recording.child) {
+            self.push_output(
+                format!("Failed to stop voice recording cleanly: {error}"),
+                OutputRole::Error,
+            );
+            let _ = std::fs::remove_file(&recording.output_path);
+            return;
+        }
+
+        let metadata = std::fs::metadata(&recording.output_path).ok();
+        let size = metadata.as_ref().map(|meta| meta.len()).unwrap_or(0);
+        if size == 0 {
+            self.push_output(
+                "Voice recording captured no audio. Check microphone permissions and input device.",
+                OutputRole::Error,
+            );
+            let _ = std::fs::remove_file(&recording.output_path);
+            return;
+        }
+
+        self.push_output(
+            format!(
+                "Voice recording saved ({:.1}s, {} bytes) via {}. Transcribing...",
+                duration.as_secs_f64(),
+                size,
+                describe_audio_recorder(recording.backend)
+            ),
+            OutputRole::System,
+        );
+        self.spawn_direct_transcription_with_cleanup(
+            recording.output_path.display().to_string(),
+            recording.submit_to_agent,
+            true,
+        );
+    }
+
+    fn abort_voice_recording(&mut self, reason: &str) {
+        let Some(mut recording) = self.voice_recording.take() else {
+            return;
+        };
+        let _ = stop_audio_recorder(&mut recording.child);
+        let _ = std::fs::remove_file(&recording.output_path);
+        self.push_output(reason.to_string(), OutputRole::System);
+    }
+
+    fn toggle_voice_recording(&mut self, submit_to_agent: bool) {
+        if self.voice_recording.is_some() {
+            self.stop_voice_recording();
+        } else {
+            self.start_voice_recording(submit_to_agent);
+        }
+    }
+
     fn personality_arg_hints(&self) -> Vec<(String, String)> {
         let mut hints = vec![
             (
@@ -7713,9 +8129,8 @@ impl App {
     // after each turn.  This provides audio feedback without blocking
     // the streaming UI.
     //
-    // EdgeCrab still does not capture live microphone audio in the TUI, but it
-    // now supports deterministic local STT/TTS commands on top of the existing
-    // media tools instead of routing everything through the model.
+    // EdgeCrab now supports deterministic local microphone capture in the TUI
+    // using controlled recorder backends plus the existing STT/TTS tools.
 
     fn handle_voice_mode(&mut self, args: String) {
         let trimmed = args.trim();
@@ -7785,6 +8200,18 @@ impl App {
             );
             self.spawn_direct_transcription(file_path.to_string(), true);
             return;
+        }
+
+        match trimmed {
+            "record" => {
+                self.toggle_voice_recording(false);
+                return;
+            }
+            "talk" => {
+                self.toggle_voice_recording(true);
+                return;
+            }
+            _ => {}
         }
 
         match trimmed {
@@ -7859,35 +8286,61 @@ impl App {
                 let playback = preferred_audio_player()
                     .map(|player| player.program.to_string())
                     .unwrap_or_else(|| "unavailable".into());
+                let recorder = preferred_audio_recorder()
+                    .map(describe_audio_recorder)
+                    .unwrap_or("unavailable");
+                let input_device =
+                    self.voice_input_device
+                        .as_deref()
+                        .unwrap_or(if cfg!(target_os = "windows") {
+                            "not configured"
+                        } else {
+                            "default"
+                        });
                 let tts_status = if TextToSpeechTool.is_available() {
                     "available"
                 } else {
                     "unavailable"
+                };
+                let stt_status = if TranscribeAudioTool.is_available() {
+                    "available"
+                } else {
+                    "unavailable"
+                };
+                let recording_state = if self.voice_recording.is_some() {
+                    "recording"
+                } else {
+                    "idle"
                 };
                 self.push_output(
                     format!(
                         "Voice mode: {status}\n\
                          Default backend: {}  Voice: {}\n\
                          TTS backend: {tts_status}\n\
+                         STT backend: {stt_status}\n\
                          Playback: {playback}\n\
-                         Push-to-talk key: {} (recording not yet wired in TUI)\n\
+                         Recorder: {recorder}\n\
+                         Recorder input: {input_device}\n\
+                         Push-to-talk key: {push_to_talk_key} ({recording_state})\n\
                          /voice on           — enable spoken readback\n\
                          /voice tts          — alias for always-on spoken readback\n\
                          /voice off          — disable TTS readback\n\
                          /voice status       — show voice mode state\n\
+                         /voice record       — record audio and transcribe it\n\
+                         /voice talk         — record audio and submit transcript\n\
                          /voice tts <text>   — speak text immediately\n\
                          /voice transcribe <audio-file> — transcribe a local audio file\n\
                          /voice reply <audio-file>      — transcribe and submit it as your next prompt",
                         runtime_config.tts.provider,
                         runtime_config.tts.voice,
-                        runtime_config.voice.push_to_talk_key,
+                        push_to_talk_key = self.voice_push_to_talk_key,
                     ),
                     OutputRole::System,
                 );
             }
             _ => {
                 self.push_output(
-                    "Usage: /voice <on|off|tts|status|tts <text>|transcribe <file>|reply <file>>",
+                    "Usage: /voice <on|off|tts|status|record|talk|tts <text>|transcribe <file>|reply <file>>",
                     OutputRole::System,
                 );
             }
@@ -8897,6 +9350,19 @@ impl App {
             format!(" ${:.4}", self.session_cost),
             cost_style,
         ));
+        if let Some(recording) = &self.voice_recording {
+            left_spans.push(Span::styled(
+                " │ ",
+                Style::default().fg(Color::Rgb(50, 50, 65)),
+            ));
+            left_spans.push(Span::styled(
+                format!(" REC {:.0}s ", recording.started_at.elapsed().as_secs_f64()),
+                Style::default()
+                    .fg(Color::Rgb(30, 20, 20))
+                    .bg(Color::Rgb(240, 110, 90))
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
         if !self.active_subagents.is_empty() {
             left_spans.push(Span::styled(
                 " │ ",
@@ -9038,10 +9504,16 @@ impl App {
                         .add_modifier(Modifier::BOLD),
                 ));
             } else {
+                let voice_hint = if self.voice_push_to_talk_key.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {}=voice ", self.voice_push_to_talk_key.to_uppercase())
+                };
                 right_spans.push(Span::styled(
                     format!(
-                        " F6=select  F1=help  {}  F2=model  F3=skills  F7=vision  Tab=complete  ^C=cancel ",
-                        self.inline_compose_hint()
+                        " F6=select  F1=help  {}  F2=model  F3=skills  F7=vision{} Tab=complete  ^C=cancel ",
+                        self.inline_compose_hint(),
+                        voice_hint
                     ),
                     Style::default().fg(Color::Rgb(70, 75, 95)),
                 ));
@@ -10293,6 +10765,9 @@ fn event_loop(
         }
 
         if app.should_exit() {
+            if app.voice_recording.is_some() {
+                app.abort_voice_recording("Voice recording cancelled during exit.");
+            }
             return Ok(());
         }
     }
@@ -10669,6 +11144,9 @@ mod tests {
 
     #[tokio::test]
     async fn mcp_search_filters_official_snapshot_entries() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
         let dir = tempfile::tempdir().expect("tempdir");
         unsafe {
             std::env::set_var("EDGECRAB_HOME", dir.path());
@@ -10708,12 +11186,48 @@ mod tests {
             visible.iter().any(|title| title.contains("Time")),
             "expected the official time preset in filtered entries, got: {visible:?}"
         );
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
     }
 
     #[test]
     fn select_audio_player_prefers_first_available_candidate() {
         let player = select_audio_player_with(|program| matches!(program, "mpv" | "ffplay"));
         assert_eq!(player.map(|player| player.program), Some("ffplay"));
+    }
+
+    #[test]
+    fn select_audio_recorder_prefers_linux_native_recorders_before_ffmpeg() {
+        let recorder =
+            select_audio_recorder_with(|program| matches!(program, "ffmpeg" | "arecord"));
+        let expected = if cfg!(target_os = "macos") {
+            Some(AudioRecorderBackend::FfmpegAvFoundation)
+        } else if cfg!(target_os = "windows") {
+            Some(AudioRecorderBackend::FfmpegDShow)
+        } else {
+            Some(AudioRecorderBackend::Arecord)
+        };
+        assert_eq!(recorder, expected);
+    }
+
+    #[test]
+    fn key_binding_match_supports_case_and_spacing_normalization() {
+        let key = event::KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL);
+        assert!(key_matches_binding(&key, " Ctrl + B "));
+    }
+
+    #[test]
+    fn key_binding_match_rejects_wrong_modifier_or_unknown_binding() {
+        let key = event::KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL);
+        assert!(!key_matches_binding(&key, "alt+b"));
+        assert!(!key_matches_binding(&key, "hyper+b"));
+    }
+
+    #[test]
+    fn key_binding_match_supports_function_keys() {
+        let key = event::KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE);
+        assert!(key_matches_binding(&key, "f6"));
     }
 
     #[tokio::test]

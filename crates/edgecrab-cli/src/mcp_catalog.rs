@@ -676,13 +676,35 @@ fn normalize_install_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::MutexGuard;
 
-    fn set_temp_edgecrab_home() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().expect("tempdir");
-        unsafe {
-            std::env::set_var("EDGECRAB_HOME", dir.path());
+    struct TempEdgecrabHome {
+        _guard: MutexGuard<'static, ()>,
+        _dir: tempfile::TempDir,
+    }
+
+    impl TempEdgecrabHome {
+        fn new() -> Self {
+            let guard = crate::gateway_catalog::TEST_ENV_LOCK
+                .lock()
+                .expect("env lock");
+            let dir = tempfile::tempdir().expect("tempdir");
+            unsafe {
+                std::env::set_var("EDGECRAB_HOME", dir.path());
+            }
+            Self {
+                _guard: guard,
+                _dir: dir,
+            }
         }
-        dir
+    }
+
+    impl Drop for TempEdgecrabHome {
+        fn drop(&mut self) {
+            unsafe {
+                std::env::remove_var("EDGECRAB_HOME");
+            }
+        }
     }
 
     #[test]
@@ -800,14 +822,14 @@ mod tests {
 
     #[test]
     fn cached_catalog_falls_back_to_snapshot() {
-        let _dir = set_temp_edgecrab_home();
+        let _home = TempEdgecrabHome::new();
         let entries = load_official_catalog_cached();
         assert!(entries.iter().any(|entry| entry.id == "git"));
     }
 
     #[test]
     fn search_official_catalog_matches_official_entry_metadata() {
-        let _dir = set_temp_edgecrab_home();
+        let _home = TempEdgecrabHome::new();
         write_cached_official_catalog(&[OfficialCatalogEntry {
             id: "brave-search-archived".into(),
             display_name: "Brave Search".into(),

@@ -2052,8 +2052,8 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[tokio::test]
-    async fn mcp_list_tools_invalid_args() {
+    #[test]
+    fn mcp_list_tools_invalid_args() {
         let _guard = EDGECRAB_HOME_LOCK.lock().expect("lock");
         let dir = tempfile::tempdir().expect("tempdir");
         // SAFETY: protected by EDGECRAB_HOME_LOCK.
@@ -2061,7 +2061,9 @@ mod tests {
         let ctx = ToolContext::test_context();
         // Empty args are fine; no config should now behave as an empty catalog
         // rather than a hard legacy-path failure.
-        let result = McpListToolsTool.execute(json!({}), &ctx).await;
+        let result = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(async { McpListToolsTool.execute(json!({}), &ctx).await });
         // SAFETY: protected by EDGECRAB_HOME_LOCK.
         unsafe { std::env::remove_var("EDGECRAB_HOME") };
         let output = result.expect("empty MCP config should be tolerated");

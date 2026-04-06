@@ -15,7 +15,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85.0"
+rust-version = "1.86.0"
 license = "Apache-2.0"
 repository = "https://github.com/raphaelmansuy/edgecrab"
 authors = ["Raphael Mansuy"]
@@ -24,7 +24,7 @@ authors = ["Raphael Mansuy"]
 # Shared across workspace — single version for consistency
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_yml = "0.0.12"
+serde_yml = { package = "serde_norway", version = "0.9.42" }
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
 uuid = { version = "1", features = ["v4"] }
@@ -50,9 +50,9 @@ rusqlite = { version = "0.32", features = ["bundled", "functions"] }
 
 # CLI / TUI
 clap = { version = "4", features = ["derive"] }
-ratatui = "0.29"
-crossterm = "0.28"
-tui-textarea = "0.7"
+ratatui = "0.30"
+crossterm = "0.29"
+tui-textarea = { package = "tui-textarea-2", version = "0.10.2" }
 dialoguer = "0.12"
 unicode-width = "0.2"
 

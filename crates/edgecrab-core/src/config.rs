@@ -1486,6 +1486,11 @@ pub struct VoiceConfig {
     pub enabled: bool,
     /// Key binding for push-to-talk (default: Ctrl+B).
     pub push_to_talk_key: String,
+    /// Optional recorder input device override.
+    ///
+    /// For ffmpeg-based backends this is passed through as the raw device spec.
+    /// Windows microphone capture is only considered reliable when this is set.
+    pub input_device: Option<String>,
     /// Continuous listening mode (no key press required).
     pub continuous: bool,
     /// Filter hallucinated transcriptions.
@@ -1497,6 +1502,7 @@ impl Default for VoiceConfig {
         Self {
             enabled: false,
             push_to_talk_key: "ctrl+b".into(),
+            input_device: None,
             continuous: false,
             hallucination_filter: true,
         }

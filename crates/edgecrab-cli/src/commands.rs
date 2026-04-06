@@ -883,7 +883,7 @@ impl CommandRegistry {
         self.register(Command {
             name: "voice",
             aliases: &["tts"],
-            description: "Toggle voice/TTS mode (on/off/tts/status) — spoken readback of agent responses",
+            description: "Voice tools: spoken readback, mic recording, transcription, and push-to-talk",
             handler: |args| CommandResult::VoiceMode(args.trim().to_string()),
         });
 
@@ -998,7 +998,7 @@ fn help_text() -> String {
          \n\
          Scheduling & Media:\n\
            /cron [subcommand]    — Manage scheduled tasks\n\
-           /voice [on|off|tts]   — Toggle voice/TTS mode\n\
+           /voice [subcommand]   — Voice tools: TTS, record, talk, transcribe\n\
            /browser [sub]        — Chrome CDP: connect, disconnect, status, tabs, recording on|off\n\
          \n\
          Appearance:\n\
