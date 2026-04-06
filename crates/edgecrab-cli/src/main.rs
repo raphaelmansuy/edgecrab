@@ -446,7 +446,7 @@ async fn run_subcommand(cmd: Command, args: &CliArgs) -> anyhow::Result<()> {
         }
 
         Command::Skills { command } => {
-            run_skills(command)?;
+            run_skills(command).await?;
         }
 
         Command::Profile { command } => {
@@ -968,7 +968,7 @@ async fn run_gateway(command: GatewayCommand, args: &CliArgs) -> anyhow::Result<
 ///
 /// WHY: Mirrors `hermes skills` subcommand. Allows installing and browsing
 /// skill prompts without entering the TUI.
-fn run_skills(command: SkillsCommand) -> anyhow::Result<()> {
+async fn run_skills(command: SkillsCommand) -> anyhow::Result<()> {
     let skills_dir = edgecrab_core::edgecrab_home().join("skills");
 
     match command {
@@ -981,13 +981,7 @@ fn run_skills(command: SkillsCommand) -> anyhow::Result<()> {
                 println!("Install with: edgecrab skills install <repo-or-path>");
                 return Ok(());
             }
-            let entries = std::fs::read_dir(&skills_dir)?;
-            let mut skills: Vec<String> = entries
-                .filter_map(|e| e.ok())
-                .filter(|e| e.path().join("SKILL.md").is_file())
-                .filter_map(|e| e.file_name().into_string().ok())
-                .collect();
-            skills.sort();
+            let skills = collect_installed_skills(&skills_dir)?;
             if skills.is_empty() {
                 println!(
                     "No skills found (no SKILL.md files in {}).",
@@ -995,110 +989,332 @@ fn run_skills(command: SkillsCommand) -> anyhow::Result<()> {
                 );
             } else {
                 println!("Installed skills ({}):", skills.len());
-                for name in &skills {
-                    println!("  {name}");
+                for skill in &skills {
+                    if skill.description.is_empty() {
+                        println!("  {}", skill.identifier);
+                    } else {
+                        println!("  {} — {}", skill.identifier, skill.description);
+                    }
                 }
             }
         }
 
         SkillsCommand::View { name } => {
-            // Block path traversal
-            if name.contains('/') || name.contains('\\') || name.contains("..") {
-                anyhow::bail!("Invalid skill name — must not contain path separators or '..'");
-            }
-            let skill_path = skills_dir.join(&name).join("SKILL.md");
-            if !skill_path.is_file() {
-                anyhow::bail!("Skill '{}' not found at {}", name, skill_path.display());
-            }
-            let content = std::fs::read_to_string(&skill_path)?;
+            let skill = resolve_installed_skill(&skills_dir, &name)?;
+            let content = std::fs::read_to_string(&skill.skill_md)?;
             println!("{}", content);
         }
 
         SkillsCommand::Search { query } => {
-            if !skills_dir.exists() {
-                println!("No skills directory found.");
-                return Ok(());
-            }
-            let q = query.to_lowercase();
-            let entries = std::fs::read_dir(&skills_dir)?;
-            let matches: Vec<String> = entries
-                .filter_map(|e| e.ok())
-                .filter(|e| e.path().join("SKILL.md").is_file())
-                .filter_map(|e| e.file_name().into_string().ok())
-                .filter(|name| name.to_lowercase().contains(&q))
+            let query_lower = query.to_lowercase();
+            let installed_matches: Vec<InstalledSkill> = collect_installed_skills(&skills_dir)?
+                .into_iter()
+                .filter(|skill| {
+                    skill.identifier.to_lowercase().contains(&query_lower)
+                        || skill.description.to_lowercase().contains(&query_lower)
+                })
                 .collect();
-            if matches.is_empty() {
+
+            let optional_root = edgecrab_tools::tools::skills_sync::optional_skills_dir()
+                .unwrap_or_else(|| edgecrab_core::edgecrab_home().join("optional-skills"));
+            let official_matches =
+                edgecrab_tools::tools::skills_hub::search_optional_skills(&optional_root, &query);
+
+            if installed_matches.is_empty() && official_matches.is_empty() {
                 println!("No skills matching '{}'.", query);
             } else {
-                println!("Skills matching '{}' ({}):", query, matches.len());
-                for name in &matches {
-                    println!("  {name}");
+                if !installed_matches.is_empty() {
+                    println!("Installed matches ({}):", installed_matches.len());
+                    for skill in &installed_matches {
+                        if skill.description.is_empty() {
+                            println!("  {}", skill.identifier);
+                        } else {
+                            println!("  {} — {}", skill.identifier, skill.description);
+                        }
+                    }
+                }
+                if !official_matches.is_empty() {
+                    println!("Official matches ({}):", official_matches.len());
+                    for skill in &official_matches {
+                        println!("  {} — {}", skill.identifier, skill.description);
+                    }
                 }
             }
         }
 
         SkillsCommand::Install { source, name } => {
-            // Derive skill name from source if not provided
-            let skill_name = name.unwrap_or_else(|| {
-                source
-                    .trim_end_matches('/')
-                    .split('/')
-                    .next_back()
-                    .unwrap_or("skill")
-                    .trim_end_matches(".git")
-                    .to_string()
-            });
-
-            // Block path traversal in derived name
-            if skill_name.contains('/') || skill_name.contains('\\') || skill_name.contains("..") {
-                anyhow::bail!(
-                    "Derived skill name '{}' is unsafe — provide --name",
-                    skill_name
-                );
-            }
-
-            let skill_dir = skills_dir.join(&skill_name);
-
-            // Local path install
             let source_path = std::path::Path::new(&source);
             if source_path.exists() {
-                let skill_md = source_path.join("SKILL.md");
-                if !skill_md.is_file() {
-                    anyhow::bail!("No SKILL.md found in {}", source_path.display());
-                }
-                std::fs::create_dir_all(&skill_dir)?;
-                std::fs::copy(&skill_md, skill_dir.join("SKILL.md"))?;
-                println!("Installed skill '{}' from local path.", skill_name);
+                let bundle = build_local_skill_bundle(source_path, name.as_deref())?;
+                let skill_name = bundle.name.clone();
+                let message =
+                    edgecrab_tools::tools::skills_hub::install_skill(&bundle, &skills_dir, false)
+                        .map_err(|e| anyhow::anyhow!(e))?;
+                println!("{message}");
+                println!("Activate with: edgecrab skills view {skill_name}");
                 return Ok(());
             }
 
-            // Git clone install
-            println!("Cloning {} into {}...", source, skill_dir.display());
-            let status = std::process::Command::new("git")
-                .args(["clone", "--depth=1", &source, &skill_dir.to_string_lossy()])
-                .status()
-                .map_err(|e| anyhow::anyhow!("git not found: {e}"))?;
-            if !status.success() {
-                anyhow::bail!("git clone failed for '{}'", source);
+            if source.starts_with("official/") {
+                let bundle = edgecrab_tools::tools::skills_hub::load_official_skill_bundle(
+                    &source,
+                    edgecrab_tools::tools::skills_sync::optional_skills_dir().as_deref(),
+                )
+                .map_err(|e| anyhow::anyhow!(e))?;
+                let skill_name = bundle.name.clone();
+                let message =
+                    edgecrab_tools::tools::skills_hub::install_skill(&bundle, &skills_dir, false)
+                        .map_err(|e| anyhow::anyhow!(e))?;
+                println!("{message}");
+                println!("Activate with: edgecrab skills view {skill_name}");
+                return Ok(());
             }
-            // Verify SKILL.md exists in clone
-            if !skill_dir.join("SKILL.md").is_file() {
-                // Try one level deeper (common pattern: git repo root has SKILL.md)
-                println!("Warning: no SKILL.md at root of cloned repo.");
+
+            if source.contains('/') {
+                let message = edgecrab_tools::tools::skills_hub::install_github_skill(
+                    &source,
+                    &skills_dir,
+                    false,
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+                let skill_name = source.split('/').next_back().unwrap_or("skill");
+                println!("{message}");
+                println!("Activate with: edgecrab skills view {skill_name}");
+                return Ok(());
             }
-            println!("Installed skill '{}'.", skill_name);
+
+            let optional_root = edgecrab_tools::tools::skills_sync::optional_skills_dir()
+                .unwrap_or_else(|| edgecrab_core::edgecrab_home().join("optional-skills"));
+            let candidates =
+                edgecrab_tools::tools::skills_hub::search_optional_skills(&optional_root, &source);
+            if let Some(candidate) = candidates.first() {
+                let bundle = edgecrab_tools::tools::skills_hub::load_official_skill_bundle(
+                    &candidate.identifier,
+                    edgecrab_tools::tools::skills_sync::optional_skills_dir().as_deref(),
+                )
+                .map_err(|e| anyhow::anyhow!(e))?;
+                let skill_name = bundle.name.clone();
+                let message =
+                    edgecrab_tools::tools::skills_hub::install_skill(&bundle, &skills_dir, false)
+                        .map_err(|e| anyhow::anyhow!(e))?;
+                println!("{message}");
+                println!("Activate with: edgecrab skills view {skill_name}");
+                return Ok(());
+            }
+
+            anyhow::bail!(
+                "Skill source '{}' not found. Use a local path, official/<category>/<skill>, or owner/repo/path",
+                source
+            );
         }
 
         SkillsCommand::Remove { name } => {
-            if name.contains('/') || name.contains('\\') || name.contains("..") {
-                anyhow::bail!("Invalid skill name");
+            let skill = resolve_installed_skill(&skills_dir, &name)?;
+            std::fs::remove_dir_all(&skill.skill_dir)?;
+            println!("Removed skill '{}'.", skill.identifier);
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct InstalledSkill {
+    identifier: String,
+    skill_dir: PathBuf,
+    skill_md: PathBuf,
+    description: String,
+}
+
+fn collect_installed_skills(skills_dir: &std::path::Path) -> anyhow::Result<Vec<InstalledSkill>> {
+    let mut skills = Vec::new();
+    if !skills_dir.is_dir() {
+        return Ok(skills);
+    }
+
+    let mut stack = vec![skills_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
             }
-            let skill_dir = skills_dir.join(&name);
-            if !skill_dir.exists() {
-                anyhow::bail!("Skill '{}' not found.", name);
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.starts_with('.'))
+                .unwrap_or(false)
+            {
+                continue;
             }
-            std::fs::remove_dir_all(&skill_dir)?;
-            println!("Removed skill '{}'.", name);
+            let skill_md = path.join("SKILL.md");
+            if skill_md.is_file() {
+                let identifier = path
+                    .strip_prefix(skills_dir)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let description = std::fs::read_to_string(&skill_md)
+                    .map(|content| extract_skill_description(&content))
+                    .unwrap_or_default();
+                skills.push(InstalledSkill {
+                    identifier,
+                    skill_dir: path,
+                    skill_md,
+                    description,
+                });
+            } else {
+                stack.push(path);
+            }
+        }
+    }
+
+    skills.sort_by(|a, b| a.identifier.cmp(&b.identifier));
+    Ok(skills)
+}
+
+fn resolve_installed_skill(
+    skills_dir: &std::path::Path,
+    query: &str,
+) -> anyhow::Result<InstalledSkill> {
+    if query.contains("..") || std::path::Path::new(query).is_absolute() {
+        anyhow::bail!("Invalid skill path '{}'", query);
+    }
+
+    let direct = skills_dir.join(query);
+    if direct.join("SKILL.md").is_file() {
+        let identifier = direct
+            .strip_prefix(skills_dir)
+            .unwrap_or(&direct)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let skill_md = direct.join("SKILL.md");
+        let description = std::fs::read_to_string(&skill_md)
+            .map(|content| extract_skill_description(&content))
+            .unwrap_or_default();
+        return Ok(InstalledSkill {
+            identifier,
+            skill_dir: direct,
+            skill_md,
+            description,
+        });
+    }
+
+    let matches: Vec<InstalledSkill> = collect_installed_skills(skills_dir)?
+        .into_iter()
+        .filter(|skill| skill.identifier.split('/').next_back() == Some(query))
+        .collect();
+
+    match matches.len() {
+        1 => Ok(matches.into_iter().next().expect("single match")),
+        0 => anyhow::bail!("Skill '{}' not found.", query),
+        _ => {
+            let options = matches
+                .iter()
+                .map(|skill| skill.identifier.clone())
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!("Skill '{}' is ambiguous. Use one of: {}", query, options);
+        }
+    }
+}
+
+fn extract_skill_description(content: &str) -> String {
+    let trimmed = content.trim_start();
+    if let Some(frontmatter) = trimmed.strip_prefix("---") {
+        if let Some(end) = frontmatter.find("\n---") {
+            for line in frontmatter[..end].lines() {
+                if let Some(desc) = line.strip_prefix("description:") {
+                    return desc.trim().trim_matches('"').trim_matches('\'').to_string();
+                }
+            }
+        }
+    }
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("---") {
+            continue;
+        }
+        return trimmed.to_string();
+    }
+
+    String::new()
+}
+
+fn build_local_skill_bundle(
+    source_path: &std::path::Path,
+    name_override: Option<&str>,
+) -> anyhow::Result<edgecrab_tools::tools::skills_hub::SkillBundle> {
+    let skill_name = name_override
+        .map(str::to_string)
+        .unwrap_or_else(|| derive_skill_name(source_path));
+
+    if skill_name.is_empty()
+        || skill_name.contains('/')
+        || skill_name.contains('\\')
+        || skill_name.contains("..")
+    {
+        anyhow::bail!(
+            "Derived skill name '{}' is unsafe; provide --name",
+            skill_name
+        );
+    }
+
+    let mut files = std::collections::HashMap::new();
+    if source_path.is_file() {
+        let content = std::fs::read_to_string(source_path)?;
+        files.insert("SKILL.md".into(), content);
+    } else {
+        let skill_md = source_path.join("SKILL.md");
+        if !skill_md.is_file() {
+            anyhow::bail!("No SKILL.md found in {}", source_path.display());
+        }
+        collect_local_skill_files(source_path, source_path, &mut files)?;
+    }
+
+    Ok(edgecrab_tools::tools::skills_hub::SkillBundle {
+        name: skill_name.clone(),
+        files,
+        source: "local".into(),
+        identifier: source_path.display().to_string(),
+        trust_level: "trusted".into(),
+    })
+}
+
+fn derive_skill_name(source_path: &std::path::Path) -> String {
+    if source_path.is_file() {
+        return source_path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or("skill")
+            .to_string();
+    }
+    source_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("skill")
+        .to_string()
+}
+
+fn collect_local_skill_files(
+    root: &std::path::Path,
+    dir: &std::path::Path,
+    files: &mut std::collections::HashMap<String, String>,
+) -> anyhow::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_local_skill_files(root, &path, files)?;
+        } else if path.is_file() {
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            files.insert(rel, std::fs::read_to_string(&path)?);
         }
     }
     Ok(())

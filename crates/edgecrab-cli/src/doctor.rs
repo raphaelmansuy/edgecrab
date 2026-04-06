@@ -189,19 +189,63 @@ fn check_memories(home: &Path) -> Check {
 fn check_skills(home: &Path) -> Check {
     let skills_dir = home.join("skills");
     if skills_dir.exists() {
-        let count = std::fs::read_dir(&skills_dir)
-            .map(|rd| rd.filter_map(|e| e.ok()).count())
-            .unwrap_or(0);
-        Check::pass(
-            "Skills",
-            format!("{} ({count} entries)", skills_dir.display()),
-        )
+        let count = count_installed_skills(&skills_dir);
+        if count == 0 {
+            Check::warn(
+                "Skills",
+                format!(
+                    "{} exists but contains no installed skills",
+                    skills_dir.display()
+                ),
+            )
+        } else {
+            Check::pass(
+                "Skills",
+                format!("{} ({count} installed skills)", skills_dir.display()),
+            )
+        }
     } else {
         Check::warn(
             "Skills",
             format!("{} not found — will be created", skills_dir.display()),
         )
     }
+}
+
+fn count_installed_skills(root: &Path) -> usize {
+    if !root.is_dir() {
+        return 0;
+    }
+
+    let mut count = 0;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.starts_with('.'))
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            if path.join("SKILL.md").is_file() {
+                count += 1;
+            } else {
+                stack.push(path);
+            }
+        }
+    }
+
+    count
 }
 
 /// Check VertexAI Application Default Credentials (ADC) and project setup.

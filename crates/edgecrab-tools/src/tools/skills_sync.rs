@@ -12,8 +12,42 @@
 //! - DELETED by user: respected, not re-added
 //! - REMOVED from bundled: cleaned from manifest
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+
+use crate::config_ref::resolve_edgecrab_home;
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct EmbeddedSkillFile {
+    pub relative_path: &'static str,
+    pub content: &'static str,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct EmbeddedSkill {
+    pub name: &'static str,
+    pub files: &'static [EmbeddedSkillFile],
+}
+
+include!(concat!(env!("OUT_DIR"), "/embedded_skills.rs"));
+
+#[derive(Debug, Clone)]
+struct SkillSnapshot {
+    name: String,
+    files: Vec<SkillSnapshotFile>,
+}
+
+#[derive(Debug, Clone)]
+struct SkillSnapshotFile {
+    relative_path: String,
+    content: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncSource {
+    Filesystem,
+    Embedded,
+}
 
 /// Locate the repo's bundled `skills/` directory.
 ///
@@ -92,14 +126,21 @@ pub fn optional_skills_dir() -> Option<PathBuf> {
 /// Discovers bundled skills from the repo, syncs them to `~/.edgecrab/skills/`,
 /// and returns a summary string.  Safe to call multiple times — idempotent.
 pub fn sync_on_startup() -> Option<SyncReport> {
-    let bundled_dir = bundled_skills_dir()?;
-    Some(sync_bundled_skills(&bundled_dir))
+    if let Some(bundled_dir) = bundled_skills_dir() {
+        return Some(sync_bundled_skills(&bundled_dir));
+    }
+    if !EMBEDDED_BUNDLED_SKILLS.is_empty() {
+        return Some(sync_skill_snapshots(
+            embedded_skill_snapshots(EMBEDDED_BUNDLED_SKILLS),
+            SyncSource::Embedded,
+        ));
+    }
+    None
 }
 
 /// Get the user's skills directory.
 fn skills_dir() -> PathBuf {
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    home.join(".edgecrab").join("skills")
+    resolve_edgecrab_home().join("skills")
 }
 
 /// Get the manifest file path.
@@ -192,12 +233,7 @@ fn walkdir(dir: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
 }
 
 /// Discover all SKILL.md files in the bundled directory, recursively.
-///
-/// Skills live at any nesting depth — e.g. `github/github-pr-workflow/SKILL.md`
-/// or `mlops/training/axolotl/SKILL.md`. The returned name is the relative path
-/// from `bundled_dir` (using `/` separators), which becomes the manifest key and
-/// the subdirectory under `~/.edgecrab/skills/`.
-fn discover_bundled_skills(bundled_dir: &Path) -> Vec<(String, PathBuf)> {
+fn discover_bundled_skills(bundled_dir: &Path) -> Vec<SkillSnapshot> {
     let mut skills = Vec::new();
     if !bundled_dir.is_dir() {
         return skills;
@@ -216,26 +252,26 @@ fn discover_bundled_skills(bundled_dir: &Path) -> Vec<(String, PathBuf)> {
             }
             let skill_md = path.join("SKILL.md");
             if skill_md.is_file() {
-                // This directory is a skill — use its relative path as the name
                 let rel = path
                     .strip_prefix(bundled_dir)
                     .unwrap_or(&path)
                     .to_string_lossy()
                     .replace('\\', "/");
-                skills.push((rel, path));
+                skills.push(read_skill_snapshot(&path, rel));
             } else {
-                // Category directory — recurse deeper
                 stack.push(path);
             }
         }
     }
 
+    skills.sort_by(|a, b| a.name.cmp(&b.name));
     skills
 }
 
 /// Sync result for reporting.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SyncReport {
+    pub source: SyncSource,
     pub added: Vec<String>,
     pub updated: Vec<String>,
     pub skipped_user_modified: Vec<String>,
@@ -258,10 +294,27 @@ impl SyncReport {
                 self.skipped_user_modified.len()
             ));
         }
-        if parts.is_empty() {
+        let base = if parts.is_empty() {
             "No changes".into()
         } else {
             parts.join(", ")
+        };
+        match self.source {
+            SyncSource::Filesystem => base,
+            SyncSource::Embedded => format!("{base} (embedded fallback)"),
+        }
+    }
+}
+
+impl Default for SyncReport {
+    fn default() -> Self {
+        Self {
+            source: SyncSource::Filesystem,
+            added: Vec::new(),
+            updated: Vec::new(),
+            skipped_user_modified: Vec::new(),
+            skipped_deleted_by_user: Vec::new(),
+            removed_from_manifest: Vec::new(),
         }
     }
 }
@@ -270,33 +323,38 @@ impl SyncReport {
 ///
 /// Returns a report of what was added, updated, or skipped.
 pub fn sync_bundled_skills(bundled_dir: &Path) -> SyncReport {
+    sync_skill_snapshots(discover_bundled_skills(bundled_dir), SyncSource::Filesystem)
+}
+
+fn sync_skill_snapshots(bundled: Vec<SkillSnapshot>, source: SyncSource) -> SyncReport {
     let user_skills = skills_dir();
     let _ = std::fs::create_dir_all(&user_skills);
 
     let mut manifest = read_manifest();
-    let mut report = SyncReport::default();
+    let mut report = SyncReport {
+        source,
+        ..SyncReport::default()
+    };
 
-    let bundled = discover_bundled_skills(bundled_dir);
-    let bundled_names: std::collections::HashSet<String> =
-        bundled.iter().map(|(name, _)| name.clone()).collect();
+    let bundled_names: HashSet<String> = bundled.iter().map(|skill| skill.name.clone()).collect();
 
-    for (name, bundled_path) in &bundled {
-        let user_path = user_skills.join(name);
-        let bundled_hash = dir_hash(bundled_path);
+    for snapshot in &bundled {
+        let user_path = user_skills.join(&snapshot.name);
+        let bundled_hash = snapshot_hash(snapshot);
 
-        if let Some(origin_hash) = manifest.get(name) {
+        if let Some(origin_hash) = manifest.get(&snapshot.name) {
             // Skill is in manifest — check if it still exists in user dir
             if !user_path.is_dir() {
                 // User deleted it — respect their choice, skip
-                report.skipped_deleted_by_user.push(name.clone());
+                report.skipped_deleted_by_user.push(snapshot.name.clone());
                 continue;
             }
 
             if origin_hash.is_empty() {
                 // v1 migration: no hash recorded, safe to update
-                copy_skill(bundled_path, &user_path);
-                manifest.insert(name.clone(), bundled_hash);
-                report.updated.push(name.clone());
+                write_skill_snapshot(snapshot, &user_path);
+                manifest.insert(snapshot.name.clone(), bundled_hash);
+                report.updated.push(snapshot.name.clone());
                 continue;
             }
 
@@ -304,20 +362,20 @@ pub fn sync_bundled_skills(bundled_dir: &Path) -> SyncReport {
             if &user_hash == origin_hash {
                 // User hasn't modified it — safe to update if bundled changed
                 if bundled_hash != *origin_hash {
-                    copy_skill(bundled_path, &user_path);
-                    manifest.insert(name.clone(), bundled_hash);
-                    report.updated.push(name.clone());
+                    write_skill_snapshot(snapshot, &user_path);
+                    manifest.insert(snapshot.name.clone(), bundled_hash);
+                    report.updated.push(snapshot.name.clone());
                 }
                 // If bundled hasn't changed either, nothing to do
             } else {
                 // User customized it — skip
-                report.skipped_user_modified.push(name.clone());
+                report.skipped_user_modified.push(snapshot.name.clone());
             }
         } else {
             // NEW skill — not in manifest
-            copy_skill(bundled_path, &user_path);
-            manifest.insert(name.clone(), bundled_hash);
-            report.added.push(name.clone());
+            write_skill_snapshot(snapshot, &user_path);
+            manifest.insert(snapshot.name.clone(), bundled_hash);
+            report.added.push(snapshot.name.clone());
         }
     }
 
@@ -336,20 +394,93 @@ pub fn sync_bundled_skills(bundled_dir: &Path) -> SyncReport {
     report
 }
 
-/// Copy a skill directory (overwriting existing files).
-fn copy_skill(src: &Path, dst: &Path) {
-    let _ = std::fs::create_dir_all(dst);
-    if let Ok(files) = walkdir(src) {
-        for file in files {
-            if let Ok(rel) = file.strip_prefix(src) {
-                let target = dst.join(rel);
-                if let Some(parent) = target.parent() {
-                    let _ = std::fs::create_dir_all(parent);
+fn read_skill_snapshot(root: &Path, name: String) -> SkillSnapshot {
+    let mut files = Vec::new();
+    if let Ok(paths) = walkdir(root) {
+        let mut sorted = paths;
+        sorted.sort();
+        for file in sorted {
+            if let Ok(rel) = file.strip_prefix(root) {
+                let rel = rel.to_string_lossy().replace('\\', "/");
+                if let Ok(content) = std::fs::read_to_string(&file) {
+                    files.push(SkillSnapshotFile {
+                        relative_path: rel,
+                        content,
+                    });
                 }
-                let _ = std::fs::copy(&file, &target);
             }
         }
     }
+    SkillSnapshot { name, files }
+}
+
+fn embedded_skill_snapshots(skills: &[EmbeddedSkill]) -> Vec<SkillSnapshot> {
+    let mut snapshots: Vec<SkillSnapshot> = skills
+        .iter()
+        .map(|skill| SkillSnapshot {
+            name: skill.name.to_string(),
+            files: skill
+                .files
+                .iter()
+                .map(|file| SkillSnapshotFile {
+                    relative_path: file.relative_path.to_string(),
+                    content: file.content.to_string(),
+                })
+                .collect(),
+        })
+        .collect();
+    snapshots.sort_by(|a, b| a.name.cmp(&b.name));
+    snapshots
+}
+
+fn snapshot_hash(snapshot: &SkillSnapshot) -> String {
+    let mut hasher = md5::Context::new();
+    for file in &snapshot.files {
+        hasher.consume(file.relative_path.as_bytes());
+        hasher.consume(file.content.as_bytes());
+    }
+    format!("{:x}", hasher.compute())
+}
+
+fn write_skill_snapshot(snapshot: &SkillSnapshot, dst: &Path) {
+    let _ = std::fs::remove_dir_all(dst);
+    let _ = std::fs::create_dir_all(dst);
+    for file in &snapshot.files {
+        if let Some(target) = safe_relative_join(dst, &file.relative_path) {
+            if let Some(parent) = target.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(target, &file.content);
+        }
+    }
+}
+
+fn safe_relative_join(base: &Path, rel_path: &str) -> Option<PathBuf> {
+    use std::path::Component;
+
+    if rel_path.is_empty() {
+        return None;
+    }
+
+    let rel = Path::new(rel_path);
+    let mut normalized = PathBuf::new();
+    for component in rel.components() {
+        match component {
+            Component::Normal(part) => normalized.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+
+    if normalized.as_os_str().is_empty() {
+        None
+    } else {
+        Some(base.join(normalized))
+    }
+}
+
+pub(crate) fn embedded_optional_skills() -> &'static [EmbeddedSkill] {
+    EMBEDDED_OPTIONAL_SKILLS
 }
 
 // ─── MD5 context (minimal implementation using standard lib) ───
@@ -411,7 +542,11 @@ mod md5 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
     use tempfile::TempDir;
+
+    static EDGECRAB_HOME_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn manifest_roundtrip() {
@@ -473,18 +608,66 @@ mod tests {
         assert_eq!(report.added[0], "skill-a");
     }
 
+    #[test]
+    fn sync_uses_edgecrab_home_env() {
+        let _guard = EDGECRAB_HOME_LOCK.lock().expect("lock");
+        let home = TempDir::new().unwrap();
+        let bundled = TempDir::new().unwrap();
+        let skill = bundled.path().join("ops").join("audit");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "# Audit").unwrap();
+
+        // SAFETY: protected by EDGECRAB_HOME_LOCK for the duration of the test.
+        unsafe { std::env::set_var("EDGECRAB_HOME", home.path()) };
+        let report = sync_bundled_skills(bundled.path());
+        // SAFETY: protected by EDGECRAB_HOME_LOCK for the duration of the test.
+        unsafe { std::env::remove_var("EDGECRAB_HOME") };
+
+        assert_eq!(report.added, vec!["ops/audit"]);
+        assert!(home.path().join("skills/ops/audit/SKILL.md").is_file());
+    }
+
+    #[test]
+    fn embedded_bundle_is_not_empty() {
+        assert!(
+            !EMBEDDED_BUNDLED_SKILLS.is_empty(),
+            "embedded bundled skill catalog should never be empty"
+        );
+        assert!(
+            !embedded_optional_skills().is_empty(),
+            "embedded optional skill catalog should never be empty"
+        );
+    }
+
+    #[test]
+    fn write_skill_snapshot_replaces_removed_files() {
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("skill");
+        std::fs::create_dir_all(target.join("references")).unwrap();
+        std::fs::write(target.join("SKILL.md"), "# Old").unwrap();
+        std::fs::write(target.join("references/old.md"), "stale").unwrap();
+
+        let snapshot = SkillSnapshot {
+            name: "skill".into(),
+            files: vec![SkillSnapshotFile {
+                relative_path: "SKILL.md".into(),
+                content: "# New".into(),
+            }],
+        };
+
+        write_skill_snapshot(&snapshot, &target);
+        assert!(target.join("SKILL.md").is_file());
+        assert!(!target.join("references/old.md").exists());
+    }
+
     /// Internal test helper that syncs to an arbitrary directory.
     fn sync_to_dir(bundled_dir: &Path, user_dir: &Path) -> SyncReport {
-        let _ = std::fs::create_dir_all(user_dir);
-        let bundled = discover_bundled_skills(bundled_dir);
+        let snapshots = discover_bundled_skills(bundled_dir);
         let mut report = SyncReport::default();
-
-        for (name, bundled_path) in &bundled {
-            let user_path = user_dir.join(name);
-            copy_skill(bundled_path, &user_path);
-            report.added.push(name.clone());
+        for snapshot in &snapshots {
+            write_skill_snapshot(snapshot, &user_dir.join(&snapshot.name));
+            report.added.push(snapshot.name.clone());
         }
-
         report
     }
 }

@@ -2587,73 +2587,54 @@ impl ToolHandler for SkillsHubTool {
                 })?;
 
                 let skills_dir = ctx.config.edgecrab_home.join("skills");
+                let optional_dir = super::skills_sync::optional_skills_dir();
 
                 // ── official/ prefix → install from optional-skills dir ──
-                if let Some(rel_path) = identifier.strip_prefix("official/") {
-                    let optional_dir = super::skills_sync::optional_skills_dir()
-                        .unwrap_or_else(|| ctx.config.edgecrab_home.join("optional-skills"));
-                    let skill_path = optional_dir.join(rel_path);
-                    let skill_md = skill_path.join("SKILL.md");
-                    if !skill_md.is_file() {
-                        return Err(ToolError::NotFound(format!(
-                            "Optional skill '{}' not found at {}",
-                            rel_path,
-                            skill_path.display()
-                        )));
-                    }
-
-                    let mut files = std::collections::HashMap::new();
-                    Self::collect_skill_files(&skill_path, &skill_path, &mut files);
-
-                    let leaf_name = skill_path
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .to_string();
-
-                    let bundle = super::skills_hub::SkillBundle {
-                        name: leaf_name.clone(),
-                        files,
-                        source: "optional".into(),
-                        identifier: format!("official/{}", rel_path),
-                        trust_level: "builtin".into(),
-                    };
-
-                    return super::skills_hub::install_skill(&bundle, &skills_dir, args.force)
-                        .map(|m| format!("{}\n\nActivate with skill_view {}", m, leaf_name))
-                        .map_err(ToolError::Other);
+                if identifier.starts_with("official/") {
+                    let bundle = super::skills_hub::load_official_skill_bundle(
+                        &identifier,
+                        optional_dir.as_deref(),
+                    )
+                    .map_err(ToolError::Other);
+                    return bundle.and_then(|bundle| {
+                        let skill_name = bundle.name.clone();
+                        super::skills_hub::install_skill(&bundle, &skills_dir, args.force)
+                            .map(|m| format!("{}\n\nActivate with skill_view {}", m, skill_name))
+                            .map_err(ToolError::Other)
+                    });
                 }
 
                 // ── owner/repo/path → GitHub install ──
                 if identifier.contains('/') {
-                    return self
-                        .install_from_github(&identifier, &skills_dir, args.force)
-                        .await;
+                    return super::skills_hub::install_github_skill(
+                        &identifier,
+                        &skills_dir,
+                        args.force,
+                    )
+                    .await
+                    .map(|m| {
+                        let skill_name = identifier.split('/').next_back().unwrap_or("skill");
+                        format!("{}\n\nActivate with skill_view {}", m, skill_name)
+                    })
+                    .map_err(ToolError::Other);
                 }
 
                 // ── bare name → search optional-skills ──
-                let optional_dir = super::skills_sync::optional_skills_dir()
+                let optional_search_root = optional_dir
+                    .clone()
                     .unwrap_or_else(|| ctx.config.edgecrab_home.join("optional-skills"));
                 let candidates =
-                    super::skills_hub::search_optional_skills(&optional_dir, &identifier);
+                    super::skills_hub::search_optional_skills(&optional_search_root, &identifier);
                 if let Some(meta) = candidates.first() {
-                    if let Some(path) = &meta.path {
-                        let skill_path = std::path::Path::new(path);
-                        let mut files = std::collections::HashMap::new();
-                        Self::collect_skill_files(skill_path, skill_path, &mut files);
-
-                        let bundle = super::skills_hub::SkillBundle {
-                            name: meta.name.clone(),
-                            files,
-                            source: "optional".into(),
-                            identifier: meta.identifier.clone(),
-                            trust_level: "builtin".into(),
-                        };
-
-                        return super::skills_hub::install_skill(&bundle, &skills_dir, args.force)
-                            .map(|m| format!("{}\n\nActivate with skill_view {}", m, meta.name))
-                            .map_err(ToolError::Other);
-                    }
+                    let bundle = super::skills_hub::load_official_skill_bundle(
+                        &meta.identifier,
+                        optional_dir.as_deref(),
+                    )
+                    .map_err(ToolError::Other)?;
+                    let skill_name = bundle.name.clone();
+                    return super::skills_hub::install_skill(&bundle, &skills_dir, args.force)
+                        .map(|m| format!("{}\n\nActivate with skill_view {}", m, skill_name))
+                        .map_err(ToolError::Other);
                 }
 
                 Err(ToolError::NotFound(format!(
@@ -2697,166 +2678,6 @@ impl ToolHandler for SkillsHubTool {
                 ),
             }),
         }
-    }
-}
-
-impl SkillsHubTool {
-    /// Recursively collect all files in a skill directory into a HashMap
-    /// of `relative_path -> content` for use in a SkillBundle.
-    fn collect_skill_files(
-        root: &std::path::Path,
-        dir: &std::path::Path,
-        files: &mut std::collections::HashMap<String, String>,
-    ) {
-        let entries = match std::fs::read_dir(dir) {
-            Ok(e) => e,
-            Err(_) => return,
-        };
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if p.is_dir() {
-                Self::collect_skill_files(root, &p, files);
-            } else if p.is_file() {
-                if let Ok(content) = std::fs::read_to_string(&p) {
-                    let rel = p
-                        .strip_prefix(root)
-                        .unwrap_or(&p)
-                        .to_string_lossy()
-                        .replace('\\', "/");
-                    files.insert(rel, content);
-                }
-            }
-        }
-    }
-
-    async fn install_from_github(
-        &self,
-        identifier: &str,
-        skills_dir: &std::path::Path,
-        force: bool,
-    ) -> Result<String, ToolError> {
-        let parts: Vec<&str> = identifier.splitn(3, '/').collect();
-        if parts.len() < 2 {
-            return Err(ToolError::InvalidArgs {
-                tool: "skills_hub".into(),
-                message: "GitHub identifier must be owner/repo or owner/repo/path".into(),
-            });
-        }
-
-        let repo = format!("{}/{}", parts[0], parts[1]);
-        let skill_path = if parts.len() == 3 { parts[2] } else { "" };
-        let api_url = if skill_path.is_empty() {
-            format!("https://api.github.com/repos/{repo}/contents")
-        } else {
-            format!("https://api.github.com/repos/{repo}/contents/{skill_path}")
-        };
-
-        let client = reqwest::Client::new();
-        let request = apply_github_auth(
-            client
-                .get(&api_url)
-                .header("Accept", "application/vnd.github.v3+json")
-                .header("User-Agent", "edgecrab-skills-hub/0.1"),
-        );
-
-        let resp = request
-            .send()
-            .await
-            .map_err(|e| ToolError::Other(format!("GitHub API request failed: {e}")))?;
-
-        if !resp.status().is_success() {
-            return Err(ToolError::Other(format!(
-                "GitHub API returned HTTP {} for {}",
-                resp.status(),
-                api_url
-            )));
-        }
-
-        let value: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| ToolError::Other(format!("Failed to parse GitHub API response: {e}")))?;
-
-        let entries: Vec<serde_json::Value> = if let Some(arr) = value.as_array() {
-            arr.clone()
-        } else {
-            vec![value]
-        };
-
-        let mut files = std::collections::HashMap::new();
-        for entry in entries {
-            if entry.get("type").and_then(|t| t.as_str()) != Some("file") {
-                continue;
-            }
-            let name = entry
-                .get("name")
-                .and_then(|n| n.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let Some(download_url) = entry.get("download_url").and_then(|u| u.as_str()) else {
-                continue;
-            };
-
-            let file_req = apply_github_auth(
-                client
-                    .get(download_url)
-                    .header("User-Agent", "edgecrab-skills-hub/0.1"),
-            );
-
-            if let Ok(file_resp) = file_req.send().await {
-                if file_resp.status().is_success() {
-                    if let Ok(content) = file_resp.text().await {
-                        files.insert(name, content);
-                    }
-                }
-            }
-        }
-
-        if !files.contains_key("SKILL.md") {
-            return Err(ToolError::Other(
-                "No SKILL.md found in the specified GitHub location".into(),
-            ));
-        }
-
-        let skill_name = identifier
-            .split('/')
-            .next_back()
-            .unwrap_or("skill")
-            .to_string();
-        let trust = determine_github_trust_level(&repo).to_string();
-        let bundle = super::skills_hub::SkillBundle {
-            name: skill_name.clone(),
-            files,
-            source: "github".into(),
-            identifier: identifier.to_string(),
-            trust_level: trust,
-        };
-
-        super::skills_hub::install_skill(&bundle, skills_dir, force)
-            .map(|m| format!("{}\n\nActivate with skill_view {}", m, skill_name))
-            .map_err(ToolError::Other)
-    }
-}
-
-fn apply_github_auth(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-    if let Ok(token) = std::env::var("GITHUB_TOKEN").or_else(|_| std::env::var("GH_TOKEN")) {
-        builder.header("Authorization", format!("Bearer {}", token))
-    } else {
-        builder
-    }
-}
-
-fn determine_github_trust_level(repo: &str) -> TrustLevel {
-    const TRUSTED_REPOS: &[&str] = &[
-        "nousresearch/hermes-agent",
-        "raphaelmansuy/edgecrab",
-        "garrytan/gstack",
-    ];
-    let repo_lower = repo.to_lowercase();
-    if TRUSTED_REPOS.iter().any(|r| *r == repo_lower) {
-        TrustLevel::Trusted
-    } else {
-        TrustLevel::Community
     }
 }
 

@@ -20,7 +20,7 @@ use edgecrab_security::path_policy::PathPolicy;
 ///   2. `~/.edgecrab`
 ///
 /// Duplicated from edgecrab-core/config.rs to avoid a circular crate dep.
-fn resolve_edgecrab_home() -> PathBuf {
+pub fn resolve_edgecrab_home() -> PathBuf {
     std::env::var("EDGECRAB_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
