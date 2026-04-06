@@ -150,7 +150,7 @@ pub enum CommandResult {
     RollbackCheckpoint(String),
     /// Drop all active MCP server connections and re-connect on next tool call.
     ReloadMcp,
-    /// Toggle voice mode — TTS readback of agent responses (on/off/status).
+    /// Toggle voice mode — TTS readback of agent responses (on/off/tts/status).
     VoiceMode(String),
     /// Manage MCP OAuth Bearer tokens (set/remove/list).
     McpToken(String),
@@ -883,7 +883,7 @@ impl CommandRegistry {
         self.register(Command {
             name: "voice",
             aliases: &["tts"],
-            description: "Toggle voice/TTS mode (on/off/status) — TTS readback of agent responses",
+            description: "Toggle voice/TTS mode (on/off/tts/status) — spoken readback of agent responses",
             handler: |args| CommandResult::VoiceMode(args.trim().to_string()),
         });
 
@@ -998,7 +998,7 @@ fn help_text() -> String {
          \n\
          Scheduling & Media:\n\
            /cron [subcommand]    — Manage scheduled tasks\n\
-           /voice [on|off]       — Toggle voice/TTS mode\n\
+           /voice [on|off|tts]   — Toggle voice/TTS mode\n\
            /browser [sub]        — Chrome CDP: connect, disconnect, status, tabs, recording on|off\n\
          \n\
          Appearance:\n\

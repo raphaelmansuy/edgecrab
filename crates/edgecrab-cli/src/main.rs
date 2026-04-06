@@ -918,15 +918,16 @@ async fn run_mcp(command: McpCommand, args: &CliArgs) -> anyhow::Result<()> {
         McpCommand::Search { query } => {
             let results = mcp_catalog::search_presets(query.as_deref());
             if results.is_empty() {
-                println!("No curated MCP presets matched.");
+                println!("No official MCP snapshot entries matched.");
                 return Ok(());
             }
             for preset in results {
                 println!(
-                    "{} — {} [{}]",
+                    "{} — {} [{}] {}",
                     preset.id,
                     preset.description,
-                    preset.tags.join(", ")
+                    preset.tags.join(", "),
+                    preset.source_url
                 );
             }
         }
@@ -936,6 +937,9 @@ async fn run_mcp(command: McpCommand, args: &CliArgs) -> anyhow::Result<()> {
             println!("Preset: {}", preset.id);
             println!("Name:   {}", preset.display_name);
             println!("Why:    {}", preset.description);
+            println!("Pkg:    {}", preset.package_name);
+            println!("Source: {}", preset.source_url);
+            println!("Docs:   {}", preset.homepage);
             println!("Cmd:    {} {}", preset.command, preset.args.join(" "));
             println!("Tags:   {}", preset.tags.join(", "));
             if !preset.required_env.is_empty() {

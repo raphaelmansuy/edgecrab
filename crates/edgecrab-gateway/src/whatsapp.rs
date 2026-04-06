@@ -780,6 +780,40 @@ impl PlatformAdapter for WhatsAppAdapter {
                 )
             })
     }
+
+    async fn send_voice(
+        &self,
+        path: &str,
+        caption: Option<&str>,
+        metadata: &MessageMetadata,
+    ) -> anyhow::Result<()> {
+        if !std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file()) {
+            anyhow::bail!("WhatsApp audio path does not exist: {path}");
+        }
+
+        let original_chat_id = metadata
+            .channel_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("WhatsApp audio delivery requires channel_id"))?;
+        let normalized_chat_id = normalize_outbound_chat_id(original_chat_id);
+        if normalized_chat_id.is_empty() {
+            anyhow::bail!("WhatsApp audio delivery requires a non-empty channel_id");
+        }
+
+        let file_name = std::path::Path::new(path)
+            .file_name()
+            .and_then(|value| value.to_str());
+        self.send_bridge_media(&normalized_chat_id, path, "audio", caption, file_name)
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "WhatsApp bridge media send failed for '{}' (normalized to '{}'): {}",
+                    original_chat_id,
+                    normalized_chat_id,
+                    error
+                )
+            })
+    }
 }
 
 fn has_node() -> bool {

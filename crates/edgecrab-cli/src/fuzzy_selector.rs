@@ -102,6 +102,7 @@ impl<T: Clone + FuzzyItem> FuzzySelector<T> {
                 }
                 item.primary().to_lowercase().contains(&q)
                     || item.secondary().to_lowercase().contains(&q)
+                    || item.tag().to_lowercase().contains(&q)
             })
             .map(|(i, _)| i)
             .collect();
@@ -152,5 +153,57 @@ impl<T: Clone + FuzzyItem> FuzzySelector<T> {
         self.filtered
             .get(self.selected)
             .and_then(|&idx| self.items.get(idx))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Clone)]
+    struct TestItem {
+        primary: &'static str,
+        secondary: &'static str,
+        tag: &'static str,
+    }
+
+    impl FuzzyItem for TestItem {
+        fn primary(&self) -> &str {
+            self.primary
+        }
+
+        fn secondary(&self) -> &str {
+            self.secondary
+        }
+
+        fn tag(&self) -> &str {
+            self.tag
+        }
+    }
+
+    #[test]
+    fn update_filter_matches_tag_column() {
+        let mut selector = FuzzySelector::new();
+        selector.set_items(vec![
+            TestItem {
+                primary: "filesystem",
+                secondary: "local files",
+                tag: "official-ref",
+            },
+            TestItem {
+                primary: "github",
+                secondary: "repo operations",
+                tag: "configured",
+            },
+        ]);
+
+        selector.query = "configured".into();
+        selector.update_filter();
+
+        assert_eq!(selector.filtered.len(), 1);
+        assert_eq!(
+            selector.current().map(|item| item.primary()),
+            Some("github")
+        );
     }
 }

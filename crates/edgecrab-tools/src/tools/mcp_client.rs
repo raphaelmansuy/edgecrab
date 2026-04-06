@@ -509,19 +509,7 @@ async fn get_or_connect(server_name: &str, cfg: McpServerConfig) -> Result<(), T
     Ok(())
 }
 
-/// Parse MCP configuration from the context.
-///
-/// Expects a JSON config at `~/.edgecrab/mcp.json` with the format:
-/// ```json
-/// {
-///   "mcpServers": {
-///     "server_name": {
-///       "command": "npx",
-///       "args": ["-y", "@some/mcp-server"]
-///     }
-///   }
-/// }
-/// ```
+/// Legacy MCP config path used for compatibility imports.
 fn mcp_config_path() -> Option<std::path::PathBuf> {
     Some(resolve_edgecrab_home().join("mcp.json"))
 }
@@ -780,27 +768,19 @@ fn load_mcp_config() -> Result<serde_json::Value, ToolError> {
         }
     }
 
-    let path = mcp_config_path().ok_or_else(|| ToolError::Unavailable {
-        tool: "mcp_client".into(),
-        reason: "Cannot determine home directory for MCP config".into(),
-    })?;
-
-    if !path.is_file() {
-        return Err(ToolError::Unavailable {
+    if let Some(path) = mcp_config_path().filter(|path| path.is_file()) {
+        let content = std::fs::read_to_string(&path).map_err(|e| ToolError::ExecutionFailed {
             tool: "mcp_client".into(),
-            reason: format!("MCP config not found at {}", path.display()),
+            message: format!("Failed to read MCP config: {e}"),
+        })?;
+
+        return serde_json::from_str(&content).map_err(|e| ToolError::ExecutionFailed {
+            tool: "mcp_client".into(),
+            message: format!("Invalid MCP config JSON: {e}"),
         });
     }
 
-    let content = std::fs::read_to_string(&path).map_err(|e| ToolError::ExecutionFailed {
-        tool: "mcp_client".into(),
-        message: format!("Failed to read MCP config: {e}"),
-    })?;
-
-    serde_json::from_str(&content).map_err(|e| ToolError::ExecutionFailed {
-        tool: "mcp_client".into(),
-        message: format!("Invalid MCP config JSON: {e}"),
-    })
+    Ok(json!({ "mcpServers": {} }))
 }
 
 pub fn configured_servers() -> Result<Vec<ConfiguredMcpServer>, ToolError> {
@@ -2079,12 +2059,13 @@ mod tests {
         // SAFETY: protected by EDGECRAB_HOME_LOCK.
         unsafe { std::env::set_var("EDGECRAB_HOME", dir.path()) };
         let ctx = ToolContext::test_context();
-        // Passing a non-object should still parse (empty args are fine)
+        // Empty args are fine; no config should now behave as an empty catalog
+        // rather than a hard legacy-path failure.
         let result = McpListToolsTool.execute(json!({}), &ctx).await;
-        // Will fail because config file doesn't exist in test, which is expected
         // SAFETY: protected by EDGECRAB_HOME_LOCK.
         unsafe { std::env::remove_var("EDGECRAB_HOME") };
-        assert!(result.is_err());
+        let output = result.expect("empty MCP config should be tolerated");
+        assert!(output.contains("No MCP tools discovered"));
     }
 
     #[tokio::test]

@@ -331,6 +331,19 @@ pub trait PlatformAdapter: Send + Sync + 'static {
         })
         .await
     }
+
+    /// Send a local audio file as a voice or audio attachment.
+    ///
+    /// The default implementation falls back to `send_document()` so delivery
+    /// stays reliable even on platforms without native audio uploads.
+    async fn send_voice(
+        &self,
+        path: &str,
+        caption: Option<&str>,
+        metadata: &MessageMetadata,
+    ) -> anyhow::Result<()> {
+        self.send_document(path, caption, metadata).await
+    }
 }
 
 /// Build the `*** ATTACHED IMAGES ***` injection block for image attachments.
@@ -392,6 +405,18 @@ impl MediaRef {
             || p.ends_with(".webp")
             || p.ends_with(".svg")
             || p.ends_with(".bmp")
+    }
+
+    /// Check whether the file extension belongs to a common audio format.
+    pub fn detect_audio(path: &str) -> bool {
+        let p = path.to_ascii_lowercase();
+        p.ends_with(".ogg")
+            || p.ends_with(".opus")
+            || p.ends_with(".mp3")
+            || p.ends_with(".wav")
+            || p.ends_with(".m4a")
+            || p.ends_with(".aac")
+            || p.ends_with(".flac")
     }
 }
 
@@ -1015,5 +1040,12 @@ mod tests {
         assert!(MediaRef::detect_image("/tmp/c.webp"));
         assert!(!MediaRef::detect_image("/tmp/d.pdf"));
         assert!(!MediaRef::detect_image("/tmp/e.txt"));
+    }
+
+    #[test]
+    fn detect_audio_extensions() {
+        assert!(MediaRef::detect_audio("/tmp/reply.ogg"));
+        assert!(MediaRef::detect_audio("/tmp/reply.mp3"));
+        assert!(!MediaRef::detect_audio("/tmp/reply.png"));
     }
 }

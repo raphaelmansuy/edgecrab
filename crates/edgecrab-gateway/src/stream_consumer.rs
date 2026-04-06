@@ -425,6 +425,10 @@ impl GatewayStreamConsumer {
                 self.adapter
                     .send_photo(&mref.path, None, &self.metadata)
                     .await
+            } else if crate::platform::MediaRef::detect_audio(&mref.path) {
+                self.adapter
+                    .send_voice(&mref.path, None, &self.metadata)
+                    .await
             } else {
                 self.adapter
                     .send_document(&mref.path, None, &self.metadata)

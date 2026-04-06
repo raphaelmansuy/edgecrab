@@ -14,16 +14,18 @@
 
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::extract::State;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use edgecrab_tools::tools::transcribe::TranscribeAudioTool;
+use edgecrab_tools::tools::tts::TextToSpeechTool;
 use edgecrab_tools::tools::vision::VisionAnalyzeTool;
 use edgecrab_tools::{AppConfigRef, ToolContext, ToolHandler};
 use futures::FutureExt;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -58,6 +60,112 @@ numbers, code, UI elements, objects, people, colors, layout, and notable context
 const MAX_GATEWAY_EAGER_IMAGE_ANALYSES: usize = 4;
 const MAX_GATEWAY_EAGER_AUDIO_TRANSCRIPTS: usize = 2;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum GatewayVoiceMode {
+    Off,
+    VoiceOnly,
+    All,
+}
+
+impl GatewayVoiceMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off (text only)",
+            Self::VoiceOnly => "On (voice reply to voice messages)",
+            Self::All => "TTS (voice reply to all messages)",
+        }
+    }
+}
+
+fn gateway_voice_mode_path() -> PathBuf {
+    edgecrab_core::edgecrab_home().join("gateway_voice_mode.json")
+}
+
+fn load_gateway_voice_modes_from(path: &Path) -> HashMap<String, GatewayVoiceMode> {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return HashMap::new();
+    };
+    let Ok(raw) = serde_json::from_str::<HashMap<String, String>>(&content) else {
+        return HashMap::new();
+    };
+
+    raw.into_iter()
+        .filter_map(|(chat_id, mode)| {
+            let parsed = match mode.as_str() {
+                "off" => GatewayVoiceMode::Off,
+                "voice_only" => GatewayVoiceMode::VoiceOnly,
+                "all" => GatewayVoiceMode::All,
+                _ => return None,
+            };
+            Some((chat_id, parsed))
+        })
+        .collect()
+}
+
+fn save_gateway_voice_modes_to(
+    path: &Path,
+    modes: &HashMap<String, GatewayVoiceMode>,
+) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let raw: HashMap<&str, &str> = modes
+        .iter()
+        .map(|(chat_id, mode)| {
+            let mode = match mode {
+                GatewayVoiceMode::Off => "off",
+                GatewayVoiceMode::VoiceOnly => "voice_only",
+                GatewayVoiceMode::All => "all",
+            };
+            (chat_id.as_str(), mode)
+        })
+        .collect();
+    std::fs::write(path, serde_json::to_vec_pretty(&raw)?)?;
+    Ok(())
+}
+
+fn incoming_message_is_voice_origin(msg: &IncomingMessage) -> bool {
+    let has_voice_note = msg
+        .metadata
+        .attachments
+        .iter()
+        .any(|attachment| attachment.kind == crate::platform::MessageAttachmentKind::Voice);
+    if has_voice_note {
+        return true;
+    }
+
+    // Some bridges only classify note-style inbound audio as `Audio`.
+    let has_audio = msg.metadata.attachments.iter().any(|attachment| {
+        matches!(
+            attachment.kind,
+            crate::platform::MessageAttachmentKind::Audio
+                | crate::platform::MessageAttachmentKind::Voice
+        )
+    });
+    has_audio && msg.text.trim().is_empty()
+}
+
+fn extract_audio_path_from_tts_output(output: &str) -> Option<String> {
+    if let Some(index) = output.find("MEDIA:") {
+        let path = output[index + "MEDIA:".len()..]
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .trim();
+        if !path.is_empty() {
+            return Some(path.to_string());
+        }
+    }
+
+    output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("Audio saved to:"))
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 /// Help text shown when a user sends /help to the gateway.
 const HELP_TEXT: &str = "\
 *Available commands:*
@@ -69,6 +177,7 @@ const HELP_TEXT: &str = "\
 /retry   - Retry your last message
 /status  - Show whether an agent is currently running
 /usage   - Show session stats
+/voice   - Control spoken replies: off, on, tts, status
 /background - Run a prompt in a separate background session
 /hooks   - List loaded event hooks
 /approve - Approve the oldest pending command request
@@ -469,6 +578,8 @@ async fn deliver_text_and_media(
             for mref in &media_refs {
                 let result = if mref.is_image {
                     adapter.send_photo(&mref.path, None, metadata).await
+                } else if crate::platform::MediaRef::detect_audio(&mref.path) {
+                    adapter.send_voice(&mref.path, None, metadata).await
                 } else {
                     adapter.send_document(&mref.path, None, metadata).await
                 };
@@ -484,6 +595,106 @@ async fn deliver_text_and_media(
     }
 
     Ok(text_result)
+}
+
+async fn maybe_send_voice_reply(
+    agent: &Agent,
+    adapter: Option<Arc<dyn PlatformAdapter>>,
+    msg: &IncomingMessage,
+    response: &str,
+    mode: GatewayVoiceMode,
+) {
+    let Some(adapter) = adapter else {
+        return;
+    };
+    if mode == GatewayVoiceMode::Off {
+        return;
+    }
+    if mode == GatewayVoiceMode::VoiceOnly && !incoming_message_is_voice_origin(msg) {
+        return;
+    }
+
+    let (cleaned, media_refs) = crate::platform::extract_media_from_response(response);
+    if media_refs
+        .iter()
+        .any(|media_ref| crate::platform::MediaRef::detect_audio(&media_ref.path))
+    {
+        return;
+    }
+    let Some(text) =
+        crate::platform::response_text_after_media_extraction(response, &cleaned, &media_refs)
+    else {
+        return;
+    };
+    let text = edgecrab_core::safe_truncate(text.trim(), 4000).to_string();
+    if text.is_empty() {
+        return;
+    }
+
+    let (tts, _, _) = agent.media_config().await;
+    let ctx = ToolContext {
+        task_id: "gateway-auto-tts".into(),
+        cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        session_id: format!("gateway-auto-tts-{}", message_origin_recipient(msg)),
+        user_task: None,
+        cancel: CancellationToken::new(),
+        config: AppConfigRef {
+            edgecrab_home: edgecrab_core::edgecrab_home(),
+            tts_provider: Some(tts.provider),
+            tts_voice: Some(tts.voice),
+            tts_rate: tts.rate,
+            tts_model: tts.model,
+            tts_elevenlabs_voice_id: tts.elevenlabs_voice_id,
+            tts_elevenlabs_model_id: tts.elevenlabs_model_id,
+            tts_elevenlabs_api_key_env: Some(tts.elevenlabs_api_key_env),
+            ..Default::default()
+        },
+        state_db: None,
+        platform: msg.platform,
+        process_table: None,
+        provider: None,
+        tool_registry: None,
+        delegate_depth: 0,
+        sub_agent_runner: None,
+        delegation_event_tx: None,
+        clarify_tx: None,
+        approval_tx: None,
+        on_skills_changed: None,
+        gateway_sender: None,
+        origin_chat: None,
+        session_key: Some(message_origin_recipient(msg)),
+        todo_store: None,
+    };
+
+    let result = match TextToSpeechTool
+        .execute(serde_json::json!({ "text": text }), &ctx)
+        .await
+    {
+        Ok(output) => output,
+        Err(error) => {
+            tracing::warn!(platform = ?msg.platform, error = %error, "gateway auto TTS failed");
+            return;
+        }
+    };
+
+    let Some(audio_path) = extract_audio_path_from_tts_output(&result) else {
+        tracing::warn!("gateway auto TTS returned no usable audio path");
+        return;
+    };
+
+    if let Err(error) = adapter.send_voice(&audio_path, None, &msg.metadata).await {
+        tracing::warn!(
+            platform = ?msg.platform,
+            path = %audio_path,
+            error = %error,
+            "gateway auto voice delivery failed"
+        );
+    }
+
+    let temp_tts_dir = std::env::temp_dir().join("edgecrab_tts");
+    if Path::new(&audio_path).starts_with(&temp_tts_dir) {
+        let _ = tokio::fs::remove_file(&audio_path).await;
+    }
 }
 
 fn delivery_recipient(chat_id: &str, thread_id: Option<&str>) -> String {
@@ -571,6 +782,9 @@ pub struct Gateway {
     last_messages: Arc<tokio::sync::Mutex<HashMap<String, String>>>,
     /// Pending approval / clarify interactions keyed by gateway session.
     interaction_broker: Arc<InteractionBroker>,
+    /// Per-chat persisted voice reply mode, mirroring Hermes gateway semantics.
+    voice_modes: Arc<tokio::sync::Mutex<HashMap<String, GatewayVoiceMode>>>,
+    voice_mode_path: PathBuf,
 }
 
 impl Gateway {
@@ -593,6 +807,10 @@ impl Gateway {
             pending_messages: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             last_messages: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             interaction_broker: InteractionBroker::new(),
+            voice_modes: Arc::new(tokio::sync::Mutex::new(load_gateway_voice_modes_from(
+                &gateway_voice_mode_path(),
+            ))),
+            voice_mode_path: gateway_voice_mode_path(),
         }
     }
 
@@ -614,6 +832,69 @@ impl Gateway {
     /// Set the delivery router.
     pub fn set_delivery(&mut self, router: DeliveryRouter) {
         self.delivery_router = Arc::new(router);
+    }
+
+    async fn set_voice_mode(&self, chat_key: &str, mode: GatewayVoiceMode) -> anyhow::Result<()> {
+        let snapshot = {
+            let mut voice_modes = self.voice_modes.lock().await;
+            voice_modes.insert(chat_key.to_string(), mode);
+            voice_modes.clone()
+        };
+        save_gateway_voice_modes_to(&self.voice_mode_path, &snapshot)
+    }
+
+    async fn voice_mode_for(&self, chat_key: &str) -> GatewayVoiceMode {
+        self.voice_modes
+            .lock()
+            .await
+            .get(chat_key)
+            .copied()
+            .unwrap_or(GatewayVoiceMode::Off)
+    }
+
+    async fn handle_voice_command(&self, msg: &IncomingMessage, chat_key: &str) -> String {
+        let args = msg.get_command_args().trim().to_ascii_lowercase();
+        match args.as_str() {
+            "on" | "enable" => match self.set_voice_mode(chat_key, GatewayVoiceMode::VoiceOnly).await {
+                Ok(()) => "Voice mode enabled.\nI'll reply with audio when you send a voice message.\nUse /voice tts to get spoken replies for every message.".into(),
+                Err(error) => format!("Failed to persist voice mode: {error}"),
+            },
+            "tts" => match self.set_voice_mode(chat_key, GatewayVoiceMode::All).await {
+                Ok(()) => "Auto-TTS enabled.\nAll replies in this chat will include an audio response when TTS is available.".into(),
+                Err(error) => format!("Failed to persist voice mode: {error}"),
+            },
+            "off" | "disable" => match self.set_voice_mode(chat_key, GatewayVoiceMode::Off).await {
+                Ok(()) => "Voice mode disabled. Text-only replies.".into(),
+                Err(error) => format!("Failed to persist voice mode: {error}"),
+            },
+            "status" => {
+                let mode = self.voice_mode_for(chat_key).await;
+                format!(
+                    "Voice mode: {}\n\
+                     /voice on   - speak replies only for voice-originating messages\n\
+                     /voice tts  - speak replies for all messages\n\
+                     /voice off  - disable spoken replies",
+                    mode.label()
+                )
+            }
+            "" => {
+                let current = self.voice_mode_for(chat_key).await;
+                let next = if current == GatewayVoiceMode::Off {
+                    GatewayVoiceMode::VoiceOnly
+                } else {
+                    GatewayVoiceMode::Off
+                };
+                match self.set_voice_mode(chat_key, next).await {
+                    Ok(()) => format!("Voice mode: {}", next.label()),
+                    Err(error) => format!("Failed to persist voice mode: {error}"),
+                }
+            }
+            _ => {
+                "Usage: /voice [on|off|tts|status]\n\
+                 `on` speaks replies to voice messages only. `tts` speaks every reply."
+                    .into()
+            }
+        }
     }
 
     /// Returns `true` if the user is authorized to use the gateway.
@@ -1126,6 +1407,9 @@ impl Gateway {
                                      • Total active sessions: {total_sessions}"
                                 ))
                             }
+                            "voice" => {
+                                Some(self.handle_voice_command(&msg, &origin_chat_id).await)
+                            }
                             "background" | "bg" => {
                                 let prompt = msg.get_command_args().trim().to_string();
                                 if prompt.is_empty() {
@@ -1634,6 +1918,7 @@ impl Gateway {
                         let running_sessions = self.running_sessions.clone();
                         let pending_messages = self.pending_messages.clone();
                         let task_session_key = session_key.clone();
+                        let gateway_voice_mode = self.voice_mode_for(&origin_chat_id_for_key).await;
                         // Clone the sender so the task can re-dispatch the pending message.
                         let msg_tx = tx.clone();
                         let hook_registry_for_spawn = self.hook_registry.clone();
@@ -1660,6 +1945,7 @@ impl Gateway {
 
                                 // NOTE: chat_streaming_with_origin() handles origin context
                                 // internally, so we do NOT pre-set it here.
+                                let voice_adapter = origin_adapter.clone();
                                 let response_result = match origin_adapter {
                                     Some(adapter_arc) => {
                                         dispatch_streaming_arc(
@@ -1699,6 +1985,24 @@ impl Gateway {
 
                                 match response_result {
                                     Ok(response_len) => {
+                                        let response_text = agent
+                                            .messages()
+                                            .await
+                                            .iter()
+                                            .rev()
+                                            .find(|message| message.role == Role::Assistant)
+                                            .map(|message| message.text_content())
+                                            .filter(|text| !text.trim().is_empty());
+                                        if let Some(response_text) = response_text {
+                                            maybe_send_voice_reply(
+                                                &agent,
+                                                voice_adapter,
+                                                &msg_clone,
+                                                &response_text,
+                                                gateway_voice_mode,
+                                            )
+                                            .await;
+                                        }
                                         tracing::info!(
                                             platform = ?msg_clone.platform,
                                             user = %msg_clone.user_id,
@@ -1880,6 +2184,7 @@ mod tests {
         sent: Mutex<Vec<String>>,
         photos: Mutex<Vec<String>>,
         documents: Mutex<Vec<String>>,
+        voices: Mutex<Vec<String>>,
     }
 
     #[async_trait]
@@ -1943,6 +2248,19 @@ mod tests {
             self.documents
                 .lock()
                 .expect("documents lock")
+                .push(path.to_string());
+            Ok(())
+        }
+
+        async fn send_voice(
+            &self,
+            path: &str,
+            _caption: Option<&str>,
+            _metadata: &crate::platform::MessageMetadata,
+        ) -> anyhow::Result<()> {
+            self.voices
+                .lock()
+                .expect("voices lock")
                 .push(path.to_string());
             Ok(())
         }
@@ -2018,6 +2336,91 @@ mod tests {
 
         let sources = audio_attachment_sources(&msg);
         assert_eq!(sources, vec!["/tmp/voice.ogg", "/tmp/audio.mp3"]);
+    }
+
+    #[test]
+    fn incoming_message_is_voice_origin_for_voice_note() {
+        let msg = IncomingMessage {
+            platform: edgecrab_types::Platform::Telegram,
+            user_id: "u1".into(),
+            channel_id: Some("chat".into()),
+            text: String::new(),
+            thread_id: None,
+            metadata: crate::platform::MessageMetadata {
+                attachments: vec![crate::platform::MessageAttachment {
+                    kind: crate::platform::MessageAttachmentKind::Voice,
+                    local_path: Some("/tmp/voice.ogg".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        };
+
+        assert!(incoming_message_is_voice_origin(&msg));
+    }
+
+    #[test]
+    fn incoming_message_is_voice_origin_for_empty_text_audio() {
+        let msg = IncomingMessage {
+            platform: edgecrab_types::Platform::Whatsapp,
+            user_id: "u1".into(),
+            channel_id: Some("chat".into()),
+            text: String::new(),
+            thread_id: None,
+            metadata: crate::platform::MessageMetadata {
+                attachments: vec![crate::platform::MessageAttachment {
+                    kind: crate::platform::MessageAttachmentKind::Audio,
+                    local_path: Some("/tmp/audio.ogg".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        };
+
+        assert!(incoming_message_is_voice_origin(&msg));
+    }
+
+    #[test]
+    fn load_gateway_voice_modes_filters_invalid_values() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("gateway_voice_mode.json");
+        std::fs::write(
+            &path,
+            r#"{"chat-a":"voice_only","chat-b":"all","chat-c":"broken"}"#,
+        )
+        .expect("write");
+
+        let loaded = load_gateway_voice_modes_from(&path);
+        assert_eq!(loaded.get("chat-a"), Some(&GatewayVoiceMode::VoiceOnly));
+        assert_eq!(loaded.get("chat-b"), Some(&GatewayVoiceMode::All));
+        assert!(!loaded.contains_key("chat-c"));
+    }
+
+    #[test]
+    fn save_gateway_voice_modes_round_trips() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("gateway_voice_mode.json");
+        let modes = HashMap::from([
+            ("chat-a".to_string(), GatewayVoiceMode::Off),
+            ("chat-b".to_string(), GatewayVoiceMode::All),
+        ]);
+
+        save_gateway_voice_modes_to(&path, &modes).expect("save");
+        let loaded = load_gateway_voice_modes_from(&path);
+
+        assert_eq!(loaded, modes);
+    }
+
+    #[test]
+    fn extract_audio_path_from_tts_output_supports_media_and_legacy_output() {
+        assert_eq!(
+            extract_audio_path_from_tts_output("Generated audio.\nMEDIA:/tmp/reply.mp3"),
+            Some("/tmp/reply.mp3".into())
+        );
+        assert_eq!(
+            extract_audio_path_from_tts_output("Audio saved to: /tmp/reply.mp3"),
+            Some("/tmp/reply.mp3".into())
+        );
     }
 
     #[test]
@@ -2274,6 +2677,7 @@ mod tests {
             "/retry",
             "/status",
             "/usage",
+            "/voice",
             "/background",
             "/approve",
             "/deny",
@@ -2355,6 +2759,30 @@ mod tests {
         assert_eq!(
             adapter.documents.lock().expect("documents lock").as_slice(),
             &["/tmp/report.pdf".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn deliver_text_and_media_routes_audio_to_send_voice() {
+        let adapter = Arc::new(RecordingAdapter::default());
+        let mut delivery = DeliveryRouter::new();
+        delivery.register(adapter.clone());
+
+        let sent = deliver_text_and_media(
+            &delivery,
+            Some(adapter.clone()),
+            "MEDIA:/tmp/reply.mp3",
+            edgecrab_types::Platform::Webhook,
+            &crate::platform::MessageMetadata::default(),
+        )
+        .await
+        .expect("delivery succeeds");
+
+        assert_eq!(sent, 0);
+        assert!(adapter.sent.lock().expect("sent lock").is_empty());
+        assert_eq!(
+            adapter.voices.lock().expect("voices lock").as_slice(),
+            &["/tmp/reply.mp3".to_string()]
         );
     }
 }

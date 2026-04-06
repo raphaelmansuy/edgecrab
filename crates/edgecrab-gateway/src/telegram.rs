@@ -1136,6 +1136,67 @@ impl PlatformAdapter for TelegramAdapter {
         }
         Ok(())
     }
+
+    async fn send_voice(
+        &self,
+        path: &str,
+        caption: Option<&str>,
+        metadata: &MessageMetadata,
+    ) -> anyhow::Result<()> {
+        let chat_id = metadata
+            .channel_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Telegram send_voice requires channel_id"))?;
+        let thread_id = metadata
+            .thread_id
+            .as_deref()
+            .and_then(|t| t.parse::<i64>().ok());
+
+        let file_bytes = tokio::fs::read(path)
+            .await
+            .map_err(|e| anyhow::anyhow!("send_voice: cannot read {}: {}", path, e))?;
+
+        let file_name = std::path::Path::new(path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("audio")
+            .to_string();
+        let is_voice_note = matches!(
+            std::path::Path::new(path)
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.to_ascii_lowercase())
+                .as_deref(),
+            Some("ogg" | "opus")
+        );
+        let endpoint = if is_voice_note {
+            "sendVoice"
+        } else {
+            "sendAudio"
+        };
+        let field = if is_voice_note { "voice" } else { "audio" };
+
+        let url = self.api_url(endpoint);
+        let mut form = reqwest::multipart::Form::new()
+            .text("chat_id", chat_id.to_string())
+            .part(
+                field,
+                reqwest::multipart::Part::bytes(file_bytes).file_name(file_name),
+            );
+        if let Some(c) = caption {
+            form = form.text("caption", c.to_string());
+        }
+        if let Some(tid) = thread_id {
+            form = form.text("message_thread_id", tid.to_string());
+        }
+
+        let resp = self.client.post(&url).multipart(form).send().await?;
+        if !resp.status().is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Telegram {endpoint} failed: {}", body);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

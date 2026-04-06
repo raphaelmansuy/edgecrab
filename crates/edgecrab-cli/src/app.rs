@@ -399,6 +399,24 @@ fn persist_image_generation_to_config(
     write_config_root(&config_path, &root)
 }
 
+/// Persist the CLI voice-mode default to ~/.edgecrab/config.yaml.
+fn persist_voice_enabled_to_config(enabled: bool) -> anyhow::Result<()> {
+    let (config_path, mut root) = load_config_root_for_edit()?;
+
+    if let serde_yml::Value::Mapping(ref mut map) = root {
+        let voice_key = serde_yml::Value::String("voice".into());
+        let enabled_key = serde_yml::Value::String("enabled".into());
+        let voice_section = map
+            .entry(voice_key)
+            .or_insert_with(|| serde_yml::Value::Mapping(Default::default()));
+        if let serde_yml::Value::Mapping(voice_map) = voice_section {
+            voice_map.insert(enabled_key, serde_yml::Value::Bool(enabled));
+        }
+    }
+
+    write_config_root(&config_path, &root)
+}
+
 #[derive(Debug, Clone, Copy)]
 struct DisplayPreferences {
     show_reasoning: bool,
@@ -422,6 +440,12 @@ fn load_display_preferences() -> DisplayPreferences {
             streaming_enabled: cfg.model.streaming && cfg.display.streaming,
         })
         .unwrap_or_default()
+}
+
+fn load_voice_mode_enabled() -> bool {
+    edgecrab_core::AppConfig::load()
+        .map(|cfg| cfg.voice.enabled)
+        .unwrap_or(false)
 }
 
 /// Persist display preferences to `config.yaml`.
@@ -756,6 +780,112 @@ impl FuzzyItem for SkillEntry {
     }
 }
 
+/// A single MCP preset entry for the MCP browser overlay.
+#[derive(Clone)]
+struct McpPresetEntry {
+    id: String,
+    kind: McpEntryKind,
+    title: String,
+    source: String,
+    detail: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum McpEntryKind {
+    Preset,
+    ConfiguredServer,
+}
+
+impl FuzzyItem for McpPresetEntry {
+    fn primary(&self) -> &str {
+        &self.title
+    }
+    fn secondary(&self) -> &str {
+        &self.detail
+    }
+    fn tag(&self) -> &str {
+        &self.source
+    }
+}
+
+fn mcp_preset_source_label(preset: &crate::mcp_catalog::McpPreset) -> &'static str {
+    if preset.tags.contains(&"archived") {
+        return "official-arch";
+    }
+    if preset.tags.contains(&"integration") {
+        return "official-app";
+    }
+    "official-ref"
+}
+
+fn format_mcp_transport(server: &edgecrab_tools::tools::mcp_client::ConfiguredMcpServer) -> String {
+    if let Some(url) = &server.url {
+        return format!("http {url}");
+    }
+
+    let mut rendered = server.command.clone();
+    if !server.args.is_empty() {
+        rendered.push(' ');
+        rendered.push_str(&server.args.join(" "));
+    }
+    rendered
+}
+
+fn build_mcp_selector_entries_from(
+    configured: &[edgecrab_tools::tools::mcp_client::ConfiguredMcpServer],
+) -> Vec<McpPresetEntry> {
+    let configured_names: std::collections::HashSet<&str> = configured
+        .iter()
+        .map(|server| server.name.as_str())
+        .collect();
+
+    let mut entries: Vec<McpPresetEntry> = configured
+        .iter()
+        .map(|server| {
+            let mut detail = format!("{} | installed", format_mcp_transport(server));
+            if server.token_from_store {
+                detail.push_str(" | token-store");
+            } else if server.token_from_config {
+                detail.push_str(" | config-token");
+            }
+            if let Some(path) = &server.cwd {
+                detail.push_str(&format!(" | cwd={}", path.display()));
+            }
+            McpPresetEntry {
+                id: server.name.clone(),
+                kind: McpEntryKind::ConfiguredServer,
+                title: server.name.clone(),
+                source: "configured".into(),
+                detail,
+            }
+        })
+        .collect();
+
+    entries.extend(
+        crate::mcp_catalog::search_presets(None)
+            .into_iter()
+            .map(|preset| {
+                let install_state = if configured_names.contains(preset.id) {
+                    "already-installed"
+                } else {
+                    "ready-to-install"
+                };
+                McpPresetEntry {
+                    id: preset.id.to_string(),
+                    kind: McpEntryKind::Preset,
+                    title: format!("{}  {}", preset.id, preset.display_name),
+                    source: mcp_preset_source_label(preset).into(),
+                    detail: format!(
+                        "{} | {} | {} | {}",
+                        preset.description, preset.package_name, install_state, preset.source_url
+                    ),
+                }
+            }),
+    );
+
+    entries
+}
+
 /// A single entry for the session browser overlay.
 /// Wraps [`edgecrab_state::SessionSummary`] with pre-formatted strings so that
 /// `FuzzyItem` filtering works without re-formatting on every keystroke.
@@ -938,6 +1068,8 @@ pub struct App {
     model_selector: FuzzySelector<ModelEntry>,
     /// Vision-model selector overlay (activated by `/vision_model`)
     vision_model_selector: FuzzySelector<ModelEntry>,
+    /// Official MCP preset selector overlay (activated by `/mcp` with no args).
+    mcp_selector: FuzzySelector<McpPresetEntry>,
     /// Skill browser overlay (activated by `/skills` with no args)
     skill_selector: FuzzySelector<SkillEntry>,
     /// Session browser overlay (activated by F5 or `/session` with no args)
@@ -1337,6 +1469,7 @@ impl App {
                 ms
             },
             vision_model_selector: FuzzySelector::new(),
+            mcp_selector: FuzzySelector::new(),
             skill_selector: FuzzySelector::new(),
             session_browser: FuzzySelector::new(),
             skin_browser: FuzzySelector::new(),
@@ -1357,7 +1490,7 @@ impl App {
             mouse_capture_enabled: true, // scroll wheel on by default; F6 to switch
             pending_mouse_capture: None,
             last_left_click: None,
-            voice_mode_enabled: false,
+            voice_mode_enabled: load_voice_mode_enabled(),
             last_agent_response_text: String::new(),
             session_personality: None,
             session_skin: None,
@@ -2944,6 +3077,7 @@ impl App {
                 self.completion.active = false;
                 self.model_selector.active = false;
                 self.vision_model_selector.active = false;
+                self.mcp_selector.active = false;
                 self.skill_selector.active = false;
                 self.needs_redraw = true;
                 let now = Instant::now();
@@ -3201,6 +3335,65 @@ impl App {
                         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                 {
                     self.vision_model_selector.push_char(c);
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // MCP selector overlay active — mirrors /model UX but installs the
+        // highlighted official preset directly for speed.
+        if self.mcp_selector.active {
+            match key.code {
+                KeyCode::Esc => {
+                    self.mcp_selector.active = false;
+                }
+                KeyCode::Enter => {
+                    if let Some(entry) = self.mcp_selector.current() {
+                        let command = match entry.kind {
+                            McpEntryKind::Preset => format!("install {}", entry.id),
+                            McpEntryKind::ConfiguredServer => format!("test {}", entry.id),
+                        };
+                        self.mcp_selector.active = false;
+                        self.handle_mcp_command(command);
+                    }
+                }
+                KeyCode::Delete => {
+                    if let Some(entry) = self.mcp_selector.current() {
+                        if entry.kind == McpEntryKind::ConfiguredServer {
+                            let command = format!("remove {}", entry.id);
+                            self.mcp_selector.active = false;
+                            self.handle_mcp_command(command);
+                        }
+                    }
+                }
+                KeyCode::Up => self.mcp_selector.move_up(),
+                KeyCode::Down => self.mcp_selector.move_down(),
+                KeyCode::PageUp => self.mcp_selector.page_up(),
+                KeyCode::PageDown => self.mcp_selector.page_down(),
+                KeyCode::Backspace => self.mcp_selector.pop_char(),
+                KeyCode::Char('v') | KeyCode::Char('V') => {
+                    if let Some(entry) = self.mcp_selector.current() {
+                        let command = format!("view {}", entry.id);
+                        self.mcp_selector.active = false;
+                        self.handle_mcp_command(command);
+                    }
+                }
+                KeyCode::Char('d') | KeyCode::Char('D') => {
+                    if let Some(entry) = self.mcp_selector.current() {
+                        if entry.kind == McpEntryKind::ConfiguredServer {
+                            let command = format!("remove {}", entry.id);
+                            self.mcp_selector.active = false;
+                            self.handle_mcp_command(command);
+                        }
+                    }
+                }
+                KeyCode::Char(c)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    self.mcp_selector.push_char(c);
                 }
                 _ => {}
             }
@@ -5350,6 +5543,23 @@ impl App {
         }
     }
 
+    fn open_mcp_selector(&mut self, initial_query: Option<&str>) -> usize {
+        let configured =
+            edgecrab_tools::tools::mcp_client::configured_servers().unwrap_or_default();
+        let entries = build_mcp_selector_entries_from(&configured);
+        self.mcp_selector.set_items(entries);
+        self.mcp_selector.active = true;
+        if let Some(query) = initial_query
+            .map(str::trim)
+            .filter(|query| !query.is_empty())
+        {
+            self.mcp_selector.query = query.to_string();
+            self.mcp_selector.update_filter();
+        }
+        self.needs_redraw = true;
+        self.mcp_selector.filtered.len()
+    }
+
     fn handle_session_list(&mut self) {
         let Some(agent) = self.require_agent() else {
             return;
@@ -7100,18 +7310,23 @@ impl App {
         edgecrab_tools::tools::mcp_client::reload_mcp_connections();
         self.push_output(
             "MCP server connections cleared.  They will be re-established on the next tool call.\n\
-             (Configured via ~/.edgecrab/mcp.json or the mcp_servers section in config.yaml)",
+             (Configured via the mcp_servers section in ~/.edgecrab/config.yaml; legacy ~/.edgecrab/mcp.json is fallback-only.)",
             OutputRole::System,
         );
     }
 
     fn handle_mcp_command(&mut self, args: String) {
         let trimmed = args.trim();
-        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("help") {
+        if trimmed.is_empty() {
+            self.open_mcp_selector(None);
+            return;
+        }
+        if trimmed.eq_ignore_ascii_case("help") {
             self.push_output(
-                "Usage: /mcp list\n\
+                "Usage: /mcp            (browse configured servers + official MCP snapshot)\n\
+                 /mcp list\n\
                  /mcp search [query]\n\
-                 /mcp view <preset>\n\
+                 /mcp view <preset-or-server>\n\
                  /mcp install <preset> [name=<server-name>] [path=<directory>]\n\
                  /mcp test [server-name]\n\
                  /mcp remove <server-name>",
@@ -7149,47 +7364,71 @@ impl App {
             },
             "search" => {
                 let query = parts.get(1).copied();
-                let results = crate::mcp_catalog::search_presets(query);
-                if results.is_empty() {
-                    self.push_output("No curated MCP presets matched.", OutputRole::System);
-                    return;
+                if self.open_mcp_selector(query) == 0 {
+                    self.mcp_selector.active = false;
+                    self.push_output("No MCP entries matched.", OutputRole::System);
                 }
-                let mut lines = Vec::new();
-                lines.push("Curated MCP presets:".to_string());
-                for preset in results {
-                    lines.push(format!(
-                        "- {}  {} [{}]",
-                        preset.id,
-                        preset.description,
-                        preset.tags.join(", ")
-                    ));
-                }
-                self.push_output(lines.join("\n"), OutputRole::System);
             }
             "view" => {
                 let Some(preset_name) = parts.get(1).copied() else {
-                    self.push_output("Usage: /mcp view <preset>", OutputRole::System);
+                    self.push_output("Usage: /mcp view <preset-or-server>", OutputRole::System);
                     return;
                 };
-                let Some(preset) = crate::mcp_catalog::find_preset(preset_name) else {
-                    self.push_output(
-                        format!("Unknown MCP preset '{preset_name}'."),
-                        OutputRole::Error,
-                    );
+                if let Some(preset) = crate::mcp_catalog::find_preset(preset_name) {
+                    let mut lines = vec![
+                        format!("Preset: {}", preset.id),
+                        format!("Name:   {}", preset.display_name),
+                        format!("Why:    {}", preset.description),
+                        format!("Pkg:    {}", preset.package_name),
+                        format!("Source: {}", preset.source_url),
+                        format!("Docs:   {}", preset.homepage),
+                        format!("Cmd:    {} {}", preset.command, preset.args.join(" ")),
+                        format!("Tags:   {}", preset.tags.join(", ")),
+                    ];
+                    if !preset.required_env.is_empty() {
+                        lines.push(format!("Env:    {}", preset.required_env.join(", ")));
+                    }
+                    lines.push(format!("Notes:  {}", preset.notes));
+                    self.push_output(lines.join("\n"), OutputRole::System);
                     return;
-                };
-                let mut lines = vec![
-                    format!("Preset: {}", preset.id),
-                    format!("Name:   {}", preset.display_name),
-                    format!("Why:    {}", preset.description),
-                    format!("Cmd:    {} {}", preset.command, preset.args.join(" ")),
-                    format!("Tags:   {}", preset.tags.join(", ")),
-                ];
-                if !preset.required_env.is_empty() {
-                    lines.push(format!("Env:    {}", preset.required_env.join(", ")));
                 }
-                lines.push(format!("Notes:  {}", preset.notes));
-                self.push_output(lines.join("\n"), OutputRole::System);
+                match edgecrab_tools::tools::mcp_client::configured_servers() {
+                    Ok(servers) => {
+                        let Some(server) = servers
+                            .into_iter()
+                            .find(|server| server.name == preset_name)
+                        else {
+                            self.push_output(
+                                format!("Unknown MCP preset or configured server '{preset_name}'."),
+                                OutputRole::Error,
+                            );
+                            return;
+                        };
+                        let mut lines = vec![
+                            format!("Server: {}", server.name),
+                            format!("Transport: {}", format_mcp_transport(&server)),
+                        ];
+                        if let Some(path) = &server.cwd {
+                            lines.push(format!("Cwd: {}", path.display()));
+                        }
+                        if !server.include.is_empty() {
+                            lines.push(format!("Include: {}", server.include.join(", ")));
+                        }
+                        if !server.exclude.is_empty() {
+                            lines.push(format!("Exclude: {}", server.exclude.join(", ")));
+                        }
+                        if server.token_from_store {
+                            lines.push("Auth: token store".into());
+                        } else if server.token_from_config {
+                            lines.push("Auth: config bearer_token".into());
+                        }
+                        self.push_output(lines.join("\n"), OutputRole::System);
+                    }
+                    Err(err) => self.push_output(
+                        format!("Failed to read MCP configuration: {err}"),
+                        OutputRole::Error,
+                    ),
+                }
             }
             "install" => {
                 let Some(preset_name) = parts.get(1).copied() else {
@@ -7331,6 +7570,7 @@ impl App {
 
     fn handle_voice_mode(&mut self, args: String) {
         let trimmed = args.trim();
+        let runtime_config = self.load_runtime_config();
         // Check for "/voice tts <text>" — immediate TTS of arbitrary text
         if let Some(text) = trimmed
             .strip_prefix("tts ")
@@ -7390,34 +7630,70 @@ impl App {
         match trimmed {
             "on" => {
                 self.voice_mode_enabled = true;
+                let persisted = persist_voice_enabled_to_config(true).is_ok();
                 self.push_output(
-                    "Voice mode: ON — agent responses will be read aloud via TTS.\n\
-                     (Uses the configured TTS backend or falls back to available local/API providers.)",
+                    format!(
+                        "Voice mode: ON — agent responses will be read aloud via TTS.\n\
+                         Backend: {}  Voice: {}\n\
+                         Persistent default: {}",
+                        runtime_config.tts.provider,
+                        runtime_config.tts.voice,
+                        if persisted { "saved" } else { "not saved" }
+                    ),
+                    OutputRole::System,
+                );
+            }
+            "tts" => {
+                self.voice_mode_enabled = true;
+                let persisted = persist_voice_enabled_to_config(true).is_ok();
+                self.push_output(
+                    format!(
+                        "Auto-TTS enabled.\n\
+                         All assistant replies will be spoken in this CLI session.\n\
+                         Backend: {}  Voice: {}\n\
+                         Persistent default: {}",
+                        runtime_config.tts.provider,
+                        runtime_config.tts.voice,
+                        if persisted { "saved" } else { "not saved" }
+                    ),
                     OutputRole::System,
                 );
             }
             "off" => {
                 self.voice_mode_enabled = false;
-                self.push_output("Voice mode: OFF", OutputRole::System);
+                let persisted = persist_voice_enabled_to_config(false).is_ok();
+                self.push_output(
+                    format!(
+                        "Voice mode: OFF\nPersistent default: {}",
+                        if persisted { "saved" } else { "not saved" }
+                    ),
+                    OutputRole::System,
+                );
             }
             "status" | "" => {
                 let status = if self.voice_mode_enabled { "ON" } else { "OFF" };
                 self.push_output(
                     format!(
                         "Voice mode: {status}\n\
-                         /voice on           — enable TTS readback\n\
+                         Default backend: {}  Voice: {}\n\
+                         Push-to-talk key: {} (recording not yet wired in TUI)\n\
+                         /voice on           — enable spoken readback\n\
+                         /voice tts          — alias for always-on spoken readback\n\
                          /voice off          — disable TTS readback\n\
                          /voice status       — show voice mode state\n\
                          /voice tts <text>   — speak text immediately\n\
                          /voice transcribe <audio-file> — transcribe a local audio file\n\
-                         /voice reply <audio-file>      — transcribe and submit it as your next prompt"
+                         /voice reply <audio-file>      — transcribe and submit it as your next prompt",
+                        runtime_config.tts.provider,
+                        runtime_config.tts.voice,
+                        runtime_config.voice.push_to_talk_key,
                     ),
                     OutputRole::System,
                 );
             }
             _ => {
                 self.push_output(
-                    "Usage: /voice <on|off|status|tts <text>|transcribe <file>|reply <file>>",
+                    "Usage: /voice <on|off|tts|status|tts <text>|transcribe <file>|reply <file>>",
                     OutputRole::System,
                 );
             }
@@ -7974,6 +8250,11 @@ impl App {
         // Vision-model selector overlay (full screen)
         if self.vision_model_selector.active {
             self.render_vision_model_selector(frame, frame.area());
+        }
+
+        // MCP selector overlay (full screen, same family as /model)
+        if self.mcp_selector.active {
+            self.render_mcp_selector(frame, frame.area());
         }
 
         // Skill selector overlay (full screen, takes precedence over model selector)
@@ -8738,6 +9019,105 @@ impl App {
             "Type to filter vision backends... (Esc to cancel)",
             "options",
         );
+    }
+
+    fn render_mcp_selector(&self, frame: &mut Frame, area: Rect) {
+        frame.render_widget(Clear, area);
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ])
+            .split(area);
+
+        let search_text = if self.mcp_selector.query.is_empty() {
+            "Search configured servers + official MCP snapshot... (Enter install/test, v view, d remove, Esc cancel)".to_string()
+        } else {
+            self.mcp_selector.query.clone()
+        };
+        let search_style = if self.mcp_selector.query.is_empty() {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let search = Paragraph::new(Line::from(vec![
+            Span::styled("  ⛓ ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled(search_text, search_style),
+        ]))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Rgb(110, 220, 210)))
+                .title(" Official MCP Catalog "),
+        );
+        frame.render_widget(search, chunks[0]);
+
+        let max_visible = chunks[1].height as usize;
+        let filtered = &self.mcp_selector.filtered;
+        let selected = self.mcp_selector.selected;
+        let scroll_start = if selected >= max_visible {
+            selected - max_visible + 1
+        } else {
+            0
+        };
+
+        let items: Vec<ListItem> = filtered
+            .iter()
+            .skip(scroll_start)
+            .take(max_visible)
+            .enumerate()
+            .map(|(vis_idx, &preset_idx)| {
+                let entry = &self.mcp_selector.items[preset_idx];
+                let is_selected = vis_idx + scroll_start == selected;
+                let row_style = if is_selected {
+                    Style::default()
+                        .bg(Color::Rgb(40, 56, 58))
+                        .fg(Color::Rgb(110, 220, 210))
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Rgb(210, 220, 220))
+                };
+                let source_style = if is_selected {
+                    Style::default()
+                        .bg(Color::Rgb(40, 56, 58))
+                        .fg(Color::Rgb(145, 170, 170))
+                } else {
+                    Style::default().fg(Color::Rgb(100, 120, 120))
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!("  {:<10}", entry.source), source_style),
+                    Span::styled(entry.title.clone(), row_style),
+                    Span::raw("  "),
+                    Span::styled(entry.detail.clone(), source_style),
+                ]))
+            })
+            .collect();
+
+        frame.render_widget(
+            List::new(items).style(Style::default().bg(Color::Rgb(18, 24, 26))),
+            chunks[1],
+        );
+
+        let help = Paragraph::new(Line::from(vec![
+            Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("browse  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Enter ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("install/test  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("v ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("view  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("d ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("remove  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Esc ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("cancel  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{} entries", filtered.len()),
+                Style::default().fg(Color::Rgb(100, 120, 120)),
+            ),
+        ]));
+        frame.render_widget(help, chunks[2]);
     }
 
     /// Render the full-screen skill browser overlay.
@@ -10024,6 +10404,70 @@ mod tests {
                 .is_some_and(|l| l.text.contains("EdgeCrab")
                     || l.text.contains("slash commands")
                     || l.text.contains("Navigation"))
+        );
+    }
+
+    #[test]
+    fn mcp_selector_builder_merges_configured_and_official_entries() {
+        let configured = vec![edgecrab_tools::tools::mcp_client::ConfiguredMcpServer {
+            name: "local-git".into(),
+            url: None,
+            bearer_token: None,
+            command: "uvx".into(),
+            args: vec![
+                "mcp-server-git".into(),
+                "--repository".into(),
+                "/tmp/repo".into(),
+            ],
+            cwd: Some(std::path::PathBuf::from("/tmp/repo")),
+            env: std::collections::HashMap::new(),
+            headers: std::collections::HashMap::new(),
+            timeout: None,
+            connect_timeout: None,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            token_from_config: false,
+            token_from_store: false,
+        }];
+
+        let entries = build_mcp_selector_entries_from(&configured);
+
+        assert!(entries.iter().any(|entry| {
+            entry.kind == McpEntryKind::ConfiguredServer && entry.id == "local-git"
+        }));
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.kind == McpEntryKind::Preset && entry.id == "git")
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_command_without_args_opens_selector_overlay() {
+        let mut app = App::new();
+
+        app.handle_mcp_command(String::new());
+
+        assert!(app.mcp_selector.active);
+        assert!(!app.mcp_selector.filtered.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mcp_search_filters_official_snapshot_entries() {
+        let mut app = App::new();
+
+        app.handle_mcp_command("search timezone".into());
+
+        assert!(app.mcp_selector.active);
+        let visible: Vec<&str> = app
+            .mcp_selector
+            .filtered
+            .iter()
+            .map(|idx| app.mcp_selector.items[*idx].title.as_str())
+            .collect();
+        assert!(
+            visible.iter().any(|title| title.contains("Time")),
+            "expected the official time preset in filtered entries, got: {visible:?}"
         );
     }
 

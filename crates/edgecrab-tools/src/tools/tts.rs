@@ -324,7 +324,8 @@ impl ToolHandler for TextToSpeechTool {
         ToolSchema {
             name: "text_to_speech".into(),
             description: "Convert text to speech audio. Uses edge-tts (free), OpenAI TTS API, \
-                 or ElevenLabs API. Returns the path to the generated audio file."
+                 or ElevenLabs API. Returns the generated file path and a MEDIA: hint \
+                 so the caller can deliver the audio natively."
                 .into(),
             parameters: json!({
                 "type": "object",
@@ -478,7 +479,9 @@ impl ToolHandler for TextToSpeechTool {
             }
         };
 
-        Ok(format!("Audio saved to: {result}"))
+        Ok(format!(
+            "Audio saved to: {result}\nUse MEDIA:{result} to send it natively."
+        ))
     }
 }
 
