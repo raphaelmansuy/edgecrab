@@ -1,4 +1,0 @@
-Actions: diagnosed startup crash from duplicate model keys (`model.default` + `model.default_model`); implemented compatibility normalization in AppConfig load/load_from; changed /model persistence to write only canonical `model.default` and remove legacy key; added regression tests for both-key parsing and precedence; built and tested.
-Decisions: preferred `default_model` when both keys exist during normalization to preserve user-selected model from previous buggy writes; removed legacy key post-normalization to prevent future parse ambiguity.
-Next steps: optional one-shot migration command to rewrite config files cleanly on disk immediately after load.
-Lessons/insights: serde field aliases can still fail on duplicate logical fields when both keys are present; safe approach is pre-deserialization normalization of raw YAML values.

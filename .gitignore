@@ -26,6 +26,7 @@ mcp-tokens/
 # ── Edgecrab runtime state (generated at run-time, not source) ───────────────
 .edgecrab/
 .agent/
+logs/
 
 # ── Node.js dependencies (root + nested) ─────────────────────────────────────
 node_modules/
@@ -68,3 +69,4 @@ coverage/
 # ── Stray / one-off files ─────────────────────────────────────────────────────
 video_script.py
 *.profdata
+demo/

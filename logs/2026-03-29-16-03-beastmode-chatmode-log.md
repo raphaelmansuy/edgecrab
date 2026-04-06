@@ -1,4 +1,0 @@
-Actions: implemented dynamic provider model discovery module with live/cache/static fallback; wired /models to dynamic discovery and refresh mode; wired /model selector to auto-refresh dynamic providers; hardened /model persistence write path and user feedback; added reqwest dependency; built and tested.
-Decisions: prioritized openrouter/ollama/lmstudio live discovery plus openai-compatible providers where practical; kept static ModelCatalog as resilient fallback; used short-lived cache (~5 min) for fast UX and offline resilience.
-Next steps: optionally add background async refresh to avoid any selector-open latency and add provider-specific auth headers for additional endpoints if needed.
-Lessons/insights: dynamic discovery works best with explicit source labeling (live/cache/static) so users trust the list and understand freshness.
