@@ -38,15 +38,19 @@ use serde_json::json;
 
 use edgecrab_types::{ToolError, ToolSchema};
 
+#[cfg(unix)]
 use crate::describe_execution_filesystem;
-use crate::execution_tmp::{
-    BACKEND_TMP_ROOT, ensure_default_shared_tmp_dir, temp_env_pairs, wrap_command_with_tmp_env,
-};
+use crate::execution_tmp::{ensure_default_shared_tmp_dir, temp_env_pairs};
+#[cfg(unix)]
+use crate::execution_tmp::{BACKEND_TMP_ROOT, wrap_command_with_tmp_env};
 #[cfg(unix)]
 use crate::registry::ToolRegistry;
 use crate::registry::{ToolContext, ToolHandler};
+#[cfg(unix)]
 use crate::tools::backend_pool::get_or_create_backend;
-use crate::tools::backends::{self, redact_output};
+use crate::tools::backends::redact_output;
+#[cfg(unix)]
+use crate::tools::backends;
 
 /// Maximum execution time before we kill the subprocess (5 minutes like hermes).
 const DEFAULT_TIMEOUT_SECS: u64 = 300;
