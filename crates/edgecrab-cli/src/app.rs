@@ -54,6 +54,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::commands::{CommandRegistry, CommandResult};
 use crate::edit_diff::{LocalEditSnapshot, capture_local_edit_snapshot, render_edit_diff_lines};
 use crate::fuzzy_selector::{FuzzyItem, FuzzySelector};
+use crate::image_models as cli_image_models;
 use crate::markdown_render;
 use crate::model_discovery::{self, DiscoverySource};
 use crate::theme::{SkinConfig, Theme};
@@ -67,7 +68,12 @@ use crate::vision_models::{
 };
 use edgecrab_core::ModelCatalog;
 use edgecrab_core::{Agent, IsolatedAgentOptions};
+use edgecrab_tools::registry::ToolHandler;
+use edgecrab_tools::tools::transcribe::TranscribeAudioTool;
+use edgecrab_tools::tools::tts::TextToSpeechTool;
+use edgecrab_tools::{AppConfigRef, ToolContext};
 use edgequake_llm::{ProviderFactory, VsCodeCopilotProvider};
+use tokio_util::sync::CancellationToken;
 
 const KEYBOARD_PROTOCOL_WARMUP: Duration = Duration::from_millis(25);
 
@@ -358,6 +364,35 @@ fn persist_vision_model_to_config(
             }
         } else {
             map.remove(&auxiliary_key);
+        }
+    }
+
+    write_config_root(&config_path, &root)
+}
+
+/// Persist the default image-generation routing to ~/.edgecrab/config.yaml.
+fn persist_image_generation_to_config(
+    image_generation: &edgecrab_core::config::ImageGenerationConfig,
+) -> anyhow::Result<()> {
+    let (config_path, mut root) = load_config_root_for_edit()?;
+
+    if let serde_yml::Value::Mapping(ref mut map) = root {
+        let section_key = serde_yml::Value::String("image_generation".into());
+        let provider_key = serde_yml::Value::String("provider".into());
+        let model_key = serde_yml::Value::String("model".into());
+
+        let section = map
+            .entry(section_key)
+            .or_insert_with(|| serde_yml::Value::Mapping(Default::default()));
+        if let serde_yml::Value::Mapping(image_map) = section {
+            image_map.insert(
+                provider_key,
+                serde_yml::Value::String(image_generation.provider.clone()),
+            );
+            image_map.insert(
+                model_key,
+                serde_yml::Value::String(image_generation.model.clone()),
+            );
         }
     }
 
@@ -1013,6 +1048,8 @@ enum AgentResponse {
     Token(String),
     /// A non-token runtime notice to show as a system line.
     Notice(String),
+    /// Deterministic direct-tool output from the TUI (for voice commands).
+    DirectToolOutput(String),
     /// A reasoning / think-mode delta or full reasoning block.
     Reasoning(String),
     /// A tool execution has started — show tool name + preview in status bar.
@@ -1076,6 +1113,11 @@ enum AgentResponse {
     },
     /// A background operation (model discovery, compress, swap) completed.
     BgOp(BackgroundOpResult),
+    /// A completed local voice transcription, optionally submitted as a prompt.
+    VoiceTranscript {
+        transcript: String,
+        submit_to_agent: bool,
+    },
     /// An isolated `/background` session finished successfully.
     BackgroundPromptComplete {
         task_num: u64,
@@ -2009,6 +2051,18 @@ impl App {
                 ("auto", "Use the current chat model when vision-capable"),
                 ("openai/gpt-4o", "Route image analysis to a dedicated model"),
                 ("copilot/gpt-5.4", "Use Copilot's multimodal backend"),
+            ],
+            "image_model" | "image-model" => &[
+                ("status", "Show the current image-generation default"),
+                ("list", "List supported image providers and models"),
+                (
+                    "gemini/gemini-2.5-flash-image",
+                    "Use the default cheap Gemini image model",
+                ),
+                (
+                    "imagen/imagen-4.0-fast-generate-001",
+                    "Use Vertex Imagen fast",
+                ),
             ],
             // All other commands accept free-form arguments; fall through.
             _ => &[],
@@ -3660,6 +3714,12 @@ impl App {
             CommandResult::SetVisionModel(spec) => {
                 self.handle_set_vision_model(spec);
             }
+            CommandResult::ShowImageModel => {
+                self.handle_show_image_model();
+            }
+            CommandResult::SetImageModel(spec) => {
+                self.handle_set_image_model(spec);
+            }
             CommandResult::SessionNew => {
                 if let Some(ref agent) = self.agent {
                     let agent = Arc::clone(agent);
@@ -4004,6 +4064,10 @@ impl App {
                     self.push_output(text, OutputRole::System);
                     self.needs_redraw = true;
                 }
+                AgentResponse::DirectToolOutput(text) => {
+                    self.push_output(text, OutputRole::System);
+                    self.needs_redraw = true;
+                }
                 AgentResponse::Reasoning(text) => {
                     if self.show_reasoning && !text.trim().is_empty() {
                         if let Some(idx) = self.reasoning_line {
@@ -4280,21 +4344,12 @@ impl App {
                     // Auto-update status bar tokens/cost from agent
                     self.auto_update_status();
 
-                    // Voice mode: speak the response via TTS after each turn.
-                    // WHY background task: TTS is async and we don't want to
-                    // block the event loop or show a fake "processing" state.
-                    // Mirrors hermes-agent's voice_mode readback pattern.
+                    // Voice mode: speak the response via direct TTS after each
+                    // turn. This avoids routing a deterministic action back
+                    // through the model and removes a major source of flakiness.
                     let response_text = std::mem::take(&mut self.last_agent_response_text);
                     if self.voice_mode_enabled && !response_text.is_empty() {
-                        if let Some(agent) = self.agent.clone() {
-                            let tts_prompt = format!(
-                                "Please call the text_to_speech tool to read the following aloud: \
-                                 {response_text}"
-                            );
-                            self.rt_handle.spawn(async move {
-                                let _ = agent.chat(&tts_prompt).await;
-                            });
-                        }
+                        self.spawn_direct_tts(response_text);
                     }
 
                     if let Some(next) = self.prompt_queue.first().cloned() {
@@ -4432,6 +4487,29 @@ impl App {
                             self.push_output(msg, OutputRole::System);
                         }
                     }
+                }
+                AgentResponse::VoiceTranscript {
+                    transcript,
+                    submit_to_agent,
+                } => {
+                    if transcript.trim().is_empty() {
+                        self.push_output(
+                            "Transcription completed, but no speech was detected.",
+                            OutputRole::System,
+                        );
+                    } else if submit_to_agent {
+                        self.push_output(
+                            format!("Voice reply transcript:\n{transcript}"),
+                            OutputRole::System,
+                        );
+                        self.process_input(&transcript);
+                    } else {
+                        self.push_output(
+                            format!("Voice transcript:\n{transcript}"),
+                            OutputRole::System,
+                        );
+                    }
+                    self.needs_redraw = true;
                 }
                 AgentResponse::BackgroundPromptComplete {
                     task_num,
@@ -4881,12 +4959,114 @@ impl App {
         }
     }
 
+    fn handle_show_image_model(&mut self) {
+        let Some(agent) = self.require_agent() else {
+            return;
+        };
+
+        let (_, _, image_generation) = self.rt_handle.block_on(agent.media_config());
+        let text = format!(
+            "Image generation routing:\n\
+             Default backend: {}/{}\n\
+             Storage:         persisted in config.yaml under image_generation\n\
+             Usage:           /image_model list | /image_model <provider>/<model> | /image_model default",
+            image_generation.provider, image_generation.model
+        );
+        self.push_output(text, OutputRole::System);
+    }
+
+    fn handle_set_image_model(&mut self, spec: String) {
+        let Some(agent) = self.require_agent() else {
+            return;
+        };
+
+        let trimmed = spec.trim();
+        if trimmed.eq_ignore_ascii_case("list") {
+            let options = cli_image_models::available_image_model_options();
+            let mut text = String::from("Supported image models:\n");
+            for option in options {
+                text.push_str(&format!(
+                    "  {}  - {}\n",
+                    option.selection_spec, option.detail
+                ));
+            }
+            self.push_output(text.trim_end().to_string(), OutputRole::System);
+            return;
+        }
+
+        if trimmed.eq_ignore_ascii_case("default")
+            || trimmed.eq_ignore_ascii_case("reset")
+            || trimmed.eq_ignore_ascii_case("auto")
+        {
+            let image_generation = edgecrab_core::config::ImageGenerationConfig::default();
+            let agent_clone = Arc::clone(&agent);
+            self.rt_handle.block_on(async move {
+                agent_clone
+                    .set_image_generation_config(image_generation.clone())
+                    .await;
+            });
+            match persist_image_generation_to_config(
+                &edgecrab_core::config::ImageGenerationConfig::default(),
+            ) {
+                Ok(()) => self.push_output(
+                    format!(
+                        "Image generation reset to default: {}",
+                        cli_image_models::default_selection_spec()
+                    ),
+                    OutputRole::System,
+                ),
+                Err(err) => self.push_output(
+                    format!("Image model updated for this session, but config save failed: {err}"),
+                    OutputRole::Error,
+                ),
+            }
+            return;
+        }
+
+        let Some((provider, model)) = cli_image_models::parse_selection_spec(trimmed) else {
+            self.push_output(
+                format!(
+                    "Invalid format: use 'provider/model-name', 'list', or 'default'. Got: '{trimmed}'"
+                ),
+                OutputRole::Error,
+            );
+            return;
+        };
+
+        let image_generation = edgecrab_core::config::ImageGenerationConfig {
+            provider: provider.clone(),
+            model: model.clone(),
+        };
+        let agent_clone = Arc::clone(&agent);
+        self.rt_handle.block_on(async move {
+            agent_clone
+                .set_image_generation_config(image_generation.clone())
+                .await;
+        });
+        match persist_image_generation_to_config(&edgecrab_core::config::ImageGenerationConfig {
+            provider: provider.clone(),
+            model: model.clone(),
+        }) {
+            Ok(()) => self.push_output(
+                format!(
+                    "Default image model set to {provider}/{model}. Future generate_image calls will use it unless the tool call overrides provider/model."
+                ),
+                OutputRole::System,
+            ),
+            Err(err) => self.push_output(
+                format!("Image model updated for this session, but config save failed: {err}"),
+                OutputRole::Error,
+            ),
+        }
+    }
+
     fn handle_show_status(&mut self) {
         let Some(agent) = self.require_agent() else {
             return;
         };
         let snap = self.agent_snapshot(&agent);
         let auxiliary = self.rt_handle.block_on(agent.auxiliary_config());
+        let (_, _, image_generation) = self.rt_handle.block_on(agent.media_config());
         let vision_routing = match (auxiliary.provider.as_deref(), auxiliary.model.as_deref()) {
             (Some(provider), Some(model)) => format!("{provider}/{model}"),
             _ => "auto".to_string(),
@@ -4896,6 +5076,7 @@ impl App {
              Session ID:  {}\n\
              Model:       {}\n\
              Vision:      {}\n\
+             Image:       {}/{}\n\
              Messages:    {}\n\
              User turns:  {}\n\
              API calls:   {}\n\
@@ -4903,6 +5084,8 @@ impl App {
             snap.session_id.as_deref().unwrap_or("(none)"),
             snap.model,
             vision_routing,
+            image_generation.provider,
+            image_generation.model,
             snap.message_count,
             snap.user_turn_count,
             snap.api_call_count,
@@ -6460,6 +6643,92 @@ impl App {
         edgecrab_core::AppConfig::load_from(&config_path).unwrap_or_default()
     }
 
+    fn direct_media_tool_context(&self) -> ToolContext {
+        let config = self.load_runtime_config();
+        ToolContext {
+            task_id: "cli-voice-tool".into(),
+            cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            session_id: "cli-voice-tool".into(),
+            user_task: None,
+            cancel: CancellationToken::new(),
+            config: AppConfigRef {
+                edgecrab_home: edgecrab_core::edgecrab_home(),
+                tts_provider: Some(config.tts.provider),
+                tts_voice: Some(config.tts.voice),
+                tts_rate: config.tts.rate,
+                tts_model: config.tts.model,
+                tts_elevenlabs_voice_id: config.tts.elevenlabs_voice_id,
+                tts_elevenlabs_model_id: config.tts.elevenlabs_model_id,
+                tts_elevenlabs_api_key_env: Some(config.tts.elevenlabs_api_key_env),
+                stt_provider: Some(config.stt.provider),
+                stt_whisper_model: Some(config.stt.whisper_model),
+                image_provider: Some(config.image_generation.provider),
+                image_model: Some(config.image_generation.model),
+                ..Default::default()
+            },
+            state_db: None,
+            platform: edgecrab_types::Platform::Cli,
+            process_table: None,
+            provider: None,
+            tool_registry: None,
+            delegate_depth: 0,
+            sub_agent_runner: None,
+            delegation_event_tx: None,
+            clarify_tx: None,
+            approval_tx: None,
+            on_skills_changed: None,
+            gateway_sender: None,
+            origin_chat: None,
+            session_key: None,
+            todo_store: None,
+        }
+    }
+
+    fn spawn_direct_tts(&mut self, text: String) {
+        let tx = self.response_tx.clone();
+        let ctx = self.direct_media_tool_context();
+        self.rt_handle.spawn(async move {
+            match TextToSpeechTool
+                .execute(serde_json::json!({ "text": text }), &ctx)
+                .await
+            {
+                Ok(output) => {
+                    let _ = tx.send(AgentResponse::DirectToolOutput(output));
+                }
+                Err(error) => {
+                    let _ = tx.send(AgentResponse::Error(format!("TTS error: {error}")));
+                }
+            }
+        });
+    }
+
+    fn spawn_direct_transcription(&mut self, file_path: String, submit_to_agent: bool) {
+        let tx = self.response_tx.clone();
+        let ctx = self.direct_media_tool_context();
+        self.rt_handle.spawn(async move {
+            match TranscribeAudioTool
+                .execute(serde_json::json!({ "file_path": file_path }), &ctx)
+                .await
+            {
+                Ok(output) => {
+                    let transcript = output
+                        .split_once('\n')
+                        .map(|(_, text)| text.trim().to_string())
+                        .unwrap_or_else(|| output.trim().to_string());
+                    let _ = tx.send(AgentResponse::VoiceTranscript {
+                        transcript,
+                        submit_to_agent,
+                    });
+                }
+                Err(error) => {
+                    let _ = tx.send(AgentResponse::Error(format!(
+                        "Transcription error: {error}"
+                    )));
+                }
+            }
+        });
+    }
+
     fn personality_arg_hints(&self) -> Vec<(String, String)> {
         let mut hints = vec![
             (
@@ -6832,9 +7101,9 @@ impl App {
     // after each turn.  This provides audio feedback without blocking
     // the streaming UI.
     //
-    // Unlike hermes (which uses sounddevice for push-to-talk recording),
-    // EdgeCrab's voice mode is currently TTS-only.  Push-to-talk requires
-    // platform audio capture (cpal) and is tracked as a future enhancement.
+    // EdgeCrab still does not capture live microphone audio in the TUI, but it
+    // now supports deterministic local STT/TTS commands on top of the existing
+    // media tools instead of routing everything through the model.
 
     fn handle_voice_mode(&mut self, args: String) {
         let trimmed = args.trim();
@@ -6848,30 +7117,49 @@ impl App {
                 self.push_output("Usage: /voice tts <text to speak>", OutputRole::System);
                 return;
             }
-            let Some(agent) = self.require_agent() else {
-                return;
-            };
-            let tx = self.response_tx.clone();
             let text_owned = text.to_string();
             self.push_output(
                 format!("Speaking: {}", &text_owned[..text_owned.len().min(80)]),
                 OutputRole::System,
             );
-            self.rt_handle.spawn(async move {
-                let tts_prompt = format!(
-                    "Please use the text_to_speech tool to speak the following text aloud: {}",
-                    text_owned
+            self.spawn_direct_tts(text_owned);
+            return;
+        }
+
+        if let Some(file_path) = trimmed
+            .strip_prefix("transcribe ")
+            .or_else(|| trimmed.strip_prefix("transcribe\t"))
+        {
+            let file_path = file_path.trim();
+            if file_path.is_empty() {
+                self.push_output(
+                    "Usage: /voice transcribe <audio-file-path>",
+                    OutputRole::System,
                 );
-                match agent.chat(&tts_prompt).await {
-                    Ok(resp) => {
-                        let _ = tx.send(AgentResponse::Token(resp));
-                        let _ = tx.send(AgentResponse::Done);
-                    }
-                    Err(e) => {
-                        let _ = tx.send(AgentResponse::Error(format!("TTS error: {e}")));
-                    }
-                }
-            });
+                return;
+            }
+            self.push_output(
+                format!("Transcribing audio: {}", file_path),
+                OutputRole::System,
+            );
+            self.spawn_direct_transcription(file_path.to_string(), false);
+            return;
+        }
+
+        if let Some(file_path) = trimmed
+            .strip_prefix("reply ")
+            .or_else(|| trimmed.strip_prefix("reply\t"))
+        {
+            let file_path = file_path.trim();
+            if file_path.is_empty() {
+                self.push_output("Usage: /voice reply <audio-file-path>", OutputRole::System);
+                return;
+            }
+            self.push_output(
+                format!("Transcribing and submitting audio reply: {}", file_path),
+                OutputRole::System,
+            );
+            self.spawn_direct_transcription(file_path.to_string(), true);
             return;
         }
 
@@ -6880,7 +7168,7 @@ impl App {
                 self.voice_mode_enabled = true;
                 self.push_output(
                     "Voice mode: ON — agent responses will be read aloud via TTS.\n\
-                     (Requires TTS_PROVIDER or OPENAI_API_KEY for text_to_speech tool.)",
+                     (Uses the configured TTS backend or falls back to available local/API providers.)",
                     OutputRole::System,
                 );
             }
@@ -6895,14 +7183,17 @@ impl App {
                         "Voice mode: {status}\n\
                          /voice on           — enable TTS readback\n\
                          /voice off          — disable TTS readback\n\
-                         /voice tts <text>   — speak text immediately"
+                         /voice status       — show voice mode state\n\
+                         /voice tts <text>   — speak text immediately\n\
+                         /voice transcribe <audio-file> — transcribe a local audio file\n\
+                         /voice reply <audio-file>      — transcribe and submit it as your next prompt"
                     ),
                     OutputRole::System,
                 );
             }
             _ => {
                 self.push_output(
-                    "Usage: /voice <on|off|status|tts <text>>",
+                    "Usage: /voice <on|off|status|tts <text>|transcribe <file>|reply <file>>",
                     OutputRole::System,
                 );
             }

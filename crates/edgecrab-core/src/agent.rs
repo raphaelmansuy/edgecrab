@@ -148,6 +148,12 @@ pub struct AgentConfig {
     pub compression: crate::config::CompressionConfig,
     /// Auxiliary side-task routing (vision, compression, other helper calls).
     pub auxiliary: crate::config::AuxiliaryConfig,
+    /// Voice output configuration projected from AppConfig.
+    pub tts: crate::config::TtsConfig,
+    /// Voice input configuration projected from AppConfig.
+    pub stt: crate::config::SttConfig,
+    /// Default image generation provider/model projected from AppConfig.
+    pub image_generation: crate::config::ImageGenerationConfig,
     /// Env-var names allowed to pass through the subprocess security blocklist.
     ///
     /// Populated from `terminal.env_passthrough` in config.yaml and applied
@@ -198,6 +204,9 @@ impl Default for AgentConfig {
                 edgecrab_tools::tools::backends::SingularityBackendConfig::default(),
             compression: crate::config::CompressionConfig::default(),
             auxiliary: crate::config::AuxiliaryConfig::default(),
+            tts: crate::config::TtsConfig::default(),
+            stt: crate::config::SttConfig::default(),
+            image_generation: crate::config::ImageGenerationConfig::default(),
             terminal_env_passthrough: Vec::new(),
             file_allowed_roots: Vec::new(),
             path_restrictions: Vec::new(),
@@ -819,6 +828,22 @@ impl Agent {
         self.config.read().await.auxiliary.clone()
     }
 
+    /// Return the current voice/media configuration used by direct tools.
+    pub async fn media_config(
+        &self,
+    ) -> (
+        crate::config::TtsConfig,
+        crate::config::SttConfig,
+        crate::config::ImageGenerationConfig,
+    ) {
+        let config = self.config.read().await;
+        (
+            config.tts.clone(),
+            config.stt.clone(),
+            config.image_generation.clone(),
+        )
+    }
+
     /// List all registered tool names.
     pub async fn tool_names(&self) -> Vec<String> {
         match &self.tool_registry {
@@ -856,6 +881,15 @@ impl Agent {
     pub async fn set_auxiliary_config(&self, auxiliary: crate::config::AuxiliaryConfig) {
         let mut config = self.config.write().await;
         config.auxiliary = auxiliary;
+    }
+
+    /// Update the default image generation routing for future turns.
+    pub async fn set_image_generation_config(
+        &self,
+        image_generation: crate::config::ImageGenerationConfig,
+    ) {
+        let mut config = self.config.write().await;
+        config.image_generation = image_generation;
     }
 }
 
@@ -1214,6 +1248,9 @@ impl AgentBuilder {
                 terminal_singularity: config.terminal.singularity.clone(),
                 compression: config.compression.clone(),
                 auxiliary: config.auxiliary.clone(),
+                tts: config.tts.clone(),
+                stt: config.stt.clone(),
+                image_generation: config.image_generation.clone(),
                 terminal_env_passthrough: config.terminal.env_passthrough.clone(),
                 file_allowed_roots: config.tools.file.allowed_roots.clone(),
                 path_restrictions: config.security.path_restrictions.clone(),

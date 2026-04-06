@@ -37,8 +37,8 @@ const DEFAULT_OPENAI_VOICE: &str = "alloy";
 const DEFAULT_ELEVENLABS_VOICE_ID: &str = "21m00Tcm4TlvDq8ikWAM"; // Rachel
 
 /// Check if the ElevenLabs API key is available for TTS.
-fn elevenlabs_tts_available() -> bool {
-    std::env::var("ELEVENLABS_API_KEY")
+fn elevenlabs_tts_available(api_key_env: &str) -> bool {
+    std::env::var(api_key_env)
         .map(|k| !k.is_empty())
         .unwrap_or(false)
 }
@@ -69,21 +69,42 @@ enum TtsBackend {
     None,
 }
 
-fn detect_backend() -> TtsBackend {
+fn configured_elevenlabs_api_key_env(ctx: &ToolContext) -> &str {
+    ctx.config
+        .tts_elevenlabs_api_key_env
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("ELEVENLABS_API_KEY")
+}
+
+fn detect_backend(ctx: &ToolContext) -> TtsBackend {
+    let elevenlabs_api_key_env = configured_elevenlabs_api_key_env(ctx);
     // Check if user has configured a preferred provider via env
     if let Ok(pref) = std::env::var("EDGECRAB_TTS_PROVIDER") {
         match pref.to_lowercase().as_str() {
-            "elevenlabs" | "eleven" if elevenlabs_tts_available() => return TtsBackend::ElevenLabs,
+            "elevenlabs" | "eleven" if elevenlabs_tts_available(elevenlabs_api_key_env) => {
+                return TtsBackend::ElevenLabs;
+            }
             "openai" if openai_tts_available() => return TtsBackend::OpenAi,
             "edge-tts" | "edge" if edge_tts_available() => return TtsBackend::EdgeTts,
             _ => {} // fall through to auto-detect
+        }
+    }
+    if let Some(pref) = ctx.config.tts_provider.as_deref() {
+        match pref.to_ascii_lowercase().as_str() {
+            "elevenlabs" | "eleven" if elevenlabs_tts_available(elevenlabs_api_key_env) => {
+                return TtsBackend::ElevenLabs;
+            }
+            "openai" if openai_tts_available() => return TtsBackend::OpenAi,
+            "edge-tts" | "edge" if edge_tts_available() => return TtsBackend::EdgeTts,
+            _ => {}
         }
     }
     // Auto-detect: prefer edge-tts (free), then elevenlabs, then openai
     if edge_tts_available() {
         return TtsBackend::EdgeTts;
     }
-    if elevenlabs_tts_available() {
+    if elevenlabs_tts_available(elevenlabs_api_key_env) {
         return TtsBackend::ElevenLabs;
     }
     if openai_tts_available() {
@@ -93,22 +114,28 @@ fn detect_backend() -> TtsBackend {
 }
 
 /// Generate speech using edge-tts subprocess.
-async fn tts_edge(text: &str, voice: &str, output_path: &Path) -> Result<String, ToolError> {
-    let output = tokio::process::Command::new("edge-tts")
-        .args([
-            "--text",
-            text,
-            "--voice",
-            voice,
-            "--write-media",
-            &output_path.to_string_lossy(),
-        ])
-        .output()
-        .await
-        .map_err(|e| ToolError::ExecutionFailed {
-            tool: "text_to_speech".into(),
-            message: format!("Failed to run edge-tts: {e}"),
-        })?;
+async fn tts_edge(
+    text: &str,
+    voice: &str,
+    rate: Option<&str>,
+    output_path: &Path,
+) -> Result<String, ToolError> {
+    let mut cmd = tokio::process::Command::new("edge-tts");
+    cmd.args([
+        "--text",
+        text,
+        "--voice",
+        voice,
+        "--write-media",
+        &output_path.to_string_lossy(),
+    ]);
+    if let Some(rate) = rate.filter(|value| !value.trim().is_empty()) {
+        cmd.args(["--rate", rate]);
+    }
+    let output = cmd.output().await.map_err(|e| ToolError::ExecutionFailed {
+        tool: "text_to_speech".into(),
+        message: format!("Failed to run edge-tts: {e}"),
+    })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -122,7 +149,12 @@ async fn tts_edge(text: &str, voice: &str, output_path: &Path) -> Result<String,
 }
 
 /// Generate speech using OpenAI TTS API.
-async fn tts_openai(text: &str, voice: &str, output_path: &Path) -> Result<String, ToolError> {
+async fn tts_openai(
+    text: &str,
+    voice: &str,
+    model: Option<&str>,
+    output_path: &Path,
+) -> Result<String, ToolError> {
     let api_key = std::env::var("OPENAI_API_KEY").map_err(|_| ToolError::Unavailable {
         tool: "text_to_speech".into(),
         reason: "OPENAI_API_KEY not set".into(),
@@ -140,7 +172,7 @@ async fn tts_openai(text: &str, voice: &str, output_path: &Path) -> Result<Strin
         .post("https://api.openai.com/v1/audio/speech")
         .bearer_auth(&api_key)
         .json(&json!({
-            "model": "tts-1",
+            "model": model.filter(|value| !value.trim().is_empty()).unwrap_or("tts-1"),
             "input": text,
             "voice": voice,
             "response_format": "mp3"
@@ -179,16 +211,21 @@ async fn tts_openai(text: &str, voice: &str, output_path: &Path) -> Result<Strin
 /// Generate speech using ElevenLabs TTS API.
 async fn tts_elevenlabs(
     text: &str,
+    api_key_env: &str,
     voice_id: &str,
+    model_id_override: Option<&str>,
     output_path: &Path,
 ) -> Result<String, ToolError> {
-    let api_key = std::env::var("ELEVENLABS_API_KEY").map_err(|_| ToolError::Unavailable {
+    let api_key = std::env::var(api_key_env).map_err(|_| ToolError::Unavailable {
         tool: "text_to_speech".into(),
-        reason: "ELEVENLABS_API_KEY not set".into(),
+        reason: format!("{api_key_env} not set"),
     })?;
 
-    let model_id =
-        std::env::var("ELEVENLABS_MODEL_ID").unwrap_or_else(|_| "eleven_turbo_v2".to_string());
+    let model_id = model_id_override
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| std::env::var("ELEVENLABS_MODEL_ID").ok())
+        .unwrap_or_else(|| "eleven_turbo_v2".to_string());
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
@@ -255,6 +292,15 @@ struct TtsArgs {
     /// Voice name (backend-dependent). Defaults to a sensible voice per backend.
     #[serde(default)]
     voice: Option<String>,
+    /// Optional provider override: edge-tts, openai, elevenlabs.
+    #[serde(default)]
+    provider: Option<String>,
+    /// Optional model override for provider-specific backends.
+    #[serde(default)]
+    model: Option<String>,
+    /// Optional speech rate override (edge-tts only).
+    #[serde(default)]
+    rate: Option<String>,
     /// Output file path. If omitted, saves to a temp file.
     #[serde(default)]
     output_path: Option<String>,
@@ -291,6 +337,18 @@ impl ToolHandler for TextToSpeechTool {
                         "type": "string",
                         "description": "Voice name (e.g. 'en-US-AriaNeural' for edge-tts, 'alloy' for OpenAI)"
                     },
+                    "provider": {
+                        "type": "string",
+                        "description": "Optional backend override. One of: 'edge-tts', 'openai', 'elevenlabs'."
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "Optional provider-specific model override (for example 'tts-1-hd' or an ElevenLabs model id)."
+                    },
+                    "rate": {
+                        "type": "string",
+                        "description": "Optional speech rate override for edge-tts, such as '+10%' or '-5%'."
+                    },
                     "output_path": {
                         "type": "string",
                         "description": "Output file path for the audio. Defaults to a temp file."
@@ -303,7 +361,9 @@ impl ToolHandler for TextToSpeechTool {
     }
 
     fn is_available(&self) -> bool {
-        edge_tts_available() || openai_tts_available() || elevenlabs_tts_available()
+        edge_tts_available()
+            || openai_tts_available()
+            || elevenlabs_tts_available("ELEVENLABS_API_KEY")
     }
 
     async fn execute(
@@ -347,25 +407,72 @@ impl ToolHandler for TextToSpeechTool {
             return Err(ToolError::Other("Cancelled".into()));
         }
 
-        let backend = detect_backend();
+        let backend = if let Some(provider) = args.provider.as_deref() {
+            match provider.to_ascii_lowercase().as_str() {
+                "edge-tts" | "edge" if edge_tts_available() => TtsBackend::EdgeTts,
+                "openai" if openai_tts_available() => TtsBackend::OpenAi,
+                "elevenlabs" | "eleven"
+                    if elevenlabs_tts_available(configured_elevenlabs_api_key_env(ctx)) =>
+                {
+                    TtsBackend::ElevenLabs
+                }
+                "edge-tts" | "edge" | "openai" | "elevenlabs" | "eleven" => TtsBackend::None,
+                other => {
+                    return Err(ToolError::InvalidArgs {
+                        tool: "text_to_speech".into(),
+                        message: format!(
+                            "Unknown provider '{other}'. Use: edge-tts, openai, elevenlabs"
+                        ),
+                    });
+                }
+            }
+        } else {
+            detect_backend(ctx)
+        };
         let result = match backend {
             TtsBackend::EdgeTts => {
-                let voice = args.voice.as_deref().unwrap_or(DEFAULT_EDGE_TTS_VOICE);
-                tts_edge(&args.text, voice, &output_path).await?
+                let voice = args
+                    .voice
+                    .as_deref()
+                    .or(ctx.config.tts_voice.as_deref())
+                    .unwrap_or(DEFAULT_EDGE_TTS_VOICE);
+                let rate = args.rate.as_deref().or(ctx.config.tts_rate.as_deref());
+                tts_edge(&args.text, voice, rate, &output_path).await?
             }
             TtsBackend::ElevenLabs => {
-                let voice_id = args.voice.as_deref().unwrap_or(DEFAULT_ELEVENLABS_VOICE_ID);
-                tts_elevenlabs(&args.text, voice_id, &output_path).await?
+                let voice_id = args
+                    .voice
+                    .as_deref()
+                    .or(ctx.config.tts_elevenlabs_voice_id.as_deref())
+                    .or(ctx.config.tts_voice.as_deref())
+                    .unwrap_or(DEFAULT_ELEVENLABS_VOICE_ID);
+                let model = args
+                    .model
+                    .as_deref()
+                    .or(ctx.config.tts_elevenlabs_model_id.as_deref());
+                tts_elevenlabs(
+                    &args.text,
+                    configured_elevenlabs_api_key_env(ctx),
+                    voice_id,
+                    model,
+                    &output_path,
+                )
+                .await?
             }
             TtsBackend::OpenAi => {
-                let voice = args.voice.as_deref().unwrap_or(DEFAULT_OPENAI_VOICE);
-                tts_openai(&args.text, voice, &output_path).await?
+                let voice = args
+                    .voice
+                    .as_deref()
+                    .or(ctx.config.tts_voice.as_deref())
+                    .unwrap_or(DEFAULT_OPENAI_VOICE);
+                let model = args.model.as_deref().or(ctx.config.tts_model.as_deref());
+                tts_openai(&args.text, voice, model, &output_path).await?
             }
             TtsBackend::None => {
                 return Err(ToolError::Unavailable {
                     tool: "text_to_speech".into(),
                     reason: "No TTS backend available. Install edge-tts (pip install edge-tts), \
-                             set OPENAI_API_KEY, or set ELEVENLABS_API_KEY."
+                             set OPENAI_API_KEY, or configure ElevenLabs credentials."
                         .into(),
                 });
             }
@@ -404,7 +511,8 @@ mod tests {
     #[test]
     fn detect_backend_returns_something() {
         // In CI neither may be available, but the function should not panic
-        let _backend = detect_backend();
+        let ctx = ToolContext::test_context();
+        let _backend = detect_backend(&ctx);
     }
 
     #[tokio::test]

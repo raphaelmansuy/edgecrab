@@ -307,6 +307,17 @@ impl Agent {
             auxiliary_model: config.auxiliary.model.clone(),
             auxiliary_base_url: config.auxiliary.base_url.clone(),
             auxiliary_api_key_env: config.auxiliary.api_key_env.clone(),
+            tts_provider: Some(config.tts.provider.clone()),
+            tts_voice: Some(config.tts.voice.clone()),
+            tts_rate: config.tts.rate.clone(),
+            tts_model: config.tts.model.clone(),
+            tts_elevenlabs_voice_id: config.tts.elevenlabs_voice_id.clone(),
+            tts_elevenlabs_model_id: config.tts.elevenlabs_model_id.clone(),
+            tts_elevenlabs_api_key_env: Some(config.tts.elevenlabs_api_key_env.clone()),
+            stt_provider: Some(config.stt.provider.clone()),
+            stt_whisper_model: Some(config.stt.whisper_model.clone()),
+            image_provider: Some(config.image_generation.provider.clone()),
+            image_model: Some(config.image_generation.model.clone()),
             ..Default::default()
         };
 

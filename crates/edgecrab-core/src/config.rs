@@ -52,6 +52,7 @@ pub struct AppConfig {
     pub timezone: Option<String>,
     pub tts: TtsConfig,
     pub stt: SttConfig,
+    pub image_generation: ImageGenerationConfig,
     pub voice: VoiceConfig,
     pub honcho: HonchoConfig,
     pub auxiliary: AuxiliaryConfig,
@@ -1442,6 +1443,35 @@ impl Default for SttConfig {
             whisper_model: "base".into(),
             silence_threshold: -40.0,
             silence_duration_ms: 1500,
+        }
+    }
+}
+
+/// Image generation configuration.
+///
+/// Keeps the default image backend/model persistent in the same way `/model`
+/// persists the primary chat model and `/vision_model` persists the auxiliary
+/// vision override.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ImageGenerationConfig {
+    /// Preferred provider for `generate_image`.
+    ///
+    /// Supported values: `auto`, `gemini`, `vertexai`, `imagen`, `fal`,
+    /// `openai`.
+    pub provider: String,
+    /// Preferred provider-native image model.
+    ///
+    /// Default is the cheapest broadly useful Gemini image model exposed by
+    /// `edgequake-llm`.
+    pub model: String,
+}
+
+impl Default for ImageGenerationConfig {
+    fn default() -> Self {
+        Self {
+            provider: "gemini".into(),
+            model: "gemini-2.5-flash-image".into(),
         }
     }
 }

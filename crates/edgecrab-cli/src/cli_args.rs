@@ -373,6 +373,7 @@ pub enum McpCommand {
         args: Vec<String>,
     },
     /// Remove an MCP server
+    #[command(visible_aliases = ["uninstall", "rm"])]
     Remove { name: String },
 }
 

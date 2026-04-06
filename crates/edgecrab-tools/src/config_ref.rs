@@ -140,6 +140,28 @@ pub struct AppConfigRef {
     pub auxiliary_base_url: Option<String>,
     /// Optional API-key environment variable for the auxiliary provider.
     pub auxiliary_api_key_env: Option<String>,
+    /// Preferred text-to-speech provider from config (`tts.provider`).
+    pub tts_provider: Option<String>,
+    /// Preferred text-to-speech voice from config (`tts.voice`).
+    pub tts_voice: Option<String>,
+    /// Optional Edge TTS rate override from config (`tts.rate`).
+    pub tts_rate: Option<String>,
+    /// Optional provider-specific TTS model (`tts.model`).
+    pub tts_model: Option<String>,
+    /// Optional ElevenLabs voice id from config (`tts.elevenlabs_voice_id`).
+    pub tts_elevenlabs_voice_id: Option<String>,
+    /// Optional ElevenLabs model id from config (`tts.elevenlabs_model_id`).
+    pub tts_elevenlabs_model_id: Option<String>,
+    /// Environment variable name for ElevenLabs credentials.
+    pub tts_elevenlabs_api_key_env: Option<String>,
+    /// Preferred speech-to-text provider from config (`stt.provider`).
+    pub stt_provider: Option<String>,
+    /// Preferred local Whisper model from config (`stt.whisper_model`).
+    pub stt_whisper_model: Option<String>,
+    /// Preferred image-generation provider from config (`image_generation.provider`).
+    pub image_provider: Option<String>,
+    /// Preferred image-generation model from config (`image_generation.model`).
+    pub image_model: Option<String>,
 }
 
 impl Default for AppConfigRef {
@@ -179,6 +201,17 @@ impl Default for AppConfigRef {
             auxiliary_model: None,
             auxiliary_base_url: None,
             auxiliary_api_key_env: None,
+            tts_provider: None,
+            tts_voice: None,
+            tts_rate: None,
+            tts_model: None,
+            tts_elevenlabs_voice_id: None,
+            tts_elevenlabs_model_id: None,
+            tts_elevenlabs_api_key_env: None,
+            stt_provider: None,
+            stt_whisper_model: None,
+            image_provider: None,
+            image_model: None,
         }
     }
 }

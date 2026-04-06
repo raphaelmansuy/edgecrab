@@ -20,6 +20,7 @@ use std::sync::Arc;
 use axum::extract::State;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use edgecrab_tools::tools::transcribe::TranscribeAudioTool;
 use edgecrab_tools::tools::vision::VisionAnalyzeTool;
 use edgecrab_tools::{AppConfigRef, ToolContext, ToolHandler};
 use futures::FutureExt;
@@ -55,6 +56,7 @@ numbers, code, UI elements, objects, people, colors, layout, and notable context
 /// every attachment path in the injected context, but pre-analyze only the
 /// first few images so single-image and small-batch UX stays reliable.
 const MAX_GATEWAY_EAGER_IMAGE_ANALYSES: usize = 4;
+const MAX_GATEWAY_EAGER_AUDIO_TRANSCRIPTS: usize = 2;
 
 /// Help text shown when a user sends /help to the gateway.
 const HELP_TEXT: &str = "\
@@ -136,6 +138,23 @@ fn image_attachment_sources(msg: &IncomingMessage) -> Vec<String> {
         .collect()
 }
 
+fn audio_attachment_sources(msg: &IncomingMessage) -> Vec<String> {
+    msg.metadata
+        .attachments
+        .iter()
+        .filter(|attachment| {
+            matches!(
+                attachment.kind,
+                crate::platform::MessageAttachmentKind::Audio
+                    | crate::platform::MessageAttachmentKind::Voice
+            )
+        })
+        .filter_map(|attachment| attachment.local_path.as_deref())
+        .filter(|path| !path.trim().is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 fn render_gateway_image_context(
     user_text: &str,
     image_sources: &[String],
@@ -201,12 +220,14 @@ fn render_gateway_image_context(
 
 async fn build_effective_text(agent: &Agent, msg: &IncomingMessage) -> String {
     let image_sources = image_attachment_sources(msg);
-    if image_sources.is_empty() {
+    let audio_sources = audio_attachment_sources(msg);
+    if image_sources.is_empty() && audio_sources.is_empty() {
         return msg.text.clone();
     }
 
     let provider = agent.provider_handle().await;
     let auxiliary = agent.auxiliary_config().await;
+    let (_, stt, _) = agent.media_config().await;
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let session_key = format!(
         "gateway-image-preanalysis-{}",
@@ -218,9 +239,12 @@ async fn build_effective_text(agent: &Agent, msg: &IncomingMessage) -> String {
         auxiliary_model: auxiliary.model,
         auxiliary_base_url: auxiliary.base_url,
         auxiliary_api_key_env: auxiliary.api_key_env,
+        stt_provider: Some(stt.provider),
+        stt_whisper_model: Some(stt.whisper_model),
         ..Default::default()
     };
 
+    let mut effective_text = msg.text.clone();
     let mut analyses = Vec::new();
     let mut failures = Vec::new();
     for (idx, source) in image_sources
@@ -268,15 +292,129 @@ async fn build_effective_text(agent: &Agent, msg: &IncomingMessage) -> String {
         }
     }
 
-    render_gateway_image_context(
-        &msg.text,
-        &image_sources,
-        &analyses,
-        &failures,
-        image_sources
-            .len()
-            .saturating_sub(MAX_GATEWAY_EAGER_IMAGE_ANALYSES),
-    )
+    if !image_sources.is_empty() {
+        effective_text = render_gateway_image_context(
+            &effective_text,
+            &image_sources,
+            &analyses,
+            &failures,
+            image_sources
+                .len()
+                .saturating_sub(MAX_GATEWAY_EAGER_IMAGE_ANALYSES),
+        );
+    }
+
+    let mut transcripts = Vec::new();
+    let mut transcription_failures = Vec::new();
+    for (idx, source) in audio_sources
+        .iter()
+        .take(MAX_GATEWAY_EAGER_AUDIO_TRANSCRIPTS)
+        .enumerate()
+    {
+        let ctx = ToolContext {
+            task_id: format!("gateway-audio-pretranscribe-{}", idx + 1),
+            cwd: cwd.clone(),
+            session_id: session_key.clone(),
+            user_task: None,
+            cancel: CancellationToken::new(),
+            config: config.clone(),
+            state_db: None,
+            platform: msg.platform,
+            process_table: None,
+            provider: None,
+            tool_registry: None,
+            delegate_depth: 0,
+            sub_agent_runner: None,
+            delegation_event_tx: None,
+            clarify_tx: None,
+            approval_tx: None,
+            on_skills_changed: None,
+            gateway_sender: None,
+            origin_chat: None,
+            session_key: Some(session_key.clone()),
+            todo_store: None,
+        };
+
+        match TranscribeAudioTool
+            .execute(serde_json::json!({ "file_path": source }), &ctx)
+            .await
+        {
+            Ok(transcript) => transcripts.push(transcript),
+            Err(error) => {
+                transcription_failures.push(format!("Audio {} ({source}): {error}", idx + 1))
+            }
+        }
+    }
+
+    if !audio_sources.is_empty() {
+        effective_text = render_gateway_audio_context(
+            &effective_text,
+            &audio_sources,
+            &transcripts,
+            &transcription_failures,
+            audio_sources
+                .len()
+                .saturating_sub(MAX_GATEWAY_EAGER_AUDIO_TRANSCRIPTS),
+        );
+    }
+
+    effective_text
+}
+
+fn render_gateway_audio_context(
+    user_text: &str,
+    audio_sources: &[String],
+    transcripts: &[String],
+    transcription_failures: &[String],
+    skipped_count: usize,
+) -> String {
+    if audio_sources.is_empty() {
+        return user_text.to_string();
+    }
+
+    let mut lines = Vec::new();
+    lines.push("*** ATTACHED AUDIO ***".to_string());
+    lines.push(format!(
+        "The user attached {} audio file(s) or voice note(s).",
+        audio_sources.len()
+    ));
+    lines.push("Audio sources:".to_string());
+    for (idx, source) in audio_sources.iter().enumerate() {
+        lines.push(format!("- Audio {}: {}", idx + 1, source));
+    }
+    if !transcripts.is_empty() {
+        lines.push(
+            "Gateway transcription already ran before this turn. Use it as primary context."
+                .to_string(),
+        );
+        for (idx, transcript) in transcripts.iter().enumerate() {
+            lines.push(format!("Transcript {}:\n{}", idx + 1, transcript));
+        }
+    }
+    if !transcription_failures.is_empty() {
+        lines.push(
+            "Some audio attachments could not be transcribed automatically. If \
+             `transcribe_audio` is available in this session and you need more detail, \
+             you may call it on one of the local audio paths above."
+                .to_string(),
+        );
+        for failure in transcription_failures {
+            lines.push(format!("- {}", failure));
+        }
+    }
+    if skipped_count > 0 {
+        lines.push(format!(
+            "{skipped_count} additional audio attachment(s) were not pre-transcribed to keep latency bounded."
+        ));
+    }
+    lines.push("*** END ATTACHED AUDIO ***".to_string());
+
+    let block = lines.join("\n");
+    if user_text.trim().is_empty() {
+        block
+    } else {
+        format!("{user_text}\n\n{block}")
+    }
 }
 
 fn background_gateway_arg_preview(args_json: &str) -> String {
@@ -1849,6 +1987,40 @@ mod tests {
     }
 
     #[test]
+    fn audio_attachment_sources_only_return_local_audio_and_voice_paths() {
+        let msg = IncomingMessage {
+            platform: edgecrab_types::Platform::Signal,
+            user_id: "u1".into(),
+            channel_id: None,
+            text: "transcribe".into(),
+            thread_id: None,
+            metadata: crate::platform::MessageMetadata {
+                attachments: vec![
+                    crate::platform::MessageAttachment {
+                        kind: crate::platform::MessageAttachmentKind::Voice,
+                        local_path: Some("/tmp/voice.ogg".into()),
+                        ..Default::default()
+                    },
+                    crate::platform::MessageAttachment {
+                        kind: crate::platform::MessageAttachmentKind::Audio,
+                        local_path: Some("/tmp/audio.mp3".into()),
+                        ..Default::default()
+                    },
+                    crate::platform::MessageAttachment {
+                        kind: crate::platform::MessageAttachmentKind::Document,
+                        local_path: Some("/tmp/report.pdf".into()),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+        };
+
+        let sources = audio_attachment_sources(&msg);
+        assert_eq!(sources, vec!["/tmp/voice.ogg", "/tmp/audio.mp3"]);
+    }
+
+    #[test]
     fn render_gateway_image_context_includes_preanalysis_without_forcing_tool_call() {
         let rendered = render_gateway_image_context(
             "Describe this",
@@ -1881,6 +2053,21 @@ mod tests {
 
         assert!(rendered.starts_with("*** ATTACHED IMAGES ***"));
         assert!(rendered.contains("unavailable"));
+    }
+
+    #[test]
+    fn render_gateway_audio_context_includes_transcripts() {
+        let rendered = render_gateway_audio_context(
+            "Reply to this",
+            &[String::from("/tmp/voice.ogg")],
+            &[String::from("Transcript (via local):\nhello from voice")],
+            &[],
+            0,
+        );
+
+        assert!(rendered.contains("ATTACHED AUDIO"));
+        assert!(rendered.contains("/tmp/voice.ogg"));
+        assert!(rendered.contains("hello from voice"));
     }
 
     #[test]

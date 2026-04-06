@@ -21,16 +21,6 @@ pub struct InstalledPreset {
 
 const PRESETS: &[McpPreset] = &[
     McpPreset {
-        id: "fetch",
-        display_name: "Fetch",
-        description: "Official MCP fetch server for retrieving and extracting public web content.",
-        command: "npx",
-        args: &["-y", "@modelcontextprotocol/server-fetch"],
-        tags: &["web", "http", "official"],
-        required_env: &[],
-        notes: "Requires Node.js and npx on PATH.",
-    },
-    McpPreset {
         id: "filesystem",
         display_name: "Filesystem",
         description: "Official MCP filesystem server scoped to one allowed root path.",
@@ -63,6 +53,36 @@ const PRESETS: &[McpPreset] = &[
         tags: &["memory", "notes", "official"],
         required_env: &[],
         notes: "Requires Node.js and npx on PATH.",
+    },
+    McpPreset {
+        id: "pdf",
+        display_name: "PDF",
+        description: "Official MCP PDF server for inspecting and extracting content from PDF files.",
+        command: "npx",
+        args: &["-y", "@modelcontextprotocol/server-pdf"],
+        tags: &["pdf", "documents", "official"],
+        required_env: &[],
+        notes: "Requires Node.js and npx on PATH.",
+    },
+    McpPreset {
+        id: "sequential-thinking",
+        display_name: "Sequential Thinking",
+        description: "Official MCP reasoning helper for explicit step-by-step decomposition and planning.",
+        command: "npx",
+        args: &["-y", "@modelcontextprotocol/server-sequential-thinking"],
+        tags: &["reasoning", "planning", "official"],
+        required_env: &[],
+        notes: "Useful when you want an external MCP server to expose explicit reasoning utilities.",
+    },
+    McpPreset {
+        id: "postgres",
+        display_name: "Postgres",
+        description: "Official MCP PostgreSQL server for querying and exploring Postgres databases.",
+        command: "npx",
+        args: &["-y", "@modelcontextprotocol/server-postgres"],
+        tags: &["database", "postgres", "sql", "official"],
+        required_env: &["DATABASE_URL"],
+        notes: "Requires Node.js and a DATABASE_URL connection string in the environment.",
     },
 ];
 
@@ -207,7 +227,7 @@ mod tests {
     fn install_rejects_unsafe_name() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut config = AppConfig::default();
-        let result = install_preset(&mut config, "fetch", Some("../bad"), None, dir.path());
+        let result = install_preset(&mut config, "filesystem", Some("../bad"), None, dir.path());
         assert!(result.is_err());
     }
 }

@@ -8,7 +8,7 @@
 //!
 //! ```text
 //!   Navigation    /help /quit /clear /new /status /version
-//!   Model         /model /vision_model /provider /reasoning /stream
+//!   Model         /model /vision_model /image_model /provider /reasoning /stream
 //!   Session       /session /retry /undo /stop /history /save /export /title /resume
 //!   Config        /config /prompt /verbose /personality /statusbar
 //!   Tools         /tools /toolsets /reload-mcp /plugins
@@ -50,6 +50,10 @@ pub enum CommandResult {
     ShowVisionModel,
     /// Update the auxiliary vision-model routing state.
     SetVisionModel(String),
+    /// Show the current image-generation routing state.
+    ShowImageModel,
+    /// Update the default image-generation routing state.
+    SetImageModel(String),
     /// Start a fresh session (app clears messages + session state)
     SessionNew,
     /// Load a theme from YAML skin file and redraw
@@ -331,6 +335,20 @@ impl CommandRegistry {
                     CommandResult::ShowVisionModel
                 } else {
                     CommandResult::SetVisionModel(trimmed.to_string())
+                }
+            },
+        });
+
+        self.register(Command {
+            name: "image_model",
+            aliases: &["image-model"],
+            description: "Show, list, or set the default image-generation backend (/image_model, /image_model list, /image_model gemini/gemini-2.5-flash-image)",
+            handler: |args| {
+                let trimmed = args.trim();
+                if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("status") {
+                    CommandResult::ShowImageModel
+                } else {
+                    CommandResult::SetImageModel(trimmed.to_string())
                 }
             },
         });
@@ -916,6 +934,7 @@ fn help_text() -> String {
          Model:\n\
           /model [name]         — Show or switch model\n\
           /vision_model [spec]  — Open, show, or set dedicated vision model\n\
+          /image_model [spec]   — Show, list, or set default image generation model\n\
           /provider             — List available providers\n\
           /reasoning [mode]     — Set reasoning effort or think mode\n\
           /stream [mode]        — Toggle live token streaming\n\
@@ -1121,6 +1140,26 @@ mod tests {
             reg.dispatch("/vision_model status"),
             Some(CommandResult::ShowVisionModel)
         ));
+    }
+
+    #[test]
+    fn dispatch_image_model_empty_shows_status() {
+        let reg = CommandRegistry::new();
+        assert!(matches!(
+            reg.dispatch("/image_model"),
+            Some(CommandResult::ShowImageModel)
+        ));
+    }
+
+    #[test]
+    fn dispatch_image_model_with_name_updates_override() {
+        let reg = CommandRegistry::new();
+        match reg.dispatch("/image_model gemini/gemini-2.5-flash-image") {
+            Some(CommandResult::SetImageModel(model)) => {
+                assert_eq!(model, "gemini/gemini-2.5-flash-image")
+            }
+            _ => panic!("expected image model override"),
+        }
     }
 
     #[test]

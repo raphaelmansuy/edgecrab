@@ -543,7 +543,11 @@ impl ToolHandler for TranscribeAudioTool {
             });
         }
 
-        let model = args.model.as_deref().unwrap_or("");
+        let model = args
+            .model
+            .as_deref()
+            .or(ctx.config.stt_whisper_model.as_deref())
+            .unwrap_or("");
         let language = args.language.as_deref().unwrap_or(DEFAULT_LOCAL_LANGUAGE);
 
         // Select backend
@@ -586,7 +590,23 @@ impl ToolHandler for TranscribeAudioTool {
                 }
             }
         } else {
-            detect_backend()
+            match ctx.config.stt_provider.as_deref() {
+                Some("local") => {
+                    if let Some(whisper_bin) = find_whisper_binary() {
+                        SttBackend::LocalCommand { whisper_bin }
+                    } else {
+                        SttBackend::None
+                    }
+                }
+                Some("groq") => std::env::var("GROQ_API_KEY")
+                    .map(|api_key| SttBackend::Groq { api_key })
+                    .unwrap_or(SttBackend::None),
+                Some("openai") => std::env::var("VOICE_TOOLS_OPENAI_KEY")
+                    .or_else(|_| std::env::var("OPENAI_API_KEY"))
+                    .map(|api_key| SttBackend::OpenAi { api_key })
+                    .unwrap_or(SttBackend::None),
+                Some(_) | None => detect_backend(),
+            }
         };
 
         if ctx.cancel.is_cancelled() {

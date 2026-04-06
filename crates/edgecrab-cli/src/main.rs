@@ -24,6 +24,7 @@ mod fuzzy_selector;
 mod gateway_catalog;
 mod gateway_cmd;
 mod gateway_setup;
+mod image_models;
 mod markdown_render;
 mod mcp_catalog;
 mod model_discovery;
@@ -1021,6 +1022,8 @@ async fn run_mcp(command: McpCommand, args: &CliArgs) -> anyhow::Result<()> {
         McpCommand::Remove { name } => {
             if config.mcp_servers.remove(&name).is_some() {
                 config.save_to(&runtime.config_path)?;
+                edgecrab_tools::tools::mcp_client::remove_mcp_token(&name);
+                edgecrab_tools::tools::mcp_client::reload_mcp_connections();
                 println!("Removed MCP server '{}'", name);
             } else {
                 anyhow::bail!("unknown MCP server '{}'", name);
