@@ -846,6 +846,10 @@ mod tests {
         assert_eq!(out.exit_code, 0);
     }
 
+    // python3 and /tmp are not reliably available on Windows runners.
+    // The path-policy layer (edgecrab-security) is tested cross-platform;
+    // this test validates the EDGECRAB_TMPDIR env injection specifics.
+    #[cfg(unix)]
     #[tokio::test]
     async fn local_backend_exports_shared_tmpdir() {
         let b = LocalBackend::new("test-tmpdir");
