@@ -146,26 +146,6 @@ fn incoming_message_is_voice_origin(msg: &IncomingMessage) -> bool {
     has_audio && msg.text.trim().is_empty()
 }
 
-fn extract_audio_path_from_tts_output(output: &str) -> Option<String> {
-    if let Some(index) = output.find("MEDIA:") {
-        let path = output[index + "MEDIA:".len()..]
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .trim();
-        if !path.is_empty() {
-            return Some(path.to_string());
-        }
-    }
-
-    output
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("Audio saved to:"))
-        .map(str::trim)
-        .filter(|path| !path.is_empty())
-        .map(ToOwned::to_owned)
-}
-
 /// Help text shown when a user sends /help to the gateway.
 const HELP_TEXT: &str = "\
 *Available commands:*
@@ -677,7 +657,8 @@ async fn maybe_send_voice_reply(
         }
     };
 
-    let Some(audio_path) = extract_audio_path_from_tts_output(&result) else {
+    let Some(audio_path) = edgecrab_tools::tools::tts::extract_audio_path_from_tts_output(&result)
+    else {
         tracing::warn!("gateway auto TTS returned no usable audio path");
         return;
     };
@@ -2414,11 +2395,15 @@ mod tests {
     #[test]
     fn extract_audio_path_from_tts_output_supports_media_and_legacy_output() {
         assert_eq!(
-            extract_audio_path_from_tts_output("Generated audio.\nMEDIA:/tmp/reply.mp3"),
+            edgecrab_tools::tools::tts::extract_audio_path_from_tts_output(
+                "Generated audio.\nMEDIA:/tmp/reply.mp3"
+            ),
             Some("/tmp/reply.mp3".into())
         );
         assert_eq!(
-            extract_audio_path_from_tts_output("Audio saved to: /tmp/reply.mp3"),
+            edgecrab_tools::tools::tts::extract_audio_path_from_tts_output(
+                "Audio saved to: /tmp/reply.mp3"
+            ),
             Some("/tmp/reply.mp3".into())
         );
     }

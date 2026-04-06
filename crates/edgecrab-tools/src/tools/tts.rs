@@ -113,6 +113,23 @@ fn detect_backend(ctx: &ToolContext) -> TtsBackend {
     TtsBackend::None
 }
 
+pub fn extract_audio_path_from_tts_output(output: &str) -> Option<String> {
+    if let Some(index) = output.find("MEDIA:") {
+        let path = output[index + "MEDIA:".len()..]
+            .lines()
+            .next()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())?;
+        return Some(path.to_string());
+    }
+
+    output
+        .strip_prefix("Audio saved to: ")
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(str::to_string)
+}
+
 /// Generate speech using edge-tts subprocess.
 async fn tts_edge(
     text: &str,
@@ -554,5 +571,17 @@ mod tests {
     fn default_voices_are_not_empty() {
         assert!(!DEFAULT_EDGE_TTS_VOICE.is_empty());
         assert!(!DEFAULT_OPENAI_VOICE.is_empty());
+    }
+
+    #[test]
+    fn extract_audio_path_supports_media_and_legacy_output() {
+        assert_eq!(
+            extract_audio_path_from_tts_output("Generated audio.\nMEDIA:/tmp/reply.mp3"),
+            Some("/tmp/reply.mp3".into())
+        );
+        assert_eq!(
+            extract_audio_path_from_tts_output("Audio saved to: /tmp/reply.mp3"),
+            Some("/tmp/reply.mp3".into())
+        );
     }
 }

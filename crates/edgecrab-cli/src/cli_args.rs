@@ -339,17 +339,19 @@ pub enum ToolsCommand {
 pub enum McpCommand {
     /// List configured MCP servers
     List,
+    /// Refresh the cached official MCP catalog from upstream
+    Refresh,
     /// Search the curated MCP preset catalog
     Search {
-        /// Optional search query; omit to list all curated presets
+        /// Optional search query; omit to list all cached official entries
         query: Option<String>,
     },
-    /// Show details for a curated MCP preset
+    /// Show details for a controlled preset or official catalog entry
     View {
         /// Preset name from `edgecrab mcp search`
         preset: String,
     },
-    /// Install a curated MCP preset into config.yaml
+    /// Install a controlled MCP preset into config.yaml
     Install {
         /// Preset name from `edgecrab mcp search`
         preset: String,

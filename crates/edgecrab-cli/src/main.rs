@@ -915,37 +915,56 @@ async fn run_mcp(command: McpCommand, args: &CliArgs) -> anyhow::Result<()> {
             }
             Err(e) => return Err(anyhow::anyhow!(e.to_string())),
         },
+        McpCommand::Refresh => {
+            let entries = mcp_catalog::refresh_official_catalog().await?;
+            println!(
+                "Refreshed official MCP catalog ({} entries).",
+                entries.len()
+            );
+        }
         McpCommand::Search { query } => {
-            let results = mcp_catalog::search_presets(query.as_deref());
+            let results = mcp_catalog::search_official_catalog_with_refresh(query.as_deref()).await;
             if results.is_empty() {
-                println!("No official MCP snapshot entries matched.");
+                println!("No official MCP entries matched.");
                 return Ok(());
             }
             for preset in results {
+                let install = preset
+                    .installable_preset_id
+                    .as_deref()
+                    .map(|id| format!(" install={id}"))
+                    .unwrap_or_else(|| " install=unavailable".to_string());
                 println!(
-                    "{} — {} [{}] {}",
+                    "{} — {} [{}] {}{}",
                     preset.id,
                     preset.description,
                     preset.tags.join(", "),
-                    preset.source_url
+                    preset.source_url,
+                    install,
                 );
             }
         }
         McpCommand::View { preset } => {
-            let preset = mcp_catalog::find_preset(&preset)
-                .ok_or_else(|| anyhow::anyhow!("unknown MCP preset '{}'", preset))?;
-            println!("Preset: {}", preset.id);
-            println!("Name:   {}", preset.display_name);
-            println!("Why:    {}", preset.description);
-            println!("Pkg:    {}", preset.package_name);
-            println!("Source: {}", preset.source_url);
-            println!("Docs:   {}", preset.homepage);
-            println!("Cmd:    {} {}", preset.command, preset.args.join(" "));
-            println!("Tags:   {}", preset.tags.join(", "));
-            if !preset.required_env.is_empty() {
-                println!("Env:    {}", preset.required_env.join(", "));
+            if let Some(preset) = mcp_catalog::find_preset(&preset) {
+                println!("Preset: {}", preset.id);
+                println!("Name:   {}", preset.display_name);
+                println!("Why:    {}", preset.description);
+                println!("Pkg:    {}", preset.package_name);
+                println!("Source: {}", preset.source_url);
+                println!("Docs:   {}", preset.homepage);
+                println!("Cmd:    {} {}", preset.command, preset.args.join(" "));
+                println!("Tags:   {}", preset.tags.join(", "));
+                if !preset.required_env.is_empty() {
+                    println!("Env:    {}", preset.required_env.join(", "));
+                }
+                println!("Notes:  {}", preset.notes);
+            } else if let Some(entry) =
+                mcp_catalog::find_official_catalog_entry_with_refresh(&preset).await
+            {
+                println!("{}", mcp_catalog::render_official_catalog_entry(&entry));
+            } else {
+                anyhow::bail!("unknown MCP preset or official catalog entry '{}'", preset);
             }
-            println!("Notes:  {}", preset.notes);
         }
         McpCommand::Install { preset, name, path } => {
             let cwd = std::env::current_dir().context("cannot determine current directory")?;

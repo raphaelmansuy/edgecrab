@@ -105,6 +105,81 @@ fn context_usage_ratio(tokens: u64, context_window: Option<u64>) -> Option<f64> 
         .map(|cw| (tokens as f64 / cw as f64).clamp(0.0, 1.0))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AudioPlayerSpec {
+    program: &'static str,
+    args: &'static [&'static str],
+}
+
+const AUDIO_PLAYER_CANDIDATES: &[AudioPlayerSpec] = &[
+    AudioPlayerSpec {
+        program: "afplay",
+        args: &[],
+    },
+    AudioPlayerSpec {
+        program: "ffplay",
+        args: &["-nodisp", "-autoexit", "-loglevel", "error"],
+    },
+    AudioPlayerSpec {
+        program: "mpv",
+        args: &["--no-terminal", "--really-quiet"],
+    },
+    AudioPlayerSpec {
+        program: "paplay",
+        args: &[],
+    },
+    AudioPlayerSpec {
+        program: "aplay",
+        args: &[],
+    },
+    AudioPlayerSpec {
+        program: "play",
+        args: &["-q"],
+    },
+];
+
+fn select_audio_player_with<F>(mut exists: F) -> Option<AudioPlayerSpec>
+where
+    F: FnMut(&str) -> bool,
+{
+    AUDIO_PLAYER_CANDIDATES
+        .iter()
+        .copied()
+        .find(|candidate| exists(candidate.program))
+}
+
+fn preferred_audio_player() -> Option<AudioPlayerSpec> {
+    select_audio_player_with(|program| which::which(program).is_ok())
+}
+
+fn voice_readback_ready() -> Result<AudioPlayerSpec, String> {
+    if !TextToSpeechTool.is_available() {
+        return Err(
+            "No TTS backend available. Install `edge-tts`, set `OPENAI_API_KEY`, or configure ElevenLabs credentials."
+                .into(),
+        );
+    }
+
+    preferred_audio_player().ok_or_else(|| {
+        "No supported local audio player found. Install one of: `afplay`, `ffplay`, `mpv`, `paplay`, `aplay`, or `play`."
+            .into()
+    })
+}
+
+async fn play_audio_file(path: &std::path::Path) -> anyhow::Result<&'static str> {
+    let player = preferred_audio_player()
+        .ok_or_else(|| anyhow::anyhow!("no supported local audio player found"))?;
+    let status = tokio::process::Command::new(player.program)
+        .args(player.args)
+        .arg(path)
+        .status()
+        .await?;
+    if !status.success() {
+        anyhow::bail!("{} exited with status {}", player.program, status);
+    }
+    Ok(player.program)
+}
+
 /// Recursively copy a directory tree from `src` to `dst`.
 /// Returns the count of files copied, or an IO error.
 fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<usize> {
@@ -785,6 +860,7 @@ impl FuzzyItem for SkillEntry {
 struct McpPresetEntry {
     id: String,
     kind: McpEntryKind,
+    install_preset_id: Option<String>,
     title: String,
     source: String,
     detail: String,
@@ -792,7 +868,7 @@ struct McpPresetEntry {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum McpEntryKind {
-    Preset,
+    CatalogEntry,
     ConfiguredServer,
 }
 
@@ -808,11 +884,11 @@ impl FuzzyItem for McpPresetEntry {
     }
 }
 
-fn mcp_preset_source_label(preset: &crate::mcp_catalog::McpPreset) -> &'static str {
-    if preset.tags.contains(&"archived") {
+fn mcp_catalog_source_label(entry: &crate::mcp_catalog::OfficialCatalogEntry) -> &'static str {
+    if entry.tags.iter().any(|tag| tag == "archived") {
         return "official-arch";
     }
-    if preset.tags.contains(&"integration") {
+    if entry.tags.iter().any(|tag| tag == "integration") {
         return "official-app";
     }
     "official-ref"
@@ -833,6 +909,7 @@ fn format_mcp_transport(server: &edgecrab_tools::tools::mcp_client::ConfiguredMc
 
 fn build_mcp_selector_entries_from(
     configured: &[edgecrab_tools::tools::mcp_client::ConfiguredMcpServer],
+    official_entries: &[crate::mcp_catalog::OfficialCatalogEntry],
 ) -> Vec<McpPresetEntry> {
     let configured_names: std::collections::HashSet<&str> = configured
         .iter()
@@ -854,6 +931,7 @@ fn build_mcp_selector_entries_from(
             McpPresetEntry {
                 id: server.name.clone(),
                 kind: McpEntryKind::ConfiguredServer,
+                install_preset_id: None,
                 title: server.name.clone(),
                 source: "configured".into(),
                 detail,
@@ -861,27 +939,30 @@ fn build_mcp_selector_entries_from(
         })
         .collect();
 
-    entries.extend(
-        crate::mcp_catalog::search_presets(None)
-            .into_iter()
-            .map(|preset| {
-                let install_state = if configured_names.contains(preset.id) {
-                    "already-installed"
-                } else {
-                    "ready-to-install"
-                };
-                McpPresetEntry {
-                    id: preset.id.to_string(),
-                    kind: McpEntryKind::Preset,
-                    title: format!("{}  {}", preset.id, preset.display_name),
-                    source: mcp_preset_source_label(preset).into(),
-                    detail: format!(
-                        "{} | {} | {} | {}",
-                        preset.description, preset.package_name, install_state, preset.source_url
-                    ),
-                }
-            }),
-    );
+    entries.extend(official_entries.iter().map(|entry| {
+        let install_state = if entry
+            .installable_preset_id
+            .as_deref()
+            .is_some_and(|preset_id| configured_names.contains(preset_id))
+        {
+            "already-installed"
+        } else if entry.installable_preset_id.is_some() {
+            "ready-to-install"
+        } else {
+            "catalog-only"
+        };
+        McpPresetEntry {
+            id: entry.id.clone(),
+            kind: McpEntryKind::CatalogEntry,
+            install_preset_id: entry.installable_preset_id.clone(),
+            title: format!("{}  {}", entry.id, entry.display_name),
+            source: mcp_catalog_source_label(entry).into(),
+            detail: format!(
+                "{} | {} | {}",
+                entry.description, install_state, entry.source_url
+            ),
+        }
+    }));
 
     entries
 }
@@ -1490,7 +1571,7 @@ impl App {
             mouse_capture_enabled: true, // scroll wheel on by default; F6 to switch
             pending_mouse_capture: None,
             last_left_click: None,
-            voice_mode_enabled: load_voice_mode_enabled(),
+            voice_mode_enabled: load_voice_mode_enabled() && voice_readback_ready().is_ok(),
             last_agent_response_text: String::new(),
             session_personality: None,
             session_skin: None,
@@ -1731,7 +1812,9 @@ impl App {
         self.push_output_spans(
             vec![
                 Span::styled("     ", Style::default()),
-                Span::styled("Model  ", label_style),
+                Span::styled("Version  ", label_style),
+                Span::styled(format!("v{}", crate::banner::VERSION), value_style),
+                Span::styled("   Model  ", label_style),
                 Span::styled(model_display, value_style),
             ],
             OutputRole::System,
@@ -2161,9 +2244,10 @@ impl App {
             ],
             "mcp" => &[
                 ("list", "List configured MCP servers"),
-                ("search", "Search curated MCP presets"),
+                ("refresh", "Refresh the official MCP catalog cache"),
+                ("search", "Search configured servers + official MCP catalog"),
                 ("view", "Show details for a preset"),
-                ("install", "Install a curated MCP preset"),
+                ("install", "Install a controlled MCP preset"),
                 ("test", "Probe a configured MCP server"),
                 ("remove", "Remove a configured MCP server"),
             ],
@@ -3341,8 +3425,8 @@ impl App {
             return;
         }
 
-        // MCP selector overlay active — mirrors /model UX but installs the
-        // highlighted official preset directly for speed.
+        // MCP selector overlay active — mirrors /model UX while keeping
+        // installs controlled. Catalog-only entries open detail view instead.
         if self.mcp_selector.active {
             match key.code {
                 KeyCode::Esc => {
@@ -3351,7 +3435,11 @@ impl App {
                 KeyCode::Enter => {
                     if let Some(entry) = self.mcp_selector.current() {
                         let command = match entry.kind {
-                            McpEntryKind::Preset => format!("install {}", entry.id),
+                            McpEntryKind::CatalogEntry => entry
+                                .install_preset_id
+                                .as_deref()
+                                .map(|preset_id| format!("install {preset_id}"))
+                                .unwrap_or_else(|| format!("view {}", entry.id)),
                             McpEntryKind::ConfiguredServer => format!("test {}", entry.id),
                         };
                         self.mcp_selector.active = false;
@@ -4553,7 +4641,7 @@ impl App {
                     // through the model and removes a major source of flakiness.
                     let response_text = std::mem::take(&mut self.last_agent_response_text);
                     if self.voice_mode_enabled && !response_text.is_empty() {
-                        self.spawn_direct_tts(response_text);
+                        self.spawn_direct_tts(response_text, false);
                     }
 
                     if let Some(next) = self.prompt_queue.first().cloned() {
@@ -5543,10 +5631,16 @@ impl App {
         }
     }
 
-    fn open_mcp_selector(&mut self, initial_query: Option<&str>) -> usize {
+    fn open_mcp_selector(&mut self, initial_query: Option<&str>, refresh_catalog: bool) -> usize {
         let configured =
             edgecrab_tools::tools::mcp_client::configured_servers().unwrap_or_default();
-        let entries = build_mcp_selector_entries_from(&configured);
+        let official_entries = if refresh_catalog {
+            self.rt_handle
+                .block_on(crate::mcp_catalog::load_official_catalog(true))
+        } else {
+            crate::mcp_catalog::load_official_catalog_cached()
+        };
+        let entries = build_mcp_selector_entries_from(&configured, &official_entries);
         self.mcp_selector.set_items(entries);
         self.mcp_selector.active = true;
         if let Some(query) = initial_query
@@ -6905,7 +6999,7 @@ impl App {
         }
     }
 
-    fn spawn_direct_tts(&mut self, text: String) {
+    fn spawn_direct_tts(&mut self, text: String, announce: bool) {
         let tx = self.response_tx.clone();
         let ctx = self.direct_media_tool_context();
         self.rt_handle.spawn(async move {
@@ -6914,7 +7008,34 @@ impl App {
                 .await
             {
                 Ok(output) => {
-                    let _ = tx.send(AgentResponse::DirectToolOutput(output));
+                    let Some(audio_path) =
+                        edgecrab_tools::tools::tts::extract_audio_path_from_tts_output(&output)
+                    else {
+                        let _ = tx.send(AgentResponse::Error(
+                            "TTS generated output without a playable audio path.".into(),
+                        ));
+                        return;
+                    };
+
+                    let audio_path_buf = std::path::PathBuf::from(&audio_path);
+                    match play_audio_file(&audio_path_buf).await {
+                        Ok(player) => {
+                            if announce {
+                                let _ = tx.send(AgentResponse::DirectToolOutput(format!(
+                                    "Voice playback via `{player}`.\n{output}"
+                                )));
+                            }
+                            let temp_tts_dir = std::env::temp_dir().join("edgecrab_tts");
+                            if audio_path_buf.starts_with(&temp_tts_dir) {
+                                let _ = tokio::fs::remove_file(&audio_path_buf).await;
+                            }
+                        }
+                        Err(error) => {
+                            let _ = tx.send(AgentResponse::Error(format!(
+                                "Voice playback failed: {error}\nGenerated audio: {audio_path}"
+                            )));
+                        }
+                    }
                 }
                 Err(error) => {
                     let _ = tx.send(AgentResponse::Error(format!("TTS error: {error}")));
@@ -7318,13 +7439,14 @@ impl App {
     fn handle_mcp_command(&mut self, args: String) {
         let trimmed = args.trim();
         if trimmed.is_empty() {
-            self.open_mcp_selector(None);
+            self.open_mcp_selector(None, false);
             return;
         }
         if trimmed.eq_ignore_ascii_case("help") {
             self.push_output(
-                "Usage: /mcp            (browse configured servers + official MCP snapshot)\n\
+                "Usage: /mcp            (browse configured servers + official MCP catalog)\n\
                  /mcp list\n\
+                 /mcp refresh\n\
                  /mcp search [query]\n\
                  /mcp view <preset-or-server>\n\
                  /mcp install <preset> [name=<server-name>] [path=<directory>]\n\
@@ -7362,9 +7484,27 @@ impl App {
                     OutputRole::Error,
                 ),
             },
+            "refresh" => {
+                match self
+                    .rt_handle
+                    .block_on(crate::mcp_catalog::refresh_official_catalog())
+                {
+                    Ok(entries) => self.push_output(
+                        format!(
+                            "Refreshed official MCP catalog ({} entries).",
+                            entries.len()
+                        ),
+                        OutputRole::System,
+                    ),
+                    Err(err) => self.push_output(
+                        format!("Failed to refresh official MCP catalog: {err}"),
+                        OutputRole::Error,
+                    ),
+                }
+            }
             "search" => {
                 let query = parts.get(1).copied();
-                if self.open_mcp_selector(query) == 0 {
+                if self.open_mcp_selector(query, true) == 0 {
                     self.mcp_selector.active = false;
                     self.push_output("No MCP entries matched.", OutputRole::System);
                 }
@@ -7390,6 +7530,15 @@ impl App {
                     }
                     lines.push(format!("Notes:  {}", preset.notes));
                     self.push_output(lines.join("\n"), OutputRole::System);
+                    return;
+                }
+                if let Some(entry) = self.rt_handle.block_on(
+                    crate::mcp_catalog::find_official_catalog_entry_with_refresh(preset_name),
+                ) {
+                    self.push_output(
+                        crate::mcp_catalog::render_official_catalog_entry(&entry),
+                        OutputRole::System,
+                    );
                     return;
                 }
                 match edgecrab_tools::tools::mcp_client::configured_servers() {
@@ -7576,6 +7725,13 @@ impl App {
             .strip_prefix("tts ")
             .or_else(|| trimmed.strip_prefix("tts\t"))
         {
+            let player = match voice_readback_ready() {
+                Ok(player) => player,
+                Err(reason) => {
+                    self.push_output(format!("Voice unavailable: {reason}"), OutputRole::Error);
+                    return;
+                }
+            };
             let text = text.trim();
             if text.is_empty() {
                 self.push_output("Usage: /voice tts <text to speak>", OutputRole::System);
@@ -7583,10 +7739,14 @@ impl App {
             }
             let text_owned = text.to_string();
             self.push_output(
-                format!("Speaking: {}", &text_owned[..text_owned.len().min(80)]),
+                format!(
+                    "Speaking via {}: {}",
+                    player.program,
+                    edgecrab_core::safe_truncate(&text_owned, 80)
+                ),
                 OutputRole::System,
             );
-            self.spawn_direct_tts(text_owned);
+            self.spawn_direct_tts(text_owned, true);
             return;
         }
 
@@ -7629,21 +7789,43 @@ impl App {
 
         match trimmed {
             "on" => {
+                let player = match voice_readback_ready() {
+                    Ok(player) => player,
+                    Err(reason) => {
+                        self.push_output(
+                            format!("Voice mode remains OFF: {reason}"),
+                            OutputRole::Error,
+                        );
+                        return;
+                    }
+                };
                 self.voice_mode_enabled = true;
                 let persisted = persist_voice_enabled_to_config(true).is_ok();
                 self.push_output(
                     format!(
                         "Voice mode: ON — agent responses will be read aloud via TTS.\n\
                          Backend: {}  Voice: {}\n\
+                         Playback: {}\n\
                          Persistent default: {}",
                         runtime_config.tts.provider,
                         runtime_config.tts.voice,
+                        player.program,
                         if persisted { "saved" } else { "not saved" }
                     ),
                     OutputRole::System,
                 );
             }
             "tts" => {
+                let player = match voice_readback_ready() {
+                    Ok(player) => player,
+                    Err(reason) => {
+                        self.push_output(
+                            format!("Auto-TTS remains OFF: {reason}"),
+                            OutputRole::Error,
+                        );
+                        return;
+                    }
+                };
                 self.voice_mode_enabled = true;
                 let persisted = persist_voice_enabled_to_config(true).is_ok();
                 self.push_output(
@@ -7651,9 +7833,11 @@ impl App {
                         "Auto-TTS enabled.\n\
                          All assistant replies will be spoken in this CLI session.\n\
                          Backend: {}  Voice: {}\n\
+                         Playback: {}\n\
                          Persistent default: {}",
                         runtime_config.tts.provider,
                         runtime_config.tts.voice,
+                        player.program,
                         if persisted { "saved" } else { "not saved" }
                     ),
                     OutputRole::System,
@@ -7672,10 +7856,20 @@ impl App {
             }
             "status" | "" => {
                 let status = if self.voice_mode_enabled { "ON" } else { "OFF" };
+                let playback = preferred_audio_player()
+                    .map(|player| player.program.to_string())
+                    .unwrap_or_else(|| "unavailable".into());
+                let tts_status = if TextToSpeechTool.is_available() {
+                    "available"
+                } else {
+                    "unavailable"
+                };
                 self.push_output(
                     format!(
                         "Voice mode: {status}\n\
                          Default backend: {}  Voice: {}\n\
+                         TTS backend: {tts_status}\n\
+                         Playback: {playback}\n\
                          Push-to-talk key: {} (recording not yet wired in TUI)\n\
                          /voice on           — enable spoken readback\n\
                          /voice tts          — alias for always-on spoken readback\n\
@@ -8476,6 +8670,14 @@ impl App {
             "│",
             Style::default().fg(Color::Rgb(50, 50, 65)),
         ));
+        left_spans.push(Span::styled(
+            format!(" v{} ", crate::banner::VERSION),
+            Style::default().fg(Color::Rgb(120, 130, 150)),
+        ));
+        left_spans.push(Span::styled(
+            "│",
+            Style::default().fg(Color::Rgb(50, 50, 65)),
+        ));
 
         // ── Spinner / state indicator ────────────────────────────────
         match &self.display_state {
@@ -9034,7 +9236,7 @@ impl App {
             .split(area);
 
         let search_text = if self.mcp_selector.query.is_empty() {
-            "Search configured servers + official MCP snapshot... (Enter install/test, v view, d remove, Esc cancel)".to_string()
+            "Search configured servers + official MCP catalog... (Enter install/test/view, v view, d remove, Esc cancel)".to_string()
         } else {
             self.mcp_selector.query.clone()
         };
@@ -10430,7 +10632,20 @@ mod tests {
             token_from_store: false,
         }];
 
-        let entries = build_mcp_selector_entries_from(&configured);
+        let entries = build_mcp_selector_entries_from(
+            &configured,
+            &[crate::mcp_catalog::OfficialCatalogEntry {
+                id: "git".into(),
+                display_name: "Git".into(),
+                description: "Official git server.".into(),
+                source_url: "https://github.com/modelcontextprotocol/servers/tree/main/src/git"
+                    .into(),
+                homepage: "https://github.com/modelcontextprotocol/servers/tree/main/src/git"
+                    .into(),
+                tags: vec!["official".into(), "reference".into()],
+                installable_preset_id: Some("git".into()),
+            }],
+        );
 
         assert!(entries.iter().any(|entry| {
             entry.kind == McpEntryKind::ConfiguredServer && entry.id == "local-git"
@@ -10438,7 +10653,7 @@ mod tests {
         assert!(
             entries
                 .iter()
-                .any(|entry| entry.kind == McpEntryKind::Preset && entry.id == "git")
+                .any(|entry| entry.kind == McpEntryKind::CatalogEntry && entry.id == "git")
         );
     }
 
@@ -10454,9 +10669,33 @@ mod tests {
 
     #[tokio::test]
     async fn mcp_search_filters_official_snapshot_entries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+        let cache_dir = dir.path().join("cache");
+        std::fs::create_dir_all(&cache_dir).expect("cache dir");
+        std::fs::write(
+            cache_dir.join("mcp_official_catalog.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "fetched_at_epoch_secs": 1,
+                "entries": [{
+                    "id": "time",
+                    "display_name": "Time",
+                    "description": "Timezone conversion capabilities.",
+                    "source_url": "https://github.com/modelcontextprotocol/servers/tree/main/src/time",
+                    "homepage": "https://github.com/modelcontextprotocol/servers/tree/main/src/time",
+                    "tags": ["official", "reference"],
+                    "installable_preset_id": "time"
+                }]
+            }))
+            .expect("json"),
+        )
+        .expect("write cache");
+
         let mut app = App::new();
 
-        app.handle_mcp_command("search timezone".into());
+        app.open_mcp_selector(Some("timezone"), false);
 
         assert!(app.mcp_selector.active);
         let visible: Vec<&str> = app
@@ -10469,6 +10708,12 @@ mod tests {
             visible.iter().any(|title| title.contains("Time")),
             "expected the official time preset in filtered entries, got: {visible:?}"
         );
+    }
+
+    #[test]
+    fn select_audio_player_prefers_first_available_candidate() {
+        let player = select_audio_player_with(|program| matches!(program, "mpv" | "ffplay"));
+        assert_eq!(player.map(|player| player.program), Some("ffplay"));
     }
 
     #[tokio::test]
