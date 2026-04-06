@@ -1019,7 +1019,6 @@ fn process_outcome_from_exit(exit_code: i32) -> ProcessOutcome {
     }
 }
 
-#[cfg(unix)]
 fn render_execute_code_result(
     stdout: String,
     stderr: String,

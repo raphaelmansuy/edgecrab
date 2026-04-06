@@ -66,7 +66,12 @@ impl PathPolicy {
             virtual_tmp_root.as_deref(),
         )?;
         let denied_roots = self.canonical_denied_roots(&workspace_root)?;
-        let candidate = resolve_candidate(path, &workspace_root, virtual_tmp_root.as_deref());
+        // Bypass virtual-tmp remapping for paths explicitly under a configured
+        // allowed root — admin intent takes precedence over sandbox redirection.
+        let effective_tmp = virtual_tmp_root
+            .as_deref()
+            .filter(|_| !self.is_under_allowed_root(path));
+        let candidate = resolve_candidate(path, &workspace_root, effective_tmp);
 
         if !path.is_absolute() {
             let normalized = normalize_path(&candidate);
@@ -96,7 +101,12 @@ impl PathPolicy {
         let allowed_roots =
             self.canonical_allowed_roots(&workspace_root, &[], virtual_tmp_root.as_deref())?;
         let denied_roots = self.canonical_denied_roots(&workspace_root)?;
-        let candidate = resolve_candidate(path, &workspace_root, virtual_tmp_root.as_deref());
+        // Bypass virtual-tmp remapping for paths explicitly under a configured
+        // allowed root — admin intent takes precedence over sandbox redirection.
+        let effective_tmp = virtual_tmp_root
+            .as_deref()
+            .filter(|_| !self.is_under_allowed_root(path));
+        let candidate = resolve_candidate(path, &workspace_root, effective_tmp);
         let normalized = normalize_path(&candidate);
 
         if !path.is_absolute() && !normalized.starts_with(&workspace_root) {
@@ -137,6 +147,14 @@ impl PathPolicy {
                 self.workspace_root.display()
             ))
         })
+    }
+
+    /// Returns true if `path` starts with any of the explicitly configured
+    /// `allowed_roots`. Uses uncanonicalized comparison — sufficient for the
+    /// virtual-tmp bypass since both sides come from the same TempDir API or
+    /// from user config (which is expected to use real paths).
+    fn is_under_allowed_root(&self, path: &Path) -> bool {
+        path.is_absolute() && self.allowed_roots.iter().any(|r| path.starts_with(r))
     }
 
     fn canonical_allowed_roots(
