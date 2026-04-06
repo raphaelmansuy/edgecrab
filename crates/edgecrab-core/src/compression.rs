@@ -63,6 +63,9 @@ use std::sync::Arc;
 use edgecrab_types::Message;
 use edgequake_llm::LLMProvider;
 
+use crate::config::CompressionConfig;
+use crate::model_catalog::ModelCatalog;
+
 // ─── Constants ────────────────────────────────────────────────────────
 
 /// Prefix for LLM-generated compaction summaries.
@@ -147,13 +150,33 @@ pub struct CompressionParams {
     pub protect_last_n: usize,
 }
 
+const DEFAULT_CONTEXT_WINDOW: usize = 128_000;
+
 impl Default for CompressionParams {
     fn default() -> Self {
         Self {
-            context_window: 128_000,
+            context_window: DEFAULT_CONTEXT_WINDOW,
             threshold: 0.50,
             target_ratio: 0.20,
             protect_last_n: 20,
+        }
+    }
+}
+
+impl CompressionParams {
+    /// Resolve compression parameters for the active model/configuration.
+    pub fn from_model_config(model: &str, cfg: &CompressionConfig) -> Self {
+        let context_window = model
+            .split_once('/')
+            .and_then(|(provider, name)| ModelCatalog::context_window(provider, name))
+            .map(|tokens| tokens as usize)
+            .unwrap_or(DEFAULT_CONTEXT_WINDOW);
+
+        Self {
+            context_window,
+            threshold: cfg.threshold.clamp(0.01, 1.0),
+            target_ratio: cfg.target_ratio.clamp(0.01, 1.0),
+            protect_last_n: cfg.protect_last_n.max(1),
         }
     }
 }
@@ -206,6 +229,14 @@ pub fn check_compression_status(
     params: &CompressionParams,
 ) -> CompressionStatus {
     let estimated = estimate_tokens(messages);
+    check_compression_status_for_estimate(estimated, params)
+}
+
+/// Classify compression pressure from a precomputed token estimate.
+pub fn check_compression_status_for_estimate(
+    estimated: usize,
+    params: &CompressionParams,
+) -> CompressionStatus {
     let threshold_tokens = (params.context_window as f32 * params.threshold) as usize;
     let warning_tokens = (threshold_tokens as f32 * 0.85) as usize;
 
@@ -822,6 +853,44 @@ mod tests {
         assert_eq!(
             check_compression_status(&msgs, &params),
             CompressionStatus::Ok
+        );
+    }
+
+    #[test]
+    fn check_status_for_estimate_reuses_threshold_logic() {
+        let params = CompressionParams {
+            context_window: 1_000,
+            threshold: 0.50,
+            target_ratio: 0.20,
+            protect_last_n: 5,
+        };
+        assert_eq!(
+            check_compression_status_for_estimate(430, &params),
+            CompressionStatus::PressureWarning
+        );
+        assert_eq!(
+            check_compression_status_for_estimate(500, &params),
+            CompressionStatus::NeedsCompression
+        );
+    }
+
+    #[test]
+    fn compression_params_from_model_config_uses_runtime_values() {
+        let cfg = CompressionConfig {
+            enabled: true,
+            threshold: 0.75,
+            target_ratio: 0.33,
+            protect_last_n: 12,
+            summary_model: None,
+        };
+        let params = CompressionParams::from_model_config("anthropic/claude-opus-4.6", &cfg);
+        assert_eq!(params.threshold, 0.75);
+        assert_eq!(params.target_ratio, 0.33);
+        assert_eq!(params.protect_last_n, 12);
+        assert_eq!(
+            params.context_window,
+            ModelCatalog::context_window("anthropic", "claude-opus-4.6").expect("catalog context")
+                as usize
         );
     }
 

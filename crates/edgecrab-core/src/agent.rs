@@ -144,6 +144,8 @@ pub struct AgentConfig {
     pub terminal_modal: edgecrab_tools::tools::backends::ModalBackendConfig,
     pub terminal_daytona: edgecrab_tools::tools::backends::DaytonaBackendConfig,
     pub terminal_singularity: edgecrab_tools::tools::backends::SingularityBackendConfig,
+    /// Context-compression policy copied from AppConfig at session start.
+    pub compression: crate::config::CompressionConfig,
     /// Auxiliary side-task routing (vision, compression, other helper calls).
     pub auxiliary: crate::config::AuxiliaryConfig,
     /// Env-var names allowed to pass through the subprocess security blocklist.
@@ -194,6 +196,7 @@ impl Default for AgentConfig {
             terminal_daytona: edgecrab_tools::tools::backends::DaytonaBackendConfig::default(),
             terminal_singularity:
                 edgecrab_tools::tools::backends::SingularityBackendConfig::default(),
+            compression: crate::config::CompressionConfig::default(),
             auxiliary: crate::config::AuxiliaryConfig::default(),
             terminal_env_passthrough: Vec::new(),
             file_allowed_roots: Vec::new(),
@@ -697,8 +700,12 @@ impl Agent {
     /// Force context compression on the next turn.
     pub async fn force_compress(&self) {
         let provider = self.provider.read().await.clone();
+        let config = self.config.read().await.clone();
         let mut session = self.session.write().await;
-        let params = crate::compression::CompressionParams::default();
+        let params = crate::compression::CompressionParams::from_model_config(
+            &config.model,
+            &config.compression,
+        );
         session.messages =
             crate::compression::compress_with_llm(&session.messages, &params, &provider).await;
     }
@@ -726,7 +733,7 @@ impl Agent {
         {
             let mut session = self.session.write().await;
             session.session_id = Some(record.id.clone());
-            session.cached_system_prompt = None;
+            session.cached_system_prompt = record.system_prompt.clone();
             session.user_turn_count = messages
                 .iter()
                 .filter(|m| matches!(m.role, edgecrab_types::Role::User))
@@ -1205,6 +1212,7 @@ impl AgentBuilder {
                 terminal_modal: config.terminal.modal.clone(),
                 terminal_daytona: config.terminal.daytona.clone(),
                 terminal_singularity: config.terminal.singularity.clone(),
+                compression: config.compression.clone(),
                 auxiliary: config.auxiliary.clone(),
                 terminal_env_passthrough: config.terminal.env_passthrough.clone(),
                 file_allowed_roots: config.tools.file.allowed_roots.clone(),
@@ -1811,5 +1819,50 @@ mod tests {
         assert_eq!(snap.prompt_tokens(), 17_003);
         assert_eq!(snap.total_tokens(), 17_020);
         assert_eq!(snap.context_pressure_tokens(), 1_234);
+    }
+
+    #[tokio::test]
+    async fn restore_session_reuses_persisted_system_prompt() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(SessionDb::open(&tmp.path().join("sessions.db")).expect("db"));
+        let provider: Arc<dyn LLMProvider> = Arc::new(edgequake_llm::MockProvider::new());
+        let session = edgecrab_state::SessionRecord {
+            id: "restore-me".into(),
+            source: "cli".into(),
+            user_id: None,
+            model: Some("mock/model".into()),
+            system_prompt: Some("Persisted system prompt".into()),
+            parent_session_id: None,
+            started_at: 1.0,
+            ended_at: Some(2.0),
+            end_reason: None,
+            message_count: 2,
+            tool_call_count: 0,
+            input_tokens: 10,
+            output_tokens: 4,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
+            estimated_cost_usd: None,
+            title: Some("restore".into()),
+        };
+        db.save_session(&session).expect("save session");
+        db.save_message("restore-me", &Message::user("hello"), 1.0)
+            .expect("save user");
+        db.save_message("restore-me", &Message::assistant("hi"), 2.0)
+            .expect("save assistant");
+
+        let agent = AgentBuilder::new("mock/model")
+            .provider(provider)
+            .state_db(db)
+            .build()
+            .expect("build agent");
+
+        let restored = agent.restore_session("restore-me").await.expect("restore");
+        assert_eq!(restored, 2);
+        assert_eq!(
+            agent.system_prompt().await.as_deref(),
+            Some("Persisted system prompt")
+        );
     }
 }

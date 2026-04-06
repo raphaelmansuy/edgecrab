@@ -59,7 +59,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::{Agent, ConversationResult, SessionState};
 use crate::compression::{
-    CompressionParams, CompressionStatus, check_compression_status, compress_with_llm,
+    CompressionParams, CompressionStatus, check_compression_status_for_estimate, compress_with_llm,
 };
 use crate::config::edgecrab_home;
 use crate::context_references::expand_context_refs_with_policy;
@@ -397,7 +397,17 @@ impl Agent {
                 {
                     disabled_skills.extend(platform_disabled.iter().cloned());
                 }
-                let skill_summary = load_skill_summary(&home, &disabled_skills, None, None);
+                let toolsets_for_prompt = if let Some(registry) = self.tool_registry.as_ref() {
+                    available_toolsets_for_prompt(registry, &tool_names_for_prompt)
+                } else {
+                    Vec::new()
+                };
+                let skill_summary = load_skill_summary(
+                    &home,
+                    &disabled_skills,
+                    Some(&tool_names_for_prompt),
+                    Some(&toolsets_for_prompt),
+                );
                 // Load preloaded skills (from -s/--skill flag or config.skills.preloaded)
                 // and prepend their full content before the auto-discovered skill summary.
                 let preloaded_content =
@@ -478,7 +488,9 @@ impl Agent {
         // The heuristic is chars/4 ≈ tokens (same as estimate_tokens in compression.rs).
         // Only fires when the expansion actually added content beyond the original text.
         if !expansion.refs_found.is_empty() {
-            let context_window = CompressionParams::default().context_window;
+            let context_window =
+                CompressionParams::from_model_config(&config.model, &config.compression)
+                    .context_window;
             let injected_chars = expansion.expanded.len().saturating_sub(user_message.len());
             let injected_tokens = injected_chars / 4;
             let hard_limit = context_window / 2; // 50% hard stop
@@ -825,11 +837,21 @@ impl Agent {
             //
             // WHY check_compression_status: Unlike the old boolean needs_compression(),
             // this returns a 3-way enum so we can emit a UI warning before firing.
-            let compression_params = CompressionParams::default();
-            match check_compression_status(&session.messages, &compression_params) {
+            let compression_params =
+                CompressionParams::from_model_config(&config.model, &config.compression);
+            let estimated_prompt_tokens = estimate_request_prompt_tokens(
+                session.cached_system_prompt.as_deref(),
+                &session.messages,
+                &tool_defs,
+            );
+            match check_compression_status_for_estimate(
+                estimated_prompt_tokens,
+                &compression_params,
+            ) {
                 CompressionStatus::NeedsCompression => {
                     tracing::info!(
                         messages = session.messages.len(),
+                        estimated_prompt_tokens,
                         "compressing context before API call"
                     );
                     session.messages =
@@ -840,25 +862,31 @@ impl Agent {
                         session.messages.push(Message::user(&snapshot));
                     }
                     // Re-check: if compression succeeded, clear the pressure flag.
-                    if check_compression_status(&session.messages, &compression_params)
-                        == CompressionStatus::Ok
+                    let recomputed_prompt_tokens = estimate_request_prompt_tokens(
+                        session.cached_system_prompt.as_deref(),
+                        &session.messages,
+                        &tool_defs,
+                    );
+                    if check_compression_status_for_estimate(
+                        recomputed_prompt_tokens,
+                        &compression_params,
+                    ) == CompressionStatus::Ok
                     {
                         pressure_warned = false;
                     }
                 }
                 CompressionStatus::PressureWarning if !pressure_warned => {
-                    let estimated = crate::compression::estimate_tokens(&session.messages);
                     let threshold_tokens = (compression_params.context_window as f32
                         * compression_params.threshold)
                         as usize;
                     tracing::warn!(
-                        estimated_tokens = estimated,
+                        estimated_tokens = estimated_prompt_tokens,
                         threshold_tokens,
                         "context approaching compression threshold"
                     );
                     if let Some(tx) = event_tx {
                         let _ = tx.send(crate::StreamEvent::ContextPressure {
-                            estimated_tokens: estimated,
+                            estimated_tokens: estimated_prompt_tokens,
                             threshold_tokens,
                         });
                     }
@@ -1753,6 +1781,28 @@ fn estimate_stream_prompt_tokens(
     tool_defs: &[edgequake_llm::ToolDefinition],
 ) -> usize {
     estimate_tokens_from_json(&(messages, tool_defs))
+}
+
+fn estimate_request_prompt_tokens(
+    system_prompt: Option<&str>,
+    messages: &[Message],
+    tool_defs: &[edgequake_llm::ToolDefinition],
+) -> usize {
+    let chat_messages = build_chat_messages(system_prompt, messages, None);
+    estimate_stream_prompt_tokens(&chat_messages, tool_defs)
+}
+
+fn available_toolsets_for_prompt(
+    registry: &edgecrab_tools::registry::ToolRegistry,
+    tool_names: &[String],
+) -> Vec<String> {
+    let mut toolsets: Vec<String> = tool_names
+        .iter()
+        .filter_map(|name| registry.toolset_for_tool(name))
+        .collect();
+    toolsets.sort();
+    toolsets.dedup();
+    toolsets
 }
 
 fn estimate_stream_completion_tokens(
@@ -3121,6 +3171,42 @@ mod tests {
         assert_eq!(chat_msgs.len(), 2);
         // System message should have cache_control set
         assert!(chat_msgs[0].cache_control.is_some());
+    }
+
+    #[test]
+    fn estimate_request_prompt_tokens_includes_fixed_prompt_mass() {
+        let messages = vec![Message::user("hi")];
+        let tool_defs = vec![edgequake_llm::ToolDefinition::function(
+            "terminal",
+            "Run shell commands.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"}
+                }
+            }),
+        )];
+
+        let bare = estimate_request_prompt_tokens(None, &messages, &[]);
+        let inflated = estimate_request_prompt_tokens(Some("system prompt"), &messages, &tool_defs);
+        assert!(
+            inflated > bare,
+            "system prompt + tool schemas must increase request pressure"
+        );
+    }
+
+    #[test]
+    fn available_toolsets_for_prompt_deduplicates_registry_matches() {
+        let registry = edgecrab_tools::registry::ToolRegistry::new();
+        let toolsets = available_toolsets_for_prompt(
+            &registry,
+            &[
+                "read_file".to_string(),
+                "write_file".to_string(),
+                "read_file".to_string(),
+            ],
+        );
+        assert_eq!(toolsets, vec!["file".to_string()]);
     }
 
     #[test]

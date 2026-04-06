@@ -1471,30 +1471,35 @@ fn skill_should_show(
     available_tools: Option<&[String]>,
     available_toolsets: Option<&[String]>,
 ) -> bool {
-    let at = available_tools.unwrap_or(&[]);
-    let ats = available_toolsets.unwrap_or(&[]);
-
     // fallback_for: hide when the primary tool/toolset IS available
-    for t in &conditions.fallback_for_tools {
-        if at.iter().any(|a| a == t) {
-            return false;
+    if let Some(at) = available_tools {
+        for t in &conditions.fallback_for_tools {
+            if at.iter().any(|a| a == t) {
+                return false;
+            }
         }
     }
-    for ts in &conditions.fallback_for_toolsets {
-        if ats.iter().any(|a| a == ts) {
-            return false;
+    if let Some(ats) = available_toolsets {
+        for ts in &conditions.fallback_for_toolsets {
+            if ats.iter().any(|a| a == ts) {
+                return false;
+            }
         }
     }
 
-    // requires: hide when a required tool/toolset is NOT available
-    for t in &conditions.requires_tools {
-        if !at.is_empty() && !at.iter().any(|a| a == t) {
-            return false;
+    // requires: if availability is known, hide when a required tool/toolset is absent.
+    if let Some(at) = available_tools {
+        for t in &conditions.requires_tools {
+            if !at.iter().any(|a| a == t) {
+                return false;
+            }
         }
     }
-    for ts in &conditions.requires_toolsets {
-        if !ats.is_empty() && !ats.iter().any(|a| a == ts) {
-            return false;
+    if let Some(ats) = available_toolsets {
+        for ts in &conditions.requires_toolsets {
+            if !ats.iter().any(|a| a == ts) {
+                return false;
+            }
         }
     }
 
@@ -1977,6 +1982,52 @@ mod tests {
         assert!(summary.contains("skill-y"), "skill-y should appear");
     }
 
+    #[test]
+    fn load_skill_summary_hides_requires_tools_when_tool_list_is_known_empty() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("skills").join("terminal-only");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("SKILL.md"),
+            "---\nrequires_tools: [terminal]\ndescription: Terminal helper\n---\n",
+        )
+        .expect("write");
+
+        let summary = load_skill_summary(tmp.path(), &[], Some(&[]), None);
+        assert!(
+            summary.is_none(),
+            "no skills should remain when the only skill requires an unavailable tool"
+        );
+    }
+
+    #[test]
+    fn load_skill_summary_filters_by_available_toolsets() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("skills").join("browser-helper");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("SKILL.md"),
+            "---\nrequires_toolsets: [browser]\ndescription: Browser helper\n---\n",
+        )
+        .expect("write");
+
+        let file_only = ["file".to_string()];
+        let browser_only = ["browser".to_string()];
+
+        let hidden = load_skill_summary(tmp.path(), &[], None, Some(&file_only));
+        let visible =
+            load_skill_summary(tmp.path(), &[], None, Some(&browser_only)).expect("Some visible");
+
+        assert!(
+            hidden.is_none(),
+            "skills gated on unavailable toolsets must be fully omitted"
+        );
+        assert!(
+            visible.contains("browser-helper"),
+            "skills gated on available toolsets must be shown"
+        );
+    }
+
     // ── Skills cache tests ─────────────────────────────────────────────
 
     #[test]
@@ -2122,6 +2173,38 @@ mod tests {
         assert!(
             !prompt.contains("NEVER call browser_vision"),
             "vision guidance must NOT appear when vision_analyze is not in tool list"
+        );
+    }
+
+    #[test]
+    fn skill_conditions_hide_requires_when_known_toolset_is_empty() {
+        let conditions = SkillConditions {
+            requires_tools: vec!["terminal".to_string()],
+            ..Default::default()
+        };
+        assert!(
+            !skill_should_show(&conditions, Some(&[]), None),
+            "requires_tools must hide skills when tool availability is known and empty"
+        );
+        assert!(
+            skill_should_show(&conditions, None, None),
+            "requires_tools must remain permissive when tool availability is unknown"
+        );
+    }
+
+    #[test]
+    fn skill_conditions_hide_requires_when_known_toolset_missing() {
+        let conditions = SkillConditions {
+            requires_toolsets: vec!["browser".to_string()],
+            ..Default::default()
+        };
+        assert!(
+            !skill_should_show(
+                &conditions,
+                None,
+                Some(&["file".to_string(), "terminal".to_string()])
+            ),
+            "requires_toolsets must hide skills when the required toolset is absent"
         );
     }
 }
