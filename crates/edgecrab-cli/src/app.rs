@@ -2026,6 +2026,14 @@ impl App {
                 ("remove", "Delete a token: remove <server-id>"),
                 ("list", "List stored server tokens"),
             ],
+            "mcp" => &[
+                ("list", "List configured MCP servers"),
+                ("search", "Search curated MCP presets"),
+                ("view", "Show details for a preset"),
+                ("install", "Install a curated MCP preset"),
+                ("test", "Probe a configured MCP server"),
+                ("remove", "Remove a configured MCP server"),
+            ],
             // ── Personality ───────────────────────────────────────────────────
             "personality" | "persona" => &[],
             // ── Appearance / skin ─────────────────────────────────────────────
@@ -3719,6 +3727,9 @@ impl App {
             }
             CommandResult::SetImageModel(spec) => {
                 self.handle_set_image_model(spec);
+            }
+            CommandResult::ShowMcp(args) => {
+                self.handle_mcp_command(args);
             }
             CommandResult::SessionNew => {
                 if let Some(ref agent) = self.agent {
@@ -7092,6 +7103,219 @@ impl App {
              (Configured via ~/.edgecrab/mcp.json or the mcp_servers section in config.yaml)",
             OutputRole::System,
         );
+    }
+
+    fn handle_mcp_command(&mut self, args: String) {
+        let trimmed = args.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("help") {
+            self.push_output(
+                "Usage: /mcp list\n\
+                 /mcp search [query]\n\
+                 /mcp view <preset>\n\
+                 /mcp install <preset> [name=<server-name>] [path=<directory>]\n\
+                 /mcp test [server-name]\n\
+                 /mcp remove <server-name>",
+                OutputRole::System,
+            );
+            return;
+        }
+
+        let parts: Vec<&str> = trimmed.split_whitespace().collect();
+        match parts.first().copied().unwrap_or_default() {
+            "list" => match edgecrab_tools::tools::mcp_client::configured_servers() {
+                Ok(servers) if !servers.is_empty() => {
+                    let mut lines = Vec::new();
+                    lines.push("Configured MCP servers:".to_string());
+                    for server in servers {
+                        let transport = if let Some(url) = &server.url {
+                            format!("http {url}")
+                        } else {
+                            let mut rendered = server.command;
+                            if !server.args.is_empty() {
+                                rendered.push(' ');
+                                rendered.push_str(&server.args.join(" "));
+                            }
+                            rendered
+                        };
+                        lines.push(format!("- {}  {}", server.name, transport));
+                    }
+                    self.push_output(lines.join("\n"), OutputRole::System);
+                }
+                Ok(_) => self.push_output("No MCP servers configured.", OutputRole::System),
+                Err(err) => self.push_output(
+                    format!("Failed to read MCP configuration: {err}"),
+                    OutputRole::Error,
+                ),
+            },
+            "search" => {
+                let query = parts.get(1).copied();
+                let results = crate::mcp_catalog::search_presets(query);
+                if results.is_empty() {
+                    self.push_output("No curated MCP presets matched.", OutputRole::System);
+                    return;
+                }
+                let mut lines = Vec::new();
+                lines.push("Curated MCP presets:".to_string());
+                for preset in results {
+                    lines.push(format!(
+                        "- {}  {} [{}]",
+                        preset.id,
+                        preset.description,
+                        preset.tags.join(", ")
+                    ));
+                }
+                self.push_output(lines.join("\n"), OutputRole::System);
+            }
+            "view" => {
+                let Some(preset_name) = parts.get(1).copied() else {
+                    self.push_output("Usage: /mcp view <preset>", OutputRole::System);
+                    return;
+                };
+                let Some(preset) = crate::mcp_catalog::find_preset(preset_name) else {
+                    self.push_output(
+                        format!("Unknown MCP preset '{preset_name}'."),
+                        OutputRole::Error,
+                    );
+                    return;
+                };
+                let mut lines = vec![
+                    format!("Preset: {}", preset.id),
+                    format!("Name:   {}", preset.display_name),
+                    format!("Why:    {}", preset.description),
+                    format!("Cmd:    {} {}", preset.command, preset.args.join(" ")),
+                    format!("Tags:   {}", preset.tags.join(", ")),
+                ];
+                if !preset.required_env.is_empty() {
+                    lines.push(format!("Env:    {}", preset.required_env.join(", ")));
+                }
+                lines.push(format!("Notes:  {}", preset.notes));
+                self.push_output(lines.join("\n"), OutputRole::System);
+            }
+            "install" => {
+                let Some(preset_name) = parts.get(1).copied() else {
+                    self.push_output(
+                        "Usage: /mcp install <preset> [name=<server-name>] [path=<directory>]",
+                        OutputRole::System,
+                    );
+                    return;
+                };
+                let name = parts
+                    .iter()
+                    .skip(2)
+                    .find_map(|part| part.strip_prefix("name="));
+                let path = parts
+                    .iter()
+                    .skip(2)
+                    .find_map(|part| part.strip_prefix("path="));
+                let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                let mut config = self.load_runtime_config();
+                match crate::mcp_catalog::install_preset(
+                    &mut config,
+                    preset_name,
+                    name,
+                    path.map(std::path::Path::new),
+                    &cwd,
+                ) {
+                    Ok(installed) => match config.save() {
+                        Ok(()) => {
+                            edgecrab_tools::tools::mcp_client::reload_mcp_connections();
+                            let mut message =
+                                format!("Configured MCP server '{}'.", installed.name);
+                            if !installed.missing_env.is_empty() {
+                                message.push_str(&format!(
+                                    "\nMissing env vars: {}",
+                                    installed.missing_env.join(", ")
+                                ));
+                            }
+                            message.push_str(&format!(
+                                "\nRun `/mcp test {}` to verify connectivity.",
+                                installed.name
+                            ));
+                            self.push_output(message, OutputRole::System);
+                        }
+                        Err(err) => self.push_output(
+                            format!(
+                                "Preset installed for this session, but config save failed: {err}"
+                            ),
+                            OutputRole::Error,
+                        ),
+                    },
+                    Err(err) => {
+                        self.push_output(format!("MCP install failed: {err}"), OutputRole::Error)
+                    }
+                }
+            }
+            "test" => {
+                let name = parts.get(1).map(|value| (*value).to_string());
+                let tx = self.response_tx.clone();
+                self.rt_handle.spawn(async move {
+                    let targets = if let Some(name) = name {
+                        vec![name]
+                    } else {
+                        match edgecrab_tools::tools::mcp_client::configured_servers() {
+                            Ok(servers) => servers.into_iter().map(|server| server.name).collect(),
+                            Err(err) => {
+                                let _ = tx.send(AgentResponse::Notice(format!(
+                                    "Failed to read MCP configuration: {err}"
+                                )));
+                                return;
+                            }
+                        }
+                    };
+                    if targets.is_empty() {
+                        let _ = tx.send(AgentResponse::Notice("No MCP servers configured.".into()));
+                        return;
+                    }
+                    for target in targets {
+                        match edgecrab_tools::tools::mcp_client::probe_configured_server(&target)
+                            .await
+                        {
+                            Ok(result) => {
+                                let _ = tx.send(AgentResponse::Notice(format!(
+                                    "{}  ok  transport={} tools={}",
+                                    result.server_name, result.transport, result.tool_count
+                                )));
+                            }
+                            Err(err) => {
+                                let _ = tx.send(AgentResponse::Notice(format!(
+                                    "{}  fail  {}",
+                                    target, err
+                                )));
+                            }
+                        }
+                    }
+                });
+            }
+            "remove" | "uninstall" | "rm" => {
+                let Some(name) = parts.get(1).copied() else {
+                    self.push_output("Usage: /mcp remove <server-name>", OutputRole::System);
+                    return;
+                };
+                let mut config = self.load_runtime_config();
+                if config.mcp_servers.remove(name).is_none() {
+                    self.push_output(format!("Unknown MCP server '{name}'."), OutputRole::Error);
+                    return;
+                }
+                match config.save() {
+                    Ok(()) => {
+                        edgecrab_tools::tools::mcp_client::remove_mcp_token(name);
+                        edgecrab_tools::tools::mcp_client::reload_mcp_connections();
+                        self.push_output(
+                            format!("Removed MCP server '{name}'."),
+                            OutputRole::System,
+                        );
+                    }
+                    Err(err) => self.push_output(
+                        format!("Failed to save config after removing MCP server: {err}"),
+                        OutputRole::Error,
+                    ),
+                }
+            }
+            other => self.push_output(
+                format!("Unknown /mcp action '{other}'. Use `/mcp help`."),
+                OutputRole::Error,
+            ),
+        }
     }
 
     // ─── Voice Mode ─────────────────────────────────────────────────

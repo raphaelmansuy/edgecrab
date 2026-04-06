@@ -11,7 +11,7 @@
 //!   Model         /model /vision_model /image_model /provider /reasoning /stream
 //!   Session       /session /retry /undo /stop /history /save /export /title /resume
 //!   Config        /config /prompt /verbose /personality /statusbar
-//!   Tools         /tools /toolsets /reload-mcp /plugins
+//!   Tools         /tools /toolsets /mcp /reload-mcp /plugins
 //!   Memory        /memory
 //!   Analysis      /cost /usage /compress /insights
 //!   Appearance    /theme /paste
@@ -108,6 +108,8 @@ pub enum CommandResult {
     Deny,
     /// Show/manage skills
     ShowSkills(String),
+    /// Show/manage MCP servers and presets
+    ShowMcp(String),
     /// Activate the interactive skill selector overlay
     SkillSelector,
     /// Show registered tools (dynamic from ToolRegistry)
@@ -746,9 +748,16 @@ impl CommandRegistry {
 
         self.register(Command {
             name: "reload-mcp",
-            aliases: &["mcp"],
+            aliases: &["mcp-reload"],
             description: "Reload MCP server connections",
             handler: |_| CommandResult::ReloadMcp,
+        });
+
+        self.register(Command {
+            name: "mcp",
+            aliases: &[],
+            description: "List, search, install, test, or remove MCP servers (/mcp help)",
+            handler: |args| CommandResult::ShowMcp(args.trim().to_string()),
         });
 
         self.register(Command {
@@ -961,6 +970,7 @@ fn help_text() -> String {
          Tools:\n\
            /tools                — List registered tools\n\
            /toolsets             — List available toolsets\n\
+           /mcp [args]           — Search, install, test, or remove MCP servers\n\
            /reload-mcp           — Reload MCP server connections\n\
            /plugins              — List installed plugins\n\
          \n\
@@ -1159,6 +1169,15 @@ mod tests {
                 assert_eq!(model, "gemini/gemini-2.5-flash-image")
             }
             _ => panic!("expected image model override"),
+        }
+    }
+
+    #[test]
+    fn dispatch_mcp_passes_args_through() {
+        let reg = CommandRegistry::new();
+        match reg.dispatch("/mcp search github") {
+            Some(CommandResult::ShowMcp(args)) => assert_eq!(args, "search github"),
+            _ => panic!("expected mcp command"),
         }
     }
 
