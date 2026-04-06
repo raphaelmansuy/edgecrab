@@ -988,6 +988,11 @@ mod tests {
         assert_eq!(refs.len(), 1);
     }
 
+    // Local bare-file detection uses a /... or ~/... regex that only matches
+    // Unix-style absolute paths. On Windows, TempDir paths use C:\... which
+    // the regex does not cover; the MEDIA: tag (tested elsewhere) is the
+    // cross-platform media dispatch mechanism.
+    #[cfg(not(windows))]
     #[test]
     fn extract_media_detects_existing_bare_local_file() {
         let dir = tempfile::tempdir().expect("tempdir");
