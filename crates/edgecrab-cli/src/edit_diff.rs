@@ -152,7 +152,13 @@ fn resolve_preview_write_path(
     };
     let normalized = normalize_path(&candidate);
 
-    if !Path::new(raw_path).is_absolute() && !normalized.starts_with(&cwd) {
+    // Traversal guard: reject relative paths that escape the workspace root.
+    // Exception: `/tmp/` prefixed paths are virtual-tmp references that have
+    // already been remapped to file_tools_tmp_dir() above; on Windows they
+    // are not considered absolute (no drive letter) so we must not reject them
+    // here — the allowed_roots check below handles the permission boundary.
+    let is_virtual_tmp = raw_path == "/tmp" || raw_path.starts_with("/tmp/");
+    if !is_virtual_tmp && !Path::new(raw_path).is_absolute() && !normalized.starts_with(&cwd) {
         return None;
     }
 
