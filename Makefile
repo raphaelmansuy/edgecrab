@@ -25,6 +25,8 @@
         publish-npm-cli publish-npm-cli-dry \
         publish-pypi-cli publish-pypi-cli-dry \
         publish-all publish-all-dry \
+        publish-python-local publish-node-local publish-npm-cli-local publish-pypi-cli-local \
+        publish-local \
         version-bump tag-release \
         site-dev site-build site-preview site-install site-deploy site-deploy-status \
         clean clean-all
@@ -196,6 +198,13 @@ publish-python: ## Build and upload Python SDK to PyPI
 	@twine upload sdks/python/dist/*
 	$(call ok,Python SDK published to PyPI)
 
+publish-python-local: ## Build Python SDK wheel and install it locally with pip
+	$(call log,Building Python SDK wheel ...)
+	@cd sdks/python && python -m build
+	$(call log,Installing Python SDK locally ...)
+	@pip install --force-reinstall sdks/python/dist/edgecrab_sdk-*.whl
+	$(call ok,Python SDK installed locally)
+
 # ── Node.js / npm ────────────────────────────────────────────────────────────
 publish-node-dry: ## Dry-run: build and pack Node.js SDK
 	$(call log,Building Node.js SDK [dry-run])
@@ -210,6 +219,13 @@ publish-node: ## Build and publish Node.js SDK to npm
 	@cd sdks/node && npm publish --access public
 	$(call ok,Node.js SDK published to npm)
 
+publish-node-local: ## Build Node.js SDK, pack it, and install it locally via npm link
+	$(call log,Building Node.js SDK ...)
+	@cd sdks/node && npm ci && npm run build
+	$(call log,Linking Node.js SDK locally ...)
+	@cd sdks/node && npm link --force
+	$(call ok,Node.js SDK linked locally — use 'npm link edgecrab-sdk' in your project)
+
 # ── npm CLI (edgecrab-cli wrapper) ───────────────────────────────────────────
 publish-npm-cli-dry: ## Dry-run: pack npm CLI wrapper package
 	$(call log,npm CLI dry-run pack)
@@ -220,6 +236,11 @@ publish-npm-cli: ## Publish npm CLI wrapper to npm registry
 	$(call log,Publishing npm CLI wrapper ...)
 	@cd sdks/npm-cli && npm publish --access public
 	$(call ok,npm CLI published to npm)
+
+publish-npm-cli-local: ## Pack npm CLI wrapper and install it globally via npm link
+	$(call log,Linking npm CLI wrapper locally ...)
+	@cd sdks/npm-cli && npm link
+	$(call ok,npm CLI linked globally — 'edgecrab' command now available)
 
 # ── PyPI CLI (edgecrab-cli wrapper) ──────────────────────────────────────────
 publish-pypi-cli-dry: ## Dry-run: build PyPI CLI wrapper and check with twine
@@ -235,6 +256,13 @@ publish-pypi-cli: ## Build and upload PyPI CLI wrapper to PyPI
 	@twine upload sdks/pypi-cli/dist/*
 	$(call ok,PyPI CLI published)
 
+publish-pypi-cli-local: ## Build PyPI CLI wrapper wheel and install it locally with pip
+	$(call log,Building PyPI CLI wrapper wheel ...)
+	@cd sdks/pypi-cli && python -m build
+	$(call log,Installing PyPI CLI wrapper locally ...)
+	@pip install --force-reinstall sdks/pypi-cli/dist/edgecrab_cli-*.whl
+	$(call ok,PyPI CLI installed locally)
+
 # ── Publish all ───────────────────────────────────────────────────────────────
 
 # Dry-run preflight for every package — run before tagging a release.
@@ -243,6 +271,9 @@ publish-all-dry: publish-rust-dry publish-python-dry publish-node-dry publish-np
 
 publish-all: publish-rust publish-python publish-node publish-npm-cli publish-pypi-cli ## Publish all packages (crates.io + PyPI + npm)
 	$(call ok,All packages published)
+
+publish-local: publish-python-local publish-node-local publish-npm-cli-local publish-pypi-cli-local ## Build and install/link all Python + npm packages locally (no registry)
+	$(call ok,All packages published locally)
 
 # ── Version bump ──────────────────────────────────────────────────────────────
 
