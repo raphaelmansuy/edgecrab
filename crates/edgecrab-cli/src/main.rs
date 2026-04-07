@@ -1211,6 +1211,34 @@ async fn run_skills(command: SkillsCommand) -> anyhow::Result<()> {
             println!("Activate with: edgecrab skills view {}", outcome.skill_name);
         }
 
+        SkillsCommand::Update { name } => {
+            let optional_dir = edgecrab_tools::tools::skills_sync::optional_skills_dir();
+            if let Some(name) = name {
+                let outcome = edgecrab_tools::tools::skills_hub::update_installed_skill(
+                    &name,
+                    &skills_dir,
+                    optional_dir.as_deref(),
+                    false,
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+                println!("{}", outcome.message);
+                println!("Activate with: edgecrab skills view {}", outcome.skill_name);
+            } else {
+                let outcomes = edgecrab_tools::tools::skills_hub::update_all_installed_skills(
+                    &skills_dir,
+                    optional_dir.as_deref(),
+                    false,
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+                println!(
+                    "{}",
+                    edgecrab_tools::tools::skills_hub::render_update_outcomes(&outcomes)
+                );
+            }
+        }
+
         SkillsCommand::Remove { name } => {
             let skill = resolve_installed_skill(&skills_dir, &name)?;
             std::fs::remove_dir_all(&skill.skill_dir)?;

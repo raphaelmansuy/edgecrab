@@ -2547,20 +2547,31 @@ impl ToolHandler for SkillsHubTool {
             }
 
             "update" => {
-                let lock = super::skills_hub::read_lock();
-                if lock.is_empty() {
-                    return Ok("No hub-installed skills found.".into());
+                let skills_dir = ctx.config.edgecrab_home.join("skills");
+                let optional_dir = super::skills_sync::optional_skills_dir();
+                if let Some(name) = args.query {
+                    let outcome = super::skills_hub::update_installed_skill(
+                        &name,
+                        &skills_dir,
+                        optional_dir.as_deref(),
+                        args.force,
+                    )
+                    .await
+                    .map_err(ToolError::Other)?;
+                    Ok(format!(
+                        "{}\n\nActivate with skill_view {}",
+                        outcome.message, outcome.skill_name
+                    ))
+                } else {
+                    let outcomes = super::skills_hub::update_all_installed_skills(
+                        &skills_dir,
+                        optional_dir.as_deref(),
+                        args.force,
+                    )
+                    .await
+                    .map_err(ToolError::Other)?;
+                    Ok(super::skills_hub::render_update_outcomes(&outcomes))
                 }
-
-                let mut output = String::from("Installed hub skills:\n\n");
-                for (name, entry) in lock {
-                    output.push_str(&format!(
-                        "- {} | source={} | id={} | installed={}\n",
-                        name, entry.source, entry.identifier, entry.installed_at
-                    ));
-                }
-                output.push_str("\nUse skills_hub install <identifier> force=true to reinstall.");
-                Ok(output)
             }
 
             "uninstall" => {

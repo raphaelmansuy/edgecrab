@@ -387,6 +387,7 @@ edgecrab skills search <query>                    # Search local + remote skill 
 edgecrab skills install <path>                    # Install from a local path
 edgecrab skills install edgecrab:<category/path>  # Install from a curated remote source
 edgecrab skills install owner/repo/path           # Install from GitHub
+edgecrab skills update [name]                     # Refresh one or all remote-installed skills
 edgecrab skills install official/<cat>/<skill>    # Install from the official catalogue
 edgecrab skills remove <name>                     # Remove an installed skill
 ```

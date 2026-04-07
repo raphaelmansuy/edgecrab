@@ -87,6 +87,8 @@ edgecrab skills install edgecrab:diagramming/ascii-diagram-master
 edgecrab skills install hermes-agent:research/ml-paper-writing
 edgecrab skills install official/security-audit   # install from bundled official skills
 edgecrab skills install raphaelmansuy/edgecrab/skills/research/ml-paper-writing
+edgecrab skills update                            # refresh all remote-installed skills
+edgecrab skills update ml-paper-writing          # refresh one installed remote skill
 edgecrab skills remove security-audit             # uninstall
 ```
 
@@ -95,6 +97,7 @@ From inside the TUI:
 ```
 /skills search diagram                                   # search remote sources
 /skills install edgecrab:diagramming/ascii-diagram-master
+/skills update ascii-diagram-master
 ```
 
 ### Manual Installation

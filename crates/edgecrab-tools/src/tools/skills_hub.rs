@@ -927,39 +927,13 @@ pub async fn install_identifier(
     optional_dir: Option<&Path>,
     force: bool,
 ) -> Result<InstallOutcome, String> {
-    if identifier.starts_with("official/") {
-        let bundle = load_official_skill_bundle(identifier, optional_dir)?;
-        let skill_name = bundle.name.clone();
-        let message = install_skill(&bundle, skills_dir, force)?;
-        return Ok(InstallOutcome {
-            message,
-            skill_name,
-        });
-    }
-
-    let resolved = resolve_curated_identifier(identifier).unwrap_or_else(|| identifier.to_string());
-    if looks_like_github_identifier(&resolved) {
-        return install_github_skill(&resolved, skills_dir, force).await;
-    }
-
-    let optional_root = optional_dir
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| resolve_edgecrab_home().join("optional-skills"));
-    let candidates = search_optional_skills(&optional_root, identifier);
-    if let Some(candidate) = candidates.first() {
-        let bundle = load_official_skill_bundle(&candidate.identifier, optional_dir)?;
-        let skill_name = bundle.name.clone();
-        let message = install_skill(&bundle, skills_dir, force)?;
-        return Ok(InstallOutcome {
-            message,
-            skill_name,
-        });
-    }
-
-    Err(format!(
-        "Skill source '{}' not found. Use official/<category>/<skill>, a source alias like edgecrab:<path>, or owner/repo/path",
-        identifier
-    ))
+    let bundle = fetch_bundle_for_identifier(identifier, optional_dir).await?;
+    let skill_name = bundle.name.clone();
+    let message = install_skill(&bundle, skills_dir, force)?;
+    Ok(InstallOutcome {
+        message,
+        skill_name,
+    })
 }
 
 pub async fn install_github_skill(
@@ -978,6 +952,88 @@ pub async fn install_github_skill(
         message,
         skill_name,
     })
+}
+
+pub async fn update_installed_skill(
+    name: &str,
+    skills_dir: &Path,
+    optional_dir: Option<&Path>,
+    force: bool,
+) -> Result<InstallOutcome, String> {
+    let lock = read_lock();
+    let Some(entry) = lock.get(name) else {
+        return Err(format!("Skill '{}' is not a hub-installed skill", name));
+    };
+
+    let mut bundle = fetch_bundle_for_identifier(&entry.identifier, optional_dir).await?;
+    bundle.name = name.to_string();
+    let install_message = install_skill(&bundle, skills_dir, force)?;
+    Ok(InstallOutcome {
+        message: format!("{} (source: {})", install_message, entry.identifier),
+        skill_name: name.to_string(),
+    })
+}
+
+pub async fn update_all_installed_skills(
+    skills_dir: &Path,
+    optional_dir: Option<&Path>,
+    force: bool,
+) -> Result<Vec<InstallOutcome>, String> {
+    let lock = read_lock();
+    if lock.is_empty() {
+        return Err("No hub-installed skills found.".into());
+    }
+
+    let mut names: Vec<String> = lock.keys().cloned().collect();
+    names.sort();
+    let mut outcomes = Vec::with_capacity(names.len());
+    for name in names {
+        outcomes.push(update_installed_skill(&name, skills_dir, optional_dir, force).await?);
+    }
+    Ok(outcomes)
+}
+
+pub fn render_update_outcomes(outcomes: &[InstallOutcome]) -> String {
+    if outcomes.is_empty() {
+        return "No hub-installed skills found.".into();
+    }
+
+    let mut output = String::from("Updated skills:\n\n");
+    for outcome in outcomes {
+        output.push_str(&format!("- {}: {}\n", outcome.skill_name, outcome.message));
+    }
+    output
+}
+
+async fn fetch_bundle_for_identifier(
+    identifier: &str,
+    optional_dir: Option<&Path>,
+) -> Result<SkillBundle, String> {
+    if identifier.starts_with("official/") {
+        return load_official_skill_bundle(identifier, optional_dir);
+    }
+
+    let resolved = resolve_curated_identifier(identifier).unwrap_or_else(|| identifier.to_string());
+    if looks_like_github_identifier(&resolved) {
+        let Some((repo, path)) = parse_github_identifier(&resolved) else {
+            return Err("GitHub identifier must be owner/repo or owner/repo/path".into());
+        };
+        let client = hub_client()?;
+        return fetch_github_bundle(&client, &repo, &path, identifier).await;
+    }
+
+    let optional_root = optional_dir
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| resolve_edgecrab_home().join("optional-skills"));
+    let candidates = search_optional_skills(&optional_root, identifier);
+    if let Some(candidate) = candidates.first() {
+        return load_official_skill_bundle(&candidate.identifier, optional_dir);
+    }
+
+    Err(format!(
+        "Skill source '{}' not found. Use official/<category>/<skill>, a source alias like edgecrab:<path>, or owner/repo/path",
+        identifier
+    ))
 }
 
 fn validate_bundle(bundle: &SkillBundle) -> Result<(), String> {
@@ -1843,5 +1899,75 @@ mod tests {
         let rendered = render_sources_catalog();
         assert!(rendered.contains("edgecrab:<path>"));
         assert!(rendered.contains("hermes-agent:<path>"));
+    }
+
+    #[tokio::test]
+    async fn update_installed_skill_refreshes_from_lock_identifier() {
+        let home = TestHome::new();
+        let skills_dir = home.path().join("skills");
+        let installed_dir = skills_dir.join("native-mcp");
+        let repo_skills_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../skills");
+        std::fs::create_dir_all(&installed_dir).unwrap();
+        std::fs::write(installed_dir.join("SKILL.md"), "# Old\nstale").unwrap();
+
+        let mut lock = HashMap::new();
+        lock.insert(
+            "native-mcp".to_string(),
+            LockEntry {
+                source: "official".into(),
+                identifier: "official/mcp/native-mcp".into(),
+                installed_at: chrono::Utc::now().to_rfc3339(),
+                content_hash: String::new(),
+            },
+        );
+        write_lock(&lock);
+
+        let outcome =
+            update_installed_skill("native-mcp", &skills_dir, Some(&repo_skills_dir), false)
+                .await
+                .expect("update");
+        let content = std::fs::read_to_string(installed_dir.join("SKILL.md")).expect("read");
+        assert_eq!(outcome.skill_name, "native-mcp");
+        assert!(content.contains("native-mcp") || content.contains("Native MCP"));
+    }
+
+    #[tokio::test]
+    async fn update_all_installed_skills_updates_every_locked_entry() {
+        let home = TestHome::new();
+        let skills_dir = home.path().join("skills");
+        let repo_skills_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../skills");
+        std::fs::create_dir_all(skills_dir.join("native-mcp")).unwrap();
+        std::fs::create_dir_all(skills_dir.join("mcporter")).unwrap();
+        std::fs::write(skills_dir.join("native-mcp/SKILL.md"), "# old").unwrap();
+        std::fs::write(skills_dir.join("mcporter/SKILL.md"), "# old").unwrap();
+
+        let mut lock = HashMap::new();
+        lock.insert(
+            "native-mcp".to_string(),
+            LockEntry {
+                source: "official".into(),
+                identifier: "official/mcp/native-mcp".into(),
+                installed_at: chrono::Utc::now().to_rfc3339(),
+                content_hash: String::new(),
+            },
+        );
+        lock.insert(
+            "mcporter".to_string(),
+            LockEntry {
+                source: "official".into(),
+                identifier: "official/mcp/mcporter".into(),
+                installed_at: chrono::Utc::now().to_rfc3339(),
+                content_hash: String::new(),
+            },
+        );
+        write_lock(&lock);
+
+        let outcomes = update_all_installed_skills(&skills_dir, Some(&repo_skills_dir), false)
+            .await
+            .expect("update all");
+        assert_eq!(outcomes.len(), 2);
+        let rendered = render_update_outcomes(&outcomes);
+        assert!(rendered.contains("native-mcp"));
+        assert!(rendered.contains("mcporter"));
     }
 }

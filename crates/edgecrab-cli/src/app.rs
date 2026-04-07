@@ -7020,6 +7020,57 @@ impl App {
                 }
             }
 
+            "update" => {
+                let skills_dir_c = skills_dir.clone();
+                let optional_dir = edgecrab_tools::tools::skills_sync::optional_skills_dir();
+                if operand.is_empty() {
+                    self.push_output(
+                        "Updating all hub-installed remote skills …",
+                        OutputRole::System,
+                    );
+                    let result = self.rt_handle.block_on(async {
+                        edgecrab_tools::tools::skills_hub::update_all_installed_skills(
+                            &skills_dir_c,
+                            optional_dir.as_deref(),
+                            false,
+                        )
+                        .await
+                    });
+                    match result {
+                        Ok(outcomes) => self.push_output(
+                            edgecrab_tools::tools::skills_hub::render_update_outcomes(&outcomes),
+                            OutputRole::System,
+                        ),
+                        Err(e) => self.push_output(format!("Remote update failed: {e}"), OutputRole::Error),
+                    }
+                } else {
+                    let skill_name = operand.to_string();
+                    self.push_output(
+                        format!("Updating remote skill '{skill_name}' …"),
+                        OutputRole::System,
+                    );
+                    let result = self.rt_handle.block_on(async {
+                        edgecrab_tools::tools::skills_hub::update_installed_skill(
+                            &skill_name,
+                            &skills_dir_c,
+                            optional_dir.as_deref(),
+                            false,
+                        )
+                        .await
+                    });
+                    match result {
+                        Ok(outcome) => self.push_output(
+                            format!(
+                                "{}\nActivate with: /skills view {}",
+                                outcome.message, outcome.skill_name
+                            ),
+                            OutputRole::System,
+                        ),
+                        Err(e) => self.push_output(format!("Remote update failed: {e}"), OutputRole::Error),
+                    }
+                }
+            }
+
             "hub" | "search" => {
                 let query = operand;
                 if query.is_empty() {
@@ -7076,7 +7127,7 @@ impl App {
             }
 
             _ => self.push_output(
-                "Usage: /skills [list | view <name> | install <path-or-source-or-owner/repo/path> | remove <name> | hub [query] | search <query>]",
+                "Usage: /skills [list | view <name> | install <path-or-source-or-owner/repo/path> | update [name] | remove <name> | hub [query] | search <query>]",
                 OutputRole::System,
             ),
         }

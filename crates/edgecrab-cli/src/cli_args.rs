@@ -627,6 +627,11 @@ pub enum SkillsCommand {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Update one or all hub-installed remote skills to the latest version
+    Update {
+        /// Skill name to update; omit to update all hub-installed skills
+        name: Option<String>,
+    },
     /// Remove an installed skill
     Remove {
         /// Skill name to remove
@@ -955,6 +960,17 @@ mod tests {
             args.command,
             Some(Command::Skills {
                 command: SkillsCommand::Remove { .. }
+            })
+        ));
+    }
+
+    #[test]
+    fn parse_skills_update_subcommand() {
+        let args = CliArgs::parse_from(["edgecrab", "skills", "update", "remote_skill"]);
+        assert!(matches!(
+            args.command,
+            Some(Command::Skills {
+                command: SkillsCommand::Update { .. }
             })
         ));
     }

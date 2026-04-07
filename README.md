@@ -463,13 +463,15 @@ edgecrab skills search "diagram"       # search remote skill sources
 edgecrab skills install edgecrab:diagramming/ascii-diagram-master
 edgecrab skills install hermes-agent:research/ml-paper-writing
 edgecrab skills install raphaelmansuy/edgecrab/skills/research/ml-paper-writing
+edgecrab skills update                 # refresh all remote-installed skills
+edgecrab skills update ml-paper-writing
 
 # Use a skill in a session
 edgecrab -S git-workflow "review this branch for prod readiness"
 edgecrab -S security,refactor          # load multiple skills
 ```
 
-Inside TUI: `/skills list`, `/skills search <query>`, `/skills install edgecrab:<path>`, `/skills view <name>`
+Inside TUI: `/skills list`, `/skills search <query>`, `/skills install edgecrab:<path>`, `/skills update [name]`, `/skills view <name>`
 
 Skills are saved to `~/.edgecrab/skills/` and loaded on demand. The agent can also create new skills mid-session during learning reflection.
 
@@ -803,6 +805,7 @@ edgecrab skills list
 edgecrab skills view <name>
 edgecrab skills search <query>
 edgecrab skills install <path|edgecrab:path|owner/repo/path>
+edgecrab skills update [name]
 edgecrab skills remove <name>
 
 # Profiles
