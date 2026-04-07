@@ -87,7 +87,7 @@ export default defineConfig({
 				},
 				{
 					tag: 'meta',
-					attrs: { property: 'og:image:type', content: 'image/jpeg' },
+					attrs: { property: 'og:image:type', content: 'image/png' },
 				},
 				{
 					tag: 'meta',
@@ -104,6 +104,62 @@ export default defineConfig({
 					tag: 'meta',
 					attrs: { property: 'og:locale', content: 'en_US' },
 				},
+				// ── Theme & manifest ──────────────────────────────────────────────
+				{
+					tag: 'meta',
+					attrs: { name: 'theme-color', content: '#EA580C' },
+				},
+				{
+					tag: 'meta',
+					attrs: { name: 'color-scheme', content: 'dark light' },
+				},
+				{
+					tag: 'meta',
+					attrs: { name: 'msapplication-TileColor', content: '#EA580C' },
+				},
+				{
+					tag: 'link',
+					attrs: { rel: 'manifest', href: '/site.webmanifest' },
+				},
+				{
+					tag: 'link',
+					attrs: {
+						rel: 'apple-touch-icon',
+						sizes: '180x180',
+						href: '/apple-touch-icon.png',
+					},
+				},
+				// ── JSON-LD structured data ───────────────────────────────────────
+				{
+					tag: 'script',
+					attrs: { type: 'application/ld+json' },
+					content: JSON.stringify({
+						'@context': 'https://schema.org',
+						'@type': 'SoftwareApplication',
+						name: 'EdgeCrab',
+						applicationCategory: 'DeveloperApplication',
+						operatingSystem: 'macOS, Linux, Windows',
+						url: siteUrl,
+						downloadUrl: 'https://github.com/raphaelmansuy/edgecrab/releases',
+						softwareVersion: '0.1.2',
+						description:
+							'Rust-native autonomous coding agent and personal assistant. 74 tools, 14 LLM providers, 15 messaging gateways, single 15 MB binary with < 50 ms startup.',
+						offers: {
+							'@type': 'Offer',
+							price: '0',
+							priceCurrency: 'USD',
+						},
+						author: {
+							'@type': 'Person',
+							name: 'Raphaël Mansuy',
+							url: 'https://github.com/raphaelmansuy',
+						},
+						codeRepository: 'https://github.com/raphaelmansuy/edgecrab',
+						license: 'https://opensource.org/licenses/Apache-2.0',
+						programmingLanguage: 'Rust',
+					}),
+				},
+				// ── Twitter / X Card ─────────────────────────────────────────────
 				{
 					tag: 'meta',
 					attrs: { name: 'twitter:card', content: 'summary_large_image' },

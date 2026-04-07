@@ -1,0 +1,23 @@
+{
+  "name": "EdgeCrab — Your SuperAgent, Built in Rust",
+  "short_name": "EdgeCrab",
+  "description": "Rust-native autonomous coding agent. 74 tools. 14 LLM providers. 15 messaging gateways. Single 15 MB binary. < 50 ms startup.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0f0f0f",
+  "theme_color": "#EA580C",
+  "icons": [
+    {
+      "src": "/apple-touch-icon.png",
+      "sizes": "180x180",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}
