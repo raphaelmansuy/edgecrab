@@ -471,7 +471,7 @@ edgecrab -S git-workflow "review this branch for prod readiness"
 edgecrab -S security,refactor          # load multiple skills
 ```
 
-Inside TUI: `/skills list`, `/skills search <query>`, `/skills install edgecrab:<path>`, `/skills update [name]`, `/skills view <name>`
+Inside TUI: `/skills` opens the installed-skill browser, and `/skills search [query]` opens the remote-skill browser with live search, source notes, and install/update actions.
 
 Skills are saved to `~/.edgecrab/skills/` and loaded on demand. The agent can also create new skills mid-session during learning reflection.
 

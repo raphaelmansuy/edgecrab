@@ -1266,7 +1266,7 @@ impl ExecutionBackend for ModalBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
+    use crate::test_support::TestEdgecrabHome;
 
     #[test]
     fn base64_via_crate_foobar() {
@@ -1308,8 +1308,8 @@ mod tests {
 
     #[test]
     fn managed_gateway_reads_nous_token_from_auth_store() {
-        let tmp = TempDir::new().expect("tmpdir");
-        let auth_path = tmp.path().join("auth.json");
+        let home = TestEdgecrabHome::new();
+        let auth_path = home.path().join("auth.json");
         std::fs::write(
             &auth_path,
             serde_json::json!({
@@ -1324,7 +1324,6 @@ mod tests {
         )
         .expect("write auth json");
 
-        unsafe { std::env::set_var("EDGECRAB_HOME", tmp.path()) };
         unsafe { std::env::set_var("MODAL_GATEWAY_URL", "https://modal-gateway.example.com") };
         unsafe { std::env::remove_var("TOOL_GATEWAY_USER_TOKEN") };
 
@@ -1336,7 +1335,6 @@ mod tests {
         assert_eq!(gateway.user_token, "fresh-n-token");
 
         unsafe { std::env::remove_var("MODAL_GATEWAY_URL") };
-        unsafe { std::env::remove_var("EDGECRAB_HOME") };
     }
 
     #[test]

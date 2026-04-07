@@ -1996,6 +1996,7 @@ async fn ensure_server_connected(server_name: &str) -> Result<(), ToolError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TestEdgecrabHome;
     use std::sync::Mutex;
 
     static EDGECRAB_HOME_LOCK: Mutex<()> = Mutex::new(());
@@ -2055,17 +2056,13 @@ mod tests {
     #[test]
     fn mcp_list_tools_invalid_args() {
         let _guard = EDGECRAB_HOME_LOCK.lock().expect("lock");
-        let dir = tempfile::tempdir().expect("tempdir");
-        // SAFETY: protected by EDGECRAB_HOME_LOCK.
-        unsafe { std::env::set_var("EDGECRAB_HOME", dir.path()) };
+        let _home = TestEdgecrabHome::new();
         let ctx = ToolContext::test_context();
         // Empty args are fine; no config should now behave as an empty catalog
         // rather than a hard legacy-path failure.
         let result = tokio::runtime::Runtime::new()
             .expect("runtime")
             .block_on(async { McpListToolsTool.execute(json!({}), &ctx).await });
-        // SAFETY: protected by EDGECRAB_HOME_LOCK.
-        unsafe { std::env::remove_var("EDGECRAB_HOME") };
         let output = result.expect("empty MCP config should be tolerated");
         assert!(output.contains("No MCP tools discovered"));
     }
@@ -2178,29 +2175,21 @@ mod tests {
     #[test]
     fn mcp_config_path_respects_edgecrab_home() {
         let _guard = EDGECRAB_HOME_LOCK.lock().expect("lock");
-        let dir = tempfile::tempdir().expect("tempdir");
-        // SAFETY: protected by EDGECRAB_HOME_LOCK.
-        unsafe { std::env::set_var("EDGECRAB_HOME", dir.path()) };
+        let home = TestEdgecrabHome::new();
         let path = mcp_config_path().expect("mcp path");
-        // SAFETY: protected by EDGECRAB_HOME_LOCK.
-        unsafe { std::env::remove_var("EDGECRAB_HOME") };
-        assert_eq!(path, dir.path().join("mcp.json"));
+        assert_eq!(path, home.path().join("mcp.json"));
     }
 
     #[test]
     fn configured_servers_reads_yaml_and_preserves_cwd() {
         let _guard = EDGECRAB_HOME_LOCK.lock().expect("lock");
-        let dir = tempfile::tempdir().expect("tempdir");
+        let home = TestEdgecrabHome::new();
         std::fs::write(
-            dir.path().join("config.yaml"),
+            home.path().join("config.yaml"),
             "mcp_servers:\n  filesystem:\n    command: npx\n    args: ['-y', '@modelcontextprotocol/server-filesystem', '/tmp']\n    cwd: /tmp\n    enabled: true\n",
         )
         .expect("config");
-        // SAFETY: protected by EDGECRAB_HOME_LOCK.
-        unsafe { std::env::set_var("EDGECRAB_HOME", dir.path()) };
         let servers = configured_servers().expect("servers");
-        // SAFETY: protected by EDGECRAB_HOME_LOCK.
-        unsafe { std::env::remove_var("EDGECRAB_HOME") };
 
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].name, "filesystem");

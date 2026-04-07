@@ -34,6 +34,56 @@ pub mod tools;
 pub mod toolsets;
 pub mod vision_models;
 
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::path::Path;
+    use std::sync::{Mutex, MutexGuard};
+
+    use tempfile::TempDir;
+
+    static EDGECRAB_HOME_LOCK: Mutex<()> = Mutex::new(());
+
+    pub(crate) struct TestEdgecrabHome {
+        _guard: MutexGuard<'static, ()>,
+        dir: TempDir,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl TestEdgecrabHome {
+        pub(crate) fn new() -> Self {
+            let guard = EDGECRAB_HOME_LOCK.lock().expect("lock");
+            let dir = TempDir::new().expect("tempdir");
+            let previous = std::env::var_os("EDGECRAB_HOME");
+            // SAFETY: serialized by EDGECRAB_HOME_LOCK for the guard lifetime.
+            unsafe { std::env::set_var("EDGECRAB_HOME", dir.path()) };
+            Self {
+                _guard: guard,
+                dir,
+                previous,
+            }
+        }
+
+        pub(crate) fn path(&self) -> &Path {
+            self.dir.path()
+        }
+    }
+
+    impl Drop for TestEdgecrabHome {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(previous) => {
+                    // SAFETY: serialized by EDGECRAB_HOME_LOCK for the guard lifetime.
+                    unsafe { std::env::set_var("EDGECRAB_HOME", previous) };
+                }
+                None => {
+                    // SAFETY: serialized by EDGECRAB_HOME_LOCK for the guard lifetime.
+                    unsafe { std::env::remove_var("EDGECRAB_HOME") };
+                }
+            }
+        }
+    }
+}
+
 /// Truncate `s` to at most `max_bytes` bytes, always stopping at a valid UTF-8
 /// char boundary so that multi-byte / emoji characters are never split.
 #[inline]

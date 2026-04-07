@@ -108,7 +108,7 @@ MCP          /mcp-token
 | Command | Description |
 |---------|-------------|
 | `/memory` | Show all persistent memory files with sizes |
-| `/skills [browse\|install\|remove]` | List, browse hub, install, or remove skills |
+| `/skills [browse\|search\|install\|update\|remove]` | Open the installed-skills browser, launch the remote-skills browser, install, update, or remove skills |
 
 ---
 

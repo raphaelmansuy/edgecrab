@@ -95,10 +95,13 @@ edgecrab skills remove security-audit             # uninstall
 From inside the TUI:
 
 ```
+/skills                                                  # browse installed skills
 /skills search diagram                                   # search remote sources
 /skills install edgecrab:diagramming/ascii-diagram-master
 /skills update ascii-diagram-master
 ```
+
+`/skills search` opens the interactive remote browser. It searches in the background, keeps the UI responsive during slow source refreshes, shows per-source notices in the details pane, and lets you jump back to the installed-skills browser without leaving the overlay.
 
 ### Manual Installation
 

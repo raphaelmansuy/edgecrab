@@ -527,6 +527,7 @@ inventory::submit!(&CheckpointTool as &dyn ToolHandler);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TestEdgecrabHome;
 
     #[test]
     fn tool_metadata() {
@@ -663,7 +664,7 @@ mod tests {
 
         let tmp = tempfile::TempDir::new().expect("tmp");
         let configured_home = tempfile::TempDir::new().expect("configured home");
-        let foreign_home = tempfile::TempDir::new().expect("foreign home");
+        let foreign_home = TestEdgecrabHome::new();
 
         let mut ctx = ToolContext::test_context();
         ctx.cwd = tmp.path().to_path_buf();
@@ -692,19 +693,11 @@ mod tests {
             .current_dir(&ctx.cwd)
             .status();
 
-        unsafe {
-            std::env::set_var("EDGECRAB_HOME", foreign_home.path());
-        }
-
         let result = CheckpointTool
             .execute(json!({ "action": "create", "name": "ctx-home" }), &ctx)
             .await
             .expect("create should succeed");
         assert!(result.contains("created"), "got: {result}");
-
-        unsafe {
-            std::env::remove_var("EDGECRAB_HOME");
-        }
 
         assert!(
             shadow_dir(configured_home.path(), &ctx.cwd)

@@ -1669,36 +1669,8 @@ fn normalize_relative_source_path(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, MutexGuard};
+    use crate::test_support::TestEdgecrabHome as TestHome;
     use tempfile::TempDir;
-
-    static EDGECRAB_HOME_LOCK: Mutex<()> = Mutex::new(());
-
-    struct TestHome {
-        _guard: MutexGuard<'static, ()>,
-        dir: TempDir,
-    }
-
-    impl TestHome {
-        fn new() -> Self {
-            let guard = EDGECRAB_HOME_LOCK.lock().expect("lock");
-            let dir = TempDir::new().expect("tmp dir");
-            // SAFETY: serialized by EDGECRAB_HOME_LOCK for the test duration.
-            unsafe { std::env::set_var("EDGECRAB_HOME", dir.path()) };
-            Self { _guard: guard, dir }
-        }
-
-        fn path(&self) -> &Path {
-            self.dir.path()
-        }
-    }
-
-    impl Drop for TestHome {
-        fn drop(&mut self) {
-            // SAFETY: serialized by EDGECRAB_HOME_LOCK for the test duration.
-            unsafe { std::env::remove_var("EDGECRAB_HOME") };
-        }
-    }
 
     #[test]
     fn extract_description_from_frontmatter() {

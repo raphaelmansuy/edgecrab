@@ -542,11 +542,9 @@ mod md5 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use crate::test_support::TestEdgecrabHome;
 
     use tempfile::TempDir;
-
-    static EDGECRAB_HOME_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn manifest_roundtrip() {
@@ -610,18 +608,13 @@ mod tests {
 
     #[test]
     fn sync_uses_edgecrab_home_env() {
-        let _guard = EDGECRAB_HOME_LOCK.lock().expect("lock");
-        let home = TempDir::new().unwrap();
+        let home = TestEdgecrabHome::new();
         let bundled = TempDir::new().unwrap();
         let skill = bundled.path().join("ops").join("audit");
         std::fs::create_dir_all(&skill).unwrap();
         std::fs::write(skill.join("SKILL.md"), "# Audit").unwrap();
 
-        // SAFETY: protected by EDGECRAB_HOME_LOCK for the duration of the test.
-        unsafe { std::env::set_var("EDGECRAB_HOME", home.path()) };
         let report = sync_bundled_skills(bundled.path());
-        // SAFETY: protected by EDGECRAB_HOME_LOCK for the duration of the test.
-        unsafe { std::env::remove_var("EDGECRAB_HOME") };
 
         assert_eq!(report.added, vec!["ops/audit"]);
         assert!(home.path().join("skills/ops/audit/SKILL.md").is_file());

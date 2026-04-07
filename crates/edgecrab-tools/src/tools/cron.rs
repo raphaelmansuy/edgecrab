@@ -540,23 +540,11 @@ inventory::submit!(&ManageCronJobsTool as &dyn ToolHandler);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use crate::test_support::TestEdgecrabHome;
 
-    static EDGECRAB_HOME_LOCK: Mutex<()> = Mutex::new(());
-
-    fn with_temp_edgecrab_home<T>(f: impl FnOnce() -> T) -> T {
-        let _guard = EDGECRAB_HOME_LOCK.lock().expect("lock");
-        let dir = tempfile::tempdir().expect("tempdir");
-        // SAFETY: protected by EDGECRAB_HOME_LOCK for the duration of the test.
-        unsafe {
-            std::env::set_var("EDGECRAB_HOME", dir.path());
-        }
-        let result = f();
-        // SAFETY: protected by EDGECRAB_HOME_LOCK for the duration of the test.
-        unsafe {
-            std::env::remove_var("EDGECRAB_HOME");
-        }
-        result
+    fn with_temp_edgecrab_home<T>(f: impl FnOnce(&TestEdgecrabHome) -> T) -> T {
+        let home = TestEdgecrabHome::new();
+        f(&home)
     }
 
     #[test]
@@ -684,7 +672,7 @@ mod tests {
 
     #[test]
     fn do_create_defaults_to_local_without_origin() {
-        with_temp_edgecrab_home(|| {
+        with_temp_edgecrab_home(|_| {
             let response = do_create(
                 CronArgs {
                     action: "create".into(),
@@ -711,15 +699,16 @@ mod tests {
 
     #[test]
     fn do_run_reenables_paused_job() {
-        with_temp_edgecrab_home(|| {
+        with_temp_edgecrab_home(|_| {
             let job =
                 create_job(CronJobBuilder::new("every 30m", "check status").name("paused-job"))
                     .expect("persist");
 
             let mut store = load_store().expect("load");
-            store.jobs[0].enabled = false;
-            store.jobs[0].state = JobState::Paused;
-            store.jobs[0].next_run_at = None;
+            let idx = resolve_job_index(&store.jobs, &job.id).expect("job index");
+            store.jobs[idx].enabled = false;
+            store.jobs[idx].state = JobState::Paused;
+            store.jobs[idx].next_run_at = None;
             save_store(&mut store).expect("save");
 
             let response = do_run(CronArgs {
@@ -737,7 +726,8 @@ mod tests {
 
             assert!(response.contains("will run on the next scheduler tick"));
             let store = load_store().expect("reload");
-            let job = &store.jobs[0];
+            let idx = resolve_job_index(&store.jobs, &job.id).expect("job index after run");
+            let job = &store.jobs[idx];
             assert!(job.enabled);
             assert_eq!(job.state, JobState::Scheduled);
             assert!(job.next_run_at.is_some());

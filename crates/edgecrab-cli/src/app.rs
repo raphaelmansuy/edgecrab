@@ -29,6 +29,7 @@
 //! - Input line highlighting (cyan for valid commands, red for invalid)
 //! - Fish-style ghost text from input history
 
+use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1319,6 +1320,81 @@ impl FuzzyItem for SkillEntry {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemoteSkillAction {
+    Install,
+    Update,
+    Replace,
+}
+
+impl RemoteSkillAction {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Install => "install",
+            Self::Update => "update",
+            Self::Replace => "replace",
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RemoteSkillEntry {
+    name: String,
+    identifier: String,
+    description: String,
+    source_label: String,
+    origin: String,
+    trust_level: String,
+    tags: Vec<String>,
+    search_text: String,
+    installed_name: Option<String>,
+    action: RemoteSkillAction,
+}
+
+impl FuzzyItem for RemoteSkillEntry {
+    fn primary(&self) -> &str {
+        &self.identifier
+    }
+
+    fn secondary(&self) -> &str {
+        &self.search_text
+    }
+
+    fn tag(&self) -> &str {
+        &self.source_label
+    }
+}
+
+struct RemoteSkillBrowser {
+    selector: FuzzySelector<RemoteSkillEntry>,
+    notices: Vec<String>,
+    last_completed_query: Option<String>,
+    search_due_at: Option<Instant>,
+    inflight_request_id: Option<u64>,
+    next_request_id: u64,
+    loading_query: Option<String>,
+    action_in_flight: Option<String>,
+}
+
+impl RemoteSkillBrowser {
+    fn new() -> Self {
+        Self {
+            selector: FuzzySelector::new(),
+            notices: Vec::new(),
+            last_completed_query: None,
+            search_due_at: None,
+            inflight_request_id: None,
+            next_request_id: 0,
+            loading_query: None,
+            action_in_flight: None,
+        }
+    }
+
+    fn current_query(&self) -> String {
+        self.selector.query.trim().to_string()
+    }
+}
+
 /// A single MCP preset entry for the MCP browser overlay.
 #[derive(Clone)]
 struct McpPresetEntry {
@@ -1737,6 +1813,8 @@ pub struct App {
     mcp_selector: FuzzySelector<McpPresetEntry>,
     /// Skill browser overlay (activated by `/skills` with no args)
     skill_selector: FuzzySelector<SkillEntry>,
+    /// Remote skill browser overlay (activated by `/skills search` or `/skills hub`)
+    remote_skill_browser: RemoteSkillBrowser,
     /// Session browser overlay (activated by F5 or `/session` with no args)
     session_browser: FuzzySelector<SessionBrowserEntry>,
     /// Skin browser overlay (activated by `/skin list`)
@@ -1938,6 +2016,20 @@ enum AgentResponse {
     },
     /// A background operation (model discovery, compress, swap) completed.
     BgOp(BackgroundOpResult),
+    /// A remote skill search completed for the given request id and query.
+    RemoteSkillSearchReady {
+        request_id: u64,
+        query: String,
+        report: edgecrab_tools::tools::skills_hub::SearchReport,
+    },
+    /// A remote skill install/update action completed.
+    RemoteSkillActionComplete { message: String, skill_name: String },
+    /// A remote skill install/update action failed.
+    RemoteSkillActionFailed {
+        action_label: String,
+        identifier: String,
+        error: String,
+    },
     /// A completed local voice transcription, optionally submitted as a prompt.
     VoiceTranscript {
         transcript: String,
@@ -2175,6 +2267,7 @@ impl App {
             image_model_selector: FuzzySelector::new(),
             mcp_selector: FuzzySelector::new(),
             skill_selector: FuzzySelector::new(),
+            remote_skill_browser: RemoteSkillBrowser::new(),
             session_browser: FuzzySelector::new(),
             skin_browser: FuzzySelector::new(),
             skills_completion_names: Vec::new(),
@@ -2793,6 +2886,236 @@ impl App {
 
         // Reload selector state
         self.skill_selector.set_items(entries);
+    }
+
+    fn normalize_skill_identifier(identifier: &str) -> String {
+        identifier.trim().replace('\\', "/")
+    }
+
+    fn build_remote_skill_entries(
+        report: &edgecrab_tools::tools::skills_hub::SearchReport,
+    ) -> (Vec<RemoteSkillEntry>, Vec<String>) {
+        let skills_dir = Self::skills_dir();
+        let lock = edgecrab_tools::tools::skills_hub::read_lock();
+        let mut installed_by_identifier = HashMap::new();
+        for (installed_name, entry) in lock {
+            installed_by_identifier.insert(
+                Self::normalize_skill_identifier(&entry.identifier),
+                installed_name,
+            );
+        }
+
+        let mut entries = Vec::new();
+        let mut notices = Vec::new();
+        for group in &report.groups {
+            if let Some(notice) = &group.notice {
+                notices.push(format!("{}: {}", group.source.label, notice));
+            }
+
+            for skill in &group.results {
+                let normalized_identifier = Self::normalize_skill_identifier(&skill.identifier);
+                let installed_name = installed_by_identifier.get(&normalized_identifier).cloned();
+                let has_local_collision = Self::find_skill_md(&skill.name).is_some()
+                    || skills_dir.join(&skill.name).exists();
+                let action = if installed_name.is_some() {
+                    RemoteSkillAction::Update
+                } else if has_local_collision {
+                    RemoteSkillAction::Replace
+                } else {
+                    RemoteSkillAction::Install
+                };
+                let description = if skill.description.trim().is_empty() {
+                    "No description available".to_string()
+                } else {
+                    unicode_trunc(skill.description.trim(), 120)
+                };
+                let search_text = format!(
+                    "{} {} {} {} {} {}",
+                    skill.name,
+                    normalized_identifier,
+                    description,
+                    skill.origin,
+                    skill.trust_level,
+                    skill.tags.join(" ")
+                );
+
+                entries.push(RemoteSkillEntry {
+                    name: skill.name.clone(),
+                    identifier: normalized_identifier,
+                    description,
+                    source_label: group.source.label.clone(),
+                    origin: skill.origin.clone(),
+                    trust_level: skill.trust_level.clone(),
+                    tags: skill.tags.clone(),
+                    search_text,
+                    installed_name,
+                    action,
+                });
+            }
+        }
+
+        (entries, notices)
+    }
+
+    fn open_remote_skill_selector(&mut self, initial_query: Option<&str>) {
+        self.skill_selector.active = false;
+        self.remote_skill_browser.selector.active = true;
+        self.remote_skill_browser.selector.query =
+            initial_query.map(str::trim).unwrap_or_default().to_string();
+        self.remote_skill_browser.selector.selected = 0;
+        self.remote_skill_browser.selector.update_filter();
+        self.remote_skill_browser.action_in_flight = None;
+        self.remote_skill_browser.notices.clear();
+        self.remote_skill_browser.last_completed_query = None;
+        self.remote_skill_browser.loading_query = None;
+        self.remote_skill_browser.inflight_request_id = None;
+        self.schedule_remote_skill_search(true);
+        self.needs_redraw = true;
+    }
+
+    fn schedule_remote_skill_search(&mut self, immediate: bool) {
+        let query = self.remote_skill_browser.current_query();
+        if query.is_empty() {
+            self.remote_skill_browser.search_due_at = None;
+            self.remote_skill_browser.inflight_request_id = None;
+            self.remote_skill_browser.loading_query = None;
+            self.remote_skill_browser.last_completed_query = None;
+            self.remote_skill_browser.notices.clear();
+            self.remote_skill_browser.selector.set_items(Vec::new());
+            self.needs_redraw = true;
+            return;
+        }
+
+        self.remote_skill_browser.search_due_at = Some(if immediate {
+            Instant::now()
+        } else {
+            Instant::now() + Duration::from_millis(250)
+        });
+        self.needs_redraw = true;
+    }
+
+    fn poll_remote_skill_search(&mut self) {
+        if !self.remote_skill_browser.selector.active {
+            return;
+        }
+
+        let Some(deadline) = self.remote_skill_browser.search_due_at else {
+            return;
+        };
+        if Instant::now() < deadline {
+            return;
+        }
+
+        let query = self.remote_skill_browser.current_query();
+        self.remote_skill_browser.search_due_at = None;
+        if query.is_empty() {
+            return;
+        }
+        if self.remote_skill_browser.loading_query.as_deref() == Some(query.as_str()) {
+            return;
+        }
+
+        self.remote_skill_browser.next_request_id =
+            self.remote_skill_browser.next_request_id.saturating_add(1);
+        let request_id = self.remote_skill_browser.next_request_id;
+        self.remote_skill_browser.inflight_request_id = Some(request_id);
+        self.remote_skill_browser.loading_query = Some(query.clone());
+        let tx = self.response_tx.clone();
+        self.rt_handle.spawn(async move {
+            let report = edgecrab_tools::tools::skills_hub::search_hub(&query, None, 12).await;
+            let _ = tx.send(AgentResponse::RemoteSkillSearchReady {
+                request_id,
+                query,
+                report,
+            });
+        });
+        self.needs_redraw = true;
+    }
+
+    fn apply_remote_skill_search_result(
+        &mut self,
+        request_id: u64,
+        query: String,
+        report: edgecrab_tools::tools::skills_hub::SearchReport,
+    ) {
+        if self.remote_skill_browser.inflight_request_id != Some(request_id) {
+            return;
+        }
+        if self.remote_skill_browser.current_query() != query {
+            return;
+        }
+
+        let (entries, notices) = Self::build_remote_skill_entries(&report);
+        self.remote_skill_browser.inflight_request_id = None;
+        self.remote_skill_browser.loading_query = None;
+        self.remote_skill_browser.last_completed_query = Some(query);
+        self.remote_skill_browser.notices = notices;
+        self.remote_skill_browser.selector.set_items(entries);
+        self.remote_skill_browser.selector.selected = 0;
+        self.needs_redraw = true;
+    }
+
+    fn run_remote_skill_action(&mut self, entry: RemoteSkillEntry) {
+        if self.remote_skill_browser.action_in_flight.is_some() {
+            self.push_output(
+                "A remote skill action is already running. Wait for it to finish.",
+                OutputRole::System,
+            );
+            return;
+        }
+
+        let action_label = entry.action.label().to_string();
+        self.remote_skill_browser.action_in_flight =
+            Some(format!("{} {}", action_label, entry.identifier));
+        self.needs_redraw = true;
+
+        let tx = self.response_tx.clone();
+        self.rt_handle.spawn(async move {
+            let skills_dir = edgecrab_core::edgecrab_home().join("skills");
+            let optional_dir = edgecrab_tools::tools::skills_sync::optional_skills_dir();
+            let result = match entry.action {
+                RemoteSkillAction::Install | RemoteSkillAction::Replace => {
+                    edgecrab_tools::tools::skills_hub::install_identifier(
+                        &entry.identifier,
+                        &skills_dir,
+                        optional_dir.as_deref(),
+                        false,
+                    )
+                    .await
+                    .map(|outcome| (outcome.message, outcome.skill_name))
+                }
+                RemoteSkillAction::Update => {
+                    let skill_name = entry
+                        .installed_name
+                        .clone()
+                        .unwrap_or_else(|| entry.name.clone());
+                    edgecrab_tools::tools::skills_hub::update_installed_skill(
+                        &skill_name,
+                        &skills_dir,
+                        optional_dir.as_deref(),
+                        false,
+                    )
+                    .await
+                    .map(|outcome| (outcome.message, outcome.skill_name))
+                }
+            };
+
+            match result {
+                Ok((message, skill_name)) => {
+                    let _ = tx.send(AgentResponse::RemoteSkillActionComplete {
+                        message,
+                        skill_name,
+                    });
+                }
+                Err(error) => {
+                    let _ = tx.send(AgentResponse::RemoteSkillActionFailed {
+                        action_label,
+                        identifier: entry.identifier,
+                        error,
+                    });
+                }
+            }
+        });
     }
 
     // ─── Tab Completion ─────────────────────────────────────────────
@@ -4187,6 +4510,66 @@ impl App {
             return;
         }
 
+        if self.remote_skill_browser.selector.active {
+            match key.code {
+                KeyCode::Esc => {
+                    self.remote_skill_browser.selector.active = false;
+                    self.remote_skill_browser.action_in_flight = None;
+                    self.needs_redraw = true;
+                }
+                KeyCode::Enter => {
+                    if let Some(entry) = self.remote_skill_browser.selector.current().cloned() {
+                        self.run_remote_skill_action(entry);
+                    }
+                }
+                KeyCode::Char('I') => {
+                    if let Some(entry) = self.remote_skill_browser.selector.current().cloned() {
+                        self.run_remote_skill_action(entry);
+                    }
+                }
+                KeyCode::Char('U') => {
+                    if let Some(mut entry) = self.remote_skill_browser.selector.current().cloned() {
+                        if entry.installed_name.is_some() {
+                            entry.action = RemoteSkillAction::Update;
+                            self.run_remote_skill_action(entry);
+                        } else {
+                            self.push_output(
+                                "This remote skill is not hub-installed yet. Use Enter or i to install it.",
+                                OutputRole::System,
+                            );
+                        }
+                    }
+                }
+                KeyCode::Char('R') => {
+                    self.schedule_remote_skill_search(true);
+                }
+                KeyCode::Char('L') => {
+                    self.remote_skill_browser.selector.active = false;
+                    self.refresh_skills_list();
+                    self.skill_selector.activate();
+                    self.needs_redraw = true;
+                }
+                KeyCode::Up => self.remote_skill_browser.selector.move_up(),
+                KeyCode::Down => self.remote_skill_browser.selector.move_down(),
+                KeyCode::PageUp => self.remote_skill_browser.selector.page_up(),
+                KeyCode::PageDown => self.remote_skill_browser.selector.page_down(),
+                KeyCode::Backspace => {
+                    self.remote_skill_browser.selector.pop_char();
+                    self.schedule_remote_skill_search(false);
+                }
+                KeyCode::Char(c)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    self.remote_skill_browser.selector.push_char(c);
+                    self.schedule_remote_skill_search(false);
+                }
+                _ => {}
+            }
+            return;
+        }
+
         // Skill selector overlay active — same key scheme as model selector
         if self.skill_selector.active {
             match key.code {
@@ -4205,6 +4588,9 @@ impl App {
                 KeyCode::Down => self.skill_selector.move_down(),
                 KeyCode::PageUp => self.skill_selector.page_up(),
                 KeyCode::PageDown => self.skill_selector.page_down(),
+                KeyCode::Char('R') => {
+                    self.open_remote_skill_selector(None);
+                }
                 KeyCode::Backspace => self.skill_selector.pop_char(),
                 KeyCode::Char(c)
                     if !key
@@ -4881,6 +5267,7 @@ impl App {
                 self.handle_show_skills(args);
             }
             CommandResult::SkillSelector => {
+                self.remote_skill_browser.selector.active = false;
                 self.refresh_skills_list();
                 self.skill_selector.activate();
             }
@@ -5497,6 +5884,39 @@ impl App {
                             self.push_output(msg, OutputRole::System);
                         }
                     }
+                }
+                AgentResponse::RemoteSkillSearchReady {
+                    request_id,
+                    query,
+                    report,
+                } => {
+                    self.apply_remote_skill_search_result(request_id, query, report);
+                }
+                AgentResponse::RemoteSkillActionComplete {
+                    message,
+                    skill_name,
+                } => {
+                    self.remote_skill_browser.action_in_flight = None;
+                    self.refresh_skills_list();
+                    self.push_output(
+                        format!("{message}\nActivate with: /skills view {skill_name}"),
+                        OutputRole::System,
+                    );
+                    if self.remote_skill_browser.selector.active {
+                        self.schedule_remote_skill_search(true);
+                    }
+                }
+                AgentResponse::RemoteSkillActionFailed {
+                    action_label,
+                    identifier,
+                    error,
+                } => {
+                    self.remote_skill_browser.action_in_flight = None;
+                    self.push_output(
+                        format!("Remote {action_label} failed for '{identifier}': {error}"),
+                        OutputRole::Error,
+                    );
+                    self.needs_redraw = true;
                 }
                 AgentResponse::VoiceTranscript {
                     transcript,
@@ -6858,7 +7278,7 @@ impl App {
                         if skills.is_empty() {
                             self.push_output(
                                 "No skills installed. Add .md files or skill directories to ~/.edgecrab/skills/\n\
-                                 Run `/skills install <path>` to install a skill.",
+                                 Run `/skills search` to browse remote skills or `/skills install <path>` to install a local skill.",
                                 OutputRole::System,
                             );
                         } else {
@@ -6870,7 +7290,9 @@ impl App {
                                 let skill_type = if s.path().is_dir() { "[dir]" } else { "[md]" };
                                 text.push_str(&format!("  {skill_type} {name}\n"));
                             }
-                            text.push_str("\nUsage: /skills view <name.md>  /skills install <path>");
+                            text.push_str(
+                                "\nUsage: /skills view <name.md>  /skills search  /skills install <path>",
+                            );
                             self.push_output(text, OutputRole::System);
                         }
                     }
@@ -7073,30 +7495,7 @@ impl App {
 
             "hub" | "search" => {
                 let query = operand;
-                if query.is_empty() {
-                    self.push_output(
-                        edgecrab_tools::tools::skills_hub::render_sources_catalog(),
-                        OutputRole::System,
-                    );
-                    return;
-                }
-
-                self.push_output(
-                    format!("Searching remote skill sources for '{query}' …"),
-                    OutputRole::System,
-                );
-
-                let query_owned = query.to_string();
-                let report = self.rt_handle.block_on(async {
-                    edgecrab_tools::tools::skills_hub::search_hub(&query_owned, None, 8).await
-                });
-                self.push_output(
-                    edgecrab_tools::tools::skills_hub::render_search_report(
-                        &query_owned,
-                        &report,
-                    ),
-                    OutputRole::System,
-                );
+                self.open_remote_skill_selector((!query.is_empty()).then_some(query));
             }
 
             "remove" | "uninstall" | "rm" => {
@@ -7127,7 +7526,7 @@ impl App {
             }
 
             _ => self.push_output(
-                "Usage: /skills [list | view <name> | install <path-or-source-or-owner/repo/path> | update [name] | remove <name> | hub [query] | search <query>]",
+                "Usage: /skills [list | view <name> | install <path-or-source-or-owner/repo/path> | update [name] | remove <name> | hub [query] | search [query]]",
                 OutputRole::System,
             ),
         }
@@ -9906,6 +10305,10 @@ impl App {
             self.render_skill_selector(frame, frame.area());
         }
 
+        if self.remote_skill_browser.selector.active {
+            self.render_remote_skill_selector(frame, frame.area());
+        }
+
         // Session browser overlay (full screen, same precedence as skill browser)
         if self.session_browser.active {
             self.render_session_browser(frame, frame.area());
@@ -10910,6 +11313,8 @@ impl App {
             Span::styled("navigate  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Enter ", Style::default().fg(Color::Rgb(255, 191, 0))),
             Span::styled("insert /skill-name  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("R ", Style::default().fg(Color::Rgb(255, 191, 0))),
+            Span::styled("remote search  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Esc ", Style::default().fg(Color::Rgb(255, 191, 0))),
             Span::styled("cancel  ", Style::default().fg(Color::DarkGray)),
             Span::styled(
@@ -10917,6 +11322,278 @@ impl App {
                 Style::default().fg(Color::Rgb(80, 75, 40)),
             ),
         ]));
+        frame.render_widget(help, chunks[2]);
+    }
+
+    fn render_remote_skill_selector(&self, frame: &mut Frame, area: Rect) {
+        frame.render_widget(Clear, area);
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ])
+            .split(area);
+        let body = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
+            .split(chunks[1]);
+
+        let browser = &self.remote_skill_browser;
+        let query = browser.current_query();
+        let search_text = if browser.selector.query.is_empty() {
+            "Type to search remote skills from EdgeCrab, Hermes, OpenAI, Anthropic, skills.sh, or a well-known URL".to_string()
+        } else {
+            browser.selector.query.clone()
+        };
+        let search_style = if browser.selector.query.is_empty() {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let border_style = if browser.inflight_request_id.is_some() {
+            Style::default().fg(Color::Rgb(110, 220, 210))
+        } else {
+            Style::default().fg(Color::Rgb(255, 191, 0))
+        };
+        let title = if browser.inflight_request_id.is_some() {
+            " Remote Skills  Searching… "
+        } else {
+            " Remote Skills "
+        };
+        let search = Paragraph::new(Line::from(vec![
+            Span::styled("  🌐 ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled(search_text, search_style),
+        ]))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(border_style)
+                .title(title),
+        );
+        frame.render_widget(search, chunks[0]);
+
+        let filtered = &browser.selector.filtered;
+        let selected = browser.selector.selected;
+        let max_visible = body[0].height as usize;
+        let scroll_start = if selected >= max_visible {
+            selected - max_visible + 1
+        } else {
+            0
+        };
+
+        let items: Vec<ListItem> = if filtered.is_empty() {
+            let empty_text = if query.is_empty() {
+                "  Start typing to search remote skills."
+            } else if browser.inflight_request_id.is_some() {
+                "  Searching remote sources…"
+            } else {
+                "  No remote skills matched this query."
+            };
+            vec![ListItem::new(Line::from(Span::styled(
+                empty_text.to_string(),
+                Style::default().fg(Color::Rgb(120, 120, 135)),
+            )))]
+        } else {
+            filtered
+                .iter()
+                .skip(scroll_start)
+                .take(max_visible)
+                .enumerate()
+                .map(|(vis_idx, &entry_idx)| {
+                    let entry = &browser.selector.items[entry_idx];
+                    let is_selected = vis_idx + scroll_start == selected;
+                    let bg = if is_selected {
+                        Color::Rgb(24, 40, 44)
+                    } else {
+                        Color::Rgb(18, 24, 26)
+                    };
+                    let source_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(145, 170, 170))
+                    } else {
+                        Style::default().fg(Color::Rgb(100, 120, 120))
+                    };
+                    let action_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(210, 240, 175))
+                    } else {
+                        Style::default().fg(Color::Rgb(135, 165, 110))
+                    };
+                    let main_style = if is_selected {
+                        Style::default()
+                            .bg(bg)
+                            .fg(Color::Rgb(110, 220, 210))
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Rgb(210, 220, 220))
+                    };
+                    let desc_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(160, 180, 180))
+                    } else {
+                        Style::default().fg(Color::Rgb(120, 140, 140))
+                    };
+                    ListItem::new(Line::from(vec![
+                        Span::styled(format!("  {:<11}", entry.source_label), source_style),
+                        Span::styled(format!("{:<8}", entry.action.label()), action_style),
+                        Span::styled(unicode_trunc(&entry.identifier, 44), main_style),
+                        Span::raw("  "),
+                        Span::styled(unicode_trunc(&entry.description, 36), desc_style),
+                    ]))
+                })
+                .collect()
+        };
+
+        frame.render_widget(
+            List::new(items).style(Style::default().bg(Color::Rgb(18, 24, 26))),
+            body[0],
+        );
+
+        let mut detail_lines = Vec::new();
+        if let Some(entry) = browser.selector.current() {
+            let status_line = match entry.action {
+                RemoteSkillAction::Install => "Default action: install".to_string(),
+                RemoteSkillAction::Update => format!(
+                    "Default action: update ({})",
+                    entry.installed_name.as_deref().unwrap_or(&entry.name)
+                ),
+                RemoteSkillAction::Replace => {
+                    "Default action: replace existing local skill".to_string()
+                }
+            };
+            detail_lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{} ", entry.source_label),
+                    Style::default()
+                        .fg(Color::Rgb(110, 220, 210))
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("[{}]", entry.trust_level),
+                    Style::default().fg(Color::Rgb(160, 180, 180)),
+                ),
+            ]));
+            detail_lines.push(Line::from(entry.identifier.clone()));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(entry.description.clone()));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(vec![
+                Span::styled("Origin: ", Style::default().fg(Color::Rgb(145, 170, 170))),
+                Span::raw(entry.origin.clone()),
+            ]));
+            detail_lines.push(Line::from(vec![
+                Span::styled("Action: ", Style::default().fg(Color::Rgb(145, 170, 170))),
+                Span::raw(status_line),
+            ]));
+            if !entry.tags.is_empty() {
+                detail_lines.push(Line::from(vec![
+                    Span::styled("Tags: ", Style::default().fg(Color::Rgb(145, 170, 170))),
+                    Span::raw(entry.tags.join(", ")),
+                ]));
+            }
+            if entry.action == RemoteSkillAction::Replace {
+                detail_lines.push(Line::from(""));
+                detail_lines.push(Line::from(Span::styled(
+                    "Warning: this source would replace an existing local skill with the same name.",
+                    Style::default().fg(Color::Rgb(255, 180, 120)),
+                )));
+            }
+        } else if query.is_empty() {
+            detail_lines.push(Line::from(Span::styled(
+                "Curated Sources",
+                Style::default()
+                    .fg(Color::Rgb(110, 220, 210))
+                    .add_modifier(Modifier::BOLD),
+            )));
+            for source in edgecrab_tools::tools::skills_hub::curated_source_summaries() {
+                detail_lines.push(Line::from(format!(
+                    "- {} [{}]",
+                    source.label, source.trust_level
+                )));
+            }
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(
+                "Paste an https:// URL to search a .well-known skills endpoint too.",
+            ));
+        } else if browser.inflight_request_id.is_some() {
+            detail_lines.push(Line::from("Searching remote sources…"));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(
+                "You can keep typing while results refresh. Slow or failing sources are reported here without blocking the UI.",
+            ));
+        } else {
+            detail_lines.push(Line::from("No results for the current query."));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(
+                "Try a broader term, a source name like 'edgecrab', or a full https:// URL for well-known skill discovery.",
+            ));
+        }
+
+        if !browser.notices.is_empty() {
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(Span::styled(
+                "Source Notes",
+                Style::default()
+                    .fg(Color::Rgb(255, 191, 0))
+                    .add_modifier(Modifier::BOLD),
+            )));
+            for notice in browser.notices.iter().take(4) {
+                detail_lines.push(Line::from(format!("- {}", unicode_trunc(notice, 120))));
+            }
+            if browser.notices.len() > 4 {
+                detail_lines.push(Line::from(format!(
+                    "... {} more notice(s)",
+                    browser.notices.len() - 4
+                )));
+            }
+        }
+
+        if let Some(action) = &browser.action_in_flight {
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(Span::styled(
+                format!("Running: {action}"),
+                Style::default().fg(Color::Rgb(210, 240, 175)),
+            )));
+        }
+
+        let detail = Paragraph::new(Text::from(detail_lines))
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Rgb(60, 80, 84)))
+                    .title(" Details "),
+            );
+        frame.render_widget(detail, body[1]);
+
+        let mut help_spans = vec![
+            Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("browse  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Enter ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("default action  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("I ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("install/update  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("U ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("force update  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("R ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("refresh  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("L ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("local browser  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Esc ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("cancel  ", Style::default().fg(Color::DarkGray)),
+        ];
+        let status_text = if browser.inflight_request_id.is_some() {
+            "searching"
+        } else if !query.is_empty() && filtered.is_empty() {
+            "no matches"
+        } else {
+            "matches"
+        };
+        help_spans.push(Span::styled(
+            format!("{} {}", filtered.len(), status_text),
+            Style::default().fg(Color::Rgb(100, 120, 120)),
+        ));
+        let help = Paragraph::new(Line::from(help_spans));
         frame.render_widget(help, chunks[2]);
     }
 
@@ -11704,6 +12381,7 @@ fn event_loop(
     loop {
         // Check for agent responses first (non-blocking)
         app.check_responses();
+        app.poll_remote_skill_search();
 
         // Advance spinner on each tick
         let now_elapsed = last_tick.elapsed();
@@ -12243,6 +12921,117 @@ mod tests {
         unsafe {
             std::env::remove_var("EDGECRAB_HOME");
         }
+    }
+
+    #[test]
+    fn build_remote_skill_entries_marks_update_replace_and_install() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+
+        let skills_dir = dir.path().join("skills");
+        std::fs::create_dir_all(skills_dir.join(".hub")).expect("hub dir");
+        std::fs::create_dir_all(skills_dir.join("local-only")).expect("local-only");
+        std::fs::write(skills_dir.join("local-only").join("SKILL.md"), "# local").expect("skill");
+        std::fs::write(
+            skills_dir.join(".hub").join("lock.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "native-mcp": {
+                    "source": "official",
+                    "identifier": "edgecrab:mcp/native-mcp",
+                    "installed_at": "2026-04-07T00:00:00Z",
+                    "content_hash": "sha256:test"
+                }
+            }))
+            .expect("json"),
+        )
+        .expect("write lock");
+
+        let report = edgecrab_tools::tools::skills_hub::SearchReport {
+            groups: vec![edgecrab_tools::tools::skills_hub::SearchGroup {
+                source: edgecrab_tools::tools::skills_hub::HubSourceInfo {
+                    id: "edgecrab".into(),
+                    label: "EdgeCrab".into(),
+                    origin: "https://github.com/raphaelmansuy/edgecrab".into(),
+                    trust_level: "trusted".into(),
+                },
+                results: vec![
+                    edgecrab_tools::tools::skills_hub::SkillMeta {
+                        name: "native-mcp".into(),
+                        description: "Native MCP skill".into(),
+                        source: "edgecrab".into(),
+                        origin: "https://github.com/raphaelmansuy/edgecrab".into(),
+                        identifier: "edgecrab:mcp/native-mcp".into(),
+                        trust_level: "trusted".into(),
+                        repo: None,
+                        path: None,
+                        url: None,
+                        tags: vec!["mcp".into()],
+                    },
+                    edgecrab_tools::tools::skills_hub::SkillMeta {
+                        name: "local-only".into(),
+                        description: "Would replace a local skill".into(),
+                        source: "edgecrab".into(),
+                        origin: "https://github.com/raphaelmansuy/edgecrab".into(),
+                        identifier: "edgecrab:tools/local-only".into(),
+                        trust_level: "trusted".into(),
+                        repo: None,
+                        path: None,
+                        url: None,
+                        tags: vec!["tools".into()],
+                    },
+                    edgecrab_tools::tools::skills_hub::SkillMeta {
+                        name: "fresh-remote".into(),
+                        description: "Brand new remote skill".into(),
+                        source: "edgecrab".into(),
+                        origin: "https://github.com/raphaelmansuy/edgecrab".into(),
+                        identifier: "edgecrab:tools/fresh-remote".into(),
+                        trust_level: "trusted".into(),
+                        repo: None,
+                        path: None,
+                        url: None,
+                        tags: vec!["tools".into()],
+                    },
+                ],
+                notice: Some("using cached index after source timeout".into()),
+            }],
+        };
+
+        let (entries, notices) = App::build_remote_skill_entries(&report);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].action, RemoteSkillAction::Update);
+        assert_eq!(entries[1].action, RemoteSkillAction::Replace);
+        assert_eq!(entries[2].action, RemoteSkillAction::Install);
+        assert_eq!(notices.len(), 1);
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[tokio::test]
+    async fn skills_search_opens_remote_browser_with_query() {
+        let mut app = App::new();
+
+        app.handle_show_skills("search native mcp".into());
+
+        assert!(app.remote_skill_browser.selector.active);
+        assert_eq!(app.remote_skill_browser.selector.query, "native mcp");
+        assert!(!app.skill_selector.active);
+    }
+
+    #[tokio::test]
+    async fn skills_hub_without_query_opens_remote_browser() {
+        let mut app = App::new();
+
+        app.handle_show_skills("hub".into());
+
+        assert!(app.remote_skill_browser.selector.active);
+        assert!(app.remote_skill_browser.selector.query.is_empty());
     }
 
     #[test]
