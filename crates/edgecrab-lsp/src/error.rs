@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use edgecrab_types::ToolError;
 use lsp_types::Uri;
@@ -73,7 +73,7 @@ impl LspError {
     }
 }
 
-pub fn path_to_uri(path: &PathBuf) -> Result<Uri, LspError> {
+pub fn path_to_uri(path: &Path) -> Result<Uri, LspError> {
     let url = url::Url::from_file_path(path)
         .map_err(|_| LspError::InvalidFilePath(path.display().to_string()))?;
     url.as_str()
@@ -86,4 +86,42 @@ pub fn uri_to_path(uri: &Uri) -> Result<PathBuf, LspError> {
         url::Url::parse(uri.as_str()).map_err(|_| LspError::InvalidFilePath(uri.to_string()))?;
     url.to_file_path()
         .map_err(|_| LspError::InvalidFilePath(uri.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn path_to_uri_round_trips_current_platform_path() {
+        let path = if cfg!(windows) {
+            PathBuf::from(r"C:\edgecrab\src\main.rs")
+        } else {
+            PathBuf::from("/tmp/edgecrab/src/main.rs")
+        };
+
+        let uri = path_to_uri(&path).expect("path to uri");
+        let round_trip = uri_to_path(&uri).expect("uri to path");
+        assert_eq!(round_trip, path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uri_to_path_handles_unix_file_uri() {
+        let uri: Uri = "file:///tmp/edgecrab/src/main.rs".parse().expect("uri");
+        assert_eq!(
+            uri_to_path(&uri).expect("path"),
+            PathBuf::from("/tmp/edgecrab/src/main.rs")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn uri_to_path_handles_windows_file_uri() {
+        let uri: Uri = "file:///C:/edgecrab/src/main.rs".parse().expect("uri");
+        assert_eq!(
+            uri_to_path(&uri).expect("path"),
+            PathBuf::from(r"C:\edgecrab\src\main.rs")
+        );
+    }
 }

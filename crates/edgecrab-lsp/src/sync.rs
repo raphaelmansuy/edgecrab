@@ -53,7 +53,7 @@ impl DocumentSyncLayer {
         language_id: &str,
         file_limit_bytes: u64,
     ) -> Result<DocumentSyncGuard, LspError> {
-        let uri = path_to_uri(&path.to_path_buf())?;
+        let uri = path_to_uri(path)?;
         let text = read_file_for_sync(path, file_limit_bytes)?;
 
         if let Some(mut entry) = self.open_docs.get_mut(&uri) {
@@ -117,7 +117,7 @@ impl DocumentSyncLayer {
         path: &Path,
         file_limit_bytes: u64,
     ) -> Result<(), LspError> {
-        let uri = path_to_uri(&path.to_path_buf())?;
+        let uri = path_to_uri(path)?;
         let text = read_file_for_sync(path, file_limit_bytes)?;
         let Some(mut entry) = self.open_docs.get_mut(&uri) else {
             return Ok(());

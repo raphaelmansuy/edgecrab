@@ -19,14 +19,28 @@ fn map_path_policy_error(err: PathPolicyError) -> ToolError {
     }
 }
 
+fn normalize_user_path_input(path: &str) -> String {
+    path.trim()
+        .chars()
+        .map(|ch| {
+            if ch == '/' || ch == '\\' {
+                std::path::MAIN_SEPARATOR
+            } else {
+                ch
+            }
+        })
+        .collect()
+}
+
 /// Resolve and jail a path for **read** operations, accepting additional trusted roots.
 pub fn jail_read_path_multi(
     path: &str,
     policy: &PathPolicy,
     trusted_roots: &[&Path],
 ) -> Result<PathBuf, ToolError> {
+    let normalized = normalize_user_path_input(path);
     policy
-        .resolve_read_path(Path::new(path), trusted_roots)
+        .resolve_read_path(Path::new(&normalized), trusted_roots)
         .map_err(map_path_policy_error)
 }
 
@@ -37,15 +51,17 @@ pub fn jail_read_path(path: &str, policy: &PathPolicy) -> Result<PathBuf, ToolEr
 
 /// Resolve and jail a path for **write** operations.
 pub fn jail_write_path(path: &str, policy: &PathPolicy) -> Result<PathBuf, ToolError> {
+    let normalized = normalize_user_path_input(path);
     policy
-        .resolve_write_path(Path::new(path), false)
+        .resolve_write_path(Path::new(&normalized), false)
         .map_err(map_path_policy_error)
 }
 
 /// Same as `jail_write_path` but creates intermediate directories first.
 pub fn jail_write_path_create_dirs(path: &str, policy: &PathPolicy) -> Result<PathBuf, ToolError> {
+    let normalized = normalize_user_path_input(path);
     policy
-        .resolve_write_path(Path::new(path), true)
+        .resolve_write_path(Path::new(&normalized), true)
         .map_err(map_path_policy_error)
 }
 
@@ -94,6 +110,46 @@ mod tests {
 
     #[test]
     fn jail_write_blocks_traversal() {
+        let dir = TempDir::new().expect("tmpdir");
+        let result = jail_write_path("../escaped.txt", &policy_for(dir.path()));
+        assert!(matches!(result, Err(ToolError::PermissionDenied(_))));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn jail_read_normalizes_windows_separators() {
+        let dir = TempDir::new().expect("tmpdir");
+        let nested = dir.path().join("nested");
+        std::fs::create_dir_all(&nested).expect("mkdir");
+        std::fs::write(nested.join("hello.txt"), "hi").expect("write");
+
+        let result = jail_read_path("nested\\hello.txt", &policy_for(dir.path()));
+        assert!(result.is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn jail_read_normalizes_unix_separators() {
+        let dir = TempDir::new().expect("tmpdir");
+        let nested = dir.path().join("nested");
+        std::fs::create_dir_all(&nested).expect("mkdir");
+        std::fs::write(nested.join("hello.txt"), "hi").expect("write");
+
+        let result = jail_read_path("nested/hello.txt", &policy_for(dir.path()));
+        assert!(result.is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn jail_write_blocks_windows_style_traversal() {
+        let dir = TempDir::new().expect("tmpdir");
+        let result = jail_write_path("..\\escaped.txt", &policy_for(dir.path()));
+        assert!(matches!(result, Err(ToolError::PermissionDenied(_))));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn jail_write_blocks_unix_style_traversal() {
         let dir = TempDir::new().expect("tmpdir");
         let result = jail_write_path("../escaped.txt", &policy_for(dir.path()));
         assert!(matches!(result, Err(ToolError::PermissionDenied(_))));

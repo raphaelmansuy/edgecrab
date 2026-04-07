@@ -754,9 +754,10 @@ pub fn load_official_skill_bundle(
     identifier: &str,
     optional_dir: Option<&Path>,
 ) -> Result<SkillBundle, String> {
-    let rel_path = identifier.strip_prefix("official/").unwrap_or(identifier);
+    let rel_path =
+        normalize_relative_source_path(identifier.strip_prefix("official/").unwrap_or(identifier));
     if let Some(dir) = optional_dir.filter(|dir| dir.is_dir()) {
-        let skill_path = dir.join(rel_path);
+        let skill_path = dir.join(&rel_path);
         let skill_md = skill_path.join("SKILL.md");
         if skill_md.is_file() {
             let mut files = HashMap::new();
@@ -927,7 +928,8 @@ pub async fn install_identifier(
     optional_dir: Option<&Path>,
     force: bool,
 ) -> Result<InstallOutcome, String> {
-    let bundle = fetch_bundle_for_identifier(identifier, optional_dir).await?;
+    let normalized_identifier = normalize_source_identifier(identifier);
+    let bundle = fetch_bundle_for_identifier(&normalized_identifier, optional_dir).await?;
     let skill_name = bundle.name.clone();
     let message = install_skill(&bundle, skills_dir, force)?;
     Ok(InstallOutcome {
@@ -941,11 +943,12 @@ pub async fn install_github_skill(
     skills_dir: &Path,
     force: bool,
 ) -> Result<InstallOutcome, String> {
-    let Some((repo, path)) = parse_github_identifier(identifier) else {
+    let normalized_identifier = normalize_source_identifier(identifier);
+    let Some((repo, path)) = parse_github_identifier(&normalized_identifier) else {
         return Err("GitHub identifier must be owner/repo or owner/repo/path".into());
     };
     let client = hub_client()?;
-    let bundle = fetch_github_bundle(&client, &repo, &path, identifier).await?;
+    let bundle = fetch_github_bundle(&client, &repo, &path, &normalized_identifier).await?;
     let skill_name = bundle.name.clone();
     let message = install_skill(&bundle, skills_dir, force)?;
     Ok(InstallOutcome {
@@ -1009,23 +1012,25 @@ async fn fetch_bundle_for_identifier(
     identifier: &str,
     optional_dir: Option<&Path>,
 ) -> Result<SkillBundle, String> {
-    if identifier.starts_with("official/") {
-        return load_official_skill_bundle(identifier, optional_dir);
+    let normalized_identifier = normalize_source_identifier(identifier);
+    if normalized_identifier.starts_with("official/") {
+        return load_official_skill_bundle(&normalized_identifier, optional_dir);
     }
 
-    let resolved = resolve_curated_identifier(identifier).unwrap_or_else(|| identifier.to_string());
+    let resolved = resolve_curated_identifier(&normalized_identifier)
+        .unwrap_or_else(|| normalized_identifier.clone());
     if looks_like_github_identifier(&resolved) {
         let Some((repo, path)) = parse_github_identifier(&resolved) else {
             return Err("GitHub identifier must be owner/repo or owner/repo/path".into());
         };
         let client = hub_client()?;
-        return fetch_github_bundle(&client, &repo, &path, identifier).await;
+        return fetch_github_bundle(&client, &repo, &path, &normalized_identifier).await;
     }
 
     let optional_root = optional_dir
         .map(Path::to_path_buf)
         .unwrap_or_else(|| resolve_edgecrab_home().join("optional-skills"));
-    let candidates = search_optional_skills(&optional_root, identifier);
+    let candidates = search_optional_skills(&optional_root, &normalized_identifier);
     if let Some(candidate) = candidates.first() {
         return load_official_skill_bundle(&candidate.identifier, optional_dir);
     }
@@ -1056,7 +1061,8 @@ fn validate_bundle(bundle: &SkillBundle) -> Result<(), String> {
 fn safe_relative_join(base: &Path, rel_path: &str) -> Result<PathBuf, String> {
     use std::path::Component;
 
-    let rel = Path::new(rel_path);
+    let normalized_rel_path = normalize_path_separators(rel_path);
+    let rel = Path::new(&normalized_rel_path);
     let mut normalized = PathBuf::new();
     for component in rel.components() {
         match component {
@@ -1616,8 +1622,9 @@ fn looks_like_github_identifier(identifier: &str) -> bool {
 }
 
 fn resolve_curated_identifier(identifier: &str) -> Option<String> {
-    let (source_id, path) = identifier.split_once(':')?;
-    let path = path.trim_matches('/');
+    let normalized = normalize_source_identifier(identifier);
+    let (source_id, path) = normalized.split_once(':')?;
+    let path = normalize_relative_source_path(path);
     if path.is_empty() {
         return None;
     }
@@ -1631,7 +1638,8 @@ fn resolve_curated_identifier(identifier: &str) -> Option<String> {
 }
 
 fn parse_github_identifier(identifier: &str) -> Option<(String, String)> {
-    let trimmed = identifier.trim_matches('/');
+    let normalized = normalize_source_identifier(identifier);
+    let trimmed = normalized.trim_matches('/');
     let mut parts = trimmed.splitn(3, '/');
     let owner = parts.next()?;
     let repo = parts.next()?;
@@ -1640,6 +1648,20 @@ fn parse_github_identifier(identifier: &str) -> Option<(String, String)> {
         return None;
     }
     Some((format!("{owner}/{repo}"), path.to_string()))
+}
+
+fn normalize_path_separators(value: &str) -> String {
+    value.replace('\\', "/")
+}
+
+fn normalize_source_identifier(identifier: &str) -> String {
+    normalize_path_separators(identifier.trim())
+}
+
+fn normalize_relative_source_path(path: &str) -> String {
+    normalize_source_identifier(path)
+        .trim_matches('/')
+        .to_string()
 }
 
 // ─── Tests ─────────────────────────────────────────────────────
@@ -1880,6 +1902,25 @@ mod tests {
     }
 
     #[test]
+    fn resolve_curated_identifier_normalizes_windows_style_paths() {
+        assert_eq!(
+            resolve_curated_identifier(r"edgecrab:research\ml-paper-writing").as_deref(),
+            Some("raphaelmansuy/edgecrab/skills/research/ml-paper-writing")
+        );
+    }
+
+    #[test]
+    fn parse_github_identifier_normalizes_windows_style_paths() {
+        assert_eq!(
+            parse_github_identifier(r"raphaelmansuy\edgecrab\skills\research\ml-paper-writing"),
+            Some((
+                "raphaelmansuy/edgecrab".to_string(),
+                "skills/research/ml-paper-writing".to_string()
+            ))
+        );
+    }
+
+    #[test]
     fn cache_entry_score_prefers_name_matches() {
         let entry = CachedSkillEntry {
             name: "ascii-diagram-fixer".into(),
@@ -1915,7 +1956,7 @@ mod tests {
             "native-mcp".to_string(),
             LockEntry {
                 source: "official".into(),
-                identifier: "official/mcp/native-mcp".into(),
+                identifier: r"official\mcp\native-mcp".into(),
                 installed_at: chrono::Utc::now().to_rfc3339(),
                 content_hash: String::new(),
             },
@@ -1969,5 +2010,27 @@ mod tests {
         let rendered = render_update_outcomes(&outcomes);
         assert!(rendered.contains("native-mcp"));
         assert!(rendered.contains("mcporter"));
+    }
+
+    #[test]
+    fn install_rejects_windows_path_traversal_files() {
+        let home = TestHome::new();
+        let skills_dir = home.path().join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+
+        let bundle = SkillBundle {
+            name: "bad-windows-skill".into(),
+            files: HashMap::from([
+                ("SKILL.md".into(), "# Safe".into()),
+                (r"..\escape.txt".into(), "boom".into()),
+            ]),
+            source: "test".into(),
+            identifier: "test/bad-windows-skill".into(),
+            trust_level: "community".into(),
+        };
+
+        let result = install_skill(&bundle, &skills_dir, false);
+        assert!(result.is_err());
+        assert!(!home.path().join("escape.txt").exists());
     }
 }
