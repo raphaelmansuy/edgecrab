@@ -50,12 +50,14 @@ jobs:
           echo "tag=$TAG"       >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Sync package.json version
+      - name: Sync package.json version and BINARY_VERSION
         run: |
           cd sdks/npm-cli
           npm version "${{ steps.version.outputs.version }}" \
             --no-git-tag-version \
             --allow-same-version
+          # Keep BINARY_VERSION in install.js in sync with the release tag
+          sed -i "s/const BINARY_VERSION = '[^']*'/const BINARY_VERSION = '${{ steps.version.outputs.version }}'/" scripts/install.js
           echo "Publishing edgecrab-cli@${{ steps.version.outputs.version }}"
 
       - name: Pack tarball (for GH Release attachment)

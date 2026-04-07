@@ -54,13 +54,15 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Publishing edgecrab-cli==$VERSION"
 
-      - name: Sync pyproject.toml version
+      - name: Sync pyproject.toml version and BINARY_VERSION
         run: |
           VERSION="${{ steps.version.outputs.version }}"
           cd sdks/pypi-cli
           sed -i "s/^version = \".*\"/version = \"$VERSION\"/" pyproject.toml
-          # Also sync the _version.py that the binary downloader reads at runtime
+          # Sync _version.py that the package exposes
           printf '__version__ = "%s"\n' "$VERSION" > edgecrab_cli/_version.py
+          # Keep BINARY_VERSION in _binary.py in sync with the release tag
+          sed -i "s/^BINARY_VERSION = \".*\"/BINARY_VERSION = \"$VERSION\"/" edgecrab_cli/_binary.py
 
       - name: Install build tool
         run: pip install --upgrade build

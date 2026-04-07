@@ -25,7 +25,7 @@ REPO = "raphaelmansuy/edgecrab"
 # BINARY_VERSION controls which GitHub Release tag is used for binary downloads.
 # It is intentionally decoupled from __version__ so the package can be patched
 # independently of binary releases.
-BINARY_VERSION = "0.1.1"
+BINARY_VERSION = "0.1.2"
 
 # ── Platform → asset name mapping ────────────────────────────────────────────
 _PLATFORM_MAP: dict[tuple[str, str], str] = {
