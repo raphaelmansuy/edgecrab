@@ -6,11 +6,31 @@ sidebar:
 ---
 
 Get EdgeCrab up and running in under two minutes. Choose the method that fits your environment —
-**no Rust toolchain required** when installing via npm or pip.
+**no build tools required** when installing via Homebrew, npm, or pip.
 
 ---
 
-## Option A — npm (recommended, no Rust required)
+## Option A — Homebrew (macOS, fastest)
+
+```bash
+brew tap raphaelmansuy/tap
+brew install edgecrab
+```
+
+Auto-detects your CPU architecture (Apple Silicon or Intel) and installs the correct binary.
+**No dependencies needed.** Instant startup (~50ms cold start).
+
+Verify:
+
+```bash
+edgecrab version
+# EdgeCrab 0.1.1  (rustc 1.85.0, 2025-02-20)
+#   providers: copilot openai anthropic gemini xai deepseek ...
+```
+
+---
+
+## Option B — npm (recommended, no Rust required)
 
 ```bash
 npm install -g edgecrab-cli
@@ -36,7 +56,7 @@ npx edgecrab-cli "summarise the git log for today"
 
 ---
 
-## Option B — pip (recommended, no Rust required)
+## Option C — pip (recommended, no Rust required)
 
 ```bash
 pip install edgecrab-cli
@@ -58,7 +78,7 @@ edgecrab "explain this codebase"
 
 ---
 
-## Option C — cargo install (from source)
+## Option D — cargo install (from source)
 
 ```bash
 cargo install edgecrab-cli
@@ -82,7 +102,7 @@ edgecrab version
 
 ---
 
-## Option D — Pre-built Binary
+## Option E — Pre-built Binary
 
 Download the archive for your platform from [GitHub Releases](https://github.com/raphaelmansuy/edgecrab/releases):
 
@@ -103,7 +123,7 @@ chmod +x /usr/local/bin/edgecrab
 
 ---
 
-## Option E — Docker
+## Option F — Docker
 
 ```bash
 docker pull ghcr.io/raphaelmansuy/edgecrab:latest
@@ -117,7 +137,7 @@ See [Docker Deployment](/user-guide/docker/) for full configuration, docker-comp
 
 ---
 
-## Option F — Build from Source
+## Option G — Build from Source
 
 ```bash
 git clone https://github.com/raphaelmansuy/edgecrab
@@ -137,13 +157,14 @@ cargo build
 
 ## Installation Methods Summary
 
-| Method | Command | Requires |
-|--------|---------|---------|
-| **npm** | `npm install -g edgecrab-cli` | Node.js 18+ |
-| **pip** | `pip install edgecrab-cli` | Python 3.10+ |
-| **cargo** | `cargo install edgecrab-cli` | Rust 1.85+ |
-| **Docker** | `docker pull ghcr.io/raphaelmansuy/edgecrab:latest` | Docker |
-| **Pre-built binary** | Download from GitHub Releases | Nothing |
+| Method | Command | Requires | Speed |
+|--------|---------|----------|-------|
+| **Homebrew** (macOS) | `brew install raphaelmansuy/tap/edgecrab` | Homebrew | ~50ms startup |
+| **npm** | `npm install -g edgecrab-cli` | Node.js 18+ | ~1-2s startup |
+| **pip** | `pip install edgecrab-cli` | Python 3.10+ | ~1-2s startup |
+| **cargo** | `cargo install edgecrab-cli` | Rust 1.85+ | ~5-10m build |
+| **Docker** | `docker pull ghcr.io/raphaelmansuy/edgecrab:latest` | Docker | ~100ms in container |
+| **Pre-built binary** | Download from GitHub Releases | Nothing | ~50ms startup |
 
 ---
 

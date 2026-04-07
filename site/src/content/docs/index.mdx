@@ -297,9 +297,27 @@ import UseCasesSection from '../../components/landing/UseCasesSection.astro';
 />
 
 <QuickStart
-  title="Four Ways to Install — Pick Yours"
-  subtitle="npm · pip · cargo · Docker — all install the same native static binary. No Python venv. No Node.js runtime for the agent itself. Your SuperAgent is live in under 90 seconds."
+  title="Five Ways to Install — Pick Yours"
+  subtitle="Homebrew · npm · pip · cargo · Docker — all install the same native static binary. No Python venv. No Node.js runtime for the agent itself. Your SuperAgent is live in under 90 seconds."
   tabs={[
+    {
+      label: 'Homebrew (macOS)',
+      lang: 'bash',
+      code: `# Install via Homebrew — auto-detects Apple Silicon or Intel
+brew tap raphaelmansuy/tap
+brew install edgecrab
+
+# Run setup wizard (detects API keys, writes config)
+edgecrab setup
+
+# Verify health (checks keys, provider ping, binary size)
+edgecrab doctor
+
+# Start chatting
+edgecrab
+edgecrab "summarise the git log for today"
+edgecrab --model anthropic/claude-opus-4-6 "review this codebase"`,
+    },
     {
       label: 'npm',
       lang: 'bash',
@@ -561,8 +579,8 @@ docker compose logs -f`,
 
 <CtaSection
   title="From the Soul of Hermes to the Speed of Rust"
-  subtitle="EdgeCrab is open source, Apache 2.0. Your SuperAgent — personal + coding, learns and grows with you. Install via npm, pip, or cargo in 90 seconds. Runs anywhere: macOS, Linux, Windows, edge hardware."
-  installCmd="npm install -g edgecrab-cli"
+  subtitle="EdgeCrab is open source, Apache 2.0. Your SuperAgent — personal + coding, learns and grows with you. Install via Homebrew (macOS), npm, pip, or cargo in 90 seconds. Runs anywhere: macOS, Linux, Windows, edge hardware."
+  installCmd="brew install raphaelmansuy/tap/edgecrab"
   primaryHref="/getting-started/quick-start/"
   primaryText="Get Started Free"
   secondaryHref="https://github.com/raphaelmansuy/edgecrab"
