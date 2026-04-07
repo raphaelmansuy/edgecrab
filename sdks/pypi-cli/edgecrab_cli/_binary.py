@@ -8,7 +8,6 @@ provides a resolve() helper to get the absolute path.
 
 from __future__ import annotations
 
-import os
 import platform
 import shutil
 import stat
@@ -26,7 +25,7 @@ REPO = "raphaelmansuy/edgecrab"
 # BINARY_VERSION controls which GitHub Release tag is used for binary downloads.
 # It is intentionally decoupled from __version__ so the package can be patched
 # independently of binary releases.
-BINARY_VERSION = "0.1.0"
+BINARY_VERSION = "0.1.1"
 
 # ── Platform → asset name mapping ────────────────────────────────────────────
 _PLATFORM_MAP: dict[tuple[str, str], str] = {
@@ -131,14 +130,32 @@ def ensure_binary() -> Path:
     return dest
 
 
+def _is_native_binary(path: str) -> bool:
+    """Return True only if *path* is a native executable, not a script wrapper."""
+    try:
+        with open(path, "rb") as fh:
+            magic = fh.read(4)
+        # ELF (Linux), Mach-O 64-bit LE (macOS arm64/x86_64), PE (Windows)
+        return magic[:4] in (
+            b"\x7fELF",           # Linux ELF
+            b"\xcf\xfa\xed\xfe",  # Mach-O 64-bit LE
+            b"\xce\xfa\xed\xfe",  # Mach-O 32-bit LE
+            b"\xca\xfe\xba\xbe",  # Mach-O fat binary
+            b"MZ\x90\x00",        # PE (Windows .exe)
+        ) or magic[:2] == b"MZ"   # PE short header
+    except OSError:
+        return False
+
+
 def resolve() -> Path:
     """
     Return the path to the edgecrab binary.
 
-    First checks for a system-wide `edgecrab` on PATH (e.g. installed via cargo),
-    then falls back to the cached downloaded binary.
+    First checks for a system-wide native `edgecrab` on PATH (e.g. installed
+    via cargo or brew).  Skips any Python wrapper scripts (like the one
+    installed by this very package) to avoid infinite-exec loops.
     """
     system_binary = shutil.which("edgecrab")
-    if system_binary:
+    if system_binary and _is_native_binary(system_binary):
         return Path(system_binary)
     return ensure_binary()
