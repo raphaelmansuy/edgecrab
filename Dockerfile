@@ -23,9 +23,6 @@ COPY crates/edgecrab-gateway/Cargo.toml   crates/edgecrab-gateway/
 COPY crates/edgecrab-acp/Cargo.toml       crates/edgecrab-acp/
 COPY crates/edgecrab-migrate/Cargo.toml   crates/edgecrab-migrate/
 
-# Vendor edgequake-llm
-COPY vendor/ vendor/
-
 # Dummy build to cache dependencies
 RUN for dir in crates/*/; do \
       mkdir -p "$dir/src"; \
