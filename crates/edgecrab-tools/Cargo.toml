@@ -22,6 +22,7 @@ async-trait = { workspace = true }
 inventory = { workspace = true }
 strsim = { workspace = true }
 shell-words = { workspace = true }
+shellexpand = { workspace = true }
 dashmap = { workspace = true }
 regex = { workspace = true }
 reqwest = { workspace = true }

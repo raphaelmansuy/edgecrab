@@ -1450,6 +1450,7 @@ dependencies = [
  "serde_norway",
  "sha2",
  "shell-words",
+ "shellexpand",
  "strip-ansi-escapes",
  "strsim",
  "tempfile",

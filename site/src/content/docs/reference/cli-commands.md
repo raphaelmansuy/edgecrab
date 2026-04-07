@@ -357,9 +357,17 @@ edgecrab mcp install <preset>             # Install a preset into config.yaml
 edgecrab mcp install filesystem --path /tmp  # Install with path override
 edgecrab mcp test                         # Probe all configured servers (connectivity + tool count)
 edgecrab mcp test <name>                  # Probe a specific server
+edgecrab mcp doctor                       # Static checks + live probe for all configured servers
+edgecrab mcp doctor <name>                # Diagnose one configured server
 edgecrab mcp add <name> <cmd> [args...]   # Add a custom MCP server by command
 edgecrab mcp remove <name>                # Remove a configured MCP server
 ```
+
+HTTP MCP servers can authenticate with bearer tokens from:
+
+- `bearer_token` in `config.yaml`
+- `/mcp-token set <server> <token>`
+- env-expanded config values such as `bearer_token: "${MY_API_TOKEN}"`
 
 ---
 

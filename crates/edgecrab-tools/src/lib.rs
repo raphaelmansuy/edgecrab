@@ -34,6 +34,29 @@ pub mod tools;
 pub mod toolsets;
 pub mod vision_models;
 
+/// Truncate `s` to at most `max_bytes` bytes, always stopping at a valid UTF-8
+/// char boundary so that multi-byte / emoji characters are never split.
+#[inline]
+pub(crate) fn safe_truncate(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let boundary = (0..=max_bytes)
+        .rev()
+        .find(|&i| s.is_char_boundary(i))
+        .unwrap_or(0);
+    &s[..boundary]
+}
+
+pub use config_ref::AppConfigRef;
+pub use execution_fs::{ExecutionFilesystemView, describe_execution_filesystem};
+pub use process_table::ProcessTable;
+pub use registry::{
+    SubAgentResult, SubAgentRunner, ToolContext, ToolHandler, ToolRegistry, to_llm_definitions,
+};
+pub use tools::todo::TodoStore;
+pub use toolsets::{ACP_TOOLS, CORE_TOOLS, resolve_active_toolsets, resolve_alias};
+
 #[cfg(test)]
 pub(crate) mod test_support {
     use std::path::Path;
@@ -83,26 +106,3 @@ pub(crate) mod test_support {
         }
     }
 }
-
-/// Truncate `s` to at most `max_bytes` bytes, always stopping at a valid UTF-8
-/// char boundary so that multi-byte / emoji characters are never split.
-#[inline]
-pub(crate) fn safe_truncate(s: &str, max_bytes: usize) -> &str {
-    if s.len() <= max_bytes {
-        return s;
-    }
-    let boundary = (0..=max_bytes)
-        .rev()
-        .find(|&i| s.is_char_boundary(i))
-        .unwrap_or(0);
-    &s[..boundary]
-}
-
-pub use config_ref::AppConfigRef;
-pub use execution_fs::{ExecutionFilesystemView, describe_execution_filesystem};
-pub use process_table::ProcessTable;
-pub use registry::{
-    SubAgentResult, SubAgentRunner, ToolContext, ToolHandler, ToolRegistry, to_llm_definitions,
-};
-pub use tools::todo::TodoStore;
-pub use toolsets::{ACP_TOOLS, CORE_TOOLS, resolve_active_toolsets, resolve_alias};

@@ -590,12 +590,26 @@ fn yaml_config_path() -> Option<std::path::PathBuf> {
     Some(resolve_edgecrab_home().join("config.yaml"))
 }
 
+fn expand_config_string(value: &str) -> String {
+    shellexpand::env(value)
+        .map(|expanded| expanded.into_owned())
+        .unwrap_or_else(|_| value.to_string())
+}
+
+fn parse_expanded_string(value: Option<&serde_json::Value>) -> Option<String> {
+    value.and_then(|v| v.as_str()).map(expand_config_string)
+}
+
+fn parse_expanded_path(value: Option<&serde_json::Value>) -> Option<PathBuf> {
+    parse_expanded_string(value).map(PathBuf::from)
+}
+
 fn parse_string_array(value: Option<&serde_json::Value>) -> Vec<String> {
     value
         .and_then(|a| a.as_array())
         .map(|a| {
             a.iter()
-                .filter_map(|v| v.as_str().map(String::from))
+                .filter_map(|v| v.as_str().map(expand_config_string))
                 .collect()
         })
         .unwrap_or_default()
@@ -606,7 +620,7 @@ fn parse_string_map(value: Option<&serde_json::Value>) -> HashMap<String, String
         .and_then(|obj| obj.as_object())
         .map(|obj| {
             obj.iter()
-                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), expand_config_string(s))))
                 .collect()
         })
         .unwrap_or_default()
@@ -616,24 +630,11 @@ fn parse_configured_server(name: &str, server_config: &serde_json::Value) -> Con
     let token_from_store = read_mcp_token(name).is_some();
     ConfiguredMcpServer {
         name: name.to_string(),
-        url: server_config
-            .get("url")
-            .and_then(|u| u.as_str())
-            .map(String::from),
-        bearer_token: server_config
-            .get("bearer_token")
-            .and_then(|t| t.as_str())
-            .map(String::from),
-        command: server_config
-            .get("command")
-            .and_then(|c| c.as_str())
-            .unwrap_or("")
-            .to_string(),
+        url: parse_expanded_string(server_config.get("url")),
+        bearer_token: parse_expanded_string(server_config.get("bearer_token")),
+        command: parse_expanded_string(server_config.get("command")).unwrap_or_default(),
         args: parse_string_array(server_config.get("args")),
-        cwd: server_config
-            .get("cwd")
-            .and_then(|c| c.as_str())
-            .map(PathBuf::from),
+        cwd: parse_expanded_path(server_config.get("cwd")),
         env: parse_string_map(server_config.get("env")),
         headers: parse_string_map(server_config.get("headers")),
         timeout: server_config.get("timeout").and_then(|t| t.as_u64()),
@@ -1064,63 +1065,26 @@ impl ToolHandler for McpCallToolTool {
                 message: format!("Unknown MCP server '{}'", args.server),
             })?;
 
-        let command = server_config
-            .get("command")
-            .and_then(|c| c.as_str())
-            .unwrap_or("")
-            .to_string();
+        let command = parse_expanded_string(server_config.get("command")).unwrap_or_default();
 
-        let url = server_config
-            .get("url")
-            .and_then(|u| u.as_str())
-            .map(String::from);
+        let url = parse_expanded_string(server_config.get("url"));
 
-        let bearer_token = server_config
-            .get("bearer_token")
-            .and_then(|t| t.as_str())
-            .map(String::from);
+        let bearer_token = parse_expanded_string(server_config.get("bearer_token"));
 
-        let cmd_args: Vec<String> = server_config
-            .get("args")
-            .and_then(|a| a.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let cmd_args = parse_string_array(server_config.get("args"));
 
         // Extract env vars from config so they reach the subprocess
-        let cmd_envs: std::collections::HashMap<String, String> = server_config
-            .get("env")
-            .and_then(|e| e.as_object())
-            .map(|obj| {
-                obj.iter()
-                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let cmd_envs = parse_string_map(server_config.get("env"));
 
         get_or_connect(
             &args.server,
             McpServerConfig {
                 url,
                 bearer_token,
-                headers: server_config
-                    .get("headers")
-                    .and_then(|h| h.as_object())
-                    .map(|obj| {
-                        obj.iter()
-                            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
+                headers: parse_string_map(server_config.get("headers")),
                 command,
                 args: cmd_args,
-                cwd: server_config
-                    .get("cwd")
-                    .and_then(|c| c.as_str())
-                    .map(PathBuf::from),
+                cwd: parse_expanded_path(server_config.get("cwd")),
                 envs: cmd_envs,
                 timeout: server_config.get("timeout").and_then(|t| t.as_u64()),
                 connect_timeout: server_config
@@ -1433,51 +1397,17 @@ pub async fn discover_and_register_mcp_tools(registry: &mut crate::registry::Too
     };
 
     for (server_name, server_config) in &servers {
-        let command = server_config
-            .get("command")
-            .and_then(|c| c.as_str())
-            .unwrap_or("")
-            .to_string();
+        let command = parse_expanded_string(server_config.get("command")).unwrap_or_default();
 
-        let url = server_config
-            .get("url")
-            .and_then(|u| u.as_str())
-            .map(String::from);
+        let url = parse_expanded_string(server_config.get("url"));
 
-        let bearer_token = server_config
-            .get("bearer_token")
-            .and_then(|t| t.as_str())
-            .map(String::from);
+        let bearer_token = parse_expanded_string(server_config.get("bearer_token"));
 
-        let cmd_args: Vec<String> = server_config
-            .get("args")
-            .and_then(|a| a.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let cmd_args = parse_string_array(server_config.get("args"));
 
-        let cmd_envs: std::collections::HashMap<String, String> = server_config
-            .get("env")
-            .and_then(|e| e.as_object())
-            .map(|obj| {
-                obj.iter()
-                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let cmd_envs = parse_string_map(server_config.get("env"));
 
-        let headers: std::collections::HashMap<String, String> = server_config
-            .get("headers")
-            .and_then(|h| h.as_object())
-            .map(|obj| {
-                obj.iter()
-                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let headers = parse_string_map(server_config.get("headers"));
 
         let timeout = server_config.get("timeout").and_then(|t| t.as_u64());
         let connect_timeout = server_config
@@ -1499,10 +1429,7 @@ pub async fn discover_and_register_mcp_tools(registry: &mut crate::registry::Too
                 headers,
                 command,
                 args: cmd_args,
-                cwd: server_config
-                    .get("cwd")
-                    .and_then(|c| c.as_str())
-                    .map(PathBuf::from),
+                cwd: parse_expanded_path(server_config.get("cwd")),
                 envs: cmd_envs,
                 timeout,
                 connect_timeout,
@@ -2196,6 +2123,51 @@ mod tests {
         assert_eq!(
             servers[0].cwd.as_deref(),
             Some(std::path::Path::new("/tmp"))
+        );
+    }
+
+    #[test]
+    fn configured_servers_expand_env_backed_http_auth_fields() {
+        let _guard = EDGECRAB_HOME_LOCK.lock().expect("lock");
+        let home = TestEdgecrabHome::new();
+        // SAFETY: serialized by EDGECRAB_HOME_LOCK for the guard lifetime.
+        unsafe {
+            std::env::set_var("MCP_HTTP_URL", "https://auth.example.com/mcp");
+            std::env::set_var("MCP_ACCESS_TOKEN", "oauth-token");
+        }
+        std::fs::write(
+            home.path().join("config.yaml"),
+            "mcp_servers:\n  oauth:\n    url: ${MCP_HTTP_URL}\n    bearer_token: ${MCP_ACCESS_TOKEN}\n    headers:\n      X-Tenant: ${MCP_ACCESS_TOKEN}\n    enabled: true\n",
+        )
+        .expect("config");
+
+        let servers = configured_servers().expect("servers");
+
+        assert_eq!(servers.len(), 1);
+        assert_eq!(
+            servers[0].url.as_deref(),
+            Some("https://auth.example.com/mcp")
+        );
+        assert_eq!(servers[0].bearer_token.as_deref(), Some("oauth-token"));
+        assert_eq!(
+            servers[0].headers.get("X-Tenant").map(String::as_str),
+            Some("oauth-token")
+        );
+
+        // SAFETY: serialized by EDGECRAB_HOME_LOCK for the guard lifetime.
+        unsafe {
+            std::env::remove_var("MCP_HTTP_URL");
+            std::env::remove_var("MCP_ACCESS_TOKEN");
+        }
+    }
+
+    #[test]
+    fn expand_config_string_leaves_unresolved_placeholders_visible() {
+        // Missing vars should not panic; the unresolved placeholder remains visible
+        // so doctor/reporting code can explain the problem.
+        assert_eq!(
+            expand_config_string("${EDGECRAB_UNKNOWN_TOKEN}"),
+            "${EDGECRAB_UNKNOWN_TOKEN}"
         );
     }
 }

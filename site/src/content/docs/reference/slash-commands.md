@@ -18,7 +18,7 @@ Navigation   /help /quit /clear /new /status /version
 Model        /model /provider /reasoning /stream
 Session      /session /retry /undo /stop /history /save /export /title /resume
 Config       /config /prompt /verbose /personality /statusbar
-Tools        /tools /toolsets /reload-mcp /plugins
+Tools        /tools /toolsets /mcp /reload-mcp /plugins
 Memory       /memory /skills
 Analysis     /cost /usage /compress /insights
 Advanced     /queue /background /rollback
@@ -28,7 +28,7 @@ Media        /voice /browser
 Appearance   /theme /skin /paste /mouse
 Diagnostics  /doctor
 Auth         /copilot-auth
-MCP          /mcp-token
+MCP          /mcp /mcp-token
 ```
 
 ---
@@ -97,6 +97,7 @@ MCP          /mcp-token
 |---------|-------------|
 | `/tools` | List all registered tools and their status |
 | `/toolsets` | List toolset aliases and their member tools |
+| `/mcp [subcommand]` | Browse, install, test, diagnose, or remove MCP servers |
 | `/reload-mcp` | Drop and reconnect all MCP server connections |
 | `/plugins` | Discover and list installed plugins |
 | `/mcp-token [set\|remove\|list] <name> [token]` | Manage MCP OAuth Bearer tokens |

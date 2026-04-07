@@ -763,7 +763,7 @@ impl CommandRegistry {
         self.register(Command {
             name: "mcp",
             aliases: &[],
-            description: "List, search, install, test, or remove MCP servers (/mcp help)",
+            description: "List, search, install, test, diagnose, or remove MCP servers (/mcp help)",
             handler: |args| CommandResult::ShowMcp(args.trim().to_string()),
         });
 

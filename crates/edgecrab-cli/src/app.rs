@@ -57,6 +57,7 @@ use crate::edit_diff::{LocalEditSnapshot, capture_local_edit_snapshot, render_ed
 use crate::fuzzy_selector::{FuzzyItem, FuzzySelector};
 use crate::image_models as cli_image_models;
 use crate::markdown_render;
+use crate::mcp_support;
 use crate::model_discovery::{self, DiscoverySource};
 use crate::theme::{SkinConfig, Theme};
 use crate::tool_display::{
@@ -1451,6 +1452,10 @@ impl McpPresetEntry {
         format!("test {}", self.id)
     }
 
+    fn doctor_command(&self) -> String {
+        format!("doctor {}", self.id)
+    }
+
     fn view_command(&self) -> String {
         format!("view {}", self.id)
     }
@@ -1471,16 +1476,7 @@ fn mcp_catalog_source_label(entry: &crate::mcp_catalog::OfficialCatalogEntry) ->
 }
 
 fn format_mcp_transport(server: &edgecrab_tools::tools::mcp_client::ConfiguredMcpServer) -> String {
-    if let Some(url) = &server.url {
-        return format!("http {url}");
-    }
-
-    let mut rendered = server.command.clone();
-    if !server.args.is_empty() {
-        rendered.push(' ');
-        rendered.push_str(&server.args.join(" "));
-    }
-    rendered
+    mcp_support::transport_summary(server)
 }
 
 fn build_configured_mcp_entry(
@@ -1488,10 +1484,9 @@ fn build_configured_mcp_entry(
 ) -> McpPresetEntry {
     let transport = format_mcp_transport(server);
     let mut detail = format!("{} | installed", transport);
-    if server.token_from_store {
-        detail.push_str(" | token-store");
-    } else if server.token_from_config {
-        detail.push_str(" | config-token");
+    let auth = mcp_support::auth_summary(server);
+    if auth != "none" {
+        detail.push_str(&format!(" | {auth}"));
     }
     if let Some(path) = &server.cwd {
         detail.push_str(&format!(" | cwd={}", path.display()));
@@ -3222,6 +3217,7 @@ impl App {
                 ("view", "Show details for a preset"),
                 ("install", "Install a controlled MCP preset"),
                 ("test", "Probe a configured MCP server"),
+                ("doctor", "Diagnose a configured MCP server"),
                 ("remove", "Remove a configured MCP server"),
             ],
             // ── Personality ───────────────────────────────────────────────────
@@ -4485,6 +4481,15 @@ impl App {
                     if let Some(entry) = self.mcp_selector.current() {
                         if entry.kind == McpEntryKind::ConfiguredServer {
                             let command = entry.test_command();
+                            self.mcp_selector.active = false;
+                            self.handle_mcp_command(command);
+                        }
+                    }
+                }
+                KeyCode::Char('c') | KeyCode::Char('C') => {
+                    if let Some(entry) = self.mcp_selector.current() {
+                        if entry.kind == McpEntryKind::ConfiguredServer {
+                            let command = entry.doctor_command();
                             self.mcp_selector.active = false;
                             self.handle_mcp_command(command);
                         }
@@ -9123,31 +9128,30 @@ impl App {
                  /mcp refresh\n\
                  /mcp search [query]\n\
                  /mcp view <preset-or-server>\n\
-                 /mcp install <preset> [name=<server-name>] [path=<directory>]\n\
+                 /mcp install <preset> [--name <server-name>|name=<server-name>] [--path <directory>|path=<directory>]\n\
                  /mcp test [server-name]\n\
+                 /mcp doctor [server-name]\n\
                  /mcp remove <server-name>",
                 OutputRole::System,
             );
             return;
         }
 
-        let parts: Vec<&str> = trimmed.split_whitespace().collect();
-        match parts.first().copied().unwrap_or_default() {
+        let parts = match mcp_support::parse_inline_command_tokens(trimmed) {
+            Ok(parts) => parts,
+            Err(err) => {
+                self.push_output(err, OutputRole::Error);
+                return;
+            }
+        };
+
+        match parts.first().map(String::as_str).unwrap_or_default() {
             "list" => match edgecrab_tools::tools::mcp_client::configured_servers() {
                 Ok(servers) if !servers.is_empty() => {
                     let mut lines = Vec::new();
                     lines.push("Configured MCP servers:".to_string());
                     for server in servers {
-                        let transport = if let Some(url) = &server.url {
-                            format!("http {url}")
-                        } else {
-                            let mut rendered = server.command;
-                            if !server.args.is_empty() {
-                                rendered.push(' ');
-                                rendered.push_str(&server.args.join(" "));
-                            }
-                            rendered
-                        };
+                        let transport = format_mcp_transport(&server);
                         lines.push(format!("- {}  {}", server.name, transport));
                     }
                     self.push_output(lines.join("\n"), OutputRole::System);
@@ -9177,14 +9181,18 @@ impl App {
                 }
             }
             "search" => {
-                let query = parts.get(1).copied();
-                if self.open_mcp_selector(query, true) == 0 {
+                let query = if parts.len() > 1 {
+                    Some(parts[1..].join(" "))
+                } else {
+                    None
+                };
+                if self.open_mcp_selector(query.as_deref(), true) == 0 {
                     self.mcp_selector.active = false;
                     self.push_output("No MCP entries matched.", OutputRole::System);
                 }
             }
             "view" => {
-                let Some(preset_name) = parts.get(1).copied() else {
+                let Some(preset_name) = parts.get(1).map(String::as_str) else {
                     self.push_output("Usage: /mcp view <preset-or-server>", OutputRole::System);
                     return;
                 };
@@ -9240,10 +9248,9 @@ impl App {
                         if !server.exclude.is_empty() {
                             lines.push(format!("Exclude: {}", server.exclude.join(", ")));
                         }
-                        if server.token_from_store {
-                            lines.push("Auth: token store".into());
-                        } else if server.token_from_config {
-                            lines.push("Auth: config bearer_token".into());
+                        let auth = mcp_support::auth_summary(&server);
+                        if auth != "none" {
+                            lines.push(format!("Auth: {auth}"));
                         }
                         self.push_output(lines.join("\n"), OutputRole::System);
                     }
@@ -9254,28 +9261,41 @@ impl App {
                 }
             }
             "install" => {
-                let Some(preset_name) = parts.get(1).copied() else {
+                let Some(preset_name) = parts.get(1).map(String::as_str) else {
                     self.push_output(
-                        "Usage: /mcp install <preset> [name=<server-name>] [path=<directory>]",
+                        "Usage: /mcp install <preset> [--name <server-name>|name=<server-name>] [--path <directory>|path=<directory>]",
                         OutputRole::System,
                     );
                     return;
                 };
-                let name = parts
-                    .iter()
-                    .skip(2)
-                    .find_map(|part| part.strip_prefix("name="));
-                let path = parts
-                    .iter()
-                    .skip(2)
-                    .find_map(|part| part.strip_prefix("path="));
+                let (path, remaining) = match mcp_support::parse_named_option(&parts[2..], "path") {
+                    Ok(parsed) => parsed,
+                    Err(err) => {
+                        self.push_output(err, OutputRole::Error);
+                        return;
+                    }
+                };
+                let (name, remaining) = match mcp_support::parse_named_option(&remaining, "name") {
+                    Ok(parsed) => parsed,
+                    Err(err) => {
+                        self.push_output(err, OutputRole::Error);
+                        return;
+                    }
+                };
+                if !remaining.is_empty() {
+                    self.push_output(
+                        format!("Unexpected MCP install arguments: {}", remaining.join(" ")),
+                        OutputRole::Error,
+                    );
+                    return;
+                }
                 let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
                 let mut config = self.load_runtime_config();
                 match crate::mcp_catalog::install_preset(
                     &mut config,
                     preset_name,
-                    name,
-                    path.map(std::path::Path::new),
+                    name.as_deref(),
+                    path.as_deref().map(std::path::Path::new),
                     &cwd,
                 ) {
                     Ok(installed) => match config.save() {
@@ -9290,7 +9310,7 @@ impl App {
                                 ));
                             }
                             message.push_str(&format!(
-                                "\nRun `/mcp test {}` to verify connectivity.",
+                                "\nRun `/mcp doctor {}` to verify connectivity and config health.",
                                 installed.name
                             ));
                             self.push_output(message, OutputRole::System);
@@ -9308,7 +9328,7 @@ impl App {
                 }
             }
             "test" => {
-                let name = parts.get(1).map(|value| (*value).to_string());
+                let name = parts.get(1).cloned();
                 let tx = self.response_tx.clone();
                 self.rt_handle.spawn(async move {
                     let targets = if let Some(name) = name {
@@ -9348,8 +9368,23 @@ impl App {
                     }
                 });
             }
+            "doctor" => {
+                let name = parts.get(1).cloned();
+                let tx = self.response_tx.clone();
+                self.rt_handle.spawn(async move {
+                    match mcp_support::render_mcp_doctor_report(name.as_deref()).await {
+                        Ok(report) => {
+                            let _ = tx.send(AgentResponse::Notice(report));
+                        }
+                        Err(err) => {
+                            let _ =
+                                tx.send(AgentResponse::Notice(format!("MCP doctor failed: {err}")));
+                        }
+                    }
+                });
+            }
             "remove" | "uninstall" | "rm" => {
-                let Some(name) = parts.get(1).copied() else {
+                let Some(name) = parts.get(1).map(String::as_str) else {
                     self.push_output("Usage: /mcp remove <server-name>", OutputRole::System);
                     return;
                 };
@@ -11105,7 +11140,7 @@ impl App {
             .split(area);
 
         let search_text = if self.mcp_selector.query.is_empty() {
-            "Search official MCP catalog + configured servers... (Enter default action, i install, t test, v view, d remove, Esc cancel)".to_string()
+            "Search official MCP catalog + configured servers... (Enter default action, i install, t test, c check, v view, d remove, Esc cancel)".to_string()
         } else {
             self.mcp_selector.query.clone()
         };
@@ -11189,6 +11224,8 @@ impl App {
             Span::styled("install  ", Style::default().fg(Color::DarkGray)),
             Span::styled("t ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("test  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("c ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("check  ", Style::default().fg(Color::DarkGray)),
             Span::styled("v ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("view  ", Style::default().fg(Color::DarkGray)),
             Span::styled("d ", Style::default().fg(Color::Rgb(110, 220, 210))),

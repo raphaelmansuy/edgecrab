@@ -656,18 +656,26 @@ mcp_servers:
 
   my-api-server:
     url: "https://my-server.example.com/mcp"
-    bearer_token: "${MY_API_TOKEN}"
+    bearer_token: "${MY_API_TOKEN}"   # env-backed bearer token works
     enabled: true
 ```
 
 ```bash
-edgecrab mcp list               # show connected MCP servers
-edgecrab mcp add server-name    # add interactively
+edgecrab mcp list                                 # show configured MCP servers
+edgecrab mcp install filesystem --path "/tmp/ws" # install a curated preset
+edgecrab mcp doctor                              # static checks + live probe
+edgecrab mcp doctor filesystem                   # diagnose one configured server
 edgecrab mcp remove server-name
-/reload-mcp                     # hot-reload in TUI without restart
+/mcp                                             # open the TUI MCP browser
+/reload-mcp                                      # hot-reload in TUI without restart
 ```
 
 The agent uses `mcp_list_tools` and `mcp_call_tool` to discover and invoke MCP server capabilities.
+The TUI MCP browser supports install, view, test, diagnose, and remove flows, and quoted
+`--path` / `name=` values are parsed safely for Unix and Windows-style paths.
+HTTP MCP servers that rely on OAuth-style bearer access tokens are supported through
+either `bearer_token`, `/mcp-token set <server> <token>`, or env-backed config values such
+as `bearer_token: "${MY_API_TOKEN}"`.
 
 ---
 
@@ -859,6 +867,7 @@ Type these inside the TUI (after `❯`):
 | `/statusbar`                             | Toggle status bar                               |
 | `/tools`                                 | List active toolsets and tools                  |
 | `/toolsets`                              | Show toolset aliases and expansions             |
+| `/mcp [subcommand]`                      | Browse, install, test, diagnose, or remove MCP servers |
 | `/reload-mcp`                            | Hot-reload MCP servers (no restart needed)      |
 | `/mcp-token <server> <token>`            | Set MCP bearer token at runtime                 |
 | `/plugins [list/install/remove]`         | Manage plugins                                  |

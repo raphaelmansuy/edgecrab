@@ -27,6 +27,7 @@ mod gateway_setup;
 mod image_models;
 mod markdown_render;
 mod mcp_catalog;
+mod mcp_support;
 mod model_discovery;
 #[cfg(target_os = "macos")]
 mod permissions;
@@ -984,7 +985,7 @@ async fn run_mcp(command: McpCommand, args: &CliArgs) -> anyhow::Result<()> {
                 );
             }
             println!(
-                "Run `edgecrab mcp test {}` to verify connectivity.",
+                "Run `edgecrab mcp doctor {}` to verify connectivity and config health.",
                 installed.name
             );
         }
@@ -1024,6 +1025,12 @@ async fn run_mcp(command: McpCommand, args: &CliArgs) -> anyhow::Result<()> {
                     }
                 }
             }
+        }
+        McpCommand::Doctor { name } => {
+            println!(
+                "{}",
+                mcp_support::render_mcp_doctor_report(name.as_deref()).await?
+            );
         }
         McpCommand::Add {
             name,

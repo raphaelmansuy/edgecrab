@@ -367,6 +367,11 @@ pub enum McpCommand {
         /// Configured MCP server name; omit to test all configured servers
         name: Option<String>,
     },
+    /// Diagnose configured MCP servers with static checks and live probe output
+    Doctor {
+        /// Configured MCP server name; omit to diagnose all configured servers
+        name: Option<String>,
+    },
     /// Add or update an MCP server
     Add {
         name: String,
@@ -847,6 +852,17 @@ mod tests {
             args.command,
             Some(Command::Mcp {
                 command: McpCommand::Install { .. }
+            })
+        ));
+    }
+
+    #[test]
+    fn parse_mcp_doctor_subcommand() {
+        let args = CliArgs::parse_from(["edgecrab", "mcp", "doctor", "github"]);
+        assert!(matches!(
+            args.command,
+            Some(Command::Mcp {
+                command: McpCommand::Doctor { .. }
             })
         ));
     }
