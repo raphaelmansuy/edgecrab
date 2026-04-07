@@ -1080,6 +1080,21 @@ impl Default for McpToolsFilterConfig {
     }
 }
 
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct McpOauthConfig {
+    pub token_url: String,
+    pub grant_type: Option<String>,
+    pub client_id: Option<String>,
+    pub client_secret: Option<String>,
+    pub auth_method: Option<String>,
+    pub scopes: Vec<String>,
+    pub audience: Option<String>,
+    pub resource: Option<String>,
+    pub refresh_token: Option<String>,
+    pub extra_params: HashMap<String, String>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct McpServerConfig {
@@ -1100,6 +1115,8 @@ pub struct McpServerConfig {
     /// Static Bearer token for HTTP MCP servers.
     /// Alternative to the token store managed by `/mcp-token`.
     pub bearer_token: Option<String>,
+    /// OAuth 2.0 token acquisition and refresh settings for HTTP MCP servers.
+    pub oauth: Option<McpOauthConfig>,
     /// Per-call tool invocation timeout in seconds (default: 30).
     pub timeout: Option<u64>,
     /// Connection / handshake timeout in seconds (default: 10).
@@ -1119,6 +1136,7 @@ impl Default for McpServerConfig {
             url: None,
             headers: HashMap::new(),
             bearer_token: None,
+            oauth: None,
             timeout: None,
             connect_timeout: None,
             tools: McpToolsFilterConfig::default(),

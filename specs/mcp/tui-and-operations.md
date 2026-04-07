@@ -21,11 +21,14 @@ The user sees a configured server in the selector but the agent cannot use it.
 Requirements:
 
 - TUI must expose a doctor/check action for configured entries.
+- TUI must expose an auth workflow that tells the operator the next action, not just the failure symptom.
 - Doctor output must distinguish:
   - bad config
   - missing command
   - invalid `cwd`
   - missing auth
+  - broken OAuth setup
+  - expired or missing cached OAuth token state
   - probe/connect failure
   - successful connection with zero tools
 
@@ -61,6 +64,16 @@ Reason:
 - The selector is already the superior UX.
 - TUI users should browse interactively by default.
 
+### `/mcp search [query]`
+
+Must open a dedicated remote MCP browser rather than reusing the local selector.
+
+Reason:
+
+- Remote discovery has different semantics from local operations.
+- Source labels and per-source notices matter when aggregating official upstream sources plus the official registry.
+- The browser must stay responsive while live registry results refresh in the background.
+
 ### Configured entries
 
 Configured entries must expose:
@@ -78,6 +91,20 @@ Catalog entries must expose:
 - `i`: install
 - `v`: view
 
+### Remote official search entries
+
+Remote official search entries must expose:
+
+- `Enter`: install when EdgeCrab has a deterministic install plan, otherwise view
+- `i`: install when supported
+- `v`: view
+- `l`: return to the local `/mcp` browser
+
+Install support is intentionally narrower than search support:
+
+- supported: bundled presets, streamable HTTP registry entries, npm stdio registry entries, PyPI stdio registry entries
+- view-only: unsupported registry transports such as SSE or package types EdgeCrab cannot launch deterministically yet
+
 ## 3. CLI Rules
 
 The CLI must remain scriptable and stable:
@@ -89,6 +116,7 @@ edgecrab mcp install filesystem --path "/tmp/workspace"
 edgecrab mcp test github
 edgecrab mcp doctor
 edgecrab mcp doctor github
+edgecrab mcp auth github
 ```
 
 The CLI is not secondary. It is the automation surface. The TUI is the operator surface.
@@ -96,6 +124,13 @@ The CLI is not secondary. It is the automation surface. The TUI is the operator 
 ## 4. Output Rules
 
 Doctor output should be compact, not verbose prose.
+
+Auth output should be operational:
+
+- active auth mode
+- cache state
+- next step
+- explicit refresh-token guidance when that flow is configured
 
 Good:
 
@@ -120,7 +155,7 @@ Claude Code excels at coding workflows, but EdgeCrab can exceed it in MCP operat
 - config-backed server lifecycle
 - hot reload
 - probe plus doctor
+- auth plus refresh-token guidance
 - TUI-native browse/test/diagnose/remove flows
 
 Hermes established the agent model. EdgeCrab should exceed it by giving MCP the same operational quality bar as model routing or gateway setup.
-

@@ -70,9 +70,11 @@ EdgeCrab already has:
 - HTTP MCP server support with bearer token storage.
 - Dynamic MCP tool registration.
 - Curated official catalog search and install.
+- Multi-source official discovery across the steering-group reference catalog, official integrations, archived upstream entries, and the official MCP Registry.
 - TUI selector overlay for configured servers and official entries.
+- Native remote `/mcp search` browser with per-source labels and install/view actions.
 - Slash commands: `/mcp`, `/reload-mcp`, `/mcp-token`.
-- CLI commands: `edgecrab mcp list|refresh|search|view|install|test|add|remove`.
+- CLI commands: `edgecrab mcp list|refresh|search|view|install|test|doctor|auth|add|remove`.
 
 The current gaps are operational, not foundational:
 
@@ -80,6 +82,7 @@ The current gaps are operational, not foundational:
 - There is no dedicated MCP diagnostic workflow that combines static config analysis with live probing.
 - TUI overlay actions are good, but not yet operator-complete.
 - Documentation is spread across README, site docs, and feature docs without one code-backed MCP control-plane spec.
+- Registry discovery is broader than install support. EdgeCrab currently auto-installs only streamable HTTP, npm stdio, and PyPI stdio registry entries; other registry transports remain view-only.
 
 ## Document Map
 
@@ -98,6 +101,7 @@ Priority 1:
 
 - Cross-platform `/mcp` TUI command parsing with quoting support.
 - Dedicated MCP doctor flow in CLI and TUI.
+- Dedicated MCP auth flow in CLI and TUI with explicit refresh-token next steps.
 
 Priority 2:
 
@@ -108,4 +112,3 @@ Priority 3:
 
 - Optional cached health state per configured server.
 - Safer reconnect and stale-connection recovery heuristics.
-

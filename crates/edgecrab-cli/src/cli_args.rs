@@ -372,6 +372,11 @@ pub enum McpCommand {
         /// Configured MCP server name; omit to diagnose all configured servers
         name: Option<String>,
     },
+    /// Explain the active MCP authentication/OAuth path for one configured server
+    Auth {
+        /// Configured MCP server name
+        name: String,
+    },
     /// Add or update an MCP server
     Add {
         name: String,
@@ -863,6 +868,17 @@ mod tests {
             args.command,
             Some(Command::Mcp {
                 command: McpCommand::Doctor { .. }
+            })
+        ));
+    }
+
+    #[test]
+    fn parse_mcp_auth_subcommand() {
+        let args = CliArgs::parse_from(["edgecrab", "mcp", "auth", "github"]);
+        assert!(matches!(
+            args.command,
+            Some(Command::Mcp {
+                command: McpCommand::Auth { .. }
             })
         ));
     }

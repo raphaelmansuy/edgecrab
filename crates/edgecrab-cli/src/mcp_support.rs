@@ -5,9 +5,10 @@
 //! duplicated parsing quirks and keeps the TUI and CLI behavior aligned.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use edgecrab_tools::tools::mcp_client::{
-    ConfiguredMcpServer, configured_servers, probe_configured_server,
+    ConfiguredMcpServer, configured_servers, probe_configured_server, read_mcp_token_status,
 };
 use edgecrab_types::ToolError;
 
@@ -134,6 +135,9 @@ pub fn auth_summary(server: &ConfiguredMcpServer) -> String {
     if has_authorization_header(server) {
         return "authorization-header".into();
     }
+    if let Some(oauth) = &server.oauth {
+        return format!("oauth2/{}", oauth.grant_type_label());
+    }
     if server.token_from_store {
         return "token-store".into();
     }
@@ -148,6 +152,30 @@ pub fn auth_summary(server: &ConfiguredMcpServer) -> String {
         return format!("custom-headers({})", server.headers.len());
     }
     "none".into()
+}
+
+fn current_epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::from_secs(0))
+        .as_secs()
+}
+
+fn format_oauth_cache_state(server_name: &str) -> Option<String> {
+    let token = read_mcp_token_status(server_name)?;
+    let expiry = match token.expires_at_epoch_secs {
+        Some(expiry) if expiry <= current_epoch_secs() => "expired".to_string(),
+        Some(expiry) => format!("expires-at={expiry}"),
+        None => "no-expiry".into(),
+    };
+    let refresh = if token.has_refresh_token {
+        "refresh=yes"
+    } else {
+        "refresh=no"
+    };
+    Some(format!(
+        "oauth-cache: access-token=yes | {refresh} | {expiry}"
+    ))
 }
 
 fn contains_unresolved_env_template(value: &str) -> bool {
@@ -247,6 +275,188 @@ pub async fn render_mcp_doctor_report(server_name: Option<&str>) -> Result<Strin
     Ok(out.join("\n"))
 }
 
+pub fn render_mcp_auth_guide(server_name: &str) -> anyhow::Result<String> {
+    let server = configured_servers()
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .into_iter()
+        .find(|server| server.name == server_name)
+        .ok_or_else(|| anyhow::anyhow!("Unknown MCP server '{server_name}'"))?;
+
+    let mut lines = vec![
+        format!("MCP Auth — {}", server.name),
+        format!("transport: {}", transport_summary(&server)),
+        format!("auth: {}", auth_summary(&server)),
+    ];
+
+    if server.url.is_none() {
+        lines
+            .push("This server uses stdio. HTTP bearer-token and OAuth flows do not apply.".into());
+        return Ok(lines.join("\n"));
+    }
+
+    if let Some(url) = &server.url {
+        lines.push(format!("url: {url}"));
+    }
+
+    if let Some(oauth) = &server.oauth {
+        let auth_method = oauth.auth_method_label();
+        lines.push(format!("oauth: token-url={}", oauth.token_url()));
+        lines.push(format!(
+            "oauth: grant={} auth-method={}",
+            oauth.grant_type_label(),
+            auth_method
+        ));
+
+        let cache_status = read_mcp_token_status(&server.name);
+        if let Some(cache) = format_oauth_cache_state(&server.name) {
+            lines.push(cache);
+        }
+
+        let has_cached_access = cache_status.is_some_and(|status| status.has_access_token);
+        let has_refresh = oauth.has_refresh_token()
+            || cache_status.is_some_and(|status| status.has_refresh_token);
+        let mut next_steps = Vec::new();
+
+        if oauth.token_url().trim().is_empty() {
+            next_steps.push(
+                "Add `oauth.token_url` in `~/.edgecrab/config.yaml`; OAuth cannot start without a token endpoint."
+                    .to_string(),
+            );
+        }
+
+        match oauth.grant_type_label() {
+            "client_credentials" => {
+                if auth_method != "none" && !oauth.has_client_id() {
+                    next_steps
+                        .push("Add `oauth.client_id` in `~/.edgecrab/config.yaml`.".to_string());
+                }
+                if auth_method != "none" && !oauth.has_client_secret() {
+                    next_steps.push(
+                        "Add `oauth.client_secret` in `~/.edgecrab/config.yaml` for the client-credentials flow.".to_string(),
+                    );
+                }
+                if next_steps.is_empty() && !has_cached_access {
+                    next_steps.push(format!(
+                        "Run `/mcp test {}` to fetch and cache an access token before the next real tool call.",
+                        server.name
+                    ));
+                } else if next_steps.is_empty() {
+                    next_steps.push(
+                        "EdgeCrab will refresh the access token automatically on expiry or after a 401."
+                            .to_string(),
+                    );
+                }
+            }
+            "refresh_token" => {
+                if !has_refresh {
+                    next_steps.push(format!(
+                        "Store a refresh token with `/mcp-token set-refresh {} <refresh-token>` or add `oauth.refresh_token` in `~/.edgecrab/config.yaml`.",
+                        server.name
+                    ));
+                } else if !has_cached_access {
+                    next_steps.push(format!(
+                        "Run `/mcp test {}` to exchange the refresh token for an access token and warm the cache.",
+                        server.name
+                    ));
+                } else {
+                    next_steps.push(
+                        "Refresh-token OAuth is ready. EdgeCrab can renew the access token automatically."
+                            .to_string(),
+                    );
+                }
+            }
+            "auto" => {
+                if has_refresh {
+                    if !has_cached_access {
+                        next_steps.push(format!(
+                            "Auto mode detected a refresh token. Run `/mcp test {}` once to exchange it for an access token.",
+                            server.name
+                        ));
+                    } else {
+                        next_steps.push(
+                            "Auto mode will prefer the refresh-token path and renew tokens automatically."
+                                .to_string(),
+                        );
+                    }
+                } else if auth_method != "none"
+                    && oauth.has_client_id()
+                    && oauth.has_client_secret()
+                {
+                    if !has_cached_access {
+                        next_steps.push(format!(
+                            "Auto mode will fall back to client credentials. Run `/mcp test {}` to fetch the first access token.",
+                            server.name
+                        ));
+                    } else {
+                        next_steps.push(
+                            "Auto mode can refresh with client credentials when the cached access token expires."
+                                .to_string(),
+                        );
+                    }
+                } else {
+                    next_steps.push(
+                        "Auto mode needs either a refresh token or usable client credentials; the current config does not provide either."
+                            .to_string(),
+                    );
+                }
+            }
+            _ => {}
+        }
+
+        lines.push("next:".into());
+        for step in next_steps {
+            lines.push(format!("- {step}"));
+        }
+        return Ok(lines.join("\n"));
+    }
+
+    if server.token_from_store {
+        lines.push("A stored bearer token is present in `~/.edgecrab/mcp-tokens/`.".into());
+        lines.push("next:".into());
+        lines.push(format!(
+            "- Run `/mcp test {}` if you want to validate the token immediately.",
+            server.name
+        ));
+        lines.push(format!(
+            "- Use `/mcp-token remove {}` to revoke the local cached token.",
+            server.name
+        ));
+        return Ok(lines.join("\n"));
+    }
+
+    if server.token_from_config {
+        lines.push("A static bearer token is configured in `~/.edgecrab/config.yaml`.".into());
+        lines.push("next:".into());
+        lines.push(format!(
+            "- Run `/mcp test {}` to validate the configured token.",
+            server.name
+        ));
+        return Ok(lines.join("\n"));
+    }
+
+    if has_authorization_header(&server) {
+        lines.push("Authorization is injected through custom HTTP headers.".into());
+        lines.push("next:".into());
+        lines.push(
+            "- Verify the custom header value is current; EdgeCrab will forward it exactly as configured."
+                .into(),
+        );
+        return Ok(lines.join("\n"));
+    }
+
+    lines.push("No HTTP auth is configured yet.".into());
+    lines.push("next:".into());
+    lines.push(format!(
+        "- Use `/mcp-token set {} <bearer-token>` for a static bearer token.",
+        server.name
+    ));
+    lines.push(
+        "- Or add `bearer_token`, `headers.Authorization`, or an `oauth` block in `~/.edgecrab/config.yaml`."
+            .into(),
+    );
+    Ok(lines.join("\n"))
+}
+
 fn analyze_server(server: &ConfiguredMcpServer) -> StaticMcpReport {
     let mut status = McpDoctorStatus::Pass;
     let mut lines = Vec::new();
@@ -268,6 +478,49 @@ fn analyze_server(server: &ConfiguredMcpServer) -> StaticMcpReport {
             lines.push("auth: none configured".into());
         } else {
             lines.push(format!("auth: {auth}"));
+        }
+
+        if let Some(oauth) = &server.oauth {
+            if oauth.token_url().trim().is_empty() {
+                status = McpDoctorStatus::Fail;
+                lines.push("oauth: token_url is missing".into());
+            } else if contains_unresolved_env_template(oauth.token_url()) {
+                status = status.max(McpDoctorStatus::Warn);
+                lines.push("oauth: token_url contains an unresolved env placeholder".into());
+            } else {
+                lines.push(format!("oauth: token-url={}", oauth.token_url()));
+            }
+
+            lines.push(format!(
+                "oauth: grant={} auth-method={}",
+                oauth.grant_type_label(),
+                oauth.auth_method_label()
+            ));
+
+            if oauth.auth_method_label() != "none" && !oauth.has_client_id() {
+                status = status.max(McpDoctorStatus::Warn);
+                lines.push("oauth: client_id is missing".into());
+            }
+            if oauth.auth_method_label() != "none"
+                && oauth.grant_type_label() == "client_credentials"
+                && !oauth.has_client_secret()
+            {
+                status = status.max(McpDoctorStatus::Warn);
+                lines.push("oauth: client_secret is missing for client-credentials flow".into());
+            }
+            if oauth.grant_type_label() == "refresh_token"
+                && !oauth.has_refresh_token()
+                && read_mcp_token_status(&server.name)
+                    .is_none_or(|status| !status.has_refresh_token)
+            {
+                status = status.max(McpDoctorStatus::Warn);
+                lines.push("oauth: refresh_token grant selected but no refresh token is configured or cached".into());
+            }
+            if let Some(cache) = format_oauth_cache_state(&server.name) {
+                lines.push(cache);
+            } else if oauth.has_refresh_token() {
+                lines.push("oauth-cache: no stored access token yet | refresh=yes".into());
+            }
         }
 
         if server
@@ -415,6 +668,7 @@ mod tests {
             name: "test".into(),
             url: None,
             bearer_token: None,
+            oauth: None,
             command: command.into(),
             args: Vec::new(),
             cwd: None,

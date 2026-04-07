@@ -924,26 +924,16 @@ async fn run_mcp(command: McpCommand, args: &CliArgs) -> anyhow::Result<()> {
             );
         }
         McpCommand::Search { query } => {
-            let results = mcp_catalog::search_official_catalog_with_refresh(query.as_deref()).await;
-            if results.is_empty() {
+            let report = mcp_catalog::search_mcp_sources(query.as_deref(), 12).await;
+            let has_results = report.groups.iter().any(|group| !group.results.is_empty());
+            if !has_results {
                 println!("No official MCP entries matched.");
                 return Ok(());
             }
-            for preset in results {
-                let install = preset
-                    .installable_preset_id
-                    .as_deref()
-                    .map(|id| format!(" install={id}"))
-                    .unwrap_or_else(|| " install=unavailable".to_string());
-                println!(
-                    "{} — {} [{}] {}{}",
-                    preset.id,
-                    preset.description,
-                    preset.tags.join(", "),
-                    preset.source_url,
-                    install,
-                );
-            }
+            println!(
+                "{}",
+                mcp_catalog::render_search_report(query.as_deref(), &report)
+            );
         }
         McpCommand::View { preset } => {
             if let Some(preset) = mcp_catalog::find_preset(&preset) {
@@ -1031,6 +1021,9 @@ async fn run_mcp(command: McpCommand, args: &CliArgs) -> anyhow::Result<()> {
                 "{}",
                 mcp_support::render_mcp_doctor_report(name.as_deref()).await?
             );
+        }
+        McpCommand::Auth { name } => {
+            println!("{}", mcp_support::render_mcp_auth_guide(&name)?);
         }
         McpCommand::Add {
             name,

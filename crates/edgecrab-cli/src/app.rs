@@ -1396,6 +1396,86 @@ impl RemoteSkillBrowser {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemoteMcpAction {
+    Install,
+    View,
+}
+
+impl RemoteMcpAction {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Install => "install",
+            Self::View => "view",
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RemoteMcpEntry {
+    id: String,
+    name: String,
+    description: String,
+    source_label: String,
+    origin: String,
+    tags: Vec<String>,
+    transport: Option<String>,
+    search_text: String,
+    install: Option<crate::mcp_catalog::McpInstallPlan>,
+}
+
+impl RemoteMcpEntry {
+    fn action(&self) -> RemoteMcpAction {
+        if self.install.is_some() {
+            RemoteMcpAction::Install
+        } else {
+            RemoteMcpAction::View
+        }
+    }
+}
+
+impl FuzzyItem for RemoteMcpEntry {
+    fn primary(&self) -> &str {
+        &self.id
+    }
+
+    fn secondary(&self) -> &str {
+        &self.search_text
+    }
+
+    fn tag(&self) -> &str {
+        &self.source_label
+    }
+}
+
+struct RemoteMcpBrowser {
+    selector: FuzzySelector<RemoteMcpEntry>,
+    notices: Vec<String>,
+    last_completed_query: Option<String>,
+    search_due_at: Option<Instant>,
+    inflight_request_id: Option<u64>,
+    next_request_id: u64,
+    loading_query: Option<String>,
+}
+
+impl RemoteMcpBrowser {
+    fn new() -> Self {
+        Self {
+            selector: FuzzySelector::new(),
+            notices: Vec::new(),
+            last_completed_query: None,
+            search_due_at: None,
+            inflight_request_id: None,
+            next_request_id: 0,
+            loading_query: None,
+        }
+    }
+
+    fn current_query(&self) -> String {
+        self.selector.query.trim().to_string()
+    }
+}
+
 /// A single MCP preset entry for the MCP browser overlay.
 #[derive(Clone)]
 struct McpPresetEntry {
@@ -1806,6 +1886,8 @@ pub struct App {
     image_model_selector: FuzzySelector<ModelEntry>,
     /// Official MCP preset selector overlay (activated by `/mcp` with no args).
     mcp_selector: FuzzySelector<McpPresetEntry>,
+    /// Remote MCP browser overlay (activated by `/mcp search`).
+    remote_mcp_browser: RemoteMcpBrowser,
     /// Skill browser overlay (activated by `/skills` with no args)
     skill_selector: FuzzySelector<SkillEntry>,
     /// Remote skill browser overlay (activated by `/skills search` or `/skills hub`)
@@ -2016,6 +2098,12 @@ enum AgentResponse {
         request_id: u64,
         query: String,
         report: edgecrab_tools::tools::skills_hub::SearchReport,
+    },
+    /// A remote MCP search completed for the given request id and query.
+    RemoteMcpSearchReady {
+        request_id: u64,
+        query: String,
+        report: crate::mcp_catalog::McpSearchReport,
     },
     /// A remote skill install/update action completed.
     RemoteSkillActionComplete { message: String, skill_name: String },
@@ -2261,6 +2349,7 @@ impl App {
             vision_model_selector: FuzzySelector::new(),
             image_model_selector: FuzzySelector::new(),
             mcp_selector: FuzzySelector::new(),
+            remote_mcp_browser: RemoteMcpBrowser::new(),
             skill_selector: FuzzySelector::new(),
             remote_skill_browser: RemoteSkillBrowser::new(),
             session_browser: FuzzySelector::new(),
@@ -2952,6 +3041,224 @@ impl App {
         (entries, notices)
     }
 
+    fn build_remote_mcp_entries(
+        report: &crate::mcp_catalog::McpSearchReport,
+    ) -> (Vec<RemoteMcpEntry>, Vec<String>) {
+        let mut entries = Vec::new();
+        let mut notices = Vec::new();
+
+        for group in &report.groups {
+            if let Some(notice) = &group.notice {
+                notices.push(format!("{}: {}", group.source.label, notice));
+            }
+
+            for entry in &group.results {
+                let description = if entry.description.trim().is_empty() {
+                    "No description available".to_string()
+                } else {
+                    unicode_trunc(entry.description.trim(), 120)
+                };
+                let transport = entry.transport.clone();
+                let search_text = format!(
+                    "{} {} {} {} {} {}",
+                    entry.id,
+                    entry.name,
+                    description,
+                    entry.origin,
+                    transport.clone().unwrap_or_default(),
+                    entry.tags.join(" ")
+                );
+
+                entries.push(RemoteMcpEntry {
+                    id: entry.id.clone(),
+                    name: entry.name.clone(),
+                    description,
+                    source_label: group.source.label.clone(),
+                    origin: entry.origin.clone(),
+                    tags: entry.tags.clone(),
+                    transport,
+                    search_text,
+                    install: entry.install.clone(),
+                });
+            }
+        }
+
+        (entries, notices)
+    }
+
+    fn open_remote_mcp_selector(&mut self, initial_query: Option<&str>) {
+        self.mcp_selector.active = false;
+        self.remote_mcp_browser.selector.active = true;
+        self.remote_mcp_browser.selector.query =
+            initial_query.map(str::trim).unwrap_or_default().to_string();
+        self.remote_mcp_browser.selector.selected = 0;
+        self.remote_mcp_browser.selector.update_filter();
+        self.remote_mcp_browser.notices.clear();
+        self.remote_mcp_browser.last_completed_query = None;
+        self.remote_mcp_browser.loading_query = None;
+        self.remote_mcp_browser.inflight_request_id = None;
+        self.schedule_remote_mcp_search(true);
+        self.needs_redraw = true;
+    }
+
+    fn schedule_remote_mcp_search(&mut self, immediate: bool) {
+        let query = self.remote_mcp_browser.current_query();
+        if query.is_empty() {
+            self.remote_mcp_browser.search_due_at = None;
+            self.remote_mcp_browser.inflight_request_id = None;
+            self.remote_mcp_browser.loading_query = None;
+            self.remote_mcp_browser.last_completed_query = None;
+            self.remote_mcp_browser.notices.clear();
+            self.remote_mcp_browser.selector.set_items(Vec::new());
+            self.needs_redraw = true;
+            return;
+        }
+
+        self.remote_mcp_browser.search_due_at = Some(if immediate {
+            Instant::now()
+        } else {
+            Instant::now() + Duration::from_millis(250)
+        });
+        self.needs_redraw = true;
+    }
+
+    fn poll_remote_mcp_search(&mut self) {
+        if !self.remote_mcp_browser.selector.active {
+            return;
+        }
+
+        let Some(deadline) = self.remote_mcp_browser.search_due_at else {
+            return;
+        };
+        if Instant::now() < deadline {
+            return;
+        }
+
+        let query = self.remote_mcp_browser.current_query();
+        self.remote_mcp_browser.search_due_at = None;
+        if query.is_empty() {
+            return;
+        }
+        if self.remote_mcp_browser.loading_query.as_deref() == Some(query.as_str()) {
+            return;
+        }
+
+        self.remote_mcp_browser.next_request_id =
+            self.remote_mcp_browser.next_request_id.saturating_add(1);
+        let request_id = self.remote_mcp_browser.next_request_id;
+        self.remote_mcp_browser.inflight_request_id = Some(request_id);
+        self.remote_mcp_browser.loading_query = Some(query.clone());
+        let tx = self.response_tx.clone();
+        self.rt_handle.spawn(async move {
+            let report = crate::mcp_catalog::search_mcp_sources(Some(&query), 12).await;
+            let _ = tx.send(AgentResponse::RemoteMcpSearchReady {
+                request_id,
+                query,
+                report,
+            });
+        });
+        self.needs_redraw = true;
+    }
+
+    fn apply_remote_mcp_search_result(
+        &mut self,
+        request_id: u64,
+        query: String,
+        report: crate::mcp_catalog::McpSearchReport,
+    ) {
+        if self.remote_mcp_browser.inflight_request_id != Some(request_id) {
+            return;
+        }
+        if self.remote_mcp_browser.current_query() != query {
+            return;
+        }
+
+        let (entries, notices) = Self::build_remote_mcp_entries(&report);
+        self.remote_mcp_browser.inflight_request_id = None;
+        self.remote_mcp_browser.loading_query = None;
+        self.remote_mcp_browser.last_completed_query = Some(query);
+        self.remote_mcp_browser.notices = notices;
+        self.remote_mcp_browser.selector.set_items(entries);
+        self.remote_mcp_browser.selector.selected = 0;
+        self.needs_redraw = true;
+    }
+
+    fn view_remote_mcp_entry(&mut self, entry: &RemoteMcpEntry) {
+        let mut lines = vec![
+            format!("Remote MCP: {}", entry.id),
+            format!("Name:       {}", entry.name),
+            format!("Source:     {}", entry.source_label),
+            format!("Why:        {}", entry.description),
+            format!("Origin:     {}", entry.origin),
+        ];
+        if let Some(transport) = &entry.transport {
+            lines.push(format!("Transport:  {transport}"));
+        }
+        if !entry.tags.is_empty() {
+            lines.push(format!("Tags:       {}", entry.tags.join(", ")));
+        }
+        let install = match &entry.install {
+            Some(crate::mcp_catalog::McpInstallPlan::Preset { preset_id }) => {
+                format!("preset {preset_id}")
+            }
+            Some(crate::mcp_catalog::McpInstallPlan::Http { url, transport, .. }) => {
+                format!("{transport} {url}")
+            }
+            Some(crate::mcp_catalog::McpInstallPlan::Stdio { command, args, .. }) => {
+                format!("stdio {} {}", command, args.join(" "))
+            }
+            None => "view-only".into(),
+        };
+        lines.push(format!("Install:    {install}"));
+        self.push_output(lines.join("\n"), OutputRole::System);
+    }
+
+    fn install_remote_mcp_entry(&mut self, entry: &RemoteMcpEntry) {
+        let Some(install) = entry.install.clone() else {
+            self.view_remote_mcp_entry(entry);
+            return;
+        };
+
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let mut config = self.load_runtime_config();
+        let search_entry = crate::mcp_catalog::McpSearchEntry {
+            id: entry.id.clone(),
+            name: entry.name.clone(),
+            description: entry.description.clone(),
+            source: entry.source_label.clone(),
+            origin: entry.origin.clone(),
+            homepage: None,
+            tags: entry.tags.clone(),
+            transport: entry.transport.clone(),
+            install: Some(install),
+        };
+
+        match crate::mcp_catalog::install_search_entry(&mut config, &search_entry, &cwd) {
+            Ok(installed) => match config.save() {
+                Ok(()) => {
+                    edgecrab_tools::tools::mcp_client::reload_mcp_connections();
+                    let mut message = format!("Configured MCP server '{}'.", installed.name);
+                    if !installed.warnings.is_empty() {
+                        message.push_str(&format!(
+                            "\nFollow-up required: {}",
+                            installed.warnings.join(", ")
+                        ));
+                    }
+                    message.push_str(&format!(
+                        "\nRun `/mcp doctor {}` to verify connectivity and config health.",
+                        installed.name
+                    ));
+                    self.push_output(message, OutputRole::System);
+                }
+                Err(err) => self.push_output(
+                    format!("MCP config save failed after install planning: {err}"),
+                    OutputRole::Error,
+                ),
+            },
+            Err(err) => self.push_output(format!("MCP install failed: {err}"), OutputRole::Error),
+        }
+    }
+
     fn open_remote_skill_selector(&mut self, initial_query: Option<&str>) {
         self.skill_selector.active = false;
         self.remote_skill_browser.selector.active = true;
@@ -3207,17 +3514,26 @@ impl App {
             // ── MCP token management ──────────────────────────────────────────
             "mcp-token" => &[
                 ("set", "Store a token: set <server-id> <token>"),
+                (
+                    "set-refresh",
+                    "Store a refresh token: set-refresh <server-id> <token>",
+                ),
+                ("status", "Show cached token state for one server"),
                 ("remove", "Delete a token: remove <server-id>"),
                 ("list", "List stored server tokens"),
             ],
             "mcp" => &[
                 ("list", "List configured MCP servers"),
                 ("refresh", "Refresh the official MCP catalog cache"),
-                ("search", "Search configured servers + official MCP catalog"),
+                (
+                    "search",
+                    "Search official MCP sources + the official registry",
+                ),
                 ("view", "Show details for a preset"),
                 ("install", "Install a controlled MCP preset"),
                 ("test", "Probe a configured MCP server"),
                 ("doctor", "Diagnose a configured MCP server"),
+                ("auth", "Explain the active auth/OAuth path for a server"),
                 ("remove", "Remove a configured MCP server"),
             ],
             // ── Personality ───────────────────────────────────────────────────
@@ -4133,7 +4449,9 @@ impl App {
                 self.vision_model_selector.active = false;
                 self.image_model_selector.active = false;
                 self.mcp_selector.active = false;
+                self.remote_mcp_browser.selector.active = false;
                 self.skill_selector.active = false;
+                self.remote_skill_browser.selector.active = false;
                 self.needs_redraw = true;
                 let now = Instant::now();
                 let is_double = self
@@ -4509,6 +4827,65 @@ impl App {
                         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                 {
                     self.mcp_selector.push_char(c);
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        if self.remote_mcp_browser.selector.active {
+            match key.code {
+                KeyCode::Esc => {
+                    self.remote_mcp_browser.selector.active = false;
+                    self.needs_redraw = true;
+                }
+                KeyCode::Enter => {
+                    if let Some(entry) = self.remote_mcp_browser.selector.current().cloned() {
+                        match entry.action() {
+                            RemoteMcpAction::Install => self.install_remote_mcp_entry(&entry),
+                            RemoteMcpAction::View => self.view_remote_mcp_entry(&entry),
+                        }
+                    }
+                }
+                KeyCode::Char('i') | KeyCode::Char('I') => {
+                    if let Some(entry) = self.remote_mcp_browser.selector.current().cloned() {
+                        if entry.install.is_some() {
+                            self.install_remote_mcp_entry(&entry);
+                        } else {
+                            self.push_output(
+                                "This remote MCP entry is view-only. Use Enter or v to inspect it.",
+                                OutputRole::System,
+                            );
+                        }
+                    }
+                }
+                KeyCode::Char('v') | KeyCode::Char('V') => {
+                    if let Some(entry) = self.remote_mcp_browser.selector.current().cloned() {
+                        self.view_remote_mcp_entry(&entry);
+                    }
+                }
+                KeyCode::Char('r') | KeyCode::Char('R') => {
+                    self.schedule_remote_mcp_search(true);
+                }
+                KeyCode::Char('l') | KeyCode::Char('L') => {
+                    self.remote_mcp_browser.selector.active = false;
+                    self.open_mcp_selector(None, false);
+                }
+                KeyCode::Up => self.remote_mcp_browser.selector.move_up(),
+                KeyCode::Down => self.remote_mcp_browser.selector.move_down(),
+                KeyCode::PageUp => self.remote_mcp_browser.selector.page_up(),
+                KeyCode::PageDown => self.remote_mcp_browser.selector.page_down(),
+                KeyCode::Backspace => {
+                    self.remote_mcp_browser.selector.pop_char();
+                    self.schedule_remote_mcp_search(false);
+                }
+                KeyCode::Char(c)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    self.remote_mcp_browser.selector.push_char(c);
+                    self.schedule_remote_mcp_search(false);
                 }
                 _ => {}
             }
@@ -5896,6 +6273,13 @@ impl App {
                     report,
                 } => {
                     self.apply_remote_skill_search_result(request_id, query, report);
+                }
+                AgentResponse::RemoteMcpSearchReady {
+                    request_id,
+                    query,
+                    report,
+                } => {
+                    self.apply_remote_mcp_search_result(request_id, query, report);
                 }
                 AgentResponse::RemoteSkillActionComplete {
                     message,
@@ -9123,14 +9507,15 @@ impl App {
         }
         if trimmed.eq_ignore_ascii_case("help") {
             self.push_output(
-                "Usage: /mcp            (browse configured servers + official MCP catalog)\n\
+                "Usage: /mcp            (browse configured servers + bundled official MCP catalog)\n\
                  /mcp list\n\
                  /mcp refresh\n\
-                 /mcp search [query]\n\
+                 /mcp search [query]  (search official MCP sources + registry)\n\
                  /mcp view <preset-or-server>\n\
                  /mcp install <preset> [--name <server-name>|name=<server-name>] [--path <directory>|path=<directory>]\n\
                  /mcp test [server-name]\n\
                  /mcp doctor [server-name]\n\
+                 /mcp auth <server-name>\n\
                  /mcp remove <server-name>",
                 OutputRole::System,
             );
@@ -9186,10 +9571,7 @@ impl App {
                 } else {
                     None
                 };
-                if self.open_mcp_selector(query.as_deref(), true) == 0 {
-                    self.mcp_selector.active = false;
-                    self.push_output("No MCP entries matched.", OutputRole::System);
-                }
+                self.open_remote_mcp_selector(query.as_deref());
             }
             "view" => {
                 let Some(preset_name) = parts.get(1).map(String::as_str) else {
@@ -9251,6 +9633,14 @@ impl App {
                         let auth = mcp_support::auth_summary(&server);
                         if auth != "none" {
                             lines.push(format!("Auth: {auth}"));
+                        }
+                        if let Some(oauth) = &server.oauth {
+                            lines.push(format!("OAuth token URL: {}", oauth.token_url()));
+                            lines.push(format!(
+                                "OAuth flow: {} via {}",
+                                oauth.grant_type_label(),
+                                oauth.auth_method_label()
+                            ));
                         }
                         self.push_output(lines.join("\n"), OutputRole::System);
                     }
@@ -9382,6 +9772,18 @@ impl App {
                         }
                     }
                 });
+            }
+            "auth" => {
+                let Some(name) = parts.get(1) else {
+                    self.push_output("Usage: /mcp auth <server-name>", OutputRole::System);
+                    return;
+                };
+                match mcp_support::render_mcp_auth_guide(name) {
+                    Ok(report) => self.push_output(report, OutputRole::System),
+                    Err(err) => {
+                        self.push_output(format!("MCP auth failed: {err}"), OutputRole::Error)
+                    }
+                }
             }
             "remove" | "uninstall" | "rm" => {
                 let Some(name) = parts.get(1).map(String::as_str) else {
@@ -9776,18 +10178,93 @@ impl App {
     /// Manage MCP OAuth Bearer tokens stored at ~/.edgecrab/mcp-tokens/.
     ///
     /// Subcommands:
-    ///   set <server> <token>  — store a Bearer token for an HTTP MCP server
+    ///   set <server> <token>  — store an access token for an HTTP MCP server
+    ///   set-refresh <server> <token>  — store a refresh token for OAuth flows
+    ///   status <server>       — show cached token state for one server
     ///   remove <server>       — delete stored tokens for a server
     ///   list                  — list servers with stored tokens
     fn handle_mcp_token(&mut self, args: String) {
-        use edgecrab_tools::tools::mcp_client::{remove_mcp_token, write_mcp_token};
+        use edgecrab_tools::tools::mcp_client::{
+            read_mcp_token_status, remove_mcp_token, write_mcp_refresh_token, write_mcp_token,
+        };
 
-        let parts: Vec<&str> = args.trim().splitn(3, ' ').collect();
+        let parts = match mcp_support::parse_inline_command_tokens(args.trim()) {
+            Ok(parts) => parts,
+            Err(err) => {
+                self.push_output(err, OutputRole::Error);
+                return;
+            }
+        };
+
+        if parts.is_empty() || matches!(parts.first().map(String::as_str), Some("list")) {
+            // List servers that have a stored token by reading the tokens dir
+            let dir = edgecrab_core::edgecrab_home().join("mcp-tokens");
+            {
+                if dir.is_dir() {
+                    let entries: Vec<String> = std::fs::read_dir(&dir)
+                        .ok()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|e| e.ok())
+                        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+                        .filter_map(|e| {
+                            e.path()
+                                .file_stem()
+                                .map(|s| s.to_string_lossy().into_owned())
+                        })
+                        .collect();
+                    if entries.is_empty() {
+                        self.push_output(
+                            "No MCP OAuth tokens stored.\n\
+                             Use: /mcp-token set <server> <bearer-token>",
+                            OutputRole::System,
+                        );
+                    } else {
+                        let mut out = String::from("Stored MCP OAuth tokens:\n");
+                        for srv in &entries {
+                            if let Some(status) = read_mcp_token_status(srv) {
+                                out.push_str(&format!(
+                                    "  {srv}  access={} refresh={}\n",
+                                    if status.has_access_token { "yes" } else { "no" },
+                                    if status.has_refresh_token {
+                                        "yes"
+                                    } else {
+                                        "no"
+                                    },
+                                ));
+                            } else {
+                                out.push_str(&format!("  {srv}\n"));
+                            }
+                        }
+                        out.push_str("\nUsage:\n");
+                        out.push_str(
+                            "  /mcp-token set <server> <token>          — store access token\n",
+                        );
+                        out.push_str(
+                            "  /mcp-token set-refresh <server> <token>  — store refresh token\n",
+                        );
+                        out.push_str(
+                            "  /mcp-token status <server>               — show cached token state\n",
+                        );
+                        out.push_str("  /mcp-token remove <server>               — remove token\n");
+                        self.push_output(out, OutputRole::System);
+                    }
+                    return;
+                }
+            }
+            self.push_output(
+                "No MCP OAuth tokens stored.\n\
+                 Use: /mcp-token set <server> <bearer-token>",
+                OutputRole::System,
+            );
+            return;
+        }
+
         match parts.as_slice() {
-            ["set", server, token] => match write_mcp_token(server, token) {
+            [action, server, token] if action == "set" => match write_mcp_token(server, token) {
                 Ok(()) => {
                     self.push_output(
-                        format!("MCP token stored for server '{server}'."),
+                        format!("MCP access token stored for server '{server}'."),
                         OutputRole::System,
                     );
                 }
@@ -9795,61 +10272,54 @@ impl App {
                     self.push_output(format!("Failed to store MCP token: {e}"), OutputRole::Error);
                 }
             },
-            ["remove", server] => {
+            [action, server, token] if action == "set-refresh" => {
+                match write_mcp_refresh_token(server, token) {
+                    Ok(()) => self.push_output(
+                        format!("MCP refresh token stored for server '{server}'."),
+                        OutputRole::System,
+                    ),
+                    Err(e) => self.push_output(
+                        format!("Failed to store MCP refresh token: {e}"),
+                        OutputRole::Error,
+                    ),
+                }
+            }
+            [action, server] if action == "status" => {
+                if let Some(status) = read_mcp_token_status(server) {
+                    let expiry = status
+                        .expires_at_epoch_secs
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "none".into());
+                    self.push_output(
+                        format!(
+                            "MCP token cache for '{server}': access_token={} refresh_token={} expires_at={expiry}",
+                            if status.has_access_token { "yes" } else { "no" },
+                            if status.has_refresh_token { "yes" } else { "no" },
+                        ),
+                        OutputRole::System,
+                    );
+                } else {
+                    self.push_output(
+                        format!("No cached MCP token state found for server '{server}'."),
+                        OutputRole::System,
+                    );
+                }
+            }
+            [action, server] if action == "remove" => {
                 remove_mcp_token(server);
                 self.push_output(
                     format!("MCP token removed for server '{server}'."),
                     OutputRole::System,
                 );
             }
-            ["list"] | [] | [""] => {
-                // List servers that have a stored token by reading the tokens dir
-                let dir = edgecrab_core::edgecrab_home().join("mcp-tokens");
-                {
-                    if dir.is_dir() {
-                        let entries: Vec<String> = std::fs::read_dir(&dir)
-                            .ok()
-                            .into_iter()
-                            .flatten()
-                            .filter_map(|e| e.ok())
-                            .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
-                            .filter_map(|e| {
-                                e.path()
-                                    .file_stem()
-                                    .map(|s| s.to_string_lossy().into_owned())
-                            })
-                            .collect();
-                        if entries.is_empty() {
-                            self.push_output(
-                                "No MCP OAuth tokens stored.\n\
-                                 Use: /mcp-token set <server> <bearer-token>",
-                                OutputRole::System,
-                            );
-                        } else {
-                            let mut out = String::from("Stored MCP OAuth tokens:\n");
-                            for srv in &entries {
-                                out.push_str(&format!("  {srv}\n"));
-                            }
-                            out.push_str("\nUsage:\n");
-                            out.push_str("  /mcp-token set <server> <token>  — store token\n");
-                            out.push_str("  /mcp-token remove <server>       — remove token\n");
-                            self.push_output(out, OutputRole::System);
-                        }
-                        return;
-                    }
-                }
-                self.push_output(
-                    "No MCP OAuth tokens stored.\n\
-                     Use: /mcp-token set <server> <bearer-token>",
-                    OutputRole::System,
-                );
-            }
             _ => {
                 self.push_output(
                     "Usage:\n\
-                     /mcp-token set <server> <token>  — store Bearer token\n\
-                     /mcp-token remove <server>        — remove stored token\n\
-                     /mcp-token list                   — list servers with tokens",
+                     /mcp-token set <server> <token>          — store access token\n\
+                     /mcp-token set-refresh <server> <token>  — store refresh token\n\
+                     /mcp-token status <server>               — show cached token state\n\
+                     /mcp-token remove <server>               — remove stored token\n\
+                     /mcp-token list                          — list servers with tokens",
                     OutputRole::System,
                 );
             }
@@ -10333,6 +10803,10 @@ impl App {
         // MCP selector overlay (full screen, same family as /model)
         if self.mcp_selector.active {
             self.render_mcp_selector(frame, frame.area());
+        }
+
+        if self.remote_mcp_browser.selector.active {
+            self.render_remote_mcp_selector(frame, frame.area());
         }
 
         // Skill selector overlay (full screen, takes precedence over model selector)
@@ -11234,6 +11708,269 @@ impl App {
             Span::styled("cancel  ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 format!("{} entries", filtered.len()),
+                Style::default().fg(Color::Rgb(100, 120, 120)),
+            ),
+        ]));
+        frame.render_widget(help, chunks[2]);
+    }
+
+    fn render_remote_mcp_selector(&self, frame: &mut Frame, area: Rect) {
+        frame.render_widget(Clear, area);
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ])
+            .split(area);
+        let body = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
+            .split(chunks[1]);
+
+        let browser = &self.remote_mcp_browser;
+        let query = browser.current_query();
+        let search_text = if browser.selector.query.is_empty() {
+            "Type to search official MCP sources and the official MCP Registry".to_string()
+        } else {
+            browser.selector.query.clone()
+        };
+        let search_style = if browser.selector.query.is_empty() {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let border_style = if browser.inflight_request_id.is_some() {
+            Style::default().fg(Color::Rgb(110, 220, 210))
+        } else {
+            Style::default().fg(Color::Rgb(90, 190, 220))
+        };
+        let title = if browser.inflight_request_id.is_some() {
+            " Remote MCP  Searching… "
+        } else {
+            " Remote MCP "
+        };
+        let search = Paragraph::new(Line::from(vec![
+            Span::styled("  ⛓ ", Style::default().fg(Color::Rgb(90, 190, 220))),
+            Span::styled(search_text, search_style),
+        ]))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(border_style)
+                .title(title),
+        );
+        frame.render_widget(search, chunks[0]);
+
+        let filtered = &browser.selector.filtered;
+        let selected = browser.selector.selected;
+        let max_visible = body[0].height as usize;
+        let scroll_start = if selected >= max_visible {
+            selected - max_visible + 1
+        } else {
+            0
+        };
+
+        let items: Vec<ListItem> = if filtered.is_empty() {
+            let empty_text = if query.is_empty() {
+                "  Start typing to search official MCP sources."
+            } else if browser.inflight_request_id.is_some() {
+                "  Searching official MCP sources…"
+            } else {
+                "  No MCP servers matched this query."
+            };
+            vec![ListItem::new(Line::from(Span::styled(
+                empty_text.to_string(),
+                Style::default().fg(Color::Rgb(120, 120, 135)),
+            )))]
+        } else {
+            filtered
+                .iter()
+                .skip(scroll_start)
+                .take(max_visible)
+                .enumerate()
+                .map(|(vis_idx, &entry_idx)| {
+                    let entry = &browser.selector.items[entry_idx];
+                    let is_selected = vis_idx + scroll_start == selected;
+                    let bg = if is_selected {
+                        Color::Rgb(24, 36, 44)
+                    } else {
+                        Color::Rgb(18, 24, 26)
+                    };
+                    let source_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(145, 170, 170))
+                    } else {
+                        Style::default().fg(Color::Rgb(100, 120, 120))
+                    };
+                    let action_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(210, 240, 175))
+                    } else {
+                        Style::default().fg(Color::Rgb(135, 165, 110))
+                    };
+                    let main_style = if is_selected {
+                        Style::default()
+                            .bg(bg)
+                            .fg(Color::Rgb(110, 220, 210))
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Rgb(210, 220, 220))
+                    };
+                    let desc_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(160, 180, 180))
+                    } else {
+                        Style::default().fg(Color::Rgb(120, 140, 140))
+                    };
+                    ListItem::new(Line::from(vec![
+                        Span::styled(format!("  {:<12}", entry.source_label), source_style),
+                        Span::styled(format!("{:<8}", entry.action().label()), action_style),
+                        Span::styled(unicode_trunc(&entry.id, 40), main_style),
+                        Span::raw("  "),
+                        Span::styled(unicode_trunc(&entry.description, 34), desc_style),
+                    ]))
+                })
+                .collect()
+        };
+
+        frame.render_widget(
+            List::new(items).style(Style::default().bg(Color::Rgb(18, 24, 26))),
+            body[0],
+        );
+
+        let mut detail_lines = Vec::new();
+        if let Some(entry) = browser.selector.current() {
+            detail_lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{} ", entry.source_label),
+                    Style::default()
+                        .fg(Color::Rgb(110, 220, 210))
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(entry.id.clone()),
+            ]));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(entry.description.clone()));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(vec![
+                Span::styled("Origin: ", Style::default().fg(Color::Rgb(145, 170, 170))),
+                Span::raw(entry.origin.clone()),
+            ]));
+            detail_lines.push(Line::from(vec![
+                Span::styled("Action: ", Style::default().fg(Color::Rgb(145, 170, 170))),
+                Span::raw(match entry.action() {
+                    RemoteMcpAction::Install => "Default action: install",
+                    RemoteMcpAction::View => "Default action: view",
+                }),
+            ]));
+            if let Some(transport) = &entry.transport {
+                detail_lines.push(Line::from(vec![
+                    Span::styled(
+                        "Transport: ",
+                        Style::default().fg(Color::Rgb(145, 170, 170)),
+                    ),
+                    Span::raw(transport.clone()),
+                ]));
+            }
+            if let Some(crate::mcp_catalog::McpInstallPlan::Http {
+                required_headers, ..
+            }) = &entry.install
+            {
+                if !required_headers.is_empty() {
+                    detail_lines.push(Line::from(vec![
+                        Span::styled("Auth: ", Style::default().fg(Color::Rgb(145, 170, 170))),
+                        Span::raw(format!(
+                            "manual header setup required: {}",
+                            required_headers.join(", ")
+                        )),
+                    ]));
+                }
+            }
+            if !entry.tags.is_empty() {
+                detail_lines.push(Line::from(vec![
+                    Span::styled("Tags: ", Style::default().fg(Color::Rgb(145, 170, 170))),
+                    Span::raw(entry.tags.join(", ")),
+                ]));
+            }
+            if entry.install.is_none() {
+                detail_lines.push(Line::from(""));
+                detail_lines.push(Line::from(Span::styled(
+                    "This entry is searchable but not auto-installable with the current EdgeCrab MCP transport support.",
+                    Style::default().fg(Color::Rgb(255, 180, 120)),
+                )));
+            }
+        } else if query.is_empty() {
+            detail_lines.push(Line::from(Span::styled(
+                "Official Sources",
+                Style::default()
+                    .fg(Color::Rgb(110, 220, 210))
+                    .add_modifier(Modifier::BOLD),
+            )));
+            detail_lines.push(Line::from("- MCP Reference"));
+            detail_lines.push(Line::from("- Official Apps"));
+            detail_lines.push(Line::from("- Archived"));
+            detail_lines.push(Line::from("- MCP Registry"));
+        } else if browser.inflight_request_id.is_some() {
+            detail_lines.push(Line::from("Searching official MCP sources…"));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(
+                "The selector stays responsive while live registry results are fetched in the background.",
+            ));
+        } else {
+            detail_lines.push(Line::from("No results for the current query."));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(
+                "Try a broader term like github, database, browser, time, or auth.",
+            ));
+        }
+
+        if !browser.notices.is_empty() {
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(Span::styled(
+                "Source Notes",
+                Style::default()
+                    .fg(Color::Rgb(255, 191, 0))
+                    .add_modifier(Modifier::BOLD),
+            )));
+            for notice in browser.notices.iter().take(4) {
+                detail_lines.push(Line::from(format!("- {}", unicode_trunc(notice, 120))));
+            }
+        }
+
+        let detail = Paragraph::new(Text::from(detail_lines))
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Rgb(60, 80, 84)))
+                    .title(" Details "),
+            );
+        frame.render_widget(detail, body[1]);
+
+        let status_text = if browser.inflight_request_id.is_some() {
+            "searching"
+        } else if !query.is_empty() && filtered.is_empty() {
+            "no matches"
+        } else {
+            "matches"
+        };
+        let help = Paragraph::new(Line::from(vec![
+            Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("browse  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Enter ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("default action  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("I ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("install  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("V ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("view  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("R ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("refresh  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("L ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("local browser  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Esc ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("cancel  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{} {}", filtered.len(), status_text),
                 Style::default().fg(Color::Rgb(100, 120, 120)),
             ),
         ]));
@@ -12419,6 +13156,7 @@ fn event_loop(
         // Check for agent responses first (non-blocking)
         app.check_responses();
         app.poll_remote_skill_search();
+        app.poll_remote_mcp_search();
 
         // Advance spinner on each tick
         let now_elapsed = last_tick.elapsed();
@@ -12833,6 +13571,7 @@ mod tests {
             name: "local-git".into(),
             url: None,
             bearer_token: None,
+            oauth: None,
             command: "uvx".into(),
             args: vec![
                 "mcp-server-git".into(),
@@ -12958,6 +13697,75 @@ mod tests {
         unsafe {
             std::env::remove_var("EDGECRAB_HOME");
         }
+    }
+
+    #[tokio::test]
+    async fn mcp_search_command_opens_remote_browser_with_query() {
+        let mut app = App::new();
+
+        app.handle_mcp_command("search github".into());
+
+        assert!(app.remote_mcp_browser.selector.active);
+        assert_eq!(app.remote_mcp_browser.selector.query, "github");
+    }
+
+    #[test]
+    fn build_remote_mcp_entries_preserves_source_notices_and_actions() {
+        let report = crate::mcp_catalog::McpSearchReport {
+            groups: vec![
+                crate::mcp_catalog::McpSearchGroup {
+                    source: crate::mcp_catalog::McpSearchSourceInfo {
+                        id: "mcp-reference".into(),
+                        label: "MCP Reference".into(),
+                        origin: "https://github.com/modelcontextprotocol/servers".into(),
+                        trust_level: "official".into(),
+                    },
+                    results: vec![crate::mcp_catalog::McpSearchEntry {
+                        id: "time".into(),
+                        name: "Time".into(),
+                        description: "Timezone server".into(),
+                        source: "official-catalog".into(),
+                        origin:
+                            "https://github.com/modelcontextprotocol/servers/tree/main/src/time"
+                                .into(),
+                        homepage: None,
+                        tags: vec!["official".into(), "reference".into()],
+                        transport: None,
+                        install: Some(crate::mcp_catalog::McpInstallPlan::Preset {
+                            preset_id: "time".into(),
+                        }),
+                    }],
+                    notice: None,
+                },
+                crate::mcp_catalog::McpSearchGroup {
+                    source: crate::mcp_catalog::McpSearchSourceInfo {
+                        id: "mcp-registry".into(),
+                        label: "MCP Registry".into(),
+                        origin: "https://registry.modelcontextprotocol.io".into(),
+                        trust_level: "official".into(),
+                    },
+                    results: vec![crate::mcp_catalog::McpSearchEntry {
+                        id: "vendor/view-only".into(),
+                        name: "View Only".into(),
+                        description: "Needs unsupported transport".into(),
+                        source: "mcp-registry".into(),
+                        origin: "https://registry.modelcontextprotocol.io".into(),
+                        homepage: None,
+                        tags: vec!["official".into(), "registry".into(), "view-only".into()],
+                        transport: Some("sse".into()),
+                        install: None,
+                    }],
+                    notice: Some("Registry search failed over to cached results".into()),
+                },
+            ],
+        };
+
+        let (entries, notices) = App::build_remote_mcp_entries(&report);
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].action(), RemoteMcpAction::Install);
+        assert_eq!(entries[1].action(), RemoteMcpAction::View);
+        assert!(notices.iter().any(|notice| notice.contains("MCP Registry")));
     }
 
     #[test]
