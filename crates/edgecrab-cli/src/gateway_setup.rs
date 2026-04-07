@@ -2265,6 +2265,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    #[serial_test::serial(edgecrab_home_env)]
     fn save_env_key_updates_exact_match_only() {
         let _guard = crate::gateway_catalog::TEST_ENV_LOCK
             .lock()
@@ -2288,6 +2289,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(edgecrab_home_env)]
     fn remove_env_key_deletes_only_target_key() {
         let _guard = crate::gateway_catalog::TEST_ENV_LOCK
             .lock()

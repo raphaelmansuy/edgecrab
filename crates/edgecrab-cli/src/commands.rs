@@ -28,6 +28,8 @@
 
 use std::collections::HashMap;
 
+use edgecrab_core::{DiscoveryAvailability, live_discovery_availability};
+
 /// Result of executing a slash command.
 #[allow(dead_code)]
 #[derive(Debug)]
@@ -373,30 +375,7 @@ impl CommandRegistry {
             name: "provider",
             aliases: &["providers"],
             description: "List available LLM providers",
-            handler: |_| {
-                CommandResult::Output(
-                    "Available providers (set via env vars):\n\
-                     \n\
-                     copilot          — GitHub Copilot (GITHUB_COPILOT_TOKEN or VS Code IPC)\n\
-                     openai           — OpenAI (OPENAI_API_KEY)\n\
-                     anthropic        — Anthropic Claude (ANTHROPIC_API_KEY)\n\
-                     google           — Google Gemini AI Studio (GEMINI_API_KEY or GOOGLE_API_KEY)\n\
-                     vertexai         — Google VertexAI / Gemini (gcloud ADC + GOOGLE_CLOUD_PROJECT)\n\
-                                        GOOGLE_CLOUD_PROJECT is auto-detected from `gcloud config` if unset.\n\
-                                        Usage: vertexai/gemini-2.5-flash\n\
-                     azure            — Azure OpenAI (AZURE_OPENAI_API_KEY + endpoint)\n\
-                     xai              — xAI Grok (XAI_API_KEY)\n\
-                     mistral          — Mistral (MISTRAL_API_KEY)\n\
-                     groq             — Groq (GROQ_API_KEY)\n\
-                     cohere           — Cohere (COHERE_API_KEY)\n\
-                     perplexity       — Perplexity (PERPLEXITY_API_KEY)\n\
-                     deepseek         — DeepSeek (DEEPSEEK_API_KEY)\n\
-                     ollama           — Ollama (local, OLLAMA_BASE_URL)\n\
-                     lmstudio         — LM Studio (local, LMSTUDIO_BASE_URL)\n\
-                     \nUsage: /model <provider>/<model-name>"
-                        .into(),
-                )
-            },
+            handler: |_| CommandResult::Output(provider_help_text()),
         });
 
         // ── Session commands ──────────────────────────────────────────
@@ -930,6 +909,51 @@ impl CommandRegistry {
     }
 }
 
+fn provider_help_text() -> String {
+    fn discovery_note(provider: &str) -> String {
+        match live_discovery_availability(provider) {
+            DiscoveryAvailability::Supported => "live discovery".to_string(),
+            DiscoveryAvailability::FeatureGated(feature) => {
+                format!("live discovery via `{feature}`")
+            }
+            DiscoveryAvailability::Unsupported => "static catalog".to_string(),
+        }
+    }
+
+    format!(
+        "Available providers (set via env vars):\n\
+         \n\
+         copilot          — GitHub Copilot (GITHUB_COPILOT_TOKEN or VS Code IPC, {})\n\
+         openai           — OpenAI (OPENAI_API_KEY, {})\n\
+         anthropic        — Anthropic Claude (ANTHROPIC_API_KEY, {})\n\
+         google           — Google Gemini AI Studio (GEMINI_API_KEY or GOOGLE_API_KEY, {})\n\
+         vertexai         — Google VertexAI / Gemini (gcloud ADC + GOOGLE_CLOUD_PROJECT, {})\n\
+                            GOOGLE_CLOUD_PROJECT is auto-detected from `gcloud config` if unset.\n\
+                            Usage: vertexai/gemini-2.5-flash\n\
+         bedrock          — AWS Bedrock (AWS credential chain + AWS_REGION, {})\n\
+         azure            — Azure OpenAI (AZURE_OPENAI_API_KEY + endpoint, static catalog)\n\
+         xai              — xAI Grok (XAI_API_KEY, static catalog)\n\
+         mistral          — Mistral (MISTRAL_API_KEY, static catalog)\n\
+         groq             — Groq (GROQ_API_KEY, static catalog)\n\
+         cohere           — Cohere (COHERE_API_KEY, static catalog)\n\
+         perplexity       — Perplexity (PERPLEXITY_API_KEY, static catalog)\n\
+         deepseek         — DeepSeek (DEEPSEEK_API_KEY, static catalog)\n\
+         ollama           — Ollama (local, OLLAMA_BASE_URL or OLLAMA_HOST, {})\n\
+         lmstudio         — LM Studio (local, LMSTUDIO_BASE_URL or LMSTUDIO_HOST, {})\n\
+         openrouter       — OpenRouter (OPENROUTER_API_KEY, {})\n\
+         \nUsage: /model <provider>/<model-name>",
+        discovery_note("copilot"),
+        discovery_note("openai"),
+        discovery_note("anthropic"),
+        discovery_note("google"),
+        discovery_note("vertexai"),
+        discovery_note("bedrock"),
+        discovery_note("ollama"),
+        discovery_note("lmstudio"),
+        discovery_note("openrouter"),
+    )
+}
+
 fn help_text() -> String {
     let permissions_help = if cfg!(target_os = "macos") {
         "                       /permissions, /perm   — Inspect or bootstrap macOS permissions\n"
@@ -1157,6 +1181,13 @@ mod tests {
             reg.dispatch("/vision_model status"),
             Some(CommandResult::ShowVisionModel)
         ));
+    }
+
+    #[test]
+    fn provider_help_mentions_bedrock() {
+        let help = provider_help_text();
+        assert!(help.contains("bedrock"));
+        assert!(help.contains("AWS Bedrock"));
     }
 
     #[test]

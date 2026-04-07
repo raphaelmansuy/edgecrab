@@ -182,10 +182,7 @@ impl CoreSubAgentRunner {
 
         // If provider/model is explicitly requested, create that provider.
         if let Some((provider_name, model_name)) = raw_model.split_once('/') {
-            let canonical = match provider_name {
-                "copilot" => "vscode-copilot",
-                other => other,
-            };
+            let canonical = edgecrab_tools::vision_models::normalize_provider_name(provider_name);
             if canonical == "vscode-copilot" {
                 let provider = VsCodeCopilotProvider::new()
                     .model(model_name)
@@ -201,7 +198,7 @@ impl CoreSubAgentRunner {
             }
 
             let provider =
-                ProviderFactory::create_llm_provider(canonical, model_name).map_err(|e| {
+                ProviderFactory::create_llm_provider(&canonical, model_name).map_err(|e| {
                     format!(
                         "Failed to create delegation provider '{}' for model '{}': {}",
                         canonical, model_name, e

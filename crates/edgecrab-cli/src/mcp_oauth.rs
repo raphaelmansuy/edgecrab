@@ -806,6 +806,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(edgecrab_home_env)]
     async fn authorization_code_login_supports_dynamic_loopback_redirects() {
         let _guard = env_lock().lock().await;
         let (base_url, shutdown_tx, state) = spawn_browser_oauth_server().await;

@@ -1359,6 +1359,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(edgecrab_home_env)]
     fn cached_catalog_falls_back_to_snapshot() {
         let _home = TempEdgecrabHome::new();
         let entries = load_official_catalog_cached();
@@ -1366,6 +1367,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(edgecrab_home_env)]
     fn search_official_catalog_matches_official_entry_metadata() {
         let _home = TempEdgecrabHome::new();
         write_cached_official_catalog(&[OfficialCatalogEntry {

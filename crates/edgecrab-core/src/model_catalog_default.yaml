@@ -364,6 +364,50 @@ providers:
         tier: fast
         pricing: { input: 0.25, output: 1.50 }
 
+  # ─── AWS Bedrock ─────────────────────────────────────────────────
+  # Uses the Bedrock runtime provider. Bare model IDs are resolved to the
+  # correct cross-region inference profile when the backend requires it.
+  bedrock:
+    label: "AWS Bedrock"
+    default_model: "amazon.nova-lite-v1:0"
+    models:
+      - model: "amazon.nova-lite-v1:0"
+        context: 300000
+        tier: fast
+      - model: "amazon.nova-pro-v1:0"
+        context: 300000
+        tier: standard
+      - model: "anthropic.claude-3-5-haiku-20241022-v1:0"
+        context: 200000
+        tier: fast
+      - model: "anthropic.claude-3-5-sonnet-20241022-v2:0"
+        context: 200000
+        tier: standard
+      - model: "anthropic.claude-3-7-sonnet-20250219-v1:0"
+        context: 200000
+        tier: reasoning
+      - model: "anthropic.claude-4-sonnet-20250514-v1:0"
+        context: 200000
+        tier: standard
+      - model: "anthropic.claude-4-opus-20250514-v1:0"
+        context: 200000
+        tier: reasoning
+      - model: "meta.llama3-70b-instruct-v1:0"
+        context: 128000
+        tier: standard
+      - model: "mistral.mistral-large-2407-v1:0"
+        context: 32000
+        tier: standard
+      - model: "cohere.command-r-plus-v1:0"
+        context: 128000
+        tier: standard
+      - model: "deepseek.r1-v1:0"
+        context: 128000
+        tier: reasoning
+      - model: "qwen.qwen2-5-72b-instruct-v1:0"
+        context: 131072
+        tier: standard
+
   # ─── xAI ─────────────────────────────────────────────────────────
   xai:
     label: "xAI"

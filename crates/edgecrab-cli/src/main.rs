@@ -29,7 +29,6 @@ mod markdown_render;
 mod mcp_catalog;
 mod mcp_oauth;
 mod mcp_support;
-mod model_discovery;
 #[cfg(target_os = "macos")]
 mod permissions;
 mod plugins;
@@ -58,6 +57,7 @@ use cli_args::{
 };
 use edgecrab_core::config::McpServerConfig;
 use edgecrab_state::SessionDb;
+use edgecrab_tools::vision_models::normalize_provider_name;
 use edgecrab_tools::{ToolRegistry, resolve_alias};
 use runtime::{
     build_agent, build_tool_registry, build_tool_registry_with_mcp_discovery, default_export_path,
@@ -81,11 +81,7 @@ pub(crate) fn create_provider(model: &str) -> Arc<dyn edgequake_llm::LLMProvider
     // This ensures "copilot/gpt-4.1-mini" always uses copilot even when
     // OPENAI_API_KEY, ANTHROPIC_API_KEY etc. are also set.
     if let Some((provider_name, model_name)) = model.split_once('/') {
-        // Map user-friendly provider aliases to edgequake-llm canonical names
-        let canonical = match provider_name {
-            "copilot" => "vscode-copilot",
-            other => other,
-        };
+        let canonical = normalize_provider_name(provider_name);
         tracing::info!(
             provider = canonical,
             model = model_name,
@@ -181,7 +177,7 @@ pub(crate) fn create_provider(model: &str) -> Arc<dyn edgequake_llm::LLMProvider
                 );
             }
 
-            match edgequake_llm::ProviderFactory::create_llm_provider(canonical, &vertex_model) {
+            match edgequake_llm::ProviderFactory::create_llm_provider(&canonical, &vertex_model) {
                 Ok(provider) => return provider,
                 Err(e) => {
                     eprintln!(
@@ -195,7 +191,7 @@ pub(crate) fn create_provider(model: &str) -> Arc<dyn edgequake_llm::LLMProvider
                 }
             }
         } else if let Ok(provider) =
-            edgequake_llm::ProviderFactory::create_llm_provider(canonical, model_name)
+            edgequake_llm::ProviderFactory::create_llm_provider(&canonical, model_name)
         {
             return provider;
         } else {

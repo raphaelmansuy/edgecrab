@@ -65,6 +65,29 @@ impl<T: Clone + FuzzyItem> FuzzySelector<T> {
         self.update_filter();
     }
 
+    /// Replace the item list while preserving the current query and best-effort
+    /// focus on the previously selected item.
+    pub fn replace_items_preserving_state(&mut self, items: Vec<T>) {
+        let selected_primary = self.current().map(|item| item.primary().to_string());
+        let query = self.query.clone();
+        let was_active = self.active;
+
+        self.items = items;
+        self.query = query;
+        self.update_filter();
+        self.active = was_active;
+
+        if let Some(primary) = selected_primary {
+            if let Some(pos) = self.filtered.iter().position(|&idx| {
+                self.items
+                    .get(idx)
+                    .is_some_and(|item| item.primary() == primary)
+            }) {
+                self.selected = pos;
+            }
+        }
+    }
+
     /// Activate the selector with an empty query, pre-selecting `primary`.
     /// If `primary` is empty the first filtered item is highlighted.
     pub fn activate_with_primary(&mut self, primary: &str) {
@@ -204,6 +227,51 @@ mod tests {
         assert_eq!(
             selector.current().map(|item| item.primary()),
             Some("github")
+        );
+    }
+
+    #[test]
+    fn replace_items_preserves_query_and_focus() {
+        let mut selector = FuzzySelector::new();
+        selector.set_items(vec![
+            TestItem {
+                primary: "bedrock/amazon.nova-lite-v1:0",
+                secondary: "static",
+                tag: "bedrock",
+            },
+            TestItem {
+                primary: "bedrock/anthropic.claude-4-sonnet-20250514-v1:0",
+                secondary: "static",
+                tag: "bedrock",
+            },
+        ]);
+        selector.active = true;
+        selector.query = "claude".into();
+        selector.update_filter();
+
+        selector.replace_items_preserving_state(vec![
+            TestItem {
+                primary: "bedrock/amazon.nova-lite-v1:0",
+                secondary: "live",
+                tag: "bedrock",
+            },
+            TestItem {
+                primary: "bedrock/anthropic.claude-4-sonnet-20250514-v1:0",
+                secondary: "live",
+                tag: "bedrock",
+            },
+            TestItem {
+                primary: "bedrock/deepseek.r1-v1:0",
+                secondary: "live",
+                tag: "bedrock",
+            },
+        ]);
+
+        assert!(selector.active);
+        assert_eq!(selector.query, "claude");
+        assert_eq!(
+            selector.current().map(|item| item.primary()),
+            Some("bedrock/anthropic.claude-4-sonnet-20250514-v1:0")
         );
     }
 }

@@ -6,6 +6,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = ["bedrock-model-discovery"]
+bedrock-model-discovery = ["dep:aws-config", "dep:aws-sdk-bedrock"]
+
 [dependencies]
 edgecrab-types = { path = "../edgecrab-types", version = "0.1.0" }
 edgecrab-lsp = { path = "../edgecrab-lsp", version = "0.1.0" }
@@ -13,6 +17,7 @@ edgecrab-tools = { path = "../edgecrab-tools", version = "0.1.0" }
 edgecrab-state = { path = "../edgecrab-state", version = "0.1.0" }
 edgecrab-security = { path = "../edgecrab-security", version = "0.1.0" }
 edgequake-llm = { workspace = true }
+anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yml = { workspace = true }
@@ -25,6 +30,9 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 dirs = { workspace = true }
 dotenvy = { workspace = true }
+reqwest = { workspace = true }
+aws-config = { version = "1.8.15", features = ["behavior-version-latest"], optional = true }
+aws-sdk-bedrock = { version = "1.140.0", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

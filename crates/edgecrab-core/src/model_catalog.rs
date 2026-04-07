@@ -315,6 +315,7 @@ mod tests {
         assert!(!cat.providers.is_empty(), "catalog must have providers");
         // Check a few expected providers
         assert!(cat.providers.contains_key("anthropic"), "missing anthropic");
+        assert!(cat.providers.contains_key("bedrock"), "missing bedrock");
         assert!(cat.providers.contains_key("copilot"), "missing copilot");
         assert!(cat.providers.contains_key("openai"), "missing openai");
     }

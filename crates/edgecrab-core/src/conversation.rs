@@ -574,10 +574,7 @@ impl Agent {
         // This overrides the primary provider for this turn only.
         let effective_provider = if !route.is_primary {
             if let Some((prov_name, model_name)) = route.model.split_once('/') {
-                let canonical = match prov_name {
-                    "copilot" => "vscode-copilot",
-                    other => other,
-                };
+                let canonical = edgecrab_tools::vision_models::normalize_provider_name(prov_name);
                 // Special-case copilot: build directly to use direct API mode
                 let cheap_opt: Option<Arc<dyn LLMProvider>> = if canonical == "vscode-copilot" {
                     match VsCodeCopilotProvider::new()
@@ -604,8 +601,10 @@ impl Agent {
                     // distinct variant. Passing canonical = "vertexai" calls
                     // `GeminiProvider::from_env_vertex_ai()` unconditionally — it never touches
                     // GEMINI_API_KEY.
-                    let is_gemini_canonical =
-                        matches!(canonical, "google" | "gemini" | "vertex" | "vertexai");
+                    let is_gemini_canonical = matches!(
+                        canonical.as_str(),
+                        "google" | "gemini" | "vertex" | "vertexai"
+                    );
                     let primary_is_vertex = provider.name() == "vertex-ai";
 
                     let (effective_canonical, effective_model) =
@@ -620,7 +619,7 @@ impl Agent {
                             let bare = model_name.strip_prefix("vertexai:").unwrap_or(model_name);
                             ("vertexai", bare)
                         } else {
-                            (canonical, model_name)
+                            (canonical.as_str(), model_name)
                         };
 
                     match edgequake_llm::ProviderFactory::create_llm_provider(
@@ -1056,10 +1055,10 @@ impl Agent {
                         );
                         if let Some((fb_prov_name, fb_model_name)) = fb_route.model.split_once('/')
                         {
-                            let fb_canonical = match fb_prov_name {
-                                "copilot" => "vscode-copilot",
-                                other => other,
-                            };
+                            let fb_canonical =
+                                edgecrab_tools::vision_models::normalize_provider_name(
+                                    fb_prov_name,
+                                );
                             // Special-case copilot: build directly to use direct API mode
                             let fb_prov_opt: Option<Arc<dyn LLMProvider>> =
                                 if fb_canonical == "vscode-copilot" {
@@ -1071,7 +1070,7 @@ impl Agent {
                                         .map(|p| Arc::new(p) as Arc<dyn LLMProvider>)
                                 } else {
                                     edgequake_llm::ProviderFactory::create_llm_provider(
-                                        fb_canonical,
+                                        &fb_canonical,
                                         fb_model_name,
                                     )
                                     .ok()

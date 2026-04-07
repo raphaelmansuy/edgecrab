@@ -168,9 +168,31 @@ impl ToolHandler for RunProcessTool {
             spawn_local_process(&args.command, &cwd, table, process_id).await
         } else {
             let backend = get_or_create_backend(ctx).await?;
-            spawn_remote_process(&args.command, &cwd, table, process_id, backend).await
+            spawn_remote_process(
+                &args.command,
+                &cwd,
+                table,
+                process_id,
+                &ctx.task_id,
+                backend,
+            )
+            .await
         }
     }
+}
+
+fn remote_process_state_base(task_id: &str, process_id: &str) -> String {
+    let sanitized_task = task_id
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    format!("/tmp/edgecrab-bg-{sanitized_task}-{process_id}")
 }
 
 async fn spawn_local_process(
@@ -270,9 +292,10 @@ async fn spawn_remote_process(
     cwd: &str,
     table: &Arc<ProcessTable>,
     process_id: String,
+    task_id: &str,
     backend: Arc<dyn ExecutionBackend>,
 ) -> Result<String, ToolError> {
-    let base = format!("/tmp/edgecrab-bg-{process_id}");
+    let base = remote_process_state_base(task_id, &process_id);
     let log_path = format!("{base}.log");
     let pid_path = format!("{base}.pid");
     let exit_path = format!("{base}.exit");
@@ -1030,6 +1053,19 @@ mod tests {
             .execute(json!({"process_id": "proc-9999"}), &ctx)
             .await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn remote_process_state_base_namespaces_by_task_id_and_normalizes_pathish_chars() {
+        let first = remote_process_state_base("task/one", "proc-1");
+        let second = remote_process_state_base("task:two", "proc-1");
+        let windowsish = remote_process_state_base(r"C:\Users\runner\task", "proc-1");
+
+        assert_eq!(first, "/tmp/edgecrab-bg-task_one-proc-1");
+        assert_eq!(second, "/tmp/edgecrab-bg-task_two-proc-1");
+        assert_eq!(windowsish, "/tmp/edgecrab-bg-C__Users_runner_task-proc-1");
+        assert_ne!(first, second);
+        assert_ne!(second, windowsish);
     }
 
     #[tokio::test]

@@ -29,7 +29,7 @@
 //! - Input line highlighting (cyan for valid commands, red for invalid)
 //! - Fish-style ghost text from input history
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{self, BufRead, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -58,7 +58,6 @@ use crate::fuzzy_selector::{FuzzyItem, FuzzySelector};
 use crate::image_models as cli_image_models;
 use crate::markdown_render;
 use crate::mcp_support;
-use crate::model_discovery::{self, DiscoverySource};
 use crate::theme::{SkinConfig, Theme};
 use crate::tool_display::{
     build_subagent_event_line, build_tool_done_line, build_tool_running_line, tool_action_verb,
@@ -68,8 +67,12 @@ use crate::vision_models::{
     available_vision_model_options_with_dynamic, canonical_provider, current_model_supports_vision,
     parse_selection_spec,
 };
-use edgecrab_core::ModelCatalog;
-use edgecrab_core::{Agent, IsolatedAgentOptions};
+use edgecrab_core::{
+    Agent, DiscoveryAvailability, DiscoverySource, IsolatedAgentOptions, ModelCatalog,
+    ProviderModels, discover_multiple, discover_provider_models, discovery_provider_statuses,
+    live_discovery_availability, live_discovery_providers, merge_grouped_catalog_with_dynamic,
+    normalize_discovery_provider,
+};
 use edgecrab_tools::registry::ToolHandler;
 use edgecrab_tools::tools::transcribe::TranscribeAudioTool;
 use edgecrab_tools::tools::tts::{TextToSpeechTool, sanitize_text_for_tts};
@@ -1301,6 +1304,146 @@ impl FuzzyItem for ModelEntry {
     }
 }
 
+fn discovery_source_label(source: DiscoverySource) -> &'static str {
+    match source {
+        DiscoverySource::Live => "live discovery",
+        DiscoverySource::Cache => "cached discovery",
+        DiscoverySource::Static => "static catalog",
+    }
+}
+
+fn discovery_availability_short(availability: DiscoveryAvailability) -> String {
+    match availability {
+        DiscoveryAvailability::Supported => "live discovery".to_string(),
+        DiscoveryAvailability::FeatureGated(feature) => {
+            format!("live discovery gated by `{feature}`")
+        }
+        DiscoveryAvailability::Unsupported => "static catalog".to_string(),
+    }
+}
+
+fn discovery_availability_detail(provider: &str, availability: DiscoveryAvailability) -> String {
+    match availability {
+        DiscoveryAvailability::Supported => {
+            format!("{provider} supports live discovery in this build.")
+        }
+        DiscoveryAvailability::FeatureGated(feature) => format!(
+            "{provider} supports live discovery, but this build falls back to the embedded catalog because `{feature}` is disabled."
+        ),
+        DiscoveryAvailability::Unsupported => {
+            format!("{provider} is served from the embedded catalog.")
+        }
+    }
+}
+
+fn build_model_selector_entries(
+    grouped: &[(String, Vec<String>)],
+    dynamic_lookup: Option<&BTreeMap<String, (DiscoverySource, BTreeSet<String>)>>,
+) -> Vec<ModelEntry> {
+    let mut all_models = Vec::new();
+    for (provider, models) in grouped {
+        for model in models {
+            let detail = match dynamic_lookup.and_then(|lookup| lookup.get(provider)) {
+                Some((source, discovered_models)) if discovered_models.contains(model) => {
+                    format!("{model} · {}", discovery_source_label(*source))
+                }
+                Some((DiscoverySource::Static, _)) => {
+                    format!(
+                        "{model} · {}",
+                        discovery_source_label(DiscoverySource::Static)
+                    )
+                }
+                Some(_) => format!("{model} · catalog fallback"),
+                None => format!(
+                    "{model} · {}",
+                    discovery_source_label(DiscoverySource::Static)
+                ),
+            };
+            all_models.push(ModelEntry {
+                display: format!("{provider}/{model}"),
+                provider: provider.clone(),
+                detail,
+                model_name: model.clone(),
+            });
+        }
+    }
+    all_models.sort_by(|left, right| left.display.cmp(&right.display));
+    all_models
+}
+
+fn build_models_inventory_report(
+    providers: &[(String, Vec<String>)],
+    current_model: &str,
+    filter: &str,
+) -> String {
+    let current_provider = current_model
+        .split_once('/')
+        .map(|(provider, _)| normalize_discovery_provider(provider));
+    let discovery_statuses: BTreeMap<String, DiscoveryAvailability> =
+        discovery_provider_statuses().into_iter().collect();
+    let mut text = if filter.is_empty() {
+        "Model inventory (* = current provider):\n\n".to_string()
+    } else {
+        format!("Providers matching '{filter}' (* = current provider):\n\n")
+    };
+
+    for (provider, models) in providers {
+        let label = ModelCatalog::provider_label(provider);
+        let marker = if current_provider.as_deref() == Some(provider.as_str()) {
+            " *"
+        } else {
+            ""
+        };
+        let availability = discovery_statuses
+            .get(provider)
+            .copied()
+            .unwrap_or(DiscoveryAvailability::Unsupported);
+        text.push_str(&format!(
+            "  {provider:<12} {label:<22} {:>3} models  {}{marker}\n",
+            models.len(),
+            discovery_availability_short(availability),
+        ));
+    }
+
+    text.push_str(
+        "\nUse /models <provider> for the full list, /models refresh [provider|all] to refresh live inventories, or /model to open the selector.",
+    );
+    text
+}
+
+fn build_provider_models_report(
+    provider_models: &ProviderModels,
+    availability: DiscoveryAvailability,
+    current_model: &str,
+) -> String {
+    let provider = &provider_models.provider;
+    let label = ModelCatalog::provider_label(provider);
+    let mut text = format!(
+        "Models for '{provider}' (* = current):\n\n  Provider: {label}\n  Discovery: {}\n  Source: {}\n  Count: {}\n\n",
+        discovery_availability_detail(provider, availability),
+        discovery_source_label(provider_models.source),
+        provider_models.models.len(),
+    );
+
+    if provider_models.models.is_empty() {
+        text.push_str(match provider_models.source {
+            DiscoverySource::Live | DiscoverySource::Cache => {
+                "  (no text models returned from provider discovery)\n"
+            }
+            DiscoverySource::Static => "  (no models known)\n",
+        });
+    } else {
+        for model in &provider_models.models {
+            let full = format!("{provider}/{model}");
+            let marker = if current_model == full { " *" } else { "" };
+            text.push_str(&format!("  {full}{marker}\n"));
+        }
+    }
+
+    text.push_str("\nSwitch with: /model <provider/model-name>");
+    text
+}
+
 /// A single skill entry for the skill selector table.
 #[derive(Clone)]
 struct SkillEntry {
@@ -1319,6 +1462,13 @@ impl FuzzyItem for SkillEntry {
     fn secondary(&self) -> &str {
         &self.desc
     }
+}
+
+struct SelectorChrome<'a> {
+    title: &'a str,
+    placeholder: &'a str,
+    count_label: &'a str,
+    status_note: Option<&'a str>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1880,6 +2030,8 @@ pub struct App {
     command_descriptions: std::collections::HashMap<String, String>,
     /// Model selector overlay (activated by `/model` with no args)
     model_selector: FuzzySelector<ModelEntry>,
+    /// True while background live model discovery is refreshing the selector.
+    model_selector_refresh_in_flight: bool,
     /// Vision-model selector overlay (activated by `/vision_model`)
     vision_model_selector: FuzzySelector<ModelEntry>,
     /// Image-model selector overlay (activated by `/image_model`)
@@ -2333,19 +2485,13 @@ impl App {
             command_descriptions,
             model_selector: {
                 let mut ms: FuzzySelector<ModelEntry> = FuzzySelector::new();
-                ms.set_items(
-                    ModelCatalog::flat_catalog()
-                        .into_iter()
-                        .map(|(display, provider, model_name)| ModelEntry {
-                            detail: model_name.clone(),
-                            display,
-                            provider,
-                            model_name,
-                        })
-                        .collect(),
-                );
+                ms.set_items(build_model_selector_entries(
+                    &ModelCatalog::grouped_catalog(),
+                    None,
+                ));
                 ms
             },
+            model_selector_refresh_in_flight: false,
             vision_model_selector: FuzzySelector::new(),
             image_model_selector: FuzzySelector::new(),
             mcp_selector: FuzzySelector::new(),
@@ -6234,17 +6380,17 @@ impl App {
                     self.needs_redraw = true;
                 }
                 AgentResponse::BgOp(result) => {
-                    // A background task completed — restore idle state, then act
-                    // on the specific result type.
-                    self.display_state = DisplayState::Idle;
-                    self.needs_redraw = true;
+                    if matches!(self.display_state, DisplayState::BgOp { .. }) {
+                        self.display_state = DisplayState::Idle;
+                        self.needs_redraw = true;
+                    }
                     match result {
                         BackgroundOpResult::ModelCatalogReady {
                             models,
                             current_model,
                         } => {
-                            self.model_selector.set_items(models);
-                            self.model_selector.activate_with_primary(&current_model);
+                            self.model_selector_refresh_in_flight = false;
+                            self.apply_model_selector_catalog(models, &current_model, true);
                         }
                         BackgroundOpResult::SystemMsg(text) => {
                             self.push_output(text, OutputRole::System);
@@ -6689,11 +6835,7 @@ impl App {
                 return;
             }
         };
-        // Map user-friendly provider aliases to edgequake-llm canonical names
-        let canonical = match provider_str {
-            "copilot" => "vscode-copilot",
-            other => other,
-        };
+        let canonical = edgecrab_tools::vision_models::normalize_provider_name(provider_str);
         // Special-case copilot: use VsCodeCopilotProvider::new() directly (direct API mode).
         // ProviderFactory::create_llm_provider forces proxy mode (localhost:4141).
         let new_provider = if canonical == "vscode-copilot" {
@@ -6712,7 +6854,7 @@ impl App {
                 }
             }
         } else {
-            match ProviderFactory::create_llm_provider(canonical, model_name) {
+            match ProviderFactory::create_llm_provider(&canonical, model_name) {
                 Ok(p) => p,
                 Err(e) => {
                     self.push_output(
@@ -8091,54 +8233,78 @@ impl App {
         self.push_output(msg, OutputRole::System);
     }
 
-    /// Spawn model catalog discovery in the background.
-    /// Sets `BgOp` spinner immediately, opens the model selector when done.
-    /// If a background op is already running this is a no-op.
+    fn apply_model_selector_catalog(
+        &mut self,
+        models: Vec<ModelEntry>,
+        current_model: &str,
+        preserve_state: bool,
+    ) {
+        if preserve_state {
+            if self.model_selector.active {
+                self.model_selector.replace_items_preserving_state(models);
+                if self.model_selector.filtered.is_empty() {
+                    self.model_selector.activate_with_primary(current_model);
+                }
+            } else {
+                self.model_selector.set_items(models);
+            }
+        } else {
+            self.model_selector.set_items(models);
+            self.model_selector.activate_with_primary(current_model);
+        }
+        self.needs_redraw = true;
+    }
+
+    fn open_model_selector(&mut self) {
+        let current_model = self.model_name.clone();
+        let static_entries = build_model_selector_entries(&ModelCatalog::grouped_catalog(), None);
+        self.apply_model_selector_catalog(static_entries, &current_model, false);
+    }
+
+    /// Spawn background live discovery while keeping the selector interactive.
     fn refresh_model_selector_catalog(&mut self) {
-        if matches!(self.display_state, DisplayState::BgOp { .. }) {
-            return; // already loading
+        self.open_model_selector();
+        if self.model_selector_refresh_in_flight {
+            return;
         }
 
-        let mut providers: Vec<String> = vec![
-            "openrouter".to_string(),
-            "ollama".to_string(),
-            "lmstudio".to_string(),
-        ];
+        let mut providers: Vec<String> = discovery_provider_statuses()
+            .into_iter()
+            .filter_map(|(provider, availability)| {
+                matches!(availability, DiscoveryAvailability::Supported).then_some(provider)
+            })
+            .collect();
         if let Some((provider, _)) = self.model_name.split_once('/') {
-            let provider = provider.to_lowercase();
-            if !providers.iter().any(|p| p == &provider) {
+            let provider = normalize_discovery_provider(provider);
+            if matches!(
+                live_discovery_availability(&provider),
+                DiscoveryAvailability::Supported
+            ) && !providers.iter().any(|p| p == &provider)
+            {
                 providers.push(provider);
             }
         }
         let current_model = self.model_name.clone();
         let tx = self.response_tx.clone();
 
-        self.display_state = DisplayState::BgOp {
-            label: "Loading models…".to_string(),
-            frame: 0,
-            started: Instant::now(),
-        };
+        self.model_selector_refresh_in_flight = true;
         self.needs_redraw = true;
 
         self.rt_handle.spawn(async move {
             let static_catalog = ModelCatalog::grouped_catalog();
-            let discovered = model_discovery::discover_multiple(&providers).await;
-            let merged =
-                model_discovery::merge_grouped_catalog_with_dynamic(&static_catalog, &discovered);
-            let mut all_models: Vec<ModelEntry> = Vec::new();
-            for (provider, models) in merged {
-                for model in models {
-                    all_models.push(ModelEntry {
-                        display: format!("{provider}/{model}"),
-                        provider: provider.clone(),
-                        detail: model.clone(),
-                        model_name: model,
-                    });
-                }
-            }
-            all_models.sort_by(|a, b| a.display.cmp(&b.display));
+            let discovered = discover_multiple(&providers).await;
+            let merged = merge_grouped_catalog_with_dynamic(&static_catalog, &discovered);
+            let dynamic_lookup: BTreeMap<String, (DiscoverySource, BTreeSet<String>)> = discovered
+                .into_iter()
+                .map(|entry| {
+                    (
+                        entry.provider,
+                        (entry.source, entry.models.into_iter().collect()),
+                    )
+                })
+                .collect();
             let _ = tx.send(AgentResponse::BgOp(BackgroundOpResult::ModelCatalogReady {
-                models: all_models,
+                models: build_model_selector_entries(&merged, Some(&dynamic_lookup)),
                 current_model,
             }));
         });
@@ -8151,10 +8317,13 @@ impl App {
             .as_ref()
             .map(|agent| self.rt_handle.block_on(agent.auxiliary_config()))
             .unwrap_or_default();
-        let dynamic_providers = vec!["ollama".to_string(), "lmstudio".to_string()];
+        let dynamic_providers: Vec<String> = live_discovery_providers()
+            .into_iter()
+            .filter(|provider| provider == "ollama" || provider == "lmstudio")
+            .collect();
         let dynamic_models = self
             .rt_handle
-            .block_on(model_discovery::discover_multiple(&dynamic_providers));
+            .block_on(discover_multiple(&dynamic_providers));
         let dynamic_pairs: Vec<(String, Vec<String>)> = dynamic_models
             .into_iter()
             .map(|entry| (entry.provider, entry.models))
@@ -8217,14 +8386,46 @@ impl App {
 
         if let Some(refresh_target) = trimmed.strip_prefix("refresh") {
             let target = refresh_target.trim().to_lowercase();
+            let discovery_statuses = discovery_provider_statuses();
+            let feature_gated: Vec<String> = discovery_statuses
+                .iter()
+                .filter_map(|(provider, availability)| match availability {
+                    DiscoveryAvailability::FeatureGated(feature) => {
+                        Some(format!("{provider} ({feature})"))
+                    }
+                    _ => None,
+                })
+                .collect();
             let providers: Vec<String> = if target.is_empty() || target == "all" {
-                vec![
-                    "openrouter".to_string(),
-                    "ollama".to_string(),
-                    "lmstudio".to_string(),
-                ]
+                discovery_statuses
+                    .into_iter()
+                    .filter_map(|(provider, availability)| {
+                        matches!(availability, DiscoveryAvailability::Supported).then_some(provider)
+                    })
+                    .collect()
             } else {
-                vec![target.clone()]
+                let canonical = normalize_discovery_provider(&target);
+                match live_discovery_availability(&canonical) {
+                    DiscoveryAvailability::Supported => vec![canonical],
+                    DiscoveryAvailability::FeatureGated(feature) => {
+                        self.push_output(
+                            format!(
+                                "Provider '{target}' supports live discovery but this build was compiled without `{feature}`."
+                            ),
+                            OutputRole::System,
+                        );
+                        return;
+                    }
+                    DiscoveryAvailability::Unsupported => {
+                        self.push_output(
+                            format!(
+                                "Provider '{target}' does not support live discovery. It is listed from the static catalog."
+                            ),
+                            OutputRole::System,
+                        );
+                        return;
+                    }
+                }
             };
             let tx = self.response_tx.clone();
             self.display_state = DisplayState::BgOp {
@@ -8234,20 +8435,22 @@ impl App {
             };
             self.needs_redraw = true;
             self.rt_handle.spawn(async move {
-                let discovered = model_discovery::discover_multiple(&providers).await;
+                let discovered = discover_multiple(&providers).await;
                 let mut text = String::from("Model discovery refresh:\n\n");
                 for entry in discovered {
-                    let source = match entry.source {
-                        DiscoverySource::Live => "live API",
-                        DiscoverySource::Cache => "cache",
-                        DiscoverySource::Static => "static catalog",
-                    };
+                    let source = discovery_source_label(entry.source);
                     text.push_str(&format!(
-                        "  {}/{} models ({})\n",
+                        "  {}: {} models ({})\n",
                         entry.provider,
                         entry.models.len(),
                         source
                     ));
+                }
+                if !feature_gated.is_empty() {
+                    text.push_str("\nFeature-gated in this build:\n");
+                    for provider in feature_gated {
+                        text.push_str(&format!("  {provider}\n"));
+                    }
                 }
                 text.push_str(
                     "\nUse /models <provider> to inspect the list, or /model to open selector.",
@@ -8258,70 +8461,89 @@ impl App {
         }
 
         let filter = trimmed.to_lowercase();
-        let is_exact_provider = !filter.is_empty() && known_providers.iter().any(|p| p == &filter);
+        let canonical_filter = normalize_discovery_provider(&filter);
+        let is_exact_provider = !filter.is_empty()
+            && (known_providers
+                .iter()
+                .any(|provider| provider == &canonical_filter)
+                || matches!(
+                    live_discovery_availability(&canonical_filter),
+                    DiscoveryAvailability::Supported | DiscoveryAvailability::FeatureGated(_)
+                ));
 
         if is_exact_provider {
-            let tx = self.response_tx.clone();
-            let filter_owned = filter.clone();
-            self.display_state = DisplayState::BgOp {
-                label: format!("Discovering {filter}…"),
-                frame: 0,
-                started: Instant::now(),
-            };
-            self.needs_redraw = true;
-            self.rt_handle.spawn(async move {
-                let discovered = model_discovery::discover_provider_models(&filter_owned).await;
-                let source = match discovered.source {
-                    DiscoverySource::Live => "live API",
-                    DiscoverySource::Cache => "cache",
-                    DiscoverySource::Static => "static catalog",
-                };
-                let mut text = format!(
-                    "Models for '{}' (* = current, source: {}):\n\n",
-                    filter_owned, source
-                );
-                text.push_str(&format!("  {}\n", filter_owned));
-                for model in discovered.models {
-                    let full = format!("{}/{}", filter_owned, model);
-                    let marker = if current == full { " *" } else { "" };
-                    text.push_str(&format!("    {}{}\n", full, marker));
+            let filter_owned = canonical_filter.clone();
+            match live_discovery_availability(&filter_owned) {
+                DiscoveryAvailability::Supported => {
+                    let tx = self.response_tx.clone();
+                    let current_model = current.clone();
+                    self.display_state = DisplayState::BgOp {
+                        label: format!("Discovering {filter_owned}…"),
+                        frame: 0,
+                        started: Instant::now(),
+                    };
+                    self.needs_redraw = true;
+                    self.rt_handle.spawn(async move {
+                        let discovered = discover_provider_models(&filter_owned).await;
+                        let text = build_provider_models_report(
+                            &discovered,
+                            DiscoveryAvailability::Supported,
+                            &current_model,
+                        );
+                        let _ = tx.send(AgentResponse::BgOp(BackgroundOpResult::SystemMsg(text)));
+                    });
                 }
-                text.push_str("\nSwitch with: /model <provider/model-name>");
-                let _ = tx.send(AgentResponse::BgOp(BackgroundOpResult::SystemMsg(text)));
-            });
+                DiscoveryAvailability::FeatureGated(feature) => {
+                    let provider_models = ProviderModels {
+                        provider: filter_owned.clone(),
+                        models: static_catalog
+                            .iter()
+                            .find(|(provider, _)| provider == &filter_owned)
+                            .map(|(_, models)| models.clone())
+                            .unwrap_or_default(),
+                        source: DiscoverySource::Static,
+                    };
+                    let text = build_provider_models_report(
+                        &provider_models,
+                        DiscoveryAvailability::FeatureGated(feature),
+                        &current,
+                    );
+                    self.push_output(text, OutputRole::System);
+                }
+                DiscoveryAvailability::Unsupported => {
+                    let provider_models = ProviderModels {
+                        provider: filter_owned.clone(),
+                        models: static_catalog
+                            .iter()
+                            .find(|(provider, _)| provider == &filter_owned)
+                            .map(|(_, models)| models.clone())
+                            .unwrap_or_default(),
+                        source: DiscoverySource::Static,
+                    };
+                    let text = build_provider_models_report(
+                        &provider_models,
+                        DiscoveryAvailability::Unsupported,
+                        &current,
+                    );
+                    self.push_output(text, OutputRole::System);
+                }
+            }
             return;
         }
 
-        let mut text = String::new();
-        for (provider, models) in &static_catalog {
-            if !filter.is_empty() && !provider.contains(&filter) {
-                continue;
-            }
-            text.push_str(&format!("  {}\n", provider));
-            for model in models {
-                let full = format!("{}/{}", provider, model);
-                let marker = if current == full { " *" } else { "" };
-                text.push_str(&format!("    {}{}\n", full, marker));
-            }
-            text.push('\n');
-        }
+        let filtered_providers: Vec<(String, Vec<String>)> = static_catalog
+            .into_iter()
+            .filter(|(provider, _)| filter.is_empty() || provider.contains(&filter))
+            .collect();
 
-        if text.is_empty() {
-            text = format!(
+        let text = if filtered_providers.is_empty() {
+            format!(
                 "No provider matching '{}'. Use /models without args to see all.\n",
                 filter
-            );
+            )
         } else {
-            let header = if filter.is_empty() {
-                "Available models (* = current):\n\n".to_string()
-            } else {
-                format!("Models for '{}' (* = current):\n\n", filter)
-            };
-            text = format!(
-                "{}{}Tip: /models <provider> uses dynamic discovery when available.\nTip: /models refresh [provider|all]\n\nSwitch with: /model <provider/model-name>",
-                header, text
-            );
-        }
+            build_models_inventory_report(&filtered_providers, &current, &filter)
+        };
 
         self.push_output(text, OutputRole::System);
     }
@@ -11486,9 +11708,7 @@ impl App {
         frame: &mut Frame,
         area: Rect,
         selector: &FuzzySelector<ModelEntry>,
-        title: &str,
-        placeholder: &str,
-        count_label: &str,
+        chrome: SelectorChrome<'_>,
     ) {
         // Clear background
         frame.render_widget(Clear, area);
@@ -11504,7 +11724,7 @@ impl App {
 
         // Search input
         let search_text = if selector.query.is_empty() {
-            placeholder.to_string()
+            chrome.placeholder.to_string()
         } else {
             selector.query.clone()
         };
@@ -11521,7 +11741,7 @@ impl App {
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan))
-                .title(format!(" {title} ")),
+                .title(format!(" {} ", chrome.title)),
         );
         frame.render_widget(search, chunks[0]);
 
@@ -11593,8 +11813,15 @@ impl App {
             Span::styled("Esc ", Style::default().fg(Color::Cyan)),
             Span::styled("cancel  ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format!("{model_count} {count_label}"),
+                format!("{model_count} {}", chrome.count_label),
                 Style::default().fg(Color::Rgb(80, 80, 100)),
+            ),
+            Span::styled(
+                chrome
+                    .status_note
+                    .map(|note| format!("  {note}"))
+                    .unwrap_or_default(),
+                Style::default().fg(Color::Yellow),
             ),
         ]));
         frame.render_widget(help, chunks[2]);
@@ -11602,13 +11829,28 @@ impl App {
 
     /// Render the full-screen model selector overlay.
     fn render_model_selector(&self, frame: &mut Frame, area: Rect) {
+        let title = if self.model_selector_refresh_in_flight {
+            "Select Model · refreshing live inventory"
+        } else {
+            "Select Model"
+        };
+        let placeholder = if self.model_selector_refresh_in_flight {
+            "Type to filter models... live discovery updates in place (Esc to cancel)"
+        } else {
+            "Type to filter models... (Esc to cancel)"
+        };
         self.render_model_like_selector(
             frame,
             area,
             &self.model_selector,
-            "Select Model",
-            "Type to filter models... (Esc to cancel)",
-            "models",
+            SelectorChrome {
+                title,
+                placeholder,
+                count_label: "models",
+                status_note: self
+                    .model_selector_refresh_in_flight
+                    .then_some("live discovery running"),
+            },
         );
     }
 
@@ -11618,9 +11860,12 @@ impl App {
             frame,
             area,
             &self.vision_model_selector,
-            "Select Vision Model",
-            "Type to filter vision backends... (Esc to cancel)",
-            "options",
+            SelectorChrome {
+                title: "Select Vision Model",
+                placeholder: "Type to filter vision backends... (Esc to cancel)",
+                count_label: "options",
+                status_note: None,
+            },
         );
     }
 
@@ -11629,9 +11874,12 @@ impl App {
             frame,
             area,
             &self.image_model_selector,
-            "Select Image Model",
-            "Type to filter image-generation backends... (Esc to cancel)",
-            "image backends",
+            SelectorChrome {
+                title: "Select Image Model",
+                placeholder: "Type to filter image-generation backends... (Esc to cancel)",
+                count_label: "image backends",
+                status_note: None,
+            },
         );
     }
 
@@ -13685,6 +13933,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(edgecrab_home_env)]
     async fn mcp_search_filters_official_snapshot_entries() {
         let _guard = crate::gateway_catalog::TEST_ENV_LOCK
             .lock()
@@ -13803,6 +14052,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(edgecrab_home_env)]
     fn build_remote_skill_entries_marks_update_replace_and_install() {
         let _guard = crate::gateway_catalog::TEST_ENV_LOCK
             .lock()
@@ -14018,6 +14268,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(edgecrab_home_env)]
     fn persist_voice_preferences_round_trip() {
         let _guard = crate::gateway_catalog::TEST_ENV_LOCK
             .lock()
@@ -14720,5 +14971,67 @@ mod tests {
         }
         app.textarea_set_text("");
         assert_eq!(app.textarea_text(), "");
+    }
+
+    #[tokio::test]
+    async fn model_selector_refresh_opens_without_blocking_overlay() {
+        let mut app = App::new();
+
+        app.refresh_model_selector_catalog();
+
+        assert!(app.model_selector.active);
+        assert!(app.model_selector_refresh_in_flight);
+        assert!(
+            !matches!(app.display_state, DisplayState::BgOp { .. }),
+            "model selector should stay interactive while discovery runs"
+        );
+        assert!(
+            app.model_selector
+                .items
+                .iter()
+                .any(|entry| entry.provider == "bedrock"),
+            "bedrock must be visible in the selector immediately from the static catalog"
+        );
+    }
+
+    #[test]
+    fn models_inventory_report_lists_bedrock() {
+        let report = build_models_inventory_report(
+            &ModelCatalog::grouped_catalog(),
+            "bedrock/amazon.nova-lite-v1:0",
+            "",
+        );
+
+        assert!(report.contains("bedrock"));
+        assert!(report.contains("AWS Bedrock"));
+        assert!(report.contains("live discovery"));
+    }
+
+    #[test]
+    fn provider_models_report_explains_feature_gated_bedrock() {
+        let report = build_provider_models_report(
+            &ProviderModels {
+                provider: "bedrock".into(),
+                models: vec!["amazon.nova-lite-v1:0".into()],
+                source: DiscoverySource::Static,
+            },
+            DiscoveryAvailability::FeatureGated("bedrock-model-discovery"),
+            "bedrock/amazon.nova-lite-v1:0",
+        );
+
+        assert!(report.contains("bedrock-model-discovery"));
+        assert!(report.contains("AWS Bedrock"));
+        assert!(report.contains("amazon.nova-lite-v1:0 *"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bedrock_provider_factory_is_wired() {
+        let result = ProviderFactory::create_llm_provider("bedrock", "amazon.nova-lite-v1:0");
+        if let Err(err) = result {
+            assert!(
+                !err.to_string().contains("Unknown LLM provider"),
+                "bedrock must be recognized by the runtime provider factory: {err}"
+            );
+        }
     }
 }

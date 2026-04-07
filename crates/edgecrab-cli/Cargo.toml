@@ -10,6 +10,10 @@ license.workspace = true
 name = "edgecrab"
 path = "src/main.rs"
 
+[features]
+default = ["bedrock-model-discovery"]
+bedrock-model-discovery = ["edgecrab-core/bedrock-model-discovery"]
+
 [dependencies]
 edgecrab-core = { path = "../edgecrab-core", version = "0.1.0" }
 edgecrab-types = { path = "../edgecrab-types", version = "0.1.0" }
@@ -54,3 +58,4 @@ libc = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true }
 tempfile = { workspace = true }
+serial_test = "3"

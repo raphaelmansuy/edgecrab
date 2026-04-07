@@ -13,6 +13,7 @@ pub mod config;
 pub mod context_references;
 pub mod conversation;
 pub mod model_catalog;
+pub mod model_discovery;
 pub mod model_router;
 pub mod pricing;
 pub mod prompt_builder;
@@ -30,6 +31,11 @@ pub use config::{
 pub use context_references::{ContextRef, ExpansionResult, expand_context_refs};
 pub use model_catalog::{
     CatalogData, ModelCatalog, ModelEntry, ModelTier, PricingPair, ProviderEntry,
+};
+pub use model_discovery::{
+    DiscoveryAvailability, DiscoverySource, ProviderModels, discover_multiple,
+    discover_provider_models, discovery_provider_statuses, live_discovery_availability,
+    live_discovery_providers, merge_grouped_catalog_with_dynamic, normalize_discovery_provider,
 };
 pub use model_router::{
     SmartRoutingConfig, TurnRoute, classify_message, fallback_route, resolve_turn_route,
