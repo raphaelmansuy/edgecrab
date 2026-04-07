@@ -164,6 +164,8 @@ pub struct AgentConfig {
     pub file_allowed_roots: Vec<std::path::PathBuf>,
     /// Denied prefixes layered over the workspace and allow-root policy.
     pub path_restrictions: Vec<std::path::PathBuf>,
+    /// LSP runtime configuration projected from AppConfig.
+    pub lsp: crate::config::LspConfig,
 }
 
 impl Default for AgentConfig {
@@ -210,6 +212,7 @@ impl Default for AgentConfig {
             terminal_env_passthrough: Vec::new(),
             file_allowed_roots: Vec::new(),
             path_restrictions: Vec::new(),
+            lsp: crate::config::LspConfig::default(),
         }
     }
 }
@@ -1254,6 +1257,7 @@ impl AgentBuilder {
                 terminal_env_passthrough: config.terminal.env_passthrough.clone(),
                 file_allowed_roots: config.tools.file.allowed_roots.clone(),
                 path_restrictions: config.security.path_restrictions.clone(),
+                lsp: config.lsp.clone(),
                 ..Default::default()
             },
             provider: None,

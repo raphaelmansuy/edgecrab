@@ -14,11 +14,92 @@ fn assert_tool_in_surface(tool_name: &str) {
     );
 }
 
+const CLAUDE_CODE_LSP_BASELINE: &[&str] = &[
+    "lsp_goto_definition",
+    "lsp_find_references",
+    "lsp_hover",
+    "lsp_document_symbols",
+    "lsp_workspace_symbols",
+    "lsp_goto_implementation",
+    "lsp_call_hierarchy_prepare",
+    "lsp_incoming_calls",
+    "lsp_outgoing_calls",
+];
+
+const EDGECRAB_LSP_ADVANTAGE: &[&str] = &[
+    "lsp_code_actions",
+    "lsp_apply_code_action",
+    "lsp_rename",
+    "lsp_format_document",
+    "lsp_format_range",
+    "lsp_inlay_hints",
+    "lsp_semantic_tokens",
+    "lsp_signature_help",
+    "lsp_type_hierarchy_prepare",
+    "lsp_supertypes",
+    "lsp_subtypes",
+    "lsp_diagnostics_pull",
+    "lsp_linked_editing_range",
+    "lsp_enrich_diagnostics",
+    "lsp_select_and_apply_action",
+    "lsp_workspace_type_errors",
+];
+
 #[test]
 fn browser_advantage_tools_are_exposed_in_core_and_acp_surfaces() {
     for tool_name in ["browser_wait_for", "browser_select", "browser_hover"] {
         assert_tool_in_surface(tool_name);
     }
+}
+
+#[test]
+fn claude_code_lsp_parity_tools_are_exposed_in_core_and_acp_surfaces() {
+    for tool_name in CLAUDE_CODE_LSP_BASELINE {
+        assert_tool_in_surface(tool_name);
+    }
+}
+
+#[test]
+fn edgecrab_lsp_advantage_tools_are_exposed_in_core_and_acp_surfaces() {
+    for tool_name in EDGECRAB_LSP_ADVANTAGE {
+        assert_tool_in_surface(tool_name);
+    }
+}
+
+#[test]
+fn edgecrab_lsp_surface_exceeds_claude_code_baseline() {
+    let core_lsp_count = CORE_TOOLS
+        .iter()
+        .filter(|name| name.starts_with("lsp_"))
+        .count();
+    let acp_lsp_count = ACP_TOOLS
+        .iter()
+        .filter(|name| name.starts_with("lsp_"))
+        .count();
+
+    assert_eq!(
+        CLAUDE_CODE_LSP_BASELINE.len(),
+        9,
+        "baseline list should track Claude Code's 9 documented LSP operations"
+    );
+    assert!(
+        core_lsp_count > CLAUDE_CODE_LSP_BASELINE.len(),
+        "CORE_TOOLS should expose more LSP operations than the 9-operation baseline"
+    );
+    assert!(
+        acp_lsp_count > CLAUDE_CODE_LSP_BASELINE.len(),
+        "ACP_TOOLS should expose more LSP operations than the 9-operation baseline"
+    );
+    assert_eq!(
+        core_lsp_count,
+        CLAUDE_CODE_LSP_BASELINE.len() + EDGECRAB_LSP_ADVANTAGE.len(),
+        "CORE_TOOLS should expose the full parity-plus LSP surface"
+    );
+    assert_eq!(
+        acp_lsp_count,
+        CLAUDE_CODE_LSP_BASELINE.len() + EDGECRAB_LSP_ADVANTAGE.len(),
+        "ACP_TOOLS should expose the full parity-plus LSP surface"
+    );
 }
 
 #[tokio::test]

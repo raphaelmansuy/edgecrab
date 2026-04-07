@@ -45,11 +45,12 @@ fix any type mismatches before moving on.
 ```
 
 What EdgeCrab does:
-1. Finds all occurrences with `file_search`
-2. Renames each file with `file_write`
-3. Runs `cargo check` after each batch
-4. Fixes any resulting type errors
-5. Reports a summary of all changed files
+1. Uses `lsp_find_references` or `lsp_workspace_symbols` to identify the symbol precisely
+2. Uses `lsp_rename` for a semantic cross-file rename when a server is available
+3. Falls back to `search_files` and file edits only if no LSP server covers the language
+4. Runs `cargo check` after each batch
+5. Fixes any resulting type errors
+6. Reports a summary of all changed files
 
 **With a skill**: Create a `rust-rename-type` skill with these steps pre-written so you can invoke it with a single line: `Rename UserRecord to User using the rust-rename-type skill.`
 
@@ -71,6 +72,25 @@ What EdgeCrab does:
 3. Identifies the main code paths and edge cases
 4. Writes test functions covering all identified cases
 5. Runs `cargo test -p edgecrab-security` to verify they pass
+
+---
+
+## Pattern 3A — Semantic Fix with LSP
+
+**Goal**: Let the agent use language-server data before editing code.
+
+```
+Use the LSP tools first. Find the definition of `build_prompt`, inspect references,
+pull diagnostics for the file, apply the best code action if one exists, and only then
+patch code manually if needed. Run the relevant tests after the fix.
+```
+
+What EdgeCrab does:
+1. Uses `lsp_goto_definition`, `lsp_find_references`, and `lsp_hover` for semantic context
+2. Uses `lsp_diagnostics_pull` or `lsp_workspace_type_errors` before making claims about type errors
+3. Tries `lsp_code_actions` / `lsp_select_and_apply_action` for server-suggested fixes
+4. Uses `lsp_rename` or formatting tools when the change is semantic
+5. Falls back to ordinary file tools only when the server lacks support or the task is textual
 
 ---
 

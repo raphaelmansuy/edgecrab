@@ -2259,7 +2259,7 @@ mod tests {
             .await;
         match result {
             Ok(text) => {
-                println!("DDG result (partial): {}", &text[..text.len().min(300)]);
+                println!("DDG result (partial): {}", crate::safe_truncate(&text, 300));
             }
             Err(e) => {
                 eprintln!("Skipped: {e}");

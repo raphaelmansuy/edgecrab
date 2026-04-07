@@ -5,6 +5,7 @@ members = [
     "crates/edgecrab-security",
     "crates/edgecrab-state",
     "crates/edgecrab-cron",
+    "crates/edgecrab-lsp",
     "crates/edgecrab-tools",
     "crates/edgecrab-core",
     "crates/edgecrab-cli",
@@ -36,6 +37,8 @@ futures = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 async-trait = "0.1"
+async-lsp = { version = "0.2.3", features = ["omni-trait", "tokio"] }
+lsp-types = { version = "0.97.0", features = ["proposed"] }
 regex = "1"
 url = "2"
 

@@ -88,6 +88,32 @@ pub const CORE_TOOLS: &[&str] = &[
     // Code execution + delegation
     "execute_code",
     "delegate_task",
+    // Language server protocol
+    "lsp_goto_definition",
+    "lsp_find_references",
+    "lsp_hover",
+    "lsp_document_symbols",
+    "lsp_workspace_symbols",
+    "lsp_goto_implementation",
+    "lsp_call_hierarchy_prepare",
+    "lsp_incoming_calls",
+    "lsp_outgoing_calls",
+    "lsp_code_actions",
+    "lsp_apply_code_action",
+    "lsp_rename",
+    "lsp_format_document",
+    "lsp_format_range",
+    "lsp_inlay_hints",
+    "lsp_semantic_tokens",
+    "lsp_signature_help",
+    "lsp_type_hierarchy_prepare",
+    "lsp_supertypes",
+    "lsp_subtypes",
+    "lsp_diagnostics_pull",
+    "lsp_linked_editing_range",
+    "lsp_enrich_diagnostics",
+    "lsp_select_and_apply_action",
+    "lsp_workspace_type_errors",
     // Mixture of Agents — multi-model consensus reasoning
     "mixture_of_agents",
     // Cron job management
@@ -157,6 +183,31 @@ pub const ACP_TOOLS: &[&str] = &[
     "checkpoint",
     "execute_code",
     "delegate_task",
+    "lsp_goto_definition",
+    "lsp_find_references",
+    "lsp_hover",
+    "lsp_document_symbols",
+    "lsp_workspace_symbols",
+    "lsp_goto_implementation",
+    "lsp_call_hierarchy_prepare",
+    "lsp_incoming_calls",
+    "lsp_outgoing_calls",
+    "lsp_code_actions",
+    "lsp_apply_code_action",
+    "lsp_rename",
+    "lsp_format_document",
+    "lsp_format_range",
+    "lsp_inlay_hints",
+    "lsp_semantic_tokens",
+    "lsp_signature_help",
+    "lsp_type_hierarchy_prepare",
+    "lsp_supertypes",
+    "lsp_subtypes",
+    "lsp_diagnostics_pull",
+    "lsp_linked_editing_range",
+    "lsp_enrich_diagnostics",
+    "lsp_select_and_apply_action",
+    "lsp_workspace_type_errors",
     "mixture_of_agents",
     "mcp_list_tools",
     "mcp_call_tool",
@@ -188,6 +239,7 @@ pub const ACP_TOOLS: &[&str] = &[
 /// - `"mcp"`          → mcp_list_tools, mcp_call_tool
 /// - `"media"`        → text_to_speech, vision_analyze, transcribe_audio
 /// - `"messaging"`    → send_message
+/// - `"lsp"`          → lsp_* language-server operations
 /// - `"core"`         → checkpoint (the single core-labelled tool)
 pub fn resolve_alias(alias: &str) -> Option<&'static [&'static str]> {
     match alias {
@@ -219,13 +271,14 @@ pub fn resolve_alias(alias: &str) -> Option<&'static [&'static str]> {
             "scheduling",     // manage_cron_jobs
             "delegation",     // delegate_task
             "code_execution", // execute_code
+            "lsp",            // lsp_* language-server tools
             "session",        // session_search
             "mcp",            // mcp_list_tools, mcp_call_tool
             "messaging",      // send_message (runtime-gated in non-gateway sessions)
             "media",          // vision_analyze, transcribe_audio, text_to_speech
             "browser",        // browser_navigate, browser_snapshot, … (runtime-gated)
         ]),
-        "coding" => Some(&["file", "terminal", "search", "code_execution"]),
+        "coding" => Some(&["file", "terminal", "search", "code_execution", "lsp"]),
         "research" => Some(&["web", "browser", "vision"]),
         "debugging" => Some(&["terminal", "web", "file"]),
         "safe" => Some(&["web", "vision", "image_gen", "moa"]),
@@ -357,6 +410,10 @@ mod tests {
         let result = resolve_alias("coding").expect("should be known alias");
         assert!(result.contains(&"file"));
         assert!(result.contains(&"terminal"));
+        assert!(
+            result.contains(&"lsp"),
+            "'coding' alias must include 'lsp' so semantic navigation and edits are discoverable in coding sessions"
+        );
     }
 
     #[test]
@@ -423,6 +480,15 @@ mod tests {
         assert!(
             expanded.contains(&"scheduling"),
             "'core' alias must include 'scheduling' toolset (manage_cron_jobs)"
+        );
+    }
+
+    #[test]
+    fn resolve_alias_core_includes_lsp_toolset() {
+        let expanded = resolve_alias("core").expect("'core' must be a registered alias");
+        assert!(
+            expanded.contains(&"lsp"),
+            "'core' alias must include 'lsp' so default sessions expose semantic code intelligence"
         );
     }
 

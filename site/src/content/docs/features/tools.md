@@ -1,11 +1,11 @@
 ---
 title: Tools & Toolsets
-description: All 74 EdgeCrab tools organized into toolsets, custom groups, toolset aliases, and runtime gating. Grounded in crates/edgecrab-tools/src/registry.rs and the tool registry.
+description: EdgeCrab's built-in tools organized into toolsets, custom groups, LSP semantic coding, and runtime gating. Grounded in crates/edgecrab-tools/src/registry.rs and toolsets.rs.
 sidebar:
   order: 4
 ---
 
-Tools are the atomic actions EdgeCrab can perform. **74 tools** are registered at compile time via `inventory::submit!`. They are organized into **toolsets** (named groups) and activated via **aliases** in config or CLI.
+Tools are the atomic actions EdgeCrab can perform. **90+ tools** are registered at compile time via `inventory::submit!`. They are organized into **toolsets** (named groups) and activated via **aliases** in config or CLI.
 
 ---
 
@@ -52,8 +52,8 @@ Then use `--toolset my-research` on the CLI.
 
 | Alias | Expands to |
 |-------|-----------|
-| `core` | file + meta + scheduling + delegation + code_execution + session + mcp + browser |
-| `coding` | file + terminal + search (`search_files`) + code_execution |
+| `core` | file + meta + scheduling + delegation + code_execution + lsp + session + mcp + messaging + media + browser |
+| `coding` | file + terminal + search (`search_files`) + code_execution + lsp |
 | `research` | web + browser + vision |
 | `debugging` | terminal + web + file |
 | `safe` | web + vision + image_gen + moa |
@@ -136,7 +136,35 @@ Then use `--toolset my-research` on the CLI.
 |------|-------------|
 | `manage_todo_list` | Create and manage a todo list for the current task |
 | `clarify` | Ask the user a clarifying question before proceeding |
-| `send_message` | Send a message to the current gateway channel |
+
+### `lsp` — Semantic Code Intelligence
+| Tool | Description |
+|------|-------------|
+| `lsp_goto_definition` | Jump to the defining symbol location |
+| `lsp_find_references` | Find all references to the symbol under the cursor |
+| `lsp_hover` | Retrieve hover docs and type information |
+| `lsp_document_symbols` | List all symbols in a file |
+| `lsp_workspace_symbols` | Search symbols across the workspace |
+| `lsp_goto_implementation` | Jump to concrete implementations |
+| `lsp_call_hierarchy_prepare` | Prepare call hierarchy items |
+| `lsp_incoming_calls` | List callers of a symbol |
+| `lsp_outgoing_calls` | List callees from a symbol |
+| `lsp_code_actions` | Ask the server for available fixes/refactors |
+| `lsp_apply_code_action` | Resolve and apply a chosen code action |
+| `lsp_rename` | Perform a semantic cross-file rename |
+| `lsp_format_document` | Format an entire file through the server |
+| `lsp_format_range` | Format just a selected range |
+| `lsp_inlay_hints` | Return inline parameter/type hints |
+| `lsp_semantic_tokens` | Return semantic token classifications |
+| `lsp_signature_help` | Show active signature and parameter info |
+| `lsp_type_hierarchy_prepare` | Prepare type hierarchy nodes |
+| `lsp_supertypes` | List direct supertypes |
+| `lsp_subtypes` | List direct subtypes |
+| `lsp_diagnostics_pull` | Pull fresh diagnostics for a document or workspace |
+| `lsp_linked_editing_range` | Return linked editing ranges |
+| `lsp_enrich_diagnostics` | Ask the LLM to explain raw diagnostics |
+| `lsp_select_and_apply_action` | Choose and apply the best code action |
+| `lsp_workspace_type_errors` | Summarize workspace-wide type or compile errors |
 
 ### `homeassistant` — Smart Home
 | Tool | Description |
@@ -186,6 +214,11 @@ Then use `--toolset my-research` on the CLI.
 | `vision_analyze` | Analyze an image file with the configured vision model |
 | `transcribe_audio` | Transcribe audio with Whisper (local) or Groq/OpenAI |
 | `generate_image` | Generate an image via DALL-E or compatible API |
+
+### `messaging` — Cross-Platform Delivery
+| Tool | Description |
+|------|-------------|
+| `send_message` | Send a message to a gateway chat, channel, or contact |
 
 ### `core` — Checkpoints
 | Tool | Description |
@@ -241,7 +274,7 @@ Inside a session:
 
 **Use the `minimal` toolset for sensitive work.** `--toolset minimal` gives the agent only `file` and `terminal`. No web access, no browser. Useful when you want full control over what the agent can reach.
 
-**Add `--toolset coding` for most development tasks.** This is the sweet spot: file read/write, terminal, file search, and code execution — everything for typical dev work without browser or web tools.
+**Add `--toolset coding` for most development tasks.** This exposes file I/O, terminal, file search, code execution, and the LSP toolset so the agent can use semantic rename, definitions, references, diagnostics, and code actions instead of grep-only heuristics.
 
 **Create project-specific toolset aliases.** Add to `config.yaml`:
 ```yaml

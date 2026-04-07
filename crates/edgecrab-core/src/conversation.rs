@@ -270,6 +270,27 @@ impl Agent {
             edgecrab_home: crate::config::edgecrab_home(),
             file_allowed_roots: config.file_allowed_roots.clone(),
             path_restrictions: config.path_restrictions.clone(),
+            lsp_enabled: config.lsp.enabled,
+            lsp_file_size_limit_bytes: config.lsp.file_size_limit_bytes,
+            lsp_servers: config
+                .lsp
+                .servers
+                .iter()
+                .map(|(name, server)| {
+                    (
+                        name.clone(),
+                        edgecrab_tools::config_ref::LspServerConfigRef {
+                            command: server.command.clone(),
+                            args: server.args.clone(),
+                            file_extensions: server.file_extensions.clone(),
+                            language_id: server.language_id.clone(),
+                            root_markers: server.root_markers.clone(),
+                            env: server.env.clone(),
+                            initialization_options: server.initialization_options.clone(),
+                        },
+                    )
+                })
+                .collect(),
             delegation_enabled: config.delegation_enabled,
             delegation_model: config.delegation_model.clone(),
             delegation_provider: config.delegation_provider.clone(),

@@ -4,6 +4,7 @@
 //! can't depend on edgecrab-core (that would create a cycle). Instead,
 //! we define a minimal config view here that edgecrab-core populates.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::execution_tmp::shared_tmp_dir;
@@ -38,6 +39,18 @@ pub fn resolve_edgecrab_home() -> PathBuf {
 ///
 /// Populated from AppConfig by the agent before tool dispatch.
 /// Only includes fields that tools actually need.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+#[serde(default)]
+pub struct LspServerConfigRef {
+    pub command: String,
+    pub args: Vec<String>,
+    pub file_extensions: Vec<String>,
+    pub language_id: String,
+    pub root_markers: Vec<String>,
+    pub env: HashMap<String, String>,
+    pub initialization_options: Option<serde_json::Value>,
+}
+
 #[derive(Debug, Clone)]
 pub struct AppConfigRef {
     /// Whether the gateway process is running (gates send_message)
@@ -54,6 +67,12 @@ pub struct AppConfigRef {
     pub file_allowed_roots: Vec<PathBuf>,
     /// Denied prefixes layered on top of the workspace and allow-roots policy.
     pub path_restrictions: Vec<PathBuf>,
+    /// Whether LSP tools are enabled for this session.
+    pub lsp_enabled: bool,
+    /// Max file size eligible for LSP document sync.
+    pub lsp_file_size_limit_bytes: u64,
+    /// Named language-server configurations keyed by logical language/server id.
+    pub lsp_servers: HashMap<String, LspServerConfigRef>,
     /// EdgeCrab home directory (memory, skills, sessions storage root).
     ///
     /// WHY renamed from workspace_root: memory and skills tools write to
@@ -174,6 +193,9 @@ impl Default for AppConfigRef {
             max_terminal_output: 100_000,         // 100K chars
             file_allowed_roots: Vec::new(),
             path_restrictions: Vec::new(),
+            lsp_enabled: true,
+            lsp_file_size_limit_bytes: 10_000_000,
+            lsp_servers: HashMap::new(),
             edgecrab_home: resolve_edgecrab_home(),
             delegation_enabled: true,
             delegation_model: None,
@@ -236,6 +258,16 @@ impl AppConfigRef {
             .with_virtual_tmp_root(file_tools_tmp_dir)
             .with_allowed_roots(self.file_allowed_roots.clone())
             .with_denied_roots(self.path_restrictions.clone())
+    }
+
+    pub fn lsp_server_for_extension(&self, ext: &str) -> Option<(&str, &LspServerConfigRef)> {
+        let ext = ext.trim_start_matches('.').to_ascii_lowercase();
+        self.lsp_servers.iter().find_map(|(name, cfg)| {
+            cfg.file_extensions
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(&ext))
+                .then_some((name.as_str(), cfg))
+        })
     }
 
     // ── Well-known directory helpers ──────────────────────────────────────

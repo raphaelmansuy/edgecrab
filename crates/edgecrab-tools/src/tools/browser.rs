@@ -2415,7 +2415,7 @@ impl ToolHandler for BrowserClickTool {
         let label = if txt.is_empty() {
             tag.to_string()
         } else {
-            format!("{tag}: {}", &txt[..txt.len().min(50)])
+            format!("{tag}: {}", crate::safe_truncate(txt, 50))
         };
         Ok(format!("Clicked @{} ({label})", args.r#ref))
     }

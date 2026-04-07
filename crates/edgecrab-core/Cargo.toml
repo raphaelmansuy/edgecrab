@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 edgecrab-types = { path = "../edgecrab-types", version = "0.1.0" }
+edgecrab-lsp = { path = "../edgecrab-lsp", version = "0.1.0" }
 edgecrab-tools = { path = "../edgecrab-tools", version = "0.1.0" }
 edgecrab-state = { path = "../edgecrab-state", version = "0.1.0" }
 edgecrab-security = { path = "../edgecrab-security", version = "0.1.0" }

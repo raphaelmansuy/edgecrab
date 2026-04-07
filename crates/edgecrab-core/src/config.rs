@@ -34,6 +34,7 @@ pub struct AppConfig {
     pub model: ModelConfig,
     pub agent: AgentConfig,
     pub tools: ToolsConfig,
+    pub lsp: LspConfig,
     pub save_trajectories: bool,
     pub skip_context_files: bool,
     pub skip_memory: bool,
@@ -644,6 +645,211 @@ impl Default for ToolsConfig {
             max_parallel_workers: 8,
         }
     }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct LspConfig {
+    pub enabled: bool,
+    pub file_size_limit_bytes: u64,
+    pub servers: HashMap<String, LspServerConfig>,
+}
+
+impl Default for LspConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            file_size_limit_bytes: 10_000_000,
+            servers: default_lsp_servers(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct LspServerConfig {
+    pub command: String,
+    pub args: Vec<String>,
+    pub file_extensions: Vec<String>,
+    pub language_id: String,
+    pub root_markers: Vec<String>,
+    pub env: HashMap<String, String>,
+    pub initialization_options: Option<serde_json::Value>,
+}
+
+fn default_lsp_servers() -> HashMap<String, LspServerConfig> {
+    fn server(
+        command: &str,
+        args: &[&str],
+        file_extensions: &[&str],
+        language_id: &str,
+        root_markers: &[&str],
+    ) -> LspServerConfig {
+        LspServerConfig {
+            command: command.into(),
+            args: args.iter().map(|value| (*value).into()).collect(),
+            file_extensions: file_extensions
+                .iter()
+                .map(|value| (*value).into())
+                .collect(),
+            language_id: language_id.into(),
+            root_markers: root_markers.iter().map(|value| (*value).into()).collect(),
+            env: HashMap::new(),
+            initialization_options: None,
+        }
+    }
+
+    [
+        (
+            "rust",
+            server(
+                "rust-analyzer",
+                &[],
+                &["rs"],
+                "rust",
+                &["Cargo.toml", "rust-project.json"],
+            ),
+        ),
+        (
+            "typescript",
+            server(
+                "typescript-language-server",
+                &["--stdio"],
+                &["ts", "tsx"],
+                "typescript",
+                &["package.json", "tsconfig.json"],
+            ),
+        ),
+        (
+            "javascript",
+            server(
+                "typescript-language-server",
+                &["--stdio"],
+                &["js", "jsx", "mjs", "cjs"],
+                "javascript",
+                &["package.json", "jsconfig.json"],
+            ),
+        ),
+        (
+            "python",
+            server(
+                "pylsp",
+                &[],
+                &["py"],
+                "python",
+                &["pyproject.toml", "setup.py", "requirements.txt"],
+            ),
+        ),
+        ("go", server("gopls", &[], &["go"], "go", &["go.mod"])),
+        (
+            "c",
+            server(
+                "clangd",
+                &[],
+                &["c", "h"],
+                "c",
+                &["compile_commands.json", ".clangd"],
+            ),
+        ),
+        (
+            "cpp",
+            server(
+                "clangd",
+                &[],
+                &["cc", "cpp", "cxx", "hpp", "hh", "hxx"],
+                "cpp",
+                &["compile_commands.json", ".clangd"],
+            ),
+        ),
+        (
+            "java",
+            server(
+                "jdtls",
+                &[],
+                &["java"],
+                "java",
+                &[
+                    "pom.xml",
+                    "build.gradle",
+                    "build.gradle.kts",
+                    "settings.gradle",
+                ],
+            ),
+        ),
+        (
+            "csharp",
+            server(
+                "csharp-ls",
+                &[],
+                &["cs"],
+                "csharp",
+                &["*.sln", "*.csproj", "global.json", "Directory.Build.props"],
+            ),
+        ),
+        (
+            "php",
+            server(
+                "intelephense",
+                &["--stdio"],
+                &["php"],
+                "php",
+                &["composer.json", ".git"],
+            ),
+        ),
+        (
+            "ruby",
+            server(
+                "ruby-lsp",
+                &[],
+                &["rb", "rake", "gemspec"],
+                "ruby",
+                &["Gemfile", ".ruby-version"],
+            ),
+        ),
+        (
+            "bash",
+            server(
+                "bash-language-server",
+                &["start"],
+                &["sh", "bash"],
+                "shellscript",
+                &[".git"],
+            ),
+        ),
+        (
+            "html",
+            server(
+                "vscode-html-language-server",
+                &["--stdio"],
+                &["html", "htm"],
+                "html",
+                &["package.json", ".git"],
+            ),
+        ),
+        (
+            "css",
+            server(
+                "vscode-css-language-server",
+                &["--stdio"],
+                &["css", "scss", "less"],
+                "css",
+                &["package.json", ".git"],
+            ),
+        ),
+        (
+            "json",
+            server(
+                "vscode-json-language-server",
+                &["--stdio"],
+                &["json", "jsonc"],
+                "json",
+                &["package.json", ".git"],
+            ),
+        ),
+    ]
+    .into_iter()
+    .map(|(name, cfg)| (name.to_string(), cfg))
+    .collect()
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -1683,6 +1889,54 @@ model:
         // Everything else should be defaults
         assert!(cfg.model.streaming);
         assert_eq!(cfg.tools.tool_delay, 1.0);
+    }
+
+    #[test]
+    fn default_lsp_server_catalog_covers_mainstream_languages() {
+        let servers = default_lsp_servers();
+        for name in [
+            "rust",
+            "typescript",
+            "javascript",
+            "python",
+            "go",
+            "c",
+            "cpp",
+            "java",
+            "csharp",
+            "php",
+            "ruby",
+            "bash",
+            "html",
+            "css",
+            "json",
+        ] {
+            assert!(
+                servers.contains_key(name),
+                "missing built-in LSP server config for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_lsp_server_catalog_has_expected_routing_details() {
+        let servers = default_lsp_servers();
+
+        let java = servers.get("java").expect("java config");
+        assert_eq!(java.command, "jdtls");
+        assert!(java.file_extensions.contains(&"java".to_string()));
+
+        let csharp = servers.get("csharp").expect("csharp config");
+        assert_eq!(csharp.command, "csharp-ls");
+        assert!(csharp.root_markers.contains(&"*.sln".to_string()));
+
+        let bash = servers.get("bash").expect("bash config");
+        assert_eq!(bash.command, "bash-language-server");
+        assert_eq!(bash.args, vec!["start".to_string()]);
+
+        let html = servers.get("html").expect("html config");
+        assert_eq!(html.command, "vscode-html-language-server");
+        assert!(html.file_extensions.contains(&"html".to_string()));
     }
 
     #[test]

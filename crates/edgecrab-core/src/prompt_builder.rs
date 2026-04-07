@@ -218,6 +218,28 @@ Rules:\n\
   - If the user names a specific channel/person and the target is ambiguous, call send_message(action='list') first.\n\
   - Do not claim you cannot send messages when send_message is available.";
 
+const LSP_GUIDANCE: &str = "\
+## Language Server Usage
+
+When working on supported source files, prefer LSP tools over plain text search for semantic code tasks.
+
+Use LSP first for:
+  - definition / implementation lookup
+  - references and symbol discovery
+  - hover, signature help, semantic tokens, inlay hints
+  - call hierarchy and type hierarchy
+  - diagnostics, workspace type-error scans, and diagnostic enrichment
+  - code actions, rename, and formatting
+
+Operational rules:
+  - Prefer lsp_document_symbols / lsp_workspace_symbols over search_files when the user asks about symbols, functions, methods, classes, or types.
+  - Prefer lsp_goto_definition, lsp_find_references, and lsp_goto_implementation for navigation instead of guessing from grep matches.
+  - Prefer lsp_code_actions, lsp_apply_code_action, lsp_rename, lsp_format_document, and lsp_format_range for code mutations that the server can perform semantically.
+  - Use lsp_diagnostics_pull and lsp_workspace_type_errors before making claims about compiler or type errors when an LSP server is available.
+  - Use search_files or read_file as fallback when the file type is unsupported, no server is configured, or the task is purely textual rather than semantic.
+
+EdgeCrab's LSP surface exceeds the common 9-operation baseline: it includes navigation plus code actions, rename, formatting, inlay hints, semantic tokens, signature help, type hierarchy, diagnostics pull, linked editing, LLM-enriched diagnostics, guided action selection, and workspace-wide type-error scans.";
+
 const SKILLS_GUIDANCE: &str = "\
 After completing a complex task (5+ tool calls), fixing a tricky error, or discovering \
 a non-trivial workflow, save the approach as a skill with skill_manage so you can reuse \
@@ -494,6 +516,10 @@ impl PromptBuilder {
         }
     }
 
+    fn has_any_tool(&self, tools: &[&str]) -> bool {
+        tools.iter().any(|tool| self.has_tool(tool))
+    }
+
     /// Build the full system prompt.
     ///
     /// `override_identity` replaces the default identity paragraph.
@@ -618,7 +644,16 @@ impl PromptBuilder {
             sections.push(Cow::Borrowed(VISION_GUIDANCE));
         }
 
-        // 14. Skills prompt (available skill descriptions)
+        // 14. LSP semantic-navigation guidance — only when the LSP surface is present.
+        if self.has_any_tool(&[
+            "lsp_goto_definition",
+            "lsp_workspace_symbols",
+            "lsp_workspace_type_errors",
+        ]) {
+            sections.push(Cow::Borrowed(LSP_GUIDANCE));
+        }
+
+        // 15. Skills prompt (available skill descriptions)
         if let Some(sp) = skill_prompt {
             if !sp.is_empty() {
                 sections.push(Cow::Borrowed(sp));
@@ -1524,8 +1559,8 @@ mod tests {
     fn override_identity() {
         let builder = PromptBuilder::new(Platform::Cli);
         let prompt = builder.build(Some("You are TestBot."), None, &[], None);
-        assert!(prompt.contains("You are TestBot."));
-        assert!(!prompt.contains("EdgeCrab"));
+        assert!(prompt.starts_with("You are TestBot."));
+        assert!(!prompt.contains(DEFAULT_IDENTITY));
     }
 
     #[test]
@@ -2173,6 +2208,38 @@ mod tests {
         assert!(
             !prompt.contains("NEVER call browser_vision"),
             "vision guidance must NOT appear when vision_analyze is not in tool list"
+        );
+    }
+
+    #[test]
+    fn lsp_guidance_present_when_lsp_tools_are_available() {
+        let builder = PromptBuilder::new(Platform::Cli)
+            .skip_context_files(true)
+            .available_tools(vec![
+                "read_file".to_string(),
+                "lsp_goto_definition".to_string(),
+                "lsp_workspace_type_errors".to_string(),
+            ]);
+        let prompt = builder.build(None, None, &[], None);
+        assert!(
+            prompt.contains("## Language Server Usage"),
+            "LSP guidance must be injected when LSP tools are available"
+        );
+        assert!(
+            prompt.contains("exceeds the common 9-operation baseline"),
+            "LSP guidance should make the richer EdgeCrab surface explicit to the model"
+        );
+    }
+
+    #[test]
+    fn lsp_guidance_absent_when_lsp_tools_are_unavailable() {
+        let builder = PromptBuilder::new(Platform::Cli)
+            .skip_context_files(true)
+            .available_tools(vec!["read_file".to_string(), "search_files".to_string()]);
+        let prompt = builder.build(None, None, &[], None);
+        assert!(
+            !prompt.contains("## Language Server Usage"),
+            "LSP guidance must not be injected when no LSP tools are available"
         );
     }
 

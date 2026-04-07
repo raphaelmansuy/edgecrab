@@ -103,6 +103,14 @@ jobs:
       - name: Wait for crates.io index (cron)
         run: sleep 30
 
+      - name: Publish edgecrab-lsp
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: publish_crate edgecrab-lsp --no-verify
+
+      - name: Wait for crates.io index (lsp)
+        run: sleep 30
+
       - name: Publish edgecrab-core
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

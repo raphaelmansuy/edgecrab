@@ -5,6 +5,8 @@
 
 #![deny(clippy::unwrap_used)]
 
+use edgecrab_lsp as _;
+
 pub mod agent;
 pub mod compression;
 pub mod config;

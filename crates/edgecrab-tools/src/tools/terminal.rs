@@ -175,13 +175,7 @@ impl ToolHandler for TerminalTool {
 
         // Auto-checkpoint before potentially destructive commands
         if is_destructive_command(&args.command) {
-            ensure_checkpoint(
-                ctx,
-                &format!(
-                    "before terminal: {}",
-                    &args.command[..args.command.len().min(80)]
-                ),
-            );
+            ensure_checkpoint(ctx, &destructive_checkpoint_label(&args.command));
         }
 
         // Security: scan command for dangerous patterns via Aho-Corasick scanner
@@ -324,6 +318,11 @@ fn is_destructive_command(cmd: &str) -> bool {
     }) || has_overwrite_redirect
 }
 
+fn destructive_checkpoint_label(command: &str) -> String {
+    let normalized = command.split_whitespace().collect::<Vec<_>>().join(" ");
+    format!("before terminal: {}", crate::safe_truncate(&normalized, 80))
+}
+
 /// Returns `true` if the backend error is worth retrying automatically.
 ///
 /// Retryable: backend temporarily unavailable (Docker pulling, SSH reconnect).
@@ -419,6 +418,20 @@ mod tests {
 
         assert!(result.contains("exit code: 42"));
         let _ = cleanup_backend_for_task(&ctx.task_id).await;
+    }
+
+    #[test]
+    fn destructive_checkpoint_label_preserves_utf8_boundaries() {
+        let label = destructive_checkpoint_label("rm -rf 你好你好你好你好你好你好你好你好你好");
+        assert!(label.starts_with("before terminal: "));
+        assert!(std::str::from_utf8(label.as_bytes()).is_ok());
+        assert!(!label.ends_with('\u{FFFD}'));
+    }
+
+    #[test]
+    fn destructive_checkpoint_label_normalizes_whitespace() {
+        let label = destructive_checkpoint_label("rm   -rf\t./tmp\nand-more");
+        assert_eq!(label, "before terminal: rm -rf ./tmp and-more");
     }
 
     #[tokio::test]

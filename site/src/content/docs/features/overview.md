@@ -77,6 +77,16 @@ Built-in browser control via Chrome DevTools Protocol (CDP):
 
 See [Browser Automation](/features/browser/)
 
+### Semantic Coding with LSP
+
+Built-in language-server support gives EdgeCrab semantic code intelligence instead of text-only heuristics:
+- Go to definition, references, implementation, document symbols, and workspace symbols
+- Code actions, semantic rename, whole-document and range formatting
+- Inlay hints, semantic tokens, signature help, call hierarchy, and type hierarchy
+- Pull diagnostics, workspace type-error scans, linked editing, and LLM-enriched diagnostic explanations
+
+See [Language Server Protocol](/features/lsp/)
+
 ### 15 Messaging Gateways
 
 Run EdgeCrab as a persistent bot on 15 platforms:
@@ -131,8 +141,8 @@ All tools sourced from `CORE_TOOLS` constant in
 
 | Alias | Expands to |
 |-------|-----------|
-| `core` | file + meta + scheduling + delegation + code_execution + session + mcp + browser (runtime-gated) |
-| `coding` | file + terminal + search + code_execution |
+| `core` | file + meta + scheduling + delegation + code_execution + lsp + session + mcp + messaging + media + browser (runtime-gated) |
+| `coding` | file + terminal + search + code_execution + lsp |
 | `research` | web + browser + vision |
 | `debugging` | terminal + web + file |
 | `safe` | web + vision + image_gen + moa |
@@ -240,6 +250,36 @@ reachable, these tools are silently absent from the tool list.
 |------|-------------|
 | `execute_code` | Execute Python, Node.js, or Bash code in isolation |
 
+### LSP Tools (`lsp`)
+
+| Tool | Description |
+|------|-------------|
+| `lsp_goto_definition` | Jump to a symbol definition |
+| `lsp_find_references` | Find symbol references |
+| `lsp_hover` | Get hover docs and type information |
+| `lsp_document_symbols` | Enumerate symbols in a file |
+| `lsp_workspace_symbols` | Search symbols across the workspace |
+| `lsp_goto_implementation` | Jump to concrete implementations |
+| `lsp_call_hierarchy_prepare` | Prepare call hierarchy items |
+| `lsp_incoming_calls` | Show incoming calls |
+| `lsp_outgoing_calls` | Show outgoing calls |
+| `lsp_code_actions` | List server-suggested fixes and refactors |
+| `lsp_apply_code_action` | Resolve and apply a code action |
+| `lsp_rename` | Rename a symbol across files |
+| `lsp_format_document` | Format a whole file |
+| `lsp_format_range` | Format a selected range |
+| `lsp_inlay_hints` | Return inlay hints |
+| `lsp_semantic_tokens` | Return semantic token classes |
+| `lsp_signature_help` | Show function signature help |
+| `lsp_type_hierarchy_prepare` | Prepare a type hierarchy item |
+| `lsp_supertypes` | List supertypes |
+| `lsp_subtypes` | List subtypes |
+| `lsp_diagnostics_pull` | Pull document or workspace diagnostics |
+| `lsp_linked_editing_range` | Return linked editing regions |
+| `lsp_enrich_diagnostics` | Explain diagnostics with the LLM |
+| `lsp_select_and_apply_action` | Pick and apply the best action |
+| `lsp_workspace_type_errors` | Summarize workspace-wide type errors |
+
 ### Session Tools (`session`)
 
 | Tool | Description |
@@ -300,6 +340,7 @@ Only available in gateway sessions (Telegram, Discord, Slack, etc.):
 - [Skills System](/features/skills/) — Creating and using reusable skills
 - [Memory](/features/memory/) — Persistent memory and Honcho user modeling
 - [Browser Automation](/features/browser/) — Browser automation with CDP
+- [Language Server Protocol](/features/lsp/) — Semantic code navigation, edits, and diagnostics
 - [SQLite State and Search](/features/state/) — Session persistence and FTS5 search
 - [Security Model](/user-guide/security/) — 7-layer defense stack
 
@@ -318,7 +359,7 @@ User Input
     |
     +--[Security checks]  <-- path jail + SSRF + command scan + approval
     |
-    +--[Tool Dispatch]    <-- file / terminal / web / browser / memory / mcp
+    +--[Tool Dispatch]    <-- file / terminal / web / browser / lsp / memory / mcp
     |
     v
 [State DB (SQLite)]  -- every message stored, FTS5 indexed
@@ -345,7 +386,7 @@ Yes. Use `--model ollama/llama3.3` (local Ollama) and `--toolset file,terminal,m
 
 **Q: How many tools can be active at once?**
 
-All 74 registered tools can be active simultaneously. The LLM receives tool schemas in the system prompt. Limiting toolsets to what's needed keeps the system prompt shorter and the LLM more focused.
+All registered tools can be active simultaneously, including the full LSP surface when semantic coding is enabled. Limiting toolsets to what's needed keeps the system prompt shorter and the LLM more focused.
 
 **Q: Edge case: Can the agent call the same tool infinitely?**
 

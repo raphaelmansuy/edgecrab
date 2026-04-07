@@ -12,6 +12,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased] — Phase 5: Integration & Polish
 
+### Added
+
+#### Language Server Protocol
+
+- **New `edgecrab-lsp` crate** — a dedicated subsystem for language-server lifecycle, document sync, diagnostics, position translation, workspace edits, and LLM-friendly result rendering.
+- **25 LSP tools** — EdgeCrab now exposes Claude-parity navigation plus code actions, rename, formatting, inlay hints, semantic tokens, signature help, type hierarchy, pull diagnostics, linked editing, LLM-enriched diagnostics, guided action selection, and workspace-wide type-error scans.
+- **LSP-first agent guidance** — when LSP tools are available, the prompt explicitly tells the agent to prefer semantic navigation and edits over plain text search.
+
+#### CI / CD and Docs
+
+- **CI and release automation updated for `edgecrab-lsp`** — CI now runs the dedicated LSP package tests explicitly and the crates.io publish order includes the new crate before `edgecrab-core`.
+- **Docs and website refreshed** — the features overview, tool reference, coding workflows guide, and configuration reference now document the LSP feature set and configuration.
+
 ### Stats
 
 | Metric | Value |
