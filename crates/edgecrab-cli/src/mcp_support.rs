@@ -7,6 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::mcp_oauth::{LoopbackPortMode, analyze_loopback_redirect_url};
 use edgecrab_tools::tools::mcp_client::{
     ConfiguredMcpServer, configured_servers, probe_configured_server, read_mcp_token_status,
 };
@@ -306,6 +307,27 @@ pub fn render_mcp_auth_guide(server_name: &str) -> anyhow::Result<String> {
             oauth.grant_type_label(),
             auth_method
         ));
+        if let Some(url) = oauth.device_authorization_url() {
+            lines.push(format!("oauth: device-url={url}"));
+        }
+        if let Some(url) = oauth.authorization_url() {
+            lines.push(format!("oauth: authorize-url={url}"));
+        }
+        if let Some(url) = oauth.redirect_url() {
+            lines.push(format!("oauth: redirect-url={url}"));
+            match analyze_loopback_redirect_url(url) {
+                Ok(info) => match info.port_mode {
+                    LoopbackPortMode::Fixed(port) => {
+                        lines.push(format!("oauth: loopback-redirect=fixed-port:{port}"));
+                    }
+                    LoopbackPortMode::Dynamic => lines.push(
+                        "oauth: loopback-redirect=dynamic-port (recommended when the local port is not guaranteed)"
+                            .into(),
+                    ),
+                },
+                Err(err) => lines.push(format!("oauth: redirect-url invalid for browser login | {err}")),
+            }
+        }
 
         let cache_status = read_mcp_token_status(&server.name);
         if let Some(cache) = format_oauth_cache_state(&server.name) {
@@ -557,6 +579,25 @@ fn analyze_server(server: &ConfiguredMcpServer) -> StaticMcpReport {
             }
             if let Some(url) = oauth.redirect_url() {
                 lines.push(format!("oauth: redirect-url={url}"));
+                match analyze_loopback_redirect_url(url) {
+                    Ok(info) => match info.port_mode {
+                        LoopbackPortMode::Fixed(port) => {
+                            lines.push(format!("oauth: loopback-redirect=fixed-port:{port}"));
+                        }
+                        LoopbackPortMode::Dynamic => {
+                            lines.push(
+                                "oauth: loopback-redirect=dynamic-port (recommended when local ports are often busy)"
+                                    .into(),
+                            );
+                        }
+                    },
+                    Err(err) => {
+                        status = status.max(McpDoctorStatus::Warn);
+                        lines.push(format!(
+                            "oauth: redirect-url invalid for browser login | {err}"
+                        ));
+                    }
+                }
             }
 
             if oauth.auth_method_label() != "none" && !oauth.has_client_id() {
@@ -601,6 +642,11 @@ fn analyze_server(server: &ConfiguredMcpServer) -> StaticMcpReport {
                         "oauth: authorization_code grant selected but redirect_url is missing"
                             .into(),
                     );
+                } else if oauth
+                    .redirect_url()
+                    .is_some_and(|url| analyze_loopback_redirect_url(url).is_err())
+                {
+                    status = status.max(McpDoctorStatus::Warn);
                 }
             }
             if let Some(cache) = format_oauth_cache_state(&server.name) {

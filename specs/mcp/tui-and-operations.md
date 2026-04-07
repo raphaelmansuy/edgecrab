@@ -138,7 +138,14 @@ Interactive login output should be operator-safe:
 
 - the verification or authorization URL
 - the device code when the server uses device flow
+- the effective loopback redirect URL when browser login is using a dynamic local port
 - a success/failure summary that states whether refresh token caching succeeded
+
+Browser-loopback login rules:
+
+- `oauth.redirect_url` must be an `http` loopback URL (`localhost`, `127.0.0.1`, or `::1`).
+- A redirect without an explicit port, or with port `0`, means EdgeCrab should allocate a free local callback port dynamically.
+- A fixed-port redirect remains supported when the operator or provider requires it.
 
 Good:
 

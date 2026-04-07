@@ -19,6 +19,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **Actionable MCP OAuth workflow guidance** — `edgecrab mcp auth <server>` and `/mcp auth <server>` now tell the operator which auth path is active, what is missing, and what to do next.
 - **Refresh-token-aware MCP token storage** — `/mcp-token` now supports refresh-token caching and per-server token status, so refresh-token OAuth servers are operable from the TUI instead of only diagnosable.
 - **Interactive MCP OAuth login** — `edgecrab mcp login <server>` and `/mcp login <server>` now run real interactive OAuth flows for HTTP MCP servers, including device-code login and browser-based authorization-code login with loopback callback support.
+- **Browser OAuth gap closed further** — browser-based MCP login now supports dynamic loopback redirect ports for busy local environments, validates redirect safety in doctor/auth output, and has end-to-end authorization-code coverage in the CLI test suite.
 - **Code-grounded MCP specification set** — new ADR-style documents under `specs/mcp/` define the MCP transport plane, TUI operator UX, path parsing model, and edge-case roadblocks from the current implementation outward.
 
 #### Skills Hub

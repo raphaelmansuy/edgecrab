@@ -76,13 +76,11 @@ EdgeCrab already has:
 - Slash commands: `/mcp`, `/reload-mcp`, `/mcp-token`.
 - CLI commands: `edgecrab mcp list|refresh|search|view|install|test|doctor|auth|login|add|remove`.
 
-The current gaps are operational, not foundational:
+The remaining gaps are now narrower and mostly around breadth rather than control-plane depth:
 
-- TUI `/mcp` parsing is whitespace-fragile for quoted values and Windows-style paths.
-- There is no dedicated MCP diagnostic workflow that combines static config analysis with live probing.
-- TUI overlay actions are good, but not yet operator-complete.
-- Documentation is spread across README, site docs, and feature docs without one code-backed MCP control-plane spec.
 - Registry discovery is broader than install support. EdgeCrab currently auto-installs only streamable HTTP, npm stdio, and PyPI stdio registry entries; other registry transports remain view-only.
+- Browser-loopback OAuth depends on provider compatibility with standard loopback redirect behavior; EdgeCrab now supports fixed-port and dynamic-port loopback redirects, but cannot normalize every provider-specific deviation.
+- EdgeCrab still relies on the system browser instead of an embedded webview for consent screens.
 
 ## Document Map
 
@@ -103,6 +101,7 @@ Priority 1:
 - Dedicated MCP doctor flow in CLI and TUI.
 - Dedicated MCP auth flow in CLI and TUI with explicit refresh-token next steps.
 - Interactive MCP OAuth login for device-code and browser-loopback authorization-code flows.
+- Dynamic loopback redirect handling so browser login does not depend on one hard-coded local port.
 
 Priority 2:
 

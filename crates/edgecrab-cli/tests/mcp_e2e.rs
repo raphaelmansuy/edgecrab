@@ -286,3 +286,45 @@ fn mcp_login_device_flow_caches_access_and_refresh_tokens() {
     assert!(stored.contains("access-token-1"), "stored:\n{stored}");
     assert!(stored.contains("refresh-token-1"), "stored:\n{stored}");
 }
+
+#[test]
+fn mcp_auth_reports_dynamic_loopback_redirects_for_browser_flow() {
+    let (base_url, shutdown_tx, _) = spawn_mock_oauth_server();
+    let home = tempdir().expect("temp home");
+    let config_dir = home.path().join(".edgecrab");
+    fs::create_dir_all(&config_dir).expect("config dir");
+
+    let config_path = config_dir.join("config.yaml");
+    fs::write(
+        &config_path,
+        format!(
+            "mcp_servers:\n  oauth-browser:\n    url: https://example.com/mcp\n    enabled: true\n    oauth:\n      token_url: {base_url}/token\n      authorization_url: {base_url}/authorize\n      redirect_url: http://127.0.0.1/callback\n      grant_type: authorization_code\n      auth_method: none\n      client_id: edgecrab-browser-client\n      use_pkce: true\n"
+        ),
+    )
+    .expect("config");
+
+    let output = edgecrab()
+        .arg("--config")
+        .arg(&config_path)
+        .args(["mcp", "auth", "oauth-browser"])
+        .env("HOME", home.path())
+        .output()
+        .expect("run edgecrab");
+
+    let _ = shutdown_tx.send(());
+
+    assert!(
+        output.status.success(),
+        "mcp auth failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let collected_stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        collected_stdout.contains("loopback-redirect=dynamic-port"),
+        "stdout:\n{collected_stdout}"
+    );
+    assert!(
+        collected_stdout.contains("/mcp login oauth-browser"),
+        "stdout:\n{collected_stdout}"
+    );
+}

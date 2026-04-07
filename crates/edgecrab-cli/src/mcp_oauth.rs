@@ -15,7 +15,7 @@ use rand::RngCore;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
-use url::Url;
+use url::{Host, Url};
 
 #[derive(Debug, Deserialize)]
 struct DeviceAuthorizationResponse {
@@ -57,6 +57,26 @@ struct OAuthTokenRecord {
 #[derive(Debug)]
 struct LoopbackCallbackPayload {
     values: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoopbackPortMode {
+    Fixed(u16),
+    Dynamic,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LoopbackRedirectInfo {
+    pub redirect_uri: String,
+    pub port_mode: LoopbackPortMode,
+}
+
+#[derive(Debug, Clone)]
+struct LoopbackRedirectPlan {
+    original_url: Url,
+    bind_host: String,
+    path: String,
+    port_mode: LoopbackPortMode,
 }
 
 pub async fn login_mcp_server<F>(server_name: &str, mut notify: F) -> anyhow::Result<String>
@@ -229,19 +249,27 @@ where
     let redirect_url = oauth
         .redirect_url()
         .ok_or_else(|| anyhow!("MCP server '{server_name}' is missing oauth.redirect_url"))?;
-    let redirect = Url::parse(redirect_url)
+    let callback = LoopbackCallback::bind(redirect_url)
+        .await
         .with_context(|| format!("redirect_url is invalid for '{server_name}'"))?;
-    let callback = LoopbackCallback::bind(&redirect).await?;
+    let effective_redirect_uri = callback.redirect_uri().to_string();
 
     let state = random_urlsafe(24);
     let code_verifier = oauth.uses_pkce().then(|| random_urlsafe(48));
     let auth_url = build_authorization_url(
         authorization_url,
         oauth,
-        redirect_url,
+        &effective_redirect_uri,
         &state,
         code_verifier.as_deref(),
     )?;
+
+    if callback.uses_dynamic_port() {
+        notify(format!(
+            "Using dynamic loopback redirect {} for '{server_name}'.",
+            callback.redirect_uri()
+        ));
+    }
 
     if open_url_in_browser(auth_url.as_str()).is_ok() {
         notify(format!(
@@ -282,7 +310,7 @@ where
     let mut params = build_token_request_base(oauth);
     params.push(("grant_type".into(), "authorization_code".into()));
     params.push(("code".into(), code.clone()));
-    params.push(("redirect_uri".into(), redirect_url.to_string()));
+    params.push(("redirect_uri".into(), effective_redirect_uri));
     if let Some(code_verifier) = code_verifier {
         params.push(("code_verifier".into(), code_verifier));
     }
@@ -492,42 +520,35 @@ async fn render_oauth_error(response: reqwest::Response, prefix: String) -> Stri
 }
 
 struct LoopbackCallback {
+    redirect_uri: String,
+    port_mode: LoopbackPortMode,
     callback_rx: oneshot::Receiver<LoopbackCallbackPayload>,
     shutdown_tx: Option<oneshot::Sender<()>>,
     _task: tokio::task::JoinHandle<()>,
 }
 
 impl LoopbackCallback {
-    async fn bind(redirect_url: &Url) -> anyhow::Result<Self> {
-        if redirect_url.scheme() != "http" {
-            bail!(
-                "redirect_url must use http loopback, not {}",
-                redirect_url.scheme()
-            );
-        }
-        let host = redirect_url
-            .host_str()
-            .ok_or_else(|| anyhow!("redirect_url is missing a host"))?;
-        if host != "127.0.0.1" && host != "localhost" {
-            bail!("redirect_url host must be 127.0.0.1 or localhost");
-        }
-        let port = redirect_url
-            .port_or_known_default()
-            .ok_or_else(|| anyhow!("redirect_url is missing a port"))?;
-        let path = match redirect_url.path() {
-            "" => "/",
-            value => value,
+    async fn bind(redirect_url: &str) -> anyhow::Result<Self> {
+        let plan = analyze_loopback_redirect_plan(redirect_url)?;
+        let requested_port = match plan.port_mode {
+            LoopbackPortMode::Fixed(port) => port,
+            LoopbackPortMode::Dynamic => 0,
         };
-
-        let listener = if host == "localhost" {
-            tokio::net::TcpListener::bind(("localhost", port))
-                .await
-                .with_context(|| format!("failed to bind local callback port {port}"))?
-        } else {
-            tokio::net::TcpListener::bind(("127.0.0.1", port))
-                .await
-                .with_context(|| format!("failed to bind local callback port {port}"))?
-        };
+        let listener = tokio::net::TcpListener::bind((plan.bind_host.as_str(), requested_port))
+            .await
+            .with_context(|| match plan.port_mode {
+                LoopbackPortMode::Fixed(port) => format!(
+                    "failed to bind local callback port {port}; if the port is busy, set `oauth.redirect_url` to a loopback URL without a port or with `:0` so EdgeCrab can allocate one dynamically"
+                ),
+                LoopbackPortMode::Dynamic => {
+                    "failed to bind a dynamic local callback port".to_string()
+                }
+            })?;
+        let actual_port = listener
+            .local_addr()
+            .context("failed to determine local callback address")?
+            .port();
+        let redirect_info = build_loopback_redirect_info(&plan, actual_port)?;
 
         let callback_state = Arc::new(Mutex::new(None));
         let (callback_tx, callback_rx) = oneshot::channel();
@@ -535,7 +556,7 @@ impl LoopbackCallback {
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let router = Router::new()
-            .route(path, get(loopback_callback_handler))
+            .route(&plan.path, get(loopback_callback_handler))
             .with_state(callback_state);
         let server = axum::serve(listener, router).with_graceful_shutdown(async {
             let _ = shutdown_rx.await;
@@ -545,16 +566,31 @@ impl LoopbackCallback {
         });
 
         Ok(Self {
+            redirect_uri: redirect_info.redirect_uri,
+            port_mode: redirect_info.port_mode,
             callback_rx,
             shutdown_tx: Some(shutdown_tx),
             _task: task,
         })
     }
 
+    fn redirect_uri(&self) -> &str {
+        &self.redirect_uri
+    }
+
+    fn uses_dynamic_port(&self) -> bool {
+        self.port_mode == LoopbackPortMode::Dynamic
+    }
+
     async fn wait_for_callback(mut self) -> anyhow::Result<LoopbackCallbackPayload> {
         let payload = tokio::time::timeout(Duration::from_secs(180), self.callback_rx)
             .await
-            .context("timed out waiting for the OAuth browser callback")?
+            .with_context(|| {
+                format!(
+                    "timed out waiting for the OAuth browser callback on {}",
+                    self.redirect_uri
+                )
+            })?
             .map_err(|_| anyhow!("OAuth browser callback channel closed unexpectedly"))?;
         if let Some(shutdown_tx) = self.shutdown_tx.take() {
             let _ = shutdown_tx.send(());
@@ -573,9 +609,172 @@ async fn loopback_callback_handler(
     Html("EdgeCrab MCP OAuth login is complete. You can return to the terminal.")
 }
 
+pub(crate) fn analyze_loopback_redirect_url(
+    redirect_url: &str,
+) -> anyhow::Result<LoopbackRedirectInfo> {
+    let plan = analyze_loopback_redirect_plan(redirect_url)?;
+    let placeholder_port = match plan.port_mode {
+        LoopbackPortMode::Fixed(port) => port,
+        LoopbackPortMode::Dynamic => 1,
+    };
+    build_loopback_redirect_info(&plan, placeholder_port)
+}
+
+fn analyze_loopback_redirect_plan(redirect_url: &str) -> anyhow::Result<LoopbackRedirectPlan> {
+    let redirect_url = Url::parse(redirect_url).context("redirect_url is invalid")?;
+    if redirect_url.scheme() != "http" {
+        bail!(
+            "redirect_url must use an http loopback URL, not {}",
+            redirect_url.scheme()
+        );
+    }
+    if redirect_url.fragment().is_some() {
+        bail!("redirect_url must not contain a fragment");
+    }
+
+    let bind_host = match redirect_url.host() {
+        Some(Host::Domain("localhost")) => "localhost".to_string(),
+        Some(Host::Ipv4(ip)) if ip.is_loopback() => ip.to_string(),
+        Some(Host::Ipv6(ip)) if ip.is_loopback() => ip.to_string(),
+        Some(_) => bail!("redirect_url host must be localhost, 127.0.0.1, or ::1"),
+        None => bail!("redirect_url is missing a host"),
+    };
+
+    let path = match redirect_url.path() {
+        "" => "/".to_string(),
+        value => value.to_string(),
+    };
+    let port_mode = match redirect_url.port() {
+        Some(0) | None => LoopbackPortMode::Dynamic,
+        Some(port) => LoopbackPortMode::Fixed(port),
+    };
+
+    Ok(LoopbackRedirectPlan {
+        original_url: redirect_url,
+        bind_host,
+        path,
+        port_mode,
+    })
+}
+
+fn build_loopback_redirect_info(
+    plan: &LoopbackRedirectPlan,
+    actual_port: u16,
+) -> anyhow::Result<LoopbackRedirectInfo> {
+    let mut effective_url = plan.original_url.clone();
+    effective_url
+        .set_port(Some(actual_port))
+        .map_err(|_| anyhow!("redirect_url port could not be updated"))?;
+    Ok(LoopbackRedirectInfo {
+        redirect_uri: effective_url.to_string(),
+        port_mode: plan.port_mode,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::sync::Arc;
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use axum::extract::{Query, State};
+    use axum::response::Redirect;
+    use axum::routing::{get, post};
+    use axum::{Json, Router, http::StatusCode};
+    use tempfile::tempdir;
+
+    #[derive(Clone)]
+    struct MockOauthState {
+        authorize_calls: Arc<AtomicUsize>,
+        token_calls: Arc<AtomicUsize>,
+    }
+
+    async fn mock_authorize_endpoint(
+        State(state): State<MockOauthState>,
+        Query(query): Query<HashMap<String, String>>,
+    ) -> Redirect {
+        let _ = state.authorize_calls.fetch_add(1, Ordering::SeqCst);
+        let redirect_uri = query.get("redirect_uri").expect("redirect_uri").to_string();
+        let state_value = query.get("state").expect("state").to_string();
+        let separator = if redirect_uri.contains('?') { '&' } else { '?' };
+        Redirect::temporary(&format!(
+            "{redirect_uri}{separator}code=auth-code-1&state={state_value}"
+        ))
+    }
+
+    async fn mock_token_endpoint(
+        State(state): State<MockOauthState>,
+    ) -> (StatusCode, Json<serde_json::Value>) {
+        let _ = state.token_calls.fetch_add(1, Ordering::SeqCst);
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "access_token": "browser-access-token-1",
+                "refresh_token": "browser-refresh-token-1",
+                "expires_in": 3600
+            })),
+        )
+    }
+
+    async fn spawn_browser_oauth_server() -> (String, oneshot::Sender<()>, MockOauthState) {
+        let state = MockOauthState {
+            authorize_calls: Arc::new(AtomicUsize::new(0)),
+            token_calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let router = Router::new()
+            .route("/authorize", get(mock_authorize_endpoint))
+            .route("/token", post(mock_token_endpoint))
+            .with_state(state.clone());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+        });
+        (format!("http://{}", addr), shutdown_tx, state)
+    }
+
+    fn env_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &std::path::Path) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: tests serialize env mutations through env_lock().
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: tests serialize env mutations through env_lock().
+            unsafe {
+                if let Some(previous) = self.previous.take() {
+                    std::env::set_var(self.key, previous);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
 
     #[test]
     fn pkce_challenge_is_url_safe() {
@@ -583,5 +782,123 @@ mod tests {
         assert!(!challenge.contains('+'));
         assert!(!challenge.contains('/'));
         assert!(!challenge.contains('='));
+    }
+
+    #[test]
+    fn analyze_loopback_redirect_accepts_dynamic_port_without_explicit_port() {
+        let info = analyze_loopback_redirect_url("http://127.0.0.1/callback").expect("info");
+        assert_eq!(info.port_mode, LoopbackPortMode::Dynamic);
+        assert!(info.redirect_uri.contains("127.0.0.1:1/callback"));
+    }
+
+    #[test]
+    fn analyze_loopback_redirect_accepts_ipv6_loopback() {
+        let info = analyze_loopback_redirect_url("http://[::1]:8123/callback").expect("info");
+        assert_eq!(info.port_mode, LoopbackPortMode::Fixed(8123));
+        assert_eq!(info.redirect_uri, "http://[::1]:8123/callback");
+    }
+
+    #[test]
+    fn analyze_loopback_redirect_rejects_non_loopback_host() {
+        let err = analyze_loopback_redirect_url("http://example.com/callback")
+            .expect_err("non-loopback host should fail");
+        assert!(err.to_string().contains("localhost"));
+    }
+
+    #[tokio::test]
+    async fn authorization_code_login_supports_dynamic_loopback_redirects() {
+        let _guard = env_lock().lock().await;
+        let (base_url, shutdown_tx, state) = spawn_browser_oauth_server().await;
+        let home = tempdir().expect("temp home");
+        let edgecrab_home = home.path().join(".edgecrab");
+        fs::create_dir_all(&edgecrab_home).expect("config dir");
+        fs::write(
+            edgecrab_home.join("config.yaml"),
+            format!(
+                "mcp_servers:\n  oauth-browser:\n    url: https://example.com/mcp\n    enabled: true\n    oauth:\n      token_url: {base_url}/token\n      authorization_url: {base_url}/authorize\n      redirect_url: http://127.0.0.1/callback\n      grant_type: authorization_code\n      auth_method: none\n      client_id: edgecrab-browser-client\n      use_pkce: true\n"
+            ),
+        )
+        .expect("config");
+        let _edgecrab_home_guard = EnvVarGuard::set("EDGECRAB_HOME", &edgecrab_home);
+        let _home_guard = EnvVarGuard::set("HOME", home.path());
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("client");
+        let (notice_tx, mut notice_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+        let login_task = tokio::spawn(async move {
+            login_mcp_server("oauth-browser", |line| {
+                let _ = notice_tx.send(line);
+            })
+            .await
+        });
+
+        let mut auth_url = None;
+        let mut dynamic_notice = None;
+        for _ in 0..4 {
+            let line = match tokio::time::timeout(Duration::from_secs(2), notice_rx.recv()).await {
+                Ok(Some(line)) => line,
+                Ok(None) => {
+                    let result = login_task.await.expect("join");
+                    panic!("login task ended before emitting notice: {result:?}");
+                }
+                Err(_) => {
+                    panic!("timed out waiting for OAuth login notices");
+                }
+            };
+            if line.contains("Using dynamic loopback redirect") {
+                dynamic_notice = Some(line.clone());
+            }
+            if let Some((_, url)) = line.rsplit_once(" visit ") {
+                auth_url = Some(url.to_string());
+                break;
+            }
+        }
+
+        let auth_url = if let Some(auth_url) = auth_url {
+            auth_url
+        } else if login_task.is_finished() {
+            let result = login_task.await.expect("join");
+            panic!("login task finished before authorization URL was emitted: {result:?}");
+        } else {
+            panic!("authorization url");
+        };
+        let dynamic_notice = dynamic_notice.expect("dynamic redirect notice");
+        assert!(dynamic_notice.contains("http://127.0.0.1:"));
+
+        let authorize_response = client.get(&auth_url).send().await.expect("authorize");
+        assert!(authorize_response.status().is_redirection());
+        let callback_url = authorize_response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string)
+            .expect("callback location");
+
+        let callback_client = reqwest::Client::new();
+        let mut callback_response = None;
+        for _ in 0..20 {
+            match callback_client.get(&callback_url).send().await {
+                Ok(value) => {
+                    callback_response = Some(value);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
+            }
+        }
+        let callback_response = callback_response.expect("callback response");
+        assert!(callback_response.status().is_success());
+
+        let token_summary = login_task.await.expect("join").expect("login result");
+        let _ = shutdown_tx.send(());
+
+        let token_record = fs::read_to_string(edgecrab_home.join("mcp-tokens/oauth-browser.json"))
+            .expect("token record");
+        assert!(token_summary.contains("OAuth login complete"));
+        assert!(token_record.contains("browser-access-token-1"));
+        assert!(token_record.contains("browser-refresh-token-1"));
+        assert!(state.authorize_calls.load(Ordering::SeqCst) >= 1);
+        assert!(state.token_calls.load(Ordering::SeqCst) >= 1);
     }
 }
