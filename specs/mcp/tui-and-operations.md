@@ -22,6 +22,7 @@ Requirements:
 
 - TUI must expose a doctor/check action for configured entries.
 - TUI must expose an auth workflow that tells the operator the next action, not just the failure symptom.
+- TUI must expose a login workflow for interactive OAuth servers so operators can finish auth without dropping to manual token surgery.
 - Doctor output must distinguish:
   - bad config
   - missing command
@@ -117,6 +118,7 @@ edgecrab mcp test github
 edgecrab mcp doctor
 edgecrab mcp doctor github
 edgecrab mcp auth github
+edgecrab mcp login github
 ```
 
 The CLI is not secondary. It is the automation surface. The TUI is the operator surface.
@@ -131,6 +133,12 @@ Auth output should be operational:
 - cache state
 - next step
 - explicit refresh-token guidance when that flow is configured
+
+Interactive login output should be operator-safe:
+
+- the verification or authorization URL
+- the device code when the server uses device flow
+- a success/failure summary that states whether refresh token caching succeeded
 
 Good:
 
@@ -156,6 +164,7 @@ Claude Code excels at coding workflows, but EdgeCrab can exceed it in MCP operat
 - hot reload
 - probe plus doctor
 - auth plus refresh-token guidance
+- interactive OAuth login from the MCP control plane
 - TUI-native browse/test/diagnose/remove flows
 
 Hermes established the agent model. EdgeCrab should exceed it by giving MCP the same operational quality bar as model routing or gateway setup.

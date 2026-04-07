@@ -27,6 +27,7 @@ mod gateway_setup;
 mod image_models;
 mod markdown_render;
 mod mcp_catalog;
+mod mcp_oauth;
 mod mcp_support;
 mod model_discovery;
 #[cfg(target_os = "macos")]
@@ -1024,6 +1025,10 @@ async fn run_mcp(command: McpCommand, args: &CliArgs) -> anyhow::Result<()> {
         }
         McpCommand::Auth { name } => {
             println!("{}", mcp_support::render_mcp_auth_guide(&name)?);
+        }
+        McpCommand::Login { name } => {
+            let summary = mcp_oauth::login_mcp_server(&name, |line| println!("{line}")).await?;
+            println!("{summary}");
         }
         McpCommand::Add {
             name,

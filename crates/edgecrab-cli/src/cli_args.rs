@@ -377,6 +377,11 @@ pub enum McpCommand {
         /// Configured MCP server name
         name: String,
     },
+    /// Perform an interactive OAuth login for one configured HTTP MCP server
+    Login {
+        /// Configured MCP server name
+        name: String,
+    },
     /// Add or update an MCP server
     Add {
         name: String,
@@ -879,6 +884,17 @@ mod tests {
             args.command,
             Some(Command::Mcp {
                 command: McpCommand::Auth { .. }
+            })
+        ));
+    }
+
+    #[test]
+    fn parse_mcp_login_subcommand() {
+        let args = CliArgs::parse_from(["edgecrab", "mcp", "login", "github"]);
+        assert!(matches!(
+            args.command,
+            Some(Command::Mcp {
+                command: McpCommand::Login { .. }
             })
         ));
     }

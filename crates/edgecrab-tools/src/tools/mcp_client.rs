@@ -172,6 +172,22 @@ pub fn write_mcp_refresh_token(server_name: &str, refresh_token: &str) -> std::i
     write_mcp_token_record(server_name, &existing)
 }
 
+pub fn write_mcp_oauth_token(
+    server_name: &str,
+    access_token: &str,
+    refresh_token: Option<&str>,
+    expires_at_epoch_secs: Option<u64>,
+) -> std::io::Result<()> {
+    let mut existing = read_mcp_token_record(server_name).unwrap_or_default();
+    existing.access_token = access_token.to_string();
+    existing.token_type = Some("Bearer".into());
+    if let Some(refresh_token) = refresh_token {
+        existing.refresh_token = Some(refresh_token.to_string());
+    }
+    existing.expires_at_epoch_secs = expires_at_epoch_secs;
+    write_mcp_token_record(server_name, &existing)
+}
+
 /// Remove stored OAuth tokens for a given server.
 pub fn remove_mcp_token(server_name: &str) {
     if let Some(dir) = mcp_tokens_dir() {
@@ -207,10 +223,15 @@ pub struct OAuthConfig {
     client_id: Option<String>,
     client_secret: Option<String>,
     auth_method: OAuthClientAuthMethod,
+    device_authorization_url: Option<String>,
+    authorization_url: Option<String>,
+    redirect_url: Option<String>,
+    use_pkce: Option<bool>,
     scopes: Vec<String>,
     audience: Option<String>,
     resource: Option<String>,
     refresh_token: Option<String>,
+    authorization_params: HashMap<String, String>,
     extra_params: HashMap<String, String>,
 }
 
@@ -224,6 +245,8 @@ impl OAuthConfig {
             OAuthGrantType::Auto => "auto",
             OAuthGrantType::ClientCredentials => "client_credentials",
             OAuthGrantType::RefreshToken => "refresh_token",
+            OAuthGrantType::DeviceCode => "device_code",
+            OAuthGrantType::AuthorizationCode => "authorization_code",
         }
     }
 
@@ -252,6 +275,58 @@ impl OAuthConfig {
             .as_deref()
             .is_some_and(|value| !value.trim().is_empty())
     }
+
+    pub fn device_authorization_url(&self) -> Option<&str> {
+        self.device_authorization_url.as_deref()
+    }
+
+    pub fn authorization_url(&self) -> Option<&str> {
+        self.authorization_url.as_deref()
+    }
+
+    pub fn redirect_url(&self) -> Option<&str> {
+        self.redirect_url.as_deref()
+    }
+
+    pub fn uses_pkce(&self) -> bool {
+        self.use_pkce.unwrap_or(true)
+    }
+
+    pub fn client_id(&self) -> Option<&str> {
+        self.client_id.as_deref()
+    }
+
+    pub fn client_secret(&self) -> Option<&str> {
+        self.client_secret.as_deref()
+    }
+
+    pub fn scopes(&self) -> &[String] {
+        &self.scopes
+    }
+
+    pub fn audience(&self) -> Option<&str> {
+        self.audience.as_deref()
+    }
+
+    pub fn resource(&self) -> Option<&str> {
+        self.resource.as_deref()
+    }
+
+    pub fn authorization_params(&self) -> &HashMap<String, String> {
+        &self.authorization_params
+    }
+
+    pub fn extra_params(&self) -> &HashMap<String, String> {
+        &self.extra_params
+    }
+
+    pub fn uses_basic_auth(&self) -> bool {
+        self.auth_method == OAuthClientAuthMethod::ClientSecretBasic
+    }
+
+    pub fn uses_post_auth(&self) -> bool {
+        self.auth_method == OAuthClientAuthMethod::ClientSecretPost
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -259,6 +334,8 @@ enum OAuthGrantType {
     Auto,
     ClientCredentials,
     RefreshToken,
+    DeviceCode,
+    AuthorizationCode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -485,6 +562,18 @@ async fn fetch_oauth_token(
                 OAuthGrantType::ClientCredentials
             }
         }
+        OAuthGrantType::DeviceCode | OAuthGrantType::AuthorizationCode => {
+            if refresh_token.is_some() {
+                OAuthGrantType::RefreshToken
+            } else {
+                return Err(ToolError::ExecutionFailed {
+                    tool: "mcp_client".into(),
+                    message: format!(
+                        "OAuth server '{server_name}' requires an interactive login before EdgeCrab can obtain an access token. Run `edgecrab mcp login {server_name}` or `/mcp login {server_name}`."
+                    ),
+                });
+            }
+        }
         other => other,
     };
 
@@ -509,6 +598,9 @@ async fn fetch_oauth_token(
             params.push(("refresh_token".into(), refresh_token));
         }
         OAuthGrantType::Auto => unreachable!("auto is resolved earlier"),
+        OAuthGrantType::DeviceCode | OAuthGrantType::AuthorizationCode => {
+            unreachable!("interactive grants are resolved earlier")
+        }
     }
 
     if !config.scopes.is_empty() {
@@ -958,10 +1050,15 @@ struct YamlMcpOauth {
     client_id: Option<String>,
     client_secret: Option<String>,
     auth_method: Option<String>,
+    device_authorization_url: Option<String>,
+    authorization_url: Option<String>,
+    redirect_url: Option<String>,
+    use_pkce: Option<bool>,
     scopes: Vec<String>,
     audience: Option<String>,
     resource: Option<String>,
     refresh_token: Option<String>,
+    authorization_params: std::collections::HashMap<String, String>,
     extra_params: std::collections::HashMap<String, String>,
 }
 
@@ -1028,6 +1125,8 @@ fn parse_oauth_grant_type(value: Option<&str>) -> OAuthGrantType {
     match value.unwrap_or("auto").trim().to_ascii_lowercase().as_str() {
         "client_credentials" | "client-credentials" => OAuthGrantType::ClientCredentials,
         "refresh_token" | "refresh-token" => OAuthGrantType::RefreshToken,
+        "device_code" | "device-code" => OAuthGrantType::DeviceCode,
+        "authorization_code" | "authorization-code" => OAuthGrantType::AuthorizationCode,
         _ => OAuthGrantType::Auto,
     }
 }
@@ -1069,6 +1168,19 @@ fn parse_oauth_config(value: Option<&serde_json::Value>) -> Option<OAuthConfig> 
         auth_method: parse_oauth_auth_method(
             oauth.get("auth_method").and_then(|value| value.as_str()),
         ),
+        device_authorization_url: oauth
+            .get("device_authorization_url")
+            .and_then(|value| value.as_str())
+            .map(expand_config_string),
+        authorization_url: oauth
+            .get("authorization_url")
+            .and_then(|value| value.as_str())
+            .map(expand_config_string),
+        redirect_url: oauth
+            .get("redirect_url")
+            .and_then(|value| value.as_str())
+            .map(expand_config_string),
+        use_pkce: oauth.get("use_pkce").and_then(|value| value.as_bool()),
         scopes: oauth
             .get("scopes")
             .and_then(|value| value.as_array())
@@ -1091,6 +1203,20 @@ fn parse_oauth_config(value: Option<&serde_json::Value>) -> Option<OAuthConfig> 
             .get("refresh_token")
             .and_then(|value| value.as_str())
             .map(expand_config_string),
+        authorization_params: oauth
+            .get("authorization_params")
+            .and_then(|value| value.as_object())
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|(key, value)| {
+                        value
+                            .as_str()
+                            .map(|value| (key.clone(), expand_config_string(value)))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
         extra_params: oauth
             .get("extra_params")
             .and_then(|value| value.as_object())

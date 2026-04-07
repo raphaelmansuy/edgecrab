@@ -63,11 +63,11 @@ EdgeCrab implements a robust, extensible tool system, dynamic MCP integration, a
 	- Implements both stdio and HTTP JSON-RPC 2.0 clients ([mcp_client.rs](../../crates/edgecrab-tools/src/tools/mcp_client.rs)).
 	- Connection pooling via DashMap, token management (`read_mcp_token`, `write_mcp_token`).
 	- Tool calls: `mcp_list_tools`, `mcp_call_tool`, etc. — discover and invoke remote tools.
-	- Operator workflows now include shared MCP doctor diagnostics, actionable MCP auth guidance, refresh-token caching, and quote-aware TUI command parsing for path-bearing install flows.
+	- Operator workflows now include shared MCP doctor diagnostics, actionable MCP auth guidance, interactive OAuth login, refresh-token caching, and quote-aware TUI command parsing for path-bearing install flows.
 - **TUI / CLI control plane:**
 	- `crates/edgecrab-cli/src/app.rs` exposes `/mcp` as a searchable MCP browser with install, view, test, diagnose, and remove actions.
 	- `/mcp search` opens a dedicated remote browser for official upstream sources plus the official MCP Registry, with per-source provenance and install/view actions.
-	- `crates/edgecrab-cli/src/main.rs` exposes the same control plane via `edgecrab mcp ...`, including `edgecrab mcp doctor`, `edgecrab mcp auth`, and grouped multi-source `edgecrab mcp search`.
+	- `crates/edgecrab-cli/src/main.rs` exposes the same control plane via `edgecrab mcp ...`, including `edgecrab mcp doctor`, `edgecrab mcp auth`, `edgecrab mcp login`, and grouped multi-source `edgecrab mcp search`.
 - **Server:**
 	- ACP adapter in `edgecrab-acp` crate (not detailed here).
 	- Allows VS Code and other agents to connect and use EdgeCrab as a tool server.

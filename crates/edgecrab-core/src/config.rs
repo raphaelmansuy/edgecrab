@@ -1088,10 +1088,15 @@ pub struct McpOauthConfig {
     pub client_id: Option<String>,
     pub client_secret: Option<String>,
     pub auth_method: Option<String>,
+    pub device_authorization_url: Option<String>,
+    pub authorization_url: Option<String>,
+    pub redirect_url: Option<String>,
+    pub use_pkce: Option<bool>,
     pub scopes: Vec<String>,
     pub audience: Option<String>,
     pub resource: Option<String>,
     pub refresh_token: Option<String>,
+    pub authorization_params: HashMap<String, String>,
     pub extra_params: HashMap<String, String>,
 }
 

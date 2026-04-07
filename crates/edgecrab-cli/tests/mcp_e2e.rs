@@ -1,10 +1,78 @@
 use std::fs;
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
+use axum::Json;
+use axum::extract::State;
+use axum::routing::post;
+use axum::{Router, http::StatusCode};
 use tempfile::tempdir;
 
 fn edgecrab() -> Command {
     Command::new(env!("CARGO_BIN_EXE_edgecrab"))
+}
+
+#[derive(Clone)]
+struct MockOauthState {
+    token_calls: Arc<AtomicUsize>,
+}
+
+async fn mock_device_endpoint() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "device_code": "device-code-1",
+        "user_code": "ABCD-EFGH",
+        "verification_uri": "https://example.com/activate",
+        "verification_uri_complete": "https://example.com/activate?user_code=ABCD-EFGH",
+        "expires_in": 60,
+        "interval": 0
+    }))
+}
+
+async fn mock_token_endpoint(
+    State(state): State<MockOauthState>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let _ = state.token_calls.fetch_add(1, Ordering::SeqCst);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "access_token": "access-token-1",
+            "refresh_token": "refresh-token-1",
+            "expires_in": 3600
+        })),
+    )
+}
+
+fn spawn_mock_oauth_server() -> (String, tokio::sync::oneshot::Sender<()>, Arc<AtomicUsize>) {
+    let token_calls = Arc::new(AtomicUsize::new(0));
+    let state = MockOauthState {
+        token_calls: token_calls.clone(),
+    };
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let (addr_tx, addr_rx) = std::sync::mpsc::channel();
+
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async move {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            addr_tx.send(addr).expect("send addr");
+            let router = Router::new()
+                .route("/device", post(mock_device_endpoint))
+                .route("/token", post(mock_token_endpoint))
+                .with_state(state);
+            let _ = axum::serve(listener, router)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+        });
+    });
+
+    let addr = addr_rx.recv().expect("receive addr");
+    (format!("http://{}", addr), shutdown_tx, token_calls)
 }
 
 #[test]
@@ -174,4 +242,47 @@ fn mcp_auth_explains_refresh_token_gap_and_operator_next_step() {
         stdout.contains("/mcp-token set-refresh oauth-demo <refresh-token>"),
         "stdout:\n{stdout}"
     );
+}
+
+#[test]
+fn mcp_login_device_flow_caches_access_and_refresh_tokens() {
+    let (base_url, shutdown_tx, token_calls) = spawn_mock_oauth_server();
+    let home = tempdir().expect("temp home");
+    let config_dir = home.path().join(".edgecrab");
+    fs::create_dir_all(&config_dir).expect("config dir");
+
+    let config_path = config_dir.join("config.yaml");
+    fs::write(
+        &config_path,
+        format!(
+            "mcp_servers:\n  oauth-device:\n    url: https://example.com/mcp\n    enabled: true\n    oauth:\n      token_url: {base_url}/token\n      device_authorization_url: {base_url}/device\n      grant_type: device_code\n      auth_method: none\n      client_id: edgecrab-device-client\n"
+        ),
+    )
+    .expect("config");
+
+    let output = edgecrab()
+        .arg("--config")
+        .arg(&config_path)
+        .args(["mcp", "login", "oauth-device"])
+        .env("HOME", home.path())
+        .output()
+        .expect("run edgecrab");
+
+    let _ = shutdown_tx.send(());
+
+    assert!(
+        output.status.success(),
+        "mcp login failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("OAuth device login"), "stdout:\n{stdout}");
+    assert!(stdout.contains("OAuth login complete"), "stdout:\n{stdout}");
+    assert_eq!(token_calls.load(Ordering::SeqCst), 1);
+
+    let token_file = config_dir.join("mcp-tokens").join("oauth-device.json");
+    let stored = fs::read_to_string(&token_file).expect("token file");
+    assert!(stored.contains("access-token-1"), "stored:\n{stored}");
+    assert!(stored.contains("refresh-token-1"), "stored:\n{stored}");
 }

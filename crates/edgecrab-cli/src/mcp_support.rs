@@ -365,6 +365,52 @@ pub fn render_mcp_auth_guide(server_name: &str) -> anyhow::Result<String> {
                     );
                 }
             }
+            "device_code" => {
+                if oauth.device_authorization_url().is_none() {
+                    next_steps.push(
+                        "Add `oauth.device_authorization_url` in `~/.edgecrab/config.yaml` so EdgeCrab can start the device-code flow."
+                            .to_string(),
+                    );
+                } else if !has_cached_access && !has_refresh {
+                    next_steps.push(format!(
+                        "Run `/mcp login {}` to open the verification URL and cache the resulting tokens.",
+                        server.name
+                    ));
+                } else if !has_cached_access && has_refresh {
+                    next_steps.push(format!(
+                        "Run `/mcp test {}` to exchange the cached refresh token for a fresh access token.",
+                        server.name
+                    ));
+                } else {
+                    next_steps.push(
+                        "Device-code OAuth is ready. EdgeCrab will use the cached token and refresh it when a refresh token is available."
+                            .to_string(),
+                    );
+                }
+            }
+            "authorization_code" => {
+                if oauth.authorization_url().is_none() || oauth.redirect_url().is_none() {
+                    next_steps.push(
+                        "Add both `oauth.authorization_url` and `oauth.redirect_url` in `~/.edgecrab/config.yaml` so EdgeCrab can run a browser-based login."
+                            .to_string(),
+                    );
+                } else if !has_cached_access && !has_refresh {
+                    next_steps.push(format!(
+                        "Run `/mcp login {}` to launch the browser flow and cache the resulting tokens.",
+                        server.name
+                    ));
+                } else if !has_cached_access && has_refresh {
+                    next_steps.push(format!(
+                        "Run `/mcp test {}` to exchange the cached refresh token for a fresh access token.",
+                        server.name
+                    ));
+                } else {
+                    next_steps.push(
+                        "Browser-based OAuth is ready. EdgeCrab will use the cached token and refresh it when possible."
+                            .to_string(),
+                    );
+                }
+            }
             "auto" => {
                 if has_refresh {
                     if !has_cached_access {
@@ -393,6 +439,13 @@ pub fn render_mcp_auth_guide(server_name: &str) -> anyhow::Result<String> {
                                 .to_string(),
                         );
                     }
+                } else if oauth.device_authorization_url().is_some()
+                    || (oauth.authorization_url().is_some() && oauth.redirect_url().is_some())
+                {
+                    next_steps.push(format!(
+                        "Run `/mcp login {}` once to bootstrap an interactive OAuth token; after that EdgeCrab will prefer refresh-token renewal when available.",
+                        server.name
+                    ));
                 } else {
                     next_steps.push(
                         "Auto mode needs either a refresh token or usable client credentials; the current config does not provide either."
@@ -496,6 +549,15 @@ fn analyze_server(server: &ConfiguredMcpServer) -> StaticMcpReport {
                 oauth.grant_type_label(),
                 oauth.auth_method_label()
             ));
+            if let Some(url) = oauth.device_authorization_url() {
+                lines.push(format!("oauth: device-url={url}"));
+            }
+            if let Some(url) = oauth.authorization_url() {
+                lines.push(format!("oauth: authorize-url={url}"));
+            }
+            if let Some(url) = oauth.redirect_url() {
+                lines.push(format!("oauth: redirect-url={url}"));
+            }
 
             if oauth.auth_method_label() != "none" && !oauth.has_client_id() {
                 status = status.max(McpDoctorStatus::Warn);
@@ -515,6 +577,31 @@ fn analyze_server(server: &ConfiguredMcpServer) -> StaticMcpReport {
             {
                 status = status.max(McpDoctorStatus::Warn);
                 lines.push("oauth: refresh_token grant selected but no refresh token is configured or cached".into());
+            }
+            if oauth.grant_type_label() == "device_code"
+                && oauth.device_authorization_url().is_none()
+            {
+                status = status.max(McpDoctorStatus::Warn);
+                lines.push(
+                    "oauth: device_code grant selected but device_authorization_url is missing"
+                        .into(),
+                );
+            }
+            if oauth.grant_type_label() == "authorization_code" {
+                if oauth.authorization_url().is_none() {
+                    status = status.max(McpDoctorStatus::Warn);
+                    lines.push(
+                        "oauth: authorization_code grant selected but authorization_url is missing"
+                            .into(),
+                    );
+                }
+                if oauth.redirect_url().is_none() {
+                    status = status.max(McpDoctorStatus::Warn);
+                    lines.push(
+                        "oauth: authorization_code grant selected but redirect_url is missing"
+                            .into(),
+                    );
+                }
             }
             if let Some(cache) = format_oauth_cache_state(&server.name) {
                 lines.push(cache);

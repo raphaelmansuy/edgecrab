@@ -74,7 +74,7 @@ EdgeCrab already has:
 - TUI selector overlay for configured servers and official entries.
 - Native remote `/mcp search` browser with per-source labels and install/view actions.
 - Slash commands: `/mcp`, `/reload-mcp`, `/mcp-token`.
-- CLI commands: `edgecrab mcp list|refresh|search|view|install|test|doctor|auth|add|remove`.
+- CLI commands: `edgecrab mcp list|refresh|search|view|install|test|doctor|auth|login|add|remove`.
 
 The current gaps are operational, not foundational:
 
@@ -102,6 +102,7 @@ Priority 1:
 - Cross-platform `/mcp` TUI command parsing with quoting support.
 - Dedicated MCP doctor flow in CLI and TUI.
 - Dedicated MCP auth flow in CLI and TUI with explicit refresh-token next steps.
+- Interactive MCP OAuth login for device-code and browser-loopback authorization-code flows.
 
 Priority 2:
 

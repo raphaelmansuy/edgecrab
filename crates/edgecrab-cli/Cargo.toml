@@ -40,6 +40,11 @@ tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 cron = { workspace = true }
 reqwest = { workspace = true }
+axum = { workspace = true }
+url = { workspace = true }
+base64 = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
 arboard = "3"
 unicode-width = { workspace = true }
 similar = { workspace = true }

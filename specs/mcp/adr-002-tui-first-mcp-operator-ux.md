@@ -24,6 +24,7 @@ The TUI will be treated as a first-class MCP operations surface, not a thin wrap
 - `/mcp search [query]` opens a dedicated remote browser for official upstream sources and the official MCP Registry.
 - Configured entries get explicit health-oriented actions, including doctor/check.
 - Configured HTTP entries also need an explicit auth explanation path because OAuth failures are not self-describing from a generic probe error.
+- Configured HTTP entries with interactive OAuth must support a first-class login flow (`/mcp login`) rather than pushing the operator into manual refresh-token extraction.
 - The selector must surface meaningful metadata, not just names.
 - Remote search must keep source provenance visible so users can distinguish steering-group references, official integrations, archived entries, and registry listings.
 - Search breadth and install breadth are allowed to differ when EdgeCrab cannot launch a registry entry deterministically yet.

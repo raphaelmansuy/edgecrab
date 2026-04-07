@@ -3534,6 +3534,7 @@ impl App {
                 ("test", "Probe a configured MCP server"),
                 ("doctor", "Diagnose a configured MCP server"),
                 ("auth", "Explain the active auth/OAuth path for a server"),
+                ("login", "Run an interactive OAuth login for a server"),
                 ("remove", "Remove a configured MCP server"),
             ],
             // ── Personality ───────────────────────────────────────────────────
@@ -9516,6 +9517,7 @@ impl App {
                  /mcp test [server-name]\n\
                  /mcp doctor [server-name]\n\
                  /mcp auth <server-name>\n\
+                 /mcp login <server-name>\n\
                  /mcp remove <server-name>",
                 OutputRole::System,
             );
@@ -9641,6 +9643,15 @@ impl App {
                                 oauth.grant_type_label(),
                                 oauth.auth_method_label()
                             ));
+                            if let Some(url) = oauth.device_authorization_url() {
+                                lines.push(format!("OAuth device URL: {url}"));
+                            }
+                            if let Some(url) = oauth.authorization_url() {
+                                lines.push(format!("OAuth authorize URL: {url}"));
+                            }
+                            if let Some(url) = oauth.redirect_url() {
+                                lines.push(format!("OAuth redirect URL: {url}"));
+                            }
                         }
                         self.push_output(lines.join("\n"), OutputRole::System);
                     }
@@ -9784,6 +9795,29 @@ impl App {
                         self.push_output(format!("MCP auth failed: {err}"), OutputRole::Error)
                     }
                 }
+            }
+            "login" => {
+                let Some(name) = parts.get(1).cloned() else {
+                    self.push_output("Usage: /mcp login <server-name>", OutputRole::System);
+                    return;
+                };
+                let tx = self.response_tx.clone();
+                self.rt_handle.spawn(async move {
+                    let summary = crate::mcp_oauth::login_mcp_server(&name, |line| {
+                        let _ = tx.send(AgentResponse::Notice(line));
+                    })
+                    .await;
+                    match summary {
+                        Ok(summary) => {
+                            let _ = tx.send(AgentResponse::Notice(summary));
+                        }
+                        Err(err) => {
+                            let _ = tx.send(AgentResponse::Notice(format!(
+                                "MCP OAuth login failed: {err}"
+                            )));
+                        }
+                    }
+                });
             }
             "remove" | "uninstall" | "rm" => {
                 let Some(name) = parts.get(1).map(String::as_str) else {
