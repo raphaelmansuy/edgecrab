@@ -1,0 +1,124 @@
+name: Release — Coordinator
+
+# One-click release: bumps all version strings, commits, tags, and kicks off
+# every downstream workflow (binaries, Docker, npm CLI, PyPI CLI, crates.io).
+#
+# Usage (GitHub UI):
+#   Actions → "Release — Coordinator" → Run workflow → enter new version
+#
+# Version format: MAJOR.MINOR.PATCH  (no leading "v")
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'New version (e.g. 0.2.0)'
+        required: true
+      dry_run:
+        description: 'Dry run — print changes without committing/pushing'
+        required: false
+        default: 'false'
+
+permissions:
+  contents: write
+
+jobs:
+  bump-and-tag:
+    name: Bump versions and push tag v${{ inputs.version }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Push requires a token with write permissions
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Validate version format
+        run: |
+          VERSION="${{ inputs.version }}"
+          if ! echo "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "ERROR: version must be MAJOR.MINOR.PATCH (e.g. 0.2.0), got: $VERSION"
+            exit 1
+          fi
+          # Guard against re-releasing an existing tag
+          if git rev-parse "v$VERSION" >/dev/null 2>&1; then
+            echo "ERROR: tag v$VERSION already exists"
+            exit 1
+          fi
+          echo "Releasing v$VERSION"
+
+      - name: Bump all version strings
+        id: bump
+        run: |
+          VERSION="${{ inputs.version }}"
+
+          # ── Rust workspace ───────────────────────────────────────────────────
+          sed -i "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
+
+          # ── npm CLI wrapper ──────────────────────────────────────────────────
+          # package.json  (jq-free: sed on the "version" line)
+          sed -i "s/\"version\": \".*\"/\"version\": \"$VERSION\"/" \
+            sdks/npm-cli/package.json
+          # install.js BINARY_VERSION
+          sed -i "s/const BINARY_VERSION = '[^']*'/const BINARY_VERSION = '$VERSION'/" \
+            sdks/npm-cli/scripts/install.js
+
+          # ── PyPI CLI wrapper ─────────────────────────────────────────────────
+          sed -i "s/^version = \".*\"/version = \"$VERSION\"/" \
+            sdks/pypi-cli/pyproject.toml
+          printf '__version__ = "%s"\n' "$VERSION" > \
+            sdks/pypi-cli/edgecrab_cli/_version.py
+          # _binary.py BINARY_VERSION
+          sed -i "s/^BINARY_VERSION = \".*\"/BINARY_VERSION = \"$VERSION\"/" \
+            sdks/pypi-cli/edgecrab_cli/_binary.py
+
+          # ── Python SDK ───────────────────────────────────────────────────────
+          sed -i "s/^version = \".*\"/version = \"$VERSION\"/" \
+            sdks/python/pyproject.toml
+
+          # ── Summary ─────────────────────────────────────────────────────────
+          echo "=== Changed files ==="
+          git diff --stat
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Commit and tag
+        if: inputs.dry_run != 'true'
+        run: |
+          VERSION="${{ steps.bump.outputs.version }}"
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add \
+            Cargo.toml \
+            sdks/npm-cli/package.json \
+            sdks/npm-cli/scripts/install.js \
+            sdks/pypi-cli/pyproject.toml \
+            sdks/pypi-cli/edgecrab_cli/_version.py \
+            sdks/pypi-cli/edgecrab_cli/_binary.py \
+            sdks/python/pyproject.toml
+
+          git commit -m "chore: bump version to $VERSION"
+          git tag "v$VERSION"
+          git push origin HEAD:main
+          git push origin "v$VERSION"
+
+          echo "### Released v$VERSION" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Tag pushed — downstream workflows triggered:" >> "$GITHUB_STEP_SUMMARY"
+          echo "- release-binaries.yml" >> "$GITHUB_STEP_SUMMARY"
+          echo "- release-docker.yml" >> "$GITHUB_STEP_SUMMARY"
+          echo "- release-npm-cli.yml" >> "$GITHUB_STEP_SUMMARY"
+          echo "- release-pypi-cli.yml" >> "$GITHUB_STEP_SUMMARY"
+          echo "- release-rust.yml" >> "$GITHUB_STEP_SUMMARY"
+          echo "- release-node.yml" >> "$GITHUB_STEP_SUMMARY"
+          echo "- release-python.yml" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Dry-run summary
+        if: inputs.dry_run == 'true'
+        run: |
+          echo "=== DRY RUN — nothing pushed ==="
+          echo "Would commit and tag v${{ steps.bump.outputs.version }}"
+          git diff

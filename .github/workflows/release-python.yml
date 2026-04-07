@@ -4,62 +4,71 @@ on:
   push:
     tags: ['v[0-9]+.[0-9]+.[0-9]+']
   workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Tag name to publish (e.g. v0.1.2)'
+        required: true
+        default: 'v0.1.2'
 
 permissions:
   id-token: write
   contents: read
 
 jobs:
-  build-sdist:
-    name: Build source distribution
+  build:
+    name: Build sdist + wheel
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: { python-version: '3.12' }
-      - run: pip install build
-      - run: |
-          cd sdks/python
-          python -m build --sdist --outdir dist/
-      - uses: actions/upload-artifact@v4
-        with:
-          name: sdist
-          path: sdks/python/dist/
 
-  build-wheels:
-    name: Build wheel — ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-14, windows-latest]
-        python-version: ['3.10', '3.11', '3.12', '3.13']
-    steps:
-      - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
-      - run: pip install build
-      - run: |
+          python-version: '3.12'
+
+      - name: Resolve version from tag
+        id: version
+        env:
+          INPUT_TAG_NAME: ${{ inputs.tag_name }}
+        run: |
+          TAG="${INPUT_TAG_NAME:-$GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Publishing edgecrab-sdk==$VERSION"
+
+      - name: Sync pyproject.toml version
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          sed -i "s/^version = \".*\"/version = \"$VERSION\"/" sdks/python/pyproject.toml
+
+      - run: pip install --upgrade build
+
+      - name: Build sdist and wheel
+        run: |
           cd sdks/python
-          python -m build --wheel --outdir dist/
+          python -m build --outdir dist/
+
       - uses: actions/upload-artifact@v4
         with:
-          name: wheel-${{ matrix.os }}-py${{ matrix.python-version }}
+          name: python-sdk-dist
           path: sdks/python/dist/
+          if-no-files-found: error
 
   publish-pypi:
     name: Publish to PyPI
-    needs: [build-wheels, build-sdist]
+    needs: build
     runs-on: ubuntu-latest
     environment: pypi
     steps:
       - uses: actions/download-artifact@v4
         with:
-          merge-multiple: true
+          name: python-sdk-dist
           path: dist/
 
-      - name: Publish to PyPI
+      - name: List dist contents
+        run: ls -lh dist/
+
+      - name: Publish to PyPI (OIDC)
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/
+          skip-existing: true
