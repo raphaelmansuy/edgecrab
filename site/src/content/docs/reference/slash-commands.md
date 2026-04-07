@@ -50,7 +50,7 @@ MCP          /mcp-token
 
 | Command | Description |
 |---------|-------------|
-| `/model [name]` | Show current model or switch (e.g. `/model anthropic/claude-opus-4.6`) |
+| `/model [name]` | Show current model or switch (e.g. `/model ollama/gemma4:latest`) |
 | `/models [provider]` | List models; `/models <provider>` queries live, `/models refresh` refreshes cache |
 | `/vision_model [spec]` | Open vision model selector, or set/show the dedicated vision backend |
 | `/provider` | List available providers |

@@ -383,8 +383,10 @@ Manage agent skills stored in `~/.edgecrab/skills/`.
 ```bash
 edgecrab skills list                              # List all installed skills
 edgecrab skills view <name>                       # Print a skill's SKILL.md
-edgecrab skills search <query>                    # Search skills by name
-edgecrab skills install <path-or-repo>            # Install from a local path or GitHub URL
+edgecrab skills search <query>                    # Search local + remote skill sources
+edgecrab skills install <path>                    # Install from a local path
+edgecrab skills install edgecrab:<category/path>  # Install from a curated remote source
+edgecrab skills install owner/repo/path           # Install from GitHub
 edgecrab skills install official/<cat>/<skill>    # Install from the official catalogue
 edgecrab skills remove <name>                     # Remove an installed skill
 ```

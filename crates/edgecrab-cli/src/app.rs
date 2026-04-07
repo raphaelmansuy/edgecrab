@@ -613,129 +613,6 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::
     Ok(count)
 }
 
-/// Install a skill from GitHub by fetching it via the GitHub raw/contents API.
-///
-/// For single .md files, fetches the raw content.
-/// For directories, uses the GitHub contents API to download all files.
-///
-/// `path` is the path within the repo (e.g. "skills/ascii-diagram-master").
-async fn install_skill_from_github(
-    owner: &str,
-    repo: &str,
-    path: &str,
-    skills_dir: &std::path::Path,
-) -> Result<String, String> {
-    // Build an HTTP client with a browser-like User-Agent (GitHub requires it)
-    let token = std::env::var("GITHUB_TOKEN").ok();
-    let mut headers = reqwest::header::HeaderMap::new();
-    if let Some(t) = &token {
-        let auth: reqwest::header::HeaderValue = format!("Bearer {t}")
-            .parse()
-            .map_err(|e| format!("Invalid GITHUB_TOKEN: {e}"))?;
-        headers.insert(reqwest::header::AUTHORIZATION, auth);
-    }
-    let accept: reqwest::header::HeaderValue = "application/vnd.github+json"
-        .parse()
-        .map_err(|e| format!("header: {e}"))?;
-    headers.insert(reqwest::header::ACCEPT, accept);
-    let ua: reqwest::header::HeaderValue = "edgecrab-agent/1.0"
-        .parse()
-        .map_err(|e| format!("ua: {e}"))?;
-    headers.insert(reqwest::header::USER_AGENT, ua);
-
-    let client = reqwest::Client::builder()
-        .default_headers(headers)
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| e.to_string())?;
-
-    // Query the GitHub Contents API to find out if path is file or directory
-    let api_url = format!("https://api.github.com/repos/{owner}/{repo}/contents/{path}");
-    let resp = client
-        .get(&api_url)
-        .send()
-        .await
-        .map_err(|e| format!("GitHub API request failed: {e}"))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        return Err(format!(
-            "GitHub API returned {status}. Check that {owner}/{repo}/{path} exists and is public."
-        ));
-    }
-
-    let body: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("GitHub API response parse error: {e}"))?;
-
-    std::fs::create_dir_all(skills_dir).map_err(|e| format!("Cannot create skills dir: {e}"))?;
-
-    if body.is_array() {
-        // It's a directory
-        let items = body.as_array().unwrap();
-        let dir_name = std::path::Path::new(path)
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "skill".to_string());
-        let dest_dir = skills_dir.join(&dir_name);
-        std::fs::create_dir_all(&dest_dir).map_err(|e| format!("Cannot create skill dir: {e}"))?;
-
-        let mut count = 0;
-        for item in items {
-            let file_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
-            let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("");
-            if file_type == "file" {
-                let raw_url = item
-                    .get("download_url")
-                    .and_then(|u| u.as_str())
-                    .unwrap_or("");
-                if raw_url.is_empty() {
-                    continue;
-                }
-                let content = client
-                    .get(raw_url)
-                    .send()
-                    .await
-                    .map_err(|e| format!("Download failed for {name}: {e}"))?
-                    .text()
-                    .await
-                    .map_err(|e| format!("Read failed for {name}: {e}"))?;
-                let dest = dest_dir.join(name);
-                std::fs::write(&dest, content)
-                    .map_err(|e| format!("Write failed for {name}: {e}"))?;
-                count += 1;
-            }
-        }
-        Ok(format!(
-            "Skill '{dir_name}' installed from GitHub ({count} files)."
-        ))
-    } else if body.get("type").and_then(|t| t.as_str()) == Some("file") {
-        // It's a file
-        let raw_url = body
-            .get("download_url")
-            .and_then(|u| u.as_str())
-            .ok_or("GitHub API: missing download_url")?;
-        let content = client
-            .get(raw_url)
-            .send()
-            .await
-            .map_err(|e| format!("Download failed: {e}"))?
-            .text()
-            .await
-            .map_err(|e| format!("Read failed: {e}"))?;
-        let file_name = std::path::Path::new(path)
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "skill.md".to_string());
-        let dest = skills_dir.join(&file_name);
-        std::fs::write(&dest, content).map_err(|e| format!("Write failed: {e}"))?;
-        Ok(format!("Skill '{file_name}' installed from GitHub."))
-    } else {
-        Err(format!("Unexpected GitHub API response for path '{path}'"))
-    }
-}
-
 fn load_config_root_for_edit() -> anyhow::Result<(std::path::PathBuf, serde_yml::Value)> {
     let config_path = edgecrab_core::edgecrab_home().join("config.yaml");
     if let Some(parent) = config_path.parent() {
@@ -7037,6 +6914,7 @@ impl App {
                     self.push_output(
                         "Usage:\n\
                          /skills install <local-path>              — install local skill file/dir\n\
+                         /skills install edgecrab:<path>           — install from a curated remote source\n\
                          /skills install owner/repo/path/skill.md  — install from GitHub",
                         OutputRole::System,
                     );
@@ -7051,45 +6929,68 @@ impl App {
                     && !std::path::Path::new(operand).exists();
 
                 if looks_like_github {
-                    // Parse: owner/repo/path
-                    let mut parts_gh = operand.splitn(3, '/');
-                    let owner = parts_gh.next().unwrap_or("");
-                    let repo  = parts_gh.next().unwrap_or("");
-                    let path  = parts_gh.next().unwrap_or("");
-
-                    if owner.is_empty() || repo.is_empty() || path.is_empty() {
-                        self.push_output(
-                            "GitHub format: /skills install owner/repo/path/to/skill.md",
-                            OutputRole::Error,
-                        );
-                        return;
-                    }
-
                     let skills_dir_c = skills_dir.clone();
-                    let owner  = owner.to_string();
-                    let repo   = repo.to_string();
-                    let path   = path.to_string();
+                    let optional_dir = edgecrab_tools::tools::skills_sync::optional_skills_dir();
+                    let remote_id = operand.to_string();
 
                     self.push_output(
-                        format!("Fetching skill from github.com/{owner}/{repo}/{path} …"),
+                        format!("Fetching remote skill bundle '{remote_id}' …"),
                         OutputRole::System,
                     );
 
-                    // Run network fetch in async context
-                    let result: Result<String, String> = self.rt_handle.block_on(async {
-                        install_skill_from_github(&owner, &repo, &path, &skills_dir_c).await
+                    let result = self.rt_handle.block_on(async {
+                        edgecrab_tools::tools::skills_hub::install_identifier(
+                            &remote_id,
+                            &skills_dir_c,
+                            optional_dir.as_deref(),
+                            false,
+                        )
+                        .await
                     });
 
                     match result {
-                        Ok(msg) => self.push_output(msg, OutputRole::System),
-                        Err(e)  => self.push_output(format!("GitHub install failed: {e}"), OutputRole::Error),
+                        Ok(outcome) => self.push_output(
+                            format!(
+                                "{}\nActivate with: /skills view {}",
+                                outcome.message, outcome.skill_name
+                            ),
+                            OutputRole::System,
+                        ),
+                        Err(e)  => self.push_output(format!("Remote install failed: {e}"), OutputRole::Error),
                     }
                     return;
                 }
 
                 let src = std::path::Path::new(operand);
                 if !src.exists() {
-                    self.push_output(format!("Path not found: {operand}"), OutputRole::Error);
+                    let skills_dir_c = skills_dir.clone();
+                    let optional_dir = edgecrab_tools::tools::skills_sync::optional_skills_dir();
+                    let remote_id = operand.to_string();
+                    self.push_output(
+                        format!("Fetching remote skill bundle '{remote_id}' …"),
+                        OutputRole::System,
+                    );
+                    let result = self.rt_handle.block_on(async {
+                        edgecrab_tools::tools::skills_hub::install_identifier(
+                            &remote_id,
+                            &skills_dir_c,
+                            optional_dir.as_deref(),
+                            false,
+                        )
+                        .await
+                    });
+                    match result {
+                        Ok(outcome) => self.push_output(
+                            format!(
+                                "{}\nActivate with: /skills view {}",
+                                outcome.message, outcome.skill_name
+                            ),
+                            OutputRole::System,
+                        ),
+                        Err(e) => {
+                            self.push_output(format!("Remote install failed: {e}"), OutputRole::Error)
+                        }
+                    }
                     return;
                 }
                 // Create skills dir if needed
@@ -7120,20 +7021,28 @@ impl App {
             }
 
             "hub" | "search" => {
-                // Simple hub browser — lists skills from the default well-known taps
                 let query = operand;
+                if query.is_empty() {
+                    self.push_output(
+                        edgecrab_tools::tools::skills_hub::render_sources_catalog(),
+                        OutputRole::System,
+                    );
+                    return;
+                }
+
                 self.push_output(
-                    format!(
-                        "Skills Hub — search '{query}'\n\
-                         \n\
-                         To install a skill from GitHub:\n\
-                         /skills install owner/repo/path/to/skill.md\n\
-                         /skills install owner/repo/skills/skill-name\n\
-                         \n\
-                         Example (edgecrab skills):\n\
-                         /skills install raphaelmansuy/edgecrab/skills/ascii-diagram-master\n\
-                         \n\
-                         Set GITHUB_TOKEN env var for higher rate limits."
+                    format!("Searching remote skill sources for '{query}' …"),
+                    OutputRole::System,
+                );
+
+                let query_owned = query.to_string();
+                let report = self.rt_handle.block_on(async {
+                    edgecrab_tools::tools::skills_hub::search_hub(&query_owned, None, 8).await
+                });
+                self.push_output(
+                    edgecrab_tools::tools::skills_hub::render_search_report(
+                        &query_owned,
+                        &report,
                     ),
                     OutputRole::System,
                 );
@@ -7167,7 +7076,7 @@ impl App {
             }
 
             _ => self.push_output(
-                "Usage: /skills [list | view <name> | install <path-or-owner/repo/path> | remove <name> | hub [query]]",
+                "Usage: /skills [list | view <name> | install <path-or-source-or-owner/repo/path> | remove <name> | hub [query] | search <query>]",
                 OutputRole::System,
             ),
         }

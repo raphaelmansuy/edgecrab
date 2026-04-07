@@ -14,7 +14,7 @@ All `EDGECRAB_*` variables are applied via `apply_env_overrides()` in `config.rs
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | `EDGECRAB_HOME` | path | `~/.edgecrab` | Override the EdgeCrab home directory |
-| `EDGECRAB_MODEL` | string | `anthropic/claude-sonnet-4-20250514` | Default LLM model |
+| `EDGECRAB_MODEL` | string | `ollama/gemma4:latest` | Default LLM model |
 | `EDGECRAB_MAX_ITERATIONS` | integer | `90` | Max tool call iterations per session |
 | `EDGECRAB_TIMEZONE` | string | (system) | IANA timezone (e.g. `America/New_York`) |
 | `EDGECRAB_REASONING_EFFORT` | string | `""` | Reasoning budget: `low`, `medium`, `high`, `xhigh` |

@@ -594,7 +594,7 @@ pub struct SmartRoutingYaml {
 impl Default for ModelConfig {
     fn default() -> Self {
         Self {
-            default_model: "anthropic/claude-sonnet-4-20250514".into(),
+            default_model: "ollama/gemma4:latest".into(),
             fallback: None,
             base_url: None,
             api_key_env: "OPENROUTER_API_KEY".into(),

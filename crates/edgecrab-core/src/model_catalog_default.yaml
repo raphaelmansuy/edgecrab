@@ -552,8 +552,11 @@ providers:
   # ─── Ollama (local) ──────────────────────────────────────────────
   ollama:
     label: "Ollama (local)"
-    default_model: "llama3.2"
+    default_model: "gemma4:latest"
     models:
+      - model: "gemma4:latest"
+        context: 128000
+        tier: standard
       - model: "llama3.2"
         context: 128000
         tier: standard

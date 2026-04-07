@@ -82,16 +82,19 @@ You are performing a security audit. Follow these steps:
 ```bash
 edgecrab skills list                               # list installed skills
 edgecrab skills view security-audit               # read a skill
-edgecrab skills install official/security-audit   # install from agentskills.io
-edgecrab skills install raphaelmansuy/rust-fixer  # install from GitHub
+edgecrab skills search "diagram"                  # search remote sources by origin
+edgecrab skills install edgecrab:diagramming/ascii-diagram-master
+edgecrab skills install hermes-agent:research/ml-paper-writing
+edgecrab skills install official/security-audit   # install from bundled official skills
+edgecrab skills install raphaelmansuy/edgecrab/skills/research/ml-paper-writing
 edgecrab skills remove security-audit             # uninstall
 ```
 
 From inside the TUI:
 
 ```
-/skills browse         # browse hub
-/skills install react  # install a skill
+/skills search diagram                                   # search remote sources
+/skills install edgecrab:diagramming/ascii-diagram-master
 ```
 
 ### Manual Installation

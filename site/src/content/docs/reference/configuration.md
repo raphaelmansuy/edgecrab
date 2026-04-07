@@ -20,7 +20,7 @@ Run `edgecrab config show` to print your active resolved configuration (after en
 
 # ── Model ──────────────────────────────────────────────────────────────
 model:
-  default: "anthropic/claude-sonnet-4-20250514"  # Default LLM model
+  default: "ollama/gemma4:latest"  # Default LLM model
   max_iterations: 90             # Max tool calls per session
   streaming: true                # Stream tokens to TUI
   prompt_caching: true           # Prompt caching (Anthropic / OpenAI)
@@ -318,7 +318,7 @@ When `enabled_toolsets` includes `core` or `coding`, the `lsp` toolset is also e
 
 | Config Key | Type | Default | Env Override |
 |------------|------|---------|-------------|
-| `model.default` | string | `anthropic/claude-sonnet-4-20250514` | `EDGECRAB_MODEL` |
+| `model.default` | string | `ollama/gemma4:latest` | `EDGECRAB_MODEL` |
 | `model.max_iterations` | integer | `90` | `EDGECRAB_MAX_ITERATIONS` |
 | `model.streaming` | bool | `true` | — |
 | `model.prompt_caching` | bool | `true` | — |

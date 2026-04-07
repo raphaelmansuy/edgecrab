@@ -1148,8 +1148,14 @@ async fn run_skills(command: SkillsCommand) -> anyhow::Result<()> {
                 .unwrap_or_else(|| edgecrab_core::edgecrab_home().join("optional-skills"));
             let official_matches =
                 edgecrab_tools::tools::skills_hub::search_optional_skills(&optional_root, &query);
+            let remote_report =
+                edgecrab_tools::tools::skills_hub::search_hub(&query, None, 8).await;
+            let has_remote_matches = remote_report
+                .groups
+                .iter()
+                .any(|group| !group.results.is_empty());
 
-            if installed_matches.is_empty() && official_matches.is_empty() {
+            if installed_matches.is_empty() && official_matches.is_empty() && !has_remote_matches {
                 println!("No skills matching '{}'.", query);
             } else {
                 if !installed_matches.is_empty() {
@@ -1168,6 +1174,15 @@ async fn run_skills(command: SkillsCommand) -> anyhow::Result<()> {
                         println!("  {} — {}", skill.identifier, skill.description);
                     }
                 }
+                if has_remote_matches {
+                    println!(
+                        "\n{}",
+                        edgecrab_tools::tools::skills_hub::render_search_report(
+                            &query,
+                            &remote_report
+                        )
+                    );
+                }
             }
         }
 
@@ -1184,58 +1199,16 @@ async fn run_skills(command: SkillsCommand) -> anyhow::Result<()> {
                 return Ok(());
             }
 
-            if source.starts_with("official/") {
-                let bundle = edgecrab_tools::tools::skills_hub::load_official_skill_bundle(
-                    &source,
-                    edgecrab_tools::tools::skills_sync::optional_skills_dir().as_deref(),
-                )
-                .map_err(|e| anyhow::anyhow!(e))?;
-                let skill_name = bundle.name.clone();
-                let message =
-                    edgecrab_tools::tools::skills_hub::install_skill(&bundle, &skills_dir, false)
-                        .map_err(|e| anyhow::anyhow!(e))?;
-                println!("{message}");
-                println!("Activate with: edgecrab skills view {skill_name}");
-                return Ok(());
-            }
-
-            if source.contains('/') {
-                let message = edgecrab_tools::tools::skills_hub::install_github_skill(
-                    &source,
-                    &skills_dir,
-                    false,
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!(e))?;
-                let skill_name = source.split('/').next_back().unwrap_or("skill");
-                println!("{message}");
-                println!("Activate with: edgecrab skills view {skill_name}");
-                return Ok(());
-            }
-
-            let optional_root = edgecrab_tools::tools::skills_sync::optional_skills_dir()
-                .unwrap_or_else(|| edgecrab_core::edgecrab_home().join("optional-skills"));
-            let candidates =
-                edgecrab_tools::tools::skills_hub::search_optional_skills(&optional_root, &source);
-            if let Some(candidate) = candidates.first() {
-                let bundle = edgecrab_tools::tools::skills_hub::load_official_skill_bundle(
-                    &candidate.identifier,
-                    edgecrab_tools::tools::skills_sync::optional_skills_dir().as_deref(),
-                )
-                .map_err(|e| anyhow::anyhow!(e))?;
-                let skill_name = bundle.name.clone();
-                let message =
-                    edgecrab_tools::tools::skills_hub::install_skill(&bundle, &skills_dir, false)
-                        .map_err(|e| anyhow::anyhow!(e))?;
-                println!("{message}");
-                println!("Activate with: edgecrab skills view {skill_name}");
-                return Ok(());
-            }
-
-            anyhow::bail!(
-                "Skill source '{}' not found. Use a local path, official/<category>/<skill>, or owner/repo/path",
-                source
-            );
+            let outcome = edgecrab_tools::tools::skills_hub::install_identifier(
+                &source,
+                &skills_dir,
+                edgecrab_tools::tools::skills_sync::optional_skills_dir().as_deref(),
+                false,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+            println!("{}", outcome.message);
+            println!("Activate with: edgecrab skills view {}", outcome.skill_name);
         }
 
         SkillsCommand::Remove { name } => {

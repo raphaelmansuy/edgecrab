@@ -459,14 +459,17 @@ Skills are reusable agent procedures — markdown files that define prompts, ste
 edgecrab skills list                    # browse installed skills
 edgecrab skills view git-workflow       # read a skill
 edgecrab skills install my-skill.md    # install from file
-edgecrab skills search "code review"   # search skills hub
+edgecrab skills search "diagram"       # search remote skill sources
+edgecrab skills install edgecrab:diagramming/ascii-diagram-master
+edgecrab skills install hermes-agent:research/ml-paper-writing
+edgecrab skills install raphaelmansuy/edgecrab/skills/research/ml-paper-writing
 
 # Use a skill in a session
 edgecrab -S git-workflow "review this branch for prod readiness"
 edgecrab -S security,refactor          # load multiple skills
 ```
 
-Inside TUI: `/skills list`, `/skills install <path>`, `/skills view <name>`
+Inside TUI: `/skills list`, `/skills search <query>`, `/skills install edgecrab:<path>`, `/skills view <name>`
 
 Skills are saved to `~/.edgecrab/skills/` and loaded on demand. The agent can also create new skills mid-session during learning reflection.
 
@@ -799,7 +802,7 @@ edgecrab status                 # overall gateway status
 edgecrab skills list
 edgecrab skills view <name>
 edgecrab skills search <query>
-edgecrab skills install <path>
+edgecrab skills install <path|edgecrab:path|owner/repo/path>
 edgecrab skills remove <name>
 
 # Profiles
@@ -961,7 +964,7 @@ EdgeCrab uses layered config: `defaults → ~/.edgecrab/config.yaml → EDGECRAB
 # ~/.edgecrab/config.yaml
 
 model:
-  default_model: "anthropic/claude-opus-4-6"
+  default_model: "ollama/gemma4:latest"
   max_iterations: 90          # ReAct loop budget per session
   streaming: true
   smart_routing:

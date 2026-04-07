@@ -171,7 +171,7 @@ pub struct AgentConfig {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            model: "anthropic/claude-opus-4.6".into(),
+            model: "ollama/gemma4:latest".into(),
             max_iterations: 90,
             enabled_toolsets: Vec::new(),
             disabled_toolsets: Vec::new(),

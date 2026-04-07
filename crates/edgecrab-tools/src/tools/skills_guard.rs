@@ -281,7 +281,12 @@ const THREAT_PATTERNS: &[ThreatPattern] = &[
 ];
 
 /// Trusted repositories — skills from these sources get elevated trust.
-pub const TRUSTED_REPOS: &[&str] = &["openai/skills", "anthropics/skills"];
+pub const TRUSTED_REPOS: &[&str] = &[
+    "nousresearch/hermes-agent",
+    "raphaelmansuy/edgecrab",
+    "openai/skills",
+    "anthropics/skills",
+];
 
 // ─── Install policy ────────────────────────────────────────────
 

@@ -76,7 +76,7 @@ const SETUP_SECTIONS: &[(&str, &str)] = &[
 /// Default model per provider — delegates to `ModelCatalog`.
 fn default_model(provider: &str) -> String {
     edgecrab_core::ModelCatalog::default_model_for(provider)
-        .unwrap_or_else(|| "copilot/gpt-5.4".to_string())
+        .unwrap_or_else(|| "ollama/gemma4:latest".to_string())
 }
 
 /// Returns the default edgecrab home directory (~/.edgecrab/).
@@ -1267,8 +1267,9 @@ mod tests {
         assert_eq!(default_model("openai"), "openai/gpt-5.4");
         assert_eq!(default_model("anthropic"), "anthropic/claude-opus-4.6");
         assert_eq!(default_model("google"), "google/gemini-2.5-flash");
-        // Unknown providers fall back to copilot default
-        assert_eq!(default_model("unknown"), "copilot/gpt-5.4");
+        assert_eq!(default_model("ollama"), "ollama/gemma4:latest");
+        // Unknown providers fall back to the global local default
+        assert_eq!(default_model("unknown"), "ollama/gemma4:latest");
     }
 
     #[test]
