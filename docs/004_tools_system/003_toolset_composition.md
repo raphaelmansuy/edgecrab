@@ -48,12 +48,13 @@ These are the atomic units the resolver works with:
 | `skills` | `skills_list`, `skills_categories`, `skill_view`, `skill_manage`, `skills_hub` |
 | `meta` | `manage_todo_list`, `clarify` |
 | `scheduling` | `manage_cron_jobs` |
-| `delegation` | `delegate_task`, `mixture_of_agents` |
+| `delegation` | `delegate_task` |
 | `code_execution` | `execute_code` |
 | `session` | `session_search` |
 | `mcp` | All 6 `mcp_*` tools |
 | `media` | `text_to_speech`, `vision_analyze`, `transcribe_audio` |
 | `messaging` | `send_message`, `generate_image` |
+| `moa` | `moa` |
 | `core` | `checkpoint` (note: `core` the toolset ≠ `core` the alias) |
 
 ---
@@ -132,12 +133,13 @@ edgecrab --toolset coding,research "find trending Rust crates and scaffold a pro
    ├── skills   ─── skills_list, skill_manage, ...
    ├── meta     ─── manage_todo_list, clarify
    ├── scheduling── manage_cron_jobs
-   ├── delegation── delegate_task, mixture_of_agents
+   ├── delegation── delegate_task
    ├── code_execution── execute_code
    ├── session  ─── session_search
    ├── mcp      ─── mcp_list_tools, mcp_call_tool, ...
    ├── media    ─── text_to_speech, vision_analyze, transcribe_audio
    ├── messaging─── send_message, generate_image
+   ├── moa      ─── moa
    └── core     ─── checkpoint
           ↑ note: "core" the canonical toolset != "core" the alias
 ```
@@ -197,6 +199,11 @@ input or produce audio don't make sense in that context.
 > **Tip: Toolsets are checked at schema generation, not at registration.**
 > A tool in the `browser` toolset will still appear in `edgecrab tools list` even
 > if browser toolset is disabled. The model just won't see its schema.
+
+> **Tip: MoA availability has two gates.**
+> `moa.enabled` must be `true`, and the toolset policy must still expose the
+> `moa` toolset. `/moa on` now repairs literal whitelist/blacklist entries when
+> possible, but a broader alias in `disabled_toolsets` can still hide it.
 
 ---
 

@@ -574,6 +574,9 @@ fn make_ctx(dir: &Path) -> ToolContext {
         origin_chat: None,
         session_key: None,
         todo_store: None,
+        current_tool_call_id: None,
+        current_tool_name: None,
+        tool_progress_tx: None,
     }
 }
 

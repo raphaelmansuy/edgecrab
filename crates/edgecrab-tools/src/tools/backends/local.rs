@@ -241,12 +241,38 @@ fn is_env_passthrough(key: &str) -> bool {
 /// If the current process has a non-empty `PATH` that already contains
 /// `/usr/bin` we return it unchanged.  Otherwise we fall back to
 /// `SANE_PATH` so that common tools are always discoverable.
-fn subprocess_path() -> String {
+pub(crate) fn subprocess_path() -> String {
     let path = env::var("PATH").unwrap_or_default();
     if !path.is_empty() && path.contains("/usr/bin") {
         path
     } else {
         SANE_PATH.to_string()
+    }
+}
+
+pub(crate) fn preferred_shell_executable() -> std::path::PathBuf {
+    which::which("bash")
+        .or_else(|_| {
+            env::var_os("SHELL")
+                .filter(|shell| !shell.is_empty())
+                .map(std::path::PathBuf::from)
+                .filter(|path| path.is_file())
+                .ok_or(which::Error::CannotFindBinaryPath)
+        })
+        .unwrap_or_else(|_| std::path::PathBuf::from("sh"))
+}
+
+pub(crate) fn shell_command_flag(
+    shell_exe: &std::path::Path,
+    interactive_login: bool,
+) -> &'static str {
+    if !interactive_login {
+        return "-c";
+    }
+
+    match shell_exe.file_name().and_then(|name| name.to_str()) {
+        Some("bash" | "zsh" | "ksh") => "-lic",
+        _ => "-c",
     }
 }
 
@@ -759,6 +785,30 @@ mod tests {
             "OPENAI_API_KEY must be blocked"
         );
         unsafe { env::remove_var("OPENAI_API_KEY") };
+    }
+
+    #[test]
+    fn shell_command_flag_uses_login_mode_for_bash_like_shells() {
+        assert_eq!(
+            shell_command_flag(std::path::Path::new("/bin/bash"), true),
+            "-lic"
+        );
+        assert_eq!(
+            shell_command_flag(std::path::Path::new("/bin/zsh"), true),
+            "-lic"
+        );
+    }
+
+    #[test]
+    fn shell_command_flag_falls_back_to_plain_exec_for_unknown_shells() {
+        assert_eq!(
+            shell_command_flag(std::path::Path::new("/bin/sh"), true),
+            "-c"
+        );
+        assert_eq!(
+            shell_command_flag(std::path::Path::new("/bin/bash"), false),
+            "-c"
+        );
     }
 
     #[tokio::test]

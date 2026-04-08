@@ -357,9 +357,17 @@ edgecrab mcp install <preset>             # Install a preset into config.yaml
 edgecrab mcp install filesystem --path /tmp  # Install with path override
 edgecrab mcp test                         # Probe all configured servers (connectivity + tool count)
 edgecrab mcp test <name>                  # Probe a specific server
+edgecrab mcp doctor                       # Static checks + live probe for all configured servers
+edgecrab mcp doctor <name>                # Diagnose one configured server
 edgecrab mcp add <name> <cmd> [args...]   # Add a custom MCP server by command
 edgecrab mcp remove <name>                # Remove a configured MCP server
 ```
+
+HTTP MCP servers can authenticate with bearer tokens from:
+
+- `bearer_token` in `config.yaml`
+- `/mcp-token set <server> <token>`
+- env-expanded config values such as `bearer_token: "${MY_API_TOKEN}"`
 
 ---
 
@@ -383,8 +391,11 @@ Manage agent skills stored in `~/.edgecrab/skills/`.
 ```bash
 edgecrab skills list                              # List all installed skills
 edgecrab skills view <name>                       # Print a skill's SKILL.md
-edgecrab skills search <query>                    # Search skills by name
-edgecrab skills install <path-or-repo>            # Install from a local path or GitHub URL
+edgecrab skills search <query>                    # Search local + remote skill sources
+edgecrab skills install <path>                    # Install from a local path
+edgecrab skills install edgecrab:<category/path>  # Install from a curated remote source
+edgecrab skills install owner/repo/path           # Install from GitHub
+edgecrab skills update [name]                     # Refresh one or all remote-installed skills
 edgecrab skills install official/<cat>/<skill>    # Install from the official catalogue
 edgecrab skills remove <name>                     # Remove an installed skill
 ```

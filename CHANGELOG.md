@@ -9,6 +9,63 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.1.3] — 2026-04-09
+
+### Added
+
+#### CLI & TUI
+- **ADR-backed CLI/TUI audit spec set** — new documents under `specs/cli_improve/` cross-reference the clap subcommand tree, slash-command registry, TUI handlers, config UX, and verification plan.
+- **ADR-backed binary CLI audit spec set** — new documents under `specs/cli_command_improve/` audit the full terminal command surface, from clap entry/help/version behavior through nested subcommand wiring and runtime-home semantics.
+- **TUI config center** — `/config` now opens a searchable control surface that summarizes runtime configuration, exposes important paths, and routes directly into model, vision, image, display, skin, voice, gateway-home, and update actions.
+- **Selector-grade cheap-model routing UX** — `/cheap_model` now matches `/model` with a fast model picker, persisted smart-routing state, `status`, and `off` flows instead of relying on manual YAML edits.
+- **First-class MoA configuration UX** — `/moa` now exposes live status, aggregator selection, explicit expert add/remove flows, searchable full-roster editing, reset behavior, and config-center entry points; the canonical callable tool is now `moa` while keeping `mixture_of_agents` as a legacy alias, and persisted `moa` defaults are consumed when per-call overrides are omitted.
+- **MoA runtime hardening and operator controls** — `moa.enabled` now gates `moa` cleanly, `/moa on|off` mirrors the cheap-model enable/disable workflow, model specs are normalized and deduplicated before persistence, and MoA no longer silently falls back to the active model while claiming a different roster.
+- **MoA activation is now end-to-end correct** — the default `core` toolset alias now expands to `moa`, `/moa on` repairs literal toolset whitelist/blacklist entries before enabling the feature, `/moa status` reports config-vs-toolset effective availability, and the system prompt now tells models to call `moa` directly when the user asks for multi-model consensus.
+- **MoA secondary Copilot routing now uses the real provider path** — when MoA needs a second `vscode-copilot/...` model for a reference or aggregator step, it now reuses the same direct Copilot construction path as the CLI instead of falling back to the broken localhost proxy factory path; live MoA Copilot coverage is now exercised by an ignored end-to-end test.
+- **MoA now degrades safely instead of dying on stale rosters** — the active chat model is appended as a last-chance safety expert at runtime, aggregation now falls back through an ordered candidate list when the configured aggregator is unsupported, `/moa status` documents the safety behavior, `/moa reset` writes a safe current-session baseline, and live Copilot E2E coverage now exercises both unsupported-aggregator and unsupported-reference fallback paths.
+- **Binary command contract hardening** — `--config` now rebases the effective runtime home for binary commands, `config edit` supports argument-bearing `$EDITOR` values such as `code --wait`, `config env-path` respects the active config root, and `version` now reflects the model catalog provider inventory instead of a hardcoded subset.
+- **Browser launch tests are explicit opt-in** — real-Chrome launch paths are now suppressed under Rust test harnesses unless `EDGECRAB_RUN_BROWSER_LAUNCH_TESTS=1` is set, so `cargo test -- --include-ignored` no longer opens Chrome by side effect.
+
+#### Model Discovery
+- **Dynamic provider discovery with principled fallback** — `edgecrab-core` now supports provider-scoped live model discovery for OpenRouter, Ollama, LM Studio, Google Gemini, GitHub Copilot, and AWS Bedrock, with per-provider cache plus static catalog fallback instead of generic `/v1/models` heuristics.
+- **AWS Bedrock as a first-class provider** — the embedded model catalog now includes Bedrock model IDs, the runtime provider is enabled in normal builds, and Bedrock discovery is documented and spec'd under `specs/dynamic_model/`.
+- **ADR-backed model discovery specification** — new design and test documents under `specs/dynamic_model/` cover architecture, provider support matrix, cache/fallback rules, TUI behavior, Bedrock constraints, and verification strategy.
+
+#### MCP
+- **`edgecrab mcp doctor` and `/mcp doctor`** — configured MCP servers can now be diagnosed with static config checks plus live probe output, including command resolution, `cwd` validation, auth source hints, filter summaries, and sample discovered tools.
+- **Exceptional TUI MCP control flow** — the MCP browser now has a dedicated `check` action for configured servers, making install, view, test, diagnose, and remove available from one overlay.
+- **Native multi-source MCP search in the TUI** — `/mcp search [query]` now opens a dedicated remote browser that searches steering-group reference servers, official integrations, archived upstream entries, and the official MCP Registry with per-source provenance and background refresh.
+- **Deterministic install plans for searchable official MCP entries** — remote MCP search results can now be installed directly when EdgeCrab can launch them safely: bundled presets, streamable HTTP registry entries, npm stdio packages, and PyPI stdio packages. Unsupported registry transports remain visible but view-only.
+- **OAuth-style HTTP MCP auth is now env-friendly** — `bearer_token` and HTTP header values from `mcp_servers` expand `${ENV_VAR}` placeholders at load time, so short-lived access tokens can be injected safely from the environment instead of hardcoding secrets.
+- **OAuth-aware MCP operator UX** — configured HTTP MCP servers now surface OAuth mode, token endpoint, grant type, token-cache freshness, and missing refresh/client credential signals through `/mcp view`, `/mcp doctor`, and the TUI MCP browser instead of collapsing everything into a generic auth warning.
+- **Actionable MCP OAuth workflow guidance** — `edgecrab mcp auth <server>` and `/mcp auth <server>` now tell the operator which auth path is active, what is missing, and what to do next.
+- **Refresh-token-aware MCP token storage** — `/mcp-token` now supports refresh-token caching and per-server token status, so refresh-token OAuth servers are operable from the TUI instead of only diagnosable.
+- **Interactive MCP OAuth login** — `edgecrab mcp login <server>` and `/mcp login <server>` now run real interactive OAuth flows for HTTP MCP servers, including device-code login and browser-based authorization-code login with loopback callback support.
+- **Browser OAuth gap closed further** — browser-based MCP login now supports dynamic loopback redirect ports for busy local environments, validates redirect safety in doctor/auth output, and has end-to-end authorization-code coverage in the CLI test suite.
+- **Code-grounded MCP specification set** — new ADR-style documents under `specs/mcp/` define the MCP transport plane, TUI operator UX, path parsing model, and edge-case roadblocks from the current implementation outward.
+
+#### Skills Hub
+- **Curated remote skill discovery** — `edgecrab skills search`, `/skills search`, and the `skills_hub` tool now search live skill catalogs from Hermes Agent, EdgeCrab, OpenAI Skills, Anthropic Skills, and `skills.sh`, with per-source origin and trust labels.
+- **Interactive remote skill browser in TUI** — `/skills search [query]` and `/skills hub [query]` now open a searchable full-screen browser with live background refresh, source/error notes, install-or-update actions, and local/remote browser switching instead of dumping raw text into the transcript.
+- **Cached parallel remote indexing** — remote GitHub-backed skill sources are searched in parallel, indexed through the GitHub tree API, cached under `~/.edgecrab/skills/.hub/index-cache/`, and reused on slow or failed refreshes for better long-search UX.
+- **Curated install aliases** — remote skills can now be installed with short identifiers like `edgecrab:<path>` and `hermes-agent:<path>` in addition to raw `owner/repo/path`.
+- **Remote skill updates** — `edgecrab skills update`, `/skills update`, and `skills_hub update` now refresh hub-installed skills from their recorded source identifier and pull the latest remote bundle.
+
+#### Language Server Protocol
+- **New `edgecrab-lsp` crate** — dedicated workspace crate for language-server lifecycle, document sync, diagnostics caching, position encoding, edit application, and LLM-facing rendering.
+- **25 LSP tools exposed to the agent and ACP/editor surface** — navigation parity with Claude Code plus `lsp_code_actions`, `lsp_apply_code_action`, `lsp_rename`, `lsp_format_document`, `lsp_format_range`, `lsp_inlay_hints`, `lsp_semantic_tokens`, `lsp_signature_help`, `lsp_type_hierarchy_prepare`, `lsp_supertypes`, `lsp_subtypes`, `lsp_diagnostics_pull`, `lsp_linked_editing_range`, `lsp_enrich_diagnostics`, `lsp_select_and_apply_action`, and `lsp_workspace_type_errors`.
+- **LSP-aware prompt guidance** — the system prompt now teaches the agent to prefer semantic LSP navigation, diagnostics, rename, formatting, and code actions over grep-style heuristics when a server is available.
+- **Configurable language servers** — new top-level `lsp` config with default Rust, TypeScript, JavaScript, Python, Go, C, and C++ server definitions plus per-server command, args, env, root markers, and initialization options.
+
+#### Tests, Automation, and Docs
+- **LSP integration and surface regressions** — integration coverage exercises the mock LSP server end to end, and surface tests now prove EdgeCrab exposes more than Claude Code's 9 documented LSP operations on both core and ACP surfaces.
+- **Build and release automation updated for `edgecrab-lsp`** — Makefile and crates.io release workflow now include the new crate in publish order, and CI runs the dedicated `edgecrab-lsp` package tests explicitly.
+- **Documentation refresh for semantic coding** — README, docs, site pages, configuration reference, and changelog now document LSP setup, capabilities, and the expanded coding toolset.
+- **CLI/model-routing documentation refresh** — the CLI architecture, config/TUI deep dive, smart-routing docs, tool catalogue, and config reference now document `/cheap_model`, `/moa`, and the new `moa:` config block consistently.
+- **MoA correctness regression coverage** — new tests now cover config sanitization, command dispatch, enable/disable persistence, selector save flows, and the provider-routing logic that prevents fake multi-model runs.
+
+---
+
 ## [0.1.0] — 2026-04-06
 
 _First public release. Phase 5: Integration & Polish._
@@ -77,6 +134,17 @@ _First public release. Phase 5: Integration & Polish._
   - All `#[ignore]`d unless `VSCODE_IPC_HOOK_CLI` or `VSCODE_COPILOT_TOKEN` is set.
 
 ### Changed
+
+- **Slash command honesty pass** — `/theme` now opens the skin browser by default and reserves `reload` for explicit `skin.yaml` reloads, matching the documented UX.
+- **Status bar is now a real persisted preference** — `/statusbar [on|off|toggle|status]` updates runtime state and stores the choice in `display.show_status_bar`.
+- **Approval and gateway utility commands now operate on real state** — `/approve`, `/deny`, `/sethome`, and `/update` now resolve active approval flow, supported home-channel config, and local git-based update status instead of placeholder output.
+
+- **`/model` waiting UX is no longer blocking** — the TUI model selector now opens immediately from the embedded catalog and refreshes live inventories in place, instead of replacing the full screen with a loading overlay.
+- **`/models` is now TUI-friendly** — provider inventory output is summarized by provider with counts and discovery status, exact-provider reports show source/fallback truthfully, and Bedrock remains visible even when live discovery is feature-gated out of the build.
+
+- **TUI `/mcp` parsing is now quote-aware and cross-platform** — `/mcp install ...` supports quoted `--path` / `--name` and `key=value` forms without breaking on spaces or Windows-style backslash paths.
+- **Default model switched to local Ollama** — fresh config defaults and the agent fallback model now use `ollama/gemma4:latest`.
+- **Remote GitHub skill install is now recursive** — installing a distant skill bundle preserves nested templates, references, and support files instead of downloading only top-level files.
 - `Theme::prompt_symbol` and `Theme::tool_prefix` changed from `&'static str` to `String` to support runtime overrides from `skin.yaml`.
 - `App::check_responses()` now handles the `AgentResponse` enum instead of a plain struct — dispatches `Token`, `Done`, and `Error` variants.
 - `compression.rs` doc comment updated to describe both structural and LLM strategies.

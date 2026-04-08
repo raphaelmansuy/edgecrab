@@ -2,10 +2,10 @@
 //!
 //! WHY line ranges: LLMs have limited context. Reading entire large files
 //! wastes tokens. Line ranges let the agent focus on relevant sections,
-//! matching how hermes-agent's read_file works.
+//! matching established paginated read workflows.
 //!
 //! WHY line numbers: Adds column-1 line numbers (`  42|content`) by default,
-//! matching hermes-agent's `_add_line_numbers()` in `file_operations.py`.
+//! matching the legacy line-numbered read format.
 //! Line numbers let the LLM reference specific locations in follow-up
 //! `patch` calls without guessing offsets.
 
@@ -28,8 +28,14 @@ struct Args {
     line_start: Option<usize>,
     #[serde(default)]
     line_end: Option<usize>,
+    /// Legacy pagination start line (1-indexed, inclusive).
+    #[serde(default)]
+    offset: Option<usize>,
+    /// Legacy pagination line count.
+    #[serde(default)]
+    limit: Option<usize>,
     /// Add `  N|` line-number prefix to every output line.
-    /// Default true — matches hermes-agent parity and makes patch calls easier.
+    /// Default true — keeps line-addressable output for follow-up edits.
     #[serde(default = "default_line_numbers")]
     line_numbers: bool,
 }
@@ -38,9 +44,39 @@ fn default_line_numbers() -> bool {
     true
 }
 
+fn normalize_line_range(args: &Args) -> Result<(Option<usize>, Option<usize>), ToolError> {
+    if args.line_start.is_some() || args.line_end.is_some() {
+        return Ok((args.line_start, args.line_end));
+    }
+
+    let Some(offset) = args.offset.or_else(|| args.limit.map(|_| 1)) else {
+        return Ok((None, None));
+    };
+
+    if offset == 0 {
+        return Err(ToolError::InvalidArgs {
+            tool: "read_file".into(),
+            message: "offset must be >= 1".into(),
+        });
+    }
+
+    if let Some(limit) = args.limit {
+        if limit == 0 {
+            return Err(ToolError::InvalidArgs {
+                tool: "read_file".into(),
+                message: "limit must be >= 1".into(),
+            });
+        }
+        let end = offset.saturating_add(limit.saturating_sub(1));
+        Ok((Some(offset), Some(end)))
+    } else {
+        Ok((Some(offset), None))
+    }
+}
+
 /// Add `  N|` line-number prefixes to `content`, starting at `first_line`.
 ///
-/// Format mirrors hermes-agent's `_add_line_numbers()`:
+/// Format mirrors the legacy numbered-read output:
 /// ```text
 ///     1| line one content
 ///    42| def foo():
@@ -63,7 +99,7 @@ fn add_line_numbers(content: &str, first_line: usize) -> String {
 ///
 /// WHY: LLMs frequently typo or guess file names. Providing nearby candidates
 /// (difflib-style, shared 50%+ chars) avoids a wasted round-trip.
-/// Mirrors hermes-agent's `_suggest_similar_files()`.
+/// Mirrors the legacy similar-file suggestion behavior.
 fn suggest_similar_files(path: &str, cwd: &std::path::Path) -> Vec<String> {
     let dir = std::path::Path::new(path)
         .parent()
@@ -130,6 +166,7 @@ impl ToolHandler for ReadFileTool {
         ToolSchema {
             name: "read_file".into(),
             description: "Read the contents of a file. Optionally specify line range. \
+                          Supports either EdgeCrab line_start/line_end or legacy offset/limit pagination. \
                           Returns content with line numbers by default (set line_numbers=false to disable)."
                 .into(),
             parameters: json!({
@@ -146,6 +183,14 @@ impl ToolHandler for ReadFileTool {
                     "line_end": {
                         "type": "integer",
                         "description": "End line (1-indexed, inclusive)"
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Legacy start line (1-indexed, inclusive). Use with limit."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Legacy line count to return. Use with offset."
                     },
                     "line_numbers": {
                         "type": "boolean",
@@ -169,8 +214,10 @@ impl ToolHandler for ReadFileTool {
         })?;
 
         // Image redirect: if the path points to an image file, redirect to vision_analyze.
-        // This mirrors hermes-agent file_operations.py:501-509 — prevents the agent from
+        // This mirrors the legacy image redirect behavior — prevents the agent from
         // trying to read binary image bytes as text, which always fails.
+        let (line_start, line_end) = normalize_line_range(&args)?;
+
         {
             let ext = std::path::Path::new(&args.path)
                 .extension()
@@ -205,7 +252,7 @@ impl ToolHandler for ReadFileTool {
         let resolved = match jail_read_path(&args.path, &path_policy) {
             Ok(p) => p,
             Err(e) => {
-                // File not found → suggest similar file names, mirrors hermes-agent.
+                // File not found → suggest similar file names, matching prior behavior.
                 if matches!(&e, ToolError::NotFound(_)) {
                     let suggestions = suggest_similar_files(&args.path, &ctx.cwd);
                     if !suggestions.is_empty() {
@@ -226,7 +273,7 @@ impl ToolHandler for ReadFileTool {
 
         if metadata.len() as usize > ctx.config.max_file_read_bytes {
             return Err(ToolError::Other(format!(
-                "File too large ({} bytes, max {}). Use line_start/line_end to read a section.",
+                "File too large ({} bytes, max {}). Use line_start/line_end or offset/limit to read a section.",
                 metadata.len(),
                 ctx.config.max_file_read_bytes
             )));
@@ -240,7 +287,7 @@ impl ToolHandler for ReadFileTool {
         // `first_line` tracks the 1-based line number of the first output line
         // so that add_line_numbers() produces correct absolute numbers even for
         // partial reads (e.g. line_start=100 → output starts at "  100|").
-        let (output, first_line) = match (args.line_start, args.line_end) {
+        let (output, first_line) = match (line_start, line_end) {
             (Some(start), Some(end)) => {
                 let lines: Vec<&str> = content.lines().collect();
                 let start_idx = start.saturating_sub(1); // 1-indexed to 0-indexed
@@ -268,9 +315,9 @@ impl ToolHandler for ReadFileTool {
             output
         };
 
-        // Consecutive re-read loop detection — mirrors hermes-agent file_tools.py.
+        // Consecutive re-read loop detection — matches the prior read-loop guard.
         // Warn at 3 identical consecutive reads; hard-block at 4.
-        let key = read_tracker::read_key(&args.path, args.line_start, args.line_end);
+        let key = read_tracker::read_key(&args.path, line_start, line_end);
         let count = read_tracker::check_and_update(&ctx.session_id, key);
 
         if count >= 4 {
@@ -278,7 +325,7 @@ impl ToolHandler for ReadFileTool {
                 "BLOCKED: You have read '{}' (lines {:?}–{:?}) {} times in a row. \
                  The content has NOT changed. You already have this information. \
                  Stop re-reading and proceed with your task.",
-                args.path, args.line_start, args.line_end, count
+                args.path, line_start, line_end, count
             )));
         } else if count >= 3 {
             let warning = format!(
@@ -339,6 +386,38 @@ mod tests {
             .expect("read");
 
         assert_eq!(result, "b\nc\nd");
+    }
+
+    #[tokio::test]
+    async fn read_file_supports_offset_limit_pagination() {
+        let dir = TempDir::new().expect("tmpdir");
+        std::fs::write(dir.path().join("paged.txt"), "a\nb\nc\nd\ne\n").expect("write");
+
+        let ctx = ctx_in(dir.path());
+        let result = ReadFileTool
+            .execute(
+                json!({"path": "paged.txt", "offset": 2, "limit": 3, "line_numbers": false}),
+                &ctx,
+            )
+            .await
+            .expect("read");
+
+        assert_eq!(result, "b\nc\nd");
+    }
+
+    #[tokio::test]
+    async fn read_file_rejects_zero_limit() {
+        let dir = TempDir::new().expect("tmpdir");
+        std::fs::write(dir.path().join("paged.txt"), "a\nb\n").expect("write");
+
+        let ctx = ctx_in(dir.path());
+        let result = ReadFileTool
+            .execute(json!({"path": "paged.txt", "offset": 1, "limit": 0}), &ctx)
+            .await;
+
+        assert!(result.is_err());
+        let error = result.expect_err("expected invalid args").to_string();
+        assert!(error.contains("limit must be >= 1"), "got: {error}");
     }
 
     #[tokio::test]

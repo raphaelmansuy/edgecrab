@@ -262,7 +262,35 @@ pub fn close_all_sessions() {
 /// Uses a dedicated `--user-data-dir` so Chrome launches as a standalone
 /// instance even on macOS (which otherwise hands the launch to the existing
 /// Chrome process, silently ignoring `--remote-debugging-port`).
+fn truthy_env_var(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes"
+        )
+    })
+}
+
+fn browser_launch_allowed_for_current_process() -> bool {
+    if truthy_env_var("EDGECRAB_RUN_BROWSER_LAUNCH_TESTS") {
+        return true;
+    }
+
+    let under_test_harness = cfg!(test)
+        || std::env::var_os("RUST_TEST_THREADS").is_some()
+        || std::env::var_os("NEXTEST").is_some();
+
+    !under_test_harness
+}
+
 pub fn launch_chrome_for_debugging(port: u16) -> bool {
+    if !browser_launch_allowed_for_current_process() {
+        tracing::info!(
+            "browser launch suppressed in test process; set EDGECRAB_RUN_BROWSER_LAUNCH_TESTS=1 to enable"
+        );
+        return false;
+    }
+
     let bin = find_chrome_binary();
     let Some(chrome) = bin else {
         return false;
@@ -2415,7 +2443,7 @@ impl ToolHandler for BrowserClickTool {
         let label = if txt.is_empty() {
             tag.to_string()
         } else {
-            format!("{tag}: {}", &txt[..txt.len().min(50)])
+            format!("{tag}: {}", crate::safe_truncate(txt, 50))
         };
         Ok(format!("Clicked @{} ({label})", args.r#ref))
     }
@@ -3982,6 +4010,10 @@ mod tests {
     use super::*;
     use tempfile::{Builder, tempdir};
 
+    fn browser_launch_tests_enabled() -> bool {
+        truthy_env_var("EDGECRAB_RUN_BROWSER_LAUNCH_TESTS")
+    }
+
     #[test]
     fn normalize_ref_valid() {
         assert_eq!(normalize_ref("@e5").unwrap(), "e5");
@@ -4789,8 +4821,14 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "may spawn a real Chrome process — run with --include-ignored in a headless CI env"]
+    #[ignore = "may spawn a real Chrome process — also requires EDGECRAB_RUN_BROWSER_LAUNCH_TESTS=1"]
     fn launch_chrome_returns_bool() {
+        if !browser_launch_tests_enabled() {
+            eprintln!(
+                "skipping real Chrome launch test; set EDGECRAB_RUN_BROWSER_LAUNCH_TESTS=1 to enable"
+            );
+            return;
+        }
         // Just verify it doesn't panic; actual launch depends on env
         let _ = launch_chrome_for_debugging(19224);
     }

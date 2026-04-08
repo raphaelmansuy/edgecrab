@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use edgecrab_tools::tools::backends::{
     BackendKind, DaytonaBackendConfig, DockerBackendConfig, ModalBackendConfig,
@@ -34,6 +34,7 @@ pub struct AppConfig {
     pub model: ModelConfig,
     pub agent: AgentConfig,
     pub tools: ToolsConfig,
+    pub lsp: LspConfig,
     pub save_trajectories: bool,
     pub skip_context_files: bool,
     pub skip_memory: bool,
@@ -56,6 +57,7 @@ pub struct AppConfig {
     pub voice: VoiceConfig,
     pub honcho: HonchoConfig,
     pub auxiliary: AuxiliaryConfig,
+    pub moa: MoaConfig,
     pub reasoning_effort: Option<String>,
 }
 
@@ -79,6 +81,7 @@ impl AppConfig {
         };
 
         config.apply_env_overrides();
+        config.moa = config.moa.sanitized();
         Ok(config)
     }
 
@@ -87,6 +90,7 @@ impl AppConfig {
         let content = std::fs::read_to_string(path).map_err(AgentError::Io)?;
         let mut config: Self = Self::parse_compat_yaml(&content, path)?;
         config.apply_env_overrides();
+        config.moa = config.moa.sanitized();
         Ok(config)
     }
 
@@ -112,7 +116,9 @@ impl AppConfig {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(AgentError::Io)?;
         }
-        let yaml = serde_yml::to_string(self)
+        let mut sanitized = self.clone();
+        sanitized.moa = sanitized.moa.sanitized();
+        let yaml = serde_yml::to_string(&sanitized)
             .map_err(|e| AgentError::Config(format!("failed to serialize config: {e}")))?;
         std::fs::write(path, yaml).map_err(AgentError::Io)
     }
@@ -593,7 +599,7 @@ pub struct SmartRoutingYaml {
 impl Default for ModelConfig {
     fn default() -> Self {
         Self {
-            default_model: "anthropic/claude-sonnet-4-20250514".into(),
+            default_model: "ollama/gemma4:latest".into(),
             fallback: None,
             base_url: None,
             api_key_env: "OPENROUTER_API_KEY".into(),
@@ -623,6 +629,8 @@ pub struct FallbackConfig {
 pub struct ToolsConfig {
     pub enabled_toolsets: Option<Vec<String>>,
     pub disabled_toolsets: Option<Vec<String>>,
+    pub enabled_tools: Option<Vec<String>>,
+    pub disabled_tools: Option<Vec<String>>,
     #[serde(default)]
     pub custom_groups: HashMap<String, Vec<String>>,
     #[serde(default)]
@@ -637,6 +645,8 @@ impl Default for ToolsConfig {
         Self {
             enabled_toolsets: None,
             disabled_toolsets: None,
+            enabled_tools: None,
+            disabled_tools: None,
             custom_groups: HashMap::new(),
             file: FileToolsConfig::default(),
             tool_delay: 1.0,
@@ -644,6 +654,211 @@ impl Default for ToolsConfig {
             max_parallel_workers: 8,
         }
     }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct LspConfig {
+    pub enabled: bool,
+    pub file_size_limit_bytes: u64,
+    pub servers: HashMap<String, LspServerConfig>,
+}
+
+impl Default for LspConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            file_size_limit_bytes: 10_000_000,
+            servers: default_lsp_servers(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct LspServerConfig {
+    pub command: String,
+    pub args: Vec<String>,
+    pub file_extensions: Vec<String>,
+    pub language_id: String,
+    pub root_markers: Vec<String>,
+    pub env: HashMap<String, String>,
+    pub initialization_options: Option<serde_json::Value>,
+}
+
+fn default_lsp_servers() -> HashMap<String, LspServerConfig> {
+    fn server(
+        command: &str,
+        args: &[&str],
+        file_extensions: &[&str],
+        language_id: &str,
+        root_markers: &[&str],
+    ) -> LspServerConfig {
+        LspServerConfig {
+            command: command.into(),
+            args: args.iter().map(|value| (*value).into()).collect(),
+            file_extensions: file_extensions
+                .iter()
+                .map(|value| (*value).into())
+                .collect(),
+            language_id: language_id.into(),
+            root_markers: root_markers.iter().map(|value| (*value).into()).collect(),
+            env: HashMap::new(),
+            initialization_options: None,
+        }
+    }
+
+    [
+        (
+            "rust",
+            server(
+                "rust-analyzer",
+                &[],
+                &["rs"],
+                "rust",
+                &["Cargo.toml", "rust-project.json"],
+            ),
+        ),
+        (
+            "typescript",
+            server(
+                "typescript-language-server",
+                &["--stdio"],
+                &["ts", "tsx"],
+                "typescript",
+                &["package.json", "tsconfig.json"],
+            ),
+        ),
+        (
+            "javascript",
+            server(
+                "typescript-language-server",
+                &["--stdio"],
+                &["js", "jsx", "mjs", "cjs"],
+                "javascript",
+                &["package.json", "jsconfig.json"],
+            ),
+        ),
+        (
+            "python",
+            server(
+                "pylsp",
+                &[],
+                &["py"],
+                "python",
+                &["pyproject.toml", "setup.py", "requirements.txt"],
+            ),
+        ),
+        ("go", server("gopls", &[], &["go"], "go", &["go.mod"])),
+        (
+            "c",
+            server(
+                "clangd",
+                &[],
+                &["c", "h"],
+                "c",
+                &["compile_commands.json", ".clangd"],
+            ),
+        ),
+        (
+            "cpp",
+            server(
+                "clangd",
+                &[],
+                &["cc", "cpp", "cxx", "hpp", "hh", "hxx"],
+                "cpp",
+                &["compile_commands.json", ".clangd"],
+            ),
+        ),
+        (
+            "java",
+            server(
+                "jdtls",
+                &[],
+                &["java"],
+                "java",
+                &[
+                    "pom.xml",
+                    "build.gradle",
+                    "build.gradle.kts",
+                    "settings.gradle",
+                ],
+            ),
+        ),
+        (
+            "csharp",
+            server(
+                "csharp-ls",
+                &[],
+                &["cs"],
+                "csharp",
+                &["*.sln", "*.csproj", "global.json", "Directory.Build.props"],
+            ),
+        ),
+        (
+            "php",
+            server(
+                "intelephense",
+                &["--stdio"],
+                &["php"],
+                "php",
+                &["composer.json", ".git"],
+            ),
+        ),
+        (
+            "ruby",
+            server(
+                "ruby-lsp",
+                &[],
+                &["rb", "rake", "gemspec"],
+                "ruby",
+                &["Gemfile", ".ruby-version"],
+            ),
+        ),
+        (
+            "bash",
+            server(
+                "bash-language-server",
+                &["start"],
+                &["sh", "bash"],
+                "shellscript",
+                &[".git"],
+            ),
+        ),
+        (
+            "html",
+            server(
+                "vscode-html-language-server",
+                &["--stdio"],
+                &["html", "htm"],
+                "html",
+                &["package.json", ".git"],
+            ),
+        ),
+        (
+            "css",
+            server(
+                "vscode-css-language-server",
+                &["--stdio"],
+                &["css", "scss", "less"],
+                "css",
+                &["package.json", ".git"],
+            ),
+        ),
+        (
+            "json",
+            server(
+                "vscode-json-language-server",
+                &["--stdio"],
+                &["json", "jsonc"],
+                "json",
+                &["package.json", ".git"],
+            ),
+        ),
+    ]
+    .into_iter()
+    .map(|(name, cfg)| (name.to_string(), cfg))
+    .collect()
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -874,6 +1089,26 @@ impl Default for McpToolsFilterConfig {
     }
 }
 
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct McpOauthConfig {
+    pub token_url: String,
+    pub grant_type: Option<String>,
+    pub client_id: Option<String>,
+    pub client_secret: Option<String>,
+    pub auth_method: Option<String>,
+    pub device_authorization_url: Option<String>,
+    pub authorization_url: Option<String>,
+    pub redirect_url: Option<String>,
+    pub use_pkce: Option<bool>,
+    pub scopes: Vec<String>,
+    pub audience: Option<String>,
+    pub resource: Option<String>,
+    pub refresh_token: Option<String>,
+    pub authorization_params: HashMap<String, String>,
+    pub extra_params: HashMap<String, String>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct McpServerConfig {
@@ -894,6 +1129,8 @@ pub struct McpServerConfig {
     /// Static Bearer token for HTTP MCP servers.
     /// Alternative to the token store managed by `/mcp-token`.
     pub bearer_token: Option<String>,
+    /// OAuth 2.0 token acquisition and refresh settings for HTTP MCP servers.
+    pub oauth: Option<McpOauthConfig>,
     /// Per-call tool invocation timeout in seconds (default: 30).
     pub timeout: Option<u64>,
     /// Connection / handshake timeout in seconds (default: 10).
@@ -913,6 +1150,7 @@ impl Default for McpServerConfig {
             url: None,
             headers: HashMap::new(),
             bearer_token: None,
+            oauth: None,
             timeout: None,
             connect_timeout: None,
             tools: McpToolsFilterConfig::default(),
@@ -1099,6 +1337,8 @@ pub struct DisplayConfig {
     pub personality: String,
     pub show_reasoning: bool,
     pub streaming: bool,
+    pub tool_progress: ToolProgressMode,
+    pub show_status_bar: bool,
     pub show_cost: bool,
     pub skin: String,
 }
@@ -1110,8 +1350,69 @@ impl Default for DisplayConfig {
             personality: "default".into(),
             show_reasoning: false,
             streaming: true,
+            tool_progress: ToolProgressMode::All,
+            show_status_bar: true,
             show_cost: true,
             skin: "default".into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolProgressMode {
+    Off,
+    New,
+    #[default]
+    All,
+    Verbose,
+}
+
+impl ToolProgressMode {
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::Off => Self::New,
+            Self::New => Self::All,
+            Self::All => Self::Verbose,
+            Self::Verbose => Self::Off,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "OFF",
+            Self::New => "NEW",
+            Self::All => "ALL",
+            Self::Verbose => "VERBOSE",
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolProgressMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Bool(bool),
+            Text(String),
+        }
+
+        let repr = Repr::deserialize(deserializer)?;
+        match repr {
+            Repr::Bool(false) => Ok(ToolProgressMode::Off),
+            Repr::Bool(true) => Ok(ToolProgressMode::All),
+            Repr::Text(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+                "off" => Ok(ToolProgressMode::Off),
+                "new" => Ok(ToolProgressMode::New),
+                "all" => Ok(ToolProgressMode::All),
+                "verbose" => Ok(ToolProgressMode::Verbose),
+                other => Err(serde::de::Error::custom(format!(
+                    "invalid tool progress mode '{other}'"
+                ))),
+            },
         }
     }
 }
@@ -1559,6 +1860,44 @@ pub struct AuxiliaryConfig {
     pub api_key_env: Option<String>,
 }
 
+/// Default Mixture-of-Agents configuration.
+///
+/// These values are used when the `moa` tool is called without
+/// explicit `reference_models` or `aggregator_model` arguments.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct MoaConfig {
+    pub enabled: bool,
+    pub reference_models: Vec<String>,
+    pub aggregator_model: String,
+}
+
+impl Default for MoaConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            reference_models: edgecrab_tools::tools::mixture_of_agents::default_reference_models(),
+            aggregator_model: edgecrab_tools::tools::mixture_of_agents::DEFAULT_AGGREGATOR_MODEL
+                .to_string(),
+        }
+    }
+}
+
+impl MoaConfig {
+    pub fn sanitized(&self) -> Self {
+        let effective = edgecrab_tools::tools::mixture_of_agents::sanitize_moa_config(
+            self.enabled,
+            &self.reference_models,
+            &self.aggregator_model,
+        );
+        Self {
+            enabled: effective.enabled,
+            reference_models: effective.reference_models,
+            aggregator_model: effective.aggregator_model,
+        }
+    }
+}
+
 // ─── Home directory resolution ────────────────────────────────────────
 
 /// Resolve the EdgeCrab home directory.
@@ -1683,6 +2022,54 @@ model:
         // Everything else should be defaults
         assert!(cfg.model.streaming);
         assert_eq!(cfg.tools.tool_delay, 1.0);
+    }
+
+    #[test]
+    fn default_lsp_server_catalog_covers_mainstream_languages() {
+        let servers = default_lsp_servers();
+        for name in [
+            "rust",
+            "typescript",
+            "javascript",
+            "python",
+            "go",
+            "c",
+            "cpp",
+            "java",
+            "csharp",
+            "php",
+            "ruby",
+            "bash",
+            "html",
+            "css",
+            "json",
+        ] {
+            assert!(
+                servers.contains_key(name),
+                "missing built-in LSP server config for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_lsp_server_catalog_has_expected_routing_details() {
+        let servers = default_lsp_servers();
+
+        let java = servers.get("java").expect("java config");
+        assert_eq!(java.command, "jdtls");
+        assert!(java.file_extensions.contains(&"java".to_string()));
+
+        let csharp = servers.get("csharp").expect("csharp config");
+        assert_eq!(csharp.command, "csharp-ls");
+        assert!(csharp.root_markers.contains(&"*.sln".to_string()));
+
+        let bash = servers.get("bash").expect("bash config");
+        assert_eq!(bash.command, "bash-language-server");
+        assert_eq!(bash.args, vec!["start".to_string()]);
+
+        let html = servers.get("html").expect("html config");
+        assert_eq!(html.command, "vscode-html-language-server");
+        assert!(html.file_extensions.contains(&"html".to_string()));
     }
 
     #[test]
@@ -1938,5 +2325,56 @@ model:
         let cfg: AppConfig = serde_yml::from_str(yaml).expect("parse");
         assert!(cfg.model.smart_routing.enabled);
         assert_eq!(cfg.model.smart_routing.cheap_model, "copilot/gpt-4.1-mini");
+    }
+
+    #[test]
+    fn moa_defaults_match_tool_defaults() {
+        let moa = MoaConfig::default();
+        assert!(moa.enabled);
+        assert_eq!(
+            moa.aggregator_model,
+            edgecrab_tools::tools::mixture_of_agents::DEFAULT_AGGREGATOR_MODEL
+        );
+        assert_eq!(
+            moa.reference_models,
+            edgecrab_tools::tools::mixture_of_agents::default_reference_models()
+        );
+    }
+
+    #[test]
+    fn moa_config_deserializes() {
+        let yaml = r#"
+moa:
+  enabled: false
+  aggregator_model: "anthropic/claude-opus-4.6"
+  reference_models:
+    - "anthropic/claude-opus-4.6"
+    - "openai/gpt-4.1"
+"#;
+        let cfg: AppConfig = serde_yml::from_str(yaml).expect("parse");
+        assert!(!cfg.moa.enabled);
+        assert_eq!(cfg.moa.aggregator_model, "anthropic/claude-opus-4.6");
+        assert_eq!(
+            cfg.moa.reference_models,
+            vec!["anthropic/claude-opus-4.6", "openai/gpt-4.1"]
+        );
+    }
+
+    #[test]
+    fn moa_config_sanitizes_invalid_entries() {
+        let moa = MoaConfig {
+            enabled: false,
+            aggregator_model: " ".into(),
+            reference_models: vec![
+                "copilot/gpt-4.1-mini".into(),
+                "copilot/gpt-4.1-mini".into(),
+                "invalid".into(),
+            ],
+        }
+        .sanitized();
+
+        assert!(!moa.enabled);
+        assert_eq!(moa.aggregator_model, "anthropic/claude-opus-4.6");
+        assert_eq!(moa.reference_models, vec!["vscode-copilot/gpt-4.1-mini"]);
     }
 }

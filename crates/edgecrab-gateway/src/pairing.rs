@@ -34,8 +34,7 @@ const MAX_PENDING_PER_PLATFORM: usize = 3;
 const MAX_FAILED_ATTEMPTS: u32 = 5;
 
 fn pairing_dir() -> PathBuf {
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    home.join(".edgecrab").join("pairing")
+    edgecrab_core::edgecrab_home().join("pairing")
 }
 
 fn now_epoch() -> f64 {
@@ -329,6 +328,7 @@ impl PairingStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn code_generation_length() {
@@ -344,5 +344,30 @@ mod tests {
         assert!(!alpha.contains('O'));
         assert!(!alpha.contains('1'));
         assert!(!alpha.contains('I'));
+    }
+
+    #[test]
+    fn pairing_store_uses_edgecrab_home() {
+        let dir = tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+
+        let store = PairingStore::new();
+        let code = store
+            .generate_code("telegram", "123456", "alice")
+            .expect("pairing code");
+
+        assert_eq!(code.len(), CODE_LENGTH);
+        assert!(
+            dir.path()
+                .join("pairing")
+                .join("telegram-pending.json")
+                .exists()
+        );
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
     }
 }

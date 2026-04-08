@@ -364,6 +364,9 @@ async fn build_effective_text(agent: &Agent, msg: &IncomingMessage) -> String {
             origin_chat: None,
             session_key: Some(session_key.clone()),
             todo_store: None,
+            current_tool_call_id: None,
+            current_tool_name: None,
+            tool_progress_tx: None,
         };
 
         match VisionAnalyzeTool
@@ -423,6 +426,9 @@ async fn build_effective_text(agent: &Agent, msg: &IncomingMessage) -> String {
             origin_chat: None,
             session_key: Some(session_key.clone()),
             todo_store: None,
+            current_tool_call_id: None,
+            current_tool_name: None,
+            tool_progress_tx: None,
         };
 
         match TranscribeAudioTool
@@ -644,6 +650,9 @@ async fn maybe_send_voice_reply(
         origin_chat: None,
         session_key: Some(message_origin_recipient(msg)),
         todo_store: None,
+        current_tool_call_id: None,
+        current_tool_name: None,
+        tool_progress_tx: None,
     };
 
     let result = match TextToSpeechTool
@@ -1481,8 +1490,25 @@ impl Gateway {
                                                 edgecrab_core::StreamEvent::Token(text) => {
                                                     response.push_str(&text);
                                                 }
-                                                edgecrab_core::StreamEvent::ToolExec { name, args_json } => {
+                                                edgecrab_core::StreamEvent::ToolExec { name, args_json, .. } => {
                                                     let label = background_gateway_tool_label(&name, &args_json);
+                                                    if last_tool.as_deref() != Some(label.as_str()) {
+                                                        last_tool = Some(label.clone());
+                                                        if let Some(adapter) = adapter.as_ref() {
+                                                            let _ = adapter
+                                                                .send_status(
+                                                                    &format!(
+                                                                        "🔧 {} {}",
+                                                                        task_id_for_spawn, label
+                                                                    ),
+                                                                    &metadata,
+                                                                )
+                                                                .await;
+                                                        }
+                                                    }
+                                                }
+                                                edgecrab_core::StreamEvent::ToolProgress { name, message, .. } => {
+                                                    let label = format!("{}: {}", name, message);
                                                     if last_tool.as_deref() != Some(label.as_str()) {
                                                         last_tool = Some(label.clone());
                                                         if let Some(adapter) = adapter.as_ref() {

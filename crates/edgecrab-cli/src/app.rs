@@ -29,10 +29,13 @@
 //! - Input line highlighting (cyan for valid commands, red for invalid)
 //! - Fish-style ghost text from input history
 
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{self, BufRead, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use chrono::TimeZone;
+use clap::Parser;
 use crossterm::event::{
     self, Event, KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton,
     MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
@@ -51,28 +54,38 @@ use tokio::sync::mpsc;
 use tui_textarea::{CursorMove, TextArea};
 use unicode_width::UnicodeWidthStr;
 
-use crate::commands::{CommandRegistry, CommandResult};
+use crate::cli_args::CliArgs;
+use crate::commands::{CommandRegistry, CommandResult, ToolManagerMode};
 use crate::edit_diff::{LocalEditSnapshot, capture_local_edit_snapshot, render_edit_diff_lines};
 use crate::fuzzy_selector::{FuzzyItem, FuzzySelector};
+use crate::gateway_browser::{
+    GatewayPlatformEntry, build_gateway_platform_entries, supports_allowlist, supports_home_channel,
+};
+use crate::gateway_catalog::collect_platform_diagnostics;
 use crate::image_models as cli_image_models;
 use crate::markdown_render;
-use crate::model_discovery::{self, DiscoverySource};
+use crate::mcp_support;
 use crate::theme::{SkinConfig, Theme};
 use crate::tool_display::{
-    build_subagent_event_line, build_tool_done_line, build_tool_running_line, tool_action_verb,
-    tool_icon, tool_status_preview,
+    build_subagent_event_line, build_tool_done_line, build_tool_running_line,
+    build_tool_verbose_lines, tool_action_verb, tool_icon, tool_signature, tool_status_preview,
 };
 use crate::vision_models::{
     available_vision_model_options_with_dynamic, canonical_provider, current_model_supports_vision,
     parse_selection_spec,
 };
-use edgecrab_core::ModelCatalog;
-use edgecrab_core::{Agent, IsolatedAgentOptions};
-use edgecrab_tools::registry::ToolHandler;
+use edgecrab_core::{
+    Agent, DiscoveryAvailability, DiscoverySource, IsolatedAgentOptions, ModelCatalog,
+    ProviderModels, ToolProgressMode, discover_multiple, discover_provider_models,
+    discovery_provider_statuses, live_discovery_availability, live_discovery_providers,
+    merge_grouped_catalog_with_dynamic, normalize_discovery_provider,
+};
+use edgecrab_tools::registry::{ToolHandler, ToolInventoryEntry};
 use edgecrab_tools::tools::transcribe::TranscribeAudioTool;
 use edgecrab_tools::tools::tts::{TextToSpeechTool, sanitize_text_for_tts};
 use edgecrab_tools::{AppConfigRef, ToolContext};
-use edgequake_llm::{ProviderFactory, VsCodeCopilotProvider};
+#[cfg(test)]
+use edgequake_llm::ProviderFactory;
 use tokio_util::sync::CancellationToken;
 
 const KEYBOARD_PROTOCOL_WARMUP: Duration = Duration::from_millis(25);
@@ -82,6 +95,86 @@ fn progressive_keyboard_flags() -> KeyboardEnhancementFlags {
         | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
         | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
         | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+}
+
+fn selector_search_char(key: &event::KeyEvent) -> Option<char> {
+    if !key.modifiers.is_empty() {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char(c) => Some(c),
+        _ => None,
+    }
+}
+
+fn selector_action_key(key: &event::KeyEvent, ch: char) -> bool {
+    let upper = ch.to_ascii_uppercase();
+    match key.code {
+        KeyCode::Char(c) => c == upper,
+        _ => false,
+    }
+}
+
+fn selector_marker(is_selected: bool, accent: Color, bg: Option<Color>) -> Span<'static> {
+    let mut style = Style::default().fg(if is_selected { accent } else { Color::DarkGray });
+    if let Some(bg) = bg {
+        style = style.bg(bg);
+    }
+    if is_selected {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    Span::styled(if is_selected { "▶ " } else { "  " }, style)
+}
+
+const SESSION_BROWSER_LIMIT: usize = 250;
+const SESSION_BROWSER_SEARCH_LIMIT: usize = 120;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SplitPaneFocus {
+    List,
+    Detail,
+}
+
+impl SplitPaneFocus {
+    fn toggle(self) -> Self {
+        match self {
+            Self::List => Self::Detail,
+            Self::Detail => Self::List,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DetailPaneState {
+    focus: SplitPaneFocus,
+    scroll: u16,
+}
+
+impl Default for DetailPaneState {
+    fn default() -> Self {
+        Self {
+            focus: SplitPaneFocus::List,
+            scroll: 0,
+        }
+    }
+}
+
+impl DetailPaneState {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn reset_scroll(&mut self) {
+        self.scroll = 0;
+    }
+
+    fn page_up(&mut self, step: u16) {
+        self.scroll = self.scroll.saturating_sub(step.max(1));
+    }
+
+    fn page_down(&mut self, step: u16) {
+        self.scroll = self.scroll.saturating_add(step.max(1));
+    }
 }
 
 fn format_context_pressure_notice(estimated_tokens: usize, threshold_tokens: usize) -> String {
@@ -103,6 +196,115 @@ fn context_usage_ratio(tokens: u64, context_window: Option<u64>) -> Option<f64> 
     context_window
         .filter(|&cw| cw > 0)
         .map(|cw| (tokens as f64 / cw as f64).clamp(0.0, 1.0))
+}
+
+fn find_git_repo_root(mut start: std::path::PathBuf) -> Option<std::path::PathBuf> {
+    loop {
+        if start.join(".git").exists() {
+            return Some(start);
+        }
+        if !start.pop() {
+            return None;
+        }
+    }
+}
+
+fn git_output(repo: &std::path::Path, args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    Some(text.trim().to_string())
+}
+
+fn render_update_status_report() -> String {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| edgecrab_core::edgecrab_home());
+    let Some(repo_root) = find_git_repo_root(cwd) else {
+        return format!(
+            "EdgeCrab v{}\nNo git checkout detected from the current working directory.\nIf you installed from source, run /update from inside the EdgeCrab repo.\nIf you installed from a package manager or `cargo install`, upgrade using that same channel.",
+            env!("CARGO_PKG_VERSION")
+        );
+    };
+
+    let branch = git_output(&repo_root, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .unwrap_or_else(|| "(unknown)".into());
+    let commit = git_output(&repo_root, &["rev-parse", "--short", "HEAD"])
+        .unwrap_or_else(|| "(unknown)".into());
+    let dirty = git_output(&repo_root, &["status", "--short"])
+        .map(|out| if out.is_empty() { "clean" } else { "dirty" })
+        .unwrap_or("unknown");
+    let upstream = git_output(
+        &repo_root,
+        &[
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "@{upstream}",
+        ],
+    );
+
+    let mut lines = vec![
+        format!("EdgeCrab v{}", env!("CARGO_PKG_VERSION")),
+        format!("Repo:   {}", repo_root.display()),
+        format!("Branch: {branch}"),
+        format!("Commit: {commit} ({dirty})"),
+    ];
+
+    if let Some(upstream_ref) = upstream {
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo_root)
+            .args(["fetch", "--quiet"])
+            .status();
+
+        let ahead_behind = git_output(
+            &repo_root,
+            &[
+                "rev-list",
+                "--left-right",
+                "--count",
+                &format!("HEAD...{upstream_ref}"),
+            ],
+        );
+        if let Some(counts) = ahead_behind {
+            let mut parts = counts.split_whitespace();
+            let ahead = parts
+                .next()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            let behind = parts
+                .next()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            lines.push(format!("Upstream: {upstream_ref}"));
+            lines.push(format!("Ahead:    {ahead}"));
+            lines.push(format!("Behind:   {behind}"));
+            if behind > 0 {
+                lines.push(format!(
+                    "Action:   run `git -C {} pull --ff-only` to update",
+                    repo_root.display()
+                ));
+            } else if ahead > 0 {
+                lines.push("Action:   local checkout is ahead of upstream; push or keep your local commits.".into());
+            } else {
+                lines.push("Action:   checkout is up to date with its upstream branch.".into());
+            }
+        } else {
+            lines.push(format!("Upstream: {upstream_ref}"));
+            lines.push("Action:   unable to compare with upstream after fetch.".into());
+        }
+    } else {
+        lines.push("Upstream: none".into());
+        lines.push("Action:   no upstream branch is configured; set one with `git branch --set-upstream-to origin/<branch>`.".into());
+    }
+
+    lines.join("\n")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -567,6 +769,11 @@ fn key_matches_binding(key: &event::KeyEvent, binding: &str) -> bool {
     code_matches && key.modifiers == expected_modifiers
 }
 
+fn current_launch_cli_args() -> CliArgs {
+    CliArgs::try_parse_from(std::env::args_os())
+        .unwrap_or_else(|_| CliArgs::parse_from(["edgecrab"]))
+}
+
 fn voice_readback_ready() -> Result<AudioPlayerSpec, String> {
     if !TextToSpeechTool.is_available() {
         return Err(
@@ -611,129 +818,6 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::
         }
     }
     Ok(count)
-}
-
-/// Install a skill from GitHub by fetching it via the GitHub raw/contents API.
-///
-/// For single .md files, fetches the raw content.
-/// For directories, uses the GitHub contents API to download all files.
-///
-/// `path` is the path within the repo (e.g. "skills/ascii-diagram-master").
-async fn install_skill_from_github(
-    owner: &str,
-    repo: &str,
-    path: &str,
-    skills_dir: &std::path::Path,
-) -> Result<String, String> {
-    // Build an HTTP client with a browser-like User-Agent (GitHub requires it)
-    let token = std::env::var("GITHUB_TOKEN").ok();
-    let mut headers = reqwest::header::HeaderMap::new();
-    if let Some(t) = &token {
-        let auth: reqwest::header::HeaderValue = format!("Bearer {t}")
-            .parse()
-            .map_err(|e| format!("Invalid GITHUB_TOKEN: {e}"))?;
-        headers.insert(reqwest::header::AUTHORIZATION, auth);
-    }
-    let accept: reqwest::header::HeaderValue = "application/vnd.github+json"
-        .parse()
-        .map_err(|e| format!("header: {e}"))?;
-    headers.insert(reqwest::header::ACCEPT, accept);
-    let ua: reqwest::header::HeaderValue = "edgecrab-agent/1.0"
-        .parse()
-        .map_err(|e| format!("ua: {e}"))?;
-    headers.insert(reqwest::header::USER_AGENT, ua);
-
-    let client = reqwest::Client::builder()
-        .default_headers(headers)
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| e.to_string())?;
-
-    // Query the GitHub Contents API to find out if path is file or directory
-    let api_url = format!("https://api.github.com/repos/{owner}/{repo}/contents/{path}");
-    let resp = client
-        .get(&api_url)
-        .send()
-        .await
-        .map_err(|e| format!("GitHub API request failed: {e}"))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        return Err(format!(
-            "GitHub API returned {status}. Check that {owner}/{repo}/{path} exists and is public."
-        ));
-    }
-
-    let body: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("GitHub API response parse error: {e}"))?;
-
-    std::fs::create_dir_all(skills_dir).map_err(|e| format!("Cannot create skills dir: {e}"))?;
-
-    if body.is_array() {
-        // It's a directory
-        let items = body.as_array().unwrap();
-        let dir_name = std::path::Path::new(path)
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "skill".to_string());
-        let dest_dir = skills_dir.join(&dir_name);
-        std::fs::create_dir_all(&dest_dir).map_err(|e| format!("Cannot create skill dir: {e}"))?;
-
-        let mut count = 0;
-        for item in items {
-            let file_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
-            let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("");
-            if file_type == "file" {
-                let raw_url = item
-                    .get("download_url")
-                    .and_then(|u| u.as_str())
-                    .unwrap_or("");
-                if raw_url.is_empty() {
-                    continue;
-                }
-                let content = client
-                    .get(raw_url)
-                    .send()
-                    .await
-                    .map_err(|e| format!("Download failed for {name}: {e}"))?
-                    .text()
-                    .await
-                    .map_err(|e| format!("Read failed for {name}: {e}"))?;
-                let dest = dest_dir.join(name);
-                std::fs::write(&dest, content)
-                    .map_err(|e| format!("Write failed for {name}: {e}"))?;
-                count += 1;
-            }
-        }
-        Ok(format!(
-            "Skill '{dir_name}' installed from GitHub ({count} files)."
-        ))
-    } else if body.get("type").and_then(|t| t.as_str()) == Some("file") {
-        // It's a file
-        let raw_url = body
-            .get("download_url")
-            .and_then(|u| u.as_str())
-            .ok_or("GitHub API: missing download_url")?;
-        let content = client
-            .get(raw_url)
-            .send()
-            .await
-            .map_err(|e| format!("Download failed: {e}"))?
-            .text()
-            .await
-            .map_err(|e| format!("Read failed: {e}"))?;
-        let file_name = std::path::Path::new(path)
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "skill.md".to_string());
-        let dest = skills_dir.join(&file_name);
-        std::fs::write(&dest, content).map_err(|e| format!("Write failed: {e}"))?;
-        Ok(format!("Skill '{file_name}' installed from GitHub."))
-    } else {
-        Err(format!("Unexpected GitHub API response for path '{path}'"))
-    }
 }
 
 fn load_config_root_for_edit() -> anyhow::Result<(std::path::PathBuf, serde_yml::Value)> {
@@ -794,6 +878,83 @@ fn persist_model_to_config(model: &str) -> anyhow::Result<()> {
         if let serde_yml::Value::Mapping(m) = model_section {
             m.insert(dm_key, serde_yml::Value::String(model.into()));
             m.remove(&legacy_dm_key);
+        }
+    }
+
+    write_config_root(&config_path, &root)
+}
+
+/// Persist smart-routing cheap-model defaults to ~/.edgecrab/config.yaml.
+fn persist_smart_routing_to_config(
+    smart_routing: &edgecrab_core::config::SmartRoutingYaml,
+) -> anyhow::Result<()> {
+    let (config_path, mut root) = load_config_root_for_edit()?;
+
+    if let serde_yml::Value::Mapping(ref mut map) = root {
+        let model_key = serde_yml::Value::String("model".into());
+        let smart_routing_key = serde_yml::Value::String("smart_routing".into());
+        let enabled_key = serde_yml::Value::String("enabled".into());
+        let cheap_model_key = serde_yml::Value::String("cheap_model".into());
+        let cheap_base_url_key = serde_yml::Value::String("cheap_base_url".into());
+        let cheap_api_key_env_key = serde_yml::Value::String("cheap_api_key_env".into());
+
+        let model_section = map
+            .entry(model_key)
+            .or_insert_with(|| serde_yml::Value::Mapping(Default::default()));
+        if let serde_yml::Value::Mapping(model_map) = model_section {
+            let has_smart_routing = smart_routing.enabled
+                || !smart_routing.cheap_model.trim().is_empty()
+                || smart_routing
+                    .cheap_base_url
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty())
+                || smart_routing
+                    .cheap_api_key_env
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty());
+
+            if has_smart_routing {
+                let section = model_map
+                    .entry(smart_routing_key.clone())
+                    .or_insert_with(|| serde_yml::Value::Mapping(Default::default()));
+                if let serde_yml::Value::Mapping(sr_map) = section {
+                    sr_map.insert(enabled_key, serde_yml::Value::Bool(smart_routing.enabled));
+                    if smart_routing.cheap_model.trim().is_empty() {
+                        sr_map.remove(&cheap_model_key);
+                    } else {
+                        sr_map.insert(
+                            cheap_model_key,
+                            serde_yml::Value::String(smart_routing.cheap_model.clone()),
+                        );
+                    }
+                    if let Some(base_url) = smart_routing
+                        .cheap_base_url
+                        .as_deref()
+                        .filter(|value| !value.trim().is_empty())
+                    {
+                        sr_map.insert(
+                            cheap_base_url_key,
+                            serde_yml::Value::String(base_url.to_string()),
+                        );
+                    } else {
+                        sr_map.remove(&cheap_base_url_key);
+                    }
+                    if let Some(api_key_env) = smart_routing
+                        .cheap_api_key_env
+                        .as_deref()
+                        .filter(|value| !value.trim().is_empty())
+                    {
+                        sr_map.insert(
+                            cheap_api_key_env_key,
+                            serde_yml::Value::String(api_key_env.to_string()),
+                        );
+                    } else {
+                        sr_map.remove(&cheap_api_key_env_key);
+                    }
+                }
+            } else {
+                model_map.remove(&smart_routing_key);
+            }
         }
     }
 
@@ -908,6 +1069,126 @@ fn persist_image_generation_to_config(
     write_config_root(&config_path, &root)
 }
 
+/// Persist Mixture-of-Agents defaults to ~/.edgecrab/config.yaml.
+fn persist_moa_config_to_config(moa: &edgecrab_core::config::MoaConfig) -> anyhow::Result<()> {
+    let moa = moa.sanitized();
+    let (config_path, mut root) = load_config_root_for_edit()?;
+
+    if let serde_yml::Value::Mapping(ref mut map) = root {
+        let section_key = serde_yml::Value::String("moa".into());
+        let enabled_key = serde_yml::Value::String("enabled".into());
+        let reference_models_key = serde_yml::Value::String("reference_models".into());
+        let aggregator_model_key = serde_yml::Value::String("aggregator_model".into());
+
+        let section = map
+            .entry(section_key)
+            .or_insert_with(|| serde_yml::Value::Mapping(Default::default()));
+        if let serde_yml::Value::Mapping(moa_map) = section {
+            moa_map.insert(enabled_key, serde_yml::Value::Bool(moa.enabled));
+            moa_map.insert(
+                aggregator_model_key,
+                serde_yml::Value::String(moa.aggregator_model.clone()),
+            );
+            moa_map.insert(
+                reference_models_key,
+                serde_yml::Value::Sequence(
+                    moa.reference_models
+                        .iter()
+                        .map(|model| serde_yml::Value::String(model.clone()))
+                        .collect(),
+                ),
+            );
+        }
+    }
+
+    write_config_root(&config_path, &root)
+}
+
+fn persist_toolset_filters_to_config(
+    enabled_toolsets: Option<&[String]>,
+    disabled_toolsets: Option<&[String]>,
+) -> anyhow::Result<()> {
+    persist_tool_filters_to_config(enabled_toolsets, disabled_toolsets, None, None)
+}
+
+fn persist_tool_filters_to_config(
+    enabled_toolsets: Option<&[String]>,
+    disabled_toolsets: Option<&[String]>,
+    enabled_tools: Option<&[String]>,
+    disabled_tools: Option<&[String]>,
+) -> anyhow::Result<()> {
+    let (config_path, mut root) = load_config_root_for_edit()?;
+
+    if let serde_yml::Value::Mapping(ref mut map) = root {
+        let tools_key = serde_yml::Value::String("tools".into());
+        let enabled_key = serde_yml::Value::String("enabled_toolsets".into());
+        let disabled_key = serde_yml::Value::String("disabled_toolsets".into());
+        let enabled_tools_key = serde_yml::Value::String("enabled_tools".into());
+        let disabled_tools_key = serde_yml::Value::String("disabled_tools".into());
+
+        let tools_section = map
+            .entry(tools_key)
+            .or_insert_with(|| serde_yml::Value::Mapping(Default::default()));
+        if let serde_yml::Value::Mapping(tools_map) = tools_section {
+            let write_list = |tools_map: &mut serde_yml::Mapping,
+                              key: serde_yml::Value,
+                              values: Option<&[String]>| {
+                if let Some(values) = values.filter(|values| !values.is_empty()) {
+                    tools_map.insert(
+                        key,
+                        serde_yml::Value::Sequence(
+                            values
+                                .iter()
+                                .map(|value| serde_yml::Value::String(value.clone()))
+                                .collect(),
+                        ),
+                    );
+                } else {
+                    tools_map.remove(&key);
+                }
+            };
+
+            write_list(tools_map, enabled_key, enabled_toolsets);
+            write_list(tools_map, disabled_key, disabled_toolsets);
+            write_list(tools_map, enabled_tools_key, enabled_tools);
+            write_list(tools_map, disabled_tools_key, disabled_tools);
+        }
+    }
+
+    write_config_root(&config_path, &root)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MoaAvailability {
+    feature_enabled: bool,
+    toolset_enabled: bool,
+}
+
+impl MoaAvailability {
+    fn effective(self) -> bool {
+        self.feature_enabled && self.toolset_enabled
+    }
+}
+
+fn toolset_entries_referencing(target_toolset: &str, entries: &[String]) -> Vec<String> {
+    entries
+        .iter()
+        .filter(|entry| {
+            if entry.as_str() == target_toolset {
+                return true;
+            }
+            edgecrab_tools::toolsets::resolve_alias(entry)
+                .is_some_and(|expanded| expanded.contains(&target_toolset))
+        })
+        .cloned()
+        .collect()
+}
+
+fn normalize_tool_policy_list(values: &mut Vec<String>) {
+    values.sort();
+    values.dedup();
+}
+
 /// Persist the CLI voice-mode default to ~/.edgecrab/config.yaml.
 fn persist_voice_enabled_to_config(enabled: bool) -> anyhow::Result<()> {
     update_voice_config_in_config_root(|voice_map| {
@@ -952,6 +1233,8 @@ fn persist_voice_preferences_to_config(
 struct DisplayPreferences {
     show_reasoning: bool,
     streaming_enabled: bool,
+    tool_progress_mode: ToolProgressMode,
+    show_status_bar: bool,
 }
 
 impl Default for DisplayPreferences {
@@ -959,6 +1242,8 @@ impl Default for DisplayPreferences {
         Self {
             show_reasoning: false,
             streaming_enabled: true,
+            tool_progress_mode: ToolProgressMode::All,
+            show_status_bar: true,
         }
     }
 }
@@ -969,6 +1254,8 @@ fn load_display_preferences() -> DisplayPreferences {
         .map(|cfg| DisplayPreferences {
             show_reasoning: cfg.display.show_reasoning,
             streaming_enabled: cfg.model.streaming && cfg.display.streaming,
+            tool_progress_mode: cfg.display.tool_progress,
+            show_status_bar: cfg.display.show_status_bar,
         })
         .unwrap_or_default()
 }
@@ -983,6 +1270,8 @@ fn load_voice_mode_enabled() -> bool {
 fn persist_display_preferences(
     show_reasoning: Option<bool>,
     streaming_enabled: Option<bool>,
+    tool_progress_mode: Option<ToolProgressMode>,
+    show_status_bar: Option<bool>,
 ) -> anyhow::Result<()> {
     let mut config = edgecrab_core::AppConfig::load().unwrap_or_default();
     if let Some(enabled) = show_reasoning {
@@ -991,6 +1280,12 @@ fn persist_display_preferences(
     if let Some(enabled) = streaming_enabled {
         config.model.streaming = enabled;
         config.display.streaming = enabled;
+    }
+    if let Some(mode) = tool_progress_mode {
+        config.display.tool_progress = mode;
+    }
+    if let Some(enabled) = show_status_bar {
+        config.display.show_status_bar = enabled;
     }
     config.save()?;
     Ok(())
@@ -1242,7 +1537,7 @@ pub enum OutputRole {
 }
 
 /// Display state machine for the spinner/status area.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum DisplayState {
     Idle,
     AwaitingFirstToken {
@@ -1259,8 +1554,10 @@ enum DisplayState {
     },
     #[allow(dead_code)]
     ToolExec {
+        tool_call_id: String,
         name: String,
         args_json: String,
+        detail: Option<String>,
         frame: usize,
         started: Instant,
     },
@@ -1310,6 +1607,23 @@ enum DisplayState {
         /// Currently typed buffer (never stored in history or output).
         buffer: String,
     },
+    /// Local inline configuration prompt used by the gateway browser.
+    ValueCapture {
+        title: String,
+        prompt: String,
+        placeholder: String,
+        masked: bool,
+        buffer: String,
+        action: ValueCaptureAction,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ValueCaptureAction {
+    BindAddress,
+    HomeChannel(String),
+    AllowedUsers(String),
+    PrimaryField(String),
 }
 
 /// Result payload delivered back to the main loop via `AgentResponse::BgOp`
@@ -1322,6 +1636,8 @@ enum BackgroundOpResult {
     },
     /// Free-form text to push to the output pane (System role).
     SystemMsg(String),
+    /// Gateway runtime command completed and the browser should refresh.
+    GatewayCommandDone { report: String },
     /// Provider swap succeeded — update model name and persist config.
     ModelSwitchDone { model: String },
     /// Context compression finished — show summary message.
@@ -1422,15 +1738,203 @@ impl FuzzyItem for ModelEntry {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModelSelectorTarget {
+    Primary,
+    Cheap,
+    MoaAggregator,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MoaReferenceSelectorMode {
+    EditRoster,
+    AddExpert,
+    RemoveExpert,
+}
+
+fn discovery_source_label(source: DiscoverySource) -> &'static str {
+    match source {
+        DiscoverySource::Live => "live discovery",
+        DiscoverySource::Cache => "cached discovery",
+        DiscoverySource::Static => "static catalog",
+    }
+}
+
+fn discovery_availability_short(availability: DiscoveryAvailability) -> String {
+    match availability {
+        DiscoveryAvailability::Supported => "live discovery".to_string(),
+        DiscoveryAvailability::FeatureGated(feature) => {
+            format!("live discovery gated by `{feature}`")
+        }
+        DiscoveryAvailability::Unsupported => "static catalog".to_string(),
+    }
+}
+
+fn discovery_availability_detail(provider: &str, availability: DiscoveryAvailability) -> String {
+    match availability {
+        DiscoveryAvailability::Supported => {
+            format!("{provider} supports live discovery in this build.")
+        }
+        DiscoveryAvailability::FeatureGated(feature) => format!(
+            "{provider} supports live discovery, but this build falls back to the embedded catalog because `{feature}` is disabled."
+        ),
+        DiscoveryAvailability::Unsupported => {
+            format!("{provider} is served from the embedded catalog.")
+        }
+    }
+}
+
+fn build_model_selector_entries(
+    grouped: &[(String, Vec<String>)],
+    dynamic_lookup: Option<&BTreeMap<String, (DiscoverySource, BTreeSet<String>)>>,
+) -> Vec<ModelEntry> {
+    let mut all_models = Vec::new();
+    for (provider, models) in grouped {
+        for model in models {
+            let detail = match dynamic_lookup.and_then(|lookup| lookup.get(provider)) {
+                Some((source, discovered_models)) if discovered_models.contains(model) => {
+                    format!("{model} · {}", discovery_source_label(*source))
+                }
+                Some((DiscoverySource::Static, _)) => {
+                    format!(
+                        "{model} · {}",
+                        discovery_source_label(DiscoverySource::Static)
+                    )
+                }
+                Some(_) => format!("{model} · catalog fallback"),
+                None => format!(
+                    "{model} · {}",
+                    discovery_source_label(DiscoverySource::Static)
+                ),
+            };
+            all_models.push(ModelEntry {
+                display: format!("{provider}/{model}"),
+                provider: provider.clone(),
+                detail,
+                model_name: model.clone(),
+            });
+        }
+    }
+    all_models.sort_by(|left, right| left.display.cmp(&right.display));
+    all_models
+}
+
+fn build_models_inventory_report(
+    providers: &[(String, Vec<String>)],
+    current_model: &str,
+    filter: &str,
+) -> String {
+    let current_provider = current_model
+        .split_once('/')
+        .map(|(provider, _)| normalize_discovery_provider(provider));
+    let discovery_statuses: BTreeMap<String, DiscoveryAvailability> =
+        discovery_provider_statuses().into_iter().collect();
+    let mut text = if filter.is_empty() {
+        "Model inventory (* = current provider):\n\n".to_string()
+    } else {
+        format!("Providers matching '{filter}' (* = current provider):\n\n")
+    };
+
+    for (provider, models) in providers {
+        let label = ModelCatalog::provider_label(provider);
+        let marker = if current_provider.as_deref() == Some(provider.as_str()) {
+            " *"
+        } else {
+            ""
+        };
+        let availability = discovery_statuses
+            .get(provider)
+            .copied()
+            .unwrap_or(DiscoveryAvailability::Unsupported);
+        text.push_str(&format!(
+            "  {provider:<12} {label:<22} {:>3} models  {}{marker}\n",
+            models.len(),
+            discovery_availability_short(availability),
+        ));
+    }
+
+    text.push_str(
+        "\nUse /models <provider> for the full list, /models refresh [provider|all] to refresh live inventories, or /model to open the selector.",
+    );
+    text
+}
+
+fn build_provider_models_report(
+    provider_models: &ProviderModels,
+    availability: DiscoveryAvailability,
+    current_model: &str,
+) -> String {
+    let provider = &provider_models.provider;
+    let label = ModelCatalog::provider_label(provider);
+    let mut text = format!(
+        "Models for '{provider}' (* = current):\n\n  Provider: {label}\n  Discovery: {}\n  Source: {}\n  Count: {}\n\n",
+        discovery_availability_detail(provider, availability),
+        discovery_source_label(provider_models.source),
+        provider_models.models.len(),
+    );
+
+    if provider_models.models.is_empty() {
+        text.push_str(match provider_models.source {
+            DiscoverySource::Live | DiscoverySource::Cache => {
+                "  (no text models returned from provider discovery)\n"
+            }
+            DiscoverySource::Static => "  (no models known)\n",
+        });
+    } else {
+        for model in &provider_models.models {
+            let full = format!("{provider}/{model}");
+            let marker = if current_model == full { " *" } else { "" };
+            text.push_str(&format!("  {full}{marker}\n"));
+        }
+    }
+
+    text.push_str("\nSwitch with: /model <provider/model-name>");
+    text
+}
+
 /// A single skill entry for the skill selector table.
 #[derive(Clone)]
 struct SkillEntry {
-    /// Skill name (without .md extension)
     name: String,
-    /// Whether the skill is a directory (true) or a single file (false)
+    display_name: String,
     is_dir: bool,
-    /// First-line description extracted from the file, if available
+    active: bool,
+    category: String,
+    relative_path: String,
     desc: String,
+    detail: String,
+    detail_view: String,
+    search_text: String,
+}
+
+impl SkillEntry {
+    fn display_title(&self) -> String {
+        let label = if self.display_name == self.name {
+            format!("/{}", self.name)
+        } else {
+            format!("/{} ({})", self.name, self.display_name)
+        };
+        format!("[{}] {}", if self.active { "x" } else { " " }, label)
+    }
+
+    fn kind_label(&self) -> &'static str {
+        if self.is_dir { "bundle" } else { "single" }
+    }
+
+    fn list_detail(&self) -> String {
+        if !self.desc.is_empty() {
+            return self.desc.clone();
+        }
+        format!("{} | {}", self.detail, self.relative_path)
+    }
+
+    fn detail_actions_line(&self) -> &'static str {
+        if self.active {
+            "Actions: Space deactivate, Enter insert /skill, R remote browser"
+        } else {
+            "Actions: Space activate, Enter insert /skill, R remote browser"
+        }
+    }
 }
 
 impl FuzzyItem for SkillEntry {
@@ -1438,7 +1942,216 @@ impl FuzzyItem for SkillEntry {
         &self.name
     }
     fn secondary(&self) -> &str {
-        &self.desc
+        &self.search_text
+    }
+    fn tag(&self) -> &str {
+        &self.category
+    }
+}
+
+struct SelectorChrome<'a> {
+    title: &'a str,
+    placeholder: &'a str,
+    count_label: &'a str,
+    status_note: Option<&'a str>,
+}
+
+struct BrowserChrome<'a> {
+    title: &'a str,
+    placeholder: &'a str,
+    icon: &'a str,
+    icon_color: Color,
+    border_color: Color,
+}
+
+struct ScrollableDetailChrome<'a> {
+    title: &'a str,
+    border_color: Color,
+    focused: bool,
+    requested_scroll: u16,
+}
+
+struct FullscreenBrowserChrome<'a> {
+    query: &'a str,
+    header: BrowserChrome<'a>,
+    detail: ScrollableDetailChrome<'a>,
+    help: Line<'static>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DetailSurface {
+    ModelSelector,
+    VisionModelSelector,
+    ImageModelSelector,
+    GatewayBrowser,
+    McpSelector,
+    RemoteMcpBrowser,
+    SkillSelector,
+    RemoteSkillBrowser,
+    ToolManager,
+    ConfigSelector,
+    SessionBrowser,
+    SessionInspector,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DetailFullscreenState {
+    surface: DetailSurface,
+    scroll: u16,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemoteSkillAction {
+    Install,
+    Update,
+    Replace,
+}
+
+impl RemoteSkillAction {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Install => "install",
+            Self::Update => "update",
+            Self::Replace => "replace",
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RemoteSkillEntry {
+    name: String,
+    identifier: String,
+    description: String,
+    source_label: String,
+    origin: String,
+    trust_level: String,
+    tags: Vec<String>,
+    search_text: String,
+    installed_name: Option<String>,
+    action: RemoteSkillAction,
+}
+
+impl FuzzyItem for RemoteSkillEntry {
+    fn primary(&self) -> &str {
+        &self.identifier
+    }
+
+    fn secondary(&self) -> &str {
+        &self.search_text
+    }
+
+    fn tag(&self) -> &str {
+        &self.source_label
+    }
+}
+
+struct RemoteSkillBrowser {
+    selector: FuzzySelector<RemoteSkillEntry>,
+    notices: Vec<String>,
+    last_completed_query: Option<String>,
+    search_due_at: Option<Instant>,
+    inflight_request_id: Option<u64>,
+    next_request_id: u64,
+    loading_query: Option<String>,
+    action_in_flight: Option<String>,
+}
+
+impl RemoteSkillBrowser {
+    fn new() -> Self {
+        Self {
+            selector: FuzzySelector::new(),
+            notices: Vec::new(),
+            last_completed_query: None,
+            search_due_at: None,
+            inflight_request_id: None,
+            next_request_id: 0,
+            loading_query: None,
+            action_in_flight: None,
+        }
+    }
+
+    fn current_query(&self) -> String {
+        self.selector.query.trim().to_string()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemoteMcpAction {
+    Install,
+    View,
+}
+
+impl RemoteMcpAction {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Install => "install",
+            Self::View => "view",
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RemoteMcpEntry {
+    id: String,
+    name: String,
+    description: String,
+    source_label: String,
+    origin: String,
+    tags: Vec<String>,
+    transport: Option<String>,
+    search_text: String,
+    install: Option<crate::mcp_catalog::McpInstallPlan>,
+}
+
+impl RemoteMcpEntry {
+    fn action(&self) -> RemoteMcpAction {
+        if self.install.is_some() {
+            RemoteMcpAction::Install
+        } else {
+            RemoteMcpAction::View
+        }
+    }
+}
+
+impl FuzzyItem for RemoteMcpEntry {
+    fn primary(&self) -> &str {
+        &self.id
+    }
+
+    fn secondary(&self) -> &str {
+        &self.search_text
+    }
+
+    fn tag(&self) -> &str {
+        &self.source_label
+    }
+}
+
+struct RemoteMcpBrowser {
+    selector: FuzzySelector<RemoteMcpEntry>,
+    notices: Vec<String>,
+    last_completed_query: Option<String>,
+    search_due_at: Option<Instant>,
+    inflight_request_id: Option<u64>,
+    next_request_id: u64,
+    loading_query: Option<String>,
+}
+
+impl RemoteMcpBrowser {
+    fn new() -> Self {
+        Self {
+            selector: FuzzySelector::new(),
+            notices: Vec::new(),
+            last_completed_query: None,
+            search_due_at: None,
+            inflight_request_id: None,
+            next_request_id: 0,
+            loading_query: None,
+        }
+    }
+
+    fn current_query(&self) -> String {
+        self.selector.query.trim().to_string()
     }
 }
 
@@ -1448,10 +2161,12 @@ struct McpPresetEntry {
     id: String,
     kind: McpEntryKind,
     install_preset_id: Option<String>,
+    enabled: bool,
     title: String,
     source: String,
     action_label: String,
     detail: String,
+    detail_view: String,
     search_text: String,
 }
 
@@ -1474,6 +2189,18 @@ impl FuzzyItem for McpPresetEntry {
 }
 
 impl McpPresetEntry {
+    fn is_configured_server(&self) -> bool {
+        self.kind == McpEntryKind::ConfiguredServer
+    }
+
+    fn display_title(&self) -> String {
+        if self.is_configured_server() {
+            format!("[{}] {}", if self.enabled { "x" } else { " " }, self.title)
+        } else {
+            self.title.clone()
+        }
+    }
+
     fn default_command(&self) -> String {
         match self.kind {
             McpEntryKind::CatalogEntry => {
@@ -1484,7 +2211,13 @@ impl McpPresetEntry {
                     self.view_command()
                 }
             }
-            McpEntryKind::ConfiguredServer => self.test_command(),
+            McpEntryKind::ConfiguredServer => {
+                if self.enabled {
+                    self.test_command()
+                } else {
+                    self.enable_command()
+                }
+            }
         }
     }
 
@@ -1496,6 +2229,39 @@ impl McpPresetEntry {
 
     fn test_command(&self) -> String {
         format!("test {}", self.id)
+    }
+
+    fn doctor_command(&self) -> String {
+        format!("doctor {}", self.id)
+    }
+
+    fn enable_command(&self) -> String {
+        format!("enable {}", self.id)
+    }
+
+    fn disable_command(&self) -> String {
+        format!("disable {}", self.id)
+    }
+
+    fn toggle_command(&self) -> Option<String> {
+        self.is_configured_server().then(|| {
+            if self.enabled {
+                self.disable_command()
+            } else {
+                self.enable_command()
+            }
+        })
+    }
+
+    fn detail_actions_line(&self) -> &'static str {
+        if !self.is_configured_server() {
+            return "Actions: Enter default, I install when available, V view, R refresh catalog";
+        }
+        if self.enabled {
+            "Actions: Space disable, Enter test, C doctor, V view, D remove, R refresh catalog"
+        } else {
+            "Actions: Space enable, Enter enable, C doctor, V view, D remove, R refresh catalog"
+        }
     }
 
     fn view_command(&self) -> String {
@@ -1518,27 +2284,23 @@ fn mcp_catalog_source_label(entry: &crate::mcp_catalog::OfficialCatalogEntry) ->
 }
 
 fn format_mcp_transport(server: &edgecrab_tools::tools::mcp_client::ConfiguredMcpServer) -> String {
-    if let Some(url) = &server.url {
-        return format!("http {url}");
-    }
+    mcp_support::transport_summary(server)
+}
 
-    let mut rendered = server.command.clone();
-    if !server.args.is_empty() {
-        rendered.push(' ');
-        rendered.push_str(&server.args.join(" "));
-    }
-    rendered
+fn mcp_enabled_label(enabled: bool) -> &'static str {
+    if enabled { "enabled" } else { "disabled" }
 }
 
 fn build_configured_mcp_entry(
     server: &edgecrab_tools::tools::mcp_client::ConfiguredMcpServer,
 ) -> McpPresetEntry {
     let transport = format_mcp_transport(server);
-    let mut detail = format!("{} | installed", transport);
-    if server.token_from_store {
-        detail.push_str(" | token-store");
-    } else if server.token_from_config {
-        detail.push_str(" | config-token");
+    let state_label = mcp_enabled_label(server.enabled);
+    let mut detail = format!("{transport} | {state_label}");
+    let detail_view = mcp_support::render_configured_server_detail(server);
+    let auth = mcp_support::auth_summary(server);
+    if auth != "none" {
+        detail.push_str(&format!(" | {auth}"));
     }
     if let Some(path) = &server.cwd {
         detail.push_str(&format!(" | cwd={}", path.display()));
@@ -1567,11 +2329,13 @@ fn build_configured_mcp_entry(
         id: server.name.clone(),
         kind: McpEntryKind::ConfiguredServer,
         install_preset_id: None,
+        enabled: server.enabled,
         title: server.name.clone(),
         source: "configured".into(),
-        action_label: "test".into(),
+        action_label: if server.enabled { "test" } else { "enable" }.into(),
         detail,
-        search_text,
+        detail_view: detail_view.clone(),
+        search_text: format!("{search_text} {}", detail_view.replace('\n', " ")),
     }
 }
 
@@ -1617,6 +2381,14 @@ fn build_catalog_mcp_entry(
             entry.description, install_state, entry.source_url
         ),
     };
+    let mut detail_view = crate::mcp_catalog::render_official_catalog_entry(entry);
+    if install_state == "already-installed" {
+        detail_view.push_str("\nStatus:  already installed in the local MCP configuration");
+    } else if install_state == "ready-to-install" {
+        detail_view.push_str("\nStatus:  ready to install into the local MCP configuration");
+    } else {
+        detail_view.push_str("\nStatus:  catalog only, inspect documentation before configuring");
+    }
     let search_text = format!(
         "{} {} {} {} {} {} {} {} {}",
         entry.id,
@@ -1635,11 +2407,13 @@ fn build_catalog_mcp_entry(
         id: entry.id.clone(),
         kind: McpEntryKind::CatalogEntry,
         install_preset_id: entry.installable_preset_id.clone(),
+        enabled: true,
         title: format!("{}  {}", entry.id, entry.display_name),
         source: mcp_catalog_source_label(entry).into(),
         action_label,
         detail,
-        search_text,
+        detail_view: detail_view.clone(),
+        search_text: format!("{search_text} {}", detail_view.replace('\n', " ")),
     }
 }
 
@@ -1673,47 +2447,106 @@ fn build_mcp_selector_entries_from(
 }
 
 /// A single entry for the session browser overlay.
-/// Wraps [`edgecrab_state::SessionSummary`] with pre-formatted strings so that
-/// `FuzzyItem` filtering works without re-formatting on every keystroke.
+/// Wraps rich session metadata with list/detail strings so that fuzzy filtering
+/// and rendering stay allocation-light while typing.
 #[derive(Clone)]
 struct SessionBrowserEntry {
-    /// Full session ID.
     id: String,
-    /// Display name: title if set, otherwise first 8 chars of ID.
     display: String,
-    /// Subtitle: model + message count.
-    subtitle: String,
-    /// Short date string (YYYY-MM-DD) derived from `started_at`.
-    date: String,
+    source: String,
+    model: String,
+    message_count: i64,
+    started_label: String,
+    last_active_label: String,
+    preview: String,
+    detail: String,
+    detail_view: String,
+    search_text: String,
+    matched_role: Option<String>,
+    matched_snippet: Option<String>,
 }
 
 impl SessionBrowserEntry {
-    fn from_summary(s: &edgecrab_state::SessionSummary) -> Self {
-        let display = s
+    fn from_summary(summary: &edgecrab_state::SessionRichSummary) -> Self {
+        Self::from_parts(summary, None, None)
+    }
+
+    fn from_search_hit(hit: &edgecrab_state::SessionSearchHit) -> Self {
+        Self::from_parts(&hit.session, Some(&hit.role), Some(&hit.snippet))
+    }
+
+    fn from_parts(
+        summary: &edgecrab_state::SessionRichSummary,
+        matched_role: Option<&str>,
+        matched_snippet: Option<&str>,
+    ) -> Self {
+        let display = summary
             .title
             .as_deref()
             .filter(|t| !t.is_empty())
-            .unwrap_or(&s.id[..s.id.len().min(12)])
+            .unwrap_or(&summary.id[..summary.id.len().min(12)])
             .to_string();
-        let model_tag = s.model.as_deref().unwrap_or("?");
-        let subtitle = format!("model={model_tag}  msgs={}", s.message_count);
-        // Convert unix-epoch float to a YYYY-MM-DD string
-        let date = {
-            let secs = s.started_at as i64;
-            // Simple manual conversion (no chrono dep needed for this format)
-            // Fallback to epoch string if overflow
-            if secs > 0 {
-                let d = time_secs_to_date(secs);
-                format!("{:04}-{:02}-{:02}", d.0, d.1, d.2)
-            } else {
-                String::new()
-            }
+        let model = summary.model.as_deref().unwrap_or("unknown").to_string();
+        let preview = session_excerpt(&summary.preview, 88);
+        let started_label = format_session_timestamp(summary.started_at);
+        let last_active_label = format_session_timestamp(summary.last_active);
+        let matched_snippet = matched_snippet
+            .map(strip_search_markup)
+            .filter(|snippet| !snippet.is_empty());
+        let detail = if let Some(role) = matched_role {
+            format!(
+                "{} msgs | {} | {} match",
+                summary.message_count, model, role
+            )
+        } else {
+            format!("{} msgs | {}", summary.message_count, model)
         };
+
+        let mut detail_sections = vec![
+            format!("Session:   {}", summary.id),
+            format!("Source:    {}", summary.source),
+            format!("Model:     {}", model),
+            format!("Messages:  {}", summary.message_count),
+            format!("Started:   {started_label}"),
+            format!("Last seen: {last_active_label}"),
+        ];
+        if !preview.is_empty() {
+            detail_sections.push(format!("Preview:   {preview}"));
+        }
+        if let (Some(role), Some(snippet)) = (matched_role, matched_snippet.as_deref()) {
+            detail_sections.push(format!("Match:     {role} -> {snippet}"));
+        }
+        detail_sections.push(String::new());
+        detail_sections.push("Actions: Enter inspect | R resume | D delete | Esc close".into());
+
+        let mut search_parts = vec![
+            summary.id.clone(),
+            display.clone(),
+            summary.source.clone(),
+            model.clone(),
+            preview.clone(),
+        ];
+        if let Some(snippet) = matched_snippet.as_deref() {
+            search_parts.push(snippet.to_string());
+        }
+        if let Some(role) = matched_role {
+            search_parts.push(role.to_string());
+        }
+
         Self {
-            id: s.id.clone(),
+            id: summary.id.clone(),
             display,
-            subtitle,
-            date,
+            source: summary.source.clone(),
+            model,
+            message_count: summary.message_count,
+            started_label,
+            last_active_label,
+            preview,
+            detail,
+            detail_view: detail_sections.join("\n"),
+            search_text: search_parts.join(" "),
+            matched_role: matched_role.map(str::to_string),
+            matched_snippet,
         }
     }
 }
@@ -1722,9 +2555,222 @@ impl FuzzyItem for SessionBrowserEntry {
     fn primary(&self) -> &str {
         &self.display
     }
+
     fn secondary(&self) -> &str {
-        &self.subtitle
+        &self.search_text
     }
+
+    fn tag(&self) -> &str {
+        &self.source
+    }
+}
+
+#[derive(Clone)]
+struct SessionMessageEntry {
+    index: usize,
+    role_label: String,
+    headline: String,
+    preview: String,
+    meta: String,
+    message: edgecrab_types::Message,
+    search_text: String,
+}
+
+impl SessionMessageEntry {
+    fn from_message(index: usize, message: &edgecrab_types::Message) -> Self {
+        let role_label = message.role.as_str().to_string();
+        let preview = message_preview(message);
+        let mut meta_bits = Vec::new();
+        if let Some(name) = message.name.as_deref().filter(|name| !name.is_empty()) {
+            meta_bits.push(format!("tool={name}"));
+        }
+        if let Some(tool_call_id) = message
+            .tool_call_id
+            .as_deref()
+            .filter(|tool_call_id| !tool_call_id.is_empty())
+        {
+            meta_bits.push(format!("call={}", unicode_trunc(tool_call_id, 16)));
+        }
+        if let Some(tool_calls) = message
+            .tool_calls
+            .as_ref()
+            .filter(|tool_calls| !tool_calls.is_empty())
+        {
+            meta_bits.push(format!("calls={}", tool_calls.len()));
+        }
+        if message
+            .reasoning
+            .as_deref()
+            .is_some_and(|reasoning| !reasoning.trim().is_empty())
+        {
+            meta_bits.push("reasoning".into());
+        }
+        if let Some(reason) = message
+            .finish_reason
+            .as_deref()
+            .filter(|reason| !reason.is_empty())
+        {
+            meta_bits.push(format!("finish={reason}"));
+        }
+        let meta = if meta_bits.is_empty() {
+            "content".into()
+        } else {
+            meta_bits.join(" | ")
+        };
+        let headline = format!("#{:<3} {}", index + 1, role_label);
+
+        let mut search_parts = vec![headline.clone(), preview.clone(), meta.clone()];
+        if let Some(reasoning) = message.reasoning.as_deref() {
+            search_parts.push(reasoning.to_string());
+        }
+        if let Some(tool_calls) = message.tool_calls.as_ref() {
+            for call in tool_calls {
+                search_parts.push(call.id.clone());
+                search_parts.push(call.function.name.clone());
+            }
+        }
+        if let Some(tool_name) = message.name.as_deref() {
+            search_parts.push(tool_name.to_string());
+        }
+
+        Self {
+            index,
+            role_label,
+            headline,
+            preview,
+            meta,
+            message: message.clone(),
+            search_text: search_parts.join(" "),
+        }
+    }
+}
+
+impl FuzzyItem for SessionMessageEntry {
+    fn primary(&self) -> &str {
+        &self.headline
+    }
+
+    fn secondary(&self) -> &str {
+        &self.search_text
+    }
+
+    fn tag(&self) -> &str {
+        &self.role_label
+    }
+}
+
+#[derive(Clone)]
+struct SessionInspectorMeta {
+    id: String,
+    title: String,
+    source: String,
+    model: String,
+    started_label: String,
+    last_active_label: String,
+    message_count: i64,
+    preview: String,
+    matched_role: Option<String>,
+    matched_snippet: Option<String>,
+    is_live: bool,
+    debug_lines: Vec<String>,
+}
+
+impl SessionInspectorMeta {
+    fn from_browser_entry(entry: &SessionBrowserEntry) -> Self {
+        Self {
+            id: entry.id.clone(),
+            title: entry.display.clone(),
+            source: entry.source.clone(),
+            model: entry.model.clone(),
+            started_label: entry.started_label.clone(),
+            last_active_label: entry.last_active_label.clone(),
+            message_count: entry.message_count,
+            preview: entry.preview.clone(),
+            matched_role: entry.matched_role.clone(),
+            matched_snippet: entry.matched_snippet.clone(),
+            is_live: false,
+            debug_lines: Vec::new(),
+        }
+    }
+}
+
+struct SessionInspector {
+    selector: FuzzySelector<SessionMessageEntry>,
+    session: Option<SessionInspectorMeta>,
+    pane: DetailPaneState,
+    return_to_browser: bool,
+}
+
+impl SessionInspector {
+    fn new() -> Self {
+        Self {
+            selector: FuzzySelector::new(),
+            session: None,
+            pane: DetailPaneState::default(),
+            return_to_browser: false,
+        }
+    }
+
+    fn active(&self) -> bool {
+        self.selector.active
+    }
+
+    fn close(&mut self) {
+        self.selector.active = false;
+        self.session = None;
+        self.pane.reset();
+        self.return_to_browser = false;
+    }
+}
+
+fn strip_search_markup(snippet: &str) -> String {
+    snippet
+        .replace("<b>", "")
+        .replace("</b>", "")
+        .replace(['\n', '\r'], " ")
+        .trim()
+        .to_string()
+}
+
+fn session_excerpt(text: &str, max_cols: usize) -> String {
+    unicode_trunc(text.replace(['\n', '\r'], " ").trim(), max_cols)
+}
+
+fn format_session_timestamp(epoch_secs: f64) -> String {
+    if !epoch_secs.is_finite() || epoch_secs <= 0.0 {
+        return "unknown".into();
+    }
+    match chrono::Local.timestamp_opt(epoch_secs as i64, 0).single() {
+        Some(timestamp) => timestamp.format("%Y-%m-%d %H:%M").to_string(),
+        None => {
+            let d = time_secs_to_date(epoch_secs as i64);
+            format!("{:04}-{:02}-{:02}", d.0, d.1, d.2)
+        }
+    }
+}
+
+fn message_preview(message: &edgecrab_types::Message) -> String {
+    let text = message.text_content();
+    if !text.trim().is_empty() {
+        return session_excerpt(&text, 96);
+    }
+    if let Some(tool_calls) = message
+        .tool_calls
+        .as_ref()
+        .filter(|tool_calls| !tool_calls.is_empty())
+    {
+        let names = tool_calls
+            .iter()
+            .take(3)
+            .map(|call| call.function.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return format!("requested tools: {names}");
+    }
+    if let Some(name) = message.name.as_deref().filter(|name| !name.is_empty()) {
+        return format!("tool output from {name}");
+    }
+    "(empty message)".into()
 }
 
 // ── Skin browser entry ────────────────────────────────────────────────────
@@ -1745,6 +2791,149 @@ impl FuzzyItem for SkinEntry {
     }
     fn secondary(&self) -> &str {
         &self.desc
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConfigAction {
+    ShowSummary,
+    ShowPaths,
+    OpenTools,
+    OpenModel,
+    OpenCheapModel,
+    ToggleMoa,
+    OpenVisionModel,
+    OpenImageModel,
+    OpenMoaAggregator,
+    OpenMoaReferences,
+    AddMoaExpert,
+    RemoveMoaExpert,
+    ToggleStreaming,
+    ToggleReasoning,
+    ToggleStatusBar,
+    OpenSkins,
+    ShowVoice,
+    OpenGatewayBrowser,
+    ShowGatewayHomes,
+    ShowUpdateStatus,
+}
+
+#[derive(Clone)]
+struct ConfigEntry {
+    title: String,
+    detail: String,
+    tag: String,
+    action: ConfigAction,
+}
+
+impl FuzzyItem for ConfigEntry {
+    fn primary(&self) -> &str {
+        &self.title
+    }
+
+    fn secondary(&self) -> &str {
+        &self.detail
+    }
+
+    fn tag(&self) -> &str {
+        &self.tag
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToolManagerScope {
+    All,
+    Toolsets,
+    Tools,
+}
+
+impl ToolManagerScope {
+    fn from_mode(mode: ToolManagerMode) -> Self {
+        match mode {
+            ToolManagerMode::All => Self::All,
+            ToolManagerMode::Toolsets => Self::Toolsets,
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::All => Self::Toolsets,
+            Self::Toolsets => Self::Tools,
+            Self::Tools => Self::All,
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Toolsets => "toolsets",
+            Self::Tools => "tools",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToolManagerItemKind {
+    Toolset,
+    Tool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToolManagerCheckState {
+    On,
+    Off,
+    Mixed,
+}
+
+impl ToolManagerCheckState {
+    fn glyph(self) -> &'static str {
+        match self {
+            Self::On => "[x]",
+            Self::Off => "[ ]",
+            Self::Mixed => "[-]",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToolPolicySource {
+    Default,
+    ExplicitEnable,
+    ExplicitDisable,
+}
+
+#[derive(Clone)]
+struct ToolManagerEntry {
+    kind: ToolManagerItemKind,
+    name: String,
+    toolset: String,
+    description: String,
+    detail: String,
+    tag: String,
+    check_state: ToolManagerCheckState,
+    policy_source: ToolPolicySource,
+    exposed: bool,
+    startup_available: bool,
+    check_allowed: bool,
+    dynamic: bool,
+    emoji: String,
+    aliases: Vec<String>,
+    selected_tools: usize,
+    total_tools: usize,
+    exposed_tools: usize,
+}
+
+impl FuzzyItem for ToolManagerEntry {
+    fn primary(&self) -> &str {
+        &self.name
+    }
+
+    fn secondary(&self) -> &str {
+        &self.detail
+    }
+
+    fn tag(&self) -> &str {
+        &self.tag
     }
 }
 
@@ -1813,6 +3002,8 @@ pub struct App {
     progress_seq: u64,
     /// Active isolated `/background` sessions keyed by task ID.
     background_tasks_active: std::collections::HashMap<String, BackgroundTaskStatus>,
+    /// Active foreground tool calls keyed by tool_call_id for parallel status summaries.
+    active_tools: std::collections::HashMap<String, ActiveToolStatus>,
     /// Active delegated child tasks for the foreground agent turn.
     active_subagents: std::collections::HashMap<usize, ActiveSubagentStatus>,
     /// Channel for cron job completion notifications from the background ticker.
@@ -1830,8 +3021,10 @@ pub struct App {
     show_reasoning: bool,
     /// Whether live token streaming is enabled for future turns.
     streaming_enabled: bool,
-    /// Verbose mode — show tool call details
-    verbose: bool,
+    /// Persisted tool-progress display policy.
+    tool_progress_mode: ToolProgressMode,
+    /// Whether the status bar is visible.
+    show_status_bar: bool,
     /// Queued prompts to run after the current one completes
     prompt_queue: Vec<String>,
     /// Display state machine (spinner animation)
@@ -1852,16 +3045,50 @@ pub struct App {
     command_descriptions: std::collections::HashMap<String, String>,
     /// Model selector overlay (activated by `/model` with no args)
     model_selector: FuzzySelector<ModelEntry>,
+    /// Which model-setting flow is currently using the shared selector.
+    model_selector_target: ModelSelectorTarget,
+    /// True while background live model discovery is refreshing the selector.
+    model_selector_refresh_in_flight: bool,
     /// Vision-model selector overlay (activated by `/vision_model`)
     vision_model_selector: FuzzySelector<ModelEntry>,
     /// Image-model selector overlay (activated by `/image_model`)
     image_model_selector: FuzzySelector<ModelEntry>,
+    /// MoA expert selector overlay (activated by `/moa experts`, `/moa add`, or `/moa remove`)
+    moa_reference_selector: FuzzySelector<ModelEntry>,
+    /// Currently selected default reference models in the MoA selector.
+    moa_reference_selected: BTreeSet<String>,
+    /// Active interaction mode for the MoA expert selector.
+    moa_reference_selector_mode: MoaReferenceSelectorMode,
     /// Official MCP preset selector overlay (activated by `/mcp` with no args).
     mcp_selector: FuzzySelector<McpPresetEntry>,
+    /// Remote MCP browser overlay (activated by `/mcp search`).
+    remote_mcp_browser: RemoteMcpBrowser,
     /// Skill browser overlay (activated by `/skills` with no args)
     skill_selector: FuzzySelector<SkillEntry>,
+    /// Tool manager overlay (activated by `/tools` or `/toolsets`)
+    tool_manager: FuzzySelector<ToolManagerEntry>,
+    /// Active tool-manager scope tab.
+    tool_manager_scope: ToolManagerScope,
+    /// Last non-error status note shown in the tool manager footer.
+    tool_manager_status_note: Option<String>,
+    /// Remote skill browser overlay (activated by `/skills search` or `/skills hub`)
+    remote_skill_browser: RemoteSkillBrowser,
     /// Session browser overlay (activated by F5 or `/session` with no args)
     session_browser: FuzzySelector<SessionBrowserEntry>,
+    /// Last non-error status note shown in the session browser footer.
+    session_browser_status_note: Option<String>,
+    /// Focus and scroll state for the session browser detail pane.
+    session_browser_pane: DetailPaneState,
+    /// Shared fullscreen detail mode for split-pane selector browsers.
+    detail_fullscreen: Option<DetailFullscreenState>,
+    /// Drill-down inspector for a single saved session.
+    session_inspector: SessionInspector,
+    /// Config center overlay (activated by `/config`)
+    config_selector: FuzzySelector<ConfigEntry>,
+    /// Gateway platform browser overlay (activated by `/platforms`)
+    gateway_browser: FuzzySelector<GatewayPlatformEntry>,
+    /// Focus and scroll state for the gateway browser detail pane.
+    gateway_browser_pane: DetailPaneState,
     /// Skin browser overlay (activated by `/skin list`)
     skin_browser: FuzzySelector<SkinEntry>,
     /// Cached skill names (without leading /) for completion suggestions
@@ -1941,16 +3168,16 @@ pub struct App {
     /// Persists across multiple streaming phases (separated by tool calls)
     /// so the status bar shows the running total rather than resetting.
     turn_stream_tokens: u64,
-    /// FIFO queue of output-area indices for in-flight "running" tool lines.
+    /// In-flight tool placeholder lines keyed by stable tool-call id.
     ///
-    /// WHY VecDeque: On ToolExec we push a cyan "··· running ···" placeholder
-    /// to the output area immediately (not waiting for ToolDone) — this gives
-    /// visual feedback inside the scrollable transcript during long operations.
-    /// On ToolDone we pop_front and update that line in-place with the final
-    /// styled duration/result, so the placeholder is replaced without a
-    /// disruptive layout shift.  FIFO order matches tool-dispatch ordering and
-    /// handles sequential multi-tool turns without any per-tool book-keeping.
-    pending_tool_lines: std::collections::VecDeque<PendingToolLine>,
+    /// WHY map instead of FIFO: root tools may execute in parallel and finish
+    /// out of order. Matching by `tool_call_id` avoids upgrading the wrong line
+    /// when completion events race.
+    pending_tool_lines: std::collections::HashMap<String, PendingToolLine>,
+    /// Tool call ids deliberately suppressed from the transcript by display policy.
+    hidden_tool_calls: HashSet<String>,
+    /// Signatures already rendered in the current turn for `tool_progress: new`.
+    seen_tool_signatures: HashSet<String>,
     /// Active local microphone recording session for push-to-talk voice input.
     voice_recording: Option<VoiceRecordingSession>,
     /// Configured push-to-talk key binding loaded from config.yaml.
@@ -1974,8 +3201,10 @@ pub struct App {
     hook_registry: std::sync::Arc<edgecrab_gateway::hooks::HookRegistry>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct PendingToolLine {
+    tool_name: String,
+    args_json: String,
     line_idx: usize,
     edit_snapshot: Option<LocalEditSnapshot>,
 }
@@ -2001,9 +3230,20 @@ enum AgentResponse {
     /// A reasoning / think-mode delta or full reasoning block.
     Reasoning(String),
     /// A tool execution has started — show tool name + preview in status bar.
-    ToolExec { name: String, args_json: String },
+    ToolExec {
+        tool_call_id: String,
+        name: String,
+        args_json: String,
+    },
+    /// A tool emitted an intermediate progress update.
+    ToolProgress {
+        tool_call_id: String,
+        name: String,
+        message: String,
+    },
     /// A tool execution completed — push a rich formatted line to the output.
     ToolDone {
+        tool_call_id: String,
         name: String,
         args_json: String,
         result_preview: Option<String>,
@@ -2061,6 +3301,26 @@ enum AgentResponse {
     },
     /// A background operation (model discovery, compress, swap) completed.
     BgOp(BackgroundOpResult),
+    /// A remote skill search completed for the given request id and query.
+    RemoteSkillSearchReady {
+        request_id: u64,
+        query: String,
+        report: edgecrab_tools::tools::skills_hub::SearchReport,
+    },
+    /// A remote MCP search completed for the given request id and query.
+    RemoteMcpSearchReady {
+        request_id: u64,
+        query: String,
+        report: crate::mcp_catalog::McpSearchReport,
+    },
+    /// A remote skill install/update action completed.
+    RemoteSkillActionComplete { message: String, skill_name: String },
+    /// A remote skill install/update action failed.
+    RemoteSkillActionFailed {
+        action_label: String,
+        identifier: String,
+        error: String,
+    },
     /// A completed local voice transcription, optionally submitted as a prompt.
     VoiceTranscript {
         transcript: String,
@@ -2107,11 +3367,35 @@ struct ActiveSubagentStatus {
     last_seq: u64,
 }
 
+#[derive(Clone, Debug)]
+struct ActiveToolStatus {
+    name: String,
+    args_json: String,
+    last_detail: Option<String>,
+    started_at: Instant,
+    last_seq: u64,
+}
+
+#[derive(Clone, Debug)]
+struct ActiveToolSummary {
+    verb: String,
+    icon: String,
+    detail: String,
+    elapsed_secs: u64,
+}
+
 fn background_progress_text(task_num: u64, event: &edgecrab_core::StreamEvent) -> Option<String> {
     match event {
-        edgecrab_core::StreamEvent::ToolExec { name, args_json } => Some(format!(
+        edgecrab_core::StreamEvent::ToolExec {
+            name, args_json, ..
+        } => Some(format!(
             "↳ bg#{task_num} {}",
             tool_status_preview(name, args_json)
+        )),
+        edgecrab_core::StreamEvent::ToolProgress { name, message, .. } => Some(format!(
+            "↳ bg#{task_num} {} · {}",
+            name.replace('_', " "),
+            edgecrab_core::safe_truncate(message.trim(), 72)
         )),
         edgecrab_core::StreamEvent::SubAgentStart {
             task_index,
@@ -2191,6 +3475,49 @@ fn format_subagent_status_summary(
     ))
 }
 
+fn latest_active_tool_entry(
+    active: &std::collections::HashMap<String, ActiveToolStatus>,
+) -> Option<(&String, &ActiveToolStatus)> {
+    active.iter().max_by_key(|(_, status)| status.last_seq)
+}
+
+fn summarize_active_tools(
+    active: &std::collections::HashMap<String, ActiveToolStatus>,
+) -> Option<ActiveToolSummary> {
+    let (_, current) = latest_active_tool_entry(active)?;
+    let mut detail = current
+        .last_detail
+        .as_deref()
+        .filter(|text| !text.trim().is_empty())
+        .map(|text| edgecrab_core::safe_truncate(text.trim(), 52).to_string())
+        .unwrap_or_else(|| {
+            edgecrab_core::safe_truncate(
+                &tool_status_preview(&current.name, &current.args_json),
+                52,
+            )
+            .to_string()
+        });
+    let count = active.len();
+    if count > 1 {
+        detail.push_str(&format!("  +{} more", count - 1));
+    }
+    let elapsed_secs = active
+        .values()
+        .map(|status| status.started_at.elapsed().as_secs())
+        .max()
+        .unwrap_or(0);
+    Some(ActiveToolSummary {
+        verb: if count > 1 {
+            "running".into()
+        } else {
+            tool_action_verb(&current.name).into()
+        },
+        icon: tool_icon(&current.name).into(),
+        detail,
+        elapsed_secs,
+    })
+}
+
 impl App {
     pub fn new() -> Self {
         let (response_tx, response_rx) = mpsc::unbounded_channel();
@@ -2256,6 +3583,7 @@ impl App {
             background_task_seq: 0,
             progress_seq: 0,
             background_tasks_active: std::collections::HashMap::new(),
+            active_tools: std::collections::HashMap::new(),
             active_subagents: std::collections::HashMap::new(),
             cron_rx,
             cron_tx,
@@ -2264,7 +3592,8 @@ impl App {
             reasoning_line: None,
             show_reasoning: display_preferences.show_reasoning,
             streaming_enabled: display_preferences.streaming_enabled,
-            verbose: false,
+            tool_progress_mode: display_preferences.tool_progress_mode,
+            show_status_bar: display_preferences.show_status_bar,
             prompt_queue: Vec::new(),
             display_state: DisplayState::Idle,
             completion: CompletionState {
@@ -2281,24 +3610,34 @@ impl App {
             command_descriptions,
             model_selector: {
                 let mut ms: FuzzySelector<ModelEntry> = FuzzySelector::new();
-                ms.set_items(
-                    ModelCatalog::flat_catalog()
-                        .into_iter()
-                        .map(|(display, provider, model_name)| ModelEntry {
-                            detail: model_name.clone(),
-                            display,
-                            provider,
-                            model_name,
-                        })
-                        .collect(),
-                );
+                ms.set_items(build_model_selector_entries(
+                    &ModelCatalog::grouped_catalog(),
+                    None,
+                ));
                 ms
             },
+            model_selector_target: ModelSelectorTarget::Primary,
+            model_selector_refresh_in_flight: false,
             vision_model_selector: FuzzySelector::new(),
             image_model_selector: FuzzySelector::new(),
+            moa_reference_selector: FuzzySelector::new(),
+            moa_reference_selected: BTreeSet::new(),
+            moa_reference_selector_mode: MoaReferenceSelectorMode::EditRoster,
             mcp_selector: FuzzySelector::new(),
+            remote_mcp_browser: RemoteMcpBrowser::new(),
             skill_selector: FuzzySelector::new(),
+            tool_manager: FuzzySelector::new(),
+            tool_manager_scope: ToolManagerScope::All,
+            tool_manager_status_note: None,
+            remote_skill_browser: RemoteSkillBrowser::new(),
             session_browser: FuzzySelector::new(),
+            session_browser_status_note: None,
+            session_browser_pane: DetailPaneState::default(),
+            detail_fullscreen: None,
+            session_inspector: SessionInspector::new(),
+            config_selector: FuzzySelector::new(),
+            gateway_browser: FuzzySelector::new(),
+            gateway_browser_pane: DetailPaneState::default(),
             skin_browser: FuzzySelector::new(),
             skills_completion_names: Vec::new(),
             active_skills: Vec::new(),
@@ -2324,7 +3663,9 @@ impl App {
             pending_images: Vec::new(),
             in_flight_tool_count: 0,
             turn_stream_tokens: 0,
-            pending_tool_lines: std::collections::VecDeque::new(),
+            pending_tool_lines: std::collections::HashMap::new(),
+            hidden_tool_calls: HashSet::new(),
+            seen_tool_signatures: HashSet::new(),
             voice_recording: None,
             voice_push_to_talk_key: runtime_config.voice.push_to_talk_key,
             voice_input_device: runtime_config.voice.input_device,
@@ -2474,6 +3815,9 @@ impl App {
         self.streaming_line = None;
         self.reasoning_line = None;
         self.pending_tool_lines.clear();
+        self.hidden_tool_calls.clear();
+        self.active_tools.clear();
+        self.seen_tool_signatures.clear();
         // Request a full terminal repaint.  ratatui's diff-based renderer
         // normally skips unchanged cells; if any out-of-band bytes reached the
         // alternate screen (e.g. tracing::warn! from a background task) those
@@ -2819,8 +4163,9 @@ impl App {
     /// Find a skill's SKILL.md by name, searching recursively through category
     /// subdirectories.  Returns the path to SKILL.md, or None.
     ///
-    /// 1. Direct flat lookup: `skills/<name>/SKILL.md`
+    /// 1. Direct flat lookup: `skills/<name>/SKILL.md` or `skills/<name>.md`
     /// 2. Recursive search: find a directory whose leaf name matches `name`
+    /// 3. Recursive search for `<name>.md` files under category directories
     fn find_skill_md(name: &str) -> Option<std::path::PathBuf> {
         let skills_dir = Self::skills_dir();
 
@@ -2829,8 +4174,16 @@ impl App {
         if direct.is_file() {
             return Some(direct);
         }
+        let direct_md = if name.ends_with(".md") {
+            skills_dir.join(name)
+        } else {
+            skills_dir.join(format!("{name}.md"))
+        };
+        if direct_md.is_file() {
+            return Some(direct_md);
+        }
 
-        // 2. Recursive search by leaf directory name
+        // 2. Recursive search by leaf directory name or file stem
         let mut stack = vec![skills_dir];
         while let Some(dir) = stack.pop() {
             let entries = match std::fs::read_dir(&dir) {
@@ -2849,6 +4202,14 @@ impl App {
                         }
                     }
                     stack.push(path);
+                } else if path.is_file()
+                    && path
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+                    && path.file_stem().and_then(|stem| stem.to_str()) == Some(name)
+                {
+                    return Some(path);
                 }
             }
         }
@@ -2856,13 +4217,173 @@ impl App {
         None
     }
 
-    /// Parse a SKILL.md file and return the frontmatter `description:` value
-    /// (truncated to 80 chars for the selector column).
     fn read_skill_desc(path: &std::path::Path) -> String {
         let content = std::fs::read_to_string(path).unwrap_or_default();
         edgecrab_core::extract_skill_description(&content)
             .map(|d| unicode_trunc(&d, 80))
+            .or_else(|| {
+                Self::read_skill_preview(&content)
+                    .lines()
+                    .next()
+                    .map(str::to_string)
+            })
             .unwrap_or_default()
+    }
+
+    fn read_skill_preview(content: &str) -> String {
+        let mut lines = Vec::new();
+        for raw in edgecrab_core::prompt_builder::strip_yaml_frontmatter(content).lines() {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let normalized = trimmed
+                .trim_start_matches('#')
+                .trim_start_matches('-')
+                .trim_start_matches('*')
+                .trim();
+            if normalized.is_empty() {
+                continue;
+            }
+            lines.push(unicode_trunc(normalized, 96).to_string());
+            if lines.len() == 5 {
+                break;
+            }
+        }
+        lines.join("\n")
+    }
+
+    fn build_skill_entry(
+        skills_root: &std::path::Path,
+        skill_path: &std::path::Path,
+        is_dir: bool,
+        active_skills: &HashSet<String>,
+    ) -> Option<SkillEntry> {
+        let (name, content_path) = if is_dir {
+            (
+                skill_path.file_name()?.to_str()?.to_string(),
+                skill_path.join("SKILL.md"),
+            )
+        } else {
+            (
+                skill_path.file_stem()?.to_str()?.to_string(),
+                skill_path.to_path_buf(),
+            )
+        };
+        let content = std::fs::read_to_string(&content_path).unwrap_or_default();
+        let display_name =
+            edgecrab_core::extract_frontmatter_name(&content).unwrap_or_else(|| name.clone());
+        let desc = Self::read_skill_desc(&content_path);
+        let preview = Self::read_skill_preview(&content);
+        let relative = skill_path
+            .strip_prefix(skills_root)
+            .unwrap_or(skill_path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let category = skill_path
+            .strip_prefix(skills_root)
+            .ok()
+            .and_then(|path| path.parent())
+            .map(|parent| parent.to_string_lossy().replace('\\', "/"))
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "uncategorized".to_string());
+        let active = active_skills.contains(&name);
+
+        let mut support_sections = Vec::new();
+        let mut support_files = 0usize;
+        if is_dir {
+            if let Ok(read_dir) = std::fs::read_dir(skill_path) {
+                for entry in read_dir.flatten() {
+                    let path = entry.path();
+                    let file_name = entry.file_name().to_string_lossy().to_string();
+                    if file_name == "SKILL.md" || file_name.starts_with('.') {
+                        continue;
+                    }
+                    support_files += 1;
+                    if path.is_dir() {
+                        support_sections.push(file_name);
+                    }
+                }
+            }
+            support_sections.sort();
+        }
+
+        let mut detail_parts = vec![category.clone()];
+        if active {
+            detail_parts.push("active".into());
+        }
+        if support_files > 0 {
+            detail_parts.push(format!("{support_files} extra file(s)"));
+        }
+        let detail = detail_parts.join(" | ");
+
+        let mut detail_view = vec![
+            format!(
+                "State: {}",
+                if active {
+                    "active for the next prompt"
+                } else {
+                    "available"
+                }
+            ),
+            format!(
+                "Kind: {}",
+                if is_dir {
+                    "skill bundle"
+                } else {
+                    "single markdown skill"
+                }
+            ),
+            format!("Category: {category}"),
+            format!("Path: {relative}"),
+        ];
+        if display_name != name {
+            detail_view.push(format!("Frontmatter name: {display_name}"));
+        }
+        if !desc.is_empty() {
+            detail_view.push(String::new());
+            detail_view.push(desc.clone());
+        }
+        if support_files > 0 {
+            detail_view.push(String::new());
+            detail_view.push(format!("Supporting files: {support_files}"));
+            if !support_sections.is_empty() {
+                detail_view.push(format!("Support folders: {}", support_sections.join(", ")));
+            }
+        }
+        if !preview.is_empty() {
+            detail_view.push(String::new());
+            detail_view.push("Preview:".into());
+            for line in preview.lines() {
+                detail_view.push(format!("  {line}"));
+            }
+        }
+
+        let mut search_fields = vec![
+            name.clone(),
+            display_name.clone(),
+            category.clone(),
+            relative.clone(),
+            desc.clone(),
+            preview.replace('\n', " "),
+        ];
+        if active {
+            search_fields.push("active".into());
+        }
+        search_fields.extend(support_sections.iter().cloned());
+
+        Some(SkillEntry {
+            name,
+            display_name,
+            is_dir,
+            active,
+            category,
+            relative_path: relative,
+            desc,
+            detail,
+            detail_view: detail_view.join("\n"),
+            search_text: search_fields.join(" "),
+        })
     }
 
     /// Reload the skills list from disk into `skill_selector` and
@@ -2875,8 +4396,17 @@ impl App {
     fn refresh_skills_list(&mut self) {
         let dir = Self::skills_dir();
         let mut entries: Vec<SkillEntry> = Vec::new();
+        let active_skills: HashSet<String> = self.active_skills.iter().cloned().collect();
 
-        // Recursive scan: walk all subdirectories to find SKILL.md files
+        if !dir.is_dir() {
+            self.skills_completion_names.clear();
+            self.skill_selector
+                .replace_items_preserving_state(Vec::new());
+            return;
+        }
+
+        // Recursive scan: walk category directories for both SKILL.md bundles and
+        // standalone markdown skills.
         let mut stack = vec![dir.clone()];
         while let Some(current) = stack.pop() {
             let read_dir = match std::fs::read_dir(&current) {
@@ -2886,6 +4416,20 @@ impl App {
             for res in read_dir.flatten() {
                 let path = res.path();
                 if !path.is_dir() {
+                    let file_name = res.file_name().to_string_lossy().to_string();
+                    if file_name.starts_with('.')
+                        || file_name == "SKILL.md"
+                        || !path
+                            .extension()
+                            .and_then(|ext| ext.to_str())
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+                    {
+                        continue;
+                    }
+                    if let Some(entry) = Self::build_skill_entry(&dir, &path, false, &active_skills)
+                    {
+                        entries.push(entry);
+                    }
                     continue;
                 }
                 // Skip hidden/system dirs
@@ -2895,13 +4439,10 @@ impl App {
                 }
                 let skill_md = path.join("SKILL.md");
                 if skill_md.is_file() {
-                    // This is a skill directory — use leaf dir name
-                    let desc = Self::read_skill_desc(&skill_md);
-                    entries.push(SkillEntry {
-                        name: dir_name,
-                        is_dir: true,
-                        desc,
-                    });
+                    if let Some(entry) = Self::build_skill_entry(&dir, &path, true, &active_skills)
+                    {
+                        entries.push(entry);
+                    }
                 } else {
                     // Not a skill — might be a category dir, recurse
                     stack.push(path);
@@ -2909,13 +4450,465 @@ impl App {
             }
         }
 
-        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        entries.sort_by(|left, right| {
+            right
+                .active
+                .cmp(&left.active)
+                .then_with(|| left.name.cmp(&right.name))
+        });
 
         // Update completion names cache (plain names, no slash prefix)
         self.skills_completion_names = entries.iter().map(|e| e.name.clone()).collect();
 
-        // Reload selector state
-        self.skill_selector.set_items(entries);
+        self.skill_selector.replace_items_preserving_state(entries);
+    }
+
+    fn normalize_skill_identifier(identifier: &str) -> String {
+        identifier.trim().replace('\\', "/")
+    }
+
+    fn build_remote_skill_entries(
+        report: &edgecrab_tools::tools::skills_hub::SearchReport,
+    ) -> (Vec<RemoteSkillEntry>, Vec<String>) {
+        let skills_dir = Self::skills_dir();
+        let lock = edgecrab_tools::tools::skills_hub::read_lock();
+        let mut installed_by_identifier = HashMap::new();
+        for (installed_name, entry) in lock {
+            installed_by_identifier.insert(
+                Self::normalize_skill_identifier(&entry.identifier),
+                installed_name,
+            );
+        }
+
+        let mut entries = Vec::new();
+        let mut notices = Vec::new();
+        for group in &report.groups {
+            if let Some(notice) = &group.notice {
+                notices.push(format!("{}: {}", group.source.label, notice));
+            }
+
+            for skill in &group.results {
+                let normalized_identifier = Self::normalize_skill_identifier(&skill.identifier);
+                let installed_name = installed_by_identifier.get(&normalized_identifier).cloned();
+                let has_local_collision = Self::find_skill_md(&skill.name).is_some()
+                    || skills_dir.join(&skill.name).exists();
+                let action = if installed_name.is_some() {
+                    RemoteSkillAction::Update
+                } else if has_local_collision {
+                    RemoteSkillAction::Replace
+                } else {
+                    RemoteSkillAction::Install
+                };
+                let description = if skill.description.trim().is_empty() {
+                    "No description available".to_string()
+                } else {
+                    unicode_trunc(skill.description.trim(), 120)
+                };
+                let search_text = format!(
+                    "{} {} {} {} {} {}",
+                    skill.name,
+                    normalized_identifier,
+                    description,
+                    skill.origin,
+                    skill.trust_level,
+                    skill.tags.join(" ")
+                );
+
+                entries.push(RemoteSkillEntry {
+                    name: skill.name.clone(),
+                    identifier: normalized_identifier,
+                    description,
+                    source_label: group.source.label.clone(),
+                    origin: skill.origin.clone(),
+                    trust_level: skill.trust_level.clone(),
+                    tags: skill.tags.clone(),
+                    search_text,
+                    installed_name,
+                    action,
+                });
+            }
+        }
+
+        (entries, notices)
+    }
+
+    fn build_remote_mcp_entries(
+        report: &crate::mcp_catalog::McpSearchReport,
+    ) -> (Vec<RemoteMcpEntry>, Vec<String>) {
+        let mut entries = Vec::new();
+        let mut notices = Vec::new();
+
+        for group in &report.groups {
+            if let Some(notice) = &group.notice {
+                notices.push(format!("{}: {}", group.source.label, notice));
+            }
+
+            for entry in &group.results {
+                let description = if entry.description.trim().is_empty() {
+                    "No description available".to_string()
+                } else {
+                    unicode_trunc(entry.description.trim(), 120)
+                };
+                let transport = entry.transport.clone();
+                let search_text = format!(
+                    "{} {} {} {} {} {}",
+                    entry.id,
+                    entry.name,
+                    description,
+                    entry.origin,
+                    transport.clone().unwrap_or_default(),
+                    entry.tags.join(" ")
+                );
+
+                entries.push(RemoteMcpEntry {
+                    id: entry.id.clone(),
+                    name: entry.name.clone(),
+                    description,
+                    source_label: group.source.label.clone(),
+                    origin: entry.origin.clone(),
+                    tags: entry.tags.clone(),
+                    transport,
+                    search_text,
+                    install: entry.install.clone(),
+                });
+            }
+        }
+
+        (entries, notices)
+    }
+
+    fn open_remote_mcp_selector(&mut self, initial_query: Option<&str>) {
+        self.mcp_selector.active = false;
+        self.remote_mcp_browser.selector.active = true;
+        self.remote_mcp_browser.selector.query =
+            initial_query.map(str::trim).unwrap_or_default().to_string();
+        self.remote_mcp_browser.selector.selected = 0;
+        self.remote_mcp_browser.selector.update_filter();
+        self.remote_mcp_browser.notices.clear();
+        self.remote_mcp_browser.last_completed_query = None;
+        self.remote_mcp_browser.loading_query = None;
+        self.remote_mcp_browser.inflight_request_id = None;
+        self.schedule_remote_mcp_search(true);
+        self.needs_redraw = true;
+    }
+
+    fn schedule_remote_mcp_search(&mut self, immediate: bool) {
+        let query = self.remote_mcp_browser.current_query();
+        if query.is_empty() {
+            self.remote_mcp_browser.search_due_at = None;
+            self.remote_mcp_browser.inflight_request_id = None;
+            self.remote_mcp_browser.loading_query = None;
+            self.remote_mcp_browser.last_completed_query = None;
+            self.remote_mcp_browser.notices.clear();
+            self.remote_mcp_browser.selector.set_items(Vec::new());
+            self.needs_redraw = true;
+            return;
+        }
+
+        self.remote_mcp_browser.search_due_at = Some(if immediate {
+            Instant::now()
+        } else {
+            Instant::now() + Duration::from_millis(250)
+        });
+        self.needs_redraw = true;
+    }
+
+    fn poll_remote_mcp_search(&mut self) {
+        if !self.remote_mcp_browser.selector.active {
+            return;
+        }
+
+        let Some(deadline) = self.remote_mcp_browser.search_due_at else {
+            return;
+        };
+        if Instant::now() < deadline {
+            return;
+        }
+
+        let query = self.remote_mcp_browser.current_query();
+        self.remote_mcp_browser.search_due_at = None;
+        if query.is_empty() {
+            return;
+        }
+        if self.remote_mcp_browser.loading_query.as_deref() == Some(query.as_str()) {
+            return;
+        }
+
+        self.remote_mcp_browser.next_request_id =
+            self.remote_mcp_browser.next_request_id.saturating_add(1);
+        let request_id = self.remote_mcp_browser.next_request_id;
+        self.remote_mcp_browser.inflight_request_id = Some(request_id);
+        self.remote_mcp_browser.loading_query = Some(query.clone());
+        let tx = self.response_tx.clone();
+        self.rt_handle.spawn(async move {
+            let report = crate::mcp_catalog::search_mcp_sources(Some(&query), 12).await;
+            let _ = tx.send(AgentResponse::RemoteMcpSearchReady {
+                request_id,
+                query,
+                report,
+            });
+        });
+        self.needs_redraw = true;
+    }
+
+    fn apply_remote_mcp_search_result(
+        &mut self,
+        request_id: u64,
+        query: String,
+        report: crate::mcp_catalog::McpSearchReport,
+    ) {
+        if self.remote_mcp_browser.inflight_request_id != Some(request_id) {
+            return;
+        }
+        if self.remote_mcp_browser.current_query() != query {
+            return;
+        }
+
+        let (entries, notices) = Self::build_remote_mcp_entries(&report);
+        self.remote_mcp_browser.inflight_request_id = None;
+        self.remote_mcp_browser.loading_query = None;
+        self.remote_mcp_browser.last_completed_query = Some(query);
+        self.remote_mcp_browser.notices = notices;
+        self.remote_mcp_browser.selector.set_items(entries);
+        self.remote_mcp_browser.selector.selected = 0;
+        self.needs_redraw = true;
+    }
+
+    fn view_remote_mcp_entry(&mut self, entry: &RemoteMcpEntry) {
+        let mut lines = vec![
+            format!("Remote MCP: {}", entry.id),
+            format!("Name:       {}", entry.name),
+            format!("Source:     {}", entry.source_label),
+            format!("Why:        {}", entry.description),
+            format!("Origin:     {}", entry.origin),
+        ];
+        if let Some(transport) = &entry.transport {
+            lines.push(format!("Transport:  {transport}"));
+        }
+        if !entry.tags.is_empty() {
+            lines.push(format!("Tags:       {}", entry.tags.join(", ")));
+        }
+        let install = match &entry.install {
+            Some(crate::mcp_catalog::McpInstallPlan::Preset { preset_id }) => {
+                format!("preset {preset_id}")
+            }
+            Some(crate::mcp_catalog::McpInstallPlan::Http { url, transport, .. }) => {
+                format!("{transport} {url}")
+            }
+            Some(crate::mcp_catalog::McpInstallPlan::Stdio { command, args, .. }) => {
+                format!("stdio {} {}", command, args.join(" "))
+            }
+            None => "view-only".into(),
+        };
+        lines.push(format!("Install:    {install}"));
+        self.push_output(lines.join("\n"), OutputRole::System);
+    }
+
+    fn install_remote_mcp_entry(&mut self, entry: &RemoteMcpEntry) {
+        let Some(install) = entry.install.clone() else {
+            self.view_remote_mcp_entry(entry);
+            return;
+        };
+
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let mut config = self.load_runtime_config();
+        let search_entry = crate::mcp_catalog::McpSearchEntry {
+            id: entry.id.clone(),
+            name: entry.name.clone(),
+            description: entry.description.clone(),
+            source: entry.source_label.clone(),
+            origin: entry.origin.clone(),
+            homepage: None,
+            tags: entry.tags.clone(),
+            transport: entry.transport.clone(),
+            install: Some(install),
+        };
+
+        match crate::mcp_catalog::install_search_entry(&mut config, &search_entry, &cwd) {
+            Ok(installed) => match config.save() {
+                Ok(()) => {
+                    edgecrab_tools::tools::mcp_client::reload_mcp_connections();
+                    let mut message = format!("Configured MCP server '{}'.", installed.name);
+                    if !installed.warnings.is_empty() {
+                        message.push_str(&format!(
+                            "\nFollow-up required: {}",
+                            installed.warnings.join(", ")
+                        ));
+                    }
+                    message.push_str(&format!(
+                        "\nRun `/mcp doctor {}` to verify connectivity and config health.",
+                        installed.name
+                    ));
+                    self.push_output(message, OutputRole::System);
+                }
+                Err(err) => self.push_output(
+                    format!("MCP config save failed after install planning: {err}"),
+                    OutputRole::Error,
+                ),
+            },
+            Err(err) => self.push_output(format!("MCP install failed: {err}"), OutputRole::Error),
+        }
+    }
+
+    fn open_remote_skill_selector(&mut self, initial_query: Option<&str>) {
+        self.skill_selector.active = false;
+        self.remote_skill_browser.selector.active = true;
+        self.remote_skill_browser.selector.query =
+            initial_query.map(str::trim).unwrap_or_default().to_string();
+        self.remote_skill_browser.selector.selected = 0;
+        self.remote_skill_browser.selector.update_filter();
+        self.remote_skill_browser.action_in_flight = None;
+        self.remote_skill_browser.notices.clear();
+        self.remote_skill_browser.last_completed_query = None;
+        self.remote_skill_browser.loading_query = None;
+        self.remote_skill_browser.inflight_request_id = None;
+        self.schedule_remote_skill_search(true);
+        self.needs_redraw = true;
+    }
+
+    fn schedule_remote_skill_search(&mut self, immediate: bool) {
+        let query = self.remote_skill_browser.current_query();
+        if query.is_empty() {
+            self.remote_skill_browser.search_due_at = None;
+            self.remote_skill_browser.inflight_request_id = None;
+            self.remote_skill_browser.loading_query = None;
+            self.remote_skill_browser.last_completed_query = None;
+            self.remote_skill_browser.notices.clear();
+            self.remote_skill_browser.selector.set_items(Vec::new());
+            self.needs_redraw = true;
+            return;
+        }
+
+        self.remote_skill_browser.search_due_at = Some(if immediate {
+            Instant::now()
+        } else {
+            Instant::now() + Duration::from_millis(250)
+        });
+        self.needs_redraw = true;
+    }
+
+    fn poll_remote_skill_search(&mut self) {
+        if !self.remote_skill_browser.selector.active {
+            return;
+        }
+
+        let Some(deadline) = self.remote_skill_browser.search_due_at else {
+            return;
+        };
+        if Instant::now() < deadline {
+            return;
+        }
+
+        let query = self.remote_skill_browser.current_query();
+        self.remote_skill_browser.search_due_at = None;
+        if query.is_empty() {
+            return;
+        }
+        if self.remote_skill_browser.loading_query.as_deref() == Some(query.as_str()) {
+            return;
+        }
+
+        self.remote_skill_browser.next_request_id =
+            self.remote_skill_browser.next_request_id.saturating_add(1);
+        let request_id = self.remote_skill_browser.next_request_id;
+        self.remote_skill_browser.inflight_request_id = Some(request_id);
+        self.remote_skill_browser.loading_query = Some(query.clone());
+        let tx = self.response_tx.clone();
+        self.rt_handle.spawn(async move {
+            let report = edgecrab_tools::tools::skills_hub::search_hub(&query, None, 12).await;
+            let _ = tx.send(AgentResponse::RemoteSkillSearchReady {
+                request_id,
+                query,
+                report,
+            });
+        });
+        self.needs_redraw = true;
+    }
+
+    fn apply_remote_skill_search_result(
+        &mut self,
+        request_id: u64,
+        query: String,
+        report: edgecrab_tools::tools::skills_hub::SearchReport,
+    ) {
+        if self.remote_skill_browser.inflight_request_id != Some(request_id) {
+            return;
+        }
+        if self.remote_skill_browser.current_query() != query {
+            return;
+        }
+
+        let (entries, notices) = Self::build_remote_skill_entries(&report);
+        self.remote_skill_browser.inflight_request_id = None;
+        self.remote_skill_browser.loading_query = None;
+        self.remote_skill_browser.last_completed_query = Some(query);
+        self.remote_skill_browser.notices = notices;
+        self.remote_skill_browser.selector.set_items(entries);
+        self.remote_skill_browser.selector.selected = 0;
+        self.needs_redraw = true;
+    }
+
+    fn run_remote_skill_action(&mut self, entry: RemoteSkillEntry) {
+        if self.remote_skill_browser.action_in_flight.is_some() {
+            self.push_output(
+                "A remote skill action is already running. Wait for it to finish.",
+                OutputRole::System,
+            );
+            return;
+        }
+
+        let action_label = entry.action.label().to_string();
+        self.remote_skill_browser.action_in_flight =
+            Some(format!("{} {}", action_label, entry.identifier));
+        self.needs_redraw = true;
+
+        let tx = self.response_tx.clone();
+        self.rt_handle.spawn(async move {
+            let skills_dir = edgecrab_core::edgecrab_home().join("skills");
+            let optional_dir = edgecrab_tools::tools::skills_sync::optional_skills_dir();
+            let result = match entry.action {
+                RemoteSkillAction::Install | RemoteSkillAction::Replace => {
+                    edgecrab_tools::tools::skills_hub::install_identifier(
+                        &entry.identifier,
+                        &skills_dir,
+                        optional_dir.as_deref(),
+                        false,
+                    )
+                    .await
+                    .map(|outcome| (outcome.message, outcome.skill_name))
+                }
+                RemoteSkillAction::Update => {
+                    let skill_name = entry
+                        .installed_name
+                        .clone()
+                        .unwrap_or_else(|| entry.name.clone());
+                    edgecrab_tools::tools::skills_hub::update_installed_skill(
+                        &skill_name,
+                        &skills_dir,
+                        optional_dir.as_deref(),
+                        false,
+                    )
+                    .await
+                    .map(|outcome| (outcome.message, outcome.skill_name))
+                }
+            };
+
+            match result {
+                Ok((message, skill_name)) => {
+                    let _ = tx.send(AgentResponse::RemoteSkillActionComplete {
+                        message,
+                        skill_name,
+                    });
+                }
+                Err(error) => {
+                    let _ = tx.send(AgentResponse::RemoteSkillActionFailed {
+                        action_label,
+                        identifier: entry.identifier,
+                        error,
+                    });
+                }
+            }
+        });
     }
 
     // ─── Tab Completion ─────────────────────────────────────────────
@@ -2934,8 +4927,21 @@ impl App {
     fn command_arg_hints(cmd_token: &str) -> &'static [(&'static str, &'static str)] {
         match cmd_token {
             // ── Session management ─────────────────────────────────────────────
-            "session" | "sessions" => &[
-                ("list", "List all saved sessions"),
+            "session" => &[
+                ("inspect", "Open the live current-session debugger"),
+                ("debug", "Open the live current-session debugger"),
+                ("browse", "Open the saved-session browser"),
+                ("search", "Search saved sessions with a seeded query"),
+                ("new", "Start a fresh session"),
+                ("switch", "Activate a saved session: switch <id-prefix>"),
+                ("delete", "Delete a saved session: delete <id-prefix>"),
+                ("rename", "Rename: rename <id-prefix> <new title>"),
+                ("prune", "Remove saved sessions older than N days"),
+            ],
+            "sessions" => &[
+                ("list", "Open the session browser"),
+                ("browse", "Open the session browser"),
+                ("search", "Open the session browser with a query"),
                 ("new", "Start a fresh session"),
                 ("switch", "Activate a session: switch <id-prefix>"),
                 ("delete", "Delete a session: delete <id-prefix>"),
@@ -3012,16 +5018,27 @@ impl App {
             // ── MCP token management ──────────────────────────────────────────
             "mcp-token" => &[
                 ("set", "Store a token: set <server-id> <token>"),
+                (
+                    "set-refresh",
+                    "Store a refresh token: set-refresh <server-id> <token>",
+                ),
+                ("status", "Show cached token state for one server"),
                 ("remove", "Delete a token: remove <server-id>"),
                 ("list", "List stored server tokens"),
             ],
             "mcp" => &[
                 ("list", "List configured MCP servers"),
                 ("refresh", "Refresh the official MCP catalog cache"),
-                ("search", "Search configured servers + official MCP catalog"),
+                (
+                    "search",
+                    "Search official MCP sources + the official registry",
+                ),
                 ("view", "Show details for a preset"),
                 ("install", "Install a controlled MCP preset"),
                 ("test", "Probe a configured MCP server"),
+                ("doctor", "Diagnose a configured MCP server"),
+                ("auth", "Explain the active auth/OAuth path for a server"),
+                ("login", "Run an interactive OAuth login for a server"),
                 ("remove", "Remove a configured MCP server"),
             ],
             // ── Personality ───────────────────────────────────────────────────
@@ -3044,6 +5061,14 @@ impl App {
                 ("copilot", "List GitHub Copilot models"),
                 ("ollama", "List locally running Ollama models"),
             ],
+            "cheap_model" | "cheap-model" => &[
+                ("status", "Show the current cheap-model routing policy"),
+                ("off", "Disable smart routing and clear the cheap model"),
+                (
+                    "copilot/gpt-4.1-mini",
+                    "Route simple turns to a fast cheap model",
+                ),
+            ],
             "vision_model" | "vision-model" => &[
                 ("status", "Show the current vision-routing policy"),
                 ("auto", "Use the current chat model when vision-capable"),
@@ -3062,6 +5087,17 @@ impl App {
                     "imagen/imagen-4.0-fast-generate-001",
                     "Use Vertex Imagen fast",
                 ),
+            ],
+            "moa" => &[
+                ("status", "Show the current Mixture-of-Agents defaults"),
+                ("on", "Enable the moa tool"),
+                ("off", "Disable the moa tool"),
+                ("aggregator", "Open the MoA aggregator selector"),
+                ("experts", "Open the full MoA expert roster editor"),
+                ("references", "Open the full MoA expert roster editor"),
+                ("reset", "Restore the built-in MoA roster"),
+                ("add", "Add one expert to the MoA roster"),
+                ("remove", "Remove one expert from the MoA roster"),
             ],
             // All other commands accept free-form arguments; fall through.
             _ => &[],
@@ -3682,12 +5718,7 @@ impl App {
         }
     }
 
-    /// Activate or deactivate a skill by name.
-    ///
-    /// Typing `/skill_name` a second time toggles the skill off.  Active
-    /// skills have their SKILL.md content silently prepended to the next agent
-    /// prompt via `build_prompt_with_skills()`.
-    fn activate_skill(&mut self, name: &str) {
+    fn set_skill_activation(&mut self, name: &str, active: bool) {
         let skill_md = Self::find_skill_md(name);
         let skill_md = match skill_md {
             Some(p) => p,
@@ -3699,25 +5730,48 @@ impl App {
                 return;
             }
         };
-        // Toggle: typing /name again deactivates the skill.
-        if let Some(pos) = self.active_skills.iter().position(|s| s == name) {
-            self.active_skills.remove(pos);
+        let current = self.active_skills.iter().any(|skill| skill == name);
+        if current == active {
+            let state = if active {
+                "already active"
+            } else {
+                "already inactive"
+            };
+            self.push_output(format!("📚 Skill '{name}' is {state}."), OutputRole::System);
+            return;
+        }
+
+        if active {
+            self.active_skills.push(name.to_string());
+            let desc = Self::read_skill_desc(&skill_md);
+            let msg = if desc.is_empty() {
+                format!(
+                    "📚 Skill '{name}' activated — its context will be prepended to your next message."
+                )
+            } else {
+                format!("📚 Skill '{name}' activated: {desc}")
+            };
+            self.push_output(msg, OutputRole::System);
+        } else {
+            self.active_skills.retain(|skill| skill != name);
             self.push_output(
                 format!("📚 Skill '{name}' deactivated."),
                 OutputRole::System,
             );
-            return;
         }
-        self.active_skills.push(name.to_string());
-        let desc = Self::read_skill_desc(&skill_md);
-        let msg = if desc.is_empty() {
-            format!(
-                "📚 Skill '{name}' activated — its context will be prepended to your next message."
-            )
-        } else {
-            format!("📚 Skill '{name}' activated: {desc}")
-        };
-        self.push_output(msg, OutputRole::System);
+
+        self.refresh_skills_list();
+        self.needs_redraw = true;
+    }
+
+    /// Activate or deactivate a skill by name.
+    ///
+    /// Typing `/skill_name` a second time toggles the skill off.  Active
+    /// skills have their SKILL.md content silently prepended to the next agent
+    /// prompt via `build_prompt_with_skills()`.
+    fn activate_skill(&mut self, name: &str) {
+        let next_state = !self.active_skills.iter().any(|skill| skill == name);
+        self.set_skill_activation(name, next_state);
     }
 
     /// Build the prompt actually sent to the agent by prepending active skill
@@ -3936,8 +5990,11 @@ impl App {
                 self.model_selector.active = false;
                 self.vision_model_selector.active = false;
                 self.image_model_selector.active = false;
+                self.moa_reference_selector.active = false;
                 self.mcp_selector.active = false;
+                self.remote_mcp_browser.selector.active = false;
                 self.skill_selector.active = false;
+                self.remote_skill_browser.selector.active = false;
                 self.needs_redraw = true;
                 let now = Instant::now();
                 let is_double = self
@@ -4125,7 +6182,7 @@ impl App {
                 self.process_input("/retry");
                 return;
             }
-            // F10 — toggle verbose mode
+            // F10 - cycle tool progress mode
             (_, KeyCode::F(10)) => {
                 self.process_input("/verbose");
                 return;
@@ -4145,29 +6202,235 @@ impl App {
             return;
         }
 
+        if matches!(self.display_state, DisplayState::ValueCapture { .. }) {
+            self.handle_value_capture_key(key);
+            return;
+        }
+
         // Model selector overlay active — intercept all keys
         if self.model_selector.active {
             match key.code {
                 KeyCode::Esc => {
-                    self.model_selector.active = false;
+                    if !self.close_detail_fullscreen(DetailSurface::ModelSelector) {
+                        self.model_selector.active = false;
+                    }
+                }
+                _ if selector_action_key(&key, 'z') => {
+                    self.toggle_detail_fullscreen(DetailSurface::ModelSelector, 0);
                 }
                 KeyCode::Enter => {
                     if let Some(model) = self.model_selector.current().map(|e| e.display.clone()) {
                         self.model_selector.active = false;
-                        self.handle_model_switch(model);
+                        self.close_detail_fullscreen(DetailSurface::ModelSelector);
+                        match self.model_selector_target {
+                            ModelSelectorTarget::Primary => self.handle_model_switch(model),
+                            ModelSelectorTarget::Cheap => self.handle_set_cheap_model(model),
+                            ModelSelectorTarget::MoaAggregator => {
+                                self.handle_set_moa_aggregator(model);
+                            }
+                        }
                     }
                 }
-                KeyCode::Up => self.model_selector.move_up(),
-                KeyCode::Down => self.model_selector.move_down(),
+                KeyCode::Up => {
+                    self.model_selector.move_up();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::ModelSelector);
+                }
+                KeyCode::Down => {
+                    self.model_selector.move_down();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::ModelSelector);
+                }
+                KeyCode::PageUp if self.detail_fullscreen_active(DetailSurface::ModelSelector) => {
+                    self.page_up_detail_fullscreen(DetailSurface::ModelSelector);
+                }
+                KeyCode::PageDown
+                    if self.detail_fullscreen_active(DetailSurface::ModelSelector) =>
+                {
+                    self.page_down_detail_fullscreen(DetailSurface::ModelSelector);
+                }
                 KeyCode::PageUp => self.model_selector.page_up(),
                 KeyCode::PageDown => self.model_selector.page_down(),
-                KeyCode::Backspace => self.model_selector.pop_char(),
+                KeyCode::Backspace => {
+                    self.model_selector.pop_char();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::ModelSelector);
+                }
                 KeyCode::Char(c)
                     if !key
                         .modifiers
                         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                 {
                     self.model_selector.push_char(c);
+                    self.reset_detail_fullscreen_scroll(DetailSurface::ModelSelector);
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        if self.gateway_browser.active {
+            match key.code {
+                KeyCode::Esc => {
+                    if !self.close_detail_fullscreen(DetailSurface::GatewayBrowser) {
+                        self.gateway_browser.active = false;
+                    }
+                }
+                _ if selector_action_key(&key, 'z') => {
+                    self.toggle_detail_fullscreen(
+                        DetailSurface::GatewayBrowser,
+                        self.gateway_browser_pane.scroll,
+                    );
+                }
+                KeyCode::Enter => {
+                    self.open_gateway_primary_editor();
+                }
+                KeyCode::Char(' ') => {
+                    self.toggle_selected_gateway_platform();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::GatewayBrowser);
+                }
+                _ if selector_action_key(&key, 'a') => {
+                    self.open_gateway_allowlist_editor();
+                }
+                _ if selector_action_key(&key, 'h') => {
+                    self.open_gateway_home_channel_editor();
+                }
+                _ if selector_action_key(&key, 'b') => {
+                    self.open_gateway_bind_editor();
+                }
+                _ if selector_action_key(&key, 'r') => {
+                    self.refresh_gateway_browser();
+                }
+                _ if selector_action_key(&key, 'x') => {
+                    self.handle_gateway_control("restart".into());
+                }
+                KeyCode::Tab | KeyCode::BackTab
+                    if !self.detail_fullscreen_active(DetailSurface::GatewayBrowser) =>
+                {
+                    self.gateway_browser_pane.focus = self.gateway_browser_pane.focus.toggle();
+                }
+                KeyCode::Up => {
+                    self.gateway_browser.move_up();
+                    self.gateway_browser_pane.reset_scroll();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::GatewayBrowser);
+                }
+                KeyCode::Down => {
+                    self.gateway_browser.move_down();
+                    self.gateway_browser_pane.reset_scroll();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::GatewayBrowser);
+                }
+                KeyCode::PageUp if self.detail_fullscreen_active(DetailSurface::GatewayBrowser) => {
+                    self.page_up_detail_fullscreen(DetailSurface::GatewayBrowser);
+                }
+                KeyCode::PageUp => {
+                    if self.gateway_browser_pane.focus == SplitPaneFocus::Detail {
+                        self.gateway_browser_pane.page_up(8);
+                    } else {
+                        self.gateway_browser.page_up();
+                        self.gateway_browser_pane.reset_scroll();
+                        self.reset_detail_fullscreen_scroll(DetailSurface::GatewayBrowser);
+                    }
+                }
+                KeyCode::PageDown
+                    if self.detail_fullscreen_active(DetailSurface::GatewayBrowser) =>
+                {
+                    self.page_down_detail_fullscreen(DetailSurface::GatewayBrowser);
+                }
+                KeyCode::PageDown => {
+                    if self.gateway_browser_pane.focus == SplitPaneFocus::Detail {
+                        self.gateway_browser_pane.page_down(8);
+                    } else {
+                        self.gateway_browser.page_down();
+                        self.gateway_browser_pane.reset_scroll();
+                        self.reset_detail_fullscreen_scroll(DetailSurface::GatewayBrowser);
+                    }
+                }
+                KeyCode::Home => {
+                    self.gateway_browser.selected = 0;
+                    self.gateway_browser_pane.reset_scroll();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::GatewayBrowser);
+                }
+                KeyCode::End => {
+                    self.gateway_browser.selected =
+                        self.gateway_browser.filtered.len().saturating_sub(1);
+                    self.gateway_browser_pane.reset_scroll();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::GatewayBrowser);
+                }
+                KeyCode::Backspace => {
+                    self.gateway_browser.pop_char();
+                    self.gateway_browser_pane.reset_scroll();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::GatewayBrowser);
+                }
+                KeyCode::Char(c) if selector_search_char(&key) == Some(c) => {
+                    self.gateway_browser.push_char(c);
+                    self.gateway_browser_pane.reset_scroll();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::GatewayBrowser);
+                }
+                _ => {}
+            }
+            self.needs_redraw = true;
+            return;
+        }
+
+        if self.moa_reference_selector.active {
+            match key.code {
+                KeyCode::Esc => {
+                    self.moa_reference_selector.active = false;
+                }
+                KeyCode::Enter => {
+                    self.moa_reference_selector.active = false;
+                    match self.moa_reference_selector_mode {
+                        MoaReferenceSelectorMode::EditRoster => {
+                            let selected: Vec<String> =
+                                self.moa_reference_selected.iter().cloned().collect();
+                            self.handle_save_moa_reference_selection(selected);
+                        }
+                        MoaReferenceSelectorMode::AddExpert => {
+                            if let Some(model) = self
+                                .moa_reference_selector
+                                .current()
+                                .map(|entry| entry.display.clone())
+                            {
+                                self.handle_add_moa_reference(model);
+                            }
+                        }
+                        MoaReferenceSelectorMode::RemoveExpert => {
+                            if let Some(model) = self
+                                .moa_reference_selector
+                                .current()
+                                .map(|entry| entry.display.clone())
+                            {
+                                self.handle_remove_moa_reference(model);
+                            }
+                        }
+                    }
+                }
+                KeyCode::Char(' ')
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    if self.moa_reference_selector_mode == MoaReferenceSelectorMode::EditRoster {
+                        if let Some(model) = self
+                            .moa_reference_selector
+                            .current()
+                            .map(|entry| entry.display.clone())
+                        {
+                            if !self.moa_reference_selected.insert(model.clone()) {
+                                self.moa_reference_selected.remove(&model);
+                            }
+                            self.needs_redraw = true;
+                        }
+                    }
+                }
+                KeyCode::Up => self.moa_reference_selector.move_up(),
+                KeyCode::Down => self.moa_reference_selector.move_down(),
+                KeyCode::PageUp => self.moa_reference_selector.page_up(),
+                KeyCode::PageDown => self.moa_reference_selector.page_down(),
+                KeyCode::Backspace => self.moa_reference_selector.pop_char(),
+                KeyCode::Char(c)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    self.moa_reference_selector.push_char(c);
                 }
                 _ => {}
             }
@@ -4178,7 +6441,12 @@ impl App {
         if self.vision_model_selector.active {
             match key.code {
                 KeyCode::Esc => {
-                    self.vision_model_selector.active = false;
+                    if !self.close_detail_fullscreen(DetailSurface::VisionModelSelector) {
+                        self.vision_model_selector.active = false;
+                    }
+                }
+                _ if selector_action_key(&key, 'z') => {
+                    self.toggle_detail_fullscreen(DetailSurface::VisionModelSelector, 0);
                 }
                 KeyCode::Enter => {
                     if let Some(model) = self
@@ -4187,20 +6455,41 @@ impl App {
                         .map(|entry| entry.display.clone())
                     {
                         self.vision_model_selector.active = false;
+                        self.close_detail_fullscreen(DetailSurface::VisionModelSelector);
                         self.handle_set_vision_model(model);
                     }
                 }
-                KeyCode::Up => self.vision_model_selector.move_up(),
-                KeyCode::Down => self.vision_model_selector.move_down(),
+                KeyCode::Up => {
+                    self.vision_model_selector.move_up();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::VisionModelSelector);
+                }
+                KeyCode::Down => {
+                    self.vision_model_selector.move_down();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::VisionModelSelector);
+                }
+                KeyCode::PageUp
+                    if self.detail_fullscreen_active(DetailSurface::VisionModelSelector) =>
+                {
+                    self.page_up_detail_fullscreen(DetailSurface::VisionModelSelector);
+                }
+                KeyCode::PageDown
+                    if self.detail_fullscreen_active(DetailSurface::VisionModelSelector) =>
+                {
+                    self.page_down_detail_fullscreen(DetailSurface::VisionModelSelector);
+                }
                 KeyCode::PageUp => self.vision_model_selector.page_up(),
                 KeyCode::PageDown => self.vision_model_selector.page_down(),
-                KeyCode::Backspace => self.vision_model_selector.pop_char(),
+                KeyCode::Backspace => {
+                    self.vision_model_selector.pop_char();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::VisionModelSelector);
+                }
                 KeyCode::Char(c)
                     if !key
                         .modifiers
                         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                 {
                     self.vision_model_selector.push_char(c);
+                    self.reset_detail_fullscreen_scroll(DetailSurface::VisionModelSelector);
                 }
                 _ => {}
             }
@@ -4210,7 +6499,12 @@ impl App {
         if self.image_model_selector.active {
             match key.code {
                 KeyCode::Esc => {
-                    self.image_model_selector.active = false;
+                    if !self.close_detail_fullscreen(DetailSurface::ImageModelSelector) {
+                        self.image_model_selector.active = false;
+                    }
+                }
+                _ if selector_action_key(&key, 'z') => {
+                    self.toggle_detail_fullscreen(DetailSurface::ImageModelSelector, 0);
                 }
                 KeyCode::Enter => {
                     if let Some(model) = self
@@ -4219,20 +6513,41 @@ impl App {
                         .map(|entry| entry.display.clone())
                     {
                         self.image_model_selector.active = false;
+                        self.close_detail_fullscreen(DetailSurface::ImageModelSelector);
                         self.handle_set_image_model(model);
                     }
                 }
-                KeyCode::Up => self.image_model_selector.move_up(),
-                KeyCode::Down => self.image_model_selector.move_down(),
+                KeyCode::Up => {
+                    self.image_model_selector.move_up();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::ImageModelSelector);
+                }
+                KeyCode::Down => {
+                    self.image_model_selector.move_down();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::ImageModelSelector);
+                }
+                KeyCode::PageUp
+                    if self.detail_fullscreen_active(DetailSurface::ImageModelSelector) =>
+                {
+                    self.page_up_detail_fullscreen(DetailSurface::ImageModelSelector);
+                }
+                KeyCode::PageDown
+                    if self.detail_fullscreen_active(DetailSurface::ImageModelSelector) =>
+                {
+                    self.page_down_detail_fullscreen(DetailSurface::ImageModelSelector);
+                }
                 KeyCode::PageUp => self.image_model_selector.page_up(),
                 KeyCode::PageDown => self.image_model_selector.page_down(),
-                KeyCode::Backspace => self.image_model_selector.pop_char(),
+                KeyCode::Backspace => {
+                    self.image_model_selector.pop_char();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::ImageModelSelector);
+                }
                 KeyCode::Char(c)
                     if !key
                         .modifiers
                         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                 {
                     self.image_model_selector.push_char(c);
+                    self.reset_detail_fullscreen_scroll(DetailSurface::ImageModelSelector);
                 }
                 _ => {}
             }
@@ -4244,12 +6559,22 @@ impl App {
         if self.mcp_selector.active {
             match key.code {
                 KeyCode::Esc => {
-                    self.mcp_selector.active = false;
+                    if !self.close_detail_fullscreen(DetailSurface::McpSelector) {
+                        self.mcp_selector.active = false;
+                    }
+                }
+                _ if selector_action_key(&key, 'z') => {
+                    self.toggle_detail_fullscreen(DetailSurface::McpSelector, 0);
+                }
+                _ if selector_action_key(&key, 'r') => {
+                    let query = self.mcp_selector.query.clone();
+                    self.open_mcp_selector(Some(&query), true);
                 }
                 KeyCode::Enter => {
                     if let Some(entry) = self.mcp_selector.current() {
                         let command = entry.default_command();
                         self.mcp_selector.active = false;
+                        self.close_detail_fullscreen(DetailSurface::McpSelector);
                         self.handle_mcp_command(command);
                     }
                 }
@@ -4261,19 +6586,43 @@ impl App {
                         }
                     }
                 }
-                KeyCode::Up => self.mcp_selector.move_up(),
-                KeyCode::Down => self.mcp_selector.move_down(),
+                KeyCode::Up => {
+                    self.mcp_selector.move_up();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::McpSelector);
+                }
+                KeyCode::Down => {
+                    self.mcp_selector.move_down();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::McpSelector);
+                }
+                KeyCode::PageUp if self.detail_fullscreen_active(DetailSurface::McpSelector) => {
+                    self.page_up_detail_fullscreen(DetailSurface::McpSelector);
+                }
+                KeyCode::PageDown if self.detail_fullscreen_active(DetailSurface::McpSelector) => {
+                    self.page_down_detail_fullscreen(DetailSurface::McpSelector);
+                }
                 KeyCode::PageUp => self.mcp_selector.page_up(),
                 KeyCode::PageDown => self.mcp_selector.page_down(),
-                KeyCode::Backspace => self.mcp_selector.pop_char(),
-                KeyCode::Char('v') | KeyCode::Char('V') => {
+                KeyCode::Backspace => {
+                    self.mcp_selector.pop_char();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::McpSelector);
+                }
+                KeyCode::Char(' ') => {
+                    if let Some(entry) = self.mcp_selector.current() {
+                        if let Some(command) = entry.toggle_command() {
+                            let query = self.mcp_selector.query.clone();
+                            self.handle_mcp_command(command);
+                            self.open_mcp_selector(Some(&query), false);
+                        }
+                    }
+                }
+                _ if selector_action_key(&key, 'v') => {
                     if let Some(entry) = self.mcp_selector.current() {
                         let command = entry.view_command();
                         self.mcp_selector.active = false;
                         self.handle_mcp_command(command);
                     }
                 }
-                KeyCode::Char('i') | KeyCode::Char('I') => {
+                _ if selector_action_key(&key, 'i') => {
                     if let Some(entry) = self.mcp_selector.current() {
                         if let Some(command) = entry.install_command() {
                             self.mcp_selector.active = false;
@@ -4281,7 +6630,7 @@ impl App {
                         }
                     }
                 }
-                KeyCode::Char('t') | KeyCode::Char('T') => {
+                _ if selector_action_key(&key, 't') => {
                     if let Some(entry) = self.mcp_selector.current() {
                         if entry.kind == McpEntryKind::ConfiguredServer {
                             let command = entry.test_command();
@@ -4290,7 +6639,16 @@ impl App {
                         }
                     }
                 }
-                KeyCode::Char('d') | KeyCode::Char('D') => {
+                _ if selector_action_key(&key, 'c') => {
+                    if let Some(entry) = self.mcp_selector.current() {
+                        if entry.kind == McpEntryKind::ConfiguredServer {
+                            let command = entry.doctor_command();
+                            self.mcp_selector.active = false;
+                            self.handle_mcp_command(command);
+                        }
+                    }
+                }
+                _ if selector_action_key(&key, 'd') => {
                     if let Some(entry) = self.mcp_selector.current() {
                         if let Some(command) = entry.remove_command() {
                             self.mcp_selector.active = false;
@@ -4298,12 +6656,168 @@ impl App {
                         }
                     }
                 }
-                KeyCode::Char(c)
-                    if !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                {
+                KeyCode::Char(c) if selector_search_char(&key) == Some(c) => {
                     self.mcp_selector.push_char(c);
+                    self.reset_detail_fullscreen_scroll(DetailSurface::McpSelector);
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        if self.remote_mcp_browser.selector.active {
+            match key.code {
+                KeyCode::Esc => {
+                    if !self.close_detail_fullscreen(DetailSurface::RemoteMcpBrowser) {
+                        self.remote_mcp_browser.selector.active = false;
+                        self.needs_redraw = true;
+                    }
+                }
+                _ if selector_action_key(&key, 'z') => {
+                    self.toggle_detail_fullscreen(DetailSurface::RemoteMcpBrowser, 0);
+                }
+                KeyCode::Enter => {
+                    if let Some(entry) = self.remote_mcp_browser.selector.current().cloned() {
+                        match entry.action() {
+                            RemoteMcpAction::Install => self.install_remote_mcp_entry(&entry),
+                            RemoteMcpAction::View => self.view_remote_mcp_entry(&entry),
+                        }
+                    }
+                }
+                _ if selector_action_key(&key, 'i') => {
+                    if let Some(entry) = self.remote_mcp_browser.selector.current().cloned() {
+                        if entry.install.is_some() {
+                            self.install_remote_mcp_entry(&entry);
+                        } else {
+                            self.push_output(
+                                "This remote MCP entry is view-only. Use Enter or V to inspect it.",
+                                OutputRole::System,
+                            );
+                        }
+                    }
+                }
+                _ if selector_action_key(&key, 'v') => {
+                    if let Some(entry) = self.remote_mcp_browser.selector.current().cloned() {
+                        self.view_remote_mcp_entry(&entry);
+                    }
+                }
+                _ if selector_action_key(&key, 'r') => {
+                    self.schedule_remote_mcp_search(true);
+                }
+                _ if selector_action_key(&key, 'l') => {
+                    self.remote_mcp_browser.selector.active = false;
+                    self.close_detail_fullscreen(DetailSurface::RemoteMcpBrowser);
+                    self.open_mcp_selector(None, false);
+                }
+                KeyCode::Up => {
+                    self.remote_mcp_browser.selector.move_up();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::RemoteMcpBrowser);
+                }
+                KeyCode::Down => {
+                    self.remote_mcp_browser.selector.move_down();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::RemoteMcpBrowser);
+                }
+                KeyCode::PageUp
+                    if self.detail_fullscreen_active(DetailSurface::RemoteMcpBrowser) =>
+                {
+                    self.page_up_detail_fullscreen(DetailSurface::RemoteMcpBrowser);
+                }
+                KeyCode::PageDown
+                    if self.detail_fullscreen_active(DetailSurface::RemoteMcpBrowser) =>
+                {
+                    self.page_down_detail_fullscreen(DetailSurface::RemoteMcpBrowser);
+                }
+                KeyCode::PageUp => self.remote_mcp_browser.selector.page_up(),
+                KeyCode::PageDown => self.remote_mcp_browser.selector.page_down(),
+                KeyCode::Backspace => {
+                    self.remote_mcp_browser.selector.pop_char();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::RemoteMcpBrowser);
+                    self.schedule_remote_mcp_search(false);
+                }
+                KeyCode::Char(c) if selector_search_char(&key) == Some(c) => {
+                    self.remote_mcp_browser.selector.push_char(c);
+                    self.reset_detail_fullscreen_scroll(DetailSurface::RemoteMcpBrowser);
+                    self.schedule_remote_mcp_search(false);
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        if self.remote_skill_browser.selector.active {
+            match key.code {
+                KeyCode::Esc => {
+                    if !self.close_detail_fullscreen(DetailSurface::RemoteSkillBrowser) {
+                        self.remote_skill_browser.selector.active = false;
+                        self.remote_skill_browser.action_in_flight = None;
+                        self.needs_redraw = true;
+                    }
+                }
+                _ if selector_action_key(&key, 'z') => {
+                    self.toggle_detail_fullscreen(DetailSurface::RemoteSkillBrowser, 0);
+                }
+                KeyCode::Enter => {
+                    if let Some(entry) = self.remote_skill_browser.selector.current().cloned() {
+                        self.run_remote_skill_action(entry);
+                    }
+                }
+                _ if selector_action_key(&key, 'i') => {
+                    if let Some(entry) = self.remote_skill_browser.selector.current().cloned() {
+                        self.run_remote_skill_action(entry);
+                    }
+                }
+                _ if selector_action_key(&key, 'u') => {
+                    if let Some(mut entry) = self.remote_skill_browser.selector.current().cloned() {
+                        if entry.installed_name.is_some() {
+                            entry.action = RemoteSkillAction::Update;
+                            self.run_remote_skill_action(entry);
+                        } else {
+                            self.push_output(
+                                "This remote skill is not hub-installed yet. Use Enter or I to install it.",
+                                OutputRole::System,
+                            );
+                        }
+                    }
+                }
+                _ if selector_action_key(&key, 'r') => {
+                    self.schedule_remote_skill_search(true);
+                }
+                _ if selector_action_key(&key, 'l') => {
+                    self.remote_skill_browser.selector.active = false;
+                    self.close_detail_fullscreen(DetailSurface::RemoteSkillBrowser);
+                    self.refresh_skills_list();
+                    self.skill_selector.activate();
+                    self.needs_redraw = true;
+                }
+                KeyCode::Up => {
+                    self.remote_skill_browser.selector.move_up();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::RemoteSkillBrowser);
+                }
+                KeyCode::Down => {
+                    self.remote_skill_browser.selector.move_down();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::RemoteSkillBrowser);
+                }
+                KeyCode::PageUp
+                    if self.detail_fullscreen_active(DetailSurface::RemoteSkillBrowser) =>
+                {
+                    self.page_up_detail_fullscreen(DetailSurface::RemoteSkillBrowser);
+                }
+                KeyCode::PageDown
+                    if self.detail_fullscreen_active(DetailSurface::RemoteSkillBrowser) =>
+                {
+                    self.page_down_detail_fullscreen(DetailSurface::RemoteSkillBrowser);
+                }
+                KeyCode::PageUp => self.remote_skill_browser.selector.page_up(),
+                KeyCode::PageDown => self.remote_skill_browser.selector.page_down(),
+                KeyCode::Backspace => {
+                    self.remote_skill_browser.selector.pop_char();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::RemoteSkillBrowser);
+                    self.schedule_remote_skill_search(false);
+                }
+                KeyCode::Char(c) if selector_search_char(&key) == Some(c) => {
+                    self.remote_skill_browser.selector.push_char(c);
+                    self.reset_detail_fullscreen_scroll(DetailSurface::RemoteSkillBrowser);
+                    self.schedule_remote_skill_search(false);
                 }
                 _ => {}
             }
@@ -4314,27 +6828,165 @@ impl App {
         if self.skill_selector.active {
             match key.code {
                 KeyCode::Esc => {
-                    self.skill_selector.active = false;
+                    if !self.close_detail_fullscreen(DetailSurface::SkillSelector) {
+                        self.skill_selector.active = false;
+                    }
+                }
+                _ if selector_action_key(&key, 'z') => {
+                    self.toggle_detail_fullscreen(DetailSurface::SkillSelector, 0);
+                }
+                KeyCode::Char(' ') => {
+                    if let Some(name) = self
+                        .skill_selector
+                        .current()
+                        .map(|entry| entry.name.clone())
+                    {
+                        self.set_skill_activation(
+                            &name,
+                            !self.active_skills.iter().any(|skill| skill == &name),
+                        );
+                    }
                 }
                 KeyCode::Enter => {
                     if let Some(entry) = self.skill_selector.current() {
                         let skill_name = format!("/{} ", entry.name);
                         self.skill_selector.active = false;
+                        self.close_detail_fullscreen(DetailSurface::SkillSelector);
                         self.textarea_set_text(&skill_name);
                         self.needs_redraw = true;
                     }
                 }
-                KeyCode::Up => self.skill_selector.move_up(),
-                KeyCode::Down => self.skill_selector.move_down(),
+                KeyCode::Up => {
+                    self.skill_selector.move_up();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::SkillSelector);
+                }
+                KeyCode::Down => {
+                    self.skill_selector.move_down();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::SkillSelector);
+                }
+                KeyCode::PageUp if self.detail_fullscreen_active(DetailSurface::SkillSelector) => {
+                    self.page_up_detail_fullscreen(DetailSurface::SkillSelector);
+                }
+                KeyCode::PageDown
+                    if self.detail_fullscreen_active(DetailSurface::SkillSelector) =>
+                {
+                    self.page_down_detail_fullscreen(DetailSurface::SkillSelector);
+                }
                 KeyCode::PageUp => self.skill_selector.page_up(),
                 KeyCode::PageDown => self.skill_selector.page_down(),
-                KeyCode::Backspace => self.skill_selector.pop_char(),
+                _ if selector_action_key(&key, 'r') => {
+                    self.open_remote_skill_selector(None);
+                }
+                KeyCode::Backspace => {
+                    self.skill_selector.pop_char();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::SkillSelector);
+                }
+                KeyCode::Char(c) if selector_search_char(&key) == Some(c) => {
+                    self.skill_selector.push_char(c);
+                    self.reset_detail_fullscreen_scroll(DetailSurface::SkillSelector);
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        if self.tool_manager.active {
+            match key.code {
+                KeyCode::Esc => {
+                    if !self.close_detail_fullscreen(DetailSurface::ToolManager) {
+                        self.tool_manager.active = false;
+                    }
+                }
+                KeyCode::Tab => {
+                    self.tool_manager_scope = self.tool_manager_scope.next();
+                    let _ = self.refresh_tool_manager_entries();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::ToolManager);
+                }
+                _ if selector_action_key(&key, 'z') => {
+                    self.toggle_detail_fullscreen(DetailSurface::ToolManager, 0);
+                }
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    self.toggle_tool_manager_selected();
+                }
+                KeyCode::Up => {
+                    self.tool_manager.move_up();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::ToolManager);
+                }
+                KeyCode::Down => {
+                    self.tool_manager.move_down();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::ToolManager);
+                }
+                KeyCode::PageUp if self.detail_fullscreen_active(DetailSurface::ToolManager) => {
+                    self.page_up_detail_fullscreen(DetailSurface::ToolManager);
+                }
+                KeyCode::PageDown if self.detail_fullscreen_active(DetailSurface::ToolManager) => {
+                    self.page_down_detail_fullscreen(DetailSurface::ToolManager);
+                }
+                KeyCode::PageUp => self.tool_manager.page_up(),
+                KeyCode::PageDown => self.tool_manager.page_down(),
+                _ if selector_action_key(&key, 'r') => {
+                    self.reset_tool_manager_policy();
+                }
+                KeyCode::Backspace => {
+                    self.tool_manager.pop_char();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::ToolManager);
+                }
+                KeyCode::Char(c) if selector_search_char(&key) == Some(c) => {
+                    self.tool_manager.push_char(c);
+                    self.reset_detail_fullscreen_scroll(DetailSurface::ToolManager);
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        if self.config_selector.active {
+            match key.code {
+                KeyCode::Esc => {
+                    if !self.close_detail_fullscreen(DetailSurface::ConfigSelector) {
+                        self.config_selector.active = false;
+                    }
+                }
+                _ if selector_action_key(&key, 'z') => {
+                    self.toggle_detail_fullscreen(DetailSurface::ConfigSelector, 0);
+                }
+                KeyCode::Enter => {
+                    if let Some(entry) = self.config_selector.current() {
+                        let action = entry.action;
+                        self.config_selector.active = false;
+                        self.close_detail_fullscreen(DetailSurface::ConfigSelector);
+                        self.handle_config_selector_action(action);
+                    }
+                }
+                KeyCode::Up => {
+                    self.config_selector.move_up();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::ConfigSelector);
+                }
+                KeyCode::Down => {
+                    self.config_selector.move_down();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::ConfigSelector);
+                }
+                KeyCode::PageUp if self.detail_fullscreen_active(DetailSurface::ConfigSelector) => {
+                    self.page_up_detail_fullscreen(DetailSurface::ConfigSelector);
+                }
+                KeyCode::PageDown
+                    if self.detail_fullscreen_active(DetailSurface::ConfigSelector) =>
+                {
+                    self.page_down_detail_fullscreen(DetailSurface::ConfigSelector);
+                }
+                KeyCode::PageUp => self.config_selector.page_up(),
+                KeyCode::PageDown => self.config_selector.page_down(),
+                KeyCode::Backspace => {
+                    self.config_selector.pop_char();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::ConfigSelector);
+                }
                 KeyCode::Char(c)
                     if !key
                         .modifiers
                         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                 {
-                    self.skill_selector.push_char(c);
+                    self.config_selector.push_char(c);
+                    self.reset_detail_fullscreen_scroll(DetailSurface::ConfigSelector);
                 }
                 _ => {}
             }
@@ -4371,33 +7023,215 @@ impl App {
             return;
         }
 
-        // Session browser overlay active — same key scheme as skill/model selectors
-        if self.session_browser.active {
+        if self.session_inspector.active() {
             match key.code {
                 KeyCode::Esc => {
-                    self.session_browser.active = false;
-                }
-                KeyCode::Enter => {
-                    if let Some(entry) = self.session_browser.current() {
-                        let session_id = entry.id.clone();
-                        self.session_browser.active = false;
-                        self.handle_resume_session(Some(session_id));
+                    if !self.close_detail_fullscreen(DetailSurface::SessionInspector) {
+                        self.close_session_inspector();
                     }
                 }
-                KeyCode::Up => self.session_browser.move_up(),
-                KeyCode::Down => self.session_browser.move_down(),
-                KeyCode::PageUp => self.session_browser.page_up(),
-                KeyCode::PageDown => self.session_browser.page_down(),
-                KeyCode::Backspace => self.session_browser.pop_char(),
-                KeyCode::Char(c)
-                    if !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                _ if selector_action_key(&key, 'z') => {
+                    self.toggle_detail_fullscreen(
+                        DetailSurface::SessionInspector,
+                        self.session_inspector.pane.scroll,
+                    );
+                }
+                _ if selector_action_key(&key, 'b') => {
+                    self.close_session_inspector();
+                }
+                _ if selector_action_key(&key, 'r') => {
+                    if let Some(session) = self.session_inspector.session.as_ref() {
+                        if session.is_live {
+                            self.push_output(
+                                "The current session is already active.",
+                                OutputRole::System,
+                            );
+                        } else {
+                            let session_id = session.id.clone();
+                            self.session_inspector.close();
+                            self.session_browser.active = false;
+                            self.close_detail_fullscreen(DetailSurface::SessionInspector);
+                            self.handle_resume_session(Some(session_id));
+                        }
+                    }
+                }
+                KeyCode::Tab | KeyCode::BackTab
+                    if !self.detail_fullscreen_active(DetailSurface::SessionInspector) =>
                 {
-                    self.session_browser.push_char(c);
+                    self.session_inspector.pane.focus = self.session_inspector.pane.focus.toggle();
+                }
+                KeyCode::Up => {
+                    self.session_inspector.selector.move_up();
+                    self.session_inspector.pane.reset_scroll();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::SessionInspector);
+                }
+                KeyCode::Down => {
+                    self.session_inspector.selector.move_down();
+                    self.session_inspector.pane.reset_scroll();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::SessionInspector);
+                }
+                KeyCode::PageUp
+                    if self.detail_fullscreen_active(DetailSurface::SessionInspector) =>
+                {
+                    self.page_up_detail_fullscreen(DetailSurface::SessionInspector);
+                }
+                KeyCode::PageUp => {
+                    if self.session_inspector.pane.focus == SplitPaneFocus::Detail {
+                        self.session_inspector.pane.page_up(8);
+                    } else {
+                        self.session_inspector.selector.page_up();
+                        self.session_inspector.pane.reset_scroll();
+                        self.reset_detail_fullscreen_scroll(DetailSurface::SessionInspector);
+                    }
+                }
+                KeyCode::PageDown
+                    if self.detail_fullscreen_active(DetailSurface::SessionInspector) =>
+                {
+                    self.page_down_detail_fullscreen(DetailSurface::SessionInspector);
+                }
+                KeyCode::PageDown => {
+                    if self.session_inspector.pane.focus == SplitPaneFocus::Detail {
+                        self.session_inspector.pane.page_down(8);
+                    } else {
+                        self.session_inspector.selector.page_down();
+                        self.session_inspector.pane.reset_scroll();
+                        self.reset_detail_fullscreen_scroll(DetailSurface::SessionInspector);
+                    }
+                }
+                KeyCode::Home => {
+                    self.session_inspector.selector.selected = 0;
+                    self.session_inspector.pane.reset_scroll();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::SessionInspector);
+                }
+                KeyCode::End => {
+                    self.session_inspector.selector.selected = self
+                        .session_inspector
+                        .selector
+                        .filtered
+                        .len()
+                        .saturating_sub(1);
+                    self.session_inspector.pane.reset_scroll();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::SessionInspector);
+                }
+                KeyCode::Backspace => {
+                    self.session_inspector.selector.pop_char();
+                    self.session_inspector.pane.reset_scroll();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::SessionInspector);
+                }
+                KeyCode::Char(c) if selector_search_char(&key) == Some(c) => {
+                    self.session_inspector.selector.push_char(c);
+                    self.session_inspector.pane.reset_scroll();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::SessionInspector);
                 }
                 _ => {}
             }
+            self.needs_redraw = true;
+            return;
+        }
+
+        // Session browser overlay active — search-first, explicit uppercase actions
+        if self.session_browser.active {
+            match key.code {
+                KeyCode::Esc => {
+                    if !self.close_detail_fullscreen(DetailSurface::SessionBrowser) {
+                        self.session_browser.active = false;
+                    }
+                }
+                _ if selector_action_key(&key, 'z') => {
+                    self.toggle_detail_fullscreen(
+                        DetailSurface::SessionBrowser,
+                        self.session_browser_pane.scroll,
+                    );
+                }
+                KeyCode::Enter => {
+                    if let Some(entry) = self.session_browser.current().cloned() {
+                        self.close_detail_fullscreen(DetailSurface::SessionBrowser);
+                        self.open_session_inspector(entry);
+                    }
+                }
+                _ if selector_action_key(&key, 'r') => {
+                    if let Some(entry) = self.session_browser.current() {
+                        let session_id = entry.id.clone();
+                        self.session_browser.active = false;
+                        self.close_detail_fullscreen(DetailSurface::SessionBrowser);
+                        self.handle_resume_session(Some(session_id));
+                    }
+                }
+                _ if selector_action_key(&key, 'd') => {
+                    if let Some(session_id) =
+                        self.session_browser.current().map(|entry| entry.id.clone())
+                    {
+                        self.delete_session_from_browser(&session_id);
+                        self.reset_detail_fullscreen_scroll(DetailSurface::SessionBrowser);
+                    }
+                }
+                KeyCode::Tab | KeyCode::BackTab
+                    if !self.detail_fullscreen_active(DetailSurface::SessionBrowser) =>
+                {
+                    self.session_browser_pane.focus = self.session_browser_pane.focus.toggle();
+                }
+                KeyCode::Up => {
+                    self.session_browser.move_up();
+                    self.session_browser_pane.reset_scroll();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::SessionBrowser);
+                }
+                KeyCode::Down => {
+                    self.session_browser.move_down();
+                    self.session_browser_pane.reset_scroll();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::SessionBrowser);
+                }
+                KeyCode::PageUp if self.detail_fullscreen_active(DetailSurface::SessionBrowser) => {
+                    self.page_up_detail_fullscreen(DetailSurface::SessionBrowser);
+                }
+                KeyCode::PageUp => {
+                    if self.session_browser_pane.focus == SplitPaneFocus::Detail {
+                        self.session_browser_pane.page_up(8);
+                    } else {
+                        self.session_browser.page_up();
+                        self.session_browser_pane.reset_scroll();
+                        self.reset_detail_fullscreen_scroll(DetailSurface::SessionBrowser);
+                    }
+                }
+                KeyCode::PageDown
+                    if self.detail_fullscreen_active(DetailSurface::SessionBrowser) =>
+                {
+                    self.page_down_detail_fullscreen(DetailSurface::SessionBrowser);
+                }
+                KeyCode::PageDown => {
+                    if self.session_browser_pane.focus == SplitPaneFocus::Detail {
+                        self.session_browser_pane.page_down(8);
+                    } else {
+                        self.session_browser.page_down();
+                        self.session_browser_pane.reset_scroll();
+                        self.reset_detail_fullscreen_scroll(DetailSurface::SessionBrowser);
+                    }
+                }
+                KeyCode::Home => {
+                    self.session_browser.selected = 0;
+                    self.session_browser_pane.reset_scroll();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::SessionBrowser);
+                }
+                KeyCode::End => {
+                    self.session_browser.selected =
+                        self.session_browser.filtered.len().saturating_sub(1);
+                    self.session_browser_pane.reset_scroll();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::SessionBrowser);
+                }
+                KeyCode::Backspace => {
+                    self.session_browser.pop_char();
+                    self.session_browser_pane.reset_scroll();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::SessionBrowser);
+                    self.refresh_session_browser();
+                }
+                KeyCode::Char(c) if selector_search_char(&key) == Some(c) => {
+                    self.session_browser.push_char(c);
+                    self.session_browser_pane.reset_scroll();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::SessionBrowser);
+                    self.refresh_session_browser();
+                }
+                _ => {}
+            }
+            self.needs_redraw = true;
             return;
         }
 
@@ -4589,6 +7423,9 @@ impl App {
         self.in_flight_tool_count = 0;
         self.active_subagents.clear();
         self.turn_stream_tokens = 0;
+        self.hidden_tool_calls.clear();
+        self.active_tools.clear();
+        self.seen_tool_signatures.clear();
         // Reset the response accumulator for the new turn (voice mode uses it).
         self.last_agent_response_text.clear();
         self.display_state = DisplayState::AwaitingFirstToken {
@@ -4638,10 +7475,30 @@ impl App {
                     StreamEvent::Reasoning(text) => {
                         let _ = tx.send(AgentResponse::Reasoning(text));
                     }
-                    StreamEvent::ToolExec { name, args_json } => {
-                        let _ = tx.send(AgentResponse::ToolExec { name, args_json });
+                    StreamEvent::ToolExec {
+                        tool_call_id,
+                        name,
+                        args_json,
+                    } => {
+                        let _ = tx.send(AgentResponse::ToolExec {
+                            tool_call_id,
+                            name,
+                            args_json,
+                        });
+                    }
+                    StreamEvent::ToolProgress {
+                        tool_call_id,
+                        name,
+                        message,
+                    } => {
+                        let _ = tx.send(AgentResponse::ToolProgress {
+                            tool_call_id,
+                            name,
+                            message,
+                        });
                     }
                     StreamEvent::ToolDone {
+                        tool_call_id,
                         name,
                         args_json,
                         result_preview,
@@ -4649,6 +7506,7 @@ impl App {
                         is_error,
                     } => {
                         let _ = tx.send(AgentResponse::ToolDone {
+                            tool_call_id,
                             name,
                             args_json,
                             result_preview,
@@ -4816,14 +7674,29 @@ impl App {
             CommandResult::ModelSelector => {
                 self.refresh_model_selector_catalog();
             }
+            CommandResult::CheapModelSelector => {
+                self.open_cheap_model_selector();
+            }
             CommandResult::VisionModelSelector => {
                 self.open_vision_model_selector();
             }
             CommandResult::ImageModelSelector => {
                 self.open_image_model_selector();
             }
+            CommandResult::MoaAggregatorSelector => {
+                self.open_moa_aggregator_selector();
+            }
+            CommandResult::MoaReferenceSelector => {
+                self.open_moa_reference_selector();
+            }
+            CommandResult::ShowCheapModel => {
+                self.handle_show_cheap_model();
+            }
             CommandResult::ShowVisionModel => {
                 self.handle_show_vision_model();
+            }
+            CommandResult::SetCheapModel(spec) => {
+                self.handle_set_cheap_model(spec);
             }
             CommandResult::SetVisionModel(spec) => {
                 self.handle_set_vision_model(spec);
@@ -4833,6 +7706,24 @@ impl App {
             }
             CommandResult::SetImageModel(spec) => {
                 self.handle_set_image_model(spec);
+            }
+            CommandResult::ShowMoaConfig => {
+                self.handle_show_moa_config();
+            }
+            CommandResult::SetMoaEnabled(enabled) => {
+                self.handle_set_moa_enabled(enabled);
+            }
+            CommandResult::SetMoaAggregator(spec) => {
+                self.handle_set_moa_aggregator(spec);
+            }
+            CommandResult::AddMoaReference(spec) => {
+                self.handle_add_moa_reference(spec);
+            }
+            CommandResult::RemoveMoaReference(spec) => {
+                self.handle_remove_moa_reference(spec);
+            }
+            CommandResult::ResetMoaConfig => {
+                self.handle_reset_moa_config();
             }
             CommandResult::ShowMcp(args) => {
                 self.handle_mcp_command(args);
@@ -4947,13 +7838,19 @@ impl App {
             CommandResult::ShowPrompt => {
                 self.handle_show_prompt();
             }
+            CommandResult::ShowConfig(args) => {
+                self.handle_config_command(args);
+            }
             CommandResult::ShowHistory => {
                 self.handle_show_history();
             }
             CommandResult::ToggleVerbose => {
-                self.verbose = !self.verbose;
-                let state = if self.verbose { "ON" } else { "OFF" };
-                self.push_output(format!("Verbose mode: {state}"), OutputRole::System);
+                let msg = self.cycle_tool_progress_mode();
+                self.push_output(msg, OutputRole::System);
+            }
+            CommandResult::SetToolProgress(mode) => {
+                let msg = self.handle_tool_progress_command(mode);
+                self.push_output(msg, OutputRole::System);
             }
             CommandResult::SaveSession(path) => {
                 self.handle_save_session(path);
@@ -4964,8 +7861,11 @@ impl App {
             CommandResult::SetTitle(title) => {
                 self.handle_set_title(title);
             }
-            CommandResult::SessionList => {
-                self.handle_session_list();
+            CommandResult::InspectCurrentSession => {
+                self.handle_inspect_current_session();
+            }
+            CommandResult::SessionBrowse(query) => {
+                self.handle_session_browser_command(query);
             }
             CommandResult::SessionSwitch(id) => {
                 self.handle_resume_session(Some(id));
@@ -4994,30 +7894,28 @@ impl App {
             CommandResult::BackgroundPrompt(prompt) => {
                 self.handle_background_prompt(prompt);
             }
-            CommandResult::Approve => {
-                self.push_output("Approved. (No pending actions.)", OutputRole::System);
-            }
-            CommandResult::Deny => {
-                self.push_output("Denied. (No pending actions.)", OutputRole::System);
-            }
             CommandResult::ShowSkills(args) => {
                 self.handle_show_skills(args);
             }
             CommandResult::SkillSelector => {
+                self.remote_skill_browser.selector.active = false;
                 self.refresh_skills_list();
                 self.skill_selector.activate();
             }
-            CommandResult::ShowTools => {
-                self.handle_show_tools();
+            CommandResult::ToolManager(mode) => {
+                self.open_tool_manager(mode);
             }
-            CommandResult::ShowToolsets => {
-                self.handle_show_toolsets();
+            CommandResult::ResetToolPolicy => {
+                self.reset_tool_manager_policy();
             }
             CommandResult::SetReasoning(level) => {
                 self.handle_set_reasoning(level);
             }
             CommandResult::SetStreaming(mode) => {
                 self.handle_set_streaming(mode);
+            }
+            CommandResult::SetStatusBar(mode) => {
+                self.handle_status_bar_command(mode);
             }
             CommandResult::ListModels(filter) => {
                 self.handle_list_models(filter);
@@ -5052,6 +7950,9 @@ impl App {
             CommandResult::MouseMode(mode) => {
                 self.handle_mouse_mode(mode);
             }
+            CommandResult::ApprovalChoice(choice) => {
+                self.handle_approval_choice_command(choice);
+            }
             #[cfg(target_os = "macos")]
             CommandResult::MacosPermissions(args) => {
                 let report = crate::permissions::run_permissions_command(&args);
@@ -5071,6 +7972,15 @@ impl App {
             }
             CommandResult::BrowserCommand(args) => {
                 self.handle_browser_command(args);
+            }
+            CommandResult::SetHomeChannel(args) => {
+                self.handle_set_home_channel(args);
+            }
+            CommandResult::GatewayControl(args) => {
+                self.handle_gateway_control(args);
+            }
+            CommandResult::CheckUpdates => {
+                self.handle_update_status();
             }
         }
     }
@@ -5118,6 +8028,247 @@ impl App {
                 self.push_output("Usage: /mouse [on|off|toggle|status]", OutputRole::System);
             }
         }
+    }
+
+    fn apply_approval_choice(&mut self, choice: edgecrab_core::ApprovalChoice) {
+        let full_command =
+            if let DisplayState::WaitingForApproval { full_command, .. } = &self.display_state {
+                Some(full_command.clone())
+            } else {
+                None
+            };
+
+        if matches!(
+            choice,
+            edgecrab_core::ApprovalChoice::Session | edgecrab_core::ApprovalChoice::Always
+        ) {
+            if let Some(full_command) = full_command.as_deref() {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                full_command.hash(&mut hasher);
+                self.session_approvals
+                    .insert(format!("{:x}", hasher.finish()));
+            }
+        }
+
+        if let Some(tx) = self.approval_pending_tx.take() {
+            let is_deny = choice == edgecrab_core::ApprovalChoice::Deny;
+            let _ = tx.send(choice);
+            self.display_state = if is_deny {
+                DisplayState::Idle
+            } else {
+                DisplayState::AwaitingFirstToken {
+                    frame: 0,
+                    started: Instant::now(),
+                }
+            };
+            self.needs_redraw = true;
+        }
+    }
+
+    fn handle_approval_choice_command(&mut self, choice: edgecrab_core::ApprovalChoice) {
+        if self.approval_pending_tx.is_some() {
+            let text = match &choice {
+                edgecrab_core::ApprovalChoice::Once => "Approved current command once.",
+                edgecrab_core::ApprovalChoice::Session => {
+                    "Approved current command for the rest of this session."
+                }
+                edgecrab_core::ApprovalChoice::Always => "Approved current command permanently.",
+                edgecrab_core::ApprovalChoice::Deny => "Denied current command.",
+            };
+            self.apply_approval_choice(choice);
+            self.push_output(text, OutputRole::System);
+            return;
+        }
+
+        if choice == edgecrab_core::ApprovalChoice::Deny
+            && let Some(tx) = self.clarify_pending_tx.take()
+        {
+            let _ = tx.send(String::new());
+            self.display_state = DisplayState::Idle;
+            self.push_output(
+                "Cancelled the pending clarification prompt.",
+                OutputRole::System,
+            );
+            self.needs_redraw = true;
+            return;
+        }
+
+        self.push_output(
+            "No pending approval prompt. Use /deny only when EdgeCrab is explicitly waiting for approval or clarification.",
+            OutputRole::System,
+        );
+    }
+
+    fn configured_home_channel_platforms(
+        &self,
+        config: &edgecrab_core::AppConfig,
+    ) -> Vec<&'static str> {
+        let mut platforms = Vec::new();
+        if config.gateway.platform_enabled("telegram") || config.gateway.telegram.enabled {
+            platforms.push("telegram");
+        }
+        if config.gateway.platform_enabled("discord") || config.gateway.discord.enabled {
+            platforms.push("discord");
+        }
+        if config.gateway.platform_enabled("slack") || config.gateway.slack.enabled {
+            platforms.push("slack");
+        }
+        platforms
+    }
+
+    fn set_home_channel_in_config(
+        &self,
+        config: &mut edgecrab_core::AppConfig,
+        platform: &str,
+        channel: Option<String>,
+    ) -> anyhow::Result<()> {
+        match platform {
+            "telegram" => {
+                config.gateway.telegram.enabled = true;
+                config.gateway.enable_platform("telegram");
+                config.gateway.telegram.home_channel = channel;
+            }
+            "discord" => {
+                config.gateway.discord.enabled = true;
+                config.gateway.enable_platform("discord");
+                config.gateway.discord.home_channel = channel;
+            }
+            "slack" => {
+                config.gateway.slack.enabled = true;
+                config.gateway.enable_platform("slack");
+                config.gateway.slack.home_channel = channel;
+            }
+            _ => anyhow::bail!(
+                "Unsupported platform '{platform}'. Supported platforms: telegram, discord, slack"
+            ),
+        }
+        Ok(())
+    }
+
+    fn handle_set_home_channel(&mut self, args: String) {
+        let trimmed = args.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("status") {
+            let config = self.load_runtime_config();
+            self.push_output(
+                self.render_gateway_home_channel_summary(&config),
+                OutputRole::System,
+            );
+            return;
+        }
+
+        let mut parts = trimmed.split_whitespace();
+        let first = parts.next().unwrap_or_default();
+        let supported = ["telegram", "discord", "slack"];
+
+        let (platform, value) = if supported.contains(&first) {
+            let rest = parts.collect::<Vec<_>>().join(" ");
+            if rest.is_empty() {
+                self.push_output(
+                    "Usage: /sethome <platform> <channel|clear>",
+                    OutputRole::System,
+                );
+                return;
+            }
+            (first.to_string(), rest)
+        } else {
+            let config = self.load_runtime_config();
+            let enabled = self.configured_home_channel_platforms(&config);
+            if enabled.len() != 1 {
+                self.push_output(
+                    "Ambiguous home-channel target. Use: /sethome <telegram|discord|slack> <channel|clear>",
+                    OutputRole::System,
+                );
+                return;
+            }
+            (enabled[0].to_string(), trimmed.to_string())
+        };
+
+        let channel = if value.eq_ignore_ascii_case("clear") {
+            None
+        } else {
+            Some(value)
+        };
+
+        let mut config = self.load_runtime_config();
+        match self.set_home_channel_in_config(&mut config, &platform, channel.clone()) {
+            Ok(()) => match config.save() {
+                Ok(()) => {
+                    let text = match channel {
+                        Some(channel) => {
+                            format!("Home channel for {platform} set to: {channel}")
+                        }
+                        None => format!("Home channel for {platform} cleared."),
+                    };
+                    self.push_output(text, OutputRole::System);
+                }
+                Err(err) => self.push_output(
+                    format!(
+                        "Updated {platform} home channel in memory, but saving config failed: {err}"
+                    ),
+                    OutputRole::Error,
+                ),
+            },
+            Err(err) => self.push_output(err.to_string(), OutputRole::Error),
+        }
+    }
+
+    fn handle_update_status(&mut self) {
+        let tx = self.response_tx.clone();
+        self.display_state = DisplayState::BgOp {
+            label: "Checking update status…".into(),
+            frame: 0,
+            started: Instant::now(),
+        };
+        self.needs_redraw = true;
+        self.rt_handle.spawn(async move {
+            let report = tokio::task::spawn_blocking(render_update_status_report)
+                .await
+                .unwrap_or_else(|err| format!("Update check failed: {err}"));
+            let _ = tx.send(AgentResponse::BgOp(BackgroundOpResult::SystemMsg(report)));
+        });
+    }
+
+    fn handle_gateway_control(&mut self, args: String) {
+        let action = match args.trim().to_ascii_lowercase().as_str() {
+            "" | "status" => crate::gateway_cmd::GatewayAction::Status,
+            "start" => crate::gateway_cmd::GatewayAction::Start { foreground: false },
+            "stop" => crate::gateway_cmd::GatewayAction::Stop,
+            "restart" => crate::gateway_cmd::GatewayAction::Restart,
+            other => {
+                self.push_output(
+                    format!(
+                        "Unknown gateway action '{other}'. Use: /gateway [start|stop|restart|status]"
+                    ),
+                    OutputRole::System,
+                );
+                return;
+            }
+        };
+
+        let label = match action {
+            crate::gateway_cmd::GatewayAction::Start { .. } => "Starting gateway…",
+            crate::gateway_cmd::GatewayAction::Stop => "Stopping gateway…",
+            crate::gateway_cmd::GatewayAction::Restart => "Restarting gateway…",
+            crate::gateway_cmd::GatewayAction::Status => "Inspecting gateway…",
+        };
+
+        let tx = self.response_tx.clone();
+        let cli_args = current_launch_cli_args();
+        self.display_state = DisplayState::BgOp {
+            label: label.into(),
+            frame: 0,
+            started: Instant::now(),
+        };
+        self.needs_redraw = true;
+        self.rt_handle.spawn(async move {
+            let result = crate::gateway_cmd::run_capture(action, &cli_args).await;
+            let payload = match result {
+                Ok(report) => BackgroundOpResult::GatewayCommandDone { report },
+                Err(err) => BackgroundOpResult::SystemMsg(format!("Gateway command failed: {err}")),
+            };
+            let _ = tx.send(AgentResponse::BgOp(payload));
+        });
     }
 
     fn take_mouse_capture_request(&mut self) -> Option<bool> {
@@ -5223,7 +8374,11 @@ impl App {
                         self.needs_redraw = true;
                     }
                 }
-                AgentResponse::ToolExec { name, args_json } => {
+                AgentResponse::ToolExec {
+                    tool_call_id,
+                    name,
+                    args_json,
+                } => {
                     // CRITICAL: Break the streaming buffer at the tool boundary.
                     // Without this, tokens arriving after the tool call append to
                     // the pre-tool text, visually merging text before and after
@@ -5232,86 +8387,186 @@ impl App {
                     // Track parallel in-flight tools — multiple ToolExec events
                     // may arrive before any ToolDone (parallel tool dispatch).
                     self.in_flight_tool_count = self.in_flight_tool_count.saturating_add(1);
+                    self.progress_seq = self.progress_seq.saturating_add(1);
+                    let started_at = Instant::now();
+                    self.active_tools.insert(
+                        tool_call_id.clone(),
+                        ActiveToolStatus {
+                            name: name.clone(),
+                            args_json: args_json.clone(),
+                            last_detail: None,
+                            started_at,
+                            last_seq: self.progress_seq,
+                        },
+                    );
                     self.display_state = DisplayState::ToolExec {
+                        tool_call_id: tool_call_id.clone(),
                         name: name.clone(),
                         args_json: args_json.clone(),
+                        detail: None,
                         frame: 0,
-                        started: Instant::now(),
+                        started: started_at,
                     };
-                    // Push a live "in-flight" placeholder line to the output area.
-                    //
-                    // WHY immediately: Long tool operations (web fetch, terminal,
-                    // delegate) can take 10-60 s.  Without this placeholder the
-                    // output area appears frozen — only the status-bar spinner
-                    // moves.  The placeholder gives the user a place in the
-                    // scrollable transcript to see that work is happening, and
-                    // ToolDone later upgrades it in-place with timing/result
-                    // info (no layout shift).
-                    let edit_snapshot = capture_local_edit_snapshot(&name, &args_json);
-                    let running_spans =
-                        build_tool_running_line(&name, &args_json, &self.theme.tool_emojis);
-                    let line_idx = self.output.len();
-                    self.output.push(OutputLine {
-                        text: String::new(),
-                        role: OutputRole::Tool,
-                        prebuilt_spans: Some(running_spans),
-                        rendered: None,
-                    });
-                    self.pending_tool_lines.push_back(PendingToolLine {
+                    if self.should_render_tool_call(&name, &args_json) {
+                        // Push a live "in-flight" placeholder line to the output area.
+                        //
+                        // WHY immediately: Long tool operations (web fetch, terminal,
+                        // delegate) can take 10-60 s.  Without this placeholder the
+                        // output area appears frozen — only the status-bar spinner
+                        // moves.  The placeholder gives the user a place in the
+                        // scrollable transcript to see that work is happening, and
+                        // ToolDone later upgrades it in-place with timing/result
+                        // info (no layout shift).
+                        let edit_snapshot = capture_local_edit_snapshot(&name, &args_json);
+                        let running_spans = build_tool_running_line(
+                            &name,
+                            &args_json,
+                            None,
+                            &self.theme.tool_emojis,
+                        );
+                        let line_idx = self.output.len();
+                        self.output.push(OutputLine {
+                            text: String::new(),
+                            role: OutputRole::Tool,
+                            prebuilt_spans: Some(running_spans),
+                            rendered: None,
+                        });
+                        self.pending_tool_lines.insert(
+                            tool_call_id,
+                            PendingToolLine {
+                                tool_name: name,
+                                args_json,
+                                line_idx,
+                                edit_snapshot,
+                            },
+                        );
+                    } else {
+                        self.hidden_tool_calls.insert(tool_call_id);
+                    }
+                    if self.at_bottom {
+                        self.scroll_offset = 0;
+                    }
+                    self.needs_redraw = true;
+                }
+                AgentResponse::ToolProgress {
+                    tool_call_id,
+                    name,
+                    message,
+                } => {
+                    let detail = message.trim().to_string();
+                    if detail.is_empty() {
+                        continue;
+                    }
+                    self.progress_seq = self.progress_seq.saturating_add(1);
+                    if let Some(status) = self.active_tools.get_mut(&tool_call_id) {
+                        status.last_detail = Some(detail.clone());
+                        status.last_seq = self.progress_seq;
+                    }
+                    if let DisplayState::ToolExec {
+                        tool_call_id: active_tool_call_id,
+                        detail: active_detail,
+                        ..
+                    } = &mut self.display_state
+                    {
+                        if active_tool_call_id == &tool_call_id {
+                            *active_detail = Some(detail.clone());
+                        }
+                    }
+                    if self.hidden_tool_calls.contains(&tool_call_id) {
+                        if self.at_bottom {
+                            self.scroll_offset = 0;
+                        }
+                        self.needs_redraw = true;
+                        continue;
+                    }
+                    if let Some(PendingToolLine {
                         line_idx,
-                        edit_snapshot,
-                    });
+                        tool_name,
+                        args_json,
+                        ..
+                    }) = self.pending_tool_lines.get(&tool_call_id).cloned()
+                    {
+                        if line_idx < self.output.len() {
+                            self.output[line_idx].prebuilt_spans = Some(build_tool_running_line(
+                                &tool_name,
+                                &args_json,
+                                Some(detail.as_str()),
+                                &self.theme.tool_emojis,
+                            ));
+                            self.output[line_idx].rendered = None;
+                        }
+                    } else {
+                        self.push_output(
+                            format!("{}: {detail}", name.replace('_', " ")),
+                            OutputRole::System,
+                        );
+                    }
                     if self.at_bottom {
                         self.scroll_offset = 0;
                     }
                     self.needs_redraw = true;
                 }
                 AgentResponse::ToolDone {
+                    tool_call_id,
                     name,
                     args_json,
                     result_preview,
                     duration_ms,
                     is_error,
                 } => {
+                    let hidden = self.hidden_tool_calls.remove(&tool_call_id);
                     // Build the final styled completion spans.
-                    let spans = build_tool_done_line(
-                        &name,
-                        &args_json,
-                        result_preview.as_deref(),
-                        duration_ms,
-                        is_error,
-                        &self.theme.tool_emojis,
-                    );
-                    // Upgrade the in-flight placeholder in-place (if present).
-                    //
-                    // WHY in-place: replacing the placeholder avoids appending a
-                    // second line for the same tool call — the layout stays stable
-                    // (no shift), and the cyan "···" naturally becomes the gold
-                    // timing string without any visual flash.
-                    let pending = self.pending_tool_lines.pop_front();
-                    if let Some(PendingToolLine { line_idx, .. }) = pending.as_ref() {
-                        if *line_idx < self.output.len() {
-                            self.output[*line_idx].prebuilt_spans = Some(spans);
-                            self.output[*line_idx].rendered = None; // invalidate cache
+                    let pending = self.pending_tool_lines.remove(&tool_call_id);
+                    self.active_tools.remove(&tool_call_id);
+                    if !hidden {
+                        let spans = build_tool_done_line(
+                            &name,
+                            &args_json,
+                            result_preview.as_deref(),
+                            duration_ms,
+                            is_error,
+                            &self.theme.tool_emojis,
+                        );
+                        // Upgrade the in-flight placeholder in-place (if present).
+                        //
+                        // WHY in-place: replacing the placeholder avoids appending a
+                        // second line for the same tool call — the layout stays stable
+                        // (no shift), and the cyan "···" naturally becomes the gold
+                        // timing string without any visual flash.
+                        if let Some(PendingToolLine { line_idx, .. }) = pending.as_ref() {
+                            if *line_idx < self.output.len() {
+                                self.output[*line_idx].prebuilt_spans = Some(spans);
+                                self.output[*line_idx].rendered = None; // invalidate cache
+                            } else {
+                                // Index out of range — fall back to append (shouldn't happen).
+                                self.push_output_spans(spans, OutputRole::Tool);
+                            }
                         } else {
-                            // Index out of range — fall back to append (shouldn't happen).
+                            // No pending placeholder (e.g. streaming disabled, or the
+                            // tool fired before the feature was introduced) — append.
                             self.push_output_spans(spans, OutputRole::Tool);
                         }
-                    } else {
-                        // No pending placeholder (e.g. streaming disabled, or the
-                        // tool fired before the feature was introduced) — append.
-                        self.push_output_spans(spans, OutputRole::Tool);
-                    }
-                    if let Some(diff_lines) = render_edit_diff_lines(
-                        &name,
-                        &args_json,
-                        is_error,
-                        pending
-                            .as_ref()
-                            .and_then(|entry| entry.edit_snapshot.as_ref()),
-                    ) {
-                        for line in diff_lines {
-                            self.push_output_spans(line, OutputRole::Tool);
+                        if self.tool_progress_mode == ToolProgressMode::Verbose {
+                            for line in build_tool_verbose_lines(
+                                &name,
+                                &args_json,
+                                result_preview.as_deref(),
+                                is_error,
+                            ) {
+                                self.push_output_spans(line, OutputRole::Tool);
+                            }
+                        }
+                        if let Some(diff_lines) = render_edit_diff_lines(
+                            &name,
+                            &args_json,
+                            is_error,
+                            pending
+                                .as_ref()
+                                .and_then(|entry| entry.edit_snapshot.as_ref()),
+                        ) {
+                            for line in diff_lines {
+                                self.push_output_spans(line, OutputRole::Tool);
+                            }
                         }
                     }
                     // Decrement the in-flight counter. Only transition back to
@@ -5322,6 +8577,17 @@ impl App {
                         self.display_state = DisplayState::AwaitingFirstToken {
                             frame: 0,
                             started: Instant::now(),
+                        };
+                    } else if let Some((active_tool_call_id, active)) =
+                        latest_active_tool_entry(&self.active_tools)
+                    {
+                        self.display_state = DisplayState::ToolExec {
+                            tool_call_id: active_tool_call_id.clone(),
+                            name: active.name.clone(),
+                            args_json: active.args_json.clone(),
+                            detail: active.last_detail.clone(),
+                            frame: 0,
+                            started: active.started_at,
                         };
                     }
                     self.needs_redraw = true;
@@ -5461,6 +8727,9 @@ impl App {
                     self.active_subagents.clear();
                     self.turn_stream_tokens = 0;
                     self.pending_tool_lines.clear();
+                    self.hidden_tool_calls.clear();
+                    self.active_tools.clear();
+                    self.seen_tool_signatures.clear();
                     self.display_state = DisplayState::Idle;
                     self.last_response_time = Some(Instant::now());
                     self.turn_count += 1;
@@ -5495,6 +8764,9 @@ impl App {
                     self.active_subagents.clear();
                     self.turn_stream_tokens = 0;
                     self.pending_tool_lines.clear();
+                    self.hidden_tool_calls.clear();
+                    self.active_tools.clear();
+                    self.seen_tool_signatures.clear();
                     self.display_state = DisplayState::Idle;
                     self.push_output(err, OutputRole::Error);
                     if self.voice_continuous_active {
@@ -5587,20 +8859,29 @@ impl App {
                     self.needs_redraw = true;
                 }
                 AgentResponse::BgOp(result) => {
-                    // A background task completed — restore idle state, then act
-                    // on the specific result type.
-                    self.display_state = DisplayState::Idle;
-                    self.needs_redraw = true;
+                    if matches!(self.display_state, DisplayState::BgOp { .. }) {
+                        self.display_state = DisplayState::Idle;
+                        self.needs_redraw = true;
+                    }
                     match result {
                         BackgroundOpResult::ModelCatalogReady {
                             models,
                             current_model,
                         } => {
-                            self.model_selector.set_items(models);
-                            self.model_selector.activate_with_primary(&current_model);
+                            self.model_selector_refresh_in_flight = false;
+                            self.apply_model_selector_catalog(
+                                models,
+                                &current_model,
+                                true,
+                                self.model_selector_target,
+                            );
                         }
                         BackgroundOpResult::SystemMsg(text) => {
                             self.push_output(text, OutputRole::System);
+                        }
+                        BackgroundOpResult::GatewayCommandDone { report } => {
+                            self.push_output(report, OutputRole::System);
+                            self.refresh_gateway_browser();
                         }
                         BackgroundOpResult::ModelSwitchDone { model } => {
                             self.model_name = model.clone();
@@ -5620,6 +8901,46 @@ impl App {
                             self.push_output(msg, OutputRole::System);
                         }
                     }
+                }
+                AgentResponse::RemoteSkillSearchReady {
+                    request_id,
+                    query,
+                    report,
+                } => {
+                    self.apply_remote_skill_search_result(request_id, query, report);
+                }
+                AgentResponse::RemoteMcpSearchReady {
+                    request_id,
+                    query,
+                    report,
+                } => {
+                    self.apply_remote_mcp_search_result(request_id, query, report);
+                }
+                AgentResponse::RemoteSkillActionComplete {
+                    message,
+                    skill_name,
+                } => {
+                    self.remote_skill_browser.action_in_flight = None;
+                    self.refresh_skills_list();
+                    self.push_output(
+                        format!("{message}\nActivate with: /skills view {skill_name}"),
+                        OutputRole::System,
+                    );
+                    if self.remote_skill_browser.selector.active {
+                        self.schedule_remote_skill_search(true);
+                    }
+                }
+                AgentResponse::RemoteSkillActionFailed {
+                    action_label,
+                    identifier,
+                    error,
+                } => {
+                    self.remote_skill_browser.action_in_flight = None;
+                    self.push_output(
+                        format!("Remote {action_label} failed for '{identifier}': {error}"),
+                        OutputRole::Error,
+                    );
+                    self.needs_redraw = true;
                 }
                 AgentResponse::VoiceTranscript {
                     transcript,
@@ -5774,15 +9095,13 @@ impl App {
         const CHOICES: usize = 4; // Once / Session / Always / Deny
 
         // Extract mutable fields we need while avoiding the borrow-checker
-        let (selected, show_full, full_cmd_clone) = if let DisplayState::WaitingForApproval {
+        let (selected, show_full) = if let DisplayState::WaitingForApproval {
             ref mut selected,
             ref mut show_full,
-            ref full_command,
             ..
         } = self.display_state
         {
-            let full_cmd_clone = full_command.clone();
-            (*selected, *show_full, full_cmd_clone)
+            (*selected, *show_full)
         } else {
             return;
         };
@@ -5823,31 +9142,10 @@ impl App {
                     2 => edgecrab_core::ApprovalChoice::Always,
                     _ => edgecrab_core::ApprovalChoice::Deny,
                 };
-
-                // Cache session-level approvals so subsequent identical commands skip
-                // the dialog for the rest of this session.
-                if choice == edgecrab_core::ApprovalChoice::Session {
-                    use std::hash::{Hash, Hasher};
-                    let mut h = std::collections::hash_map::DefaultHasher::new();
-                    full_cmd_clone.hash(&mut h);
-                    let cache_key = format!("{:x}", h.finish());
-                    self.session_approvals.insert(cache_key);
-                }
-
-                if let Some(tx) = self.approval_pending_tx.take() {
-                    let _ = tx.send(choice);
-                }
-                self.display_state = DisplayState::AwaitingFirstToken {
-                    frame: 0,
-                    started: std::time::Instant::now(),
-                };
+                self.apply_approval_choice(choice);
             }
             KeyCode::Esc => {
-                // Esc = deny
-                if let Some(tx) = self.approval_pending_tx.take() {
-                    let _ = tx.send(edgecrab_core::ApprovalChoice::Deny);
-                }
-                self.display_state = DisplayState::Idle;
+                self.apply_approval_choice(edgecrab_core::ApprovalChoice::Deny);
             }
             _ => {}
         }
@@ -5912,6 +9210,251 @@ impl App {
         self.needs_redraw = true;
     }
 
+    fn handle_value_capture_key(&mut self, key: crossterm::event::KeyEvent) {
+        match key.code {
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                if let DisplayState::ValueCapture { ref mut buffer, .. } = self.display_state {
+                    buffer.push(c);
+                }
+            }
+            KeyCode::Backspace => {
+                if let DisplayState::ValueCapture { ref mut buffer, .. } = self.display_state {
+                    buffer.pop();
+                }
+            }
+            KeyCode::Enter => {
+                let (action, value) = match &mut self.display_state {
+                    DisplayState::ValueCapture { action, buffer, .. } => {
+                        (action.clone(), buffer.trim().to_string())
+                    }
+                    _ => return,
+                };
+                self.display_state = DisplayState::Idle;
+                self.apply_value_capture_action(action, value);
+            }
+            KeyCode::Esc => {
+                self.display_state = DisplayState::Idle;
+                self.needs_redraw = true;
+            }
+            _ => {}
+        }
+        self.needs_redraw = true;
+    }
+
+    fn apply_value_capture_action(&mut self, action: ValueCaptureAction, value: String) {
+        match action {
+            ValueCaptureAction::BindAddress => {
+                let trimmed = value.trim();
+                let bind = if trimmed.eq_ignore_ascii_case("clear") || trimmed.is_empty() {
+                    "127.0.0.1:8080".to_string()
+                } else {
+                    trimmed.to_string()
+                };
+                let Some((host, port)) = bind.rsplit_once(':') else {
+                    self.push_output(
+                        "Bind must use host:port format, for example 127.0.0.1:8080",
+                        OutputRole::Error,
+                    );
+                    return;
+                };
+                let Ok(port) = port.parse::<u16>() else {
+                    self.push_output("Gateway port must be a valid TCP port.", OutputRole::Error);
+                    return;
+                };
+                if port == 0 {
+                    self.push_output(
+                        "Gateway port must be between 1 and 65535.",
+                        OutputRole::Error,
+                    );
+                    return;
+                }
+                let mut config = self.load_runtime_config();
+                config.gateway.host = host.trim().to_string();
+                config.gateway.port = port;
+                match config.save() {
+                    Ok(()) => self.push_output(
+                        format!(
+                            "Gateway bind set to {}:{}",
+                            config.gateway.host, config.gateway.port
+                        ),
+                        OutputRole::System,
+                    ),
+                    Err(error) => self.push_output(
+                        format!("Failed to save gateway bind: {error}"),
+                        OutputRole::Error,
+                    ),
+                }
+            }
+            ValueCaptureAction::HomeChannel(platform) => {
+                let mut config = self.load_runtime_config();
+                let channel = if value.is_empty() || value.eq_ignore_ascii_case("clear") {
+                    None
+                } else {
+                    Some(value)
+                };
+                match self.set_home_channel_in_config(&mut config, &platform, channel.clone()) {
+                    Ok(()) => match config.save() {
+                        Ok(()) => self.push_output(
+                            match channel {
+                                Some(channel) => {
+                                    format!("Home channel for {platform} set to: {channel}")
+                                }
+                                None => format!("Home channel for {platform} cleared."),
+                            },
+                            OutputRole::System,
+                        ),
+                        Err(error) => self.push_output(
+                            format!("Failed to save {platform} home channel: {error}"),
+                            OutputRole::Error,
+                        ),
+                    },
+                    Err(error) => self.push_output(error.to_string(), OutputRole::Error),
+                }
+            }
+            ValueCaptureAction::AllowedUsers(platform) => {
+                let values = if value.is_empty() || value.eq_ignore_ascii_case("clear") {
+                    Vec::new()
+                } else {
+                    value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|entry| !entry.is_empty())
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                };
+                let mut config = self.load_runtime_config();
+                let env_key = format!("{}_ALLOWED_USERS", platform.to_ascii_uppercase());
+                let save_result: Result<(), String> = match platform.as_str() {
+                    "telegram" => {
+                        config.gateway.telegram.allowed_users = values.clone();
+                        config.save().map_err(|error| error.to_string())
+                    }
+                    "discord" => {
+                        config.gateway.discord.allowed_users = values.clone();
+                        config.save().map_err(|error| error.to_string())
+                    }
+                    "slack" => {
+                        config.gateway.slack.allowed_users = values.clone();
+                        config.save().map_err(|error| error.to_string())
+                    }
+                    "signal" => {
+                        config.gateway.signal.allowed_users = values.clone();
+                        config.save().map_err(|error| error.to_string())
+                    }
+                    "whatsapp" => {
+                        config.gateway.whatsapp.allowed_users = values.clone();
+                        config.save().map_err(|error| error.to_string())
+                    }
+                    _ => if values.is_empty() {
+                        crate::gateway_setup::remove_env_key(&env_key)
+                    } else {
+                        crate::gateway_setup::save_env_key(&env_key, &values.join(","))
+                    }
+                    .map_err(|error| error.to_string()),
+                };
+                match save_result {
+                    Ok(()) => self.push_output(
+                        if values.is_empty() {
+                            format!("{platform} allowlist cleared.")
+                        } else {
+                            format!("{platform} allowlist updated ({} entrie(s)).", values.len())
+                        },
+                        OutputRole::System,
+                    ),
+                    Err(error) => self.push_output(
+                        format!("Failed to save {platform} allowlist: {error}"),
+                        OutputRole::Error,
+                    ),
+                }
+            }
+            ValueCaptureAction::PrimaryField(field) => {
+                if !self.save_gateway_primary_field(&field, &value) {
+                    return;
+                }
+            }
+        }
+        self.refresh_gateway_browser();
+    }
+
+    fn save_gateway_primary_field(&mut self, field: &str, value: &str) -> bool {
+        let clear = value.is_empty() || value.eq_ignore_ascii_case("clear");
+        let result: Result<(), String> = match field {
+            "SIGNAL_HTTP_URL" => {
+                let mut config = self.load_runtime_config();
+                config.gateway.signal.http_url = (!clear).then_some(value.to_string());
+                config.save().map_err(|error| error.to_string())
+            }
+            "SIGNAL_ACCOUNT" => {
+                let mut config = self.load_runtime_config();
+                config.gateway.signal.account = (!clear).then_some(value.to_string());
+                config.save().map_err(|error| error.to_string())
+            }
+            "WHATSAPP_MODE" => {
+                let normalized = if clear {
+                    "self-chat".to_string()
+                } else {
+                    value.trim().to_ascii_lowercase()
+                };
+                if normalized != "bot" && normalized != "self-chat" {
+                    self.push_output(
+                        "WhatsApp mode must be `bot` or `self-chat`.",
+                        OutputRole::Error,
+                    );
+                    return false;
+                }
+                let mut config = self.load_runtime_config();
+                config.gateway.whatsapp.mode = normalized.clone();
+                match config.save() {
+                    Ok(()) => {
+                        self.push_output(
+                            format!("WhatsApp mode set to: {}", config.gateway.whatsapp.mode),
+                            OutputRole::System,
+                        );
+                        return true;
+                    }
+                    Err(error) => {
+                        self.push_output(
+                            format!("Failed to save WhatsApp mode: {error}"),
+                            OutputRole::Error,
+                        );
+                        return false;
+                    }
+                }
+            }
+            key => if clear {
+                crate::gateway_setup::remove_env_key(key)
+            } else {
+                crate::gateway_setup::save_env_key(key, value)
+            }
+            .map_err(|error| error.to_string()),
+        };
+
+        match result {
+            Ok(()) => {
+                self.push_output(
+                    if clear {
+                        format!("{field} cleared.")
+                    } else {
+                        format!("{field} updated.")
+                    },
+                    OutputRole::System,
+                );
+                true
+            }
+            Err(error) => {
+                self.push_output(
+                    format!("Failed to save {field}: {error}"),
+                    OutputRole::Error,
+                );
+                false
+            }
+        }
+    }
+
     /// Advance spinner frame (called on every tick).
     fn tick_spinner(&mut self) {
         self.poll_voice_recording_completion();
@@ -5945,7 +9488,8 @@ impl App {
             DisplayState::Idle
             | DisplayState::WaitingForClarify
             | DisplayState::WaitingForApproval { .. }
-            | DisplayState::SecretCapture { .. } => false,
+            | DisplayState::SecretCapture { .. }
+            | DisplayState::ValueCapture { .. } => false,
         };
         if self.voice_recording.is_some()
             || self.voice_playback_active
@@ -6002,38 +9546,15 @@ impl App {
                 return;
             }
         };
-        // Map user-friendly provider aliases to edgequake-llm canonical names
-        let canonical = match provider_str {
-            "copilot" => "vscode-copilot",
-            other => other,
-        };
-        // Special-case copilot: use VsCodeCopilotProvider::new() directly (direct API mode).
-        // ProviderFactory::create_llm_provider forces proxy mode (localhost:4141).
-        let new_provider = if canonical == "vscode-copilot" {
-            match VsCodeCopilotProvider::new()
-                .model(model_name)
-                .with_vision(true) // Enable vision so copilot-vision-request header is sent
-                .build()
-            {
-                Ok(p) => std::sync::Arc::new(p) as Arc<dyn edgequake_llm::LLMProvider>,
-                Err(e) => {
-                    self.push_output(
-                        format!("Failed to create copilot provider: {e}"),
-                        OutputRole::Error,
-                    );
-                    return;
-                }
-            }
-        } else {
-            match ProviderFactory::create_llm_provider(canonical, model_name) {
-                Ok(p) => p,
-                Err(e) => {
-                    self.push_output(
-                        format!("Failed to create provider '{provider_str}': {e}"),
-                        OutputRole::Error,
-                    );
-                    return;
-                }
+        let canonical = edgecrab_tools::vision_models::normalize_provider_name(provider_str);
+        let new_provider = match edgecrab_tools::create_provider_for_model(&canonical, model_name) {
+            Ok(p) => p,
+            Err(e) => {
+                self.push_output(
+                    format!("Failed to create provider '{provider_str}': {e}"),
+                    OutputRole::Error,
+                );
+                return;
             }
         };
         let model_clone = model.clone();
@@ -6050,6 +9571,975 @@ impl App {
                 model: model_clone,
             }));
         });
+    }
+
+    fn open_cheap_model_selector(&mut self) {
+        let smart_routing = self
+            .agent
+            .as_ref()
+            .map(|agent| self.rt_handle.block_on(agent.smart_routing_config()))
+            .unwrap_or_else(|| self.load_runtime_config().model.smart_routing);
+        let current_model = smart_routing.cheap_model.trim().to_string();
+        self.refresh_shared_model_selector_catalog(current_model, ModelSelectorTarget::Cheap);
+    }
+
+    fn handle_show_cheap_model(&mut self) {
+        let Some(agent) = self.require_agent() else {
+            return;
+        };
+
+        let primary_model = self.rt_handle.block_on(agent.model());
+        let smart_routing = self.rt_handle.block_on(agent.smart_routing_config());
+        let text = if smart_routing.enabled && !smart_routing.cheap_model.trim().is_empty() {
+            format!(
+                "Smart routing:\n\
+                 Enabled:          yes\n\
+                 Primary model:    {primary_model}\n\
+                 Cheap model:      {}\n\
+                 Route policy:     short/simple turns prefer the cheap model\n\
+                 Usage:            /cheap_model | /cheap_model status | /cheap_model off | /cheap_model <provider/model>",
+                smart_routing.cheap_model,
+            )
+        } else {
+            format!(
+                "Smart routing:\n\
+                 Enabled:          no\n\
+                 Primary model:    {primary_model}\n\
+                 Cheap model:      (not configured)\n\
+                 Usage:            /cheap_model to pick a cheap model, then EdgeCrab will auto-route obviously simple turns."
+            )
+        };
+        self.push_output(text, OutputRole::System);
+    }
+
+    fn handle_set_cheap_model(&mut self, spec: String) {
+        let Some(agent) = self.require_agent() else {
+            return;
+        };
+
+        let trimmed = spec.trim();
+        if trimmed.is_empty()
+            || trimmed.eq_ignore_ascii_case("open")
+            || trimmed.eq_ignore_ascii_case("list")
+        {
+            self.open_cheap_model_selector();
+            return;
+        }
+
+        let mut smart_routing = self.rt_handle.block_on(agent.smart_routing_config());
+
+        if trimmed.eq_ignore_ascii_case("status") {
+            self.handle_show_cheap_model();
+            return;
+        }
+
+        if matches!(
+            trimmed.to_ascii_lowercase().as_str(),
+            "off" | "disable" | "disabled" | "reset" | "clear"
+        ) {
+            smart_routing.enabled = false;
+            smart_routing.cheap_model.clear();
+            smart_routing.cheap_base_url = None;
+            smart_routing.cheap_api_key_env = None;
+            let persisted = smart_routing.clone();
+            let agent_clone = Arc::clone(&agent);
+            self.rt_handle.block_on(async move {
+                agent_clone.set_smart_routing_config(persisted).await;
+            });
+            match persist_smart_routing_to_config(&smart_routing) {
+                Ok(()) => self.push_output(
+                    "Smart routing disabled. Future turns will stay on the primary model until a cheap model is configured again.",
+                    OutputRole::System,
+                ),
+                Err(err) => self.push_output(
+                    format!("Smart routing disabled for this session, but config save failed: {err}"),
+                    OutputRole::Error,
+                ),
+            }
+            return;
+        }
+
+        let Some((parsed_provider, canonical_model)) = parse_selection_spec(trimmed) else {
+            self.push_output(
+                format!("Invalid format: use 'provider/model-name' or 'off'. Got: '{trimmed}'"),
+                OutputRole::Error,
+            );
+            return;
+        };
+
+        let provider = canonical_provider(&parsed_provider);
+        smart_routing.enabled = true;
+        smart_routing.cheap_model = format!("{provider}/{canonical_model}");
+        let persisted = smart_routing.clone();
+        let agent_clone = Arc::clone(&agent);
+        self.rt_handle.block_on(async move {
+            agent_clone.set_smart_routing_config(persisted).await;
+        });
+        match persist_smart_routing_to_config(&smart_routing) {
+            Ok(()) => self.push_output(
+                format!(
+                    "Cheap model set to {}. EdgeCrab will auto-route obviously simple turns to this model.",
+                    smart_routing.cheap_model
+                ),
+                OutputRole::System,
+            ),
+            Err(err) => self.push_output(
+                format!("Cheap model updated for this session, but config save failed: {err}"),
+                OutputRole::Error,
+            ),
+        }
+    }
+
+    fn open_moa_aggregator_selector(&mut self) {
+        let moa = self.current_moa_config();
+        self.refresh_shared_model_selector_catalog(
+            moa.aggregator_model,
+            ModelSelectorTarget::MoaAggregator,
+        );
+    }
+
+    fn current_moa_config(&self) -> edgecrab_core::config::MoaConfig {
+        self.agent
+            .as_ref()
+            .map(|agent| self.rt_handle.block_on(agent.moa_config()))
+            .unwrap_or_else(|| self.load_runtime_config().moa)
+    }
+
+    fn current_toolset_filters(&self) -> (Vec<String>, Vec<String>) {
+        let (enabled_toolsets, disabled_toolsets, _, _) = self.current_tool_filters();
+        (enabled_toolsets, disabled_toolsets)
+    }
+
+    fn current_tool_filters(&self) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
+        self.agent
+            .as_ref()
+            .map(|agent| self.rt_handle.block_on(agent.tool_filters()))
+            .unwrap_or_else(|| {
+                let config = self.load_runtime_config();
+                (
+                    config.tools.enabled_toolsets.unwrap_or_default(),
+                    config.tools.disabled_toolsets.unwrap_or_default(),
+                    config.tools.enabled_tools.unwrap_or_default(),
+                    config.tools.disabled_tools.unwrap_or_default(),
+                )
+            })
+    }
+
+    fn current_tool_inventory(&self) -> Vec<ToolInventoryEntry> {
+        self.agent
+            .as_ref()
+            .map(|agent| self.rt_handle.block_on(agent.tool_inventory()))
+            .unwrap_or_default()
+    }
+
+    fn build_tool_manager_entries(&self, scope: ToolManagerScope) -> Vec<ToolManagerEntry> {
+        let inventory = self.current_tool_inventory();
+        let (enabled_toolsets, disabled_toolsets, enabled_tools, disabled_tools) =
+            self.current_tool_filters();
+
+        let mut tool_entries: Vec<ToolManagerEntry> = inventory
+            .iter()
+            .map(|entry| {
+                let policy_source = if disabled_tools
+                    .iter()
+                    .any(|candidate| candidate == &entry.name)
+                {
+                    ToolPolicySource::ExplicitDisable
+                } else if enabled_tools
+                    .iter()
+                    .any(|candidate| candidate == &entry.name)
+                {
+                    ToolPolicySource::ExplicitEnable
+                } else {
+                    ToolPolicySource::Default
+                };
+
+                let detail = format!(
+                    "{} · {}",
+                    entry.toolset,
+                    if entry.exposed() {
+                        "exposed"
+                    } else if !entry.policy_enabled {
+                        "disabled by policy"
+                    } else if !entry.startup_available {
+                        "startup unavailable"
+                    } else {
+                        "runtime gated"
+                    }
+                );
+
+                ToolManagerEntry {
+                    kind: ToolManagerItemKind::Tool,
+                    name: entry.name.clone(),
+                    toolset: entry.toolset.clone(),
+                    description: entry.description.clone(),
+                    detail,
+                    tag: if entry.dynamic {
+                        "dynamic".into()
+                    } else {
+                        "tool".into()
+                    },
+                    check_state: if entry.policy_enabled {
+                        ToolManagerCheckState::On
+                    } else {
+                        ToolManagerCheckState::Off
+                    },
+                    policy_source,
+                    exposed: entry.exposed(),
+                    startup_available: entry.startup_available,
+                    check_allowed: entry.check_allowed,
+                    dynamic: entry.dynamic,
+                    emoji: entry.emoji.clone(),
+                    aliases: entry.aliases.clone(),
+                    selected_tools: usize::from(entry.policy_enabled),
+                    total_tools: 1,
+                    exposed_tools: usize::from(entry.exposed()),
+                }
+            })
+            .collect();
+        tool_entries.sort_by(|left, right| left.name.cmp(&right.name));
+
+        let mut toolset_entries = Vec::new();
+        for (toolset, tools) in inventory.iter().fold(
+            BTreeMap::<String, Vec<&ToolInventoryEntry>>::new(),
+            |mut acc, entry| {
+                acc.entry(entry.toolset.clone()).or_default().push(entry);
+                acc
+            },
+        ) {
+            let total_tools = tools.len();
+            let selected_tools = tools.iter().filter(|tool| tool.policy_enabled).count();
+            let exposed_tools = tools.iter().filter(|tool| tool.exposed()).count();
+            let toolset_enabled = edgecrab_tools::toolsets::toolset_enabled(
+                Some(&enabled_toolsets),
+                Some(&disabled_toolsets),
+                &toolset,
+            );
+            let explicit_enabled = tools
+                .iter()
+                .filter(|tool| {
+                    enabled_tools
+                        .iter()
+                        .any(|candidate| candidate == &tool.name)
+                })
+                .count();
+            let explicit_disabled = tools
+                .iter()
+                .filter(|tool| {
+                    disabled_tools
+                        .iter()
+                        .any(|candidate| candidate == &tool.name)
+                })
+                .count();
+            let check_state = if explicit_enabled > 0 || explicit_disabled > 0 {
+                ToolManagerCheckState::Mixed
+            } else if toolset_enabled {
+                ToolManagerCheckState::On
+            } else {
+                ToolManagerCheckState::Off
+            };
+            let policy_source =
+                if !toolset_entries_referencing(&toolset, &disabled_toolsets).is_empty() {
+                    ToolPolicySource::ExplicitDisable
+                } else if toolset_enabled
+                    && !enabled_toolsets.is_empty()
+                    && !edgecrab_tools::toolsets::contains_all_sentinel(&enabled_toolsets)
+                {
+                    ToolPolicySource::ExplicitEnable
+                } else {
+                    ToolPolicySource::Default
+                };
+            let preview = tools
+                .iter()
+                .take(4)
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            toolset_entries.push(ToolManagerEntry {
+                kind: ToolManagerItemKind::Toolset,
+                name: toolset.clone(),
+                toolset: toolset.clone(),
+                description: preview,
+                detail: format!(
+                    "{selected_tools}/{total_tools} selected · {exposed_tools}/{total_tools} exposed"
+                ),
+                tag: "toolset".into(),
+                check_state,
+                policy_source,
+                exposed: exposed_tools > 0,
+                startup_available: true,
+                check_allowed: true,
+                dynamic: tools.iter().any(|tool| tool.dynamic),
+                emoji: "◈".into(),
+                aliases: Vec::new(),
+                selected_tools,
+                total_tools,
+                exposed_tools,
+            });
+        }
+
+        match scope {
+            ToolManagerScope::All => {
+                toolset_entries.sort_by(|left, right| left.name.cmp(&right.name));
+                toolset_entries.extend(tool_entries);
+                toolset_entries
+            }
+            ToolManagerScope::Toolsets => {
+                toolset_entries.sort_by(|left, right| left.name.cmp(&right.name));
+                toolset_entries
+            }
+            ToolManagerScope::Tools => tool_entries,
+        }
+    }
+
+    fn refresh_tool_manager_entries(&mut self) -> bool {
+        if self.agent.is_none() {
+            self.push_output(
+                "Tool manager requires an active agent session.",
+                OutputRole::Error,
+            );
+            return false;
+        }
+        let entries = self.build_tool_manager_entries(self.tool_manager_scope);
+        if self.tool_manager.active {
+            self.tool_manager.replace_items_preserving_state(entries);
+        } else {
+            self.tool_manager.set_items(entries);
+        }
+        self.needs_redraw = true;
+        true
+    }
+
+    fn open_tool_manager(&mut self, mode: ToolManagerMode) {
+        self.tool_manager_scope = ToolManagerScope::from_mode(mode);
+        if !self.refresh_tool_manager_entries() {
+            return;
+        }
+        self.tool_manager_status_note =
+            Some("Space toggles policy. Tab switches scope. R restores defaults.".into());
+        self.tool_manager.active = true;
+        self.needs_redraw = true;
+    }
+
+    fn persist_and_apply_tool_filters(
+        &mut self,
+        enabled_toolsets: Vec<String>,
+        disabled_toolsets: Vec<String>,
+        enabled_tools: Vec<String>,
+        disabled_tools: Vec<String>,
+    ) -> Result<(), String> {
+        if let Some(agent) = self.agent.as_ref() {
+            let agent = Arc::clone(agent);
+            let agent_enabled_toolsets = enabled_toolsets.clone();
+            let agent_disabled_toolsets = disabled_toolsets.clone();
+            let agent_enabled_tools = enabled_tools.clone();
+            let agent_disabled_tools = disabled_tools.clone();
+            self.rt_handle.block_on(async move {
+                agent
+                    .set_tool_filters(
+                        agent_enabled_toolsets,
+                        agent_disabled_toolsets,
+                        agent_enabled_tools,
+                        agent_disabled_tools,
+                    )
+                    .await;
+            });
+        }
+
+        let enabled_toolsets_option = (!enabled_toolsets.is_empty()).then_some(enabled_toolsets);
+        let disabled_toolsets_option = (!disabled_toolsets.is_empty()).then_some(disabled_toolsets);
+        let enabled_tools_option = (!enabled_tools.is_empty()).then_some(enabled_tools);
+        let disabled_tools_option = (!disabled_tools.is_empty()).then_some(disabled_tools);
+
+        persist_tool_filters_to_config(
+            enabled_toolsets_option.as_deref(),
+            disabled_toolsets_option.as_deref(),
+            enabled_tools_option.as_deref(),
+            disabled_tools_option.as_deref(),
+        )
+        .map_err(|err| err.to_string())
+    }
+
+    fn toggle_tool_manager_selected(&mut self) {
+        let Some(entry) = self.tool_manager.current().cloned() else {
+            return;
+        };
+        let (mut enabled_toolsets, mut disabled_toolsets, mut enabled_tools, mut disabled_tools) =
+            self.current_tool_filters();
+
+        match entry.kind {
+            ToolManagerItemKind::Toolset => {
+                let is_enabled = edgecrab_tools::toolsets::toolset_enabled(
+                    Some(&enabled_toolsets),
+                    Some(&disabled_toolsets),
+                    &entry.toolset,
+                );
+                if is_enabled {
+                    disabled_toolsets.push(entry.toolset.clone());
+                } else {
+                    let mut enabled_option =
+                        (!enabled_toolsets.is_empty()).then_some(enabled_toolsets);
+                    let mut disabled_option =
+                        (!disabled_toolsets.is_empty()).then_some(disabled_toolsets);
+                    edgecrab_tools::toolsets::ensure_literal_toolset_enabled(
+                        &mut enabled_option,
+                        &mut disabled_option,
+                        &entry.toolset,
+                    );
+                    enabled_toolsets = enabled_option.unwrap_or_default();
+                    disabled_toolsets = disabled_option.unwrap_or_default();
+                }
+                normalize_tool_policy_list(&mut enabled_toolsets);
+                normalize_tool_policy_list(&mut disabled_toolsets);
+            }
+            ToolManagerItemKind::Tool => {
+                let is_enabled = edgecrab_tools::toolsets::tool_enabled(
+                    Some(&enabled_toolsets),
+                    Some(&disabled_toolsets),
+                    Some(&enabled_tools),
+                    Some(&disabled_tools),
+                    &entry.name,
+                    &entry.toolset,
+                );
+                if is_enabled {
+                    disabled_tools.push(entry.name.clone());
+                    enabled_tools.retain(|candidate| candidate != &entry.name);
+                } else {
+                    enabled_tools.push(entry.name.clone());
+                    disabled_tools.retain(|candidate| candidate != &entry.name);
+                }
+                normalize_tool_policy_list(&mut enabled_tools);
+                normalize_tool_policy_list(&mut disabled_tools);
+            }
+        }
+
+        match self.persist_and_apply_tool_filters(
+            enabled_toolsets,
+            disabled_toolsets,
+            enabled_tools,
+            disabled_tools,
+        ) {
+            Ok(()) => {
+                self.tool_manager_status_note = Some(format!(
+                    "{} {}",
+                    if matches!(entry.kind, ToolManagerItemKind::Toolset) {
+                        "Updated toolset policy for"
+                    } else {
+                        "Updated tool policy for"
+                    },
+                    entry.name
+                ));
+                let _ = self.refresh_tool_manager_entries();
+            }
+            Err(err) => {
+                self.push_output(
+                    format!("Failed to update tool policy: {err}"),
+                    OutputRole::Error,
+                );
+            }
+        }
+    }
+
+    fn reset_tool_manager_policy(&mut self) {
+        match self.persist_and_apply_tool_filters(Vec::new(), Vec::new(), Vec::new(), Vec::new()) {
+            Ok(()) => {
+                self.tool_manager_status_note = Some("Tool policy reset to defaults.".to_string());
+                let _ = self.refresh_tool_manager_entries();
+                self.push_output("Tool policy reset to defaults.", OutputRole::System);
+            }
+            Err(err) => {
+                self.push_output(
+                    format!("Failed to reset tool policy: {err}"),
+                    OutputRole::Error,
+                );
+            }
+        }
+    }
+
+    fn current_moa_availability(&self) -> MoaAvailability {
+        let moa = self.current_moa_config();
+        let (enabled_toolsets, disabled_toolsets) = self.current_toolset_filters();
+        MoaAvailability {
+            feature_enabled: moa.enabled,
+            toolset_enabled: edgecrab_tools::toolsets::toolset_enabled(
+                Some(&enabled_toolsets),
+                Some(&disabled_toolsets),
+                "moa",
+            ),
+        }
+    }
+
+    fn describe_moa_toolset_policy(&self) -> Option<String> {
+        let (enabled_toolsets, disabled_toolsets) = self.current_toolset_filters();
+        let disabled_blockers = toolset_entries_referencing("moa", &disabled_toolsets);
+        if !disabled_blockers.is_empty() {
+            return Some(format!(
+                "`tools.disabled_toolsets` still blocks `moa` via {}. Remove that entry or edit the toolset policy.",
+                disabled_blockers.join(", ")
+            ));
+        }
+
+        if !edgecrab_tools::toolsets::toolset_enabled(
+            Some(&enabled_toolsets),
+            Some(&disabled_toolsets),
+            "moa",
+        ) && !enabled_toolsets.is_empty()
+            && !edgecrab_tools::toolsets::contains_all_sentinel(&enabled_toolsets)
+        {
+            return Some(
+                "`tools.enabled_toolsets` still excludes `moa`. Add the literal `moa` entry or use an alias that expands to it."
+                    .into(),
+            );
+        }
+
+        None
+    }
+
+    fn apply_moa_config_update(
+        &mut self,
+        moa: edgecrab_core::config::MoaConfig,
+        ensure_toolset_reachable: bool,
+    ) -> Result<edgecrab_tools::toolsets::ToolsetEnableSync, String> {
+        let moa = moa.sanitized();
+        let sync = if ensure_toolset_reachable && moa.enabled {
+            self.ensure_moa_toolset_is_reachable()?
+        } else {
+            edgecrab_tools::toolsets::ToolsetEnableSync::default()
+        };
+
+        if let Some(agent) = self.agent.as_ref() {
+            let agent = Arc::clone(agent);
+            let persisted = moa.clone();
+            self.rt_handle.block_on(async move {
+                agent.set_moa_config(persisted).await;
+            });
+        }
+
+        persist_moa_config_to_config(&moa).map_err(|err| err.to_string())?;
+        Ok(sync)
+    }
+
+    fn emit_moa_enabled_feedback(
+        &mut self,
+        base_message: String,
+        sync: edgecrab_tools::toolsets::ToolsetEnableSync,
+    ) {
+        let availability = self.current_moa_availability();
+        if availability.effective() {
+            let mut details = Vec::new();
+            if sync.added_to_enabled {
+                details.push("added `moa` to `tools.enabled_toolsets`");
+            }
+            if sync.removed_from_disabled {
+                details.push("removed the literal `moa` block from `tools.disabled_toolsets`");
+            }
+            let message = if details.is_empty() {
+                base_message
+            } else {
+                format!(
+                    "{base_message} Tool exposure was repaired: {}.",
+                    details.join("; ")
+                )
+            };
+            self.push_output(message, OutputRole::System);
+            return;
+        }
+
+        let detail = self
+            .describe_moa_toolset_policy()
+            .unwrap_or_else(|| "the current toolset policy still hides it from the model.".into());
+        self.push_output(
+            format!("{base_message} However `moa` is still unavailable to the model: {detail}"),
+            OutputRole::Error,
+        );
+    }
+
+    fn ensure_moa_toolset_is_reachable(
+        &mut self,
+    ) -> Result<edgecrab_tools::toolsets::ToolsetEnableSync, String> {
+        let (enabled_toolsets, disabled_toolsets) = self.current_toolset_filters();
+        let mut enabled_option = if enabled_toolsets.is_empty() {
+            None
+        } else {
+            Some(enabled_toolsets)
+        };
+        let mut disabled_option = if disabled_toolsets.is_empty() {
+            None
+        } else {
+            Some(disabled_toolsets)
+        };
+        let sync = edgecrab_tools::toolsets::ensure_literal_toolset_enabled(
+            &mut enabled_option,
+            &mut disabled_option,
+            "moa",
+        );
+
+        let enabled_vec = enabled_option.clone().unwrap_or_default();
+        let disabled_vec = disabled_option.clone().unwrap_or_default();
+
+        if let Some(agent) = self.agent.as_ref() {
+            let agent = Arc::clone(agent);
+            self.rt_handle.block_on(async move {
+                agent.set_toolset_filters(enabled_vec, disabled_vec).await;
+            });
+        }
+
+        persist_toolset_filters_to_config(enabled_option.as_deref(), disabled_option.as_deref())
+            .map_err(|err| err.to_string())?;
+
+        Ok(sync)
+    }
+
+    fn open_moa_reference_selector_for_mode(&mut self, mode: MoaReferenceSelectorMode) {
+        let moa = self.current_moa_config();
+        self.moa_reference_selected = moa.reference_models.iter().cloned().collect();
+
+        let mut entries = build_model_selector_entries(&ModelCatalog::grouped_catalog(), None);
+        match mode {
+            MoaReferenceSelectorMode::EditRoster => {}
+            MoaReferenceSelectorMode::AddExpert => {
+                entries.retain(|entry| !self.moa_reference_selected.contains(&entry.display));
+            }
+            MoaReferenceSelectorMode::RemoveExpert => {
+                entries.retain(|entry| self.moa_reference_selected.contains(&entry.display));
+            }
+        }
+
+        if entries.is_empty() {
+            let message = match mode {
+                MoaReferenceSelectorMode::EditRoster => {
+                    "No model catalog entries are available to build an MoA roster.".to_string()
+                }
+                MoaReferenceSelectorMode::AddExpert => {
+                    "No additional models are available to add to the MoA expert roster."
+                        .to_string()
+                }
+                MoaReferenceSelectorMode::RemoveExpert => {
+                    "The MoA expert roster is empty, so there is nothing to remove.".to_string()
+                }
+            };
+            self.push_output(message, OutputRole::System);
+            return;
+        }
+
+        let primary = match mode {
+            MoaReferenceSelectorMode::EditRoster | MoaReferenceSelectorMode::RemoveExpert => moa
+                .reference_models
+                .first()
+                .cloned()
+                .unwrap_or_else(|| entries[0].display.clone()),
+            MoaReferenceSelectorMode::AddExpert => entries[0].display.clone(),
+        };
+
+        self.moa_reference_selector_mode = mode;
+        self.moa_reference_selector.set_items(entries);
+        self.moa_reference_selector.activate_with_primary(&primary);
+        self.needs_redraw = true;
+    }
+
+    fn open_moa_reference_selector(&mut self) {
+        self.open_moa_reference_selector_for_mode(MoaReferenceSelectorMode::EditRoster);
+    }
+
+    fn open_moa_add_expert_selector(&mut self) {
+        self.open_moa_reference_selector_for_mode(MoaReferenceSelectorMode::AddExpert);
+    }
+
+    fn open_moa_remove_expert_selector(&mut self) {
+        self.open_moa_reference_selector_for_mode(MoaReferenceSelectorMode::RemoveExpert);
+    }
+
+    fn handle_set_moa_enabled(&mut self, enabled: bool) {
+        let Some(agent) = self.require_agent() else {
+            return;
+        };
+
+        let mut moa = self.rt_handle.block_on(agent.moa_config());
+        moa.enabled = enabled;
+        match self.apply_moa_config_update(moa.clone(), enabled) {
+            Ok(sync) => {
+                if enabled {
+                    self.emit_moa_enabled_feedback(
+                        format!(
+                            "Mixture-of-Agents enabled. Future `moa` tool calls will use aggregator {} and {} reference model(s).",
+                            moa.aggregator_model,
+                            moa.reference_models.len()
+                        ),
+                        sync,
+                    );
+                } else {
+                    self.push_output(
+                        "Mixture-of-Agents disabled. The tool is hidden from future turns until you run `/moa on` or edit the MoA defaults again.",
+                        OutputRole::System,
+                    );
+                }
+            }
+            Err(err) => self.push_output(
+                if enabled {
+                    format!(
+                        "Mixture-of-Agents enabled for this session, but config save failed: {err}"
+                    )
+                } else {
+                    format!(
+                        "Mixture-of-Agents disabled for this session, but config save failed: {err}"
+                    )
+                },
+                OutputRole::Error,
+            ),
+        }
+    }
+
+    fn handle_show_moa_config(&mut self) {
+        let Some(agent) = self.require_agent() else {
+            return;
+        };
+
+        let moa = self.rt_handle.block_on(agent.moa_config());
+        let current_model = self.rt_handle.block_on(agent.model());
+        let availability = self.current_moa_availability();
+        let references = if moa.reference_models.is_empty() {
+            "(none)".to_string()
+        } else {
+            moa.reference_models
+                .iter()
+                .map(|model| format!("  - {model}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let toolset_note = self
+            .describe_moa_toolset_policy()
+            .unwrap_or_else(|| "The current toolset policy exposes `moa` to the model.".into());
+        let text = format!(
+            "Mixture-of-Agents defaults:\n\
+             Config enabled:   {}\n\
+             Toolset exposed:  {}\n\
+             Effective:        {}\n\
+             Current chat model: {}\n\
+             Aggregator:       {}\n\
+             Reference count:  {}\n\
+             Reference roster:\n{}\n\
+             Toolset policy:   {}\n\
+             Runtime safety:   MoA auto-adds the current chat model as a last-chance expert \
+                               and falls back to it for aggregation if the saved aggregator \
+                               cannot run.\n\
+             \nUsage:\n\
+              /moa on                     enable the tool with the saved defaults\n\
+              /moa off                    disable the tool without losing the roster\n\
+              /moa aggregator             open the aggregator selector\n\
+              /moa experts                open the full expert roster editor\n\
+              /moa add [provider/model]   add one expert from the catalog or by id\n\
+              /moa remove [provider/model] remove one configured expert\n\
+              /moa reset                  reset to a safe baseline for the current chat model\n\
+              Tool name:                   `moa` (legacy alias: `mixture_of_agents`)",
+            if availability.feature_enabled {
+                "yes"
+            } else {
+                "no"
+            },
+            if availability.toolset_enabled {
+                "yes"
+            } else {
+                "no"
+            },
+            if availability.effective() {
+                "yes"
+            } else {
+                "no"
+            },
+            current_model,
+            moa.aggregator_model,
+            moa.reference_models.len(),
+            references,
+            toolset_note,
+        );
+        self.push_output(text, OutputRole::System);
+    }
+
+    fn handle_set_moa_aggregator(&mut self, spec: String) {
+        let Some(agent) = self.require_agent() else {
+            return;
+        };
+
+        let trimmed = spec.trim();
+        if trimmed.is_empty()
+            || trimmed.eq_ignore_ascii_case("open")
+            || trimmed.eq_ignore_ascii_case("list")
+        {
+            self.open_moa_aggregator_selector();
+            return;
+        }
+
+        let mut moa = self.rt_handle.block_on(agent.moa_config());
+        moa.enabled = true;
+        if matches!(trimmed.to_ascii_lowercase().as_str(), "default" | "reset") {
+            moa.aggregator_model =
+                edgecrab_tools::tools::mixture_of_agents::DEFAULT_AGGREGATOR_MODEL.to_string();
+        } else {
+            let Some((provider, model)) = parse_selection_spec(trimmed) else {
+                self.push_output(
+                    format!("Invalid format: use 'provider/model-name'. Got: '{trimmed}'"),
+                    OutputRole::Error,
+                );
+                return;
+            };
+            moa.aggregator_model = format!("{}/{}", canonical_provider(&provider), model);
+        }
+
+        match self.apply_moa_config_update(moa.clone(), true) {
+            Ok(sync) => self.emit_moa_enabled_feedback(
+                format!("MoA aggregator set to {}.", moa.aggregator_model),
+                sync,
+            ),
+            Err(err) => self.push_output(
+                format!("MoA aggregator updated for this session, but config save failed: {err}"),
+                OutputRole::Error,
+            ),
+        }
+    }
+
+    fn handle_save_moa_reference_selection(&mut self, selected: Vec<String>) {
+        let Some(agent) = self.require_agent() else {
+            return;
+        };
+
+        if selected.is_empty() {
+            self.push_output(
+                "MoA needs at least one reference model. Use Space to select one or more entries before pressing Enter.",
+                OutputRole::Error,
+            );
+            return;
+        }
+
+        let mut moa = self.rt_handle.block_on(agent.moa_config());
+        moa.enabled = true;
+        moa.reference_models = selected;
+        match self.apply_moa_config_update(moa.clone(), true) {
+            Ok(sync) => self.emit_moa_enabled_feedback(
+                format!(
+                    "MoA reference roster updated ({} models).",
+                    moa.reference_models.len()
+                ),
+                sync,
+            ),
+            Err(err) => self.push_output(
+                format!("MoA references updated for this session, but config save failed: {err}"),
+                OutputRole::Error,
+            ),
+        }
+    }
+
+    fn handle_add_moa_reference(&mut self, spec: String) {
+        let Some(agent) = self.require_agent() else {
+            return;
+        };
+
+        let trimmed = spec.trim();
+        if trimmed.is_empty() {
+            self.open_moa_add_expert_selector();
+            return;
+        }
+
+        let Some((provider, model)) = parse_selection_spec(trimmed) else {
+            self.push_output(
+                format!("Invalid format: use 'provider/model-name'. Got: '{trimmed}'"),
+                OutputRole::Error,
+            );
+            return;
+        };
+
+        let mut moa = self.rt_handle.block_on(agent.moa_config());
+        moa.enabled = true;
+        let selection = format!("{}/{}", canonical_provider(&provider), model);
+        if !moa
+            .reference_models
+            .iter()
+            .any(|candidate| candidate == &selection)
+        {
+            moa.reference_models.push(selection.clone());
+        }
+        match self.apply_moa_config_update(moa, true) {
+            Ok(sync) => self.emit_moa_enabled_feedback(
+                format!("Added {selection} to the MoA reference roster."),
+                sync,
+            ),
+            Err(err) => self.push_output(
+                format!("MoA reference updated for this session, but config save failed: {err}"),
+                OutputRole::Error,
+            ),
+        }
+    }
+
+    fn handle_remove_moa_reference(&mut self, spec: String) {
+        let Some(agent) = self.require_agent() else {
+            return;
+        };
+
+        let trimmed = spec.trim();
+        if trimmed.is_empty() {
+            self.open_moa_remove_expert_selector();
+            return;
+        }
+
+        let Some((provider, model)) = parse_selection_spec(trimmed) else {
+            self.push_output(
+                format!("Invalid format: use 'provider/model-name'. Got: '{trimmed}'"),
+                OutputRole::Error,
+            );
+            return;
+        };
+
+        let selection = format!("{}/{}", canonical_provider(&provider), model);
+        let mut moa = self.rt_handle.block_on(agent.moa_config());
+        moa.enabled = true;
+        moa.reference_models
+            .retain(|candidate| candidate != &selection);
+        if moa.reference_models.is_empty() {
+            self.push_output(
+                "MoA needs at least one reference model. Use /moa experts to pick a replacement before removing the last entry.",
+                OutputRole::Error,
+            );
+            return;
+        }
+
+        match self.apply_moa_config_update(moa, true) {
+            Ok(sync) => self.emit_moa_enabled_feedback(
+                format!("Removed {selection} from the MoA reference roster."),
+                sync,
+            ),
+            Err(err) => self.push_output(
+                format!("MoA reference updated for this session, but config save failed: {err}"),
+                OutputRole::Error,
+            ),
+        }
+    }
+
+    fn handle_reset_moa_config(&mut self) {
+        let Some(agent) = self.require_agent() else {
+            return;
+        };
+        let current_model = self.rt_handle.block_on(agent.model());
+        let recommended =
+            edgecrab_tools::tools::mixture_of_agents::recommended_moa_config_for_model_spec(
+                &current_model,
+            );
+        let moa = edgecrab_core::config::MoaConfig {
+            enabled: recommended.enabled,
+            reference_models: recommended.reference_models,
+            aggregator_model: recommended.aggregator_model,
+        };
+        match self.apply_moa_config_update(moa, true) {
+            Ok(sync) => self.emit_moa_enabled_feedback(
+                format!(
+                    "MoA defaults reset to a safe baseline for {}. Add more experts with `/moa add` or `/moa experts` when you want a broader roster.",
+                    current_model
+                ),
+                sync,
+            ),
+            Err(err) => self.push_output(
+                format!("MoA defaults restored for this session, but config save failed: {err}"),
+                OutputRole::Error,
+            ),
+        }
     }
 
     fn handle_show_vision_model(&mut self) {
@@ -6319,6 +10809,7 @@ impl App {
         };
         let snap = self.agent_snapshot(&agent);
         let auxiliary = self.rt_handle.block_on(agent.auxiliary_config());
+        let smart_routing = self.rt_handle.block_on(agent.smart_routing_config());
         let (_, _, image_generation) = self.rt_handle.block_on(agent.media_config());
         let vision_routing = match (auxiliary.provider.as_deref(), auxiliary.model.as_deref()) {
             (Some(provider), Some(model)) => format!("{provider}/{model}"),
@@ -6328,6 +10819,7 @@ impl App {
             "Session status:\n\
              Session ID:  {}\n\
              Model:       {}\n\
+             Cheap:       {}\n\
              Vision:      {}\n\
              Image:       {}/{}\n\
              Messages:    {}\n\
@@ -6336,6 +10828,11 @@ impl App {
              Budget:      {}/{} iterations remaining",
             snap.session_id.as_deref().unwrap_or("(none)"),
             snap.model,
+            if smart_routing.enabled && !smart_routing.cheap_model.trim().is_empty() {
+                smart_routing.cheap_model
+            } else {
+                "off".to_string()
+            },
             vision_routing,
             image_generation.provider,
             image_generation.model,
@@ -6419,6 +10916,406 @@ impl App {
                     OutputRole::System,
                 );
             }
+        }
+    }
+
+    fn render_config_summary(&self) -> String {
+        let config = self.load_runtime_config();
+        let voice_mode = if self.voice_mode_enabled { "on" } else { "off" };
+        let session_personality = self
+            .session_personality
+            .as_deref()
+            .unwrap_or("(config default)");
+        let session_skin = self.session_skin.as_deref().unwrap_or("(config default)");
+        let model = if self.model_name == "none" {
+            config.model.default_model.clone()
+        } else {
+            self.model_name.clone()
+        };
+        format!(
+            "EdgeCrab config summary:\n\
+             Model:           {}\n\
+             Cheap model:     {}\n\
+             MoA:             {}\n\
+             MoA aggregator:  {}\n\
+             MoA refs:        {}\n\
+             Reasoning pane:  {}\n\
+             Streaming:       {}\n\
+             Tool progress:   {}\n\
+             Status bar:      {}\n\
+             Voice readback:  {}\n\
+             Personality:     {} (session: {})\n\
+             Skin:            {} (session: {})\n\
+             Toolsets:        {}\n\
+             Gateway host:    {}:{}\n\
+             MCP servers:     {}\n\
+             Skills preload:  {}\n\
+            \n{}",
+            model,
+            if config.model.smart_routing.enabled
+                && !config.model.smart_routing.cheap_model.is_empty()
+            {
+                config.model.smart_routing.cheap_model.clone()
+            } else {
+                "off".into()
+            },
+            if config.moa.enabled { "on" } else { "off" },
+            config.moa.aggregator_model,
+            config.moa.reference_models.len(),
+            if self.show_reasoning {
+                "shown"
+            } else {
+                "hidden"
+            },
+            if self.streaming_enabled { "on" } else { "off" },
+            self.tool_progress_mode.label(),
+            if self.show_status_bar {
+                "visible"
+            } else {
+                "hidden"
+            },
+            voice_mode,
+            config.display.personality,
+            session_personality,
+            config.display.skin,
+            session_skin,
+            config
+                .tools
+                .enabled_toolsets
+                .as_ref()
+                .filter(|sets| !sets.is_empty())
+                .map(|sets| sets.join(", "))
+                .unwrap_or_else(|| "(default)".into()),
+            config.gateway.host,
+            config.gateway.port,
+            config.mcp_servers.len(),
+            if config.skills.preloaded.is_empty() {
+                "(none)".into()
+            } else {
+                config.skills.preloaded.join(", ")
+            },
+            self.render_gateway_home_channel_summary(&config),
+        )
+    }
+
+    fn render_config_paths(&self) -> String {
+        let home = edgecrab_core::edgecrab_home();
+        format!(
+            "EdgeCrab paths:\n\
+             Config:      {}\n\
+             Env:         {}\n\
+             Memories:    {}\n\
+             Skills:      {}\n\
+             Sessions DB: {}\n\
+             Skins:       {}\n\
+             MCP tokens:  {}\n\
+             Images:      {}\n\
+             \nUse `edgecrab config edit` for editor-based changes or `/config` for the in-TUI control center.",
+            home.join("config.yaml").display(),
+            home.join(".env").display(),
+            home.join("memories").display(),
+            home.join("skills").display(),
+            home.join("sessions.db").display(),
+            home.join("skin.yaml").display(),
+            home.join("mcp-tokens").display(),
+            home.join("images").display(),
+        )
+    }
+
+    fn render_gateway_home_channel_summary(&self, config: &edgecrab_core::AppConfig) -> String {
+        crate::gateway_presentation::render_gateway_home_channel_summary(config)
+    }
+
+    fn build_config_entries(&self) -> Vec<ConfigEntry> {
+        let config = self.load_runtime_config();
+        vec![
+            ConfigEntry {
+                title: "Session Summary".into(),
+                detail: "Current model, display state, toolsets, gateway host, skills preload"
+                    .into(),
+                tag: "overview".into(),
+                action: ConfigAction::ShowSummary,
+            },
+            ConfigEntry {
+                title: "Paths".into(),
+                detail: "Config, env, memories, skills, sessions DB, skin and image directories"
+                    .into(),
+                tag: "files".into(),
+                action: ConfigAction::ShowPaths,
+            },
+            ConfigEntry {
+                title: "Tools".into(),
+                detail:
+                    "Browse toolsets and individual tools with live checkboxes and reset support"
+                        .into(),
+                tag: "tools".into(),
+                action: ConfigAction::OpenTools,
+            },
+            ConfigEntry {
+                title: format!("Model  [{}]", self.model_name),
+                detail: "Open the live model selector".into(),
+                tag: "model".into(),
+                action: ConfigAction::OpenModel,
+            },
+            ConfigEntry {
+                title: format!(
+                    "Cheap Model  [{}]",
+                    if config.model.smart_routing.enabled
+                        && !config.model.smart_routing.cheap_model.trim().is_empty()
+                    {
+                        config.model.smart_routing.cheap_model.as_str()
+                    } else {
+                        "off"
+                    }
+                ),
+                detail: "Pick the model used for obviously simple turns".into(),
+                tag: "model".into(),
+                action: ConfigAction::OpenCheapModel,
+            },
+            ConfigEntry {
+                title: format!("MoA  [{}]", if config.moa.enabled { "on" } else { "off" }),
+                detail: "Enable or disable the moa tool while preserving its saved defaults".into(),
+                tag: "moa".into(),
+                action: ConfigAction::ToggleMoa,
+            },
+            ConfigEntry {
+                title: "Vision Backend".into(),
+                detail: "Inspect or switch the dedicated vision routing".into(),
+                tag: "model".into(),
+                action: ConfigAction::OpenVisionModel,
+            },
+            ConfigEntry {
+                title: "Image Backend".into(),
+                detail: "Inspect or switch the default image generation backend".into(),
+                tag: "model".into(),
+                action: ConfigAction::OpenImageModel,
+            },
+            ConfigEntry {
+                title: format!(
+                    "MoA Aggregator  [{}]",
+                    if config.moa.enabled {
+                        config.moa.aggregator_model.as_str()
+                    } else {
+                        "disabled"
+                    }
+                ),
+                detail: "Choose the synthesizer model used by the moa tool when it is enabled"
+                    .into(),
+                tag: "moa".into(),
+                action: ConfigAction::OpenMoaAggregator,
+            },
+            ConfigEntry {
+                title: format!(
+                    "MoA References  [{} models]",
+                    config.moa.reference_models.len()
+                ),
+                detail: "Edit the full default expert roster used by the moa tool".into(),
+                tag: "moa".into(),
+                action: ConfigAction::OpenMoaReferences,
+            },
+            ConfigEntry {
+                title: "MoA Add Expert".into(),
+                detail: "Add one expert to the default MoA roster from the model catalog".into(),
+                tag: "moa".into(),
+                action: ConfigAction::AddMoaExpert,
+            },
+            ConfigEntry {
+                title: "MoA Remove Expert".into(),
+                detail: "Remove one configured expert from the default MoA roster".into(),
+                tag: "moa".into(),
+                action: ConfigAction::RemoveMoaExpert,
+            },
+            ConfigEntry {
+                title: format!(
+                    "Streaming  [{}]",
+                    if self.streaming_enabled { "on" } else { "off" }
+                ),
+                detail: "Toggle token-by-token rendering for future turns".into(),
+                tag: "display".into(),
+                action: ConfigAction::ToggleStreaming,
+            },
+            ConfigEntry {
+                title: format!(
+                    "Reasoning Pane  [{}]",
+                    if self.show_reasoning {
+                        "shown"
+                    } else {
+                        "hidden"
+                    }
+                ),
+                detail: "Toggle visible reasoning blocks in the transcript".into(),
+                tag: "display".into(),
+                action: ConfigAction::ToggleReasoning,
+            },
+            ConfigEntry {
+                title: format!(
+                    "Status Bar  [{}]",
+                    if self.show_status_bar {
+                        "visible"
+                    } else {
+                        "hidden"
+                    }
+                ),
+                detail: "Toggle the live status strip below the transcript".into(),
+                tag: "display".into(),
+                action: ConfigAction::ToggleStatusBar,
+            },
+            ConfigEntry {
+                title: format!("Skin  [{}]", config.display.skin),
+                detail: "Browse installed skins and apply one without leaving the TUI".into(),
+                tag: "display".into(),
+                action: ConfigAction::OpenSkins,
+            },
+            ConfigEntry {
+                title: format!(
+                    "Voice  [{}]",
+                    if self.voice_mode_enabled {
+                        "readback on"
+                    } else {
+                        "readback off"
+                    }
+                ),
+                detail: "Show voice/TTS status and configuration".into(),
+                tag: "voice".into(),
+                action: ConfigAction::ShowVoice,
+            },
+            ConfigEntry {
+                title: "Gateway Platforms".into(),
+                detail: "Browse platform state, delivery semantics, and inline gateway controls"
+                    .into(),
+                tag: "gateway".into(),
+                action: ConfigAction::OpenGatewayBrowser,
+            },
+            ConfigEntry {
+                title: "Gateway Home Channels".into(),
+                detail: "Review or edit Telegram, Discord, and Slack home-channel routing".into(),
+                tag: "gateway".into(),
+                action: ConfigAction::ShowGatewayHomes,
+            },
+            ConfigEntry {
+                title: "Update Status".into(),
+                detail: "Check git-based upgrade status and show actionable local guidance".into(),
+                tag: "ops".into(),
+                action: ConfigAction::ShowUpdateStatus,
+            },
+        ]
+    }
+
+    fn open_config_selector(&mut self) {
+        self.config_selector.set_items(self.build_config_entries());
+        self.config_selector.activate();
+        self.needs_redraw = true;
+    }
+
+    fn handle_config_selector_action(&mut self, action: ConfigAction) {
+        match action {
+            ConfigAction::ShowSummary => {
+                self.push_output(self.render_config_summary(), OutputRole::System);
+            }
+            ConfigAction::ShowPaths => {
+                self.push_output(self.render_config_paths(), OutputRole::System);
+            }
+            ConfigAction::OpenTools => {
+                self.open_tool_manager(ToolManagerMode::All);
+            }
+            ConfigAction::OpenModel => {
+                self.refresh_model_selector_catalog();
+            }
+            ConfigAction::OpenCheapModel => {
+                self.open_cheap_model_selector();
+            }
+            ConfigAction::ToggleMoa => {
+                let enabled = self
+                    .agent
+                    .as_ref()
+                    .map(|agent| self.rt_handle.block_on(agent.moa_config()).enabled)
+                    .unwrap_or_else(|| self.load_runtime_config().moa.enabled);
+                self.handle_set_moa_enabled(!enabled);
+            }
+            ConfigAction::OpenVisionModel => {
+                self.open_vision_model_selector();
+            }
+            ConfigAction::OpenImageModel => {
+                self.open_image_model_selector();
+            }
+            ConfigAction::OpenMoaAggregator => {
+                self.open_moa_aggregator_selector();
+            }
+            ConfigAction::OpenMoaReferences => {
+                self.open_moa_reference_selector();
+            }
+            ConfigAction::AddMoaExpert => {
+                self.open_moa_add_expert_selector();
+            }
+            ConfigAction::RemoveMoaExpert => {
+                self.open_moa_remove_expert_selector();
+            }
+            ConfigAction::ToggleStreaming => {
+                self.handle_set_streaming("toggle".into());
+            }
+            ConfigAction::ToggleReasoning => {
+                let next = if self.show_reasoning { "hide" } else { "show" };
+                self.handle_set_reasoning(next.into());
+            }
+            ConfigAction::ToggleStatusBar => {
+                self.handle_status_bar_command("toggle".into());
+            }
+            ConfigAction::OpenSkins => {
+                self.open_skin_browser();
+            }
+            ConfigAction::ShowVoice => {
+                self.handle_voice_mode("status".into());
+            }
+            ConfigAction::OpenGatewayBrowser => {
+                self.open_gateway_browser();
+            }
+            ConfigAction::ShowGatewayHomes => {
+                let config = self.load_runtime_config();
+                self.push_output(
+                    self.render_gateway_home_channel_summary(&config),
+                    OutputRole::System,
+                );
+            }
+            ConfigAction::ShowUpdateStatus => {
+                self.handle_update_status();
+            }
+        }
+    }
+
+    fn handle_config_command(&mut self, args: String) {
+        let normalized = args.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "" | "open" | "browse" => self.open_config_selector(),
+            "show" | "summary" | "status" => {
+                self.push_output(self.render_config_summary(), OutputRole::System);
+            }
+            "model" => self.refresh_model_selector_catalog(),
+            "cheap" | "cheap_model" | "cheap-model" | "routing" => {
+                self.open_cheap_model_selector();
+            }
+            "moa" => self.handle_show_moa_config(),
+            "tools" | "toolsets" => self.open_tool_manager(ToolManagerMode::All),
+            "paths" | "path" => {
+                self.push_output(self.render_config_paths(), OutputRole::System);
+            }
+            "voice" => self.handle_voice_mode("status".into()),
+            "gateway" | "homes" => {
+                self.open_gateway_browser();
+            }
+            "update" => self.handle_update_status(),
+            "edit" => {
+                self.push_output(
+                    format!(
+                        "Edit the config file with your editor of choice:\n{}\n\nCLI shortcut: edgecrab config edit",
+                        edgecrab_core::edgecrab_home().join("config.yaml").display()
+                    ),
+                    OutputRole::System,
+                );
+            }
+            _ => self.push_output(
+                "Usage: /config [open|show|model|cheap|moa|paths|voice|gateway|update|edit]",
+                OutputRole::System,
+            ),
         }
     }
 
@@ -6562,39 +11459,285 @@ impl App {
         self.needs_redraw = true;
     }
 
-    fn open_session_browser(&mut self) {
-        let Some(agent) = self.require_agent() else {
-            return;
-        };
+    fn require_session_db(&mut self) -> Option<Arc<edgecrab_state::SessionDb>> {
+        let agent = self.require_agent()?;
         if !agent.has_state_db() {
             self.push_output(
                 "No state database configured (run with --session to enable)",
                 OutputRole::System,
             );
-            return;
+            return None;
         }
-        match agent.list_sessions(50) {
-            Ok(sessions) if sessions.is_empty() => {
-                self.push_output("No saved sessions to browse.", OutputRole::System);
-            }
-            Ok(sessions) => {
-                let entries: Vec<SessionBrowserEntry> = sessions
-                    .iter()
-                    .map(SessionBrowserEntry::from_summary)
-                    .collect();
-                self.session_browser.set_items(entries);
-                self.session_browser.active = true;
-                self.needs_redraw = true;
-            }
-            Err(e) => {
-                self.push_output(format!("DB error: {e}"), OutputRole::Error);
+        match agent.state_db_handle() {
+            Some(db) => Some(db),
+            None => {
+                self.push_output("No state database configured.", OutputRole::System);
+                None
             }
         }
     }
 
+    fn load_session_browser_entries(
+        db: &edgecrab_state::SessionDb,
+        query: &str,
+    ) -> Result<(Vec<SessionBrowserEntry>, Option<String>), edgecrab_types::AgentError> {
+        let recent = db.list_sessions_rich(None, SESSION_BROWSER_LIMIT)?;
+        let trimmed = query.trim();
+        if trimmed.is_empty() {
+            let entries = recent
+                .iter()
+                .map(SessionBrowserEntry::from_summary)
+                .collect::<Vec<_>>();
+            return Ok((
+                entries,
+                Some("Recent sessions. Type to search metadata or full message history.".into()),
+            ));
+        }
+
+        let hits = db.search_sessions_rich(trimmed, SESSION_BROWSER_SEARCH_LIMIT)?;
+        let mut entries = Vec::new();
+        let mut seen = HashSet::new();
+        for hit in &hits {
+            seen.insert(hit.session.id.clone());
+            entries.push(SessionBrowserEntry::from_search_hit(hit));
+        }
+        for summary in &recent {
+            if seen.insert(summary.id.clone()) {
+                entries.push(SessionBrowserEntry::from_summary(summary));
+            }
+        }
+
+        let status_note = if hits.is_empty() {
+            Some("Searching recent metadata plus the indexed message history.".into())
+        } else {
+            Some(format!(
+                "{} ranked content match(es) surfaced from the full session archive.",
+                hits.len()
+            ))
+        };
+
+        Ok((entries, status_note))
+    }
+
+    fn refresh_session_browser(&mut self) -> bool {
+        let query = self.session_browser.query.clone();
+        let Some(db) = self.require_session_db() else {
+            return false;
+        };
+        match Self::load_session_browser_entries(db.as_ref(), &query) {
+            Ok((entries, status_note)) => {
+                self.session_browser.replace_items_preserving_state(entries);
+                self.session_browser_status_note = status_note;
+                self.needs_redraw = true;
+                true
+            }
+            Err(e) => {
+                self.push_output(format!("DB error: {e}"), OutputRole::Error);
+                false
+            }
+        }
+    }
+
+    fn open_session_browser_with_query(&mut self, initial_query: Option<&str>) {
+        self.session_inspector.close();
+        self.close_detail_fullscreen(DetailSurface::SessionInspector);
+        self.close_detail_fullscreen(DetailSurface::SessionBrowser);
+        self.session_browser_pane.reset();
+        self.session_browser.query = initial_query.unwrap_or_default().trim().to_string();
+        self.session_browser.selected = 0;
+        if !self.refresh_session_browser() {
+            return;
+        }
+        if self.session_browser.items.is_empty() && self.session_browser.query.is_empty() {
+            self.push_output("No saved sessions to browse.", OutputRole::System);
+            return;
+        }
+        self.session_browser.active = true;
+        self.needs_redraw = true;
+    }
+
+    fn open_session_browser(&mut self) {
+        self.open_session_browser_with_query(None);
+    }
+
+    fn open_session_inspector(&mut self, entry: SessionBrowserEntry) {
+        let Some(db) = self.require_session_db() else {
+            return;
+        };
+
+        match db.get_messages(&entry.id) {
+            Ok(messages) => {
+                let items = messages
+                    .iter()
+                    .enumerate()
+                    .map(|(index, message)| SessionMessageEntry::from_message(index, message))
+                    .collect::<Vec<_>>();
+                self.session_inspector.selector.query.clear();
+                self.session_inspector.selector.selected = 0;
+                self.session_inspector.selector.set_items(items);
+                self.session_inspector.session =
+                    Some(SessionInspectorMeta::from_browser_entry(&entry));
+                self.session_inspector.pane.reset();
+                self.session_inspector.return_to_browser = true;
+                self.session_inspector.selector.active = true;
+                self.session_browser.active = false;
+                self.close_detail_fullscreen(DetailSurface::SessionBrowser);
+                self.close_detail_fullscreen(DetailSurface::SessionInspector);
+                self.needs_redraw = true;
+            }
+            Err(e) => self.push_output(format!("DB error: {e}"), OutputRole::Error),
+        }
+    }
+
+    fn open_current_session_inspector(&mut self) {
+        let Some(agent) = self.require_agent() else {
+            return;
+        };
+
+        let (snapshot, messages) = match tokio::runtime::Handle::try_current()
+            .map(|handle| handle.runtime_flavor())
+        {
+            Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(|| {
+                self.rt_handle.block_on(async {
+                    let snapshot = agent.session_snapshot().await;
+                    let messages = agent.messages().await;
+                    (snapshot, messages)
+                })
+            }),
+            Ok(_) => {
+                let Some(snapshot) = agent.try_session_snapshot() else {
+                    self.push_output(
+                        "Current session is busy; try again after the current turn.",
+                        OutputRole::System,
+                    );
+                    return;
+                };
+                let Some(messages) = agent.try_messages() else {
+                    self.push_output(
+                        "Current session is busy; try again after the current turn.",
+                        OutputRole::System,
+                    );
+                    return;
+                };
+                (snapshot, messages)
+            }
+            Err(_) => self.rt_handle.block_on(async {
+                let snapshot = agent.session_snapshot().await;
+                let messages = agent.messages().await;
+                (snapshot, messages)
+            }),
+        };
+        let preview = messages
+            .iter()
+            .map(message_preview)
+            .find(|text| !text.trim().is_empty())
+            .unwrap_or_else(|| "No conversation content yet.".into());
+
+        let mut meta = SessionInspectorMeta {
+            id: snapshot
+                .session_id
+                .clone()
+                .unwrap_or_else(|| "current-session".into()),
+            title: "Current session".into(),
+            source: "live".into(),
+            model: snapshot.model.clone(),
+            started_label: "active now".into(),
+            last_active_label: "active now".into(),
+            message_count: messages.len() as i64,
+            preview,
+            matched_role: None,
+            matched_snippet: None,
+            is_live: true,
+            debug_lines: vec![
+                format!(
+                    "Live stats: {} user turn(s) · {} API call(s)",
+                    snapshot.user_turn_count, snapshot.api_call_count
+                ),
+                format!(
+                    "Tokens: prompt {} · output {} · reasoning {}",
+                    snapshot.prompt_tokens(),
+                    snapshot.output_tokens,
+                    snapshot.reasoning_tokens
+                ),
+                format!(
+                    "Budget: {} / {} remaining",
+                    snapshot.budget_remaining, snapshot.budget_max
+                ),
+            ],
+        };
+
+        if let Some(session_id) = snapshot.session_id.as_deref() {
+            if let Some(db) = agent.state_db_handle() {
+                match db.get_session(session_id) {
+                    Ok(Some(record)) => {
+                        meta.id = record.id;
+                        meta.title = record.title.unwrap_or_else(|| "Current session".into());
+                        meta.source = record.source;
+                        meta.model = record.model.unwrap_or(snapshot.model);
+                        meta.started_label = format_session_timestamp(record.started_at);
+                        meta.last_active_label = "active now".into();
+                    }
+                    Ok(None) => {}
+                    Err(e) => self.push_output(format!("DB error: {e}"), OutputRole::Error),
+                }
+            }
+        }
+
+        let items = messages
+            .iter()
+            .enumerate()
+            .map(|(index, message)| SessionMessageEntry::from_message(index, message))
+            .collect::<Vec<_>>();
+
+        self.session_browser.active = false;
+        self.close_detail_fullscreen(DetailSurface::SessionBrowser);
+        self.close_detail_fullscreen(DetailSurface::SessionInspector);
+        self.session_inspector.selector.query.clear();
+        self.session_inspector.selector.selected = 0;
+        self.session_inspector.selector.set_items(items);
+        self.session_inspector.session = Some(meta);
+        self.session_inspector.pane.reset();
+        self.session_inspector.return_to_browser = false;
+        self.session_inspector.selector.active = true;
+        self.needs_redraw = true;
+    }
+
+    fn close_session_inspector(&mut self) {
+        let return_to_browser = self.session_inspector.return_to_browser;
+        self.close_detail_fullscreen(DetailSurface::SessionInspector);
+        self.session_inspector.close();
+        self.session_browser.active = return_to_browser;
+        self.needs_redraw = true;
+    }
+
+    fn delete_session_from_browser(&mut self, session_id: &str) {
+        let Some(agent) = self.require_agent() else {
+            return;
+        };
+        match agent.delete_session(session_id) {
+            Ok(()) => {
+                self.push_output(
+                    format!(
+                        "Deleted session {}",
+                        &session_id[..session_id.len().min(12)]
+                    ),
+                    OutputRole::System,
+                );
+                let had_query = !self.session_browser.query.trim().is_empty();
+                if self.refresh_session_browser()
+                    && self.session_browser.items.is_empty()
+                    && !had_query
+                {
+                    self.session_browser.active = false;
+                    self.close_detail_fullscreen(DetailSurface::SessionBrowser);
+                }
+            }
+            Err(e) => self.push_output(format!("Delete failed: {e}"), OutputRole::Error),
+        }
+    }
+
     fn open_mcp_selector(&mut self, initial_query: Option<&str>, refresh_catalog: bool) -> usize {
-        let configured =
-            edgecrab_tools::tools::mcp_client::configured_servers().unwrap_or_default();
+        let configured = self.configured_mcp_servers(true).unwrap_or_default();
         let official_entries = if refresh_catalog {
             self.rt_handle
                 .block_on(crate::mcp_catalog::load_official_catalog(true))
@@ -6615,38 +11758,77 @@ impl App {
         self.mcp_selector.filtered.len()
     }
 
-    fn handle_session_list(&mut self) {
-        let Some(agent) = self.require_agent() else {
+    fn configured_mcp_servers(
+        &self,
+        include_disabled: bool,
+    ) -> Result<Vec<edgecrab_tools::tools::mcp_client::ConfiguredMcpServer>, String> {
+        let servers = if include_disabled {
+            edgecrab_tools::tools::mcp_client::configured_servers_with_disabled()
+        } else {
+            edgecrab_tools::tools::mcp_client::configured_servers()
+        };
+        servers.map_err(|err| format!("Failed to read MCP configuration: {err}"))
+    }
+
+    fn configured_mcp_server(
+        &self,
+        name: &str,
+    ) -> Result<edgecrab_tools::tools::mcp_client::ConfiguredMcpServer, String> {
+        self.configured_mcp_servers(true)?
+            .into_iter()
+            .find(|server| server.name == name)
+            .ok_or_else(|| format!("Unknown MCP preset or configured server '{name}'."))
+    }
+
+    fn set_mcp_server_enabled(&mut self, name: &str, enabled: bool) {
+        let mut config = self.load_runtime_config();
+        let Some(server) = config.mcp_servers.get_mut(name) else {
+            self.push_output(format!("Unknown MCP server '{name}'."), OutputRole::Error);
             return;
         };
-        if !agent.has_state_db() {
+
+        if server.enabled == enabled {
             self.push_output(
-                "No state database configured (run with --session to enable)",
+                format!(
+                    "MCP server '{}' is already {}.",
+                    name,
+                    if enabled { "enabled" } else { "disabled" }
+                ),
                 OutputRole::System,
             );
             return;
         }
-        match agent.list_sessions(20) {
-            Ok(sessions) if sessions.is_empty() => {
-                self.push_output("No saved sessions.", OutputRole::System)
+
+        server.enabled = enabled;
+        match config.save() {
+            Ok(()) => {
+                edgecrab_tools::tools::mcp_client::reload_mcp_connections();
+                self.push_output(
+                    format!(
+                        "{} MCP server '{}'.",
+                        if enabled { "Enabled" } else { "Disabled" },
+                        name
+                    ),
+                    OutputRole::System,
+                );
             }
-            Ok(sessions) => {
-                let mut text = format!("Sessions ({} found):\n", sessions.len());
-                for s in &sessions {
-                    let title = s.title.as_deref().unwrap_or("-");
-                    let model = s.model.as_deref().unwrap_or("?");
-                    text.push_str(&format!(
-                        "  {}  {}  model={}  msgs={}\n",
-                        &s.id[..s.id.len().min(8)],
-                        title,
-                        model,
-                        s.message_count
-                    ));
-                }
-                self.push_output(text, OutputRole::System);
-            }
-            Err(e) => self.push_output(format!("DB error: {e}"), OutputRole::Error),
+            Err(err) => self.push_output(
+                format!(
+                    "Failed to save config after {} MCP server '{}': {err}",
+                    if enabled { "enabling" } else { "disabling" },
+                    name
+                ),
+                OutputRole::Error,
+            ),
         }
+    }
+
+    fn handle_session_browser_command(&mut self, query: Option<String>) {
+        self.open_session_browser_with_query(query.as_deref());
+    }
+
+    fn handle_inspect_current_session(&mut self) {
+        self.open_current_session_inspector();
     }
 
     fn handle_session_delete(&mut self, id_prefix: String) {
@@ -6981,7 +12163,7 @@ impl App {
                         if skills.is_empty() {
                             self.push_output(
                                 "No skills installed. Add .md files or skill directories to ~/.edgecrab/skills/\n\
-                                 Run `/skills install <path>` to install a skill.",
+                                 Run `/skills search` to browse remote skills or `/skills install <path>` to install a local skill.",
                                 OutputRole::System,
                             );
                         } else {
@@ -6993,7 +12175,9 @@ impl App {
                                 let skill_type = if s.path().is_dir() { "[dir]" } else { "[md]" };
                                 text.push_str(&format!("  {skill_type} {name}\n"));
                             }
-                            text.push_str("\nUsage: /skills view <name.md>  /skills install <path>");
+                            text.push_str(
+                                "\nUsage: /skills view <name.md>  /skills search  /skills install <path>",
+                            );
                             self.push_output(text, OutputRole::System);
                         }
                     }
@@ -7037,6 +12221,7 @@ impl App {
                     self.push_output(
                         "Usage:\n\
                          /skills install <local-path>              — install local skill file/dir\n\
+                         /skills install edgecrab:<path>           — install from a curated remote source\n\
                          /skills install owner/repo/path/skill.md  — install from GitHub",
                         OutputRole::System,
                     );
@@ -7051,45 +12236,68 @@ impl App {
                     && !std::path::Path::new(operand).exists();
 
                 if looks_like_github {
-                    // Parse: owner/repo/path
-                    let mut parts_gh = operand.splitn(3, '/');
-                    let owner = parts_gh.next().unwrap_or("");
-                    let repo  = parts_gh.next().unwrap_or("");
-                    let path  = parts_gh.next().unwrap_or("");
-
-                    if owner.is_empty() || repo.is_empty() || path.is_empty() {
-                        self.push_output(
-                            "GitHub format: /skills install owner/repo/path/to/skill.md",
-                            OutputRole::Error,
-                        );
-                        return;
-                    }
-
                     let skills_dir_c = skills_dir.clone();
-                    let owner  = owner.to_string();
-                    let repo   = repo.to_string();
-                    let path   = path.to_string();
+                    let optional_dir = edgecrab_tools::tools::skills_sync::optional_skills_dir();
+                    let remote_id = operand.to_string();
 
                     self.push_output(
-                        format!("Fetching skill from github.com/{owner}/{repo}/{path} …"),
+                        format!("Fetching remote skill bundle '{remote_id}' …"),
                         OutputRole::System,
                     );
 
-                    // Run network fetch in async context
-                    let result: Result<String, String> = self.rt_handle.block_on(async {
-                        install_skill_from_github(&owner, &repo, &path, &skills_dir_c).await
+                    let result = self.rt_handle.block_on(async {
+                        edgecrab_tools::tools::skills_hub::install_identifier(
+                            &remote_id,
+                            &skills_dir_c,
+                            optional_dir.as_deref(),
+                            false,
+                        )
+                        .await
                     });
 
                     match result {
-                        Ok(msg) => self.push_output(msg, OutputRole::System),
-                        Err(e)  => self.push_output(format!("GitHub install failed: {e}"), OutputRole::Error),
+                        Ok(outcome) => self.push_output(
+                            format!(
+                                "{}\nActivate with: /skills view {}",
+                                outcome.message, outcome.skill_name
+                            ),
+                            OutputRole::System,
+                        ),
+                        Err(e)  => self.push_output(format!("Remote install failed: {e}"), OutputRole::Error),
                     }
                     return;
                 }
 
                 let src = std::path::Path::new(operand);
                 if !src.exists() {
-                    self.push_output(format!("Path not found: {operand}"), OutputRole::Error);
+                    let skills_dir_c = skills_dir.clone();
+                    let optional_dir = edgecrab_tools::tools::skills_sync::optional_skills_dir();
+                    let remote_id = operand.to_string();
+                    self.push_output(
+                        format!("Fetching remote skill bundle '{remote_id}' …"),
+                        OutputRole::System,
+                    );
+                    let result = self.rt_handle.block_on(async {
+                        edgecrab_tools::tools::skills_hub::install_identifier(
+                            &remote_id,
+                            &skills_dir_c,
+                            optional_dir.as_deref(),
+                            false,
+                        )
+                        .await
+                    });
+                    match result {
+                        Ok(outcome) => self.push_output(
+                            format!(
+                                "{}\nActivate with: /skills view {}",
+                                outcome.message, outcome.skill_name
+                            ),
+                            OutputRole::System,
+                        ),
+                        Err(e) => {
+                            self.push_output(format!("Remote install failed: {e}"), OutputRole::Error)
+                        }
+                    }
                     return;
                 }
                 // Create skills dir if needed
@@ -7119,24 +12327,60 @@ impl App {
                 }
             }
 
+            "update" => {
+                let skills_dir_c = skills_dir.clone();
+                let optional_dir = edgecrab_tools::tools::skills_sync::optional_skills_dir();
+                if operand.is_empty() {
+                    self.push_output(
+                        "Updating all hub-installed remote skills …",
+                        OutputRole::System,
+                    );
+                    let result = self.rt_handle.block_on(async {
+                        edgecrab_tools::tools::skills_hub::update_all_installed_skills(
+                            &skills_dir_c,
+                            optional_dir.as_deref(),
+                            false,
+                        )
+                        .await
+                    });
+                    match result {
+                        Ok(outcomes) => self.push_output(
+                            edgecrab_tools::tools::skills_hub::render_update_outcomes(&outcomes),
+                            OutputRole::System,
+                        ),
+                        Err(e) => self.push_output(format!("Remote update failed: {e}"), OutputRole::Error),
+                    }
+                } else {
+                    let skill_name = operand.to_string();
+                    self.push_output(
+                        format!("Updating remote skill '{skill_name}' …"),
+                        OutputRole::System,
+                    );
+                    let result = self.rt_handle.block_on(async {
+                        edgecrab_tools::tools::skills_hub::update_installed_skill(
+                            &skill_name,
+                            &skills_dir_c,
+                            optional_dir.as_deref(),
+                            false,
+                        )
+                        .await
+                    });
+                    match result {
+                        Ok(outcome) => self.push_output(
+                            format!(
+                                "{}\nActivate with: /skills view {}",
+                                outcome.message, outcome.skill_name
+                            ),
+                            OutputRole::System,
+                        ),
+                        Err(e) => self.push_output(format!("Remote update failed: {e}"), OutputRole::Error),
+                    }
+                }
+            }
+
             "hub" | "search" => {
-                // Simple hub browser — lists skills from the default well-known taps
                 let query = operand;
-                self.push_output(
-                    format!(
-                        "Skills Hub — search '{query}'\n\
-                         \n\
-                         To install a skill from GitHub:\n\
-                         /skills install owner/repo/path/to/skill.md\n\
-                         /skills install owner/repo/skills/skill-name\n\
-                         \n\
-                         Example (edgecrab skills):\n\
-                         /skills install raphaelmansuy/edgecrab/skills/ascii-diagram-master\n\
-                         \n\
-                         Set GITHUB_TOKEN env var for higher rate limits."
-                    ),
-                    OutputRole::System,
-                );
+                self.open_remote_skill_selector((!query.is_empty()).then_some(query));
             }
 
             "remove" | "uninstall" | "rm" => {
@@ -7167,43 +12411,9 @@ impl App {
             }
 
             _ => self.push_output(
-                "Usage: /skills [list | view <name> | install <path-or-owner/repo/path> | remove <name> | hub [query]]",
+                "Usage: /skills [list | view <name> | install <path-or-source-or-owner/repo/path> | update [name] | remove <name> | hub [query] | search [query]]",
                 OutputRole::System,
             ),
-        }
-    }
-
-    fn handle_show_tools(&mut self) {
-        let Some(agent) = self.require_agent() else {
-            return;
-        };
-        let names = self.rt_handle.block_on(async { agent.tool_names().await });
-        if names.is_empty() {
-            self.push_output("No tools registered.", OutputRole::System);
-        } else {
-            let mut text = format!("Registered tools ({}):\n", names.len());
-            for name in &names {
-                text.push_str(&format!("  {name}\n"));
-            }
-            self.push_output(text, OutputRole::System);
-        }
-    }
-
-    fn handle_show_toolsets(&mut self) {
-        let Some(agent) = self.require_agent() else {
-            return;
-        };
-        let toolsets = self
-            .rt_handle
-            .block_on(async { agent.toolset_summary().await });
-        if toolsets.is_empty() {
-            self.push_output("No toolsets registered.", OutputRole::System);
-        } else {
-            let mut text = String::from("Available toolsets:\n");
-            for (name, count) in &toolsets {
-                text.push_str(&format!("  {name:<14} ({count} tools)\n"));
-            }
-            self.push_output(text, OutputRole::System);
         }
     }
 
@@ -7228,7 +12438,7 @@ impl App {
         if !enabled {
             self.remove_reasoning_output_block();
         }
-        persist_display_preferences(Some(enabled), None)
+        persist_display_preferences(Some(enabled), None, None, None)
     }
 
     fn set_streaming_preference(&mut self, enabled: bool) -> anyhow::Result<()> {
@@ -7238,7 +12448,88 @@ impl App {
                 agent.set_streaming(enabled).await;
             });
         }
-        persist_display_preferences(None, Some(enabled))
+        persist_display_preferences(None, Some(enabled), None, None)
+    }
+
+    fn set_tool_progress_mode(&mut self, mode: ToolProgressMode) -> anyhow::Result<()> {
+        self.tool_progress_mode = mode;
+        persist_display_preferences(None, None, Some(mode), None)
+    }
+
+    fn set_status_bar_visibility(&mut self, enabled: bool) -> anyhow::Result<()> {
+        self.show_status_bar = enabled;
+        self.needs_redraw = true;
+        persist_display_preferences(None, None, None, Some(enabled))
+    }
+
+    fn should_render_tool_call(&mut self, tool_name: &str, args_json: &str) -> bool {
+        match self.tool_progress_mode {
+            ToolProgressMode::Off => false,
+            ToolProgressMode::All | ToolProgressMode::Verbose => true,
+            ToolProgressMode::New => {
+                let signature = tool_signature(tool_name, args_json);
+                self.seen_tool_signatures.insert(signature)
+            }
+        }
+    }
+
+    fn tool_progress_mode_detail(mode: ToolProgressMode) -> &'static str {
+        match mode {
+            ToolProgressMode::Off => "silent transcript; status bar still shows active work.",
+            ToolProgressMode::New => "show each distinct tool call once per turn.",
+            ToolProgressMode::All => "show every tool call in the transcript.",
+            ToolProgressMode::Verbose => {
+                "show every tool call plus curated detail lines for plan and result context."
+            }
+        }
+    }
+
+    fn format_tool_progress_status(&self) -> String {
+        format!(
+            "Tool progress: {} - {} Modes: off, new, all, verbose.",
+            self.tool_progress_mode.label(),
+            Self::tool_progress_mode_detail(self.tool_progress_mode)
+        )
+    }
+
+    fn cycle_tool_progress_mode(&mut self) -> String {
+        let next = self.tool_progress_mode.cycle();
+        let save_note = match self.set_tool_progress_mode(next) {
+            Ok(()) => String::new(),
+            Err(err) => format!(" Saving config failed: {err}"),
+        };
+        let detail = Self::tool_progress_mode_detail(next);
+        format!("Tool progress: {} - {detail}{save_note}", next.label())
+    }
+
+    fn handle_tool_progress_command(&mut self, raw: String) -> String {
+        let normalized = raw.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "" | "cycle" | "next" => self.cycle_tool_progress_mode(),
+            "status" => self.format_tool_progress_status(),
+            "off" => self.set_tool_progress_mode_explicit(ToolProgressMode::Off),
+            "new" => self.set_tool_progress_mode_explicit(ToolProgressMode::New),
+            "all" => self.set_tool_progress_mode_explicit(ToolProgressMode::All),
+            "verbose" => self.set_tool_progress_mode_explicit(ToolProgressMode::Verbose),
+            _ => "Usage: /verbose [off|new|all|verbose|status]".into(),
+        }
+    }
+
+    fn set_tool_progress_mode_explicit(&mut self, mode: ToolProgressMode) -> String {
+        let already_active = self.tool_progress_mode == mode;
+        let save_note = match self.set_tool_progress_mode(mode) {
+            Ok(()) => String::new(),
+            Err(err) => format!(" Saving config failed: {err}"),
+        };
+        let detail = Self::tool_progress_mode_detail(mode);
+        if already_active {
+            format!(
+                "Tool progress: {} - already active. {detail}{save_note}",
+                mode.label()
+            )
+        } else {
+            format!("Tool progress: {} - {detail}{save_note}", mode.label())
+        }
     }
 
     fn handle_set_reasoning(&mut self, level: String) {
@@ -7342,57 +12633,131 @@ impl App {
         self.push_output(msg, OutputRole::System);
     }
 
-    /// Spawn model catalog discovery in the background.
-    /// Sets `BgOp` spinner immediately, opens the model selector when done.
-    /// If a background op is already running this is a no-op.
-    fn refresh_model_selector_catalog(&mut self) {
-        if matches!(self.display_state, DisplayState::BgOp { .. }) {
-            return; // already loading
+    fn handle_status_bar_command(&mut self, mode: String) {
+        let normalized = mode.trim().to_ascii_lowercase();
+        let msg = match normalized.as_str() {
+            "" | "status" => format!(
+                "Status bar: {}. Usage: /statusbar <on|off|toggle|status>",
+                if self.show_status_bar {
+                    "visible"
+                } else {
+                    "hidden"
+                }
+            ),
+            "on" | "show" | "enable" | "enabled" => match self.set_status_bar_visibility(true) {
+                Ok(()) => "Status bar: visible.".into(),
+                Err(err) => {
+                    format!("Status bar enabled for this session, but saving config failed: {err}")
+                }
+            },
+            "off" | "hide" | "disable" | "disabled" => {
+                match self.set_status_bar_visibility(false) {
+                    Ok(()) => "Status bar: hidden.".into(),
+                    Err(err) => format!(
+                        "Status bar disabled for this session, but saving config failed: {err}"
+                    ),
+                }
+            }
+            "toggle" => {
+                let next = !self.show_status_bar;
+                match self.set_status_bar_visibility(next) {
+                    Ok(()) => format!("Status bar: {}.", if next { "visible" } else { "hidden" }),
+                    Err(err) => format!(
+                        "Status bar changed for this session, but saving config failed: {err}"
+                    ),
+                }
+            }
+            _ => "Unknown status bar option. Use: on, off, toggle, status".into(),
+        };
+        self.push_output(msg, OutputRole::System);
+    }
+
+    fn apply_model_selector_catalog(
+        &mut self,
+        models: Vec<ModelEntry>,
+        current_model: &str,
+        preserve_state: bool,
+        target: ModelSelectorTarget,
+    ) {
+        self.model_selector_target = target;
+        if preserve_state {
+            if self.model_selector.active {
+                self.model_selector.replace_items_preserving_state(models);
+                if self.model_selector.filtered.is_empty() {
+                    self.model_selector.activate_with_primary(current_model);
+                }
+            } else {
+                self.model_selector.set_items(models);
+            }
+        } else {
+            self.model_selector.set_items(models);
+            self.model_selector.activate_with_primary(current_model);
+        }
+        self.needs_redraw = true;
+    }
+
+    fn open_model_selector_for(&mut self, current_model: &str, target: ModelSelectorTarget) {
+        let static_entries = build_model_selector_entries(&ModelCatalog::grouped_catalog(), None);
+        self.apply_model_selector_catalog(static_entries, current_model, false, target);
+    }
+
+    fn refresh_shared_model_selector_catalog(
+        &mut self,
+        current_model: String,
+        target: ModelSelectorTarget,
+    ) {
+        self.open_model_selector_for(&current_model, target);
+        if self.model_selector_refresh_in_flight {
+            return;
         }
 
-        let mut providers: Vec<String> = vec![
-            "openrouter".to_string(),
-            "ollama".to_string(),
-            "lmstudio".to_string(),
-        ];
-        if let Some((provider, _)) = self.model_name.split_once('/') {
-            let provider = provider.to_lowercase();
-            if !providers.iter().any(|p| p == &provider) {
+        let mut providers: Vec<String> = discovery_provider_statuses()
+            .into_iter()
+            .filter_map(|(provider, availability)| {
+                matches!(availability, DiscoveryAvailability::Supported).then_some(provider)
+            })
+            .collect();
+        if let Some((provider, _)) = current_model.split_once('/') {
+            let provider = normalize_discovery_provider(provider);
+            if matches!(
+                live_discovery_availability(&provider),
+                DiscoveryAvailability::Supported
+            ) && !providers.iter().any(|p| p == &provider)
+            {
                 providers.push(provider);
             }
         }
-        let current_model = self.model_name.clone();
         let tx = self.response_tx.clone();
 
-        self.display_state = DisplayState::BgOp {
-            label: "Loading models…".to_string(),
-            frame: 0,
-            started: Instant::now(),
-        };
+        self.model_selector_refresh_in_flight = true;
         self.needs_redraw = true;
 
         self.rt_handle.spawn(async move {
             let static_catalog = ModelCatalog::grouped_catalog();
-            let discovered = model_discovery::discover_multiple(&providers).await;
-            let merged =
-                model_discovery::merge_grouped_catalog_with_dynamic(&static_catalog, &discovered);
-            let mut all_models: Vec<ModelEntry> = Vec::new();
-            for (provider, models) in merged {
-                for model in models {
-                    all_models.push(ModelEntry {
-                        display: format!("{provider}/{model}"),
-                        provider: provider.clone(),
-                        detail: model.clone(),
-                        model_name: model,
-                    });
-                }
-            }
-            all_models.sort_by(|a, b| a.display.cmp(&b.display));
+            let discovered = discover_multiple(&providers).await;
+            let merged = merge_grouped_catalog_with_dynamic(&static_catalog, &discovered);
+            let dynamic_lookup: BTreeMap<String, (DiscoverySource, BTreeSet<String>)> = discovered
+                .into_iter()
+                .map(|entry| {
+                    (
+                        entry.provider,
+                        (entry.source, entry.models.into_iter().collect()),
+                    )
+                })
+                .collect();
             let _ = tx.send(AgentResponse::BgOp(BackgroundOpResult::ModelCatalogReady {
-                models: all_models,
+                models: build_model_selector_entries(&merged, Some(&dynamic_lookup)),
                 current_model,
             }));
         });
+    }
+
+    /// Spawn background live discovery while keeping the selector interactive.
+    fn refresh_model_selector_catalog(&mut self) {
+        self.refresh_shared_model_selector_catalog(
+            self.model_name.clone(),
+            ModelSelectorTarget::Primary,
+        );
     }
 
     fn open_vision_model_selector(&mut self) {
@@ -7402,10 +12767,13 @@ impl App {
             .as_ref()
             .map(|agent| self.rt_handle.block_on(agent.auxiliary_config()))
             .unwrap_or_default();
-        let dynamic_providers = vec!["ollama".to_string(), "lmstudio".to_string()];
+        let dynamic_providers: Vec<String> = live_discovery_providers()
+            .into_iter()
+            .filter(|provider| provider == "ollama" || provider == "lmstudio")
+            .collect();
         let dynamic_models = self
             .rt_handle
-            .block_on(model_discovery::discover_multiple(&dynamic_providers));
+            .block_on(discover_multiple(&dynamic_providers));
         let dynamic_pairs: Vec<(String, Vec<String>)> = dynamic_models
             .into_iter()
             .map(|entry| (entry.provider, entry.models))
@@ -7468,14 +12836,46 @@ impl App {
 
         if let Some(refresh_target) = trimmed.strip_prefix("refresh") {
             let target = refresh_target.trim().to_lowercase();
+            let discovery_statuses = discovery_provider_statuses();
+            let feature_gated: Vec<String> = discovery_statuses
+                .iter()
+                .filter_map(|(provider, availability)| match availability {
+                    DiscoveryAvailability::FeatureGated(feature) => {
+                        Some(format!("{provider} ({feature})"))
+                    }
+                    _ => None,
+                })
+                .collect();
             let providers: Vec<String> = if target.is_empty() || target == "all" {
-                vec![
-                    "openrouter".to_string(),
-                    "ollama".to_string(),
-                    "lmstudio".to_string(),
-                ]
+                discovery_statuses
+                    .into_iter()
+                    .filter_map(|(provider, availability)| {
+                        matches!(availability, DiscoveryAvailability::Supported).then_some(provider)
+                    })
+                    .collect()
             } else {
-                vec![target.clone()]
+                let canonical = normalize_discovery_provider(&target);
+                match live_discovery_availability(&canonical) {
+                    DiscoveryAvailability::Supported => vec![canonical],
+                    DiscoveryAvailability::FeatureGated(feature) => {
+                        self.push_output(
+                            format!(
+                                "Provider '{target}' supports live discovery but this build was compiled without `{feature}`."
+                            ),
+                            OutputRole::System,
+                        );
+                        return;
+                    }
+                    DiscoveryAvailability::Unsupported => {
+                        self.push_output(
+                            format!(
+                                "Provider '{target}' does not support live discovery. It is listed from the static catalog."
+                            ),
+                            OutputRole::System,
+                        );
+                        return;
+                    }
+                }
             };
             let tx = self.response_tx.clone();
             self.display_state = DisplayState::BgOp {
@@ -7485,20 +12885,22 @@ impl App {
             };
             self.needs_redraw = true;
             self.rt_handle.spawn(async move {
-                let discovered = model_discovery::discover_multiple(&providers).await;
+                let discovered = discover_multiple(&providers).await;
                 let mut text = String::from("Model discovery refresh:\n\n");
                 for entry in discovered {
-                    let source = match entry.source {
-                        DiscoverySource::Live => "live API",
-                        DiscoverySource::Cache => "cache",
-                        DiscoverySource::Static => "static catalog",
-                    };
+                    let source = discovery_source_label(entry.source);
                     text.push_str(&format!(
-                        "  {}/{} models ({})\n",
+                        "  {}: {} models ({})\n",
                         entry.provider,
                         entry.models.len(),
                         source
                     ));
+                }
+                if !feature_gated.is_empty() {
+                    text.push_str("\nFeature-gated in this build:\n");
+                    for provider in feature_gated {
+                        text.push_str(&format!("  {provider}\n"));
+                    }
                 }
                 text.push_str(
                     "\nUse /models <provider> to inspect the list, or /model to open selector.",
@@ -7509,70 +12911,89 @@ impl App {
         }
 
         let filter = trimmed.to_lowercase();
-        let is_exact_provider = !filter.is_empty() && known_providers.iter().any(|p| p == &filter);
+        let canonical_filter = normalize_discovery_provider(&filter);
+        let is_exact_provider = !filter.is_empty()
+            && (known_providers
+                .iter()
+                .any(|provider| provider == &canonical_filter)
+                || matches!(
+                    live_discovery_availability(&canonical_filter),
+                    DiscoveryAvailability::Supported | DiscoveryAvailability::FeatureGated(_)
+                ));
 
         if is_exact_provider {
-            let tx = self.response_tx.clone();
-            let filter_owned = filter.clone();
-            self.display_state = DisplayState::BgOp {
-                label: format!("Discovering {filter}…"),
-                frame: 0,
-                started: Instant::now(),
-            };
-            self.needs_redraw = true;
-            self.rt_handle.spawn(async move {
-                let discovered = model_discovery::discover_provider_models(&filter_owned).await;
-                let source = match discovered.source {
-                    DiscoverySource::Live => "live API",
-                    DiscoverySource::Cache => "cache",
-                    DiscoverySource::Static => "static catalog",
-                };
-                let mut text = format!(
-                    "Models for '{}' (* = current, source: {}):\n\n",
-                    filter_owned, source
-                );
-                text.push_str(&format!("  {}\n", filter_owned));
-                for model in discovered.models {
-                    let full = format!("{}/{}", filter_owned, model);
-                    let marker = if current == full { " *" } else { "" };
-                    text.push_str(&format!("    {}{}\n", full, marker));
+            let filter_owned = canonical_filter.clone();
+            match live_discovery_availability(&filter_owned) {
+                DiscoveryAvailability::Supported => {
+                    let tx = self.response_tx.clone();
+                    let current_model = current.clone();
+                    self.display_state = DisplayState::BgOp {
+                        label: format!("Discovering {filter_owned}…"),
+                        frame: 0,
+                        started: Instant::now(),
+                    };
+                    self.needs_redraw = true;
+                    self.rt_handle.spawn(async move {
+                        let discovered = discover_provider_models(&filter_owned).await;
+                        let text = build_provider_models_report(
+                            &discovered,
+                            DiscoveryAvailability::Supported,
+                            &current_model,
+                        );
+                        let _ = tx.send(AgentResponse::BgOp(BackgroundOpResult::SystemMsg(text)));
+                    });
                 }
-                text.push_str("\nSwitch with: /model <provider/model-name>");
-                let _ = tx.send(AgentResponse::BgOp(BackgroundOpResult::SystemMsg(text)));
-            });
+                DiscoveryAvailability::FeatureGated(feature) => {
+                    let provider_models = ProviderModels {
+                        provider: filter_owned.clone(),
+                        models: static_catalog
+                            .iter()
+                            .find(|(provider, _)| provider == &filter_owned)
+                            .map(|(_, models)| models.clone())
+                            .unwrap_or_default(),
+                        source: DiscoverySource::Static,
+                    };
+                    let text = build_provider_models_report(
+                        &provider_models,
+                        DiscoveryAvailability::FeatureGated(feature),
+                        &current,
+                    );
+                    self.push_output(text, OutputRole::System);
+                }
+                DiscoveryAvailability::Unsupported => {
+                    let provider_models = ProviderModels {
+                        provider: filter_owned.clone(),
+                        models: static_catalog
+                            .iter()
+                            .find(|(provider, _)| provider == &filter_owned)
+                            .map(|(_, models)| models.clone())
+                            .unwrap_or_default(),
+                        source: DiscoverySource::Static,
+                    };
+                    let text = build_provider_models_report(
+                        &provider_models,
+                        DiscoveryAvailability::Unsupported,
+                        &current,
+                    );
+                    self.push_output(text, OutputRole::System);
+                }
+            }
             return;
         }
 
-        let mut text = String::new();
-        for (provider, models) in &static_catalog {
-            if !filter.is_empty() && !provider.contains(&filter) {
-                continue;
-            }
-            text.push_str(&format!("  {}\n", provider));
-            for model in models {
-                let full = format!("{}/{}", provider, model);
-                let marker = if current == full { " *" } else { "" };
-                text.push_str(&format!("    {}{}\n", full, marker));
-            }
-            text.push('\n');
-        }
+        let filtered_providers: Vec<(String, Vec<String>)> = static_catalog
+            .into_iter()
+            .filter(|(provider, _)| filter.is_empty() || provider.contains(&filter))
+            .collect();
 
-        if text.is_empty() {
-            text = format!(
+        let text = if filtered_providers.is_empty() {
+            format!(
                 "No provider matching '{}'. Use /models without args to see all.\n",
                 filter
-            );
+            )
         } else {
-            let header = if filter.is_empty() {
-                "Available models (* = current):\n\n".to_string()
-            } else {
-                format!("Models for '{}' (* = current):\n\n", filter)
-            };
-            text = format!(
-                "{}{}Tip: /models <provider> uses dynamic discovery when available.\nTip: /models refresh [provider|all]\n\nSwitch with: /model <provider/model-name>",
-                header, text
-            );
-        }
+            build_models_inventory_report(&filtered_providers, &current, &filter)
+        };
 
         self.push_output(text, OutputRole::System);
     }
@@ -7764,56 +13185,316 @@ impl App {
     }
 
     fn handle_show_platforms(&mut self) {
-        let mut text = String::from("Gateway platforms:\n");
-        // Webhook is always available
-        text.push_str("  webhook   ✓ available (always-on HTTP adapter)\n");
-        // WhatsApp: check if bridge config exists
-        let wa_available = edgecrab_core::edgecrab_home()
-            .join("whatsapp")
-            .join("config.json")
-            .exists();
-        text.push_str(&format!(
-            "  whatsapp  {} {}\n",
-            if wa_available { "✓" } else { "✗" },
-            if wa_available {
-                "configured"
+        self.open_gateway_browser();
+    }
+
+    fn open_gateway_browser(&mut self) {
+        self.gateway_browser.query.clear();
+        self.gateway_browser.selected = 0;
+        self.gateway_browser.active = true;
+        self.gateway_browser_pane.reset();
+        self.refresh_gateway_browser();
+    }
+
+    fn refresh_gateway_browser(&mut self) {
+        let config = self.load_runtime_config();
+        let diagnostics = collect_platform_diagnostics(&config);
+        let entries = build_gateway_platform_entries(&config, &diagnostics);
+        self.gateway_browser.replace_items_preserving_state(entries);
+        self.needs_redraw = true;
+    }
+
+    fn gateway_browser_current(&self) -> Option<&GatewayPlatformEntry> {
+        self.gateway_browser.current()
+    }
+
+    fn toggle_selected_gateway_platform(&mut self) {
+        let Some(platform_id) = self
+            .gateway_browser_current()
+            .map(|entry| entry.diagnostic.id)
+        else {
+            return;
+        };
+
+        let mut config = self.load_runtime_config();
+        let enabled_now = match platform_id {
+            "telegram" => config
+                .gateway
+                .platform_requested(platform_id, config.gateway.telegram.enabled),
+            "discord" => config
+                .gateway
+                .platform_requested(platform_id, config.gateway.discord.enabled),
+            "slack" => config
+                .gateway
+                .platform_requested(platform_id, config.gateway.slack.enabled),
+            "signal" => config
+                .gateway
+                .platform_requested(platform_id, config.gateway.signal.enabled),
+            "whatsapp" => config
+                .gateway
+                .platform_requested(platform_id, config.gateway.whatsapp.enabled),
+            "webhook" => config.gateway.webhook_enabled,
+            _ => config.gateway.platform_enabled(platform_id),
+        };
+
+        if platform_id == "webhook" {
+            config.gateway.webhook_enabled = !enabled_now;
+        } else {
+            if !enabled_now {
+                config.gateway.enable_platform(platform_id);
             } else {
-                "not configured (run: edgecrab whatsapp)"
-            },
-        ));
-        // Check env vars for other platforms
-        let telegram = std::env::var("TELEGRAM_BOT_TOKEN").is_ok();
-        text.push_str(&format!(
-            "  telegram  {} {}\n",
-            if telegram { "✓" } else { "✗" },
-            if telegram {
-                "token found"
-            } else {
-                "TELEGRAM_BOT_TOKEN not set"
-            },
-        ));
-        let discord = std::env::var("DISCORD_BOT_TOKEN").is_ok();
-        text.push_str(&format!(
-            "  discord   {} {}\n",
-            if discord { "✓" } else { "✗" },
-            if discord {
-                "token found"
-            } else {
-                "DISCORD_BOT_TOKEN not set"
-            },
-        ));
-        let slack = std::env::var("SLACK_BOT_TOKEN").is_ok();
-        text.push_str(&format!(
-            "  slack     {} {}\n",
-            if slack { "✓" } else { "✗" },
-            if slack {
-                "token found"
-            } else {
-                "SLACK_BOT_TOKEN not set"
-            },
-        ));
-        text.push_str("\nRun `edgecrab gateway start` to launch the gateway server.");
-        self.push_output(text, OutputRole::System);
+                config.gateway.disable_platform(platform_id);
+            }
+            match platform_id {
+                "telegram" => config.gateway.telegram.enabled = !enabled_now,
+                "discord" => config.gateway.discord.enabled = !enabled_now,
+                "slack" => config.gateway.slack.enabled = !enabled_now,
+                "signal" => config.gateway.signal.enabled = !enabled_now,
+                "whatsapp" => config.gateway.whatsapp.enabled = !enabled_now,
+                _ => {}
+            }
+        }
+
+        match config.save() {
+            Ok(()) => self.push_output(
+                format!(
+                    "{} {}.",
+                    platform_id,
+                    if enabled_now { "disabled" } else { "enabled" }
+                ),
+                OutputRole::System,
+            ),
+            Err(error) => self.push_output(
+                format!("Updated {platform_id} in memory, but saving config failed: {error}"),
+                OutputRole::Error,
+            ),
+        }
+        self.refresh_gateway_browser();
+    }
+
+    fn open_gateway_bind_editor(&mut self) {
+        let config = self.load_runtime_config();
+        self.display_state = DisplayState::ValueCapture {
+            title: "Gateway Bind".into(),
+            prompt: "Edit the bind address as host:port. Use `clear` to reset to 127.0.0.1:8080."
+                .into(),
+            placeholder: "127.0.0.1:8080".into(),
+            masked: false,
+            buffer: format!("{}:{}", config.gateway.host, config.gateway.port),
+            action: ValueCaptureAction::BindAddress,
+        };
+        self.needs_redraw = true;
+    }
+
+    fn open_gateway_home_channel_editor(&mut self) {
+        let Some(entry) = self.gateway_browser_current() else {
+            return;
+        };
+        if !supports_home_channel(entry.diagnostic.id) {
+            self.push_output(
+                format!(
+                    "{} does not use a home-channel route.",
+                    entry.diagnostic.name
+                ),
+                OutputRole::System,
+            );
+            return;
+        }
+
+        let config = self.load_runtime_config();
+        let current = match entry.diagnostic.id {
+            "telegram" => config.gateway.telegram.home_channel.unwrap_or_default(),
+            "discord" => config.gateway.discord.home_channel.unwrap_or_default(),
+            "slack" => config.gateway.slack.home_channel.unwrap_or_default(),
+            _ => String::new(),
+        };
+        self.display_state = DisplayState::ValueCapture {
+            title: format!("{} Home Channel", entry.diagnostic.name),
+            prompt: "Set the proactive delivery target. Use `clear` to remove it.".into(),
+            placeholder: "chat-id, channel-id, or thread target".into(),
+            masked: false,
+            buffer: current,
+            action: ValueCaptureAction::HomeChannel(entry.diagnostic.id.into()),
+        };
+        self.needs_redraw = true;
+    }
+
+    fn open_gateway_allowlist_editor(&mut self) {
+        let Some(entry) = self.gateway_browser_current() else {
+            return;
+        };
+        if !supports_allowlist(entry.diagnostic.id) {
+            self.push_output(
+                format!(
+                    "{} has no allowlist field to edit here.",
+                    entry.diagnostic.name
+                ),
+                OutputRole::System,
+            );
+            return;
+        }
+
+        let config = self.load_runtime_config();
+        let current = match entry.diagnostic.id {
+            "telegram" => config.gateway.telegram.allowed_users.join(","),
+            "discord" => config.gateway.discord.allowed_users.join(","),
+            "slack" => config.gateway.slack.allowed_users.join(","),
+            "signal" => config.gateway.signal.allowed_users.join(","),
+            "whatsapp" => config.gateway.whatsapp.allowed_users.join(","),
+            _ => crate::gateway_setup::read_env_key(&format!(
+                "{}_ALLOWED_USERS",
+                entry.diagnostic.id.to_ascii_uppercase()
+            ))
+            .unwrap_or_default(),
+        };
+
+        self.display_state = DisplayState::ValueCapture {
+            title: format!("{} Allowlist", entry.diagnostic.name),
+            prompt: "Comma-separated IDs. Leave blank or use `clear` for open access.".into(),
+            placeholder: "user-1,user-2".into(),
+            masked: false,
+            buffer: current,
+            action: ValueCaptureAction::AllowedUsers(entry.diagnostic.id.into()),
+        };
+        self.needs_redraw = true;
+    }
+
+    fn open_gateway_primary_editor(&mut self) {
+        let Some(entry) = self.gateway_browser_current().cloned() else {
+            return;
+        };
+
+        if let Some((title, prompt, placeholder, masked, current, action)) =
+            self.gateway_primary_capture_for(&entry)
+        {
+            self.display_state = DisplayState::ValueCapture {
+                title,
+                prompt,
+                placeholder,
+                masked,
+                buffer: current,
+                action,
+            };
+            self.needs_redraw = true;
+        } else {
+            self.push_output(
+                format!(
+                    "{} does not expose a single-step inline editor yet. Use `edgecrab gateway configure {}` for the full workflow.",
+                    entry.diagnostic.name, entry.diagnostic.id
+                ),
+                OutputRole::System,
+            );
+        }
+    }
+
+    fn gateway_primary_capture_for(
+        &self,
+        entry: &GatewayPlatformEntry,
+    ) -> Option<(String, String, String, bool, String, ValueCaptureAction)> {
+        let config = self.load_runtime_config();
+        match entry.diagnostic.id {
+            "telegram" => Some((
+                "Telegram Bot Token".into(),
+                "Paste the bot token. Use `clear` to remove it.".into(),
+                "123456:ABCDEF...".into(),
+                true,
+                String::new(),
+                ValueCaptureAction::PrimaryField("TELEGRAM_BOT_TOKEN".into()),
+            )),
+            "discord" => Some((
+                "Discord Bot Token".into(),
+                "Paste the bot token. Use `clear` to remove it.".into(),
+                "discord bot token".into(),
+                true,
+                String::new(),
+                ValueCaptureAction::PrimaryField("DISCORD_BOT_TOKEN".into()),
+            )),
+            "slack" => {
+                let key = if entry
+                    .diagnostic
+                    .missing_required
+                    .contains(&"SLACK_APP_TOKEN")
+                    && !entry
+                        .diagnostic
+                        .missing_required
+                        .contains(&"SLACK_BOT_TOKEN")
+                {
+                    "SLACK_APP_TOKEN"
+                } else {
+                    "SLACK_BOT_TOKEN"
+                };
+                Some((
+                    format!("Slack {}", key.strip_prefix("SLACK_").unwrap_or(key)),
+                    "Paste the token. Use `clear` to remove it.".into(),
+                    key.to_ascii_lowercase(),
+                    true,
+                    String::new(),
+                    ValueCaptureAction::PrimaryField(key.into()),
+                ))
+            }
+            "signal" => {
+                let missing_url = entry
+                    .diagnostic
+                    .missing_required
+                    .contains(&"SIGNAL_HTTP_URL");
+                if missing_url || config.gateway.signal.http_url.is_none() {
+                    Some((
+                        "Signal Daemon URL".into(),
+                        "Set the signal-cli HTTP endpoint. Use `clear` to remove it.".into(),
+                        "http://127.0.0.1:8081".into(),
+                        false,
+                        config.gateway.signal.http_url.unwrap_or_default(),
+                        ValueCaptureAction::PrimaryField("SIGNAL_HTTP_URL".into()),
+                    ))
+                } else {
+                    Some((
+                        "Signal Account".into(),
+                        "Set the registered Signal account number. Use `clear` to remove it."
+                            .into(),
+                        "+15551234567".into(),
+                        false,
+                        config.gateway.signal.account.unwrap_or_default(),
+                        ValueCaptureAction::PrimaryField("SIGNAL_ACCOUNT".into()),
+                    ))
+                }
+            }
+            "whatsapp" => Some((
+                "WhatsApp Mode".into(),
+                "Set `bot` or `self-chat`. Use `clear` to reset to self-chat.".into(),
+                "bot or self-chat".into(),
+                false,
+                config.gateway.whatsapp.mode,
+                ValueCaptureAction::PrimaryField("WHATSAPP_MODE".into()),
+            )),
+            "webhook" => None,
+            other => {
+                let def = crate::gateway_catalog::find_platform(other)?;
+                let field = def
+                    .env_fields
+                    .iter()
+                    .find(|field| {
+                        entry
+                            .diagnostic
+                            .missing_required
+                            .iter()
+                            .any(|missing| missing == &field.key)
+                    })
+                    .or_else(|| def.env_fields.iter().find(|field| field.required))
+                    .or_else(|| def.env_fields.first())?;
+                Some((
+                    field.prompt.into(),
+                    format!("{} Use `clear` to remove it.", field.help),
+                    field.default_value.unwrap_or("").into(),
+                    field.kind == crate::gateway_catalog::FieldKind::Secret,
+                    if field.kind == crate::gateway_catalog::FieldKind::Secret {
+                        String::new()
+                    } else {
+                        crate::gateway_setup::read_env_key(field.key).unwrap_or_default()
+                    },
+                    ValueCaptureAction::PrimaryField(field.key.into()),
+                ))
+            }
+        }
     }
 
     fn handle_show_personality(&mut self) {
@@ -7957,6 +13638,9 @@ impl App {
             origin_chat: None,
             session_key: None,
             todo_store: None,
+            current_tool_call_id: None,
+            current_tool_name: None,
+            tool_progress_tx: None,
         }
     }
 
@@ -8759,45 +14443,50 @@ impl App {
         }
         if trimmed.eq_ignore_ascii_case("help") {
             self.push_output(
-                "Usage: /mcp            (browse configured servers + official MCP catalog)\n\
+                "Usage: /mcp            (browse configured servers + bundled official MCP catalog)\n\
                  /mcp list\n\
                  /mcp refresh\n\
-                 /mcp search [query]\n\
+                 /mcp search [query]  (search official MCP sources + registry)\n\
                  /mcp view <preset-or-server>\n\
-                 /mcp install <preset> [name=<server-name>] [path=<directory>]\n\
+                 /mcp install <preset> [--name <server-name>|name=<server-name>] [--path <directory>|path=<directory>]\n\
+                 /mcp enable <server-name>\n\
+                 /mcp disable <server-name>\n\
                  /mcp test [server-name]\n\
+                 /mcp doctor [server-name]\n\
+                 /mcp auth <server-name>\n\
+                 /mcp login <server-name>\n\
                  /mcp remove <server-name>",
                 OutputRole::System,
             );
             return;
         }
 
-        let parts: Vec<&str> = trimmed.split_whitespace().collect();
-        match parts.first().copied().unwrap_or_default() {
-            "list" => match edgecrab_tools::tools::mcp_client::configured_servers() {
+        let parts = match mcp_support::parse_inline_command_tokens(trimmed) {
+            Ok(parts) => parts,
+            Err(err) => {
+                self.push_output(err, OutputRole::Error);
+                return;
+            }
+        };
+
+        match parts.first().map(String::as_str).unwrap_or_default() {
+            "list" => match self.configured_mcp_servers(true) {
                 Ok(servers) if !servers.is_empty() => {
                     let mut lines = Vec::new();
                     lines.push("Configured MCP servers:".to_string());
                     for server in servers {
-                        let transport = if let Some(url) = &server.url {
-                            format!("http {url}")
-                        } else {
-                            let mut rendered = server.command;
-                            if !server.args.is_empty() {
-                                rendered.push(' ');
-                                rendered.push_str(&server.args.join(" "));
-                            }
-                            rendered
-                        };
-                        lines.push(format!("- {}  {}", server.name, transport));
+                        let transport = format_mcp_transport(&server);
+                        lines.push(format!(
+                            "- {}  [{}]  {}",
+                            server.name,
+                            mcp_enabled_label(server.enabled),
+                            transport
+                        ));
                     }
                     self.push_output(lines.join("\n"), OutputRole::System);
                 }
                 Ok(_) => self.push_output("No MCP servers configured.", OutputRole::System),
-                Err(err) => self.push_output(
-                    format!("Failed to read MCP configuration: {err}"),
-                    OutputRole::Error,
-                ),
+                Err(err) => self.push_output(err, OutputRole::Error),
             },
             "refresh" => {
                 match self
@@ -8818,33 +14507,23 @@ impl App {
                 }
             }
             "search" => {
-                let query = parts.get(1).copied();
-                if self.open_mcp_selector(query, true) == 0 {
-                    self.mcp_selector.active = false;
-                    self.push_output("No MCP entries matched.", OutputRole::System);
-                }
+                let query = if parts.len() > 1 {
+                    Some(parts[1..].join(" "))
+                } else {
+                    None
+                };
+                self.open_remote_mcp_selector(query.as_deref());
             }
             "view" => {
-                let Some(preset_name) = parts.get(1).copied() else {
+                let Some(preset_name) = parts.get(1).map(String::as_str) else {
                     self.push_output("Usage: /mcp view <preset-or-server>", OutputRole::System);
                     return;
                 };
                 if let Some(preset) = crate::mcp_catalog::find_preset(preset_name) {
-                    let mut lines = vec![
-                        format!("Preset: {}", preset.id),
-                        format!("Name:   {}", preset.display_name),
-                        format!("Why:    {}", preset.description),
-                        format!("Pkg:    {}", preset.package_name),
-                        format!("Source: {}", preset.source_url),
-                        format!("Docs:   {}", preset.homepage),
-                        format!("Cmd:    {} {}", preset.command, preset.args.join(" ")),
-                        format!("Tags:   {}", preset.tags.join(", ")),
-                    ];
-                    if !preset.required_env.is_empty() {
-                        lines.push(format!("Env:    {}", preset.required_env.join(", ")));
-                    }
-                    lines.push(format!("Notes:  {}", preset.notes));
-                    self.push_output(lines.join("\n"), OutputRole::System);
+                    self.push_output(
+                        crate::mcp_catalog::render_preset_detail(preset),
+                        OutputRole::System,
+                    );
                     return;
                 }
                 if let Some(entry) = self.rt_handle.block_on(
@@ -8856,67 +14535,64 @@ impl App {
                     );
                     return;
                 }
-                match edgecrab_tools::tools::mcp_client::configured_servers() {
-                    Ok(servers) => {
-                        let Some(server) = servers
-                            .into_iter()
-                            .find(|server| server.name == preset_name)
-                        else {
-                            self.push_output(
-                                format!("Unknown MCP preset or configured server '{preset_name}'."),
-                                OutputRole::Error,
-                            );
-                            return;
-                        };
-                        let mut lines = vec![
-                            format!("Server: {}", server.name),
-                            format!("Transport: {}", format_mcp_transport(&server)),
-                        ];
-                        if let Some(path) = &server.cwd {
-                            lines.push(format!("Cwd: {}", path.display()));
-                        }
-                        if !server.include.is_empty() {
-                            lines.push(format!("Include: {}", server.include.join(", ")));
-                        }
-                        if !server.exclude.is_empty() {
-                            lines.push(format!("Exclude: {}", server.exclude.join(", ")));
-                        }
-                        if server.token_from_store {
-                            lines.push("Auth: token store".into());
-                        } else if server.token_from_config {
-                            lines.push("Auth: config bearer_token".into());
-                        }
-                        self.push_output(lines.join("\n"), OutputRole::System);
-                    }
-                    Err(err) => self.push_output(
-                        format!("Failed to read MCP configuration: {err}"),
-                        OutputRole::Error,
+                match self.configured_mcp_server(preset_name) {
+                    Ok(server) => self.push_output(
+                        mcp_support::render_configured_server_detail(&server),
+                        OutputRole::System,
                     ),
+                    Err(err) => self.push_output(err, OutputRole::Error),
                 }
             }
+            "enable" | "activate" => {
+                let Some(name) = parts.get(1).map(String::as_str) else {
+                    self.push_output("Usage: /mcp enable <server-name>", OutputRole::System);
+                    return;
+                };
+                self.set_mcp_server_enabled(name, true);
+            }
+            "disable" | "deactivate" => {
+                let Some(name) = parts.get(1).map(String::as_str) else {
+                    self.push_output("Usage: /mcp disable <server-name>", OutputRole::System);
+                    return;
+                };
+                self.set_mcp_server_enabled(name, false);
+            }
             "install" => {
-                let Some(preset_name) = parts.get(1).copied() else {
+                let Some(preset_name) = parts.get(1).map(String::as_str) else {
                     self.push_output(
-                        "Usage: /mcp install <preset> [name=<server-name>] [path=<directory>]",
+                        "Usage: /mcp install <preset> [--name <server-name>|name=<server-name>] [--path <directory>|path=<directory>]",
                         OutputRole::System,
                     );
                     return;
                 };
-                let name = parts
-                    .iter()
-                    .skip(2)
-                    .find_map(|part| part.strip_prefix("name="));
-                let path = parts
-                    .iter()
-                    .skip(2)
-                    .find_map(|part| part.strip_prefix("path="));
+                let (path, remaining) = match mcp_support::parse_named_option(&parts[2..], "path") {
+                    Ok(parsed) => parsed,
+                    Err(err) => {
+                        self.push_output(err, OutputRole::Error);
+                        return;
+                    }
+                };
+                let (name, remaining) = match mcp_support::parse_named_option(&remaining, "name") {
+                    Ok(parsed) => parsed,
+                    Err(err) => {
+                        self.push_output(err, OutputRole::Error);
+                        return;
+                    }
+                };
+                if !remaining.is_empty() {
+                    self.push_output(
+                        format!("Unexpected MCP install arguments: {}", remaining.join(" ")),
+                        OutputRole::Error,
+                    );
+                    return;
+                }
                 let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
                 let mut config = self.load_runtime_config();
                 match crate::mcp_catalog::install_preset(
                     &mut config,
                     preset_name,
-                    name,
-                    path.map(std::path::Path::new),
+                    name.as_deref(),
+                    path.as_deref().map(std::path::Path::new),
                     &cwd,
                 ) {
                     Ok(installed) => match config.save() {
@@ -8931,7 +14607,7 @@ impl App {
                                 ));
                             }
                             message.push_str(&format!(
-                                "\nRun `/mcp test {}` to verify connectivity.",
+                                "\nRun `/mcp doctor {}` to verify connectivity and config health.",
                                 installed.name
                             ));
                             self.push_output(message, OutputRole::System);
@@ -8949,7 +14625,7 @@ impl App {
                 }
             }
             "test" => {
-                let name = parts.get(1).map(|value| (*value).to_string());
+                let name = parts.get(1).cloned();
                 let tx = self.response_tx.clone();
                 self.rt_handle.spawn(async move {
                     let targets = if let Some(name) = name {
@@ -8989,8 +14665,58 @@ impl App {
                     }
                 });
             }
+            "doctor" => {
+                let name = parts.get(1).cloned();
+                let tx = self.response_tx.clone();
+                self.rt_handle.spawn(async move {
+                    match mcp_support::render_mcp_doctor_report(name.as_deref()).await {
+                        Ok(report) => {
+                            let _ = tx.send(AgentResponse::Notice(report));
+                        }
+                        Err(err) => {
+                            let _ =
+                                tx.send(AgentResponse::Notice(format!("MCP doctor failed: {err}")));
+                        }
+                    }
+                });
+            }
+            "auth" => {
+                let Some(name) = parts.get(1) else {
+                    self.push_output("Usage: /mcp auth <server-name>", OutputRole::System);
+                    return;
+                };
+                match mcp_support::render_mcp_auth_guide(name) {
+                    Ok(report) => self.push_output(report, OutputRole::System),
+                    Err(err) => {
+                        self.push_output(format!("MCP auth failed: {err}"), OutputRole::Error)
+                    }
+                }
+            }
+            "login" => {
+                let Some(name) = parts.get(1).cloned() else {
+                    self.push_output("Usage: /mcp login <server-name>", OutputRole::System);
+                    return;
+                };
+                let tx = self.response_tx.clone();
+                self.rt_handle.spawn(async move {
+                    let summary = crate::mcp_oauth::login_mcp_server(&name, |line| {
+                        let _ = tx.send(AgentResponse::Notice(line));
+                    })
+                    .await;
+                    match summary {
+                        Ok(summary) => {
+                            let _ = tx.send(AgentResponse::Notice(summary));
+                        }
+                        Err(err) => {
+                            let _ = tx.send(AgentResponse::Notice(format!(
+                                "MCP OAuth login failed: {err}"
+                            )));
+                        }
+                    }
+                });
+            }
             "remove" | "uninstall" | "rm" => {
-                let Some(name) = parts.get(1).copied() else {
+                let Some(name) = parts.get(1).map(String::as_str) else {
                     self.push_output("Usage: /mcp remove <server-name>", OutputRole::System);
                     return;
                 };
@@ -9382,18 +15108,93 @@ impl App {
     /// Manage MCP OAuth Bearer tokens stored at ~/.edgecrab/mcp-tokens/.
     ///
     /// Subcommands:
-    ///   set <server> <token>  — store a Bearer token for an HTTP MCP server
+    ///   set <server> <token>  — store an access token for an HTTP MCP server
+    ///   set-refresh <server> <token>  — store a refresh token for OAuth flows
+    ///   status <server>       — show cached token state for one server
     ///   remove <server>       — delete stored tokens for a server
     ///   list                  — list servers with stored tokens
     fn handle_mcp_token(&mut self, args: String) {
-        use edgecrab_tools::tools::mcp_client::{remove_mcp_token, write_mcp_token};
+        use edgecrab_tools::tools::mcp_client::{
+            read_mcp_token_status, remove_mcp_token, write_mcp_refresh_token, write_mcp_token,
+        };
 
-        let parts: Vec<&str> = args.trim().splitn(3, ' ').collect();
+        let parts = match mcp_support::parse_inline_command_tokens(args.trim()) {
+            Ok(parts) => parts,
+            Err(err) => {
+                self.push_output(err, OutputRole::Error);
+                return;
+            }
+        };
+
+        if parts.is_empty() || matches!(parts.first().map(String::as_str), Some("list")) {
+            // List servers that have a stored token by reading the tokens dir
+            let dir = edgecrab_core::edgecrab_home().join("mcp-tokens");
+            {
+                if dir.is_dir() {
+                    let entries: Vec<String> = std::fs::read_dir(&dir)
+                        .ok()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|e| e.ok())
+                        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+                        .filter_map(|e| {
+                            e.path()
+                                .file_stem()
+                                .map(|s| s.to_string_lossy().into_owned())
+                        })
+                        .collect();
+                    if entries.is_empty() {
+                        self.push_output(
+                            "No MCP OAuth tokens stored.\n\
+                             Use: /mcp-token set <server> <bearer-token>",
+                            OutputRole::System,
+                        );
+                    } else {
+                        let mut out = String::from("Stored MCP OAuth tokens:\n");
+                        for srv in &entries {
+                            if let Some(status) = read_mcp_token_status(srv) {
+                                out.push_str(&format!(
+                                    "  {srv}  access={} refresh={}\n",
+                                    if status.has_access_token { "yes" } else { "no" },
+                                    if status.has_refresh_token {
+                                        "yes"
+                                    } else {
+                                        "no"
+                                    },
+                                ));
+                            } else {
+                                out.push_str(&format!("  {srv}\n"));
+                            }
+                        }
+                        out.push_str("\nUsage:\n");
+                        out.push_str(
+                            "  /mcp-token set <server> <token>          — store access token\n",
+                        );
+                        out.push_str(
+                            "  /mcp-token set-refresh <server> <token>  — store refresh token\n",
+                        );
+                        out.push_str(
+                            "  /mcp-token status <server>               — show cached token state\n",
+                        );
+                        out.push_str("  /mcp-token remove <server>               — remove token\n");
+                        self.push_output(out, OutputRole::System);
+                    }
+                    return;
+                }
+            }
+            self.push_output(
+                "No MCP OAuth tokens stored.\n\
+                 Use: /mcp-token set <server> <bearer-token>",
+                OutputRole::System,
+            );
+            return;
+        }
+
         match parts.as_slice() {
-            ["set", server, token] => match write_mcp_token(server, token) {
+            [action, server, token] if action == "set" => match write_mcp_token(server, token) {
                 Ok(()) => {
                     self.push_output(
-                        format!("MCP token stored for server '{server}'."),
+                        format!("MCP access token stored for server '{server}'."),
                         OutputRole::System,
                     );
                 }
@@ -9401,61 +15202,54 @@ impl App {
                     self.push_output(format!("Failed to store MCP token: {e}"), OutputRole::Error);
                 }
             },
-            ["remove", server] => {
+            [action, server, token] if action == "set-refresh" => {
+                match write_mcp_refresh_token(server, token) {
+                    Ok(()) => self.push_output(
+                        format!("MCP refresh token stored for server '{server}'."),
+                        OutputRole::System,
+                    ),
+                    Err(e) => self.push_output(
+                        format!("Failed to store MCP refresh token: {e}"),
+                        OutputRole::Error,
+                    ),
+                }
+            }
+            [action, server] if action == "status" => {
+                if let Some(status) = read_mcp_token_status(server) {
+                    let expiry = status
+                        .expires_at_epoch_secs
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "none".into());
+                    self.push_output(
+                        format!(
+                            "MCP token cache for '{server}': access_token={} refresh_token={} expires_at={expiry}",
+                            if status.has_access_token { "yes" } else { "no" },
+                            if status.has_refresh_token { "yes" } else { "no" },
+                        ),
+                        OutputRole::System,
+                    );
+                } else {
+                    self.push_output(
+                        format!("No cached MCP token state found for server '{server}'."),
+                        OutputRole::System,
+                    );
+                }
+            }
+            [action, server] if action == "remove" => {
                 remove_mcp_token(server);
                 self.push_output(
                     format!("MCP token removed for server '{server}'."),
                     OutputRole::System,
                 );
             }
-            ["list"] | [] | [""] => {
-                // List servers that have a stored token by reading the tokens dir
-                let dir = edgecrab_core::edgecrab_home().join("mcp-tokens");
-                {
-                    if dir.is_dir() {
-                        let entries: Vec<String> = std::fs::read_dir(&dir)
-                            .ok()
-                            .into_iter()
-                            .flatten()
-                            .filter_map(|e| e.ok())
-                            .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
-                            .filter_map(|e| {
-                                e.path()
-                                    .file_stem()
-                                    .map(|s| s.to_string_lossy().into_owned())
-                            })
-                            .collect();
-                        if entries.is_empty() {
-                            self.push_output(
-                                "No MCP OAuth tokens stored.\n\
-                                 Use: /mcp-token set <server> <bearer-token>",
-                                OutputRole::System,
-                            );
-                        } else {
-                            let mut out = String::from("Stored MCP OAuth tokens:\n");
-                            for srv in &entries {
-                                out.push_str(&format!("  {srv}\n"));
-                            }
-                            out.push_str("\nUsage:\n");
-                            out.push_str("  /mcp-token set <server> <token>  — store token\n");
-                            out.push_str("  /mcp-token remove <server>       — remove token\n");
-                            self.push_output(out, OutputRole::System);
-                        }
-                        return;
-                    }
-                }
-                self.push_output(
-                    "No MCP OAuth tokens stored.\n\
-                     Use: /mcp-token set <server> <bearer-token>",
-                    OutputRole::System,
-                );
-            }
             _ => {
                 self.push_output(
                     "Usage:\n\
-                     /mcp-token set <server> <token>  — store Bearer token\n\
-                     /mcp-token remove <server>        — remove stored token\n\
-                     /mcp-token list                   — list servers with tokens",
+                     /mcp-token set <server> <token>          — store access token\n\
+                     /mcp-token set-refresh <server> <token>  — store refresh token\n\
+                     /mcp-token status <server>               — show cached token state\n\
+                     /mcp-token remove <server>               — remove stored token\n\
+                     /mcp-token list                          — list servers with tokens",
                     OutputRole::System,
                 );
             }
@@ -9906,9 +15700,9 @@ impl App {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Min(1),                  // output area
-                Constraint::Length(1),               // separator
-                Constraint::Length(1),               // status bar
+                Constraint::Min(1),                                           // output area
+                Constraint::Length(1),                                        // separator
+                Constraint::Length(if self.show_status_bar { 1 } else { 0 }), // status bar
                 Constraint::Length(textarea_height), // input area (dynamic height)
             ])
             .split(frame.area());
@@ -9918,7 +15712,9 @@ impl App {
         let sep = Paragraph::new(Line::from("─".repeat(chunks[1].width as usize)))
             .style(Style::default().fg(Color::Rgb(60, 60, 70)));
         frame.render_widget(sep, chunks[1]);
-        self.render_status_bar(frame, chunks[2]);
+        if self.show_status_bar {
+            self.render_status_bar(frame, chunks[2]);
+        }
         self.render_input(frame, chunks[3]);
 
         // Model selector overlay (full screen)
@@ -9936,9 +15732,17 @@ impl App {
             self.render_image_model_selector(frame, frame.area());
         }
 
+        if self.moa_reference_selector.active {
+            self.render_moa_reference_selector(frame, frame.area());
+        }
+
         // MCP selector overlay (full screen, same family as /model)
         if self.mcp_selector.active {
             self.render_mcp_selector(frame, frame.area());
+        }
+
+        if self.remote_mcp_browser.selector.active {
+            self.render_remote_mcp_selector(frame, frame.area());
         }
 
         // Skill selector overlay (full screen, takes precedence over model selector)
@@ -9946,9 +15750,29 @@ impl App {
             self.render_skill_selector(frame, frame.area());
         }
 
+        if self.tool_manager.active {
+            self.render_tool_manager(frame, frame.area());
+        }
+
+        if self.remote_skill_browser.selector.active {
+            self.render_remote_skill_selector(frame, frame.area());
+        }
+
+        if self.config_selector.active {
+            self.render_config_selector(frame, frame.area());
+        }
+
+        if self.gateway_browser.active {
+            self.render_gateway_browser(frame, frame.area());
+        }
+
         // Session browser overlay (full screen, same precedence as skill browser)
         if self.session_browser.active {
             self.render_session_browser(frame, frame.area());
+        }
+
+        if self.session_inspector.active() {
+            self.render_session_inspector(frame, frame.area());
         }
 
         // Skin browser overlay (full screen, same precedence as session browser)
@@ -9964,6 +15788,9 @@ impl App {
         // Secret capture overlay (full screen, highest precedence — masks the secret)
         if matches!(self.display_state, DisplayState::SecretCapture { .. }) {
             self.render_secret_capture_overlay(frame, frame.area());
+        }
+        if matches!(self.display_state, DisplayState::ValueCapture { .. }) {
+            self.render_value_capture_overlay(frame, frame.area());
         }
     }
 
@@ -10218,11 +16045,17 @@ impl App {
             DisplayState::ToolExec {
                 name,
                 args_json,
+                detail,
                 frame: f,
                 started,
+                ..
             } => {
                 let spinner = SPINNER_FRAMES[*f % SPINNER_FRAMES.len()];
-                let elapsed_secs = started.elapsed().as_secs();
+                let summary = summarize_active_tools(&self.active_tools);
+                let elapsed_secs = summary
+                    .as_ref()
+                    .map(|active| active.elapsed_secs)
+                    .unwrap_or_else(|| started.elapsed().as_secs());
                 // Show elapsed time after 3 s (mirrors Thinking state behaviour).
                 // Show the stop hint after 10 s for long-running tools.
                 let time_part = if elapsed_secs >= 3 {
@@ -10231,20 +16064,19 @@ impl App {
                     String::new()
                 };
                 let stop_hint = if elapsed_secs >= 10 { "  ^C=stop" } else { "" };
-                // When multiple tools are in-flight (parallel dispatch), show
-                // the count rather than a single name — prevents misleading display
-                // (e.g. showing only the last-dispatched tool while 3 run in parallel).
-                let content = if self.in_flight_tool_count > 1 {
+                let content = if let Some(active) = summary {
                     format!(
-                        " {spinner} {} tools in parallel{time_part}{stop_hint} ",
-                        self.in_flight_tool_count
+                        " {spinner} {} {} {}{time_part}{stop_hint} ",
+                        active.verb, active.icon, active.detail
                     )
                 } else {
                     let icon = tool_icon(name);
-                    // Tool-specific verb ("searching", "executing", "reading", …)
-                    // gives more context than a generic spinner label.
                     let verb = tool_action_verb(name);
-                    let preview = tool_status_preview(name, args_json);
+                    let preview = detail
+                        .as_deref()
+                        .filter(|detail| !detail.trim().is_empty())
+                        .map(|detail| edgecrab_core::safe_truncate(detail.trim(), 60).to_string())
+                        .unwrap_or_else(|| tool_status_preview(name, args_json));
                     format!(" {spinner} {verb} {icon} {preview}{time_part}{stop_hint} ")
                 };
                 left_spans.push(Span::styled(
@@ -10309,6 +16141,14 @@ impl App {
                     label,
                     Style::default()
                         .fg(Color::Rgb(255, 80, 80))
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            DisplayState::ValueCapture { title, .. } => {
+                left_spans.push(Span::styled(
+                    format!(" ⛵ Editing: {title} "),
+                    Style::default()
+                        .fg(Color::Rgb(120, 220, 200))
                         .add_modifier(Modifier::BOLD),
                 ));
             }
@@ -10580,56 +16420,30 @@ impl App {
         frame: &mut Frame,
         area: Rect,
         selector: &FuzzySelector<ModelEntry>,
-        title: &str,
-        placeholder: &str,
-        count_label: &str,
+        detail_surface: DetailSurface,
+        chrome: SelectorChrome<'_>,
     ) {
-        // Clear background
         frame.render_widget(Clear, area);
 
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3), // search box
-                Constraint::Min(1),    // model list
-                Constraint::Length(1), // help line
-            ])
-            .split(area);
-
-        // Search input
-        let search_text = if selector.query.is_empty() {
-            placeholder.to_string()
-        } else {
-            selector.query.clone()
-        };
-        let search_style = if selector.query.is_empty() {
-            Style::default().fg(Color::DarkGray)
-        } else {
-            Style::default().fg(Color::White)
-        };
-        let search = Paragraph::new(Line::from(Span::styled(
-            format!("  > {search_text}"),
-            search_style,
-        )))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan))
-                .title(format!(" {title} ")),
+        let chunks = Self::browser_overlay_chunks(area);
+        let body = Self::browser_body_chunks(chunks[1]);
+        self.render_browser_header(
+            frame,
+            chunks[0],
+            &selector.query,
+            BrowserChrome {
+                title: chrome.title,
+                placeholder: chrome.placeholder,
+                icon: "◈",
+                icon_color: Color::Cyan,
+                border_color: Color::Cyan,
+            },
         );
-        frame.render_widget(search, chunks[0]);
 
-        // Model list grouped by provider
-        let max_visible = chunks[1].height as usize;
+        let max_visible = body[0].height as usize;
         let filtered = &selector.filtered;
         let selected = selector.selected;
-
-        // Scroll to keep selection visible
-        let scroll_start = if selected >= max_visible {
-            selected - max_visible + 1
-        } else {
-            0
-        };
+        let scroll_start = Self::browser_scroll_start(selected, max_visible);
 
         let items: Vec<ListItem> = filtered
             .iter()
@@ -10640,30 +16454,32 @@ impl App {
                 let entry = &selector.items[model_idx];
                 let (display, provider) = (&entry.display, &entry.provider);
                 let is_selected = vis_idx + scroll_start == selected;
+                let bg = if is_selected {
+                    Color::Rgb(50, 50, 70)
+                } else {
+                    Color::Rgb(20, 20, 28)
+                };
                 let style = if is_selected {
                     Style::default()
-                        .bg(Color::Rgb(50, 50, 70))
+                        .bg(bg)
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::Rgb(200, 200, 200))
                 };
                 let provider_style = if is_selected {
-                    Style::default()
-                        .bg(Color::Rgb(50, 50, 70))
-                        .fg(Color::Rgb(120, 120, 150))
+                    Style::default().bg(bg).fg(Color::Rgb(120, 120, 150))
                 } else {
                     Style::default().fg(Color::Rgb(80, 80, 100))
                 };
                 let mut spans = vec![
+                    selector_marker(is_selected, Color::Cyan, Some(bg)),
                     Span::styled(format!("  {:<12}", provider), provider_style),
                     Span::styled(display.clone(), style),
                 ];
                 if !entry.detail.is_empty() && entry.detail != entry.model_name {
                     let detail_style = if is_selected {
-                        Style::default()
-                            .bg(Color::Rgb(50, 50, 70))
-                            .fg(Color::Rgb(160, 160, 180))
+                        Style::default().bg(bg).fg(Color::Rgb(160, 160, 180))
                     } else {
                         Style::default().fg(Color::Rgb(110, 110, 130))
                     };
@@ -10676,19 +16492,121 @@ impl App {
 
         let model_count = filtered.len();
         let list = List::new(items).style(Style::default().bg(Color::Rgb(20, 20, 28)));
-        frame.render_widget(list, chunks[1]);
+        frame.render_widget(list, body[0]);
 
-        // Help line
+        let mut detail_lines = Vec::new();
+        if let Some(entry) = selector.current() {
+            detail_lines.push(Line::from(Span::styled(
+                entry.display.clone(),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(vec![
+                Span::styled("Provider: ", Style::default().fg(Color::Rgb(145, 170, 170))),
+                Span::raw(entry.provider.clone()),
+            ]));
+            detail_lines.push(Line::from(vec![
+                Span::styled("Model: ", Style::default().fg(Color::Rgb(145, 170, 170))),
+                Span::raw(entry.model_name.clone()),
+            ]));
+            if !entry.detail.is_empty() {
+                detail_lines.push(Line::from(vec![
+                    Span::styled(
+                        "Inventory: ",
+                        Style::default().fg(Color::Rgb(145, 170, 170)),
+                    ),
+                    Span::raw(entry.detail.clone()),
+                ]));
+            }
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(
+                "Use Enter to switch immediately. Plain typing keeps refining the list without triggering actions.",
+            ));
+        } else if selector.query.trim().is_empty() {
+            detail_lines.push(Line::from(Span::styled(
+                chrome.title.to_string(),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(
+                "Browse models with fuzzy search over provider, model name, and discovery source.",
+            ));
+            if let Some(note) = chrome.status_note {
+                detail_lines.push(Line::from(""));
+                detail_lines.push(Line::from(note.to_string()));
+            }
+        } else {
+            detail_lines.push(Line::from("No models matched this query."));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(
+                "Try a broader provider name or a shorter model fragment.",
+            ));
+        }
+        if self.detail_fullscreen_active(detail_surface) {
+            self.render_fullscreen_browser_detail(
+                frame,
+                area,
+                FullscreenBrowserChrome {
+                    query: &selector.query,
+                    header: BrowserChrome {
+                        title: chrome.title,
+                        placeholder: chrome.placeholder,
+                        icon: "◈",
+                        icon_color: Color::Cyan,
+                        border_color: Color::Cyan,
+                    },
+                    detail: ScrollableDetailChrome {
+                        title: "Details",
+                        border_color: Color::Cyan,
+                        focused: true,
+                        requested_scroll: self.detail_fullscreen_scroll(detail_surface),
+                    },
+                    help: Line::from(vec![
+                        Span::styled(" ↑↓ ", Style::default().fg(Color::Cyan)),
+                        Span::styled("change item  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("type ", Style::default().fg(Color::Cyan)),
+                        Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("PgUp/Dn ", Style::default().fg(Color::Cyan)),
+                        Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Enter ", Style::default().fg(Color::Cyan)),
+                        Span::styled("select  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Z ", Style::default().fg(Color::Cyan)),
+                        Span::styled("split view  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Esc ", Style::default().fg(Color::Cyan)),
+                        Span::styled("close  ", Style::default().fg(Color::DarkGray)),
+                    ]),
+                },
+                detail_lines,
+            );
+            return;
+        }
+        self.render_browser_detail(frame, body[1], detail_lines);
+
         let help = Paragraph::new(Line::from(vec![
             Span::styled(" ↑↓ ", Style::default().fg(Color::Cyan)),
-            Span::styled("navigate  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("browse  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("type ", Style::default().fg(Color::Cyan)),
+            Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Enter ", Style::default().fg(Color::Cyan)),
             Span::styled("select  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Z ", Style::default().fg(Color::Cyan)),
+            Span::styled("detail  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Esc ", Style::default().fg(Color::Cyan)),
             Span::styled("cancel  ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format!("{model_count} {count_label}"),
+                format!("{model_count} {}", chrome.count_label),
                 Style::default().fg(Color::Rgb(80, 80, 100)),
+            ),
+            Span::styled(
+                chrome
+                    .status_note
+                    .map(|note| format!("  {note}"))
+                    .unwrap_or_default(),
+                Style::default().fg(Color::Yellow),
             ),
         ]));
         frame.render_widget(help, chunks[2]);
@@ -10696,13 +16614,34 @@ impl App {
 
     /// Render the full-screen model selector overlay.
     fn render_model_selector(&self, frame: &mut Frame, area: Rect) {
+        let base_title = match self.model_selector_target {
+            ModelSelectorTarget::Primary => "Select Model",
+            ModelSelectorTarget::Cheap => "Select Cheap Model",
+            ModelSelectorTarget::MoaAggregator => "Select MoA Aggregator",
+        };
+        let title = if self.model_selector_refresh_in_flight {
+            format!("{base_title} · refreshing live inventory")
+        } else {
+            base_title.to_string()
+        };
+        let placeholder = if self.model_selector_refresh_in_flight {
+            "Type to filter models... live discovery updates in place (Esc to cancel)"
+        } else {
+            "Type to filter models... (Esc to cancel)"
+        };
         self.render_model_like_selector(
             frame,
             area,
             &self.model_selector,
-            "Select Model",
-            "Type to filter models... (Esc to cancel)",
-            "models",
+            DetailSurface::ModelSelector,
+            SelectorChrome {
+                title: &title,
+                placeholder,
+                count_label: "models",
+                status_note: self
+                    .model_selector_refresh_in_flight
+                    .then_some("live discovery running"),
+            },
         );
     }
 
@@ -10712,9 +16651,13 @@ impl App {
             frame,
             area,
             &self.vision_model_selector,
-            "Select Vision Model",
-            "Type to filter vision backends... (Esc to cancel)",
-            "options",
+            DetailSurface::VisionModelSelector,
+            SelectorChrome {
+                title: "Select Vision Model",
+                placeholder: "Type to filter vision backends... (Esc to cancel)",
+                count_label: "options",
+                status_note: None,
+            },
         );
     }
 
@@ -10723,14 +16666,39 @@ impl App {
             frame,
             area,
             &self.image_model_selector,
-            "Select Image Model",
-            "Type to filter image-generation backends... (Esc to cancel)",
-            "image backends",
+            DetailSurface::ImageModelSelector,
+            SelectorChrome {
+                title: "Select Image Model",
+                placeholder: "Type to filter image-generation backends... (Esc to cancel)",
+                count_label: "image backends",
+                status_note: None,
+            },
         );
     }
 
-    fn render_mcp_selector(&self, frame: &mut Frame, area: Rect) {
+    fn render_moa_reference_selector(&self, frame: &mut Frame, area: Rect) {
         frame.render_widget(Clear, area);
+
+        let (title, placeholder, action_hint, count_hint) = match self.moa_reference_selector_mode {
+            MoaReferenceSelectorMode::EditRoster => (
+                " Select MoA Experts ",
+                "Type to filter expert models…",
+                "Space toggle  ",
+                format!("{} selected", self.moa_reference_selected.len()),
+            ),
+            MoaReferenceSelectorMode::AddExpert => (
+                " Add MoA Expert ",
+                "Type to find an expert to add…",
+                "Enter add  ",
+                format!("{} configured", self.moa_reference_selected.len()),
+            ),
+            MoaReferenceSelectorMode::RemoveExpert => (
+                " Remove MoA Expert ",
+                "Type to find a configured expert…",
+                "Enter remove  ",
+                format!("{} configured", self.moa_reference_selected.len()),
+            ),
+        };
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -10741,31 +16709,31 @@ impl App {
             ])
             .split(area);
 
-        let search_text = if self.mcp_selector.query.is_empty() {
-            "Search official MCP catalog + configured servers... (Enter default action, i install, t test, v view, d remove, Esc cancel)".to_string()
+        let search_text = if self.moa_reference_selector.query.is_empty() {
+            placeholder.to_string()
         } else {
-            self.mcp_selector.query.clone()
+            self.moa_reference_selector.query.clone()
         };
-        let search_style = if self.mcp_selector.query.is_empty() {
+        let search_style = if self.moa_reference_selector.query.is_empty() {
             Style::default().fg(Color::DarkGray)
         } else {
             Style::default().fg(Color::White)
         };
         let search = Paragraph::new(Line::from(vec![
-            Span::styled("  ⛓ ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("  🧠 ", Style::default().fg(Color::Rgb(130, 210, 255))),
             Span::styled(search_text, search_style),
         ]))
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Rgb(110, 220, 210)))
-                .title(" Official MCP Catalog "),
+                .border_style(Style::default().fg(Color::Rgb(130, 210, 255)))
+                .title(title),
         );
         frame.render_widget(search, chunks[0]);
 
+        let filtered = &self.moa_reference_selector.filtered;
+        let selected = self.moa_reference_selector.selected;
         let max_visible = chunks[1].height as usize;
-        let filtered = &self.mcp_selector.filtered;
-        let selected = self.mcp_selector.selected;
         let scroll_start = if selected >= max_visible {
             selected - max_visible + 1
         } else {
@@ -10777,63 +16745,818 @@ impl App {
             .skip(scroll_start)
             .take(max_visible)
             .enumerate()
-            .map(|(vis_idx, &preset_idx)| {
-                let entry = &self.mcp_selector.items[preset_idx];
+            .map(|(vis_idx, &entry_idx)| {
+                let entry = &self.moa_reference_selector.items[entry_idx];
                 let is_selected = vis_idx + scroll_start == selected;
-                let row_style = if is_selected {
-                    Style::default()
-                        .bg(Color::Rgb(40, 56, 58))
-                        .fg(Color::Rgb(110, 220, 210))
-                        .add_modifier(Modifier::BOLD)
+                let is_checked = self.moa_reference_selected.contains(&entry.display);
+                let bg = if is_selected {
+                    Color::Rgb(22, 36, 44)
                 } else {
-                    Style::default().fg(Color::Rgb(210, 220, 220))
+                    Color::Rgb(18, 22, 28)
                 };
-                let source_style = if is_selected {
-                    Style::default()
-                        .bg(Color::Rgb(40, 56, 58))
-                        .fg(Color::Rgb(145, 170, 170))
-                } else {
-                    Style::default().fg(Color::Rgb(100, 120, 120))
+                let prefix = match self.moa_reference_selector_mode {
+                    MoaReferenceSelectorMode::EditRoster => {
+                        format!("  [{}] ", if is_checked { "x" } else { " " })
+                    }
+                    MoaReferenceSelectorMode::AddExpert => "  [+] ".to_string(),
+                    MoaReferenceSelectorMode::RemoveExpert => "  [-] ".to_string(),
                 };
-                let action_style = if is_selected {
-                    Style::default()
-                        .bg(Color::Rgb(40, 56, 58))
-                        .fg(Color::Rgb(210, 240, 175))
-                } else {
-                    Style::default().fg(Color::Rgb(135, 165, 110))
+                let prefix_color = match self.moa_reference_selector_mode {
+                    MoaReferenceSelectorMode::EditRoster => {
+                        if is_checked {
+                            Color::Green
+                        } else {
+                            Color::DarkGray
+                        }
+                    }
+                    MoaReferenceSelectorMode::AddExpert => Color::Rgb(120, 220, 160),
+                    MoaReferenceSelectorMode::RemoveExpert => Color::Rgb(255, 130, 130),
                 };
                 ListItem::new(Line::from(vec![
-                    Span::styled(format!("  {:<12}", entry.source), source_style),
-                    Span::styled(format!("{:<9}", entry.action_label), action_style),
-                    Span::styled(entry.title.clone(), row_style),
-                    Span::raw("  "),
-                    Span::styled(entry.detail.clone(), source_style),
+                    selector_marker(is_selected, Color::Rgb(130, 210, 255), Some(bg)),
+                    Span::styled(prefix, Style::default().bg(bg).fg(prefix_color)),
+                    Span::styled(
+                        unicode_pad_right(&entry.display, 38),
+                        Style::default().bg(bg).fg(if is_selected {
+                            Color::Rgb(130, 210, 255)
+                        } else {
+                            Color::Rgb(220, 232, 240)
+                        }),
+                    ),
+                    Span::styled(
+                        unicode_trunc(&entry.detail, 44),
+                        Style::default().bg(bg).fg(Color::Rgb(125, 140, 150)),
+                    ),
                 ]))
             })
             .collect();
-
         frame.render_widget(
-            List::new(items).style(Style::default().bg(Color::Rgb(18, 24, 26))),
+            List::new(items).style(Style::default().bg(Color::Rgb(18, 22, 28))),
             chunks[1],
         );
 
         let help = Paragraph::new(Line::from(vec![
+            Span::styled(" ↑↓ ", Style::default().fg(Color::Cyan)),
+            Span::styled("navigate  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                if self.moa_reference_selector_mode == MoaReferenceSelectorMode::EditRoster {
+                    "Space "
+                } else {
+                    "Enter "
+                },
+                Style::default().fg(Color::Cyan),
+            ),
+            Span::styled(action_hint, Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                if self.moa_reference_selector_mode == MoaReferenceSelectorMode::EditRoster {
+                    "Enter "
+                } else {
+                    ""
+                },
+                Style::default().fg(Color::Cyan),
+            ),
+            Span::styled(
+                if self.moa_reference_selector_mode == MoaReferenceSelectorMode::EditRoster {
+                    "save  "
+                } else {
+                    ""
+                },
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled("Esc ", Style::default().fg(Color::Cyan)),
+            Span::styled("cancel  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(count_hint, Style::default().fg(Color::Rgb(80, 80, 100))),
+        ]));
+        frame.render_widget(help, chunks[2]);
+    }
+
+    fn browser_overlay_chunks(area: Rect) -> std::rc::Rc<[Rect]> {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ])
+            .split(area)
+    }
+
+    fn browser_body_chunks(area: Rect) -> std::rc::Rc<[Rect]> {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
+            .split(area)
+    }
+
+    fn browser_scroll_start(selected: usize, max_visible: usize) -> usize {
+        if selected >= max_visible {
+            selected - max_visible + 1
+        } else {
+            0
+        }
+    }
+
+    fn render_browser_header(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        query: &str,
+        chrome: BrowserChrome<'_>,
+    ) {
+        let search_text = if query.is_empty() {
+            chrome.placeholder.to_string()
+        } else {
+            query.to_string()
+        };
+        let search_style = if query.is_empty() {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let search = Paragraph::new(Line::from(vec![
+            Span::styled(
+                format!("  {} ", chrome.icon),
+                Style::default().fg(chrome.icon_color),
+            ),
+            Span::styled(search_text, search_style),
+        ]))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(chrome.border_color))
+                .title(format!(" {} ", chrome.title)),
+        );
+        frame.render_widget(search, area);
+    }
+
+    fn render_browser_detail(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        detail_lines: Vec<Line<'static>>,
+    ) {
+        let detail = Paragraph::new(Text::from(detail_lines))
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Rgb(60, 80, 84)))
+                    .title(" Details "),
+            );
+        frame.render_widget(detail, area);
+    }
+
+    fn render_scrollable_browser_detail(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        chrome: ScrollableDetailChrome<'_>,
+        detail_lines: Vec<Line<'static>>,
+    ) {
+        let border_style = if chrome.focused {
+            Style::default()
+                .fg(chrome.border_color)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Rgb(60, 80, 84))
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(border_style)
+            .title(format!(" {} ", chrome.title));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+
+        let content_width = inner.width.saturating_sub(1).max(1) as usize;
+        let visual_rows: u16 = detail_lines
+            .iter()
+            .map(|line| {
+                let width = line.width();
+                if width == 0 {
+                    1
+                } else {
+                    width.div_ceil(content_width) as u16
+                }
+            })
+            .sum();
+        let max_scroll = visual_rows.saturating_sub(inner.height);
+        let scroll = chrome.requested_scroll.min(max_scroll);
+
+        let paragraph = Paragraph::new(Text::from(detail_lines))
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0));
+        let content_area = Rect {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width.saturating_sub(1),
+            height: inner.height,
+        };
+        frame.render_widget(paragraph, content_area);
+
+        if visual_rows > inner.height {
+            let mut scrollbar_state =
+                ScrollbarState::new(max_scroll as usize).position(scroll as usize);
+            let scrollbar_area = Rect {
+                x: inner.right().saturating_sub(1),
+                y: inner.y,
+                width: 1,
+                height: inner.height,
+            };
+            frame.render_stateful_widget(
+                Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .begin_symbol(None)
+                    .end_symbol(None)
+                    .track_symbol(Some("│"))
+                    .thumb_symbol("█"),
+                scrollbar_area,
+                &mut scrollbar_state,
+            );
+        }
+    }
+
+    fn detail_fullscreen_active(&self, surface: DetailSurface) -> bool {
+        self.detail_fullscreen
+            .is_some_and(|state| state.surface == surface)
+    }
+
+    fn toggle_detail_fullscreen(&mut self, surface: DetailSurface, initial_scroll: u16) {
+        if self.detail_fullscreen_active(surface) {
+            self.detail_fullscreen = None;
+        } else {
+            self.detail_fullscreen = Some(DetailFullscreenState {
+                surface,
+                scroll: initial_scroll,
+            });
+        }
+        self.needs_redraw = true;
+    }
+
+    fn close_detail_fullscreen(&mut self, surface: DetailSurface) -> bool {
+        if self.detail_fullscreen_active(surface) {
+            self.detail_fullscreen = None;
+            self.needs_redraw = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn reset_detail_fullscreen_scroll(&mut self, surface: DetailSurface) {
+        if let Some(state) = self.detail_fullscreen.as_mut() {
+            if state.surface == surface {
+                state.scroll = 0;
+                self.needs_redraw = true;
+            }
+        }
+    }
+
+    fn page_up_detail_fullscreen(&mut self, surface: DetailSurface) {
+        if let Some(state) = self.detail_fullscreen.as_mut() {
+            if state.surface == surface {
+                state.scroll = state.scroll.saturating_sub(8);
+                self.needs_redraw = true;
+            }
+        }
+    }
+
+    fn page_down_detail_fullscreen(&mut self, surface: DetailSurface) {
+        if let Some(state) = self.detail_fullscreen.as_mut() {
+            if state.surface == surface {
+                state.scroll = state.scroll.saturating_add(8);
+                self.needs_redraw = true;
+            }
+        }
+    }
+
+    fn detail_fullscreen_scroll(&self, surface: DetailSurface) -> u16 {
+        self.detail_fullscreen
+            .filter(|state| state.surface == surface)
+            .map_or(0, |state| state.scroll)
+    }
+
+    fn render_fullscreen_browser_detail(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        chrome: FullscreenBrowserChrome<'_>,
+        detail_lines: Vec<Line<'static>>,
+    ) {
+        frame.render_widget(Clear, area);
+        let chunks = Self::browser_overlay_chunks(area);
+        let header_title = format!("{} · Detail", chrome.header.title);
+        self.render_browser_header(
+            frame,
+            chunks[0],
+            chrome.query,
+            BrowserChrome {
+                title: &header_title,
+                placeholder: chrome.header.placeholder,
+                icon: chrome.header.icon,
+                icon_color: chrome.header.icon_color,
+                border_color: chrome.header.border_color,
+            },
+        );
+        self.render_scrollable_browser_detail(frame, chunks[1], chrome.detail, detail_lines);
+        frame.render_widget(Paragraph::new(chrome.help), chunks[2]);
+    }
+
+    fn render_mcp_selector(&self, frame: &mut Frame, area: Rect) {
+        frame.render_widget(Clear, area);
+
+        let chunks = Self::browser_overlay_chunks(area);
+        let body = Self::browser_body_chunks(chunks[1]);
+        self.render_browser_header(
+            frame,
+            chunks[0],
+            &self.mcp_selector.query,
+            BrowserChrome {
+                title: "MCP Browser",
+                placeholder: "Search configured MCP servers and the official catalog.",
+                icon: "⛓",
+                icon_color: Color::Rgb(110, 220, 210),
+                border_color: Color::Rgb(110, 220, 210),
+            },
+        );
+
+        let max_visible = body[0].height as usize;
+        let filtered = &self.mcp_selector.filtered;
+        let selected = self.mcp_selector.selected;
+        let scroll_start = Self::browser_scroll_start(selected, max_visible);
+
+        let items: Vec<ListItem> = if filtered.is_empty() {
+            let empty_text = if self.mcp_selector.query.trim().is_empty() {
+                "  No configured servers or catalog entries are available."
+            } else {
+                "  No MCP entries matched this query."
+            };
+            vec![ListItem::new(Line::from(Span::styled(
+                empty_text.to_string(),
+                Style::default().fg(Color::Rgb(120, 120, 135)),
+            )))]
+        } else {
+            filtered
+                .iter()
+                .skip(scroll_start)
+                .take(max_visible)
+                .enumerate()
+                .map(|(vis_idx, &preset_idx)| {
+                    let entry = &self.mcp_selector.items[preset_idx];
+                    let is_selected = vis_idx + scroll_start == selected;
+                    let bg = if is_selected {
+                        Color::Rgb(24, 36, 44)
+                    } else {
+                        Color::Rgb(18, 24, 26)
+                    };
+                    let row_style = if is_selected {
+                        Style::default()
+                            .bg(bg)
+                            .fg(Color::Rgb(110, 220, 210))
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Rgb(210, 220, 220))
+                    };
+                    let source_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(145, 170, 170))
+                    } else {
+                        Style::default().fg(Color::Rgb(100, 120, 120))
+                    };
+                    let action_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(210, 240, 175))
+                    } else {
+                        Style::default().fg(Color::Rgb(135, 165, 110))
+                    };
+                    let detail_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(160, 180, 180))
+                    } else {
+                        Style::default().fg(Color::Rgb(120, 140, 140))
+                    };
+                    ListItem::new(Line::from(vec![
+                        selector_marker(is_selected, Color::Rgb(110, 220, 210), Some(bg)),
+                        Span::styled(format!("  {:<12}", entry.source), source_style),
+                        Span::styled(format!("{:<9}", entry.action_label), action_style),
+                        Span::styled(unicode_trunc(&entry.display_title(), 38), row_style),
+                        Span::raw("  "),
+                        Span::styled(unicode_trunc(&entry.detail, 38), detail_style),
+                    ]))
+                })
+                .collect()
+        };
+
+        frame.render_widget(
+            List::new(items).style(Style::default().bg(Color::Rgb(18, 24, 26))),
+            body[0],
+        );
+
+        let mut detail_lines = Vec::new();
+        if let Some(entry) = self.mcp_selector.current() {
+            detail_lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{} ", entry.source),
+                    Style::default()
+                        .fg(Color::Rgb(110, 220, 210))
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(entry.title.clone()),
+            ]));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(vec![
+                Span::styled(
+                    "Default action: ",
+                    Style::default().fg(Color::Rgb(145, 170, 170)),
+                ),
+                Span::raw(entry.action_label.clone()),
+            ]));
+            detail_lines.push(Line::from(""));
+            for line in entry.detail_view.lines() {
+                detail_lines.push(Line::from(line.to_string()));
+            }
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(entry.detail_actions_line()));
+        } else if self.mcp_selector.query.trim().is_empty() {
+            detail_lines.push(Line::from(Span::styled(
+                "MCP Browser",
+                Style::default()
+                    .fg(Color::Rgb(110, 220, 210))
+                    .add_modifier(Modifier::BOLD),
+            )));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from("Browse two sources in one place:"));
+            detail_lines.push(Line::from(
+                "- configured MCP servers from your local config",
+            ));
+            detail_lines.push(Line::from(
+                "- the cached official MCP catalog with installable presets",
+            ));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(
+                "Use fuzzy search to jump by server name, package, tags, transport, env vars, or docs source.",
+            ));
+        } else {
+            detail_lines.push(Line::from("No results for the current query."));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(
+                "Try broader terms like github, browser, database, time, filesystem, oauth, or http.",
+            ));
+        }
+
+        if self.detail_fullscreen_active(DetailSurface::McpSelector) {
+            self.render_fullscreen_browser_detail(
+                frame,
+                area,
+                FullscreenBrowserChrome {
+                    query: &self.mcp_selector.query,
+                    header: BrowserChrome {
+                        title: "MCP Browser",
+                        placeholder: "Search configured MCP servers and the official catalog.",
+                        icon: "⛓",
+                        icon_color: Color::Rgb(110, 220, 210),
+                        border_color: Color::Rgb(110, 220, 210),
+                    },
+                    detail: ScrollableDetailChrome {
+                        title: "Details",
+                        border_color: Color::Rgb(110, 220, 210),
+                        focused: true,
+                        requested_scroll: self.detail_fullscreen_scroll(DetailSurface::McpSelector),
+                    },
+                    help: Line::from(vec![
+                        Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                        Span::styled("change item  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("type ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                        Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                        Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Space ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                        Span::styled("toggle  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Enter ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                        Span::styled("default action  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Z ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                        Span::styled("split view  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Esc ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                        Span::styled("close  ", Style::default().fg(Color::DarkGray)),
+                    ]),
+                },
+                detail_lines,
+            );
+            return;
+        }
+
+        self.render_browser_detail(frame, body[1], detail_lines);
+
+        let help = Paragraph::new(Line::from(vec![
             Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("browse  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("type ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Enter ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("default action  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("i ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("Space ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("toggle active  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("I ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("install  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("t ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("T ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("test  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("v ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("C ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("check  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Z ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("detail  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("V ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("view  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("d ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("D ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("remove  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("R ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("refresh  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Esc ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("cancel  ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 format!("{} entries", filtered.len()),
+                Style::default().fg(Color::Rgb(100, 120, 120)),
+            ),
+        ]));
+        frame.render_widget(help, chunks[2]);
+    }
+
+    fn render_remote_mcp_selector(&self, frame: &mut Frame, area: Rect) {
+        frame.render_widget(Clear, area);
+
+        let chunks = Self::browser_overlay_chunks(area);
+        let body = Self::browser_body_chunks(chunks[1]);
+
+        let browser = &self.remote_mcp_browser;
+        let query = browser.current_query();
+        self.render_browser_header(
+            frame,
+            chunks[0],
+            &browser.selector.query,
+            BrowserChrome {
+                title: if browser.inflight_request_id.is_some() {
+                    "Remote MCP · Searching…"
+                } else {
+                    "Remote MCP"
+                },
+                placeholder: "Type to search official MCP sources and the official MCP Registry",
+                icon: "⛓",
+                icon_color: Color::Rgb(90, 190, 220),
+                border_color: if browser.inflight_request_id.is_some() {
+                    Color::Rgb(110, 220, 210)
+                } else {
+                    Color::Rgb(90, 190, 220)
+                },
+            },
+        );
+
+        let filtered = &browser.selector.filtered;
+        let selected = browser.selector.selected;
+        let max_visible = body[0].height as usize;
+        let scroll_start = Self::browser_scroll_start(selected, max_visible);
+
+        let items: Vec<ListItem> = if filtered.is_empty() {
+            let empty_text = if query.is_empty() {
+                "  Start typing to search official MCP sources."
+            } else if browser.inflight_request_id.is_some() {
+                "  Searching official MCP sources…"
+            } else {
+                "  No MCP servers matched this query."
+            };
+            vec![ListItem::new(Line::from(Span::styled(
+                empty_text.to_string(),
+                Style::default().fg(Color::Rgb(120, 120, 135)),
+            )))]
+        } else {
+            filtered
+                .iter()
+                .skip(scroll_start)
+                .take(max_visible)
+                .enumerate()
+                .map(|(vis_idx, &entry_idx)| {
+                    let entry = &browser.selector.items[entry_idx];
+                    let is_selected = vis_idx + scroll_start == selected;
+                    let bg = if is_selected {
+                        Color::Rgb(24, 36, 44)
+                    } else {
+                        Color::Rgb(18, 24, 26)
+                    };
+                    let source_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(145, 170, 170))
+                    } else {
+                        Style::default().fg(Color::Rgb(100, 120, 120))
+                    };
+                    let action_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(210, 240, 175))
+                    } else {
+                        Style::default().fg(Color::Rgb(135, 165, 110))
+                    };
+                    let main_style = if is_selected {
+                        Style::default()
+                            .bg(bg)
+                            .fg(Color::Rgb(110, 220, 210))
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Rgb(210, 220, 220))
+                    };
+                    let desc_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(160, 180, 180))
+                    } else {
+                        Style::default().fg(Color::Rgb(120, 140, 140))
+                    };
+                    ListItem::new(Line::from(vec![
+                        selector_marker(is_selected, Color::Rgb(110, 220, 210), Some(bg)),
+                        Span::styled(format!("  {:<12}", entry.source_label), source_style),
+                        Span::styled(format!("{:<8}", entry.action().label()), action_style),
+                        Span::styled(unicode_trunc(&entry.id, 40), main_style),
+                        Span::raw("  "),
+                        Span::styled(unicode_trunc(&entry.description, 34), desc_style),
+                    ]))
+                })
+                .collect()
+        };
+
+        frame.render_widget(
+            List::new(items).style(Style::default().bg(Color::Rgb(18, 24, 26))),
+            body[0],
+        );
+
+        let mut detail_lines = Vec::new();
+        if let Some(entry) = browser.selector.current() {
+            detail_lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{} ", entry.source_label),
+                    Style::default()
+                        .fg(Color::Rgb(110, 220, 210))
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(entry.id.clone()),
+            ]));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(entry.description.clone()));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(vec![
+                Span::styled("Origin: ", Style::default().fg(Color::Rgb(145, 170, 170))),
+                Span::raw(entry.origin.clone()),
+            ]));
+            detail_lines.push(Line::from(vec![
+                Span::styled("Action: ", Style::default().fg(Color::Rgb(145, 170, 170))),
+                Span::raw(match entry.action() {
+                    RemoteMcpAction::Install => "Default action: install",
+                    RemoteMcpAction::View => "Default action: view",
+                }),
+            ]));
+            if let Some(transport) = &entry.transport {
+                detail_lines.push(Line::from(vec![
+                    Span::styled(
+                        "Transport: ",
+                        Style::default().fg(Color::Rgb(145, 170, 170)),
+                    ),
+                    Span::raw(transport.clone()),
+                ]));
+            }
+            if let Some(crate::mcp_catalog::McpInstallPlan::Http {
+                required_headers, ..
+            }) = &entry.install
+            {
+                if !required_headers.is_empty() {
+                    detail_lines.push(Line::from(vec![
+                        Span::styled("Auth: ", Style::default().fg(Color::Rgb(145, 170, 170))),
+                        Span::raw(format!(
+                            "manual header setup required: {}",
+                            required_headers.join(", ")
+                        )),
+                    ]));
+                }
+            }
+            if !entry.tags.is_empty() {
+                detail_lines.push(Line::from(vec![
+                    Span::styled("Tags: ", Style::default().fg(Color::Rgb(145, 170, 170))),
+                    Span::raw(entry.tags.join(", ")),
+                ]));
+            }
+            if entry.install.is_none() {
+                detail_lines.push(Line::from(""));
+                detail_lines.push(Line::from(Span::styled(
+                    "This entry is searchable but not auto-installable with the current EdgeCrab MCP transport support.",
+                    Style::default().fg(Color::Rgb(255, 180, 120)),
+                )));
+            }
+        } else if query.is_empty() {
+            detail_lines.push(Line::from(Span::styled(
+                "Official Sources",
+                Style::default()
+                    .fg(Color::Rgb(110, 220, 210))
+                    .add_modifier(Modifier::BOLD),
+            )));
+            detail_lines.push(Line::from("- MCP Reference"));
+            detail_lines.push(Line::from("- Official Apps"));
+            detail_lines.push(Line::from("- Archived"));
+            detail_lines.push(Line::from("- MCP Registry"));
+        } else if browser.inflight_request_id.is_some() {
+            detail_lines.push(Line::from("Searching official MCP sources…"));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(
+                "The selector stays responsive while live registry results are fetched in the background.",
+            ));
+        } else {
+            detail_lines.push(Line::from("No results for the current query."));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(
+                "Try a broader term like github, database, browser, time, or auth.",
+            ));
+        }
+
+        if !browser.notices.is_empty() {
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(Span::styled(
+                "Source Notes",
+                Style::default()
+                    .fg(Color::Rgb(255, 191, 0))
+                    .add_modifier(Modifier::BOLD),
+            )));
+            for notice in browser.notices.iter().take(4) {
+                detail_lines.push(Line::from(format!("- {}", unicode_trunc(notice, 120))));
+            }
+        }
+
+        if self.detail_fullscreen_active(DetailSurface::RemoteMcpBrowser) {
+            self.render_fullscreen_browser_detail(
+                frame,
+                area,
+                FullscreenBrowserChrome {
+                    query: &browser.selector.query,
+                    header: BrowserChrome {
+                        title: if browser.inflight_request_id.is_some() {
+                            "Remote MCP · Searching…"
+                        } else {
+                            "Remote MCP"
+                        },
+                        placeholder:
+                            "Type to search official MCP sources and the official MCP Registry",
+                        icon: "⛓",
+                        icon_color: Color::Rgb(90, 190, 220),
+                        border_color: if browser.inflight_request_id.is_some() {
+                            Color::Rgb(110, 220, 210)
+                        } else {
+                            Color::Rgb(90, 190, 220)
+                        },
+                    },
+                    detail: ScrollableDetailChrome {
+                        title: "Details",
+                        border_color: Color::Rgb(90, 190, 220),
+                        focused: true,
+                        requested_scroll: self
+                            .detail_fullscreen_scroll(DetailSurface::RemoteMcpBrowser),
+                    },
+                    help: Line::from(vec![
+                        Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                        Span::styled("change item  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("type ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                        Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                        Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Enter ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                        Span::styled("default action  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Z ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                        Span::styled("split view  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Esc ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                        Span::styled("close  ", Style::default().fg(Color::DarkGray)),
+                    ]),
+                },
+                detail_lines,
+            );
+            return;
+        }
+
+        self.render_browser_detail(frame, body[1], detail_lines);
+
+        let status_text = if browser.inflight_request_id.is_some() {
+            "searching"
+        } else if !query.is_empty() && filtered.is_empty() {
+            "no matches"
+        } else {
+            "matches"
+        };
+        let help = Paragraph::new(Line::from(vec![
+            Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("browse  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("type ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Enter ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("default action  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("I ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("install  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("V ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("view  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Z ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("detail  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("R ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("refresh  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("L ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("local browser  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Esc ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("cancel  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{} {}", filtered.len(), status_text),
                 Style::default().fg(Color::Rgb(100, 120, 120)),
             ),
         ]));
@@ -10847,52 +17570,25 @@ impl App {
     fn render_skill_selector(&self, frame: &mut Frame, area: Rect) {
         frame.render_widget(Clear, area);
 
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3), // search input
-                Constraint::Min(1),    // skill table
-                Constraint::Length(1), // help line
-            ])
-            .split(area);
-
-        // ── Search box ───────────────────────────────────────────────
-        let search_text = if self.skill_selector.query.is_empty() {
-            "Type to search skills…  (Esc to cancel)".to_string()
-        } else {
-            self.skill_selector.query.clone()
-        };
-        let search_style = if self.skill_selector.query.is_empty() {
-            Style::default().fg(Color::DarkGray)
-        } else {
-            Style::default().fg(Color::White)
-        };
-        let search = Paragraph::new(Line::from(vec![
-            Span::styled("  📚 ", Style::default().fg(Color::Rgb(255, 191, 0))),
-            Span::styled(search_text, search_style),
-        ]))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Rgb(255, 191, 0)))
-                .title(" Browse Skills "),
+        let chunks = Self::browser_overlay_chunks(area);
+        let body = Self::browser_body_chunks(chunks[1]);
+        self.render_browser_header(
+            frame,
+            chunks[0],
+            &self.skill_selector.query,
+            BrowserChrome {
+                title: "Browse Skills",
+                placeholder: "Search local skills by name, category, path, preview, or support files.",
+                icon: "📚",
+                icon_color: Color::Rgb(255, 191, 0),
+                border_color: Color::Rgb(255, 191, 0),
+            },
         );
-        frame.render_widget(search, chunks[0]);
 
-        // ── Skill table ──────────────────────────────────────────────
-        let max_visible = chunks[1].height as usize;
+        let max_visible = body[0].height as usize;
         let filtered = &self.skill_selector.filtered;
         let selected = self.skill_selector.selected;
-
-        let scroll_start = if selected >= max_visible {
-            selected - max_visible + 1
-        } else {
-            0
-        };
-
-        // Column widths:  type(4) + gap(1) + name(28) + gap(2) + desc(rest)
-        let type_w = 4usize;
-        let name_w = 28usize;
+        let scroll_start = Self::browser_scroll_start(selected, max_visible);
 
         let items: Vec<ListItem> = filtered
             .iter()
@@ -10908,13 +17604,11 @@ impl App {
                 } else {
                     Color::Rgb(20, 20, 28)
                 };
-                let type_tag = if entry.is_dir { " dir" } else { "  md" };
-                let type_style = if is_selected {
-                    Style::default().bg(bg).fg(Color::Rgb(120, 110, 60))
+                let state_style = if is_selected {
+                    Style::default().bg(bg).fg(Color::Rgb(150, 140, 90))
                 } else {
-                    Style::default().fg(Color::Rgb(80, 75, 40))
+                    Style::default().fg(Color::Rgb(90, 80, 45))
                 };
-                let name_str = unicode_pad_right(&format!("/{}", entry.name), name_w + 1);
                 let name_style = if is_selected {
                     Style::default()
                         .bg(bg)
@@ -10923,33 +17617,136 @@ impl App {
                 } else {
                     Style::default().fg(Color::Rgb(220, 200, 100))
                 };
-                let desc_str = unicode_trunc(&entry.desc, 60);
                 let desc_style = if is_selected {
                     Style::default().bg(bg).fg(Color::Rgb(160, 150, 90))
                 } else {
                     Style::default().fg(Color::Rgb(100, 95, 55))
                 };
 
-                let _ = type_w; // used for width planning
-
                 ListItem::new(Line::from(vec![
-                    Span::styled(format!("  {type_tag}"), type_style),
-                    Span::styled(format!("  {name_str}"), name_style),
-                    Span::styled(format!("  {desc_str}"), desc_style),
+                    selector_marker(is_selected, Color::Rgb(255, 191, 0), Some(bg)),
+                    Span::styled(
+                        format!("  {:<7}", if entry.active { "active" } else { "ready" }),
+                        state_style,
+                    ),
+                    Span::styled(
+                        format!("{:<7}", entry.kind_label()),
+                        if is_selected {
+                            Style::default().bg(bg).fg(Color::Rgb(120, 110, 60))
+                        } else {
+                            Style::default().fg(Color::Rgb(80, 75, 40))
+                        },
+                    ),
+                    Span::styled(unicode_trunc(&entry.display_title(), 34), name_style),
+                    Span::raw("  "),
+                    Span::styled(unicode_trunc(&entry.list_detail(), 42), desc_style),
                 ]))
             })
             .collect();
 
         let skill_count = filtered.len();
         let list = List::new(items).style(Style::default().bg(Color::Rgb(20, 20, 28)));
-        frame.render_widget(list, chunks[1]);
+        frame.render_widget(list, body[0]);
 
-        // ── Help line ────────────────────────────────────────────────
+        let mut detail_lines = Vec::new();
+        if let Some(entry) = self.skill_selector.current() {
+            detail_lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{} ", if entry.active { "ACTIVE" } else { "READY" }),
+                    Style::default()
+                        .fg(Color::Rgb(255, 191, 0))
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(entry.display_title()),
+            ]));
+            detail_lines.push(Line::from(""));
+            for line in entry.detail_view.lines() {
+                detail_lines.push(Line::from(line.to_string()));
+            }
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(entry.detail_actions_line()));
+        } else if self.skill_selector.query.trim().is_empty() {
+            detail_lines.push(Line::from(Span::styled(
+                "Local Skills",
+                Style::default()
+                    .fg(Color::Rgb(255, 191, 0))
+                    .add_modifier(Modifier::BOLD),
+            )));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(
+                "Browse installed skills with fuzzy search across names, categories, previews, and supporting files.",
+            ));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(
+                "Space toggles whether a skill is injected into your next prompt.",
+            ));
+            detail_lines.push(Line::from(
+                "Enter inserts `/skill-name` into the composer if you want the explicit slash flow instead.",
+            ));
+        } else {
+            detail_lines.push(Line::from("No local skills matched this query."));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(
+                "Try a broader term, a category name, or press R to search remote sources.",
+            ));
+        }
+        if self.detail_fullscreen_active(DetailSurface::SkillSelector) {
+            self.render_fullscreen_browser_detail(
+                frame,
+                area,
+                FullscreenBrowserChrome {
+                    query: &self.skill_selector.query,
+                    header: BrowserChrome {
+                        title: "Browse Skills",
+                        placeholder:
+                            "Search local skills by name, category, path, preview, or support files.",
+                        icon: "📚",
+                        icon_color: Color::Rgb(255, 191, 0),
+                        border_color: Color::Rgb(255, 191, 0),
+                    },
+                    detail: ScrollableDetailChrome {
+                        title: "Details",
+                        border_color: Color::Rgb(255, 191, 0),
+                        focused: true,
+                        requested_scroll: self
+                            .detail_fullscreen_scroll(DetailSurface::SkillSelector),
+                    },
+                    help: Line::from(vec![
+                        Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(255, 191, 0))),
+                        Span::styled("change item  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("type ", Style::default().fg(Color::Rgb(255, 191, 0))),
+                        Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(255, 191, 0))),
+                        Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Space ", Style::default().fg(Color::Rgb(255, 191, 0))),
+                        Span::styled("toggle active  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Enter ", Style::default().fg(Color::Rgb(255, 191, 0))),
+                        Span::styled("insert /skill  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Z ", Style::default().fg(Color::Rgb(255, 191, 0))),
+                        Span::styled("split view  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Esc ", Style::default().fg(Color::Rgb(255, 191, 0))),
+                        Span::styled("close  ", Style::default().fg(Color::DarkGray)),
+                    ]),
+                },
+                detail_lines,
+            );
+            return;
+        }
+        self.render_browser_detail(frame, body[1], detail_lines);
+
         let help = Paragraph::new(Line::from(vec![
             Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(255, 191, 0))),
-            Span::styled("navigate  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("browse  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("type ", Style::default().fg(Color::Rgb(255, 191, 0))),
+            Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Space ", Style::default().fg(Color::Rgb(255, 191, 0))),
+            Span::styled("toggle active  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Enter ", Style::default().fg(Color::Rgb(255, 191, 0))),
             Span::styled("insert /skill-name  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Z ", Style::default().fg(Color::Rgb(255, 191, 0))),
+            Span::styled("detail  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("R ", Style::default().fg(Color::Rgb(255, 191, 0))),
+            Span::styled("remote search  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Esc ", Style::default().fg(Color::Rgb(255, 191, 0))),
             Span::styled("cancel  ", Style::default().fg(Color::DarkGray)),
             Span::styled(
@@ -10960,117 +17757,1536 @@ impl App {
         frame.render_widget(help, chunks[2]);
     }
 
-    /// Render the session browser overlay (activated by F4 or `/session` with no args).
-    ///
-    /// Layout mirrors the skill browser: search box + list + help line.
-    fn render_session_browser(&self, frame: &mut Frame, area: Rect) {
+    fn render_remote_skill_selector(&self, frame: &mut Frame, area: Rect) {
+        frame.render_widget(Clear, area);
+
+        let chunks = Self::browser_overlay_chunks(area);
+        let body = Self::browser_body_chunks(chunks[1]);
+
+        let browser = &self.remote_skill_browser;
+        let query = browser.current_query();
+        self.render_browser_header(
+            frame,
+            chunks[0],
+            &browser.selector.query,
+            BrowserChrome {
+                title: if browser.inflight_request_id.is_some() {
+                    "Remote Skills · Searching…"
+                } else {
+                    "Remote Skills"
+                },
+                placeholder: "Type to search remote skills from EdgeCrab, Hermes, OpenAI, Anthropic, skills.sh, or a well-known URL",
+                icon: "🌐",
+                icon_color: Color::Rgb(110, 220, 210),
+                border_color: if browser.inflight_request_id.is_some() {
+                    Color::Rgb(110, 220, 210)
+                } else {
+                    Color::Rgb(255, 191, 0)
+                },
+            },
+        );
+
+        let filtered = &browser.selector.filtered;
+        let selected = browser.selector.selected;
+        let max_visible = body[0].height as usize;
+        let scroll_start = Self::browser_scroll_start(selected, max_visible);
+
+        let items: Vec<ListItem> = if filtered.is_empty() {
+            let empty_text = if query.is_empty() {
+                "  Start typing to search remote skills."
+            } else if browser.inflight_request_id.is_some() {
+                "  Searching remote sources…"
+            } else {
+                "  No remote skills matched this query."
+            };
+            vec![ListItem::new(Line::from(Span::styled(
+                empty_text.to_string(),
+                Style::default().fg(Color::Rgb(120, 120, 135)),
+            )))]
+        } else {
+            filtered
+                .iter()
+                .skip(scroll_start)
+                .take(max_visible)
+                .enumerate()
+                .map(|(vis_idx, &entry_idx)| {
+                    let entry = &browser.selector.items[entry_idx];
+                    let is_selected = vis_idx + scroll_start == selected;
+                    let bg = if is_selected {
+                        Color::Rgb(24, 40, 44)
+                    } else {
+                        Color::Rgb(18, 24, 26)
+                    };
+                    let source_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(145, 170, 170))
+                    } else {
+                        Style::default().fg(Color::Rgb(100, 120, 120))
+                    };
+                    let action_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(210, 240, 175))
+                    } else {
+                        Style::default().fg(Color::Rgb(135, 165, 110))
+                    };
+                    let main_style = if is_selected {
+                        Style::default()
+                            .bg(bg)
+                            .fg(Color::Rgb(110, 220, 210))
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Rgb(210, 220, 220))
+                    };
+                    let desc_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(160, 180, 180))
+                    } else {
+                        Style::default().fg(Color::Rgb(120, 140, 140))
+                    };
+                    ListItem::new(Line::from(vec![
+                        selector_marker(is_selected, Color::Rgb(110, 220, 210), Some(bg)),
+                        Span::styled(format!("  {:<11}", entry.source_label), source_style),
+                        Span::styled(format!("{:<8}", entry.action.label()), action_style),
+                        Span::styled(unicode_trunc(&entry.identifier, 44), main_style),
+                        Span::raw("  "),
+                        Span::styled(unicode_trunc(&entry.description, 36), desc_style),
+                    ]))
+                })
+                .collect()
+        };
+
+        frame.render_widget(
+            List::new(items).style(Style::default().bg(Color::Rgb(18, 24, 26))),
+            body[0],
+        );
+
+        let mut detail_lines = Vec::new();
+        if let Some(entry) = browser.selector.current() {
+            let status_line = match entry.action {
+                RemoteSkillAction::Install => "Default action: install".to_string(),
+                RemoteSkillAction::Update => format!(
+                    "Default action: update ({})",
+                    entry.installed_name.as_deref().unwrap_or(&entry.name)
+                ),
+                RemoteSkillAction::Replace => {
+                    "Default action: replace existing local skill".to_string()
+                }
+            };
+            detail_lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{} ", entry.source_label),
+                    Style::default()
+                        .fg(Color::Rgb(110, 220, 210))
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("[{}]", entry.trust_level),
+                    Style::default().fg(Color::Rgb(160, 180, 180)),
+                ),
+            ]));
+            detail_lines.push(Line::from(entry.identifier.clone()));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(entry.description.clone()));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(vec![
+                Span::styled("Origin: ", Style::default().fg(Color::Rgb(145, 170, 170))),
+                Span::raw(entry.origin.clone()),
+            ]));
+            detail_lines.push(Line::from(vec![
+                Span::styled("Action: ", Style::default().fg(Color::Rgb(145, 170, 170))),
+                Span::raw(status_line),
+            ]));
+            if !entry.tags.is_empty() {
+                detail_lines.push(Line::from(vec![
+                    Span::styled("Tags: ", Style::default().fg(Color::Rgb(145, 170, 170))),
+                    Span::raw(entry.tags.join(", ")),
+                ]));
+            }
+            if entry.action == RemoteSkillAction::Replace {
+                detail_lines.push(Line::from(""));
+                detail_lines.push(Line::from(Span::styled(
+                    "Warning: this source would replace an existing local skill with the same name.",
+                    Style::default().fg(Color::Rgb(255, 180, 120)),
+                )));
+            }
+        } else if query.is_empty() {
+            detail_lines.push(Line::from(Span::styled(
+                "Curated Sources",
+                Style::default()
+                    .fg(Color::Rgb(110, 220, 210))
+                    .add_modifier(Modifier::BOLD),
+            )));
+            for source in edgecrab_tools::tools::skills_hub::curated_source_summaries() {
+                detail_lines.push(Line::from(format!(
+                    "- {} [{}]",
+                    source.label, source.trust_level
+                )));
+            }
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(
+                "Paste an https:// URL to search a .well-known skills endpoint too.",
+            ));
+        } else if browser.inflight_request_id.is_some() {
+            detail_lines.push(Line::from("Searching remote sources…"));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(
+                "You can keep typing while results refresh. Slow or failing sources are reported here without blocking the UI.",
+            ));
+        } else {
+            detail_lines.push(Line::from("No results for the current query."));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(
+                "Try a broader term, a source name like 'edgecrab', or a full https:// URL for well-known skill discovery.",
+            ));
+        }
+
+        if !browser.notices.is_empty() {
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(Span::styled(
+                "Source Notes",
+                Style::default()
+                    .fg(Color::Rgb(255, 191, 0))
+                    .add_modifier(Modifier::BOLD),
+            )));
+            for notice in browser.notices.iter().take(4) {
+                detail_lines.push(Line::from(format!("- {}", unicode_trunc(notice, 120))));
+            }
+            if browser.notices.len() > 4 {
+                detail_lines.push(Line::from(format!(
+                    "... {} more notice(s)",
+                    browser.notices.len() - 4
+                )));
+            }
+        }
+
+        if let Some(action) = &browser.action_in_flight {
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(Span::styled(
+                format!("Running: {action}"),
+                Style::default().fg(Color::Rgb(210, 240, 175)),
+            )));
+        }
+
+        if self.detail_fullscreen_active(DetailSurface::RemoteSkillBrowser) {
+            self.render_fullscreen_browser_detail(
+                frame,
+                area,
+                FullscreenBrowserChrome {
+                    query: &browser.selector.query,
+                    header: BrowserChrome {
+                        title: if browser.inflight_request_id.is_some() {
+                            "Remote Skills · Searching…"
+                        } else {
+                            "Remote Skills"
+                        },
+                        placeholder: "Type to search remote skills from EdgeCrab, Hermes, OpenAI, Anthropic, skills.sh, or a well-known URL",
+                        icon: "🌐",
+                        icon_color: Color::Rgb(110, 220, 210),
+                        border_color: if browser.inflight_request_id.is_some() {
+                            Color::Rgb(110, 220, 210)
+                        } else {
+                            Color::Rgb(255, 191, 0)
+                        },
+                    },
+                    detail: ScrollableDetailChrome {
+                        title: "Details",
+                        border_color: Color::Rgb(255, 191, 0),
+                        focused: true,
+                        requested_scroll: self
+                            .detail_fullscreen_scroll(DetailSurface::RemoteSkillBrowser),
+                    },
+                    help: Line::from(vec![
+                        Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                        Span::styled("change item  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("type ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                        Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                        Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Enter ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                        Span::styled("default action  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Z ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                        Span::styled("split view  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Esc ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                        Span::styled("close  ", Style::default().fg(Color::DarkGray)),
+                    ]),
+                },
+                detail_lines,
+            );
+            return;
+        }
+
+        self.render_browser_detail(frame, body[1], detail_lines);
+
+        let mut help_spans = vec![
+            Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("browse  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("type ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Enter ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("default action  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("I ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("install/update  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("U ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("force update  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Z ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("detail  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("R ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("refresh  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("L ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("local browser  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Esc ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("cancel  ", Style::default().fg(Color::DarkGray)),
+        ];
+        let status_text = if browser.inflight_request_id.is_some() {
+            "searching"
+        } else if !query.is_empty() && filtered.is_empty() {
+            "no matches"
+        } else {
+            "matches"
+        };
+        help_spans.push(Span::styled(
+            format!("{} {}", filtered.len(), status_text),
+            Style::default().fg(Color::Rgb(100, 120, 120)),
+        ));
+        let help = Paragraph::new(Line::from(help_spans));
+        frame.render_widget(help, chunks[2]);
+    }
+
+    fn render_tool_manager(&self, frame: &mut Frame, area: Rect) {
         frame.render_widget(Clear, area);
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(3), // search input
-                Constraint::Min(1),    // session list
-                Constraint::Length(1), // help line
+                Constraint::Length(3),
+                Constraint::Min(1),
+                Constraint::Length(1),
             ])
             .split(area);
+        let body = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+            .split(chunks[1]);
 
-        // ── Search box ───────────────────────────────────────────────
-        let search_text = if self.session_browser.query.is_empty() {
-            "Type to search sessions…  (Esc to cancel)".to_string()
+        let tabs = [
+            ToolManagerScope::All,
+            ToolManagerScope::Toolsets,
+            ToolManagerScope::Tools,
+        ]
+        .into_iter()
+        .map(|scope| {
+            let style = if scope == self.tool_manager_scope {
+                Style::default()
+                    .fg(Color::Rgb(255, 238, 170))
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Rgb(120, 132, 146))
+            };
+            Span::styled(format!("[{}] ", scope.title()), style)
+        })
+        .collect::<Vec<_>>();
+
+        let search_text = if self.tool_manager.query.is_empty() {
+            "Search tools, toolsets, descriptions, or tags".to_string()
         } else {
-            self.session_browser.query.clone()
+            self.tool_manager.query.clone()
         };
-        let search_style = if self.session_browser.query.is_empty() {
+        let search_style = if self.tool_manager.query.is_empty() {
             Style::default().fg(Color::DarkGray)
         } else {
             Style::default().fg(Color::White)
         };
-        let search = Paragraph::new(Line::from(vec![
-            Span::styled("  💾 ", Style::default().fg(Color::Rgb(100, 200, 255))),
+        let mut search_spans = vec![
+            Span::styled("  🧰 ", Style::default().fg(Color::Rgb(140, 220, 210))),
             Span::styled(search_text, search_style),
-        ]))
-        .block(
+            Span::raw("   "),
+        ];
+        search_spans.extend(tabs);
+        let search = Paragraph::new(Line::from(search_spans)).block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Rgb(100, 200, 255)))
-                .title(" Browse Sessions  [F4] "),
+                .border_style(Style::default().fg(Color::Rgb(110, 220, 210)))
+                .title(" Tool Manager "),
         );
         frame.render_widget(search, chunks[0]);
 
-        // ── Session list ─────────────────────────────────────────────
-        let max_visible = chunks[1].height as usize;
-        let filtered = &self.session_browser.filtered;
-        let selected = self.session_browser.selected;
-
+        let filtered = &self.tool_manager.filtered;
+        let selected = self.tool_manager.selected;
+        let max_visible = body[0].height as usize;
         let scroll_start = if selected >= max_visible {
             selected - max_visible + 1
         } else {
             0
         };
 
-        let date_w = 10usize;
-        let title_w = 30usize;
+        let items: Vec<ListItem> = if filtered.is_empty() {
+            vec![ListItem::new(Line::from(Span::styled(
+                "  No tools matched the current filter.",
+                Style::default().fg(Color::Rgb(120, 120, 135)),
+            )))]
+        } else {
+            filtered
+                .iter()
+                .skip(scroll_start)
+                .take(max_visible)
+                .enumerate()
+                .map(|(vis_idx, &entry_idx)| {
+                    let entry = &self.tool_manager.items[entry_idx];
+                    let is_selected = vis_idx + scroll_start == selected;
+                    let bg = if is_selected {
+                        Color::Rgb(20, 42, 46)
+                    } else {
+                        Color::Rgb(16, 22, 28)
+                    };
+                    let check_style = if is_selected {
+                        Style::default()
+                            .bg(bg)
+                            .fg(Color::Rgb(210, 240, 175))
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Rgb(145, 185, 120))
+                    };
+                    let kind_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(150, 180, 188))
+                    } else {
+                        Style::default().fg(Color::Rgb(95, 115, 125))
+                    };
+                    let name_style = if is_selected {
+                        Style::default()
+                            .bg(bg)
+                            .fg(Color::Rgb(110, 220, 210))
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Rgb(210, 220, 220))
+                    };
+                    let detail_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(170, 190, 190))
+                    } else {
+                        Style::default().fg(Color::Rgb(118, 138, 138))
+                    };
 
-        let items: Vec<ListItem> = filtered
-            .iter()
-            .skip(scroll_start)
-            .take(max_visible)
-            .enumerate()
-            .map(|(vis_idx, &entry_idx)| {
-                let entry = &self.session_browser.items[entry_idx];
-                let is_selected = vis_idx + scroll_start == selected;
+                    ListItem::new(Line::from(vec![
+                        selector_marker(is_selected, Color::Rgb(110, 220, 210), Some(bg)),
+                        Span::styled(format!("  {}", entry.check_state.glyph()), check_style),
+                        Span::raw("  "),
+                        Span::styled(unicode_pad_right(&entry.tag, 8), kind_style),
+                        Span::styled(
+                            unicode_pad_right(&format!("{} {}", entry.emoji, entry.name), 30),
+                            name_style,
+                        ),
+                        Span::raw("  "),
+                        Span::styled(unicode_trunc(&entry.detail, 36), detail_style),
+                    ]))
+                })
+                .collect()
+        };
 
-                let bg = if is_selected {
-                    Color::Rgb(15, 30, 50)
-                } else {
-                    Color::Rgb(20, 20, 28)
-                };
+        frame.render_widget(
+            List::new(items).style(Style::default().bg(Color::Rgb(16, 22, 28))),
+            body[0],
+        );
 
-                let date_style = if is_selected {
-                    Style::default().bg(bg).fg(Color::Rgb(100, 150, 180))
-                } else {
-                    Style::default().fg(Color::Rgb(60, 90, 110))
-                };
-                let title_str = unicode_pad_right(&entry.display, title_w);
-                let title_style = if is_selected {
-                    Style::default()
-                        .bg(bg)
-                        .fg(Color::Rgb(130, 210, 255))
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::Rgb(100, 180, 220))
-                };
-                let subtitle_style = if is_selected {
-                    Style::default().bg(bg).fg(Color::Rgb(100, 140, 160))
-                } else {
-                    Style::default().fg(Color::Rgb(70, 100, 120))
-                };
+        let mut detail_lines = Vec::new();
+        if let Some(entry) = self.tool_manager.current() {
+            let policy_text = match entry.policy_source {
+                ToolPolicySource::Default => "inherits default policy",
+                ToolPolicySource::ExplicitEnable => "forced on by explicit override",
+                ToolPolicySource::ExplicitDisable => "forced off by explicit override",
+            };
+            let runtime_text = if entry.exposed {
+                "visible to the model right now"
+            } else if !entry.startup_available {
+                "hidden because the tool is unavailable at startup"
+            } else if !entry.check_allowed {
+                "hidden by runtime gating in this session"
+            } else {
+                "hidden by current policy"
+            };
 
-                let _ = date_w;
-                ListItem::new(Line::from(vec![
-                    Span::styled(format!("  {:10}", entry.date), date_style),
-                    Span::styled(format!("  {title_str}"), title_style),
-                    Span::styled(format!("  {}", entry.subtitle), subtitle_style),
-                ]))
-            })
-            .collect();
+            detail_lines.push(Line::from(Span::styled(
+                format!("{} {}", entry.emoji, entry.name),
+                Style::default()
+                    .fg(Color::Rgb(110, 220, 210))
+                    .add_modifier(Modifier::BOLD),
+            )));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(format!("Kind: {}", entry.tag)));
+            detail_lines.push(Line::from(format!("Policy: {policy_text}")));
+            detail_lines.push(Line::from(format!("Runtime: {runtime_text}")));
 
-        let session_count = filtered.len();
-        let list = List::new(items).style(Style::default().bg(Color::Rgb(20, 20, 28)));
-        frame.render_widget(list, chunks[1]);
+            match entry.kind {
+                ToolManagerItemKind::Toolset => {
+                    detail_lines.push(Line::from(format!(
+                        "Coverage: {}/{} selected · {}/{} exposed",
+                        entry.selected_tools,
+                        entry.total_tools,
+                        entry.exposed_tools,
+                        entry.total_tools
+                    )));
+                    if !entry.description.is_empty() {
+                        detail_lines.push(Line::from(""));
+                        detail_lines.push(Line::from("Included tools:"));
+                        for tool in entry.description.split(", ").take(8) {
+                            detail_lines.push(Line::from(format!("  • {tool}")));
+                        }
+                    }
+                }
+                ToolManagerItemKind::Tool => {
+                    detail_lines.push(Line::from(format!("Toolset: {}", entry.toolset)));
+                    if entry.dynamic {
+                        detail_lines.push(Line::from("Origin: dynamic runtime tool"));
+                    }
+                    if !entry.aliases.is_empty() {
+                        detail_lines
+                            .push(Line::from(format!("Aliases: {}", entry.aliases.join(", "))));
+                    }
+                    detail_lines.push(Line::from(""));
+                    for line in entry.description.lines() {
+                        detail_lines.push(Line::from(line.to_string()));
+                    }
+                }
+            }
+        }
 
-        // ── Help line ────────────────────────────────────────────────
+        let detail = Paragraph::new(Text::from(detail_lines.clone()))
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Rgb(64, 88, 98)))
+                    .title(" Details "),
+            );
+        if self.detail_fullscreen_active(DetailSurface::ToolManager) {
+            self.render_fullscreen_browser_detail(
+                frame,
+                area,
+                FullscreenBrowserChrome {
+                    query: &self.tool_manager.query,
+                    header: BrowserChrome {
+                        title: "Tool Manager",
+                        placeholder: "Search tools, toolsets, descriptions, or tags",
+                        icon: "🧰",
+                        icon_color: Color::Rgb(140, 220, 210),
+                        border_color: Color::Rgb(110, 220, 210),
+                    },
+                    detail: ScrollableDetailChrome {
+                        title: "Details",
+                        border_color: Color::Rgb(110, 220, 210),
+                        focused: true,
+                        requested_scroll: self.detail_fullscreen_scroll(DetailSurface::ToolManager),
+                    },
+                    help: Line::from(vec![
+                        Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                        Span::styled("change item  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("type ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                        Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                        Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Space ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                        Span::styled("toggle  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Tab ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                        Span::styled("scope  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Z ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                        Span::styled("split view  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Esc ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                        Span::styled("close  ", Style::default().fg(Color::DarkGray)),
+                    ]),
+                },
+                detail_lines,
+            );
+            return;
+        }
+        frame.render_widget(detail, body[1]);
+
+        let footer_note = self
+            .tool_manager_status_note
+            .as_deref()
+            .unwrap_or("Space toggles. Tab switches scope. R restores defaults.");
         let help = Paragraph::new(Line::from(vec![
-            Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(100, 200, 255))),
-            Span::styled("navigate  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Enter ", Style::default().fg(Color::Rgb(100, 200, 255))),
-            Span::styled("resume session  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Esc ", Style::default().fg(Color::Rgb(100, 200, 255))),
+            Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("browse  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Space ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("toggle  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Tab ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("scope  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Z ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("detail  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("R ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("reset  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Esc ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("close  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                edgecrab_core::safe_truncate(footer_note, 44),
+                Style::default().fg(Color::Rgb(95, 115, 125)),
+            ),
+        ]));
+        frame.render_widget(help, chunks[2]);
+    }
+
+    fn render_config_selector(&self, frame: &mut Frame, area: Rect) {
+        frame.render_widget(Clear, area);
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ])
+            .split(area);
+        let body = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+            .split(chunks[1]);
+
+        let search_text = if self.config_selector.query.is_empty() {
+            "Type to filter settings and controls…".to_string()
+        } else {
+            self.config_selector.query.clone()
+        };
+        let search_style = if self.config_selector.query.is_empty() {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let search = Paragraph::new(Line::from(vec![
+            Span::styled("  ⚙ ", Style::default().fg(Color::Rgb(130, 210, 255))),
+            Span::styled(search_text, search_style),
+        ]))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Rgb(130, 210, 255)))
+                .title(" Config Center  [/config] "),
+        );
+        frame.render_widget(search, chunks[0]);
+
+        let filtered = &self.config_selector.filtered;
+        let selected = self.config_selector.selected;
+        let max_visible = body[0].height as usize;
+        let scroll_start = if selected >= max_visible {
+            selected - max_visible + 1
+        } else {
+            0
+        };
+
+        let items: Vec<ListItem> = if filtered.is_empty() {
+            vec![ListItem::new(Line::from(Span::styled(
+                "  No settings matched the current filter.",
+                Style::default().fg(Color::Rgb(120, 120, 135)),
+            )))]
+        } else {
+            filtered
+                .iter()
+                .skip(scroll_start)
+                .take(max_visible)
+                .enumerate()
+                .map(|(vis_idx, &entry_idx)| {
+                    let entry = &self.config_selector.items[entry_idx];
+                    let is_selected = vis_idx + scroll_start == selected;
+                    let bg = if is_selected {
+                        Color::Rgb(22, 36, 44)
+                    } else {
+                        Color::Rgb(18, 22, 28)
+                    };
+                    let tag_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(150, 180, 200))
+                    } else {
+                        Style::default().fg(Color::Rgb(105, 125, 140))
+                    };
+                    let title_style = if is_selected {
+                        Style::default()
+                            .bg(bg)
+                            .fg(Color::Rgb(130, 210, 255))
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Rgb(220, 232, 240))
+                    };
+                    let detail_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(172, 190, 204))
+                    } else {
+                        Style::default().fg(Color::Rgb(125, 140, 150))
+                    };
+                    ListItem::new(Line::from(vec![
+                        selector_marker(is_selected, Color::Rgb(130, 210, 255), Some(bg)),
+                        Span::styled(format!("  {:<9}", entry.tag), tag_style),
+                        Span::styled(unicode_pad_right(&entry.title, 28), title_style),
+                        Span::raw("  "),
+                        Span::styled(unicode_trunc(&entry.detail, 54), detail_style),
+                    ]))
+                })
+                .collect()
+        };
+        frame.render_widget(
+            List::new(items).style(Style::default().bg(Color::Rgb(18, 22, 28))),
+            body[0],
+        );
+
+        let mut detail_lines = Vec::new();
+        if let Some(entry) = self.config_selector.current() {
+            detail_lines.push(Line::from(Span::styled(
+                entry.title.clone(),
+                Style::default()
+                    .fg(Color::Rgb(130, 210, 255))
+                    .add_modifier(Modifier::BOLD),
+            )));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(entry.detail.clone()));
+            detail_lines.push(Line::from(""));
+            let detail_body = match entry.action {
+                ConfigAction::ShowSummary => self.render_config_summary(),
+                ConfigAction::ShowPaths => self.render_config_paths(),
+                ConfigAction::OpenTools => {
+                    "Press Enter to open the live tool manager. Use Space to toggle toolsets or individual tools, Tab to switch scopes, and R to restore defaults.".into()
+                }
+                ConfigAction::OpenGatewayBrowser => {
+                    "Press Enter to open the gateway control browser. From there you can toggle platforms, edit bind settings, change allowlists, update home channels, and restart the gateway runtime without leaving the TUI.".into()
+                }
+                ConfigAction::ShowGatewayHomes => {
+                    let config = self.load_runtime_config();
+                    self.render_gateway_home_channel_summary(&config)
+                }
+                ConfigAction::ShowVoice => format!(
+                    "Voice readback is {}.\nRun `/voice status` for recorder, provider, and push-to-talk details.",
+                    if self.voice_mode_enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                ),
+                ConfigAction::ShowUpdateStatus => {
+                    "Runs the local git-based update check and prints ahead/behind guidance.".into()
+                }
+                ConfigAction::OpenModel => "Press Enter to open the model selector overlay.".into(),
+                ConfigAction::OpenCheapModel => {
+                    "Press Enter to open the cheap-model selector. Selecting a model enables smart routing for obviously simple turns.".into()
+                }
+                ConfigAction::ToggleMoa => {
+                    "Press Enter to enable or disable the moa tool while keeping the saved aggregator and expert roster.".into()
+                }
+                ConfigAction::OpenVisionModel => {
+                    "Press Enter to open the dedicated vision-model selector.".into()
+                }
+                ConfigAction::OpenImageModel => {
+                    "Press Enter to open the image-model selector.".into()
+                }
+                ConfigAction::OpenMoaAggregator => {
+                    "Press Enter to pick the default aggregator model used by the moa tool.".into()
+                }
+                ConfigAction::OpenMoaReferences => {
+                    "Press Enter to edit the full default MoA expert roster. Use Space to toggle experts and Enter to save.".into()
+                }
+                ConfigAction::AddMoaExpert => {
+                    "Press Enter to choose one model to add to the saved MoA expert roster.".into()
+                }
+                ConfigAction::RemoveMoaExpert => {
+                    "Press Enter to choose one configured expert to remove from the saved MoA roster.".into()
+                }
+                ConfigAction::ToggleStreaming => {
+                    "Press Enter to toggle live token streaming.".into()
+                }
+                ConfigAction::ToggleReasoning => {
+                    "Press Enter to toggle visible reasoning output.".into()
+                }
+                ConfigAction::ToggleStatusBar => {
+                    "Press Enter to show or hide the status bar.".into()
+                }
+                ConfigAction::OpenSkins => {
+                    "Press Enter to browse installed skins and apply one live.".into()
+                }
+            };
+            for line in detail_body.lines().take(18) {
+                detail_lines.push(Line::from(line.to_string()));
+            }
+        }
+
+        let detail = Paragraph::new(Text::from(detail_lines.clone()))
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Rgb(64, 88, 98)))
+                    .title(" Details "),
+            );
+        if self.detail_fullscreen_active(DetailSurface::ConfigSelector) {
+            self.render_fullscreen_browser_detail(
+                frame,
+                area,
+                FullscreenBrowserChrome {
+                    query: &self.config_selector.query,
+                    header: BrowserChrome {
+                        title: "Config Center",
+                        placeholder: "Type to filter settings and controls…",
+                        icon: "⚙",
+                        icon_color: Color::Rgb(130, 210, 255),
+                        border_color: Color::Rgb(130, 210, 255),
+                    },
+                    detail: ScrollableDetailChrome {
+                        title: "Details",
+                        border_color: Color::Rgb(130, 210, 255),
+                        focused: true,
+                        requested_scroll: self
+                            .detail_fullscreen_scroll(DetailSurface::ConfigSelector),
+                    },
+                    help: Line::from(vec![
+                        Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(130, 210, 255))),
+                        Span::styled("change item  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("type ", Style::default().fg(Color::Rgb(130, 210, 255))),
+                        Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(130, 210, 255))),
+                        Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Enter ", Style::default().fg(Color::Rgb(130, 210, 255))),
+                        Span::styled("run action  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Z ", Style::default().fg(Color::Rgb(130, 210, 255))),
+                        Span::styled("split view  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Esc ", Style::default().fg(Color::Rgb(130, 210, 255))),
+                        Span::styled("close  ", Style::default().fg(Color::DarkGray)),
+                    ]),
+                },
+                detail_lines,
+            );
+            return;
+        }
+        frame.render_widget(detail, body[1]);
+
+        let help = Paragraph::new(Line::from(vec![
+            Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(130, 210, 255))),
+            Span::styled("browse  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Enter ", Style::default().fg(Color::Rgb(130, 210, 255))),
+            Span::styled("run action  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Z ", Style::default().fg(Color::Rgb(130, 210, 255))),
+            Span::styled("detail  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Esc ", Style::default().fg(Color::Rgb(130, 210, 255))),
             Span::styled("cancel  ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format!("{session_count} session(s)"),
-                Style::default().fg(Color::Rgb(60, 100, 120)),
+                format!("{} item(s)", filtered.len()),
+                Style::default().fg(Color::Rgb(100, 120, 130)),
+            ),
+        ]));
+        frame.render_widget(help, chunks[2]);
+    }
+
+    fn render_gateway_browser(&self, frame: &mut Frame, area: Rect) {
+        frame.render_widget(Clear, area);
+
+        let chunks = Self::browser_overlay_chunks(area);
+        let body = Self::browser_body_chunks(chunks[1]);
+        self.render_browser_header(
+            frame,
+            chunks[0],
+            &self.gateway_browser.query,
+            BrowserChrome {
+                title: "Gateway Control",
+                placeholder:
+                    "Search platforms by name, state, delivery mode, or missing setup fields.",
+                icon: "⛵",
+                icon_color: Color::Rgb(120, 220, 200),
+                border_color: Color::Rgb(120, 220, 200),
+            },
+        );
+
+        let filtered = &self.gateway_browser.filtered;
+        let selected = self.gateway_browser.selected;
+        let max_visible = body[0].height as usize;
+        let scroll_start = Self::browser_scroll_start(selected, max_visible);
+
+        let items: Vec<ListItem> = if filtered.is_empty() {
+            vec![ListItem::new(Line::from(Span::styled(
+                "  No gateway platforms matched this filter.".to_string(),
+                Style::default().fg(Color::Rgb(120, 120, 135)),
+            )))]
+        } else {
+            filtered
+                .iter()
+                .skip(scroll_start)
+                .take(max_visible)
+                .enumerate()
+                .map(|(vis_idx, &entry_idx)| {
+                    let entry = &self.gateway_browser.items[entry_idx];
+                    let is_selected = vis_idx + scroll_start == selected;
+                    let bg = if is_selected {
+                        Color::Rgb(18, 42, 42)
+                    } else {
+                        Color::Rgb(18, 22, 28)
+                    };
+                    let accent = match entry.diagnostic.state {
+                        crate::gateway_catalog::PlatformState::Ready => Color::Rgb(120, 220, 160),
+                        crate::gateway_catalog::PlatformState::Available => {
+                            Color::Rgb(170, 210, 120)
+                        }
+                        crate::gateway_catalog::PlatformState::Incomplete => {
+                            Color::Rgb(255, 180, 110)
+                        }
+                        crate::gateway_catalog::PlatformState::NotConfigured => {
+                            Color::Rgb(120, 140, 150)
+                        }
+                    };
+                    let tag_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(155, 185, 175))
+                    } else {
+                        Style::default().fg(Color::Rgb(105, 125, 118))
+                    };
+                    let title_style = if is_selected {
+                        Style::default()
+                            .bg(bg)
+                            .fg(accent)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(accent)
+                    };
+                    let detail_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(175, 195, 188))
+                    } else {
+                        Style::default().fg(Color::Rgb(125, 140, 150))
+                    };
+
+                    ListItem::new(Line::from(vec![
+                        selector_marker(is_selected, accent, Some(bg)),
+                        Span::styled(
+                            format!("  {:<16}", entry.diagnostic.state.label()),
+                            tag_style,
+                        ),
+                        Span::styled(unicode_pad_right(entry.diagnostic.name, 12), title_style),
+                        Span::raw("  "),
+                        Span::styled(unicode_trunc(&entry.summary, 64), detail_style),
+                    ]))
+                })
+                .collect()
+        };
+        frame.render_widget(
+            List::new(items).style(Style::default().bg(Color::Rgb(18, 22, 28))),
+            body[0],
+        );
+
+        let mut detail_lines = Vec::new();
+        if let Some(entry) = self.gateway_browser.current() {
+            for line in entry.detail_view.lines() {
+                detail_lines.push(Line::from(line.to_string()));
+            }
+        } else {
+            detail_lines.push(Line::from(Span::styled(
+                "Gateway Control",
+                Style::default()
+                    .fg(Color::Rgb(120, 220, 200))
+                    .add_modifier(Modifier::BOLD),
+            )));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(
+                "This browser turns `/platforms` into an operator cockpit instead of a text dump.",
+            ));
+            detail_lines.push(Line::from(
+                "Use Enter for the next setup field, Space to toggle enablement, and B to edit the gateway bind address without leaving the TUI.",
+            ));
+        }
+
+        if self.detail_fullscreen_active(DetailSurface::GatewayBrowser) {
+            self.render_fullscreen_browser_detail(
+                frame,
+                area,
+                FullscreenBrowserChrome {
+                    query: &self.gateway_browser.query,
+                    header: BrowserChrome {
+                        title: "Gateway Control",
+                        placeholder:
+                            "Search platforms by name, state, delivery mode, or missing setup fields.",
+                        icon: "⛵",
+                        icon_color: Color::Rgb(120, 220, 200),
+                        border_color: Color::Rgb(120, 220, 200),
+                    },
+                    detail: ScrollableDetailChrome {
+                        title: "Details",
+                        border_color: Color::Rgb(120, 220, 200),
+                        focused: true,
+                        requested_scroll: self
+                            .detail_fullscreen_scroll(DetailSurface::GatewayBrowser),
+                    },
+                    help: Line::from(vec![
+                        Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(120, 220, 200))),
+                        Span::styled("change item  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("type ", Style::default().fg(Color::Rgb(120, 220, 200))),
+                        Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(120, 220, 200))),
+                        Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Enter ", Style::default().fg(Color::Rgb(120, 220, 200))),
+                        Span::styled("edit setup  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Space ", Style::default().fg(Color::Rgb(120, 220, 200))),
+                        Span::styled("toggle  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("X ", Style::default().fg(Color::Rgb(120, 220, 200))),
+                        Span::styled("restart  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Z ", Style::default().fg(Color::Rgb(120, 220, 200))),
+                        Span::styled("split view  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Esc ", Style::default().fg(Color::Rgb(120, 220, 200))),
+                        Span::styled("close  ", Style::default().fg(Color::DarkGray)),
+                    ]),
+                },
+                detail_lines,
+            );
+            return;
+        }
+
+        self.render_scrollable_browser_detail(
+            frame,
+            body[1],
+            ScrollableDetailChrome {
+                title: "Details",
+                border_color: Color::Rgb(120, 220, 200),
+                focused: self.gateway_browser_pane.focus == SplitPaneFocus::Detail,
+                requested_scroll: self.gateway_browser_pane.scroll,
+            },
+            detail_lines,
+        );
+
+        let help = Paragraph::new(Line::from(vec![
+            Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(120, 220, 200))),
+            Span::styled("browse  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Enter ", Style::default().fg(Color::Rgb(120, 220, 200))),
+            Span::styled("edit key field  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Space ", Style::default().fg(Color::Rgb(120, 220, 200))),
+            Span::styled("toggle  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("A ", Style::default().fg(Color::Rgb(120, 220, 200))),
+            Span::styled("allowlist  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("H ", Style::default().fg(Color::Rgb(120, 220, 200))),
+            Span::styled("home  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("B ", Style::default().fg(Color::Rgb(120, 220, 200))),
+            Span::styled("bind  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("R ", Style::default().fg(Color::Rgb(120, 220, 200))),
+            Span::styled("refresh  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("X ", Style::default().fg(Color::Rgb(120, 220, 200))),
+            Span::styled("restart  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Z ", Style::default().fg(Color::Rgb(120, 220, 200))),
+            Span::styled("detail  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Esc ", Style::default().fg(Color::Rgb(120, 220, 200))),
+            Span::styled("close  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{} platform(s)", filtered.len()),
+                Style::default().fg(Color::Rgb(95, 120, 112)),
+            ),
+        ]));
+        frame.render_widget(help, chunks[2]);
+    }
+
+    /// Render the session browser overlay (activated by F5 or `/sessions`).
+    fn render_session_browser(&self, frame: &mut Frame, area: Rect) {
+        frame.render_widget(Clear, area);
+
+        let chunks = Self::browser_overlay_chunks(area);
+        let body = Self::browser_body_chunks(chunks[1]);
+        self.render_browser_header(
+            frame,
+            chunks[0],
+            &self.session_browser.query,
+            BrowserChrome {
+                title: "Session Browser",
+                placeholder: "Search by title, id, source, model, or any indexed message text.",
+                icon: "⏱",
+                icon_color: Color::Rgb(110, 190, 255),
+                border_color: Color::Rgb(110, 190, 255),
+            },
+        );
+
+        let filtered = &self.session_browser.filtered;
+        let selected = self.session_browser.selected;
+        let max_visible = body[0].height as usize;
+        let scroll_start = Self::browser_scroll_start(selected, max_visible);
+
+        let items: Vec<ListItem> = if filtered.is_empty() {
+            let empty_text = if self.session_browser.query.trim().is_empty() {
+                "  No saved sessions are available."
+            } else {
+                "  No sessions matched this query."
+            };
+            vec![ListItem::new(Line::from(Span::styled(
+                empty_text.to_string(),
+                Style::default().fg(Color::Rgb(120, 120, 135)),
+            )))]
+        } else {
+            filtered
+                .iter()
+                .skip(scroll_start)
+                .take(max_visible)
+                .enumerate()
+                .map(|(vis_idx, &entry_idx)| {
+                    let entry = &self.session_browser.items[entry_idx];
+                    let is_selected = vis_idx + scroll_start == selected;
+                    let bg = if is_selected {
+                        Color::Rgb(20, 34, 48)
+                    } else {
+                        Color::Rgb(18, 22, 28)
+                    };
+                    let source_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(140, 170, 210))
+                    } else {
+                        Style::default().fg(Color::Rgb(95, 115, 145))
+                    };
+                    let title_style = if is_selected {
+                        Style::default()
+                            .bg(bg)
+                            .fg(Color::Rgb(125, 215, 255))
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Rgb(210, 225, 235))
+                    };
+                    let detail_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(145, 175, 188))
+                    } else {
+                        Style::default().fg(Color::Rgb(118, 135, 150))
+                    };
+                    let preview_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(168, 188, 196))
+                    } else {
+                        Style::default().fg(Color::Rgb(132, 146, 156))
+                    };
+
+                    ListItem::new(Line::from(vec![
+                        selector_marker(is_selected, Color::Rgb(110, 190, 255), Some(bg)),
+                        Span::styled(format!("  {:<10}", entry.source), source_style),
+                        Span::styled(unicode_trunc(&entry.display, 28), title_style),
+                        Span::raw("  "),
+                        Span::styled(unicode_trunc(&entry.detail, 28), detail_style),
+                        Span::raw("  "),
+                        Span::styled(unicode_trunc(&entry.preview, 34), preview_style),
+                    ]))
+                })
+                .collect()
+        };
+        let list_border_style = if self.session_browser_pane.focus == SplitPaneFocus::List {
+            Style::default()
+                .fg(Color::Rgb(110, 190, 255))
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Rgb(60, 80, 84))
+        };
+        frame.render_widget(
+            List::new(items)
+                .style(Style::default().bg(Color::Rgb(18, 22, 28)))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(list_border_style)
+                        .title(" Sessions "),
+                ),
+            body[0],
+        );
+
+        let mut detail_lines = Vec::new();
+        if let Some(entry) = self.session_browser.current() {
+            detail_lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{} ", entry.source),
+                    Style::default()
+                        .fg(Color::Rgb(110, 190, 255))
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(entry.display.clone()),
+            ]));
+            detail_lines.push(Line::from(""));
+            for line in entry.detail_view.lines() {
+                detail_lines.push(Line::from(line.to_string()));
+            }
+        } else if self.session_browser.query.trim().is_empty() {
+            detail_lines.push(Line::from(Span::styled(
+                "Session Browser",
+                Style::default()
+                    .fg(Color::Rgb(110, 190, 255))
+                    .add_modifier(Modifier::BOLD),
+            )));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(
+                "Browse recent sessions on the left and inspect metadata on the right.",
+            ));
+            detail_lines.push(Line::from(
+                "Search matches local metadata instantly and also checks the full indexed message archive.",
+            ));
+        } else {
+            detail_lines.push(Line::from("No results for the current query."));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(
+                "Try a title fragment, model name, source like cli or telegram, or terms from the conversation itself.",
+            ));
+        }
+        self.render_scrollable_browser_detail(
+            frame,
+            body[1],
+            ScrollableDetailChrome {
+                title: "Details",
+                border_color: Color::Rgb(110, 190, 255),
+                focused: self.session_browser_pane.focus == SplitPaneFocus::Detail,
+                requested_scroll: self.session_browser_pane.scroll,
+            },
+            detail_lines.clone(),
+        );
+        if self.detail_fullscreen_active(DetailSurface::SessionBrowser) {
+            self.render_fullscreen_browser_detail(
+                frame,
+                area,
+                FullscreenBrowserChrome {
+                    query: &self.session_browser.query,
+                    header: BrowserChrome {
+                        title: "Session Browser",
+                        placeholder:
+                            "Search by title, id, source, model, or any indexed message text.",
+                        icon: "⏱",
+                        icon_color: Color::Rgb(110, 190, 255),
+                        border_color: Color::Rgb(110, 190, 255),
+                    },
+                    detail: ScrollableDetailChrome {
+                        title: "Details",
+                        border_color: Color::Rgb(110, 190, 255),
+                        focused: true,
+                        requested_scroll: self
+                            .detail_fullscreen_scroll(DetailSurface::SessionBrowser),
+                    },
+                    help: Line::from(vec![
+                        Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(110, 190, 255))),
+                        Span::styled("change item  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("type ", Style::default().fg(Color::Rgb(110, 190, 255))),
+                        Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(110, 190, 255))),
+                        Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Enter ", Style::default().fg(Color::Rgb(110, 190, 255))),
+                        Span::styled("inspect  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("R ", Style::default().fg(Color::Rgb(110, 190, 255))),
+                        Span::styled("resume  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Z ", Style::default().fg(Color::Rgb(110, 190, 255))),
+                        Span::styled("split view  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Esc ", Style::default().fg(Color::Rgb(110, 190, 255))),
+                        Span::styled("close  ", Style::default().fg(Color::DarkGray)),
+                    ]),
+                },
+                detail_lines,
+            );
+            return;
+        }
+
+        let note = self.session_browser_status_note.as_deref().unwrap_or(
+            "Lowercase keeps typing in the filter. Uppercase shortcuts trigger actions.",
+        );
+        let help = Paragraph::new(Line::from(vec![
+            Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(110, 190, 255))),
+            Span::styled("list  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Tab ", Style::default().fg(Color::Rgb(110, 190, 255))),
+            Span::styled("focus pane  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("type ", Style::default().fg(Color::Rgb(110, 190, 255))),
+            Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(110, 190, 255))),
+            Span::styled("page or scroll  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Enter ", Style::default().fg(Color::Rgb(110, 190, 255))),
+            Span::styled("inspect  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Z ", Style::default().fg(Color::Rgb(110, 190, 255))),
+            Span::styled("detail  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("R ", Style::default().fg(Color::Rgb(110, 190, 255))),
+            Span::styled("resume  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("D ", Style::default().fg(Color::Rgb(110, 190, 255))),
+            Span::styled("delete  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Esc ", Style::default().fg(Color::Rgb(110, 190, 255))),
+            Span::styled("close  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!(
+                    "{} visible · {} pane · {}",
+                    filtered.len(),
+                    match self.session_browser_pane.focus {
+                        SplitPaneFocus::List => "list",
+                        SplitPaneFocus::Detail => "detail",
+                    },
+                    note
+                ),
+                Style::default().fg(Color::Rgb(100, 120, 130)),
+            ),
+        ]));
+        frame.render_widget(help, chunks[2]);
+    }
+
+    fn render_session_inspector(&self, frame: &mut Frame, area: Rect) {
+        frame.render_widget(Clear, area);
+
+        let chunks = Self::browser_overlay_chunks(area);
+        let body = Self::browser_body_chunks(chunks[1]);
+        self.render_browser_header(
+            frame,
+            chunks[0],
+            &self.session_inspector.selector.query,
+            BrowserChrome {
+                title: "Session Inspector",
+                placeholder:
+                    "Filter this timeline by role, content, tool ids, tool names, or reasoning text.",
+                icon: "⌕",
+                icon_color: Color::Rgb(120, 215, 185),
+                border_color: Color::Rgb(120, 215, 185),
+            },
+        );
+
+        let selector = &self.session_inspector.selector;
+        let filtered = &selector.filtered;
+        let selected = selector.selected;
+        let max_visible = body[0].height as usize;
+        let scroll_start = Self::browser_scroll_start(selected, max_visible);
+
+        let items: Vec<ListItem> = if filtered.is_empty() {
+            let empty_text = if selector.query.trim().is_empty() {
+                "  No messages were stored for this session."
+            } else {
+                "  No messages in this session matched the current filter."
+            };
+            vec![ListItem::new(Line::from(Span::styled(
+                empty_text.to_string(),
+                Style::default().fg(Color::Rgb(120, 120, 135)),
+            )))]
+        } else {
+            filtered
+                .iter()
+                .skip(scroll_start)
+                .take(max_visible)
+                .enumerate()
+                .map(|(vis_idx, &entry_idx)| {
+                    let entry = &selector.items[entry_idx];
+                    let is_selected = vis_idx + scroll_start == selected;
+                    let bg = if is_selected {
+                        Color::Rgb(24, 36, 34)
+                    } else {
+                        Color::Rgb(18, 24, 24)
+                    };
+                    let role_color = match entry.role_label.as_str() {
+                        "user" => Color::Rgb(110, 190, 255),
+                        "assistant" => Color::Rgb(120, 215, 185),
+                        "tool" => Color::Rgb(235, 190, 105),
+                        "system" => Color::Rgb(190, 145, 240),
+                        _ => Color::Rgb(190, 190, 190),
+                    };
+                    let index_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(145, 170, 170))
+                    } else {
+                        Style::default().fg(Color::Rgb(92, 112, 112))
+                    };
+                    let role_style = if is_selected {
+                        Style::default()
+                            .bg(bg)
+                            .fg(role_color)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(role_color)
+                    };
+                    let preview_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(218, 230, 228))
+                    } else {
+                        Style::default().fg(Color::Rgb(188, 198, 196))
+                    };
+                    let meta_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(145, 175, 170))
+                    } else {
+                        Style::default().fg(Color::Rgb(110, 136, 132))
+                    };
+
+                    ListItem::new(Line::from(vec![
+                        selector_marker(is_selected, role_color, Some(bg)),
+                        Span::styled(format!("  {:>3}", entry.index + 1), index_style),
+                        Span::raw("  "),
+                        Span::styled(format!("{:<10}", entry.role_label), role_style),
+                        Span::styled(unicode_trunc(&entry.preview, 38), preview_style),
+                        Span::raw("  "),
+                        Span::styled(unicode_trunc(&entry.meta, 22), meta_style),
+                    ]))
+                })
+                .collect()
+        };
+        let list_border_style = if self.session_inspector.pane.focus == SplitPaneFocus::List {
+            Style::default()
+                .fg(Color::Rgb(120, 215, 185))
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Rgb(60, 80, 84))
+        };
+        frame.render_widget(
+            List::new(items)
+                .style(Style::default().bg(Color::Rgb(18, 24, 24)))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(list_border_style)
+                        .title(" Timeline "),
+                ),
+            body[0],
+        );
+
+        let mut detail_lines = Vec::new();
+        if let Some(session) = self.session_inspector.session.as_ref() {
+            detail_lines.push(Line::from(vec![
+                Span::styled(
+                    session.title.clone(),
+                    Style::default()
+                        .fg(Color::Rgb(120, 215, 185))
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!("  ({})", session.source)),
+            ]));
+            detail_lines.push(Line::from(format!(
+                "{} · {} messages · started {} · last active {}",
+                session.model,
+                session.message_count,
+                session.started_label,
+                session.last_active_label
+            )));
+            detail_lines.push(Line::from(format!("Session ID: {}", session.id)));
+            if !session.preview.is_empty() {
+                detail_lines.push(Line::from(format!("Preview: {}", session.preview)));
+            }
+            if let (Some(role), Some(snippet)) = (
+                session.matched_role.as_deref(),
+                session.matched_snippet.as_deref(),
+            ) {
+                detail_lines.push(Line::from(format!("Search hit: {role} -> {snippet}")));
+            }
+            if !selector.query.trim().is_empty() {
+                detail_lines.push(Line::from(format!("Local filter: {}", selector.query)));
+            }
+            if session.is_live {
+                detail_lines.push(Line::from("Mode: live in-memory session debugger"));
+            }
+            for line in &session.debug_lines {
+                detail_lines.push(Line::from(line.clone()));
+            }
+            detail_lines.push(Line::from(""));
+
+            if let Some(entry) = selector.current() {
+                detail_lines.push(Line::from(vec![
+                    Span::styled(
+                        entry.headline.clone(),
+                        Style::default()
+                            .fg(Color::Rgb(120, 215, 185))
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(format!("  {}", entry.meta)),
+                ]));
+                detail_lines.push(Line::from(""));
+
+                let content = entry.message.text_content();
+                if !content.trim().is_empty() {
+                    detail_lines.push(Line::from(Span::styled(
+                        "Content",
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )));
+                    for line in content.lines() {
+                        detail_lines.push(Line::from(line.to_string()));
+                    }
+                } else {
+                    detail_lines.push(Line::from("(No text content stored for this message.)"));
+                }
+
+                if let Some(reasoning) = entry
+                    .message
+                    .reasoning
+                    .as_deref()
+                    .filter(|reasoning| !reasoning.trim().is_empty())
+                {
+                    detail_lines.push(Line::from(""));
+                    detail_lines.push(Line::from(Span::styled(
+                        "Reasoning",
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )));
+                    for line in reasoning.lines() {
+                        detail_lines.push(Line::from(line.to_string()));
+                    }
+                }
+
+                if let Some(tool_calls) = entry
+                    .message
+                    .tool_calls
+                    .as_ref()
+                    .filter(|tool_calls| !tool_calls.is_empty())
+                {
+                    detail_lines.push(Line::from(""));
+                    detail_lines.push(Line::from(Span::styled(
+                        "Tool Calls",
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )));
+                    for call in tool_calls {
+                        detail_lines.push(Line::from(format!(
+                            "- {}  ({})",
+                            call.function.name, call.id
+                        )));
+                    }
+                }
+            } else {
+                detail_lines.push(Line::from(
+                    "No message is selected. Clear the filter or move the cursor to inspect the timeline.",
+                ));
+            }
+        }
+        self.render_scrollable_browser_detail(
+            frame,
+            body[1],
+            ScrollableDetailChrome {
+                title: "Details",
+                border_color: Color::Rgb(120, 215, 185),
+                focused: self.session_inspector.pane.focus == SplitPaneFocus::Detail,
+                requested_scroll: self.session_inspector.pane.scroll,
+            },
+            detail_lines.clone(),
+        );
+        if self.detail_fullscreen_active(DetailSurface::SessionInspector) {
+            self.render_fullscreen_browser_detail(
+                frame,
+                area,
+                FullscreenBrowserChrome {
+                    query: &self.session_inspector.selector.query,
+                    header: BrowserChrome {
+                        title: "Session Inspector",
+                        placeholder:
+                            "Filter this timeline by role, content, tool ids, tool names, or reasoning text.",
+                        icon: "⌕",
+                        icon_color: Color::Rgb(120, 215, 185),
+                        border_color: Color::Rgb(120, 215, 185),
+                    },
+                    detail: ScrollableDetailChrome {
+                        title: "Details",
+                        border_color: Color::Rgb(120, 215, 185),
+                        focused: true,
+                        requested_scroll: self
+                            .detail_fullscreen_scroll(DetailSurface::SessionInspector),
+                    },
+                    help: Line::from(vec![
+                        Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(120, 215, 185))),
+                        Span::styled("change item  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("type ", Style::default().fg(Color::Rgb(120, 215, 185))),
+                        Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(120, 215, 185))),
+                        Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("R ", Style::default().fg(Color::Rgb(120, 215, 185))),
+                        Span::styled("resume saved  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Z ", Style::default().fg(Color::Rgb(120, 215, 185))),
+                        Span::styled("split view  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Esc ", Style::default().fg(Color::Rgb(120, 215, 185))),
+                        Span::styled("back  ", Style::default().fg(Color::DarkGray)),
+                    ]),
+                },
+                detail_lines,
+            );
+            return;
+        }
+
+        let help = Paragraph::new(Line::from(vec![
+            Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(120, 215, 185))),
+            Span::styled("timeline  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Tab ", Style::default().fg(Color::Rgb(120, 215, 185))),
+            Span::styled("focus pane  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("type ", Style::default().fg(Color::Rgb(120, 215, 185))),
+            Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(120, 215, 185))),
+            Span::styled("page or scroll  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Z ", Style::default().fg(Color::Rgb(120, 215, 185))),
+            Span::styled("detail  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("B ", Style::default().fg(Color::Rgb(120, 215, 185))),
+            Span::styled("back  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("R ", Style::default().fg(Color::Rgb(120, 215, 185))),
+            Span::styled("resume saved  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Esc ", Style::default().fg(Color::Rgb(120, 215, 185))),
+            Span::styled("back  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!(
+                    "{} visible · {} pane",
+                    filtered.len(),
+                    match self.session_inspector.pane.focus {
+                        SplitPaneFocus::List => "list",
+                        SplitPaneFocus::Detail => "detail",
+                    }
+                ),
+                Style::default().fg(Color::Rgb(100, 120, 120)),
             ),
         ]));
         frame.render_widget(help, chunks[2]);
@@ -11161,6 +19377,96 @@ impl App {
         frame.render_widget(help, chunks[2]);
     }
 
+    fn render_value_capture_overlay(&self, frame: &mut Frame, area: Rect) {
+        let (title, prompt, placeholder, masked, buffer) = if let DisplayState::ValueCapture {
+            ref title,
+            ref prompt,
+            ref placeholder,
+            masked,
+            ref buffer,
+            ..
+        } = self.display_state
+        {
+            (
+                title.as_str(),
+                prompt.as_str(),
+                placeholder.as_str(),
+                masked,
+                buffer.as_str(),
+            )
+        } else {
+            return;
+        };
+
+        frame.render_widget(Clear, area);
+
+        let dlg_w = area.width.min(84);
+        let dlg_h = 8u16;
+        let x = area.x + (area.width.saturating_sub(dlg_w)) / 2;
+        let y = area.y + (area.height.saturating_sub(dlg_h)) / 2;
+        let dlg = Rect::new(x, y, dlg_w, dlg_h);
+        let accent = Color::Rgb(120, 220, 200);
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2),
+                Constraint::Length(3),
+                Constraint::Length(1),
+            ])
+            .split(dlg);
+
+        let prompt_para = Paragraph::new(Line::from(vec![
+            Span::styled("  ⛵ ", Style::default().fg(accent)),
+            Span::styled(
+                prompt,
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]))
+        .wrap(Wrap { trim: false })
+        .block(
+            Block::default()
+                .borders(Borders::LEFT | Borders::TOP | Borders::RIGHT)
+                .border_style(Style::default().fg(accent))
+                .title(format!(" {} ", title)),
+        );
+        frame.render_widget(prompt_para, chunks[0]);
+
+        let visible = if buffer.is_empty() {
+            placeholder.to_string()
+        } else if masked {
+            "•".repeat(buffer.chars().count())
+        } else {
+            buffer.to_string()
+        };
+        let input_style = if buffer.is_empty() {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let input_para = Paragraph::new(Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(visible, input_style),
+            Span::styled("█", Style::default().fg(accent)),
+        ]))
+        .block(
+            Block::default()
+                .borders(Borders::LEFT | Borders::BOTTOM | Borders::RIGHT)
+                .border_style(Style::default().fg(accent)),
+        );
+        frame.render_widget(input_para, chunks[1]);
+
+        let help = Paragraph::new(Line::from(vec![
+            Span::styled("  Enter ", Style::default().fg(accent)),
+            Span::styled("save  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Esc ", Style::default().fg(accent)),
+            Span::styled("cancel", Style::default().fg(Color::DarkGray)),
+        ]));
+        frame.render_widget(help, chunks[2]);
+    }
+
     fn render_skin_browser(&self, frame: &mut Frame, area: Rect) {
         frame.render_widget(Clear, area);
 
@@ -11235,6 +19541,7 @@ impl App {
                 let badge_fg = Color::Rgb(100, 200, 100);
 
                 ListItem::new(Line::from(vec![
+                    selector_marker(is_selected, accent, Some(bg)),
                     Span::styled(
                         format!("  {name_cell}"),
                         Style::default().fg(name_fg).bg(bg),
@@ -11744,6 +20051,8 @@ fn event_loop(
     loop {
         // Check for agent responses first (non-blocking)
         app.check_responses();
+        app.poll_remote_skill_search();
+        app.poll_remote_mcp_search();
 
         // Advance spinner on each tick
         let now_elapsed = last_tick.elapsed();
@@ -11943,6 +20252,71 @@ fn png_crc32(data: &[u8]) -> u32 {
 mod tests {
     use super::*;
 
+    fn line_spans_text(line: &OutputLine) -> String {
+        line.prebuilt_spans
+            .as_ref()
+            .map(|spans| {
+                spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .unwrap_or_else(|| line.text.clone())
+    }
+
+    fn mock_agent() -> Arc<edgecrab_core::Agent> {
+        let provider: Arc<dyn edgequake_llm::LLMProvider> =
+            Arc::new(edgequake_llm::MockProvider::new());
+        Arc::new(
+            edgecrab_core::AgentBuilder::new("mock")
+                .provider(provider)
+                .tools(Arc::new(edgecrab_tools::registry::ToolRegistry::new()))
+                .build()
+                .expect("build agent"),
+        )
+    }
+
+    fn mock_agent_with_state_db(db: Arc<edgecrab_state::SessionDb>) -> Arc<edgecrab_core::Agent> {
+        let provider: Arc<dyn edgequake_llm::LLMProvider> =
+            Arc::new(edgequake_llm::MockProvider::new());
+        Arc::new(
+            edgecrab_core::AgentBuilder::new("mock")
+                .provider(provider)
+                .tools(Arc::new(edgecrab_tools::registry::ToolRegistry::new()))
+                .state_db(db)
+                .build()
+                .expect("build agent"),
+        )
+    }
+
+    fn sample_browser_session(
+        id: &str,
+        title: &str,
+        started_at: f64,
+        model: &str,
+    ) -> edgecrab_state::SessionRecord {
+        edgecrab_state::SessionRecord {
+            id: id.into(),
+            source: "cli".into(),
+            user_id: None,
+            model: Some(model.into()),
+            system_prompt: None,
+            parent_session_id: None,
+            started_at,
+            ended_at: None,
+            end_reason: None,
+            message_count: 0,
+            tool_call_count: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
+            estimated_cost_usd: None,
+            title: Some(title.into()),
+        }
+    }
+
     #[tokio::test]
     async fn app_init() {
         let app = App::new();
@@ -11965,6 +20339,209 @@ mod tests {
         app.push_output("line2", OutputRole::System);
         app.clear_output();
         assert!(app.output.is_empty());
+    }
+
+    #[test]
+    #[serial_test::serial(edgecrab_home_env)]
+    fn gateway_platform_panel_surfaces_runtime_states_and_actions() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+            std::env::set_var("TELEGRAM_BOT_TOKEN", "telegram-token");
+            std::env::set_var("DISCORD_BOT_TOKEN", "discord-token");
+        }
+
+        let mut config = edgecrab_core::AppConfig::default();
+        config.gateway.enable_platform("telegram");
+        config.gateway.telegram.home_channel = Some("ops-room".into());
+        config.gateway.whatsapp.enabled = true;
+        config.gateway.whatsapp.session_path = Some(dir.path().join("whatsapp-session"));
+
+        let diagnostics = collect_platform_diagnostics(&config);
+        let panel = crate::gateway_presentation::render_gateway_platforms_panel(
+            &config,
+            &diagnostics,
+            Some(&crate::gateway_cmd::GatewayStatus {
+                pid: Some(42),
+                running: true,
+                stale_pid: false,
+                log_path: dir.path().join("logs").join("gateway.log"),
+            }),
+            &[(
+                "telegram".into(),
+                "XKGH5N7P".into(),
+                "123456".into(),
+                "alice".into(),
+                12,
+            )],
+            &[("telegram".into(), "123456".into(), "alice".into())],
+        );
+
+        assert!(panel.contains("Runtime"));
+        assert!(panel.contains("Process: running (pid 42)"));
+        assert!(panel.contains("Gateway homes:"));
+        assert!(panel.contains("telegram  ops-room"));
+        assert!(panel.contains("Pairing"));
+        assert!(panel.contains("Pending DM approvals: 1"));
+        assert!(panel.contains("Ready now"));
+        assert!(panel.contains("Telegram"));
+        assert!(panel.contains("live edits + typing keepalive"));
+        assert!(panel.contains("Needs attention"));
+        assert!(panel.contains("WhatsApp"));
+        assert!(panel.contains("QR pairing"));
+        assert!(panel.contains("Ready to enable"));
+        assert!(panel.contains("Discord"));
+        assert!(panel.contains("Not configured yet"));
+        assert!(panel.contains("edgecrab gateway configure"));
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+            std::env::remove_var("TELEGRAM_BOT_TOKEN");
+            std::env::remove_var("DISCORD_BOT_TOKEN");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(edgecrab_home_env)]
+    async fn platforms_command_opens_gateway_browser_overlay() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+            std::env::set_var("TELEGRAM_BOT_TOKEN", "telegram-token");
+        }
+
+        let mut app = App::new();
+        app.handle_show_platforms();
+
+        assert!(app.gateway_browser.active);
+        let current = app
+            .gateway_browser
+            .current()
+            .expect("selected gateway entry");
+        assert!(current.detail_view.contains("Enter  primary setup field"));
+        assert!(
+            current
+                .detail_view
+                .contains("Space  enable or disable this platform")
+        );
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+            std::env::remove_var("TELEGRAM_BOT_TOKEN");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(edgecrab_home_env)]
+    async fn gateway_bind_editor_persists_from_tui_flow() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+
+        let mut app = App::new();
+        app.apply_value_capture_action(ValueCaptureAction::BindAddress, "0.0.0.0:9091".into());
+
+        let config = edgecrab_core::AppConfig::load_from(&dir.path().join("config.yaml"))
+            .expect("load config");
+        assert_eq!(config.gateway.host, "0.0.0.0");
+        assert_eq!(config.gateway.port, 9091);
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(edgecrab_home_env)]
+    fn stream_command_updates_runtime_behavior_and_config() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let _enter = rt.enter();
+        let provider = Arc::new(edgequake_llm::MockProvider::new());
+        rt.block_on(provider.add_response("A".repeat(160)));
+        let provider_dyn: Arc<dyn edgequake_llm::LLMProvider> = provider.clone();
+        let agent = Arc::new(
+            edgecrab_core::AgentBuilder::new("mock")
+                .provider(provider_dyn)
+                .tools(Arc::new(edgecrab_tools::registry::ToolRegistry::new()))
+                .build()
+                .expect("build agent"),
+        );
+        let mut app = App::new();
+        drop(_enter);
+        app.set_agent(agent.clone());
+
+        app.handle_set_streaming("off".into());
+        assert!(!app.streaming_enabled);
+        assert!(
+            app.output
+                .last()
+                .is_some_and(|line| line.text.contains("Streaming: OFF"))
+        );
+
+        let mut off_token_count = 0;
+        let (off_tx, mut off_rx) = tokio::sync::mpsc::unbounded_channel();
+        rt.block_on(agent.chat_streaming("hello", off_tx))
+            .expect("stream off");
+        rt.block_on(async {
+            while let Some(event) = off_rx.recv().await {
+                if matches!(event, edgecrab_core::StreamEvent::Token(_)) {
+                    off_token_count += 1;
+                }
+            }
+        });
+        assert_eq!(off_token_count, 1);
+
+        let cfg = edgecrab_core::AppConfig::load().expect("load config");
+        assert!(!cfg.display.streaming);
+        assert!(!cfg.model.streaming);
+
+        rt.block_on(provider.add_response("B".repeat(160)));
+        app.handle_set_streaming("on".into());
+        assert!(app.streaming_enabled);
+        assert!(
+            app.output
+                .last()
+                .is_some_and(|line| line.text.contains("Streaming: ON"))
+        );
+
+        let mut on_token_count = 0;
+        let (on_tx, mut on_rx) = tokio::sync::mpsc::unbounded_channel();
+        rt.block_on(agent.chat_streaming("hello again", on_tx))
+            .expect("stream on");
+        rt.block_on(async {
+            while let Some(event) = on_rx.recv().await {
+                if matches!(event, edgecrab_core::StreamEvent::Token(_)) {
+                    on_token_count += 1;
+                }
+            }
+        });
+        assert!(on_token_count > 1);
+
+        let cfg = edgecrab_core::AppConfig::load().expect("load config");
+        assert!(cfg.display.streaming);
+        assert!(cfg.model.streaming);
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
     }
 
     #[tokio::test]
@@ -12009,12 +20586,14 @@ mod tests {
     #[test]
     fn background_progress_text_formats_tool_events() {
         let event = edgecrab_core::StreamEvent::ToolExec {
+            tool_call_id: "call_1".into(),
             name: "terminal".into(),
             args_json: r#"{"command":"cargo test -p edgecrab-core"}"#.into(),
         };
         let text = background_progress_text(2, &event).expect("progress text");
         assert!(text.contains("bg#2"));
-        assert!(text.contains("terminal"));
+        assert!(text.contains("$"));
+        assert!(text.contains("cargo test -p edgecrab-core"));
     }
 
     #[test]
@@ -12089,6 +20668,47 @@ mod tests {
     }
 
     #[test]
+    fn active_tool_status_summary_prefers_latest_detail_and_parallel_count() {
+        let mut tools = std::collections::HashMap::new();
+        tools.insert(
+            "call_1".into(),
+            ActiveToolStatus {
+                name: "read_file".into(),
+                args_json: r#"{"path":"src/lib.rs"}"#.into(),
+                last_detail: None,
+                started_at: Instant::now(),
+                last_seq: 1,
+            },
+        );
+        tools.insert(
+            "call_2".into(),
+            ActiveToolStatus {
+                name: "manage_todo_list".into(),
+                args_json:
+                    r#"{"items":[{"id":1,"title":"Audit","status":"in-progress"}],"merge":true}"#
+                        .into(),
+                last_detail: Some("1/3 completed; updating remaining tasks".into()),
+                started_at: Instant::now(),
+                last_seq: 2,
+            },
+        );
+
+        let summary = summarize_active_tools(&tools).expect("summary");
+        assert_eq!(summary.verb, "running");
+        assert_eq!(summary.icon, "☑");
+        assert!(
+            summary.detail.contains("1/3 completed"),
+            "got: {}",
+            summary.detail
+        );
+        assert!(
+            summary.detail.contains("+1 more"),
+            "got: {}",
+            summary.detail
+        );
+    }
+
+    #[test]
     fn background_progress_text_formats_subagent_reasoning() {
         let event = edgecrab_core::StreamEvent::SubAgentReasoning {
             task_index: 0,
@@ -12152,12 +20772,410 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn model_selector_fullscreen_esc_returns_to_split_view() {
+        let mut app = App::new();
+        app.open_model_selector_for("anthropic/claude-opus-4.6", ModelSelectorTarget::Primary);
+
+        app.handle_key_event(event::KeyEvent::new(KeyCode::Char('Z'), KeyModifiers::NONE));
+        app.handle_key_event(event::KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+
+        assert!(app.model_selector.active);
+        assert!(app.detail_fullscreen_active(DetailSurface::ModelSelector));
+        assert_eq!(
+            app.detail_fullscreen_scroll(DetailSurface::ModelSelector),
+            8
+        );
+
+        app.handle_key_event(event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(app.model_selector.active);
+        assert!(!app.detail_fullscreen_active(DetailSurface::ModelSelector));
+    }
+
+    #[tokio::test]
+    async fn session_browser_builds_rich_entries_from_saved_sessions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(
+            edgecrab_state::SessionDb::open(&dir.path().join("sessions.db")).expect("session db"),
+        );
+        let session = sample_browser_session(
+            "sess-alpha-123456",
+            "Debug auth flow",
+            1_720_000_000.0,
+            "openai/gpt-4o",
+        );
+        db.save_session(&session).expect("save session");
+        db.save_message(
+            "sess-alpha-123456",
+            &edgecrab_types::Message::user("Review the OAuth callback regression."),
+            1_720_000_010.0,
+        )
+        .expect("save message");
+
+        let agent = mock_agent_with_state_db(db);
+        let mut app = App::new();
+        app.set_agent(agent);
+        app.open_session_browser();
+
+        assert!(app.session_browser.active);
+        let entry = app
+            .session_browser
+            .items
+            .iter()
+            .find(|entry| entry.id == "sess-alpha-123456")
+            .expect("session entry");
+        assert_eq!(entry.display, "Debug auth flow");
+        assert_eq!(entry.preview, "Review the OAuth callback regression.");
+        assert!(entry.detail_view.contains("Model:     openai/gpt-4o"));
+        assert!(entry.detail_view.contains("Actions: Enter inspect"));
+    }
+
+    #[tokio::test]
+    async fn session_browser_query_surfaces_archived_message_content_hits() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(
+            edgecrab_state::SessionDb::open(&dir.path().join("sessions.db")).expect("session db"),
+        );
+
+        let session = sample_browser_session(
+            "sess-beta-654321",
+            "Support triage",
+            1_720_000_100.0,
+            "anthropic/claude-opus-4.6",
+        );
+        db.save_session(&session).expect("save session");
+        db.save_message(
+            "sess-beta-654321",
+            &edgecrab_types::Message::user("Need help tracing websocket reconnect jitter"),
+            1_720_000_110.0,
+        )
+        .expect("save message");
+
+        let agent = mock_agent_with_state_db(db);
+        let mut app = App::new();
+        app.set_agent(agent);
+        app.open_session_browser();
+        app.session_browser.query = "websocket jitter".into();
+        app.refresh_session_browser();
+
+        assert!(app.session_browser.active);
+        assert!(app.session_browser.items.iter().any(|entry| {
+            entry.id == "sess-beta-654321"
+                && entry.matched_snippet.is_some()
+                && entry
+                    .matched_snippet
+                    .as_deref()
+                    .is_some_and(|snippet| snippet.contains("websocket"))
+        }));
+        assert_eq!(
+            app.session_browser.current().map(|entry| entry.id.as_str()),
+            Some("sess-beta-654321")
+        );
+    }
+
+    #[tokio::test]
+    async fn session_inspector_opens_and_escape_returns_to_browser() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(
+            edgecrab_state::SessionDb::open(&dir.path().join("sessions.db")).expect("session db"),
+        );
+
+        let session = sample_browser_session(
+            "sess-gamma-222222",
+            "Tool chain debug",
+            1_720_000_200.0,
+            "openai/gpt-4.1",
+        );
+        db.save_session(&session).expect("save session");
+        db.save_message(
+            "sess-gamma-222222",
+            &edgecrab_types::Message::user("Run cargo clippy on the CLI crate"),
+            1_720_000_210.0,
+        )
+        .expect("save user");
+        db.save_message(
+            "sess-gamma-222222",
+            &edgecrab_types::Message::assistant("I will inspect the warnings first."),
+            1_720_000_220.0,
+        )
+        .expect("save assistant");
+
+        let agent = mock_agent_with_state_db(db);
+        let mut app = App::new();
+        app.set_agent(agent);
+        app.open_session_browser();
+
+        let entry = app
+            .session_browser
+            .items
+            .iter()
+            .find(|entry| entry.id == "sess-gamma-222222")
+            .cloned()
+            .expect("session entry");
+        app.open_session_inspector(entry);
+
+        assert!(app.session_inspector.active());
+        assert!(!app.session_browser.active);
+        assert_eq!(app.session_inspector.selector.items.len(), 2);
+        assert_eq!(
+            app.session_inspector
+                .session
+                .as_ref()
+                .map(|session| session.id.as_str()),
+            Some("sess-gamma-222222")
+        );
+
+        app.handle_key_event(event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(!app.session_inspector.active());
+        assert!(app.session_browser.active);
+    }
+
+    #[tokio::test]
+    async fn session_browser_lowercase_letters_stay_in_filter() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(
+            edgecrab_state::SessionDb::open(&dir.path().join("sessions.db")).expect("session db"),
+        );
+
+        let session = sample_browser_session(
+            "sess-delta-333333",
+            "Resume rehearsal",
+            1_720_000_300.0,
+            "anthropic/claude-3-5-sonnet",
+        );
+        db.save_session(&session).expect("save session");
+        db.save_message(
+            "sess-delta-333333",
+            &edgecrab_types::Message::user("Resume this later after lunch"),
+            1_720_000_310.0,
+        )
+        .expect("save message");
+
+        let agent = mock_agent_with_state_db(db);
+        let mut app = App::new();
+        app.set_agent(agent);
+        app.open_session_browser();
+
+        app.handle_key_event(event::KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+
+        assert!(app.session_browser.active);
+        assert_eq!(app.session_browser.query, "r");
+        assert!(!app.session_inspector.active());
+    }
+
+    #[tokio::test]
+    async fn session_slash_command_opens_live_current_session_inspector() {
+        let agent = mock_agent();
+        agent
+            .inject_assistant_context("Live note for debugging")
+            .await;
+
+        let mut app = App::new();
+        app.set_agent(agent);
+
+        app.process_input("/session");
+
+        assert!(app.session_inspector.active());
+        assert!(!app.session_browser.active);
+        assert_eq!(app.session_inspector.selector.items.len(), 1);
+        assert_eq!(
+            app.session_inspector
+                .session
+                .as_ref()
+                .map(|session| session.title.as_str()),
+            Some("Current session")
+        );
+        assert!(
+            app.session_inspector
+                .session
+                .as_ref()
+                .is_some_and(|session| session.is_live)
+        );
+        assert!(
+            app.output.is_empty(),
+            "rich inspector should replace shallow dump"
+        );
+    }
+
+    #[tokio::test]
+    async fn sessions_slash_command_opens_rich_browser_overlay() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(
+            edgecrab_state::SessionDb::open(&dir.path().join("sessions.db")).expect("session db"),
+        );
+
+        let session = sample_browser_session(
+            "sess-epsilon-444444",
+            "Overlay test",
+            1_720_000_400.0,
+            "copilot/gpt-5-mini",
+        );
+        db.save_session(&session).expect("save session");
+        db.save_message(
+            "sess-epsilon-444444",
+            &edgecrab_types::Message::user("Inspect via slash command"),
+            1_720_000_410.0,
+        )
+        .expect("save message");
+
+        let agent = mock_agent_with_state_db(db);
+        let mut app = App::new();
+        app.set_agent(agent);
+
+        app.process_input("/sessions");
+
+        assert!(app.session_browser.active);
+        assert!(
+            app.output.is_empty(),
+            "rich browser should replace shallow dump"
+        );
+    }
+
+    #[tokio::test]
+    async fn sessions_alias_search_seeds_browser_query() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(
+            edgecrab_state::SessionDb::open(&dir.path().join("sessions.db")).expect("session db"),
+        );
+
+        let session = sample_browser_session(
+            "sess-zeta-555555",
+            "OAuth troubleshooting",
+            1_720_000_500.0,
+            "copilot/gpt-5-mini",
+        );
+        db.save_session(&session).expect("save session");
+        db.save_message(
+            "sess-zeta-555555",
+            &edgecrab_types::Message::user("oauth callback mismatch debugging"),
+            1_720_000_510.0,
+        )
+        .expect("save message");
+
+        let agent = mock_agent_with_state_db(db);
+        let mut app = App::new();
+        app.set_agent(agent);
+
+        app.process_input("/sessions search oauth mismatch");
+
+        assert!(app.session_browser.active);
+        assert_eq!(app.session_browser.query, "oauth mismatch");
+        assert_eq!(
+            app.session_browser.current().map(|entry| entry.id.as_str()),
+            Some("sess-zeta-555555")
+        );
+    }
+
+    #[tokio::test]
+    async fn session_browser_tab_and_page_down_drive_detail_pane() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(
+            edgecrab_state::SessionDb::open(&dir.path().join("sessions.db")).expect("session db"),
+        );
+
+        let session = sample_browser_session(
+            "sess-pane-666666",
+            "Pane focus",
+            1_720_000_600.0,
+            "copilot/gpt-5-mini",
+        );
+        db.save_session(&session).expect("save session");
+        db.save_message(
+            "sess-pane-666666",
+            &edgecrab_types::Message::user("One\nTwo\nThree\nFour\nFive\nSix\nSeven\nEight\nNine"),
+            1_720_000_610.0,
+        )
+        .expect("save message");
+
+        let agent = mock_agent_with_state_db(db);
+        let mut app = App::new();
+        app.set_agent(agent);
+        app.open_session_browser();
+
+        app.handle_key_event(event::KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.handle_key_event(event::KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+
+        assert_eq!(app.session_browser_pane.focus, SplitPaneFocus::Detail);
+        assert_eq!(app.session_browser_pane.scroll, 8);
+        assert_eq!(app.session_browser.query, "");
+    }
+
+    #[tokio::test]
+    async fn session_browser_fullscreen_esc_returns_to_split_view() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(
+            edgecrab_state::SessionDb::open(&dir.path().join("sessions.db")).expect("session db"),
+        );
+
+        let session = sample_browser_session(
+            "sess-full-777777",
+            "Fullscreen detail",
+            1_720_000_700.0,
+            "copilot/gpt-5-mini",
+        );
+        db.save_session(&session).expect("save session");
+        db.save_message(
+            "sess-full-777777",
+            &edgecrab_types::Message::user(
+                "alpha\nbeta\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\niota",
+            ),
+            1_720_000_710.0,
+        )
+        .expect("save message");
+
+        let agent = mock_agent_with_state_db(db);
+        let mut app = App::new();
+        app.set_agent(agent);
+        app.open_session_browser();
+        app.handle_key_event(event::KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.handle_key_event(event::KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(app.session_browser_pane.scroll, 8);
+
+        app.handle_key_event(event::KeyEvent::new(KeyCode::Char('Z'), KeyModifiers::NONE));
+        app.handle_key_event(event::KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+
+        assert!(app.session_browser.active);
+        assert!(app.detail_fullscreen_active(DetailSurface::SessionBrowser));
+        assert_eq!(
+            app.detail_fullscreen_scroll(DetailSurface::SessionBrowser),
+            16
+        );
+
+        app.handle_key_event(event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(app.session_browser.active);
+        assert!(!app.detail_fullscreen_active(DetailSurface::SessionBrowser));
+        assert_eq!(app.session_browser_pane.scroll, 8);
+    }
+
+    #[tokio::test]
+    async fn current_session_inspector_tab_and_page_down_scroll_detail() {
+        let agent = mock_agent();
+        agent
+            .inject_assistant_context("alpha\nbeta\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\niota")
+            .await;
+
+        let mut app = App::new();
+        app.set_agent(agent);
+        app.process_input("/session");
+
+        app.handle_key_event(event::KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.handle_key_event(event::KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+
+        assert_eq!(app.session_inspector.pane.focus, SplitPaneFocus::Detail);
+        assert_eq!(app.session_inspector.pane.scroll, 8);
+    }
+
     #[test]
     fn mcp_selector_builder_merges_configured_and_official_entries() {
         let configured = vec![edgecrab_tools::tools::mcp_client::ConfiguredMcpServer {
             name: "local-git".into(),
+            enabled: true,
             url: None,
             bearer_token: None,
+            oauth: None,
             command: "uvx".into(),
             args: vec![
                 "mcp-server-git".into(),
@@ -12226,6 +21244,123 @@ mod tests {
         );
     }
 
+    #[test]
+    fn mcp_selector_builds_rich_detail_view_for_catalog_entries() {
+        let entries = build_mcp_selector_entries_from(
+            &[],
+            &[crate::mcp_catalog::OfficialCatalogEntry {
+                id: "github".into(),
+                display_name: "GitHub".into(),
+                description: "Official GitHub server.".into(),
+                source_url: "https://github.com/github/github-mcp-server".into(),
+                homepage: "https://modelcontextprotocol.io".into(),
+                tags: vec!["official".into(), "integration".into()],
+                installable_preset_id: Some("github".into()),
+            }],
+        );
+
+        let entry = entries
+            .into_iter()
+            .find(|entry| entry.id == "github")
+            .expect("github entry");
+
+        assert!(entry.detail_view.contains("Catalog: github"));
+        assert!(
+            entry
+                .detail_view
+                .contains("Pkg:     @modelcontextprotocol/server-github")
+        );
+        assert!(entry.detail_view.contains("Status:  ready to install"));
+    }
+
+    #[test]
+    fn mcp_selector_builds_rich_detail_view_for_configured_servers() {
+        let entries = build_mcp_selector_entries_from(
+            &[edgecrab_tools::tools::mcp_client::ConfiguredMcpServer {
+                name: "remote-http".into(),
+                enabled: true,
+                url: Some("https://example.com/mcp".into()),
+                bearer_token: None,
+                oauth: None,
+                command: "ignored".into(),
+                args: vec![],
+                cwd: Some(std::path::PathBuf::from("/tmp/workspace")),
+                env: std::collections::HashMap::from([
+                    ("EDGE_API_KEY".into(), "value".into()),
+                    ("EDGE_PROJECT".into(), "demo".into()),
+                ]),
+                headers: std::collections::HashMap::from([
+                    ("X-Edge".into(), "1".into()),
+                    ("Authorization".into(), "Bearer token".into()),
+                ]),
+                timeout: None,
+                connect_timeout: None,
+                include: vec!["repo/*".into()],
+                exclude: vec!["admin/*".into()],
+                token_from_config: false,
+                token_from_store: true,
+            }],
+            &[],
+        );
+
+        let entry = entries
+            .into_iter()
+            .find(|entry| entry.id == "remote-http")
+            .expect("remote-http entry");
+
+        assert!(entry.detail_view.contains("Server: remote-http"));
+        assert!(
+            entry
+                .detail_view
+                .contains("Transport: http https://example.com/mcp")
+        );
+        assert!(
+            entry
+                .detail_view
+                .contains("Env keys: EDGE_API_KEY, EDGE_PROJECT")
+        );
+        assert!(
+            entry
+                .detail_view
+                .contains("Header keys: Authorization, X-Edge")
+        );
+    }
+
+    #[test]
+    fn mcp_selector_uses_enable_as_default_action_for_disabled_servers() {
+        let entries = build_mcp_selector_entries_from(
+            &[edgecrab_tools::tools::mcp_client::ConfiguredMcpServer {
+                name: "disabled-http".into(),
+                enabled: false,
+                url: Some("https://example.com/mcp".into()),
+                bearer_token: None,
+                oauth: None,
+                command: "ignored".into(),
+                args: vec![],
+                cwd: None,
+                env: std::collections::HashMap::new(),
+                headers: std::collections::HashMap::new(),
+                timeout: None,
+                connect_timeout: None,
+                include: Vec::new(),
+                exclude: Vec::new(),
+                token_from_config: false,
+                token_from_store: false,
+            }],
+            &[],
+        );
+
+        let entry = entries
+            .into_iter()
+            .find(|entry| entry.id == "disabled-http")
+            .expect("disabled entry");
+
+        assert_eq!(entry.action_label, "enable");
+        assert_eq!(entry.default_command(), "enable disabled-http");
+        assert!(entry.detail.contains("disabled"));
+        assert!(entry.detail_view.contains("State: disabled"));
+    }
+
     #[tokio::test]
     async fn mcp_command_without_args_opens_selector_overlay() {
         let mut app = App::new();
@@ -12237,6 +21372,81 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(edgecrab_home_env)]
+    async fn mcp_selector_shows_disabled_servers_from_config() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+        std::fs::write(
+            dir.path().join("config.yaml"),
+            "mcp_servers:\n  disabled-http:\n    url: https://example.com/mcp\n    enabled: false\n",
+        )
+        .expect("config");
+
+        let mut app = App::new();
+        app.handle_mcp_command(String::new());
+
+        assert!(app.mcp_selector.active);
+        assert!(
+            app.mcp_selector
+                .items
+                .iter()
+                .any(|entry| entry.id == "disabled-http" && !entry.enabled)
+        );
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(edgecrab_home_env)]
+    async fn mcp_enable_and_disable_commands_persist_server_state() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+        std::fs::write(
+            dir.path().join("config.yaml"),
+            "mcp_servers:\n  github:\n    url: https://example.com/mcp\n    enabled: false\n",
+        )
+        .expect("config");
+
+        let mut app = App::new();
+        app.handle_mcp_command("enable github".into());
+
+        let cfg = edgecrab_core::AppConfig::load_from(&dir.path().join("config.yaml"))
+            .expect("config after enable");
+        assert!(
+            cfg.mcp_servers
+                .get("github")
+                .is_some_and(|server| server.enabled)
+        );
+
+        app.handle_mcp_command("disable github".into());
+
+        let cfg = edgecrab_core::AppConfig::load_from(&dir.path().join("config.yaml"))
+            .expect("config after disable");
+        assert!(
+            cfg.mcp_servers
+                .get("github")
+                .is_some_and(|server| !server.enabled)
+        );
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(edgecrab_home_env)]
     async fn mcp_search_filters_official_snapshot_entries() {
         let _guard = crate::gateway_catalog::TEST_ENV_LOCK
             .lock()
@@ -12283,6 +21493,349 @@ mod tests {
         unsafe {
             std::env::remove_var("EDGECRAB_HOME");
         }
+    }
+
+    #[tokio::test]
+    async fn mcp_search_command_opens_remote_browser_with_query() {
+        let mut app = App::new();
+
+        app.handle_mcp_command("search github".into());
+
+        assert!(app.remote_mcp_browser.selector.active);
+        assert_eq!(app.remote_mcp_browser.selector.query, "github");
+    }
+
+    #[test]
+    fn build_remote_mcp_entries_preserves_source_notices_and_actions() {
+        let report = crate::mcp_catalog::McpSearchReport {
+            groups: vec![
+                crate::mcp_catalog::McpSearchGroup {
+                    source: crate::mcp_catalog::McpSearchSourceInfo {
+                        id: "mcp-reference".into(),
+                        label: "MCP Reference".into(),
+                        origin: "https://github.com/modelcontextprotocol/servers".into(),
+                        trust_level: "official".into(),
+                    },
+                    results: vec![crate::mcp_catalog::McpSearchEntry {
+                        id: "time".into(),
+                        name: "Time".into(),
+                        description: "Timezone server".into(),
+                        source: "official-catalog".into(),
+                        origin:
+                            "https://github.com/modelcontextprotocol/servers/tree/main/src/time"
+                                .into(),
+                        homepage: None,
+                        tags: vec!["official".into(), "reference".into()],
+                        transport: None,
+                        install: Some(crate::mcp_catalog::McpInstallPlan::Preset {
+                            preset_id: "time".into(),
+                        }),
+                    }],
+                    notice: None,
+                },
+                crate::mcp_catalog::McpSearchGroup {
+                    source: crate::mcp_catalog::McpSearchSourceInfo {
+                        id: "mcp-registry".into(),
+                        label: "MCP Registry".into(),
+                        origin: "https://registry.modelcontextprotocol.io".into(),
+                        trust_level: "official".into(),
+                    },
+                    results: vec![crate::mcp_catalog::McpSearchEntry {
+                        id: "vendor/view-only".into(),
+                        name: "View Only".into(),
+                        description: "Needs unsupported transport".into(),
+                        source: "mcp-registry".into(),
+                        origin: "https://registry.modelcontextprotocol.io".into(),
+                        homepage: None,
+                        tags: vec!["official".into(), "registry".into(), "view-only".into()],
+                        transport: Some("sse".into()),
+                        install: None,
+                    }],
+                    notice: Some("Registry search failed over to cached results".into()),
+                },
+            ],
+        };
+
+        let (entries, notices) = App::build_remote_mcp_entries(&report);
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].action(), RemoteMcpAction::Install);
+        assert_eq!(entries[1].action(), RemoteMcpAction::View);
+        assert!(notices.iter().any(|notice| notice.contains("MCP Registry")));
+    }
+
+    #[test]
+    #[serial_test::serial(edgecrab_home_env)]
+    fn build_remote_skill_entries_marks_update_replace_and_install() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+
+        let skills_dir = dir.path().join("skills");
+        std::fs::create_dir_all(skills_dir.join(".hub")).expect("hub dir");
+        std::fs::create_dir_all(skills_dir.join("local-only")).expect("local-only");
+        std::fs::write(skills_dir.join("local-only").join("SKILL.md"), "# local").expect("skill");
+        std::fs::write(
+            skills_dir.join(".hub").join("lock.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "native-mcp": {
+                    "source": "official",
+                    "identifier": "edgecrab:mcp/native-mcp",
+                    "installed_at": "2026-04-07T00:00:00Z",
+                    "content_hash": "sha256:test"
+                }
+            }))
+            .expect("json"),
+        )
+        .expect("write lock");
+
+        let report = edgecrab_tools::tools::skills_hub::SearchReport {
+            groups: vec![edgecrab_tools::tools::skills_hub::SearchGroup {
+                source: edgecrab_tools::tools::skills_hub::HubSourceInfo {
+                    id: "edgecrab".into(),
+                    label: "EdgeCrab".into(),
+                    origin: "https://github.com/raphaelmansuy/edgecrab".into(),
+                    trust_level: "trusted".into(),
+                },
+                results: vec![
+                    edgecrab_tools::tools::skills_hub::SkillMeta {
+                        name: "native-mcp".into(),
+                        description: "Native MCP skill".into(),
+                        source: "edgecrab".into(),
+                        origin: "https://github.com/raphaelmansuy/edgecrab".into(),
+                        identifier: "edgecrab:mcp/native-mcp".into(),
+                        trust_level: "trusted".into(),
+                        repo: None,
+                        path: None,
+                        url: None,
+                        tags: vec!["mcp".into()],
+                    },
+                    edgecrab_tools::tools::skills_hub::SkillMeta {
+                        name: "local-only".into(),
+                        description: "Would replace a local skill".into(),
+                        source: "edgecrab".into(),
+                        origin: "https://github.com/raphaelmansuy/edgecrab".into(),
+                        identifier: "edgecrab:tools/local-only".into(),
+                        trust_level: "trusted".into(),
+                        repo: None,
+                        path: None,
+                        url: None,
+                        tags: vec!["tools".into()],
+                    },
+                    edgecrab_tools::tools::skills_hub::SkillMeta {
+                        name: "fresh-remote".into(),
+                        description: "Brand new remote skill".into(),
+                        source: "edgecrab".into(),
+                        origin: "https://github.com/raphaelmansuy/edgecrab".into(),
+                        identifier: "edgecrab:tools/fresh-remote".into(),
+                        trust_level: "trusted".into(),
+                        repo: None,
+                        path: None,
+                        url: None,
+                        tags: vec!["tools".into()],
+                    },
+                ],
+                notice: Some("using cached index after source timeout".into()),
+            }],
+        };
+
+        let (entries, notices) = App::build_remote_skill_entries(&report);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].action, RemoteSkillAction::Update);
+        assert_eq!(entries[1].action, RemoteSkillAction::Replace);
+        assert_eq!(entries[2].action, RemoteSkillAction::Install);
+        assert_eq!(notices.len(), 1);
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[tokio::test]
+    async fn skills_search_opens_remote_browser_with_query() {
+        let mut app = App::new();
+
+        app.handle_show_skills("search native mcp".into());
+
+        assert!(app.remote_skill_browser.selector.active);
+        assert_eq!(app.remote_skill_browser.selector.query, "native mcp");
+        assert!(!app.skill_selector.active);
+    }
+
+    #[tokio::test]
+    async fn skills_hub_without_query_opens_remote_browser() {
+        let mut app = App::new();
+
+        app.handle_show_skills("hub".into());
+
+        assert!(app.remote_skill_browser.selector.active);
+        assert!(app.remote_skill_browser.selector.query.is_empty());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(edgecrab_home_env)]
+    async fn refresh_skills_list_builds_rich_entries_for_bundle_and_flat_skills() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+
+        let skills_dir = dir.path().join("skills");
+        std::fs::create_dir_all(skills_dir.join("automation").join("deploy")).expect("skill dir");
+        std::fs::create_dir_all(
+            skills_dir
+                .join("automation")
+                .join("deploy")
+                .join("references"),
+        )
+        .expect("references");
+        std::fs::write(
+            skills_dir
+                .join("automation")
+                .join("deploy")
+                .join("SKILL.md"),
+            "---\nname: deploy-pro\n\
+             description: Deploy services safely\n\
+             ---\n\
+             # Deploy\n\
+             Preview line one\n\
+             Preview line two\n",
+        )
+        .expect("write bundle skill");
+        std::fs::write(
+            skills_dir
+                .join("automation")
+                .join("deploy")
+                .join("references")
+                .join("runbook.md"),
+            "# Runbook",
+        )
+        .expect("write support file");
+        std::fs::write(
+            skills_dir.join("quickstart.md"),
+            "---\ndescription: Quick command snippets\n---\n# Quickstart\nUse this for shell snippets.\n",
+        )
+        .expect("write flat skill");
+
+        let mut app = App::new();
+        app.active_skills.push("deploy".into());
+        app.refresh_skills_list();
+
+        let deploy = app
+            .skill_selector
+            .items
+            .iter()
+            .find(|entry| entry.name == "deploy")
+            .expect("deploy skill");
+        assert!(deploy.active);
+        assert_eq!(deploy.category, "automation");
+        assert!(deploy.display_title().contains("deploy-pro"));
+        assert!(deploy.detail_view.contains("Supporting files: 1"));
+        assert!(deploy.detail_view.contains("Preview:"));
+
+        let quick = app
+            .skill_selector
+            .items
+            .iter()
+            .find(|entry| entry.name == "quickstart")
+            .expect("flat skill");
+        assert!(!quick.is_dir);
+        assert!(quick.detail_view.contains("single markdown skill"));
+        assert!(quick.detail_view.contains("Path: quickstart.md"));
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(edgecrab_home_env)]
+    async fn activate_skill_supports_flat_markdown_files() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+
+        let skills_dir = dir.path().join("skills");
+        std::fs::create_dir_all(&skills_dir).expect("skills dir");
+        std::fs::write(
+            skills_dir.join("quickstart.md"),
+            "---\ndescription: Quick command snippets\n---\n# Quickstart\nUse this for shell snippets.\n",
+        )
+        .expect("write flat skill");
+
+        let mut app = App::new();
+        app.activate_skill("quickstart");
+
+        assert!(app.active_skills.iter().any(|entry| entry == "quickstart"));
+        assert!(
+            app.output
+                .last()
+                .expect("activation output")
+                .text
+                .contains("activated")
+        );
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[test]
+    fn selector_search_and_action_keys_are_separated() {
+        let lower = event::KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE);
+        let upper = event::KeyEvent::new(KeyCode::Char('I'), KeyModifiers::SHIFT);
+
+        assert_eq!(selector_search_char(&lower), Some('i'));
+        assert_eq!(selector_search_char(&upper), None);
+        assert!(!selector_action_key(&lower, 'i'));
+        assert!(selector_action_key(&upper, 'i'));
+    }
+
+    #[tokio::test]
+    async fn mcp_selector_lowercase_letters_stay_in_filter() {
+        let mut app = App::new();
+        app.handle_mcp_command(String::new());
+        assert!(app.mcp_selector.active);
+
+        app.handle_key_event(event::KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+
+        assert!(app.mcp_selector.active);
+        assert_eq!(app.mcp_selector.query, "i");
+    }
+
+    #[tokio::test]
+    async fn skill_selector_lowercase_letters_stay_in_filter() {
+        let mut app = App::new();
+        app.skill_selector.set_items(vec![SkillEntry {
+            name: "rust".into(),
+            display_name: "rust".into(),
+            is_dir: true,
+            active: false,
+            category: "coding".into(),
+            relative_path: "coding/rust".into(),
+            desc: "Rust helper".into(),
+            detail: "coding | ready".into(),
+            detail_view: "State: available".into(),
+            search_text: "rust coding helper".into(),
+        }]);
+        app.skill_selector.activate();
+
+        app.handle_key_event(event::KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+
+        assert!(app.skill_selector.active);
+        assert_eq!(app.skill_selector.query, "r");
+        assert!(!app.remote_skill_browser.selector.active);
     }
 
     #[test]
@@ -12390,6 +21943,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(edgecrab_home_env)]
     fn persist_voice_preferences_round_trip() {
         let _guard = crate::gateway_catalog::TEST_ENV_LOCK
             .lock()
@@ -12407,6 +21961,595 @@ mod tests {
         assert!(cfg.voice.continuous);
         assert!(!cfg.voice.hallucination_filter);
         assert_eq!(cfg.voice.input_device.as_deref(), Some("Mic 1"));
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(edgecrab_home_env)]
+    fn persist_display_preferences_round_trip_includes_tool_progress_and_status_bar() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+
+        persist_display_preferences(
+            Some(true),
+            Some(false),
+            Some(ToolProgressMode::Verbose),
+            Some(false),
+        )
+        .expect("persist display prefs");
+
+        let cfg = edgecrab_core::AppConfig::load().expect("load config");
+        assert!(cfg.display.show_reasoning);
+        assert!(!cfg.display.streaming);
+        assert!(!cfg.model.streaming);
+        assert_eq!(cfg.display.tool_progress, ToolProgressMode::Verbose);
+        assert!(!cfg.display.show_status_bar);
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(edgecrab_home_env)]
+    fn persist_smart_routing_round_trip() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+
+        persist_smart_routing_to_config(&edgecrab_core::config::SmartRoutingYaml {
+            enabled: true,
+            cheap_model: "copilot/gpt-4.1-mini".into(),
+            cheap_base_url: None,
+            cheap_api_key_env: None,
+        })
+        .expect("persist smart routing");
+
+        let cfg = edgecrab_core::AppConfig::load().expect("load config");
+        assert!(cfg.model.smart_routing.enabled);
+        assert_eq!(cfg.model.smart_routing.cheap_model, "copilot/gpt-4.1-mini");
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(edgecrab_home_env)]
+    fn persist_moa_config_round_trip() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+
+        persist_moa_config_to_config(&edgecrab_core::config::MoaConfig {
+            enabled: false,
+            aggregator_model: "anthropic/claude-opus-4.6".into(),
+            reference_models: vec!["anthropic/claude-opus-4.6".into(), "openai/gpt-4.1".into()],
+        })
+        .expect("persist moa");
+
+        let cfg = edgecrab_core::AppConfig::load().expect("load config");
+        assert!(!cfg.moa.enabled);
+        assert_eq!(cfg.moa.aggregator_model, "anthropic/claude-opus-4.6");
+        assert_eq!(cfg.moa.reference_models.len(), 2);
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[tokio::test]
+    async fn approve_command_resolves_pending_overlay() {
+        let mut app = App::new();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.approval_pending_tx = Some(tx);
+        app.display_state = DisplayState::WaitingForApproval {
+            command: "rm".into(),
+            full_command: "rm -rf /tmp/demo".into(),
+            selected: 0,
+            show_full: false,
+        };
+
+        app.handle_approval_choice_command(edgecrab_core::ApprovalChoice::Session);
+
+        assert_eq!(
+            rx.await.expect("approval choice"),
+            edgecrab_core::ApprovalChoice::Session
+        );
+        assert!(matches!(
+            app.display_state,
+            DisplayState::AwaitingFirstToken { .. }
+        ));
+        assert_eq!(app.session_approvals.len(), 1);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(edgecrab_home_env)]
+    async fn sethome_updates_single_enabled_platform_without_explicit_platform_arg() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+
+        let mut cfg = edgecrab_core::AppConfig::default();
+        cfg.gateway.telegram.enabled = true;
+        cfg.gateway.enable_platform("telegram");
+        cfg.save().expect("save config");
+
+        let mut app = App::new();
+        app.handle_set_home_channel("123456".into());
+
+        let reloaded = edgecrab_core::AppConfig::load().expect("load config");
+        assert_eq!(
+            reloaded.gateway.telegram.home_channel.as_deref(),
+            Some("123456")
+        );
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[tokio::test]
+    async fn config_command_opens_overlay() {
+        let mut app = App::new();
+        app.handle_config_command(String::new());
+        assert!(app.config_selector.active);
+        assert!(!app.config_selector.filtered.is_empty());
+    }
+
+    #[test]
+    #[serial_test::serial(edgecrab_home_env)]
+    fn cheap_model_command_updates_agent_and_config() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let _enter = rt.enter();
+        let mut app = App::new();
+        let agent = mock_agent();
+        drop(_enter);
+        app.set_agent(agent.clone());
+
+        app.handle_set_cheap_model("copilot/gpt-4.1-mini".into());
+
+        let smart_routing = rt.block_on(agent.smart_routing_config());
+        assert!(smart_routing.enabled);
+        assert_eq!(smart_routing.cheap_model, "vscode-copilot/gpt-4.1-mini");
+
+        let cfg = edgecrab_core::AppConfig::load().expect("load config");
+        assert!(cfg.model.smart_routing.enabled);
+        assert_eq!(
+            cfg.model.smart_routing.cheap_model,
+            "vscode-copilot/gpt-4.1-mini"
+        );
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(edgecrab_home_env)]
+    fn moa_reference_selector_tracks_saved_selection() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let _enter = rt.enter();
+        let mut app = App::new();
+        let agent = mock_agent();
+        drop(_enter);
+        app.set_agent(agent.clone());
+
+        app.handle_save_moa_reference_selection(vec![
+            "anthropic/claude-opus-4.6".into(),
+            "openai/gpt-4.1".into(),
+        ]);
+
+        let moa = rt.block_on(agent.moa_config());
+        assert!(moa.enabled);
+        assert_eq!(moa.reference_models.len(), 2);
+        assert!(
+            moa.reference_models
+                .iter()
+                .any(|model| model == "openai/gpt-4.1")
+        );
+
+        let cfg = edgecrab_core::AppConfig::load().expect("load config");
+        assert!(cfg.moa.enabled);
+        assert_eq!(cfg.moa.reference_models.len(), 2);
+
+        app.open_moa_reference_selector();
+        assert!(app.moa_reference_selector.active);
+        assert_eq!(app.moa_reference_selected.len(), 2);
+        assert_eq!(
+            app.moa_reference_selector_mode,
+            MoaReferenceSelectorMode::EditRoster
+        );
+
+        app.open_moa_add_expert_selector();
+        assert!(app.moa_reference_selector.active);
+        assert_eq!(
+            app.moa_reference_selector_mode,
+            MoaReferenceSelectorMode::AddExpert
+        );
+        assert!(
+            app.moa_reference_selector
+                .items
+                .iter()
+                .all(|entry| !app.moa_reference_selected.contains(&entry.display))
+        );
+
+        app.open_moa_remove_expert_selector();
+        assert!(app.moa_reference_selector.active);
+        assert_eq!(
+            app.moa_reference_selector_mode,
+            MoaReferenceSelectorMode::RemoveExpert
+        );
+        assert_eq!(app.moa_reference_selector.items.len(), 2);
+        assert!(
+            app.moa_reference_selector
+                .items
+                .iter()
+                .all(|entry| app.moa_reference_selected.contains(&entry.display))
+        );
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(edgecrab_home_env)]
+    fn moa_off_command_updates_agent_and_config() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let _enter = rt.enter();
+        let mut app = App::new();
+        let agent = mock_agent();
+        drop(_enter);
+        app.set_agent(agent.clone());
+
+        app.handle_set_moa_enabled(false);
+
+        let moa = rt.block_on(agent.moa_config());
+        assert!(!moa.enabled);
+        assert!(!moa.reference_models.is_empty());
+
+        let cfg = edgecrab_core::AppConfig::load().expect("load config");
+        assert!(!cfg.moa.enabled);
+        assert!(!cfg.moa.reference_models.is_empty());
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(edgecrab_home_env)]
+    fn moa_aggregator_command_enables_feature_and_normalizes_model() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let _enter = rt.enter();
+        let mut app = App::new();
+        let agent = mock_agent();
+        drop(_enter);
+        app.set_agent(agent.clone());
+
+        app.handle_set_moa_enabled(false);
+        app.handle_set_moa_aggregator("copilot/gpt-4.1-mini".into());
+
+        let moa = rt.block_on(agent.moa_config());
+        assert!(moa.enabled);
+        assert_eq!(moa.aggregator_model, "vscode-copilot/gpt-4.1-mini");
+
+        let cfg = edgecrab_core::AppConfig::load().expect("load config");
+        assert!(cfg.moa.enabled);
+        assert_eq!(cfg.moa.aggregator_model, "vscode-copilot/gpt-4.1-mini");
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(edgecrab_home_env)]
+    fn moa_on_repairs_whitelist_and_persists_toolset_filters() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let _enter = rt.enter();
+        let mut app = App::new();
+        let agent = mock_agent();
+        drop(_enter);
+        app.set_agent(agent.clone());
+
+        let enabled_toolsets = vec!["web".to_string(), "terminal".to_string()];
+        persist_toolset_filters_to_config(Some(&enabled_toolsets), None).expect("persist toolsets");
+        rt.block_on(agent.set_toolset_filters(enabled_toolsets, Vec::new()));
+        app.handle_set_moa_enabled(true);
+
+        let (enabled_toolsets, disabled_toolsets) = rt.block_on(agent.toolset_filters());
+        assert!(enabled_toolsets.iter().any(|entry| entry == "moa"));
+        assert!(disabled_toolsets.is_empty());
+
+        let cfg = edgecrab_core::AppConfig::load().expect("load config");
+        assert!(
+            cfg.tools
+                .enabled_toolsets
+                .unwrap_or_default()
+                .iter()
+                .any(|entry| entry == "moa")
+        );
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(edgecrab_home_env)]
+    fn moa_on_removes_literal_disabled_toolset_block() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let _enter = rt.enter();
+        let mut app = App::new();
+        let agent = mock_agent();
+        drop(_enter);
+        app.set_agent(agent.clone());
+
+        let disabled_toolsets = vec!["moa".to_string()];
+        persist_toolset_filters_to_config(None, Some(&disabled_toolsets))
+            .expect("persist toolsets");
+        rt.block_on(agent.set_toolset_filters(Vec::new(), disabled_toolsets));
+        app.handle_set_moa_enabled(true);
+
+        let (_, disabled_toolsets) = rt.block_on(agent.toolset_filters());
+        assert!(disabled_toolsets.is_empty());
+
+        let cfg = edgecrab_core::AppConfig::load().expect("load config");
+        assert!(
+            cfg.tools
+                .disabled_toolsets
+                .unwrap_or_default()
+                .iter()
+                .all(|entry| entry != "moa")
+        );
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(edgecrab_home_env)]
+    fn moa_on_reports_alias_blocker_when_toolset_policy_still_hides_tool() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let _enter = rt.enter();
+        let mut app = App::new();
+        let agent = mock_agent();
+        drop(_enter);
+        app.set_agent(agent.clone());
+
+        let disabled_toolsets = vec!["safe".to_string()];
+        persist_toolset_filters_to_config(None, Some(&disabled_toolsets))
+            .expect("persist toolsets");
+        rt.block_on(agent.set_toolset_filters(Vec::new(), disabled_toolsets));
+        app.handle_set_moa_enabled(true);
+
+        let availability = app.current_moa_availability();
+        assert!(availability.feature_enabled);
+        assert!(!availability.toolset_enabled);
+        assert!(
+            app.output
+                .last()
+                .expect("moa feedback")
+                .text
+                .contains("tools.disabled_toolsets` still blocks `moa` via safe")
+        );
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(edgecrab_home_env)]
+    fn persist_tool_filters_round_trip() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+
+        let enabled_toolsets = vec!["core".to_string()];
+        let disabled_toolsets = vec!["web".to_string()];
+        let enabled_tools = vec!["browser_click".to_string()];
+        let disabled_tools = vec!["terminal".to_string()];
+
+        persist_tool_filters_to_config(
+            Some(&enabled_toolsets),
+            Some(&disabled_toolsets),
+            Some(&enabled_tools),
+            Some(&disabled_tools),
+        )
+        .expect("persist tool filters");
+
+        let cfg = edgecrab_core::AppConfig::load().expect("load config");
+        assert_eq!(
+            cfg.tools.enabled_toolsets.unwrap_or_default(),
+            enabled_toolsets
+        );
+        assert_eq!(
+            cfg.tools.disabled_toolsets.unwrap_or_default(),
+            disabled_toolsets
+        );
+        assert_eq!(cfg.tools.enabled_tools.unwrap_or_default(), enabled_tools);
+        assert_eq!(cfg.tools.disabled_tools.unwrap_or_default(), disabled_tools);
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(edgecrab_home_env)]
+    fn tool_manager_toggle_persists_explicit_tool_disable() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let _enter = rt.enter();
+        let mut app = App::new();
+        let agent = mock_agent();
+        drop(_enter);
+        app.set_agent(agent.clone());
+
+        app.open_tool_manager(ToolManagerMode::All);
+        app.tool_manager_scope = ToolManagerScope::Tools;
+        let _ = app.refresh_tool_manager_entries();
+        let tool_idx = app
+            .tool_manager
+            .items
+            .iter()
+            .position(|entry| {
+                entry.kind == ToolManagerItemKind::Tool && entry.name.as_str() == "terminal"
+            })
+            .expect("terminal tool");
+        app.tool_manager.selected = app
+            .tool_manager
+            .filtered
+            .iter()
+            .position(|candidate| *candidate == tool_idx)
+            .expect("terminal selected");
+
+        app.toggle_tool_manager_selected();
+
+        let (_, _, _, disabled_tools) = rt.block_on(agent.tool_filters());
+        assert!(disabled_tools.iter().any(|entry| entry == "terminal"));
+
+        let cfg = edgecrab_core::AppConfig::load().expect("load config");
+        assert!(
+            cfg.tools
+                .disabled_tools
+                .unwrap_or_default()
+                .iter()
+                .any(|entry| entry == "terminal")
+        );
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(edgecrab_home_env)]
+    fn moa_reset_uses_current_chat_model_as_safe_baseline() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let _enter = rt.enter();
+        let mut app = App::new();
+        let provider: Arc<dyn edgequake_llm::LLMProvider> =
+            Arc::new(edgequake_llm::MockProvider::new());
+        let agent = Arc::new(
+            edgecrab_core::AgentBuilder::new("copilot/gpt-5-mini")
+                .provider(provider)
+                .build()
+                .expect("build agent"),
+        );
+        drop(_enter);
+        app.set_agent(agent.clone());
+
+        app.handle_reset_moa_config();
+
+        let moa = rt.block_on(agent.moa_config());
+        assert!(moa.enabled);
+        assert_eq!(moa.aggregator_model, "vscode-copilot/gpt-5-mini");
+        assert_eq!(moa.reference_models, vec!["vscode-copilot/gpt-5-mini"]);
+
+        let cfg = edgecrab_core::AppConfig::load().expect("load config");
+        assert!(cfg.moa.enabled);
+        assert_eq!(cfg.moa.aggregator_model, "vscode-copilot/gpt-5-mini");
+        assert_eq!(cfg.moa.reference_models, vec!["vscode-copilot/gpt-5-mini"]);
 
         unsafe {
             std::env::remove_var("EDGECRAB_HOME");
@@ -12446,6 +22589,7 @@ mod tests {
     #[tokio::test]
     async fn first_token_transitions_awaiting_state_to_streaming() {
         let mut app = App::new();
+        app.streaming_enabled = true;
         app.display_state = DisplayState::AwaitingFirstToken {
             frame: 0,
             started: Instant::now(),
@@ -12455,6 +22599,309 @@ mod tests {
             .expect("send token");
         app.check_responses();
         assert!(matches!(app.display_state, DisplayState::Streaming { .. }));
+    }
+
+    #[tokio::test]
+    async fn tool_done_updates_matching_placeholder_even_when_completions_arrive_out_of_order() {
+        let mut app = App::new();
+        app.tool_progress_mode = ToolProgressMode::All;
+        app.response_tx
+            .send(AgentResponse::ToolExec {
+                tool_call_id: "call_1".into(),
+                name: "read_file".into(),
+                args_json: r#"{"path":"a.rs"}"#.into(),
+            })
+            .expect("send tool exec 1");
+        app.response_tx
+            .send(AgentResponse::ToolExec {
+                tool_call_id: "call_2".into(),
+                name: "terminal".into(),
+                args_json: r#"{"command":"echo hi"}"#.into(),
+            })
+            .expect("send tool exec 2");
+        app.response_tx
+            .send(AgentResponse::ToolDone {
+                tool_call_id: "call_2".into(),
+                name: "terminal".into(),
+                args_json: r#"{"command":"echo hi"}"#.into(),
+                result_preview: Some("stdout: hi".into()),
+                duration_ms: 12,
+                is_error: false,
+            })
+            .expect("send terminal done");
+        app.check_responses();
+
+        assert_eq!(app.output.len(), 2);
+        let first = line_spans_text(&app.output[0]);
+        let second = line_spans_text(&app.output[1]);
+        assert!(first.contains("read"), "unexpected first line: {first}");
+        assert!(first.contains("···"), "unexpected first line: {first}");
+        assert!(second.contains("$"), "unexpected second line: {second}");
+        assert!(
+            second.contains("echo hi"),
+            "unexpected second line: {second}"
+        );
+        assert!(second.contains("12ms"), "unexpected second line: {second}");
+    }
+
+    #[tokio::test]
+    async fn tool_progress_updates_active_placeholder_and_status_detail() {
+        let mut app = App::new();
+        app.response_tx
+            .send(AgentResponse::ToolExec {
+                tool_call_id: "call_moa".into(),
+                name: "moa".into(),
+                args_json: r#"{"user_prompt":"ping"}"#.into(),
+            })
+            .expect("send moa tool exec");
+        app.response_tx
+            .send(AgentResponse::ToolProgress {
+                tool_call_id: "call_moa".into(),
+                name: "moa".into(),
+                message: "2/3 experts completed; trying aggregator fallback".into(),
+            })
+            .expect("send moa progress");
+        app.check_responses();
+
+        assert_eq!(app.output.len(), 1);
+        let running = line_spans_text(&app.output[0]);
+        assert!(running.contains("2/3 experts completed"), "got: {running}");
+        match &app.display_state {
+            DisplayState::ToolExec { detail, .. } => {
+                assert_eq!(
+                    detail.as_deref(),
+                    Some("2/3 experts completed; trying aggregator fallback")
+                );
+            }
+            other => panic!("expected ToolExec state, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_done_retargets_status_to_remaining_parallel_tool() {
+        let mut app = App::new();
+        app.response_tx
+            .send(AgentResponse::ToolExec {
+                tool_call_id: "call_read".into(),
+                name: "read_file".into(),
+                args_json: r#"{"path":"src/main.rs"}"#.into(),
+            })
+            .expect("send read tool exec");
+        app.response_tx
+            .send(AgentResponse::ToolExec {
+                tool_call_id: "call_todo".into(),
+                name: "manage_todo_list".into(),
+                args_json:
+                    r#"{"items":[{"id":1,"title":"Audit","status":"in-progress"}],"merge":true}"#
+                        .into(),
+            })
+            .expect("send todo tool exec");
+        app.response_tx
+            .send(AgentResponse::ToolProgress {
+                tool_call_id: "call_read".into(),
+                name: "read_file".into(),
+                message: "line window 1-120 loaded".into(),
+            })
+            .expect("send read progress");
+        app.response_tx
+            .send(AgentResponse::ToolDone {
+                tool_call_id: "call_todo".into(),
+                name: "manage_todo_list".into(),
+                args_json:
+                    r#"{"items":[{"id":1,"title":"Audit","status":"in-progress"}],"merge":true}"#
+                        .into(),
+                result_preview: Some("1/3 done, 1 in progress".into()),
+                duration_ms: 6,
+                is_error: false,
+            })
+            .expect("send todo done");
+        app.check_responses();
+
+        match &app.display_state {
+            DisplayState::ToolExec {
+                tool_call_id,
+                name,
+                detail,
+                ..
+            } => {
+                assert_eq!(tool_call_id, "call_read");
+                assert_eq!(name, "read_file");
+                assert_eq!(detail.as_deref(), Some("line window 1-120 loaded"));
+            }
+            other => panic!("expected ToolExec state, got {other:?}"),
+        }
+        assert_eq!(app.in_flight_tool_count, 1);
+        assert!(app.active_tools.contains_key("call_read"));
+        assert!(!app.active_tools.contains_key("call_todo"));
+    }
+
+    #[tokio::test]
+    async fn tool_progress_off_hides_transcript_lines() {
+        let mut app = App::new();
+        app.tool_progress_mode = ToolProgressMode::Off;
+        app.response_tx
+            .send(AgentResponse::ToolExec {
+                tool_call_id: "call_hidden".into(),
+                name: "read_file".into(),
+                args_json: r#"{"path":"src/main.rs"}"#.into(),
+            })
+            .expect("send tool exec");
+        app.response_tx
+            .send(AgentResponse::ToolDone {
+                tool_call_id: "call_hidden".into(),
+                name: "read_file".into(),
+                args_json: r#"{"path":"src/main.rs"}"#.into(),
+                result_preview: Some("loaded".into()),
+                duration_ms: 8,
+                is_error: false,
+            })
+            .expect("send tool done");
+        app.check_responses();
+
+        assert!(
+            app.output.is_empty(),
+            "unexpected output: {:?}",
+            app.output.len()
+        );
+        assert!(app.pending_tool_lines.is_empty());
+        assert!(app.hidden_tool_calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn tool_progress_new_suppresses_repeated_signatures() {
+        let mut app = App::new();
+        app.tool_progress_mode = ToolProgressMode::New;
+        for tool_call_id in ["call_1", "call_2"] {
+            app.response_tx
+                .send(AgentResponse::ToolExec {
+                    tool_call_id: tool_call_id.into(),
+                    name: "read_file".into(),
+                    args_json: r#"{"path":"src/main.rs"}"#.into(),
+                })
+                .expect("send tool exec");
+            app.response_tx
+                .send(AgentResponse::ToolDone {
+                    tool_call_id: tool_call_id.into(),
+                    name: "read_file".into(),
+                    args_json: r#"{"path":"src/main.rs"}"#.into(),
+                    result_preview: Some("loaded".into()),
+                    duration_ms: 5,
+                    is_error: false,
+                })
+                .expect("send tool done");
+        }
+        app.check_responses();
+
+        assert_eq!(app.output.len(), 1);
+        let rendered = line_spans_text(&app.output[0]);
+        assert!(
+            rendered.contains("src/main.rs"),
+            "unexpected line: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_progress_verbose_adds_detail_lines() {
+        let mut app = App::new();
+        app.tool_progress_mode = ToolProgressMode::Verbose;
+        app.response_tx
+            .send(AgentResponse::ToolExec {
+                tool_call_id: "call_verbose".into(),
+                name: "terminal".into(),
+                args_json: r#"{"command":"cargo test -p edgecrab-cli"}"#.into(),
+            })
+            .expect("send tool exec");
+        app.response_tx
+            .send(AgentResponse::ToolDone {
+                tool_call_id: "call_verbose".into(),
+                name: "terminal".into(),
+                args_json: r#"{"command":"cargo test -p edgecrab-cli"}"#.into(),
+                result_preview: Some("test result: ok".into()),
+                duration_ms: 42,
+                is_error: false,
+            })
+            .expect("send tool done");
+        app.check_responses();
+
+        assert_eq!(app.output.len(), 3);
+        assert!(line_spans_text(&app.output[1]).contains("args"));
+        assert!(line_spans_text(&app.output[2]).contains("test result: ok"));
+    }
+
+    #[tokio::test]
+    async fn tool_progress_verbose_renders_todo_plan_board() {
+        let mut app = App::new();
+        app.tool_progress_mode = ToolProgressMode::Verbose;
+        app.response_tx
+            .send(AgentResponse::ToolExec {
+                tool_call_id: "call_todo_verbose".into(),
+                name: "manage_todo_list".into(),
+                args_json: r#"{"items":[{"id":1,"title":"Audit Hermes display","status":"completed"},{"id":2,"title":"Improve todo renderer","status":"in-progress"},{"id":3,"title":"Reassess UX","status":"not-started"}],"merge":true}"#.into(),
+            })
+            .expect("send todo tool exec");
+        app.response_tx
+            .send(AgentResponse::ToolDone {
+                tool_call_id: "call_todo_verbose".into(),
+                name: "manage_todo_list".into(),
+                args_json: r#"{"items":[{"id":1,"title":"Audit Hermes display","status":"completed"},{"id":2,"title":"Improve todo renderer","status":"in-progress"},{"id":3,"title":"Reassess UX","status":"not-started"}],"merge":true}"#.into(),
+                result_preview: Some("1/3 done, 1 in progress".into()),
+                duration_ms: 19,
+                is_error: false,
+            })
+            .expect("send todo tool done");
+        app.check_responses();
+
+        assert_eq!(app.output.len(), 5);
+        assert!(line_spans_text(&app.output[0]).contains("plan"));
+        assert!(line_spans_text(&app.output[1]).contains("1/3 done, 1 in progress"));
+        assert!(line_spans_text(&app.output[2]).contains("[x]"));
+        assert!(line_spans_text(&app.output[3]).contains("[>]"));
+        assert!(line_spans_text(&app.output[4]).contains("[ ]"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(edgecrab_home_env)]
+    async fn cycle_tool_progress_mode_follows_hermes_order() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+        let mut app = App::new();
+        app.tool_progress_mode = ToolProgressMode::Off;
+        assert!(app.cycle_tool_progress_mode().contains("NEW"));
+        assert_eq!(app.tool_progress_mode, ToolProgressMode::New);
+        assert!(app.cycle_tool_progress_mode().contains("ALL"));
+        assert_eq!(app.tool_progress_mode, ToolProgressMode::All);
+        assert!(app.cycle_tool_progress_mode().contains("VERBOSE"));
+        assert_eq!(app.tool_progress_mode, ToolProgressMode::Verbose);
+        assert!(app.cycle_tool_progress_mode().contains("OFF"));
+        assert_eq!(app.tool_progress_mode, ToolProgressMode::Off);
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_tool_progress_command_sets_and_reports_status() {
+        let mut app = App::new();
+        app.tool_progress_mode = ToolProgressMode::All;
+        assert!(
+            app.handle_tool_progress_command("status".into())
+                .contains("ALL")
+        );
+        assert!(
+            app.handle_tool_progress_command("verbose".into())
+                .contains("VERBOSE")
+        );
+        assert_eq!(app.tool_progress_mode, ToolProgressMode::Verbose);
+        assert!(
+            app.handle_tool_progress_command("bogus".into())
+                .contains("Usage: /verbose")
+        );
     }
 
     #[tokio::test]
@@ -12910,6 +23357,15 @@ mod tests {
         assert!(app.pending_images.is_empty());
     }
 
+    #[test]
+    fn selector_marker_uses_explicit_selected_chevron() {
+        let selected = selector_marker(true, Color::Cyan, Some(Color::Black));
+        let idle = selector_marker(false, Color::Cyan, Some(Color::Black));
+
+        assert_eq!(selected.content, "▶ ");
+        assert_eq!(idle.content, "  ");
+    }
+
     // ── Subcommand / argument completion ────────────────────────────────────
 
     /// command_arg_hints should return non-empty slices for known commands.
@@ -12918,7 +23374,22 @@ mod tests {
         let hints = App::command_arg_hints("session");
         assert!(!hints.is_empty(), "session should have subcommand hints");
         let names: Vec<&str> = hints.iter().map(|(n, _)| *n).collect();
-        assert!(names.contains(&"list"), "session hints must include 'list'");
+        assert!(
+            names.contains(&"inspect"),
+            "session hints must include 'inspect'"
+        );
+        assert!(
+            names.contains(&"debug"),
+            "session hints must include 'debug'"
+        );
+        assert!(
+            names.contains(&"browse"),
+            "session hints must include 'browse'"
+        );
+        assert!(
+            names.contains(&"search"),
+            "session hints must include 'search'"
+        );
         assert!(
             names.contains(&"switch"),
             "session hints must include 'switch'"
@@ -12926,14 +23397,15 @@ mod tests {
         assert!(names.contains(&"new"), "session hints must include 'new'");
     }
 
-    /// Alias "sessions" and canonical "session" must return the same hints.
+    /// `/sessions` should expose archive-centric hints.
     #[test]
-    fn command_arg_hints_alias_sessions_matches_session() {
-        assert_eq!(
-            App::command_arg_hints("sessions"),
-            App::command_arg_hints("session"),
-            "alias 'sessions' must mirror 'session'"
-        );
+    fn command_arg_hints_sessions_returns_archive_actions() {
+        let hints = App::command_arg_hints("sessions");
+        let names: Vec<&str> = hints.iter().map(|(name, _)| *name).collect();
+        assert!(names.contains(&"list"));
+        assert!(names.contains(&"browse"));
+        assert!(names.contains(&"search"));
+        assert!(names.contains(&"switch"));
     }
 
     /// command_arg_hints for an unknown token should return an empty slice.
@@ -12951,19 +23423,19 @@ mod tests {
         assert!(names.contains(&"status"));
     }
 
-    /// After typing "/session " (with trailing space) update_completion should
+    /// After typing "/sessions " (with trailing space) update_completion should
     /// populate candidates with subcommands and set arg_start > 0.
     #[tokio::test]
     async fn update_completion_arg_context_populates_subcommands() {
         let mut app = App::new();
-        // "/session" must be a registered command for arg-context to fire.
+        // "/sessions" must be a registered command for archive arg-context.
         assert!(
             app.all_command_names
                 .iter()
                 .any(|c| c == "/session" || c == "/sessions"),
-            "/session must be a registered command"
+            "/sessions must be a registered command"
         );
-        for ch in "/session ".chars() {
+        for ch in "/sessions ".chars() {
             app.textarea.insert_char(ch);
         }
         app.update_completion();
@@ -12991,11 +23463,11 @@ mod tests {
         );
     }
 
-    /// Prefix "/session sw" should narrow candidates to those starting with "sw".
+    /// Prefix "/sessions sw" should narrow candidates to those starting with "sw".
     #[tokio::test]
     async fn update_completion_arg_prefix_filters_candidates() {
         let mut app = App::new();
-        for ch in "/session sw".chars() {
+        for ch in "/sessions sw".chars() {
             app.textarea.insert_char(ch);
         }
         app.update_completion();
@@ -13016,11 +23488,11 @@ mod tests {
         );
     }
 
-    /// Accepting a subcommand must produce "/session switch " (cmd preserved, arg appended).
+    /// Accepting a subcommand must produce "/sessions switch " (cmd preserved, arg appended).
     #[tokio::test]
     async fn accept_completion_arg_context_preserves_command_prefix() {
         let mut app = App::new();
-        for ch in "/session ".chars() {
+        for ch in "/sessions ".chars() {
             app.textarea.insert_char(ch);
         }
         app.update_completion();
@@ -13038,8 +23510,8 @@ mod tests {
         app.accept_completion();
         let result = app.textarea_text();
         assert!(
-            result.starts_with("/session "),
-            "command prefix '/session ' must be preserved, got: {result}"
+            result.starts_with("/sessions "),
+            "command prefix '/sessions ' must be preserved, got: {result}"
         );
         assert!(
             result.ends_with("switch "),
@@ -13047,11 +23519,11 @@ mod tests {
         );
     }
 
-    /// Fuzzy match: "/session lisst" should still surface "list" when score ≥ 0.65.
+    /// Fuzzy match: "/sessions lisst" should still surface "list" when score ≥ 0.65.
     #[tokio::test]
     async fn update_completion_arg_fuzzy_typo_matches_list() {
         let mut app = App::new();
-        for ch in "/session lisst".chars() {
+        for ch in "/sessions lisst".chars() {
             app.textarea.insert_char(ch);
         }
         app.update_completion();
@@ -13092,5 +23564,67 @@ mod tests {
         }
         app.textarea_set_text("");
         assert_eq!(app.textarea_text(), "");
+    }
+
+    #[tokio::test]
+    async fn model_selector_refresh_opens_without_blocking_overlay() {
+        let mut app = App::new();
+
+        app.refresh_model_selector_catalog();
+
+        assert!(app.model_selector.active);
+        assert!(app.model_selector_refresh_in_flight);
+        assert!(
+            !matches!(app.display_state, DisplayState::BgOp { .. }),
+            "model selector should stay interactive while discovery runs"
+        );
+        assert!(
+            app.model_selector
+                .items
+                .iter()
+                .any(|entry| entry.provider == "bedrock"),
+            "bedrock must be visible in the selector immediately from the static catalog"
+        );
+    }
+
+    #[test]
+    fn models_inventory_report_lists_bedrock() {
+        let report = build_models_inventory_report(
+            &ModelCatalog::grouped_catalog(),
+            "bedrock/amazon.nova-lite-v1:0",
+            "",
+        );
+
+        assert!(report.contains("bedrock"));
+        assert!(report.contains("AWS Bedrock"));
+        assert!(report.contains("live discovery"));
+    }
+
+    #[test]
+    fn provider_models_report_explains_feature_gated_bedrock() {
+        let report = build_provider_models_report(
+            &ProviderModels {
+                provider: "bedrock".into(),
+                models: vec!["amazon.nova-lite-v1:0".into()],
+                source: DiscoverySource::Static,
+            },
+            DiscoveryAvailability::FeatureGated("bedrock-model-discovery"),
+            "bedrock/amazon.nova-lite-v1:0",
+        );
+
+        assert!(report.contains("bedrock-model-discovery"));
+        assert!(report.contains("AWS Bedrock"));
+        assert!(report.contains("amazon.nova-lite-v1:0 *"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bedrock_provider_factory_is_wired() {
+        let result = ProviderFactory::create_llm_provider("bedrock", "amazon.nova-lite-v1:0");
+        if let Err(err) = result {
+            assert!(
+                !err.to_string().contains("Unknown LLM provider"),
+                "bedrock must be recognized by the runtime provider factory: {err}"
+            );
+        }
     }
 }

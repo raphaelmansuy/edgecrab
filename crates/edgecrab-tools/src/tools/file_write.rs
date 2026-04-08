@@ -10,6 +10,9 @@ use serde_json::json;
 
 use edgecrab_types::{ToolError, ToolSchema};
 
+use crate::edit_contract::{
+    MAX_MUTATION_PAYLOAD_BYTES, MAX_MUTATION_PAYLOAD_KIB, enforce_write_payload_limit,
+};
 use crate::path_utils::{jail_write_path, jail_write_path_create_dirs};
 use crate::registry::{ToolContext, ToolHandler};
 use crate::tools::checkpoint::ensure_checkpoint;
@@ -41,7 +44,11 @@ impl ToolHandler for WriteFileTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "write_file".into(),
-            description: "Write content to a file. Creates the file if it doesn't exist.".into(),
+            description: format!(
+                "Write content to a file. Creates the file if it doesn't exist. \
+                 Hard content limit: {MAX_MUTATION_PAYLOAD_BYTES} bytes ({MAX_MUTATION_PAYLOAD_KIB} KiB) per call. \
+                 For larger files, create a small scaffold first and then extend it with patch/apply_patch."
+            ),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -69,9 +76,17 @@ impl ToolHandler for WriteFileTool {
         args: serde_json::Value,
         ctx: &ToolContext,
     ) -> Result<String, ToolError> {
-        let args: Args = serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs {
-            tool: "write_file".into(),
-            message: e.to_string(),
+        let args: Args = serde_json::from_value(args).map_err(|e| {
+            let raw = e.to_string();
+            let message = if raw.contains("missing field `content`") {
+                "missing field `content`. `write_file` must include the full file payload. For substantial new files, create a small scaffold first and then grow it with focused patch/apply_patch edits instead of one giant write.".to_string()
+            } else {
+                raw
+            };
+            ToolError::InvalidArgs {
+                tool: "write_file".into(),
+                message,
+            }
         })?;
 
         // Auto-checkpoint before mutation
@@ -86,6 +101,7 @@ impl ToolHandler for WriteFileTool {
         } else {
             jail_write_path(&args.path, &path_policy)?
         };
+        enforce_write_payload_limit("write_file", &args.path, &resolved, &args.content)?;
 
         let bytes_written = args.content.len();
 
@@ -215,5 +231,40 @@ mod tests {
         let content = std::fs::read_to_string(edgecrab_home.path().join("tmp/files/summary.md"))
             .expect("read mapped tmp file");
         assert_eq!(content, "hello tmp");
+    }
+
+    #[tokio::test]
+    async fn write_file_rejects_oversized_payloads() {
+        let dir = TempDir::new().expect("workspace");
+        let ctx = ctx_in(dir.path());
+        let oversized = "x".repeat(MAX_MUTATION_PAYLOAD_BYTES + 1);
+
+        let result = WriteFileTool
+            .execute(json!({"path": "big.rs", "content": oversized}), &ctx)
+            .await;
+
+        let err = result.expect_err("oversized write must be rejected");
+        assert!(
+            err.to_string()
+                .contains("Large single-call mutation payloads are unreliable")
+        );
+    }
+
+    #[tokio::test]
+    async fn write_file_rejects_oversized_overwrites() {
+        let dir = TempDir::new().expect("workspace");
+        std::fs::write(dir.path().join("existing.rs"), "fn main() {}\n").expect("seed");
+        let ctx = ctx_in(dir.path());
+        let oversized = "y".repeat(MAX_MUTATION_PAYLOAD_BYTES + 10);
+
+        let result = WriteFileTool
+            .execute(json!({"path": "existing.rs", "content": oversized}), &ctx)
+            .await;
+
+        let err = result.expect_err("oversized overwrite must be rejected");
+        assert!(
+            err.to_string()
+                .contains("Refusing overwrite via write_file")
+        );
     }
 }

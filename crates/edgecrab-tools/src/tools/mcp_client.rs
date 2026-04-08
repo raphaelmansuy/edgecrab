@@ -22,12 +22,13 @@
 
 use async_trait::async_trait;
 use dashmap::DashMap;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::Mutex;
@@ -39,6 +40,7 @@ use crate::registry::{ToolContext, ToolHandler};
 
 /// Directory under ~/.edgecrab where MCP OAuth tokens are persisted.
 const MCP_TOKENS_DIR: &str = "mcp-tokens";
+const OAUTH_EXPIRY_SKEW_SECS: u64 = 60;
 
 /// Sanitize a server name to a safe filename component.
 fn sanitize_server_name(name: &str) -> String {
@@ -64,24 +66,31 @@ fn mcp_tokens_dir() -> Option<std::path::PathBuf> {
     Some(resolve_edgecrab_home().join(MCP_TOKENS_DIR))
 }
 
-/// Read a Bearer token from the token store for a given server.
-///
-/// Token file format: `{ "access_token": "...", "token_type": "Bearer" }`
-pub fn read_mcp_token(server_name: &str) -> Option<String> {
-    let dir = mcp_tokens_dir()?;
-    let file = dir.join(format!("{}.json", sanitize_server_name(server_name)));
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
+struct StoredMcpToken {
+    access_token: String,
+    #[serde(default)]
+    token_type: Option<String>,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    expires_at_epoch_secs: Option<u64>,
+}
+
+fn token_file_path(server_name: &str) -> Option<std::path::PathBuf> {
+    mcp_tokens_dir().map(|dir| dir.join(format!("{}.json", sanitize_server_name(server_name))))
+}
+
+fn read_mcp_token_record(server_name: &str) -> Option<StoredMcpToken> {
+    let file = token_file_path(server_name)?;
     if !file.is_file() {
         return None;
     }
     let content = std::fs::read_to_string(&file).ok()?;
-    let val: serde_json::Value = serde_json::from_str(&content).ok()?;
-    val.get("access_token")
-        .and_then(|t| t.as_str())
-        .map(String::from)
+    serde_json::from_str(&content).ok()
 }
 
-/// Persist a Bearer token to the token store for a given server.
-pub fn write_mcp_token(server_name: &str, token: &str) -> std::io::Result<()> {
+fn write_mcp_token_record(server_name: &str, token: &StoredMcpToken) -> std::io::Result<()> {
     let dir = mcp_tokens_dir().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -90,15 +99,93 @@ pub fn write_mcp_token(server_name: &str, token: &str) -> std::io::Result<()> {
     })?;
     std::fs::create_dir_all(&dir)?;
     let file = dir.join(format!("{}.json", sanitize_server_name(server_name)));
-    let payload = serde_json::json!({ "access_token": token, "token_type": "Bearer" });
-    std::fs::write(&file, payload.to_string())?;
-    // Restrict permissions on Unix
+    let payload = serde_json::to_vec(token)?;
+    std::fs::write(&file, payload)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))?;
     }
     Ok(())
+}
+
+fn current_epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_secs()
+}
+
+fn token_is_fresh(token: &StoredMcpToken) -> bool {
+    token
+        .expires_at_epoch_secs
+        .is_none_or(|expiry| expiry > current_epoch_secs() + OAUTH_EXPIRY_SKEW_SECS)
+}
+
+/// Read a Bearer token from the token store for a given server.
+///
+/// Token file format: `{ "access_token": "...", "token_type": "Bearer" }`
+pub fn read_mcp_token(server_name: &str) -> Option<String> {
+    read_mcp_token_record(server_name).map(|token| token.access_token)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct McpStoredTokenStatus {
+    pub has_access_token: bool,
+    pub has_refresh_token: bool,
+    pub expires_at_epoch_secs: Option<u64>,
+}
+
+pub fn read_mcp_token_status(server_name: &str) -> Option<McpStoredTokenStatus> {
+    let token = read_mcp_token_record(server_name)?;
+    Some(McpStoredTokenStatus {
+        has_access_token: !token.access_token.trim().is_empty(),
+        has_refresh_token: token
+            .refresh_token
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty()),
+        expires_at_epoch_secs: token.expires_at_epoch_secs,
+    })
+}
+
+/// Persist a Bearer token to the token store for a given server.
+pub fn write_mcp_token(server_name: &str, token: &str) -> std::io::Result<()> {
+    let existing = read_mcp_token_record(server_name).unwrap_or_default();
+    write_mcp_token_record(
+        server_name,
+        &StoredMcpToken {
+            access_token: token.to_string(),
+            token_type: existing.token_type.or(Some("Bearer".into())),
+            refresh_token: existing.refresh_token,
+            expires_at_epoch_secs: None,
+        },
+    )
+}
+
+/// Persist a refresh token to the token store while preserving any access token.
+pub fn write_mcp_refresh_token(server_name: &str, refresh_token: &str) -> std::io::Result<()> {
+    let mut existing = read_mcp_token_record(server_name).unwrap_or_default();
+    existing.refresh_token = Some(refresh_token.to_string());
+    if existing.token_type.is_none() {
+        existing.token_type = Some("Bearer".into());
+    }
+    write_mcp_token_record(server_name, &existing)
+}
+
+pub fn write_mcp_oauth_token(
+    server_name: &str,
+    access_token: &str,
+    refresh_token: Option<&str>,
+    expires_at_epoch_secs: Option<u64>,
+) -> std::io::Result<()> {
+    let mut existing = read_mcp_token_record(server_name).unwrap_or_default();
+    existing.access_token = access_token.to_string();
+    existing.token_type = Some("Bearer".into());
+    if let Some(refresh_token) = refresh_token {
+        existing.refresh_token = Some(refresh_token.to_string());
+    }
+    existing.expires_at_epoch_secs = expires_at_epoch_secs;
+    write_mcp_token_record(server_name, &existing)
 }
 
 /// Remove stored OAuth tokens for a given server.
@@ -121,18 +208,185 @@ pub fn remove_mcp_token(server_name: &str) {
 /// Custom headers: any additional headers from the `headers` config map are
 /// forwarded verbatim, allowing custom auth schemes.
 struct HttpMcpConnection {
+    server_name: String,
     url: String,
-    bearer_token: Option<String>,
+    auth: HttpAuthState,
     /// Extra headers sent with every request (e.g. `X-Custom-Auth`).
     headers: std::collections::HashMap<String, String>,
     client: reqwest::Client,
 }
 
+#[derive(Debug, Clone)]
+pub struct OAuthConfig {
+    token_url: String,
+    grant_type: OAuthGrantType,
+    client_id: Option<String>,
+    client_secret: Option<String>,
+    auth_method: OAuthClientAuthMethod,
+    device_authorization_url: Option<String>,
+    authorization_url: Option<String>,
+    redirect_url: Option<String>,
+    use_pkce: Option<bool>,
+    scopes: Vec<String>,
+    audience: Option<String>,
+    resource: Option<String>,
+    refresh_token: Option<String>,
+    authorization_params: HashMap<String, String>,
+    extra_params: HashMap<String, String>,
+}
+
+impl OAuthConfig {
+    pub fn token_url(&self) -> &str {
+        &self.token_url
+    }
+
+    pub fn grant_type_label(&self) -> &'static str {
+        match self.grant_type {
+            OAuthGrantType::Auto => "auto",
+            OAuthGrantType::ClientCredentials => "client_credentials",
+            OAuthGrantType::RefreshToken => "refresh_token",
+            OAuthGrantType::DeviceCode => "device_code",
+            OAuthGrantType::AuthorizationCode => "authorization_code",
+        }
+    }
+
+    pub fn auth_method_label(&self) -> &'static str {
+        match self.auth_method {
+            OAuthClientAuthMethod::ClientSecretPost => "client_secret_post",
+            OAuthClientAuthMethod::ClientSecretBasic => "client_secret_basic",
+            OAuthClientAuthMethod::None => "none",
+        }
+    }
+
+    pub fn has_client_id(&self) -> bool {
+        self.client_id
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+    }
+
+    pub fn has_client_secret(&self) -> bool {
+        self.client_secret
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+    }
+
+    pub fn has_refresh_token(&self) -> bool {
+        self.refresh_token
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+    }
+
+    pub fn device_authorization_url(&self) -> Option<&str> {
+        self.device_authorization_url.as_deref()
+    }
+
+    pub fn authorization_url(&self) -> Option<&str> {
+        self.authorization_url.as_deref()
+    }
+
+    pub fn redirect_url(&self) -> Option<&str> {
+        self.redirect_url.as_deref()
+    }
+
+    pub fn uses_pkce(&self) -> bool {
+        self.use_pkce.unwrap_or(true)
+    }
+
+    pub fn client_id(&self) -> Option<&str> {
+        self.client_id.as_deref()
+    }
+
+    pub fn client_secret(&self) -> Option<&str> {
+        self.client_secret.as_deref()
+    }
+
+    pub fn scopes(&self) -> &[String] {
+        &self.scopes
+    }
+
+    pub fn audience(&self) -> Option<&str> {
+        self.audience.as_deref()
+    }
+
+    pub fn resource(&self) -> Option<&str> {
+        self.resource.as_deref()
+    }
+
+    pub fn authorization_params(&self) -> &HashMap<String, String> {
+        &self.authorization_params
+    }
+
+    pub fn extra_params(&self) -> &HashMap<String, String> {
+        &self.extra_params
+    }
+
+    pub fn uses_basic_auth(&self) -> bool {
+        self.auth_method == OAuthClientAuthMethod::ClientSecretBasic
+    }
+
+    pub fn uses_post_auth(&self) -> bool {
+        self.auth_method == OAuthClientAuthMethod::ClientSecretPost
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OAuthGrantType {
+    Auto,
+    ClientCredentials,
+    RefreshToken,
+    DeviceCode,
+    AuthorizationCode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OAuthClientAuthMethod {
+    ClientSecretPost,
+    ClientSecretBasic,
+    None,
+}
+
+#[derive(Debug, Clone)]
+enum HttpAuthState {
+    None,
+    StaticBearer(Option<String>),
+    OAuth {
+        config: Box<OAuthConfig>,
+        token: Option<StoredMcpToken>,
+    },
+}
+
+impl HttpAuthState {
+    fn can_refresh(&self) -> bool {
+        matches!(self, Self::OAuth { .. })
+    }
+
+    fn invalidate_access_token(&mut self) {
+        if let Self::OAuth {
+            token: Some(token), ..
+        } = self
+        {
+            token.expires_at_epoch_secs = Some(0);
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct OAuthTokenResponse {
+    access_token: String,
+    #[serde(default)]
+    token_type: Option<String>,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    expires_in: Option<serde_json::Value>,
+}
+
 impl HttpMcpConnection {
     /// Create an HTTP connection and verify connectivity with an initialize call.
     async fn connect(
+        server_name: &str,
         url: &str,
-        bearer_token: Option<String>,
+        auth: HttpAuthState,
         headers: std::collections::HashMap<String, String>,
         timeout_secs: u64,
         connect_timeout_secs: u64,
@@ -147,8 +401,9 @@ impl HttpMcpConnection {
             })?;
 
         let conn = Self {
+            server_name: server_name.to_string(),
             url: url.to_string(),
-            bearer_token,
+            auth,
             headers,
             client,
         };
@@ -167,18 +422,23 @@ impl HttpMcpConnection {
                 }
             }
         });
+        let mut conn = conn;
         conn.post_rpc(init_req).await?;
 
         Ok(conn)
     }
 
-    fn request_builder(&self, body: serde_json::Value) -> reqwest::RequestBuilder {
+    fn request_builder(
+        &self,
+        body: serde_json::Value,
+        bearer_token: Option<&str>,
+    ) -> reqwest::RequestBuilder {
         let mut req = self
             .client
             .post(&self.url)
             .header("Content-Type", "application/json")
             .json(&body);
-        if let Some(token) = &self.bearer_token {
+        if let Some(token) = bearer_token {
             req = req.header("Authorization", format!("Bearer {token}"));
         }
         // Apply extra headers (may override Authorization if user sets it explicitly)
@@ -188,15 +448,33 @@ impl HttpMcpConnection {
         req
     }
 
-    async fn post_rpc(&self, body: serde_json::Value) -> Result<serde_json::Value, ToolError> {
-        let resp =
-            self.request_builder(body)
-                .send()
-                .await
-                .map_err(|e| ToolError::ExecutionFailed {
-                    tool: "mcp_client".into(),
-                    message: format!("HTTP MCP request failed: {e}"),
-                })?;
+    async fn post_rpc(&mut self, body: serde_json::Value) -> Result<serde_json::Value, ToolError> {
+        match self.post_rpc_once(body.clone()).await {
+            Ok(value) => Ok(value),
+            Err(err)
+                if matches!(&err, ToolError::ExecutionFailed { message, .. } if message.contains("status 401"))
+                    && self.auth.can_refresh() =>
+            {
+                self.auth.invalidate_access_token();
+                self.post_rpc_once(body).await
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn post_rpc_once(
+        &mut self,
+        body: serde_json::Value,
+    ) -> Result<serde_json::Value, ToolError> {
+        let bearer_token = self.ensure_bearer_token().await?;
+        let resp = self
+            .request_builder(body, bearer_token.as_deref())
+            .send()
+            .await
+            .map_err(|e| ToolError::ExecutionFailed {
+                tool: "mcp_client".into(),
+                message: format!("HTTP MCP request failed: {e}"),
+            })?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -226,7 +504,7 @@ impl HttpMcpConnection {
     }
 
     async fn rpc_call(
-        &self,
+        &mut self,
         method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, ToolError> {
@@ -238,6 +516,183 @@ impl HttpMcpConnection {
         });
         self.post_rpc(body).await
     }
+
+    async fn ensure_bearer_token(&mut self) -> Result<Option<String>, ToolError> {
+        match &mut self.auth {
+            HttpAuthState::None => Ok(None),
+            HttpAuthState::StaticBearer(token) => Ok(token.clone()),
+            HttpAuthState::OAuth { config, token } => {
+                if token.as_ref().is_some_and(token_is_fresh) {
+                    return Ok(token.as_ref().map(|token| token.access_token.clone()));
+                }
+
+                let refreshed =
+                    fetch_oauth_token(&self.client, &self.server_name, config, token.as_ref())
+                        .await?;
+                let access_token = refreshed.access_token.clone();
+                *token = Some(refreshed);
+                Ok(Some(access_token))
+            }
+        }
+    }
+}
+
+fn parse_expires_in_secs(value: &serde_json::Value) -> Option<u64> {
+    if let Some(secs) = value.as_u64() {
+        return Some(secs);
+    }
+    value.as_str()?.trim().parse().ok()
+}
+
+async fn fetch_oauth_token(
+    client: &reqwest::Client,
+    server_name: &str,
+    config: &OAuthConfig,
+    cached_token: Option<&StoredMcpToken>,
+) -> Result<StoredMcpToken, ToolError> {
+    let refresh_token = cached_token
+        .and_then(|token| token.refresh_token.clone())
+        .or_else(|| config.refresh_token.clone());
+
+    let grant = match config.grant_type {
+        OAuthGrantType::Auto => {
+            if refresh_token.is_some() {
+                OAuthGrantType::RefreshToken
+            } else {
+                OAuthGrantType::ClientCredentials
+            }
+        }
+        OAuthGrantType::DeviceCode | OAuthGrantType::AuthorizationCode => {
+            if refresh_token.is_some() {
+                OAuthGrantType::RefreshToken
+            } else {
+                return Err(ToolError::ExecutionFailed {
+                    tool: "mcp_client".into(),
+                    message: format!(
+                        "OAuth server '{server_name}' requires an interactive login before EdgeCrab can obtain an access token. Run `edgecrab mcp login {server_name}` or `/mcp login {server_name}`."
+                    ),
+                });
+            }
+        }
+        other => other,
+    };
+
+    let mut params: Vec<(String, String)> = config
+        .extra_params
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+
+    match grant {
+        OAuthGrantType::ClientCredentials => {
+            params.push(("grant_type".into(), "client_credentials".into()));
+        }
+        OAuthGrantType::RefreshToken => {
+            let refresh_token = refresh_token.ok_or_else(|| ToolError::ExecutionFailed {
+                tool: "mcp_client".into(),
+                message: format!(
+                    "OAuth refresh_token grant requested for server '{server_name}' but no refresh token is available"
+                ),
+            })?;
+            params.push(("grant_type".into(), "refresh_token".into()));
+            params.push(("refresh_token".into(), refresh_token));
+        }
+        OAuthGrantType::Auto => unreachable!("auto is resolved earlier"),
+        OAuthGrantType::DeviceCode | OAuthGrantType::AuthorizationCode => {
+            unreachable!("interactive grants are resolved earlier")
+        }
+    }
+
+    if !config.scopes.is_empty() {
+        params.push(("scope".into(), config.scopes.join(" ")));
+    }
+    if let Some(audience) = &config.audience {
+        params.push(("audience".into(), audience.clone()));
+    }
+    if let Some(resource) = &config.resource {
+        params.push(("resource".into(), resource.clone()));
+    }
+
+    let mut request = client.post(&config.token_url);
+    match config.auth_method {
+        OAuthClientAuthMethod::ClientSecretPost => {
+            if let Some(client_id) = &config.client_id {
+                params.push(("client_id".into(), client_id.clone()));
+            }
+            if let Some(client_secret) = &config.client_secret {
+                params.push(("client_secret".into(), client_secret.clone()));
+            }
+        }
+        OAuthClientAuthMethod::ClientSecretBasic => {
+            request = request.basic_auth(
+                config.client_id.clone().unwrap_or_default(),
+                config.client_secret.clone(),
+            );
+        }
+        OAuthClientAuthMethod::None => {
+            if let Some(client_id) = &config.client_id {
+                params.push(("client_id".into(), client_id.clone()));
+            }
+        }
+    }
+
+    let response = request
+        .form(&params)
+        .send()
+        .await
+        .map_err(|e| ToolError::ExecutionFailed {
+            tool: "mcp_client".into(),
+            message: format!("OAuth token request failed for server '{server_name}': {e}"),
+        })?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(ToolError::ExecutionFailed {
+            tool: "mcp_client".into(),
+            message: format!(
+                "OAuth token endpoint returned status {status} for server '{server_name}'"
+            ),
+        });
+    }
+
+    let token: OAuthTokenResponse =
+        response
+            .json()
+            .await
+            .map_err(|e| ToolError::ExecutionFailed {
+                tool: "mcp_client".into(),
+                message: format!(
+                    "OAuth token endpoint returned invalid JSON for server '{server_name}': {e}"
+                ),
+            })?;
+    if token.access_token.trim().is_empty() {
+        return Err(ToolError::ExecutionFailed {
+            tool: "mcp_client".into(),
+            message: format!(
+                "OAuth token endpoint returned an empty access token for server '{server_name}'"
+            ),
+        });
+    }
+
+    let stored = StoredMcpToken {
+        access_token: token.access_token,
+        token_type: token.token_type.or(Some("Bearer".into())),
+        refresh_token: token
+            .refresh_token
+            .or_else(|| cached_token.and_then(|token| token.refresh_token.clone()))
+            .or_else(|| config.refresh_token.clone()),
+        expires_at_epoch_secs: token
+            .expires_in
+            .as_ref()
+            .and_then(parse_expires_in_secs)
+            .map(|secs| current_epoch_secs() + secs),
+    };
+
+    write_mcp_token_record(server_name, &stored).map_err(|e| ToolError::ExecutionFailed {
+        tool: "mcp_client".into(),
+        message: format!("Failed to persist OAuth token for server '{server_name}': {e}"),
+    })?;
+
+    Ok(stored)
 }
 
 // ─── Unified connection enum ─────────────────────────────────────────────────
@@ -245,7 +700,7 @@ impl HttpMcpConnection {
 /// Either a stdio subprocess connection or an HTTP connection to an MCP server.
 enum McpConnectionKind {
     Stdio(Box<McpConnection>),
-    Http(HttpMcpConnection),
+    Http(Box<HttpMcpConnection>),
 }
 
 impl McpConnectionKind {
@@ -465,6 +920,8 @@ struct McpServerConfig {
     url: Option<String>,
     /// Bearer token for HTTP servers (from config or token store).
     bearer_token: Option<String>,
+    /// OAuth 2.0 config for HTTP servers.
+    pub oauth: Option<OAuthConfig>,
     /// Extra HTTP headers for HTTP-based servers.
     headers: std::collections::HashMap<String, String>,
     /// Command for stdio-based servers.
@@ -489,15 +946,30 @@ async fn get_or_connect(server_name: &str, cfg: McpServerConfig) -> Result<(), T
     let connect_timeout_secs = cfg.connect_timeout.unwrap_or(10);
 
     let kind = if let Some(ref url) = cfg.url {
-        // HTTP MCP server — resolve token from config or token store
-        let token = cfg
-            .bearer_token
-            .clone()
-            .or_else(|| read_mcp_token(server_name));
-        let http =
-            HttpMcpConnection::connect(url, token, cfg.headers, timeout_secs, connect_timeout_secs)
-                .await?;
-        McpConnectionKind::Http(http)
+        let auth = if let Some(oauth) = cfg.oauth.clone() {
+            HttpAuthState::OAuth {
+                config: Box::new(oauth),
+                token: read_mcp_token_record(server_name),
+            }
+        } else if cfg.bearer_token.is_some() || read_mcp_token(server_name).is_some() {
+            HttpAuthState::StaticBearer(
+                cfg.bearer_token
+                    .clone()
+                    .or_else(|| read_mcp_token(server_name)),
+            )
+        } else {
+            HttpAuthState::None
+        };
+        let http = HttpMcpConnection::connect(
+            server_name,
+            url,
+            auth,
+            cfg.headers,
+            timeout_secs,
+            connect_timeout_secs,
+        )
+        .await?;
+        McpConnectionKind::Http(Box::new(http))
     } else {
         // Stdio subprocess MCP server
         let conn =
@@ -553,6 +1025,8 @@ struct YamlMcpServer {
     url: Option<String>,
     /// Static Bearer token for HTTP servers (alternative to token store file).
     bearer_token: Option<String>,
+    /// OAuth 2.0 token acquisition settings for HTTP servers.
+    oauth: Option<YamlMcpOauth>,
     /// Extra HTTP headers for HTTP-based servers (e.g. custom auth schemes).
     headers: std::collections::HashMap<String, String>,
     command: String,
@@ -568,11 +1042,32 @@ struct YamlMcpServer {
     tools: YamlMcpToolsFilter,
 }
 
+#[derive(Debug, Deserialize, Serialize, Default)]
+#[serde(default)]
+struct YamlMcpOauth {
+    token_url: String,
+    grant_type: Option<String>,
+    client_id: Option<String>,
+    client_secret: Option<String>,
+    auth_method: Option<String>,
+    device_authorization_url: Option<String>,
+    authorization_url: Option<String>,
+    redirect_url: Option<String>,
+    use_pkce: Option<bool>,
+    scopes: Vec<String>,
+    audience: Option<String>,
+    resource: Option<String>,
+    refresh_token: Option<String>,
+    authorization_params: std::collections::HashMap<String, String>,
+    extra_params: std::collections::HashMap<String, String>,
+}
+
 impl Default for YamlMcpServer {
     fn default() -> Self {
         Self {
             url: None,
             bearer_token: None,
+            oauth: None,
             headers: std::collections::HashMap::new(),
             command: String::new(),
             args: Vec::new(),
@@ -590,12 +1085,26 @@ fn yaml_config_path() -> Option<std::path::PathBuf> {
     Some(resolve_edgecrab_home().join("config.yaml"))
 }
 
+fn expand_config_string(value: &str) -> String {
+    shellexpand::env(value)
+        .map(|expanded| expanded.into_owned())
+        .unwrap_or_else(|_| value.to_string())
+}
+
+fn parse_expanded_string(value: Option<&serde_json::Value>) -> Option<String> {
+    value.and_then(|v| v.as_str()).map(expand_config_string)
+}
+
+fn parse_expanded_path(value: Option<&serde_json::Value>) -> Option<PathBuf> {
+    parse_expanded_string(value).map(PathBuf::from)
+}
+
 fn parse_string_array(value: Option<&serde_json::Value>) -> Vec<String> {
     value
         .and_then(|a| a.as_array())
         .map(|a| {
             a.iter()
-                .filter_map(|v| v.as_str().map(String::from))
+                .filter_map(|v| v.as_str().map(expand_config_string))
                 .collect()
         })
         .unwrap_or_default()
@@ -606,34 +1115,139 @@ fn parse_string_map(value: Option<&serde_json::Value>) -> HashMap<String, String
         .and_then(|obj| obj.as_object())
         .map(|obj| {
             obj.iter()
-                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), expand_config_string(s))))
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn parse_oauth_grant_type(value: Option<&str>) -> OAuthGrantType {
+    match value.unwrap_or("auto").trim().to_ascii_lowercase().as_str() {
+        "client_credentials" | "client-credentials" => OAuthGrantType::ClientCredentials,
+        "refresh_token" | "refresh-token" => OAuthGrantType::RefreshToken,
+        "device_code" | "device-code" => OAuthGrantType::DeviceCode,
+        "authorization_code" | "authorization-code" => OAuthGrantType::AuthorizationCode,
+        _ => OAuthGrantType::Auto,
+    }
+}
+
+fn parse_oauth_auth_method(value: Option<&str>) -> OAuthClientAuthMethod {
+    match value
+        .unwrap_or("client_secret_post")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "client_secret_basic" | "client-secret-basic" => OAuthClientAuthMethod::ClientSecretBasic,
+        "none" => OAuthClientAuthMethod::None,
+        _ => OAuthClientAuthMethod::ClientSecretPost,
+    }
+}
+
+fn parse_oauth_config(value: Option<&serde_json::Value>) -> Option<OAuthConfig> {
+    let oauth = value?.as_object()?;
+    let token_url = oauth
+        .get("token_url")
+        .and_then(|value| value.as_str())
+        .map(expand_config_string)
+        .filter(|value| !value.trim().is_empty())?;
+
+    Some(OAuthConfig {
+        token_url,
+        grant_type: parse_oauth_grant_type(
+            oauth.get("grant_type").and_then(|value| value.as_str()),
+        ),
+        client_id: oauth
+            .get("client_id")
+            .and_then(|value| value.as_str())
+            .map(expand_config_string),
+        client_secret: oauth
+            .get("client_secret")
+            .and_then(|value| value.as_str())
+            .map(expand_config_string),
+        auth_method: parse_oauth_auth_method(
+            oauth.get("auth_method").and_then(|value| value.as_str()),
+        ),
+        device_authorization_url: oauth
+            .get("device_authorization_url")
+            .and_then(|value| value.as_str())
+            .map(expand_config_string),
+        authorization_url: oauth
+            .get("authorization_url")
+            .and_then(|value| value.as_str())
+            .map(expand_config_string),
+        redirect_url: oauth
+            .get("redirect_url")
+            .and_then(|value| value.as_str())
+            .map(expand_config_string),
+        use_pkce: oauth.get("use_pkce").and_then(|value| value.as_bool()),
+        scopes: oauth
+            .get("scopes")
+            .and_then(|value| value.as_array())
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|value| value.as_str().map(expand_config_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        audience: oauth
+            .get("audience")
+            .and_then(|value| value.as_str())
+            .map(expand_config_string),
+        resource: oauth
+            .get("resource")
+            .and_then(|value| value.as_str())
+            .map(expand_config_string),
+        refresh_token: oauth
+            .get("refresh_token")
+            .and_then(|value| value.as_str())
+            .map(expand_config_string),
+        authorization_params: oauth
+            .get("authorization_params")
+            .and_then(|value| value.as_object())
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|(key, value)| {
+                        value
+                            .as_str()
+                            .map(|value| (key.clone(), expand_config_string(value)))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        extra_params: oauth
+            .get("extra_params")
+            .and_then(|value| value.as_object())
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|(key, value)| {
+                        value
+                            .as_str()
+                            .map(|value| (key.clone(), expand_config_string(value)))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    })
 }
 
 fn parse_configured_server(name: &str, server_config: &serde_json::Value) -> ConfiguredMcpServer {
     let token_from_store = read_mcp_token(name).is_some();
     ConfiguredMcpServer {
         name: name.to_string(),
-        url: server_config
-            .get("url")
-            .and_then(|u| u.as_str())
-            .map(String::from),
-        bearer_token: server_config
-            .get("bearer_token")
-            .and_then(|t| t.as_str())
-            .map(String::from),
-        command: server_config
-            .get("command")
-            .and_then(|c| c.as_str())
-            .unwrap_or("")
-            .to_string(),
+        enabled: server_config
+            .get("enabled")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(true),
+        url: parse_expanded_string(server_config.get("url")),
+        bearer_token: parse_expanded_string(server_config.get("bearer_token")),
+        oauth: parse_oauth_config(server_config.get("oauth")),
+        command: parse_expanded_string(server_config.get("command")).unwrap_or_default(),
         args: parse_string_array(server_config.get("args")),
-        cwd: server_config
-            .get("cwd")
-            .and_then(|c| c.as_str())
-            .map(PathBuf::from),
+        cwd: parse_expanded_path(server_config.get("cwd")),
         env: parse_string_map(server_config.get("env")),
         headers: parse_string_map(server_config.get("headers")),
         timeout: server_config.get("timeout").and_then(|t| t.as_u64()),
@@ -654,6 +1268,7 @@ fn to_runtime_server_config(server: &ConfiguredMcpServer) -> McpServerConfig {
     McpServerConfig {
         url: server.url.clone(),
         bearer_token: server.bearer_token.clone(),
+        oauth: server.oauth.clone(),
         headers: server.headers.clone(),
         command: server.command.clone(),
         args: server.args.clone(),
@@ -717,7 +1332,7 @@ fn extract_tool_filter(server_config: &serde_json::Value) -> (Vec<String>, Vec<S
     (include, exclude)
 }
 
-fn load_mcp_config() -> Result<serde_json::Value, ToolError> {
+fn load_mcp_config(include_disabled: bool) -> Result<serde_json::Value, ToolError> {
     if let Some(path) = yaml_config_path() {
         if path.is_file() {
             let content =
@@ -734,7 +1349,7 @@ fn load_mcp_config() -> Result<serde_json::Value, ToolError> {
             if !config.mcp_servers.is_empty() {
                 let mut servers = serde_json::Map::new();
                 for (name, server) in config.mcp_servers {
-                    if !server.enabled {
+                    if !include_disabled && !server.enabled {
                         continue;
                     }
                     // HTTP server: url must be present
@@ -749,8 +1364,10 @@ fn load_mcp_config() -> Result<serde_json::Value, ToolError> {
                             "args": server.args,
                             "env": server.env,
                             "cwd": server.cwd,
+                            "enabled": server.enabled,
                             "url": server.url,
                             "bearer_token": server.bearer_token,
+                            "oauth": server.oauth,
                             "headers": server.headers,
                             "timeout": server.timeout,
                             "connect_timeout": server.connect_timeout,
@@ -783,8 +1400,10 @@ fn load_mcp_config() -> Result<serde_json::Value, ToolError> {
     Ok(json!({ "mcpServers": {} }))
 }
 
-pub fn configured_servers() -> Result<Vec<ConfiguredMcpServer>, ToolError> {
-    let config = load_mcp_config()?;
+fn configured_servers_internal(
+    include_disabled: bool,
+) -> Result<Vec<ConfiguredMcpServer>, ToolError> {
+    let config = load_mcp_config(include_disabled)?;
     let servers = config
         .get("mcpServers")
         .and_then(|s| s.as_object())
@@ -801,14 +1420,29 @@ pub fn configured_servers() -> Result<Vec<ConfiguredMcpServer>, ToolError> {
     Ok(parsed)
 }
 
+pub fn configured_servers() -> Result<Vec<ConfiguredMcpServer>, ToolError> {
+    configured_servers_internal(false)
+}
+
+pub fn configured_servers_with_disabled() -> Result<Vec<ConfiguredMcpServer>, ToolError> {
+    configured_servers_internal(true)
+}
+
 pub async fn probe_configured_server(server_name: &str) -> Result<McpProbeResult, ToolError> {
-    let server = configured_servers()?
+    let server = configured_servers_with_disabled()?
         .into_iter()
         .find(|server| server.name == server_name)
         .ok_or_else(|| ToolError::InvalidArgs {
             tool: "mcp_client".into(),
             message: format!("Unknown MCP server '{server_name}'"),
         })?;
+
+    if !server.enabled {
+        return Err(ToolError::InvalidArgs {
+            tool: "mcp_client".into(),
+            message: format!("MCP server '{server_name}' is disabled. Enable it before testing."),
+        });
+    }
 
     get_or_connect(server_name, to_runtime_server_config(&server)).await?;
 
@@ -1048,7 +1682,7 @@ impl ToolHandler for McpCallToolTool {
         })?;
 
         // Ensure server is connected
-        let config = load_mcp_config()?;
+        let config = load_mcp_config(false)?;
         let servers = config
             .get("mcpServers")
             .and_then(|s| s.as_object())
@@ -1064,63 +1698,27 @@ impl ToolHandler for McpCallToolTool {
                 message: format!("Unknown MCP server '{}'", args.server),
             })?;
 
-        let command = server_config
-            .get("command")
-            .and_then(|c| c.as_str())
-            .unwrap_or("")
-            .to_string();
+        let command = parse_expanded_string(server_config.get("command")).unwrap_or_default();
 
-        let url = server_config
-            .get("url")
-            .and_then(|u| u.as_str())
-            .map(String::from);
+        let url = parse_expanded_string(server_config.get("url"));
 
-        let bearer_token = server_config
-            .get("bearer_token")
-            .and_then(|t| t.as_str())
-            .map(String::from);
+        let bearer_token = parse_expanded_string(server_config.get("bearer_token"));
 
-        let cmd_args: Vec<String> = server_config
-            .get("args")
-            .and_then(|a| a.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let cmd_args = parse_string_array(server_config.get("args"));
 
         // Extract env vars from config so they reach the subprocess
-        let cmd_envs: std::collections::HashMap<String, String> = server_config
-            .get("env")
-            .and_then(|e| e.as_object())
-            .map(|obj| {
-                obj.iter()
-                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let cmd_envs = parse_string_map(server_config.get("env"));
 
         get_or_connect(
             &args.server,
             McpServerConfig {
                 url,
                 bearer_token,
-                headers: server_config
-                    .get("headers")
-                    .and_then(|h| h.as_object())
-                    .map(|obj| {
-                        obj.iter()
-                            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
+                oauth: parse_oauth_config(server_config.get("oauth")),
+                headers: parse_string_map(server_config.get("headers")),
                 command,
                 args: cmd_args,
-                cwd: server_config
-                    .get("cwd")
-                    .and_then(|c| c.as_str())
-                    .map(PathBuf::from),
+                cwd: parse_expanded_path(server_config.get("cwd")),
                 envs: cmd_envs,
                 timeout: server_config.get("timeout").and_then(|t| t.as_u64()),
                 connect_timeout: server_config
@@ -1214,8 +1812,10 @@ pub fn reload_mcp_connections() {
 #[derive(Debug, Clone)]
 pub struct ConfiguredMcpServer {
     pub name: String,
+    pub enabled: bool,
     pub url: Option<String>,
     pub bearer_token: Option<String>,
+    pub oauth: Option<OAuthConfig>,
     pub command: String,
     pub args: Vec<String>,
     pub cwd: Option<PathBuf>,
@@ -1417,7 +2017,7 @@ impl ToolHandler for McpDynamicTool {
 /// Errors from individual servers are logged as warnings but do not prevent
 /// other servers from being registered.
 pub async fn discover_and_register_mcp_tools(registry: &mut crate::registry::ToolRegistry) {
-    let config = match load_mcp_config() {
+    let config = match load_mcp_config(false) {
         Ok(c) => c,
         Err(e) => {
             tracing::debug!(
@@ -1433,51 +2033,17 @@ pub async fn discover_and_register_mcp_tools(registry: &mut crate::registry::Too
     };
 
     for (server_name, server_config) in &servers {
-        let command = server_config
-            .get("command")
-            .and_then(|c| c.as_str())
-            .unwrap_or("")
-            .to_string();
+        let command = parse_expanded_string(server_config.get("command")).unwrap_or_default();
 
-        let url = server_config
-            .get("url")
-            .and_then(|u| u.as_str())
-            .map(String::from);
+        let url = parse_expanded_string(server_config.get("url"));
 
-        let bearer_token = server_config
-            .get("bearer_token")
-            .and_then(|t| t.as_str())
-            .map(String::from);
+        let bearer_token = parse_expanded_string(server_config.get("bearer_token"));
 
-        let cmd_args: Vec<String> = server_config
-            .get("args")
-            .and_then(|a| a.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let cmd_args = parse_string_array(server_config.get("args"));
 
-        let cmd_envs: std::collections::HashMap<String, String> = server_config
-            .get("env")
-            .and_then(|e| e.as_object())
-            .map(|obj| {
-                obj.iter()
-                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let cmd_envs = parse_string_map(server_config.get("env"));
 
-        let headers: std::collections::HashMap<String, String> = server_config
-            .get("headers")
-            .and_then(|h| h.as_object())
-            .map(|obj| {
-                obj.iter()
-                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let headers = parse_string_map(server_config.get("headers"));
 
         let timeout = server_config.get("timeout").and_then(|t| t.as_u64());
         let connect_timeout = server_config
@@ -1496,13 +2062,11 @@ pub async fn discover_and_register_mcp_tools(registry: &mut crate::registry::Too
             McpServerConfig {
                 url,
                 bearer_token,
+                oauth: parse_oauth_config(server_config.get("oauth")),
                 headers,
                 command,
                 args: cmd_args,
-                cwd: server_config
-                    .get("cwd")
-                    .and_then(|c| c.as_str())
-                    .map(PathBuf::from),
+                cwd: parse_expanded_path(server_config.get("cwd")),
                 envs: cmd_envs,
                 timeout,
                 connect_timeout,
@@ -1996,6 +2560,7 @@ async fn ensure_server_connected(server_name: &str) -> Result<(), ToolError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TestEdgecrabHome;
     use std::sync::Mutex;
 
     static EDGECRAB_HOME_LOCK: Mutex<()> = Mutex::new(());
@@ -2055,17 +2620,13 @@ mod tests {
     #[test]
     fn mcp_list_tools_invalid_args() {
         let _guard = EDGECRAB_HOME_LOCK.lock().expect("lock");
-        let dir = tempfile::tempdir().expect("tempdir");
-        // SAFETY: protected by EDGECRAB_HOME_LOCK.
-        unsafe { std::env::set_var("EDGECRAB_HOME", dir.path()) };
+        let _home = TestEdgecrabHome::new();
         let ctx = ToolContext::test_context();
         // Empty args are fine; no config should now behave as an empty catalog
         // rather than a hard legacy-path failure.
         let result = tokio::runtime::Runtime::new()
             .expect("runtime")
             .block_on(async { McpListToolsTool.execute(json!({}), &ctx).await });
-        // SAFETY: protected by EDGECRAB_HOME_LOCK.
-        unsafe { std::env::remove_var("EDGECRAB_HOME") };
         let output = result.expect("empty MCP config should be tolerated");
         assert!(output.contains("No MCP tools discovered"));
     }
@@ -2178,35 +2739,143 @@ mod tests {
     #[test]
     fn mcp_config_path_respects_edgecrab_home() {
         let _guard = EDGECRAB_HOME_LOCK.lock().expect("lock");
-        let dir = tempfile::tempdir().expect("tempdir");
-        // SAFETY: protected by EDGECRAB_HOME_LOCK.
-        unsafe { std::env::set_var("EDGECRAB_HOME", dir.path()) };
+        let home = TestEdgecrabHome::new();
         let path = mcp_config_path().expect("mcp path");
-        // SAFETY: protected by EDGECRAB_HOME_LOCK.
-        unsafe { std::env::remove_var("EDGECRAB_HOME") };
-        assert_eq!(path, dir.path().join("mcp.json"));
+        assert_eq!(path, home.path().join("mcp.json"));
     }
 
     #[test]
     fn configured_servers_reads_yaml_and_preserves_cwd() {
         let _guard = EDGECRAB_HOME_LOCK.lock().expect("lock");
-        let dir = tempfile::tempdir().expect("tempdir");
+        let home = TestEdgecrabHome::new();
         std::fs::write(
-            dir.path().join("config.yaml"),
+            home.path().join("config.yaml"),
             "mcp_servers:\n  filesystem:\n    command: npx\n    args: ['-y', '@modelcontextprotocol/server-filesystem', '/tmp']\n    cwd: /tmp\n    enabled: true\n",
         )
         .expect("config");
-        // SAFETY: protected by EDGECRAB_HOME_LOCK.
-        unsafe { std::env::set_var("EDGECRAB_HOME", dir.path()) };
         let servers = configured_servers().expect("servers");
-        // SAFETY: protected by EDGECRAB_HOME_LOCK.
-        unsafe { std::env::remove_var("EDGECRAB_HOME") };
 
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].name, "filesystem");
+        assert!(servers[0].enabled);
         assert_eq!(
             servers[0].cwd.as_deref(),
             Some(std::path::Path::new("/tmp"))
         );
+    }
+
+    #[test]
+    fn configured_servers_with_disabled_includes_disabled_entries() {
+        let _guard = EDGECRAB_HOME_LOCK.lock().expect("lock");
+        let home = TestEdgecrabHome::new();
+        std::fs::write(
+            home.path().join("config.yaml"),
+            "mcp_servers:\n  enabled-http:\n    url: https://example.com/mcp\n    enabled: true\n  disabled-http:\n    url: https://example.com/mcp\n    enabled: false\n",
+        )
+        .expect("config");
+
+        let active = configured_servers().expect("active servers");
+        let all = configured_servers_with_disabled().expect("all servers");
+
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].name, "enabled-http");
+        assert_eq!(all.len(), 2);
+        assert!(
+            all.iter()
+                .any(|server| server.name == "disabled-http" && !server.enabled)
+        );
+    }
+
+    #[test]
+    fn configured_servers_expand_env_backed_http_auth_fields() {
+        let _guard = EDGECRAB_HOME_LOCK.lock().expect("lock");
+        let home = TestEdgecrabHome::new();
+        // SAFETY: serialized by EDGECRAB_HOME_LOCK for the guard lifetime.
+        unsafe {
+            std::env::set_var("MCP_HTTP_URL", "https://auth.example.com/mcp");
+            std::env::set_var("MCP_ACCESS_TOKEN", "oauth-token");
+        }
+        std::fs::write(
+            home.path().join("config.yaml"),
+            "mcp_servers:\n  oauth:\n    url: ${MCP_HTTP_URL}\n    bearer_token: ${MCP_ACCESS_TOKEN}\n    headers:\n      X-Tenant: ${MCP_ACCESS_TOKEN}\n    enabled: true\n",
+        )
+        .expect("config");
+
+        let servers = configured_servers().expect("servers");
+
+        assert_eq!(servers.len(), 1);
+        assert_eq!(
+            servers[0].url.as_deref(),
+            Some("https://auth.example.com/mcp")
+        );
+        assert_eq!(servers[0].bearer_token.as_deref(), Some("oauth-token"));
+        assert_eq!(
+            servers[0].headers.get("X-Tenant").map(String::as_str),
+            Some("oauth-token")
+        );
+
+        // SAFETY: serialized by EDGECRAB_HOME_LOCK for the guard lifetime.
+        unsafe {
+            std::env::remove_var("MCP_HTTP_URL");
+            std::env::remove_var("MCP_ACCESS_TOKEN");
+        }
+    }
+
+    #[test]
+    fn configured_servers_read_oauth_from_yaml_config() {
+        let _guard = EDGECRAB_HOME_LOCK.lock().expect("lock");
+        let home = TestEdgecrabHome::new();
+        std::fs::write(
+            home.path().join("config.yaml"),
+            "mcp_servers:\n  oauth:\n    url: https://example.com/mcp\n    enabled: true\n    oauth:\n      token_url: https://example.com/oauth/token\n      grant_type: refresh_token\n      auth_method: none\n",
+        )
+        .expect("config");
+
+        let servers = configured_servers().expect("servers");
+
+        assert_eq!(servers.len(), 1);
+        let oauth = servers[0].oauth.as_ref().expect("oauth config");
+        assert_eq!(oauth.token_url(), "https://example.com/oauth/token");
+        assert_eq!(oauth.grant_type_label(), "refresh_token");
+        assert_eq!(oauth.auth_method_label(), "none");
+    }
+
+    #[test]
+    fn expand_config_string_leaves_unresolved_placeholders_visible() {
+        // Missing vars should not panic; the unresolved placeholder remains visible
+        // so doctor/reporting code can explain the problem.
+        assert_eq!(
+            expand_config_string("${EDGECRAB_UNKNOWN_TOKEN}"),
+            "${EDGECRAB_UNKNOWN_TOKEN}"
+        );
+    }
+
+    #[test]
+    fn write_mcp_token_preserves_existing_refresh_token() {
+        let _guard = EDGECRAB_HOME_LOCK.lock().expect("lock");
+        let home = TestEdgecrabHome::new();
+        let _ = home;
+
+        write_mcp_refresh_token("oauth", "refresh-1").expect("write refresh");
+        write_mcp_token("oauth", "access-1").expect("write access");
+
+        let status = read_mcp_token_status("oauth").expect("status");
+        assert!(status.has_access_token);
+        assert!(status.has_refresh_token);
+    }
+
+    #[test]
+    fn write_mcp_refresh_token_preserves_existing_access_token() {
+        let _guard = EDGECRAB_HOME_LOCK.lock().expect("lock");
+        let home = TestEdgecrabHome::new();
+        let _ = home;
+
+        write_mcp_token("oauth", "access-1").expect("write access");
+        write_mcp_refresh_token("oauth", "refresh-1").expect("write refresh");
+
+        assert_eq!(read_mcp_token("oauth").as_deref(), Some("access-1"));
+        let status = read_mcp_token_status("oauth").expect("status");
+        assert!(status.has_access_token);
+        assert!(status.has_refresh_token);
     }
 }

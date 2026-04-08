@@ -80,6 +80,105 @@ const COMPLEX_KEYWORDS: &[&str] = &[
     "bug",
 ];
 
+/// Short edit requests are often where cheap routing hurts most:
+/// "replace labels", "change the UI", "add a file", etc.
+/// We only escalate when an edit verb is paired with a likely implementation target.
+const EDIT_INTENT_VERBS: &[&str] = &[
+    "add",
+    "change",
+    "create",
+    "delete",
+    "edit",
+    "implement",
+    "modify",
+    "move",
+    "patch",
+    "refactor",
+    "remove",
+    "rename",
+    "replace",
+    "rewrite",
+    "update",
+];
+
+const IMPLEMENTATION_TARGETS: &[&str] = &[
+    "agent",
+    "api",
+    "app",
+    "backend",
+    "button",
+    "buttons",
+    "cache",
+    "class",
+    "cli",
+    "code",
+    "component",
+    "config",
+    "css",
+    "dialog",
+    "endpoint",
+    "file",
+    "files",
+    "flow",
+    "footer",
+    "form",
+    "frontend",
+    "function",
+    "header",
+    "html",
+    "javascript",
+    "js",
+    "json",
+    "label",
+    "labels",
+    "layout",
+    "loop",
+    "markdown",
+    "md",
+    "message",
+    "messages",
+    "model",
+    "module",
+    "page",
+    "pages",
+    "prompt",
+    "python",
+    "react",
+    "repo",
+    "repository",
+    "route",
+    "router",
+    "rs",
+    "rust",
+    "screen",
+    "session",
+    "sidebar",
+    "sql",
+    "state",
+    "style",
+    "styles",
+    "styling",
+    "table",
+    "test",
+    "tests",
+    "theme",
+    "toml",
+    "tsx",
+    "typescript",
+    "ts",
+    "ui",
+    "ux",
+    "workflow",
+    "yaml",
+    "yml",
+];
+
+const CODEISH_SUFFIXES: &[&str] = &[
+    ".c", ".cc", ".cpp", ".cs", ".css", ".go", ".h", ".hpp", ".html", ".java", ".js", ".json",
+    ".jsx", ".kt", ".md", ".mjs", ".php", ".py", ".rb", ".rs", ".sh", ".sql", ".swift", ".toml",
+    ".ts", ".tsx", ".txt", ".yaml", ".yml",
+];
+
 /// Thresholds for classifying a message as "simple".
 #[derive(Debug, Clone)]
 pub struct RoutingThresholds {
@@ -108,6 +207,8 @@ pub enum ComplexityReason {
     ContainsInlineCode,
     ContainsUrl,
     ContainsComplexKeyword(String),
+    ContainsEditIntent(String),
+    ContainsPathLikeToken(String),
     Empty,
 }
 
@@ -146,6 +247,7 @@ pub fn classify_message(text: &str, thresholds: &RoutingThresholds) -> Option<Co
     let words: HashSet<&str> = lowered
         .split_whitespace()
         .map(|w| w.trim_matches(|c: char| c.is_ascii_punctuation()))
+        .filter(|w| !w.is_empty())
         .collect();
 
     for &kw in COMPLEX_KEYWORDS {
@@ -154,7 +256,52 @@ pub fn classify_message(text: &str, thresholds: &RoutingThresholds) -> Option<Co
         }
     }
 
+    if let Some(reason) = detect_edit_intent(&words) {
+        return Some(reason);
+    }
+
+    if let Some(reason) = detect_path_like_token(text) {
+        return Some(reason);
+    }
+
     None // simple!
+}
+
+fn detect_edit_intent(words: &HashSet<&str>) -> Option<ComplexityReason> {
+    let verb = EDIT_INTENT_VERBS
+        .iter()
+        .find(|verb| words.contains(**verb))
+        .copied()?;
+    let target = IMPLEMENTATION_TARGETS
+        .iter()
+        .find(|target| words.contains(**target))
+        .copied()?;
+    Some(ComplexityReason::ContainsEditIntent(format!(
+        "{verb}+{target}"
+    )))
+}
+
+fn detect_path_like_token(text: &str) -> Option<ComplexityReason> {
+    for token in text.split_whitespace() {
+        let token = token.trim_matches(|c: char| {
+            c.is_ascii_punctuation() && c != '.' && c != '_' && c != '-' && c != '/' && c != '\\'
+        });
+        if token.is_empty() {
+            continue;
+        }
+
+        let lowered = token.to_ascii_lowercase();
+        if lowered.contains('/') || lowered.contains('\\') {
+            return Some(ComplexityReason::ContainsPathLikeToken(token.to_string()));
+        }
+        if CODEISH_SUFFIXES
+            .iter()
+            .any(|suffix| lowered.ends_with(suffix))
+        {
+            return Some(ComplexityReason::ContainsPathLikeToken(token.to_string()));
+        }
+    }
+    None
 }
 
 // ─── Route resolution ─────────────────────────────────────────────────
@@ -279,6 +426,24 @@ mod tests {
     }
 
     #[test]
+    fn edit_intent_with_ui_target_is_complex() {
+        let thresholds = RoutingThresholds::default();
+        assert!(matches!(
+            classify_message("replace the labels in the UI", &thresholds),
+            Some(ComplexityReason::ContainsEditIntent(_))
+        ));
+    }
+
+    #[test]
+    fn edit_intent_with_code_target_is_complex() {
+        let thresholds = RoutingThresholds::default();
+        assert!(matches!(
+            classify_message("add a Rust file for the session cache", &thresholds),
+            Some(ComplexityReason::ContainsEditIntent(_))
+        ));
+    }
+
+    #[test]
     fn long_message_is_complex() {
         let thresholds = RoutingThresholds::default();
         let long = "a ".repeat(100); // 200 chars
@@ -322,6 +487,19 @@ mod tests {
             classify_message("line1\nline2\nline3", &thresholds),
             Some(ComplexityReason::MultiLine)
         );
+    }
+
+    #[test]
+    fn path_like_token_is_complex() {
+        let thresholds = RoutingThresholds::default();
+        assert!(matches!(
+            classify_message("update src/agent.rs", &thresholds),
+            Some(ComplexityReason::ContainsPathLikeToken(_))
+        ));
+        assert!(matches!(
+            classify_message("change Cargo.toml", &thresholds),
+            Some(ComplexityReason::ContainsPathLikeToken(_))
+        ));
     }
 
     #[test]
@@ -369,6 +547,24 @@ mod tests {
             thresholds: RoutingThresholds::default(),
         };
         let route = resolve_turn_route("please debug this error", &model_config, &smart);
+        assert!(route.is_primary);
+    }
+
+    #[test]
+    fn smart_routing_keeps_primary_for_short_implementation_request() {
+        let model_config = ModelConfig::default();
+        let smart = SmartRoutingConfig {
+            enabled: true,
+            cheap_model: "gpt-4.1-mini".into(),
+            cheap_base_url: None,
+            cheap_api_key_env: None,
+            thresholds: RoutingThresholds::default(),
+        };
+        let route = resolve_turn_route(
+            "replace the labels in the React component",
+            &model_config,
+            &smart,
+        );
         assert!(route.is_primary);
     }
 

@@ -20,7 +20,7 @@ Run `edgecrab config show` to print your active resolved configuration (after en
 
 # ── Model ──────────────────────────────────────────────────────────────
 model:
-  default: "anthropic/claude-sonnet-4-20250514"  # Default LLM model
+  default: "ollama/gemma4:latest"  # Default LLM model
   max_iterations: 90             # Max tool calls per session
   streaming: true                # Stream tokens to TUI
   prompt_caching: true           # Prompt caching (Anthropic / OpenAI)
@@ -48,6 +48,68 @@ tools:
   tool_delay: 1.0                # seconds between tool calls
   parallel_execution: true       # allow concurrent tool calls
   max_parallel_workers: 8        # concurrency limit
+
+# ── Language Server Protocol ───────────────────────────────────────────
+lsp:
+  enabled: true
+  file_size_limit_bytes: 10000000
+  servers:
+    rust:
+      command: "rust-analyzer"
+      args: []
+      file_extensions: ["rs"]
+      language_id: "rust"
+      root_markers: ["Cargo.toml", "rust-project.json"]
+      env: {}
+      initialization_options: ~
+    typescript:
+      command: "typescript-language-server"
+      args: ["--stdio"]
+      file_extensions: ["ts", "tsx"]
+      language_id: "typescript"
+      root_markers: ["package.json", "tsconfig.json"]
+      env: {}
+      initialization_options: ~
+    javascript:
+      command: "typescript-language-server"
+      args: ["--stdio"]
+      file_extensions: ["js", "jsx", "mjs", "cjs"]
+      language_id: "javascript"
+      root_markers: ["package.json", "jsconfig.json"]
+      env: {}
+      initialization_options: ~
+    python:
+      command: "pylsp"
+      args: []
+      file_extensions: ["py"]
+      language_id: "python"
+      root_markers: ["pyproject.toml", "setup.py", "requirements.txt"]
+      env: {}
+      initialization_options: ~
+    go:
+      command: "gopls"
+      args: []
+      file_extensions: ["go"]
+      language_id: "go"
+      root_markers: ["go.mod"]
+      env: {}
+      initialization_options: ~
+    c:
+      command: "clangd"
+      args: []
+      file_extensions: ["c", "h"]
+      language_id: "c"
+      root_markers: ["compile_commands.json", ".clangd"]
+      env: {}
+      initialization_options: ~
+    cpp:
+      command: "clangd"
+      args: []
+      file_extensions: ["cc", "cpp", "cxx", "hpp"]
+      language_id: "cpp"
+      root_markers: ["compile_commands.json", ".clangd"]
+      env: {}
+      initialization_options: ~
 
 # ── Memory ─────────────────────────────────────────────────────────────
 memory:
@@ -226,11 +288,37 @@ timezone: ""                     # "" = system timezone; IANA format
 
 ---
 
+## LSP Configuration
+
+The `lsp` section controls EdgeCrab's semantic coding subsystem.
+
+| Field | Type | Default | Meaning |
+|-------|------|---------|---------|
+| `enabled` | bool | `true` | Master switch for all `lsp_*` tools |
+| `file_size_limit_bytes` | u64 | `10000000` | Refuses to sync very large files into language servers |
+| `servers` | map | built in | Server definitions keyed by logical language name |
+
+Each entry under `lsp.servers` supports:
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `command` | string | Executable to spawn, for example `rust-analyzer` or `pylsp` |
+| `args` | string[] | Extra CLI args such as `["--stdio"]` |
+| `file_extensions` | string[] | Extensions routed to this server |
+| `language_id` | string | LSP language id used in `textDocument/didOpen` |
+| `root_markers` | string[] | Files that define the workspace root |
+| `env` | map | Extra environment variables for the server process |
+| `initialization_options` | JSON | Optional server-specific init payload |
+
+When `enabled_toolsets` includes `core` or `coding`, the `lsp` toolset is also exposed, so the agent can discover semantic navigation, diagnostics, rename, formatting, and code actions automatically.
+
+---
+
 ## Field Index
 
 | Config Key | Type | Default | Env Override |
 |------------|------|---------|-------------|
-| `model.default` | string | `anthropic/claude-sonnet-4-20250514` | `EDGECRAB_MODEL` |
+| `model.default` | string | `ollama/gemma4:latest` | `EDGECRAB_MODEL` |
 | `model.max_iterations` | integer | `90` | `EDGECRAB_MAX_ITERATIONS` |
 | `model.streaming` | bool | `true` | — |
 | `model.prompt_caching` | bool | `true` | — |

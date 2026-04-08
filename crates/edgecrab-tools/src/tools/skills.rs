@@ -1371,7 +1371,9 @@ impl ToolHandler for SkillManageTool {
                            Use action='patch' with old_string and new_string for targeted replacement. \
                            Use action='delete' to remove the skill directory. \
                            Use action='write_file' with file_path and file_content to add/overwrite a supporting file. \
-                           Use action='remove_file' with file_path to remove a supporting file."
+                           Use action='remove_file' with file_path to remove a supporting file. \
+                           Skills are procedural memory: save non-trivial reusable workflows, and \
+                           patch a skill when you discover missing steps or pitfalls."
                 .into(),
             parameters: json!({
                 "type": "object",
@@ -2446,8 +2448,7 @@ impl ToolHandler for SkillsHubTool {
                     },
                     "source": {
                         "type": "string",
-                        "enum": ["skills.sh", "well-known", "github-tap", "all"],
-                        "description": "Registry source (default: all)"
+                        "description": "Optional source filter: all, edgecrab, hermes-agent, openai, anthropics, skills.sh, well-known, github, or curated"
                     },
                     "force": {
                         "type": "boolean",
@@ -2477,83 +2478,26 @@ impl ToolHandler for SkillsHubTool {
                     message: "search requires 'query' parameter".into(),
                 })?;
 
-                let mut output = format!("🔍 Searching registries for: '{}'\n\n", query);
-
-                let source_filter = args.source.as_deref().unwrap_or("all");
-
-                // Search skills.sh registry
-                if source_filter == "all" || source_filter == "skills.sh" {
-                    match search_skills_sh_registry(&query, 10).await {
-                        Ok(results) => {
-                            output.push_str("### skills.sh Results\n\n");
-                            if results.is_empty() {
-                                output.push_str("- No results\n");
-                            }
-                            for meta in results {
-                                output.push_str(&format!(
-                                    "- **{}** — {} [trust: {}]\n",
-                                    meta.name, meta.description, meta.trust_level
-                                ));
-                            }
-                            output.push('\n');
-                        }
-                        Err(msg) => output.push_str(&format!("ℹ️  skills.sh: {}\n\n", msg)),
-                    }
-                }
-
-                if source_filter == "all" || source_filter == "github-tap" {
-                    let taps = super::skills_hub::read_taps();
-                    if !taps.is_empty() {
-                        output.push_str("### GitHub Taps\n\n");
-                        for tap in taps {
-                            output.push_str(&format!("- **{}** ({})\n", tap.name, tap.url));
-                        }
-                        output.push('\n');
-                    }
-                }
-
-                if (source_filter == "all" || source_filter == "well-known")
-                    && (query.starts_with("http://") || query.starts_with("https://"))
-                {
-                    match discover_well_known_skills(&query).await {
-                        Ok(results) => {
-                            output.push_str("### Well-known Endpoint Results\n\n");
-                            if results.is_empty() {
-                                output.push_str("- No results\n");
-                            }
-                            for meta in results {
-                                output.push_str(&format!(
-                                    "- **{}** — {} [trust: {}]\n",
-                                    meta.name, meta.description, meta.trust_level
-                                ));
-                            }
-                            output.push('\n');
-                        }
-                        Err(msg) => output.push_str(&format!("ℹ️  well-known: {}\n\n", msg)),
-                    }
-                }
-
-                output.push_str("\n💡 **Pro tip**: Use `skills_hub inspect <identifier>` to view details before installing.\n");
-
-                Ok(output)
+                let report = super::skills_hub::search_hub(&query, args.source.as_deref(), 8).await;
+                Ok(format!(
+                    "{}\nUse `skills_hub install <identifier>` to install a result.",
+                    super::skills_hub::render_search_report(&query, &report)
+                ))
             }
 
             "browse" => {
-                let mut output = String::from("🌐 Skills Hub — Sources\n\n");
-                output.push_str("Featured registry: https://skills.sh\n\n");
-                output.push_str("- skills.sh (public registry)\n");
-                output.push_str("- well-known endpoints (.well-known/skills/index.json)\n");
-                output.push_str("- GitHub taps (custom sources)\n");
-                output.push_str("- optional skills (bundled local skills)\n\n");
+                let mut output = super::skills_hub::render_sources_catalog();
+                output.push_str("\nConfigured taps:\n");
 
                 let taps = super::skills_hub::read_taps();
-                if !taps.is_empty() {
-                    output.push_str("Configured taps:\n");
+                if taps.is_empty() {
+                    output.push_str("- none\n");
+                } else {
                     for tap in taps {
                         output.push_str(&format!("- {} -> {}\n", tap.name, tap.url));
                     }
-                    output.push('\n');
                 }
+                output.push('\n');
 
                 let installed = super::skills_hub::read_lock();
                 if !installed.is_empty() {
@@ -2563,7 +2507,7 @@ impl ToolHandler for SkillsHubTool {
                     }
                 }
 
-                output.push_str("\nTry: `skills_hub search coding`\n");
+                output.push_str("\nTry: `skills_hub search diagram`\n");
                 Ok(output)
             }
 
@@ -2588,76 +2532,48 @@ impl ToolHandler for SkillsHubTool {
 
                 let skills_dir = ctx.config.edgecrab_home.join("skills");
                 let optional_dir = super::skills_sync::optional_skills_dir();
-
-                // ── official/ prefix → install from optional-skills dir ──
-                if identifier.starts_with("official/") {
-                    let bundle = super::skills_hub::load_official_skill_bundle(
-                        &identifier,
-                        optional_dir.as_deref(),
+                super::skills_hub::install_identifier(
+                    &identifier,
+                    &skills_dir,
+                    optional_dir.as_deref(),
+                    args.force,
+                )
+                .await
+                .map(|outcome| {
+                    format!(
+                        "{}\n\nActivate with skill_view {}",
+                        outcome.message, outcome.skill_name
                     )
-                    .map_err(ToolError::Other);
-                    return bundle.and_then(|bundle| {
-                        let skill_name = bundle.name.clone();
-                        super::skills_hub::install_skill(&bundle, &skills_dir, args.force)
-                            .map(|m| format!("{}\n\nActivate with skill_view {}", m, skill_name))
-                            .map_err(ToolError::Other)
-                    });
-                }
-
-                // ── owner/repo/path → GitHub install ──
-                if identifier.contains('/') {
-                    return super::skills_hub::install_github_skill(
-                        &identifier,
-                        &skills_dir,
-                        args.force,
-                    )
-                    .await
-                    .map(|m| {
-                        let skill_name = identifier.split('/').next_back().unwrap_or("skill");
-                        format!("{}\n\nActivate with skill_view {}", m, skill_name)
-                    })
-                    .map_err(ToolError::Other);
-                }
-
-                // ── bare name → search optional-skills ──
-                let optional_search_root = optional_dir
-                    .clone()
-                    .unwrap_or_else(|| ctx.config.edgecrab_home.join("optional-skills"));
-                let candidates =
-                    super::skills_hub::search_optional_skills(&optional_search_root, &identifier);
-                if let Some(meta) = candidates.first() {
-                    let bundle = super::skills_hub::load_official_skill_bundle(
-                        &meta.identifier,
-                        optional_dir.as_deref(),
-                    )
-                    .map_err(ToolError::Other)?;
-                    let skill_name = bundle.name.clone();
-                    return super::skills_hub::install_skill(&bundle, &skills_dir, args.force)
-                        .map(|m| format!("{}\n\nActivate with skill_view {}", m, skill_name))
-                        .map_err(ToolError::Other);
-                }
-
-                Err(ToolError::NotFound(format!(
-                    "Skill '{}' not found in optional skills. Use official/<category>/<skill> or owner/repo/path for GitHub install.",
-                    identifier
-                )))
+                })
+                .map_err(ToolError::Other)
             }
 
             "update" => {
-                let lock = super::skills_hub::read_lock();
-                if lock.is_empty() {
-                    return Ok("No hub-installed skills found.".into());
+                let skills_dir = ctx.config.edgecrab_home.join("skills");
+                let optional_dir = super::skills_sync::optional_skills_dir();
+                if let Some(name) = args.query {
+                    let outcome = super::skills_hub::update_installed_skill(
+                        &name,
+                        &skills_dir,
+                        optional_dir.as_deref(),
+                        args.force,
+                    )
+                    .await
+                    .map_err(ToolError::Other)?;
+                    Ok(format!(
+                        "{}\n\nActivate with skill_view {}",
+                        outcome.message, outcome.skill_name
+                    ))
+                } else {
+                    let outcomes = super::skills_hub::update_all_installed_skills(
+                        &skills_dir,
+                        optional_dir.as_deref(),
+                        args.force,
+                    )
+                    .await
+                    .map_err(ToolError::Other)?;
+                    Ok(super::skills_hub::render_update_outcomes(&outcomes))
                 }
-
-                let mut output = String::from("Installed hub skills:\n\n");
-                for (name, entry) in lock {
-                    output.push_str(&format!(
-                        "- {} | source={} | id={} | installed={}\n",
-                        name, entry.source, entry.identifier, entry.installed_at
-                    ));
-                }
-                output.push_str("\nUse skills_hub install <identifier> force=true to reinstall.");
-                Ok(output)
             }
 
             "uninstall" => {
@@ -2697,7 +2613,7 @@ mod skills_hub_tests {
             .await;
         assert!(result.is_ok());
         let msg = result.unwrap();
-        assert!(msg.contains("skills.sh"));
+        assert!(msg.contains("Remote skill matches"));
     }
 
     #[tokio::test]

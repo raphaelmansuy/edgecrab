@@ -46,6 +46,137 @@ fn unicode_trunc(s: &str, max_cols: usize) -> String {
     out
 }
 
+fn oneline(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn quoted_preview(text: &str, max_cols: usize) -> String {
+    unicode_trunc(&format!("\"{}\"", oneline(text)), max_cols)
+}
+
+fn url_domain(url: &str) -> String {
+    url.trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .unwrap_or(url)
+        .to_string()
+}
+
+fn extract_patch_targets(patch_text: &str) -> Vec<String> {
+    let mut targets = Vec::new();
+    for line in patch_text.lines() {
+        let path = line
+            .strip_prefix("*** Update File: ")
+            .or_else(|| line.strip_prefix("*** Add File: "))
+            .or_else(|| line.strip_prefix("*** Delete File: "))
+            .or_else(|| line.strip_prefix("*** Move to: "))
+            .map(str::trim);
+        if let Some(path) = path.filter(|path| !path.is_empty()) {
+            if !targets.iter().any(|existing| existing == path) {
+                targets.push(path.to_string());
+            }
+        }
+    }
+    targets
+}
+
+fn line_range_suffix(obj: &serde_json::Map<String, serde_json::Value>) -> String {
+    let line_start = obj.get("line_start").and_then(|v| v.as_u64());
+    let line_end = obj.get("line_end").and_then(|v| v.as_u64());
+    match (line_start, line_end) {
+        (Some(start), Some(end)) if start == end => format!(":{start}"),
+        (Some(start), Some(end)) => format!(":{start}-{end}"),
+        (Some(start), None) => format!(":{start}"),
+        _ => String::new(),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TodoDisplayItem {
+    id: Option<String>,
+    title: String,
+    status: String,
+}
+
+fn normalize_todo_status(status: &str) -> String {
+    match status.trim() {
+        "pending" => "not-started".into(),
+        "in_progress" => "in-progress".into(),
+        "not-started" | "in-progress" | "completed" | "cancelled" => status.trim().into(),
+        _ => "not-started".into(),
+    }
+}
+
+fn extract_todo_items(obj: &serde_json::Map<String, serde_json::Value>) -> Vec<TodoDisplayItem> {
+    let Some(items) = obj
+        .get("items")
+        .or_else(|| obj.get("todos"))
+        .and_then(|v| v.as_array())
+    else {
+        return Vec::new();
+    };
+
+    items
+        .iter()
+        .filter_map(|item| {
+            let item = item.as_object()?;
+            let title = item
+                .get("title")
+                .or_else(|| item.get("content"))
+                .and_then(|v| v.as_str())
+                .map(oneline)
+                .filter(|text| !text.is_empty())?;
+            let id = item
+                .get("id")
+                .and_then(|v| match v {
+                    serde_json::Value::String(text) => Some(text.clone()),
+                    serde_json::Value::Number(num) => Some(num.to_string()),
+                    _ => None,
+                })
+                .filter(|text| !text.is_empty());
+            let status = item
+                .get("status")
+                .and_then(|v| v.as_str())
+                .map(normalize_todo_status)
+                .unwrap_or_else(|| "not-started".into());
+            Some(TodoDisplayItem { id, title, status })
+        })
+        .collect()
+}
+
+fn todo_preview(obj: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    let items = extract_todo_items(obj);
+    if items.is_empty() {
+        return Some("review current plan".into());
+    }
+
+    let action = if obj.get("merge").and_then(|v| v.as_bool()).unwrap_or(false) {
+        "update"
+    } else {
+        "set"
+    };
+    let first = unicode_trunc(&items[0].title, 20);
+    Some(if items.len() == 1 {
+        format!("{action} 1 task · {first}")
+    } else {
+        format!(
+            "{action} {} tasks · {first} +{}",
+            items.len(),
+            items.len() - 1
+        )
+    })
+}
+
+fn parse_args_json(args_json: &str) -> Option<serde_json::Value> {
+    serde_json::from_str(args_json).ok()
+}
+
+fn args_object(args_json: &str) -> Option<serde_json::Map<String, serde_json::Value>> {
+    parse_args_json(args_json)?.as_object().cloned()
+}
+
 // ── tool_emoji ───────────────────────────────────────────────────────────────
 
 /// Map a tool name to a display emoji using keyword pattern matching.
@@ -150,7 +281,7 @@ fn json_value_preview(val: &serde_json::Value) -> Option<String> {
 ///  1. Try keys in a priority order that covers the most "meaningful" args.
 ///  2. Show `key: value` so the display is self-documenting for any tool.
 ///  3. Fall back to the first non-trivial key-value pair in the object.
-pub fn extract_tool_preview(_tool_name: &str, args_json: &str) -> String {
+fn extract_generic_preview(obj: &serde_json::Map<String, serde_json::Value>) -> String {
     const PRIORITY: &[&str] = &[
         "query",
         "url",
@@ -184,13 +315,6 @@ pub fn extract_tool_preview(_tool_name: &str, args_json: &str) -> String {
         "output_format",
     ];
 
-    let args: serde_json::Value =
-        serde_json::from_str(args_json).unwrap_or(serde_json::Value::Null);
-    let obj = match args.as_object() {
-        Some(o) => o,
-        None => return String::new(),
-    };
-
     for &key in PRIORITY {
         if let Some(val) = obj.get(key) {
             if let Some(preview) = json_value_preview(val) {
@@ -209,6 +333,565 @@ pub fn extract_tool_preview(_tool_name: &str, args_json: &str) -> String {
     }
 
     String::new()
+}
+
+pub fn tool_label(tool_name: &str) -> String {
+    match tool_name {
+        "web_search" => "search".into(),
+        "web_extract" => "fetch".into(),
+        "web_crawl" => "crawl".into(),
+        "terminal" => "$".into(),
+        "process" | "process_start" | "process_list" | "process_kill" | "process_wait"
+        | "process_logs" | "process_write" => "proc".into(),
+        "read_file" => "read".into(),
+        "write_file" => "write".into(),
+        "patch" | "apply_patch" => "patch".into(),
+        "search_files" => "grep".into(),
+        "browser_navigate" => "navigate".into(),
+        "browser_snapshot" => "snapshot".into(),
+        "browser_click" => "click".into(),
+        "browser_type" => "type".into(),
+        "browser_scroll" => "scroll".into(),
+        "browser_back" => "back".into(),
+        "browser_press" => "press".into(),
+        "browser_get_images" => "images".into(),
+        "browser_vision" => "vision".into(),
+        "browser_console" => "console".into(),
+        "browser_wait_for" => "wait".into(),
+        "browser_select" => "select".into(),
+        "browser_hover" => "hover".into(),
+        "browser_close" => "close".into(),
+        "todo" | "manage_todo_list" => "plan".into(),
+        "session_search" => "recall".into(),
+        "memory" => "memory".into(),
+        "skills_list" => "skills".into(),
+        "skill_view" => "skill".into(),
+        "generate_image" | "image_generate" => "create".into(),
+        "text_to_speech" => "speak".into(),
+        "transcribe_audio" => "transcribe".into(),
+        "vision_analyze" => "vision".into(),
+        "mixture_of_agents" | "moa" => "reason".into(),
+        "send_message" => "send".into(),
+        "cronjob" | "cron" => "cron".into(),
+        "execute_code" => "exec".into(),
+        "delegate_task" => "delegate".into(),
+        "clarify" => "clarify".into(),
+        "checkpoint" => "checkpoint".into(),
+        "pdf_to_markdown" => "pdf".into(),
+        "ha_list_entities" => "ha entities".into(),
+        "ha_get_state" => "ha state".into(),
+        "ha_list_services" => "ha services".into(),
+        "ha_call_service" => "ha call".into(),
+        "honcho_conclude" => "honcho save".into(),
+        "honcho_search" => "honcho search".into(),
+        "honcho_list" => "honcho list".into(),
+        "honcho_remove" => "honcho remove".into(),
+        "honcho_profile" => "honcho profile".into(),
+        "honcho_context" => "honcho ask".into(),
+        "mcp_list_tools" => "mcp tools".into(),
+        "mcp_call_tool" => "mcp call".into(),
+        "mcp_list_resources" => "mcp resources".into(),
+        "mcp_read_resource" => "mcp read".into(),
+        "mcp_list_prompts" => "mcp prompts".into(),
+        "mcp_get_prompt" => "mcp prompt".into(),
+        _ => tool_name.replace('_', " "),
+    }
+}
+
+pub fn extract_tool_preview(tool_name: &str, args_json: &str) -> String {
+    let Some(obj) = args_object(args_json) else {
+        return String::new();
+    };
+
+    let preview = match tool_name {
+        "web_search" => obj.get("query").and_then(|v| v.as_str()).map(oneline),
+        "web_extract" => obj.get("urls").and_then(|v| match v {
+            serde_json::Value::Array(urls) if !urls.is_empty() => {
+                let first = urls.first()?.as_str()?;
+                let domain = url_domain(first);
+                Some(if urls.len() > 1 {
+                    format!("{domain} +{}", urls.len() - 1)
+                } else {
+                    domain
+                })
+            }
+            serde_json::Value::String(url) if !url.is_empty() => Some(url_domain(url)),
+            _ => None,
+        }),
+        "web_crawl" | "browser_navigate" => obj.get("url").and_then(|v| v.as_str()).map(url_domain),
+        "terminal" => obj.get("command").and_then(|v| v.as_str()).map(oneline),
+        "read_file" => obj.get("path").and_then(|v| v.as_str()).map(|path| {
+            let suffix = line_range_suffix(&obj);
+            format!("{path}{suffix}")
+        }),
+        "write_file" => obj.get("path").and_then(|v| v.as_str()).map(oneline),
+        "patch" => obj
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(oneline)
+            .or_else(|| {
+                obj.get("patch")
+                    .and_then(|v| v.as_str())
+                    .map(extract_patch_targets)
+                    .filter(|targets| !targets.is_empty())
+                    .map(|targets| {
+                        if targets.len() == 1 {
+                            targets[0].clone()
+                        } else {
+                            format!("{} file(s): {}", targets.len(), targets[0])
+                        }
+                    })
+            }),
+        "apply_patch" => obj
+            .get("patch")
+            .and_then(|v| v.as_str())
+            .map(extract_patch_targets)
+            .filter(|targets| !targets.is_empty())
+            .map(|targets| {
+                if targets.len() == 1 {
+                    targets[0].clone()
+                } else {
+                    format!("{} file(s): {}", targets.len(), targets[0])
+                }
+            }),
+        "search_files" => {
+            let Some(pattern) = obj.get("pattern").and_then(|v| v.as_str()).map(oneline) else {
+                return String::new();
+            };
+            let target = obj
+                .get("target")
+                .and_then(|v| v.as_str())
+                .unwrap_or("content");
+            let include = obj
+                .get("include")
+                .or_else(|| obj.get("file_glob"))
+                .and_then(|v| v.as_str())
+                .filter(|value| !value.is_empty());
+            Some(match include {
+                Some(glob) if target == "files" => format!("{pattern} in {glob}"),
+                Some(glob) => format!("{pattern} @ {glob}"),
+                None => pattern,
+            })
+        }
+        "process" => {
+            let action = obj
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let sid = obj
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .map(|s| edgecrab_core::safe_truncate(s, 12).to_string())
+                .unwrap_or_default();
+            let detail = match action {
+                "list" => "list".to_string(),
+                "poll" | "log" | "wait" | "kill" | "write" | "submit" if !sid.is_empty() => {
+                    format!("{action} {sid}")
+                }
+                _ if !action.is_empty() => action.to_string(),
+                _ => String::new(),
+            };
+            (!detail.is_empty()).then_some(detail)
+        }
+        "todo" | "manage_todo_list" => todo_preview(&obj),
+        "session_search" => obj
+            .get("query")
+            .and_then(|v| v.as_str())
+            .map(|q| format!("\"{}\"", oneline(q))),
+        "memory" => {
+            let action = obj
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let target = obj
+                .get("target")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            match action {
+                "add" => obj
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .map(|content| format!("+{target}: \"{}\"", oneline(content))),
+                "replace" | "remove" => {
+                    obj.get("old_text").and_then(|v| v.as_str()).map(|content| {
+                        format!(
+                            "{}{}: \"{}\"",
+                            if action == "replace" { "~" } else { "-" },
+                            target,
+                            oneline(content)
+                        )
+                    })
+                }
+                _ if !action.is_empty() => Some(action.to_string()),
+                _ => None,
+            }
+        }
+        "send_message" => {
+            let target = obj.get("target").and_then(|v| v.as_str()).unwrap_or("?");
+            obj.get("message")
+                .and_then(|v| v.as_str())
+                .map(|msg| format!("{target}: {}", quoted_preview(msg, 34)))
+        }
+        "cronjob" | "cron" => {
+            let action = obj
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            if action == "create" {
+                obj.get("name")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| obj.get("prompt").and_then(|v| v.as_str()))
+                    .map(oneline)
+            } else if !action.is_empty() {
+                Some(action.to_string())
+            } else {
+                None
+            }
+        }
+        "execute_code" => obj
+            .get("code")
+            .and_then(|v| v.as_str())
+            .map(|code| oneline(code.lines().next().unwrap_or_default())),
+        "browser_snapshot" => Some(
+            if obj.get("full").and_then(|v| v.as_bool()).unwrap_or(false) {
+                "full page".into()
+            } else {
+                "interactive view".into()
+            },
+        ),
+        "browser_click" | "browser_hover" => obj.get("ref").and_then(|v| v.as_str()).map(oneline),
+        "browser_type" => {
+            let target = obj.get("ref").and_then(|v| v.as_str()).unwrap_or("?");
+            obj.get("text")
+                .and_then(|v| v.as_str())
+                .map(|text| format!("{target} {}", quoted_preview(text, 28)))
+        }
+        "browser_scroll" => obj
+            .get("direction")
+            .and_then(|v| v.as_str())
+            .map(|direction| {
+                let amount = obj.get("amount").and_then(|v| v.as_u64()).unwrap_or(500);
+                format!("{direction} {amount}px")
+            }),
+        "browser_press" => obj.get("key").and_then(|v| v.as_str()).map(oneline),
+        "browser_console" => Some(
+            if obj.get("clear").and_then(|v| v.as_bool()).unwrap_or(false) {
+                "read + clear".into()
+            } else {
+                "read".into()
+            },
+        ),
+        "browser_get_images" => Some("extract page images".into()),
+        "browser_vision" => obj
+            .get("question")
+            .and_then(|v| v.as_str())
+            .map(|question| quoted_preview(question, 40))
+            .or_else(|| Some("analyze page".into())),
+        "browser_wait_for" => obj
+            .get("text")
+            .and_then(|v| v.as_str())
+            .map(|text| format!("text {}", quoted_preview(text, 28)))
+            .or_else(|| {
+                obj.get("selector")
+                    .and_then(|v| v.as_str())
+                    .map(|selector| format!("selector {selector}"))
+            }),
+        "browser_select" => {
+            let target = obj.get("ref").and_then(|v| v.as_str()).unwrap_or("?");
+            obj.get("option")
+                .and_then(|v| v.as_str())
+                .map(|option| format!("{target} -> {}", quoted_preview(option, 28)))
+        }
+        "generate_image" | "image_generate" => obj
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .map(|prompt| quoted_preview(prompt, 44)),
+        "text_to_speech" => obj
+            .get("text")
+            .and_then(|v| v.as_str())
+            .map(|text| quoted_preview(text, 40)),
+        "transcribe_audio" => obj
+            .get("audio_path")
+            .or_else(|| obj.get("path"))
+            .and_then(|v| v.as_str())
+            .map(oneline),
+        "vision_analyze" => obj
+            .get("prompt")
+            .or_else(|| obj.get("question"))
+            .and_then(|v| v.as_str())
+            .map(|question| quoted_preview(question, 40))
+            .or_else(|| {
+                obj.get("image_source")
+                    .and_then(|v| v.as_str())
+                    .map(oneline)
+            }),
+        "delegate_task" => match obj.get("tasks") {
+            Some(serde_json::Value::Array(tasks)) => {
+                Some(format!("{} parallel task(s)", tasks.len()))
+            }
+            _ => obj.get("goal").and_then(|v| v.as_str()).map(oneline),
+        },
+        "clarify" => obj
+            .get("question")
+            .and_then(|v| v.as_str())
+            .map(|question| quoted_preview(question, 40)),
+        "checkpoint" => {
+            let action = obj
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let name = obj
+                .get("name")
+                .or_else(|| obj.get("checkpoint"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            match (action.is_empty(), name.is_empty()) {
+                (false, false) => Some(format!("{action} {name}")),
+                (false, true) => Some(action.to_string()),
+                (true, false) => Some(name.to_string()),
+                (true, true) => None,
+            }
+        }
+        "pdf_to_markdown" => obj.get("path").and_then(|v| v.as_str()).map(oneline),
+        "ha_list_entities" => obj
+            .get("domain")
+            .and_then(|v| v.as_str())
+            .map(oneline)
+            .or_else(|| Some("all domains".into())),
+        "ha_get_state" => obj.get("entity_id").and_then(|v| v.as_str()).map(oneline),
+        "ha_list_services" => obj
+            .get("domain")
+            .and_then(|v| v.as_str())
+            .map(oneline)
+            .or_else(|| Some("all domains".into())),
+        "ha_call_service" => {
+            let domain = obj.get("domain").and_then(|v| v.as_str()).unwrap_or("?");
+            let service = obj.get("service").and_then(|v| v.as_str()).unwrap_or("?");
+            Some(format!("{domain}.{service}"))
+        }
+        "honcho_conclude" => obj
+            .get("entry")
+            .and_then(|v| v.as_str())
+            .map(|entry| quoted_preview(entry, 40)),
+        "honcho_search" | "honcho_context" => obj
+            .get("query")
+            .or_else(|| obj.get("question"))
+            .and_then(|v| v.as_str())
+            .map(|query| quoted_preview(query, 40)),
+        "honcho_remove" => obj.get("id").and_then(|v| v.as_str()).map(oneline),
+        "honcho_profile" | "honcho_list" => Some("read".into()),
+        "mcp_list_tools" | "mcp_list_resources" | "mcp_list_prompts" => obj
+            .get("server")
+            .or_else(|| obj.get("server_name"))
+            .and_then(|v| v.as_str())
+            .map(oneline),
+        "mcp_call_tool" => {
+            let server = obj
+                .get("server")
+                .or_else(|| obj.get("server_name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let tool = obj
+                .get("tool")
+                .or_else(|| obj.get("tool_name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            Some(format!("{server}/{tool}"))
+        }
+        "mcp_read_resource" => obj
+            .get("uri")
+            .or_else(|| obj.get("resource"))
+            .and_then(|v| v.as_str())
+            .map(oneline),
+        "mcp_get_prompt" => obj
+            .get("prompt")
+            .or_else(|| obj.get("prompt_name"))
+            .and_then(|v| v.as_str())
+            .map(oneline),
+        _ => None,
+    };
+
+    preview
+        .filter(|text| !text.trim().is_empty())
+        .map(|text| unicode_trunc(&text, 44))
+        .unwrap_or_else(|| extract_generic_preview(&obj))
+}
+
+pub fn tool_signature(tool_name: &str, args_json: &str) -> String {
+    let preview = extract_tool_preview(tool_name, args_json);
+    if preview.is_empty() {
+        tool_name.to_ascii_lowercase()
+    } else {
+        format!("{}::{preview}", tool_name.to_ascii_lowercase())
+    }
+}
+
+pub fn build_tool_verbose_lines(
+    tool_name: &str,
+    args_json: &str,
+    result_preview: Option<&str>,
+    is_error: bool,
+) -> Vec<Vec<Span<'static>>> {
+    if matches!(tool_name, "todo" | "manage_todo_list") {
+        return build_todo_verbose_lines(args_json, result_preview, is_error);
+    }
+
+    let mut lines = Vec::new();
+    let label = tool_label(tool_name);
+    let args_line = unicode_trunc(&format!("args  {args_json}"), 108);
+    lines.push(vec![
+        Span::styled(
+            "     ",
+            Style::default()
+                .fg(Color::Rgb(52, 56, 66))
+                .add_modifier(Modifier::DIM),
+        ),
+        Span::styled(
+            unicode_pad_right(&label, 9),
+            Style::default()
+                .fg(Color::Rgb(108, 118, 138))
+                .add_modifier(Modifier::DIM),
+        ),
+        Span::styled(
+            args_line,
+            Style::default()
+                .fg(Color::Rgb(120, 132, 152))
+                .add_modifier(Modifier::DIM),
+        ),
+    ]);
+    if let Some(result) = result_preview
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        lines.push(vec![
+            Span::styled(
+                "     ",
+                Style::default()
+                    .fg(Color::Rgb(52, 56, 66))
+                    .add_modifier(Modifier::DIM),
+            ),
+            Span::styled(
+                unicode_pad_right("result", 9),
+                Style::default()
+                    .fg(Color::Rgb(108, 118, 138))
+                    .add_modifier(Modifier::DIM),
+            ),
+            Span::styled(
+                unicode_trunc(result, 108),
+                if is_error {
+                    Style::default().fg(Color::Rgb(235, 170, 170))
+                } else {
+                    Style::default().fg(Color::Rgb(148, 198, 164))
+                },
+            ),
+        ]);
+    }
+    lines
+}
+
+fn build_todo_verbose_lines(
+    args_json: &str,
+    result_preview: Option<&str>,
+    is_error: bool,
+) -> Vec<Vec<Span<'static>>> {
+    let mut lines = Vec::new();
+    let obj = args_object(args_json).unwrap_or_default();
+    let items = extract_todo_items(&obj);
+    let mode = if obj.get("merge").and_then(|v| v.as_bool()).unwrap_or(false) {
+        "merge update"
+    } else if items.is_empty() {
+        "read current plan"
+    } else {
+        "replace plan"
+    };
+    let summary = result_preview
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .unwrap_or(mode);
+
+    lines.push(vec![
+        Span::styled(
+            "     ",
+            Style::default()
+                .fg(Color::Rgb(52, 56, 66))
+                .add_modifier(Modifier::DIM),
+        ),
+        Span::styled(
+            unicode_pad_right("plan", 9),
+            Style::default()
+                .fg(Color::Rgb(108, 118, 138))
+                .add_modifier(Modifier::DIM),
+        ),
+        Span::styled(
+            unicode_trunc(summary, 108),
+            if is_error {
+                Style::default().fg(Color::Rgb(235, 170, 170))
+            } else {
+                Style::default().fg(Color::Rgb(156, 208, 188))
+            },
+        ),
+    ]);
+
+    for item in items.iter().take(6) {
+        let (badge, badge_style, text_style) = match item.status.as_str() {
+            "completed" => (
+                "[x]",
+                Style::default().fg(Color::Rgb(104, 196, 129)),
+                Style::default().fg(Color::Rgb(168, 215, 184)),
+            ),
+            "in-progress" => (
+                "[>]",
+                Style::default().fg(Color::Rgb(77, 208, 225)),
+                Style::default().fg(Color::Rgb(176, 220, 236)),
+            ),
+            "cancelled" => (
+                "[-]",
+                Style::default().fg(Color::Rgb(220, 120, 120)),
+                Style::default()
+                    .fg(Color::Rgb(175, 145, 145))
+                    .add_modifier(Modifier::DIM),
+            ),
+            _ => (
+                "[ ]",
+                Style::default().fg(Color::Rgb(150, 160, 180)),
+                Style::default().fg(Color::Rgb(205, 212, 224)),
+            ),
+        };
+        let title = if let Some(id) = &item.id {
+            format!("{id}. {}", item.title)
+        } else {
+            item.title.clone()
+        };
+        lines.push(vec![
+            Span::styled(
+                "     ",
+                Style::default()
+                    .fg(Color::Rgb(52, 56, 66))
+                    .add_modifier(Modifier::DIM),
+            ),
+            Span::styled(format!("{badge} "), badge_style),
+            Span::styled(unicode_trunc(&title, 92), text_style),
+        ]);
+    }
+
+    if items.len() > 6 {
+        lines.push(vec![
+            Span::styled(
+                "     ",
+                Style::default()
+                    .fg(Color::Rgb(52, 56, 66))
+                    .add_modifier(Modifier::DIM),
+            ),
+            Span::styled(
+                format!("+{} more task(s)", items.len() - 6),
+                Style::default()
+                    .fg(Color::Rgb(120, 132, 152))
+                    .add_modifier(Modifier::DIM),
+            ),
+        ]);
+    }
+
+    lines
 }
 
 // ── Span builders ─────────────────────────────────────────────────────────────
@@ -243,8 +926,8 @@ pub fn build_tool_done_line(
             .unwrap_or_else(|| tool_emoji(tool_name))
     };
 
-    let display_name = tool_name.replace('_', " ");
-    let name_padded = unicode_pad_right(&display_name, 18);
+    let label = tool_label(tool_name);
+    let name_padded = unicode_pad_right(&label, 18);
 
     let preview_part = if preview.is_empty() {
         String::new()
@@ -254,7 +937,11 @@ pub fn build_tool_done_line(
     let result_part = if result_preview.is_empty() {
         String::new()
     } else {
-        format!("  {}", unicode_trunc(result_preview, 54))
+        format!(
+            "  {} {}",
+            if is_error { "!" } else { "->" },
+            unicode_trunc(result_preview, 52)
+        )
     };
 
     let bar_style = Style::default()
@@ -299,6 +986,7 @@ pub fn build_tool_done_line(
 pub fn build_tool_running_line(
     tool_name: &str,
     args_json: &str,
+    detail: Option<&str>,
     emoji_overrides: &std::collections::HashMap<String, String>,
 ) -> Vec<Span<'static>> {
     let preview = extract_tool_preview(tool_name, args_json);
@@ -306,13 +994,18 @@ pub fn build_tool_running_line(
         .get(tool_name)
         .map(|s| s.as_str())
         .unwrap_or_else(|| tool_emoji(tool_name));
-    let display_name = tool_name.replace('_', " ");
-    let name_padded = unicode_pad_right(&display_name, 18);
+    let label = tool_label(tool_name);
+    let name_padded = unicode_pad_right(&label, 18);
     let preview_part = if preview.is_empty() {
         String::new()
     } else {
         format!(" {preview}")
     };
+    let detail_part = detail
+        .map(str::trim)
+        .filter(|detail| !detail.is_empty())
+        .map(|detail| format!("  {}", unicode_trunc(detail, 54)))
+        .unwrap_or_default();
 
     let bar_style = Style::default()
         .fg(Color::Rgb(60, 60, 72))
@@ -331,6 +1024,7 @@ pub fn build_tool_running_line(
         Span::styled(emoji.to_string(), indicator_style),
         Span::styled(format!(" {name_padded}"), name_style),
         Span::styled(preview_part, preview_style),
+        Span::styled(detail_part, preview_style),
         Span::styled("  ···".to_string(), running_style),
     ]
 }
@@ -435,7 +1129,10 @@ pub fn tool_action_verb(name: &str) -> &'static str {
     if n.contains("clarify") {
         return "asking";
     }
-    if n.contains("skill") || n.contains("session_search") || n.contains("todo") {
+    if n.contains("todo") || n.contains("task") || n.contains("plan") {
+        return "planning";
+    }
+    if n.contains("skill") || n.contains("session_search") {
         return "fetching";
     }
     "running"
@@ -461,6 +1158,9 @@ pub fn tool_icon(name: &str) -> &'static str {
     if n.contains("memory") || n.contains("store") {
         return "⊞";
     }
+    if n.contains("todo") || n.contains("task") || n.contains("plan") {
+        return "☑";
+    }
     if n.contains("delegate") || n.contains("spawn") || n.contains("agent") {
         return "⊛";
     }
@@ -479,7 +1179,7 @@ pub fn tool_icon(name: &str) -> &'static str {
 /// Short preview for the live status bar during tool execution.
 /// Format: `tool name · key: value` (single line, truncated).
 pub fn tool_status_preview(tool_name: &str, args_json: &str) -> String {
-    let display_name = tool_name.replace('_', " ");
+    let display_name = tool_label(tool_name);
     let preview = extract_tool_preview(tool_name, args_json);
     let full = if preview.is_empty() {
         display_name
@@ -508,6 +1208,61 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_tool_preview_uses_specialized_terminal_summary() {
+        let preview =
+            extract_tool_preview("terminal", r#"{"command":"cargo test -p edgecrab-cli"}"#);
+        assert_eq!(preview, "cargo test -p edgecrab-cli");
+    }
+
+    #[test]
+    fn test_tool_signature_tracks_preview_not_raw_json_order() {
+        let left = tool_signature("read_file", r#"{"path":"src/main.rs","offset":0}"#);
+        let right = tool_signature("read_file", r#"{"offset":25,"path":"src/main.rs"}"#);
+        assert_eq!(left, right);
+    }
+
+    #[test]
+    fn test_extract_tool_preview_summarizes_apply_patch_targets() {
+        let patch = "*** Begin Patch\n*** Update File: src/main.rs\n@@\n-old\n+new\n*** Add File: src/lib.rs\n+hello\n*** End Patch\n";
+        let preview = extract_tool_preview(
+            "apply_patch",
+            &format!(
+                r#"{{"patch":{}}}"#,
+                serde_json::to_string(patch).expect("json")
+            ),
+        );
+        assert!(preview.contains("2 file(s): src/main.rs"), "got: {preview}");
+    }
+
+    #[test]
+    fn test_extract_tool_preview_formats_browser_wait() {
+        let preview = extract_tool_preview(
+            "browser_wait_for",
+            r#"{"selector":".results","timeout":10}"#,
+        );
+        assert_eq!(preview, "selector .results");
+    }
+
+    #[test]
+    fn test_extract_tool_preview_formats_send_message_with_quote() {
+        let preview = extract_tool_preview(
+            "send_message",
+            r#"{"target":"telegram:#ops","message":"deploy is complete"}"#,
+        );
+        assert!(preview.contains("telegram:#ops"), "got: {preview}");
+        assert!(preview.contains("\"deploy is complete\""), "got: {preview}");
+    }
+
+    #[test]
+    fn test_extract_tool_preview_supports_manage_todo_list_alias() {
+        let preview = extract_tool_preview(
+            "manage_todo_list",
+            r#"{"items":[{"id":1,"title":"Audit","status":"in-progress"}],"merge":true}"#,
+        );
+        assert_eq!(preview, "update 1 task · Audit");
+    }
+
+    #[test]
     fn test_tool_emoji_search_variants() {
         assert_eq!(tool_emoji("grep_files"), "🔍");
         assert_eq!(tool_emoji("find_in_dir"), "🔍");
@@ -526,8 +1281,8 @@ mod tests {
         let args = r#"{"query": "rust async", "verbose": true}"#;
         let preview = extract_tool_preview("web_search", args);
         assert!(
-            preview.contains("query:"),
-            "expected 'query:' in '{preview}'"
+            !preview.contains("query:"),
+            "expected concise preview in '{preview}'"
         );
         assert!(
             preview.contains("rust async"),
@@ -566,8 +1321,32 @@ mod tests {
         assert_eq!(tool_action_verb("bash_exec"), "executing");
         assert_eq!(tool_action_verb("read_file"), "reading");
         assert_eq!(tool_action_verb("write_file"), "writing");
+        assert_eq!(tool_action_verb("manage_todo_list"), "planning");
         assert_eq!(tool_action_verb("mcp_call"), "calling");
         assert_eq!(tool_action_verb("unknown_op"), "running");
+    }
+
+    #[test]
+    fn test_build_tool_verbose_lines_renders_todo_plan_board() {
+        let lines = build_tool_verbose_lines(
+            "manage_todo_list",
+            r#"{"items":[{"id":1,"title":"Audit Hermes display","status":"completed"},{"id":2,"title":"Improve todo renderer","status":"in-progress"},{"id":3,"title":"Reassess UX","status":"not-started"}],"merge":true}"#,
+            Some("1/3 done, 1 in progress"),
+            false,
+        );
+        assert_eq!(lines.len(), 4);
+        let joined = lines
+            .iter()
+            .map(|line| {
+                line.iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert!(joined[0].contains("1/3 done, 1 in progress"));
+        assert!(joined[1].contains("[x]"));
+        assert!(joined[2].contains("[>]"));
+        assert!(joined[3].contains("[ ]"));
     }
 
     #[test]
@@ -577,6 +1356,7 @@ mod tests {
         assert_eq!(tool_icon("write_file"), "✎");
         assert_eq!(tool_icon("read_file"), "≡"); // matches "read" check
         assert_eq!(tool_icon("mcp_call"), "◎");
+        assert_eq!(tool_icon("manage_todo_list"), "☑");
         assert_eq!(tool_icon("unknown_op"), "⚙"); // no pattern matches → gear fallback
     }
 
@@ -584,7 +1364,7 @@ mod tests {
     fn test_tool_status_preview_format() {
         let args = r#"{"query": "hello"}"#;
         let preview = tool_status_preview("web_search", args);
-        assert!(preview.contains("web search"), "should contain human name");
+        assert!(preview.contains("search"), "should contain tool label");
         assert!(preview.contains("hello"), "should contain query value");
     }
 
@@ -602,8 +1382,8 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect::<String>();
-        assert!(joined.contains("path: src/main.rs"));
-        assert!(joined.contains("Wrote 42 bytes"));
+        assert!(joined.contains("src/main.rs"));
+        assert!(joined.contains("-> Wrote 42 bytes"));
     }
 
     #[test]

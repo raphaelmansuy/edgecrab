@@ -85,10 +85,11 @@ impl ToolHandler for SessionSearchTool {
             name: "session_search".into(),
             description: concat!(
                 "Search past sessions using full-text search (FTS5), or list the most recent ",
-                "sessions when no query is given. ",
+                "sessions when no query is given. Use this proactively when the user refers to ",
+                "previous work or asks what happened in a past session. ",
                 "Omit `query` (or pass an empty string) to get the latest N sessions ordered ",
                 "by start time. Provide a keyword `query` to find sessions whose messages ",
-                "contain that text."
+                "contain that text. Prefer OR between independent keywords for broader recall."
             )
             .into(),
             parameters: json!({

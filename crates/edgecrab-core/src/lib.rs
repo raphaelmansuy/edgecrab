@@ -5,12 +5,15 @@
 
 #![deny(clippy::unwrap_used)]
 
+use edgecrab_lsp as _;
+
 pub mod agent;
 pub mod compression;
 pub mod config;
 pub mod context_references;
 pub mod conversation;
 pub mod model_catalog;
+pub mod model_discovery;
 pub mod model_router;
 pub mod pricing;
 pub mod prompt_builder;
@@ -22,12 +25,17 @@ pub use agent::{
 };
 pub use compression::{PRUNED_TOOL_PLACEHOLDER, SUMMARY_PREFIX};
 pub use config::{
-    AppConfig, CliOverrides, SmartRoutingYaml, edgecrab_home, ensure_edgecrab_home,
-    gateway_image_cache_dir, gateway_media_dir,
+    AppConfig, CliOverrides, SmartRoutingYaml, ToolProgressMode, edgecrab_home,
+    ensure_edgecrab_home, gateway_image_cache_dir, gateway_media_dir,
 };
 pub use context_references::{ContextRef, ExpansionResult, expand_context_refs};
 pub use model_catalog::{
     CatalogData, ModelCatalog, ModelEntry, ModelTier, PricingPair, ProviderEntry,
+};
+pub use model_discovery::{
+    DiscoveryAvailability, DiscoverySource, ProviderModels, discover_multiple,
+    discover_provider_models, discovery_provider_statuses, live_discovery_availability,
+    live_discovery_providers, merge_grouped_catalog_with_dynamic, normalize_discovery_provider,
 };
 pub use model_router::{
     SmartRoutingConfig, TurnRoute, classify_message, fallback_route, resolve_turn_route,

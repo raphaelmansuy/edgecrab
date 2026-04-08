@@ -13,19 +13,23 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-14, windows-latest]
+        os: [ubuntu-latest, macos-14]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build
-      - run: cargo test
-      - run: cargo clippy -- -D warnings
+      - run: cargo build --workspace
+      - run: cargo build -p edgecrab-lsp --examples  # pre-build mock server used by integration tests
+      - run: cargo test -p edgecrab-lsp
+      - run: cargo test --workspace
+      - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo fmt --all --check
 
   python-sdk:
     name: Python SDK — build & test
     runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -53,6 +57,8 @@ jobs:
   security:
     name: Security audit
     runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -62,10 +68,11 @@ jobs:
   site:
     name: Site — build check
     runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
-        with: { version: '10' }
       - uses: actions/setup-node@v4
         with:
           node-version: '24'

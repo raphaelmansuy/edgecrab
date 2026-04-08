@@ -73,6 +73,19 @@ pub struct ProcessRecord {
     /// WHY VecDeque: allows O(1) `pop_front()` eviction when the buffer is full,
     /// vs the O(n) `Vec::remove(0)` that shifts all elements on each insert.
     pub output_lines: VecDeque<String>,
+    /// Trailing output that has not been terminated by a newline yet.
+    ///
+    /// PTY-backed processes frequently emit prompts like `>>> ` or `Password: `
+    /// without a trailing newline. Keeping that tail visible is required for
+    /// reliable observation and stdin round-trips.
+    pub partial_line: String,
+    /// Whether the last observed control byte was a bare `\r`.
+    ///
+    /// PTY streams use carriage return to redraw progress lines in place.
+    /// EdgeCrab does not model a full terminal screen, but it must at least
+    /// treat the next text chunk as an overwrite of the current logical line
+    /// rather than as a brand-new line.
+    pub carriage_return_pending: bool,
     /// Exit code (set when status transitions to Exited)
     pub exit_code: Option<i32>,
     /// OS process ID — set immediately after spawn.
@@ -117,6 +130,30 @@ impl ProcessStatus {
 
 // Maximum output lines retained per process (prevents unbounded memory growth)
 const RING_CAPACITY: usize = 500;
+const PARTIAL_LINE_FLUSH_BYTES: usize = 4096;
+
+fn push_output_line(rec: &mut ProcessRecord, line: String) {
+    if rec.output_lines.len() >= RING_CAPACITY {
+        rec.output_lines.pop_front();
+    }
+    rec.output_lines.push_back(line);
+}
+
+fn redact_terminal_control(text: &str) -> String {
+    strip_ansi_escapes::strip_str(text)
+}
+
+fn snapshot_output_lines(rec: &ProcessRecord) -> Vec<String> {
+    let mut lines: Vec<String> = rec
+        .output_lines
+        .iter()
+        .map(|line| redact_terminal_control(line))
+        .collect();
+    if !rec.partial_line.is_empty() {
+        lines.push(redact_terminal_control(&rec.partial_line));
+    }
+    lines
+}
 
 // ─── ProcessTable ─────────────────────────────────────────────────────
 
@@ -208,6 +245,8 @@ impl ProcessTable {
             started_at: std::time::SystemTime::now(),
             cwd: cwd.into(),
             output_lines: VecDeque::new(),
+            partial_line: String::new(),
+            carriage_return_pending: false,
             exit_code: None,
             pid: None,
             session_key: session_key.into(),
@@ -287,10 +326,51 @@ impl ProcessTable {
         if let Some(entry) = self.records.get(process_id) {
             let mut rec: tokio::sync::MutexGuard<'_, ProcessRecord> = entry.value().lock().await;
             for line in lines {
-                if rec.output_lines.len() >= RING_CAPACITY {
-                    rec.output_lines.pop_front(); // O(1) eviction
+                if rec.partial_line.is_empty() {
+                    push_output_line(&mut rec, line);
+                } else {
+                    rec.partial_line.push_str(&line);
+                    let merged = std::mem::take(&mut rec.partial_line);
+                    push_output_line(&mut rec, merged);
                 }
-                rec.output_lines.push_back(line);
+            }
+        }
+    }
+
+    /// Append a raw output chunk, preserving prompts that do not end in `\n`.
+    pub async fn append_output_chunk(&self, process_id: &str, chunk: &str) {
+        if let Some(entry) = self.records.get(process_id) {
+            let mut rec = entry.value().lock().await;
+            let mut chars = chunk.chars().peekable();
+            while let Some(ch) = chars.next() {
+                match ch {
+                    '\r' => {
+                        if matches!(chars.peek(), Some('\n')) {
+                            let line = std::mem::take(&mut rec.partial_line);
+                            push_output_line(&mut rec, line);
+                            rec.carriage_return_pending = false;
+                            let _ = chars.next();
+                        } else {
+                            rec.carriage_return_pending = true;
+                        }
+                    }
+                    '\n' => {
+                        let line = std::mem::take(&mut rec.partial_line);
+                        push_output_line(&mut rec, line);
+                        rec.carriage_return_pending = false;
+                    }
+                    _ => {
+                        if rec.carriage_return_pending {
+                            rec.partial_line.clear();
+                            rec.carriage_return_pending = false;
+                        }
+                        rec.partial_line.push(ch);
+                        if rec.partial_line.len() >= PARTIAL_LINE_FLUSH_BYTES {
+                            let line = std::mem::take(&mut rec.partial_line);
+                            push_output_line(&mut rec, line);
+                        }
+                    }
+                }
             }
         }
     }
@@ -304,11 +384,10 @@ impl ProcessTable {
         if let Some(entry) = self.records.get(process_id) {
             let mut rec = entry.value().lock().await;
             rec.output_lines.clear();
+            rec.partial_line.clear();
+            rec.carriage_return_pending = false;
             for line in lines {
-                if rec.output_lines.len() >= RING_CAPACITY {
-                    rec.output_lines.pop_front();
-                }
-                rec.output_lines.push_back(line);
+                push_output_line(&mut rec, line);
             }
         }
     }
@@ -323,6 +402,19 @@ impl ProcessTable {
         self.controls.remove(process_id);
     }
 
+    /// Mark a process as exited only if it is still running.
+    pub async fn mark_exited_if_running(&self, process_id: &str, exit_code: i32) {
+        if let Some(entry) = self.records.get(process_id) {
+            let mut rec = entry.value().lock().await;
+            if rec.status == ProcessStatus::Running {
+                rec.status = ProcessStatus::Exited;
+                rec.exit_code = Some(exit_code);
+                drop(rec);
+                self.controls.remove(process_id);
+            }
+        }
+    }
+
     /// Mark a process as killed.
     pub async fn mark_killed(&self, process_id: &str) {
         if let Some(entry) = self.records.get(process_id) {
@@ -330,6 +422,18 @@ impl ProcessTable {
             rec.status = ProcessStatus::Killed;
         }
         self.controls.remove(process_id);
+    }
+
+    /// Mark a process as killed only if it is still running.
+    pub async fn mark_killed_if_running(&self, process_id: &str) {
+        if let Some(entry) = self.records.get(process_id) {
+            let mut rec = entry.value().lock().await;
+            if rec.status == ProcessStatus::Running {
+                rec.status = ProcessStatus::Killed;
+                drop(rec);
+                self.controls.remove(process_id);
+            }
+        }
     }
 
     /// List all process records (cloned snapshots, sorted by start time desc).
@@ -347,7 +451,7 @@ impl ProcessTable {
     pub async fn get_output(&self, process_id: &str) -> Option<Vec<String>> {
         if let Some(entry) = self.records.get(process_id) {
             let rec: tokio::sync::MutexGuard<'_, ProcessRecord> = entry.value().lock().await;
-            Some(rec.output_lines.iter().cloned().collect())
+            Some(snapshot_output_lines(&rec))
         } else {
             None
         }
@@ -364,9 +468,9 @@ impl ProcessTable {
     ) -> Option<(String, ProcessStatus, Option<i32>)> {
         if let Some(entry) = self.records.get(process_id) {
             let rec = entry.value().lock().await;
-            let skip = rec.output_lines.len().saturating_sub(tail);
-            let text = rec
-                .output_lines
+            let lines = snapshot_output_lines(&rec);
+            let skip = lines.len().saturating_sub(tail);
+            let text = lines
                 .iter()
                 .skip(skip)
                 .cloned()
@@ -397,17 +501,14 @@ impl ProcessTable {
     ) -> Option<(String, usize, ProcessStatus, Option<i32>)> {
         if let Some(entry) = self.records.get(process_id) {
             let rec = entry.value().lock().await;
-            let total = rec.output_lines.len();
+            let lines = snapshot_output_lines(&rec);
+            let total = lines.len();
             let selected: Vec<&str> = if offset == 0 {
                 // Default: last `limit` lines (tail behaviour)
                 let skip = total.saturating_sub(limit);
-                rec.output_lines
-                    .iter()
-                    .skip(skip)
-                    .map(|s| s.as_str())
-                    .collect()
+                lines.iter().skip(skip).map(|s| s.as_str()).collect()
             } else {
-                rec.output_lines
+                lines
                     .iter()
                     .skip(offset)
                     .take(limit)
@@ -592,6 +693,36 @@ mod tests {
         table.append_output(&id, lines).await;
         let output = table.get_output(&id).await.expect("should exist");
         assert!(output.len() <= RING_CAPACITY, "ring buffer exceeded");
+    }
+
+    #[tokio::test]
+    async fn append_output_chunk_preserves_partial_prompt() {
+        let table = ProcessTable::new();
+        let id = table.register("python", "/tmp", "");
+        table.append_output_chunk(&id, ">>> ").await;
+        let output = table.get_output(&id).await.expect("should exist");
+        assert_eq!(output, vec![">>> "]);
+    }
+
+    #[tokio::test]
+    async fn append_output_chunk_treats_carriage_return_as_line_rewrite() {
+        let table = ProcessTable::new();
+        let id = table.register("build", "/tmp", "");
+        table.append_output_chunk(&id, "Progress 10%\r").await;
+        table.append_output_chunk(&id, "Progress 25%\r").await;
+        let output = table.get_output(&id).await.expect("should exist");
+        assert_eq!(output, vec!["Progress 25%"]);
+    }
+
+    #[tokio::test]
+    async fn get_output_strips_ansi_escape_sequences() {
+        let table = ProcessTable::new();
+        let id = table.register("color", "/tmp", "");
+        table
+            .append_output_chunk(&id, "\u{1b}[31mred\u{1b}[0m\n")
+            .await;
+        let output = table.get_output(&id).await.expect("should exist");
+        assert_eq!(output, vec!["red"]);
     }
 
     #[tokio::test]

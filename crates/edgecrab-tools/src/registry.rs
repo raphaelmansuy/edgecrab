@@ -171,6 +171,15 @@ pub trait ToolHandler: Send + Sync + 'static {
     /// Unique tool name (e.g., "read_file", "terminal")
     fn name(&self) -> &'static str;
 
+    /// Backward-compatible aliases accepted by the dispatcher.
+    ///
+    /// These aliases are not exposed to the LLM tool schema list; they exist so
+    /// renamed tools can keep accepting historical names without duplicating
+    /// implementations.
+    fn aliases(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// Toolset membership for enable/disable filtering (e.g., "file", "web")
     fn toolset(&self) -> &'static str;
 
@@ -292,6 +301,42 @@ pub struct ToolContext {
     /// so the model never loses its plan. When None (tests, minimal contexts),
     /// the todo tool falls back to stateless formatting.
     pub todo_store: Option<Arc<crate::tools::todo::TodoStore>>,
+    /// Stable identifier for the current tool invocation.
+    ///
+    /// WHY separate from `task_id`: a single conversation turn can dispatch
+    /// multiple tools in parallel. UI progress updates must target the exact
+    /// placeholder line for this invocation rather than relying on FIFO order.
+    pub current_tool_call_id: Option<String>,
+    /// Canonical tool name for the current invocation.
+    pub current_tool_name: Option<String>,
+    /// Optional channel used by tools to emit structured progress updates.
+    pub tool_progress_tx: Option<tokio::sync::mpsc::UnboundedSender<ToolProgressUpdate>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolProgressUpdate {
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolInventoryEntry {
+    pub name: String,
+    pub toolset: String,
+    pub description: String,
+    pub emoji: String,
+    pub aliases: Vec<String>,
+    pub dynamic: bool,
+    pub policy_enabled: bool,
+    pub startup_available: bool,
+    pub check_allowed: bool,
+}
+
+impl ToolInventoryEntry {
+    pub fn exposed(&self) -> bool {
+        self.policy_enabled && self.startup_available && self.check_allowed
+    }
 }
 
 /// Trait for sending messages through the gateway to external platforms.
@@ -336,7 +381,31 @@ impl ToolContext {
             origin_chat: None,
             session_key: None,
             todo_store: None,
+            current_tool_call_id: None,
+            current_tool_name: None,
+            tool_progress_tx: None,
         }
+    }
+
+    pub fn emit_progress(&self, message: impl Into<String>) {
+        let Some(tx) = &self.tool_progress_tx else {
+            return;
+        };
+        let Some(tool_call_id) = &self.current_tool_call_id else {
+            return;
+        };
+        let Some(tool_name) = &self.current_tool_name else {
+            return;
+        };
+        let message = message.into();
+        if message.trim().is_empty() {
+            return;
+        }
+        let _ = tx.send(ToolProgressUpdate {
+            tool_call_id: tool_call_id.clone(),
+            tool_name: tool_name.clone(),
+            message,
+        });
     }
 }
 
@@ -350,15 +419,19 @@ impl ToolContext {
 pub struct ToolRegistry {
     /// name → handler lookup
     tools: HashMap<&'static str, &'static dyn ToolHandler>,
+    /// alias → canonical tool name lookup
+    tool_aliases: HashMap<&'static str, &'static str>,
     /// toolset → [tool_names] for group operations
     toolset_index: HashMap<&'static str, Vec<&'static str>>,
     /// Dynamic tools registered at runtime (plugins, MCP)
     dynamic_tools: HashMap<String, Box<dyn ToolHandler>>,
+    /// alias → canonical dynamic tool name lookup
+    dynamic_tool_aliases: HashMap<String, String>,
 }
 
 impl ToolRegistry {
-    fn toolset_allowed_in_ctx(toolset: &str, ctx: &ToolContext) -> bool {
-        ctx.config.is_toolset_enabled(toolset)
+    fn tool_allowed_in_ctx(tool_name: &str, toolset: &str, ctx: &ToolContext) -> bool {
+        ctx.config.is_tool_enabled(tool_name, toolset)
     }
 
     /// Build registry from all inventory-registered tools.
@@ -367,9 +440,20 @@ impl ToolRegistry {
     /// and builds lookup indices.
     pub fn new() -> Self {
         let mut tools = HashMap::new();
+        let mut tool_aliases = HashMap::new();
         let mut toolset_index: HashMap<&str, Vec<&str>> = HashMap::new();
 
         for handler in inventory::iter::<&dyn ToolHandler> {
+            for &alias in handler.aliases() {
+                if alias == handler.name() {
+                    continue;
+                }
+                assert!(
+                    !tools.contains_key(alias) && !tool_aliases.contains_key(alias),
+                    "duplicate tool alias registered: {alias}"
+                );
+                tool_aliases.insert(alias, handler.name());
+            }
             tools.insert(handler.name(), *handler);
             toolset_index
                 .entry(handler.toolset())
@@ -379,8 +463,10 @@ impl ToolRegistry {
 
         Self {
             tools,
+            tool_aliases,
             toolset_index,
             dynamic_tools: HashMap::new(),
+            dynamic_tool_aliases: HashMap::new(),
         }
     }
 
@@ -398,24 +484,41 @@ impl ToolRegistry {
         // WHY closure: the identical 4-check predicate was previously duplicated
         // for static and dynamic tool iterators. Extracting it keeps the
         // enabled/disabled logic in a single place.
-        let is_eligible = |toolset: &str, available: bool, passes_check: bool| -> bool {
-            available
-                && passes_check
-                && Self::toolset_allowed_in_ctx(toolset, ctx)
-                && enabled.is_none_or(|sets| sets.iter().any(|s| s == toolset))
-                && disabled.is_none_or(|sets| !sets.iter().any(|s| s == toolset))
-        };
+        let is_eligible =
+            |tool_name: &str, toolset: &str, available: bool, passes_check: bool| -> bool {
+                let explicitly_enabled = ctx
+                    .config
+                    .enabled_tools
+                    .iter()
+                    .any(|candidate| candidate == tool_name);
+                let explicitly_disabled = ctx
+                    .config
+                    .disabled_tools
+                    .iter()
+                    .any(|candidate| candidate == tool_name);
+
+                if explicitly_disabled {
+                    return false;
+                }
+
+                let toolset_allowed = explicitly_enabled
+                    || (Self::tool_allowed_in_ctx(tool_name, toolset, ctx)
+                        && enabled.is_none_or(|sets| sets.iter().any(|s| s == toolset))
+                        && disabled.is_none_or(|sets| !sets.iter().any(|s| s == toolset)));
+
+                available && passes_check && toolset_allowed
+            };
 
         let static_schemas = self
             .tools
             .values()
-            .filter(|h| is_eligible(h.toolset(), h.is_available(), h.check_fn(ctx)))
+            .filter(|h| is_eligible(h.name(), h.toolset(), h.is_available(), h.check_fn(ctx)))
             .map(|h| h.schema());
 
         let dynamic_schemas = self
             .dynamic_tools
             .values()
-            .filter(|h| is_eligible(h.toolset(), h.is_available(), h.check_fn(ctx)))
+            .filter(|h| is_eligible(h.name(), h.toolset(), h.is_available(), h.check_fn(ctx)))
             .map(|h| h.schema());
 
         static_schemas.chain(dynamic_schemas).collect()
@@ -440,13 +543,14 @@ impl ToolRegistry {
         }
 
         // Check static tools first
-        if let Some(handler) = self.tools.get(name) {
-            if !Self::toolset_allowed_in_ctx(handler.toolset(), ctx) {
+        let static_name = self.tool_aliases.get(name).copied().unwrap_or(name);
+        if let Some(handler) = self.tools.get(static_name) {
+            if !Self::tool_allowed_in_ctx(handler.name(), handler.toolset(), ctx) {
                 return Err(ToolError::Unavailable {
                     tool: name.to_string(),
                     reason: format!(
-                        "toolset '{}' is disabled in this session",
-                        handler.toolset()
+                        "tool '{}' is disabled in this session policy",
+                        handler.name()
                     ),
                 });
             }
@@ -460,13 +564,18 @@ impl ToolRegistry {
         }
 
         // Check dynamic tools
-        if let Some(handler) = self.dynamic_tools.get(name) {
-            if !Self::toolset_allowed_in_ctx(handler.toolset(), ctx) {
+        let dynamic_name = self
+            .dynamic_tool_aliases
+            .get(name)
+            .map(String::as_str)
+            .unwrap_or(name);
+        if let Some(handler) = self.dynamic_tools.get(dynamic_name) {
+            if !Self::tool_allowed_in_ctx(handler.name(), handler.toolset(), ctx) {
                 return Err(ToolError::Unavailable {
                     tool: name.to_string(),
                     reason: format!(
-                        "toolset '{}' is disabled in this session",
-                        handler.toolset()
+                        "tool '{}' is disabled in this session policy",
+                        handler.name()
                     ),
                 });
             }
@@ -493,6 +602,12 @@ impl ToolRegistry {
     /// Register a dynamic tool at runtime (plugins, MCP proxies).
     pub fn register_dynamic(&mut self, handler: Box<dyn ToolHandler>) {
         let name = handler.name().to_string();
+        for &alias in handler.aliases() {
+            if alias != handler.name() {
+                self.dynamic_tool_aliases
+                    .insert(alias.to_string(), name.clone());
+            }
+        }
         self.dynamic_tools.insert(name, handler);
     }
 
@@ -519,32 +634,98 @@ impl ToolRegistry {
     /// Toolset containing a specific tool.
     pub fn toolset_for_tool(&self, name: &str) -> Option<String> {
         self.tools
-            .get(name)
+            .get(self.tool_aliases.get(name).copied().unwrap_or(name))
             .map(|h| h.toolset().to_string())
             .or_else(|| {
                 self.dynamic_tools
-                    .get(name)
+                    .get(
+                        self.dynamic_tool_aliases
+                            .get(name)
+                            .map(String::as_str)
+                            .unwrap_or(name),
+                    )
                     .map(|h| h.toolset().to_string())
             })
     }
 
     /// Summary of toolsets with tool counts.
     pub fn toolset_summary(&self) -> Vec<(String, usize)> {
-        let mut summary: Vec<(String, usize)> = self
+        let mut counts: std::collections::BTreeMap<String, usize> = self
             .toolset_index
             .iter()
             .map(|(name, tools)| (name.to_string(), tools.len()))
             .collect();
+        for handler in self.dynamic_tools.values() {
+            *counts.entry(handler.toolset().to_string()).or_default() += 1;
+        }
+        let mut summary: Vec<(String, usize)> = counts.into_iter().collect();
         summary.sort_by(|a, b| a.0.cmp(&b.0));
         summary
+    }
+
+    /// Rich tool inventory for TUI configuration and diagnostics.
+    pub fn tool_inventory(&self, ctx: &ToolContext) -> Vec<ToolInventoryEntry> {
+        let mut entries: Vec<ToolInventoryEntry> = self
+            .tools
+            .values()
+            .map(|handler| ToolInventoryEntry {
+                name: handler.name().to_string(),
+                toolset: handler.toolset().to_string(),
+                description: handler.schema().description,
+                emoji: handler.emoji().to_string(),
+                aliases: handler
+                    .aliases()
+                    .iter()
+                    .map(|alias| (*alias).to_string())
+                    .collect(),
+                dynamic: false,
+                policy_enabled: ctx
+                    .config
+                    .is_tool_enabled(handler.name(), handler.toolset()),
+                startup_available: handler.is_available(),
+                check_allowed: handler.check_fn(ctx),
+            })
+            .collect();
+
+        entries.extend(self.dynamic_tools.values().map(|handler| {
+            ToolInventoryEntry {
+                name: handler.name().to_string(),
+                toolset: handler.toolset().to_string(),
+                description: handler.schema().description,
+                emoji: handler.emoji().to_string(),
+                aliases: handler
+                    .aliases()
+                    .iter()
+                    .map(|alias| (*alias).to_string())
+                    .collect(),
+                dynamic: true,
+                policy_enabled: ctx
+                    .config
+                    .is_tool_enabled(handler.name(), handler.toolset()),
+                startup_available: handler.is_available(),
+                check_allowed: handler.check_fn(ctx),
+            }
+        }));
+
+        entries.sort_by(|left, right| left.name.cmp(&right.name));
+        entries
     }
 
     /// Check if a tool is parallel-safe
     pub fn is_parallel_safe(&self, name: &str) -> bool {
         self.tools
-            .get(name)
+            .get(self.tool_aliases.get(name).copied().unwrap_or(name))
             .map(|h| h.parallel_safe())
-            .or_else(|| self.dynamic_tools.get(name).map(|h| h.parallel_safe()))
+            .or_else(|| {
+                self.dynamic_tools
+                    .get(
+                        self.dynamic_tool_aliases
+                            .get(name)
+                            .map(String::as_str)
+                            .unwrap_or(name),
+                    )
+                    .map(|h| h.parallel_safe())
+            })
             .unwrap_or(false)
     }
 
@@ -563,12 +744,30 @@ impl ToolRegistry {
             }
         }
 
+        for (&alias, &canonical) in &self.tool_aliases {
+            let dist = strsim::levenshtein(name, alias);
+            if dist <= threshold
+                && (best.is_none() || dist < best.as_ref().map_or(usize::MAX, |b| b.1))
+            {
+                best = Some((canonical, dist));
+            }
+        }
+
         for tool_name in self.dynamic_tools.keys() {
             let dist = strsim::levenshtein(name, tool_name);
             if dist <= threshold
                 && (best.is_none() || dist < best.as_ref().map_or(usize::MAX, |b| b.1))
             {
                 best = Some((tool_name.as_str(), dist));
+            }
+        }
+
+        for (alias, canonical) in &self.dynamic_tool_aliases {
+            let dist = strsim::levenshtein(name, alias);
+            if dist <= threshold
+                && (best.is_none() || dist < best.as_ref().map_or(usize::MAX, |b| b.1))
+            {
+                best = Some((canonical.as_str(), dist));
             }
         }
 
@@ -608,6 +807,9 @@ mod tests {
     impl ToolHandler for TestTool {
         fn name(&self) -> &'static str {
             "test_tool"
+        }
+        fn aliases(&self) -> &'static [&'static str] {
+            &["legacy_test_tool"]
         }
         fn toolset(&self) -> &'static str {
             "test"
@@ -680,8 +882,10 @@ mod tests {
     fn make_registry_with_tools() -> ToolRegistry {
         let mut registry = ToolRegistry {
             tools: HashMap::new(),
+            tool_aliases: HashMap::new(),
             toolset_index: HashMap::new(),
             dynamic_tools: HashMap::new(),
+            dynamic_tool_aliases: HashMap::new(),
         };
 
         // Leak static references for test tools (only in tests)
@@ -689,6 +893,9 @@ mod tests {
         let gated_tool: &'static dyn ToolHandler = Box::leak(Box::new(GatedTool));
 
         registry.tools.insert(test_tool.name(), test_tool);
+        registry
+            .tool_aliases
+            .insert("legacy_test_tool", "test_tool");
         registry.tools.insert(gated_tool.name(), gated_tool);
         registry
             .toolset_index
@@ -740,6 +947,18 @@ mod tests {
             }
             other => panic!("Expected Unavailable, got: {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn dispatch_accepts_legacy_alias() {
+        let registry = make_registry_with_tools();
+        let ctx = ToolContext::test_context();
+
+        let result = registry
+            .dispatch("legacy_test_tool", json!({"input": "hello"}), &ctx)
+            .await;
+
+        assert_eq!(result.expect("alias dispatch"), "echo: hello");
     }
 
     #[tokio::test]
@@ -844,6 +1063,37 @@ mod tests {
     }
 
     #[test]
+    fn get_definitions_includes_explicitly_enabled_tool_from_blocked_toolset() {
+        let registry = make_registry_with_tools();
+        let mut ctx = ToolContext::test_context();
+        ctx.config.parent_active_toolsets = vec!["other".into()];
+        ctx.config.enabled_tools = vec!["test_tool".into()];
+
+        let defs = registry.get_definitions(Some(&["other".to_string()]), None, &ctx);
+        assert!(defs.iter().any(|d| d.name == "test_tool"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_rejects_explicitly_disabled_tool() {
+        let registry = make_registry_with_tools();
+        let mut ctx = ToolContext::test_context();
+        ctx.config.enabled_tools = vec!["test_tool".into()];
+        ctx.config.disabled_tools = vec!["test_tool".into()];
+
+        let err = registry
+            .dispatch("test_tool", json!({"input": "hello"}), &ctx)
+            .await
+            .expect_err("disabled tool should be blocked");
+
+        match err {
+            ToolError::Unavailable { reason, .. } => {
+                assert!(reason.contains("disabled"));
+            }
+            other => panic!("Expected Unavailable, got: {:?}", other),
+        }
+    }
+
+    #[test]
     fn tool_names_sorted() {
         let registry = make_registry_with_tools();
         let names = registry.tool_names();
@@ -856,6 +1106,7 @@ mod tests {
     fn parallel_safe_check() {
         let registry = make_registry_with_tools();
         assert!(registry.is_parallel_safe("test_tool"));
+        assert!(registry.is_parallel_safe("legacy_test_tool"));
         assert!(!registry.is_parallel_safe("gated_tool"));
         assert!(!registry.is_parallel_safe("nonexistent"));
     }
@@ -917,5 +1168,14 @@ mod tests {
 
         let test_tools = registry.tools_in_toolset("test");
         assert!(test_tools.contains(&"test_tool"));
+    }
+
+    #[test]
+    fn toolset_for_alias_resolves_to_canonical_toolset() {
+        let registry = make_registry_with_tools();
+        assert_eq!(
+            registry.toolset_for_tool("legacy_test_tool").as_deref(),
+            Some("test")
+        );
     }
 }

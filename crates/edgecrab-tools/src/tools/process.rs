@@ -21,7 +21,7 @@
 //! chatty processes.
 //!
 //! Shell startup noise (job-control warnings from `sh -lic`) is filtered
-//! from the first chunk, mirroring hermes-agent's `_clean_shell_noise()`.
+//! from the first chunk, matching prior terminal cleanup behavior.
 //!
 //! The ProcessTable lives on the Agent and is shared via `ToolContext.process_table`.
 //!
@@ -29,7 +29,7 @@
 //!
 //! Local backends use a real host subprocess with live stdout/stderr pipes and
 //! stdin injection. Non-local backends (Docker / SSH / Modal / Daytona /
-//! Singularity) mirror hermes-agent's `spawn_via_env()` model: launch the
+//! Singularity) follow the established remote-background model: launch the
 //! command under `nohup sh -lc ...`, redirect output to a sandbox log file,
 //! then poll that log and exit-code file through the active execution backend.
 
@@ -53,8 +53,8 @@ use crate::tools::backends::{BackendKind, ExecutionBackend, shell_quote};
 /// Shell startup warnings to strip from the first output line.
 ///
 /// These appear when `sh -lic` is used and the shell is not attached to a
-/// terminal.  Filtering them prevents confusing the agent.  Mirrors
-/// hermes-agent's `ProcessRegistry._SHELL_NOISE_SUBSTRINGS`.
+/// terminal. Filtering them prevents confusing the agent and matches prior
+/// background-process filtering.
 const SHELL_NOISE: &[&str] = &[
     "bash: cannot set terminal process group",
     "bash: no job control in this shell",
@@ -66,6 +66,32 @@ const SHELL_NOISE: &[&str] = &[
 /// Return true if `line` is a shell startup warning that should be dropped.
 fn is_shell_noise(line: &str) -> bool {
     SHELL_NOISE.iter().any(|noise| line.contains(noise))
+}
+
+fn format_process_listing(records: &[crate::process_table::ProcessRecord]) -> String {
+    if records.is_empty() {
+        return "No background processes running.".into();
+    }
+
+    let mut lines = vec![format!("Background processes ({}):", records.len())];
+    for rec in records {
+        let duration = rec
+            .started_at
+            .elapsed()
+            .map(|d| format!("{}s ago", d.as_secs()))
+            .unwrap_or_else(|_| "?".into());
+        let pid_str = rec.pid.map(|p| format!(" pid={}", p)).unwrap_or_default();
+        lines.push(format!(
+            "  {} [{}]{} {} — started {} in {}",
+            rec.process_id,
+            rec.status.as_str(),
+            pid_str,
+            rec.command,
+            duration,
+            rec.cwd
+        ));
+    }
+    lines.join("\n")
 }
 
 // ─── run_process ───────────────────────────────────────────────
@@ -83,6 +109,80 @@ struct RunArgs {
     command: String,
     /// Optional working directory (defaults to current directory)
     cwd: Option<String>,
+    #[serde(default)]
+    pty: bool,
+}
+
+pub(crate) async fn start_background_process(
+    tool_name: &'static str,
+    command: &str,
+    cwd_override: Option<&str>,
+    pty: bool,
+    ctx: &ToolContext,
+) -> Result<String, ToolError> {
+    // Security: scan for dangerous patterns before spawning.
+    // WHY: Background processes persist beyond a single tool call, so
+    // we must prevent agents from launching persistent malicious processes.
+    if let Some(reasons) = crate::approval_runtime::command_approval_reasons(ctx, command) {
+        crate::approval_runtime::request_command_approval(ctx, command, reasons).await?;
+    }
+
+    crate::command_interaction::guard_run_process_command(
+        command,
+        &ctx.config.terminal_backend,
+        pty,
+    )?;
+
+    let cwd = resolve_workdir(ctx, cwd_override);
+
+    let Some(ref table) = ctx.process_table else {
+        return Err(ToolError::Unavailable {
+            tool: tool_name.into(),
+            reason: "Process table not available in this context.".into(),
+        });
+    };
+
+    // Enforce the MAX_PROCESSES cap: evict oldest finished entries first.
+    table.prune_if_full().await;
+
+    // Use the session_key from context (gateway: "platform:chat_id", CLI: session_id).
+    // Enables has_active_for_session() — matches the existing session-scoped process model.
+    let session_key = ctx.session_key.clone().unwrap_or_default();
+
+    if pty && ctx.config.terminal_backend != BackendKind::Local {
+        return Err(
+            ToolError::capability_denied(
+                tool_name,
+                "pty_backend_unsupported",
+                format!(
+                    "PTY mode is only available on the local terminal backend. The active backend is {}.",
+                    ctx.config.terminal_backend
+                ),
+            )
+            .with_suggested_action(
+                "Switch to the local backend for interactive PTY commands, or run a non-PTY background command."
+                    .to_string(),
+            ),
+        );
+    }
+
+    let process_id = table.register(command.to_string(), cwd.clone(), session_key);
+
+    if ctx.config.terminal_backend == BackendKind::Local {
+        spawn_local_process(tool_name, command, &cwd, pty, table, process_id).await
+    } else {
+        let backend = get_or_create_backend(ctx).await?;
+        spawn_remote_process(
+            tool_name,
+            command,
+            &cwd,
+            table,
+            process_id,
+            &ctx.task_id,
+            backend,
+        )
+        .await
+    }
 }
 
 #[async_trait]
@@ -115,6 +215,10 @@ impl ToolHandler for RunProcessTool {
                     "cwd": {
                         "type": "string",
                         "description": "Working directory (defaults to current dir)"
+                    },
+                    "pty": {
+                        "type": "boolean",
+                        "description": "Allocate a PTY for local interactive CLI sessions. Local backend only. Full-screen terminal UIs remain unsupported."
                     }
                 },
                 "required": ["command"]
@@ -133,63 +237,61 @@ impl ToolHandler for RunProcessTool {
             message: e.to_string(),
         })?;
 
-        // Security: scan for dangerous patterns before spawning.
-        // WHY: Background processes persist beyond a single tool call, so
-        // we must prevent agents from launching persistent malicious processes.
-        if let Some(reasons) = crate::approval_runtime::command_approval_reasons(ctx, &args.command)
-        {
-            crate::approval_runtime::request_command_approval(ctx, &args.command, reasons).await?;
-        }
-
-        crate::command_interaction::guard_run_process_command(
+        start_background_process(
+            "run_process",
             &args.command,
-            &ctx.config.terminal_backend,
-        )?;
-
-        let cwd = resolve_workdir(ctx, args.cwd.as_deref());
-
-        let Some(ref table) = ctx.process_table else {
-            return Err(ToolError::Unavailable {
-                tool: "run_process".into(),
-                reason: "Process table not available in this context.".into(),
-            });
-        };
-
-        // Enforce the MAX_PROCESSES cap: evict oldest finished entries first.
-        table.prune_if_full().await;
-
-        // Use the session_key from context (gateway: "platform:chat_id", CLI: session_id).
-        // Enables has_active_for_session() — mirrors hermes-agent ProcessSession.session_key.
-        let session_key = ctx.session_key.clone().unwrap_or_default();
-
-        let process_id = table.register(args.command.clone(), cwd.clone(), session_key);
-
-        if ctx.config.terminal_backend == BackendKind::Local {
-            spawn_local_process(&args.command, &cwd, table, process_id).await
-        } else {
-            let backend = get_or_create_backend(ctx).await?;
-            spawn_remote_process(&args.command, &cwd, table, process_id, backend).await
-        }
+            args.cwd.as_deref(),
+            args.pty,
+            ctx,
+        )
+        .await
     }
 }
 
+fn remote_process_state_base(task_id: &str, process_id: &str) -> String {
+    let sanitized_task = task_id
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    format!("/tmp/edgecrab-bg-{sanitized_task}-{process_id}")
+}
+
 async fn spawn_local_process(
+    tool_name: &'static str,
     command: &str,
     cwd: &str,
+    pty: bool,
     table: &Arc<ProcessTable>,
     process_id: String,
 ) -> Result<String, ToolError> {
+    if pty {
+        return crate::local_pty::spawn_background(tool_name, command, cwd, table, process_id)
+            .await;
+    }
+
     let cwd_path = std::path::Path::new(cwd);
-    let mut cmd = TokioCommand::new("sh");
-    cmd.arg("-c")
-        .arg(command)
-        .current_dir(cwd_path)
-        .env_clear()
-        .envs(crate::tools::backends::local::safe_env())
-        .env("PYTHONUNBUFFERED", "1")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .stdin(std::process::Stdio::piped());
+    let shell_exe = crate::tools::backends::local::preferred_shell_executable();
+    let mut cmd = TokioCommand::new(&shell_exe);
+    cmd.arg(crate::tools::backends::local::shell_command_flag(
+        &shell_exe, true,
+    ))
+    .arg(command)
+    .current_dir(cwd_path)
+    .env_clear()
+    .envs(crate::tools::backends::local::safe_env())
+    .env("PYTHONUNBUFFERED", "1")
+    .env("TERM", "dumb")
+    .env("LC_ALL", "C.UTF-8")
+    .env("PATH", crate::tools::backends::local::subprocess_path())
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .stdin(std::process::Stdio::piped());
     #[cfg(unix)]
     cmd.process_group(0);
     let child_result = cmd.spawn();
@@ -199,7 +301,7 @@ async fn spawn_local_process(
         Err(e) => {
             table.mark_killed(&process_id).await;
             return Err(ToolError::ExecutionFailed {
-                tool: "run_process".into(),
+                tool: tool_name.into(),
                 message: format!("Failed to spawn process: {e}"),
             });
         }
@@ -266,13 +368,15 @@ async fn spawn_local_process(
 }
 
 async fn spawn_remote_process(
+    tool_name: &'static str,
     command: &str,
     cwd: &str,
     table: &Arc<ProcessTable>,
     process_id: String,
+    task_id: &str,
     backend: Arc<dyn ExecutionBackend>,
 ) -> Result<String, ToolError> {
-    let base = format!("/tmp/edgecrab-bg-{process_id}");
+    let base = remote_process_state_base(task_id, &process_id);
     let log_path = format!("{base}.log");
     let pid_path = format!("{base}.pid");
     let exit_path = format!("{base}.exit");
@@ -322,7 +426,7 @@ async fn spawn_remote_process(
     let Some(pid) = pid else {
         table.mark_killed(&process_id).await;
         return Err(ToolError::ExecutionFailed {
-            tool: "run_process".into(),
+            tool: tool_name.into(),
             message: format!(
                 "Failed to start background process in {} backend: {}",
                 backend.kind(),
@@ -456,7 +560,7 @@ fn normalize_output_lines(output: &str) -> Vec<String> {
 /// Tool output (compiler warnings, log lines) is inherently line-structured.
 ///
 /// Shell noise filtering: The first non-empty lines are checked against
-/// `SHELL_NOISE` and silently dropped.  This mirrors hermes-agent's
+/// `SHELL_NOISE` and silently dropped. This matches the prior
 /// `ProcessRegistry._clean_shell_noise()`.
 async fn drain_reader(
     mut reader: BufReader<impl tokio::io::AsyncRead + Unpin>,
@@ -526,29 +630,7 @@ impl ToolHandler for ListProcessesTool {
         };
 
         let records = table.list_all().await;
-        if records.is_empty() {
-            return Ok("No background processes running.".into());
-        }
-
-        let mut lines = vec![format!("Background processes ({}):", records.len())];
-        for rec in &records {
-            let duration = rec
-                .started_at
-                .elapsed()
-                .map(|d| format!("{}s ago", d.as_secs()))
-                .unwrap_or_else(|_| "?".into());
-            let pid_str = rec.pid.map(|p| format!(" pid={}", p)).unwrap_or_default();
-            lines.push(format!(
-                "  {} [{}]{} {} — started {} in {}",
-                rec.process_id,
-                rec.status.as_str(),
-                pid_str,
-                rec.command,
-                duration,
-                rec.cwd
-            ));
-        }
-        Ok(lines.join("\n"))
+        Ok(format_process_listing(&records))
     }
 }
 
@@ -628,7 +710,7 @@ inventory::submit!(&KillProcessTool as &dyn ToolHandler);
 
 // ─── get_process_output ────────────────────────────────────────
 //
-// Mirrors hermes-agent's `process(action="poll")`.
+// Matches the legacy `process(action="poll")` contract.
 // Returns the last N lines of buffered output plus status/exit code.
 
 pub struct GetProcessOutputTool;
@@ -640,7 +722,7 @@ struct GetOutputArgs {
     tail: Option<usize>,
     /// Line offset from the start of the buffer (default: 0 = last `tail` lines).
     /// When > 0, skip the first `offset` lines and return up to `tail` lines.
-    /// Mirrors hermes-agent's `process(action="log", offset=K, limit=N)`.
+    /// Matches the legacy `process(action="log", offset=K, limit=N)` contract.
     offset: Option<usize>,
 }
 
@@ -743,7 +825,7 @@ inventory::submit!(&GetProcessOutputTool as &dyn ToolHandler);
 
 // ─── wait_for_process ─────────────────────────────────────────
 //
-// Mirrors hermes-agent's `process(action="wait")`.
+// Matches the legacy `process(action="wait")` contract.
 // Blocks (with async yield) until the process exits or timeout.
 
 pub struct WaitForProcessTool;
@@ -815,7 +897,7 @@ impl ToolHandler for WaitForProcessTool {
 
         // Poll the table every 500ms until the process is no longer Running.
         //
-        // WHY tokio::select! with cancel: mirrors hermes-agent's wait() which
+        // WHY tokio::select! with cancel: matches the prior wait behavior which
         // checks _interrupt_event in its poll loop. Without this, a user Ctrl+C
         // during wait_for_process would not break out until the deadline.
         loop {
@@ -865,13 +947,94 @@ inventory::submit!(&WaitForProcessTool as &dyn ToolHandler);
 
 // ─── write_stdin ──────────────────────────────────────────────
 //
-// Mirrors hermes-agent's `process_registry.write_stdin(session_id, data)`.
+// Matches the legacy `process_registry.write_stdin(session_id, data)` contract.
 // Sends raw bytes to a running process's stdin, enabling interactive control
 // (e.g. answering prompts, sending keystrokes to a Python REPL or REPL-based CLI).
 //
 // WHY `newline` parameter: Most interactive prompts expect input terminated
 // with '\n' (like pressing Enter).  Making it explicit avoids silent
-// surprises and matches hermes-agent's `submit_stdin()` vs `write_stdin()`.
+// surprises and matches the prior `submit_stdin()` vs `write_stdin()` split.
+
+fn encode_terminal_key(key: &str) -> Option<&'static str> {
+    match key.trim().to_ascii_lowercase().as_str() {
+        "enter" | "return" => Some("\n"),
+        "tab" => Some("\t"),
+        "escape" | "esc" => Some("\u{1b}"),
+        "backspace" => Some("\u{7f}"),
+        "delete" => Some("\u{1b}[3~"),
+        "up" | "arrow_up" => Some("\u{1b}[A"),
+        "down" | "arrow_down" => Some("\u{1b}[B"),
+        "right" | "arrow_right" => Some("\u{1b}[C"),
+        "left" | "arrow_left" => Some("\u{1b}[D"),
+        "home" => Some("\u{1b}[H"),
+        "end" => Some("\u{1b}[F"),
+        "page_up" => Some("\u{1b}[5~"),
+        "page_down" => Some("\u{1b}[6~"),
+        "ctrl_c" => Some("\u{3}"),
+        "ctrl_d" => Some("\u{4}"),
+        "ctrl_z" => Some("\u{1a}"),
+        _ => None,
+    }
+}
+
+fn build_stdin_payload(
+    tool: &'static str,
+    data: Option<&str>,
+    key: Option<&str>,
+    newline: bool,
+) -> Result<String, ToolError> {
+    let mut payload = String::new();
+    if let Some(data) = data {
+        payload.push_str(data);
+    }
+    if let Some(key) = key {
+        let encoded = encode_terminal_key(key).ok_or_else(|| ToolError::InvalidArgs {
+            tool: tool.into(),
+            message: format!(
+                "Unsupported terminal key '{key}'. Supported keys: enter, tab, escape, backspace, delete, up, down, left, right, home, end, page_up, page_down, ctrl_c, ctrl_d, ctrl_z."
+            ),
+        })?;
+        payload.push_str(encoded);
+    }
+    if newline {
+        payload.push('\n');
+    }
+    if payload.is_empty() {
+        return Err(ToolError::InvalidArgs {
+            tool: tool.into(),
+            message: "At least one of 'data', 'key', or 'newline=true' is required.".into(),
+        });
+    }
+    Ok(payload)
+}
+
+async fn send_stdin_payload(
+    tool: &'static str,
+    table: &ProcessTable,
+    process_id: &str,
+    payload: String,
+) -> Result<String, ToolError> {
+    match table.get_stdin_tx(process_id).await {
+        None => Err(ToolError::NotFound(format!(
+            "No process with ID '{}' found (or stdin is not available).",
+            process_id
+        ))),
+        Some(tx) => {
+            let bytes = payload.len();
+            tx.send(payload).map_err(|_| ToolError::ExecutionFailed {
+                tool: tool.into(),
+                message: format!(
+                    "Process '{}' stdin channel closed — process may have exited.",
+                    process_id
+                ),
+            })?;
+            Ok(format!(
+                "Wrote {} bytes to stdin of process '{}'.",
+                bytes, process_id
+            ))
+        }
+    }
+}
 
 pub struct WriteStdinTool;
 
@@ -879,7 +1042,12 @@ pub struct WriteStdinTool;
 struct WriteStdinArgs {
     process_id: String,
     /// Text to send to the process stdin.
-    data: String,
+    data: Option<String>,
+    /// Optional terminal key encoded as raw bytes.
+    ///
+    /// This is a deterministic transport helper, not a screen-model feature.
+    /// It maps key names onto the exact bytes written to stdin/PTY.
+    key: Option<String>,
     /// If true, append a newline (like pressing Enter). Default: true.
     newline: Option<bool>,
 }
@@ -916,12 +1084,16 @@ impl ToolHandler for WriteStdinTool {
                         "type": "string",
                         "description": "Text to write to stdin"
                     },
+                    "key": {
+                        "type": "string",
+                        "description": "Optional special key to encode as terminal bytes: enter, tab, escape, backspace, delete, up, down, left, right, home, end, page_up, page_down, ctrl_c, ctrl_d, ctrl_z"
+                    },
                     "newline": {
                         "type": "boolean",
-                        "description": "Append a newline character (like pressing Enter). Default: true"
+                        "description": "Append a newline character (like pressing Enter). Defaults to true for plain text writes and false when a special key is supplied."
                     }
                 },
-                "required": ["process_id", "data"]
+                "required": ["process_id"]
             }),
             strict: None,
         }
@@ -945,37 +1117,224 @@ impl ToolHandler for WriteStdinTool {
             });
         };
 
-        let append_newline = args.newline.unwrap_or(true);
-        let payload = if append_newline {
-            format!("{}\n", args.data)
-        } else {
-            args.data.clone()
-        };
-
-        match table.get_stdin_tx(&args.process_id).await {
-            None => Err(ToolError::NotFound(format!(
-                "No process with ID '{}' found (or stdin is not available).",
-                args.process_id
-            ))),
-            Some(tx) => {
-                tx.send(payload).map_err(|_| ToolError::ExecutionFailed {
-                    tool: "write_stdin".into(),
-                    message: format!(
-                        "Process '{}' stdin channel closed — process may have exited.",
-                        args.process_id
-                    ),
-                })?;
-                Ok(format!(
-                    "Wrote {} bytes to stdin of process '{}'.",
-                    args.data.len() + if append_newline { 1 } else { 0 },
-                    args.process_id
-                ))
-            }
-        }
+        let append_newline = args.newline.unwrap_or(args.key.is_none());
+        let payload = build_stdin_payload(
+            "write_stdin",
+            args.data.as_deref(),
+            args.key.as_deref(),
+            append_newline,
+        )?;
+        send_stdin_payload("write_stdin", table, &args.process_id, payload).await
     }
 }
 
 inventory::submit!(&WriteStdinTool as &dyn ToolHandler);
+
+// ─── process (legacy compatibility facade) ───────────────────────────
+
+pub struct ProcessCompatTool;
+
+#[derive(Deserialize)]
+struct ProcessCompatArgs {
+    action: String,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    data: Option<String>,
+    #[serde(default)]
+    timeout: Option<u64>,
+    #[serde(default)]
+    offset: Option<usize>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[async_trait]
+impl ToolHandler for ProcessCompatTool {
+    fn name(&self) -> &'static str {
+        "process"
+    }
+
+    fn toolset(&self) -> &'static str {
+        "terminal"
+    }
+
+    fn emoji(&self) -> &'static str {
+        "🧰"
+    }
+
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: "process".into(),
+            description: "Manage background processes started with the legacy process contract. \
+                          Actions: list, poll, log, wait, kill, write, submit. \
+                          This is a compatibility facade over EdgeCrab's run_process/list_processes/\
+                          get_process_output/wait_for_process/kill_process/write_stdin tools."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["list", "poll", "log", "wait", "kill", "write", "submit"],
+                        "description": "Action to perform on background processes"
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": "Process ID from run_process. Required for all actions except list."
+                    },
+                    "data": {
+                        "type": "string",
+                        "description": "Text to send to stdin for write/submit actions"
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "description": "Timeout in seconds for wait"
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Offset for log pagination"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Line limit for poll/log"
+                    }
+                },
+                "required": ["action"]
+            }),
+            strict: None,
+        }
+    }
+
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<String, ToolError> {
+        let args: ProcessCompatArgs =
+            serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs {
+                tool: "process".into(),
+                message: e.to_string(),
+            })?;
+
+        let Some(ref table) = ctx.process_table else {
+            return Err(ToolError::Unavailable {
+                tool: "process".into(),
+                reason: "Process table not available in this context.".into(),
+            });
+        };
+
+        if args.action == "list" {
+            return Ok(format_process_listing(&table.list_all().await));
+        }
+
+        let process_id = args
+            .session_id
+            .as_deref()
+            .ok_or_else(|| ToolError::InvalidArgs {
+                tool: "process".into(),
+                message: "session_id is required for this action".into(),
+            })?;
+
+        match args.action.as_str() {
+            "poll" => {
+                let tail = args.limit.unwrap_or(100).clamp(1, 500);
+                match table.get_output_tail(process_id, tail).await {
+                    Some((output, status, exit_code)) => {
+                        let status_str = match (&status, exit_code) {
+                            (crate::process_table::ProcessStatus::Exited, Some(code)) => {
+                                format!("exited (code {})", code)
+                            }
+                            (crate::process_table::ProcessStatus::Killed, _) => "killed".into(),
+                            _ => "running".into(),
+                        };
+                        Ok(format!("[{}: {}]\n{}", process_id, status_str, output))
+                    }
+                    None => Err(ToolError::NotFound(format!(
+                        "No process with ID '{}' found.",
+                        process_id
+                    ))),
+                }
+            }
+            "log" => {
+                let offset = args.offset.unwrap_or(0);
+                let limit = args.limit.unwrap_or(200).clamp(1, 500);
+                match table.get_output_page(process_id, offset, limit).await {
+                    Some((output, total, _, _)) => Ok(format!(
+                        "[{}: showing up to {} lines from offset {} of {}]\n{}",
+                        process_id, limit, offset, total, output
+                    )),
+                    None => Err(ToolError::NotFound(format!(
+                        "No process with ID '{}' found.",
+                        process_id
+                    ))),
+                }
+            }
+            "wait" => {
+                let timeout_secs = args.timeout.unwrap_or(60).clamp(1, 3600);
+                let deadline =
+                    std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+                loop {
+                    match table.get_output_tail(process_id, 50).await {
+                        None => {
+                            return Err(ToolError::NotFound(format!(
+                                "No process with ID '{}' found.",
+                                process_id
+                            )));
+                        }
+                        Some((output, status, exit_code)) => {
+                            let is_done = status != crate::process_table::ProcessStatus::Running;
+                            if is_done {
+                                let status_str = match (&status, exit_code) {
+                                    (crate::process_table::ProcessStatus::Exited, Some(code)) => {
+                                        format!("exited (code {})", code)
+                                    }
+                                    (crate::process_table::ProcessStatus::Killed, _) => {
+                                        "killed".into()
+                                    }
+                                    _ => "done".into(),
+                                };
+                                return Ok(format!("[{}: {}]\n{}", process_id, status_str, output));
+                            }
+
+                            if std::time::Instant::now() >= deadline {
+                                return Ok(format!(
+                                    "[{}: still running after {}s]\n{}",
+                                    process_id, timeout_secs, output
+                                ));
+                            }
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+            }
+            "kill" => {
+                if table.kill(process_id).await {
+                    Ok(format!("Process '{}' has been killed.", process_id))
+                } else {
+                    Err(ToolError::NotFound(format!(
+                        "No process with ID '{}' found.",
+                        process_id
+                    )))
+                }
+            }
+            "write" | "submit" => {
+                let data = args.data.unwrap_or_default();
+                let newline = args.action == "submit";
+                let payload = build_stdin_payload("process", Some(&data), None, newline)?;
+                send_stdin_payload("process", table, process_id, payload).await
+            }
+            other => Err(ToolError::InvalidArgs {
+                tool: "process".into(),
+                message: format!(
+                    "Unknown action '{other}'. Use list, poll, log, wait, kill, write, or submit."
+                ),
+            }),
+        }
+    }
+}
+
+inventory::submit!(&ProcessCompatTool as &dyn ToolHandler);
 
 #[cfg(test)]
 mod tests {
@@ -1013,6 +1372,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn process_compat_list_shows_entries() {
+        let (ctx, table) = ctx_with_table();
+        table.register("cargo test", "/tmp", "");
+        let result = ProcessCompatTool
+            .execute(json!({"action": "list"}), &ctx)
+            .await
+            .expect("no error");
+        assert!(result.contains("cargo test"));
+        assert!(result.contains("proc-1"));
+    }
+
+    #[tokio::test]
+    async fn process_compat_submit_appends_newline() {
+        let (ctx, table) = ctx_with_table();
+        let id = table.register("python", "/tmp", "");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        table.set_stdin_tx(&id, tx).await;
+
+        ProcessCompatTool
+            .execute(
+                json!({"action": "submit", "session_id": id, "data": "print(1)"}),
+                &ctx,
+            )
+            .await
+            .expect("submit");
+
+        assert_eq!(rx.recv().await.expect("stdin payload"), "print(1)\n");
+    }
+
+    #[test]
+    fn write_stdin_key_encoding_is_deterministic() {
+        assert_eq!(encode_terminal_key("ctrl_c"), Some("\u{3}"));
+        assert_eq!(encode_terminal_key("up"), Some("\u{1b}[A"));
+        assert_eq!(encode_terminal_key("escape"), Some("\u{1b}"));
+        assert_eq!(encode_terminal_key("unknown"), None);
+    }
+
+    #[tokio::test]
+    async fn write_stdin_supports_special_keys() {
+        let (ctx, table) = ctx_with_table();
+        let id = table.register("python", "/tmp", "");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        table.set_stdin_tx(&id, tx).await;
+
+        WriteStdinTool
+            .execute(json!({"process_id": id, "key": "ctrl_c"}), &ctx)
+            .await
+            .expect("special key write");
+
+        assert_eq!(rx.recv().await.expect("stdin payload"), "\u{3}");
+    }
+
+    #[tokio::test]
+    async fn write_stdin_rejects_unknown_special_key() {
+        let (ctx, _table) = ctx_with_table();
+        let err = WriteStdinTool
+            .execute(json!({"process_id": "proc-1", "key": "hyper"}), &ctx)
+            .await
+            .expect_err("unknown key should fail");
+        let ToolError::InvalidArgs { message, .. } = err else {
+            panic!("expected invalid args");
+        };
+        assert!(message.contains("Unsupported terminal key"));
+    }
+
+    #[tokio::test]
     async fn kill_process_success() {
         let (ctx, table) = ctx_with_table();
         table.register("long_running", "/tmp", "");
@@ -1032,6 +1457,19 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[test]
+    fn remote_process_state_base_namespaces_by_task_id_and_normalizes_pathish_chars() {
+        let first = remote_process_state_base("task/one", "proc-1");
+        let second = remote_process_state_base("task:two", "proc-1");
+        let windowsish = remote_process_state_base(r"C:\Users\runner\task", "proc-1");
+
+        assert_eq!(first, "/tmp/edgecrab-bg-task_one-proc-1");
+        assert_eq!(second, "/tmp/edgecrab-bg-task_two-proc-1");
+        assert_eq!(windowsish, "/tmp/edgecrab-bg-C__Users_runner_task-proc-1");
+        assert_ne!(first, second);
+        assert_ne!(second, windowsish);
+    }
+
     #[tokio::test]
     async fn run_process_rejects_tty_ui_commands() {
         let (ctx, _table) = ctx_with_table();
@@ -1044,6 +1482,70 @@ mod tests {
         };
         assert_eq!(code, "background_interactive_terminal_unsupported");
         assert!(message.contains("interactive terminal UI"));
+    }
+
+    #[tokio::test]
+    #[ignore = "PTY stdin write round-trip is not reliable in headless CI environments — run locally with --include-ignored"]
+    async fn run_process_pty_round_trips_stdin() {
+        let (ctx, table) = ctx_with_table();
+        let result = RunProcessTool
+            .execute(
+                json!({
+                    "command": "[ -t 0 ] && printf 'tty\\n'; IFS= read -r line; printf 'got:%s\\n' \"$line\"",
+                    "pty": true
+                }),
+                &ctx,
+            )
+            .await
+            .expect("pty process");
+        assert!(result.contains("id=proc-1"), "got: {result}");
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let initial = table
+            .get_output_tail("proc-1", 10)
+            .await
+            .expect("process output");
+        assert!(initial.0.contains("tty"), "got: {}", initial.0);
+
+        WriteStdinTool
+            .execute(json!({"process_id": "proc-1", "data": "hello"}), &ctx)
+            .await
+            .expect("stdin write");
+
+        let waited = WaitForProcessTool
+            .execute(json!({"process_id": "proc-1", "timeout_secs": 5}), &ctx)
+            .await
+            .expect("wait");
+        assert!(waited.contains("got:hello"), "got: {waited}");
+    }
+
+    #[tokio::test]
+    async fn run_process_pty_rejects_remote_backend() {
+        let (mut ctx, _table) = ctx_with_table();
+        ctx.config.terminal_backend = BackendKind::Modal;
+
+        let err = RunProcessTool
+            .execute(json!({"command": "printf ok", "pty": true}), &ctx)
+            .await
+            .expect_err("remote PTY should fail");
+        let ToolError::CapabilityDenied { code, message, .. } = err else {
+            panic!("expected capability denied");
+        };
+        assert_eq!(code, "pty_backend_unsupported");
+        assert!(message.contains("local terminal backend"));
+    }
+
+    #[tokio::test]
+    async fn run_process_pty_still_blocks_fullscreen_ui() {
+        let (ctx, _table) = ctx_with_table();
+        let err = RunProcessTool
+            .execute(json!({"command": "top", "pty": true}), &ctx)
+            .await
+            .expect_err("fullscreen UI should fail");
+        let ToolError::CapabilityDenied { code, .. } = err else {
+            panic!("expected capability denied");
+        };
+        assert_eq!(code, "background_terminal_observation_unsupported");
     }
 
     #[tokio::test]

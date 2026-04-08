@@ -39,10 +39,60 @@ pub struct TodoItem {
 #[derive(Deserialize)]
 struct Args {
     /// Full todo list to write. Omit to read the current list.
+    #[serde(default)]
     items: Option<Vec<TodoItem>>,
+    /// Hermes-compatible todo payload shape.
+    #[serde(default)]
+    todos: Option<Vec<HermesTodoItem>>,
     /// true → update existing items by id, append new ones.
     /// false (default) → replace the entire list.
+    #[serde(default)]
     merge: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct HermesTodoItem {
+    id: String,
+    content: String,
+    status: String,
+}
+
+fn status_from_hermes(status: &str) -> &str {
+    match status {
+        "pending" => "not-started",
+        "in_progress" => "in-progress",
+        "completed" => "completed",
+        "cancelled" => "cancelled",
+        _ => "not-started",
+    }
+}
+
+fn stable_todo_id(raw: &str) -> u32 {
+    if let Ok(parsed) = raw.parse::<u32>() {
+        return parsed;
+    }
+
+    let mut hash: u32 = 2166136261;
+    for byte in raw.as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(16777619);
+    }
+    hash.max(1)
+}
+
+fn normalize_items(args: &Args) -> Option<Vec<TodoItem>> {
+    args.items.clone().or_else(|| {
+        args.todos.as_ref().map(|todos| {
+            todos
+                .iter()
+                .map(|item| TodoItem {
+                    id: stable_todo_id(&item.id),
+                    title: item.content.clone(),
+                    status: status_from_hermes(&item.status).to_string(),
+                })
+                .collect()
+        })
+    })
 }
 
 // ─── TodoStore ────────────────────────────────────────────────────────
@@ -145,6 +195,10 @@ impl ToolHandler for TodoTool {
         "manage_todo_list"
     }
 
+    fn aliases(&self) -> &'static [&'static str] {
+        &["todo"]
+    }
+
     fn toolset(&self) -> &'static str {
         "meta"
     }
@@ -165,6 +219,8 @@ impl ToolHandler for TodoTool {
                           - merge=true: update existing items by id, add any new ones\n\n\
                           Each item: {id: integer, title: string, \
                           status: not-started|in-progress|completed|cancelled}\n\
+                          Hermes-compatible calls using `todo` with `todos`, `content`, and \
+                          pending|in_progress statuses are also accepted.\n\
                           Only ONE item in-progress at a time. \
                           Mark items completed immediately when done.\n\n\
                           Always returns the full current list."
@@ -209,10 +265,11 @@ impl ToolHandler for TodoTool {
             tool: "manage_todo_list".into(),
             message: e.to_string(),
         })?;
+        let normalized_items = normalize_items(&args);
 
         if let Some(store) = &ctx.todo_store {
             // ── Stateful path: use per-session TodoStore ──────────────────
-            if let Some(mut raw_items) = args.items {
+            if let Some(mut raw_items) = normalized_items {
                 // Normalize statuses before writing.
                 for item in &mut raw_items {
                     normalize_status(item);
@@ -228,7 +285,7 @@ impl ToolHandler for TodoTool {
             format_response(items)
         } else {
             // ── Stateless fallback (tests, minimal contexts without a store) ──
-            let raw_items = args.items.unwrap_or_default();
+            let raw_items = normalized_items.unwrap_or_default();
             let items: Vec<TodoItem> = raw_items
                 .into_iter()
                 .map(|mut i| {
@@ -344,6 +401,24 @@ mod tests {
         assert_eq!(items[0].status, "completed", "Task A should be updated");
         assert_eq!(items[1].status, "not-started", "Task B unchanged");
         assert_eq!(items[2].title, "Task C", "Task C appended");
+    }
+
+    #[test]
+    fn normalize_items_accepts_hermes_shape() {
+        let args = Args {
+            items: None,
+            todos: Some(vec![HermesTodoItem {
+                id: "plan-step-1".into(),
+                content: "Inspect the bug".into(),
+                status: "in_progress".into(),
+            }]),
+            merge: Some(true),
+        };
+        let items = normalize_items(&args).expect("compat items");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].title, "Inspect the bug");
+        assert_eq!(items[0].status, "in-progress");
+        assert_ne!(items[0].id, 0);
     }
 
     #[test]

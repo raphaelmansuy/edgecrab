@@ -367,6 +367,21 @@ pub enum McpCommand {
         /// Configured MCP server name; omit to test all configured servers
         name: Option<String>,
     },
+    /// Diagnose configured MCP servers with static checks and live probe output
+    Doctor {
+        /// Configured MCP server name; omit to diagnose all configured servers
+        name: Option<String>,
+    },
+    /// Explain the active MCP authentication/OAuth path for one configured server
+    Auth {
+        /// Configured MCP server name
+        name: String,
+    },
+    /// Perform an interactive OAuth login for one configured HTTP MCP server
+    Login {
+        /// Configured MCP server name
+        name: String,
+    },
     /// Add or update an MCP server
     Add {
         name: String,
@@ -627,6 +642,11 @@ pub enum SkillsCommand {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Update one or all hub-installed remote skills to the latest version
+    Update {
+        /// Skill name to update; omit to update all hub-installed skills
+        name: Option<String>,
+    },
     /// Remove an installed skill
     Remove {
         /// Skill name to remove
@@ -847,6 +867,39 @@ mod tests {
     }
 
     #[test]
+    fn parse_mcp_doctor_subcommand() {
+        let args = CliArgs::parse_from(["edgecrab", "mcp", "doctor", "github"]);
+        assert!(matches!(
+            args.command,
+            Some(Command::Mcp {
+                command: McpCommand::Doctor { .. }
+            })
+        ));
+    }
+
+    #[test]
+    fn parse_mcp_auth_subcommand() {
+        let args = CliArgs::parse_from(["edgecrab", "mcp", "auth", "github"]);
+        assert!(matches!(
+            args.command,
+            Some(Command::Mcp {
+                command: McpCommand::Auth { .. }
+            })
+        ));
+    }
+
+    #[test]
+    fn parse_mcp_login_subcommand() {
+        let args = CliArgs::parse_from(["edgecrab", "mcp", "login", "github"]);
+        assert!(matches!(
+            args.command,
+            Some(Command::Mcp {
+                command: McpCommand::Login { .. }
+            })
+        ));
+    }
+
+    #[test]
     fn parse_plugins_list_subcommand() {
         let args = CliArgs::parse_from(["edgecrab", "plugins", "list"]);
         assert!(matches!(
@@ -955,6 +1008,17 @@ mod tests {
             args.command,
             Some(Command::Skills {
                 command: SkillsCommand::Remove { .. }
+            })
+        ));
+    }
+
+    #[test]
+    fn parse_skills_update_subcommand() {
+        let args = CliArgs::parse_from(["edgecrab", "skills", "update", "remote_skill"]);
+        assert!(matches!(
+            args.command,
+            Some(Command::Skills {
+                command: SkillsCommand::Update { .. }
             })
         ));
     }

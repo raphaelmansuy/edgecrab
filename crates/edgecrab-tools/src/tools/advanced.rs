@@ -269,6 +269,9 @@ impl ToolHandler for GenerateImageTool {
     fn name(&self) -> &'static str {
         "generate_image"
     }
+    fn aliases(&self) -> &'static [&'static str] {
+        &["image_generate"]
+    }
     fn toolset(&self) -> &'static str {
         "media"
     }

@@ -41,6 +41,66 @@ struct CachedOfficialCatalog {
     entries: Vec<OfficialCatalogEntry>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpSearchSourceInfo {
+    pub id: String,
+    pub label: String,
+    pub origin: String,
+    pub trust_level: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum McpInstallPlan {
+    Preset {
+        preset_id: String,
+    },
+    Http {
+        url: String,
+        transport: String,
+        required_headers: Vec<String>,
+    },
+    Stdio {
+        command: String,
+        args: Vec<String>,
+        required_env: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpSearchEntry {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub source: String,
+    pub origin: String,
+    pub homepage: Option<String>,
+    pub tags: Vec<String>,
+    pub transport: Option<String>,
+    pub install: Option<McpInstallPlan>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpSearchGroup {
+    pub source: McpSearchSourceInfo,
+    #[serde(default)]
+    pub results: Vec<McpSearchEntry>,
+    #[serde(default)]
+    pub notice: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpSearchReport {
+    #[serde(default)]
+    pub groups: Vec<McpSearchGroup>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledSearchEntry {
+    pub name: String,
+    pub warnings: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OfficialCatalogSection {
     None,
@@ -65,6 +125,7 @@ const OFFICIAL_MCP_README_URL: &str =
 const OFFICIAL_CATALOG_MAX_AGE_SECS: u64 = 24 * 60 * 60;
 const OFFICIAL_MCP_REPO_BASE_URL: &str =
     "https://github.com/modelcontextprotocol/servers/tree/main/";
+const MCP_REGISTRY_BASE_URL: &str = "https://registry.modelcontextprotocol.io";
 
 const PRESETS: &[McpPreset] = &[
     McpPreset {
@@ -531,6 +592,375 @@ pub fn load_official_catalog_cached() -> Vec<OfficialCatalogEntry> {
         .unwrap_or_else(official_snapshot_entries)
 }
 
+#[derive(Debug, Deserialize)]
+struct RegistryResponse {
+    #[serde(default)]
+    servers: Vec<RegistryServerEnvelope>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RegistryServerEnvelope {
+    server: RegistryServer,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RegistryServer {
+    name: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    website_url: Option<String>,
+    #[serde(default)]
+    repository: Option<RegistryRepository>,
+    #[serde(default)]
+    remotes: Vec<RegistryRemote>,
+    #[serde(default)]
+    packages: Vec<RegistryPackage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RegistryRepository {
+    #[serde(default)]
+    url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RegistryRemote {
+    #[serde(rename = "type")]
+    transport_type: String,
+    url: String,
+    #[serde(default)]
+    headers: Vec<RegistryHeaderRequirement>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RegistryHeaderRequirement {
+    name: String,
+    #[serde(default)]
+    is_required: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RegistryPackage {
+    registry_type: String,
+    identifier: String,
+    #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
+    transport: Option<RegistryPackageTransport>,
+    #[serde(default)]
+    environment_variables: Vec<RegistryEnvironmentVariable>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RegistryPackageTransport {
+    #[serde(rename = "type")]
+    kind: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RegistryEnvironmentVariable {
+    name: String,
+    #[serde(default)]
+    is_required: bool,
+}
+
+fn official_search_source(id: &str, label: &str, origin: &str) -> McpSearchSourceInfo {
+    McpSearchSourceInfo {
+        id: id.to_string(),
+        label: label.to_string(),
+        origin: origin.to_string(),
+        trust_level: "official".into(),
+    }
+}
+
+fn entry_matches_source(entry: &OfficialCatalogEntry, tag: &str) -> bool {
+    entry.tags.iter().any(|entry_tag| entry_tag == tag)
+}
+
+fn official_entry_to_search_entry(entry: OfficialCatalogEntry) -> McpSearchEntry {
+    let install = entry
+        .installable_preset_id
+        .clone()
+        .map(|preset_id| McpInstallPlan::Preset { preset_id });
+    McpSearchEntry {
+        id: entry.id,
+        name: entry.display_name,
+        description: entry.description,
+        source: "official-catalog".into(),
+        origin: entry.source_url.clone(),
+        homepage: Some(entry.homepage),
+        tags: entry.tags,
+        transport: None,
+        install,
+    }
+}
+
+fn registry_origin(server: &RegistryServer) -> String {
+    server
+        .website_url
+        .clone()
+        .or_else(|| server.repository.as_ref().and_then(|repo| repo.url.clone()))
+        .unwrap_or_else(|| format!("{MCP_REGISTRY_BASE_URL}/?q={}", server.name))
+}
+
+fn registry_package_install_plan(package: &RegistryPackage) -> Option<McpInstallPlan> {
+    if package.transport.as_ref().map(|t| t.kind.as_str()) != Some("stdio") {
+        return None;
+    }
+
+    let required_env = package
+        .environment_variables
+        .iter()
+        .filter(|env| env.is_required)
+        .map(|env| env.name.clone())
+        .collect::<Vec<_>>();
+
+    match package.registry_type.as_str() {
+        "npm" => {
+            let identifier = if let Some(version) = &package.version {
+                format!("{}@{version}", package.identifier)
+            } else {
+                package.identifier.clone()
+            };
+            Some(McpInstallPlan::Stdio {
+                command: "npx".into(),
+                args: vec!["-y".into(), identifier],
+                required_env,
+            })
+        }
+        "pypi" => {
+            let identifier = if let Some(version) = &package.version {
+                format!("{}=={version}", package.identifier)
+            } else {
+                package.identifier.clone()
+            };
+            Some(McpInstallPlan::Stdio {
+                command: "uvx".into(),
+                args: vec![identifier],
+                required_env,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn registry_remote_install_plan(remote: &RegistryRemote) -> Option<McpInstallPlan> {
+    if remote.transport_type != "streamable-http" {
+        return None;
+    }
+
+    Some(McpInstallPlan::Http {
+        url: remote.url.clone(),
+        transport: remote.transport_type.clone(),
+        required_headers: remote
+            .headers
+            .iter()
+            .filter(|header| header.is_required)
+            .map(|header| header.name.clone())
+            .collect(),
+    })
+}
+
+fn registry_server_to_search_entry(server: RegistryServer) -> McpSearchEntry {
+    let origin = registry_origin(&server);
+    let install = server
+        .remotes
+        .iter()
+        .find_map(registry_remote_install_plan)
+        .or_else(|| {
+            server
+                .packages
+                .iter()
+                .find_map(registry_package_install_plan)
+        });
+    let transport = server
+        .remotes
+        .first()
+        .map(|remote| remote.transport_type.clone())
+        .or_else(|| {
+            server.packages.first().and_then(|pkg| {
+                pkg.transport
+                    .as_ref()
+                    .map(|transport| transport.kind.clone())
+            })
+        });
+    let mut tags = vec!["official".into(), "registry".into()];
+    if let Some(transport) = &transport {
+        tags.push(transport.clone());
+    }
+    if install.is_none() {
+        tags.push("view-only".into());
+    }
+    McpSearchEntry {
+        id: server.name.clone(),
+        name: server.title.clone().unwrap_or_else(|| server.name.clone()),
+        description: server
+            .description
+            .unwrap_or_else(|| "No description available.".into()),
+        source: "mcp-registry".into(),
+        origin,
+        homepage: server.website_url.clone(),
+        tags,
+        transport,
+        install,
+    }
+}
+
+async fn search_registry(query: Option<&str>, limit: usize) -> anyhow::Result<Vec<McpSearchEntry>> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(12))
+        .user_agent("edgecrab/mcp-registry-search")
+        .build()?;
+    let mut request = client
+        .get(format!("{MCP_REGISTRY_BASE_URL}/v0.1/servers"))
+        .query(&[
+            ("limit", limit.to_string()),
+            ("version", "latest".to_string()),
+        ]);
+    if let Some(query) = query.map(str::trim).filter(|query| !query.is_empty()) {
+        request = request.query(&[("search", query.to_string())]);
+    }
+    let response = request.send().await?.error_for_status()?;
+    let payload: RegistryResponse = response.json().await?;
+    Ok(payload
+        .servers
+        .into_iter()
+        .map(|entry| registry_server_to_search_entry(entry.server))
+        .collect())
+}
+
+pub async fn search_mcp_sources(query: Option<&str>, per_source_limit: usize) -> McpSearchReport {
+    let (official_entries, registry_results) = tokio::join!(
+        load_official_catalog(true),
+        search_registry(query, per_source_limit)
+    );
+
+    let filtered_official = search_entries(official_entries, query);
+    let mut groups = Vec::new();
+
+    let reference_results = filtered_official
+        .iter()
+        .filter(|entry| entry_matches_source(entry, "reference"))
+        .cloned()
+        .map(official_entry_to_search_entry)
+        .take(per_source_limit)
+        .collect::<Vec<_>>();
+    groups.push(McpSearchGroup {
+        source: official_search_source("mcp-reference", "MCP Reference", OFFICIAL_MCP_README_URL),
+        results: reference_results,
+        notice: None,
+    });
+
+    let integration_results = filtered_official
+        .iter()
+        .filter(|entry| entry_matches_source(entry, "integration"))
+        .cloned()
+        .map(official_entry_to_search_entry)
+        .take(per_source_limit)
+        .collect::<Vec<_>>();
+    groups.push(McpSearchGroup {
+        source: official_search_source(
+            "mcp-integrations",
+            "Official Apps",
+            OFFICIAL_MCP_README_URL,
+        ),
+        results: integration_results,
+        notice: None,
+    });
+
+    let archived_results = filtered_official
+        .iter()
+        .filter(|entry| entry_matches_source(entry, "archived"))
+        .cloned()
+        .map(official_entry_to_search_entry)
+        .take(per_source_limit)
+        .collect::<Vec<_>>();
+    groups.push(McpSearchGroup {
+        source: official_search_source(
+            "mcp-archived",
+            "Archived",
+            OFFICIAL_MCP_README_URL,
+        ),
+        results: archived_results,
+        notice: Some(
+            "Archived upstream entries are shown for discovery but should be treated as compatibility-only.".into(),
+        ),
+    });
+
+    match registry_results {
+        Ok(results) => groups.push(McpSearchGroup {
+            source: official_search_source(
+                "mcp-registry",
+                "MCP Registry",
+                MCP_REGISTRY_BASE_URL,
+            ),
+            results,
+            notice: Some(
+                "Registry results are live official listings. EdgeCrab only auto-installs streamable HTTP, npm stdio, and PyPI stdio entries.".into(),
+            ),
+        }),
+        Err(err) => groups.push(McpSearchGroup {
+            source: official_search_source(
+                "mcp-registry",
+                "MCP Registry",
+                MCP_REGISTRY_BASE_URL,
+            ),
+            results: Vec::new(),
+            notice: Some(format!("Registry search failed: {err}")),
+        }),
+    }
+
+    McpSearchReport { groups }
+}
+
+pub fn render_search_report(query: Option<&str>, report: &McpSearchReport) -> String {
+    let mut lines = vec![match query.map(str::trim).filter(|q| !q.is_empty()) {
+        Some(query) => format!("Official MCP search for '{query}'"),
+        None => "Official MCP search".into(),
+    }];
+
+    for group in &report.groups {
+        lines.push(String::new());
+        lines.push(format!(
+            "{} [{}]",
+            group.source.label, group.source.trust_level
+        ));
+        if group.results.is_empty() {
+            lines.push("  (no matches)".into());
+        } else {
+            for entry in &group.results {
+                let install = match &entry.install {
+                    Some(McpInstallPlan::Preset { preset_id }) => format!("install={preset_id}"),
+                    Some(McpInstallPlan::Http { transport, .. }) => {
+                        format!("install=http:{transport}")
+                    }
+                    Some(McpInstallPlan::Stdio { command, .. }) => {
+                        format!("install=stdio:{command}")
+                    }
+                    None => "install=view-only".into(),
+                };
+                lines.push(format!(
+                    "  {} — {} [{}] {}",
+                    entry.id,
+                    entry.description,
+                    entry.tags.join(", "),
+                    install,
+                ));
+            }
+        }
+        if let Some(notice) = &group.notice {
+            lines.push(format!("  note: {notice}"));
+        }
+    }
+
+    lines.join("\n")
+}
+
 pub async fn load_official_catalog(prefer_refresh: bool) -> Vec<OfficialCatalogEntry> {
     let cache = read_cached_official_catalog();
     if !prefer_refresh {
@@ -554,12 +984,6 @@ pub async fn load_official_catalog(prefer_refresh: bool) -> Vec<OfficialCatalogE
 #[cfg(test)]
 pub fn search_official_catalog(query: Option<&str>) -> Vec<OfficialCatalogEntry> {
     search_entries(load_official_catalog_cached(), query)
-}
-
-pub async fn search_official_catalog_with_refresh(
-    query: Option<&str>,
-) -> Vec<OfficialCatalogEntry> {
-    search_entries(load_official_catalog(true).await, query)
 }
 
 pub async fn find_official_catalog_entry_with_refresh(id: &str) -> Option<OfficialCatalogEntry> {
@@ -586,6 +1010,7 @@ pub async fn refresh_official_catalog() -> anyhow::Result<Vec<OfficialCatalogEnt
 }
 
 pub fn render_official_catalog_entry(entry: &OfficialCatalogEntry) -> String {
+    let preset = entry.installable_preset_id.as_deref().and_then(find_preset);
     let mut lines = vec![
         format!("Catalog: {}", entry.id),
         format!("Name:    {}", entry.display_name),
@@ -594,12 +1019,104 @@ pub fn render_official_catalog_entry(entry: &OfficialCatalogEntry) -> String {
         format!("Docs:    {}", entry.homepage),
         format!("Tags:    {}", entry.tags.join(", ")),
     ];
-    if let Some(installable) = &entry.installable_preset_id {
-        lines.push(format!("Install: /mcp install {installable}"));
-    } else {
-        lines.push("Install: not available as a controlled preset yet".into());
+    match (&entry.installable_preset_id, preset) {
+        (Some(installable), Some(preset)) => {
+            lines.push(format!("Install: /mcp install {installable}"));
+            lines.push(format!("Preset:  {}", preset.display_name));
+            lines.push(format!("Pkg:     {}", preset.package_name));
+            lines.push(format!(
+                "Cmd:     {} {}",
+                preset.command,
+                preset.args.join(" ")
+            ));
+            if !preset.required_env.is_empty() {
+                lines.push(format!("Env:     {}", preset.required_env.join(", ")));
+            }
+            lines.push(format!("Notes:   {}", preset.notes));
+        }
+        (Some(installable), None) => {
+            lines.push(format!("Install: /mcp install {installable}"));
+            lines.push(
+                "Preset:  installable catalog entry, but no bundled preset metadata was found"
+                    .into(),
+            );
+        }
+        (None, _) => {
+            lines.push("Install: not available as a controlled preset yet".into());
+        }
     }
     lines.join("\n")
+}
+
+pub fn render_preset_detail(preset: &McpPreset) -> String {
+    let mut lines = vec![
+        format!("Preset: {}", preset.id),
+        format!("Name:   {}", preset.display_name),
+        format!("Why:    {}", preset.description),
+        format!("Pkg:    {}", preset.package_name),
+        format!("Source: {}", preset.source_url),
+        format!("Docs:   {}", preset.homepage),
+        format!("Cmd:    {} {}", preset.command, preset.args.join(" ")),
+        format!("Tags:   {}", preset.tags.join(", ")),
+    ];
+    if !preset.required_env.is_empty() {
+        lines.push(format!("Env:    {}", preset.required_env.join(", ")));
+    }
+    lines.push(format!("Notes:  {}", preset.notes));
+    lines.join("\n")
+}
+
+#[cfg(test)]
+mod render_tests {
+    use super::*;
+
+    #[test]
+    fn render_official_catalog_entry_includes_install_plan_metadata() {
+        let rendered = render_official_catalog_entry(&OfficialCatalogEntry {
+            id: "github".into(),
+            display_name: "GitHub".into(),
+            description: "Official GitHub server.".into(),
+            source_url: "https://github.com/github/github-mcp-server".into(),
+            homepage: "https://modelcontextprotocol.io".into(),
+            tags: vec!["official".into(), "integration".into()],
+            installable_preset_id: Some("github".into()),
+        });
+
+        assert!(rendered.contains("Install: /mcp install github"));
+        assert!(rendered.contains("Pkg:     @modelcontextprotocol/server-github"));
+        assert!(rendered.contains("Cmd:     npx -y @modelcontextprotocol/server-github"));
+        assert!(rendered.contains("Env:     GITHUB_PERSONAL_ACCESS_TOKEN, GITHUB_TOKEN"));
+    }
+
+    #[test]
+    fn render_preset_detail_includes_notes_and_command() {
+        let preset = find_preset("time").expect("time preset");
+        let rendered = render_preset_detail(preset);
+
+        assert!(rendered.contains("Preset: time"));
+        assert!(rendered.contains("Cmd:    uvx mcp-server-time"));
+        assert!(rendered.contains("Notes:"));
+    }
+}
+
+#[cfg(test)]
+mod detail_render_tests {
+    use super::*;
+
+    #[test]
+    fn render_official_catalog_entry_without_install_plan_mentions_catalog_only_state() {
+        let rendered = render_official_catalog_entry(&OfficialCatalogEntry {
+            id: "custom-http".into(),
+            display_name: "Custom HTTP".into(),
+            description: "HTTP-only catalog entry.".into(),
+            source_url: "https://example.com/custom-http".into(),
+            homepage: "https://example.com/docs".into(),
+            tags: vec!["community".into()],
+            installable_preset_id: None,
+        });
+
+        assert!(rendered.contains("Install: not available as a controlled preset yet"));
+    }
 }
 
 pub fn install_preset(
@@ -658,6 +1175,109 @@ pub fn install_preset(
         .collect();
 
     Ok(InstalledPreset { name, missing_env })
+}
+
+fn preferred_search_entry_name(entry: &McpSearchEntry) -> String {
+    let candidate = if let Some(McpInstallPlan::Preset { preset_id }) = &entry.install {
+        preset_id.clone()
+    } else if !entry.id.trim().is_empty() {
+        entry
+            .id
+            .split('/')
+            .next_back()
+            .map(slugify_name)
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| slugify_name(&entry.name))
+    } else {
+        slugify_name(&entry.name)
+    };
+    if candidate.is_empty() {
+        "mcp-server".into()
+    } else {
+        candidate
+    }
+}
+
+fn allocate_server_name(config: &AppConfig, preferred: &str) -> String {
+    if !config.mcp_servers.contains_key(preferred) {
+        return preferred.to_string();
+    }
+
+    for idx in 2..1000 {
+        let candidate = format!("{preferred}-{idx}");
+        if !config.mcp_servers.contains_key(&candidate) {
+            return candidate;
+        }
+    }
+
+    format!("{preferred}-{}", current_epoch_secs())
+}
+
+pub fn install_search_entry(
+    config: &mut AppConfig,
+    entry: &McpSearchEntry,
+    cwd: &Path,
+) -> anyhow::Result<InstalledSearchEntry> {
+    match &entry.install {
+        Some(McpInstallPlan::Preset { preset_id }) => {
+            let installed = install_preset(config, preset_id, None, None, cwd)?;
+            Ok(InstalledSearchEntry {
+                name: installed.name,
+                warnings: installed.missing_env,
+            })
+        }
+        Some(McpInstallPlan::Http {
+            url,
+            required_headers,
+            ..
+        }) => {
+            let preferred = preferred_search_entry_name(entry);
+            let name = allocate_server_name(config, &preferred);
+            config.mcp_servers.insert(
+                name.clone(),
+                McpServerConfig {
+                    url: Some(url.clone()),
+                    enabled: true,
+                    ..Default::default()
+                },
+            );
+            let warnings = if required_headers.is_empty() {
+                Vec::new()
+            } else {
+                vec![format!(
+                    "Required auth/config headers still need manual setup: {}",
+                    required_headers.join(", ")
+                )]
+            };
+            Ok(InstalledSearchEntry { name, warnings })
+        }
+        Some(McpInstallPlan::Stdio {
+            command,
+            args,
+            required_env,
+        }) => {
+            let preferred = preferred_search_entry_name(entry);
+            let name = allocate_server_name(config, &preferred);
+            config.mcp_servers.insert(
+                name.clone(),
+                McpServerConfig {
+                    command: command.clone(),
+                    args: args.clone(),
+                    cwd: Some(normalize_install_path(cwd)),
+                    enabled: true,
+                    ..Default::default()
+                },
+            );
+            Ok(InstalledSearchEntry {
+                name,
+                warnings: required_env.clone(),
+            })
+        }
+        None => anyhow::bail!(
+            "'{}' is view-only and cannot be installed automatically",
+            entry.id
+        ),
+    }
 }
 
 fn render_arg(arg: &str, resolved_path: Option<&Path>) -> String {
@@ -832,6 +1452,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(edgecrab_home_env)]
     fn cached_catalog_falls_back_to_snapshot() {
         let _home = TempEdgecrabHome::new();
         let entries = load_official_catalog_cached();
@@ -839,6 +1460,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(edgecrab_home_env)]
     fn search_official_catalog_matches_official_entry_metadata() {
         let _home = TempEdgecrabHome::new();
         write_cached_official_catalog(&[OfficialCatalogEntry {
@@ -855,5 +1477,71 @@ mod tests {
         let results = search_official_catalog(Some("brave search archived"));
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "brave-search-archived");
+    }
+
+    #[test]
+    fn registry_server_http_entries_become_installable_http_results() {
+        let entry = registry_server_to_search_entry(RegistryServer {
+            name: "acme/http".into(),
+            title: Some("Acme HTTP".into()),
+            description: Some("Remote HTTP MCP".into()),
+            website_url: Some("https://acme.test/mcp".into()),
+            repository: None,
+            remotes: vec![RegistryRemote {
+                transport_type: "streamable-http".into(),
+                url: "https://acme.test/mcp".into(),
+                headers: vec![RegistryHeaderRequirement {
+                    name: "Authorization".into(),
+                    is_required: true,
+                }],
+            }],
+            packages: Vec::new(),
+        });
+
+        assert_eq!(entry.id, "acme/http");
+        assert_eq!(entry.transport.as_deref(), Some("streamable-http"));
+        assert!(matches!(entry.install, Some(McpInstallPlan::Http { .. })));
+    }
+
+    #[test]
+    fn install_search_entry_allocates_unique_name_for_registry_http_entry() {
+        let mut config = AppConfig::default();
+        config.mcp_servers.insert(
+            "docs-mcp".into(),
+            McpServerConfig {
+                command: "npx".into(),
+                ..Default::default()
+            },
+        );
+
+        let installed = install_search_entry(
+            &mut config,
+            &McpSearchEntry {
+                id: "ac.tandem/docs-mcp".into(),
+                name: "Docs MCP".into(),
+                description: "Docs".into(),
+                source: "mcp-registry".into(),
+                origin: "https://tandem.ac/mcp".into(),
+                homepage: None,
+                tags: vec!["official".into(), "registry".into()],
+                transport: Some("streamable-http".into()),
+                install: Some(McpInstallPlan::Http {
+                    url: "https://tandem.ac/mcp".into(),
+                    transport: "streamable-http".into(),
+                    required_headers: vec!["Authorization".into()],
+                }),
+            },
+            Path::new("."),
+        )
+        .expect("install");
+
+        assert_eq!(installed.name, "docs-mcp-2");
+        assert!(
+            config
+                .mcp_servers
+                .get("docs-mcp-2")
+                .and_then(|server| server.url.as_deref())
+                .is_some_and(|url| url == "https://tandem.ac/mcp")
+        );
     }
 }

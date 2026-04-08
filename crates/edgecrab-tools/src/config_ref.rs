@@ -4,6 +4,7 @@
 //! can't depend on edgecrab-core (that would create a cycle). Instead,
 //! we define a minimal config view here that edgecrab-core populates.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::execution_tmp::shared_tmp_dir;
@@ -38,6 +39,18 @@ pub fn resolve_edgecrab_home() -> PathBuf {
 ///
 /// Populated from AppConfig by the agent before tool dispatch.
 /// Only includes fields that tools actually need.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+#[serde(default)]
+pub struct LspServerConfigRef {
+    pub command: String,
+    pub args: Vec<String>,
+    pub file_extensions: Vec<String>,
+    pub language_id: String,
+    pub root_markers: Vec<String>,
+    pub env: HashMap<String, String>,
+    pub initialization_options: Option<serde_json::Value>,
+}
+
 #[derive(Debug, Clone)]
 pub struct AppConfigRef {
     /// Whether the gateway process is running (gates send_message)
@@ -54,6 +67,12 @@ pub struct AppConfigRef {
     pub file_allowed_roots: Vec<PathBuf>,
     /// Denied prefixes layered on top of the workspace and allow-roots policy.
     pub path_restrictions: Vec<PathBuf>,
+    /// Whether LSP tools are enabled for this session.
+    pub lsp_enabled: bool,
+    /// Max file size eligible for LSP document sync.
+    pub lsp_file_size_limit_bytes: u64,
+    /// Named language-server configurations keyed by logical language/server id.
+    pub lsp_servers: HashMap<String, LspServerConfigRef>,
     /// EdgeCrab home directory (memory, skills, sessions storage root).
     ///
     /// WHY renamed from workspace_root: memory and skills tools write to
@@ -82,6 +101,15 @@ pub struct AppConfigRef {
     /// explicit deny-list so a hallucinated tool call cannot bypass schema
     /// filtering.
     pub disabled_toolsets: Vec<String>,
+    /// Tools explicitly enabled for the current session.
+    ///
+    /// WHY separate from toolsets: users may want one browser or MCP helper
+    /// without exposing the rest of that toolset.
+    pub enabled_tools: Vec<String>,
+    /// Tools explicitly disabled for the current session.
+    ///
+    /// Disabled tools always win, even if their parent toolset is enabled.
+    pub disabled_tools: Vec<String>,
     /// External skill directories to scan in addition to ~/.edgecrab/skills/.
     /// Supports ~ and ${VAR} expansion (hermes-compatible paths).
     pub external_skill_dirs: Vec<String>,
@@ -162,6 +190,12 @@ pub struct AppConfigRef {
     pub image_provider: Option<String>,
     /// Preferred image-generation model from config (`image_generation.model`).
     pub image_model: Option<String>,
+    /// Whether the `moa` tool is enabled for this session.
+    pub moa_enabled: bool,
+    /// Default reference models for the `moa` tool.
+    pub moa_reference_models: Vec<String>,
+    /// Default aggregator model for the `moa` tool.
+    pub moa_aggregator_model: Option<String>,
 }
 
 impl Default for AppConfigRef {
@@ -174,6 +208,9 @@ impl Default for AppConfigRef {
             max_terminal_output: 100_000,         // 100K chars
             file_allowed_roots: Vec::new(),
             path_restrictions: Vec::new(),
+            lsp_enabled: true,
+            lsp_file_size_limit_bytes: 10_000_000,
+            lsp_servers: HashMap::new(),
             edgecrab_home: resolve_edgecrab_home(),
             delegation_enabled: true,
             delegation_model: None,
@@ -182,6 +219,8 @@ impl Default for AppConfigRef {
             delegation_max_iterations: 50,
             parent_active_toolsets: Vec::new(),
             disabled_toolsets: Vec::new(),
+            enabled_tools: Vec::new(),
+            disabled_tools: Vec::new(),
             external_skill_dirs: Vec::new(),
             disabled_skills: Vec::new(),
             browser_record_sessions: false,
@@ -212,6 +251,9 @@ impl Default for AppConfigRef {
             stt_whisper_model: None,
             image_provider: None,
             image_model: None,
+            moa_enabled: true,
+            moa_reference_models: Vec::new(),
+            moa_aggregator_model: None,
         }
     }
 }
@@ -227,6 +269,18 @@ impl AppConfigRef {
             && !self.disabled_toolsets.iter().any(|t| t == toolset)
     }
 
+    /// Whether a specific tool is allowed in the current session.
+    pub fn is_tool_enabled(&self, tool_name: &str, toolset: &str) -> bool {
+        crate::toolsets::tool_enabled(
+            Some(&self.parent_active_toolsets),
+            Some(&self.disabled_toolsets),
+            Some(&self.enabled_tools),
+            Some(&self.disabled_tools),
+            tool_name,
+            toolset,
+        )
+    }
+
     /// Build the effective file path policy for a session workspace.
     pub fn file_path_policy(&self, cwd: &std::path::Path) -> PathPolicy {
         let file_tools_tmp_dir = self.file_tools_tmp_dir();
@@ -236,6 +290,16 @@ impl AppConfigRef {
             .with_virtual_tmp_root(file_tools_tmp_dir)
             .with_allowed_roots(self.file_allowed_roots.clone())
             .with_denied_roots(self.path_restrictions.clone())
+    }
+
+    pub fn lsp_server_for_extension(&self, ext: &str) -> Option<(&str, &LspServerConfigRef)> {
+        let ext = ext.trim_start_matches('.').to_ascii_lowercase();
+        self.lsp_servers.iter().find_map(|(name, cfg)| {
+            cfg.file_extensions
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(&ext))
+                .then_some((name.as_str(), cfg))
+        })
     }
 
     // ── Well-known directory helpers ──────────────────────────────────────

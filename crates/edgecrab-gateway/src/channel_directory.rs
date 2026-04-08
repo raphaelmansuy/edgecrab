@@ -6,7 +6,7 @@
 //!
 //! Mirrors hermes-agent's `gateway/channel_directory.py`:
 //! - Built on gateway startup, refreshed periodically
-//! - Saved to `~/.edgecrab/channel_directory.json`
+//! - Saved to `$EDGECRAB_HOME/channel_directory.json`
 //! - Used by send_message tool for name resolution
 
 use serde::{Deserialize, Serialize};
@@ -35,8 +35,7 @@ pub struct ChannelDirectory {
 
 /// Get the path to the channel directory file.
 fn directory_path() -> PathBuf {
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    home.join(".edgecrab").join("channel_directory.json")
+    edgecrab_core::edgecrab_home().join("channel_directory.json")
 }
 
 /// Load the cached channel directory from disk.

@@ -21,13 +21,16 @@ mod cron_cmd;
 mod doctor;
 mod edit_diff;
 mod fuzzy_selector;
+mod gateway_browser;
 mod gateway_catalog;
 mod gateway_cmd;
+mod gateway_presentation;
 mod gateway_setup;
 mod image_models;
 mod markdown_render;
 mod mcp_catalog;
-mod model_discovery;
+mod mcp_oauth;
+mod mcp_support;
 #[cfg(target_os = "macos")]
 mod permissions;
 mod plugins;
@@ -45,8 +48,9 @@ mod whatsapp_cmd;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::Context;
+use anyhow::{Context, anyhow};
 use clap::Parser;
+use shell_words::split as shell_split;
 use tokio_util::sync::CancellationToken;
 
 use app::App;
@@ -56,7 +60,8 @@ use cli_args::{
 };
 use edgecrab_core::config::McpServerConfig;
 use edgecrab_state::SessionDb;
-use edgecrab_tools::{ToolRegistry, resolve_alias};
+use edgecrab_tools::vision_models::normalize_provider_name;
+use edgecrab_tools::{ToolRegistry, create_provider_for_model, resolve_alias};
 use runtime::{
     build_agent, build_tool_registry, build_tool_registry_with_mcp_discovery, default_export_path,
     load_runtime, open_state_db, render_markdown_export,
@@ -74,145 +79,61 @@ use runtime::{
 ///       ↓ fails
 ///   MockProvider                        ← fallback for dev/test
 /// ```
-pub(crate) fn create_provider(model: &str) -> Arc<dyn edgequake_llm::LLMProvider> {
-    // If model string contains provider/model, honour it explicitly first.
-    // This ensures "copilot/gpt-4.1-mini" always uses copilot even when
-    // OPENAI_API_KEY, ANTHROPIC_API_KEY etc. are also set.
-    if let Some((provider_name, model_name)) = model.split_once('/') {
-        // Map user-friendly provider aliases to edgequake-llm canonical names
-        let canonical = match provider_name {
-            "copilot" => "vscode-copilot",
-            other => other,
-        };
+pub(crate) fn create_provider(model: &str) -> anyhow::Result<Arc<dyn edgequake_llm::LLMProvider>> {
+    if let Some((provider_name, model_name)) = explicit_provider_request(model) {
+        let canonical = normalize_provider_name(provider_name);
         tracing::info!(
             provider = canonical,
             model = model_name,
             "creating provider from model string"
         );
-
-        // Special-case vscode-copilot: create_llm_provider always forces proxy mode
-        // (localhost:4141). Instead, build the provider directly so it uses the default
-        // direct mode (api.githubcopilot.com) and respects VSCODE_COPILOT_DIRECT env var.
-        if canonical == "vscode-copilot" {
-            match edgequake_llm::VsCodeCopilotProvider::new()
-                .model(model_name)
-                .with_vision(true) // Enable vision so copilot-vision-request header is sent
-                .build()
-            {
-                Ok(provider) => return Arc::new(provider),
-                Err(e) => {
-                    tracing::warn!(error = %e, model = model_name, "copilot direct mode failed, trying env auto-detect");
-                }
-            }
-        } else if canonical == "vertexai" {
-            // ── Hard VertexAI route ──────────────────────────────────────────────────
-            // The user explicitly said "vertexai/<model>".  We MUST NOT silently fall
-            // through to from_env() (which would pick up GEMINI_API_KEY and route to
-            // Google AI Studio instead) or to MockProvider.  Any failure is surfaced
-            // immediately with actionable guidance.
-            //
-            // Why "vertexai:" prefix: edgequake-llm's factory only calls
-            // GeminiProvider::from_env_vertex_ai() when the model string starts with
-            // "vertexai:".  split_once('/') strips that context, so we restore it here.
-            //
-            // Why auto-detect GOOGLE_CLOUD_PROJECT: `gcloud auth login` does NOT export
-            // it; from_env_vertex_ai() treats it as required.
-
-            if std::env::var("GOOGLE_CLOUD_PROJECT").is_err() {
-                match std::process::Command::new("gcloud")
-                    .args(["config", "get-value", "project"])
-                    .output()
-                {
-                    Ok(output) if output.status.success() => {
-                        let raw = String::from_utf8_lossy(&output.stdout);
-                        let project = raw.trim();
-                        if !project.is_empty() && project != "(unset)" {
-                            // SAFETY: called before the tokio worker pool is spawned;
-                            // no other thread reads env vars at this point.
-                            unsafe { std::env::set_var("GOOGLE_CLOUD_PROJECT", project) };
-                            tracing::info!(
-                                project,
-                                "auto-detected GOOGLE_CLOUD_PROJECT from gcloud config"
-                            );
-                        } else {
-                            eprintln!(
-                                "error: VertexAI requires a GCP project but gcloud returned \
-                                 empty/unset.\n  Fix: gcloud config set project <your-project-id>\n\
-                                        or: export GOOGLE_CLOUD_PROJECT=<your-project-id>"
-                            );
-                            std::process::exit(1);
-                        }
-                    }
-                    Ok(_) => {
-                        eprintln!(
-                            "error: gcloud exited with a non-zero status while detecting \
-                             GOOGLE_CLOUD_PROJECT.\n  Fix: export GOOGLE_CLOUD_PROJECT=<your-project-id>"
-                        );
-                        std::process::exit(1);
-                    }
-                    Err(_) => {
-                        eprintln!(
-                            "error: GOOGLE_CLOUD_PROJECT is not set and gcloud was not found \
-                             in PATH.\n  Fix: export GOOGLE_CLOUD_PROJECT=<your-project-id>\n\
-                                    or: install the Google Cloud SDK and run gcloud auth login"
-                        );
-                        std::process::exit(1);
-                    }
-                }
-            }
-
-            let vertex_model = format!("vertexai:{model_name}");
-
-            // Gemini 3.x Preview models (gemini-3-flash-preview, gemini-3.1-pro-preview,
-            // gemini-3.1-flash-lite-preview, …) are ONLY available on the Vertex AI
-            // global endpoint.  The 2.x GA models work on regional endpoints like
-            // us-central1.  edgequake-llm reads GOOGLE_CLOUD_REGION to build the
-            // endpoint URL; auto-set it to "global" when the user hasn't set it
-            // and the model name indicates a Gemini 3 generation.
-            // Source: https://cloud.google.com/vertex-ai/generative-ai/docs/learn/locations
-            if model_name.starts_with("gemini-3") && std::env::var("GOOGLE_CLOUD_REGION").is_err() {
-                // SAFETY: single-threaded startup, no concurrent env reads.
-                unsafe { std::env::set_var("GOOGLE_CLOUD_REGION", "global") };
-                tracing::info!(
-                    model = model_name,
-                    "auto-set GOOGLE_CLOUD_REGION=global (Gemini 3.x is global-endpoint-only)"
-                );
-            }
-
-            match edgequake_llm::ProviderFactory::create_llm_provider(canonical, &vertex_model) {
-                Ok(provider) => return provider,
-                Err(e) => {
-                    eprintln!(
-                        "error: VertexAI provider failed for model '{model_name}': {e}\n\
-                         Fix:\n\
-                         \x20  • gcloud auth application-default login\n\
-                         \x20  • export GOOGLE_CLOUD_PROJECT=<your-project-id>\n\
-                         \x20  • edgecrab doctor    ← full diagnostics"
-                    );
-                    std::process::exit(1);
-                }
-            }
-        } else if let Ok(provider) =
-            edgequake_llm::ProviderFactory::create_llm_provider(canonical, model_name)
-        {
-            return provider;
-        } else {
-            tracing::warn!(
-                provider = canonical,
-                model = model_name,
-                "explicit provider failed, trying env auto-detect"
-            );
-        }
+        return create_explicit_provider(&canonical, model_name);
     }
 
-    // Fallback: environment auto-detection (only reached when no "provider/model" slash
-    // syntax was used, or a non-vertexai explicit provider soft-failed).
+    // Fallback: environment auto-detection (only reached when no explicit
+    // "provider/model" syntax was used).
     if let Ok((llm, _embedding)) = edgequake_llm::ProviderFactory::from_env() {
-        return llm;
+        return Ok(llm);
     }
 
     tracing::warn!("no provider configured, falling back to mock");
-    Arc::new(edgequake_llm::MockProvider::new())
+    Ok(Arc::new(edgequake_llm::MockProvider::new()))
+}
+
+fn explicit_provider_request(model: &str) -> Option<(&str, &str)> {
+    model.split_once('/')
+}
+
+fn create_explicit_provider(
+    provider_name: &str,
+    model_name: &str,
+) -> anyhow::Result<Arc<dyn edgequake_llm::LLMProvider>> {
+    create_provider_for_model(provider_name, model_name).map_err(|e| {
+        let guidance = match provider_name {
+            "vscode-copilot" => {
+                "Fix:\n\
+                 \x20  • ensure VS Code Copilot is authenticated\n\
+                 \x20  • set VSCODE_COPILOT_DIRECT=false to force proxy mode\n\
+                 \x20  • or set VSCODE_COPILOT_PROXY_URL for a custom proxy"
+            }
+            "vertexai" => {
+                "Fix:\n\
+                 \x20  • gcloud auth application-default login\n\
+                 \x20  • export GOOGLE_CLOUD_PROJECT=<your-project-id>\n\
+                 \x20  • edgecrab doctor"
+            }
+            _ => {
+                "Refusing to fall back to a different provider because the model was selected explicitly.\n\
+                 Fix the named provider configuration or choose a different provider/model."
+            }
+        };
+        anyhow!(
+            "explicit provider '{}' failed for model '{}': {e}\n{}",
+            provider_name,
+            model_name,
+            guidance
+        )
+    })
 }
 
 #[tokio::main]
@@ -240,6 +161,8 @@ async fn main() -> anyhow::Result<()> {
     }
     if args.config.is_none() && !manages_profiles {
         profile::activate_profile(args.profile.as_deref())?;
+    } else if !manages_profiles {
+        activate_runtime_home_from_config(args.config.as_deref())?;
     }
 
     // Route to subcommand if one was given
@@ -277,7 +200,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let model = runtime.config.model.default_model.clone();
-    let provider = create_provider(&model);
+    let provider = create_provider(&model)?;
     let state_db = open_state_db(&runtime.state_db_path)?;
     let tool_registry = build_tool_registry_with_mcp_discovery(&runtime.config).await;
 
@@ -565,7 +488,7 @@ async fn run_acp(args: &CliArgs) -> anyhow::Result<()> {
         args.toolset.as_deref(),
     )?;
     let model_str = runtime.config.model.default_model.clone();
-    let provider = create_provider(&model_str);
+    let provider = create_provider(&model_str)?;
     let state_db = open_state_db(&runtime.state_db_path)?;
     let tool_registry = build_tool_registry_with_mcp_discovery(&runtime.config).await;
     let agent = build_agent(
@@ -587,38 +510,7 @@ async fn run_acp(args: &CliArgs) -> anyhow::Result<()> {
 
 /// Print detailed version and provider information.
 fn run_version() {
-    let version = env!("CARGO_PKG_VERSION");
-    println!("EdgeCrab v{version}");
-    println!("Rust {}", env!("CARGO_PKG_RUST_VERSION", "unknown"));
-    println!();
-    println!("Supported providers (via edgequake-llm):");
-    let providers = [
-        ("copilot", "GitHub Copilot (GITHUB_TOKEN)"),
-        ("openai", "OpenAI (OPENAI_API_KEY)"),
-        ("anthropic", "Anthropic (ANTHROPIC_API_KEY)"),
-        ("gemini", "Google Gemini (GOOGLE_API_KEY)"),
-        ("openrouter", "OpenRouter (OPENROUTER_API_KEY)"),
-        ("xai", "xAI Grok (XAI_API_KEY)"),
-        ("mistral", "Mistral AI (MISTRAL_API_KEY)"),
-        ("ollama", "Ollama (local, no key)"),
-        ("lmstudio", "LMStudio (local, no key)"),
-        ("azure", "Azure OpenAI (AZURE_OPENAI_API_KEY)"),
-        ("bedrock", "AWS Bedrock (AWS_ACCESS_KEY_ID)"),
-        ("huggingface", "HuggingFace (HUGGINGFACE_API_KEY)"),
-    ];
-    for (id, desc) in providers {
-        println!("  {id:<14} — {desc}");
-    }
-    println!();
-    println!("Home:   {}", setup::edgecrab_home().display());
-    println!(
-        "Config: {}",
-        setup::edgecrab_home().join("config.yaml").display()
-    );
-    println!();
-    println!("Links:");
-    println!("  Docs:    https://github.com/raphaelmansuy/edgecrab");
-    println!("  Issues:  https://github.com/raphaelmansuy/edgecrab/issues");
+    print!("{}", render_version_report());
 }
 
 fn run_sessions(command: SessionCommand, args: &CliArgs) -> anyhow::Result<()> {
@@ -627,50 +519,16 @@ fn run_sessions(command: SessionCommand, args: &CliArgs) -> anyhow::Result<()> {
 
     match command {
         SessionCommand::List { limit, source } => {
-            let sessions = if let Some(ref src) = source {
-                db.list_sessions_by_source(src, limit)?
-            } else {
-                db.list_sessions(limit)?
-            };
+            let sessions = db.list_sessions_rich(source.as_deref(), limit)?;
             if sessions.is_empty() {
                 println!("No persisted sessions.");
                 return Ok(());
             }
-            // Check if any session has a title — use rich format if so
-            let has_titles = sessions.iter().any(|s| s.title.is_some());
-            if has_titles {
-                println!("{:<22} {:<14} {:<6} ID", "Title", "Last Active", "Src");
-                println!("{}", "─".repeat(70));
-            } else {
-                println!("{:<14} {:<6} ID", "Last Active", "Src");
-                println!("{}", "─".repeat(40));
-            }
-            for session in &sessions {
-                let last_active = format_timestamp(session.started_at);
-                let src = &session.source.chars().take(5).collect::<String>();
-                if has_titles {
-                    let title = session.title.as_deref().unwrap_or("—");
-                    let title_short: String = title.chars().take(21).collect();
-                    println!(
-                        "{:<22} {:<14} {:<6} {}",
-                        title_short,
-                        last_active,
-                        src,
-                        &session.id[..session.id.len().min(12)],
-                    );
-                } else {
-                    println!(
-                        "{:<14} {:<6} {}",
-                        last_active,
-                        src,
-                        &session.id[..session.id.len().min(12)],
-                    );
-                }
-            }
+            print_session_rich_list(&sessions);
         }
         SessionCommand::Browse { query, limit } => {
             if let Some(query) = query {
-                let results = db.search(&query, limit)?;
+                let results = db.search_sessions_rich(&query, limit)?;
                 if results.is_empty() {
                     println!("No sessions matched '{}'.", query);
                     return Ok(());
@@ -678,28 +536,29 @@ fn run_sessions(command: SessionCommand, args: &CliArgs) -> anyhow::Result<()> {
                 for result in results {
                     println!(
                         "{}  {}  score={:.3}",
-                        &result.session_id[..result.session_id.len().min(12)],
+                        edgecrab_core::safe_truncate(&result.session.id, 12),
                         result.role,
                         result.score,
                     );
-                    println!("  {}", result.snippet);
+                    println!(
+                        "  {}  model={}  msgs={}  last_active={}",
+                        result.session.title.as_deref().unwrap_or("—"),
+                        result.session.model.as_deref().unwrap_or("?"),
+                        result.session.message_count,
+                        format_timestamp(result.session.last_active),
+                    );
+                    println!("  match: {}", result.snippet);
+                    if !result.session.preview.is_empty() {
+                        println!("  preview: {}", result.session.preview);
+                    }
                 }
             } else {
-                let sessions = db.list_sessions(limit)?;
+                let sessions = db.list_sessions_rich(None, limit)?;
                 if sessions.is_empty() {
                     println!("No persisted sessions.");
                     return Ok(());
                 }
-                for session in sessions {
-                    println!(
-                        "{}  {}  model={}  msgs={}  started={}",
-                        &session.id[..session.id.len().min(12)],
-                        session.title.as_deref().unwrap_or("-"),
-                        session.model.as_deref().unwrap_or("?"),
-                        session.message_count,
-                        format_timestamp(session.started_at),
-                    );
-                }
+                print_session_rich_list(&sessions);
                 println!(
                     "Hint: use `edgecrab sessions browse --query <text>` to search message history."
                 );
@@ -820,6 +679,27 @@ fn run_sessions(command: SessionCommand, args: &CliArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn print_session_rich_list(sessions: &[edgecrab_state::SessionRichSummary]) {
+    println!(
+        "{:<22} {:<16} {:<10} {:<6} {:<14} Preview",
+        "Title", "Model", "Source", "Msgs", "Last Active"
+    );
+    println!("{}", "─".repeat(104));
+    for session in sessions {
+        let title = session.title.as_deref().unwrap_or("—");
+        println!(
+            "{:<22} {:<16} {:<10} {:<6} {:<14} {}",
+            edgecrab_core::safe_truncate(title, 22),
+            edgecrab_core::safe_truncate(session.model.as_deref().unwrap_or("?"), 16),
+            edgecrab_core::safe_truncate(&session.source, 10),
+            session.message_count,
+            edgecrab_core::safe_truncate(&format_timestamp(session.last_active), 14),
+            edgecrab_core::safe_truncate(&session.preview, 42),
+        );
+        println!("  id={}", edgecrab_core::safe_truncate(&session.id, 12));
+    }
+}
+
 fn run_config(command: ConfigCommand, args: &CliArgs) -> anyhow::Result<()> {
     let runtime = load_runtime(args.config.as_deref(), args.model.as_deref(), None)?;
     match command {
@@ -827,13 +707,22 @@ fn run_config(command: ConfigCommand, args: &CliArgs) -> anyhow::Result<()> {
             println!("{}", serde_yml::to_string(&runtime.config)?);
         }
         ConfigCommand::Edit => {
-            let editor = std::env::var("EDITOR")
-                .or_else(|_| std::env::var("VISUAL"))
-                .unwrap_or_else(|_| "vi".to_string());
-            let status = std::process::Command::new(&editor)
+            let mut editor = editor_command_from_env()?;
+            let config_parent = runtime
+                .config_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."));
+            std::fs::create_dir_all(config_parent).with_context(|| {
+                format!(
+                    "failed to create config directory {}",
+                    config_parent.display()
+                )
+            })?;
+            let display_editor = format_command_for_display(&editor);
+            let status = editor
                 .arg(&runtime.config_path)
                 .status()
-                .with_context(|| format!("failed to launch editor: {editor}"))?;
+                .with_context(|| format!("failed to launch editor: {display_editor}"))?;
             if !status.success() {
                 anyhow::bail!("editor exited with status: {status}");
             }
@@ -842,7 +731,12 @@ fn run_config(command: ConfigCommand, args: &CliArgs) -> anyhow::Result<()> {
             println!("{}", runtime.config_path.display());
         }
         ConfigCommand::EnvPath => {
-            println!("{}", setup::edgecrab_home().join(".env").display());
+            let env_path = runtime
+                .config_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join(".env");
+            println!("{}", env_path.display());
         }
         ConfigCommand::Set { key, value } => {
             let mut config = runtime.config;
@@ -923,26 +817,16 @@ async fn run_mcp(command: McpCommand, args: &CliArgs) -> anyhow::Result<()> {
             );
         }
         McpCommand::Search { query } => {
-            let results = mcp_catalog::search_official_catalog_with_refresh(query.as_deref()).await;
-            if results.is_empty() {
+            let report = mcp_catalog::search_mcp_sources(query.as_deref(), 12).await;
+            let has_results = report.groups.iter().any(|group| !group.results.is_empty());
+            if !has_results {
                 println!("No official MCP entries matched.");
                 return Ok(());
             }
-            for preset in results {
-                let install = preset
-                    .installable_preset_id
-                    .as_deref()
-                    .map(|id| format!(" install={id}"))
-                    .unwrap_or_else(|| " install=unavailable".to_string());
-                println!(
-                    "{} — {} [{}] {}{}",
-                    preset.id,
-                    preset.description,
-                    preset.tags.join(", "),
-                    preset.source_url,
-                    install,
-                );
-            }
+            println!(
+                "{}",
+                mcp_catalog::render_search_report(query.as_deref(), &report)
+            );
         }
         McpCommand::View { preset } => {
             if let Some(preset) = mcp_catalog::find_preset(&preset) {
@@ -984,7 +868,7 @@ async fn run_mcp(command: McpCommand, args: &CliArgs) -> anyhow::Result<()> {
                 );
             }
             println!(
-                "Run `edgecrab mcp test {}` to verify connectivity.",
+                "Run `edgecrab mcp doctor {}` to verify connectivity and config health.",
                 installed.name
             );
         }
@@ -1024,6 +908,19 @@ async fn run_mcp(command: McpCommand, args: &CliArgs) -> anyhow::Result<()> {
                     }
                 }
             }
+        }
+        McpCommand::Doctor { name } => {
+            println!(
+                "{}",
+                mcp_support::render_mcp_doctor_report(name.as_deref()).await?
+            );
+        }
+        McpCommand::Auth { name } => {
+            println!("{}", mcp_support::render_mcp_auth_guide(&name)?);
+        }
+        McpCommand::Login { name } => {
+            let summary = mcp_oauth::login_mcp_server(&name, |line| println!("{line}")).await?;
+            println!("{summary}");
         }
         McpCommand::Add {
             name,
@@ -1148,8 +1045,14 @@ async fn run_skills(command: SkillsCommand) -> anyhow::Result<()> {
                 .unwrap_or_else(|| edgecrab_core::edgecrab_home().join("optional-skills"));
             let official_matches =
                 edgecrab_tools::tools::skills_hub::search_optional_skills(&optional_root, &query);
+            let remote_report =
+                edgecrab_tools::tools::skills_hub::search_hub(&query, None, 8).await;
+            let has_remote_matches = remote_report
+                .groups
+                .iter()
+                .any(|group| !group.results.is_empty());
 
-            if installed_matches.is_empty() && official_matches.is_empty() {
+            if installed_matches.is_empty() && official_matches.is_empty() && !has_remote_matches {
                 println!("No skills matching '{}'.", query);
             } else {
                 if !installed_matches.is_empty() {
@@ -1168,6 +1071,15 @@ async fn run_skills(command: SkillsCommand) -> anyhow::Result<()> {
                         println!("  {} — {}", skill.identifier, skill.description);
                     }
                 }
+                if has_remote_matches {
+                    println!(
+                        "\n{}",
+                        edgecrab_tools::tools::skills_hub::render_search_report(
+                            &query,
+                            &remote_report
+                        )
+                    );
+                }
             }
         }
 
@@ -1184,58 +1096,44 @@ async fn run_skills(command: SkillsCommand) -> anyhow::Result<()> {
                 return Ok(());
             }
 
-            if source.starts_with("official/") {
-                let bundle = edgecrab_tools::tools::skills_hub::load_official_skill_bundle(
-                    &source,
-                    edgecrab_tools::tools::skills_sync::optional_skills_dir().as_deref(),
-                )
-                .map_err(|e| anyhow::anyhow!(e))?;
-                let skill_name = bundle.name.clone();
-                let message =
-                    edgecrab_tools::tools::skills_hub::install_skill(&bundle, &skills_dir, false)
-                        .map_err(|e| anyhow::anyhow!(e))?;
-                println!("{message}");
-                println!("Activate with: edgecrab skills view {skill_name}");
-                return Ok(());
-            }
+            let outcome = edgecrab_tools::tools::skills_hub::install_identifier(
+                &source,
+                &skills_dir,
+                edgecrab_tools::tools::skills_sync::optional_skills_dir().as_deref(),
+                false,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+            println!("{}", outcome.message);
+            println!("Activate with: edgecrab skills view {}", outcome.skill_name);
+        }
 
-            if source.contains('/') {
-                let message = edgecrab_tools::tools::skills_hub::install_github_skill(
-                    &source,
+        SkillsCommand::Update { name } => {
+            let optional_dir = edgecrab_tools::tools::skills_sync::optional_skills_dir();
+            if let Some(name) = name {
+                let outcome = edgecrab_tools::tools::skills_hub::update_installed_skill(
+                    &name,
                     &skills_dir,
+                    optional_dir.as_deref(),
                     false,
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!(e))?;
-                let skill_name = source.split('/').next_back().unwrap_or("skill");
-                println!("{message}");
-                println!("Activate with: edgecrab skills view {skill_name}");
-                return Ok(());
-            }
-
-            let optional_root = edgecrab_tools::tools::skills_sync::optional_skills_dir()
-                .unwrap_or_else(|| edgecrab_core::edgecrab_home().join("optional-skills"));
-            let candidates =
-                edgecrab_tools::tools::skills_hub::search_optional_skills(&optional_root, &source);
-            if let Some(candidate) = candidates.first() {
-                let bundle = edgecrab_tools::tools::skills_hub::load_official_skill_bundle(
-                    &candidate.identifier,
-                    edgecrab_tools::tools::skills_sync::optional_skills_dir().as_deref(),
+                println!("{}", outcome.message);
+                println!("Activate with: edgecrab skills view {}", outcome.skill_name);
+            } else {
+                let outcomes = edgecrab_tools::tools::skills_hub::update_all_installed_skills(
+                    &skills_dir,
+                    optional_dir.as_deref(),
+                    false,
                 )
+                .await
                 .map_err(|e| anyhow::anyhow!(e))?;
-                let skill_name = bundle.name.clone();
-                let message =
-                    edgecrab_tools::tools::skills_hub::install_skill(&bundle, &skills_dir, false)
-                        .map_err(|e| anyhow::anyhow!(e))?;
-                println!("{message}");
-                println!("Activate with: edgecrab skills view {skill_name}");
-                return Ok(());
+                println!(
+                    "{}",
+                    edgecrab_tools::tools::skills_hub::render_update_outcomes(&outcomes)
+                );
             }
-
-            anyhow::bail!(
-                "Skill source '{}' not found. Use a local path, official/<category>/<skill>, or owner/repo/path",
-                source
-            );
         }
 
         SkillsCommand::Remove { name } => {
@@ -1564,6 +1462,100 @@ fn parse_csv(value: &str) -> Vec<String> {
         .collect()
 }
 
+fn runtime_home_for_config_override(config_override: Option<&str>) -> Option<PathBuf> {
+    config_override.map(|path| {
+        std::path::Path::new(path)
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .to_path_buf()
+    })
+}
+
+fn activate_runtime_home_from_config(config_override: Option<&str>) -> anyhow::Result<()> {
+    let Some(home) = runtime_home_for_config_override(config_override) else {
+        return Ok(());
+    };
+    #[allow(unsafe_code)]
+    unsafe {
+        std::env::set_var("EDGECRAB_HOME", &home);
+    }
+    Ok(())
+}
+
+fn editor_command_from_env() -> anyhow::Result<std::process::Command> {
+    let editor = std::env::var("EDITOR")
+        .or_else(|_| std::env::var("VISUAL"))
+        .unwrap_or_else(|_| "vi".to_string());
+    parse_editor_command(&editor)
+}
+
+fn parse_editor_command(editor: &str) -> anyhow::Result<std::process::Command> {
+    let parts = shell_split(editor)
+        .map_err(|e| anyhow::anyhow!("invalid $EDITOR/$VISUAL command '{}': {e}", editor))?;
+    let (program, args) = parts
+        .split_first()
+        .ok_or_else(|| anyhow::anyhow!("$EDITOR/$VISUAL is empty"))?;
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args);
+    Ok(cmd)
+}
+
+fn format_command_for_display(cmd: &std::process::Command) -> String {
+    let mut rendered = cmd.get_program().to_string_lossy().to_string();
+    for arg in cmd.get_args() {
+        rendered.push(' ');
+        rendered.push_str(&arg.to_string_lossy());
+    }
+    rendered
+}
+
+fn provider_environment_hint(provider: &str) -> &'static str {
+    match provider {
+        "anthropic" => "ANTHROPIC_API_KEY",
+        "azure" => "AZURE_OPENAI_API_KEY",
+        "bedrock" => "AWS_ACCESS_KEY_ID",
+        "copilot" => "GITHUB_TOKEN",
+        "gemini" => "GOOGLE_API_KEY",
+        "huggingface" => "HUGGINGFACE_API_KEY",
+        "lmstudio" => "local, no key",
+        "mistral" => "MISTRAL_API_KEY",
+        "ollama" => "local, no key",
+        "openai" => "OPENAI_API_KEY",
+        "openrouter" => "OPENROUTER_API_KEY",
+        "vertexai" => "GOOGLE_CLOUD_PROJECT + ADC",
+        "xai" => "XAI_API_KEY",
+        _ => "Provider configured via model catalog/runtime integration",
+    }
+}
+
+fn render_version_report() -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    let version = env!("CARGO_PKG_VERSION");
+    let _ = writeln!(out, "EdgeCrab v{version}");
+    let _ = writeln!(out, "Rust {}", env!("CARGO_PKG_RUST_VERSION", "unknown"));
+    let _ = writeln!(out);
+    let _ = writeln!(out, "Supported providers (from model catalog):");
+    for provider in edgecrab_core::ModelCatalog::provider_ids() {
+        let label = edgecrab_core::ModelCatalog::provider_label(&provider);
+        let hint = provider_environment_hint(&provider);
+        let _ = writeln!(out, "  {provider:<14} — {label} ({hint})");
+    }
+    let _ = writeln!(out);
+    let home = setup::edgecrab_home();
+    let _ = writeln!(out, "Home:   {}", home.display());
+    let _ = writeln!(out, "Config: {}", home.join("config.yaml").display());
+    let _ = writeln!(out);
+    let _ = writeln!(out, "Links:");
+    let _ = writeln!(out, "  Docs:    https://github.com/raphaelmansuy/edgecrab");
+    let _ = writeln!(
+        out,
+        "  Issues:  https://github.com/raphaelmansuy/edgecrab/issues"
+    );
+    out
+}
+
 fn set_config_value(
     config: &mut edgecrab_core::AppConfig,
     key: &str,
@@ -1581,11 +1573,25 @@ fn set_config_value(
         "display.skin" => config.display.skin = value.to_string(),
         "display.personality" => config.display.personality = value.to_string(),
         "display.show_reasoning" => config.display.show_reasoning = parse_bool(value)?,
+        "display.show_status_bar" => config.display.show_status_bar = parse_bool(value)?,
         "display.streaming" => {
             let enabled = parse_bool(value)?;
             config.display.streaming = enabled;
             config.model.streaming = enabled;
         }
+        "model.smart_routing.enabled" => config.model.smart_routing.enabled = parse_bool(value)?,
+        "model.smart_routing.cheap_model" => {
+            config.model.smart_routing.cheap_model = value.to_string()
+        }
+        "model.smart_routing.cheap_base_url" => {
+            config.model.smart_routing.cheap_base_url = Some(value.to_string())
+        }
+        "model.smart_routing.cheap_api_key_env" => {
+            config.model.smart_routing.cheap_api_key_env = Some(value.to_string())
+        }
+        "moa.enabled" => config.moa.enabled = parse_bool(value)?,
+        "moa.aggregator_model" => config.moa.aggregator_model = value.to_string(),
+        "moa.reference_models" => config.moa.reference_models = parse_csv(value),
         "memory.enabled" => config.memory.enabled = parse_bool(value)?,
         "skills.enabled" => config.skills.enabled = parse_bool(value)?,
         "timezone" => config.timezone = Some(value.to_string()),
@@ -1724,4 +1730,129 @@ fn setup_worktree() -> anyhow::Result<PathBuf> {
     }
 
     Ok(wt_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    use super::{
+        activate_runtime_home_from_config, explicit_provider_request, parse_editor_command,
+        render_version_report, runtime_home_for_config_override, set_config_value,
+    };
+
+    #[test]
+    fn set_config_value_supports_smart_routing_and_moa_keys() {
+        let mut config = edgecrab_core::AppConfig::default();
+
+        set_config_value(&mut config, "model.smart_routing.enabled", "true")
+            .expect("enable smart routing");
+        set_config_value(
+            &mut config,
+            "model.smart_routing.cheap_model",
+            "copilot/gpt-4.1-mini",
+        )
+        .expect("set cheap model");
+        set_config_value(&mut config, "moa.enabled", "false").expect("disable moa");
+        set_config_value(
+            &mut config,
+            "moa.aggregator_model",
+            "anthropic/claude-opus-4.6",
+        )
+        .expect("set moa aggregator");
+        set_config_value(
+            &mut config,
+            "moa.reference_models",
+            "anthropic/claude-opus-4.6,openai/gpt-4.1",
+        )
+        .expect("set moa refs");
+
+        assert!(config.model.smart_routing.enabled);
+        assert_eq!(
+            config.model.smart_routing.cheap_model,
+            "copilot/gpt-4.1-mini"
+        );
+        assert!(!config.moa.enabled);
+        assert_eq!(config.moa.aggregator_model, "anthropic/claude-opus-4.6");
+        assert_eq!(
+            config.moa.reference_models,
+            vec!["anthropic/claude-opus-4.6", "openai/gpt-4.1"]
+        );
+    }
+
+    #[test]
+    fn set_config_value_supports_status_bar_visibility() {
+        let mut config = edgecrab_core::AppConfig::default();
+        set_config_value(&mut config, "display.show_status_bar", "false").expect("set status bar");
+        assert!(!config.display.show_status_bar);
+    }
+
+    #[test]
+    fn runtime_home_for_config_override_uses_parent_directory() {
+        let home = runtime_home_for_config_override(Some("/tmp/edgecrab-custom/config.yaml"))
+            .expect("home from config");
+        assert_eq!(home, PathBuf::from("/tmp/edgecrab-custom"));
+    }
+
+    #[test]
+    fn activate_runtime_home_from_config_sets_edgecrab_home() {
+        let previous = std::env::var_os("EDGECRAB_HOME");
+        activate_runtime_home_from_config(Some("/tmp/edgecrab-runtime/config.yaml"))
+            .expect("activate runtime home");
+        assert_eq!(
+            std::env::var_os("EDGECRAB_HOME"),
+            Some(OsString::from("/tmp/edgecrab-runtime"))
+        );
+        #[allow(unsafe_code)]
+        unsafe {
+            if let Some(value) = previous {
+                std::env::set_var("EDGECRAB_HOME", value);
+            } else {
+                std::env::remove_var("EDGECRAB_HOME");
+            }
+        }
+    }
+
+    #[test]
+    fn parse_editor_command_supports_editor_arguments() {
+        let cmd = parse_editor_command("code --wait").expect("editor command");
+        assert_eq!(cmd.get_program().to_string_lossy(), "code");
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(args, vec!["--wait"]);
+    }
+
+    #[test]
+    fn version_report_covers_catalog_providers() {
+        let report = render_version_report();
+        for provider in edgecrab_core::ModelCatalog::provider_ids() {
+            assert!(
+                report.contains(&provider),
+                "version report missing provider {provider}"
+            );
+        }
+        assert!(report.contains("EdgeCrab v"));
+        assert!(report.contains("Supported providers (from model catalog):"));
+    }
+
+    #[test]
+    fn explicit_provider_request_detects_provider_model_syntax() {
+        assert_eq!(
+            explicit_provider_request("openai/gpt-5-nano"),
+            Some(("openai", "gpt-5-nano"))
+        );
+        assert_eq!(
+            explicit_provider_request("vscode-copilot/gpt-4.1"),
+            Some(("vscode-copilot", "gpt-4.1"))
+        );
+    }
+
+    #[test]
+    fn explicit_provider_request_ignores_implicit_model_names() {
+        assert_eq!(explicit_provider_request("gpt-5-nano"), None);
+        assert_eq!(explicit_provider_request(""), None);
+    }
 }

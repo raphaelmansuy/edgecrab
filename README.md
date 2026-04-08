@@ -52,7 +52,7 @@ hermes-agent soul  +  OpenClaw vision  =  EdgeCrab
     - [First Prompts](#first-prompts)
   - [What EdgeCrab Can Do](#what-edgecrab-can-do)
     - [ReAct Tool Loop](#react-tool-loop)
-    - [74 Built-in Tools](#74-built-in-tools)
+    - [Built-in Tools](#built-in-tools)
       - [File Tools (`file` toolset)](#file-tools-file-toolset)
       - [Terminal Tools (`terminal` toolset)](#terminal-tools-terminal-toolset)
       - [Web Tools (`web` toolset)](#web-tools-web-toolset)
@@ -203,9 +203,20 @@ EdgeCrab uses a **Reason → Act → Observe** loop (ReAct pattern) implemented 
 
 The budget default is **90 iterations** (`max_iterations` in config). Increase it for long autonomous tasks.
 
-### 74 Built-in Tools
+### Built-in Tools
 
 Tools are registered at compile time via the `inventory` crate — zero startup cost. The `ToolRegistry` dispatches by exact name with fuzzy (Levenshtein ≤3) fallback suggestions.
+
+### Semantic Code Intelligence (LSP)
+
+EdgeCrab now exposes a dedicated LSP subsystem through the `lsp` toolset. When a language server is configured, the agent can prefer semantic operations over grep-style guesses:
+
+- Claude-parity navigation: `lsp_goto_definition`, `lsp_find_references`, `lsp_hover`, `lsp_document_symbols`, `lsp_workspace_symbols`, `lsp_goto_implementation`, `lsp_call_hierarchy_prepare`, `lsp_incoming_calls`, `lsp_outgoing_calls`
+- EdgeCrab-only semantic edits: `lsp_code_actions`, `lsp_apply_code_action`, `lsp_rename`, `lsp_format_document`, `lsp_format_range`
+- Deep analysis: `lsp_inlay_hints`, `lsp_semantic_tokens`, `lsp_signature_help`, `lsp_type_hierarchy_prepare`, `lsp_supertypes`, `lsp_subtypes`
+- Diagnostics: `lsp_diagnostics_pull`, `lsp_linked_editing_range`, `lsp_enrich_diagnostics`, `lsp_select_and_apply_action`, `lsp_workspace_type_errors`
+
+Built-in default server definitions now cover Rust, TypeScript, JavaScript, Python, Go, C, C++, Java, C#, PHP, Ruby, Bash, HTML, CSS, and JSON.
 
 #### File Tools (`file` toolset)
 | Tool           | What it does                                                                 |
@@ -296,7 +307,7 @@ Tools are registered at compile time via the `inventory` crate — zero startup 
 ```bash
 edgecrab --toolset file,terminal "add tests"        # minimal dev
 edgecrab --toolset all "go wild"                    # full capability
-edgecrab --toolset coding "refactor this module"    # file+terminal+search+exec
+edgecrab --toolset coding "refactor this module"    # file+terminal+search+exec+lsp
 edgecrab --toolset research "investigate this bug"  # web+browser+vision
 ```
 
@@ -448,14 +459,19 @@ Skills are reusable agent procedures — markdown files that define prompts, ste
 edgecrab skills list                    # browse installed skills
 edgecrab skills view git-workflow       # read a skill
 edgecrab skills install my-skill.md    # install from file
-edgecrab skills search "code review"   # search skills hub
+edgecrab skills search "diagram"       # search remote skill sources
+edgecrab skills install edgecrab:diagramming/ascii-diagram-master
+edgecrab skills install hermes-agent:research/ml-paper-writing
+edgecrab skills install raphaelmansuy/edgecrab/skills/research/ml-paper-writing
+edgecrab skills update                 # refresh all remote-installed skills
+edgecrab skills update ml-paper-writing
 
 # Use a skill in a session
 edgecrab -S git-workflow "review this branch for prod readiness"
 edgecrab -S security,refactor          # load multiple skills
 ```
 
-Inside TUI: `/skills list`, `/skills install <path>`, `/skills view <name>`
+Inside TUI: `/skills` opens the installed-skill browser, and `/skills search [query]` opens the remote-skill browser with live search, source notes, and install/update actions.
 
 Skills are saved to `~/.edgecrab/skills/` and loaded on demand. The agent can also create new skills mid-session during learning reflection.
 
@@ -640,18 +656,26 @@ mcp_servers:
 
   my-api-server:
     url: "https://my-server.example.com/mcp"
-    bearer_token: "${MY_API_TOKEN}"
+    bearer_token: "${MY_API_TOKEN}"   # env-backed bearer token works
     enabled: true
 ```
 
 ```bash
-edgecrab mcp list               # show connected MCP servers
-edgecrab mcp add server-name    # add interactively
+edgecrab mcp list                                 # show configured MCP servers
+edgecrab mcp install filesystem --path "/tmp/ws" # install a curated preset
+edgecrab mcp doctor                              # static checks + live probe
+edgecrab mcp doctor filesystem                   # diagnose one configured server
 edgecrab mcp remove server-name
-/reload-mcp                     # hot-reload in TUI without restart
+/mcp                                             # open the TUI MCP browser
+/reload-mcp                                      # hot-reload in TUI without restart
 ```
 
 The agent uses `mcp_list_tools` and `mcp_call_tool` to discover and invoke MCP server capabilities.
+The TUI MCP browser supports install, view, test, diagnose, and remove flows, and quoted
+`--path` / `name=` values are parsed safely for Unix and Windows-style paths.
+HTTP MCP servers that rely on OAuth-style bearer access tokens are supported through
+either `bearer_token`, `/mcp-token set <server> <token>`, or env-backed config values such
+as `bearer_token: "${MY_API_TOKEN}"`.
 
 ---
 
@@ -788,7 +812,8 @@ edgecrab status                 # overall gateway status
 edgecrab skills list
 edgecrab skills view <name>
 edgecrab skills search <query>
-edgecrab skills install <path>
+edgecrab skills install <path|edgecrab:path|owner/repo/path>
+edgecrab skills update [name]
 edgecrab skills remove <name>
 
 # Profiles
@@ -842,6 +867,7 @@ Type these inside the TUI (after `❯`):
 | `/statusbar`                             | Toggle status bar                               |
 | `/tools`                                 | List active toolsets and tools                  |
 | `/toolsets`                              | Show toolset aliases and expansions             |
+| `/mcp [subcommand]`                      | Browse, install, test, diagnose, or remove MCP servers |
 | `/reload-mcp`                            | Hot-reload MCP servers (no restart needed)      |
 | `/mcp-token <server> <token>`            | Set MCP bearer token at runtime                 |
 | `/plugins [list/install/remove]`         | Manage plugins                                  |
@@ -901,7 +927,7 @@ Path safety and SSRF use Rust's **type system** as the primary control — not r
 
 ## Architecture
 
-EdgeCrab is a 10-crate Rust workspace. The dependency graph is a strict DAG — no circular dependencies, no feature flags that reverse the graph.
+EdgeCrab is an 11-crate Rust workspace. The dependency graph is a strict DAG — no circular dependencies, no feature flags that reverse the graph.
 
 ```
 edgecrab-types      (shared types — no deps on other crates)
@@ -909,7 +935,8 @@ edgecrab-types      (shared types — no deps on other crates)
 edgecrab-security   (path safety, SSRF, cmd scan — types only)
 edgecrab-cron       (standalone cron store + schedule parser)
        ↑
-edgecrab-tools      (ToolRegistry + 74 tool implementations)
+edgecrab-tools      (ToolRegistry + built-in tool implementations)
+edgecrab-lsp        (language-server client, document sync, semantic tools)
 edgecrab-state      (SQLite WAL + FTS5 session store)
        ↑
 edgecrab-core       (Agent, ReAct loop, prompt builder, compression)
@@ -923,7 +950,8 @@ edgecrab-cli    edgecrab-gateway    edgecrab-acp    edgecrab-migrate
 | `edgecrab-security` | Path jail, SSRF, command scan, redaction, approval engine                                                                    |
 | `edgecrab-state`    | SQLite WAL + FTS5 session storage (`~/.edgecrab/state.db`)                                                                   |
 | `edgecrab-cron`     | Cron expression parser, job store (`~/.edgecrab/cron/`)                                                                      |
-| `edgecrab-tools`    | `ToolRegistry`, `ToolHandler` trait, `ToolContext`, all 74 tools                                                             |
+| `edgecrab-tools`    | `ToolRegistry`, `ToolHandler` trait, `ToolContext`, the built-in tool surface including browser, MCP, media, and LSP       |
+| `edgecrab-lsp`      | Language-server manager, JSON-RPC client, document sync, diagnostics, edit application, and `lsp_*` tool handlers          |
 | `edgecrab-core`     | `Agent`, `AgentBuilder`, `execute_loop()`, `PromptBuilder`, compression, routing, 200+ model catalog                         |
 | `edgecrab-cli`      | ratatui TUI, 42 slash commands, all CLI subcommands, skin engine, profiles                                                   |
 | `edgecrab-gateway`  | axum HTTP + 15 platform adapters, streaming delivery, `MEDIA://` protocol                                                    |
@@ -948,7 +976,7 @@ EdgeCrab uses layered config: `defaults → ~/.edgecrab/config.yaml → EDGECRAB
 # ~/.edgecrab/config.yaml
 
 model:
-  default_model: "anthropic/claude-opus-4-6"
+  default_model: "ollama/gemma4:latest"
   max_iterations: 90          # ReAct loop budget per session
   streaming: true
   smart_routing:
@@ -970,6 +998,17 @@ tools:
       - write_file
       - terminal
       - session_search
+
+lsp:
+  enabled: true
+  file_size_limit_bytes: 10000000
+  servers:
+    rust:
+      command: "rust-analyzer"
+      args: []
+      file_extensions: ["rs"]
+      language_id: "rust"
+      root_markers: ["Cargo.toml", "rust-project.json"]
 
 memory:
   enabled: true
@@ -1184,7 +1223,7 @@ edgecrab/
 │   ├── edgecrab-security/      Path jail, SSRF, cmd scanner, injection, redact
 │   ├── edgecrab-state/         SQLite WAL + FTS5 session store
 │   ├── edgecrab-cron/          Cron parser, job store, scheduler
-│   ├── edgecrab-tools/         ToolRegistry + all 74 tool implementations
+│   ├── edgecrab-tools/         ToolRegistry + built-in tool implementations
 │   │   └── tools/
 │   │       ├── file.rs         read_file, write_file, patch_file, search_files
 │   │       ├── terminal.rs     terminal, manage_process
@@ -1195,6 +1234,7 @@ edgecrab/
 │   │       ├── execute_code.rs Sandboxed multi-language code execution
 │   │       ├── vision.rs       vision_analyze, text_to_speech, transcribe_audio
 │   │       └── ...             session, cron, checkpoint, skills, mcp, todo, HA
+│   ├── edgecrab-lsp/           LSP client, document sync, diagnostics, semantic edits
 │   ├── edgecrab-core/
 │   │   └── src/
 │   │       ├── agent.rs        AgentBuilder, Agent, StreamEvent, fork_isolated
@@ -1279,7 +1319,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for full details.
 | -------------- | -------------------------------------------------- | ------------------------------------------------------------------- |
 | **npm**        | `edgecrab-cli` (binary wrapper — no Rust required) | `npm install -g edgecrab-cli`                                       |
 | **pip**        | `edgecrab-cli` (binary wrapper — no Rust required) | `pip install edgecrab-cli`                                          |
-| **cargo**      | Rust crates (10 crates published)                  | `cargo install edgecrab-cli`                                        |
+| **cargo**      | Rust crates (11 crates published)                  | `cargo install edgecrab-cli`                                        |
 | **Python SDK** | `edgecrab-sdk`                                     | `pip install edgecrab-sdk`                                          |
 | **Node SDK**   | `edgecrab-sdk`                                     | `npm install edgecrab-sdk`                                          |
 | **Docker**     | GHCR multi-arch                                    | `docker pull ghcr.io/raphaelmansuy/edgecrab:latest`                 |

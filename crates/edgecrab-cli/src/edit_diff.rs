@@ -98,8 +98,15 @@ fn resolve_local_edit_paths(
 
     let mut raw_paths = Vec::new();
     match tool_name {
-        "write_file" | "patch" => {
+        "write_file" => {
             if let Some(path) = obj.get("path").and_then(|value| value.as_str()) {
+                raw_paths.push(path.to_string());
+            }
+        }
+        "patch" => {
+            if let Some(patch_text) = obj.get("patch").and_then(|value| value.as_str()) {
+                raw_paths.extend(extract_apply_patch_paths(patch_text));
+            } else if let Some(path) = obj.get("path").and_then(|value| value.as_str()) {
                 raw_paths.push(path.to_string());
             }
         }

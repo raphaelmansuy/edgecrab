@@ -53,11 +53,11 @@ use edgecrab_types::{
     AgentError, Content, Cost, Message, Role, ToolError, ToolErrorResponse, Trajectory, Usage,
 };
 use edgequake_llm::traits::{StreamChunk, StreamUsage};
-use edgequake_llm::{CachePromptConfig, LLMProvider, VsCodeCopilotProvider, apply_cache_control};
+use edgequake_llm::{CachePromptConfig, LLMProvider, apply_cache_control};
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::{Agent, ConversationResult, SessionState};
+use crate::agent::{Agent, ConversationResult, SessionState, resolve_tool_policy};
 use crate::compression::{
     CompressionParams, CompressionStatus, check_compression_status_for_estimate, compress_with_llm,
 };
@@ -81,6 +81,92 @@ const BASE_BACKOFF: Duration = Duration::from_millis(500);
 /// learning reflection fires. Mirrors hermes-agent's "5+ tool calls" rule.
 const SKILL_REFLECTION_THRESHOLD: u32 = 5;
 
+struct ApiCallContext<'a> {
+    options: Option<&'a edgequake_llm::CompletionOptions>,
+    cancel: &'a CancellationToken,
+    event_tx: Option<&'a tokio::sync::mpsc::UnboundedSender<crate::StreamEvent>>,
+    use_native_streaming: bool,
+}
+
+fn provider_manages_transport_retries(provider: &dyn LLMProvider) -> bool {
+    matches!(provider.name(), "vscode-copilot")
+}
+
+fn is_transport_retry_error(error: &edgequake_llm::LlmError) -> bool {
+    matches!(
+        error,
+        edgequake_llm::LlmError::RateLimited(_)
+            | edgequake_llm::LlmError::NetworkError(_)
+            | edgequake_llm::LlmError::Timeout
+            | edgequake_llm::LlmError::AuthError(_)
+    )
+}
+
+fn is_retryable_nonvisible_stream_error(error: &edgequake_llm::LlmError) -> bool {
+    matches!(
+        error,
+        edgequake_llm::LlmError::RateLimited(_)
+            | edgequake_llm::LlmError::NetworkError(_)
+            | edgequake_llm::LlmError::Timeout
+            | edgequake_llm::LlmError::AuthError(_)
+            | edgequake_llm::LlmError::ApiError(_)
+            | edgequake_llm::LlmError::InvalidRequest(_)
+            | edgequake_llm::LlmError::ProviderError(_)
+            | edgequake_llm::LlmError::NotSupported(_)
+    )
+}
+
+fn is_streamed_tool_capability_error(error: &edgequake_llm::LlmError) -> bool {
+    let message = match error {
+        edgequake_llm::LlmError::ApiError(message)
+        | edgequake_llm::LlmError::InvalidRequest(message)
+        | edgequake_llm::LlmError::ProviderError(message)
+        | edgequake_llm::LlmError::NotSupported(message) => message,
+        _ => return false,
+    };
+
+    let normalized = message.to_ascii_lowercase();
+    let mentions_streaming = normalized.contains("stream");
+    let mentions_tools = normalized.contains("tool")
+        || normalized.contains("function call")
+        || normalized.contains("function calling");
+    let rejects_capability = normalized.contains("not supported")
+        || normalized.contains("unsupported")
+        || normalized.contains("does not support");
+
+    mentions_streaming && mentions_tools && rejects_capability
+}
+
+fn completion_options_for(config: &crate::agent::AgentConfig) -> edgequake_llm::CompletionOptions {
+    edgequake_llm::CompletionOptions {
+        max_tokens: config.model_config.max_tokens.map(|tokens| tokens as usize),
+        temperature: config.temperature.or(config.model_config.temperature),
+        reasoning_effort: config.reasoning_effort.clone(),
+        ..Default::default()
+    }
+}
+
+fn provider_prefers_nonstreaming_tool_turns(provider: &dyn LLMProvider) -> bool {
+    matches!(provider.name(), "vscode-copilot")
+}
+
+pub(crate) fn should_use_native_streaming(
+    provider: &dyn LLMProvider,
+    tool_defs: &[edgequake_llm::ToolDefinition],
+    streaming_enabled: bool,
+    event_tx_present: bool,
+) -> bool {
+    if !streaming_enabled || !event_tx_present || !provider.supports_tool_streaming() {
+        return false;
+    }
+
+    if tool_defs.is_empty() {
+        return true;
+    }
+
+    !provider_prefers_nonstreaming_tool_turns(provider)
+}
+
 /// Build a `ToolContext` from shared agent state.
 ///
 /// WHY extracted: This was duplicated in `execute_loop` and
@@ -102,8 +188,13 @@ fn build_tool_context(
         tokio::sync::mpsc::UnboundedSender<edgecrab_tools::registry::ClarifyRequest>,
     >,
     approval_tx: Option<tokio::sync::mpsc::UnboundedSender<ApprovalRequest>>,
+    tool_progress_tx: Option<
+        tokio::sync::mpsc::UnboundedSender<edgecrab_tools::ToolProgressUpdate>,
+    >,
     gateway_sender: Option<Arc<dyn edgecrab_tools::registry::GatewaySender>>,
     origin_chat: Option<(String, String)>,
+    current_tool_call_id: Option<String>,
+    current_tool_name: Option<String>,
     // Stable per-conversation session identifier — used as the browser session key
     // so all tool calls within one session share the same Chrome tab.
     conversation_session_id: &str,
@@ -145,6 +236,9 @@ fn build_tool_context(
             None => conversation_session_id.to_string(),
         }),
         todo_store,
+        current_tool_call_id,
+        current_tool_name,
+        tool_progress_tx,
     }
 }
 
@@ -209,6 +303,7 @@ impl Agent {
         event_tx: Option<&tokio::sync::mpsc::UnboundedSender<crate::StreamEvent>>,
         cwd_override: Option<&std::path::Path>,
     ) -> Result<ConversationResult, AgentError> {
+        let _conversation_guard = self.conversation_lock.lock().await;
         self.budget.reset();
 
         // Extract (and optionally reset) the cancel token for this conversation turn.
@@ -230,12 +325,14 @@ impl Agent {
         let config = self.config.read().await.clone();
         let provider = self.provider.read().await.clone();
 
-        let mut session = self.session.write().await;
-
-        // Seed from history if provided (gateway mode: fresh Agent per message)
-        if let Some(hist) = history {
-            session.messages = hist;
-        }
+        let mut session = {
+            let mut shared = self.session.write().await;
+            // Seed from history if provided (gateway mode: fresh Agent per message)
+            if let Some(hist) = history {
+                shared.messages = hist;
+            }
+            shared.clone()
+        };
 
         // Resolve cwd early — used by both PromptBuilder and @context expansion.
         let cwd = cwd_override
@@ -246,80 +343,11 @@ impl Agent {
 
         // Expand parent toolset configuration once and reuse for schema filtering,
         // ToolContext propagation, and child delegation restrictions.
-        let expanded_enabled =
-            edgecrab_tools::toolsets::expand_toolset_names(&config.enabled_toolsets);
-        let expanded_disabled =
-            edgecrab_tools::toolsets::expand_toolset_names(&config.disabled_toolsets);
-        let parent_active_toolsets = if config.enabled_toolsets.is_empty()
-            || edgecrab_tools::toolsets::contains_all_sentinel(&config.enabled_toolsets)
-            || expanded_enabled.is_empty()
-        {
-            Vec::new()
-        } else {
-            expanded_enabled
-                .iter()
-                .filter(|toolset| !expanded_disabled.iter().any(|d| d == *toolset))
-                .cloned()
-                .collect()
-        };
-
-        let app_config_ref = AppConfigRef {
-            // WHY explicit edgecrab_home: memory and skills tools use this path
-            // to resolve ~/.edgecrab/memories/ and ~/.edgecrab/skills/. Leaving
-            // it as current_dir() would write memories to the project workspace.
-            edgecrab_home: crate::config::edgecrab_home(),
-            file_allowed_roots: config.file_allowed_roots.clone(),
-            path_restrictions: config.path_restrictions.clone(),
-            delegation_enabled: config.delegation_enabled,
-            delegation_model: config.delegation_model.clone(),
-            delegation_provider: config.delegation_provider.clone(),
-            delegation_max_subagents: config.delegation_max_subagents,
-            delegation_max_iterations: config.delegation_max_iterations,
-            parent_active_toolsets,
-            disabled_toolsets: expanded_disabled.clone(),
-            external_skill_dirs: config.skills_config.external_dirs.clone(),
-            disabled_skills: {
-                let mut d = config.skills_config.disabled.clone();
-                let platform_str_cfg = config.platform.to_string();
-                if let Some(pd) = config
-                    .skills_config
-                    .platform_disabled
-                    .get(&platform_str_cfg)
-                {
-                    d.extend(pd.iter().cloned());
-                }
-                d
-            },
-            browser_record_sessions: config.browser.record_sessions,
-            browser_command_timeout: config.browser.command_timeout,
-            browser_recording_max_age_hours: config.browser.recording_max_age_hours,
-            checkpoints_enabled: config.checkpoints_enabled,
-            checkpoints_max_snapshots: config.checkpoints_max_snapshots,
-            preloaded_skills: config.skills_config.preloaded.clone(),
-            terminal_backend: config.terminal_backend.clone(),
-            terminal_docker: config.terminal_docker.clone(),
-            terminal_ssh: config.terminal_ssh.clone(),
-            terminal_modal: config.terminal_modal.clone(),
-            terminal_daytona: config.terminal_daytona.clone(),
-            terminal_singularity: config.terminal_singularity.clone(),
-            terminal_env_passthrough: config.terminal_env_passthrough.clone(),
-            auxiliary_provider: config.auxiliary.provider.clone(),
-            auxiliary_model: config.auxiliary.model.clone(),
-            auxiliary_base_url: config.auxiliary.base_url.clone(),
-            auxiliary_api_key_env: config.auxiliary.api_key_env.clone(),
-            tts_provider: Some(config.tts.provider.clone()),
-            tts_voice: Some(config.tts.voice.clone()),
-            tts_rate: config.tts.rate.clone(),
-            tts_model: config.tts.model.clone(),
-            tts_elevenlabs_voice_id: config.tts.elevenlabs_voice_id.clone(),
-            tts_elevenlabs_model_id: config.tts.elevenlabs_model_id.clone(),
-            tts_elevenlabs_api_key_env: Some(config.tts.elevenlabs_api_key_env.clone()),
-            stt_provider: Some(config.stt.provider.clone()),
-            stt_whisper_model: Some(config.stt.whisper_model.clone()),
-            image_provider: Some(config.image_generation.provider.clone()),
-            image_model: Some(config.image_generation.model.clone()),
-            ..Default::default()
-        };
+        let gateway_running = self.gateway_sender.read().await.is_some();
+        let tool_policy = resolve_tool_policy(&config);
+        let expanded_enabled = tool_policy.expanded_enabled.clone();
+        let expanded_disabled = tool_policy.expanded_disabled.clone();
+        let app_config_ref = config.to_app_config_ref(gateway_running, &tool_policy);
 
         // Apply config-based env passthrough so it is available to every
         // PersistentShell::spawn() call within this session.
@@ -337,47 +365,51 @@ impl Agent {
         // session_search, skills) on whether the corresponding tools are
         // actually enabled. Without this, the agent gets instructions for tools
         // it cannot use.
-        let (tool_defs, tool_names_for_prompt) = if let Some(ref registry) = self.tool_registry {
-            let ctx = build_tool_context(
-                &cwd,
-                app_config_ref.clone(),
-                &cancel,
-                &self.state_db,
-                config.platform,
-                &self.process_table,
-                Some(provider.clone()),
-                self.tool_registry.clone(),
-                None,
-                None,
-                None, // clarify_tx not needed for schema resolution
-                None, // approval_tx not needed for schema resolution
-                self.gateway_sender.read().await.clone(),
-                config.origin_chat.clone(),
-                "schema-resolution", // placeholder — schemas are not browser-session-sensitive
-                Some(self.todo_store.clone()),
-            );
+        let (mut active_tool_defs, tool_names_for_prompt) =
+            if let Some(ref registry) = self.tool_registry {
+                let ctx = build_tool_context(
+                    &cwd,
+                    app_config_ref.clone(),
+                    &cancel,
+                    &self.state_db,
+                    config.platform,
+                    &self.process_table,
+                    Some(provider.clone()),
+                    self.tool_registry.clone(),
+                    None,
+                    None,
+                    None, // clarify_tx not needed for schema resolution
+                    None, // approval_tx not needed for schema resolution
+                    None, // tool_progress_tx not needed for schema resolution
+                    self.gateway_sender.read().await.clone(),
+                    config.origin_chat.clone(),
+                    None,                // current_tool_call_id not needed for schema resolution
+                    None,                // current_tool_name not needed for schema resolution
+                    "schema-resolution", // placeholder — schemas are not browser-session-sensitive
+                    Some(self.todo_store.clone()),
+                );
 
-            // "all" sentinel / genuinely empty → pass None (no filtering).
-            let enabled_filter = if config.enabled_toolsets.is_empty()
-                || edgecrab_tools::toolsets::contains_all_sentinel(&config.enabled_toolsets)
-                || expanded_enabled.is_empty()
-            {
-                None
-            } else {
-                Some(expanded_enabled.as_slice())
-            };
-            let disabled_filter = if expanded_disabled.is_empty() {
-                None
-            } else {
-                Some(expanded_disabled.as_slice())
-            };
+                // "all" sentinel / genuinely empty → pass None (no filtering).
+                let enabled_filter = if config.enabled_toolsets.is_empty()
+                    || edgecrab_tools::toolsets::contains_all_sentinel(&config.enabled_toolsets)
+                    || expanded_enabled.is_empty()
+                {
+                    None
+                } else {
+                    Some(expanded_enabled.as_slice())
+                };
+                let disabled_filter = if expanded_disabled.is_empty() {
+                    None
+                } else {
+                    Some(expanded_disabled.as_slice())
+                };
 
-            let schemas = registry.get_definitions(enabled_filter, disabled_filter, &ctx);
-            let names: Vec<String> = schemas.iter().map(|s| s.name.clone()).collect();
-            (to_llm_definitions(&schemas), names)
-        } else {
-            (Vec::new(), Vec::new())
-        };
+                let schemas = registry.get_definitions(enabled_filter, disabled_filter, &ctx);
+                let names: Vec<String> = schemas.iter().map(|s| s.name.clone()).collect();
+                (to_llm_definitions(&schemas), names)
+            } else {
+                (Vec::new(), Vec::new())
+            };
 
         // Cache system prompt on first turn — assemble via PromptBuilder
         //
@@ -553,18 +585,11 @@ impl Agent {
         // This overrides the primary provider for this turn only.
         let effective_provider = if !route.is_primary {
             if let Some((prov_name, model_name)) = route.model.split_once('/') {
-                let canonical = match prov_name {
-                    "copilot" => "vscode-copilot",
-                    other => other,
-                };
+                let canonical = edgecrab_tools::vision_models::normalize_provider_name(prov_name);
                 // Special-case copilot: build directly to use direct API mode
                 let cheap_opt: Option<Arc<dyn LLMProvider>> = if canonical == "vscode-copilot" {
-                    match VsCodeCopilotProvider::new()
-                        .model(model_name)
-                        .with_vision(true)
-                        .build()
-                    {
-                        Ok(p) => Some(Arc::new(p) as Arc<dyn LLMProvider>),
+                    match edgecrab_tools::create_provider_for_model(&canonical, model_name) {
+                        Ok(p) => Some(p),
                         Err(e) => {
                             tracing::warn!(error = %e, "failed to create copilot provider, using primary");
                             None
@@ -583,8 +608,10 @@ impl Agent {
                     // distinct variant. Passing canonical = "vertexai" calls
                     // `GeminiProvider::from_env_vertex_ai()` unconditionally — it never touches
                     // GEMINI_API_KEY.
-                    let is_gemini_canonical =
-                        matches!(canonical, "google" | "gemini" | "vertex" | "vertexai");
+                    let is_gemini_canonical = matches!(
+                        canonical.as_str(),
+                        "google" | "gemini" | "vertex" | "vertexai"
+                    );
                     let primary_is_vertex = provider.name() == "vertex-ai";
 
                     let (effective_canonical, effective_model) =
@@ -599,10 +626,10 @@ impl Agent {
                             let bare = model_name.strip_prefix("vertexai:").unwrap_or(model_name);
                             ("vertexai", bare)
                         } else {
-                            (canonical, model_name)
+                            (canonical.as_str(), model_name)
                         };
 
-                    match edgequake_llm::ProviderFactory::create_llm_provider(
+                    match edgecrab_tools::create_provider_for_model(
                         effective_canonical,
                         effective_model,
                     ) {
@@ -808,6 +835,7 @@ impl Agent {
         if session.session_id.is_none() {
             session.session_id = Some(conversation_session_id.clone());
         }
+        self.publish_session_state(&session).await;
 
         // Main loop: each iteration = one API call
         let mut final_response = String::new();
@@ -817,12 +845,58 @@ impl Agent {
         let mut tool_errors_acc: Vec<edgecrab_types::ToolErrorRecord> = Vec::new();
         let capability_suppressions: Arc<Mutex<HashMap<String, ToolErrorResponse>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let mut tool_defs_dirty = false;
         // Track whether we already emitted a ContextPressure warning this turn
         // so we do not spam the UI on every iteration when compression fails to
         // bring usage below the warning level.
         let mut pressure_warned = false;
 
         loop {
+            if tool_defs_dirty {
+                active_tool_defs = if let Some(ref registry) = self.tool_registry {
+                    let schema_ctx = build_tool_context(
+                        &cwd,
+                        app_config_ref.clone(),
+                        &cancel,
+                        &self.state_db,
+                        config.platform,
+                        &self.process_table,
+                        Some(effective_provider.clone()),
+                        self.tool_registry.clone(),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        self.gateway_sender.read().await.clone(),
+                        config.origin_chat.clone(),
+                        None,
+                        None,
+                        &conversation_session_id,
+                        Some(self.todo_store.clone()),
+                    );
+                    let enabled_filter = if config.enabled_toolsets.is_empty()
+                        || edgecrab_tools::toolsets::contains_all_sentinel(&config.enabled_toolsets)
+                        || expanded_enabled.is_empty()
+                    {
+                        None
+                    } else {
+                        Some(expanded_enabled.as_slice())
+                    };
+                    let disabled_filter = if expanded_disabled.is_empty() {
+                        None
+                    } else {
+                        Some(expanded_disabled.as_slice())
+                    };
+                    let schemas =
+                        registry.get_definitions(enabled_filter, disabled_filter, &schema_ctx);
+                    to_llm_definitions(&schemas)
+                } else {
+                    Vec::new()
+                };
+                tool_defs_dirty = false;
+            }
+
             // Budget gate
             if !self.budget.try_consume() {
                 tracing::warn!(
@@ -840,6 +914,10 @@ impl Agent {
                 break;
             }
 
+            // Sanitize orphaned tool results before estimating prompt pressure or
+            // building the next provider payload.
+            sanitize_orphaned_tool_results(&mut session.messages);
+
             // Context compression: check status, emit pressure warning, compress if needed.
             //
             // WHY before the API call: Compressing after the call is too late —
@@ -853,7 +931,7 @@ impl Agent {
             let estimated_prompt_tokens = estimate_request_prompt_tokens(
                 session.cached_system_prompt.as_deref(),
                 &session.messages,
-                &tool_defs,
+                &active_tool_defs,
             );
             match check_compression_status_for_estimate(
                 estimated_prompt_tokens,
@@ -876,7 +954,7 @@ impl Agent {
                     let recomputed_prompt_tokens = estimate_request_prompt_tokens(
                         session.cached_system_prompt.as_deref(),
                         &session.messages,
-                        &tool_defs,
+                        &active_tool_defs,
                     );
                     if check_compression_status_for_estimate(
                         recomputed_prompt_tokens,
@@ -885,6 +963,7 @@ impl Agent {
                     {
                         pressure_warned = false;
                     }
+                    self.publish_session_state(&session).await;
                 }
                 CompressionStatus::PressureWarning if !pressure_warned => {
                     let threshold_tokens = (compression_params.context_window as f32
@@ -911,106 +990,42 @@ impl Agent {
             // WHY cache config here: Anthropic prompt caching requires stable
             // cache_control breakpoints on the system prompt and last N messages.
             // We derive the config from the user's prompt_caching setting.
-            let cache_cfg = if config.model_config.prompt_caching {
-                Some(CachePromptConfig::default())
-            } else {
-                None
-            };
+            let cache_cfg =
+                prompt_cache_config_for(&effective_provider, config.model_config.prompt_caching);
             let chat_messages = build_chat_messages(
                 session.cached_system_prompt.as_deref(),
                 &session.messages,
                 cache_cfg.as_ref(),
             );
-
-            // Sanitize orphaned tool results before building the API call.
-            // An orphaned tool_result is one without a preceding assistant
-            // message containing the matching tool_call_id. This can happen
-            // after /undo or /compress manipulates the history.
-            sanitize_orphaned_tool_results(&mut session.messages);
-
-            // Recompute tool definitions each iteration so dynamic availability
-            // changes (e.g. `/browser connect` setting CDP_OVERRIDE after the
-            // session started) are reflected in the schema sent to the LLM.
-            // The initial `tool_defs` computed before the loop is kept only for
-            // `tool_names_for_prompt` (prompt building) which happens once.
-            let tool_defs = if let Some(ref registry) = self.tool_registry {
-                let schema_ctx = build_tool_context(
-                    &cwd,
-                    app_config_ref.clone(),
-                    &cancel,
-                    &self.state_db,
-                    config.platform,
-                    &self.process_table,
-                    Some(effective_provider.clone()),
-                    self.tool_registry.clone(),
-                    None,
-                    None,
-                    None,
-                    None,
-                    self.gateway_sender.read().await.clone(),
-                    config.origin_chat.clone(),
-                    &conversation_session_id,
-                    Some(self.todo_store.clone()),
-                );
-                let enabled_filter = if config.enabled_toolsets.is_empty()
-                    || edgecrab_tools::toolsets::contains_all_sentinel(&config.enabled_toolsets)
-                    || expanded_enabled.is_empty()
-                {
-                    None
-                } else {
-                    Some(expanded_enabled.as_slice())
-                };
-                let disabled_filter = if expanded_disabled.is_empty() {
-                    None
-                } else {
-                    Some(expanded_disabled.as_slice())
-                };
-                let schemas =
-                    registry.get_definitions(enabled_filter, disabled_filter, &schema_ctx);
-                to_llm_definitions(&schemas)
-            } else {
-                Vec::new()
-            };
-
-            // Debug: log which tools are being sent so we can confirm browser_navigate
-            // is present when CDP is connected. Remove after diagnosis.
-            {
-                let names: Vec<&str> = tool_defs.iter().map(|t| t.function.name.as_str()).collect();
-                tracing::debug!(
-                    tools = ?names,
-                    browser_present = names.iter().any(|&n| n.starts_with("browser_")),
-                    "tool schema for next API call"
-                );
-                if names.iter().any(|&n| n.starts_with("browser_")) {
-                    tracing::info!(
-                        "✓ browser tools present in schema ({})",
-                        names.iter().filter(|&&n| n.starts_with("browser_")).count()
-                    );
-                } else {
-                    tracing::warn!("✗ NO browser tools in schema — model will use mcp_call_tool");
-                }
-            }
+            let completion_options = completion_options_for(&config);
 
             // API call with retry — sends tool definitions so LLM can request tool calls.
             // On failure, attempt the fallback provider if configured.
             // WHY cancel passed here: api_call_with_retry now races every sleep
             // and every API future against the CancellationToken so Ctrl+C takes
             // effect within one event-loop tick rather than after all retries finish.
-            let native_streaming_active = config.streaming
-                && event_tx.is_some()
-                && effective_provider.supports_tool_streaming();
-            let response = match api_call_with_retry(
+            let native_streaming_active = should_use_native_streaming(
+                effective_provider.as_ref(),
+                &active_tool_defs,
+                config.streaming,
+                event_tx.is_some(),
+            ) && (!session.native_tool_streaming_disabled
+                || active_tool_defs.is_empty());
+            let api_outcome = match api_call_with_retry(
                 &effective_provider,
                 &chat_messages,
-                &tool_defs,
+                &active_tool_defs,
                 MAX_RETRIES,
-                &cancel,
-                event_tx,
-                native_streaming_active,
+                ApiCallContext {
+                    options: Some(&completion_options),
+                    cancel: &cancel,
+                    event_tx,
+                    use_native_streaming: native_streaming_active,
+                },
             )
             .await
             {
-                Ok(r) => r,
+                Ok(outcome) => outcome,
                 // Cancellation during the API call — break cleanly without
                 // attempting the fallback provider (user wants to stop NOW).
                 Err(AgentError::Interrupted) => {
@@ -1023,6 +1038,7 @@ impl Agent {
                     // provider would duplicate / scramble the live transcript, so
                     // fail fast and let the user decide whether to retry.
                     if native_streaming_active {
+                        self.publish_session_state(&session).await;
                         return Err(primary_err);
                     }
                     // Try fallback provider if configured
@@ -1035,42 +1051,39 @@ impl Agent {
                         );
                         if let Some((fb_prov_name, fb_model_name)) = fb_route.model.split_once('/')
                         {
-                            let fb_canonical = match fb_prov_name {
-                                "copilot" => "vscode-copilot",
-                                other => other,
-                            };
+                            let fb_canonical =
+                                edgecrab_tools::vision_models::normalize_provider_name(
+                                    fb_prov_name,
+                                );
                             // Special-case copilot: build directly to use direct API mode
                             let fb_prov_opt: Option<Arc<dyn LLMProvider>> =
-                                if fb_canonical == "vscode-copilot" {
-                                    VsCodeCopilotProvider::new()
-                                        .model(fb_model_name)
-                                        .with_vision(true) // Enable vision so copilot-vision-request header is sent
-                                        .build()
-                                        .ok()
-                                        .map(|p| Arc::new(p) as Arc<dyn LLMProvider>)
-                                } else {
-                                    edgequake_llm::ProviderFactory::create_llm_provider(
-                                        fb_canonical,
-                                        fb_model_name,
-                                    )
-                                    .ok()
-                                };
+                                edgecrab_tools::create_provider_for_model(
+                                    &fb_canonical,
+                                    fb_model_name,
+                                )
+                                .ok();
                             if let Some(fb_prov) = fb_prov_opt {
-                                let fallback_native_streaming = config.streaming
-                                    && event_tx.is_some()
-                                    && fb_prov.supports_tool_streaming();
+                                let fallback_native_streaming = should_use_native_streaming(
+                                    fb_prov.as_ref(),
+                                    &active_tool_defs,
+                                    config.streaming,
+                                    event_tx.is_some(),
+                                );
                                 match api_call_with_retry(
                                     &fb_prov,
                                     &chat_messages,
-                                    &tool_defs,
+                                    &active_tool_defs,
                                     1,
-                                    &cancel,
-                                    event_tx,
-                                    fallback_native_streaming,
+                                    ApiCallContext {
+                                        options: Some(&completion_options),
+                                        cancel: &cancel,
+                                        event_tx,
+                                        use_native_streaming: fallback_native_streaming,
+                                    },
                                 )
                                 .await
                                 {
-                                    Ok(r) => r,
+                                    Ok(outcome) => outcome,
                                     // Also handle cancellation during fallback call.
                                     Err(AgentError::Interrupted) => {
                                         interrupted = true;
@@ -1078,20 +1091,28 @@ impl Agent {
                                     }
                                     Err(fb_err) => {
                                         tracing::error!(fallback_error = %fb_err, "fallback also failed");
+                                        self.publish_session_state(&session).await;
                                         return Err(primary_err);
                                     }
                                 }
                             } else {
+                                self.publish_session_state(&session).await;
                                 return Err(primary_err);
                             }
                         } else {
+                            self.publish_session_state(&session).await;
                             return Err(primary_err);
                         }
                     } else {
+                        self.publish_session_state(&session).await;
                         return Err(primary_err);
                     }
                 }
             };
+            if api_outcome.disabled_native_tool_streaming {
+                session.native_tool_streaming_disabled = true;
+            }
+            let response = api_outcome.response;
 
             // ── Post-call cancellation check ──────────────────────────────
             // The API call returned successfully but the token may have been
@@ -1150,8 +1171,21 @@ impl Agent {
                 todo_store: Some(self.todo_store.clone()),
                 capability_suppressions: capability_suppressions.clone(),
             };
-            let action =
-                process_response(&response, &mut session, &dctx, &mut tool_errors_acc).await?;
+            let action = match process_response(
+                &response,
+                &mut session,
+                &dctx,
+                &mut tool_errors_acc,
+            )
+            .await
+            {
+                Ok(action) => action,
+                Err(err) => {
+                    self.publish_session_state(&session).await;
+                    return Err(err);
+                }
+            };
+            self.publish_session_state(&session).await;
 
             match action {
                 LoopAction::Done(text) => {
@@ -1181,6 +1215,8 @@ impl Agent {
                     {
                         inject_budget_warning(&mut session.messages, &warning);
                     }
+                    tool_defs_dirty = true;
+                    self.publish_session_state(&session).await;
                     continue;
                 }
             }
@@ -1262,7 +1298,7 @@ impl Agent {
             let bg_ctx = BackgroundReflectionCtx {
                 messages: session.messages.clone(),
                 system_prompt: session.cached_system_prompt.clone(),
-                tool_defs: tool_defs.clone(),
+                tool_defs: active_tool_defs.clone(),
                 cwd: cwd.clone(),
                 registry: self.tool_registry.as_ref().map(Arc::clone),
                 cancel: cancel.clone(),
@@ -1279,6 +1315,7 @@ impl Agent {
             };
             tokio::spawn(run_learning_reflection_bg(bg_ctx));
         }
+        self.publish_session_state(&session).await;
 
         // Resolve session_id: prefer SessionState's, then config's, then generate.
         let session_id = session
@@ -1289,6 +1326,7 @@ impl Agent {
 
         // Store into session state for downstream use (slash commands, etc.)
         session.session_id = Some(session_id.clone());
+        self.publish_session_state(&session).await;
 
         let usage = Usage {
             input_tokens: session.session_input_tokens,
@@ -1521,6 +1559,27 @@ pub fn build_chat_messages(
     out
 }
 
+fn provider_supports_prompt_caching(provider_name: &str) -> bool {
+    matches!(provider_name, "anthropic")
+}
+
+fn prompt_cache_config_for(
+    provider: &Arc<dyn LLMProvider>,
+    prompt_caching_enabled: bool,
+) -> Option<CachePromptConfig> {
+    (prompt_caching_enabled && provider_supports_prompt_caching(provider.name()))
+        .then(CachePromptConfig::default)
+}
+
+fn augment_provider_error(provider: &Arc<dyn LLMProvider>, error: String) -> String {
+    if provider.name() == "vscode-copilot" && error.contains("api.githubcopilot.com") {
+        return format!(
+            "{error} GitHub Copilot direct mode could not reach the remote API. If you rely on a local Copilot proxy, set `VSCODE_COPILOT_DIRECT=false` or configure `VSCODE_COPILOT_PROXY_URL`."
+        );
+    }
+    error
+}
+
 /// Check whether a tool result string represents an error.
 ///
 /// Extracted to eliminate the duplicated condition in the parallel and
@@ -1575,6 +1634,7 @@ fn is_tool_error(result: &str) -> bool {
 /// `process_response`.
 fn emit_tool_done(
     tx: Option<&tokio::sync::mpsc::UnboundedSender<crate::StreamEvent>>,
+    tool_call_id: &str,
     name: &str,
     args_json: &str,
     tool_result: &str,
@@ -1583,6 +1643,7 @@ fn emit_tool_done(
 ) {
     if let Some(tx) = tx {
         let _ = tx.send(crate::StreamEvent::ToolDone {
+            tool_call_id: tool_call_id.to_string(),
             name: name.to_string(),
             args_json: args_json.to_string(),
             result_preview: summarize_tool_result_preview(name, tool_result, is_error),
@@ -1590,6 +1651,24 @@ fn emit_tool_done(
             is_error,
         });
     }
+}
+
+fn make_tool_progress_tx(
+    event_tx: Option<&tokio::sync::mpsc::UnboundedSender<crate::StreamEvent>>,
+) -> Option<tokio::sync::mpsc::UnboundedSender<edgecrab_tools::ToolProgressUpdate>> {
+    let event_tx = event_tx.cloned()?;
+    let (tool_progress_tx, mut tool_progress_rx) =
+        tokio::sync::mpsc::unbounded_channel::<edgecrab_tools::ToolProgressUpdate>();
+    tokio::spawn(async move {
+        while let Some(update) = tool_progress_rx.recv().await {
+            let _ = event_tx.send(crate::StreamEvent::ToolProgress {
+                tool_call_id: update.tool_call_id,
+                name: update.tool_name,
+                message: update.message,
+            });
+        }
+    });
+    Some(tool_progress_tx)
 }
 
 fn summarize_tool_result_preview(name: &str, tool_result: &str, is_error: bool) -> Option<String> {
@@ -1604,6 +1683,116 @@ fn summarize_tool_result_preview(name: &str, tool_result: &str, is_error: bool) 
         crate::safe_truncate(text, limit).to_string()
     }
 
+    fn count_truthy_entries(arr: &[serde_json::Value], key: &str) -> usize {
+        arr.iter()
+            .filter(|entry| entry.get(key).and_then(|v| v.as_bool()).unwrap_or(false))
+            .count()
+    }
+
+    fn summarize_structured_result(
+        name: &str,
+        obj: &serde_json::Map<String, serde_json::Value>,
+    ) -> Option<String> {
+        match name {
+            "web_search" => {
+                let count = obj
+                    .get("results")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.len())?;
+                let backend = obj.get("backend").and_then(|v| v.as_str()).unwrap_or("web");
+                Some(format!("{count} result(s) via {backend}"))
+            }
+            "web_extract" | "web_crawl" => {
+                let backend = obj.get("backend").and_then(|v| v.as_str()).unwrap_or("web");
+                if let Some(results) = obj.get("results").and_then(|v| v.as_array()) {
+                    let success = count_truthy_entries(results, "success");
+                    return Some(format!("{success}/{} page(s) via {backend}", results.len()));
+                }
+                if obj.get("result").is_some() {
+                    return Some(format!("1 page via {backend}"));
+                }
+                None
+            }
+            "todo" | "manage_todo_list" => {
+                let summary = obj.get("summary")?.as_object()?;
+                let total = summary.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
+                let completed = summary
+                    .get("completed")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let in_progress = summary
+                    .get("in_progress")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                Some(format!(
+                    "{completed}/{total} done, {in_progress} in progress"
+                ))
+            }
+            "delegate_task" => {
+                let results = obj.get("results")?.as_array()?;
+                let completed = results
+                    .iter()
+                    .filter(|entry| {
+                        matches!(
+                            entry.get("status").and_then(|v| v.as_str()),
+                            Some("success" | "completed")
+                        )
+                    })
+                    .count();
+                let duration = obj
+                    .get("total_duration_seconds")
+                    .and_then(|v| v.as_f64())
+                    .map(|secs| format!(" in {secs:.2}s"))
+                    .unwrap_or_default();
+                Some(format!(
+                    "{completed}/{} task(s) completed{duration}",
+                    results.len()
+                ))
+            }
+            "generate_image" | "image_generate" => {
+                let files = obj.get("files").and_then(|v| v.as_array())?;
+                let provider = obj
+                    .get("provider")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("image");
+                Some(format!("{} image(s) via {provider}", files.len()))
+            }
+            "send_message" => {
+                let platform = obj.get("platform").and_then(|v| v.as_str()).unwrap_or("?");
+                let recipient = obj
+                    .get("recipient")
+                    .and_then(|v| v.as_str())
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("home");
+                Some(format!("sent via {platform} to {recipient}"))
+            }
+            "cronjob" | "cron" | "manage_cron_jobs" => {
+                if let Some(message) = obj.get("message").and_then(|v| v.as_str()) {
+                    return Some(message.trim().to_string());
+                }
+                if let Some(total) = obj.get("total").and_then(|v| v.as_u64()) {
+                    return Some(format!("{total} cron job(s)"));
+                }
+                if let Some(total_jobs) = obj.get("total_jobs").and_then(|v| v.as_u64()) {
+                    let active = obj.get("active_jobs").and_then(|v| v.as_u64()).unwrap_or(0);
+                    return Some(format!("{active}/{total_jobs} active cron job(s)"));
+                }
+                None
+            }
+            "mcp_list_tools" | "mcp_list_resources" | "mcp_list_prompts" => {
+                for key in ["tools", "resources", "prompts"] {
+                    if let Some(count) =
+                        obj.get(key).and_then(|v| v.as_array()).map(|arr| arr.len())
+                    {
+                        return Some(format!("{count} {key}"));
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
     if is_error {
         let line = extract_tool_error_text(tool_result);
         let line = if line.trim().is_empty() {
@@ -1616,6 +1805,9 @@ fn summarize_tool_result_preview(name: &str, tool_result: &str, is_error: bool) 
 
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(tool_result) {
         if let Some(obj) = value.as_object() {
+            if let Some(summary) = summarize_structured_result(name, obj) {
+                return Some(truncate(&summary, 88));
+            }
             for key in ["summary", "message", "status", "result", "path"] {
                 if let Some(text) = obj.get(key).and_then(|v| v.as_str()) {
                     let text = text.trim();
@@ -1656,6 +1848,50 @@ struct PartialToolCall {
     thought_signature: Option<String>,
 }
 
+fn finalize_streamed_tool_calls(
+    partials: BTreeMap<usize, PartialToolCall>,
+) -> edgequake_llm::Result<Vec<edgequake_llm::ToolCall>> {
+    partials
+        .into_iter()
+        .map(|(index, partial)| {
+            let id = partial.id.unwrap_or_else(|| format!("stream_call_{index}"));
+            let function_name = partial.function_name.ok_or_else(|| {
+                edgequake_llm::LlmError::ApiError(format!(
+                    "streamed tool call {id} finished without a function name"
+                ))
+            })?;
+            let arguments = partial.arguments.trim();
+            if arguments.is_empty() {
+                return Err(edgequake_llm::LlmError::ApiError(format!(
+                    "streamed tool call {id} ({function_name}) finished without arguments"
+                )));
+            }
+
+            let parsed: serde_json::Value = serde_json::from_str(arguments).map_err(|err| {
+                edgequake_llm::LlmError::ApiError(format!(
+                    "streamed tool call {id} ({function_name}) produced invalid JSON arguments: \
+                     {err}"
+                ))
+            })?;
+            if !parsed.is_object() {
+                return Err(edgequake_llm::LlmError::ApiError(format!(
+                    "streamed tool call {id} ({function_name}) arguments must be a JSON object"
+                )));
+            }
+
+            Ok(edgequake_llm::ToolCall {
+                id,
+                call_type: "function".to_string(),
+                function: edgequake_llm::FunctionCall {
+                    name: function_name,
+                    arguments: arguments.to_string(),
+                },
+                thought_signature: partial.thought_signature,
+            })
+        })
+        .collect()
+}
+
 /// Native provider-streaming path used by the TUI.
 ///
 /// WHY separate helper: real-time streaming and tool-call accumulation are a
@@ -1666,11 +1902,12 @@ async fn api_call_streaming(
     provider: &Arc<dyn LLMProvider>,
     messages: &[edgequake_llm::ChatMessage],
     tool_defs: &[edgequake_llm::ToolDefinition],
+    options: Option<&edgequake_llm::CompletionOptions>,
     event_tx: &tokio::sync::mpsc::UnboundedSender<crate::StreamEvent>,
     any_tokens_sent: &std::sync::atomic::AtomicBool,
 ) -> edgequake_llm::Result<edgequake_llm::LLMResponse> {
     let mut stream = provider
-        .chat_with_tools_stream(messages, tool_defs, None, None)
+        .chat_with_tools_stream(messages, tool_defs, None, options)
         .await?;
 
     let mut content = String::new();
@@ -1708,7 +1945,6 @@ async fn api_call_streaming(
                 function_arguments,
                 thought_signature,
             } => {
-                any_tokens_sent.store(true, std::sync::atomic::Ordering::Relaxed);
                 let entry = tool_calls.entry(index).or_default();
                 if let Some(id) = id {
                     entry.id = Some(id);
@@ -1740,24 +1976,7 @@ async fn api_call_streaming(
         response.thinking_content = Some(thinking);
     }
 
-    response.tool_calls = tool_calls
-        .into_iter()
-        .map(|(index, partial)| edgequake_llm::ToolCall {
-            id: partial.id.unwrap_or_else(|| format!("stream_call_{index}")),
-            call_type: "function".to_string(),
-            function: edgequake_llm::FunctionCall {
-                name: partial
-                    .function_name
-                    .unwrap_or_else(|| "unknown_tool".to_string()),
-                arguments: if partial.arguments.trim().is_empty() {
-                    "{}".to_string()
-                } else {
-                    partial.arguments
-                },
-            },
-            thought_signature: partial.thought_signature,
-        })
-        .collect();
+    response.tool_calls = finalize_streamed_tool_calls(tool_calls)?;
 
     if let Some(usage) = final_usage {
         response = response.with_usage(usage.prompt_tokens, usage.completion_tokens);
@@ -1871,11 +2090,11 @@ async fn api_call_with_retry(
     messages: &[edgequake_llm::ChatMessage],
     tool_defs: &[edgequake_llm::ToolDefinition],
     max_retries: u32,
-    cancel: &CancellationToken,
-    event_tx: Option<&tokio::sync::mpsc::UnboundedSender<crate::StreamEvent>>,
-    use_native_streaming: bool,
-) -> Result<edgequake_llm::LLMResponse, AgentError> {
+    ctx: ApiCallContext<'_>,
+) -> Result<ApiCallOutcome, AgentError> {
     let mut last_err = None;
+    let mut native_tool_streaming_enabled = ctx.use_native_streaming;
+    let mut disabled_native_tool_streaming = false;
     // WHY max_retries for both streaming and non-streaming:
     //
     // The old code used `retry_budget = 0` for native streaming to avoid
@@ -1894,13 +2113,13 @@ async fn api_call_with_retry(
     // We enforce this in the Err arm below.
     let retry_budget = max_retries;
 
-    for attempt in 0..=retry_budget {
+    'attempt_loop: for attempt in 0..=retry_budget {
         // ── Backoff sleep — interruptible ──────────────────────────────
         if attempt > 0 {
             let delay = BASE_BACKOFF * 2u32.saturating_pow(attempt - 1);
             tokio::select! {
                 biased;
-                _ = cancel.cancelled() => {
+                _ = ctx.cancel.cancelled() => {
                     tracing::debug!(attempt, "api_call_with_retry: cancelled during backoff sleep");
                     return Err(AgentError::Interrupted);
                 }
@@ -1915,98 +2134,119 @@ async fn api_call_with_retry(
         // before erroring. If tokens arrived, the error is mid-stream and
         // retrying would produce duplicate TUI content — so we abort instead.
         // A fresh AtomicBool for each attempt resets the flag correctly.
-        let tokens_sent = std::sync::atomic::AtomicBool::new(false);
+        let mut use_native_streaming_this_attempt = native_tool_streaming_enabled;
 
-        // ── API call — interruptible ────────────────────────────────────
-        // We race the provider future against the cancel token.
-        // Dropping the provider future is safe: HTTP futures in reqwest
-        // are cancel-safe (the TCP connection is simply closed).
+        loop {
+            let tokens_sent = std::sync::atomic::AtomicBool::new(false);
 
-        // Emit llm:pre hook event (fire-and-forget, informational)
-        if let Some(tx) = event_tx {
-            let ctx_json = serde_json::json!({
-                "event": "llm:pre",
-                "model": provider.model(),
-                "attempt": attempt,
-            })
-            .to_string();
-            let _ = tx.send(crate::StreamEvent::HookEvent {
-                event: "llm:pre".to_string(),
-                context_json: ctx_json,
-            });
-        }
-
-        let call_fut = async {
-            if use_native_streaming {
-                let tx = event_tx.expect("native streaming requires event channel");
-                api_call_streaming(provider, messages, tool_defs, tx, &tokens_sent).await
-            } else if tool_defs.is_empty() {
-                provider.chat(messages, None).await
-            } else {
-                provider
-                    .chat_with_tools(messages, tool_defs, None, None)
-                    .await
+            // ── API call — interruptible ────────────────────────────────
+            // We race the provider future against the cancel token.
+            // Dropping the provider future is safe: HTTP futures in reqwest
+            // are cancel-safe (the TCP connection is simply closed).
+            if let Some(tx) = ctx.event_tx {
+                let ctx_json = serde_json::json!({
+                    "event": "llm:pre",
+                    "model": provider.model(),
+                    "attempt": attempt,
+                    "native_tool_streaming": use_native_streaming_this_attempt,
+                })
+                .to_string();
+                let _ = tx.send(crate::StreamEvent::HookEvent {
+                    event: "llm:pre".to_string(),
+                    context_json: ctx_json,
+                });
             }
-        };
 
-        let result = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => {
-                tracing::debug!(attempt, "api_call_with_retry: cancelled during API call");
-                return Err(AgentError::Interrupted);
-            }
-            r = call_fut => r,
-        };
+            let call_fut = async {
+                if use_native_streaming_this_attempt {
+                    let tx = ctx
+                        .event_tx
+                        .expect("native streaming requires event channel");
+                    api_call_streaming(provider, messages, tool_defs, ctx.options, tx, &tokens_sent)
+                        .await
+                } else if tool_defs.is_empty() {
+                    provider.chat(messages, ctx.options).await
+                } else {
+                    provider
+                        .chat_with_tools(messages, tool_defs, None, ctx.options)
+                        .await
+                }
+            };
 
-        match result {
-            Ok(response) => {
-                // Emit llm:post hook event
-                if let Some(tx) = event_tx {
-                    let ctx_json = serde_json::json!({
-                        "event": "llm:post",
-                        "model": provider.model(),
-                        "prompt_tokens": response.prompt_tokens,
-                        "completion_tokens": response.completion_tokens,
-                    })
-                    .to_string();
-                    let _ = tx.send(crate::StreamEvent::HookEvent {
-                        event: "llm:post".to_string(),
-                        context_json: ctx_json,
+            let result = tokio::select! {
+                biased;
+                _ = ctx.cancel.cancelled() => {
+                    tracing::debug!(attempt, "api_call_with_retry: cancelled during API call");
+                    return Err(AgentError::Interrupted);
+                }
+                r = call_fut => r,
+            };
+
+            match result {
+                Ok(response) => {
+                    if let Some(tx) = ctx.event_tx {
+                        let ctx_json = serde_json::json!({
+                            "event": "llm:post",
+                            "model": provider.model(),
+                            "prompt_tokens": response.prompt_tokens,
+                            "completion_tokens": response.completion_tokens,
+                            "native_tool_streaming": use_native_streaming_this_attempt,
+                        })
+                        .to_string();
+                        let _ = tx.send(crate::StreamEvent::HookEvent {
+                            event: "llm:post".to_string(),
+                            context_json: ctx_json,
+                        });
+                    }
+                    return Ok(ApiCallOutcome {
+                        response,
+                        disabled_native_tool_streaming,
                     });
                 }
-                return Ok(response);
-            }
-            Err(e) => {
-                tracing::warn!(attempt, error = %e, "API call failed");
+                Err(e) => {
+                    tracing::warn!(attempt, error = %e, "API call failed");
 
-                // For native streaming, only continue retrying if the error
-                // is pre-stream-safe (occurred before any tokens were emitted).
-                // ApiError during streaming may be a mid-stream failure (partial
-                // tokens already sent to the TUI); retrying would produce
-                // duplicate content.
-                if use_native_streaming {
-                    // If any tokens were already streamed to the TUI, treat this
-                    // as a mid-stream error and abort immediately — retrying
-                    // would duplicate the already-displayed content.
-                    let mid_stream = tokens_sent.load(std::sync::atomic::Ordering::Relaxed);
-                    let is_prestream_retryable = !mid_stream
-                        && matches!(
-                            e,
-                            edgequake_llm::LlmError::RateLimited(_)
-                                | edgequake_llm::LlmError::NetworkError(_)
-                                | edgequake_llm::LlmError::Timeout
-                                | edgequake_llm::LlmError::AuthError(_)
-                        );
-                    if !is_prestream_retryable {
-                        // Mid-stream or unknown error — abort immediately.
-                        return Err(AgentError::Llm(format!(
-                            "API call failed after {} retries: {}",
-                            attempt, e
-                        )));
+                    let provider_handles_error =
+                        provider_manages_transport_retries(provider.as_ref())
+                            && is_transport_retry_error(&e);
+
+                    if use_native_streaming_this_attempt {
+                        let visible_output_sent =
+                            tokens_sent.load(std::sync::atomic::Ordering::Relaxed);
+                        if !visible_output_sent
+                            && !tool_defs.is_empty()
+                            && is_streamed_tool_capability_error(&e)
+                        {
+                            tracing::warn!(
+                                provider = provider.name(),
+                                model = provider.model(),
+                                "provider rejected streamed tool turns; downgrading this session to non-streaming tool calls"
+                            );
+                            use_native_streaming_this_attempt = false;
+                            native_tool_streaming_enabled = false;
+                            disabled_native_tool_streaming = true;
+                            continue;
+                        }
+
+                        // For native streaming, only continue retrying if the error
+                        // happened before any visible output was emitted. Tool-call
+                        // deltas are buffered locally and are not user-visible, so a
+                        // malformed streamed tool call can safely be retried.
+                        if visible_output_sent || !is_retryable_nonvisible_stream_error(&e) {
+                            let err = augment_provider_error(provider, e.to_string());
+                            return Err(AgentError::Llm(format!(
+                                "API call failed after {} retries: {}",
+                                attempt, err
+                            )));
+                        }
                     }
-                }
 
-                last_err = Some(e);
+                    last_err = Some(e);
+                    if provider_handles_error {
+                        break 'attempt_loop;
+                    }
+                    break;
+                }
             }
         }
     }
@@ -2014,8 +2254,17 @@ async fn api_call_with_retry(
     Err(AgentError::Llm(format!(
         "API call failed after {} retries: {}",
         retry_budget,
-        last_err.map_or_else(|| "unknown error".to_string(), |e| e.to_string())
+        last_err.map_or_else(
+            || "unknown error".to_string(),
+            |e| augment_provider_error(provider, e.to_string())
+        )
     )))
+}
+
+#[derive(Debug)]
+struct ApiCallOutcome {
+    response: edgequake_llm::LLMResponse,
+    disabled_native_tool_streaming: bool,
 }
 
 // ─── Budget pressure warnings ─────────────────────────────────────────────
@@ -2252,6 +2501,7 @@ async fn process_response(
             // Notify TUI that a tool execution is starting
             if let Some(tx) = dctx.event_tx {
                 let _ = tx.send(crate::StreamEvent::ToolExec {
+                    tool_call_id: tc.id.clone(),
                     name: tc.function.name.clone(),
                     args_json: tc.function.arguments.clone(),
                 });
@@ -2304,7 +2554,7 @@ async fn process_response(
                         todo_store: todo_store_clone,
                         capability_suppressions,
                     };
-                    let result = dispatch_single_tool(&tc_name, &tc_args, &inner).await;
+                    let result = dispatch_single_tool(&tc_id, &tc_name, &tc_args, &inner).await;
                     let duration_ms = started.elapsed().as_millis() as u64;
                     (tc_id, tc_name, args_for_done, result, duration_ms)
                 });
@@ -2322,6 +2572,7 @@ async fn process_response(
                     let is_error = is_tool_error(&tool_result);
                     emit_tool_done(
                         dctx.event_tx,
+                        &tc_id,
                         &tc_name,
                         &args_json,
                         &tool_result,
@@ -2379,12 +2630,13 @@ async fn process_response(
         for tc in sequential_calls {
             let started = std::time::Instant::now();
             let tool_result =
-                dispatch_single_tool(&tc.function.name, &tc.function.arguments, dctx).await;
+                dispatch_single_tool(&tc.id, &tc.function.name, &tc.function.arguments, dctx).await;
             let duration_ms = started.elapsed().as_millis() as u64;
 
             let is_error = is_tool_error(&tool_result);
             emit_tool_done(
                 dctx.event_tx,
+                &tc.id,
                 &tc.function.name,
                 &tc.function.arguments,
                 &tool_result,
@@ -2461,7 +2713,12 @@ fn cap_delegate_task_calls(
 }
 
 /// Dispatch a single tool call through the registry.
-async fn dispatch_single_tool(name: &str, args_json: &str, dctx: &DispatchContext<'_>) -> String {
+async fn dispatch_single_tool(
+    tool_call_id: &str,
+    name: &str,
+    args_json: &str,
+    dctx: &DispatchContext<'_>,
+) -> String {
     let Some(reg) = dctx.registry else {
         return format!(
             "Tool '{}' execution is not yet wired (no ToolRegistry provided).",
@@ -2509,8 +2766,11 @@ async fn dispatch_single_tool(name: &str, args_json: &str, dctx: &DispatchContex
         dctx.delegation_event_tx.clone(),
         dctx.clarify_tx.clone(),
         dctx.approval_tx.clone(),
+        make_tool_progress_tx(dctx.event_tx),
         dctx.gateway_sender.clone(),
         dctx.origin_chat.clone(),
+        Some(tool_call_id.to_string()),
+        Some(name.to_string()),
         &dctx.conversation_session_id,
         dctx.todo_store.clone(),
     );
@@ -2818,6 +3078,25 @@ mod tests {
         chunks: Vec<StreamChunk>,
     }
 
+    #[derive(Clone)]
+    struct OrphanRejectingProvider;
+
+    #[derive(Clone)]
+    struct RetryCountingProvider {
+        provider_name: &'static str,
+        attempts: Arc<std::sync::atomic::AtomicUsize>,
+        last_options: Arc<Mutex<Option<CompletionOptions>>>,
+    }
+    struct FlakyToolStreamProvider {
+        attempts: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[derive(Clone)]
+    struct ToolStreamingRejectedProvider {
+        stream_attempts: Arc<std::sync::atomic::AtomicUsize>,
+        nonstream_attempts: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
     #[async_trait]
     impl LLMProvider for StreamingUsageProvider {
         fn name(&self) -> &str {
@@ -2884,6 +3163,286 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl LLMProvider for OrphanRejectingProvider {
+        fn name(&self) -> &str {
+            "orphan-rejecting-test"
+        }
+
+        fn model(&self) -> &str {
+            "orphan-rejecting-test-model"
+        }
+
+        fn max_context_length(&self) -> usize {
+            8192
+        }
+
+        async fn complete(
+            &self,
+            prompt: &str,
+        ) -> edgequake_llm::Result<edgequake_llm::LLMResponse> {
+            Ok(edgequake_llm::LLMResponse::new(prompt, self.model()))
+        }
+
+        async fn complete_with_options(
+            &self,
+            prompt: &str,
+            _options: &CompletionOptions,
+        ) -> edgequake_llm::Result<edgequake_llm::LLMResponse> {
+            self.complete(prompt).await
+        }
+
+        async fn chat(
+            &self,
+            messages: &[ChatMessage],
+            _options: Option<&CompletionOptions>,
+        ) -> edgequake_llm::Result<edgequake_llm::LLMResponse> {
+            self.assert_no_orphaned_tool_result(messages)?;
+            Ok(edgequake_llm::LLMResponse::new(
+                "clean history",
+                self.model(),
+            ))
+        }
+    }
+
+    impl OrphanRejectingProvider {
+        fn assert_no_orphaned_tool_result(
+            &self,
+            messages: &[ChatMessage],
+        ) -> edgequake_llm::Result<()> {
+            let mut valid_tool_ids = std::collections::HashSet::new();
+            for message in messages {
+                if matches!(message.role, edgequake_llm::ChatRole::Assistant) {
+                    if let Some(tool_calls) = &message.tool_calls {
+                        for tool_call in tool_calls {
+                            valid_tool_ids.insert(tool_call.id.clone());
+                        }
+                    }
+                }
+                let tool_call_id = message.tool_call_id.as_deref();
+                if matches!(message.role, edgequake_llm::ChatRole::Tool)
+                    && tool_call_id.is_none_or(|id| !valid_tool_ids.contains(id))
+                {
+                    return Err(edgequake_llm::LlmError::ApiError(
+                        "orphaned tool result reached provider".into(),
+                    ));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl LLMProvider for RetryCountingProvider {
+        fn name(&self) -> &str {
+            self.provider_name
+        }
+
+        fn model(&self) -> &str {
+            "retry-counting-model"
+        }
+
+        fn max_context_length(&self) -> usize {
+            8192
+        }
+
+        async fn complete(
+            &self,
+            prompt: &str,
+        ) -> edgequake_llm::Result<edgequake_llm::LLMResponse> {
+            Ok(edgequake_llm::LLMResponse::new(prompt, self.model()))
+        }
+
+        async fn complete_with_options(
+            &self,
+            prompt: &str,
+            _options: &CompletionOptions,
+        ) -> edgequake_llm::Result<edgequake_llm::LLMResponse> {
+            self.complete(prompt).await
+        }
+
+        async fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            options: Option<&CompletionOptions>,
+        ) -> edgequake_llm::Result<edgequake_llm::LLMResponse> {
+            self.attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            *self.last_options.lock().expect("lock") = options.cloned();
+            Err(edgequake_llm::LlmError::NetworkError(
+                "synthetic network failure".into(),
+            ))
+        }
+    }
+
+    #[async_trait]
+    impl LLMProvider for FlakyToolStreamProvider {
+        fn name(&self) -> &str {
+            "flaky-tool-stream"
+        }
+
+        fn model(&self) -> &str {
+            "flaky-tool-stream-model"
+        }
+
+        fn max_context_length(&self) -> usize {
+            8192
+        }
+
+        async fn complete(
+            &self,
+            prompt: &str,
+        ) -> edgequake_llm::Result<edgequake_llm::LLMResponse> {
+            Ok(edgequake_llm::LLMResponse::new(prompt, self.model()))
+        }
+
+        async fn complete_with_options(
+            &self,
+            prompt: &str,
+            _options: &CompletionOptions,
+        ) -> edgequake_llm::Result<edgequake_llm::LLMResponse> {
+            self.complete(prompt).await
+        }
+
+        async fn chat(
+            &self,
+            messages: &[ChatMessage],
+            options: Option<&CompletionOptions>,
+        ) -> edgequake_llm::Result<edgequake_llm::LLMResponse> {
+            self.chat_with_tools(messages, &[], None, options).await
+        }
+
+        async fn chat_with_tools(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[ToolDefinition],
+            _tool_choice: Option<ToolChoice>,
+            _options: Option<&CompletionOptions>,
+        ) -> edgequake_llm::Result<edgequake_llm::LLMResponse> {
+            Ok(edgequake_llm::LLMResponse::new("non-stream", self.model()))
+        }
+
+        async fn chat_with_tools_stream(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[ToolDefinition],
+            _tool_choice: Option<ToolChoice>,
+            _options: Option<&CompletionOptions>,
+        ) -> edgequake_llm::Result<
+            futures::stream::BoxStream<'static, edgequake_llm::Result<StreamChunk>>,
+        > {
+            use futures::StreamExt;
+
+            let attempt = self
+                .attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let chunks = if attempt == 0 {
+                vec![
+                    StreamChunk::ToolCallDelta {
+                        index: 0,
+                        id: Some("call_write".into()),
+                        function_name: Some("write_file".into()),
+                        function_arguments: None,
+                        thought_signature: None,
+                    },
+                    StreamChunk::Finished {
+                        reason: "stop".into(),
+                        ttft_ms: None,
+                        usage: None,
+                    },
+                ]
+            } else {
+                vec![
+                    StreamChunk::Content("recovered".into()),
+                    StreamChunk::Finished {
+                        reason: "stop".into(),
+                        ttft_ms: None,
+                        usage: None,
+                    },
+                ]
+            };
+
+            Ok(futures::stream::iter(chunks.into_iter().map(Ok)).boxed())
+        }
+
+        fn supports_tool_streaming(&self) -> bool {
+            true
+        }
+    }
+
+    #[async_trait]
+    impl LLMProvider for ToolStreamingRejectedProvider {
+        fn name(&self) -> &str {
+            "tool-streaming-rejected"
+        }
+
+        fn model(&self) -> &str {
+            "tool-streaming-rejected-model"
+        }
+
+        fn max_context_length(&self) -> usize {
+            8192
+        }
+
+        async fn complete(
+            &self,
+            prompt: &str,
+        ) -> edgequake_llm::Result<edgequake_llm::LLMResponse> {
+            Ok(edgequake_llm::LLMResponse::new(prompt, self.model()))
+        }
+
+        async fn complete_with_options(
+            &self,
+            prompt: &str,
+            _options: &CompletionOptions,
+        ) -> edgequake_llm::Result<edgequake_llm::LLMResponse> {
+            self.complete(prompt).await
+        }
+
+        async fn chat(
+            &self,
+            messages: &[ChatMessage],
+            options: Option<&CompletionOptions>,
+        ) -> edgequake_llm::Result<edgequake_llm::LLMResponse> {
+            self.chat_with_tools(messages, &[], None, options).await
+        }
+
+        async fn chat_with_tools(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[ToolDefinition],
+            _tool_choice: Option<ToolChoice>,
+            _options: Option<&CompletionOptions>,
+        ) -> edgequake_llm::Result<edgequake_llm::LLMResponse> {
+            self.nonstream_attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(edgequake_llm::LLMResponse::new(
+                "tool fallback",
+                self.model(),
+            ))
+        }
+
+        async fn chat_with_tools_stream(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[ToolDefinition],
+            _tool_choice: Option<ToolChoice>,
+            _options: Option<&CompletionOptions>,
+        ) -> edgequake_llm::Result<
+            futures::stream::BoxStream<'static, edgequake_llm::Result<StreamChunk>>,
+        > {
+            self.stream_attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(edgequake_llm::LlmError::InvalidRequest(
+                "Tool calling is not supported in streaming mode".into(),
+            ))
+        }
+
+        fn supports_tool_streaming(&self) -> bool {
+            true
+        }
+    }
+
     #[tokio::test]
     async fn api_call_streaming_preserves_authoritative_usage() {
         let provider: Arc<dyn LLMProvider> = Arc::new(StreamingUsageProvider {
@@ -2907,6 +3466,10 @@ mod tests {
             &provider,
             &[ChatMessage::user("hello")],
             &[],
+            Some(&CompletionOptions {
+                max_tokens: Some(256),
+                ..Default::default()
+            }),
             &tx,
             &tokens_sent,
         )
@@ -2959,6 +3522,10 @@ mod tests {
                 ChatMessage::user("hello world"),
             ],
             &tool_defs,
+            Some(&CompletionOptions {
+                max_tokens: Some(512),
+                ..Default::default()
+            }),
             &tx,
             &tokens_sent,
         )
@@ -2975,6 +3542,259 @@ mod tests {
         );
         assert_eq!(response.thinking_tokens, Some(3));
         assert_eq!(response.finish_reason.as_deref(), Some("stop"));
+    }
+
+    #[tokio::test]
+    async fn api_call_streaming_rejects_tool_calls_without_arguments() {
+        let provider: Arc<dyn LLMProvider> = Arc::new(StreamingUsageProvider {
+            chunks: vec![
+                StreamChunk::ToolCallDelta {
+                    index: 0,
+                    id: Some("call_execute".into()),
+                    function_name: Some("execute_code".into()),
+                    function_arguments: None,
+                    thought_signature: None,
+                },
+                StreamChunk::Finished {
+                    reason: "stop".to_string(),
+                    ttft_ms: None,
+                    usage: None,
+                },
+            ],
+        });
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let tokens_sent = std::sync::atomic::AtomicBool::new(false);
+
+        let err = api_call_streaming(
+            &provider,
+            &[ChatMessage::user("hello")],
+            &[],
+            None,
+            &tx,
+            &tokens_sent,
+        )
+        .await
+        .expect_err("missing streamed arguments must be rejected");
+
+        assert!(
+            err.to_string().contains("finished without arguments"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !tokens_sent.load(std::sync::atomic::Ordering::Relaxed),
+            "tool-call deltas alone must not count as visible streamed output"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_call_with_retry_does_not_double_retry_copilot_requests() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider: Arc<dyn LLMProvider> = Arc::new(RetryCountingProvider {
+            provider_name: "vscode-copilot",
+            attempts: attempts.clone(),
+            last_options: Arc::new(Mutex::new(None)),
+        });
+        let cancel = CancellationToken::new();
+
+        let err = api_call_with_retry(
+            &provider,
+            &[ChatMessage::user("hello")],
+            &[],
+            3,
+            ApiCallContext {
+                options: None,
+                cancel: &cancel,
+                event_tx: None,
+                use_native_streaming: false,
+            },
+        )
+        .await
+        .expect_err("copilot request should fail");
+
+        assert!(matches!(err, AgentError::Llm(_)));
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "Copilot already retries internally; the outer loop must not multiply attempts"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_call_with_retry_forwards_completion_options() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let last_options = Arc::new(Mutex::new(None));
+        let provider: Arc<dyn LLMProvider> = Arc::new(RetryCountingProvider {
+            provider_name: "options-test-provider",
+            attempts,
+            last_options: last_options.clone(),
+        });
+        let cancel = CancellationToken::new();
+        let options = CompletionOptions {
+            max_tokens: Some(2048),
+            temperature: Some(0.1),
+            reasoning_effort: Some("low".into()),
+            ..Default::default()
+        };
+
+        let _ = api_call_with_retry(
+            &provider,
+            &[ChatMessage::user("hello")],
+            &[],
+            0,
+            ApiCallContext {
+                options: Some(&options),
+                cancel: &cancel,
+                event_tx: None,
+                use_native_streaming: false,
+            },
+        )
+        .await;
+
+        let recorded = last_options.lock().expect("lock").clone().expect("options");
+        assert_eq!(recorded.max_tokens, Some(2048));
+        assert_eq!(recorded.temperature, Some(0.1));
+        assert_eq!(recorded.reasoning_effort.as_deref(), Some("low"));
+    }
+
+    #[tokio::test]
+    async fn api_call_with_retry_retries_malformed_streamed_tool_calls() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider: Arc<dyn LLMProvider> = Arc::new(FlakyToolStreamProvider {
+            attempts: attempts.clone(),
+        });
+        let cancel = CancellationToken::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let outcome = api_call_with_retry(
+            &provider,
+            &[ChatMessage::user("hello")],
+            &[],
+            1,
+            ApiCallContext {
+                options: None,
+                cancel: &cancel,
+                event_tx: Some(&tx),
+                use_native_streaming: true,
+            },
+        )
+        .await
+        .expect("malformed tool stream should be retried once");
+
+        let response = outcome.response;
+        assert_eq!(response.content, "recovered");
+        assert_eq!(response.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn api_call_with_retry_falls_back_when_streamed_tools_are_rejected() {
+        let stream_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let nonstream_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider: Arc<dyn LLMProvider> = Arc::new(ToolStreamingRejectedProvider {
+            stream_attempts: stream_attempts.clone(),
+            nonstream_attempts: nonstream_attempts.clone(),
+        });
+        let cancel = CancellationToken::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let tool_defs = vec![ToolDefinition::function(
+            "write_file",
+            "Write a file",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"}
+                },
+                "required": ["path", "content"]
+            }),
+        )];
+
+        let outcome = api_call_with_retry(
+            &provider,
+            &[ChatMessage::user("hello")],
+            &tool_defs,
+            1,
+            ApiCallContext {
+                options: None,
+                cancel: &cancel,
+                event_tx: Some(&tx),
+                use_native_streaming: true,
+            },
+        )
+        .await
+        .expect("tool-stream capability miss should downgrade cleanly");
+
+        assert_eq!(outcome.response.content, "tool fallback");
+        assert!(outcome.disabled_native_tool_streaming);
+        assert_eq!(stream_attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            nonstream_attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[test]
+    fn streamed_tool_capability_error_detection_is_specific() {
+        assert!(is_streamed_tool_capability_error(
+            &edgequake_llm::LlmError::InvalidRequest(
+                "Tool calling is not supported in streaming mode".into(),
+            )
+        ));
+        assert!(!is_streamed_tool_capability_error(
+            &edgequake_llm::LlmError::InvalidRequest("temperature must be <= 2".into())
+        ));
+    }
+
+    #[test]
+    fn completion_options_include_model_budget_and_reasoning_policy() {
+        let config = crate::agent::AgentConfig {
+            temperature: Some(0.2),
+            reasoning_effort: Some("medium".into()),
+            model_config: crate::config::ModelConfig {
+                max_tokens: Some(3072),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let options = completion_options_for(&config);
+
+        assert_eq!(options.max_tokens, Some(3072));
+        assert_eq!(options.temperature, Some(0.2));
+        assert_eq!(options.reasoning_effort.as_deref(), Some("medium"));
+    }
+
+    #[test]
+    fn native_streaming_policy_disables_copilot_for_tool_turns() {
+        let copilot_provider: Arc<dyn LLMProvider> = Arc::new(RetryCountingProvider {
+            provider_name: "vscode-copilot",
+            attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            last_options: Arc::new(Mutex::new(None)),
+        });
+        let streaming_provider: Arc<dyn LLMProvider> = Arc::new(FlakyToolStreamProvider {
+            attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        });
+        let tool_defs = vec![ToolDefinition::function(
+            "write_file",
+            "Write a file",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"}
+                },
+                "required": ["path", "content"]
+            }),
+        )];
+
+        assert!(
+            !should_use_native_streaming(copilot_provider.as_ref(), &tool_defs, true, true),
+            "Copilot tool turns should use the safer non-native path"
+        );
+        assert!(
+            should_use_native_streaming(streaming_provider.as_ref(), &[], true, true),
+            "Plain-text turns can still use native streaming"
+        );
     }
 
     #[test]
@@ -3052,6 +3872,33 @@ mod tests {
 
         // History (2) + user (1) + assistant (1) = 4
         assert_eq!(result.messages.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn execute_loop_sanitizes_history_before_provider_call() {
+        let provider: Arc<dyn LLMProvider> = Arc::new(OrphanRejectingProvider);
+        let agent = AgentBuilder::new("mock")
+            .provider(provider)
+            .build()
+            .expect("build");
+        let history = vec![
+            Message::user("previous question"),
+            Message::tool_result("orphan-id", "read_file", "stale output"),
+        ];
+
+        let result = agent
+            .execute_loop("follow-up", None, Some(history), None, None)
+            .await
+            .expect("loop");
+
+        assert_eq!(result.final_response, "clean history");
+        assert!(
+            result
+                .messages
+                .iter()
+                .all(|message| message.tool_call_id.as_deref() != Some("orphan-id")),
+            "orphaned tool result should be removed before persistence"
+        );
     }
 
     #[tokio::test]
@@ -3182,6 +4029,16 @@ mod tests {
         assert_eq!(chat_msgs.len(), 2);
         // System message should have cache_control set
         assert!(chat_msgs[0].cache_control.is_some());
+    }
+
+    #[test]
+    fn prompt_cache_config_is_provider_aware() {
+        let provider: Arc<dyn LLMProvider> = Arc::new(edgequake_llm::MockProvider::new());
+        assert!(
+            prompt_cache_config_for(&provider, true).is_none(),
+            "non-Anthropic providers should not receive Anthropic cache markers"
+        );
+        assert!(provider_supports_prompt_caching("anthropic"));
     }
 
     #[test]
@@ -3581,6 +4438,50 @@ mod tests {
         assert!(preview.contains("permission denied"));
     }
 
+    #[test]
+    fn summarize_tool_result_preview_summarizes_web_search_results() {
+        let preview = summarize_tool_result_preview(
+            "web_search",
+            r#"{"success":true,"backend":"Brave","results":[{"title":"A"},{"title":"B"}]}"#,
+            false,
+        )
+        .expect("preview");
+        assert_eq!(preview, "2 result(s) via Brave");
+    }
+
+    #[test]
+    fn summarize_tool_result_preview_summarizes_todo_state() {
+        let preview = summarize_tool_result_preview(
+            "todo",
+            r#"{"todos":[],"summary":{"total":4,"completed":2,"in_progress":1,"not_started":1,"cancelled":0}}"#,
+            false,
+        )
+        .expect("preview");
+        assert_eq!(preview, "2/4 done, 1 in progress");
+    }
+
+    #[test]
+    fn summarize_tool_result_preview_supports_manage_todo_list_alias() {
+        let preview = summarize_tool_result_preview(
+            "manage_todo_list",
+            r#"{"todos":[],"summary":{"total":3,"completed":1,"in_progress":1,"not_started":1,"cancelled":0}}"#,
+            false,
+        )
+        .expect("preview");
+        assert_eq!(preview, "1/3 done, 1 in progress");
+    }
+
+    #[test]
+    fn summarize_tool_result_preview_summarizes_delegate_batch() {
+        let preview = summarize_tool_result_preview(
+            "delegate_task",
+            r#"{"results":[{"status":"success"},{"status":"completed"},{"status":"error"}],"total_duration_seconds":1.25}"#,
+            false,
+        )
+        .expect("preview");
+        assert_eq!(preview, "2/3 task(s) completed in 1.25s");
+    }
+
     // ── build_chat_messages edge cases ───────────────────────────────────
 
     #[test]
@@ -3663,6 +4564,7 @@ mod tests {
         dctx.cwd = workspace.path().to_path_buf();
 
         let result = dispatch_single_tool(
+            "call-read-file",
             "read_file",
             r#"{"path":"proof.txt","line_numbers":false}"#,
             &dctx,
@@ -3687,7 +4589,7 @@ mod tests {
             capability_suppressions,
         );
 
-        let result = dispatch_single_tool("read_file", "{}", &dctx).await;
+        let result = dispatch_single_tool("call-read-file", "read_file", "{}", &dctx).await;
         let parsed = parse_tool_error_response(&result).expect("structured tool error");
         assert_eq!(parsed.response_type, "tool_error");
         assert_eq!(parsed.category, "arguments");
@@ -3711,12 +4613,12 @@ mod tests {
         );
         let args_json = r#"{"command":"top"}"#;
 
-        let first = dispatch_single_tool("terminal", args_json, &dctx).await;
+        let first = dispatch_single_tool("call-terminal-1", "terminal", args_json, &dctx).await;
         let first_payload = parse_tool_error_response(&first).expect("structured error");
         assert_eq!(first_payload.code, "non_interactive_terminal_required");
         remember_tool_suppression(&capability_suppressions, "terminal", args_json, &first);
 
-        let second = dispatch_single_tool("terminal", args_json, &dctx).await;
+        let second = dispatch_single_tool("call-terminal-2", "terminal", args_json, &dctx).await;
         let second_payload = parse_tool_error_response(&second).expect("structured error");
         assert_eq!(second_payload.code, "suppressed_capability_retry");
         assert!(second_payload.error.contains("already blocked"));

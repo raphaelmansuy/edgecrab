@@ -17,7 +17,6 @@
 use std::sync::Arc;
 
 use edgecrab_core::agent::{AgentBuilder, ApprovalChoice, StreamEvent};
-use edgequake_llm::ProviderFactory;
 
 /// Guard: skip test when VS Code Copilot is not available.
 ///
@@ -43,7 +42,7 @@ async fn e2e_agent_chat_with_copilot_gpt4_mini() {
         return;
     }
 
-    let provider = ProviderFactory::create_llm_provider("vscode-copilot", "gpt-4.1-mini")
+    let provider = edgecrab_tools::create_provider_for_model("vscode-copilot", "gpt-4.1-mini")
         .expect("should create VsCodeCopilot provider");
 
     let agent = AgentBuilder::new("vscode-copilot/gpt-4.1-mini")
@@ -73,7 +72,7 @@ async fn e2e_agent_streaming_with_copilot() {
         return;
     }
 
-    let provider = ProviderFactory::create_llm_provider("vscode-copilot", "gpt-4.1-mini")
+    let provider = edgecrab_tools::create_provider_for_model("vscode-copilot", "gpt-4.1-mini")
         .expect("should create VsCodeCopilot provider");
 
     let agent = Arc::new(
@@ -100,7 +99,8 @@ async fn e2e_agent_streaming_with_copilot() {
     while let Some(event) = chunk_rx.recv().await {
         match event {
             StreamEvent::Token(text) => accumulated.push_str(&text),
-            StreamEvent::ToolExec { .. } => {} // tool progress events — just ignore in this test
+            StreamEvent::ToolExec { .. } => {} // tool execution events — just ignore in this test
+            StreamEvent::ToolProgress { .. } => {} // tool progress events — just ignore in this test
             StreamEvent::ToolDone { .. } => {} // tool completion events — just ignore in this test
             StreamEvent::SubAgentStart { .. } => {} // delegated progress — not relevant here
             StreamEvent::SubAgentReasoning { .. } => {} // delegated progress — not relevant here
@@ -146,7 +146,7 @@ async fn e2e_model_swap_with_copilot() {
         return;
     }
 
-    let provider = ProviderFactory::create_llm_provider("vscode-copilot", "gpt-4.1-mini")
+    let provider = edgecrab_tools::create_provider_for_model("vscode-copilot", "gpt-4.1-mini")
         .expect("copilot provider");
 
     let agent = AgentBuilder::new("vscode-copilot/gpt-4.1-mini")
@@ -160,7 +160,7 @@ async fn e2e_model_swap_with_copilot() {
     assert!(r1.to_uppercase().contains("ALPHA"), "got: {r1}");
 
     // Hot-swap to the same model (no-op but validates the plumbing)
-    let provider2 = ProviderFactory::create_llm_provider("vscode-copilot", "gpt-4.1-mini")
+    let provider2 = edgecrab_tools::create_provider_for_model("vscode-copilot", "gpt-4.1-mini")
         .expect("second provider");
     agent
         .swap_model("vscode-copilot/gpt-4.1-mini".into(), provider2)

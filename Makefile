@@ -16,7 +16,7 @@
 
 .DEFAULT_GOAL := help
 .PHONY: help \
-        build build-debug check fmt fmt-check lint test ci \
+        build build-debug check fmt fmt-check lint test test-lsp ci \
         install uninstall \
         test-python test-node test-sdks \
         publish-rust publish-rust-dry \
@@ -108,11 +108,15 @@ lint: ## Run Clippy — warnings promoted to errors
 	$(call log,cargo clippy -- -D warnings)
 	@cargo clippy -- -D warnings
 
-test: ## Run all Rust unit and integration tests
-	$(call log,cargo test)
-	@cargo test
+test: ## Run all Rust unit and integration tests across the workspace
+	$(call log,cargo test --workspace)
+	@cargo test --workspace
 
-ci: fmt-check lint test test-sdks ## Full CI gate: fmt → lint → test → SDK tests
+test-lsp: ## Run the dedicated LSP crate tests and integration coverage
+	$(call log,cargo test -p edgecrab-lsp)
+	@cargo test -p edgecrab-lsp
+
+ci: fmt-check lint test-lsp test test-sdks ## Full CI gate: fmt → lint → LSP → workspace test → SDK tests
 	$(call ok,All CI checks passed)
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -151,9 +155,9 @@ test-sdks: test-python test-node ## Run all SDK test suites
 
 # Dry-run every crate in publish order.  Uses --no-verify + --allow-dirty so
 # workspace path deps don't cause false failures locally.
-publish-rust-dry: ## Dry-run: verify all 10 crates package cleanly
+publish-rust-dry: ## Dry-run: verify all 11 crates package cleanly
 	$(call log,Dry-run: all Rust crates ...)
-	@for crate in edgecrab-types edgecrab-security edgecrab-state edgecrab-cron edgecrab-tools edgecrab-core edgecrab-gateway edgecrab-acp edgecrab-migrate edgecrab-cli; do \
+	@for crate in edgecrab-types edgecrab-security edgecrab-state edgecrab-cron edgecrab-tools edgecrab-lsp edgecrab-core edgecrab-gateway edgecrab-acp edgecrab-migrate edgecrab-cli; do \
 	  printf " $(CYAN)→$(RESET) cargo publish -p $$crate --dry-run\n"; \
 	  cargo publish -p $$crate --dry-run --allow-dirty --no-verify 2>&1 | grep -v 'Uploading' || true; \
 	done
@@ -163,7 +167,7 @@ publish-rust-dry: ## Dry-run: verify all 10 crates package cleanly
 # we sleep 30 s so crates.io has time to index the crate before the next
 # dependent crate is submitted.  Errors due to "already published" are
 # treated as non-fatal; all other errors abort immediately.
-publish-rust: ## Publish all 10 crates to crates.io (dependency order)
+publish-rust: ## Publish all 11 crates to crates.io (dependency order)
 	$(call log,Publishing edgecrab-types ...)
 	@OUTPUT=$$(cargo publish -p edgecrab-types 2>&1); STATUS=$$?; \
 	 echo "$$OUTPUT"; \
@@ -173,7 +177,7 @@ publish-rust: ## Publish all 10 crates to crates.io (dependency order)
 	$(call log,Waiting 30 s for index propagation ...)
 	@sleep 30
 	$(call log,Publishing remaining crates ...)
-	@for crate in edgecrab-security edgecrab-state edgecrab-cron edgecrab-tools edgecrab-core edgecrab-gateway edgecrab-acp edgecrab-migrate edgecrab-cli; do \
+	@for crate in edgecrab-security edgecrab-state edgecrab-cron edgecrab-tools edgecrab-lsp edgecrab-core edgecrab-gateway edgecrab-acp edgecrab-migrate edgecrab-cli; do \
 	  printf " $(CYAN)→$(RESET) cargo publish -p $$crate --no-verify\n"; \
 	  OUTPUT=$$(cargo publish -p $$crate --no-verify 2>&1); STATUS=$$?; \
 	  echo "$$OUTPUT"; \

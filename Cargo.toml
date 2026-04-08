@@ -5,6 +5,7 @@ members = [
     "crates/edgecrab-security",
     "crates/edgecrab-state",
     "crates/edgecrab-cron",
+    "crates/edgecrab-lsp",
     "crates/edgecrab-tools",
     "crates/edgecrab-core",
     "crates/edgecrab-cli",
@@ -13,7 +14,7 @@ members = [
     "crates/edgecrab-migrate",
 ]
 [workspace.package]
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 rust-version = "1.86.0"
 license = "Apache-2.0"
@@ -36,11 +37,13 @@ futures = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 async-trait = "0.1"
+async-lsp = { version = "0.2.3", features = ["omni-trait", "tokio"] }
+lsp-types = { version = "0.97.0", features = ["proposed"] }
 regex = "1"
 url = "2"
 
 # LLM backend
-edgequake-llm = "0.5.1"
+edgequake-llm = { version = "0.5.1", features = ["bedrock"] }
 
 # Image processing (vision tool: resize/compress before base64 encoding)
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
@@ -88,6 +91,7 @@ which = "7"
 dotenvy = "0.15"
 mockall = "0.13"
 libc = "0.2"
+portable-pty = "0.9"
 
 # Execution backends
 bollard = { version = "0.18", features = ["ssl"] }

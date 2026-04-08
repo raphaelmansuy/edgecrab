@@ -17,15 +17,17 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
 use edgecrab_state::SessionDb;
 use edgecrab_tools::ProcessTable;
 use edgecrab_tools::TodoStore;
-use edgecrab_tools::registry::{GatewaySender, ToolRegistry};
+use edgecrab_tools::config_ref::{AppConfigRef, LspServerConfigRef};
+use edgecrab_tools::registry::{GatewaySender, ToolInventoryEntry, ToolRegistry};
 use edgecrab_types::{AgentError, ApiMode, Cost, Message, Platform, Role, Usage};
 use edgequake_llm::LLMProvider;
 
@@ -55,6 +57,13 @@ pub struct Agent {
     /// WHY on Agent: All tool invocations in the same session share the
     /// same process namespace — Agent lifetime == session lifetime.
     pub(crate) process_table: Arc<ProcessTable>,
+    /// Serializes conversation execution without blocking session readers.
+    ///
+    /// WHY separate from `session`: the old design used the session write lock
+    /// as both the mutable state guard and the conversation-level mutex. That
+    /// kept `/status`, session inspection, and other read paths blocked for the
+    /// full duration of prompt assembly, API calls, and tool execution.
+    pub(crate) conversation_lock: Mutex<()>,
     pub(crate) session: RwLock<SessionState>,
     pub(crate) budget: Arc<IterationBudget>,
     /// Cancel token is wrapped in a Mutex so it can be RESET before each new
@@ -100,6 +109,8 @@ pub struct AgentConfig {
     pub max_iterations: u32,
     pub enabled_toolsets: Vec<String>,
     pub disabled_toolsets: Vec<String>,
+    pub enabled_tools: Vec<String>,
+    pub disabled_tools: Vec<String>,
     pub streaming: bool,
     pub temperature: Option<f32>,
     pub platform: Platform,
@@ -148,6 +159,8 @@ pub struct AgentConfig {
     pub compression: crate::config::CompressionConfig,
     /// Auxiliary side-task routing (vision, compression, other helper calls).
     pub auxiliary: crate::config::AuxiliaryConfig,
+    /// Default Mixture-of-Agents roster and aggregator.
+    pub moa: crate::config::MoaConfig,
     /// Voice output configuration projected from AppConfig.
     pub tts: crate::config::TtsConfig,
     /// Voice input configuration projected from AppConfig.
@@ -164,15 +177,19 @@ pub struct AgentConfig {
     pub file_allowed_roots: Vec<std::path::PathBuf>,
     /// Denied prefixes layered over the workspace and allow-root policy.
     pub path_restrictions: Vec<std::path::PathBuf>,
+    /// LSP runtime configuration projected from AppConfig.
+    pub lsp: crate::config::LspConfig,
 }
 
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            model: "anthropic/claude-opus-4.6".into(),
+            model: "ollama/gemma4:latest".into(),
             max_iterations: 90,
             enabled_toolsets: Vec::new(),
             disabled_toolsets: Vec::new(),
+            enabled_tools: Vec::new(),
+            disabled_tools: Vec::new(),
             streaming: true,
             temperature: None,
             platform: Platform::Cli,
@@ -204,18 +221,146 @@ impl Default for AgentConfig {
                 edgecrab_tools::tools::backends::SingularityBackendConfig::default(),
             compression: crate::config::CompressionConfig::default(),
             auxiliary: crate::config::AuxiliaryConfig::default(),
+            moa: crate::config::MoaConfig::default(),
             tts: crate::config::TtsConfig::default(),
             stt: crate::config::SttConfig::default(),
             image_generation: crate::config::ImageGenerationConfig::default(),
             terminal_env_passthrough: Vec::new(),
             file_allowed_roots: Vec::new(),
             path_restrictions: Vec::new(),
+            lsp: crate::config::LspConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedToolPolicy {
+    pub expanded_enabled: Vec<String>,
+    pub expanded_disabled: Vec<String>,
+    pub parent_active_toolsets: Vec<String>,
+}
+
+pub(crate) fn resolve_tool_policy(config: &AgentConfig) -> ResolvedToolPolicy {
+    let expanded_enabled = edgecrab_tools::toolsets::expand_toolset_names(&config.enabled_toolsets);
+    let expanded_disabled =
+        edgecrab_tools::toolsets::expand_toolset_names(&config.disabled_toolsets);
+    let parent_active_toolsets = if config.enabled_toolsets.is_empty()
+        || edgecrab_tools::toolsets::contains_all_sentinel(&config.enabled_toolsets)
+        || expanded_enabled.is_empty()
+    {
+        Vec::new()
+    } else {
+        expanded_enabled
+            .iter()
+            .filter(|toolset| {
+                !expanded_disabled
+                    .iter()
+                    .any(|disabled| disabled == *toolset)
+            })
+            .cloned()
+            .collect()
+    };
+
+    ResolvedToolPolicy {
+        expanded_enabled,
+        expanded_disabled,
+        parent_active_toolsets,
+    }
+}
+
+impl AgentConfig {
+    fn lsp_server_refs(&self) -> std::collections::HashMap<String, LspServerConfigRef> {
+        self.lsp
+            .servers
+            .iter()
+            .map(|(name, server)| {
+                (
+                    name.clone(),
+                    LspServerConfigRef {
+                        command: server.command.clone(),
+                        args: server.args.clone(),
+                        file_extensions: server.file_extensions.clone(),
+                        language_id: server.language_id.clone(),
+                        root_markers: server.root_markers.clone(),
+                        env: server.env.clone(),
+                        initialization_options: server.initialization_options.clone(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn disabled_skills_for_platform(&self) -> Vec<String> {
+        let mut disabled = self.skills_config.disabled.clone();
+        let platform_key = self.platform.to_string();
+        if let Some(platform_disabled) = self.skills_config.platform_disabled.get(&platform_key) {
+            disabled.extend(platform_disabled.iter().cloned());
+        }
+        disabled
+    }
+
+    pub(crate) fn to_app_config_ref(
+        &self,
+        gateway_running: bool,
+        tool_policy: &ResolvedToolPolicy,
+    ) -> AppConfigRef {
+        AppConfigRef {
+            edgecrab_home: crate::config::edgecrab_home(),
+            file_allowed_roots: self.file_allowed_roots.clone(),
+            path_restrictions: self.path_restrictions.clone(),
+            lsp_enabled: self.lsp.enabled,
+            lsp_file_size_limit_bytes: self.lsp.file_size_limit_bytes,
+            lsp_servers: self.lsp_server_refs(),
+            delegation_enabled: self.delegation_enabled,
+            delegation_model: self.delegation_model.clone(),
+            delegation_provider: self.delegation_provider.clone(),
+            delegation_max_subagents: self.delegation_max_subagents,
+            delegation_max_iterations: self.delegation_max_iterations,
+            parent_active_toolsets: tool_policy.parent_active_toolsets.clone(),
+            disabled_toolsets: tool_policy.expanded_disabled.clone(),
+            enabled_tools: self.enabled_tools.clone(),
+            disabled_tools: self.disabled_tools.clone(),
+            external_skill_dirs: self.skills_config.external_dirs.clone(),
+            disabled_skills: self.disabled_skills_for_platform(),
+            preloaded_skills: self.skills_config.preloaded.clone(),
+            browser_record_sessions: self.browser.record_sessions,
+            browser_command_timeout: self.browser.command_timeout,
+            browser_recording_max_age_hours: self.browser.recording_max_age_hours,
+            checkpoints_enabled: self.checkpoints_enabled,
+            checkpoints_max_snapshots: self.checkpoints_max_snapshots,
+            terminal_backend: self.terminal_backend.clone(),
+            terminal_docker: self.terminal_docker.clone(),
+            terminal_ssh: self.terminal_ssh.clone(),
+            terminal_modal: self.terminal_modal.clone(),
+            terminal_daytona: self.terminal_daytona.clone(),
+            terminal_singularity: self.terminal_singularity.clone(),
+            terminal_env_passthrough: self.terminal_env_passthrough.clone(),
+            auxiliary_provider: self.auxiliary.provider.clone(),
+            auxiliary_model: self.auxiliary.model.clone(),
+            auxiliary_base_url: self.auxiliary.base_url.clone(),
+            auxiliary_api_key_env: self.auxiliary.api_key_env.clone(),
+            moa_enabled: self.moa.enabled,
+            moa_reference_models: self.moa.reference_models.clone(),
+            moa_aggregator_model: Some(self.moa.aggregator_model.clone()),
+            tts_provider: Some(self.tts.provider.clone()),
+            tts_voice: Some(self.tts.voice.clone()),
+            tts_rate: self.tts.rate.clone(),
+            tts_model: self.tts.model.clone(),
+            tts_elevenlabs_voice_id: self.tts.elevenlabs_voice_id.clone(),
+            tts_elevenlabs_model_id: self.tts.elevenlabs_model_id.clone(),
+            tts_elevenlabs_api_key_env: Some(self.tts.elevenlabs_api_key_env.clone()),
+            stt_provider: Some(self.stt.provider.clone()),
+            stt_whisper_model: Some(self.stt.whisper_model.clone()),
+            image_provider: Some(self.image_generation.provider.clone()),
+            image_model: Some(self.image_generation.model.clone()),
+            gateway_running,
+            ..Default::default()
         }
     }
 }
 
 /// Per-session mutable state, protected by RwLock.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct SessionState {
     /// Unique session identifier — set once at conversation start,
     /// persisted to SQLite at loop end for session search/history.
@@ -234,6 +379,13 @@ pub struct SessionState {
     /// This tracks current context pressure. Session token counters above track
     /// cumulative spend across the whole conversation.
     pub last_prompt_tokens: u64,
+    /// Disable native streamed tool turns after a provider rejects them once.
+    ///
+    /// WHY session-scoped: some provider/model combinations incorrectly
+    /// advertise streamed tool support, then reject the actual request at
+    /// runtime. Once observed, repeating the same request wastes latency and
+    /// spams users with avoidable 400s. Plain text streaming still remains on.
+    pub native_tool_streaming_disabled: bool,
     pub session_tool_call_count: u32,
 }
 
@@ -334,6 +486,7 @@ impl Agent {
             tool_registry,
             gateway_sender: RwLock::new(None),
             process_table,
+            conversation_lock: Mutex::new(()),
             session: RwLock::new(SessionState::default()),
             budget,
             cancel: std::sync::Mutex::new(CancellationToken::new()),
@@ -433,24 +586,36 @@ impl Agent {
         message: &str,
         chunk_tx: tokio::sync::mpsc::UnboundedSender<StreamEvent>,
     ) -> Result<(), AgentError> {
-        let (streaming_enabled, use_native_streaming) = {
+        let streaming_enabled = {
             let config = self.config.read().await;
-            let provider = self.provider.read().await;
-            let streaming_enabled = config.streaming;
-            let use_native_streaming = streaming_enabled && provider.supports_tool_streaming();
-            (streaming_enabled, use_native_streaming)
+            config.streaming
         };
 
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let saw_live_content = Arc::new(AtomicBool::new(false));
+        let saw_live_content_forwarder = saw_live_content.clone();
+        let chunk_tx_forwarder = chunk_tx.clone();
+        let forwarder = tokio::spawn(async move {
+            while let Some(event) = event_rx.recv().await {
+                if matches!(event, StreamEvent::Token(_) | StreamEvent::Reasoning(_)) {
+                    saw_live_content_forwarder.store(true, AtomicOrdering::Relaxed);
+                }
+                let _ = chunk_tx_forwarder.send(event);
+            }
+        });
+
         match self
-            .execute_loop(message, None, None, Some(&chunk_tx), None)
+            .execute_loop(message, None, None, Some(&event_tx), None)
             .await
         {
             Ok(result) => {
+                drop(event_tx);
+                let _ = forwarder.await;
                 // Fallback path: provider doesn't expose live deltas through
                 // the full tool loop, so synthesize only what the user asked for:
                 // - streaming ON  → chunk the final answer for progressive UX
                 // - streaming OFF → send one complete answer at the end
-                if !use_native_streaming {
+                if !saw_live_content.load(AtomicOrdering::Relaxed) {
                     if let Some(reasoning) = result
                         .messages
                         .iter()
@@ -475,6 +640,8 @@ impl Agent {
                 Ok(())
             }
             Err(e) => {
+                drop(event_tx);
+                let _ = forwarder.await;
                 let _ = chunk_tx.send(StreamEvent::Error(e.to_string()));
                 Err(e)
             }
@@ -633,9 +800,39 @@ impl Agent {
         }
     }
 
+    /// Best-effort synchronous snapshot accessor for non-async inspection paths.
+    pub fn try_session_snapshot(&self) -> Option<SessionSnapshot> {
+        let session = self.session.try_read().ok()?;
+        let config = self.config.try_read().ok()?;
+        Some(SessionSnapshot {
+            session_id: session.session_id.clone(),
+            model: config.model.clone(),
+            message_count: session.messages.len(),
+            user_turn_count: session.user_turn_count,
+            api_call_count: session.api_call_count,
+            input_tokens: session.session_input_tokens,
+            output_tokens: session.session_output_tokens,
+            cache_read_tokens: session.session_cache_read_tokens,
+            cache_write_tokens: session.session_cache_write_tokens,
+            reasoning_tokens: session.session_reasoning_tokens,
+            last_prompt_tokens: session.last_prompt_tokens,
+            budget_remaining: self.budget.remaining(),
+            budget_max: self.budget.max(),
+        })
+    }
+
     /// Get the currently assembled system prompt (if cached).
     pub async fn system_prompt(&self) -> Option<String> {
         self.session.read().await.cached_system_prompt.clone()
+    }
+
+    /// Publish the latest local turn snapshot back into shared session state.
+    ///
+    /// WHY whole-state replace: execute_loop now owns a local SessionState copy
+    /// so expensive work happens lock-free. Publishing the full snapshot keeps
+    /// read paths coherent without re-introducing field-by-field lock churn.
+    pub(crate) async fn publish_session_state(&self, session: &SessionState) {
+        *self.session.write().await = session.clone();
     }
 
     /// Append a note to the cached system prompt.
@@ -686,6 +883,11 @@ impl Agent {
     /// Get full message history for export.
     pub async fn messages(&self) -> Vec<Message> {
         self.session.read().await.messages.clone()
+    }
+
+    /// Best-effort synchronous message accessor for non-async inspection paths.
+    pub fn try_messages(&self) -> Option<Vec<Message>> {
+        Some(self.session.try_read().ok()?.messages.clone())
     }
 
     /// Remove the last user + assistant turn from history (undo).
@@ -815,6 +1017,11 @@ impl Agent {
         self.state_db.clone()
     }
 
+    /// Return a clone of the state DB handle without requiring an async hop.
+    pub fn state_db_handle(&self) -> Option<Arc<SessionDb>> {
+        self.state_db.clone()
+    }
+
     /// Return a clone of the current provider handle.
     ///
     /// Used by the gateway for deterministic pre-processing steps such as
@@ -826,6 +1033,16 @@ impl Agent {
     /// Return a clone of the current auxiliary side-task routing config.
     pub async fn auxiliary_config(&self) -> crate::config::AuxiliaryConfig {
         self.config.read().await.auxiliary.clone()
+    }
+
+    /// Return the current smart-routing configuration for future turns.
+    pub async fn smart_routing_config(&self) -> crate::config::SmartRoutingYaml {
+        self.config.read().await.model_config.smart_routing.clone()
+    }
+
+    /// Return the current Mixture-of-Agents defaults for future tool calls.
+    pub async fn moa_config(&self) -> crate::config::MoaConfig {
+        self.config.read().await.moa.clone()
     }
 
     /// Return the current voice/media configuration used by direct tools.
@@ -864,6 +1081,47 @@ impl Agent {
         }
     }
 
+    /// Rich tool inventory for UI selectors and diagnostics.
+    pub async fn tool_inventory(&self) -> Vec<ToolInventoryEntry> {
+        let Some(registry) = &self.tool_registry else {
+            return Vec::new();
+        };
+        let config = self.config.read().await.clone();
+        let tool_policy = resolve_tool_policy(&config);
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let ctx = edgecrab_tools::registry::ToolContext {
+            task_id: "tool-inventory".into(),
+            cwd,
+            session_id: config
+                .session_id
+                .clone()
+                .unwrap_or_else(|| "tool-inventory".into()),
+            user_task: None,
+            cancel: CancellationToken::new(),
+            config: config
+                .to_app_config_ref(self.gateway_sender.read().await.is_some(), &tool_policy),
+            state_db: self.state_db.clone(),
+            platform: config.platform,
+            process_table: Some(self.process_table.clone()),
+            provider: Some(self.provider.read().await.clone()),
+            tool_registry: self.tool_registry.clone(),
+            delegate_depth: 0,
+            sub_agent_runner: None,
+            delegation_event_tx: None,
+            clarify_tx: None,
+            approval_tx: None,
+            on_skills_changed: None,
+            gateway_sender: self.gateway_sender.read().await.clone(),
+            origin_chat: config.origin_chat.clone(),
+            session_key: config.session_id.clone(),
+            todo_store: Some(self.todo_store.clone()),
+            current_tool_call_id: None,
+            current_tool_name: None,
+            tool_progress_tx: None,
+        };
+        registry.tool_inventory(&ctx)
+    }
+
     /// Set reasoning effort on the agent config.
     pub async fn set_reasoning_effort(&self, level: Option<String>) {
         let mut config = self.config.write().await;
@@ -883,6 +1141,12 @@ impl Agent {
         config.auxiliary = auxiliary;
     }
 
+    /// Update smart routing for future turns.
+    pub async fn set_smart_routing_config(&self, smart_routing: crate::config::SmartRoutingYaml) {
+        let mut config = self.config.write().await;
+        config.model_config.smart_routing = smart_routing;
+    }
+
     /// Update the default image generation routing for future turns.
     pub async fn set_image_generation_config(
         &self,
@@ -890,6 +1154,54 @@ impl Agent {
     ) {
         let mut config = self.config.write().await;
         config.image_generation = image_generation;
+    }
+
+    /// Update the default Mixture-of-Agents roster and aggregator.
+    pub async fn set_moa_config(&self, moa: crate::config::MoaConfig) {
+        let mut config = self.config.write().await;
+        config.moa = moa.sanitized();
+    }
+
+    /// Update the enabled/disabled toolset filters for future turns.
+    pub async fn set_toolset_filters(&self, enabled: Vec<String>, disabled: Vec<String>) {
+        let mut config = self.config.write().await;
+        config.enabled_toolsets = enabled;
+        config.disabled_toolsets = disabled;
+    }
+
+    /// Update the tool and toolset filters for future turns.
+    pub async fn set_tool_filters(
+        &self,
+        enabled_toolsets: Vec<String>,
+        disabled_toolsets: Vec<String>,
+        enabled_tools: Vec<String>,
+        disabled_tools: Vec<String>,
+    ) {
+        let mut config = self.config.write().await;
+        config.enabled_toolsets = enabled_toolsets;
+        config.disabled_toolsets = disabled_toolsets;
+        config.enabled_tools = enabled_tools;
+        config.disabled_tools = disabled_tools;
+    }
+
+    /// Current enabled/disabled toolset filters used for schema resolution.
+    pub async fn toolset_filters(&self) -> (Vec<String>, Vec<String>) {
+        let config = self.config.read().await;
+        (
+            config.enabled_toolsets.clone(),
+            config.disabled_toolsets.clone(),
+        )
+    }
+
+    /// Current tool and toolset filters used for schema resolution.
+    pub async fn tool_filters(&self) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
+        let config = self.config.read().await;
+        (
+            config.enabled_toolsets.clone(),
+            config.disabled_toolsets.clone(),
+            config.enabled_tools.clone(),
+            config.disabled_tools.clone(),
+        )
     }
 }
 
@@ -956,13 +1268,26 @@ pub enum StreamEvent {
     Reasoning(String),
     /// A tool execution has started.
     ToolExec {
+        /// Stable tool call id from the LLM tool invocation.
+        tool_call_id: String,
         /// Tool name (e.g. "web_search")
         name: String,
         /// Raw JSON arguments string (for preview extraction in the TUI)
         args_json: String,
     },
+    /// A tool surfaced an intermediate progress update.
+    ToolProgress {
+        /// Stable tool call id from the LLM tool invocation.
+        tool_call_id: String,
+        /// Tool name (e.g. "moa")
+        name: String,
+        /// Human-readable progress message for the active invocation.
+        message: String,
+    },
     /// A tool execution has completed.
     ToolDone {
+        /// Stable tool call id from the LLM tool invocation.
+        tool_call_id: String,
         /// Tool name (e.g. "web_search")
         name: String,
         /// Raw JSON arguments string (for preview extraction in the TUI)
@@ -1077,6 +1402,9 @@ impl std::fmt::Debug for StreamEvent {
             Self::Token(t) => write!(f, "Token({t:?})"),
             Self::Reasoning(t) => write!(f, "Reasoning({t:?})"),
             Self::ToolExec { name, .. } => write!(f, "ToolExec({name:?})"),
+            Self::ToolProgress { name, message, .. } => {
+                write!(f, "ToolProgress({name:?}, {message:?})")
+            }
             Self::ToolDone {
                 name,
                 duration_ms,
@@ -1223,6 +1551,8 @@ impl AgentBuilder {
                 model: config.model.default_model.clone(),
                 enabled_toolsets: config.tools.enabled_toolsets.clone().unwrap_or_default(),
                 disabled_toolsets: config.tools.disabled_toolsets.clone().unwrap_or_default(),
+                enabled_tools: config.tools.enabled_tools.clone().unwrap_or_default(),
+                disabled_tools: config.tools.disabled_tools.clone().unwrap_or_default(),
                 max_iterations: config.model.max_iterations,
                 streaming: config.model.streaming,
                 save_trajectories: config.save_trajectories,
@@ -1248,12 +1578,14 @@ impl AgentBuilder {
                 terminal_singularity: config.terminal.singularity.clone(),
                 compression: config.compression.clone(),
                 auxiliary: config.auxiliary.clone(),
+                moa: config.moa.clone(),
                 tts: config.tts.clone(),
                 stt: config.stt.clone(),
                 image_generation: config.image_generation.clone(),
                 terminal_env_passthrough: config.terminal.env_passthrough.clone(),
                 file_allowed_roots: config.tools.file.allowed_roots.clone(),
                 path_restrictions: config.security.path_restrictions.clone(),
+                lsp: config.lsp.clone(),
                 ..Default::default()
             },
             provider: None,
@@ -1351,8 +1683,13 @@ mod tests {
         ChatMessage, CompletionOptions, StreamChunk, ToolChoice, ToolDefinition,
     };
     use futures::StreamExt;
+    use tokio::sync::Notify;
 
     struct ReasoningStreamProvider;
+    struct SlowChatProvider {
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+    }
     struct MockGatewaySender;
 
     #[test]
@@ -1460,6 +1797,56 @@ mod tests {
     }
 
     #[async_trait]
+    impl LLMProvider for SlowChatProvider {
+        fn name(&self) -> &str {
+            "slow-chat"
+        }
+
+        fn model(&self) -> &str {
+            "slow-chat/mock"
+        }
+
+        fn max_context_length(&self) -> usize {
+            128_000
+        }
+
+        async fn complete(
+            &self,
+            prompt: &str,
+        ) -> edgequake_llm::Result<edgequake_llm::LLMResponse> {
+            Ok(edgequake_llm::LLMResponse::new(prompt, self.model()))
+        }
+
+        async fn complete_with_options(
+            &self,
+            prompt: &str,
+            _options: &CompletionOptions,
+        ) -> edgequake_llm::Result<edgequake_llm::LLMResponse> {
+            self.complete(prompt).await
+        }
+
+        async fn chat(
+            &self,
+            messages: &[ChatMessage],
+            options: Option<&CompletionOptions>,
+        ) -> edgequake_llm::Result<edgequake_llm::LLMResponse> {
+            self.chat_with_tools(messages, &[], None, options).await
+        }
+
+        async fn chat_with_tools(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[ToolDefinition],
+            _tool_choice: Option<ToolChoice>,
+            _options: Option<&CompletionOptions>,
+        ) -> edgequake_llm::Result<edgequake_llm::LLMResponse> {
+            self.started.notify_waiters();
+            self.release.notified().await;
+            Ok(edgequake_llm::LLMResponse::new("slow answer", self.model()))
+        }
+    }
+
+    #[async_trait]
     impl GatewaySender for MockGatewaySender {
         async fn send_message(
             &self,
@@ -1532,6 +1919,39 @@ mod tests {
         assert!(!response.is_empty());
     }
 
+    #[tokio::test]
+    async fn try_session_snapshot_remains_readable_during_slow_turn() {
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let provider: Arc<dyn LLMProvider> = Arc::new(SlowChatProvider {
+            started: started.clone(),
+            release: release.clone(),
+        });
+        let agent = Arc::new(
+            AgentBuilder::new("slow-chat/mock")
+                .provider(provider)
+                .build()
+                .expect("build agent"),
+        );
+
+        let agent_task = agent.clone();
+        let chat_task = tokio::spawn(async move { agent_task.chat("hello").await });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), started.notified())
+            .await
+            .expect("provider started");
+
+        let snapshot = agent
+            .try_session_snapshot()
+            .expect("session snapshot should stay readable mid-turn");
+        assert_eq!(snapshot.message_count, 1);
+        assert_eq!(snapshot.user_turn_count, 1);
+
+        release.notify_waiters();
+        let result = chat_task.await.expect("join").expect("chat");
+        assert_eq!(result, "slow answer");
+    }
+
     #[test]
     fn from_config_wires_agent_flags() {
         let config = AppConfig {
@@ -1546,6 +1966,55 @@ mod tests {
         assert!(builder.config.save_trajectories);
         assert!(builder.config.skip_context_files);
         assert!(builder.config.skip_memory);
+    }
+
+    #[test]
+    fn resolve_tool_policy_expands_aliases_once() {
+        let config = AgentConfig {
+            enabled_toolsets: vec!["core".into()],
+            disabled_toolsets: vec!["browser".into()],
+            ..Default::default()
+        };
+
+        let policy = resolve_tool_policy(&config);
+        assert!(
+            policy
+                .expanded_enabled
+                .iter()
+                .any(|toolset| toolset == "file")
+        );
+        assert!(
+            policy
+                .expanded_disabled
+                .iter()
+                .any(|toolset| toolset == "browser")
+        );
+        assert!(
+            !policy
+                .parent_active_toolsets
+                .iter()
+                .any(|toolset| toolset == "browser")
+        );
+    }
+
+    #[test]
+    fn app_config_ref_projection_keeps_runtime_policy_consistent() {
+        let config = AgentConfig {
+            platform: Platform::Telegram,
+            enabled_toolsets: vec!["core".into()],
+            disabled_toolsets: vec!["browser".into()],
+            ..Default::default()
+        };
+
+        let policy = resolve_tool_policy(&config);
+        let projected = config.to_app_config_ref(true, &policy);
+
+        assert!(projected.gateway_running);
+        assert_eq!(
+            projected.parent_active_toolsets,
+            policy.parent_active_toolsets
+        );
+        assert_eq!(projected.disabled_toolsets, policy.expanded_disabled);
     }
 
     #[tokio::test]

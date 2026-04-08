@@ -89,7 +89,18 @@ model:
   smart_routing:
     enabled: false
     cheap_model: "copilot/gpt-4.1-mini"
+
+# Mixture-of-Agents defaults
+moa:
+  enabled: true
+  aggregator_model: "copilot/gpt-5-mini"
+  reference_models:
+    - "copilot/gpt-5-mini"
 ```
+
+`/moa reset` now rewrites this block to a safe baseline for the current chat
+model, and runtime execution will still auto-use the current chat model as a
+last-chance expert and aggregator fallback if a saved MoA roster is stale.
 
 **Defaults (from `ModelConfig::default()`):**
 

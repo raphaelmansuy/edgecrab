@@ -573,11 +573,8 @@ fn describe_configured_provider(model: &str) -> String {
 
 fn configured_provider(model: &str) -> Option<ProviderType> {
     let (provider, _) = split_model_identifier(model);
-    let canonical = match provider.as_str() {
-        "copilot" => "vscode-copilot",
-        other => other,
-    };
-    ProviderType::from_str(canonical)
+    let canonical = edgecrab_tools::vision_models::normalize_provider_name(&provider);
+    ProviderType::from_str(&canonical)
 }
 
 fn split_model_identifier(model: &str) -> (String, Option<String>) {
@@ -746,6 +743,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(edgecrab_home_env)]
     fn check_mcp_servers_warns_when_absent() {
         let _guard = crate::gateway_catalog::TEST_ENV_LOCK
             .lock()
@@ -761,6 +759,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(edgecrab_home_env)]
     fn check_mcp_servers_reports_configured_stdio_server() {
         let _guard = crate::gateway_catalog::TEST_ENV_LOCK
             .lock()

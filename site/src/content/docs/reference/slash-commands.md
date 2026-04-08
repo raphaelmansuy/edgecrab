@@ -15,10 +15,10 @@ shown there as runnable commands.
 
 ```
 Navigation   /help /quit /clear /new /status /version
-Model        /model /provider /reasoning /stream
+Model        /model /cheap_model /vision_model /image_model /moa /provider /reasoning /stream
 Session      /session /retry /undo /stop /history /save /export /title /resume
 Config       /config /prompt /verbose /personality /statusbar
-Tools        /tools /toolsets /reload-mcp /plugins
+Tools        /tools /toolsets /mcp /reload-mcp /plugins
 Memory       /memory /skills
 Analysis     /cost /usage /compress /insights
 Advanced     /queue /background /rollback
@@ -28,7 +28,7 @@ Media        /voice /browser
 Appearance   /theme /skin /paste /mouse
 Diagnostics  /doctor
 Auth         /copilot-auth
-MCP          /mcp-token
+MCP          /mcp /mcp-token
 ```
 
 ---
@@ -50,8 +50,11 @@ MCP          /mcp-token
 
 | Command | Description |
 |---------|-------------|
-| `/model [name]` | Show current model or switch (e.g. `/model anthropic/claude-opus-4.6`) |
+| `/model [name]` | Show current model or switch (e.g. `/model ollama/gemma4:latest`) |
+| `/cheap_model [spec]` | Open, show, or set the cheap smart-routing model; `/cheap_model off` disables it |
 | `/models [provider]` | List models; `/models <provider>` queries live, `/models refresh` refreshes cache |
+| `/image_model [spec]` | Open image-model selector, or set/show the default image-generation backend |
+| `/moa [subcommand]` | Show, enable, disable, or configure Mixture-of-Agents defaults (`status`, `on`, `off`, `reset`, `aggregator`, `experts`, `add`, `remove`); reset writes a safe baseline for the current chat model |
 | `/vision_model [spec]` | Open vision model selector, or set/show the dedicated vision backend |
 | `/provider` | List available providers |
 | `/reasoning [level]` | Set reasoning effort: `off`, `low`, `medium`, `high` — or `show`/`hide` for think-block visibility (alias: `/think`) |
@@ -97,6 +100,7 @@ MCP          /mcp-token
 |---------|-------------|
 | `/tools` | List all registered tools and their status |
 | `/toolsets` | List toolset aliases and their member tools |
+| `/mcp [subcommand]` | Browse, install, test, diagnose, or remove MCP servers |
 | `/reload-mcp` | Drop and reconnect all MCP server connections |
 | `/plugins` | Discover and list installed plugins |
 | `/mcp-token [set\|remove\|list] <name> [token]` | Manage MCP OAuth Bearer tokens |
@@ -108,7 +112,7 @@ MCP          /mcp-token
 | Command | Description |
 |---------|-------------|
 | `/memory` | Show all persistent memory files with sizes |
-| `/skills [browse\|install\|remove]` | List, browse hub, install, or remove skills |
+| `/skills [browse\|search\|install\|update\|remove]` | Open the installed-skills browser, launch the remote-skills browser, install, update, or remove skills |
 
 ---
 

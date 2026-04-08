@@ -65,6 +65,29 @@ impl<T: Clone + FuzzyItem> FuzzySelector<T> {
         self.update_filter();
     }
 
+    /// Replace the item list while preserving the current query and best-effort
+    /// focus on the previously selected item.
+    pub fn replace_items_preserving_state(&mut self, items: Vec<T>) {
+        let selected_primary = self.current().map(|item| item.primary().to_string());
+        let query = self.query.clone();
+        let was_active = self.active;
+
+        self.items = items;
+        self.query = query;
+        self.update_filter();
+        self.active = was_active;
+
+        if let Some(primary) = selected_primary {
+            if let Some(pos) = self.filtered.iter().position(|&idx| {
+                self.items
+                    .get(idx)
+                    .is_some_and(|item| item.primary() == primary)
+            }) {
+                self.selected = pos;
+            }
+        }
+    }
+
     /// Activate the selector with an empty query, pre-selecting `primary`.
     /// If `primary` is empty the first filtered item is highlighted.
     pub fn activate_with_primary(&mut self, primary: &str) {
@@ -92,6 +115,10 @@ impl<T: Clone + FuzzyItem> FuzzySelector<T> {
     /// Recompute `filtered` based on the current `query`.
     pub fn update_filter(&mut self) {
         let q = self.query.to_lowercase();
+        let tokens: Vec<&str> = q
+            .split_whitespace()
+            .filter(|token| !token.is_empty())
+            .collect();
         self.filtered = self
             .items
             .iter()
@@ -100,9 +127,17 @@ impl<T: Clone + FuzzyItem> FuzzySelector<T> {
                 if q.is_empty() {
                     return true;
                 }
-                item.primary().to_lowercase().contains(&q)
-                    || item.secondary().to_lowercase().contains(&q)
-                    || item.tag().to_lowercase().contains(&q)
+                let primary = item.primary().to_lowercase();
+                let secondary = item.secondary().to_lowercase();
+                let tag = item.tag().to_lowercase();
+                if primary.contains(&q) || secondary.contains(&q) || tag.contains(&q) {
+                    return true;
+                }
+                if tokens.is_empty() {
+                    return false;
+                }
+                let haystack = format!("{primary} {secondary} {tag}");
+                tokens.iter().all(|token| haystack.contains(token))
             })
             .map(|(i, _)| i)
             .collect();
@@ -204,6 +239,70 @@ mod tests {
         assert_eq!(
             selector.current().map(|item| item.primary()),
             Some("github")
+        );
+    }
+
+    #[test]
+    fn replace_items_preserves_query_and_focus() {
+        let mut selector = FuzzySelector::new();
+        selector.set_items(vec![
+            TestItem {
+                primary: "bedrock/amazon.nova-lite-v1:0",
+                secondary: "static",
+                tag: "bedrock",
+            },
+            TestItem {
+                primary: "bedrock/anthropic.claude-4-sonnet-20250514-v1:0",
+                secondary: "static",
+                tag: "bedrock",
+            },
+        ]);
+        selector.active = true;
+        selector.query = "claude".into();
+        selector.update_filter();
+
+        selector.replace_items_preserving_state(vec![
+            TestItem {
+                primary: "bedrock/amazon.nova-lite-v1:0",
+                secondary: "live",
+                tag: "bedrock",
+            },
+            TestItem {
+                primary: "bedrock/anthropic.claude-4-sonnet-20250514-v1:0",
+                secondary: "live",
+                tag: "bedrock",
+            },
+            TestItem {
+                primary: "bedrock/deepseek.r1-v1:0",
+                secondary: "live",
+                tag: "bedrock",
+            },
+        ]);
+
+        assert!(selector.active);
+        assert_eq!(selector.query, "claude");
+        assert_eq!(
+            selector.current().map(|item| item.primary()),
+            Some("bedrock/anthropic.claude-4-sonnet-20250514-v1:0")
+        );
+    }
+
+    #[test]
+    fn update_filter_matches_multi_word_queries_by_token() {
+        let mut selector = FuzzySelector::new();
+        selector.set_items(vec![TestItem {
+            primary: "support triage",
+            secondary: "trace websocket reconnect jitter",
+            tag: "cli",
+        }]);
+
+        selector.query = "websocket jitter".into();
+        selector.update_filter();
+
+        assert_eq!(selector.filtered.len(), 1);
+        assert_eq!(
+            selector.current().map(|item| item.primary()),
+            Some("support triage")
         );
     }
 }

@@ -76,7 +76,7 @@ const SETUP_SECTIONS: &[(&str, &str)] = &[
 /// Default model per provider — delegates to `ModelCatalog`.
 fn default_model(provider: &str) -> String {
     edgecrab_core::ModelCatalog::default_model_for(provider)
-        .unwrap_or_else(|| "copilot/gpt-5.4".to_string())
+        .unwrap_or_else(|| "ollama/gemma4:latest".to_string())
 }
 
 /// Returns the default edgecrab home directory (~/.edgecrab/).
@@ -1213,12 +1213,12 @@ tools:
   # Available literal names: file, terminal, web, browser, memory, skills,
   #   core, meta, scheduling, delegation, code_execution, session, mcp,
   #   media, messaging, moa
-  # Aliases:  core (→ file+meta+scheduling+delegation+code_execution+session+mcp+messaging+media+browser)
+  # Aliases:  core (→ file+meta+scheduling+delegation+code_execution+session+mcp+messaging+media+browser+moa)
   #           coding (→ file+terminal+search+code_execution)
   #           research (→ web+browser+vision)
   #           all  (→ every registered tool, no filter)
   enabled_toolsets:
-    - core       # expands to: file, meta, scheduling, delegation, code_execution, session, mcp, messaging, media, browser
+    - core       # expands to: file, meta, scheduling, delegation, code_execution, session, mcp, messaging, media, browser, moa
     - web        # web_search, web_extract, web_crawl
     - terminal   # terminal, run_process, list_processes, kill_process
     - memory     # memory_read, memory_write, honcho_*
@@ -1267,8 +1267,9 @@ mod tests {
         assert_eq!(default_model("openai"), "openai/gpt-5.4");
         assert_eq!(default_model("anthropic"), "anthropic/claude-opus-4.6");
         assert_eq!(default_model("google"), "google/gemini-2.5-flash");
-        // Unknown providers fall back to copilot default
-        assert_eq!(default_model("unknown"), "copilot/gpt-5.4");
+        assert_eq!(default_model("ollama"), "ollama/gemma4:latest");
+        // Unknown providers fall back to the global local default
+        assert_eq!(default_model("unknown"), "ollama/gemma4:latest");
     }
 
     #[test]

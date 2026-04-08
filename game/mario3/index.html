@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Super Mario 3 — 2D Platformer</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="wrapper">
+    <!-- HUD -->
+    <div id="hud">
+      <span>⭐ SCORE <span id="score">0</span></span>
+      <span>❤️ <span id="lives">3</span></span>
+      <span>🍄 x<span id="coins">0</span></span>
+      <span>🕐 <span id="timer">300</span></span>
+      <span>WORLD <span id="world">1-1</span></span>
+    </div>
+
+    <!-- Game canvas -->
+    <canvas id="gameCanvas"></canvas>
+
+    <!-- Overlays -->
+    <div id="startScreen" class="overlay">
+      <h1>🍄 SUPER MARIO 3</h1>
+      <p class="subtitle">2D Platformer Adventure</p>
+      <div class="controls-box">
+        <p>🎮 <b>Controls</b></p>
+        <p>← → Arrow Keys / A D — Move</p>
+        <p>↑ / Space / W — Jump</p>
+        <p>Z / X / Shift — Run (hold)</p>
+        <p>P — Pause</p>
+      </div>
+      <button id="startBtn" class="big-btn">▶ START GAME</button>
+      <p class="hint">Press <b>Enter</b> to start</p>
+    </div>
+
+    <div id="pauseScreen" class="overlay hidden">
+      <h1>⏸ PAUSED</h1>
+      <button id="resumeBtn" class="big-btn">▶ RESUME</button>
+      <button id="restartBtn" class="big-btn secondary">↺ RESTART</button>
+    </div>
+
+    <div id="gameOverScreen" class="overlay hidden">
+      <h1>💀 GAME OVER</h1>
+      <p id="finalScore">Score: 0</p>
+      <button id="playAgainBtn" class="big-btn">▶ PLAY AGAIN</button>
+    </div>
+
+    <div id="levelCompleteScreen" class="overlay hidden">
+      <h1>🏁 LEVEL CLEAR!</h1>
+      <p id="levelScore">Score: 0</p>
+      <p id="timeBonus">Time Bonus: 0</p>
+      <button id="nextLevelBtn" class="big-btn">▶ NEXT LEVEL</button>
+    </div>
+
+    <!-- Mobile controls -->
+    <div id="mobileControls">
+      <button class="mBtn" data-key="ArrowLeft">◀</button>
+      <button class="mBtn" data-key=" ">⬆ JUMP</button>
+      <button class="mBtn" data-key="ArrowRight">▶</button>
+    </div>
+  </div>
+
+  <script src="game.js"></script>
+</body>
+</html>

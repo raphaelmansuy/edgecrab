@@ -137,12 +137,21 @@ impl PathPolicy {
             })?;
         }
 
-        let resolved_parent = parent.canonicalize().map_err(|e| {
-            PathPolicyError::InvalidRoot(format!(
-                "Cannot resolve parent '{}': {e}",
-                parent.display()
-            ))
-        })?;
+        // `canonicalize` requires the path to physically exist, which can fail
+        // on Linux when writing to a virtual-tmp-root subtree whose sub-directory
+        // has not been created yet (the parent is already normalized at this
+        // point, so no `..`-escape or symlink confusion is possible for
+        // non-existent paths).
+        let resolved_parent = if parent.exists() {
+            parent.canonicalize().map_err(|e| {
+                PathPolicyError::InvalidRoot(format!(
+                    "Cannot resolve parent '{}': {e}",
+                    parent.display()
+                ))
+            })?
+        } else {
+            parent.to_path_buf()
+        };
 
         self.ensure_allowed(&resolved_parent, &allowed_roots)?;
         self.ensure_not_denied(&resolved_parent, &denied_roots)?;

@@ -22,6 +22,7 @@ async-trait = { workspace = true }
 inventory = { workspace = true }
 strsim = { workspace = true }
 shell-words = { workspace = true }
+shellexpand = { workspace = true }
 dashmap = { workspace = true }
 regex = { workspace = true }
 reqwest = { workspace = true }
@@ -42,6 +43,7 @@ which = { workspace = true }
 tempfile = { workspace = true }
 libc = { workspace = true }
 bollard = { workspace = true }
+portable-pty = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 openssh = { workspace = true }

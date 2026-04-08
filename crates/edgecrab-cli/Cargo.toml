@@ -10,6 +10,10 @@ license.workspace = true
 name = "edgecrab"
 path = "src/main.rs"
 
+[features]
+default = ["bedrock-model-discovery"]
+bedrock-model-discovery = ["edgecrab-core/bedrock-model-discovery"]
+
 [dependencies]
 edgecrab-core = { path = "../edgecrab-core", version = "0.1.0" }
 edgecrab-types = { path = "../edgecrab-types", version = "0.1.0" }
@@ -35,11 +39,17 @@ dirs = { workspace = true }
 chrono = { workspace = true }
 serde_json = { workspace = true }
 shellexpand = { workspace = true }
+shell-words = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 cron = { workspace = true }
 reqwest = { workspace = true }
+axum = { workspace = true }
+url = { workspace = true }
+base64 = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
 arboard = "3"
 unicode-width = { workspace = true }
 similar = { workspace = true }
@@ -49,3 +59,4 @@ libc = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true }
 tempfile = { workspace = true }
+serial_test = "3"

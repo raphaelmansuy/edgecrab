@@ -14,6 +14,7 @@ use edgecrab_types::ToolError;
 use regex::Regex;
 
 use crate::macos_permissions::{MacosConsentState, preflight_command_permissions};
+use crate::shell_syntax::command_contains_heredoc;
 use crate::tools::backends::{BackendKind, ExecOutput};
 
 const DEFAULT_MACOS_DIALOG_STALL_SECS: u64 = 15;
@@ -205,22 +206,48 @@ pub(crate) fn assess_command(command: &str) -> CommandInteractionAssessment {
 pub(crate) fn guard_terminal_command(
     command: &str,
     backend_kind: &BackendKind,
+    pty: bool,
 ) -> Result<CommandInteractionAssessment, ToolError> {
     let assessment = assess_command(command);
-    if let Some(reason) = assessment.tty_reason {
+    if command_contains_heredoc(command) {
         return Err(
             ToolError::capability_denied(
                 "terminal",
-                "non_interactive_terminal_required",
+                "shell_heredoc_unsupported",
                 format!(
-                    "Command requires an interactive terminal UI ({reason}), but the terminal tool runs non-interactively. Use non-interactive flags, explicit stdin redirection, or a real terminal session instead.\nCommand: `{}`",
+                    "Shell heredocs are not supported in `terminal`. A heredoc embeds multi-line input directly inside the tool-call command string, which is a second content-transport path and is unreliable for edits or large stdin payloads.\nCommand: `{}`",
                     command_preview(command)
                 ),
             )
             .with_suggested_action(
-                "Use a non-interactive command form, explicit stdin redirection, or a real terminal session."
+                "Use `write_file`, `patch`, or `apply_patch` for file content. If a command genuinely needs stdin, write the input to a file first and redirect it with `< file`."
                     .to_string(),
             ),
+        );
+    }
+    if let Some(reason) = assessment.tty_reason {
+        let (code, message, action) = if pty {
+            (
+                "terminal_observation_unsupported",
+                format!(
+                    "Command requires an interactive terminal UI ({reason}). PTY transport is available, but EdgeCrab does not model full-screen terminal screens, cursor state, or alternate-screen redraws. Running this command would still be unobservable and unreliable.\nCommand: `{}`",
+                    command_preview(command)
+                ),
+                "Use a line-oriented CLI mode, a non-interactive flag, or a real terminal session."
+                    .to_string(),
+            )
+        } else {
+            (
+                "non_interactive_terminal_required",
+                format!(
+                    "Command requires an interactive terminal UI ({reason}), but the terminal tool runs non-interactively unless PTY is enabled. Use non-interactive flags, explicit stdin redirection, or a real terminal session instead.\nCommand: `{}`",
+                    command_preview(command)
+                ),
+                "Use a non-interactive command form, explicit stdin redirection, or a real terminal session.".to_string(),
+            )
+        };
+        return Err(
+            ToolError::capability_denied("terminal", code, message).with_suggested_action(action)
         );
     }
     if !host_is_local_macos(backend_kind) {
@@ -251,23 +278,32 @@ pub(crate) fn guard_terminal_command(
 pub(crate) fn guard_run_process_command(
     command: &str,
     backend_kind: &BackendKind,
+    pty: bool,
 ) -> Result<(), ToolError> {
     let assessment = assess_command(command);
     if let Some(reason) = assessment.tty_reason {
-        return Err(
-            ToolError::capability_denied(
-                "run_process",
+        let (code, message, action) = if pty {
+            (
+                "background_terminal_observation_unsupported",
+                format!(
+                    "Command requires an interactive terminal UI ({reason}). A PTY can carry bytes, but background process observation is stream-based and cannot faithfully observe full-screen terminal state. Backgrounding this command would be unreliable.\nCommand: `{}`",
+                    command_preview(command)
+                ),
+                "Use a line-oriented CLI mode or run the command in a real terminal session."
+                    .to_string(),
+            )
+        } else {
+            (
                 "background_interactive_terminal_unsupported",
                 format!(
                     "Command requires an interactive terminal UI ({reason}), which is unsafe to background without a PTY. Use a non-interactive form of the command or run it in a real terminal session.\nCommand: `{}`",
                     command_preview(command)
                 ),
+                "Use a non-interactive command form or run it in a real terminal session instead of `run_process`.".to_string(),
             )
-            .with_suggested_action(
-                "Use a non-interactive command form or run it in a real terminal session instead of `run_process`."
-                    .to_string(),
-            ),
-        );
+        };
+        return Err(ToolError::capability_denied("run_process", code, message)
+            .with_suggested_action(action));
     }
     if host_is_local_macos(backend_kind) {
         if let Some(reason) = assessment.macos_prompt_reason {
@@ -471,7 +507,7 @@ mod tests {
         let blocked = assess_command("memo notes -a");
         assert_eq!(blocked.tty_reason, Some("interactive memo notes flow"));
 
-        let allowed = assess_command("memo notes -a \"Title\" <<'EOF'\nbody\nEOF");
+        let allowed = assess_command("printf '%s\\n' body | memo notes -a \"Title\"");
         assert_eq!(allowed.tty_reason, None);
         assert_eq!(allowed.macos_prompt_reason, Some("Apple Notes automation"));
     }
@@ -497,7 +533,8 @@ mod tests {
 
     #[test]
     fn terminal_guard_blocks_tty_commands() {
-        let err = guard_terminal_command("top", &BackendKind::Local).expect_err("tty should fail");
+        let err =
+            guard_terminal_command("top", &BackendKind::Local, false).expect_err("tty should fail");
         let ToolError::CapabilityDenied { message, code, .. } = err else {
             panic!("expected capability denied");
         };
@@ -506,12 +543,25 @@ mod tests {
     }
 
     #[test]
+    fn terminal_guard_blocks_shell_heredocs() {
+        let command = "cat >> src/app.rs <<'EOF'\nfn main() {}\nEOF";
+        let err = guard_terminal_command(command, &BackendKind::Local, false)
+            .expect_err("heredoc should fail fast");
+        let ToolError::CapabilityDenied { message, code, .. } = err else {
+            panic!("expected capability denied");
+        };
+        assert_eq!(code, "shell_heredoc_unsupported");
+        assert!(message.contains("Shell heredocs are not supported"));
+        assert!(message.contains("second content-transport path"));
+    }
+
+    #[test]
     fn run_process_guard_blocks_macos_prompt_commands() {
         if !cfg!(target_os = "macos") {
             return;
         }
 
-        let err = guard_run_process_command("memo notes -s \"Title\"", &BackendKind::Local)
+        let err = guard_run_process_command("memo notes -s \"Title\"", &BackendKind::Local, false)
             .expect_err("macos automation should fail");
         let ToolError::CapabilityDenied { message, code, .. } = err else {
             panic!("expected capability denied");
@@ -527,7 +577,7 @@ mod tests {
         }
 
         let command = "osascript -e 'tell application id \"com.example.DoesNotExist\" to activate'";
-        let err = guard_terminal_command(command, &BackendKind::Local)
+        let err = guard_terminal_command(command, &BackendKind::Local, false)
             .expect_err("unresolved automation consent should fail fast");
         let ToolError::CapabilityDenied { message, code, .. } = err else {
             panic!("expected capability denied");
@@ -578,5 +628,27 @@ mod tests {
         if matches!(preflight.automation_state, Some(MacosConsentState::Granted)) {
             assert!(timeout.is_none());
         }
+    }
+
+    #[test]
+    fn terminal_guard_blocks_fullscreen_ui_even_with_pty() {
+        let err = guard_terminal_command("vim Cargo.toml", &BackendKind::Local, true)
+            .expect_err("tty ui should fail");
+        let ToolError::CapabilityDenied { code, message, .. } = err else {
+            panic!("expected capability denied");
+        };
+        assert_eq!(code, "terminal_observation_unsupported");
+        assert!(message.contains("full-screen terminal screens"));
+    }
+
+    #[test]
+    fn run_process_guard_blocks_fullscreen_ui_even_with_pty() {
+        let err = guard_run_process_command("top", &BackendKind::Local, true)
+            .expect_err("tty ui should fail");
+        let ToolError::CapabilityDenied { code, message, .. } = err else {
+            panic!("expected capability denied");
+        };
+        assert_eq!(code, "background_terminal_observation_unsupported");
+        assert!(message.contains("stream-based"));
     }
 }

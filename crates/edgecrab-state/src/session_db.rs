@@ -158,6 +158,15 @@ pub struct SessionRichSummary {
     pub last_active: f64,
 }
 
+/// Full-text session search result with rich session metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSearchHit {
+    pub session: SessionRichSummary,
+    pub role: String,
+    pub snippet: String,
+    pub score: f64,
+}
+
 /// Full session export (session record + messages) for JSONL backup.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionExport {
@@ -1058,6 +1067,89 @@ impl SessionDb {
         Ok(results)
     }
 
+    /// Full-text search returning one ranked hit per session with session metadata.
+    pub fn search_sessions_rich(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SessionSearchHit>, AgentError> {
+        if query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| AgentError::Database(e.to_string()))?;
+
+        let safe_query = Self::escape_fts5_query(query);
+        let mut stmt = conn
+            .prepare(
+                "WITH hits AS (
+                    SELECT m.id AS message_rowid,
+                           m.session_id,
+                           m.role,
+                           rank,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY m.session_id
+                               ORDER BY rank, m.id
+                           ) AS rn
+                    FROM messages_fts
+                    JOIN messages m ON m.id = messages_fts.rowid
+                    WHERE messages_fts MATCH ?1
+                 )
+                 SELECT s.id, s.source, s.model, s.started_at, s.message_count, s.title,
+                        COALESCE(
+                            (SELECT SUBSTR(REPLACE(REPLACE(m0.content, X'0A', ' '), X'0D', ' '), 1, 63)
+                             FROM messages m0
+                             WHERE m0.session_id = s.id AND m0.role = 'user' AND m0.content IS NOT NULL
+                             ORDER BY m0.timestamp, m0.id LIMIT 1),
+                            ''
+                        ) AS preview,
+                        COALESCE(
+                            (SELECT MAX(m2.timestamp) FROM messages m2 WHERE m2.session_id = s.id),
+                            s.started_at
+                        ) AS last_active,
+                        h.role,
+                        snippet(messages_fts, 0, '<b>', '</b>', '...', 32) AS snippet,
+                        h.rank
+                 FROM hits h
+                 JOIN sessions s ON s.id = h.session_id
+                 JOIN messages_fts ON messages_fts.rowid = h.message_rowid
+                 WHERE h.rn = 1
+                 ORDER BY h.rank
+                 LIMIT ?2",
+            )
+            .map_err(|e| AgentError::Database(e.to_string()))?;
+
+        let rows = stmt
+            .query_map(params![safe_query, limit as i64], |row| {
+                Ok(SessionSearchHit {
+                    session: SessionRichSummary {
+                        id: row.get(0)?,
+                        source: row.get(1)?,
+                        model: row.get(2)?,
+                        started_at: row.get(3)?,
+                        message_count: row.get(4)?,
+                        title: row.get(5)?,
+                        preview: row.get::<_, String>(6).unwrap_or_default(),
+                        last_active: row.get(7)?,
+                    },
+                    role: row.get(8)?,
+                    snippet: row.get::<_, String>(9).unwrap_or_default(),
+                    score: row.get(10)?,
+                })
+            })
+            .map_err(|e| AgentError::Database(e.to_string()))?;
+
+        let mut hits = Vec::new();
+        for row in rows {
+            hits.push(row.map_err(|e| AgentError::Database(e.to_string()))?);
+        }
+
+        Ok(hits)
+    }
+
     /// Escape an FTS5 query to prevent syntax errors from user input.
     /// Wraps each token in double-quotes to treat them as literal terms.
     fn escape_fts5_query(query: &str) -> String {
@@ -1471,6 +1563,44 @@ mod tests {
         let results = db.search("Rust", 10).expect("search");
         assert!(!results.is_empty(), "Should find 'Rust' in messages");
         assert_eq!(results[0].session_id, "s1");
+    }
+
+    #[test]
+    fn rich_session_search_returns_ranked_unique_sessions() {
+        let db = test_db();
+
+        let mut s1 = sample_session("s1");
+        s1.title = Some("Rust ownership deep dive".into());
+        db.save_session(&s1).expect("save s1");
+        db.save_message("s1", &Message::user("Rust ownership model"), 1.0)
+            .expect("msg1");
+        db.save_message("s1", &Message::assistant("Borrow checker explanation"), 2.0)
+            .expect("msg2");
+
+        let mut s2 = sample_session("s2");
+        s2.title = Some("Python reference guide".into());
+        db.save_session(&s2).expect("save s2");
+        db.save_message("s2", &Message::user("Python uses reference counting"), 3.0)
+            .expect("msg3");
+        db.save_message("s2", &Message::assistant("Rust differs here"), 4.0)
+            .expect("msg4");
+
+        let hits = db.search_sessions_rich("Rust", 10).expect("rich search");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].session.id, "s1");
+        assert!(hits[0].snippet.contains("Rust"));
+        assert_eq!(hits[0].session.preview, "Rust ownership model");
+        assert_eq!(hits[1].session.id, "s2");
+    }
+
+    #[test]
+    fn rich_session_search_ignores_empty_query() {
+        let db = test_db();
+        db.save_session(&sample_session("s1")).expect("save");
+        let hits = db
+            .search_sessions_rich("   ", 10)
+            .expect("empty search should not fail");
+        assert!(hits.is_empty());
     }
 
     #[test]
