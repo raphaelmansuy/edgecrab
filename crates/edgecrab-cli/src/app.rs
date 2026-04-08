@@ -1934,6 +1934,34 @@ struct ScrollableDetailChrome<'a> {
     requested_scroll: u16,
 }
 
+struct FullscreenBrowserChrome<'a> {
+    query: &'a str,
+    header: BrowserChrome<'a>,
+    detail: ScrollableDetailChrome<'a>,
+    help: Line<'static>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DetailSurface {
+    ModelSelector,
+    VisionModelSelector,
+    ImageModelSelector,
+    McpSelector,
+    RemoteMcpBrowser,
+    SkillSelector,
+    RemoteSkillBrowser,
+    ToolManager,
+    ConfigSelector,
+    SessionBrowser,
+    SessionInspector,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DetailFullscreenState {
+    surface: DetailSurface,
+    scroll: u16,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RemoteSkillAction {
     Install,
@@ -3010,6 +3038,8 @@ pub struct App {
     session_browser_status_note: Option<String>,
     /// Focus and scroll state for the session browser detail pane.
     session_browser_pane: DetailPaneState,
+    /// Shared fullscreen detail mode for split-pane selector browsers.
+    detail_fullscreen: Option<DetailFullscreenState>,
     /// Drill-down inspector for a single saved session.
     session_inspector: SessionInspector,
     /// Config center overlay (activated by `/config`)
@@ -3493,6 +3523,7 @@ impl App {
             session_browser: FuzzySelector::new(),
             session_browser_status_note: None,
             session_browser_pane: DetailPaneState::default(),
+            detail_fullscreen: None,
             session_inspector: SessionInspector::new(),
             config_selector: FuzzySelector::new(),
             skin_browser: FuzzySelector::new(),
@@ -6058,11 +6089,17 @@ impl App {
         if self.model_selector.active {
             match key.code {
                 KeyCode::Esc => {
-                    self.model_selector.active = false;
+                    if !self.close_detail_fullscreen(DetailSurface::ModelSelector) {
+                        self.model_selector.active = false;
+                    }
+                }
+                _ if selector_action_key(&key, 'z') => {
+                    self.toggle_detail_fullscreen(DetailSurface::ModelSelector, 0);
                 }
                 KeyCode::Enter => {
                     if let Some(model) = self.model_selector.current().map(|e| e.display.clone()) {
                         self.model_selector.active = false;
+                        self.close_detail_fullscreen(DetailSurface::ModelSelector);
                         match self.model_selector_target {
                             ModelSelectorTarget::Primary => self.handle_model_switch(model),
                             ModelSelectorTarget::Cheap => self.handle_set_cheap_model(model),
@@ -6072,17 +6109,35 @@ impl App {
                         }
                     }
                 }
-                KeyCode::Up => self.model_selector.move_up(),
-                KeyCode::Down => self.model_selector.move_down(),
+                KeyCode::Up => {
+                    self.model_selector.move_up();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::ModelSelector);
+                }
+                KeyCode::Down => {
+                    self.model_selector.move_down();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::ModelSelector);
+                }
+                KeyCode::PageUp if self.detail_fullscreen_active(DetailSurface::ModelSelector) => {
+                    self.page_up_detail_fullscreen(DetailSurface::ModelSelector);
+                }
+                KeyCode::PageDown
+                    if self.detail_fullscreen_active(DetailSurface::ModelSelector) =>
+                {
+                    self.page_down_detail_fullscreen(DetailSurface::ModelSelector);
+                }
                 KeyCode::PageUp => self.model_selector.page_up(),
                 KeyCode::PageDown => self.model_selector.page_down(),
-                KeyCode::Backspace => self.model_selector.pop_char(),
+                KeyCode::Backspace => {
+                    self.model_selector.pop_char();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::ModelSelector);
+                }
                 KeyCode::Char(c)
                     if !key
                         .modifiers
                         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                 {
                     self.model_selector.push_char(c);
+                    self.reset_detail_fullscreen_scroll(DetailSurface::ModelSelector);
                 }
                 _ => {}
             }
@@ -6161,7 +6216,12 @@ impl App {
         if self.vision_model_selector.active {
             match key.code {
                 KeyCode::Esc => {
-                    self.vision_model_selector.active = false;
+                    if !self.close_detail_fullscreen(DetailSurface::VisionModelSelector) {
+                        self.vision_model_selector.active = false;
+                    }
+                }
+                _ if selector_action_key(&key, 'z') => {
+                    self.toggle_detail_fullscreen(DetailSurface::VisionModelSelector, 0);
                 }
                 KeyCode::Enter => {
                     if let Some(model) = self
@@ -6170,20 +6230,41 @@ impl App {
                         .map(|entry| entry.display.clone())
                     {
                         self.vision_model_selector.active = false;
+                        self.close_detail_fullscreen(DetailSurface::VisionModelSelector);
                         self.handle_set_vision_model(model);
                     }
                 }
-                KeyCode::Up => self.vision_model_selector.move_up(),
-                KeyCode::Down => self.vision_model_selector.move_down(),
+                KeyCode::Up => {
+                    self.vision_model_selector.move_up();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::VisionModelSelector);
+                }
+                KeyCode::Down => {
+                    self.vision_model_selector.move_down();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::VisionModelSelector);
+                }
+                KeyCode::PageUp
+                    if self.detail_fullscreen_active(DetailSurface::VisionModelSelector) =>
+                {
+                    self.page_up_detail_fullscreen(DetailSurface::VisionModelSelector);
+                }
+                KeyCode::PageDown
+                    if self.detail_fullscreen_active(DetailSurface::VisionModelSelector) =>
+                {
+                    self.page_down_detail_fullscreen(DetailSurface::VisionModelSelector);
+                }
                 KeyCode::PageUp => self.vision_model_selector.page_up(),
                 KeyCode::PageDown => self.vision_model_selector.page_down(),
-                KeyCode::Backspace => self.vision_model_selector.pop_char(),
+                KeyCode::Backspace => {
+                    self.vision_model_selector.pop_char();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::VisionModelSelector);
+                }
                 KeyCode::Char(c)
                     if !key
                         .modifiers
                         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                 {
                     self.vision_model_selector.push_char(c);
+                    self.reset_detail_fullscreen_scroll(DetailSurface::VisionModelSelector);
                 }
                 _ => {}
             }
@@ -6193,7 +6274,12 @@ impl App {
         if self.image_model_selector.active {
             match key.code {
                 KeyCode::Esc => {
-                    self.image_model_selector.active = false;
+                    if !self.close_detail_fullscreen(DetailSurface::ImageModelSelector) {
+                        self.image_model_selector.active = false;
+                    }
+                }
+                _ if selector_action_key(&key, 'z') => {
+                    self.toggle_detail_fullscreen(DetailSurface::ImageModelSelector, 0);
                 }
                 KeyCode::Enter => {
                     if let Some(model) = self
@@ -6202,20 +6288,41 @@ impl App {
                         .map(|entry| entry.display.clone())
                     {
                         self.image_model_selector.active = false;
+                        self.close_detail_fullscreen(DetailSurface::ImageModelSelector);
                         self.handle_set_image_model(model);
                     }
                 }
-                KeyCode::Up => self.image_model_selector.move_up(),
-                KeyCode::Down => self.image_model_selector.move_down(),
+                KeyCode::Up => {
+                    self.image_model_selector.move_up();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::ImageModelSelector);
+                }
+                KeyCode::Down => {
+                    self.image_model_selector.move_down();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::ImageModelSelector);
+                }
+                KeyCode::PageUp
+                    if self.detail_fullscreen_active(DetailSurface::ImageModelSelector) =>
+                {
+                    self.page_up_detail_fullscreen(DetailSurface::ImageModelSelector);
+                }
+                KeyCode::PageDown
+                    if self.detail_fullscreen_active(DetailSurface::ImageModelSelector) =>
+                {
+                    self.page_down_detail_fullscreen(DetailSurface::ImageModelSelector);
+                }
                 KeyCode::PageUp => self.image_model_selector.page_up(),
                 KeyCode::PageDown => self.image_model_selector.page_down(),
-                KeyCode::Backspace => self.image_model_selector.pop_char(),
+                KeyCode::Backspace => {
+                    self.image_model_selector.pop_char();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::ImageModelSelector);
+                }
                 KeyCode::Char(c)
                     if !key
                         .modifiers
                         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                 {
                     self.image_model_selector.push_char(c);
+                    self.reset_detail_fullscreen_scroll(DetailSurface::ImageModelSelector);
                 }
                 _ => {}
             }
@@ -6227,7 +6334,12 @@ impl App {
         if self.mcp_selector.active {
             match key.code {
                 KeyCode::Esc => {
-                    self.mcp_selector.active = false;
+                    if !self.close_detail_fullscreen(DetailSurface::McpSelector) {
+                        self.mcp_selector.active = false;
+                    }
+                }
+                _ if selector_action_key(&key, 'z') => {
+                    self.toggle_detail_fullscreen(DetailSurface::McpSelector, 0);
                 }
                 _ if selector_action_key(&key, 'r') => {
                     let query = self.mcp_selector.query.clone();
@@ -6237,6 +6349,7 @@ impl App {
                     if let Some(entry) = self.mcp_selector.current() {
                         let command = entry.default_command();
                         self.mcp_selector.active = false;
+                        self.close_detail_fullscreen(DetailSurface::McpSelector);
                         self.handle_mcp_command(command);
                     }
                 }
@@ -6248,11 +6361,26 @@ impl App {
                         }
                     }
                 }
-                KeyCode::Up => self.mcp_selector.move_up(),
-                KeyCode::Down => self.mcp_selector.move_down(),
+                KeyCode::Up => {
+                    self.mcp_selector.move_up();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::McpSelector);
+                }
+                KeyCode::Down => {
+                    self.mcp_selector.move_down();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::McpSelector);
+                }
+                KeyCode::PageUp if self.detail_fullscreen_active(DetailSurface::McpSelector) => {
+                    self.page_up_detail_fullscreen(DetailSurface::McpSelector);
+                }
+                KeyCode::PageDown if self.detail_fullscreen_active(DetailSurface::McpSelector) => {
+                    self.page_down_detail_fullscreen(DetailSurface::McpSelector);
+                }
                 KeyCode::PageUp => self.mcp_selector.page_up(),
                 KeyCode::PageDown => self.mcp_selector.page_down(),
-                KeyCode::Backspace => self.mcp_selector.pop_char(),
+                KeyCode::Backspace => {
+                    self.mcp_selector.pop_char();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::McpSelector);
+                }
                 KeyCode::Char(' ') => {
                     if let Some(entry) = self.mcp_selector.current() {
                         if let Some(command) = entry.toggle_command() {
@@ -6305,6 +6433,7 @@ impl App {
                 }
                 KeyCode::Char(c) if selector_search_char(&key) == Some(c) => {
                     self.mcp_selector.push_char(c);
+                    self.reset_detail_fullscreen_scroll(DetailSurface::McpSelector);
                 }
                 _ => {}
             }
@@ -6314,8 +6443,13 @@ impl App {
         if self.remote_mcp_browser.selector.active {
             match key.code {
                 KeyCode::Esc => {
-                    self.remote_mcp_browser.selector.active = false;
-                    self.needs_redraw = true;
+                    if !self.close_detail_fullscreen(DetailSurface::RemoteMcpBrowser) {
+                        self.remote_mcp_browser.selector.active = false;
+                        self.needs_redraw = true;
+                    }
+                }
+                _ if selector_action_key(&key, 'z') => {
+                    self.toggle_detail_fullscreen(DetailSurface::RemoteMcpBrowser, 0);
                 }
                 KeyCode::Enter => {
                     if let Some(entry) = self.remote_mcp_browser.selector.current().cloned() {
@@ -6347,18 +6481,37 @@ impl App {
                 }
                 _ if selector_action_key(&key, 'l') => {
                     self.remote_mcp_browser.selector.active = false;
+                    self.close_detail_fullscreen(DetailSurface::RemoteMcpBrowser);
                     self.open_mcp_selector(None, false);
                 }
-                KeyCode::Up => self.remote_mcp_browser.selector.move_up(),
-                KeyCode::Down => self.remote_mcp_browser.selector.move_down(),
+                KeyCode::Up => {
+                    self.remote_mcp_browser.selector.move_up();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::RemoteMcpBrowser);
+                }
+                KeyCode::Down => {
+                    self.remote_mcp_browser.selector.move_down();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::RemoteMcpBrowser);
+                }
+                KeyCode::PageUp
+                    if self.detail_fullscreen_active(DetailSurface::RemoteMcpBrowser) =>
+                {
+                    self.page_up_detail_fullscreen(DetailSurface::RemoteMcpBrowser);
+                }
+                KeyCode::PageDown
+                    if self.detail_fullscreen_active(DetailSurface::RemoteMcpBrowser) =>
+                {
+                    self.page_down_detail_fullscreen(DetailSurface::RemoteMcpBrowser);
+                }
                 KeyCode::PageUp => self.remote_mcp_browser.selector.page_up(),
                 KeyCode::PageDown => self.remote_mcp_browser.selector.page_down(),
                 KeyCode::Backspace => {
                     self.remote_mcp_browser.selector.pop_char();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::RemoteMcpBrowser);
                     self.schedule_remote_mcp_search(false);
                 }
                 KeyCode::Char(c) if selector_search_char(&key) == Some(c) => {
                     self.remote_mcp_browser.selector.push_char(c);
+                    self.reset_detail_fullscreen_scroll(DetailSurface::RemoteMcpBrowser);
                     self.schedule_remote_mcp_search(false);
                 }
                 _ => {}
@@ -6369,9 +6522,14 @@ impl App {
         if self.remote_skill_browser.selector.active {
             match key.code {
                 KeyCode::Esc => {
-                    self.remote_skill_browser.selector.active = false;
-                    self.remote_skill_browser.action_in_flight = None;
-                    self.needs_redraw = true;
+                    if !self.close_detail_fullscreen(DetailSurface::RemoteSkillBrowser) {
+                        self.remote_skill_browser.selector.active = false;
+                        self.remote_skill_browser.action_in_flight = None;
+                        self.needs_redraw = true;
+                    }
+                }
+                _ if selector_action_key(&key, 'z') => {
+                    self.toggle_detail_fullscreen(DetailSurface::RemoteSkillBrowser, 0);
                 }
                 KeyCode::Enter => {
                     if let Some(entry) = self.remote_skill_browser.selector.current().cloned() {
@@ -6401,20 +6559,39 @@ impl App {
                 }
                 _ if selector_action_key(&key, 'l') => {
                     self.remote_skill_browser.selector.active = false;
+                    self.close_detail_fullscreen(DetailSurface::RemoteSkillBrowser);
                     self.refresh_skills_list();
                     self.skill_selector.activate();
                     self.needs_redraw = true;
                 }
-                KeyCode::Up => self.remote_skill_browser.selector.move_up(),
-                KeyCode::Down => self.remote_skill_browser.selector.move_down(),
+                KeyCode::Up => {
+                    self.remote_skill_browser.selector.move_up();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::RemoteSkillBrowser);
+                }
+                KeyCode::Down => {
+                    self.remote_skill_browser.selector.move_down();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::RemoteSkillBrowser);
+                }
+                KeyCode::PageUp
+                    if self.detail_fullscreen_active(DetailSurface::RemoteSkillBrowser) =>
+                {
+                    self.page_up_detail_fullscreen(DetailSurface::RemoteSkillBrowser);
+                }
+                KeyCode::PageDown
+                    if self.detail_fullscreen_active(DetailSurface::RemoteSkillBrowser) =>
+                {
+                    self.page_down_detail_fullscreen(DetailSurface::RemoteSkillBrowser);
+                }
                 KeyCode::PageUp => self.remote_skill_browser.selector.page_up(),
                 KeyCode::PageDown => self.remote_skill_browser.selector.page_down(),
                 KeyCode::Backspace => {
                     self.remote_skill_browser.selector.pop_char();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::RemoteSkillBrowser);
                     self.schedule_remote_skill_search(false);
                 }
                 KeyCode::Char(c) if selector_search_char(&key) == Some(c) => {
                     self.remote_skill_browser.selector.push_char(c);
+                    self.reset_detail_fullscreen_scroll(DetailSurface::RemoteSkillBrowser);
                     self.schedule_remote_skill_search(false);
                 }
                 _ => {}
@@ -6426,7 +6603,12 @@ impl App {
         if self.skill_selector.active {
             match key.code {
                 KeyCode::Esc => {
-                    self.skill_selector.active = false;
+                    if !self.close_detail_fullscreen(DetailSurface::SkillSelector) {
+                        self.skill_selector.active = false;
+                    }
+                }
+                _ if selector_action_key(&key, 'z') => {
+                    self.toggle_detail_fullscreen(DetailSurface::SkillSelector, 0);
                 }
                 KeyCode::Char(' ') => {
                     if let Some(name) = self
@@ -6444,20 +6626,39 @@ impl App {
                     if let Some(entry) = self.skill_selector.current() {
                         let skill_name = format!("/{} ", entry.name);
                         self.skill_selector.active = false;
+                        self.close_detail_fullscreen(DetailSurface::SkillSelector);
                         self.textarea_set_text(&skill_name);
                         self.needs_redraw = true;
                     }
                 }
-                KeyCode::Up => self.skill_selector.move_up(),
-                KeyCode::Down => self.skill_selector.move_down(),
+                KeyCode::Up => {
+                    self.skill_selector.move_up();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::SkillSelector);
+                }
+                KeyCode::Down => {
+                    self.skill_selector.move_down();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::SkillSelector);
+                }
+                KeyCode::PageUp if self.detail_fullscreen_active(DetailSurface::SkillSelector) => {
+                    self.page_up_detail_fullscreen(DetailSurface::SkillSelector);
+                }
+                KeyCode::PageDown
+                    if self.detail_fullscreen_active(DetailSurface::SkillSelector) =>
+                {
+                    self.page_down_detail_fullscreen(DetailSurface::SkillSelector);
+                }
                 KeyCode::PageUp => self.skill_selector.page_up(),
                 KeyCode::PageDown => self.skill_selector.page_down(),
                 _ if selector_action_key(&key, 'r') => {
                     self.open_remote_skill_selector(None);
                 }
-                KeyCode::Backspace => self.skill_selector.pop_char(),
+                KeyCode::Backspace => {
+                    self.skill_selector.pop_char();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::SkillSelector);
+                }
                 KeyCode::Char(c) if selector_search_char(&key) == Some(c) => {
                     self.skill_selector.push_char(c);
+                    self.reset_detail_fullscreen_scroll(DetailSurface::SkillSelector);
                 }
                 _ => {}
             }
@@ -6467,25 +6668,47 @@ impl App {
         if self.tool_manager.active {
             match key.code {
                 KeyCode::Esc => {
-                    self.tool_manager.active = false;
+                    if !self.close_detail_fullscreen(DetailSurface::ToolManager) {
+                        self.tool_manager.active = false;
+                    }
                 }
                 KeyCode::Tab => {
                     self.tool_manager_scope = self.tool_manager_scope.next();
                     let _ = self.refresh_tool_manager_entries();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::ToolManager);
+                }
+                _ if selector_action_key(&key, 'z') => {
+                    self.toggle_detail_fullscreen(DetailSurface::ToolManager, 0);
                 }
                 KeyCode::Enter | KeyCode::Char(' ') => {
                     self.toggle_tool_manager_selected();
                 }
-                KeyCode::Up => self.tool_manager.move_up(),
-                KeyCode::Down => self.tool_manager.move_down(),
+                KeyCode::Up => {
+                    self.tool_manager.move_up();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::ToolManager);
+                }
+                KeyCode::Down => {
+                    self.tool_manager.move_down();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::ToolManager);
+                }
+                KeyCode::PageUp if self.detail_fullscreen_active(DetailSurface::ToolManager) => {
+                    self.page_up_detail_fullscreen(DetailSurface::ToolManager);
+                }
+                KeyCode::PageDown if self.detail_fullscreen_active(DetailSurface::ToolManager) => {
+                    self.page_down_detail_fullscreen(DetailSurface::ToolManager);
+                }
                 KeyCode::PageUp => self.tool_manager.page_up(),
                 KeyCode::PageDown => self.tool_manager.page_down(),
                 _ if selector_action_key(&key, 'r') => {
                     self.reset_tool_manager_policy();
                 }
-                KeyCode::Backspace => self.tool_manager.pop_char(),
+                KeyCode::Backspace => {
+                    self.tool_manager.pop_char();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::ToolManager);
+                }
                 KeyCode::Char(c) if selector_search_char(&key) == Some(c) => {
                     self.tool_manager.push_char(c);
+                    self.reset_detail_fullscreen_scroll(DetailSurface::ToolManager);
                 }
                 _ => {}
             }
@@ -6495,26 +6718,50 @@ impl App {
         if self.config_selector.active {
             match key.code {
                 KeyCode::Esc => {
-                    self.config_selector.active = false;
+                    if !self.close_detail_fullscreen(DetailSurface::ConfigSelector) {
+                        self.config_selector.active = false;
+                    }
+                }
+                _ if selector_action_key(&key, 'z') => {
+                    self.toggle_detail_fullscreen(DetailSurface::ConfigSelector, 0);
                 }
                 KeyCode::Enter => {
                     if let Some(entry) = self.config_selector.current() {
                         let action = entry.action;
                         self.config_selector.active = false;
+                        self.close_detail_fullscreen(DetailSurface::ConfigSelector);
                         self.handle_config_selector_action(action);
                     }
                 }
-                KeyCode::Up => self.config_selector.move_up(),
-                KeyCode::Down => self.config_selector.move_down(),
+                KeyCode::Up => {
+                    self.config_selector.move_up();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::ConfigSelector);
+                }
+                KeyCode::Down => {
+                    self.config_selector.move_down();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::ConfigSelector);
+                }
+                KeyCode::PageUp if self.detail_fullscreen_active(DetailSurface::ConfigSelector) => {
+                    self.page_up_detail_fullscreen(DetailSurface::ConfigSelector);
+                }
+                KeyCode::PageDown
+                    if self.detail_fullscreen_active(DetailSurface::ConfigSelector) =>
+                {
+                    self.page_down_detail_fullscreen(DetailSurface::ConfigSelector);
+                }
                 KeyCode::PageUp => self.config_selector.page_up(),
                 KeyCode::PageDown => self.config_selector.page_down(),
-                KeyCode::Backspace => self.config_selector.pop_char(),
+                KeyCode::Backspace => {
+                    self.config_selector.pop_char();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::ConfigSelector);
+                }
                 KeyCode::Char(c)
                     if !key
                         .modifiers
                         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                 {
                     self.config_selector.push_char(c);
+                    self.reset_detail_fullscreen_scroll(DetailSurface::ConfigSelector);
                 }
                 _ => {}
             }
@@ -6554,7 +6801,15 @@ impl App {
         if self.session_inspector.active() {
             match key.code {
                 KeyCode::Esc => {
-                    self.close_session_inspector();
+                    if !self.close_detail_fullscreen(DetailSurface::SessionInspector) {
+                        self.close_session_inspector();
+                    }
+                }
+                _ if selector_action_key(&key, 'z') => {
+                    self.toggle_detail_fullscreen(
+                        DetailSurface::SessionInspector,
+                        self.session_inspector.pane.scroll,
+                    );
                 }
                 _ if selector_action_key(&key, 'b') => {
                     self.close_session_inspector();
@@ -6570,24 +6825,30 @@ impl App {
                             let session_id = session.id.clone();
                             self.session_inspector.close();
                             self.session_browser.active = false;
+                            self.close_detail_fullscreen(DetailSurface::SessionInspector);
                             self.handle_resume_session(Some(session_id));
                         }
                     }
                 }
-                KeyCode::Tab | KeyCode::BackTab => {
+                KeyCode::Tab | KeyCode::BackTab
+                    if !self.detail_fullscreen_active(DetailSurface::SessionInspector) =>
+                {
                     self.session_inspector.pane.focus = self.session_inspector.pane.focus.toggle();
                 }
                 KeyCode::Up => {
-                    if self.session_inspector.pane.focus == SplitPaneFocus::List {
-                        self.session_inspector.selector.move_up();
-                        self.session_inspector.pane.reset_scroll();
-                    }
+                    self.session_inspector.selector.move_up();
+                    self.session_inspector.pane.reset_scroll();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::SessionInspector);
                 }
                 KeyCode::Down => {
-                    if self.session_inspector.pane.focus == SplitPaneFocus::List {
-                        self.session_inspector.selector.move_down();
-                        self.session_inspector.pane.reset_scroll();
-                    }
+                    self.session_inspector.selector.move_down();
+                    self.session_inspector.pane.reset_scroll();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::SessionInspector);
+                }
+                KeyCode::PageUp
+                    if self.detail_fullscreen_active(DetailSurface::SessionInspector) =>
+                {
+                    self.page_up_detail_fullscreen(DetailSurface::SessionInspector);
                 }
                 KeyCode::PageUp => {
                     if self.session_inspector.pane.focus == SplitPaneFocus::Detail {
@@ -6595,7 +6856,13 @@ impl App {
                     } else {
                         self.session_inspector.selector.page_up();
                         self.session_inspector.pane.reset_scroll();
+                        self.reset_detail_fullscreen_scroll(DetailSurface::SessionInspector);
                     }
+                }
+                KeyCode::PageDown
+                    if self.detail_fullscreen_active(DetailSurface::SessionInspector) =>
+                {
+                    self.page_down_detail_fullscreen(DetailSurface::SessionInspector);
                 }
                 KeyCode::PageDown => {
                     if self.session_inspector.pane.focus == SplitPaneFocus::Detail {
@@ -6603,11 +6870,13 @@ impl App {
                     } else {
                         self.session_inspector.selector.page_down();
                         self.session_inspector.pane.reset_scroll();
+                        self.reset_detail_fullscreen_scroll(DetailSurface::SessionInspector);
                     }
                 }
                 KeyCode::Home => {
                     self.session_inspector.selector.selected = 0;
                     self.session_inspector.pane.reset_scroll();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::SessionInspector);
                 }
                 KeyCode::End => {
                     self.session_inspector.selector.selected = self
@@ -6617,14 +6886,17 @@ impl App {
                         .len()
                         .saturating_sub(1);
                     self.session_inspector.pane.reset_scroll();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::SessionInspector);
                 }
                 KeyCode::Backspace => {
                     self.session_inspector.selector.pop_char();
                     self.session_inspector.pane.reset_scroll();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::SessionInspector);
                 }
                 KeyCode::Char(c) if selector_search_char(&key) == Some(c) => {
                     self.session_inspector.selector.push_char(c);
                     self.session_inspector.pane.reset_scroll();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::SessionInspector);
                 }
                 _ => {}
             }
@@ -6636,10 +6908,19 @@ impl App {
         if self.session_browser.active {
             match key.code {
                 KeyCode::Esc => {
-                    self.session_browser.active = false;
+                    if !self.close_detail_fullscreen(DetailSurface::SessionBrowser) {
+                        self.session_browser.active = false;
+                    }
+                }
+                _ if selector_action_key(&key, 'z') => {
+                    self.toggle_detail_fullscreen(
+                        DetailSurface::SessionBrowser,
+                        self.session_browser_pane.scroll,
+                    );
                 }
                 KeyCode::Enter => {
                     if let Some(entry) = self.session_browser.current().cloned() {
+                        self.close_detail_fullscreen(DetailSurface::SessionBrowser);
                         self.open_session_inspector(entry);
                     }
                 }
@@ -6647,6 +6928,7 @@ impl App {
                     if let Some(entry) = self.session_browser.current() {
                         let session_id = entry.id.clone();
                         self.session_browser.active = false;
+                        self.close_detail_fullscreen(DetailSurface::SessionBrowser);
                         self.handle_resume_session(Some(session_id));
                     }
                 }
@@ -6655,22 +6937,26 @@ impl App {
                         self.session_browser.current().map(|entry| entry.id.clone())
                     {
                         self.delete_session_from_browser(&session_id);
+                        self.reset_detail_fullscreen_scroll(DetailSurface::SessionBrowser);
                     }
                 }
-                KeyCode::Tab | KeyCode::BackTab => {
+                KeyCode::Tab | KeyCode::BackTab
+                    if !self.detail_fullscreen_active(DetailSurface::SessionBrowser) =>
+                {
                     self.session_browser_pane.focus = self.session_browser_pane.focus.toggle();
                 }
                 KeyCode::Up => {
-                    if self.session_browser_pane.focus == SplitPaneFocus::List {
-                        self.session_browser.move_up();
-                        self.session_browser_pane.reset_scroll();
-                    }
+                    self.session_browser.move_up();
+                    self.session_browser_pane.reset_scroll();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::SessionBrowser);
                 }
                 KeyCode::Down => {
-                    if self.session_browser_pane.focus == SplitPaneFocus::List {
-                        self.session_browser.move_down();
-                        self.session_browser_pane.reset_scroll();
-                    }
+                    self.session_browser.move_down();
+                    self.session_browser_pane.reset_scroll();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::SessionBrowser);
+                }
+                KeyCode::PageUp if self.detail_fullscreen_active(DetailSurface::SessionBrowser) => {
+                    self.page_up_detail_fullscreen(DetailSurface::SessionBrowser);
                 }
                 KeyCode::PageUp => {
                     if self.session_browser_pane.focus == SplitPaneFocus::Detail {
@@ -6678,7 +6964,13 @@ impl App {
                     } else {
                         self.session_browser.page_up();
                         self.session_browser_pane.reset_scroll();
+                        self.reset_detail_fullscreen_scroll(DetailSurface::SessionBrowser);
                     }
+                }
+                KeyCode::PageDown
+                    if self.detail_fullscreen_active(DetailSurface::SessionBrowser) =>
+                {
+                    self.page_down_detail_fullscreen(DetailSurface::SessionBrowser);
                 }
                 KeyCode::PageDown => {
                     if self.session_browser_pane.focus == SplitPaneFocus::Detail {
@@ -6686,25 +6978,30 @@ impl App {
                     } else {
                         self.session_browser.page_down();
                         self.session_browser_pane.reset_scroll();
+                        self.reset_detail_fullscreen_scroll(DetailSurface::SessionBrowser);
                     }
                 }
                 KeyCode::Home => {
                     self.session_browser.selected = 0;
                     self.session_browser_pane.reset_scroll();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::SessionBrowser);
                 }
                 KeyCode::End => {
                     self.session_browser.selected =
                         self.session_browser.filtered.len().saturating_sub(1);
                     self.session_browser_pane.reset_scroll();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::SessionBrowser);
                 }
                 KeyCode::Backspace => {
                     self.session_browser.pop_char();
                     self.session_browser_pane.reset_scroll();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::SessionBrowser);
                     self.refresh_session_browser();
                 }
                 KeyCode::Char(c) if selector_search_char(&key) == Some(c) => {
                     self.session_browser.push_char(c);
                     self.session_browser_pane.reset_scroll();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::SessionBrowser);
                     self.refresh_session_browser();
                 }
                 _ => {}
@@ -10681,6 +10978,8 @@ impl App {
 
     fn open_session_browser_with_query(&mut self, initial_query: Option<&str>) {
         self.session_inspector.close();
+        self.close_detail_fullscreen(DetailSurface::SessionInspector);
+        self.close_detail_fullscreen(DetailSurface::SessionBrowser);
         self.session_browser_pane.reset();
         self.session_browser.query = initial_query.unwrap_or_default().trim().to_string();
         self.session_browser.selected = 0;
@@ -10720,6 +11019,8 @@ impl App {
                 self.session_inspector.return_to_browser = true;
                 self.session_inspector.selector.active = true;
                 self.session_browser.active = false;
+                self.close_detail_fullscreen(DetailSurface::SessionBrowser);
+                self.close_detail_fullscreen(DetailSurface::SessionInspector);
                 self.needs_redraw = true;
             }
             Err(e) => self.push_output(format!("DB error: {e}"), OutputRole::Error),
@@ -10796,6 +11097,8 @@ impl App {
             .collect::<Vec<_>>();
 
         self.session_browser.active = false;
+        self.close_detail_fullscreen(DetailSurface::SessionBrowser);
+        self.close_detail_fullscreen(DetailSurface::SessionInspector);
         self.session_inspector.selector.query.clear();
         self.session_inspector.selector.selected = 0;
         self.session_inspector.selector.set_items(items);
@@ -10808,6 +11111,7 @@ impl App {
 
     fn close_session_inspector(&mut self) {
         let return_to_browser = self.session_inspector.return_to_browser;
+        self.close_detail_fullscreen(DetailSurface::SessionInspector);
         self.session_inspector.close();
         self.session_browser.active = return_to_browser;
         self.needs_redraw = true;
@@ -10832,6 +11136,7 @@ impl App {
                     && !had_query
                 {
                     self.session_browser.active = false;
+                    self.close_detail_fullscreen(DetailSurface::SessionBrowser);
                 }
             }
             Err(e) => self.push_output(format!("Delete failed: {e}"), OutputRole::Error),
@@ -15173,6 +15478,7 @@ impl App {
         frame: &mut Frame,
         area: Rect,
         selector: &FuzzySelector<ModelEntry>,
+        detail_surface: DetailSurface,
         chrome: SelectorChrome<'_>,
     ) {
         frame.render_widget(Clear, area);
@@ -15298,6 +15604,44 @@ impl App {
                 "Try a broader provider name or a shorter model fragment.",
             ));
         }
+        if self.detail_fullscreen_active(detail_surface) {
+            self.render_fullscreen_browser_detail(
+                frame,
+                area,
+                FullscreenBrowserChrome {
+                    query: &selector.query,
+                    header: BrowserChrome {
+                        title: chrome.title,
+                        placeholder: chrome.placeholder,
+                        icon: "◈",
+                        icon_color: Color::Cyan,
+                        border_color: Color::Cyan,
+                    },
+                    detail: ScrollableDetailChrome {
+                        title: "Details",
+                        border_color: Color::Cyan,
+                        focused: true,
+                        requested_scroll: self.detail_fullscreen_scroll(detail_surface),
+                    },
+                    help: Line::from(vec![
+                        Span::styled(" ↑↓ ", Style::default().fg(Color::Cyan)),
+                        Span::styled("change item  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("type ", Style::default().fg(Color::Cyan)),
+                        Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("PgUp/Dn ", Style::default().fg(Color::Cyan)),
+                        Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Enter ", Style::default().fg(Color::Cyan)),
+                        Span::styled("select  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Z ", Style::default().fg(Color::Cyan)),
+                        Span::styled("split view  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Esc ", Style::default().fg(Color::Cyan)),
+                        Span::styled("close  ", Style::default().fg(Color::DarkGray)),
+                    ]),
+                },
+                detail_lines,
+            );
+            return;
+        }
         self.render_browser_detail(frame, body[1], detail_lines);
 
         let help = Paragraph::new(Line::from(vec![
@@ -15307,6 +15651,8 @@ impl App {
             Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Enter ", Style::default().fg(Color::Cyan)),
             Span::styled("select  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Z ", Style::default().fg(Color::Cyan)),
+            Span::styled("detail  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Esc ", Style::default().fg(Color::Cyan)),
             Span::styled("cancel  ", Style::default().fg(Color::DarkGray)),
             Span::styled(
@@ -15345,6 +15691,7 @@ impl App {
             frame,
             area,
             &self.model_selector,
+            DetailSurface::ModelSelector,
             SelectorChrome {
                 title: &title,
                 placeholder,
@@ -15362,6 +15709,7 @@ impl App {
             frame,
             area,
             &self.vision_model_selector,
+            DetailSurface::VisionModelSelector,
             SelectorChrome {
                 title: "Select Vision Model",
                 placeholder: "Type to filter vision backends... (Esc to cancel)",
@@ -15376,6 +15724,7 @@ impl App {
             frame,
             area,
             &self.image_model_selector,
+            DetailSurface::ImageModelSelector,
             SelectorChrome {
                 title: "Select Image Model",
                 placeholder: "Type to filter image-generation backends... (Esc to cancel)",
@@ -15687,6 +16036,92 @@ impl App {
         }
     }
 
+    fn detail_fullscreen_active(&self, surface: DetailSurface) -> bool {
+        self.detail_fullscreen
+            .is_some_and(|state| state.surface == surface)
+    }
+
+    fn toggle_detail_fullscreen(&mut self, surface: DetailSurface, initial_scroll: u16) {
+        if self.detail_fullscreen_active(surface) {
+            self.detail_fullscreen = None;
+        } else {
+            self.detail_fullscreen = Some(DetailFullscreenState {
+                surface,
+                scroll: initial_scroll,
+            });
+        }
+        self.needs_redraw = true;
+    }
+
+    fn close_detail_fullscreen(&mut self, surface: DetailSurface) -> bool {
+        if self.detail_fullscreen_active(surface) {
+            self.detail_fullscreen = None;
+            self.needs_redraw = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn reset_detail_fullscreen_scroll(&mut self, surface: DetailSurface) {
+        if let Some(state) = self.detail_fullscreen.as_mut() {
+            if state.surface == surface {
+                state.scroll = 0;
+                self.needs_redraw = true;
+            }
+        }
+    }
+
+    fn page_up_detail_fullscreen(&mut self, surface: DetailSurface) {
+        if let Some(state) = self.detail_fullscreen.as_mut() {
+            if state.surface == surface {
+                state.scroll = state.scroll.saturating_sub(8);
+                self.needs_redraw = true;
+            }
+        }
+    }
+
+    fn page_down_detail_fullscreen(&mut self, surface: DetailSurface) {
+        if let Some(state) = self.detail_fullscreen.as_mut() {
+            if state.surface == surface {
+                state.scroll = state.scroll.saturating_add(8);
+                self.needs_redraw = true;
+            }
+        }
+    }
+
+    fn detail_fullscreen_scroll(&self, surface: DetailSurface) -> u16 {
+        self.detail_fullscreen
+            .filter(|state| state.surface == surface)
+            .map_or(0, |state| state.scroll)
+    }
+
+    fn render_fullscreen_browser_detail(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        chrome: FullscreenBrowserChrome<'_>,
+        detail_lines: Vec<Line<'static>>,
+    ) {
+        frame.render_widget(Clear, area);
+        let chunks = Self::browser_overlay_chunks(area);
+        let header_title = format!("{} · Detail", chrome.header.title);
+        self.render_browser_header(
+            frame,
+            chunks[0],
+            chrome.query,
+            BrowserChrome {
+                title: &header_title,
+                placeholder: chrome.header.placeholder,
+                icon: chrome.header.icon,
+                icon_color: chrome.header.icon_color,
+                border_color: chrome.header.border_color,
+            },
+        );
+        self.render_scrollable_browser_detail(frame, chunks[1], chrome.detail, detail_lines);
+        frame.render_widget(Paragraph::new(chrome.help), chunks[2]);
+    }
+
     fn render_mcp_selector(&self, frame: &mut Frame, area: Rect) {
         frame.render_widget(Clear, area);
 
@@ -15826,6 +16261,47 @@ impl App {
             ));
         }
 
+        if self.detail_fullscreen_active(DetailSurface::McpSelector) {
+            self.render_fullscreen_browser_detail(
+                frame,
+                area,
+                FullscreenBrowserChrome {
+                    query: &self.mcp_selector.query,
+                    header: BrowserChrome {
+                        title: "MCP Browser",
+                        placeholder: "Search configured MCP servers and the official catalog.",
+                        icon: "⛓",
+                        icon_color: Color::Rgb(110, 220, 210),
+                        border_color: Color::Rgb(110, 220, 210),
+                    },
+                    detail: ScrollableDetailChrome {
+                        title: "Details",
+                        border_color: Color::Rgb(110, 220, 210),
+                        focused: true,
+                        requested_scroll: self.detail_fullscreen_scroll(DetailSurface::McpSelector),
+                    },
+                    help: Line::from(vec![
+                        Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                        Span::styled("change item  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("type ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                        Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                        Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Space ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                        Span::styled("toggle  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Enter ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                        Span::styled("default action  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Z ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                        Span::styled("split view  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Esc ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                        Span::styled("close  ", Style::default().fg(Color::DarkGray)),
+                    ]),
+                },
+                detail_lines,
+            );
+            return;
+        }
+
         self.render_browser_detail(frame, body[1], detail_lines);
 
         let help = Paragraph::new(Line::from(vec![
@@ -15843,6 +16319,8 @@ impl App {
             Span::styled("test  ", Style::default().fg(Color::DarkGray)),
             Span::styled("C ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("check  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Z ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("detail  ", Style::default().fg(Color::DarkGray)),
             Span::styled("V ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("view  ", Style::default().fg(Color::DarkGray)),
             Span::styled("D ", Style::default().fg(Color::Rgb(110, 220, 210))),
@@ -16058,6 +16536,55 @@ impl App {
             }
         }
 
+        if self.detail_fullscreen_active(DetailSurface::RemoteMcpBrowser) {
+            self.render_fullscreen_browser_detail(
+                frame,
+                area,
+                FullscreenBrowserChrome {
+                    query: &browser.selector.query,
+                    header: BrowserChrome {
+                        title: if browser.inflight_request_id.is_some() {
+                            "Remote MCP · Searching…"
+                        } else {
+                            "Remote MCP"
+                        },
+                        placeholder:
+                            "Type to search official MCP sources and the official MCP Registry",
+                        icon: "⛓",
+                        icon_color: Color::Rgb(90, 190, 220),
+                        border_color: if browser.inflight_request_id.is_some() {
+                            Color::Rgb(110, 220, 210)
+                        } else {
+                            Color::Rgb(90, 190, 220)
+                        },
+                    },
+                    detail: ScrollableDetailChrome {
+                        title: "Details",
+                        border_color: Color::Rgb(90, 190, 220),
+                        focused: true,
+                        requested_scroll: self
+                            .detail_fullscreen_scroll(DetailSurface::RemoteMcpBrowser),
+                    },
+                    help: Line::from(vec![
+                        Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                        Span::styled("change item  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("type ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                        Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                        Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Enter ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                        Span::styled("default action  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Z ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                        Span::styled("split view  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Esc ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                        Span::styled("close  ", Style::default().fg(Color::DarkGray)),
+                    ]),
+                },
+                detail_lines,
+            );
+            return;
+        }
+
         self.render_browser_detail(frame, body[1], detail_lines);
 
         let status_text = if browser.inflight_request_id.is_some() {
@@ -16078,6 +16605,8 @@ impl App {
             Span::styled("install  ", Style::default().fg(Color::DarkGray)),
             Span::styled("V ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("view  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Z ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("detail  ", Style::default().fg(Color::DarkGray)),
             Span::styled("R ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("refresh  ", Style::default().fg(Color::DarkGray)),
             Span::styled("L ", Style::default().fg(Color::Rgb(110, 220, 210))),
@@ -16219,6 +16748,48 @@ impl App {
                 "Try a broader term, a category name, or press R to search remote sources.",
             ));
         }
+        if self.detail_fullscreen_active(DetailSurface::SkillSelector) {
+            self.render_fullscreen_browser_detail(
+                frame,
+                area,
+                FullscreenBrowserChrome {
+                    query: &self.skill_selector.query,
+                    header: BrowserChrome {
+                        title: "Browse Skills",
+                        placeholder:
+                            "Search local skills by name, category, path, preview, or support files.",
+                        icon: "📚",
+                        icon_color: Color::Rgb(255, 191, 0),
+                        border_color: Color::Rgb(255, 191, 0),
+                    },
+                    detail: ScrollableDetailChrome {
+                        title: "Details",
+                        border_color: Color::Rgb(255, 191, 0),
+                        focused: true,
+                        requested_scroll: self
+                            .detail_fullscreen_scroll(DetailSurface::SkillSelector),
+                    },
+                    help: Line::from(vec![
+                        Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(255, 191, 0))),
+                        Span::styled("change item  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("type ", Style::default().fg(Color::Rgb(255, 191, 0))),
+                        Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(255, 191, 0))),
+                        Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Space ", Style::default().fg(Color::Rgb(255, 191, 0))),
+                        Span::styled("toggle active  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Enter ", Style::default().fg(Color::Rgb(255, 191, 0))),
+                        Span::styled("insert /skill  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Z ", Style::default().fg(Color::Rgb(255, 191, 0))),
+                        Span::styled("split view  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Esc ", Style::default().fg(Color::Rgb(255, 191, 0))),
+                        Span::styled("close  ", Style::default().fg(Color::DarkGray)),
+                    ]),
+                },
+                detail_lines,
+            );
+            return;
+        }
         self.render_browser_detail(frame, body[1], detail_lines);
 
         let help = Paragraph::new(Line::from(vec![
@@ -16230,6 +16801,8 @@ impl App {
             Span::styled("toggle active  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Enter ", Style::default().fg(Color::Rgb(255, 191, 0))),
             Span::styled("insert /skill-name  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Z ", Style::default().fg(Color::Rgb(255, 191, 0))),
+            Span::styled("detail  ", Style::default().fg(Color::DarkGray)),
             Span::styled("R ", Style::default().fg(Color::Rgb(255, 191, 0))),
             Span::styled("remote search  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Esc ", Style::default().fg(Color::Rgb(255, 191, 0))),
@@ -16449,6 +17022,54 @@ impl App {
             )));
         }
 
+        if self.detail_fullscreen_active(DetailSurface::RemoteSkillBrowser) {
+            self.render_fullscreen_browser_detail(
+                frame,
+                area,
+                FullscreenBrowserChrome {
+                    query: &browser.selector.query,
+                    header: BrowserChrome {
+                        title: if browser.inflight_request_id.is_some() {
+                            "Remote Skills · Searching…"
+                        } else {
+                            "Remote Skills"
+                        },
+                        placeholder: "Type to search remote skills from EdgeCrab, Hermes, OpenAI, Anthropic, skills.sh, or a well-known URL",
+                        icon: "🌐",
+                        icon_color: Color::Rgb(110, 220, 210),
+                        border_color: if browser.inflight_request_id.is_some() {
+                            Color::Rgb(110, 220, 210)
+                        } else {
+                            Color::Rgb(255, 191, 0)
+                        },
+                    },
+                    detail: ScrollableDetailChrome {
+                        title: "Details",
+                        border_color: Color::Rgb(255, 191, 0),
+                        focused: true,
+                        requested_scroll: self
+                            .detail_fullscreen_scroll(DetailSurface::RemoteSkillBrowser),
+                    },
+                    help: Line::from(vec![
+                        Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                        Span::styled("change item  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("type ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                        Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                        Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Enter ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                        Span::styled("default action  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Z ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                        Span::styled("split view  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Esc ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                        Span::styled("close  ", Style::default().fg(Color::DarkGray)),
+                    ]),
+                },
+                detail_lines,
+            );
+            return;
+        }
+
         self.render_browser_detail(frame, body[1], detail_lines);
 
         let mut help_spans = vec![
@@ -16462,6 +17083,8 @@ impl App {
             Span::styled("install/update  ", Style::default().fg(Color::DarkGray)),
             Span::styled("U ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("force update  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Z ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("detail  ", Style::default().fg(Color::DarkGray)),
             Span::styled("R ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("refresh  ", Style::default().fg(Color::DarkGray)),
             Span::styled("L ", Style::default().fg(Color::Rgb(110, 220, 210))),
@@ -16680,7 +17303,7 @@ impl App {
             }
         }
 
-        let detail = Paragraph::new(Text::from(detail_lines))
+        let detail = Paragraph::new(Text::from(detail_lines.clone()))
             .wrap(Wrap { trim: false })
             .block(
                 Block::default()
@@ -16688,6 +17311,46 @@ impl App {
                     .border_style(Style::default().fg(Color::Rgb(64, 88, 98)))
                     .title(" Details "),
             );
+        if self.detail_fullscreen_active(DetailSurface::ToolManager) {
+            self.render_fullscreen_browser_detail(
+                frame,
+                area,
+                FullscreenBrowserChrome {
+                    query: &self.tool_manager.query,
+                    header: BrowserChrome {
+                        title: "Tool Manager",
+                        placeholder: "Search tools, toolsets, descriptions, or tags",
+                        icon: "🧰",
+                        icon_color: Color::Rgb(140, 220, 210),
+                        border_color: Color::Rgb(110, 220, 210),
+                    },
+                    detail: ScrollableDetailChrome {
+                        title: "Details",
+                        border_color: Color::Rgb(110, 220, 210),
+                        focused: true,
+                        requested_scroll: self.detail_fullscreen_scroll(DetailSurface::ToolManager),
+                    },
+                    help: Line::from(vec![
+                        Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                        Span::styled("change item  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("type ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                        Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                        Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Space ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                        Span::styled("toggle  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Tab ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                        Span::styled("scope  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Z ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                        Span::styled("split view  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Esc ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                        Span::styled("close  ", Style::default().fg(Color::DarkGray)),
+                    ]),
+                },
+                detail_lines,
+            );
+            return;
+        }
         frame.render_widget(detail, body[1]);
 
         let footer_note = self
@@ -16701,6 +17364,8 @@ impl App {
             Span::styled("toggle  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Tab ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("scope  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Z ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("detail  ", Style::default().fg(Color::DarkGray)),
             Span::styled("R ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("reset  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Esc ", Style::default().fg(Color::Rgb(110, 220, 210))),
@@ -16815,7 +17480,7 @@ impl App {
         let mut detail_lines = Vec::new();
         if let Some(entry) = self.config_selector.current() {
             detail_lines.push(Line::from(Span::styled(
-                &entry.title,
+                entry.title.clone(),
                 Style::default()
                     .fg(Color::Rgb(130, 210, 255))
                     .add_modifier(Modifier::BOLD),
@@ -16887,7 +17552,7 @@ impl App {
             }
         }
 
-        let detail = Paragraph::new(Text::from(detail_lines))
+        let detail = Paragraph::new(Text::from(detail_lines.clone()))
             .wrap(Wrap { trim: false })
             .block(
                 Block::default()
@@ -16895,6 +17560,45 @@ impl App {
                     .border_style(Style::default().fg(Color::Rgb(64, 88, 98)))
                     .title(" Details "),
             );
+        if self.detail_fullscreen_active(DetailSurface::ConfigSelector) {
+            self.render_fullscreen_browser_detail(
+                frame,
+                area,
+                FullscreenBrowserChrome {
+                    query: &self.config_selector.query,
+                    header: BrowserChrome {
+                        title: "Config Center",
+                        placeholder: "Type to filter settings and controls…",
+                        icon: "⚙",
+                        icon_color: Color::Rgb(130, 210, 255),
+                        border_color: Color::Rgb(130, 210, 255),
+                    },
+                    detail: ScrollableDetailChrome {
+                        title: "Details",
+                        border_color: Color::Rgb(130, 210, 255),
+                        focused: true,
+                        requested_scroll: self
+                            .detail_fullscreen_scroll(DetailSurface::ConfigSelector),
+                    },
+                    help: Line::from(vec![
+                        Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(130, 210, 255))),
+                        Span::styled("change item  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("type ", Style::default().fg(Color::Rgb(130, 210, 255))),
+                        Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(130, 210, 255))),
+                        Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Enter ", Style::default().fg(Color::Rgb(130, 210, 255))),
+                        Span::styled("run action  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Z ", Style::default().fg(Color::Rgb(130, 210, 255))),
+                        Span::styled("split view  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Esc ", Style::default().fg(Color::Rgb(130, 210, 255))),
+                        Span::styled("close  ", Style::default().fg(Color::DarkGray)),
+                    ]),
+                },
+                detail_lines,
+            );
+            return;
+        }
         frame.render_widget(detail, body[1]);
 
         let help = Paragraph::new(Line::from(vec![
@@ -16902,6 +17606,8 @@ impl App {
             Span::styled("browse  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Enter ", Style::default().fg(Color::Rgb(130, 210, 255))),
             Span::styled("run action  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Z ", Style::default().fg(Color::Rgb(130, 210, 255))),
+            Span::styled("detail  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Esc ", Style::default().fg(Color::Rgb(130, 210, 255))),
             Span::styled("cancel  ", Style::default().fg(Color::DarkGray)),
             Span::styled(
@@ -17060,8 +17766,50 @@ impl App {
                 focused: self.session_browser_pane.focus == SplitPaneFocus::Detail,
                 requested_scroll: self.session_browser_pane.scroll,
             },
-            detail_lines,
+            detail_lines.clone(),
         );
+        if self.detail_fullscreen_active(DetailSurface::SessionBrowser) {
+            self.render_fullscreen_browser_detail(
+                frame,
+                area,
+                FullscreenBrowserChrome {
+                    query: &self.session_browser.query,
+                    header: BrowserChrome {
+                        title: "Session Browser",
+                        placeholder:
+                            "Search by title, id, source, model, or any indexed message text.",
+                        icon: "⏱",
+                        icon_color: Color::Rgb(110, 190, 255),
+                        border_color: Color::Rgb(110, 190, 255),
+                    },
+                    detail: ScrollableDetailChrome {
+                        title: "Details",
+                        border_color: Color::Rgb(110, 190, 255),
+                        focused: true,
+                        requested_scroll: self
+                            .detail_fullscreen_scroll(DetailSurface::SessionBrowser),
+                    },
+                    help: Line::from(vec![
+                        Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(110, 190, 255))),
+                        Span::styled("change item  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("type ", Style::default().fg(Color::Rgb(110, 190, 255))),
+                        Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(110, 190, 255))),
+                        Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Enter ", Style::default().fg(Color::Rgb(110, 190, 255))),
+                        Span::styled("inspect  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("R ", Style::default().fg(Color::Rgb(110, 190, 255))),
+                        Span::styled("resume  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Z ", Style::default().fg(Color::Rgb(110, 190, 255))),
+                        Span::styled("split view  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Esc ", Style::default().fg(Color::Rgb(110, 190, 255))),
+                        Span::styled("close  ", Style::default().fg(Color::DarkGray)),
+                    ]),
+                },
+                detail_lines,
+            );
+            return;
+        }
 
         let note = self.session_browser_status_note.as_deref().unwrap_or(
             "Lowercase keeps typing in the filter. Uppercase shortcuts trigger actions.",
@@ -17077,6 +17825,8 @@ impl App {
             Span::styled("page or scroll  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Enter ", Style::default().fg(Color::Rgb(110, 190, 255))),
             Span::styled("inspect  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Z ", Style::default().fg(Color::Rgb(110, 190, 255))),
+            Span::styled("detail  ", Style::default().fg(Color::DarkGray)),
             Span::styled("R ", Style::default().fg(Color::Rgb(110, 190, 255))),
             Span::styled("resume  ", Style::default().fg(Color::DarkGray)),
             Span::styled("D ", Style::default().fg(Color::Rgb(110, 190, 255))),
@@ -17323,8 +18073,48 @@ impl App {
                 focused: self.session_inspector.pane.focus == SplitPaneFocus::Detail,
                 requested_scroll: self.session_inspector.pane.scroll,
             },
-            detail_lines,
+            detail_lines.clone(),
         );
+        if self.detail_fullscreen_active(DetailSurface::SessionInspector) {
+            self.render_fullscreen_browser_detail(
+                frame,
+                area,
+                FullscreenBrowserChrome {
+                    query: &self.session_inspector.selector.query,
+                    header: BrowserChrome {
+                        title: "Session Inspector",
+                        placeholder:
+                            "Filter this timeline by role, content, tool ids, tool names, or reasoning text.",
+                        icon: "⌕",
+                        icon_color: Color::Rgb(120, 215, 185),
+                        border_color: Color::Rgb(120, 215, 185),
+                    },
+                    detail: ScrollableDetailChrome {
+                        title: "Details",
+                        border_color: Color::Rgb(120, 215, 185),
+                        focused: true,
+                        requested_scroll: self
+                            .detail_fullscreen_scroll(DetailSurface::SessionInspector),
+                    },
+                    help: Line::from(vec![
+                        Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(120, 215, 185))),
+                        Span::styled("change item  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("type ", Style::default().fg(Color::Rgb(120, 215, 185))),
+                        Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(120, 215, 185))),
+                        Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("R ", Style::default().fg(Color::Rgb(120, 215, 185))),
+                        Span::styled("resume saved  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Z ", Style::default().fg(Color::Rgb(120, 215, 185))),
+                        Span::styled("split view  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Esc ", Style::default().fg(Color::Rgb(120, 215, 185))),
+                        Span::styled("back  ", Style::default().fg(Color::DarkGray)),
+                    ]),
+                },
+                detail_lines,
+            );
+            return;
+        }
 
         let help = Paragraph::new(Line::from(vec![
             Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(120, 215, 185))),
@@ -17335,6 +18125,8 @@ impl App {
             Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
             Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(120, 215, 185))),
             Span::styled("page or scroll  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Z ", Style::default().fg(Color::Rgb(120, 215, 185))),
+            Span::styled("detail  ", Style::default().fg(Color::DarkGray)),
             Span::styled("B ", Style::default().fg(Color::Rgb(120, 215, 185))),
             Span::styled("back  ", Style::default().fg(Color::DarkGray)),
             Span::styled("R ", Style::default().fg(Color::Rgb(120, 215, 185))),
@@ -18502,6 +19294,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn model_selector_fullscreen_esc_returns_to_split_view() {
+        let mut app = App::new();
+        app.open_model_selector_for("anthropic/claude-opus-4.6", ModelSelectorTarget::Primary);
+
+        app.handle_key_event(event::KeyEvent::new(KeyCode::Char('Z'), KeyModifiers::NONE));
+        app.handle_key_event(event::KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+
+        assert!(app.model_selector.active);
+        assert!(app.detail_fullscreen_active(DetailSurface::ModelSelector));
+        assert_eq!(
+            app.detail_fullscreen_scroll(DetailSurface::ModelSelector),
+            8
+        );
+
+        app.handle_key_event(event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(app.model_selector.active);
+        assert!(!app.detail_fullscreen_active(DetailSurface::ModelSelector));
+    }
+
+    #[tokio::test]
     async fn session_browser_builds_rich_entries_from_saved_sessions() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = Arc::new(
@@ -18808,6 +19621,54 @@ mod tests {
         assert_eq!(app.session_browser_pane.focus, SplitPaneFocus::Detail);
         assert_eq!(app.session_browser_pane.scroll, 8);
         assert_eq!(app.session_browser.query, "");
+    }
+
+    #[tokio::test]
+    async fn session_browser_fullscreen_esc_returns_to_split_view() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(
+            edgecrab_state::SessionDb::open(&dir.path().join("sessions.db")).expect("session db"),
+        );
+
+        let session = sample_browser_session(
+            "sess-full-777777",
+            "Fullscreen detail",
+            1_720_000_700.0,
+            "copilot/gpt-5-mini",
+        );
+        db.save_session(&session).expect("save session");
+        db.save_message(
+            "sess-full-777777",
+            &edgecrab_types::Message::user(
+                "alpha\nbeta\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\niota",
+            ),
+            1_720_000_710.0,
+        )
+        .expect("save message");
+
+        let agent = mock_agent_with_state_db(db);
+        let mut app = App::new();
+        app.set_agent(agent);
+        app.open_session_browser();
+        app.handle_key_event(event::KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.handle_key_event(event::KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(app.session_browser_pane.scroll, 8);
+
+        app.handle_key_event(event::KeyEvent::new(KeyCode::Char('Z'), KeyModifiers::NONE));
+        app.handle_key_event(event::KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+
+        assert!(app.session_browser.active);
+        assert!(app.detail_fullscreen_active(DetailSurface::SessionBrowser));
+        assert_eq!(
+            app.detail_fullscreen_scroll(DetailSurface::SessionBrowser),
+            16
+        );
+
+        app.handle_key_event(event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(app.session_browser.active);
+        assert!(!app.detail_fullscreen_active(DetailSurface::SessionBrowser));
+        assert_eq!(app.session_browser_pane.scroll, 8);
     }
 
     #[tokio::test]
