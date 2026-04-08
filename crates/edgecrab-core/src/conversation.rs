@@ -1655,6 +1655,116 @@ fn summarize_tool_result_preview(name: &str, tool_result: &str, is_error: bool) 
         crate::safe_truncate(text, limit).to_string()
     }
 
+    fn count_truthy_entries(arr: &[serde_json::Value], key: &str) -> usize {
+        arr.iter()
+            .filter(|entry| entry.get(key).and_then(|v| v.as_bool()).unwrap_or(false))
+            .count()
+    }
+
+    fn summarize_structured_result(
+        name: &str,
+        obj: &serde_json::Map<String, serde_json::Value>,
+    ) -> Option<String> {
+        match name {
+            "web_search" => {
+                let count = obj
+                    .get("results")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.len())?;
+                let backend = obj.get("backend").and_then(|v| v.as_str()).unwrap_or("web");
+                Some(format!("{count} result(s) via {backend}"))
+            }
+            "web_extract" | "web_crawl" => {
+                let backend = obj.get("backend").and_then(|v| v.as_str()).unwrap_or("web");
+                if let Some(results) = obj.get("results").and_then(|v| v.as_array()) {
+                    let success = count_truthy_entries(results, "success");
+                    return Some(format!("{success}/{} page(s) via {backend}", results.len()));
+                }
+                if obj.get("result").is_some() {
+                    return Some(format!("1 page via {backend}"));
+                }
+                None
+            }
+            "todo" => {
+                let summary = obj.get("summary")?.as_object()?;
+                let total = summary.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
+                let completed = summary
+                    .get("completed")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let in_progress = summary
+                    .get("in_progress")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                Some(format!(
+                    "{completed}/{total} done, {in_progress} in progress"
+                ))
+            }
+            "delegate_task" => {
+                let results = obj.get("results")?.as_array()?;
+                let completed = results
+                    .iter()
+                    .filter(|entry| {
+                        matches!(
+                            entry.get("status").and_then(|v| v.as_str()),
+                            Some("success" | "completed")
+                        )
+                    })
+                    .count();
+                let duration = obj
+                    .get("total_duration_seconds")
+                    .and_then(|v| v.as_f64())
+                    .map(|secs| format!(" in {secs:.2}s"))
+                    .unwrap_or_default();
+                Some(format!(
+                    "{completed}/{} task(s) completed{duration}",
+                    results.len()
+                ))
+            }
+            "generate_image" | "image_generate" => {
+                let files = obj.get("files").and_then(|v| v.as_array())?;
+                let provider = obj
+                    .get("provider")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("image");
+                Some(format!("{} image(s) via {provider}", files.len()))
+            }
+            "send_message" => {
+                let platform = obj.get("platform").and_then(|v| v.as_str()).unwrap_or("?");
+                let recipient = obj
+                    .get("recipient")
+                    .and_then(|v| v.as_str())
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("home");
+                Some(format!("sent via {platform} to {recipient}"))
+            }
+            "cronjob" | "cron" | "manage_cron_jobs" => {
+                if let Some(message) = obj.get("message").and_then(|v| v.as_str()) {
+                    return Some(message.trim().to_string());
+                }
+                if let Some(total) = obj.get("total").and_then(|v| v.as_u64()) {
+                    return Some(format!("{total} cron job(s)"));
+                }
+                if let Some(total_jobs) = obj.get("total_jobs").and_then(|v| v.as_u64()) {
+                    let active = obj.get("active_jobs").and_then(|v| v.as_u64()).unwrap_or(0);
+                    return Some(format!("{active}/{total_jobs} active cron job(s)"));
+                }
+                None
+            }
+            "mcp_list_tools" | "mcp_list_resources" | "mcp_list_prompts" => {
+                for key in ["tools", "resources", "prompts"] {
+                    if let Some(count) =
+                        obj.get(key).and_then(|v| v.as_array()).map(|arr| arr.len())
+                    {
+                        return Some(format!("{count} {key}"));
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
     if is_error {
         let line = extract_tool_error_text(tool_result);
         let line = if line.trim().is_empty() {
@@ -1667,6 +1777,9 @@ fn summarize_tool_result_preview(name: &str, tool_result: &str, is_error: bool) 
 
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(tool_result) {
         if let Some(obj) = value.as_object() {
+            if let Some(summary) = summarize_structured_result(name, obj) {
+                return Some(truncate(&summary, 88));
+            }
             for key in ["summary", "message", "status", "result", "path"] {
                 if let Some(text) = obj.get(key).and_then(|v| v.as_str()) {
                     let text = text.trim();
@@ -4120,6 +4233,39 @@ mod tests {
         )
         .expect("preview");
         assert!(preview.contains("permission denied"));
+    }
+
+    #[test]
+    fn summarize_tool_result_preview_summarizes_web_search_results() {
+        let preview = summarize_tool_result_preview(
+            "web_search",
+            r#"{"success":true,"backend":"Brave","results":[{"title":"A"},{"title":"B"}]}"#,
+            false,
+        )
+        .expect("preview");
+        assert_eq!(preview, "2 result(s) via Brave");
+    }
+
+    #[test]
+    fn summarize_tool_result_preview_summarizes_todo_state() {
+        let preview = summarize_tool_result_preview(
+            "todo",
+            r#"{"todos":[],"summary":{"total":4,"completed":2,"in_progress":1,"not_started":1,"cancelled":0}}"#,
+            false,
+        )
+        .expect("preview");
+        assert_eq!(preview, "2/4 done, 1 in progress");
+    }
+
+    #[test]
+    fn summarize_tool_result_preview_summarizes_delegate_batch() {
+        let preview = summarize_tool_result_preview(
+            "delegate_task",
+            r#"{"results":[{"status":"success"},{"status":"completed"},{"status":"error"}],"total_duration_seconds":1.25}"#,
+            false,
+        )
+        .expect("preview");
+        assert_eq!(preview, "2/3 task(s) completed in 1.25s");
     }
 
     // ── build_chat_messages edge cases ───────────────────────────────────

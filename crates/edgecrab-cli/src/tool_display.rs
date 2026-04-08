@@ -50,6 +50,49 @@ fn oneline(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn quoted_preview(text: &str, max_cols: usize) -> String {
+    unicode_trunc(&format!("\"{}\"", oneline(text)), max_cols)
+}
+
+fn url_domain(url: &str) -> String {
+    url.trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .unwrap_or(url)
+        .to_string()
+}
+
+fn extract_patch_targets(patch_text: &str) -> Vec<String> {
+    let mut targets = Vec::new();
+    for line in patch_text.lines() {
+        let path = line
+            .strip_prefix("*** Update File: ")
+            .or_else(|| line.strip_prefix("*** Add File: "))
+            .or_else(|| line.strip_prefix("*** Delete File: "))
+            .or_else(|| line.strip_prefix("*** Move to: "))
+            .map(str::trim);
+        if let Some(path) = path.filter(|path| !path.is_empty()) {
+            if !targets.iter().any(|existing| existing == path) {
+                targets.push(path.to_string());
+            }
+        }
+    }
+    targets
+}
+
+fn line_range_suffix(obj: &serde_json::Map<String, serde_json::Value>) -> String {
+    let line_start = obj.get("line_start").and_then(|v| v.as_u64());
+    let line_end = obj.get("line_end").and_then(|v| v.as_u64());
+    match (line_start, line_end) {
+        (Some(start), Some(end)) if start == end => format!(":{start}"),
+        (Some(start), Some(end)) => format!(":{start}-{end}"),
+        (Some(start), None) => format!(":{start}"),
+        _ => String::new(),
+    }
+}
+
 fn parse_args_json(args_json: &str) -> Option<serde_json::Value> {
     serde_json::from_str(args_json).ok()
 }
@@ -222,7 +265,8 @@ pub fn tool_label(tool_name: &str) -> String {
         "web_extract" => "fetch".into(),
         "web_crawl" => "crawl".into(),
         "terminal" => "$".into(),
-        "process" => "proc".into(),
+        "process" | "process_start" | "process_list" | "process_kill" | "process_wait"
+        | "process_logs" | "process_write" => "proc".into(),
         "read_file" => "read".into(),
         "write_file" => "write".into(),
         "patch" | "apply_patch" => "patch".into(),
@@ -236,19 +280,44 @@ pub fn tool_label(tool_name: &str) -> String {
         "browser_press" => "press".into(),
         "browser_get_images" => "images".into(),
         "browser_vision" => "vision".into(),
+        "browser_console" => "console".into(),
+        "browser_wait_for" => "wait".into(),
+        "browser_select" => "select".into(),
+        "browser_hover" => "hover".into(),
+        "browser_close" => "close".into(),
         "todo" => "plan".into(),
         "session_search" => "recall".into(),
         "memory" => "memory".into(),
         "skills_list" => "skills".into(),
         "skill_view" => "skill".into(),
-        "image_generate" => "create".into(),
+        "generate_image" | "image_generate" => "create".into(),
         "text_to_speech" => "speak".into(),
+        "transcribe_audio" => "transcribe".into(),
         "vision_analyze" => "vision".into(),
         "mixture_of_agents" | "moa" => "reason".into(),
         "send_message" => "send".into(),
         "cronjob" | "cron" => "cron".into(),
         "execute_code" => "exec".into(),
         "delegate_task" => "delegate".into(),
+        "clarify" => "clarify".into(),
+        "checkpoint" => "checkpoint".into(),
+        "pdf_to_markdown" => "pdf".into(),
+        "ha_list_entities" => "ha entities".into(),
+        "ha_get_state" => "ha state".into(),
+        "ha_list_services" => "ha services".into(),
+        "ha_call_service" => "ha call".into(),
+        "honcho_conclude" => "honcho save".into(),
+        "honcho_search" => "honcho search".into(),
+        "honcho_list" => "honcho list".into(),
+        "honcho_remove" => "honcho remove".into(),
+        "honcho_profile" => "honcho profile".into(),
+        "honcho_context" => "honcho ask".into(),
+        "mcp_list_tools" => "mcp tools".into(),
+        "mcp_call_tool" => "mcp call".into(),
+        "mcp_list_resources" => "mcp resources".into(),
+        "mcp_read_resource" => "mcp read".into(),
+        "mcp_list_prompts" => "mcp prompts".into(),
+        "mcp_get_prompt" => "mcp prompt".into(),
         _ => tool_name.replace('_', " "),
     }
 }
@@ -263,40 +332,71 @@ pub fn extract_tool_preview(tool_name: &str, args_json: &str) -> String {
         "web_extract" => obj.get("urls").and_then(|v| match v {
             serde_json::Value::Array(urls) if !urls.is_empty() => {
                 let first = urls.first()?.as_str()?;
-                let domain = first
-                    .trim()
-                    .trim_start_matches("https://")
-                    .trim_start_matches("http://")
-                    .split('/')
-                    .next()
-                    .unwrap_or(first);
+                let domain = url_domain(first);
                 Some(if urls.len() > 1 {
                     format!("{domain} +{}", urls.len() - 1)
                 } else {
-                    domain.to_string()
+                    domain
                 })
             }
-            serde_json::Value::String(url) if !url.is_empty() => Some(
-                url.trim()
-                    .trim_start_matches("https://")
-                    .trim_start_matches("http://")
-                    .split('/')
-                    .next()
-                    .unwrap_or(url)
-                    .to_string(),
-            ),
+            serde_json::Value::String(url) if !url.is_empty() => Some(url_domain(url)),
             _ => None,
         }),
-        "web_crawl" | "browser_navigate" => obj.get("url").and_then(|v| v.as_str()).map(|url| {
-            url.trim()
-                .trim_start_matches("https://")
-                .trim_start_matches("http://")
-                .split('/')
-                .next()
-                .unwrap_or(url)
-                .to_string()
-        }),
+        "web_crawl" | "browser_navigate" => obj.get("url").and_then(|v| v.as_str()).map(url_domain),
         "terminal" => obj.get("command").and_then(|v| v.as_str()).map(oneline),
+        "read_file" => obj.get("path").and_then(|v| v.as_str()).map(|path| {
+            let suffix = line_range_suffix(&obj);
+            format!("{path}{suffix}")
+        }),
+        "write_file" => obj.get("path").and_then(|v| v.as_str()).map(oneline),
+        "patch" => obj
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(oneline)
+            .or_else(|| {
+                obj.get("patch")
+                    .and_then(|v| v.as_str())
+                    .map(extract_patch_targets)
+                    .filter(|targets| !targets.is_empty())
+                    .map(|targets| {
+                        if targets.len() == 1 {
+                            targets[0].clone()
+                        } else {
+                            format!("{} file(s): {}", targets.len(), targets[0])
+                        }
+                    })
+            }),
+        "apply_patch" => obj
+            .get("patch")
+            .and_then(|v| v.as_str())
+            .map(extract_patch_targets)
+            .filter(|targets| !targets.is_empty())
+            .map(|targets| {
+                if targets.len() == 1 {
+                    targets[0].clone()
+                } else {
+                    format!("{} file(s): {}", targets.len(), targets[0])
+                }
+            }),
+        "search_files" => {
+            let Some(pattern) = obj.get("pattern").and_then(|v| v.as_str()).map(oneline) else {
+                return String::new();
+            };
+            let target = obj
+                .get("target")
+                .and_then(|v| v.as_str())
+                .unwrap_or("content");
+            let include = obj
+                .get("include")
+                .or_else(|| obj.get("file_glob"))
+                .and_then(|v| v.as_str())
+                .filter(|value| !value.is_empty());
+            Some(match include {
+                Some(glob) if target == "files" => format!("{pattern} in {glob}"),
+                Some(glob) => format!("{pattern} @ {glob}"),
+                None => pattern,
+            })
+        }
         "process" => {
             let action = obj
                 .get("action")
@@ -364,7 +464,7 @@ pub fn extract_tool_preview(tool_name: &str, args_json: &str) -> String {
             let target = obj.get("target").and_then(|v| v.as_str()).unwrap_or("?");
             obj.get("message")
                 .and_then(|v| v.as_str())
-                .map(|msg| format!("{target}: \"{}\"", oneline(msg)))
+                .map(|msg| format!("{target}: {}", quoted_preview(msg, 34)))
         }
         "cronjob" | "cron" => {
             let action = obj
@@ -386,12 +486,162 @@ pub fn extract_tool_preview(tool_name: &str, args_json: &str) -> String {
             .get("code")
             .and_then(|v| v.as_str())
             .map(|code| oneline(code.lines().next().unwrap_or_default())),
+        "browser_snapshot" => Some(
+            if obj.get("full").and_then(|v| v.as_bool()).unwrap_or(false) {
+                "full page".into()
+            } else {
+                "interactive view".into()
+            },
+        ),
+        "browser_click" | "browser_hover" => obj.get("ref").and_then(|v| v.as_str()).map(oneline),
+        "browser_type" => {
+            let target = obj.get("ref").and_then(|v| v.as_str()).unwrap_or("?");
+            obj.get("text")
+                .and_then(|v| v.as_str())
+                .map(|text| format!("{target} {}", quoted_preview(text, 28)))
+        }
+        "browser_scroll" => obj
+            .get("direction")
+            .and_then(|v| v.as_str())
+            .map(|direction| {
+                let amount = obj.get("amount").and_then(|v| v.as_u64()).unwrap_or(500);
+                format!("{direction} {amount}px")
+            }),
+        "browser_press" => obj.get("key").and_then(|v| v.as_str()).map(oneline),
+        "browser_console" => Some(
+            if obj.get("clear").and_then(|v| v.as_bool()).unwrap_or(false) {
+                "read + clear".into()
+            } else {
+                "read".into()
+            },
+        ),
+        "browser_get_images" => Some("extract page images".into()),
+        "browser_vision" => obj
+            .get("question")
+            .and_then(|v| v.as_str())
+            .map(|question| quoted_preview(question, 40))
+            .or_else(|| Some("analyze page".into())),
+        "browser_wait_for" => obj
+            .get("text")
+            .and_then(|v| v.as_str())
+            .map(|text| format!("text {}", quoted_preview(text, 28)))
+            .or_else(|| {
+                obj.get("selector")
+                    .and_then(|v| v.as_str())
+                    .map(|selector| format!("selector {selector}"))
+            }),
+        "browser_select" => {
+            let target = obj.get("ref").and_then(|v| v.as_str()).unwrap_or("?");
+            obj.get("option")
+                .and_then(|v| v.as_str())
+                .map(|option| format!("{target} -> {}", quoted_preview(option, 28)))
+        }
+        "generate_image" | "image_generate" => obj
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .map(|prompt| quoted_preview(prompt, 44)),
+        "text_to_speech" => obj
+            .get("text")
+            .and_then(|v| v.as_str())
+            .map(|text| quoted_preview(text, 40)),
+        "transcribe_audio" => obj
+            .get("audio_path")
+            .or_else(|| obj.get("path"))
+            .and_then(|v| v.as_str())
+            .map(oneline),
+        "vision_analyze" => obj
+            .get("prompt")
+            .or_else(|| obj.get("question"))
+            .and_then(|v| v.as_str())
+            .map(|question| quoted_preview(question, 40))
+            .or_else(|| {
+                obj.get("image_source")
+                    .and_then(|v| v.as_str())
+                    .map(oneline)
+            }),
         "delegate_task" => match obj.get("tasks") {
             Some(serde_json::Value::Array(tasks)) => {
                 Some(format!("{} parallel task(s)", tasks.len()))
             }
             _ => obj.get("goal").and_then(|v| v.as_str()).map(oneline),
         },
+        "clarify" => obj
+            .get("question")
+            .and_then(|v| v.as_str())
+            .map(|question| quoted_preview(question, 40)),
+        "checkpoint" => {
+            let action = obj
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let name = obj
+                .get("name")
+                .or_else(|| obj.get("checkpoint"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            match (action.is_empty(), name.is_empty()) {
+                (false, false) => Some(format!("{action} {name}")),
+                (false, true) => Some(action.to_string()),
+                (true, false) => Some(name.to_string()),
+                (true, true) => None,
+            }
+        }
+        "pdf_to_markdown" => obj.get("path").and_then(|v| v.as_str()).map(oneline),
+        "ha_list_entities" => obj
+            .get("domain")
+            .and_then(|v| v.as_str())
+            .map(oneline)
+            .or_else(|| Some("all domains".into())),
+        "ha_get_state" => obj.get("entity_id").and_then(|v| v.as_str()).map(oneline),
+        "ha_list_services" => obj
+            .get("domain")
+            .and_then(|v| v.as_str())
+            .map(oneline)
+            .or_else(|| Some("all domains".into())),
+        "ha_call_service" => {
+            let domain = obj.get("domain").and_then(|v| v.as_str()).unwrap_or("?");
+            let service = obj.get("service").and_then(|v| v.as_str()).unwrap_or("?");
+            Some(format!("{domain}.{service}"))
+        }
+        "honcho_conclude" => obj
+            .get("entry")
+            .and_then(|v| v.as_str())
+            .map(|entry| quoted_preview(entry, 40)),
+        "honcho_search" | "honcho_context" => obj
+            .get("query")
+            .or_else(|| obj.get("question"))
+            .and_then(|v| v.as_str())
+            .map(|query| quoted_preview(query, 40)),
+        "honcho_remove" => obj.get("id").and_then(|v| v.as_str()).map(oneline),
+        "honcho_profile" | "honcho_list" => Some("read".into()),
+        "mcp_list_tools" | "mcp_list_resources" | "mcp_list_prompts" => obj
+            .get("server")
+            .or_else(|| obj.get("server_name"))
+            .and_then(|v| v.as_str())
+            .map(oneline),
+        "mcp_call_tool" => {
+            let server = obj
+                .get("server")
+                .or_else(|| obj.get("server_name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let tool = obj
+                .get("tool")
+                .or_else(|| obj.get("tool_name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            Some(format!("{server}/{tool}"))
+        }
+        "mcp_read_resource" => obj
+            .get("uri")
+            .or_else(|| obj.get("resource"))
+            .and_then(|v| v.as_str())
+            .map(oneline),
+        "mcp_get_prompt" => obj
+            .get("prompt")
+            .or_else(|| obj.get("prompt_name"))
+            .and_then(|v| v.as_str())
+            .map(oneline),
         _ => None,
     };
 
@@ -512,7 +762,11 @@ pub fn build_tool_done_line(
     let result_part = if result_preview.is_empty() {
         String::new()
     } else {
-        format!("  {}", unicode_trunc(result_preview, 54))
+        format!(
+            "  {} {}",
+            if is_error { "!" } else { "->" },
+            unicode_trunc(result_preview, 52)
+        )
     };
 
     let bar_style = Style::default()
@@ -787,6 +1041,38 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_tool_preview_summarizes_apply_patch_targets() {
+        let patch = "*** Begin Patch\n*** Update File: src/main.rs\n@@\n-old\n+new\n*** Add File: src/lib.rs\n+hello\n*** End Patch\n";
+        let preview = extract_tool_preview(
+            "apply_patch",
+            &format!(
+                r#"{{"patch":{}}}"#,
+                serde_json::to_string(patch).expect("json")
+            ),
+        );
+        assert!(preview.contains("2 file(s): src/main.rs"), "got: {preview}");
+    }
+
+    #[test]
+    fn test_extract_tool_preview_formats_browser_wait() {
+        let preview = extract_tool_preview(
+            "browser_wait_for",
+            r#"{"selector":".results","timeout":10}"#,
+        );
+        assert_eq!(preview, "selector .results");
+    }
+
+    #[test]
+    fn test_extract_tool_preview_formats_send_message_with_quote() {
+        let preview = extract_tool_preview(
+            "send_message",
+            r#"{"target":"telegram:#ops","message":"deploy is complete"}"#,
+        );
+        assert!(preview.contains("telegram:#ops"), "got: {preview}");
+        assert!(preview.contains("\"deploy is complete\""), "got: {preview}");
+    }
+
+    #[test]
     fn test_tool_emoji_search_variants() {
         assert_eq!(tool_emoji("grep_files"), "🔍");
         assert_eq!(tool_emoji("find_in_dir"), "🔍");
@@ -881,8 +1167,8 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect::<String>();
-        assert!(joined.contains("path: src/main.rs"));
-        assert!(joined.contains("Wrote 42 bytes"));
+        assert!(joined.contains("src/main.rs"));
+        assert!(joined.contains("-> Wrote 42 bytes"));
     }
 
     #[test]
