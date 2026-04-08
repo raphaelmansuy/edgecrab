@@ -115,7 +115,7 @@ pub const CORE_TOOLS: &[&str] = &[
     "lsp_select_and_apply_action",
     "lsp_workspace_type_errors",
     // Mixture of Agents — multi-model consensus reasoning
-    "mixture_of_agents",
+    "moa",
     // Cron job management
     "manage_cron_jobs",
     // MCP
@@ -208,7 +208,7 @@ pub const ACP_TOOLS: &[&str] = &[
     "lsp_enrich_diagnostics",
     "lsp_select_and_apply_action",
     "lsp_workspace_type_errors",
-    "mixture_of_agents",
+    "moa",
     "mcp_list_tools",
     "mcp_call_tool",
     "mcp_list_resources",
@@ -216,6 +216,13 @@ pub const ACP_TOOLS: &[&str] = &[
     "mcp_list_prompts",
     "mcp_get_prompt",
 ];
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ToolsetEnableSync {
+    pub added_to_enabled: bool,
+    pub removed_from_disabled: bool,
+    pub still_blocked: bool,
+}
 
 /// Expand a toolset alias to its component toolset names.
 ///
@@ -277,6 +284,7 @@ pub fn resolve_alias(alias: &str) -> Option<&'static [&'static str]> {
             "messaging",      // send_message (runtime-gated in non-gateway sessions)
             "media",          // vision_analyze, transcribe_audio, text_to_speech
             "browser",        // browser_navigate, browser_snapshot, … (runtime-gated)
+            "moa",            // multi-model consensus reasoning
         ]),
         "coding" => Some(&["file", "terminal", "search", "code_execution", "lsp"]),
         "research" => Some(&["web", "browser", "vision"]),
@@ -330,6 +338,81 @@ pub fn contains_all_sentinel(names: &[String]) -> bool {
     names
         .iter()
         .any(|n| n == "all" || resolve_alias(n) == Some(&[]))
+}
+
+/// Whether a toolset is reachable under the current whitelist/blacklist policy.
+pub fn toolset_enabled(
+    enabled: Option<&[String]>,
+    disabled: Option<&[String]>,
+    toolset: &str,
+) -> bool {
+    let allowed = enabled.is_none_or(|sets| {
+        sets.is_empty()
+            || contains_all_sentinel(sets)
+            || expand_toolset_names(sets)
+                .iter()
+                .any(|candidate| candidate == toolset)
+    });
+    let blocked = disabled.is_some_and(|sets| {
+        expand_toolset_names(sets)
+            .iter()
+            .any(|candidate| candidate == toolset)
+    });
+    allowed && !blocked
+}
+
+/// Whether a specific tool is reachable under the current policy.
+///
+/// Precedence is explicit and stable:
+/// 1. `disabled_tools` always blocks the tool.
+/// 2. `enabled_tools` force-enables the tool even if its toolset is filtered out.
+/// 3. Otherwise the containing toolset policy decides.
+pub fn tool_enabled(
+    enabled_toolsets: Option<&[String]>,
+    disabled_toolsets: Option<&[String]>,
+    enabled_tools: Option<&[String]>,
+    disabled_tools: Option<&[String]>,
+    tool_name: &str,
+    toolset: &str,
+) -> bool {
+    if disabled_tools.is_some_and(|tools| tools.iter().any(|candidate| candidate == tool_name)) {
+        return false;
+    }
+
+    if enabled_tools.is_some_and(|tools| tools.iter().any(|candidate| candidate == tool_name)) {
+        return true;
+    }
+
+    toolset_enabled(enabled_toolsets, disabled_toolsets, toolset)
+}
+
+/// Ensure a literal toolset is reachable without mutating broader aliases.
+pub fn ensure_literal_toolset_enabled(
+    enabled: &mut Option<Vec<String>>,
+    disabled: &mut Option<Vec<String>>,
+    toolset: &str,
+) -> ToolsetEnableSync {
+    let mut sync = ToolsetEnableSync::default();
+
+    if let Some(enabled_sets) = enabled.as_mut()
+        && !enabled_sets.is_empty()
+        && !contains_all_sentinel(enabled_sets)
+        && !expand_toolset_names(enabled_sets)
+            .iter()
+            .any(|candidate| candidate == toolset)
+    {
+        enabled_sets.push(toolset.to_string());
+        sync.added_to_enabled = true;
+    }
+
+    if let Some(disabled_sets) = disabled.as_mut() {
+        let before = disabled_sets.len();
+        disabled_sets.retain(|candidate| candidate != toolset);
+        sync.removed_from_disabled = before != disabled_sets.len();
+    }
+
+    sync.still_blocked = !toolset_enabled(enabled.as_deref(), disabled.as_deref(), toolset);
+    sync
 }
 
 /// Resolve which toolsets are active given enabled/disabled lists.
@@ -450,6 +533,37 @@ mod tests {
         assert!(!result.contains(&"web".to_string()));
     }
 
+    #[test]
+    fn tool_enabled_respects_explicit_tool_enable() {
+        let enabled_toolsets = vec!["file".to_string()];
+        let disabled_toolsets = vec!["web".to_string()];
+        let enabled_tools = vec!["web_search".to_string()];
+
+        assert!(tool_enabled(
+            Some(&enabled_toolsets),
+            Some(&disabled_toolsets),
+            Some(&enabled_tools),
+            None,
+            "web_search",
+            "web",
+        ));
+    }
+
+    #[test]
+    fn tool_enabled_respects_explicit_tool_disable() {
+        let enabled_toolsets = vec!["web".to_string()];
+        let disabled_tools = vec!["web_search".to_string()];
+
+        assert!(!tool_enabled(
+            Some(&enabled_toolsets),
+            None,
+            None,
+            Some(&disabled_tools),
+            "web_search",
+            "web",
+        ));
+    }
+
     // ── New regression tests for the "core" alias and expand_toolset_names ──
 
     #[test]
@@ -508,6 +622,15 @@ mod tests {
     }
 
     #[test]
+    fn resolve_alias_core_includes_moa_toolset() {
+        let expanded = resolve_alias("core").expect("'core' must be a registered alias");
+        assert!(
+            expanded.contains(&"moa"),
+            "'core' alias must include 'moa' so Mixture-of-Agents is exposed in default sessions"
+        );
+    }
+
+    #[test]
     fn resolve_alias_core_includes_messaging_toolset() {
         let expanded = resolve_alias("core").expect("'core' must be a registered alias");
         assert!(
@@ -557,6 +680,10 @@ mod tests {
             expanded.contains(&"media".to_string()),
             "media must be in expanded list"
         );
+        assert!(
+            expanded.contains(&"moa".to_string()),
+            "moa must be in expanded list"
+        );
         // Must still contain explicit ones
         assert!(expanded.contains(&"web".to_string()));
         assert!(expanded.contains(&"terminal".to_string()));
@@ -596,5 +723,42 @@ mod tests {
     fn contains_all_sentinel_false_for_normal_list() {
         let names = vec!["core".to_string(), "web".to_string()];
         assert!(!contains_all_sentinel(&names));
+    }
+
+    #[test]
+    fn toolset_enabled_respects_alias_expansion() {
+        let enabled = vec!["core".to_string()];
+        assert!(toolset_enabled(Some(&enabled), None, "moa"));
+    }
+
+    #[test]
+    fn ensure_literal_toolset_enabled_adds_missing_whitelist_entry() {
+        let mut enabled = Some(vec!["web".to_string(), "terminal".to_string()]);
+        let mut disabled = Some(vec!["moa".to_string()]);
+
+        let sync = ensure_literal_toolset_enabled(&mut enabled, &mut disabled, "moa");
+
+        assert!(sync.added_to_enabled);
+        assert!(sync.removed_from_disabled);
+        assert!(!sync.still_blocked);
+        assert!(enabled.expect("enabled").contains(&"moa".to_string()));
+        assert!(
+            !disabled
+                .expect("disabled")
+                .iter()
+                .any(|candidate| candidate == "moa")
+        );
+    }
+
+    #[test]
+    fn ensure_literal_toolset_enabled_reports_alias_blocker() {
+        let mut enabled = None;
+        let mut disabled = Some(vec!["safe".to_string()]);
+
+        let sync = ensure_literal_toolset_enabled(&mut enabled, &mut disabled, "moa");
+
+        assert!(!sync.added_to_enabled);
+        assert!(!sync.removed_from_disabled);
+        assert!(sync.still_blocked);
     }
 }

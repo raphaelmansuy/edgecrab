@@ -28,6 +28,7 @@ pub mod macos_permissions;
 pub mod macos_permissions;
 pub mod path_utils;
 pub mod process_table;
+pub mod provider_factory;
 pub mod read_tracker;
 pub mod registry;
 pub mod tools;
@@ -51,8 +52,10 @@ pub(crate) fn safe_truncate(s: &str, max_bytes: usize) -> &str {
 pub use config_ref::AppConfigRef;
 pub use execution_fs::{ExecutionFilesystemView, describe_execution_filesystem};
 pub use process_table::ProcessTable;
+pub use provider_factory::create_provider_for_model;
 pub use registry::{
-    SubAgentResult, SubAgentRunner, ToolContext, ToolHandler, ToolRegistry, to_llm_definitions,
+    SubAgentResult, SubAgentRunner, ToolContext, ToolHandler, ToolProgressUpdate, ToolRegistry,
+    to_llm_definitions,
 };
 pub use tools::todo::TodoStore;
 pub use toolsets::{ACP_TOOLS, CORE_TOOLS, resolve_active_toolsets, resolve_alias};

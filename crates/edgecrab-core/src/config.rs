@@ -81,6 +81,7 @@ impl AppConfig {
         };
 
         config.apply_env_overrides();
+        config.moa = config.moa.sanitized();
         Ok(config)
     }
 
@@ -89,6 +90,7 @@ impl AppConfig {
         let content = std::fs::read_to_string(path).map_err(AgentError::Io)?;
         let mut config: Self = Self::parse_compat_yaml(&content, path)?;
         config.apply_env_overrides();
+        config.moa = config.moa.sanitized();
         Ok(config)
     }
 
@@ -114,7 +116,9 @@ impl AppConfig {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(AgentError::Io)?;
         }
-        let yaml = serde_yml::to_string(self)
+        let mut sanitized = self.clone();
+        sanitized.moa = sanitized.moa.sanitized();
+        let yaml = serde_yml::to_string(&sanitized)
             .map_err(|e| AgentError::Config(format!("failed to serialize config: {e}")))?;
         std::fs::write(path, yaml).map_err(AgentError::Io)
     }
@@ -625,6 +629,8 @@ pub struct FallbackConfig {
 pub struct ToolsConfig {
     pub enabled_toolsets: Option<Vec<String>>,
     pub disabled_toolsets: Option<Vec<String>>,
+    pub enabled_tools: Option<Vec<String>>,
+    pub disabled_tools: Option<Vec<String>>,
     #[serde(default)]
     pub custom_groups: HashMap<String, Vec<String>>,
     #[serde(default)]
@@ -639,6 +645,8 @@ impl Default for ToolsConfig {
         Self {
             enabled_toolsets: None,
             disabled_toolsets: None,
+            enabled_tools: None,
+            disabled_tools: None,
             custom_groups: HashMap::new(),
             file: FileToolsConfig::default(),
             tool_delay: 1.0,
@@ -1793,11 +1801,12 @@ pub struct AuxiliaryConfig {
 
 /// Default Mixture-of-Agents configuration.
 ///
-/// These values are used when the `mixture_of_agents` tool is called without
+/// These values are used when the `moa` tool is called without
 /// explicit `reference_models` or `aggregator_model` arguments.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct MoaConfig {
+    pub enabled: bool,
     pub reference_models: Vec<String>,
     pub aggregator_model: String,
 }
@@ -1805,9 +1814,25 @@ pub struct MoaConfig {
 impl Default for MoaConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             reference_models: edgecrab_tools::tools::mixture_of_agents::default_reference_models(),
             aggregator_model: edgecrab_tools::tools::mixture_of_agents::DEFAULT_AGGREGATOR_MODEL
                 .to_string(),
+        }
+    }
+}
+
+impl MoaConfig {
+    pub fn sanitized(&self) -> Self {
+        let effective = edgecrab_tools::tools::mixture_of_agents::sanitize_moa_config(
+            self.enabled,
+            &self.reference_models,
+            &self.aggregator_model,
+        );
+        Self {
+            enabled: effective.enabled,
+            reference_models: effective.reference_models,
+            aggregator_model: effective.aggregator_model,
         }
     }
 }
@@ -2244,6 +2269,7 @@ model:
     #[test]
     fn moa_defaults_match_tool_defaults() {
         let moa = MoaConfig::default();
+        assert!(moa.enabled);
         assert_eq!(
             moa.aggregator_model,
             edgecrab_tools::tools::mixture_of_agents::DEFAULT_AGGREGATOR_MODEL
@@ -2258,16 +2284,36 @@ model:
     fn moa_config_deserializes() {
         let yaml = r#"
 moa:
+  enabled: false
   aggregator_model: "anthropic/claude-opus-4.6"
   reference_models:
     - "anthropic/claude-opus-4.6"
     - "openai/gpt-4.1"
 "#;
         let cfg: AppConfig = serde_yml::from_str(yaml).expect("parse");
+        assert!(!cfg.moa.enabled);
         assert_eq!(cfg.moa.aggregator_model, "anthropic/claude-opus-4.6");
         assert_eq!(
             cfg.moa.reference_models,
             vec!["anthropic/claude-opus-4.6", "openai/gpt-4.1"]
         );
+    }
+
+    #[test]
+    fn moa_config_sanitizes_invalid_entries() {
+        let moa = MoaConfig {
+            enabled: false,
+            aggregator_model: " ".into(),
+            reference_models: vec![
+                "copilot/gpt-4.1-mini".into(),
+                "copilot/gpt-4.1-mini".into(),
+                "invalid".into(),
+            ],
+        }
+        .sanitized();
+
+        assert!(!moa.enabled);
+        assert_eq!(moa.aggregator_model, "anthropic/claude-opus-4.6");
+        assert_eq!(moa.reference_models, vec!["vscode-copilot/gpt-4.1-mini"]);
     }
 }

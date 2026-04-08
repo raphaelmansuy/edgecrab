@@ -1213,12 +1213,12 @@ tools:
   # Available literal names: file, terminal, web, browser, memory, skills,
   #   core, meta, scheduling, delegation, code_execution, session, mcp,
   #   media, messaging, moa
-  # Aliases:  core (→ file+meta+scheduling+delegation+code_execution+session+mcp+messaging+media+browser)
+  # Aliases:  core (→ file+meta+scheduling+delegation+code_execution+session+mcp+messaging+media+browser+moa)
   #           coding (→ file+terminal+search+code_execution)
   #           research (→ web+browser+vision)
   #           all  (→ every registered tool, no filter)
   enabled_toolsets:
-    - core       # expands to: file, meta, scheduling, delegation, code_execution, session, mcp, messaging, media, browser
+    - core       # expands to: file, meta, scheduling, delegation, code_execution, session, mcp, messaging, media, browser, moa
     - web        # web_search, web_extract, web_crawl
     - terminal   # terminal, run_process, list_processes, kill_process
     - memory     # memory_read, memory_write, honcho_*

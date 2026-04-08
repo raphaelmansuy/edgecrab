@@ -74,7 +74,7 @@ const MAX_TOOL_CALLS: usize = 50;
 ///
 /// Explicitly EXCLUDED by category:
 ///   • clarify / checkpoint           — require live user interaction, deadlock in subprocess
-///   • execute_code / delegate_task / mixture_of_agents — recursive agent spawning
+///   • execute_code / delegate_task / moa — recursive agent spawning
 ///   • browser_* / browser_vision     — browser state is stateful & shared with parent
 ///   • memory_read / memory_write     — persistent user store is parent-owned; scripts
 ///                                      should not permanently mutate agent memory
@@ -1087,7 +1087,7 @@ fn resolve_sandbox_tools(ctx: &ToolContext) -> Vec<&'static str> {
         let Some(toolset) = registry.toolset_for_tool(tool_name) else {
             continue;
         };
-        if ctx.config.is_toolset_enabled(&toolset) {
+        if ctx.config.is_tool_enabled(tool_name, &toolset) {
             resolved.push(tool_name);
         }
     }
@@ -1517,6 +1517,9 @@ async fn execute_remote(
                 origin_chat: ctx.origin_chat.clone(),
                 session_key: ctx.session_key.clone(),
                 todo_store: ctx.todo_store.clone(),
+                current_tool_call_id: None,
+                current_tool_name: None,
+                tool_progress_tx: None,
             };
             let rpc_dir = format!("{sandbox_dir}/rpc");
             let allowed = Arc::new(sandbox_tools.iter().map(|tool| tool.to_string()).collect());
@@ -1757,6 +1760,9 @@ impl ToolHandler for ExecuteCodeToolReal {
                     origin_chat: ctx.origin_chat.clone(),
                     session_key: ctx.session_key.clone(),
                     todo_store: ctx.todo_store.clone(),
+                    current_tool_call_id: None,
+                    current_tool_name: None,
+                    tool_progress_tx: None,
                 };
                 let counter = tool_call_counter.clone();
                 let allowed: Arc<Vec<String>> =

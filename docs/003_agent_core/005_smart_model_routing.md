@@ -141,10 +141,11 @@ The cheap-model selector persists `model.smart_routing.enabled` and
 ## Related multi-model defaults
 
 EdgeCrab also exposes a separate top-level `moa` block for the
-`mixture_of_agents` tool:
+`moa` tool (legacy alias: `mixture_of_agents`):
 
 ```yaml
 moa:
+  enabled: true
   aggregator_model: anthropic/claude-opus-4.6
   reference_models:
     - anthropic/claude-opus-4.6
@@ -154,14 +155,31 @@ moa:
 ```
 
 These defaults are used when the MoA tool call omits explicit
-`aggregator_model` or `reference_models` arguments. The TUI exposes:
+`aggregator_model` or `reference_models` arguments. When `moa.enabled` is
+`false`, the tool is hidden from the model and direct calls are rejected. MoA
+also depends on toolset policy: `tools.enabled_toolsets` / `tools.disabled_toolsets`
+must still expose the `moa` toolset. `/moa on` repairs literal whitelist and
+blacklist entries when possible and reports when a broader alias still blocks
+the tool. The TUI exposes:
 
 ```sh
 /moa status
+/moa on
+/moa off
 /moa aggregator
-/moa references
+/moa experts
+/moa add
+/moa remove
 /config moa
 ```
+
+Editing the aggregator or reference roster normalizes provider aliases,
+deduplicates the roster, and re-enables MoA for future turns. During execution,
+the active chat model is also used as a safety net: it is appended as an
+implicit last-chance expert when needed, and aggregation falls back to the
+current chat model before failing the tool outright. `/moa reset` now writes a
+safe baseline for the current chat model instead of restoring a brittle
+cross-provider roster blindly.
 
 ---
 

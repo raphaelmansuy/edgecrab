@@ -15,7 +15,7 @@ shown there as runnable commands.
 
 ```
 Navigation   /help /quit /clear /new /status /version
-Model        /model /provider /reasoning /stream
+Model        /model /cheap_model /vision_model /image_model /moa /provider /reasoning /stream
 Session      /session /retry /undo /stop /history /save /export /title /resume
 Config       /config /prompt /verbose /personality /statusbar
 Tools        /tools /toolsets /mcp /reload-mcp /plugins
@@ -51,7 +51,10 @@ MCP          /mcp /mcp-token
 | Command | Description |
 |---------|-------------|
 | `/model [name]` | Show current model or switch (e.g. `/model ollama/gemma4:latest`) |
+| `/cheap_model [spec]` | Open, show, or set the cheap smart-routing model; `/cheap_model off` disables it |
 | `/models [provider]` | List models; `/models <provider>` queries live, `/models refresh` refreshes cache |
+| `/image_model [spec]` | Open image-model selector, or set/show the default image-generation backend |
+| `/moa [subcommand]` | Show, enable, disable, or configure Mixture-of-Agents defaults (`status`, `on`, `off`, `reset`, `aggregator`, `experts`, `add`, `remove`); reset writes a safe baseline for the current chat model |
 | `/vision_model [spec]` | Open vision model selector, or set/show the dedicated vision backend |
 | `/provider` | List available providers |
 | `/reasoning [level]` | Set reasoning effort: `off`, `low`, `medium`, `high` — or `show`/`hide` for think-block visibility (alias: `/think`) |

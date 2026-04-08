@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use edgecrab_tools::registry::{DelegationEvent, SubAgentRunRequest, ToolRegistry};
 use edgecrab_tools::{SubAgentResult, SubAgentRunner};
 use edgecrab_types::Platform;
-use edgequake_llm::{LLMProvider, ProviderFactory, VsCodeCopilotProvider};
+use edgequake_llm::LLMProvider;
 
 /// Real implementation of SubAgentRunner that spawns child Agent instances.
 ///
@@ -122,7 +122,9 @@ impl SubAgentRunner for CoreSubAgentRunner {
                                 });
                             }
                         }
-                        crate::StreamEvent::ToolExec { name, args_json } => {
+                        crate::StreamEvent::ToolExec {
+                            name, args_json, ..
+                        } => {
                             let _ = progress_tx.send(DelegationEvent::ToolCalled {
                                 task_index,
                                 task_count,
@@ -183,22 +185,8 @@ impl CoreSubAgentRunner {
         // If provider/model is explicitly requested, create that provider.
         if let Some((provider_name, model_name)) = raw_model.split_once('/') {
             let canonical = edgecrab_tools::vision_models::normalize_provider_name(provider_name);
-            if canonical == "vscode-copilot" {
-                let provider = VsCodeCopilotProvider::new()
-                    .model(model_name)
-                    .with_vision(true) // Enable vision so copilot-vision-request header is sent
-                    .build()
-                    .map_err(|e| {
-                        format!(
-                            "Failed to create delegation provider '{}' for model '{}': {}",
-                            canonical, model_name, e
-                        )
-                    })?;
-                return Ok((Arc::new(provider), raw_model.to_string()));
-            }
-
-            let provider =
-                ProviderFactory::create_llm_provider(&canonical, model_name).map_err(|e| {
+            let provider = edgecrab_tools::create_provider_for_model(&canonical, model_name)
+                .map_err(|e| {
                     format!(
                         "Failed to create delegation provider '{}' for model '{}': {}",
                         canonical, model_name, e

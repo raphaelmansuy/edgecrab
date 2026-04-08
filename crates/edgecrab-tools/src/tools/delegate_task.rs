@@ -573,6 +573,9 @@ impl ToolHandler for DelegateTaskToolReal {
                     origin_chat: None, // sub-agents don't inherit origin
                     session_key: ctx.session_key.clone(),
                     todo_store: None,
+                    current_tool_call_id: None,
+                    current_tool_name: None,
+                    tool_progress_tx: None,
                 };
 
                 let goal = t.goal.clone();

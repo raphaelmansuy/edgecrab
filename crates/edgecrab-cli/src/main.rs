@@ -1679,6 +1679,7 @@ fn set_config_value(
         "model.smart_routing.cheap_api_key_env" => {
             config.model.smart_routing.cheap_api_key_env = Some(value.to_string())
         }
+        "moa.enabled" => config.moa.enabled = parse_bool(value)?,
         "moa.aggregator_model" => config.moa.aggregator_model = value.to_string(),
         "moa.reference_models" => config.moa.reference_models = parse_csv(value),
         "memory.enabled" => config.memory.enabled = parse_bool(value)?,
@@ -1843,6 +1844,7 @@ mod tests {
             "copilot/gpt-4.1-mini",
         )
         .expect("set cheap model");
+        set_config_value(&mut config, "moa.enabled", "false").expect("disable moa");
         set_config_value(
             &mut config,
             "moa.aggregator_model",
@@ -1861,6 +1863,7 @@ mod tests {
             config.model.smart_routing.cheap_model,
             "copilot/gpt-4.1-mini"
         );
+        assert!(!config.moa.enabled);
         assert_eq!(config.moa.aggregator_model, "anthropic/claude-opus-4.6");
         assert_eq!(
             config.moa.reference_models,

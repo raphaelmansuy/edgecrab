@@ -53,7 +53,7 @@ use edgecrab_types::{
     AgentError, Content, Cost, Message, Role, ToolError, ToolErrorResponse, Trajectory, Usage,
 };
 use edgequake_llm::traits::{StreamChunk, StreamUsage};
-use edgequake_llm::{CachePromptConfig, LLMProvider, VsCodeCopilotProvider, apply_cache_control};
+use edgequake_llm::{CachePromptConfig, LLMProvider, apply_cache_control};
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 
@@ -102,8 +102,13 @@ fn build_tool_context(
         tokio::sync::mpsc::UnboundedSender<edgecrab_tools::registry::ClarifyRequest>,
     >,
     approval_tx: Option<tokio::sync::mpsc::UnboundedSender<ApprovalRequest>>,
+    tool_progress_tx: Option<
+        tokio::sync::mpsc::UnboundedSender<edgecrab_tools::ToolProgressUpdate>,
+    >,
     gateway_sender: Option<Arc<dyn edgecrab_tools::registry::GatewaySender>>,
     origin_chat: Option<(String, String)>,
+    current_tool_call_id: Option<String>,
+    current_tool_name: Option<String>,
     // Stable per-conversation session identifier — used as the browser session key
     // so all tool calls within one session share the same Chrome tab.
     conversation_session_id: &str,
@@ -145,6 +150,9 @@ fn build_tool_context(
             None => conversation_session_id.to_string(),
         }),
         todo_store,
+        current_tool_call_id,
+        current_tool_name,
+        tool_progress_tx,
     }
 }
 
@@ -298,6 +306,8 @@ impl Agent {
             delegation_max_iterations: config.delegation_max_iterations,
             parent_active_toolsets,
             disabled_toolsets: expanded_disabled.clone(),
+            enabled_tools: config.enabled_tools.clone(),
+            disabled_tools: config.disabled_tools.clone(),
             external_skill_dirs: config.skills_config.external_dirs.clone(),
             disabled_skills: {
                 let mut d = config.skills_config.disabled.clone();
@@ -328,6 +338,7 @@ impl Agent {
             auxiliary_model: config.auxiliary.model.clone(),
             auxiliary_base_url: config.auxiliary.base_url.clone(),
             auxiliary_api_key_env: config.auxiliary.api_key_env.clone(),
+            moa_enabled: config.moa.enabled,
             moa_reference_models: config.moa.reference_models.clone(),
             moa_aggregator_model: Some(config.moa.aggregator_model.clone()),
             tts_provider: Some(config.tts.provider.clone()),
@@ -374,8 +385,11 @@ impl Agent {
                 None,
                 None, // clarify_tx not needed for schema resolution
                 None, // approval_tx not needed for schema resolution
+                None, // tool_progress_tx not needed for schema resolution
                 self.gateway_sender.read().await.clone(),
                 config.origin_chat.clone(),
+                None,                // current_tool_call_id not needed for schema resolution
+                None,                // current_tool_name not needed for schema resolution
                 "schema-resolution", // placeholder — schemas are not browser-session-sensitive
                 Some(self.todo_store.clone()),
             );
@@ -579,12 +593,8 @@ impl Agent {
                 let canonical = edgecrab_tools::vision_models::normalize_provider_name(prov_name);
                 // Special-case copilot: build directly to use direct API mode
                 let cheap_opt: Option<Arc<dyn LLMProvider>> = if canonical == "vscode-copilot" {
-                    match VsCodeCopilotProvider::new()
-                        .model(model_name)
-                        .with_vision(true)
-                        .build()
-                    {
-                        Ok(p) => Some(Arc::new(p) as Arc<dyn LLMProvider>),
+                    match edgecrab_tools::create_provider_for_model(&canonical, model_name) {
+                        Ok(p) => Some(p),
                         Err(e) => {
                             tracing::warn!(error = %e, "failed to create copilot provider, using primary");
                             None
@@ -969,8 +979,11 @@ impl Agent {
                     None,
                     None,
                     None,
+                    None,
                     self.gateway_sender.read().await.clone(),
                     config.origin_chat.clone(),
+                    None,
+                    None,
                     &conversation_session_id,
                     Some(self.todo_store.clone()),
                 );
@@ -1064,12 +1077,11 @@ impl Agent {
                             // Special-case copilot: build directly to use direct API mode
                             let fb_prov_opt: Option<Arc<dyn LLMProvider>> =
                                 if fb_canonical == "vscode-copilot" {
-                                    VsCodeCopilotProvider::new()
-                                        .model(fb_model_name)
-                                        .with_vision(true) // Enable vision so copilot-vision-request header is sent
-                                        .build()
-                                        .ok()
-                                        .map(|p| Arc::new(p) as Arc<dyn LLMProvider>)
+                                    edgecrab_tools::create_provider_for_model(
+                                        &fb_canonical,
+                                        fb_model_name,
+                                    )
+                                    .ok()
                                 } else {
                                     edgequake_llm::ProviderFactory::create_llm_provider(
                                         &fb_canonical,
@@ -1597,6 +1609,7 @@ fn is_tool_error(result: &str) -> bool {
 /// `process_response`.
 fn emit_tool_done(
     tx: Option<&tokio::sync::mpsc::UnboundedSender<crate::StreamEvent>>,
+    tool_call_id: &str,
     name: &str,
     args_json: &str,
     tool_result: &str,
@@ -1605,6 +1618,7 @@ fn emit_tool_done(
 ) {
     if let Some(tx) = tx {
         let _ = tx.send(crate::StreamEvent::ToolDone {
+            tool_call_id: tool_call_id.to_string(),
             name: name.to_string(),
             args_json: args_json.to_string(),
             result_preview: summarize_tool_result_preview(name, tool_result, is_error),
@@ -1612,6 +1626,24 @@ fn emit_tool_done(
             is_error,
         });
     }
+}
+
+fn make_tool_progress_tx(
+    event_tx: Option<&tokio::sync::mpsc::UnboundedSender<crate::StreamEvent>>,
+) -> Option<tokio::sync::mpsc::UnboundedSender<edgecrab_tools::ToolProgressUpdate>> {
+    let event_tx = event_tx.cloned()?;
+    let (tool_progress_tx, mut tool_progress_rx) =
+        tokio::sync::mpsc::unbounded_channel::<edgecrab_tools::ToolProgressUpdate>();
+    tokio::spawn(async move {
+        while let Some(update) = tool_progress_rx.recv().await {
+            let _ = event_tx.send(crate::StreamEvent::ToolProgress {
+                tool_call_id: update.tool_call_id,
+                name: update.tool_name,
+                message: update.message,
+            });
+        }
+    });
+    Some(tool_progress_tx)
 }
 
 fn summarize_tool_result_preview(name: &str, tool_result: &str, is_error: bool) -> Option<String> {
@@ -2274,6 +2306,7 @@ async fn process_response(
             // Notify TUI that a tool execution is starting
             if let Some(tx) = dctx.event_tx {
                 let _ = tx.send(crate::StreamEvent::ToolExec {
+                    tool_call_id: tc.id.clone(),
                     name: tc.function.name.clone(),
                     args_json: tc.function.arguments.clone(),
                 });
@@ -2326,7 +2359,7 @@ async fn process_response(
                         todo_store: todo_store_clone,
                         capability_suppressions,
                     };
-                    let result = dispatch_single_tool(&tc_name, &tc_args, &inner).await;
+                    let result = dispatch_single_tool(&tc_id, &tc_name, &tc_args, &inner).await;
                     let duration_ms = started.elapsed().as_millis() as u64;
                     (tc_id, tc_name, args_for_done, result, duration_ms)
                 });
@@ -2344,6 +2377,7 @@ async fn process_response(
                     let is_error = is_tool_error(&tool_result);
                     emit_tool_done(
                         dctx.event_tx,
+                        &tc_id,
                         &tc_name,
                         &args_json,
                         &tool_result,
@@ -2401,12 +2435,13 @@ async fn process_response(
         for tc in sequential_calls {
             let started = std::time::Instant::now();
             let tool_result =
-                dispatch_single_tool(&tc.function.name, &tc.function.arguments, dctx).await;
+                dispatch_single_tool(&tc.id, &tc.function.name, &tc.function.arguments, dctx).await;
             let duration_ms = started.elapsed().as_millis() as u64;
 
             let is_error = is_tool_error(&tool_result);
             emit_tool_done(
                 dctx.event_tx,
+                &tc.id,
                 &tc.function.name,
                 &tc.function.arguments,
                 &tool_result,
@@ -2483,7 +2518,12 @@ fn cap_delegate_task_calls(
 }
 
 /// Dispatch a single tool call through the registry.
-async fn dispatch_single_tool(name: &str, args_json: &str, dctx: &DispatchContext<'_>) -> String {
+async fn dispatch_single_tool(
+    tool_call_id: &str,
+    name: &str,
+    args_json: &str,
+    dctx: &DispatchContext<'_>,
+) -> String {
     let Some(reg) = dctx.registry else {
         return format!(
             "Tool '{}' execution is not yet wired (no ToolRegistry provided).",
@@ -2531,8 +2571,11 @@ async fn dispatch_single_tool(name: &str, args_json: &str, dctx: &DispatchContex
         dctx.delegation_event_tx.clone(),
         dctx.clarify_tx.clone(),
         dctx.approval_tx.clone(),
+        make_tool_progress_tx(dctx.event_tx),
         dctx.gateway_sender.clone(),
         dctx.origin_chat.clone(),
+        Some(tool_call_id.to_string()),
+        Some(name.to_string()),
         &dctx.conversation_session_id,
         dctx.todo_store.clone(),
     );
@@ -3685,6 +3728,7 @@ mod tests {
         dctx.cwd = workspace.path().to_path_buf();
 
         let result = dispatch_single_tool(
+            "call-read-file",
             "read_file",
             r#"{"path":"proof.txt","line_numbers":false}"#,
             &dctx,
@@ -3709,7 +3753,7 @@ mod tests {
             capability_suppressions,
         );
 
-        let result = dispatch_single_tool("read_file", "{}", &dctx).await;
+        let result = dispatch_single_tool("call-read-file", "read_file", "{}", &dctx).await;
         let parsed = parse_tool_error_response(&result).expect("structured tool error");
         assert_eq!(parsed.response_type, "tool_error");
         assert_eq!(parsed.category, "arguments");
@@ -3733,12 +3777,12 @@ mod tests {
         );
         let args_json = r#"{"command":"top"}"#;
 
-        let first = dispatch_single_tool("terminal", args_json, &dctx).await;
+        let first = dispatch_single_tool("call-terminal-1", "terminal", args_json, &dctx).await;
         let first_payload = parse_tool_error_response(&first).expect("structured error");
         assert_eq!(first_payload.code, "non_interactive_terminal_required");
         remember_tool_suppression(&capability_suppressions, "terminal", args_json, &first);
 
-        let second = dispatch_single_tool("terminal", args_json, &dctx).await;
+        let second = dispatch_single_tool("call-terminal-2", "terminal", args_json, &dctx).await;
         let second_payload = parse_tool_error_response(&second).expect("structured error");
         assert_eq!(second_payload.code, "suppressed_capability_retry");
         assert!(second_payload.error.contains("already blocked"));

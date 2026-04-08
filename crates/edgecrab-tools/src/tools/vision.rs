@@ -27,7 +27,7 @@ use edgecrab_types::{ToolError, ToolSchema};
 use edgequake_llm::{
     ChatMessage, CompletionOptions, ConfigProviderType, LLMProvider, ModelCapabilities, ModelCard,
     ModelType, ModelsConfig, OpenAICompatibleProvider, ProviderConfig, ProviderFactory,
-    ProviderType, VsCodeCopilotProvider,
+    ProviderType,
 };
 
 use crate::path_utils::jail_read_path_multi;
@@ -298,18 +298,8 @@ fn build_provider_for_target(
         return build_custom_openai_compatible_target(target);
     }
 
-    if target.provider == "vscode-copilot" {
-        return VsCodeCopilotProvider::new()
-            .model(&target.model)
-            .with_vision(true)
-            .build()
-            .map(|provider| Arc::new(provider) as Arc<dyn LLMProvider>)
-            .map_err(|err| err.to_string());
-    }
-
     if ProviderType::from_str(&target.provider).is_some() {
-        return ProviderFactory::create_llm_provider(&target.provider, &target.model)
-            .map_err(|err| err.to_string());
+        return crate::create_provider_for_model(&target.provider, &target.model);
     }
 
     let Some(models) = models else {
@@ -875,6 +865,9 @@ mod tests {
             origin_chat: None,
             session_key: None,
             todo_store: None,
+            current_tool_call_id: None,
+            current_tool_name: None,
+            tool_progress_tx: None,
         };
 
         let target = resolve_explicit_target(&ctx, "openai", "gpt-4o", Some(&models))

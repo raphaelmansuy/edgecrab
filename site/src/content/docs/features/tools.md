@@ -185,7 +185,7 @@ Then use `--toolset my-research` on the CLI.
 | Tool | Description |
 |------|-------------|
 | `delegate_task` | Spawn a subagent to complete a parallel subtask |
-| `mixture_of_agents` | Run a task through multiple models, synthesize consensus |
+| `moa` | Run a task through multiple models, synthesize consensus |
 
 ### `code_execution` — Sandboxed Execution
 | Tool | Description |

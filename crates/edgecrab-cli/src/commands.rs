@@ -30,6 +30,12 @@ use std::collections::HashMap;
 
 use edgecrab_core::{DiscoveryAvailability, live_discovery_availability};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolManagerMode {
+    All,
+    Toolsets,
+}
+
 /// Result of executing a slash command.
 #[allow(dead_code)]
 #[derive(Debug)]
@@ -70,6 +76,8 @@ pub enum CommandResult {
     SetImageModel(String),
     /// Show the current Mixture-of-Agents defaults.
     ShowMoaConfig,
+    /// Enable or disable Mixture-of-Agents for future tool calls.
+    SetMoaEnabled(bool),
     /// Update the default MoA aggregator model.
     SetMoaAggregator(String),
     /// Add a reference model to the default MoA roster.
@@ -134,10 +142,10 @@ pub enum CommandResult {
     ShowMcp(String),
     /// Activate the interactive skill selector overlay
     SkillSelector,
-    /// Show registered tools (dynamic from ToolRegistry)
-    ShowTools,
-    /// Show available toolsets (dynamic from ToolRegistry)
-    ShowToolsets,
+    /// Activate the interactive tool manager overlay.
+    ToolManager(ToolManagerMode),
+    /// Reset tool and toolset policy back to defaults.
+    ResetToolPolicy,
     /// Set reasoning effort or think-mode visibility (low/medium/high/show/hide/status)
     SetReasoning(String),
     /// Toggle live token streaming (on/off/toggle/status)
@@ -412,11 +420,30 @@ impl CommandRegistry {
         self.register(Command {
             name: "moa",
             aliases: &[],
-            description: "Inspect or configure Mixture-of-Agents defaults (/moa status, /moa aggregator, /moa references)",
+            description: "Inspect, enable, or configure MoA defaults (/moa status, /moa on, /moa aggregator, /moa experts, /moa add, /moa remove)",
             handler: |args| {
                 let trimmed = args.trim();
-                if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("status") {
+                if trimmed.is_empty()
+                    || matches!(
+                        trimmed.to_ascii_lowercase().as_str(),
+                        "status" | "show" | "list"
+                    )
+                {
                     return CommandResult::ShowMoaConfig;
+                }
+
+                if matches!(
+                    trimmed.to_ascii_lowercase().as_str(),
+                    "on" | "enable" | "enabled"
+                ) {
+                    return CommandResult::SetMoaEnabled(true);
+                }
+
+                if matches!(
+                    trimmed.to_ascii_lowercase().as_str(),
+                    "off" | "disable" | "disabled"
+                ) {
+                    return CommandResult::SetMoaEnabled(false);
                 }
 
                 if trimmed.eq_ignore_ascii_case("reset")
@@ -428,6 +455,10 @@ impl CommandRegistry {
                 if trimmed.eq_ignore_ascii_case("references")
                     || trimmed.eq_ignore_ascii_case("refs")
                     || trimmed.eq_ignore_ascii_case("roster")
+                    || trimmed.eq_ignore_ascii_case("experts")
+                    || trimmed.eq_ignore_ascii_case("expert")
+                    || trimmed.eq_ignore_ascii_case("edit")
+                    || trimmed.eq_ignore_ascii_case("open")
                 {
                     return CommandResult::MoaReferenceSelector;
                 }
@@ -444,8 +475,14 @@ impl CommandRegistry {
                 if let Some(model) = trimmed.strip_prefix("agg ") {
                     return CommandResult::SetMoaAggregator(model.trim().to_string());
                 }
+                if trimmed.eq_ignore_ascii_case("add") {
+                    return CommandResult::AddMoaReference(String::new());
+                }
                 if let Some(model) = trimmed.strip_prefix("add ") {
                     return CommandResult::AddMoaReference(model.trim().to_string());
+                }
+                if trimmed.eq_ignore_ascii_case("remove") || trimmed.eq_ignore_ascii_case("rm") {
+                    return CommandResult::RemoveMoaReference(String::new());
                 }
                 if let Some(model) = trimmed.strip_prefix("remove ") {
                     return CommandResult::RemoveMoaReference(model.trim().to_string());
@@ -455,7 +492,7 @@ impl CommandRegistry {
                 }
 
                 CommandResult::Output(
-                    "Usage: /moa [status|reset|aggregator [provider/model]|references|add <provider/model>|remove <provider/model>]"
+                    "Usage: /moa [status|on|off|reset|aggregator [provider/model]|experts|add [provider/model]|remove [provider/model]]"
                         .into(),
                 )
             },
@@ -632,15 +669,21 @@ impl CommandRegistry {
         self.register(Command {
             name: "tools",
             aliases: &[],
-            description: "List active tools",
-            handler: |_| CommandResult::ShowTools,
+            description: "Browse and configure tools (/tools reset restores defaults)",
+            handler: |args| match args.trim() {
+                "reset" => CommandResult::ResetToolPolicy,
+                _ => CommandResult::ToolManager(ToolManagerMode::All),
+            },
         });
 
         self.register(Command {
             name: "toolsets",
             aliases: &["ts"],
-            description: "List available toolsets and their status",
-            handler: |_| CommandResult::ShowToolsets,
+            description: "Browse and configure toolsets (/toolsets reset restores defaults)",
+            handler: |args| match args.trim() {
+                "reset" => CommandResult::ResetToolPolicy,
+                _ => CommandResult::ToolManager(ToolManagerMode::Toolsets),
+            },
         });
 
         // ── Memory commands ───────────────────────────────────────────
@@ -1087,8 +1130,8 @@ fn help_text() -> String {
            /statusbar [mode]     — Show or set status bar visibility\n\
          \n\
          Tools:\n\
-           /tools                — List registered tools\n\
-           /toolsets             — List available toolsets\n\
+           /tools                — Browse and configure tools\n\
+           /toolsets             — Browse and configure toolsets\n\
            /mcp [args]           — Search, install, test, or remove MCP servers\n\
            /reload-mcp           — Reload MCP server connections\n\
            /plugins              — List installed plugins\n\
@@ -1343,11 +1386,23 @@ mod tests {
             Some(CommandResult::ShowMoaConfig)
         ));
         assert!(matches!(
+            reg.dispatch("/moa on"),
+            Some(CommandResult::SetMoaEnabled(true))
+        ));
+        assert!(matches!(
+            reg.dispatch("/moa off"),
+            Some(CommandResult::SetMoaEnabled(false))
+        ));
+        assert!(matches!(
             reg.dispatch("/moa aggregator"),
             Some(CommandResult::MoaAggregatorSelector)
         ));
         assert!(matches!(
             reg.dispatch("/moa references"),
+            Some(CommandResult::MoaReferenceSelector)
+        ));
+        assert!(matches!(
+            reg.dispatch("/moa experts"),
             Some(CommandResult::MoaReferenceSelector)
         ));
         match reg.dispatch("/moa aggregator anthropic/claude-opus-4.6") {
@@ -1362,11 +1417,19 @@ mod tests {
             }
             _ => panic!("expected moa add"),
         }
+        match reg.dispatch("/moa add") {
+            Some(CommandResult::AddMoaReference(model)) => assert!(model.is_empty()),
+            _ => panic!("expected empty moa add"),
+        }
         match reg.dispatch("/moa remove openai/gpt-4.1") {
             Some(CommandResult::RemoveMoaReference(model)) => {
                 assert_eq!(model, "openai/gpt-4.1")
             }
             _ => panic!("expected moa remove"),
+        }
+        match reg.dispatch("/moa remove") {
+            Some(CommandResult::RemoveMoaReference(model)) => assert!(model.is_empty()),
+            _ => panic!("expected empty moa remove"),
         }
     }
 
@@ -1438,11 +1501,20 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_toolsets_shows_toolsets() {
+    fn dispatch_toolsets_opens_tool_manager() {
         let reg = CommandRegistry::new();
         match reg.dispatch("/toolsets") {
-            Some(CommandResult::ShowToolsets) => {} // dynamic variant
-            other => panic!("expected ShowToolsets, got {other:?}"),
+            Some(CommandResult::ToolManager(ToolManagerMode::Toolsets)) => {}
+            other => panic!("expected ToolManager(Toolsets), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_tools_reset_resets_policy() {
+        let reg = CommandRegistry::new();
+        match reg.dispatch("/tools reset") {
+            Some(CommandResult::ResetToolPolicy) => {}
+            other => panic!("expected ResetToolPolicy, got {other:?}"),
         }
     }
 

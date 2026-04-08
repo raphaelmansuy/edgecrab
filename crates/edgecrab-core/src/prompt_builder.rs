@@ -218,6 +218,17 @@ Rules:\n\
   - If the user names a specific channel/person and the target is ambiguous, call send_message(action='list') first.\n\
   - Do not claim you cannot send messages when send_message is available.";
 
+const MOA_GUIDANCE: &str = "\
+## Mixture-of-Agents
+
+When the user asks for MoA, mixture-of-agents, multiple experts, cross-model consensus, \
+or wants several models compared and then synthesized, call the `moa` tool directly.
+
+Rules:
+  - Use `moa` when the request is specifically about multi-model comparison or synthesis.
+  - Do not claim the feature is unavailable when `moa` is in the tool list.
+  - The canonical tool name is `moa`. `mixture_of_agents` is a legacy alias.";
+
 const LSP_GUIDANCE: &str = "\
 ## Language Server Usage
 
@@ -635,7 +646,12 @@ impl PromptBuilder {
             sections.push(Cow::Borrowed(MESSAGE_DELIVERY_GUIDANCE));
         }
 
-        // 13. Vision tool disambiguation — only when vision_analyze is present.
+        // 13. MoA tool-selection guidance — only when moa is present.
+        if self.has_tool("moa") {
+            sections.push(Cow::Borrowed(MOA_GUIDANCE));
+        }
+
+        // 14. Vision tool disambiguation — only when vision_analyze is present.
         // WHY: Smaller local models (qwen3, llama3) reliably pick browser_vision over
         // vision_analyze when local image files are attached, because browser_vision
         // appears earlier in the tool list. Schema descriptions alone are insufficient;
@@ -644,7 +660,7 @@ impl PromptBuilder {
             sections.push(Cow::Borrowed(VISION_GUIDANCE));
         }
 
-        // 14. LSP semantic-navigation guidance — only when the LSP surface is present.
+        // 15. LSP semantic-navigation guidance — only when the LSP surface is present.
         if self.has_any_tool(&[
             "lsp_goto_definition",
             "lsp_workspace_symbols",
@@ -2169,6 +2185,34 @@ mod tests {
             !prompt
                 .contains("Use send_message only when the user explicitly wants content delivered"),
             "message delivery guidance must not appear when send_message is unavailable"
+        );
+    }
+
+    #[test]
+    fn moa_guidance_present_when_moa_available() {
+        let builder = PromptBuilder::new(Platform::Cli)
+            .skip_context_files(true)
+            .available_tools(vec!["moa".to_string()]);
+        let prompt = builder.build(None, None, &[], None);
+        assert!(
+            prompt.contains("call the `moa` tool directly"),
+            "moa guidance must explicitly tell the model to call the canonical tool"
+        );
+        assert!(
+            prompt.contains("Do not claim the feature is unavailable"),
+            "moa guidance must block false unavailability claims"
+        );
+    }
+
+    #[test]
+    fn moa_guidance_absent_when_moa_unavailable() {
+        let builder = PromptBuilder::new(Platform::Cli)
+            .skip_context_files(true)
+            .available_tools(vec!["read_file".to_string()]);
+        let prompt = builder.build(None, None, &[], None);
+        assert!(
+            !prompt.contains("call the `moa` tool directly"),
+            "moa guidance must not appear when moa is unavailable"
         );
     }
 

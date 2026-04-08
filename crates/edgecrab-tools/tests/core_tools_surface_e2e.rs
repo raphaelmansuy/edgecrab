@@ -53,6 +53,11 @@ fn browser_advantage_tools_are_exposed_in_core_and_acp_surfaces() {
 }
 
 #[test]
+fn moa_tool_is_exposed_in_core_and_acp_surfaces() {
+    assert_tool_in_surface("moa");
+}
+
+#[test]
 fn claude_code_lsp_parity_tools_are_exposed_in_core_and_acp_surfaces() {
     for tool_name in CLAUDE_CODE_LSP_BASELINE {
         assert_tool_in_surface(tool_name);
@@ -127,6 +132,9 @@ async fn browser_advantage_tools_dispatch_through_registry_with_edge_case_valida
         origin_chat: None,
         session_key: None,
         todo_store: None,
+        current_tool_call_id: None,
+        current_tool_name: None,
+        tool_progress_tx: None,
     };
 
     let wait_for_err = registry

@@ -25,7 +25,8 @@ use tokio_util::sync::CancellationToken;
 use edgecrab_state::SessionDb;
 use edgecrab_tools::ProcessTable;
 use edgecrab_tools::TodoStore;
-use edgecrab_tools::registry::{GatewaySender, ToolRegistry};
+use edgecrab_tools::config_ref::{AppConfigRef, LspServerConfigRef};
+use edgecrab_tools::registry::{GatewaySender, ToolInventoryEntry, ToolRegistry};
 use edgecrab_types::{AgentError, ApiMode, Cost, Message, Platform, Role, Usage};
 use edgequake_llm::LLMProvider;
 
@@ -100,6 +101,8 @@ pub struct AgentConfig {
     pub max_iterations: u32,
     pub enabled_toolsets: Vec<String>,
     pub disabled_toolsets: Vec<String>,
+    pub enabled_tools: Vec<String>,
+    pub disabled_tools: Vec<String>,
     pub streaming: bool,
     pub temperature: Option<f32>,
     pub platform: Platform,
@@ -177,6 +180,8 @@ impl Default for AgentConfig {
             max_iterations: 90,
             enabled_toolsets: Vec::new(),
             disabled_toolsets: Vec::new(),
+            enabled_tools: Vec::new(),
+            disabled_tools: Vec::new(),
             streaming: true,
             temperature: None,
             platform: Platform::Cli,
@@ -880,6 +885,111 @@ impl Agent {
         }
     }
 
+    /// Rich tool inventory for UI selectors and diagnostics.
+    pub async fn tool_inventory(&self) -> Vec<ToolInventoryEntry> {
+        let Some(registry) = &self.tool_registry else {
+            return Vec::new();
+        };
+        let config = self.config.read().await.clone();
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let ctx = edgecrab_tools::registry::ToolContext {
+            task_id: "tool-inventory".into(),
+            cwd,
+            session_id: config
+                .session_id
+                .clone()
+                .unwrap_or_else(|| "tool-inventory".into()),
+            user_task: None,
+            cancel: CancellationToken::new(),
+            config: AppConfigRef {
+                gateway_running: self.gateway_sender.read().await.is_some(),
+                edgecrab_home: crate::config::edgecrab_home(),
+                lsp_enabled: config.lsp.enabled,
+                lsp_file_size_limit_bytes: config.lsp.file_size_limit_bytes,
+                lsp_servers: config
+                    .lsp
+                    .servers
+                    .iter()
+                    .map(|(name, server)| {
+                        (
+                            name.clone(),
+                            LspServerConfigRef {
+                                command: server.command.clone(),
+                                args: server.args.clone(),
+                                file_extensions: server.file_extensions.clone(),
+                                language_id: server.language_id.clone(),
+                                root_markers: server.root_markers.clone(),
+                                env: server.env.clone(),
+                                initialization_options: server.initialization_options.clone(),
+                            },
+                        )
+                    })
+                    .collect(),
+                delegation_enabled: config.delegation_enabled,
+                delegation_model: config.delegation_model.clone(),
+                delegation_provider: config.delegation_provider.clone(),
+                delegation_max_subagents: config.delegation_max_subagents,
+                delegation_max_iterations: config.delegation_max_iterations,
+                parent_active_toolsets: config.enabled_toolsets.clone(),
+                disabled_toolsets: config.disabled_toolsets.clone(),
+                enabled_tools: config.enabled_tools.clone(),
+                disabled_tools: config.disabled_tools.clone(),
+                browser_record_sessions: config.browser.record_sessions,
+                browser_command_timeout: config.browser.command_timeout,
+                browser_recording_max_age_hours: config.browser.recording_max_age_hours,
+                checkpoints_enabled: config.checkpoints_enabled,
+                checkpoints_max_snapshots: config.checkpoints_max_snapshots,
+                terminal_backend: config.terminal_backend.clone(),
+                terminal_docker: config.terminal_docker.clone(),
+                terminal_ssh: config.terminal_ssh.clone(),
+                terminal_modal: config.terminal_modal.clone(),
+                terminal_daytona: config.terminal_daytona.clone(),
+                terminal_singularity: config.terminal_singularity.clone(),
+                terminal_env_passthrough: config.terminal_env_passthrough.clone(),
+                auxiliary_provider: config.auxiliary.provider.clone(),
+                auxiliary_model: config.auxiliary.model.clone(),
+                auxiliary_base_url: config.auxiliary.base_url.clone(),
+                auxiliary_api_key_env: config.auxiliary.api_key_env.clone(),
+                moa_enabled: config.moa.enabled,
+                moa_reference_models: config.moa.reference_models.clone(),
+                moa_aggregator_model: Some(config.moa.aggregator_model.clone()),
+                tts_provider: Some(config.tts.provider.clone()),
+                tts_voice: Some(config.tts.voice.clone()),
+                tts_rate: config.tts.rate.clone(),
+                tts_model: config.tts.model.clone(),
+                tts_elevenlabs_voice_id: config.tts.elevenlabs_voice_id.clone(),
+                tts_elevenlabs_model_id: config.tts.elevenlabs_model_id.clone(),
+                tts_elevenlabs_api_key_env: Some(config.tts.elevenlabs_api_key_env.clone()),
+                stt_provider: Some(config.stt.provider.clone()),
+                stt_whisper_model: Some(config.stt.whisper_model.clone()),
+                image_provider: Some(config.image_generation.provider.clone()),
+                image_model: Some(config.image_generation.model.clone()),
+                file_allowed_roots: config.file_allowed_roots.clone(),
+                path_restrictions: config.path_restrictions.clone(),
+                ..Default::default()
+            },
+            state_db: self.state_db.clone(),
+            platform: config.platform,
+            process_table: Some(self.process_table.clone()),
+            provider: Some(self.provider.read().await.clone()),
+            tool_registry: self.tool_registry.clone(),
+            delegate_depth: 0,
+            sub_agent_runner: None,
+            delegation_event_tx: None,
+            clarify_tx: None,
+            approval_tx: None,
+            on_skills_changed: None,
+            gateway_sender: self.gateway_sender.read().await.clone(),
+            origin_chat: config.origin_chat.clone(),
+            session_key: config.session_id.clone(),
+            todo_store: Some(self.todo_store.clone()),
+            current_tool_call_id: None,
+            current_tool_name: None,
+            tool_progress_tx: None,
+        };
+        registry.tool_inventory(&ctx)
+    }
+
     /// Set reasoning effort on the agent config.
     pub async fn set_reasoning_effort(&self, level: Option<String>) {
         let mut config = self.config.write().await;
@@ -917,7 +1027,49 @@ impl Agent {
     /// Update the default Mixture-of-Agents roster and aggregator.
     pub async fn set_moa_config(&self, moa: crate::config::MoaConfig) {
         let mut config = self.config.write().await;
-        config.moa = moa;
+        config.moa = moa.sanitized();
+    }
+
+    /// Update the enabled/disabled toolset filters for future turns.
+    pub async fn set_toolset_filters(&self, enabled: Vec<String>, disabled: Vec<String>) {
+        let mut config = self.config.write().await;
+        config.enabled_toolsets = enabled;
+        config.disabled_toolsets = disabled;
+    }
+
+    /// Update the tool and toolset filters for future turns.
+    pub async fn set_tool_filters(
+        &self,
+        enabled_toolsets: Vec<String>,
+        disabled_toolsets: Vec<String>,
+        enabled_tools: Vec<String>,
+        disabled_tools: Vec<String>,
+    ) {
+        let mut config = self.config.write().await;
+        config.enabled_toolsets = enabled_toolsets;
+        config.disabled_toolsets = disabled_toolsets;
+        config.enabled_tools = enabled_tools;
+        config.disabled_tools = disabled_tools;
+    }
+
+    /// Current enabled/disabled toolset filters used for schema resolution.
+    pub async fn toolset_filters(&self) -> (Vec<String>, Vec<String>) {
+        let config = self.config.read().await;
+        (
+            config.enabled_toolsets.clone(),
+            config.disabled_toolsets.clone(),
+        )
+    }
+
+    /// Current tool and toolset filters used for schema resolution.
+    pub async fn tool_filters(&self) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
+        let config = self.config.read().await;
+        (
+            config.enabled_toolsets.clone(),
+            config.disabled_toolsets.clone(),
+            config.enabled_tools.clone(),
+            config.disabled_tools.clone(),
+        )
     }
 }
 
@@ -984,13 +1136,26 @@ pub enum StreamEvent {
     Reasoning(String),
     /// A tool execution has started.
     ToolExec {
+        /// Stable tool call id from the LLM tool invocation.
+        tool_call_id: String,
         /// Tool name (e.g. "web_search")
         name: String,
         /// Raw JSON arguments string (for preview extraction in the TUI)
         args_json: String,
     },
+    /// A tool surfaced an intermediate progress update.
+    ToolProgress {
+        /// Stable tool call id from the LLM tool invocation.
+        tool_call_id: String,
+        /// Tool name (e.g. "moa")
+        name: String,
+        /// Human-readable progress message for the active invocation.
+        message: String,
+    },
     /// A tool execution has completed.
     ToolDone {
+        /// Stable tool call id from the LLM tool invocation.
+        tool_call_id: String,
         /// Tool name (e.g. "web_search")
         name: String,
         /// Raw JSON arguments string (for preview extraction in the TUI)
@@ -1105,6 +1270,9 @@ impl std::fmt::Debug for StreamEvent {
             Self::Token(t) => write!(f, "Token({t:?})"),
             Self::Reasoning(t) => write!(f, "Reasoning({t:?})"),
             Self::ToolExec { name, .. } => write!(f, "ToolExec({name:?})"),
+            Self::ToolProgress { name, message, .. } => {
+                write!(f, "ToolProgress({name:?}, {message:?})")
+            }
             Self::ToolDone {
                 name,
                 duration_ms,
@@ -1251,6 +1419,8 @@ impl AgentBuilder {
                 model: config.model.default_model.clone(),
                 enabled_toolsets: config.tools.enabled_toolsets.clone().unwrap_or_default(),
                 disabled_toolsets: config.tools.disabled_toolsets.clone().unwrap_or_default(),
+                enabled_tools: config.tools.enabled_tools.clone().unwrap_or_default(),
+                disabled_tools: config.tools.disabled_tools.clone().unwrap_or_default(),
                 max_iterations: config.model.max_iterations,
                 streaming: config.model.streaming,
                 save_trajectories: config.save_trajectories,

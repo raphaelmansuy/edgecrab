@@ -65,6 +65,9 @@ fn make_ctx(workspace: &TempDir, home: &TempDir) -> ToolContext {
         origin_chat: None,
         session_key: None,
         todo_store: None,
+        current_tool_call_id: None,
+        current_tool_name: None,
+        tool_progress_tx: None,
     };
     ctx.config.edgecrab_home = home.path().to_path_buf();
     ctx.config.lsp_servers = HashMap::from([(

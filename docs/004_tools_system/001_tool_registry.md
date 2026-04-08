@@ -127,7 +127,7 @@ pub struct ToolContext {
     pub platform:         Platform,
     pub process_table:    Option<Arc<ProcessTable>>,
     pub provider:         Option<Arc<dyn LLMProvider>>,  // for generate_image, etc.
-    pub tool_registry:    Option<Arc<ToolRegistry>>,     // for mixture_of_agents
+    pub tool_registry:    Option<Arc<ToolRegistry>>,     // for moa
     pub delegate_depth:   u32,              // max=2; prevents runaway recursion
     pub sub_agent_runner: Option<Arc<dyn SubAgentRunner>>,
     pub clarify_tx:       Option<UnboundedSender<ClarifyRequest>>,   // ask user

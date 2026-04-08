@@ -180,6 +180,7 @@ memory:
   max_inject_tokens: 4000
 
 moa:
+  enabled: true
   aggregator_model: "anthropic/claude-opus-4.6"
   reference_models:
     - "anthropic/claude-opus-4.6"

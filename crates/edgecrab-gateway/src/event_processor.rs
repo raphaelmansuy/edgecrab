@@ -6,8 +6,9 @@
 //!
 //! ```text
 //!   StreamEvent::Reasoning(text)          LLM thinking block
-//!   StreamEvent::ToolExec { name, args }  A tool is starting
-//!   StreamEvent::ToolDone { name, .. }    A tool finished
+//!   StreamEvent::ToolExec { name, .. }     A tool is starting
+//!   StreamEvent::ToolProgress { name, .. } A tool reported progress
+//!   StreamEvent::ToolDone { name, .. }     A tool finished
 //!   StreamEvent::Token(text)              A response token
 //!   StreamEvent::Done                     Full response complete
 //!   StreamEvent::Error(msg)               Agent failed
@@ -249,6 +250,12 @@ impl GatewayEventProcessor {
                     if self.cfg.tool_progress {
                         let status = format!("🔧 {}…", name);
                         self.send_status(&status).await;
+                    }
+                }
+
+                StreamEvent::ToolProgress { name, message, .. } => {
+                    if self.cfg.tool_progress {
+                        self.send_status(&format!("🔧 {}: {}", name, message)).await;
                     }
                 }
 
@@ -675,6 +682,7 @@ mod tests {
 
         event_tx
             .send(StreamEvent::ToolExec {
+                tool_call_id: "call-web-search".into(),
                 name: "web_search".into(),
                 args_json: "{}".into(),
             })
@@ -719,6 +727,7 @@ mod tests {
 
         event_tx
             .send(StreamEvent::ToolExec {
+                tool_call_id: "call-file-read".into(),
                 name: "file_read".into(),
                 args_json: "{}".into(),
             })
@@ -883,6 +892,7 @@ mod tests {
 
         event_tx
             .send(StreamEvent::ToolDone {
+                tool_call_id: "call-terminal".into(),
                 name: "terminal".into(),
                 args_json: "{}".into(),
                 result_preview: Some("permission denied".into()),

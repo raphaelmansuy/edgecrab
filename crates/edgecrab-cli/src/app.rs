@@ -52,7 +52,7 @@ use tokio::sync::mpsc;
 use tui_textarea::{CursorMove, TextArea};
 use unicode_width::UnicodeWidthStr;
 
-use crate::commands::{CommandRegistry, CommandResult};
+use crate::commands::{CommandRegistry, CommandResult, ToolManagerMode};
 use crate::edit_diff::{LocalEditSnapshot, capture_local_edit_snapshot, render_edit_diff_lines};
 use crate::fuzzy_selector::{FuzzyItem, FuzzySelector};
 use crate::image_models as cli_image_models;
@@ -73,11 +73,12 @@ use edgecrab_core::{
     live_discovery_availability, live_discovery_providers, merge_grouped_catalog_with_dynamic,
     normalize_discovery_provider,
 };
-use edgecrab_tools::registry::ToolHandler;
+use edgecrab_tools::registry::{ToolHandler, ToolInventoryEntry};
 use edgecrab_tools::tools::transcribe::TranscribeAudioTool;
 use edgecrab_tools::tools::tts::{TextToSpeechTool, sanitize_text_for_tts};
 use edgecrab_tools::{AppConfigRef, ToolContext};
-use edgequake_llm::{ProviderFactory, VsCodeCopilotProvider};
+#[cfg(test)]
+use edgequake_llm::ProviderFactory;
 use tokio_util::sync::CancellationToken;
 
 const KEYBOARD_PROTOCOL_WARMUP: Duration = Duration::from_millis(25);
@@ -978,10 +979,12 @@ fn persist_image_generation_to_config(
 
 /// Persist Mixture-of-Agents defaults to ~/.edgecrab/config.yaml.
 fn persist_moa_config_to_config(moa: &edgecrab_core::config::MoaConfig) -> anyhow::Result<()> {
+    let moa = moa.sanitized();
     let (config_path, mut root) = load_config_root_for_edit()?;
 
     if let serde_yml::Value::Mapping(ref mut map) = root {
         let section_key = serde_yml::Value::String("moa".into());
+        let enabled_key = serde_yml::Value::String("enabled".into());
         let reference_models_key = serde_yml::Value::String("reference_models".into());
         let aggregator_model_key = serde_yml::Value::String("aggregator_model".into());
 
@@ -989,6 +992,7 @@ fn persist_moa_config_to_config(moa: &edgecrab_core::config::MoaConfig) -> anyho
             .entry(section_key)
             .or_insert_with(|| serde_yml::Value::Mapping(Default::default()));
         if let serde_yml::Value::Mapping(moa_map) = section {
+            moa_map.insert(enabled_key, serde_yml::Value::Bool(moa.enabled));
             moa_map.insert(
                 aggregator_model_key,
                 serde_yml::Value::String(moa.aggregator_model.clone()),
@@ -1006,6 +1010,91 @@ fn persist_moa_config_to_config(moa: &edgecrab_core::config::MoaConfig) -> anyho
     }
 
     write_config_root(&config_path, &root)
+}
+
+fn persist_toolset_filters_to_config(
+    enabled_toolsets: Option<&[String]>,
+    disabled_toolsets: Option<&[String]>,
+) -> anyhow::Result<()> {
+    persist_tool_filters_to_config(enabled_toolsets, disabled_toolsets, None, None)
+}
+
+fn persist_tool_filters_to_config(
+    enabled_toolsets: Option<&[String]>,
+    disabled_toolsets: Option<&[String]>,
+    enabled_tools: Option<&[String]>,
+    disabled_tools: Option<&[String]>,
+) -> anyhow::Result<()> {
+    let (config_path, mut root) = load_config_root_for_edit()?;
+
+    if let serde_yml::Value::Mapping(ref mut map) = root {
+        let tools_key = serde_yml::Value::String("tools".into());
+        let enabled_key = serde_yml::Value::String("enabled_toolsets".into());
+        let disabled_key = serde_yml::Value::String("disabled_toolsets".into());
+        let enabled_tools_key = serde_yml::Value::String("enabled_tools".into());
+        let disabled_tools_key = serde_yml::Value::String("disabled_tools".into());
+
+        let tools_section = map
+            .entry(tools_key)
+            .or_insert_with(|| serde_yml::Value::Mapping(Default::default()));
+        if let serde_yml::Value::Mapping(tools_map) = tools_section {
+            let write_list = |tools_map: &mut serde_yml::Mapping,
+                              key: serde_yml::Value,
+                              values: Option<&[String]>| {
+                if let Some(values) = values.filter(|values| !values.is_empty()) {
+                    tools_map.insert(
+                        key,
+                        serde_yml::Value::Sequence(
+                            values
+                                .iter()
+                                .map(|value| serde_yml::Value::String(value.clone()))
+                                .collect(),
+                        ),
+                    );
+                } else {
+                    tools_map.remove(&key);
+                }
+            };
+
+            write_list(tools_map, enabled_key, enabled_toolsets);
+            write_list(tools_map, disabled_key, disabled_toolsets);
+            write_list(tools_map, enabled_tools_key, enabled_tools);
+            write_list(tools_map, disabled_tools_key, disabled_tools);
+        }
+    }
+
+    write_config_root(&config_path, &root)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MoaAvailability {
+    feature_enabled: bool,
+    toolset_enabled: bool,
+}
+
+impl MoaAvailability {
+    fn effective(self) -> bool {
+        self.feature_enabled && self.toolset_enabled
+    }
+}
+
+fn toolset_entries_referencing(target_toolset: &str, entries: &[String]) -> Vec<String> {
+    entries
+        .iter()
+        .filter(|entry| {
+            if entry.as_str() == target_toolset {
+                return true;
+            }
+            edgecrab_tools::toolsets::resolve_alias(entry)
+                .is_some_and(|expanded| expanded.contains(&target_toolset))
+        })
+        .cloned()
+        .collect()
+}
+
+fn normalize_tool_policy_list(values: &mut Vec<String>) {
+    values.sort();
+    values.dedup();
 }
 
 /// Persist the CLI voice-mode default to ~/.edgecrab/config.yaml.
@@ -1349,7 +1438,7 @@ pub enum OutputRole {
 }
 
 /// Display state machine for the spinner/status area.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum DisplayState {
     Idle,
     AwaitingFirstToken {
@@ -1366,8 +1455,10 @@ enum DisplayState {
     },
     #[allow(dead_code)]
     ToolExec {
+        tool_call_id: String,
         name: String,
         args_json: String,
+        detail: Option<String>,
         frame: usize,
         started: Instant,
     },
@@ -1534,6 +1625,13 @@ enum ModelSelectorTarget {
     Primary,
     Cheap,
     MoaAggregator,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MoaReferenceSelectorMode {
+    EditRoster,
+    AddExpert,
+    RemoveExpert,
 }
 
 fn discovery_source_label(source: DiscoverySource) -> &'static str {
@@ -2162,12 +2260,16 @@ impl FuzzyItem for SkinEntry {
 enum ConfigAction {
     ShowSummary,
     ShowPaths,
+    OpenTools,
     OpenModel,
     OpenCheapModel,
+    ToggleMoa,
     OpenVisionModel,
     OpenImageModel,
     OpenMoaAggregator,
     OpenMoaReferences,
+    AddMoaExpert,
+    RemoveMoaExpert,
     ToggleStreaming,
     ToggleReasoning,
     ToggleStatusBar,
@@ -2188,6 +2290,103 @@ struct ConfigEntry {
 impl FuzzyItem for ConfigEntry {
     fn primary(&self) -> &str {
         &self.title
+    }
+
+    fn secondary(&self) -> &str {
+        &self.detail
+    }
+
+    fn tag(&self) -> &str {
+        &self.tag
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToolManagerScope {
+    All,
+    Toolsets,
+    Tools,
+}
+
+impl ToolManagerScope {
+    fn from_mode(mode: ToolManagerMode) -> Self {
+        match mode {
+            ToolManagerMode::All => Self::All,
+            ToolManagerMode::Toolsets => Self::Toolsets,
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::All => Self::Toolsets,
+            Self::Toolsets => Self::Tools,
+            Self::Tools => Self::All,
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Toolsets => "toolsets",
+            Self::Tools => "tools",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToolManagerItemKind {
+    Toolset,
+    Tool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToolManagerCheckState {
+    On,
+    Off,
+    Mixed,
+}
+
+impl ToolManagerCheckState {
+    fn glyph(self) -> &'static str {
+        match self {
+            Self::On => "[x]",
+            Self::Off => "[ ]",
+            Self::Mixed => "[-]",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToolPolicySource {
+    Default,
+    ExplicitEnable,
+    ExplicitDisable,
+}
+
+#[derive(Clone)]
+struct ToolManagerEntry {
+    kind: ToolManagerItemKind,
+    name: String,
+    toolset: String,
+    description: String,
+    detail: String,
+    tag: String,
+    check_state: ToolManagerCheckState,
+    policy_source: ToolPolicySource,
+    exposed: bool,
+    startup_available: bool,
+    check_allowed: bool,
+    dynamic: bool,
+    emoji: String,
+    aliases: Vec<String>,
+    selected_tools: usize,
+    total_tools: usize,
+    exposed_tools: usize,
+}
+
+impl FuzzyItem for ToolManagerEntry {
+    fn primary(&self) -> &str {
+        &self.name
     }
 
     fn secondary(&self) -> &str {
@@ -2313,16 +2512,24 @@ pub struct App {
     vision_model_selector: FuzzySelector<ModelEntry>,
     /// Image-model selector overlay (activated by `/image_model`)
     image_model_selector: FuzzySelector<ModelEntry>,
-    /// MoA reference-model selector overlay (activated by `/moa references`)
+    /// MoA expert selector overlay (activated by `/moa experts`, `/moa add`, or `/moa remove`)
     moa_reference_selector: FuzzySelector<ModelEntry>,
     /// Currently selected default reference models in the MoA selector.
     moa_reference_selected: BTreeSet<String>,
+    /// Active interaction mode for the MoA expert selector.
+    moa_reference_selector_mode: MoaReferenceSelectorMode,
     /// Official MCP preset selector overlay (activated by `/mcp` with no args).
     mcp_selector: FuzzySelector<McpPresetEntry>,
     /// Remote MCP browser overlay (activated by `/mcp search`).
     remote_mcp_browser: RemoteMcpBrowser,
     /// Skill browser overlay (activated by `/skills` with no args)
     skill_selector: FuzzySelector<SkillEntry>,
+    /// Tool manager overlay (activated by `/tools` or `/toolsets`)
+    tool_manager: FuzzySelector<ToolManagerEntry>,
+    /// Active tool-manager scope tab.
+    tool_manager_scope: ToolManagerScope,
+    /// Last non-error status note shown in the tool manager footer.
+    tool_manager_status_note: Option<String>,
     /// Remote skill browser overlay (activated by `/skills search` or `/skills hub`)
     remote_skill_browser: RemoteSkillBrowser,
     /// Session browser overlay (activated by F5 or `/session` with no args)
@@ -2408,16 +2615,12 @@ pub struct App {
     /// Persists across multiple streaming phases (separated by tool calls)
     /// so the status bar shows the running total rather than resetting.
     turn_stream_tokens: u64,
-    /// FIFO queue of output-area indices for in-flight "running" tool lines.
+    /// In-flight tool placeholder lines keyed by stable tool-call id.
     ///
-    /// WHY VecDeque: On ToolExec we push a cyan "··· running ···" placeholder
-    /// to the output area immediately (not waiting for ToolDone) — this gives
-    /// visual feedback inside the scrollable transcript during long operations.
-    /// On ToolDone we pop_front and update that line in-place with the final
-    /// styled duration/result, so the placeholder is replaced without a
-    /// disruptive layout shift.  FIFO order matches tool-dispatch ordering and
-    /// handles sequential multi-tool turns without any per-tool book-keeping.
-    pending_tool_lines: std::collections::VecDeque<PendingToolLine>,
+    /// WHY map instead of FIFO: root tools may execute in parallel and finish
+    /// out of order. Matching by `tool_call_id` avoids upgrading the wrong line
+    /// when completion events race.
+    pending_tool_lines: std::collections::HashMap<String, PendingToolLine>,
     /// Active local microphone recording session for push-to-talk voice input.
     voice_recording: Option<VoiceRecordingSession>,
     /// Configured push-to-talk key binding loaded from config.yaml.
@@ -2441,8 +2644,10 @@ pub struct App {
     hook_registry: std::sync::Arc<edgecrab_gateway::hooks::HookRegistry>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct PendingToolLine {
+    tool_name: String,
+    args_json: String,
     line_idx: usize,
     edit_snapshot: Option<LocalEditSnapshot>,
 }
@@ -2468,9 +2673,20 @@ enum AgentResponse {
     /// A reasoning / think-mode delta or full reasoning block.
     Reasoning(String),
     /// A tool execution has started — show tool name + preview in status bar.
-    ToolExec { name: String, args_json: String },
+    ToolExec {
+        tool_call_id: String,
+        name: String,
+        args_json: String,
+    },
+    /// A tool emitted an intermediate progress update.
+    ToolProgress {
+        tool_call_id: String,
+        name: String,
+        message: String,
+    },
     /// A tool execution completed — push a rich formatted line to the output.
     ToolDone {
+        tool_call_id: String,
         name: String,
         args_json: String,
         result_preview: Option<String>,
@@ -2596,9 +2812,16 @@ struct ActiveSubagentStatus {
 
 fn background_progress_text(task_num: u64, event: &edgecrab_core::StreamEvent) -> Option<String> {
     match event {
-        edgecrab_core::StreamEvent::ToolExec { name, args_json } => Some(format!(
+        edgecrab_core::StreamEvent::ToolExec {
+            name, args_json, ..
+        } => Some(format!(
             "↳ bg#{task_num} {}",
             tool_status_preview(name, args_json)
+        )),
+        edgecrab_core::StreamEvent::ToolProgress { name, message, .. } => Some(format!(
+            "↳ bg#{task_num} {} · {}",
+            name.replace('_', " "),
+            edgecrab_core::safe_truncate(message.trim(), 72)
         )),
         edgecrab_core::StreamEvent::SubAgentStart {
             task_index,
@@ -2781,9 +3004,13 @@ impl App {
             image_model_selector: FuzzySelector::new(),
             moa_reference_selector: FuzzySelector::new(),
             moa_reference_selected: BTreeSet::new(),
+            moa_reference_selector_mode: MoaReferenceSelectorMode::EditRoster,
             mcp_selector: FuzzySelector::new(),
             remote_mcp_browser: RemoteMcpBrowser::new(),
             skill_selector: FuzzySelector::new(),
+            tool_manager: FuzzySelector::new(),
+            tool_manager_scope: ToolManagerScope::All,
+            tool_manager_status_note: None,
             remote_skill_browser: RemoteSkillBrowser::new(),
             session_browser: FuzzySelector::new(),
             config_selector: FuzzySelector::new(),
@@ -2812,7 +3039,7 @@ impl App {
             pending_images: Vec::new(),
             in_flight_tool_count: 0,
             turn_stream_tokens: 0,
-            pending_tool_lines: std::collections::VecDeque::new(),
+            pending_tool_lines: std::collections::HashMap::new(),
             voice_recording: None,
             voice_push_to_talk_key: runtime_config.voice.push_to_talk_key,
             voice_input_device: runtime_config.voice.input_device,
@@ -4020,11 +4247,14 @@ impl App {
             ],
             "moa" => &[
                 ("status", "Show the current Mixture-of-Agents defaults"),
+                ("on", "Enable the moa tool"),
+                ("off", "Disable the moa tool"),
                 ("aggregator", "Open the MoA aggregator selector"),
-                ("references", "Open the MoA reference roster selector"),
+                ("experts", "Open the full MoA expert roster editor"),
+                ("references", "Open the full MoA expert roster editor"),
                 ("reset", "Restore the built-in MoA roster"),
-                ("add", "Add one reference model"),
-                ("remove", "Remove one reference model"),
+                ("add", "Add one expert to the MoA roster"),
+                ("remove", "Remove one expert from the MoA roster"),
             ],
             // All other commands accept free-form arguments; fall through.
             _ => &[],
@@ -5153,24 +5383,48 @@ impl App {
                 }
                 KeyCode::Enter => {
                     self.moa_reference_selector.active = false;
-                    let selected: Vec<String> =
-                        self.moa_reference_selected.iter().cloned().collect();
-                    self.handle_save_moa_reference_selection(selected);
+                    match self.moa_reference_selector_mode {
+                        MoaReferenceSelectorMode::EditRoster => {
+                            let selected: Vec<String> =
+                                self.moa_reference_selected.iter().cloned().collect();
+                            self.handle_save_moa_reference_selection(selected);
+                        }
+                        MoaReferenceSelectorMode::AddExpert => {
+                            if let Some(model) = self
+                                .moa_reference_selector
+                                .current()
+                                .map(|entry| entry.display.clone())
+                            {
+                                self.handle_add_moa_reference(model);
+                            }
+                        }
+                        MoaReferenceSelectorMode::RemoveExpert => {
+                            if let Some(model) = self
+                                .moa_reference_selector
+                                .current()
+                                .map(|entry| entry.display.clone())
+                            {
+                                self.handle_remove_moa_reference(model);
+                            }
+                        }
+                    }
                 }
                 KeyCode::Char(' ')
                     if !key
                         .modifiers
                         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                 {
-                    if let Some(model) = self
-                        .moa_reference_selector
-                        .current()
-                        .map(|entry| entry.display.clone())
-                    {
-                        if !self.moa_reference_selected.insert(model.clone()) {
-                            self.moa_reference_selected.remove(&model);
+                    if self.moa_reference_selector_mode == MoaReferenceSelectorMode::EditRoster {
+                        if let Some(model) = self
+                            .moa_reference_selector
+                            .current()
+                            .map(|entry| entry.display.clone())
+                        {
+                            if !self.moa_reference_selected.insert(model.clone()) {
+                                self.moa_reference_selected.remove(&model);
+                            }
+                            self.needs_redraw = true;
                         }
-                        self.needs_redraw = true;
                     }
                 }
                 KeyCode::Up => self.moa_reference_selector.move_up(),
@@ -5482,6 +5736,38 @@ impl App {
                         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                 {
                     self.skill_selector.push_char(c);
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        if self.tool_manager.active {
+            match key.code {
+                KeyCode::Esc => {
+                    self.tool_manager.active = false;
+                }
+                KeyCode::Tab => {
+                    self.tool_manager_scope = self.tool_manager_scope.next();
+                    let _ = self.refresh_tool_manager_entries();
+                }
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    self.toggle_tool_manager_selected();
+                }
+                KeyCode::Up => self.tool_manager.move_up(),
+                KeyCode::Down => self.tool_manager.move_down(),
+                KeyCode::PageUp => self.tool_manager.page_up(),
+                KeyCode::PageDown => self.tool_manager.page_down(),
+                KeyCode::Char('r') | KeyCode::Char('R') => {
+                    self.reset_tool_manager_policy();
+                }
+                KeyCode::Backspace => self.tool_manager.pop_char(),
+                KeyCode::Char(c)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    self.tool_manager.push_char(c);
                 }
                 _ => {}
             }
@@ -5814,10 +6100,30 @@ impl App {
                     StreamEvent::Reasoning(text) => {
                         let _ = tx.send(AgentResponse::Reasoning(text));
                     }
-                    StreamEvent::ToolExec { name, args_json } => {
-                        let _ = tx.send(AgentResponse::ToolExec { name, args_json });
+                    StreamEvent::ToolExec {
+                        tool_call_id,
+                        name,
+                        args_json,
+                    } => {
+                        let _ = tx.send(AgentResponse::ToolExec {
+                            tool_call_id,
+                            name,
+                            args_json,
+                        });
+                    }
+                    StreamEvent::ToolProgress {
+                        tool_call_id,
+                        name,
+                        message,
+                    } => {
+                        let _ = tx.send(AgentResponse::ToolProgress {
+                            tool_call_id,
+                            name,
+                            message,
+                        });
                     }
                     StreamEvent::ToolDone {
+                        tool_call_id,
                         name,
                         args_json,
                         result_preview,
@@ -5825,6 +6131,7 @@ impl App {
                         is_error,
                     } => {
                         let _ = tx.send(AgentResponse::ToolDone {
+                            tool_call_id,
                             name,
                             args_json,
                             result_preview,
@@ -6028,6 +6335,9 @@ impl App {
             CommandResult::ShowMoaConfig => {
                 self.handle_show_moa_config();
             }
+            CommandResult::SetMoaEnabled(enabled) => {
+                self.handle_set_moa_enabled(enabled);
+            }
             CommandResult::SetMoaAggregator(spec) => {
                 self.handle_set_moa_aggregator(spec);
             }
@@ -6211,11 +6521,11 @@ impl App {
                 self.refresh_skills_list();
                 self.skill_selector.activate();
             }
-            CommandResult::ShowTools => {
-                self.handle_show_tools();
+            CommandResult::ToolManager(mode) => {
+                self.open_tool_manager(mode);
             }
-            CommandResult::ShowToolsets => {
-                self.handle_show_toolsets();
+            CommandResult::ResetToolPolicy => {
+                self.reset_tool_manager_policy();
             }
             CommandResult::SetReasoning(level) => {
                 self.handle_set_reasoning(level);
@@ -6638,7 +6948,11 @@ impl App {
                         self.needs_redraw = true;
                     }
                 }
-                AgentResponse::ToolExec { name, args_json } => {
+                AgentResponse::ToolExec {
+                    tool_call_id,
+                    name,
+                    args_json,
+                } => {
                     // CRITICAL: Break the streaming buffer at the tool boundary.
                     // Without this, tokens arriving after the tool call append to
                     // the pre-tool text, visually merging text before and after
@@ -6648,8 +6962,10 @@ impl App {
                     // may arrive before any ToolDone (parallel tool dispatch).
                     self.in_flight_tool_count = self.in_flight_tool_count.saturating_add(1);
                     self.display_state = DisplayState::ToolExec {
+                        tool_call_id: tool_call_id.clone(),
                         name: name.clone(),
                         args_json: args_json.clone(),
+                        detail: None,
                         frame: 0,
                         started: Instant::now(),
                     };
@@ -6664,7 +6980,7 @@ impl App {
                     // info (no layout shift).
                     let edit_snapshot = capture_local_edit_snapshot(&name, &args_json);
                     let running_spans =
-                        build_tool_running_line(&name, &args_json, &self.theme.tool_emojis);
+                        build_tool_running_line(&name, &args_json, None, &self.theme.tool_emojis);
                     let line_idx = self.output.len();
                     self.output.push(OutputLine {
                         text: String::new(),
@@ -6672,16 +6988,68 @@ impl App {
                         prebuilt_spans: Some(running_spans),
                         rendered: None,
                     });
-                    self.pending_tool_lines.push_back(PendingToolLine {
+                    self.pending_tool_lines.insert(
+                        tool_call_id,
+                        PendingToolLine {
+                            tool_name: name,
+                            args_json,
+                            line_idx,
+                            edit_snapshot,
+                        },
+                    );
+                    if self.at_bottom {
+                        self.scroll_offset = 0;
+                    }
+                    self.needs_redraw = true;
+                }
+                AgentResponse::ToolProgress {
+                    tool_call_id,
+                    name,
+                    message,
+                } => {
+                    let detail = message.trim().to_string();
+                    if detail.is_empty() {
+                        continue;
+                    }
+                    if let DisplayState::ToolExec {
+                        tool_call_id: active_tool_call_id,
+                        detail: active_detail,
+                        ..
+                    } = &mut self.display_state
+                    {
+                        if active_tool_call_id == &tool_call_id {
+                            *active_detail = Some(detail.clone());
+                        }
+                    }
+                    if let Some(PendingToolLine {
                         line_idx,
-                        edit_snapshot,
-                    });
+                        tool_name,
+                        args_json,
+                        ..
+                    }) = self.pending_tool_lines.get(&tool_call_id).cloned()
+                    {
+                        if line_idx < self.output.len() {
+                            self.output[line_idx].prebuilt_spans = Some(build_tool_running_line(
+                                &tool_name,
+                                &args_json,
+                                Some(detail.as_str()),
+                                &self.theme.tool_emojis,
+                            ));
+                            self.output[line_idx].rendered = None;
+                        }
+                    } else {
+                        self.push_output(
+                            format!("{}: {detail}", name.replace('_', " ")),
+                            OutputRole::System,
+                        );
+                    }
                     if self.at_bottom {
                         self.scroll_offset = 0;
                     }
                     self.needs_redraw = true;
                 }
                 AgentResponse::ToolDone {
+                    tool_call_id,
                     name,
                     args_json,
                     result_preview,
@@ -6703,7 +7071,7 @@ impl App {
                     // second line for the same tool call — the layout stays stable
                     // (no shift), and the cyan "···" naturally becomes the gold
                     // timing string without any visual flash.
-                    let pending = self.pending_tool_lines.pop_front();
+                    let pending = self.pending_tool_lines.remove(&tool_call_id);
                     if let Some(PendingToolLine { line_idx, .. }) = pending.as_ref() {
                         if *line_idx < self.output.len() {
                             self.output[*line_idx].prebuilt_spans = Some(spans);
@@ -7440,33 +7808,14 @@ impl App {
             }
         };
         let canonical = edgecrab_tools::vision_models::normalize_provider_name(provider_str);
-        // Special-case copilot: use VsCodeCopilotProvider::new() directly (direct API mode).
-        // ProviderFactory::create_llm_provider forces proxy mode (localhost:4141).
-        let new_provider = if canonical == "vscode-copilot" {
-            match VsCodeCopilotProvider::new()
-                .model(model_name)
-                .with_vision(true) // Enable vision so copilot-vision-request header is sent
-                .build()
-            {
-                Ok(p) => std::sync::Arc::new(p) as Arc<dyn edgequake_llm::LLMProvider>,
-                Err(e) => {
-                    self.push_output(
-                        format!("Failed to create copilot provider: {e}"),
-                        OutputRole::Error,
-                    );
-                    return;
-                }
-            }
-        } else {
-            match ProviderFactory::create_llm_provider(&canonical, model_name) {
-                Ok(p) => p,
-                Err(e) => {
-                    self.push_output(
-                        format!("Failed to create provider '{provider_str}': {e}"),
-                        OutputRole::Error,
-                    );
-                    return;
-                }
+        let new_provider = match edgecrab_tools::create_provider_for_model(&canonical, model_name) {
+            Ok(p) => p,
+            Err(e) => {
+                self.push_output(
+                    format!("Failed to create provider '{provider_str}': {e}"),
+                    OutputRole::Error,
+                );
+                return;
             }
         };
         let model_clone = model.clone();
@@ -7603,32 +7952,602 @@ impl App {
     }
 
     fn open_moa_aggregator_selector(&mut self) {
-        let moa = self
-            .agent
-            .as_ref()
-            .map(|agent| self.rt_handle.block_on(agent.moa_config()))
-            .unwrap_or_else(|| self.load_runtime_config().moa);
+        let moa = self.current_moa_config();
         self.refresh_shared_model_selector_catalog(
             moa.aggregator_model,
             ModelSelectorTarget::MoaAggregator,
         );
     }
 
-    fn open_moa_reference_selector(&mut self) {
-        let moa = self
-            .agent
+    fn current_moa_config(&self) -> edgecrab_core::config::MoaConfig {
+        self.agent
             .as_ref()
             .map(|agent| self.rt_handle.block_on(agent.moa_config()))
-            .unwrap_or_else(|| self.load_runtime_config().moa);
-        self.moa_reference_selected = moa.reference_models.iter().cloned().collect();
-        self.moa_reference_selector
-            .set_items(build_model_selector_entries(
-                &ModelCatalog::grouped_catalog(),
-                None,
+            .unwrap_or_else(|| self.load_runtime_config().moa)
+    }
+
+    fn current_toolset_filters(&self) -> (Vec<String>, Vec<String>) {
+        let (enabled_toolsets, disabled_toolsets, _, _) = self.current_tool_filters();
+        (enabled_toolsets, disabled_toolsets)
+    }
+
+    fn current_tool_filters(&self) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
+        self.agent
+            .as_ref()
+            .map(|agent| self.rt_handle.block_on(agent.tool_filters()))
+            .unwrap_or_else(|| {
+                let config = self.load_runtime_config();
+                (
+                    config.tools.enabled_toolsets.unwrap_or_default(),
+                    config.tools.disabled_toolsets.unwrap_or_default(),
+                    config.tools.enabled_tools.unwrap_or_default(),
+                    config.tools.disabled_tools.unwrap_or_default(),
+                )
+            })
+    }
+
+    fn current_tool_inventory(&self) -> Vec<ToolInventoryEntry> {
+        self.agent
+            .as_ref()
+            .map(|agent| self.rt_handle.block_on(agent.tool_inventory()))
+            .unwrap_or_default()
+    }
+
+    fn build_tool_manager_entries(&self, scope: ToolManagerScope) -> Vec<ToolManagerEntry> {
+        let inventory = self.current_tool_inventory();
+        let (enabled_toolsets, disabled_toolsets, enabled_tools, disabled_tools) =
+            self.current_tool_filters();
+
+        let mut tool_entries: Vec<ToolManagerEntry> = inventory
+            .iter()
+            .map(|entry| {
+                let policy_source = if disabled_tools
+                    .iter()
+                    .any(|candidate| candidate == &entry.name)
+                {
+                    ToolPolicySource::ExplicitDisable
+                } else if enabled_tools
+                    .iter()
+                    .any(|candidate| candidate == &entry.name)
+                {
+                    ToolPolicySource::ExplicitEnable
+                } else {
+                    ToolPolicySource::Default
+                };
+
+                let detail = format!(
+                    "{} · {}",
+                    entry.toolset,
+                    if entry.exposed() {
+                        "exposed"
+                    } else if !entry.policy_enabled {
+                        "disabled by policy"
+                    } else if !entry.startup_available {
+                        "startup unavailable"
+                    } else {
+                        "runtime gated"
+                    }
+                );
+
+                ToolManagerEntry {
+                    kind: ToolManagerItemKind::Tool,
+                    name: entry.name.clone(),
+                    toolset: entry.toolset.clone(),
+                    description: entry.description.clone(),
+                    detail,
+                    tag: if entry.dynamic {
+                        "dynamic".into()
+                    } else {
+                        "tool".into()
+                    },
+                    check_state: if entry.policy_enabled {
+                        ToolManagerCheckState::On
+                    } else {
+                        ToolManagerCheckState::Off
+                    },
+                    policy_source,
+                    exposed: entry.exposed(),
+                    startup_available: entry.startup_available,
+                    check_allowed: entry.check_allowed,
+                    dynamic: entry.dynamic,
+                    emoji: entry.emoji.clone(),
+                    aliases: entry.aliases.clone(),
+                    selected_tools: usize::from(entry.policy_enabled),
+                    total_tools: 1,
+                    exposed_tools: usize::from(entry.exposed()),
+                }
+            })
+            .collect();
+        tool_entries.sort_by(|left, right| left.name.cmp(&right.name));
+
+        let mut toolset_entries = Vec::new();
+        for (toolset, tools) in inventory.iter().fold(
+            BTreeMap::<String, Vec<&ToolInventoryEntry>>::new(),
+            |mut acc, entry| {
+                acc.entry(entry.toolset.clone()).or_default().push(entry);
+                acc
+            },
+        ) {
+            let total_tools = tools.len();
+            let selected_tools = tools.iter().filter(|tool| tool.policy_enabled).count();
+            let exposed_tools = tools.iter().filter(|tool| tool.exposed()).count();
+            let toolset_enabled = edgecrab_tools::toolsets::toolset_enabled(
+                Some(&enabled_toolsets),
+                Some(&disabled_toolsets),
+                &toolset,
+            );
+            let explicit_enabled = tools
+                .iter()
+                .filter(|tool| {
+                    enabled_tools
+                        .iter()
+                        .any(|candidate| candidate == &tool.name)
+                })
+                .count();
+            let explicit_disabled = tools
+                .iter()
+                .filter(|tool| {
+                    disabled_tools
+                        .iter()
+                        .any(|candidate| candidate == &tool.name)
+                })
+                .count();
+            let check_state = if explicit_enabled > 0 || explicit_disabled > 0 {
+                ToolManagerCheckState::Mixed
+            } else if toolset_enabled {
+                ToolManagerCheckState::On
+            } else {
+                ToolManagerCheckState::Off
+            };
+            let policy_source =
+                if !toolset_entries_referencing(&toolset, &disabled_toolsets).is_empty() {
+                    ToolPolicySource::ExplicitDisable
+                } else if toolset_enabled
+                    && !enabled_toolsets.is_empty()
+                    && !edgecrab_tools::toolsets::contains_all_sentinel(&enabled_toolsets)
+                {
+                    ToolPolicySource::ExplicitEnable
+                } else {
+                    ToolPolicySource::Default
+                };
+            let preview = tools
+                .iter()
+                .take(4)
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            toolset_entries.push(ToolManagerEntry {
+                kind: ToolManagerItemKind::Toolset,
+                name: toolset.clone(),
+                toolset: toolset.clone(),
+                description: preview,
+                detail: format!(
+                    "{selected_tools}/{total_tools} selected · {exposed_tools}/{total_tools} exposed"
+                ),
+                tag: "toolset".into(),
+                check_state,
+                policy_source,
+                exposed: exposed_tools > 0,
+                startup_available: true,
+                check_allowed: true,
+                dynamic: tools.iter().any(|tool| tool.dynamic),
+                emoji: "◈".into(),
+                aliases: Vec::new(),
+                selected_tools,
+                total_tools,
+                exposed_tools,
+            });
+        }
+
+        match scope {
+            ToolManagerScope::All => {
+                toolset_entries.sort_by(|left, right| left.name.cmp(&right.name));
+                toolset_entries.extend(tool_entries);
+                toolset_entries
+            }
+            ToolManagerScope::Toolsets => {
+                toolset_entries.sort_by(|left, right| left.name.cmp(&right.name));
+                toolset_entries
+            }
+            ToolManagerScope::Tools => tool_entries,
+        }
+    }
+
+    fn refresh_tool_manager_entries(&mut self) -> bool {
+        if self.agent.is_none() {
+            self.push_output(
+                "Tool manager requires an active agent session.",
+                OutputRole::Error,
+            );
+            return false;
+        }
+        let entries = self.build_tool_manager_entries(self.tool_manager_scope);
+        if self.tool_manager.active {
+            self.tool_manager.replace_items_preserving_state(entries);
+        } else {
+            self.tool_manager.set_items(entries);
+        }
+        self.needs_redraw = true;
+        true
+    }
+
+    fn open_tool_manager(&mut self, mode: ToolManagerMode) {
+        self.tool_manager_scope = ToolManagerScope::from_mode(mode);
+        if !self.refresh_tool_manager_entries() {
+            return;
+        }
+        self.tool_manager_status_note =
+            Some("Space toggles policy. Tab switches scope. R restores defaults.".into());
+        self.tool_manager.active = true;
+        self.needs_redraw = true;
+    }
+
+    fn persist_and_apply_tool_filters(
+        &mut self,
+        enabled_toolsets: Vec<String>,
+        disabled_toolsets: Vec<String>,
+        enabled_tools: Vec<String>,
+        disabled_tools: Vec<String>,
+    ) -> Result<(), String> {
+        if let Some(agent) = self.agent.as_ref() {
+            let agent = Arc::clone(agent);
+            let agent_enabled_toolsets = enabled_toolsets.clone();
+            let agent_disabled_toolsets = disabled_toolsets.clone();
+            let agent_enabled_tools = enabled_tools.clone();
+            let agent_disabled_tools = disabled_tools.clone();
+            self.rt_handle.block_on(async move {
+                agent
+                    .set_tool_filters(
+                        agent_enabled_toolsets,
+                        agent_disabled_toolsets,
+                        agent_enabled_tools,
+                        agent_disabled_tools,
+                    )
+                    .await;
+            });
+        }
+
+        let enabled_toolsets_option = (!enabled_toolsets.is_empty()).then_some(enabled_toolsets);
+        let disabled_toolsets_option = (!disabled_toolsets.is_empty()).then_some(disabled_toolsets);
+        let enabled_tools_option = (!enabled_tools.is_empty()).then_some(enabled_tools);
+        let disabled_tools_option = (!disabled_tools.is_empty()).then_some(disabled_tools);
+
+        persist_tool_filters_to_config(
+            enabled_toolsets_option.as_deref(),
+            disabled_toolsets_option.as_deref(),
+            enabled_tools_option.as_deref(),
+            disabled_tools_option.as_deref(),
+        )
+        .map_err(|err| err.to_string())
+    }
+
+    fn toggle_tool_manager_selected(&mut self) {
+        let Some(entry) = self.tool_manager.current().cloned() else {
+            return;
+        };
+        let (mut enabled_toolsets, mut disabled_toolsets, mut enabled_tools, mut disabled_tools) =
+            self.current_tool_filters();
+
+        match entry.kind {
+            ToolManagerItemKind::Toolset => {
+                let is_enabled = edgecrab_tools::toolsets::toolset_enabled(
+                    Some(&enabled_toolsets),
+                    Some(&disabled_toolsets),
+                    &entry.toolset,
+                );
+                if is_enabled {
+                    disabled_toolsets.push(entry.toolset.clone());
+                } else {
+                    let mut enabled_option =
+                        (!enabled_toolsets.is_empty()).then_some(enabled_toolsets);
+                    let mut disabled_option =
+                        (!disabled_toolsets.is_empty()).then_some(disabled_toolsets);
+                    edgecrab_tools::toolsets::ensure_literal_toolset_enabled(
+                        &mut enabled_option,
+                        &mut disabled_option,
+                        &entry.toolset,
+                    );
+                    enabled_toolsets = enabled_option.unwrap_or_default();
+                    disabled_toolsets = disabled_option.unwrap_or_default();
+                }
+                normalize_tool_policy_list(&mut enabled_toolsets);
+                normalize_tool_policy_list(&mut disabled_toolsets);
+            }
+            ToolManagerItemKind::Tool => {
+                let is_enabled = edgecrab_tools::toolsets::tool_enabled(
+                    Some(&enabled_toolsets),
+                    Some(&disabled_toolsets),
+                    Some(&enabled_tools),
+                    Some(&disabled_tools),
+                    &entry.name,
+                    &entry.toolset,
+                );
+                if is_enabled {
+                    disabled_tools.push(entry.name.clone());
+                    enabled_tools.retain(|candidate| candidate != &entry.name);
+                } else {
+                    enabled_tools.push(entry.name.clone());
+                    disabled_tools.retain(|candidate| candidate != &entry.name);
+                }
+                normalize_tool_policy_list(&mut enabled_tools);
+                normalize_tool_policy_list(&mut disabled_tools);
+            }
+        }
+
+        match self.persist_and_apply_tool_filters(
+            enabled_toolsets,
+            disabled_toolsets,
+            enabled_tools,
+            disabled_tools,
+        ) {
+            Ok(()) => {
+                self.tool_manager_status_note = Some(format!(
+                    "{} {}",
+                    if matches!(entry.kind, ToolManagerItemKind::Toolset) {
+                        "Updated toolset policy for"
+                    } else {
+                        "Updated tool policy for"
+                    },
+                    entry.name
+                ));
+                let _ = self.refresh_tool_manager_entries();
+            }
+            Err(err) => {
+                self.push_output(
+                    format!("Failed to update tool policy: {err}"),
+                    OutputRole::Error,
+                );
+            }
+        }
+    }
+
+    fn reset_tool_manager_policy(&mut self) {
+        match self.persist_and_apply_tool_filters(Vec::new(), Vec::new(), Vec::new(), Vec::new()) {
+            Ok(()) => {
+                self.tool_manager_status_note = Some("Tool policy reset to defaults.".to_string());
+                let _ = self.refresh_tool_manager_entries();
+                self.push_output("Tool policy reset to defaults.", OutputRole::System);
+            }
+            Err(err) => {
+                self.push_output(
+                    format!("Failed to reset tool policy: {err}"),
+                    OutputRole::Error,
+                );
+            }
+        }
+    }
+
+    fn current_moa_availability(&self) -> MoaAvailability {
+        let moa = self.current_moa_config();
+        let (enabled_toolsets, disabled_toolsets) = self.current_toolset_filters();
+        MoaAvailability {
+            feature_enabled: moa.enabled,
+            toolset_enabled: edgecrab_tools::toolsets::toolset_enabled(
+                Some(&enabled_toolsets),
+                Some(&disabled_toolsets),
+                "moa",
+            ),
+        }
+    }
+
+    fn describe_moa_toolset_policy(&self) -> Option<String> {
+        let (enabled_toolsets, disabled_toolsets) = self.current_toolset_filters();
+        let disabled_blockers = toolset_entries_referencing("moa", &disabled_toolsets);
+        if !disabled_blockers.is_empty() {
+            return Some(format!(
+                "`tools.disabled_toolsets` still blocks `moa` via {}. Remove that entry or edit the toolset policy.",
+                disabled_blockers.join(", ")
             ));
-        let primary = moa.reference_models.first().cloned().unwrap_or_default();
+        }
+
+        if !edgecrab_tools::toolsets::toolset_enabled(
+            Some(&enabled_toolsets),
+            Some(&disabled_toolsets),
+            "moa",
+        ) && !enabled_toolsets.is_empty()
+            && !edgecrab_tools::toolsets::contains_all_sentinel(&enabled_toolsets)
+        {
+            return Some(
+                "`tools.enabled_toolsets` still excludes `moa`. Add the literal `moa` entry or use an alias that expands to it."
+                    .into(),
+            );
+        }
+
+        None
+    }
+
+    fn apply_moa_config_update(
+        &mut self,
+        moa: edgecrab_core::config::MoaConfig,
+        ensure_toolset_reachable: bool,
+    ) -> Result<edgecrab_tools::toolsets::ToolsetEnableSync, String> {
+        let moa = moa.sanitized();
+        let sync = if ensure_toolset_reachable && moa.enabled {
+            self.ensure_moa_toolset_is_reachable()?
+        } else {
+            edgecrab_tools::toolsets::ToolsetEnableSync::default()
+        };
+
+        if let Some(agent) = self.agent.as_ref() {
+            let agent = Arc::clone(agent);
+            let persisted = moa.clone();
+            self.rt_handle.block_on(async move {
+                agent.set_moa_config(persisted).await;
+            });
+        }
+
+        persist_moa_config_to_config(&moa).map_err(|err| err.to_string())?;
+        Ok(sync)
+    }
+
+    fn emit_moa_enabled_feedback(
+        &mut self,
+        base_message: String,
+        sync: edgecrab_tools::toolsets::ToolsetEnableSync,
+    ) {
+        let availability = self.current_moa_availability();
+        if availability.effective() {
+            let mut details = Vec::new();
+            if sync.added_to_enabled {
+                details.push("added `moa` to `tools.enabled_toolsets`");
+            }
+            if sync.removed_from_disabled {
+                details.push("removed the literal `moa` block from `tools.disabled_toolsets`");
+            }
+            let message = if details.is_empty() {
+                base_message
+            } else {
+                format!(
+                    "{base_message} Tool exposure was repaired: {}.",
+                    details.join("; ")
+                )
+            };
+            self.push_output(message, OutputRole::System);
+            return;
+        }
+
+        let detail = self
+            .describe_moa_toolset_policy()
+            .unwrap_or_else(|| "the current toolset policy still hides it from the model.".into());
+        self.push_output(
+            format!("{base_message} However `moa` is still unavailable to the model: {detail}"),
+            OutputRole::Error,
+        );
+    }
+
+    fn ensure_moa_toolset_is_reachable(
+        &mut self,
+    ) -> Result<edgecrab_tools::toolsets::ToolsetEnableSync, String> {
+        let (enabled_toolsets, disabled_toolsets) = self.current_toolset_filters();
+        let mut enabled_option = if enabled_toolsets.is_empty() {
+            None
+        } else {
+            Some(enabled_toolsets)
+        };
+        let mut disabled_option = if disabled_toolsets.is_empty() {
+            None
+        } else {
+            Some(disabled_toolsets)
+        };
+        let sync = edgecrab_tools::toolsets::ensure_literal_toolset_enabled(
+            &mut enabled_option,
+            &mut disabled_option,
+            "moa",
+        );
+
+        let enabled_vec = enabled_option.clone().unwrap_or_default();
+        let disabled_vec = disabled_option.clone().unwrap_or_default();
+
+        if let Some(agent) = self.agent.as_ref() {
+            let agent = Arc::clone(agent);
+            self.rt_handle.block_on(async move {
+                agent.set_toolset_filters(enabled_vec, disabled_vec).await;
+            });
+        }
+
+        persist_toolset_filters_to_config(enabled_option.as_deref(), disabled_option.as_deref())
+            .map_err(|err| err.to_string())?;
+
+        Ok(sync)
+    }
+
+    fn open_moa_reference_selector_for_mode(&mut self, mode: MoaReferenceSelectorMode) {
+        let moa = self.current_moa_config();
+        self.moa_reference_selected = moa.reference_models.iter().cloned().collect();
+
+        let mut entries = build_model_selector_entries(&ModelCatalog::grouped_catalog(), None);
+        match mode {
+            MoaReferenceSelectorMode::EditRoster => {}
+            MoaReferenceSelectorMode::AddExpert => {
+                entries.retain(|entry| !self.moa_reference_selected.contains(&entry.display));
+            }
+            MoaReferenceSelectorMode::RemoveExpert => {
+                entries.retain(|entry| self.moa_reference_selected.contains(&entry.display));
+            }
+        }
+
+        if entries.is_empty() {
+            let message = match mode {
+                MoaReferenceSelectorMode::EditRoster => {
+                    "No model catalog entries are available to build an MoA roster.".to_string()
+                }
+                MoaReferenceSelectorMode::AddExpert => {
+                    "No additional models are available to add to the MoA expert roster."
+                        .to_string()
+                }
+                MoaReferenceSelectorMode::RemoveExpert => {
+                    "The MoA expert roster is empty, so there is nothing to remove.".to_string()
+                }
+            };
+            self.push_output(message, OutputRole::System);
+            return;
+        }
+
+        let primary = match mode {
+            MoaReferenceSelectorMode::EditRoster | MoaReferenceSelectorMode::RemoveExpert => moa
+                .reference_models
+                .first()
+                .cloned()
+                .unwrap_or_else(|| entries[0].display.clone()),
+            MoaReferenceSelectorMode::AddExpert => entries[0].display.clone(),
+        };
+
+        self.moa_reference_selector_mode = mode;
+        self.moa_reference_selector.set_items(entries);
         self.moa_reference_selector.activate_with_primary(&primary);
         self.needs_redraw = true;
+    }
+
+    fn open_moa_reference_selector(&mut self) {
+        self.open_moa_reference_selector_for_mode(MoaReferenceSelectorMode::EditRoster);
+    }
+
+    fn open_moa_add_expert_selector(&mut self) {
+        self.open_moa_reference_selector_for_mode(MoaReferenceSelectorMode::AddExpert);
+    }
+
+    fn open_moa_remove_expert_selector(&mut self) {
+        self.open_moa_reference_selector_for_mode(MoaReferenceSelectorMode::RemoveExpert);
+    }
+
+    fn handle_set_moa_enabled(&mut self, enabled: bool) {
+        let Some(agent) = self.require_agent() else {
+            return;
+        };
+
+        let mut moa = self.rt_handle.block_on(agent.moa_config());
+        moa.enabled = enabled;
+        match self.apply_moa_config_update(moa.clone(), enabled) {
+            Ok(sync) => {
+                if enabled {
+                    self.emit_moa_enabled_feedback(
+                        format!(
+                            "Mixture-of-Agents enabled. Future `moa` tool calls will use aggregator {} and {} reference model(s).",
+                            moa.aggregator_model,
+                            moa.reference_models.len()
+                        ),
+                        sync,
+                    );
+                } else {
+                    self.push_output(
+                        "Mixture-of-Agents disabled. The tool is hidden from future turns until you run `/moa on` or edit the MoA defaults again.",
+                        OutputRole::System,
+                    );
+                }
+            }
+            Err(err) => self.push_output(
+                if enabled {
+                    format!(
+                        "Mixture-of-Agents enabled for this session, but config save failed: {err}"
+                    )
+                } else {
+                    format!(
+                        "Mixture-of-Agents disabled for this session, but config save failed: {err}"
+                    )
+                },
+                OutputRole::Error,
+            ),
+        }
     }
 
     fn handle_show_moa_config(&mut self) {
@@ -7637,6 +8556,8 @@ impl App {
         };
 
         let moa = self.rt_handle.block_on(agent.moa_config());
+        let current_model = self.rt_handle.block_on(agent.model());
+        let availability = self.current_moa_availability();
         let references = if moa.reference_models.is_empty() {
             "(none)".to_string()
         } else {
@@ -7646,20 +8567,51 @@ impl App {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
+        let toolset_note = self
+            .describe_moa_toolset_policy()
+            .unwrap_or_else(|| "The current toolset policy exposes `moa` to the model.".into());
         let text = format!(
             "Mixture-of-Agents defaults:\n\
+             Config enabled:   {}\n\
+             Toolset exposed:  {}\n\
+             Effective:        {}\n\
+             Current chat model: {}\n\
              Aggregator:       {}\n\
              Reference count:  {}\n\
              Reference roster:\n{}\n\
+             Toolset policy:   {}\n\
+             Runtime safety:   MoA auto-adds the current chat model as a last-chance expert \
+                               and falls back to it for aggregation if the saved aggregator \
+                               cannot run.\n\
              \nUsage:\n\
-              /moa aggregator            open the aggregator selector\n\
-              /moa references            open the reference roster selector\n\
-              /moa add <provider/model>  add one reference model\n\
-              /moa remove <provider/model>\n\
-              /moa reset                 restore built-in defaults",
+              /moa on                     enable the tool with the saved defaults\n\
+              /moa off                    disable the tool without losing the roster\n\
+              /moa aggregator             open the aggregator selector\n\
+              /moa experts                open the full expert roster editor\n\
+              /moa add [provider/model]   add one expert from the catalog or by id\n\
+              /moa remove [provider/model] remove one configured expert\n\
+              /moa reset                  reset to a safe baseline for the current chat model\n\
+              Tool name:                   `moa` (legacy alias: `mixture_of_agents`)",
+            if availability.feature_enabled {
+                "yes"
+            } else {
+                "no"
+            },
+            if availability.toolset_enabled {
+                "yes"
+            } else {
+                "no"
+            },
+            if availability.effective() {
+                "yes"
+            } else {
+                "no"
+            },
+            current_model,
             moa.aggregator_model,
             moa.reference_models.len(),
             references,
+            toolset_note,
         );
         self.push_output(text, OutputRole::System);
     }
@@ -7679,6 +8631,7 @@ impl App {
         }
 
         let mut moa = self.rt_handle.block_on(agent.moa_config());
+        moa.enabled = true;
         if matches!(trimmed.to_ascii_lowercase().as_str(), "default" | "reset") {
             moa.aggregator_model =
                 edgecrab_tools::tools::mixture_of_agents::DEFAULT_AGGREGATOR_MODEL.to_string();
@@ -7693,15 +8646,10 @@ impl App {
             moa.aggregator_model = format!("{}/{}", canonical_provider(&provider), model);
         }
 
-        let persisted = moa.clone();
-        let agent_clone = Arc::clone(&agent);
-        self.rt_handle.block_on(async move {
-            agent_clone.set_moa_config(persisted).await;
-        });
-        match persist_moa_config_to_config(&moa) {
-            Ok(()) => self.push_output(
+        match self.apply_moa_config_update(moa.clone(), true) {
+            Ok(sync) => self.emit_moa_enabled_feedback(
                 format!("MoA aggregator set to {}.", moa.aggregator_model),
-                OutputRole::System,
+                sync,
             ),
             Err(err) => self.push_output(
                 format!("MoA aggregator updated for this session, but config save failed: {err}"),
@@ -7724,19 +8672,15 @@ impl App {
         }
 
         let mut moa = self.rt_handle.block_on(agent.moa_config());
+        moa.enabled = true;
         moa.reference_models = selected;
-        let persisted = moa.clone();
-        let agent_clone = Arc::clone(&agent);
-        self.rt_handle.block_on(async move {
-            agent_clone.set_moa_config(persisted).await;
-        });
-        match persist_moa_config_to_config(&moa) {
-            Ok(()) => self.push_output(
+        match self.apply_moa_config_update(moa.clone(), true) {
+            Ok(sync) => self.emit_moa_enabled_feedback(
                 format!(
                     "MoA reference roster updated ({} models).",
                     moa.reference_models.len()
                 ),
-                OutputRole::System,
+                sync,
             ),
             Err(err) => self.push_output(
                 format!("MoA references updated for this session, but config save failed: {err}"),
@@ -7752,7 +8696,7 @@ impl App {
 
         let trimmed = spec.trim();
         if trimmed.is_empty() {
-            self.open_moa_reference_selector();
+            self.open_moa_add_expert_selector();
             return;
         }
 
@@ -7765,6 +8709,7 @@ impl App {
         };
 
         let mut moa = self.rt_handle.block_on(agent.moa_config());
+        moa.enabled = true;
         let selection = format!("{}/{}", canonical_provider(&provider), model);
         if !moa
             .reference_models
@@ -7773,15 +8718,10 @@ impl App {
         {
             moa.reference_models.push(selection.clone());
         }
-        let persisted = moa.clone();
-        let agent_clone = Arc::clone(&agent);
-        self.rt_handle.block_on(async move {
-            agent_clone.set_moa_config(persisted).await;
-        });
-        match persist_moa_config_to_config(&moa) {
-            Ok(()) => self.push_output(
+        match self.apply_moa_config_update(moa, true) {
+            Ok(sync) => self.emit_moa_enabled_feedback(
                 format!("Added {selection} to the MoA reference roster."),
-                OutputRole::System,
+                sync,
             ),
             Err(err) => self.push_output(
                 format!("MoA reference updated for this session, but config save failed: {err}"),
@@ -7797,7 +8737,7 @@ impl App {
 
         let trimmed = spec.trim();
         if trimmed.is_empty() {
-            self.open_moa_reference_selector();
+            self.open_moa_remove_expert_selector();
             return;
         }
 
@@ -7811,25 +8751,21 @@ impl App {
 
         let selection = format!("{}/{}", canonical_provider(&provider), model);
         let mut moa = self.rt_handle.block_on(agent.moa_config());
+        moa.enabled = true;
         moa.reference_models
             .retain(|candidate| candidate != &selection);
         if moa.reference_models.is_empty() {
             self.push_output(
-                "MoA needs at least one reference model. Use /moa references to pick a replacement before removing the last entry.",
+                "MoA needs at least one reference model. Use /moa experts to pick a replacement before removing the last entry.",
                 OutputRole::Error,
             );
             return;
         }
 
-        let persisted = moa.clone();
-        let agent_clone = Arc::clone(&agent);
-        self.rt_handle.block_on(async move {
-            agent_clone.set_moa_config(persisted).await;
-        });
-        match persist_moa_config_to_config(&moa) {
-            Ok(()) => self.push_output(
+        match self.apply_moa_config_update(moa, true) {
+            Ok(sync) => self.emit_moa_enabled_feedback(
                 format!("Removed {selection} from the MoA reference roster."),
-                OutputRole::System,
+                sync,
             ),
             Err(err) => self.push_output(
                 format!("MoA reference updated for this session, but config save failed: {err}"),
@@ -7842,17 +8778,23 @@ impl App {
         let Some(agent) = self.require_agent() else {
             return;
         };
-
-        let moa = edgecrab_core::config::MoaConfig::default();
-        let persisted = moa.clone();
-        let agent_clone = Arc::clone(&agent);
-        self.rt_handle.block_on(async move {
-            agent_clone.set_moa_config(persisted).await;
-        });
-        match persist_moa_config_to_config(&moa) {
-            Ok(()) => self.push_output(
-                "MoA defaults restored to the built-in frontier roster.",
-                OutputRole::System,
+        let current_model = self.rt_handle.block_on(agent.model());
+        let recommended =
+            edgecrab_tools::tools::mixture_of_agents::recommended_moa_config_for_model_spec(
+                &current_model,
+            );
+        let moa = edgecrab_core::config::MoaConfig {
+            enabled: recommended.enabled,
+            reference_models: recommended.reference_models,
+            aggregator_model: recommended.aggregator_model,
+        };
+        match self.apply_moa_config_update(moa, true) {
+            Ok(sync) => self.emit_moa_enabled_feedback(
+                format!(
+                    "MoA defaults reset to a safe baseline for {}. Add more experts with `/moa add` or `/moa experts` when you want a broader roster.",
+                    current_model
+                ),
+                sync,
             ),
             Err(err) => self.push_output(
                 format!("MoA defaults restored for this session, but config save failed: {err}"),
@@ -8255,6 +9197,7 @@ impl App {
             "EdgeCrab config summary:\n\
              Model:           {}\n\
              Cheap model:     {}\n\
+             MoA:             {}\n\
              MoA aggregator:  {}\n\
              MoA refs:        {}\n\
              Reasoning pane:  {}\n\
@@ -8276,6 +9219,7 @@ impl App {
             } else {
                 "off".into()
             },
+            if config.moa.enabled { "on" } else { "off" },
             config.moa.aggregator_model,
             config.moa.reference_models.len(),
             if self.show_reasoning {
@@ -8394,6 +9338,14 @@ impl App {
                 action: ConfigAction::ShowPaths,
             },
             ConfigEntry {
+                title: "Tools".into(),
+                detail:
+                    "Browse toolsets and individual tools with live checkboxes and reset support"
+                        .into(),
+                tag: "tools".into(),
+                action: ConfigAction::OpenTools,
+            },
+            ConfigEntry {
                 title: format!("Model  [{}]", self.model_name),
                 detail: "Open the live model selector".into(),
                 tag: "model".into(),
@@ -8415,6 +9367,12 @@ impl App {
                 action: ConfigAction::OpenCheapModel,
             },
             ConfigEntry {
+                title: format!("MoA  [{}]", if config.moa.enabled { "on" } else { "off" }),
+                detail: "Enable or disable the moa tool while preserving its saved defaults".into(),
+                tag: "moa".into(),
+                action: ConfigAction::ToggleMoa,
+            },
+            ConfigEntry {
                 title: "Vision Backend".into(),
                 detail: "Inspect or switch the dedicated vision routing".into(),
                 tag: "model".into(),
@@ -8427,8 +9385,16 @@ impl App {
                 action: ConfigAction::OpenImageModel,
             },
             ConfigEntry {
-                title: format!("MoA Aggregator  [{}]", config.moa.aggregator_model),
-                detail: "Choose the synthesizer model for mixture_of_agents".into(),
+                title: format!(
+                    "MoA Aggregator  [{}]",
+                    if config.moa.enabled {
+                        config.moa.aggregator_model.as_str()
+                    } else {
+                        "disabled"
+                    }
+                ),
+                detail: "Choose the synthesizer model used by the moa tool when it is enabled"
+                    .into(),
                 tag: "moa".into(),
                 action: ConfigAction::OpenMoaAggregator,
             },
@@ -8437,9 +9403,21 @@ impl App {
                     "MoA References  [{} models]",
                     config.moa.reference_models.len()
                 ),
-                detail: "Edit the default frontier roster for mixture_of_agents".into(),
+                detail: "Edit the full default expert roster used by the moa tool".into(),
                 tag: "moa".into(),
                 action: ConfigAction::OpenMoaReferences,
+            },
+            ConfigEntry {
+                title: "MoA Add Expert".into(),
+                detail: "Add one expert to the default MoA roster from the model catalog".into(),
+                tag: "moa".into(),
+                action: ConfigAction::AddMoaExpert,
+            },
+            ConfigEntry {
+                title: "MoA Remove Expert".into(),
+                detail: "Remove one configured expert from the default MoA roster".into(),
+                tag: "moa".into(),
+                action: ConfigAction::RemoveMoaExpert,
             },
             ConfigEntry {
                 title: format!(
@@ -8524,11 +9502,22 @@ impl App {
             ConfigAction::ShowPaths => {
                 self.push_output(self.render_config_paths(), OutputRole::System);
             }
+            ConfigAction::OpenTools => {
+                self.open_tool_manager(ToolManagerMode::All);
+            }
             ConfigAction::OpenModel => {
                 self.refresh_model_selector_catalog();
             }
             ConfigAction::OpenCheapModel => {
                 self.open_cheap_model_selector();
+            }
+            ConfigAction::ToggleMoa => {
+                let enabled = self
+                    .agent
+                    .as_ref()
+                    .map(|agent| self.rt_handle.block_on(agent.moa_config()).enabled)
+                    .unwrap_or_else(|| self.load_runtime_config().moa.enabled);
+                self.handle_set_moa_enabled(!enabled);
             }
             ConfigAction::OpenVisionModel => {
                 self.open_vision_model_selector();
@@ -8541,6 +9530,12 @@ impl App {
             }
             ConfigAction::OpenMoaReferences => {
                 self.open_moa_reference_selector();
+            }
+            ConfigAction::AddMoaExpert => {
+                self.open_moa_add_expert_selector();
+            }
+            ConfigAction::RemoveMoaExpert => {
+                self.open_moa_remove_expert_selector();
             }
             ConfigAction::ToggleStreaming => {
                 self.handle_set_streaming("toggle".into());
@@ -8583,6 +9578,7 @@ impl App {
                 self.open_cheap_model_selector();
             }
             "moa" => self.handle_show_moa_config(),
+            "tools" | "toolsets" => self.open_tool_manager(ToolManagerMode::All),
             "paths" | "path" => {
                 self.push_output(self.render_config_paths(), OutputRole::System);
             }
@@ -9421,40 +10417,6 @@ impl App {
                 "Usage: /skills [list | view <name> | install <path-or-source-or-owner/repo/path> | update [name] | remove <name> | hub [query] | search [query]]",
                 OutputRole::System,
             ),
-        }
-    }
-
-    fn handle_show_tools(&mut self) {
-        let Some(agent) = self.require_agent() else {
-            return;
-        };
-        let names = self.rt_handle.block_on(async { agent.tool_names().await });
-        if names.is_empty() {
-            self.push_output("No tools registered.", OutputRole::System);
-        } else {
-            let mut text = format!("Registered tools ({}):\n", names.len());
-            for name in &names {
-                text.push_str(&format!("  {name}\n"));
-            }
-            self.push_output(text, OutputRole::System);
-        }
-    }
-
-    fn handle_show_toolsets(&mut self) {
-        let Some(agent) = self.require_agent() else {
-            return;
-        };
-        let toolsets = self
-            .rt_handle
-            .block_on(async { agent.toolset_summary().await });
-        if toolsets.is_empty() {
-            self.push_output("No toolsets registered.", OutputRole::System);
-        } else {
-            let mut text = String::from("Available toolsets:\n");
-            for (name, count) in &toolsets {
-                text.push_str(&format!("  {name:<14} ({count} tools)\n"));
-            }
-            self.push_output(text, OutputRole::System);
         }
     }
 
@@ -10344,6 +11306,9 @@ impl App {
             origin_chat: None,
             session_key: None,
             todo_store: None,
+            current_tool_call_id: None,
+            current_tool_name: None,
+            tool_progress_tx: None,
         }
     }
 
@@ -12492,6 +13457,10 @@ impl App {
             self.render_skill_selector(frame, frame.area());
         }
 
+        if self.tool_manager.active {
+            self.render_tool_manager(frame, frame.area());
+        }
+
         if self.remote_skill_browser.selector.active {
             self.render_remote_skill_selector(frame, frame.area());
         }
@@ -12772,8 +13741,10 @@ impl App {
             DisplayState::ToolExec {
                 name,
                 args_json,
+                detail,
                 frame: f,
                 started,
+                ..
             } => {
                 let spinner = SPINNER_FRAMES[*f % SPINNER_FRAMES.len()];
                 let elapsed_secs = started.elapsed().as_secs();
@@ -12798,7 +13769,11 @@ impl App {
                     // Tool-specific verb ("searching", "executing", "reading", …)
                     // gives more context than a generic spinner label.
                     let verb = tool_action_verb(name);
-                    let preview = tool_status_preview(name, args_json);
+                    let preview = detail
+                        .as_deref()
+                        .filter(|detail| !detail.trim().is_empty())
+                        .map(|detail| edgecrab_core::safe_truncate(detail.trim(), 60).to_string())
+                        .unwrap_or_else(|| tool_status_preview(name, args_json));
                     format!(" {spinner} {verb} {icon} {preview}{time_part}{stop_hint} ")
                 };
                 left_spans.push(Span::styled(
@@ -13317,6 +14292,27 @@ impl App {
     fn render_moa_reference_selector(&self, frame: &mut Frame, area: Rect) {
         frame.render_widget(Clear, area);
 
+        let (title, placeholder, action_hint, count_hint) = match self.moa_reference_selector_mode {
+            MoaReferenceSelectorMode::EditRoster => (
+                " Select MoA Experts ",
+                "Type to filter expert models…",
+                "Space toggle  ",
+                format!("{} selected", self.moa_reference_selected.len()),
+            ),
+            MoaReferenceSelectorMode::AddExpert => (
+                " Add MoA Expert ",
+                "Type to find an expert to add…",
+                "Enter add  ",
+                format!("{} configured", self.moa_reference_selected.len()),
+            ),
+            MoaReferenceSelectorMode::RemoveExpert => (
+                " Remove MoA Expert ",
+                "Type to find a configured expert…",
+                "Enter remove  ",
+                format!("{} configured", self.moa_reference_selected.len()),
+            ),
+        };
+
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -13327,7 +14323,7 @@ impl App {
             .split(area);
 
         let search_text = if self.moa_reference_selector.query.is_empty() {
-            "Type to filter reference models…".to_string()
+            placeholder.to_string()
         } else {
             self.moa_reference_selector.query.clone()
         };
@@ -13344,7 +14340,7 @@ impl App {
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Rgb(130, 210, 255)))
-                .title(" Select MoA References "),
+                .title(title),
         );
         frame.render_widget(search, chunks[0]);
 
@@ -13371,15 +14367,26 @@ impl App {
                 } else {
                     Color::Rgb(18, 22, 28)
                 };
-                ListItem::new(Line::from(vec![
-                    Span::styled(
-                        format!("  [{}] ", if is_checked { "x" } else { " " }),
-                        Style::default().bg(bg).fg(if is_checked {
+                let prefix = match self.moa_reference_selector_mode {
+                    MoaReferenceSelectorMode::EditRoster => {
+                        format!("  [{}] ", if is_checked { "x" } else { " " })
+                    }
+                    MoaReferenceSelectorMode::AddExpert => "  [+] ".to_string(),
+                    MoaReferenceSelectorMode::RemoveExpert => "  [-] ".to_string(),
+                };
+                let prefix_color = match self.moa_reference_selector_mode {
+                    MoaReferenceSelectorMode::EditRoster => {
+                        if is_checked {
                             Color::Green
                         } else {
                             Color::DarkGray
-                        }),
-                    ),
+                        }
+                    }
+                    MoaReferenceSelectorMode::AddExpert => Color::Rgb(120, 220, 160),
+                    MoaReferenceSelectorMode::RemoveExpert => Color::Rgb(255, 130, 130),
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(prefix, Style::default().bg(bg).fg(prefix_color)),
                     Span::styled(
                         unicode_pad_right(&entry.display, 38),
                         Style::default().bg(bg).fg(if is_selected {
@@ -13403,16 +14410,34 @@ impl App {
         let help = Paragraph::new(Line::from(vec![
             Span::styled(" ↑↓ ", Style::default().fg(Color::Cyan)),
             Span::styled("navigate  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Space ", Style::default().fg(Color::Cyan)),
-            Span::styled("toggle  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Enter ", Style::default().fg(Color::Cyan)),
-            Span::styled("save  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                if self.moa_reference_selector_mode == MoaReferenceSelectorMode::EditRoster {
+                    "Space "
+                } else {
+                    "Enter "
+                },
+                Style::default().fg(Color::Cyan),
+            ),
+            Span::styled(action_hint, Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                if self.moa_reference_selector_mode == MoaReferenceSelectorMode::EditRoster {
+                    "Enter "
+                } else {
+                    ""
+                },
+                Style::default().fg(Color::Cyan),
+            ),
+            Span::styled(
+                if self.moa_reference_selector_mode == MoaReferenceSelectorMode::EditRoster {
+                    "save  "
+                } else {
+                    ""
+                },
+                Style::default().fg(Color::DarkGray),
+            ),
             Span::styled("Esc ", Style::default().fg(Color::Cyan)),
             Span::styled("cancel  ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format!("{} selected", self.moa_reference_selected.len()),
-                Style::default().fg(Color::Rgb(80, 80, 100)),
-            ),
+            Span::styled(count_hint, Style::default().fg(Color::Rgb(80, 80, 100))),
         ]));
         frame.render_widget(help, chunks[2]);
     }
@@ -14187,6 +15212,234 @@ impl App {
         frame.render_widget(help, chunks[2]);
     }
 
+    fn render_tool_manager(&self, frame: &mut Frame, area: Rect) {
+        frame.render_widget(Clear, area);
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ])
+            .split(area);
+        let body = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+            .split(chunks[1]);
+
+        let tabs = [
+            ToolManagerScope::All,
+            ToolManagerScope::Toolsets,
+            ToolManagerScope::Tools,
+        ]
+        .into_iter()
+        .map(|scope| {
+            let style = if scope == self.tool_manager_scope {
+                Style::default()
+                    .fg(Color::Rgb(255, 238, 170))
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Rgb(120, 132, 146))
+            };
+            Span::styled(format!("[{}] ", scope.title()), style)
+        })
+        .collect::<Vec<_>>();
+
+        let search_text = if self.tool_manager.query.is_empty() {
+            "Search tools, toolsets, descriptions, or tags".to_string()
+        } else {
+            self.tool_manager.query.clone()
+        };
+        let search_style = if self.tool_manager.query.is_empty() {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let mut search_spans = vec![
+            Span::styled("  🧰 ", Style::default().fg(Color::Rgb(140, 220, 210))),
+            Span::styled(search_text, search_style),
+            Span::raw("   "),
+        ];
+        search_spans.extend(tabs);
+        let search = Paragraph::new(Line::from(search_spans)).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Rgb(110, 220, 210)))
+                .title(" Tool Manager "),
+        );
+        frame.render_widget(search, chunks[0]);
+
+        let filtered = &self.tool_manager.filtered;
+        let selected = self.tool_manager.selected;
+        let max_visible = body[0].height as usize;
+        let scroll_start = if selected >= max_visible {
+            selected - max_visible + 1
+        } else {
+            0
+        };
+
+        let items: Vec<ListItem> = if filtered.is_empty() {
+            vec![ListItem::new(Line::from(Span::styled(
+                "  No tools matched the current filter.",
+                Style::default().fg(Color::Rgb(120, 120, 135)),
+            )))]
+        } else {
+            filtered
+                .iter()
+                .skip(scroll_start)
+                .take(max_visible)
+                .enumerate()
+                .map(|(vis_idx, &entry_idx)| {
+                    let entry = &self.tool_manager.items[entry_idx];
+                    let is_selected = vis_idx + scroll_start == selected;
+                    let bg = if is_selected {
+                        Color::Rgb(20, 42, 46)
+                    } else {
+                        Color::Rgb(16, 22, 28)
+                    };
+                    let check_style = if is_selected {
+                        Style::default()
+                            .bg(bg)
+                            .fg(Color::Rgb(210, 240, 175))
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Rgb(145, 185, 120))
+                    };
+                    let kind_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(150, 180, 188))
+                    } else {
+                        Style::default().fg(Color::Rgb(95, 115, 125))
+                    };
+                    let name_style = if is_selected {
+                        Style::default()
+                            .bg(bg)
+                            .fg(Color::Rgb(110, 220, 210))
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Rgb(210, 220, 220))
+                    };
+                    let detail_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(170, 190, 190))
+                    } else {
+                        Style::default().fg(Color::Rgb(118, 138, 138))
+                    };
+
+                    ListItem::new(Line::from(vec![
+                        Span::styled(format!("  {}", entry.check_state.glyph()), check_style),
+                        Span::raw("  "),
+                        Span::styled(unicode_pad_right(&entry.tag, 8), kind_style),
+                        Span::styled(
+                            unicode_pad_right(&format!("{} {}", entry.emoji, entry.name), 30),
+                            name_style,
+                        ),
+                        Span::raw("  "),
+                        Span::styled(unicode_trunc(&entry.detail, 36), detail_style),
+                    ]))
+                })
+                .collect()
+        };
+
+        frame.render_widget(
+            List::new(items).style(Style::default().bg(Color::Rgb(16, 22, 28))),
+            body[0],
+        );
+
+        let mut detail_lines = Vec::new();
+        if let Some(entry) = self.tool_manager.current() {
+            let policy_text = match entry.policy_source {
+                ToolPolicySource::Default => "inherits default policy",
+                ToolPolicySource::ExplicitEnable => "forced on by explicit override",
+                ToolPolicySource::ExplicitDisable => "forced off by explicit override",
+            };
+            let runtime_text = if entry.exposed {
+                "visible to the model right now"
+            } else if !entry.startup_available {
+                "hidden because the tool is unavailable at startup"
+            } else if !entry.check_allowed {
+                "hidden by runtime gating in this session"
+            } else {
+                "hidden by current policy"
+            };
+
+            detail_lines.push(Line::from(Span::styled(
+                format!("{} {}", entry.emoji, entry.name),
+                Style::default()
+                    .fg(Color::Rgb(110, 220, 210))
+                    .add_modifier(Modifier::BOLD),
+            )));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(format!("Kind: {}", entry.tag)));
+            detail_lines.push(Line::from(format!("Policy: {policy_text}")));
+            detail_lines.push(Line::from(format!("Runtime: {runtime_text}")));
+
+            match entry.kind {
+                ToolManagerItemKind::Toolset => {
+                    detail_lines.push(Line::from(format!(
+                        "Coverage: {}/{} selected · {}/{} exposed",
+                        entry.selected_tools,
+                        entry.total_tools,
+                        entry.exposed_tools,
+                        entry.total_tools
+                    )));
+                    if !entry.description.is_empty() {
+                        detail_lines.push(Line::from(""));
+                        detail_lines.push(Line::from("Included tools:"));
+                        for tool in entry.description.split(", ").take(8) {
+                            detail_lines.push(Line::from(format!("  • {tool}")));
+                        }
+                    }
+                }
+                ToolManagerItemKind::Tool => {
+                    detail_lines.push(Line::from(format!("Toolset: {}", entry.toolset)));
+                    if entry.dynamic {
+                        detail_lines.push(Line::from("Origin: dynamic runtime tool"));
+                    }
+                    if !entry.aliases.is_empty() {
+                        detail_lines
+                            .push(Line::from(format!("Aliases: {}", entry.aliases.join(", "))));
+                    }
+                    detail_lines.push(Line::from(""));
+                    for line in entry.description.lines() {
+                        detail_lines.push(Line::from(line.to_string()));
+                    }
+                }
+            }
+        }
+
+        let detail = Paragraph::new(Text::from(detail_lines))
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Rgb(64, 88, 98)))
+                    .title(" Details "),
+            );
+        frame.render_widget(detail, body[1]);
+
+        let footer_note = self
+            .tool_manager_status_note
+            .as_deref()
+            .unwrap_or("Space toggles. Tab switches scope. R restores defaults.");
+        let help = Paragraph::new(Line::from(vec![
+            Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("browse  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Space ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("toggle  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Tab ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("scope  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("R ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("reset  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Esc ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("close  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                edgecrab_core::safe_truncate(footer_note, 44),
+                Style::default().fg(Color::Rgb(95, 115, 125)),
+            ),
+        ]));
+        frame.render_widget(help, chunks[2]);
+    }
+
     fn render_config_selector(&self, frame: &mut Frame, area: Rect) {
         frame.render_widget(Clear, area);
 
@@ -14299,6 +15552,9 @@ impl App {
             let detail_body = match entry.action {
                 ConfigAction::ShowSummary => self.render_config_summary(),
                 ConfigAction::ShowPaths => self.render_config_paths(),
+                ConfigAction::OpenTools => {
+                    "Press Enter to open the live tool manager. Use Space to toggle toolsets or individual tools, Tab to switch scopes, and R to restore defaults.".into()
+                }
                 ConfigAction::ShowGatewayHomes => {
                     let config = self.load_runtime_config();
                     self.render_gateway_home_channel_summary(&config)
@@ -14318,6 +15574,9 @@ impl App {
                 ConfigAction::OpenCheapModel => {
                     "Press Enter to open the cheap-model selector. Selecting a model enables smart routing for obviously simple turns.".into()
                 }
+                ConfigAction::ToggleMoa => {
+                    "Press Enter to enable or disable the moa tool while keeping the saved aggregator and expert roster.".into()
+                }
                 ConfigAction::OpenVisionModel => {
                     "Press Enter to open the dedicated vision-model selector.".into()
                 }
@@ -14325,10 +15584,16 @@ impl App {
                     "Press Enter to open the image-model selector.".into()
                 }
                 ConfigAction::OpenMoaAggregator => {
-                    "Press Enter to pick the default aggregator model used by mixture_of_agents.".into()
+                    "Press Enter to pick the default aggregator model used by the moa tool.".into()
                 }
                 ConfigAction::OpenMoaReferences => {
-                    "Press Enter to edit the default MoA reference roster. Use Space to toggle models and Enter to save.".into()
+                    "Press Enter to edit the full default MoA expert roster. Use Space to toggle experts and Enter to save.".into()
+                }
+                ConfigAction::AddMoaExpert => {
+                    "Press Enter to choose one model to add to the saved MoA expert roster.".into()
+                }
+                ConfigAction::RemoveMoaExpert => {
+                    "Press Enter to choose one configured expert to remove from the saved MoA roster.".into()
                 }
                 ConfigAction::ToggleStreaming => {
                     "Press Enter to toggle live token streaming.".into()
@@ -15358,12 +16623,25 @@ fn png_crc32(data: &[u8]) -> u32 {
 mod tests {
     use super::*;
 
+    fn line_spans_text(line: &OutputLine) -> String {
+        line.prebuilt_spans
+            .as_ref()
+            .map(|spans| {
+                spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .unwrap_or_else(|| line.text.clone())
+    }
+
     fn mock_agent() -> Arc<edgecrab_core::Agent> {
         let provider: Arc<dyn edgequake_llm::LLMProvider> =
             Arc::new(edgequake_llm::MockProvider::new());
         Arc::new(
             edgecrab_core::AgentBuilder::new("mock")
                 .provider(provider)
+                .tools(Arc::new(edgecrab_tools::registry::ToolRegistry::new()))
                 .build()
                 .expect("build agent"),
         )
@@ -15435,6 +16713,7 @@ mod tests {
     #[test]
     fn background_progress_text_formats_tool_events() {
         let event = edgecrab_core::StreamEvent::ToolExec {
+            tool_call_id: "call_1".into(),
             name: "terminal".into(),
             args_json: r#"{"command":"cargo test -p edgecrab-core"}"#.into(),
         };
@@ -16088,12 +17367,14 @@ mod tests {
         }
 
         persist_moa_config_to_config(&edgecrab_core::config::MoaConfig {
+            enabled: false,
             aggregator_model: "anthropic/claude-opus-4.6".into(),
             reference_models: vec!["anthropic/claude-opus-4.6".into(), "openai/gpt-4.1".into()],
         })
         .expect("persist moa");
 
         let cfg = edgecrab_core::AppConfig::load().expect("load config");
+        assert!(!cfg.moa.enabled);
         assert_eq!(cfg.moa.aggregator_model, "anthropic/claude-opus-4.6");
         assert_eq!(cfg.moa.reference_models.len(), 2);
 
@@ -16225,6 +17506,7 @@ mod tests {
         ]);
 
         let moa = rt.block_on(agent.moa_config());
+        assert!(moa.enabled);
         assert_eq!(moa.reference_models.len(), 2);
         assert!(
             moa.reference_models
@@ -16233,11 +17515,370 @@ mod tests {
         );
 
         let cfg = edgecrab_core::AppConfig::load().expect("load config");
+        assert!(cfg.moa.enabled);
         assert_eq!(cfg.moa.reference_models.len(), 2);
 
         app.open_moa_reference_selector();
         assert!(app.moa_reference_selector.active);
         assert_eq!(app.moa_reference_selected.len(), 2);
+        assert_eq!(
+            app.moa_reference_selector_mode,
+            MoaReferenceSelectorMode::EditRoster
+        );
+
+        app.open_moa_add_expert_selector();
+        assert!(app.moa_reference_selector.active);
+        assert_eq!(
+            app.moa_reference_selector_mode,
+            MoaReferenceSelectorMode::AddExpert
+        );
+        assert!(
+            app.moa_reference_selector
+                .items
+                .iter()
+                .all(|entry| !app.moa_reference_selected.contains(&entry.display))
+        );
+
+        app.open_moa_remove_expert_selector();
+        assert!(app.moa_reference_selector.active);
+        assert_eq!(
+            app.moa_reference_selector_mode,
+            MoaReferenceSelectorMode::RemoveExpert
+        );
+        assert_eq!(app.moa_reference_selector.items.len(), 2);
+        assert!(
+            app.moa_reference_selector
+                .items
+                .iter()
+                .all(|entry| app.moa_reference_selected.contains(&entry.display))
+        );
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(edgecrab_home_env)]
+    fn moa_off_command_updates_agent_and_config() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let _enter = rt.enter();
+        let mut app = App::new();
+        let agent = mock_agent();
+        drop(_enter);
+        app.set_agent(agent.clone());
+
+        app.handle_set_moa_enabled(false);
+
+        let moa = rt.block_on(agent.moa_config());
+        assert!(!moa.enabled);
+        assert!(!moa.reference_models.is_empty());
+
+        let cfg = edgecrab_core::AppConfig::load().expect("load config");
+        assert!(!cfg.moa.enabled);
+        assert!(!cfg.moa.reference_models.is_empty());
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(edgecrab_home_env)]
+    fn moa_aggregator_command_enables_feature_and_normalizes_model() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let _enter = rt.enter();
+        let mut app = App::new();
+        let agent = mock_agent();
+        drop(_enter);
+        app.set_agent(agent.clone());
+
+        app.handle_set_moa_enabled(false);
+        app.handle_set_moa_aggregator("copilot/gpt-4.1-mini".into());
+
+        let moa = rt.block_on(agent.moa_config());
+        assert!(moa.enabled);
+        assert_eq!(moa.aggregator_model, "vscode-copilot/gpt-4.1-mini");
+
+        let cfg = edgecrab_core::AppConfig::load().expect("load config");
+        assert!(cfg.moa.enabled);
+        assert_eq!(cfg.moa.aggregator_model, "vscode-copilot/gpt-4.1-mini");
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(edgecrab_home_env)]
+    fn moa_on_repairs_whitelist_and_persists_toolset_filters() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let _enter = rt.enter();
+        let mut app = App::new();
+        let agent = mock_agent();
+        drop(_enter);
+        app.set_agent(agent.clone());
+
+        let enabled_toolsets = vec!["web".to_string(), "terminal".to_string()];
+        persist_toolset_filters_to_config(Some(&enabled_toolsets), None).expect("persist toolsets");
+        rt.block_on(agent.set_toolset_filters(enabled_toolsets, Vec::new()));
+        app.handle_set_moa_enabled(true);
+
+        let (enabled_toolsets, disabled_toolsets) = rt.block_on(agent.toolset_filters());
+        assert!(enabled_toolsets.iter().any(|entry| entry == "moa"));
+        assert!(disabled_toolsets.is_empty());
+
+        let cfg = edgecrab_core::AppConfig::load().expect("load config");
+        assert!(
+            cfg.tools
+                .enabled_toolsets
+                .unwrap_or_default()
+                .iter()
+                .any(|entry| entry == "moa")
+        );
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(edgecrab_home_env)]
+    fn moa_on_removes_literal_disabled_toolset_block() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let _enter = rt.enter();
+        let mut app = App::new();
+        let agent = mock_agent();
+        drop(_enter);
+        app.set_agent(agent.clone());
+
+        let disabled_toolsets = vec!["moa".to_string()];
+        persist_toolset_filters_to_config(None, Some(&disabled_toolsets))
+            .expect("persist toolsets");
+        rt.block_on(agent.set_toolset_filters(Vec::new(), disabled_toolsets));
+        app.handle_set_moa_enabled(true);
+
+        let (_, disabled_toolsets) = rt.block_on(agent.toolset_filters());
+        assert!(disabled_toolsets.is_empty());
+
+        let cfg = edgecrab_core::AppConfig::load().expect("load config");
+        assert!(
+            cfg.tools
+                .disabled_toolsets
+                .unwrap_or_default()
+                .iter()
+                .all(|entry| entry != "moa")
+        );
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(edgecrab_home_env)]
+    fn moa_on_reports_alias_blocker_when_toolset_policy_still_hides_tool() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let _enter = rt.enter();
+        let mut app = App::new();
+        let agent = mock_agent();
+        drop(_enter);
+        app.set_agent(agent.clone());
+
+        let disabled_toolsets = vec!["safe".to_string()];
+        persist_toolset_filters_to_config(None, Some(&disabled_toolsets))
+            .expect("persist toolsets");
+        rt.block_on(agent.set_toolset_filters(Vec::new(), disabled_toolsets));
+        app.handle_set_moa_enabled(true);
+
+        let availability = app.current_moa_availability();
+        assert!(availability.feature_enabled);
+        assert!(!availability.toolset_enabled);
+        assert!(
+            app.output
+                .last()
+                .expect("moa feedback")
+                .text
+                .contains("tools.disabled_toolsets` still blocks `moa` via safe")
+        );
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(edgecrab_home_env)]
+    fn persist_tool_filters_round_trip() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+
+        let enabled_toolsets = vec!["core".to_string()];
+        let disabled_toolsets = vec!["web".to_string()];
+        let enabled_tools = vec!["browser_click".to_string()];
+        let disabled_tools = vec!["terminal".to_string()];
+
+        persist_tool_filters_to_config(
+            Some(&enabled_toolsets),
+            Some(&disabled_toolsets),
+            Some(&enabled_tools),
+            Some(&disabled_tools),
+        )
+        .expect("persist tool filters");
+
+        let cfg = edgecrab_core::AppConfig::load().expect("load config");
+        assert_eq!(
+            cfg.tools.enabled_toolsets.unwrap_or_default(),
+            enabled_toolsets
+        );
+        assert_eq!(
+            cfg.tools.disabled_toolsets.unwrap_or_default(),
+            disabled_toolsets
+        );
+        assert_eq!(cfg.tools.enabled_tools.unwrap_or_default(), enabled_tools);
+        assert_eq!(cfg.tools.disabled_tools.unwrap_or_default(), disabled_tools);
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(edgecrab_home_env)]
+    fn tool_manager_toggle_persists_explicit_tool_disable() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let _enter = rt.enter();
+        let mut app = App::new();
+        let agent = mock_agent();
+        drop(_enter);
+        app.set_agent(agent.clone());
+
+        app.open_tool_manager(ToolManagerMode::All);
+        app.tool_manager_scope = ToolManagerScope::Tools;
+        let _ = app.refresh_tool_manager_entries();
+        let tool_idx = app
+            .tool_manager
+            .items
+            .iter()
+            .position(|entry| {
+                entry.kind == ToolManagerItemKind::Tool && entry.name.as_str() == "terminal"
+            })
+            .expect("terminal tool");
+        app.tool_manager.selected = app
+            .tool_manager
+            .filtered
+            .iter()
+            .position(|candidate| *candidate == tool_idx)
+            .expect("terminal selected");
+
+        app.toggle_tool_manager_selected();
+
+        let (_, _, _, disabled_tools) = rt.block_on(agent.tool_filters());
+        assert!(disabled_tools.iter().any(|entry| entry == "terminal"));
+
+        let cfg = edgecrab_core::AppConfig::load().expect("load config");
+        assert!(
+            cfg.tools
+                .disabled_tools
+                .unwrap_or_default()
+                .iter()
+                .any(|entry| entry == "terminal")
+        );
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(edgecrab_home_env)]
+    fn moa_reset_uses_current_chat_model_as_safe_baseline() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let _enter = rt.enter();
+        let mut app = App::new();
+        let provider: Arc<dyn edgequake_llm::LLMProvider> =
+            Arc::new(edgequake_llm::MockProvider::new());
+        let agent = Arc::new(
+            edgecrab_core::AgentBuilder::new("copilot/gpt-5-mini")
+                .provider(provider)
+                .build()
+                .expect("build agent"),
+        );
+        drop(_enter);
+        app.set_agent(agent.clone());
+
+        app.handle_reset_moa_config();
+
+        let moa = rt.block_on(agent.moa_config());
+        assert!(moa.enabled);
+        assert_eq!(moa.aggregator_model, "vscode-copilot/gpt-5-mini");
+        assert_eq!(moa.reference_models, vec!["vscode-copilot/gpt-5-mini"]);
+
+        let cfg = edgecrab_core::AppConfig::load().expect("load config");
+        assert!(cfg.moa.enabled);
+        assert_eq!(cfg.moa.aggregator_model, "vscode-copilot/gpt-5-mini");
+        assert_eq!(cfg.moa.reference_models, vec!["vscode-copilot/gpt-5-mini"]);
 
         unsafe {
             std::env::remove_var("EDGECRAB_HOME");
@@ -16287,6 +17928,83 @@ mod tests {
             .expect("send token");
         app.check_responses();
         assert!(matches!(app.display_state, DisplayState::Streaming { .. }));
+    }
+
+    #[tokio::test]
+    async fn tool_done_updates_matching_placeholder_even_when_completions_arrive_out_of_order() {
+        let mut app = App::new();
+        app.response_tx
+            .send(AgentResponse::ToolExec {
+                tool_call_id: "call_1".into(),
+                name: "read_file".into(),
+                args_json: r#"{"path":"a.rs"}"#.into(),
+            })
+            .expect("send tool exec 1");
+        app.response_tx
+            .send(AgentResponse::ToolExec {
+                tool_call_id: "call_2".into(),
+                name: "terminal".into(),
+                args_json: r#"{"command":"echo hi"}"#.into(),
+            })
+            .expect("send tool exec 2");
+        app.response_tx
+            .send(AgentResponse::ToolDone {
+                tool_call_id: "call_2".into(),
+                name: "terminal".into(),
+                args_json: r#"{"command":"echo hi"}"#.into(),
+                result_preview: Some("stdout: hi".into()),
+                duration_ms: 12,
+                is_error: false,
+            })
+            .expect("send terminal done");
+        app.check_responses();
+
+        assert_eq!(app.output.len(), 2);
+        let first = line_spans_text(&app.output[0]);
+        let second = line_spans_text(&app.output[1]);
+        assert!(
+            first.contains("read file"),
+            "unexpected first line: {first}"
+        );
+        assert!(first.contains("···"), "unexpected first line: {first}");
+        assert!(
+            second.contains("terminal"),
+            "unexpected second line: {second}"
+        );
+        assert!(second.contains("12ms"), "unexpected second line: {second}");
+    }
+
+    #[tokio::test]
+    async fn tool_progress_updates_active_placeholder_and_status_detail() {
+        let mut app = App::new();
+        app.response_tx
+            .send(AgentResponse::ToolExec {
+                tool_call_id: "call_moa".into(),
+                name: "moa".into(),
+                args_json: r#"{"user_prompt":"ping"}"#.into(),
+            })
+            .expect("send moa tool exec");
+        app.response_tx
+            .send(AgentResponse::ToolProgress {
+                tool_call_id: "call_moa".into(),
+                name: "moa".into(),
+                message: "2/3 experts completed; trying aggregator fallback".into(),
+            })
+            .expect("send moa progress");
+        app.check_responses();
+
+        assert_eq!(app.output.len(), 1);
+        let running = line_spans_text(&app.output[0]);
+        assert!(running.contains("2/3 experts completed"), "got: {running}");
+        match &app.display_state {
+            DisplayState::ToolExec { detail, .. } => {
+                assert_eq!(
+                    detail.as_deref(),
+                    Some("2/3 experts completed; trying aggregator fallback")
+                );
+            }
+            other => panic!("expected ToolExec state, got {other:?}"),
+        }
     }
 
     #[tokio::test]

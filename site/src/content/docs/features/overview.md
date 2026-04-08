@@ -242,7 +242,7 @@ reachable, these tools are silently absent from the tool list.
 | Tool | Description |
 |------|-------------|
 | `delegate_task` | Spawn a subagent for a parallel subtask |
-| `mixture_of_agents` | Multi-model consensus reasoning |
+| `moa` | Multi-model consensus reasoning |
 
 ### Code Execution (`code_execution`)
 

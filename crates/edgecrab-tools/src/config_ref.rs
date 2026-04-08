@@ -101,6 +101,15 @@ pub struct AppConfigRef {
     /// explicit deny-list so a hallucinated tool call cannot bypass schema
     /// filtering.
     pub disabled_toolsets: Vec<String>,
+    /// Tools explicitly enabled for the current session.
+    ///
+    /// WHY separate from toolsets: users may want one browser or MCP helper
+    /// without exposing the rest of that toolset.
+    pub enabled_tools: Vec<String>,
+    /// Tools explicitly disabled for the current session.
+    ///
+    /// Disabled tools always win, even if their parent toolset is enabled.
+    pub disabled_tools: Vec<String>,
     /// External skill directories to scan in addition to ~/.edgecrab/skills/.
     /// Supports ~ and ${VAR} expansion (hermes-compatible paths).
     pub external_skill_dirs: Vec<String>,
@@ -181,9 +190,11 @@ pub struct AppConfigRef {
     pub image_provider: Option<String>,
     /// Preferred image-generation model from config (`image_generation.model`).
     pub image_model: Option<String>,
-    /// Default reference models for the `mixture_of_agents` tool.
+    /// Whether the `moa` tool is enabled for this session.
+    pub moa_enabled: bool,
+    /// Default reference models for the `moa` tool.
     pub moa_reference_models: Vec<String>,
-    /// Default aggregator model for the `mixture_of_agents` tool.
+    /// Default aggregator model for the `moa` tool.
     pub moa_aggregator_model: Option<String>,
 }
 
@@ -208,6 +219,8 @@ impl Default for AppConfigRef {
             delegation_max_iterations: 50,
             parent_active_toolsets: Vec::new(),
             disabled_toolsets: Vec::new(),
+            enabled_tools: Vec::new(),
+            disabled_tools: Vec::new(),
             external_skill_dirs: Vec::new(),
             disabled_skills: Vec::new(),
             browser_record_sessions: false,
@@ -238,6 +251,7 @@ impl Default for AppConfigRef {
             stt_whisper_model: None,
             image_provider: None,
             image_model: None,
+            moa_enabled: true,
             moa_reference_models: Vec::new(),
             moa_aggregator_model: None,
         }
@@ -253,6 +267,18 @@ impl AppConfigRef {
         (self.parent_active_toolsets.is_empty()
             || self.parent_active_toolsets.iter().any(|t| t == toolset))
             && !self.disabled_toolsets.iter().any(|t| t == toolset)
+    }
+
+    /// Whether a specific tool is allowed in the current session.
+    pub fn is_tool_enabled(&self, tool_name: &str, toolset: &str) -> bool {
+        crate::toolsets::tool_enabled(
+            Some(&self.parent_active_toolsets),
+            Some(&self.disabled_toolsets),
+            Some(&self.enabled_tools),
+            Some(&self.disabled_tools),
+            tool_name,
+            toolset,
+        )
     }
 
     /// Build the effective file path policy for a session workspace.

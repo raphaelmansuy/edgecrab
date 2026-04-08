@@ -176,7 +176,8 @@ Recent UX notes:
 
 - `/config` opens a searchable config center instead of only dumping paths.
 - `/cheap_model` and `/moa aggregator` reuse the same fast selector pattern as `/model`.
-- `/moa references` uses a searchable multi-select overlay instead of raw text editing.
+- `/moa experts` uses a searchable multi-select overlay for full roster editing, while `/moa add` and `/moa remove` open focused add/remove expert pickers.
+- `/moa on|off` gives Mixture-of-Agents the same explicit enable/disable ergonomics as cheap-model routing, and `/config` exposes a live MoA toggle.
 - `/theme` opens the skin browser by default; `/theme reload` is explicit.
 - `/statusbar` is a real persisted toggle.
 - `/approve`, `/deny`, `/sethome`, and `/update` now operate on live TUI or config state.

@@ -38,7 +38,7 @@ EdgeCrab implements a robust, extensible tool system, dynamic MCP integration, a
 	- Skills: `skills_list`, `skill_view`, `skill_manage`, `skills_hub`, `skills_guard`, `skills_sync`
 	- Session: `session_search`, `checkpoint`, `manage_todo_list`
 	- Memory: `memory_read`, `memory_write`
-	- Delegation: `delegate_task`, `mixture_of_agents`
+	- Delegation: `delegate_task`, `moa` (legacy alias: `mixture_of_agents`)
 	- Code execution: `execute_code` (sandboxed, RPC tool access)
 	- MCP: `mcp_list_tools`, `mcp_call_tool`, `mcp_list_resources`, etc.
 	- Media: `vision_analyze`, `text_to_speech`, `transcribe_audio`, `generate_image`

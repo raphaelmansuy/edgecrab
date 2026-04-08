@@ -299,6 +299,7 @@ pub fn build_tool_done_line(
 pub fn build_tool_running_line(
     tool_name: &str,
     args_json: &str,
+    detail: Option<&str>,
     emoji_overrides: &std::collections::HashMap<String, String>,
 ) -> Vec<Span<'static>> {
     let preview = extract_tool_preview(tool_name, args_json);
@@ -313,6 +314,11 @@ pub fn build_tool_running_line(
     } else {
         format!(" {preview}")
     };
+    let detail_part = detail
+        .map(str::trim)
+        .filter(|detail| !detail.is_empty())
+        .map(|detail| format!("  {}", unicode_trunc(detail, 54)))
+        .unwrap_or_default();
 
     let bar_style = Style::default()
         .fg(Color::Rgb(60, 60, 72))
@@ -331,6 +337,7 @@ pub fn build_tool_running_line(
         Span::styled(emoji.to_string(), indicator_style),
         Span::styled(format!(" {name_padded}"), name_style),
         Span::styled(preview_part, preview_style),
+        Span::styled(detail_part, preview_style),
         Span::styled("  ···".to_string(), running_style),
     ]
 }
