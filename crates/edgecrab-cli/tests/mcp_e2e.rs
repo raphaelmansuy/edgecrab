@@ -115,6 +115,10 @@ fn mcp_doctor_reports_static_stdio_failures() {
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "path canonicalization expands 8.3 short names (RUNNER~1) on Windows CI, causing path comparison mismatch"
+)]
 fn mcp_install_accepts_path_with_spaces_and_persists_it() {
     let home = tempdir().expect("temp home");
     let config_dir = home.path().join(".edgecrab");
