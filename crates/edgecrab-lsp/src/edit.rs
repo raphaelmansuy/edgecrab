@@ -28,6 +28,7 @@ pub fn apply_text_edits(original: &str, edits: &[TextEdit]) -> Result<String, Ls
     Ok(text)
 }
 
+#[allow(clippy::result_large_err)]
 fn apply_file_edits(
     ctx: &ToolContext,
     file_url: &Uri,
