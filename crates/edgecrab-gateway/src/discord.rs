@@ -135,6 +135,16 @@ struct MessageReference<'a> {
     message_id: &'a str,
 }
 
+#[derive(Debug, Deserialize)]
+struct CreateMessageResponse {
+    id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct UpdateMessageRequest<'a> {
+    content: &'a str,
+}
+
 // Trigger typing indicator request (empty body, POST).
 // No request body fields are needed; the POST URL is enough.
 
@@ -166,6 +176,8 @@ pub struct DiscordAdapter {
     token: String,
     /// Pre-built HTTP client
     client: reqwest::Client,
+    /// Base URL for the Discord REST API.
+    api_base: String,
     /// User IDs allowed to message the agent (empty = open access).
     allowed_users: Vec<String>,
 }
@@ -186,6 +198,7 @@ impl DiscordAdapter {
         Ok(Self {
             token,
             client,
+            api_base: DISCORD_API_BASE.into(),
             allowed_users: Vec::new(),
         })
     }
@@ -198,6 +211,7 @@ impl DiscordAdapter {
         Ok(Self {
             token,
             client,
+            api_base: DISCORD_API_BASE.into(),
             allowed_users,
         })
     }
@@ -265,7 +279,7 @@ impl DiscordAdapter {
 
     /// Trigger the typing indicator in a channel.
     async fn trigger_typing(&self, channel_id: &str) -> anyhow::Result<()> {
-        let url = format!("{}/channels/{}/typing", DISCORD_API_BASE, channel_id);
+        let url = format!("{}/channels/{}/typing", self.api_base, channel_id);
         self.client
             .post(&url)
             .header("Authorization", format!("Bot {}", self.token))
@@ -275,13 +289,13 @@ impl DiscordAdapter {
     }
 
     /// Send a message to a Discord channel via REST.
-    async fn send_rest_message(
+    async fn send_rest_message_with_id(
         &self,
         channel_id: &str,
         text: &str,
         reply_to: Option<&str>,
-    ) -> anyhow::Result<()> {
-        let url = format!("{}/channels/{}/messages", DISCORD_API_BASE, channel_id);
+    ) -> anyhow::Result<String> {
+        let url = format!("{}/channels/{}/messages", self.api_base, channel_id);
         let body = CreateMessageRequest {
             content: text,
             message_reference: reply_to.map(|id| MessageReference { message_id: id }),
@@ -296,7 +310,8 @@ impl DiscordAdapter {
             .await?;
 
         if resp.status().is_success() {
-            return Ok(());
+            let created: CreateMessageResponse = resp.json().await?;
+            return Ok(created.id);
         }
 
         let status = resp.status();
@@ -316,7 +331,8 @@ impl DiscordAdapter {
                 .send()
                 .await?;
             if retry.status().is_success() {
-                return Ok(());
+                let created: CreateMessageResponse = retry.json().await?;
+                return Ok(created.id);
             }
             let retry_status = retry.status();
             let retry_body = retry.text().await.unwrap_or_default();
@@ -328,6 +344,45 @@ impl DiscordAdapter {
         }
 
         anyhow::bail!("Discord sendMessage failed ({}): {}", status, body_text)
+    }
+
+    async fn send_rest_message(
+        &self,
+        channel_id: &str,
+        text: &str,
+        reply_to: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.send_rest_message_with_id(channel_id, text, reply_to)
+            .await
+            .map(|_| ())
+    }
+
+    async fn edit_rest_message(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        let url = format!(
+            "{}/channels/{}/messages/{}",
+            self.api_base, channel_id, message_id
+        );
+        let body = UpdateMessageRequest { content: text };
+        let resp = self
+            .client
+            .patch(&url)
+            .header("Authorization", format!("Bot {}", self.token))
+            .json(&body)
+            .send()
+            .await?;
+
+        if resp.status().is_success() {
+            return Ok(());
+        }
+
+        let status = resp.status();
+        let body_text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("Discord editMessage failed ({}): {}", status, body_text)
     }
 
     /// Upload a local file as a Discord message attachment using multipart POST.
@@ -388,7 +443,7 @@ impl DiscordAdapter {
             .part("files[0]", file_part)
             .part("payload_json", payload_part);
 
-        let url = format!("{}/channels/{}/messages", DISCORD_API_BASE, channel_id);
+        let url = format!("{}/channels/{}/messages", self.api_base, channel_id);
         let resp = self
             .client
             .post(&url)
@@ -798,6 +853,58 @@ impl PlatformAdapter for DiscordAdapter {
         true
     }
 
+    fn supports_editing(&self) -> bool {
+        true
+    }
+
+    async fn send_typing(&self, metadata: &MessageMetadata) -> anyhow::Result<()> {
+        let channel_id = metadata
+            .channel_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Discord send_typing requires channel_id"))?;
+        self.trigger_typing(channel_id).await
+    }
+
+    async fn send_and_get_id(&self, msg: OutgoingMessage) -> anyhow::Result<Option<String>> {
+        let channel_id = msg
+            .metadata
+            .channel_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Discord send_and_get_id requires channel_id"))?;
+        let reply_to = msg.metadata.message_id.as_deref();
+        let formatted = self.format_response(&msg.text, &msg.metadata);
+        let chunks = split_message(&formatted, MAX_MESSAGE_LENGTH);
+        let first_chunk = chunks.first().cloned().unwrap_or_default();
+        let message_id = self
+            .send_rest_message_with_id(channel_id, &first_chunk, reply_to)
+            .await?;
+        for chunk in chunks.iter().skip(1) {
+            self.send_rest_message(channel_id, chunk, None).await?;
+        }
+        Ok(Some(message_id))
+    }
+
+    async fn edit_message(
+        &self,
+        message_id: &str,
+        metadata: &MessageMetadata,
+        new_text: &str,
+    ) -> anyhow::Result<String> {
+        let channel_id = metadata
+            .channel_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Discord edit_message requires channel_id"))?;
+        let formatted = self.format_response(new_text, metadata);
+        let truncated = if formatted.len() > MAX_MESSAGE_LENGTH {
+            edgecrab_core::safe_truncate(&formatted, MAX_MESSAGE_LENGTH)
+        } else {
+            &formatted
+        };
+        self.edit_rest_message(channel_id, message_id, truncated)
+            .await?;
+        Ok(message_id.to_string())
+    }
+
     /// Send a local image file as a Discord attachment.
     ///
     /// Uses the Discord REST multipart upload (`files[0]` field) so the image
@@ -931,6 +1038,7 @@ mod tests {
         DiscordAdapter {
             token: "test".into(),
             client: reqwest::Client::new(),
+            api_base: "http://localhost".into(),
             allowed_users: Vec::new(),
         }
     }
@@ -968,6 +1076,7 @@ mod tests {
         assert!(adapter.supports_markdown());
         assert!(adapter.supports_images());
         assert!(adapter.supports_files());
+        assert!(adapter.supports_editing());
         assert_eq!(adapter.platform(), Platform::Discord);
     }
 
@@ -1036,6 +1145,92 @@ mod tests {
             "expected gateway_media/discord in {local_path}"
         );
         assert_eq!(attachment.url.as_deref(), Some(image_url.as_str()));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn discord_streaming_paths_support_editing_and_typing() {
+        use axum::{
+            Json, Router,
+            extract::{Request, State},
+            http::StatusCode,
+            routing::any,
+        };
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct RequestLog {
+            paths: Arc<Mutex<Vec<String>>>,
+        }
+
+        async fn record_request(
+            State(log): State<RequestLog>,
+            request: Request,
+        ) -> (StatusCode, Json<serde_json::Value>) {
+            let path = request.uri().path().to_string();
+            let method = request.method().as_str().to_string();
+            log.paths
+                .lock()
+                .expect("paths")
+                .push(format!("{method} {path}"));
+
+            let response = if method == "POST" && path.ends_with("/messages") {
+                serde_json::json!({ "id": "msg_123" })
+            } else if method == "PATCH" && path.contains("/messages/") {
+                let message_id = path.rsplit('/').next().unwrap_or("unknown");
+                serde_json::json!({ "id": message_id })
+            } else if method == "POST" && path.ends_with("/typing") {
+                serde_json::json!({})
+            } else {
+                return (StatusCode::NOT_FOUND, Json(serde_json::json!({})));
+            };
+
+            (StatusCode::OK, Json(response))
+        }
+
+        let log = RequestLog::default();
+        let app = Router::new()
+            .fallback(any(record_request))
+            .with_state(log.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+
+        let adapter = DiscordAdapter {
+            token: "test".into(),
+            client: reqwest::Client::new(),
+            api_base: format!("http://{addr}"),
+            allowed_users: Vec::new(),
+        };
+        let metadata = MessageMetadata {
+            channel_id: Some("chan_1".into()),
+            ..Default::default()
+        };
+
+        let message_id = adapter
+            .send_and_get_id(OutgoingMessage {
+                text: "hello".into(),
+                metadata: metadata.clone(),
+            })
+            .await
+            .expect("send and get id");
+        assert_eq!(message_id.as_deref(), Some("msg_123"));
+
+        adapter
+            .edit_message("msg_123", &metadata, "updated")
+            .await
+            .expect("edit message");
+        adapter.send_typing(&metadata).await.expect("send typing");
+
+        let paths = log.paths.lock().expect("paths").clone();
+        assert!(paths.contains(&"POST /channels/chan_1/messages".to_string()));
+        assert!(paths.contains(&"PATCH /channels/chan_1/messages/msg_123".to_string()));
+        assert!(paths.contains(&"POST /channels/chan_1/typing".to_string()));
 
         server.abort();
     }

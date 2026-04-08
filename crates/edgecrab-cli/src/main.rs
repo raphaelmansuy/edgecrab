@@ -23,6 +23,7 @@ mod edit_diff;
 mod fuzzy_selector;
 mod gateway_catalog;
 mod gateway_cmd;
+mod gateway_presentation;
 mod gateway_setup;
 mod image_models;
 mod markdown_render;
