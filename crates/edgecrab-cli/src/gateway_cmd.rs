@@ -763,15 +763,13 @@ pub fn snapshot() -> anyhow::Result<GatewayStatus> {
 }
 
 fn gateway_pid_path() -> anyhow::Result<PathBuf> {
-    let home = dirs::home_dir().context("cannot resolve home directory")?;
-    let dir = home.join(".edgecrab");
+    let dir = edgecrab_core::edgecrab_home();
     std::fs::create_dir_all(dir.join("logs"))?;
     Ok(dir.join("gateway.pid"))
 }
 
 fn gateway_log_path() -> anyhow::Result<PathBuf> {
-    let home = dirs::home_dir().context("cannot resolve home directory")?;
-    let dir = home.join(".edgecrab").join("logs");
+    let dir = edgecrab_core::edgecrab_home().join("logs");
     std::fs::create_dir_all(&dir)?;
     Ok(dir.join("gateway.log"))
 }
@@ -1030,8 +1028,7 @@ fn parse_java_major(version_output: &str) -> Option<u32> {
 }
 
 fn home_dir() -> anyhow::Result<std::path::PathBuf> {
-    let h = std::env::var("HOME").context("HOME env var not set")?;
-    Ok(std::path::PathBuf::from(h).join(".edgecrab"))
+    Ok(edgecrab_core::edgecrab_home())
 }
 
 #[cfg(test)]
@@ -1107,6 +1104,28 @@ mod tests {
 
         unsafe {
             std::env::remove_var("TELEGRAM_BOT_TOKEN");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(edgecrab_home_env)]
+    fn gateway_paths_follow_edgecrab_home() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+
+        let pid_path = gateway_pid_path().expect("pid path");
+        let log_path = gateway_log_path().expect("log path");
+
+        assert_eq!(pid_path, dir.path().join("gateway.pid"));
+        assert_eq!(log_path, dir.path().join("logs").join("gateway.log"));
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
         }
     }
 }

@@ -56,6 +56,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::commands::{CommandRegistry, CommandResult, ToolManagerMode};
 use crate::edit_diff::{LocalEditSnapshot, capture_local_edit_snapshot, render_edit_diff_lines};
 use crate::fuzzy_selector::{FuzzyItem, FuzzySelector};
+use crate::gateway_catalog::{PlatformDiagnostic, PlatformState, collect_platform_diagnostics};
 use crate::image_models as cli_image_models;
 use crate::markdown_render;
 use crate::mcp_support;
@@ -74,6 +75,7 @@ use edgecrab_core::{
     discovery_provider_statuses, live_discovery_availability, live_discovery_providers,
     merge_grouped_catalog_with_dynamic, normalize_discovery_provider,
 };
+use edgecrab_gateway::pairing::PairingStore;
 use edgecrab_tools::registry::{ToolHandler, ToolInventoryEntry};
 use edgecrab_tools::tools::transcribe::TranscribeAudioTool;
 use edgecrab_tools::tools::tts::{TextToSpeechTool, sanitize_text_for_tts};
@@ -10582,42 +10584,23 @@ impl App {
     }
 
     fn render_gateway_home_channel_summary(&self, config: &edgecrab_core::AppConfig) -> String {
-        let entries = [
-            (
-                "telegram",
-                config.gateway.platform_enabled("telegram") || config.gateway.telegram.enabled,
-                config.gateway.telegram.home_channel.as_deref(),
-            ),
-            (
-                "discord",
-                config.gateway.platform_enabled("discord") || config.gateway.discord.enabled,
-                config.gateway.discord.home_channel.as_deref(),
-            ),
-            (
-                "slack",
-                config.gateway.platform_enabled("slack") || config.gateway.slack.enabled,
-                config.gateway.slack.home_channel.as_deref(),
-            ),
-        ];
+        format_gateway_home_channel_summary(config)
+    }
 
-        let mut lines = Vec::new();
-        for (platform, enabled, home_channel) in entries {
-            if enabled || home_channel.is_some() {
-                lines.push(format!(
-                    "  {platform:<9} {}",
-                    home_channel.unwrap_or("(not set)")
-                ));
-            }
-        }
+    fn render_gateway_platforms_panel(&self, config: &edgecrab_core::AppConfig) -> String {
+        let diagnostics = collect_platform_diagnostics(config);
+        let gateway_status = crate::gateway_cmd::snapshot().ok();
+        let pairing_store = PairingStore::new();
+        let pending_pairings = pairing_store.list_pending(None);
+        let approved_pairings = pairing_store.list_approved(None);
 
-        if lines.is_empty() {
-            "Gateway homes: no supported home-channel platform is configured yet.\nSet one with: /sethome <platform> <channel>".into()
-        } else {
-            format!(
-                "Gateway homes:\n{}\nSet with: /sethome <platform> <channel>  or /sethome <channel> when exactly one supported platform is enabled.",
-                lines.join("\n")
-            )
-        }
+        render_gateway_platforms_panel(
+            config,
+            &diagnostics,
+            gateway_status.as_ref(),
+            &pending_pairings,
+            &approved_pairings,
+        )
     }
 
     fn build_config_entries(&self) -> Vec<ConfigEntry> {
@@ -12773,56 +12756,11 @@ impl App {
     }
 
     fn handle_show_platforms(&mut self) {
-        let mut text = String::from("Gateway platforms:\n");
-        // Webhook is always available
-        text.push_str("  webhook   ✓ available (always-on HTTP adapter)\n");
-        // WhatsApp: check if bridge config exists
-        let wa_available = edgecrab_core::edgecrab_home()
-            .join("whatsapp")
-            .join("config.json")
-            .exists();
-        text.push_str(&format!(
-            "  whatsapp  {} {}\n",
-            if wa_available { "✓" } else { "✗" },
-            if wa_available {
-                "configured"
-            } else {
-                "not configured (run: edgecrab whatsapp)"
-            },
-        ));
-        // Check env vars for other platforms
-        let telegram = std::env::var("TELEGRAM_BOT_TOKEN").is_ok();
-        text.push_str(&format!(
-            "  telegram  {} {}\n",
-            if telegram { "✓" } else { "✗" },
-            if telegram {
-                "token found"
-            } else {
-                "TELEGRAM_BOT_TOKEN not set"
-            },
-        ));
-        let discord = std::env::var("DISCORD_BOT_TOKEN").is_ok();
-        text.push_str(&format!(
-            "  discord   {} {}\n",
-            if discord { "✓" } else { "✗" },
-            if discord {
-                "token found"
-            } else {
-                "DISCORD_BOT_TOKEN not set"
-            },
-        ));
-        let slack = std::env::var("SLACK_BOT_TOKEN").is_ok();
-        text.push_str(&format!(
-            "  slack     {} {}\n",
-            if slack { "✓" } else { "✗" },
-            if slack {
-                "token found"
-            } else {
-                "SLACK_BOT_TOKEN not set"
-            },
-        ));
-        text.push_str("\nRun `edgecrab gateway start` to launch the gateway server.");
-        self.push_output(text, OutputRole::System);
+        let config = self.load_runtime_config();
+        self.push_output(
+            self.render_gateway_platforms_panel(&config),
+            OutputRole::System,
+        );
     }
 
     fn handle_show_personality(&mut self) {
@@ -19269,6 +19207,233 @@ fn png_crc32(data: &[u8]) -> u32 {
     !crc
 }
 
+type PendingPairingSummary = (String, String, String, String, u64);
+type ApprovedPairingSummary = (String, String, String);
+
+fn format_gateway_home_channel_summary(config: &edgecrab_core::AppConfig) -> String {
+    let entries = [
+        (
+            "telegram",
+            config.gateway.platform_enabled("telegram") || config.gateway.telegram.enabled,
+            config.gateway.telegram.home_channel.as_deref(),
+        ),
+        (
+            "discord",
+            config.gateway.platform_enabled("discord") || config.gateway.discord.enabled,
+            config.gateway.discord.home_channel.as_deref(),
+        ),
+        (
+            "slack",
+            config.gateway.platform_enabled("slack") || config.gateway.slack.enabled,
+            config.gateway.slack.home_channel.as_deref(),
+        ),
+    ];
+
+    let mut lines = Vec::new();
+    for (platform, enabled, home_channel) in entries {
+        if enabled || home_channel.is_some() {
+            lines.push(format!(
+                "  {platform:<9} {}",
+                home_channel.unwrap_or("(not set)")
+            ));
+        }
+    }
+
+    if lines.is_empty() {
+        "Gateway homes:\n  No supported home-channel platform is configured yet.\n  Set one with: /sethome <platform> <channel>".into()
+    } else {
+        format!(
+            "Gateway homes:\n{}\n  Set with: /sethome <platform> <channel>  or /sethome <channel> when exactly one supported platform is enabled.",
+            lines.join("\n")
+        )
+    }
+}
+
+fn render_gateway_platforms_panel(
+    config: &edgecrab_core::AppConfig,
+    diagnostics: &[PlatformDiagnostic],
+    gateway_status: Option<&crate::gateway_cmd::GatewayStatus>,
+    pending_pairings: &[PendingPairingSummary],
+    approved_pairings: &[ApprovedPairingSummary],
+) -> String {
+    let mut ready = Vec::new();
+    let mut available = Vec::new();
+    let mut attention = Vec::new();
+    let mut dormant = Vec::new();
+
+    for diagnostic in diagnostics {
+        match diagnostic.state {
+            PlatformState::Ready => ready.push(diagnostic),
+            PlatformState::Available => available.push(diagnostic),
+            PlatformState::Incomplete => attention.push(diagnostic),
+            PlatformState::NotConfigured => dormant.push(diagnostic),
+        }
+    }
+
+    let mut text = String::from("Gateway control\n");
+    text.push_str(&format_gateway_runtime_summary(
+        config,
+        diagnostics,
+        gateway_status,
+    ));
+    text.push_str("\n\n");
+    text.push_str(&format_gateway_home_channel_summary(config));
+    text.push_str("\n\n");
+    text.push_str(&format_gateway_pairing_summary(
+        pending_pairings,
+        approved_pairings,
+    ));
+
+    append_gateway_platform_group(&mut text, "Ready now", &ready);
+    append_gateway_platform_group(&mut text, "Needs attention", &attention);
+    append_gateway_platform_group(&mut text, "Ready to enable", &available);
+
+    if !dormant.is_empty() {
+        text.push_str("\n\nNot configured yet\n");
+        text.push_str("  ");
+        text.push_str(
+            &dormant
+                .iter()
+                .map(|diagnostic| diagnostic.name)
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        text.push_str("\n  Use `edgecrab gateway configure` to wire up more surfaces.");
+    }
+
+    text.push_str("\n\nNext steps\n");
+    if gateway_status.is_some_and(|status| status.running) {
+        text.push_str("  edgecrab gateway restart     apply config changes cleanly\n");
+        text.push_str("  edgecrab gateway stop        stop the background gateway\n");
+    } else {
+        text.push_str("  edgecrab gateway start       launch the background gateway\n");
+    }
+    text.push_str("  edgecrab gateway status      inspect runtime health and logs\n");
+    text.push_str("  edgecrab gateway configure   open the curated setup flow\n");
+    text.push_str("  /sethome <platform> <channel>  route proactive messages where they belong");
+
+    text
+}
+
+fn format_gateway_runtime_summary(
+    config: &edgecrab_core::AppConfig,
+    diagnostics: &[PlatformDiagnostic],
+    gateway_status: Option<&crate::gateway_cmd::GatewayStatus>,
+) -> String {
+    let process = match gateway_status {
+        Some(status) if status.running => match status.pid {
+            Some(pid) => format!("running (pid {pid})"),
+            None => "running".into(),
+        },
+        Some(status) if status.stale_pid => "stopped (stale pid cleaned)".into(),
+        Some(_) => "stopped".into(),
+        None => "unknown".into(),
+    };
+    let active_routes = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.active)
+        .count();
+    let attention_count = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.state == PlatformState::Incomplete)
+        .count();
+    let log_path = gateway_status
+        .map(|status| status.log_path.display().to_string())
+        .unwrap_or_else(|| {
+            edgecrab_core::edgecrab_home()
+                .join("logs")
+                .join("gateway.log")
+                .display()
+                .to_string()
+        });
+
+    format!(
+        "Runtime\n  Process: {process}\n  Bind: http://{}:{}\n  Active routes: {active_routes}\n  Needs attention: {attention_count}\n  Log: {log_path}",
+        config.gateway.host, config.gateway.port
+    )
+}
+
+fn format_gateway_pairing_summary(
+    pending_pairings: &[PendingPairingSummary],
+    approved_pairings: &[ApprovedPairingSummary],
+) -> String {
+    let mut text = format!(
+        "Pairing\n  Pending DM approvals: {}\n  Approved identities: {}",
+        pending_pairings.len(),
+        approved_pairings.len()
+    );
+
+    if !pending_pairings.is_empty() {
+        let mut pending = pending_pairings.to_vec();
+        pending.sort_by(|left, right| right.4.cmp(&left.4));
+        for (platform, code, user_id, user_name, age_minutes) in pending.into_iter().take(3) {
+            let label = if user_name.trim().is_empty() {
+                user_id
+            } else {
+                format!("{user_name} ({user_id})")
+            };
+            text.push_str(&format!(
+                "\n  Pending: {platform}/{label}  code {code}  {age_minutes}m old"
+            ));
+        }
+    }
+
+    text
+}
+
+fn append_gateway_platform_group(
+    text: &mut String,
+    heading: &str,
+    diagnostics: &[&PlatformDiagnostic],
+) {
+    if diagnostics.is_empty() {
+        return;
+    }
+
+    text.push_str(&format!("\n\n{heading}\n"));
+    for diagnostic in diagnostics {
+        text.push_str(&format!("{}\n", format_gateway_platform_line(diagnostic)));
+        if let Some(next_step) = gateway_platform_next_step(diagnostic) {
+            text.push_str(&format!("    Next: {next_step}\n"));
+        }
+    }
+    text.truncate(text.trim_end_matches('\n').len());
+}
+
+fn format_gateway_platform_line(diagnostic: &PlatformDiagnostic) -> String {
+    let marker = match diagnostic.state {
+        PlatformState::Ready => "✓",
+        PlatformState::Available => "○",
+        PlatformState::Incomplete => "!",
+        PlatformState::NotConfigured => "·",
+    };
+    format!("  {marker} {:<12} {}", diagnostic.name, diagnostic.detail)
+}
+
+fn gateway_platform_next_step(diagnostic: &PlatformDiagnostic) -> Option<String> {
+    match diagnostic.state {
+        PlatformState::Incomplete => Some(match diagnostic.id {
+            "whatsapp" => {
+                "Run `edgecrab whatsapp`, finish QR pairing, then restart the gateway.".into()
+            }
+            "api_server" => "Set `API_SERVER_ENABLED=true` to activate the API surface.".into(),
+            _ if !diagnostic.missing_required.is_empty() => format!(
+                "Set {} and rerun `edgecrab gateway configure`.",
+                diagnostic.missing_required.join(", ")
+            ),
+            _ => "Complete setup in `edgecrab gateway configure`.".into(),
+        }),
+        PlatformState::Available => Some(match diagnostic.id {
+            "telegram" | "discord" | "slack" => {
+                "Enable it in config, then set a home channel if you want proactive delivery."
+                    .into()
+            }
+            _ => "Enable it in config to make it live in the gateway.".into(),
+        }),
+        PlatformState::Ready | PlatformState::NotConfigured => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -19360,6 +19525,151 @@ mod tests {
         app.push_output("line2", OutputRole::System);
         app.clear_output();
         assert!(app.output.is_empty());
+    }
+
+    #[test]
+    #[serial_test::serial(edgecrab_home_env)]
+    fn gateway_platform_panel_surfaces_runtime_states_and_actions() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+            std::env::set_var("TELEGRAM_BOT_TOKEN", "telegram-token");
+            std::env::set_var("DISCORD_BOT_TOKEN", "discord-token");
+        }
+
+        let mut config = edgecrab_core::AppConfig::default();
+        config.gateway.enable_platform("telegram");
+        config.gateway.telegram.home_channel = Some("ops-room".into());
+        config.gateway.whatsapp.enabled = true;
+        config.gateway.whatsapp.session_path = Some(dir.path().join("whatsapp-session"));
+
+        let diagnostics = collect_platform_diagnostics(&config);
+        let panel = render_gateway_platforms_panel(
+            &config,
+            &diagnostics,
+            Some(&crate::gateway_cmd::GatewayStatus {
+                pid: Some(42),
+                running: true,
+                stale_pid: false,
+                log_path: dir.path().join("logs").join("gateway.log"),
+            }),
+            &[(
+                "telegram".into(),
+                "XKGH5N7P".into(),
+                "123456".into(),
+                "alice".into(),
+                12,
+            )],
+            &[("telegram".into(), "123456".into(), "alice".into())],
+        );
+
+        assert!(panel.contains("Runtime"));
+        assert!(panel.contains("Process: running (pid 42)"));
+        assert!(panel.contains("Gateway homes:"));
+        assert!(panel.contains("telegram  ops-room"));
+        assert!(panel.contains("Pairing"));
+        assert!(panel.contains("Pending DM approvals: 1"));
+        assert!(panel.contains("Ready now"));
+        assert!(panel.contains("Telegram"));
+        assert!(panel.contains("Needs attention"));
+        assert!(panel.contains("WhatsApp"));
+        assert!(panel.contains("QR pairing"));
+        assert!(panel.contains("Ready to enable"));
+        assert!(panel.contains("Discord"));
+        assert!(panel.contains("Not configured yet"));
+        assert!(panel.contains("edgecrab gateway configure"));
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+            std::env::remove_var("TELEGRAM_BOT_TOKEN");
+            std::env::remove_var("DISCORD_BOT_TOKEN");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(edgecrab_home_env)]
+    fn stream_command_updates_runtime_behavior_and_config() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let _enter = rt.enter();
+        let provider = Arc::new(edgequake_llm::MockProvider::new());
+        rt.block_on(provider.add_response("A".repeat(160)));
+        let provider_dyn: Arc<dyn edgequake_llm::LLMProvider> = provider.clone();
+        let agent = Arc::new(
+            edgecrab_core::AgentBuilder::new("mock")
+                .provider(provider_dyn)
+                .tools(Arc::new(edgecrab_tools::registry::ToolRegistry::new()))
+                .build()
+                .expect("build agent"),
+        );
+        let mut app = App::new();
+        drop(_enter);
+        app.set_agent(agent.clone());
+
+        app.handle_set_streaming("off".into());
+        assert!(!app.streaming_enabled);
+        assert!(
+            app.output
+                .last()
+                .is_some_and(|line| line.text.contains("Streaming: OFF"))
+        );
+
+        let mut off_token_count = 0;
+        let (off_tx, mut off_rx) = tokio::sync::mpsc::unbounded_channel();
+        rt.block_on(agent.chat_streaming("hello", off_tx))
+            .expect("stream off");
+        rt.block_on(async {
+            while let Some(event) = off_rx.recv().await {
+                if matches!(event, edgecrab_core::StreamEvent::Token(_)) {
+                    off_token_count += 1;
+                }
+            }
+        });
+        assert_eq!(off_token_count, 1);
+
+        let cfg = edgecrab_core::AppConfig::load().expect("load config");
+        assert!(!cfg.display.streaming);
+        assert!(!cfg.model.streaming);
+
+        rt.block_on(provider.add_response("B".repeat(160)));
+        app.handle_set_streaming("on".into());
+        assert!(app.streaming_enabled);
+        assert!(
+            app.output
+                .last()
+                .is_some_and(|line| line.text.contains("Streaming: ON"))
+        );
+
+        let mut on_token_count = 0;
+        let (on_tx, mut on_rx) = tokio::sync::mpsc::unbounded_channel();
+        rt.block_on(agent.chat_streaming("hello again", on_tx))
+            .expect("stream on");
+        rt.block_on(async {
+            while let Some(event) = on_rx.recv().await {
+                if matches!(event, edgecrab_core::StreamEvent::Token(_)) {
+                    on_token_count += 1;
+                }
+            }
+        });
+        assert!(on_token_count > 1);
+
+        let cfg = edgecrab_core::AppConfig::load().expect("load config");
+        assert!(cfg.display.streaming);
+        assert!(cfg.model.streaming);
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
     }
 
     #[tokio::test]
