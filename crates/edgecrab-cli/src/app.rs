@@ -29,7 +29,7 @@
 //! - Input line highlighting (cyan for valid commands, red for invalid)
 //! - Fish-style ghost text from input history
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{self, BufRead, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -88,6 +88,24 @@ fn progressive_keyboard_flags() -> KeyboardEnhancementFlags {
         | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
         | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
         | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+}
+
+fn selector_search_char(key: &event::KeyEvent) -> Option<char> {
+    if !key.modifiers.is_empty() {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char(c) => Some(c),
+        _ => None,
+    }
+}
+
+fn selector_action_key(key: &event::KeyEvent, ch: char) -> bool {
+    let upper = ch.to_ascii_uppercase();
+    match key.code {
+        KeyCode::Char(c) => c == upper,
+        _ => false,
+    }
 }
 
 fn format_context_pressure_notice(estimated_tokens: usize, threshold_tokens: usize) -> String {
@@ -1777,12 +1795,46 @@ fn build_provider_models_report(
 /// A single skill entry for the skill selector table.
 #[derive(Clone)]
 struct SkillEntry {
-    /// Skill name (without .md extension)
     name: String,
-    /// Whether the skill is a directory (true) or a single file (false)
+    display_name: String,
     is_dir: bool,
-    /// First-line description extracted from the file, if available
+    active: bool,
+    category: String,
+    relative_path: String,
     desc: String,
+    detail: String,
+    detail_view: String,
+    search_text: String,
+}
+
+impl SkillEntry {
+    fn display_title(&self) -> String {
+        let label = if self.display_name == self.name {
+            format!("/{}", self.name)
+        } else {
+            format!("/{} ({})", self.name, self.display_name)
+        };
+        format!("[{}] {}", if self.active { "x" } else { " " }, label)
+    }
+
+    fn kind_label(&self) -> &'static str {
+        if self.is_dir { "bundle" } else { "single" }
+    }
+
+    fn list_detail(&self) -> String {
+        if !self.desc.is_empty() {
+            return self.desc.clone();
+        }
+        format!("{} | {}", self.detail, self.relative_path)
+    }
+
+    fn detail_actions_line(&self) -> &'static str {
+        if self.active {
+            "Actions: Space deactivate, Enter insert /skill, R remote browser"
+        } else {
+            "Actions: Space activate, Enter insert /skill, R remote browser"
+        }
+    }
 }
 
 impl FuzzyItem for SkillEntry {
@@ -1790,7 +1842,10 @@ impl FuzzyItem for SkillEntry {
         &self.name
     }
     fn secondary(&self) -> &str {
-        &self.desc
+        &self.search_text
+    }
+    fn tag(&self) -> &str {
+        &self.category
     }
 }
 
@@ -1799,6 +1854,14 @@ struct SelectorChrome<'a> {
     placeholder: &'a str,
     count_label: &'a str,
     status_note: Option<&'a str>,
+}
+
+struct BrowserChrome<'a> {
+    title: &'a str,
+    placeholder: &'a str,
+    icon: &'a str,
+    icon_color: Color,
+    border_color: Color,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3601,8 +3664,9 @@ impl App {
     /// Find a skill's SKILL.md by name, searching recursively through category
     /// subdirectories.  Returns the path to SKILL.md, or None.
     ///
-    /// 1. Direct flat lookup: `skills/<name>/SKILL.md`
+    /// 1. Direct flat lookup: `skills/<name>/SKILL.md` or `skills/<name>.md`
     /// 2. Recursive search: find a directory whose leaf name matches `name`
+    /// 3. Recursive search for `<name>.md` files under category directories
     fn find_skill_md(name: &str) -> Option<std::path::PathBuf> {
         let skills_dir = Self::skills_dir();
 
@@ -3611,8 +3675,16 @@ impl App {
         if direct.is_file() {
             return Some(direct);
         }
+        let direct_md = if name.ends_with(".md") {
+            skills_dir.join(name)
+        } else {
+            skills_dir.join(format!("{name}.md"))
+        };
+        if direct_md.is_file() {
+            return Some(direct_md);
+        }
 
-        // 2. Recursive search by leaf directory name
+        // 2. Recursive search by leaf directory name or file stem
         let mut stack = vec![skills_dir];
         while let Some(dir) = stack.pop() {
             let entries = match std::fs::read_dir(&dir) {
@@ -3631,6 +3703,14 @@ impl App {
                         }
                     }
                     stack.push(path);
+                } else if path.is_file()
+                    && path
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+                    && path.file_stem().and_then(|stem| stem.to_str()) == Some(name)
+                {
+                    return Some(path);
                 }
             }
         }
@@ -3638,13 +3718,173 @@ impl App {
         None
     }
 
-    /// Parse a SKILL.md file and return the frontmatter `description:` value
-    /// (truncated to 80 chars for the selector column).
     fn read_skill_desc(path: &std::path::Path) -> String {
         let content = std::fs::read_to_string(path).unwrap_or_default();
         edgecrab_core::extract_skill_description(&content)
             .map(|d| unicode_trunc(&d, 80))
+            .or_else(|| {
+                Self::read_skill_preview(&content)
+                    .lines()
+                    .next()
+                    .map(str::to_string)
+            })
             .unwrap_or_default()
+    }
+
+    fn read_skill_preview(content: &str) -> String {
+        let mut lines = Vec::new();
+        for raw in edgecrab_core::prompt_builder::strip_yaml_frontmatter(content).lines() {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let normalized = trimmed
+                .trim_start_matches('#')
+                .trim_start_matches('-')
+                .trim_start_matches('*')
+                .trim();
+            if normalized.is_empty() {
+                continue;
+            }
+            lines.push(unicode_trunc(normalized, 96).to_string());
+            if lines.len() == 5 {
+                break;
+            }
+        }
+        lines.join("\n")
+    }
+
+    fn build_skill_entry(
+        skills_root: &std::path::Path,
+        skill_path: &std::path::Path,
+        is_dir: bool,
+        active_skills: &HashSet<String>,
+    ) -> Option<SkillEntry> {
+        let (name, content_path) = if is_dir {
+            (
+                skill_path.file_name()?.to_str()?.to_string(),
+                skill_path.join("SKILL.md"),
+            )
+        } else {
+            (
+                skill_path.file_stem()?.to_str()?.to_string(),
+                skill_path.to_path_buf(),
+            )
+        };
+        let content = std::fs::read_to_string(&content_path).unwrap_or_default();
+        let display_name =
+            edgecrab_core::extract_frontmatter_name(&content).unwrap_or_else(|| name.clone());
+        let desc = Self::read_skill_desc(&content_path);
+        let preview = Self::read_skill_preview(&content);
+        let relative = skill_path
+            .strip_prefix(skills_root)
+            .unwrap_or(skill_path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let category = skill_path
+            .strip_prefix(skills_root)
+            .ok()
+            .and_then(|path| path.parent())
+            .map(|parent| parent.to_string_lossy().replace('\\', "/"))
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "uncategorized".to_string());
+        let active = active_skills.contains(&name);
+
+        let mut support_sections = Vec::new();
+        let mut support_files = 0usize;
+        if is_dir {
+            if let Ok(read_dir) = std::fs::read_dir(skill_path) {
+                for entry in read_dir.flatten() {
+                    let path = entry.path();
+                    let file_name = entry.file_name().to_string_lossy().to_string();
+                    if file_name == "SKILL.md" || file_name.starts_with('.') {
+                        continue;
+                    }
+                    support_files += 1;
+                    if path.is_dir() {
+                        support_sections.push(file_name);
+                    }
+                }
+            }
+            support_sections.sort();
+        }
+
+        let mut detail_parts = vec![category.clone()];
+        if active {
+            detail_parts.push("active".into());
+        }
+        if support_files > 0 {
+            detail_parts.push(format!("{support_files} extra file(s)"));
+        }
+        let detail = detail_parts.join(" | ");
+
+        let mut detail_view = vec![
+            format!(
+                "State: {}",
+                if active {
+                    "active for the next prompt"
+                } else {
+                    "available"
+                }
+            ),
+            format!(
+                "Kind: {}",
+                if is_dir {
+                    "skill bundle"
+                } else {
+                    "single markdown skill"
+                }
+            ),
+            format!("Category: {category}"),
+            format!("Path: {relative}"),
+        ];
+        if display_name != name {
+            detail_view.push(format!("Frontmatter name: {display_name}"));
+        }
+        if !desc.is_empty() {
+            detail_view.push(String::new());
+            detail_view.push(desc.clone());
+        }
+        if support_files > 0 {
+            detail_view.push(String::new());
+            detail_view.push(format!("Supporting files: {support_files}"));
+            if !support_sections.is_empty() {
+                detail_view.push(format!("Support folders: {}", support_sections.join(", ")));
+            }
+        }
+        if !preview.is_empty() {
+            detail_view.push(String::new());
+            detail_view.push("Preview:".into());
+            for line in preview.lines() {
+                detail_view.push(format!("  {line}"));
+            }
+        }
+
+        let mut search_fields = vec![
+            name.clone(),
+            display_name.clone(),
+            category.clone(),
+            relative.clone(),
+            desc.clone(),
+            preview.replace('\n', " "),
+        ];
+        if active {
+            search_fields.push("active".into());
+        }
+        search_fields.extend(support_sections.iter().cloned());
+
+        Some(SkillEntry {
+            name,
+            display_name,
+            is_dir,
+            active,
+            category,
+            relative_path: relative,
+            desc,
+            detail,
+            detail_view: detail_view.join("\n"),
+            search_text: search_fields.join(" "),
+        })
     }
 
     /// Reload the skills list from disk into `skill_selector` and
@@ -3657,8 +3897,17 @@ impl App {
     fn refresh_skills_list(&mut self) {
         let dir = Self::skills_dir();
         let mut entries: Vec<SkillEntry> = Vec::new();
+        let active_skills: HashSet<String> = self.active_skills.iter().cloned().collect();
 
-        // Recursive scan: walk all subdirectories to find SKILL.md files
+        if !dir.is_dir() {
+            self.skills_completion_names.clear();
+            self.skill_selector
+                .replace_items_preserving_state(Vec::new());
+            return;
+        }
+
+        // Recursive scan: walk category directories for both SKILL.md bundles and
+        // standalone markdown skills.
         let mut stack = vec![dir.clone()];
         while let Some(current) = stack.pop() {
             let read_dir = match std::fs::read_dir(&current) {
@@ -3668,6 +3917,20 @@ impl App {
             for res in read_dir.flatten() {
                 let path = res.path();
                 if !path.is_dir() {
+                    let file_name = res.file_name().to_string_lossy().to_string();
+                    if file_name.starts_with('.')
+                        || file_name == "SKILL.md"
+                        || !path
+                            .extension()
+                            .and_then(|ext| ext.to_str())
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+                    {
+                        continue;
+                    }
+                    if let Some(entry) = Self::build_skill_entry(&dir, &path, false, &active_skills)
+                    {
+                        entries.push(entry);
+                    }
                     continue;
                 }
                 // Skip hidden/system dirs
@@ -3677,13 +3940,10 @@ impl App {
                 }
                 let skill_md = path.join("SKILL.md");
                 if skill_md.is_file() {
-                    // This is a skill directory — use leaf dir name
-                    let desc = Self::read_skill_desc(&skill_md);
-                    entries.push(SkillEntry {
-                        name: dir_name,
-                        is_dir: true,
-                        desc,
-                    });
+                    if let Some(entry) = Self::build_skill_entry(&dir, &path, true, &active_skills)
+                    {
+                        entries.push(entry);
+                    }
                 } else {
                     // Not a skill — might be a category dir, recurse
                     stack.push(path);
@@ -3691,13 +3951,17 @@ impl App {
             }
         }
 
-        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        entries.sort_by(|left, right| {
+            right
+                .active
+                .cmp(&left.active)
+                .then_with(|| left.name.cmp(&right.name))
+        });
 
         // Update completion names cache (plain names, no slash prefix)
         self.skills_completion_names = entries.iter().map(|e| e.name.clone()).collect();
 
-        // Reload selector state
-        self.skill_selector.set_items(entries);
+        self.skill_selector.replace_items_preserving_state(entries);
     }
 
     fn normalize_skill_identifier(identifier: &str) -> String {
@@ -4942,12 +5206,7 @@ impl App {
         }
     }
 
-    /// Activate or deactivate a skill by name.
-    ///
-    /// Typing `/skill_name` a second time toggles the skill off.  Active
-    /// skills have their SKILL.md content silently prepended to the next agent
-    /// prompt via `build_prompt_with_skills()`.
-    fn activate_skill(&mut self, name: &str) {
+    fn set_skill_activation(&mut self, name: &str, active: bool) {
         let skill_md = Self::find_skill_md(name);
         let skill_md = match skill_md {
             Some(p) => p,
@@ -4959,25 +5218,48 @@ impl App {
                 return;
             }
         };
-        // Toggle: typing /name again deactivates the skill.
-        if let Some(pos) = self.active_skills.iter().position(|s| s == name) {
-            self.active_skills.remove(pos);
+        let current = self.active_skills.iter().any(|skill| skill == name);
+        if current == active {
+            let state = if active {
+                "already active"
+            } else {
+                "already inactive"
+            };
+            self.push_output(format!("📚 Skill '{name}' is {state}."), OutputRole::System);
+            return;
+        }
+
+        if active {
+            self.active_skills.push(name.to_string());
+            let desc = Self::read_skill_desc(&skill_md);
+            let msg = if desc.is_empty() {
+                format!(
+                    "📚 Skill '{name}' activated — its context will be prepended to your next message."
+                )
+            } else {
+                format!("📚 Skill '{name}' activated: {desc}")
+            };
+            self.push_output(msg, OutputRole::System);
+        } else {
+            self.active_skills.retain(|skill| skill != name);
             self.push_output(
                 format!("📚 Skill '{name}' deactivated."),
                 OutputRole::System,
             );
-            return;
         }
-        self.active_skills.push(name.to_string());
-        let desc = Self::read_skill_desc(&skill_md);
-        let msg = if desc.is_empty() {
-            format!(
-                "📚 Skill '{name}' activated — its context will be prepended to your next message."
-            )
-        } else {
-            format!("📚 Skill '{name}' activated: {desc}")
-        };
-        self.push_output(msg, OutputRole::System);
+
+        self.refresh_skills_list();
+        self.needs_redraw = true;
+    }
+
+    /// Activate or deactivate a skill by name.
+    ///
+    /// Typing `/skill_name` a second time toggles the skill off.  Active
+    /// skills have their SKILL.md content silently prepended to the next agent
+    /// prompt via `build_prompt_with_skills()`.
+    fn activate_skill(&mut self, name: &str) {
+        let next_state = !self.active_skills.iter().any(|skill| skill == name);
+        self.set_skill_activation(name, next_state);
     }
 
     /// Build the prompt actually sent to the agent by prepending active skill
@@ -5583,7 +5865,7 @@ impl App {
                 KeyCode::Esc => {
                     self.mcp_selector.active = false;
                 }
-                KeyCode::Char('r') | KeyCode::Char('R') => {
+                _ if selector_action_key(&key, 'r') => {
                     let query = self.mcp_selector.query.clone();
                     self.open_mcp_selector(Some(&query), true);
                 }
@@ -5616,14 +5898,14 @@ impl App {
                         }
                     }
                 }
-                KeyCode::Char('v') | KeyCode::Char('V') => {
+                _ if selector_action_key(&key, 'v') => {
                     if let Some(entry) = self.mcp_selector.current() {
                         let command = entry.view_command();
                         self.mcp_selector.active = false;
                         self.handle_mcp_command(command);
                     }
                 }
-                KeyCode::Char('i') | KeyCode::Char('I') => {
+                _ if selector_action_key(&key, 'i') => {
                     if let Some(entry) = self.mcp_selector.current() {
                         if let Some(command) = entry.install_command() {
                             self.mcp_selector.active = false;
@@ -5631,7 +5913,7 @@ impl App {
                         }
                     }
                 }
-                KeyCode::Char('t') | KeyCode::Char('T') => {
+                _ if selector_action_key(&key, 't') => {
                     if let Some(entry) = self.mcp_selector.current() {
                         if entry.kind == McpEntryKind::ConfiguredServer {
                             let command = entry.test_command();
@@ -5640,7 +5922,7 @@ impl App {
                         }
                     }
                 }
-                KeyCode::Char('c') | KeyCode::Char('C') => {
+                _ if selector_action_key(&key, 'c') => {
                     if let Some(entry) = self.mcp_selector.current() {
                         if entry.kind == McpEntryKind::ConfiguredServer {
                             let command = entry.doctor_command();
@@ -5649,7 +5931,7 @@ impl App {
                         }
                     }
                 }
-                KeyCode::Char('d') | KeyCode::Char('D') => {
+                _ if selector_action_key(&key, 'd') => {
                     if let Some(entry) = self.mcp_selector.current() {
                         if let Some(command) = entry.remove_command() {
                             self.mcp_selector.active = false;
@@ -5657,11 +5939,7 @@ impl App {
                         }
                     }
                 }
-                KeyCode::Char(c)
-                    if !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                {
+                KeyCode::Char(c) if selector_search_char(&key) == Some(c) => {
                     self.mcp_selector.push_char(c);
                 }
                 _ => {}
@@ -5683,27 +5961,27 @@ impl App {
                         }
                     }
                 }
-                KeyCode::Char('i') | KeyCode::Char('I') => {
+                _ if selector_action_key(&key, 'i') => {
                     if let Some(entry) = self.remote_mcp_browser.selector.current().cloned() {
                         if entry.install.is_some() {
                             self.install_remote_mcp_entry(&entry);
                         } else {
                             self.push_output(
-                                "This remote MCP entry is view-only. Use Enter or v to inspect it.",
+                                "This remote MCP entry is view-only. Use Enter or V to inspect it.",
                                 OutputRole::System,
                             );
                         }
                     }
                 }
-                KeyCode::Char('v') | KeyCode::Char('V') => {
+                _ if selector_action_key(&key, 'v') => {
                     if let Some(entry) = self.remote_mcp_browser.selector.current().cloned() {
                         self.view_remote_mcp_entry(&entry);
                     }
                 }
-                KeyCode::Char('r') | KeyCode::Char('R') => {
+                _ if selector_action_key(&key, 'r') => {
                     self.schedule_remote_mcp_search(true);
                 }
-                KeyCode::Char('l') | KeyCode::Char('L') => {
+                _ if selector_action_key(&key, 'l') => {
                     self.remote_mcp_browser.selector.active = false;
                     self.open_mcp_selector(None, false);
                 }
@@ -5715,11 +5993,7 @@ impl App {
                     self.remote_mcp_browser.selector.pop_char();
                     self.schedule_remote_mcp_search(false);
                 }
-                KeyCode::Char(c)
-                    if !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                {
+                KeyCode::Char(c) if selector_search_char(&key) == Some(c) => {
                     self.remote_mcp_browser.selector.push_char(c);
                     self.schedule_remote_mcp_search(false);
                 }
@@ -5740,28 +6014,28 @@ impl App {
                         self.run_remote_skill_action(entry);
                     }
                 }
-                KeyCode::Char('I') => {
+                _ if selector_action_key(&key, 'i') => {
                     if let Some(entry) = self.remote_skill_browser.selector.current().cloned() {
                         self.run_remote_skill_action(entry);
                     }
                 }
-                KeyCode::Char('U') => {
+                _ if selector_action_key(&key, 'u') => {
                     if let Some(mut entry) = self.remote_skill_browser.selector.current().cloned() {
                         if entry.installed_name.is_some() {
                             entry.action = RemoteSkillAction::Update;
                             self.run_remote_skill_action(entry);
                         } else {
                             self.push_output(
-                                "This remote skill is not hub-installed yet. Use Enter or i to install it.",
+                                "This remote skill is not hub-installed yet. Use Enter or I to install it.",
                                 OutputRole::System,
                             );
                         }
                     }
                 }
-                KeyCode::Char('R') => {
+                _ if selector_action_key(&key, 'r') => {
                     self.schedule_remote_skill_search(true);
                 }
-                KeyCode::Char('L') => {
+                _ if selector_action_key(&key, 'l') => {
                     self.remote_skill_browser.selector.active = false;
                     self.refresh_skills_list();
                     self.skill_selector.activate();
@@ -5775,11 +6049,7 @@ impl App {
                     self.remote_skill_browser.selector.pop_char();
                     self.schedule_remote_skill_search(false);
                 }
-                KeyCode::Char(c)
-                    if !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                {
+                KeyCode::Char(c) if selector_search_char(&key) == Some(c) => {
                     self.remote_skill_browser.selector.push_char(c);
                     self.schedule_remote_skill_search(false);
                 }
@@ -5794,6 +6064,18 @@ impl App {
                 KeyCode::Esc => {
                     self.skill_selector.active = false;
                 }
+                KeyCode::Char(' ') => {
+                    if let Some(name) = self
+                        .skill_selector
+                        .current()
+                        .map(|entry| entry.name.clone())
+                    {
+                        self.set_skill_activation(
+                            &name,
+                            !self.active_skills.iter().any(|skill| skill == &name),
+                        );
+                    }
+                }
                 KeyCode::Enter => {
                     if let Some(entry) = self.skill_selector.current() {
                         let skill_name = format!("/{} ", entry.name);
@@ -5806,15 +6088,11 @@ impl App {
                 KeyCode::Down => self.skill_selector.move_down(),
                 KeyCode::PageUp => self.skill_selector.page_up(),
                 KeyCode::PageDown => self.skill_selector.page_down(),
-                KeyCode::Char('R') => {
+                _ if selector_action_key(&key, 'r') => {
                     self.open_remote_skill_selector(None);
                 }
                 KeyCode::Backspace => self.skill_selector.pop_char(),
-                KeyCode::Char(c)
-                    if !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                {
+                KeyCode::Char(c) if selector_search_char(&key) == Some(c) => {
                     self.skill_selector.push_char(c);
                 }
                 _ => {}
@@ -5838,15 +6116,11 @@ impl App {
                 KeyCode::Down => self.tool_manager.move_down(),
                 KeyCode::PageUp => self.tool_manager.page_up(),
                 KeyCode::PageDown => self.tool_manager.page_down(),
-                KeyCode::Char('r') | KeyCode::Char('R') => {
+                _ if selector_action_key(&key, 'r') => {
                     self.reset_tool_manager_policy();
                 }
                 KeyCode::Backspace => self.tool_manager.pop_char(),
-                KeyCode::Char(c)
-                    if !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                {
+                KeyCode::Char(c) if selector_search_char(&key) == Some(c) => {
                     self.tool_manager.push_char(c);
                 }
                 _ => {}
@@ -14216,52 +14490,27 @@ impl App {
         selector: &FuzzySelector<ModelEntry>,
         chrome: SelectorChrome<'_>,
     ) {
-        // Clear background
         frame.render_widget(Clear, area);
 
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3), // search box
-                Constraint::Min(1),    // model list
-                Constraint::Length(1), // help line
-            ])
-            .split(area);
-
-        // Search input
-        let search_text = if selector.query.is_empty() {
-            chrome.placeholder.to_string()
-        } else {
-            selector.query.clone()
-        };
-        let search_style = if selector.query.is_empty() {
-            Style::default().fg(Color::DarkGray)
-        } else {
-            Style::default().fg(Color::White)
-        };
-        let search = Paragraph::new(Line::from(Span::styled(
-            format!("  > {search_text}"),
-            search_style,
-        )))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan))
-                .title(format!(" {} ", chrome.title)),
+        let chunks = Self::browser_overlay_chunks(area);
+        let body = Self::browser_body_chunks(chunks[1]);
+        self.render_browser_header(
+            frame,
+            chunks[0],
+            &selector.query,
+            BrowserChrome {
+                title: chrome.title,
+                placeholder: chrome.placeholder,
+                icon: "◈",
+                icon_color: Color::Cyan,
+                border_color: Color::Cyan,
+            },
         );
-        frame.render_widget(search, chunks[0]);
 
-        // Model list grouped by provider
-        let max_visible = chunks[1].height as usize;
+        let max_visible = body[0].height as usize;
         let filtered = &selector.filtered;
         let selected = selector.selected;
-
-        // Scroll to keep selection visible
-        let scroll_start = if selected >= max_visible {
-            selected - max_visible + 1
-        } else {
-            0
-        };
+        let scroll_start = Self::browser_scroll_start(selected, max_visible);
 
         let items: Vec<ListItem> = filtered
             .iter()
@@ -14308,12 +14557,67 @@ impl App {
 
         let model_count = filtered.len();
         let list = List::new(items).style(Style::default().bg(Color::Rgb(20, 20, 28)));
-        frame.render_widget(list, chunks[1]);
+        frame.render_widget(list, body[0]);
 
-        // Help line
+        let mut detail_lines = Vec::new();
+        if let Some(entry) = selector.current() {
+            detail_lines.push(Line::from(Span::styled(
+                entry.display.clone(),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(vec![
+                Span::styled("Provider: ", Style::default().fg(Color::Rgb(145, 170, 170))),
+                Span::raw(entry.provider.clone()),
+            ]));
+            detail_lines.push(Line::from(vec![
+                Span::styled("Model: ", Style::default().fg(Color::Rgb(145, 170, 170))),
+                Span::raw(entry.model_name.clone()),
+            ]));
+            if !entry.detail.is_empty() {
+                detail_lines.push(Line::from(vec![
+                    Span::styled(
+                        "Inventory: ",
+                        Style::default().fg(Color::Rgb(145, 170, 170)),
+                    ),
+                    Span::raw(entry.detail.clone()),
+                ]));
+            }
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(
+                "Use Enter to switch immediately. Plain typing keeps refining the list without triggering actions.",
+            ));
+        } else if selector.query.trim().is_empty() {
+            detail_lines.push(Line::from(Span::styled(
+                chrome.title.to_string(),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(
+                "Browse models with fuzzy search over provider, model name, and discovery source.",
+            ));
+            if let Some(note) = chrome.status_note {
+                detail_lines.push(Line::from(""));
+                detail_lines.push(Line::from(note.to_string()));
+            }
+        } else {
+            detail_lines.push(Line::from("No models matched this query."));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(
+                "Try a broader provider name or a shorter model fragment.",
+            ));
+        }
+        self.render_browser_detail(frame, body[1], detail_lines);
+
         let help = Paragraph::new(Line::from(vec![
             Span::styled(" ↑↓ ", Style::default().fg(Color::Cyan)),
-            Span::styled("navigate  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("browse  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("type ", Style::default().fg(Color::Cyan)),
+            Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Enter ", Style::default().fg(Color::Cyan)),
             Span::styled("select  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Esc ", Style::default().fg(Color::Cyan)),
@@ -14547,52 +14851,104 @@ impl App {
         frame.render_widget(help, chunks[2]);
     }
 
-    fn render_mcp_selector(&self, frame: &mut Frame, area: Rect) {
-        frame.render_widget(Clear, area);
-
-        let chunks = Layout::default()
+    fn browser_overlay_chunks(area: Rect) -> std::rc::Rc<[Rect]> {
+        Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(3),
                 Constraint::Min(1),
                 Constraint::Length(1),
             ])
-            .split(area);
-        let body = Layout::default()
+            .split(area)
+    }
+
+    fn browser_body_chunks(area: Rect) -> std::rc::Rc<[Rect]> {
+        Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
-            .split(chunks[1]);
+            .split(area)
+    }
 
-        let search_text = if self.mcp_selector.query.is_empty() {
-            "Search configured MCP servers and the official catalog.".to_string()
+    fn browser_scroll_start(selected: usize, max_visible: usize) -> usize {
+        if selected >= max_visible {
+            selected - max_visible + 1
         } else {
-            self.mcp_selector.query.clone()
+            0
+        }
+    }
+
+    fn render_browser_header(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        query: &str,
+        chrome: BrowserChrome<'_>,
+    ) {
+        let search_text = if query.is_empty() {
+            chrome.placeholder.to_string()
+        } else {
+            query.to_string()
         };
-        let search_style = if self.mcp_selector.query.is_empty() {
+        let search_style = if query.is_empty() {
             Style::default().fg(Color::DarkGray)
         } else {
             Style::default().fg(Color::White)
         };
         let search = Paragraph::new(Line::from(vec![
-            Span::styled("  ⛓ ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled(
+                format!("  {} ", chrome.icon),
+                Style::default().fg(chrome.icon_color),
+            ),
             Span::styled(search_text, search_style),
         ]))
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Rgb(110, 220, 210)))
-                .title(" MCP Browser "),
+                .border_style(Style::default().fg(chrome.border_color))
+                .title(format!(" {} ", chrome.title)),
         );
-        frame.render_widget(search, chunks[0]);
+        frame.render_widget(search, area);
+    }
+
+    fn render_browser_detail(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        detail_lines: Vec<Line<'static>>,
+    ) {
+        let detail = Paragraph::new(Text::from(detail_lines))
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Rgb(60, 80, 84)))
+                    .title(" Details "),
+            );
+        frame.render_widget(detail, area);
+    }
+
+    fn render_mcp_selector(&self, frame: &mut Frame, area: Rect) {
+        frame.render_widget(Clear, area);
+
+        let chunks = Self::browser_overlay_chunks(area);
+        let body = Self::browser_body_chunks(chunks[1]);
+        self.render_browser_header(
+            frame,
+            chunks[0],
+            &self.mcp_selector.query,
+            BrowserChrome {
+                title: "MCP Browser",
+                placeholder: "Search configured MCP servers and the official catalog.",
+                icon: "⛓",
+                icon_color: Color::Rgb(110, 220, 210),
+                border_color: Color::Rgb(110, 220, 210),
+            },
+        );
 
         let max_visible = body[0].height as usize;
         let filtered = &self.mcp_selector.filtered;
         let selected = self.mcp_selector.selected;
-        let scroll_start = if selected >= max_visible {
-            selected - max_visible + 1
-        } else {
-            0
-        };
+        let scroll_start = Self::browser_scroll_start(selected, max_visible);
 
         let items: Vec<ListItem> = if filtered.is_empty() {
             let empty_text = if self.mcp_selector.query.trim().is_empty() {
@@ -14709,34 +15065,28 @@ impl App {
             ));
         }
 
-        let detail = Paragraph::new(Text::from(detail_lines))
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Rgb(60, 80, 84)))
-                    .title(" Details "),
-            );
-        frame.render_widget(detail, body[1]);
+        self.render_browser_detail(frame, body[1], detail_lines);
 
         let help = Paragraph::new(Line::from(vec![
             Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("browse  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("type ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Enter ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("default action  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Space ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("toggle active  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("i ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("I ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("install  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("t ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("T ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("test  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("c ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("C ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("check  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("v ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("V ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("view  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("d ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("D ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("remove  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("r ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("R ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("refresh  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Esc ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("cancel  ", Style::default().fg(Color::DarkGray)),
@@ -14751,61 +15101,36 @@ impl App {
     fn render_remote_mcp_selector(&self, frame: &mut Frame, area: Rect) {
         frame.render_widget(Clear, area);
 
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3),
-                Constraint::Min(1),
-                Constraint::Length(1),
-            ])
-            .split(area);
-        let body = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
-            .split(chunks[1]);
+        let chunks = Self::browser_overlay_chunks(area);
+        let body = Self::browser_body_chunks(chunks[1]);
 
         let browser = &self.remote_mcp_browser;
         let query = browser.current_query();
-        let search_text = if browser.selector.query.is_empty() {
-            "Type to search official MCP sources and the official MCP Registry".to_string()
-        } else {
-            browser.selector.query.clone()
-        };
-        let search_style = if browser.selector.query.is_empty() {
-            Style::default().fg(Color::DarkGray)
-        } else {
-            Style::default().fg(Color::White)
-        };
-        let border_style = if browser.inflight_request_id.is_some() {
-            Style::default().fg(Color::Rgb(110, 220, 210))
-        } else {
-            Style::default().fg(Color::Rgb(90, 190, 220))
-        };
-        let title = if browser.inflight_request_id.is_some() {
-            " Remote MCP  Searching… "
-        } else {
-            " Remote MCP "
-        };
-        let search = Paragraph::new(Line::from(vec![
-            Span::styled("  ⛓ ", Style::default().fg(Color::Rgb(90, 190, 220))),
-            Span::styled(search_text, search_style),
-        ]))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(border_style)
-                .title(title),
+        self.render_browser_header(
+            frame,
+            chunks[0],
+            &browser.selector.query,
+            BrowserChrome {
+                title: if browser.inflight_request_id.is_some() {
+                    "Remote MCP · Searching…"
+                } else {
+                    "Remote MCP"
+                },
+                placeholder: "Type to search official MCP sources and the official MCP Registry",
+                icon: "⛓",
+                icon_color: Color::Rgb(90, 190, 220),
+                border_color: if browser.inflight_request_id.is_some() {
+                    Color::Rgb(110, 220, 210)
+                } else {
+                    Color::Rgb(90, 190, 220)
+                },
+            },
         );
-        frame.render_widget(search, chunks[0]);
 
         let filtered = &browser.selector.filtered;
         let selected = browser.selector.selected;
         let max_visible = body[0].height as usize;
-        let scroll_start = if selected >= max_visible {
-            selected - max_visible + 1
-        } else {
-            0
-        };
+        let scroll_start = Self::browser_scroll_start(selected, max_visible);
 
         let items: Vec<ListItem> = if filtered.is_empty() {
             let empty_text = if query.is_empty() {
@@ -14971,15 +15296,7 @@ impl App {
             }
         }
 
-        let detail = Paragraph::new(Text::from(detail_lines))
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Rgb(60, 80, 84)))
-                    .title(" Details "),
-            );
-        frame.render_widget(detail, body[1]);
+        self.render_browser_detail(frame, body[1], detail_lines);
 
         let status_text = if browser.inflight_request_id.is_some() {
             "searching"
@@ -14991,6 +15308,8 @@ impl App {
         let help = Paragraph::new(Line::from(vec![
             Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("browse  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("type ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Enter ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("default action  ", Style::default().fg(Color::DarkGray)),
             Span::styled("I ", Style::default().fg(Color::Rgb(110, 220, 210))),
@@ -15018,52 +15337,25 @@ impl App {
     fn render_skill_selector(&self, frame: &mut Frame, area: Rect) {
         frame.render_widget(Clear, area);
 
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3), // search input
-                Constraint::Min(1),    // skill table
-                Constraint::Length(1), // help line
-            ])
-            .split(area);
-
-        // ── Search box ───────────────────────────────────────────────
-        let search_text = if self.skill_selector.query.is_empty() {
-            "Type to search skills…  (Esc to cancel)".to_string()
-        } else {
-            self.skill_selector.query.clone()
-        };
-        let search_style = if self.skill_selector.query.is_empty() {
-            Style::default().fg(Color::DarkGray)
-        } else {
-            Style::default().fg(Color::White)
-        };
-        let search = Paragraph::new(Line::from(vec![
-            Span::styled("  📚 ", Style::default().fg(Color::Rgb(255, 191, 0))),
-            Span::styled(search_text, search_style),
-        ]))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Rgb(255, 191, 0)))
-                .title(" Browse Skills "),
+        let chunks = Self::browser_overlay_chunks(area);
+        let body = Self::browser_body_chunks(chunks[1]);
+        self.render_browser_header(
+            frame,
+            chunks[0],
+            &self.skill_selector.query,
+            BrowserChrome {
+                title: "Browse Skills",
+                placeholder: "Search local skills by name, category, path, preview, or support files.",
+                icon: "📚",
+                icon_color: Color::Rgb(255, 191, 0),
+                border_color: Color::Rgb(255, 191, 0),
+            },
         );
-        frame.render_widget(search, chunks[0]);
 
-        // ── Skill table ──────────────────────────────────────────────
-        let max_visible = chunks[1].height as usize;
+        let max_visible = body[0].height as usize;
         let filtered = &self.skill_selector.filtered;
         let selected = self.skill_selector.selected;
-
-        let scroll_start = if selected >= max_visible {
-            selected - max_visible + 1
-        } else {
-            0
-        };
-
-        // Column widths:  type(4) + gap(1) + name(28) + gap(2) + desc(rest)
-        let type_w = 4usize;
-        let name_w = 28usize;
+        let scroll_start = Self::browser_scroll_start(selected, max_visible);
 
         let items: Vec<ListItem> = filtered
             .iter()
@@ -15079,13 +15371,11 @@ impl App {
                 } else {
                     Color::Rgb(20, 20, 28)
                 };
-                let type_tag = if entry.is_dir { " dir" } else { "  md" };
-                let type_style = if is_selected {
-                    Style::default().bg(bg).fg(Color::Rgb(120, 110, 60))
+                let state_style = if is_selected {
+                    Style::default().bg(bg).fg(Color::Rgb(150, 140, 90))
                 } else {
-                    Style::default().fg(Color::Rgb(80, 75, 40))
+                    Style::default().fg(Color::Rgb(90, 80, 45))
                 };
-                let name_str = unicode_pad_right(&format!("/{}", entry.name), name_w + 1);
                 let name_style = if is_selected {
                     Style::default()
                         .bg(bg)
@@ -15094,31 +15384,87 @@ impl App {
                 } else {
                     Style::default().fg(Color::Rgb(220, 200, 100))
                 };
-                let desc_str = unicode_trunc(&entry.desc, 60);
                 let desc_style = if is_selected {
                     Style::default().bg(bg).fg(Color::Rgb(160, 150, 90))
                 } else {
                     Style::default().fg(Color::Rgb(100, 95, 55))
                 };
 
-                let _ = type_w; // used for width planning
-
                 ListItem::new(Line::from(vec![
-                    Span::styled(format!("  {type_tag}"), type_style),
-                    Span::styled(format!("  {name_str}"), name_style),
-                    Span::styled(format!("  {desc_str}"), desc_style),
+                    Span::styled(
+                        format!("  {:<7}", if entry.active { "active" } else { "ready" }),
+                        state_style,
+                    ),
+                    Span::styled(
+                        format!("{:<7}", entry.kind_label()),
+                        if is_selected {
+                            Style::default().bg(bg).fg(Color::Rgb(120, 110, 60))
+                        } else {
+                            Style::default().fg(Color::Rgb(80, 75, 40))
+                        },
+                    ),
+                    Span::styled(unicode_trunc(&entry.display_title(), 34), name_style),
+                    Span::raw("  "),
+                    Span::styled(unicode_trunc(&entry.list_detail(), 42), desc_style),
                 ]))
             })
             .collect();
 
         let skill_count = filtered.len();
         let list = List::new(items).style(Style::default().bg(Color::Rgb(20, 20, 28)));
-        frame.render_widget(list, chunks[1]);
+        frame.render_widget(list, body[0]);
 
-        // ── Help line ────────────────────────────────────────────────
+        let mut detail_lines = Vec::new();
+        if let Some(entry) = self.skill_selector.current() {
+            detail_lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{} ", if entry.active { "ACTIVE" } else { "READY" }),
+                    Style::default()
+                        .fg(Color::Rgb(255, 191, 0))
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(entry.display_title()),
+            ]));
+            detail_lines.push(Line::from(""));
+            for line in entry.detail_view.lines() {
+                detail_lines.push(Line::from(line.to_string()));
+            }
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(entry.detail_actions_line()));
+        } else if self.skill_selector.query.trim().is_empty() {
+            detail_lines.push(Line::from(Span::styled(
+                "Local Skills",
+                Style::default()
+                    .fg(Color::Rgb(255, 191, 0))
+                    .add_modifier(Modifier::BOLD),
+            )));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(
+                "Browse installed skills with fuzzy search across names, categories, previews, and supporting files.",
+            ));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(
+                "Space toggles whether a skill is injected into your next prompt.",
+            ));
+            detail_lines.push(Line::from(
+                "Enter inserts `/skill-name` into the composer if you want the explicit slash flow instead.",
+            ));
+        } else {
+            detail_lines.push(Line::from("No local skills matched this query."));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(
+                "Try a broader term, a category name, or press R to search remote sources.",
+            ));
+        }
+        self.render_browser_detail(frame, body[1], detail_lines);
+
         let help = Paragraph::new(Line::from(vec![
             Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(255, 191, 0))),
-            Span::styled("navigate  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("browse  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("type ", Style::default().fg(Color::Rgb(255, 191, 0))),
+            Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Space ", Style::default().fg(Color::Rgb(255, 191, 0))),
+            Span::styled("toggle active  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Enter ", Style::default().fg(Color::Rgb(255, 191, 0))),
             Span::styled("insert /skill-name  ", Style::default().fg(Color::DarkGray)),
             Span::styled("R ", Style::default().fg(Color::Rgb(255, 191, 0))),
@@ -15136,61 +15482,36 @@ impl App {
     fn render_remote_skill_selector(&self, frame: &mut Frame, area: Rect) {
         frame.render_widget(Clear, area);
 
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3),
-                Constraint::Min(1),
-                Constraint::Length(1),
-            ])
-            .split(area);
-        let body = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
-            .split(chunks[1]);
+        let chunks = Self::browser_overlay_chunks(area);
+        let body = Self::browser_body_chunks(chunks[1]);
 
         let browser = &self.remote_skill_browser;
         let query = browser.current_query();
-        let search_text = if browser.selector.query.is_empty() {
-            "Type to search remote skills from EdgeCrab, Hermes, OpenAI, Anthropic, skills.sh, or a well-known URL".to_string()
-        } else {
-            browser.selector.query.clone()
-        };
-        let search_style = if browser.selector.query.is_empty() {
-            Style::default().fg(Color::DarkGray)
-        } else {
-            Style::default().fg(Color::White)
-        };
-        let border_style = if browser.inflight_request_id.is_some() {
-            Style::default().fg(Color::Rgb(110, 220, 210))
-        } else {
-            Style::default().fg(Color::Rgb(255, 191, 0))
-        };
-        let title = if browser.inflight_request_id.is_some() {
-            " Remote Skills  Searching… "
-        } else {
-            " Remote Skills "
-        };
-        let search = Paragraph::new(Line::from(vec![
-            Span::styled("  🌐 ", Style::default().fg(Color::Rgb(110, 220, 210))),
-            Span::styled(search_text, search_style),
-        ]))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(border_style)
-                .title(title),
+        self.render_browser_header(
+            frame,
+            chunks[0],
+            &browser.selector.query,
+            BrowserChrome {
+                title: if browser.inflight_request_id.is_some() {
+                    "Remote Skills · Searching…"
+                } else {
+                    "Remote Skills"
+                },
+                placeholder: "Type to search remote skills from EdgeCrab, Hermes, OpenAI, Anthropic, skills.sh, or a well-known URL",
+                icon: "🌐",
+                icon_color: Color::Rgb(110, 220, 210),
+                border_color: if browser.inflight_request_id.is_some() {
+                    Color::Rgb(110, 220, 210)
+                } else {
+                    Color::Rgb(255, 191, 0)
+                },
+            },
         );
-        frame.render_widget(search, chunks[0]);
 
         let filtered = &browser.selector.filtered;
         let selected = browser.selector.selected;
         let max_visible = body[0].height as usize;
-        let scroll_start = if selected >= max_visible {
-            selected - max_visible + 1
-        } else {
-            0
-        };
+        let scroll_start = Self::browser_scroll_start(selected, max_visible);
 
         let items: Vec<ListItem> = if filtered.is_empty() {
             let empty_text = if query.is_empty() {
@@ -15364,19 +15685,13 @@ impl App {
             )));
         }
 
-        let detail = Paragraph::new(Text::from(detail_lines))
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Rgb(60, 80, 84)))
-                    .title(" Details "),
-            );
-        frame.render_widget(detail, body[1]);
+        self.render_browser_detail(frame, body[1], detail_lines);
 
         let mut help_spans = vec![
             Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("browse  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("type ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Enter ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("default action  ", Style::default().fg(Color::DarkGray)),
             Span::styled("I ", Style::default().fg(Color::Rgb(110, 220, 210))),
@@ -17556,6 +17871,168 @@ mod tests {
 
         assert!(app.remote_skill_browser.selector.active);
         assert!(app.remote_skill_browser.selector.query.is_empty());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(edgecrab_home_env)]
+    async fn refresh_skills_list_builds_rich_entries_for_bundle_and_flat_skills() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+
+        let skills_dir = dir.path().join("skills");
+        std::fs::create_dir_all(skills_dir.join("automation").join("deploy")).expect("skill dir");
+        std::fs::create_dir_all(
+            skills_dir
+                .join("automation")
+                .join("deploy")
+                .join("references"),
+        )
+        .expect("references");
+        std::fs::write(
+            skills_dir
+                .join("automation")
+                .join("deploy")
+                .join("SKILL.md"),
+            "---\nname: deploy-pro\n\
+             description: Deploy services safely\n\
+             ---\n\
+             # Deploy\n\
+             Preview line one\n\
+             Preview line two\n",
+        )
+        .expect("write bundle skill");
+        std::fs::write(
+            skills_dir
+                .join("automation")
+                .join("deploy")
+                .join("references")
+                .join("runbook.md"),
+            "# Runbook",
+        )
+        .expect("write support file");
+        std::fs::write(
+            skills_dir.join("quickstart.md"),
+            "---\ndescription: Quick command snippets\n---\n# Quickstart\nUse this for shell snippets.\n",
+        )
+        .expect("write flat skill");
+
+        let mut app = App::new();
+        app.active_skills.push("deploy".into());
+        app.refresh_skills_list();
+
+        let deploy = app
+            .skill_selector
+            .items
+            .iter()
+            .find(|entry| entry.name == "deploy")
+            .expect("deploy skill");
+        assert!(deploy.active);
+        assert_eq!(deploy.category, "automation");
+        assert!(deploy.display_title().contains("deploy-pro"));
+        assert!(deploy.detail_view.contains("Supporting files: 1"));
+        assert!(deploy.detail_view.contains("Preview:"));
+
+        let quick = app
+            .skill_selector
+            .items
+            .iter()
+            .find(|entry| entry.name == "quickstart")
+            .expect("flat skill");
+        assert!(!quick.is_dir);
+        assert!(quick.detail_view.contains("single markdown skill"));
+        assert!(quick.detail_view.contains("Path: quickstart.md"));
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(edgecrab_home_env)]
+    async fn activate_skill_supports_flat_markdown_files() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+
+        let skills_dir = dir.path().join("skills");
+        std::fs::create_dir_all(&skills_dir).expect("skills dir");
+        std::fs::write(
+            skills_dir.join("quickstart.md"),
+            "---\ndescription: Quick command snippets\n---\n# Quickstart\nUse this for shell snippets.\n",
+        )
+        .expect("write flat skill");
+
+        let mut app = App::new();
+        app.activate_skill("quickstart");
+
+        assert!(app.active_skills.iter().any(|entry| entry == "quickstart"));
+        assert!(
+            app.output
+                .last()
+                .expect("activation output")
+                .text
+                .contains("activated")
+        );
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[test]
+    fn selector_search_and_action_keys_are_separated() {
+        let lower = event::KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE);
+        let upper = event::KeyEvent::new(KeyCode::Char('I'), KeyModifiers::SHIFT);
+
+        assert_eq!(selector_search_char(&lower), Some('i'));
+        assert_eq!(selector_search_char(&upper), None);
+        assert!(!selector_action_key(&lower, 'i'));
+        assert!(selector_action_key(&upper, 'i'));
+    }
+
+    #[tokio::test]
+    async fn mcp_selector_lowercase_letters_stay_in_filter() {
+        let mut app = App::new();
+        app.handle_mcp_command(String::new());
+        assert!(app.mcp_selector.active);
+
+        app.handle_key_event(event::KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+
+        assert!(app.mcp_selector.active);
+        assert_eq!(app.mcp_selector.query, "i");
+    }
+
+    #[tokio::test]
+    async fn skill_selector_lowercase_letters_stay_in_filter() {
+        let mut app = App::new();
+        app.skill_selector.set_items(vec![SkillEntry {
+            name: "rust".into(),
+            display_name: "rust".into(),
+            is_dir: true,
+            active: false,
+            category: "coding".into(),
+            relative_path: "coding/rust".into(),
+            desc: "Rust helper".into(),
+            detail: "coding | ready".into(),
+            detail_view: "State: available".into(),
+            search_text: "rust coding helper".into(),
+        }]);
+        app.skill_selector.activate();
+
+        app.handle_key_event(event::KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+
+        assert!(app.skill_selector.active);
+        assert_eq!(app.skill_selector.query, "r");
+        assert!(!app.remote_skill_browser.selector.active);
     }
 
     #[test]
