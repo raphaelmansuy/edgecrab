@@ -514,7 +514,10 @@ mod tests {
         assert_eq!(label, "before terminal: rm -rf ./tmp and-more");
     }
 
-    #[cfg_attr(windows, ignore = "PTY and POSIX shell syntax not available on Windows")]
+    #[cfg_attr(
+        windows,
+        ignore = "PTY and POSIX shell syntax not available on Windows"
+    )]
     #[tokio::test]
     async fn terminal_pty_reports_tty_to_child() {
         let dir = TempDir::new().expect("tmpdir");
