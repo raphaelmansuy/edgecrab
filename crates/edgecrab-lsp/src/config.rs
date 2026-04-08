@@ -498,6 +498,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // relies on a shell script that cannot be executed directly on Windows
     fn resolve_server_command_finds_relative_binary_from_workspace() {
         let workspace = TempDir::new().expect("workspace");
         let bin_dir = workspace.path().join("bin");
@@ -540,6 +541,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // relies on a shell script that cannot be executed directly on Windows
     fn resolve_server_command_finds_project_local_node_binary() {
         let workspace = TempDir::new().expect("workspace");
         let local_bin = workspace.path().join("node_modules/.bin");

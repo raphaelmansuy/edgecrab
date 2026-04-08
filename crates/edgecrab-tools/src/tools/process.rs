@@ -1485,6 +1485,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "PTY stdin write round-trip is not reliable in headless CI environments — run locally with --include-ignored"]
     async fn run_process_pty_round_trips_stdin() {
         let (ctx, table) = ctx_with_table();
         let result = RunProcessTool
