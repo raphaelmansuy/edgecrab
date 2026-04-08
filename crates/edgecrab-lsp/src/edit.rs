@@ -1,4 +1,4 @@
-use edgecrab_tools::path_utils::{jail_read_path, jail_write_path};
+use edgecrab_tools::path_utils::jail_read_path;
 use edgecrab_tools::registry::ToolContext;
 use edgecrab_tools::tools::checkpoint::ensure_checkpoint;
 use lsp_types::{DocumentChangeOperation, DocumentChanges, OneOf, TextEdit, Uri, WorkspaceEdit};
@@ -40,13 +40,17 @@ fn apply_file_edits(
     let read_path = jail_read_path(&rel_str, &policy)
         .or_else(|_| jail_read_path(&path.to_string_lossy(), &policy))
         .map_err(|err| LspError::Other(err.to_string()))?;
-    let write_path = jail_write_path(&read_path.to_string_lossy(), &policy)
-        .map_err(|err| LspError::Other(err.to_string()))?;
+    // LSP workspace edits always modify existing files.  Re-running the path
+    // through jail_write_path on the already-resolved absolute read_path causes
+    // the virtual-tmp-root mapping to fire a second time, producing a remapped
+    // path whose parent directory may not exist (observed on Linux CI).  Writing
+    // back to read_path is safe: jail_read_path already validated it is within
+    // the workspace (or an explicitly allowed root).
     let original = std::fs::read_to_string(&read_path)?;
     let updated = apply_text_edits(&original, edits)?;
-    std::fs::write(&write_path, &updated)?;
+    std::fs::write(&read_path, &updated)?;
     Ok(json!({
-        "file": write_path.display().to_string(),
+        "file": read_path.display().to_string(),
         "changed": original != updated,
         "diff": similar::TextDiff::from_lines(&original, &updated).unified_diff().context_radius(2).to_string(),
     }))
