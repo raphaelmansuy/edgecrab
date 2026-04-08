@@ -34,6 +34,7 @@ use std::io::{self, BufRead, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use chrono::TimeZone;
 use crossterm::event::{
     self, Event, KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton,
     MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
@@ -107,6 +108,9 @@ fn selector_action_key(key: &event::KeyEvent, ch: char) -> bool {
         _ => false,
     }
 }
+
+const SESSION_BROWSER_LIMIT: usize = 250;
+const SESSION_BROWSER_SEARCH_LIMIT: usize = 120;
 
 fn format_context_pressure_notice(estimated_tokens: usize, threshold_tokens: usize) -> String {
     let ratio = if threshold_tokens == 0 {
@@ -2311,47 +2315,106 @@ fn build_mcp_selector_entries_from(
 }
 
 /// A single entry for the session browser overlay.
-/// Wraps [`edgecrab_state::SessionSummary`] with pre-formatted strings so that
-/// `FuzzyItem` filtering works without re-formatting on every keystroke.
+/// Wraps rich session metadata with list/detail strings so that fuzzy filtering
+/// and rendering stay allocation-light while typing.
 #[derive(Clone)]
 struct SessionBrowserEntry {
-    /// Full session ID.
     id: String,
-    /// Display name: title if set, otherwise first 8 chars of ID.
     display: String,
-    /// Subtitle: model + message count.
-    subtitle: String,
-    /// Short date string (YYYY-MM-DD) derived from `started_at`.
-    date: String,
+    source: String,
+    model: String,
+    message_count: i64,
+    started_label: String,
+    last_active_label: String,
+    preview: String,
+    detail: String,
+    detail_view: String,
+    search_text: String,
+    matched_role: Option<String>,
+    matched_snippet: Option<String>,
 }
 
 impl SessionBrowserEntry {
-    fn from_summary(s: &edgecrab_state::SessionSummary) -> Self {
-        let display = s
+    fn from_summary(summary: &edgecrab_state::SessionRichSummary) -> Self {
+        Self::from_parts(summary, None, None)
+    }
+
+    fn from_search_hit(hit: &edgecrab_state::SessionSearchHit) -> Self {
+        Self::from_parts(&hit.session, Some(&hit.role), Some(&hit.snippet))
+    }
+
+    fn from_parts(
+        summary: &edgecrab_state::SessionRichSummary,
+        matched_role: Option<&str>,
+        matched_snippet: Option<&str>,
+    ) -> Self {
+        let display = summary
             .title
             .as_deref()
             .filter(|t| !t.is_empty())
-            .unwrap_or(&s.id[..s.id.len().min(12)])
+            .unwrap_or(&summary.id[..summary.id.len().min(12)])
             .to_string();
-        let model_tag = s.model.as_deref().unwrap_or("?");
-        let subtitle = format!("model={model_tag}  msgs={}", s.message_count);
-        // Convert unix-epoch float to a YYYY-MM-DD string
-        let date = {
-            let secs = s.started_at as i64;
-            // Simple manual conversion (no chrono dep needed for this format)
-            // Fallback to epoch string if overflow
-            if secs > 0 {
-                let d = time_secs_to_date(secs);
-                format!("{:04}-{:02}-{:02}", d.0, d.1, d.2)
-            } else {
-                String::new()
-            }
+        let model = summary.model.as_deref().unwrap_or("unknown").to_string();
+        let preview = session_excerpt(&summary.preview, 88);
+        let started_label = format_session_timestamp(summary.started_at);
+        let last_active_label = format_session_timestamp(summary.last_active);
+        let matched_snippet = matched_snippet
+            .map(strip_search_markup)
+            .filter(|snippet| !snippet.is_empty());
+        let detail = if let Some(role) = matched_role {
+            format!(
+                "{} msgs | {} | {} match",
+                summary.message_count, model, role
+            )
+        } else {
+            format!("{} msgs | {}", summary.message_count, model)
         };
+
+        let mut detail_sections = vec![
+            format!("Session:   {}", summary.id),
+            format!("Source:    {}", summary.source),
+            format!("Model:     {}", model),
+            format!("Messages:  {}", summary.message_count),
+            format!("Started:   {started_label}"),
+            format!("Last seen: {last_active_label}"),
+        ];
+        if !preview.is_empty() {
+            detail_sections.push(format!("Preview:   {preview}"));
+        }
+        if let (Some(role), Some(snippet)) = (matched_role, matched_snippet.as_deref()) {
+            detail_sections.push(format!("Match:     {role} -> {snippet}"));
+        }
+        detail_sections.push(String::new());
+        detail_sections.push("Actions: Enter inspect | R resume | D delete | Esc close".into());
+
+        let mut search_parts = vec![
+            summary.id.clone(),
+            display.clone(),
+            summary.source.clone(),
+            model.clone(),
+            preview.clone(),
+        ];
+        if let Some(snippet) = matched_snippet.as_deref() {
+            search_parts.push(snippet.to_string());
+        }
+        if let Some(role) = matched_role {
+            search_parts.push(role.to_string());
+        }
+
         Self {
-            id: s.id.clone(),
+            id: summary.id.clone(),
             display,
-            subtitle,
-            date,
+            source: summary.source.clone(),
+            model,
+            message_count: summary.message_count,
+            started_label,
+            last_active_label,
+            preview,
+            detail,
+            detail_view: detail_sections.join("\n"),
+            search_text: search_parts.join(" "),
+            matched_role: matched_role.map(str::to_string),
+            matched_snippet,
         }
     }
 }
@@ -2360,9 +2423,212 @@ impl FuzzyItem for SessionBrowserEntry {
     fn primary(&self) -> &str {
         &self.display
     }
+
     fn secondary(&self) -> &str {
-        &self.subtitle
+        &self.search_text
     }
+
+    fn tag(&self) -> &str {
+        &self.source
+    }
+}
+
+#[derive(Clone)]
+struct SessionMessageEntry {
+    index: usize,
+    role_label: String,
+    headline: String,
+    preview: String,
+    meta: String,
+    message: edgecrab_types::Message,
+    search_text: String,
+}
+
+impl SessionMessageEntry {
+    fn from_message(index: usize, message: &edgecrab_types::Message) -> Self {
+        let role_label = message.role.as_str().to_string();
+        let preview = message_preview(message);
+        let mut meta_bits = Vec::new();
+        if let Some(name) = message.name.as_deref().filter(|name| !name.is_empty()) {
+            meta_bits.push(format!("tool={name}"));
+        }
+        if let Some(tool_call_id) = message
+            .tool_call_id
+            .as_deref()
+            .filter(|tool_call_id| !tool_call_id.is_empty())
+        {
+            meta_bits.push(format!("call={}", unicode_trunc(tool_call_id, 16)));
+        }
+        if let Some(tool_calls) = message
+            .tool_calls
+            .as_ref()
+            .filter(|tool_calls| !tool_calls.is_empty())
+        {
+            meta_bits.push(format!("calls={}", tool_calls.len()));
+        }
+        if message
+            .reasoning
+            .as_deref()
+            .is_some_and(|reasoning| !reasoning.trim().is_empty())
+        {
+            meta_bits.push("reasoning".into());
+        }
+        if let Some(reason) = message
+            .finish_reason
+            .as_deref()
+            .filter(|reason| !reason.is_empty())
+        {
+            meta_bits.push(format!("finish={reason}"));
+        }
+        let meta = if meta_bits.is_empty() {
+            "content".into()
+        } else {
+            meta_bits.join(" | ")
+        };
+        let headline = format!("#{:<3} {}", index + 1, role_label);
+
+        let mut search_parts = vec![headline.clone(), preview.clone(), meta.clone()];
+        if let Some(reasoning) = message.reasoning.as_deref() {
+            search_parts.push(reasoning.to_string());
+        }
+        if let Some(tool_calls) = message.tool_calls.as_ref() {
+            for call in tool_calls {
+                search_parts.push(call.id.clone());
+                search_parts.push(call.function.name.clone());
+            }
+        }
+        if let Some(tool_name) = message.name.as_deref() {
+            search_parts.push(tool_name.to_string());
+        }
+
+        Self {
+            index,
+            role_label,
+            headline,
+            preview,
+            meta,
+            message: message.clone(),
+            search_text: search_parts.join(" "),
+        }
+    }
+}
+
+impl FuzzyItem for SessionMessageEntry {
+    fn primary(&self) -> &str {
+        &self.headline
+    }
+
+    fn secondary(&self) -> &str {
+        &self.search_text
+    }
+
+    fn tag(&self) -> &str {
+        &self.role_label
+    }
+}
+
+#[derive(Clone)]
+struct SessionInspectorMeta {
+    id: String,
+    title: String,
+    source: String,
+    model: String,
+    started_label: String,
+    last_active_label: String,
+    message_count: i64,
+    preview: String,
+    matched_role: Option<String>,
+    matched_snippet: Option<String>,
+}
+
+impl SessionInspectorMeta {
+    fn from_browser_entry(entry: &SessionBrowserEntry) -> Self {
+        Self {
+            id: entry.id.clone(),
+            title: entry.display.clone(),
+            source: entry.source.clone(),
+            model: entry.model.clone(),
+            started_label: entry.started_label.clone(),
+            last_active_label: entry.last_active_label.clone(),
+            message_count: entry.message_count,
+            preview: entry.preview.clone(),
+            matched_role: entry.matched_role.clone(),
+            matched_snippet: entry.matched_snippet.clone(),
+        }
+    }
+}
+
+struct SessionInspector {
+    selector: FuzzySelector<SessionMessageEntry>,
+    session: Option<SessionInspectorMeta>,
+}
+
+impl SessionInspector {
+    fn new() -> Self {
+        Self {
+            selector: FuzzySelector::new(),
+            session: None,
+        }
+    }
+
+    fn active(&self) -> bool {
+        self.selector.active
+    }
+
+    fn close(&mut self) {
+        self.selector.active = false;
+        self.session = None;
+    }
+}
+
+fn strip_search_markup(snippet: &str) -> String {
+    snippet
+        .replace("<b>", "")
+        .replace("</b>", "")
+        .replace(['\n', '\r'], " ")
+        .trim()
+        .to_string()
+}
+
+fn session_excerpt(text: &str, max_cols: usize) -> String {
+    unicode_trunc(text.replace(['\n', '\r'], " ").trim(), max_cols)
+}
+
+fn format_session_timestamp(epoch_secs: f64) -> String {
+    if !epoch_secs.is_finite() || epoch_secs <= 0.0 {
+        return "unknown".into();
+    }
+    match chrono::Local.timestamp_opt(epoch_secs as i64, 0).single() {
+        Some(timestamp) => timestamp.format("%Y-%m-%d %H:%M").to_string(),
+        None => {
+            let d = time_secs_to_date(epoch_secs as i64);
+            format!("{:04}-{:02}-{:02}", d.0, d.1, d.2)
+        }
+    }
+}
+
+fn message_preview(message: &edgecrab_types::Message) -> String {
+    let text = message.text_content();
+    if !text.trim().is_empty() {
+        return session_excerpt(&text, 96);
+    }
+    if let Some(tool_calls) = message
+        .tool_calls
+        .as_ref()
+        .filter(|tool_calls| !tool_calls.is_empty())
+    {
+        let names = tool_calls
+            .iter()
+            .take(3)
+            .map(|call| call.function.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return format!("requested tools: {names}");
+    }
+    if let Some(name) = message.name.as_deref().filter(|name| !name.is_empty()) {
+        return format!("tool output from {name}");
+    }
+    "(empty message)".into()
 }
 
 // ── Skin browser entry ────────────────────────────────────────────────────
@@ -2664,6 +2930,10 @@ pub struct App {
     remote_skill_browser: RemoteSkillBrowser,
     /// Session browser overlay (activated by F5 or `/session` with no args)
     session_browser: FuzzySelector<SessionBrowserEntry>,
+    /// Last non-error status note shown in the session browser footer.
+    session_browser_status_note: Option<String>,
+    /// Drill-down inspector for a single saved session.
+    session_inspector: SessionInspector,
     /// Config center overlay (activated by `/config`)
     config_selector: FuzzySelector<ConfigEntry>,
     /// Skin browser overlay (activated by `/skin list`)
@@ -3143,6 +3413,8 @@ impl App {
             tool_manager_status_note: None,
             remote_skill_browser: RemoteSkillBrowser::new(),
             session_browser: FuzzySelector::new(),
+            session_browser_status_note: None,
+            session_inspector: SessionInspector::new(),
             config_selector: FuzzySelector::new(),
             skin_browser: FuzzySelector::new(),
             skills_completion_names: Vec::new(),
@@ -6187,33 +6459,90 @@ impl App {
             return;
         }
 
-        // Session browser overlay active — same key scheme as skill/model selectors
+        if self.session_inspector.active() {
+            match key.code {
+                KeyCode::Esc => {
+                    self.close_session_inspector();
+                }
+                _ if selector_action_key(&key, 'b') => {
+                    self.close_session_inspector();
+                }
+                _ if selector_action_key(&key, 'r') => {
+                    if let Some(session) = self.session_inspector.session.as_ref() {
+                        let session_id = session.id.clone();
+                        self.session_inspector.close();
+                        self.session_browser.active = false;
+                        self.handle_resume_session(Some(session_id));
+                    }
+                }
+                KeyCode::Up => self.session_inspector.selector.move_up(),
+                KeyCode::Down => self.session_inspector.selector.move_down(),
+                KeyCode::PageUp => self.session_inspector.selector.page_up(),
+                KeyCode::PageDown => self.session_inspector.selector.page_down(),
+                KeyCode::Home => self.session_inspector.selector.selected = 0,
+                KeyCode::End => {
+                    self.session_inspector.selector.selected = self
+                        .session_inspector
+                        .selector
+                        .filtered
+                        .len()
+                        .saturating_sub(1);
+                }
+                KeyCode::Backspace => self.session_inspector.selector.pop_char(),
+                KeyCode::Char(c) if selector_search_char(&key) == Some(c) => {
+                    self.session_inspector.selector.push_char(c);
+                }
+                _ => {}
+            }
+            self.needs_redraw = true;
+            return;
+        }
+
+        // Session browser overlay active — search-first, explicit uppercase actions
         if self.session_browser.active {
             match key.code {
                 KeyCode::Esc => {
                     self.session_browser.active = false;
                 }
                 KeyCode::Enter => {
+                    if let Some(entry) = self.session_browser.current().cloned() {
+                        self.open_session_inspector(entry);
+                    }
+                }
+                _ if selector_action_key(&key, 'r') => {
                     if let Some(entry) = self.session_browser.current() {
                         let session_id = entry.id.clone();
                         self.session_browser.active = false;
                         self.handle_resume_session(Some(session_id));
                     }
                 }
+                _ if selector_action_key(&key, 'd') => {
+                    if let Some(session_id) =
+                        self.session_browser.current().map(|entry| entry.id.clone())
+                    {
+                        self.delete_session_from_browser(&session_id);
+                    }
+                }
                 KeyCode::Up => self.session_browser.move_up(),
                 KeyCode::Down => self.session_browser.move_down(),
                 KeyCode::PageUp => self.session_browser.page_up(),
                 KeyCode::PageDown => self.session_browser.page_down(),
-                KeyCode::Backspace => self.session_browser.pop_char(),
-                KeyCode::Char(c)
-                    if !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                {
+                KeyCode::Home => self.session_browser.selected = 0,
+                KeyCode::End => {
+                    self.session_browser.selected =
+                        self.session_browser.filtered.len().saturating_sub(1)
+                }
+                KeyCode::Backspace => {
+                    self.session_browser.pop_char();
+                    self.refresh_session_browser();
+                }
+                KeyCode::Char(c) if selector_search_char(&key) == Some(c) => {
                     self.session_browser.push_char(c);
+                    self.refresh_session_browser();
                 }
                 _ => {}
             }
+            self.needs_redraw = true;
             return;
         }
 
@@ -10101,33 +10430,153 @@ impl App {
         self.needs_redraw = true;
     }
 
-    fn open_session_browser(&mut self) {
-        let Some(agent) = self.require_agent() else {
-            return;
-        };
+    fn require_session_db(&mut self) -> Option<Arc<edgecrab_state::SessionDb>> {
+        let agent = self.require_agent()?;
         if !agent.has_state_db() {
             self.push_output(
                 "No state database configured (run with --session to enable)",
                 OutputRole::System,
             );
-            return;
+            return None;
         }
-        match agent.list_sessions(50) {
-            Ok(sessions) if sessions.is_empty() => {
-                self.push_output("No saved sessions to browse.", OutputRole::System);
+        match agent.state_db_handle() {
+            Some(db) => Some(db),
+            None => {
+                self.push_output("No state database configured.", OutputRole::System);
+                None
             }
-            Ok(sessions) => {
-                let entries: Vec<SessionBrowserEntry> = sessions
-                    .iter()
-                    .map(SessionBrowserEntry::from_summary)
-                    .collect();
-                self.session_browser.set_items(entries);
-                self.session_browser.active = true;
+        }
+    }
+
+    fn load_session_browser_entries(
+        db: &edgecrab_state::SessionDb,
+        query: &str,
+    ) -> Result<(Vec<SessionBrowserEntry>, Option<String>), edgecrab_types::AgentError> {
+        let recent = db.list_sessions_rich(None, SESSION_BROWSER_LIMIT)?;
+        let trimmed = query.trim();
+        if trimmed.is_empty() {
+            let entries = recent
+                .iter()
+                .map(SessionBrowserEntry::from_summary)
+                .collect::<Vec<_>>();
+            return Ok((
+                entries,
+                Some("Recent sessions. Type to search metadata or full message history.".into()),
+            ));
+        }
+
+        let hits = db.search_sessions_rich(trimmed, SESSION_BROWSER_SEARCH_LIMIT)?;
+        let mut entries = Vec::new();
+        let mut seen = HashSet::new();
+        for hit in &hits {
+            seen.insert(hit.session.id.clone());
+            entries.push(SessionBrowserEntry::from_search_hit(hit));
+        }
+        for summary in &recent {
+            if seen.insert(summary.id.clone()) {
+                entries.push(SessionBrowserEntry::from_summary(summary));
+            }
+        }
+
+        let status_note = if hits.is_empty() {
+            Some("Searching recent metadata plus the indexed message history.".into())
+        } else {
+            Some(format!(
+                "{} ranked content match(es) surfaced from the full session archive.",
+                hits.len()
+            ))
+        };
+
+        Ok((entries, status_note))
+    }
+
+    fn refresh_session_browser(&mut self) -> bool {
+        let query = self.session_browser.query.clone();
+        let Some(db) = self.require_session_db() else {
+            return false;
+        };
+        match Self::load_session_browser_entries(db.as_ref(), &query) {
+            Ok((entries, status_note)) => {
+                self.session_browser.replace_items_preserving_state(entries);
+                self.session_browser_status_note = status_note;
                 self.needs_redraw = true;
+                true
             }
             Err(e) => {
                 self.push_output(format!("DB error: {e}"), OutputRole::Error);
+                false
             }
+        }
+    }
+
+    fn open_session_browser(&mut self) {
+        self.session_inspector.close();
+        self.session_browser.query.clear();
+        self.session_browser.selected = 0;
+        if !self.refresh_session_browser() {
+            return;
+        }
+        if self.session_browser.items.is_empty() {
+            self.push_output("No saved sessions to browse.", OutputRole::System);
+            return;
+        }
+        self.session_browser.active = true;
+        self.needs_redraw = true;
+    }
+
+    fn open_session_inspector(&mut self, entry: SessionBrowserEntry) {
+        let Some(db) = self.require_session_db() else {
+            return;
+        };
+
+        match db.get_messages(&entry.id) {
+            Ok(messages) => {
+                let items = messages
+                    .iter()
+                    .enumerate()
+                    .map(|(index, message)| SessionMessageEntry::from_message(index, message))
+                    .collect::<Vec<_>>();
+                self.session_inspector.selector.query.clear();
+                self.session_inspector.selector.selected = 0;
+                self.session_inspector.selector.set_items(items);
+                self.session_inspector.session =
+                    Some(SessionInspectorMeta::from_browser_entry(&entry));
+                self.session_inspector.selector.active = true;
+                self.session_browser.active = false;
+                self.needs_redraw = true;
+            }
+            Err(e) => self.push_output(format!("DB error: {e}"), OutputRole::Error),
+        }
+    }
+
+    fn close_session_inspector(&mut self) {
+        self.session_inspector.close();
+        self.session_browser.active = true;
+        self.needs_redraw = true;
+    }
+
+    fn delete_session_from_browser(&mut self, session_id: &str) {
+        let Some(agent) = self.require_agent() else {
+            return;
+        };
+        match agent.delete_session(session_id) {
+            Ok(()) => {
+                self.push_output(
+                    format!(
+                        "Deleted session {}",
+                        &session_id[..session_id.len().min(12)]
+                    ),
+                    OutputRole::System,
+                );
+                let had_query = !self.session_browser.query.trim().is_empty();
+                if self.refresh_session_browser()
+                    && self.session_browser.items.is_empty()
+                    && !had_query
+                {
+                    self.session_browser.active = false;
+                }
+            }
+            Err(e) => self.push_output(format!("Delete failed: {e}"), OutputRole::Error),
         }
     }
 
@@ -13853,6 +14302,10 @@ impl App {
             self.render_session_browser(frame, frame.area());
         }
 
+        if self.session_inspector.active() {
+            self.render_session_inspector(frame, frame.area());
+        }
+
         // Skin browser overlay (full screen, same precedence as session browser)
         if self.skin_browser.active {
             self.render_skin_browser(frame, frame.area());
@@ -16147,116 +16600,366 @@ impl App {
     }
 
     /// Render the session browser overlay (activated by F4 or `/session` with no args).
-    ///
-    /// Layout mirrors the skill browser: search box + list + help line.
     fn render_session_browser(&self, frame: &mut Frame, area: Rect) {
         frame.render_widget(Clear, area);
 
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3), // search input
-                Constraint::Min(1),    // session list
-                Constraint::Length(1), // help line
-            ])
-            .split(area);
-
-        // ── Search box ───────────────────────────────────────────────
-        let search_text = if self.session_browser.query.is_empty() {
-            "Type to search sessions…  (Esc to cancel)".to_string()
-        } else {
-            self.session_browser.query.clone()
-        };
-        let search_style = if self.session_browser.query.is_empty() {
-            Style::default().fg(Color::DarkGray)
-        } else {
-            Style::default().fg(Color::White)
-        };
-        let search = Paragraph::new(Line::from(vec![
-            Span::styled("  💾 ", Style::default().fg(Color::Rgb(100, 200, 255))),
-            Span::styled(search_text, search_style),
-        ]))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Rgb(100, 200, 255)))
-                .title(" Browse Sessions  [F4] "),
+        let chunks = Self::browser_overlay_chunks(area);
+        let body = Self::browser_body_chunks(chunks[1]);
+        self.render_browser_header(
+            frame,
+            chunks[0],
+            &self.session_browser.query,
+            BrowserChrome {
+                title: "Session Browser",
+                placeholder: "Search by title, id, source, model, or any indexed message text.",
+                icon: "⏱",
+                icon_color: Color::Rgb(110, 190, 255),
+                border_color: Color::Rgb(110, 190, 255),
+            },
         );
-        frame.render_widget(search, chunks[0]);
 
-        // ── Session list ─────────────────────────────────────────────
-        let max_visible = chunks[1].height as usize;
         let filtered = &self.session_browser.filtered;
         let selected = self.session_browser.selected;
+        let max_visible = body[0].height as usize;
+        let scroll_start = Self::browser_scroll_start(selected, max_visible);
 
-        let scroll_start = if selected >= max_visible {
-            selected - max_visible + 1
+        let items: Vec<ListItem> = if filtered.is_empty() {
+            let empty_text = if self.session_browser.query.trim().is_empty() {
+                "  No saved sessions are available."
+            } else {
+                "  No sessions matched this query."
+            };
+            vec![ListItem::new(Line::from(Span::styled(
+                empty_text.to_string(),
+                Style::default().fg(Color::Rgb(120, 120, 135)),
+            )))]
         } else {
-            0
+            filtered
+                .iter()
+                .skip(scroll_start)
+                .take(max_visible)
+                .enumerate()
+                .map(|(vis_idx, &entry_idx)| {
+                    let entry = &self.session_browser.items[entry_idx];
+                    let is_selected = vis_idx + scroll_start == selected;
+                    let bg = if is_selected {
+                        Color::Rgb(20, 34, 48)
+                    } else {
+                        Color::Rgb(18, 22, 28)
+                    };
+                    let source_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(140, 170, 210))
+                    } else {
+                        Style::default().fg(Color::Rgb(95, 115, 145))
+                    };
+                    let title_style = if is_selected {
+                        Style::default()
+                            .bg(bg)
+                            .fg(Color::Rgb(125, 215, 255))
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Rgb(210, 225, 235))
+                    };
+                    let detail_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(145, 175, 188))
+                    } else {
+                        Style::default().fg(Color::Rgb(118, 135, 150))
+                    };
+                    let preview_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(168, 188, 196))
+                    } else {
+                        Style::default().fg(Color::Rgb(132, 146, 156))
+                    };
+
+                    ListItem::new(Line::from(vec![
+                        Span::styled(format!("  {:<10}", entry.source), source_style),
+                        Span::styled(unicode_trunc(&entry.display, 28), title_style),
+                        Span::raw("  "),
+                        Span::styled(unicode_trunc(&entry.detail, 28), detail_style),
+                        Span::raw("  "),
+                        Span::styled(unicode_trunc(&entry.preview, 34), preview_style),
+                    ]))
+                })
+                .collect()
         };
+        frame.render_widget(
+            List::new(items).style(Style::default().bg(Color::Rgb(18, 22, 28))),
+            body[0],
+        );
 
-        let date_w = 10usize;
-        let title_w = 30usize;
-
-        let items: Vec<ListItem> = filtered
-            .iter()
-            .skip(scroll_start)
-            .take(max_visible)
-            .enumerate()
-            .map(|(vis_idx, &entry_idx)| {
-                let entry = &self.session_browser.items[entry_idx];
-                let is_selected = vis_idx + scroll_start == selected;
-
-                let bg = if is_selected {
-                    Color::Rgb(15, 30, 50)
-                } else {
-                    Color::Rgb(20, 20, 28)
-                };
-
-                let date_style = if is_selected {
-                    Style::default().bg(bg).fg(Color::Rgb(100, 150, 180))
-                } else {
-                    Style::default().fg(Color::Rgb(60, 90, 110))
-                };
-                let title_str = unicode_pad_right(&entry.display, title_w);
-                let title_style = if is_selected {
+        let mut detail_lines = Vec::new();
+        if let Some(entry) = self.session_browser.current() {
+            detail_lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{} ", entry.source),
                     Style::default()
-                        .bg(bg)
-                        .fg(Color::Rgb(130, 210, 255))
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::Rgb(100, 180, 220))
-                };
-                let subtitle_style = if is_selected {
-                    Style::default().bg(bg).fg(Color::Rgb(100, 140, 160))
-                } else {
-                    Style::default().fg(Color::Rgb(70, 100, 120))
-                };
+                        .fg(Color::Rgb(110, 190, 255))
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(entry.display.clone()),
+            ]));
+            detail_lines.push(Line::from(""));
+            for line in entry.detail_view.lines() {
+                detail_lines.push(Line::from(line.to_string()));
+            }
+        } else if self.session_browser.query.trim().is_empty() {
+            detail_lines.push(Line::from(Span::styled(
+                "Session Browser",
+                Style::default()
+                    .fg(Color::Rgb(110, 190, 255))
+                    .add_modifier(Modifier::BOLD),
+            )));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(
+                "Browse recent sessions on the left and inspect metadata on the right.",
+            ));
+            detail_lines.push(Line::from(
+                "Search matches local metadata instantly and also checks the full indexed message archive.",
+            ));
+        } else {
+            detail_lines.push(Line::from("No results for the current query."));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(
+                "Try a title fragment, model name, source like cli or telegram, or terms from the conversation itself.",
+            ));
+        }
+        self.render_browser_detail(frame, body[1], detail_lines);
 
-                let _ = date_w;
-                ListItem::new(Line::from(vec![
-                    Span::styled(format!("  {:10}", entry.date), date_style),
-                    Span::styled(format!("  {title_str}"), title_style),
-                    Span::styled(format!("  {}", entry.subtitle), subtitle_style),
-                ]))
-            })
-            .collect();
-
-        let session_count = filtered.len();
-        let list = List::new(items).style(Style::default().bg(Color::Rgb(20, 20, 28)));
-        frame.render_widget(list, chunks[1]);
-
-        // ── Help line ────────────────────────────────────────────────
+        let note = self
+            .session_browser_status_note
+            .as_deref()
+            .unwrap_or("Search is keyboard-first: lowercase types, uppercase triggers actions.");
         let help = Paragraph::new(Line::from(vec![
-            Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(100, 200, 255))),
-            Span::styled("navigate  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Enter ", Style::default().fg(Color::Rgb(100, 200, 255))),
-            Span::styled("resume session  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Esc ", Style::default().fg(Color::Rgb(100, 200, 255))),
-            Span::styled("cancel  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(110, 190, 255))),
+            Span::styled("browse  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("type ", Style::default().fg(Color::Rgb(110, 190, 255))),
+            Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Enter ", Style::default().fg(Color::Rgb(110, 190, 255))),
+            Span::styled("inspect  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("R ", Style::default().fg(Color::Rgb(110, 190, 255))),
+            Span::styled("resume  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("D ", Style::default().fg(Color::Rgb(110, 190, 255))),
+            Span::styled("delete  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Esc ", Style::default().fg(Color::Rgb(110, 190, 255))),
+            Span::styled("close  ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format!("{session_count} session(s)"),
-                Style::default().fg(Color::Rgb(60, 100, 120)),
+                format!("{} visible · {}", filtered.len(), note),
+                Style::default().fg(Color::Rgb(100, 120, 130)),
+            ),
+        ]));
+        frame.render_widget(help, chunks[2]);
+    }
+
+    fn render_session_inspector(&self, frame: &mut Frame, area: Rect) {
+        frame.render_widget(Clear, area);
+
+        let chunks = Self::browser_overlay_chunks(area);
+        let body = Self::browser_body_chunks(chunks[1]);
+        self.render_browser_header(
+            frame,
+            chunks[0],
+            &self.session_inspector.selector.query,
+            BrowserChrome {
+                title: "Session Inspector",
+                placeholder:
+                    "Filter this timeline by role, content, tool ids, tool names, or reasoning text.",
+                icon: "⌕",
+                icon_color: Color::Rgb(120, 215, 185),
+                border_color: Color::Rgb(120, 215, 185),
+            },
+        );
+
+        let selector = &self.session_inspector.selector;
+        let filtered = &selector.filtered;
+        let selected = selector.selected;
+        let max_visible = body[0].height as usize;
+        let scroll_start = Self::browser_scroll_start(selected, max_visible);
+
+        let items: Vec<ListItem> = if filtered.is_empty() {
+            let empty_text = if selector.query.trim().is_empty() {
+                "  No messages were stored for this session."
+            } else {
+                "  No messages in this session matched the current filter."
+            };
+            vec![ListItem::new(Line::from(Span::styled(
+                empty_text.to_string(),
+                Style::default().fg(Color::Rgb(120, 120, 135)),
+            )))]
+        } else {
+            filtered
+                .iter()
+                .skip(scroll_start)
+                .take(max_visible)
+                .enumerate()
+                .map(|(vis_idx, &entry_idx)| {
+                    let entry = &selector.items[entry_idx];
+                    let is_selected = vis_idx + scroll_start == selected;
+                    let bg = if is_selected {
+                        Color::Rgb(24, 36, 34)
+                    } else {
+                        Color::Rgb(18, 24, 24)
+                    };
+                    let role_color = match entry.role_label.as_str() {
+                        "user" => Color::Rgb(110, 190, 255),
+                        "assistant" => Color::Rgb(120, 215, 185),
+                        "tool" => Color::Rgb(235, 190, 105),
+                        "system" => Color::Rgb(190, 145, 240),
+                        _ => Color::Rgb(190, 190, 190),
+                    };
+                    let index_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(145, 170, 170))
+                    } else {
+                        Style::default().fg(Color::Rgb(92, 112, 112))
+                    };
+                    let role_style = if is_selected {
+                        Style::default()
+                            .bg(bg)
+                            .fg(role_color)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(role_color)
+                    };
+                    let preview_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(218, 230, 228))
+                    } else {
+                        Style::default().fg(Color::Rgb(188, 198, 196))
+                    };
+                    let meta_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(145, 175, 170))
+                    } else {
+                        Style::default().fg(Color::Rgb(110, 136, 132))
+                    };
+
+                    ListItem::new(Line::from(vec![
+                        Span::styled(format!("  {:>3}", entry.index + 1), index_style),
+                        Span::raw("  "),
+                        Span::styled(format!("{:<10}", entry.role_label), role_style),
+                        Span::styled(unicode_trunc(&entry.preview, 38), preview_style),
+                        Span::raw("  "),
+                        Span::styled(unicode_trunc(&entry.meta, 22), meta_style),
+                    ]))
+                })
+                .collect()
+        };
+        frame.render_widget(
+            List::new(items).style(Style::default().bg(Color::Rgb(18, 24, 24))),
+            body[0],
+        );
+
+        let mut detail_lines = Vec::new();
+        if let Some(session) = self.session_inspector.session.as_ref() {
+            detail_lines.push(Line::from(vec![
+                Span::styled(
+                    session.title.clone(),
+                    Style::default()
+                        .fg(Color::Rgb(120, 215, 185))
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!("  ({})", session.source)),
+            ]));
+            detail_lines.push(Line::from(format!(
+                "{} · {} messages · started {} · last active {}",
+                session.model,
+                session.message_count,
+                session.started_label,
+                session.last_active_label
+            )));
+            detail_lines.push(Line::from(format!("Session ID: {}", session.id)));
+            if !session.preview.is_empty() {
+                detail_lines.push(Line::from(format!("Preview: {}", session.preview)));
+            }
+            if let (Some(role), Some(snippet)) = (
+                session.matched_role.as_deref(),
+                session.matched_snippet.as_deref(),
+            ) {
+                detail_lines.push(Line::from(format!("Search hit: {role} -> {snippet}")));
+            }
+            if !selector.query.trim().is_empty() {
+                detail_lines.push(Line::from(format!("Local filter: {}", selector.query)));
+            }
+            detail_lines.push(Line::from(""));
+
+            if let Some(entry) = selector.current() {
+                detail_lines.push(Line::from(vec![
+                    Span::styled(
+                        entry.headline.clone(),
+                        Style::default()
+                            .fg(Color::Rgb(120, 215, 185))
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(format!("  {}", entry.meta)),
+                ]));
+                detail_lines.push(Line::from(""));
+
+                let content = entry.message.text_content();
+                if !content.trim().is_empty() {
+                    detail_lines.push(Line::from(Span::styled(
+                        "Content",
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )));
+                    for line in content.lines() {
+                        detail_lines.push(Line::from(line.to_string()));
+                    }
+                } else {
+                    detail_lines.push(Line::from("(No text content stored for this message.)"));
+                }
+
+                if let Some(reasoning) = entry
+                    .message
+                    .reasoning
+                    .as_deref()
+                    .filter(|reasoning| !reasoning.trim().is_empty())
+                {
+                    detail_lines.push(Line::from(""));
+                    detail_lines.push(Line::from(Span::styled(
+                        "Reasoning",
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )));
+                    for line in reasoning.lines() {
+                        detail_lines.push(Line::from(line.to_string()));
+                    }
+                }
+
+                if let Some(tool_calls) = entry
+                    .message
+                    .tool_calls
+                    .as_ref()
+                    .filter(|tool_calls| !tool_calls.is_empty())
+                {
+                    detail_lines.push(Line::from(""));
+                    detail_lines.push(Line::from(Span::styled(
+                        "Tool Calls",
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )));
+                    for call in tool_calls {
+                        detail_lines.push(Line::from(format!(
+                            "- {}  ({})",
+                            call.function.name, call.id
+                        )));
+                    }
+                }
+            } else {
+                detail_lines.push(Line::from(
+                    "No message is selected. Clear the filter or move the cursor to inspect the timeline.",
+                ));
+            }
+        }
+        self.render_browser_detail(frame, body[1], detail_lines);
+
+        let help = Paragraph::new(Line::from(vec![
+            Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(120, 215, 185))),
+            Span::styled("timeline  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("type ", Style::default().fg(Color::Rgb(120, 215, 185))),
+            Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("B ", Style::default().fg(Color::Rgb(120, 215, 185))),
+            Span::styled("back  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("R ", Style::default().fg(Color::Rgb(120, 215, 185))),
+            Span::styled("resume  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Esc ", Style::default().fg(Color::Rgb(120, 215, 185))),
+            Span::styled("back  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{} visible", filtered.len()),
+                Style::default().fg(Color::Rgb(100, 120, 120)),
             ),
         ]));
         frame.render_widget(help, chunks[2]);
@@ -17155,6 +17858,47 @@ mod tests {
         )
     }
 
+    fn mock_agent_with_state_db(db: Arc<edgecrab_state::SessionDb>) -> Arc<edgecrab_core::Agent> {
+        let provider: Arc<dyn edgequake_llm::LLMProvider> =
+            Arc::new(edgequake_llm::MockProvider::new());
+        Arc::new(
+            edgecrab_core::AgentBuilder::new("mock")
+                .provider(provider)
+                .tools(Arc::new(edgecrab_tools::registry::ToolRegistry::new()))
+                .state_db(db)
+                .build()
+                .expect("build agent"),
+        )
+    }
+
+    fn sample_browser_session(
+        id: &str,
+        title: &str,
+        started_at: f64,
+        model: &str,
+    ) -> edgecrab_state::SessionRecord {
+        edgecrab_state::SessionRecord {
+            id: id.into(),
+            source: "cli".into(),
+            user_id: None,
+            model: Some(model.into()),
+            system_prompt: None,
+            parent_session_id: None,
+            started_at,
+            ended_at: None,
+            end_reason: None,
+            message_count: 0,
+            tool_call_count: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
+            estimated_cost_usd: None,
+            title: Some(title.into()),
+        }
+    }
+
     #[tokio::test]
     async fn app_init() {
         let app = App::new();
@@ -17363,6 +18107,178 @@ mod tests {
                 .iter()
                 .any(|entry| entry.display == "gemini/gemini-2.5-flash-image")
         );
+    }
+
+    #[tokio::test]
+    async fn session_browser_builds_rich_entries_from_saved_sessions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(
+            edgecrab_state::SessionDb::open(&dir.path().join("sessions.db")).expect("session db"),
+        );
+        let session = sample_browser_session(
+            "sess-alpha-123456",
+            "Debug auth flow",
+            1_720_000_000.0,
+            "openai/gpt-4o",
+        );
+        db.save_session(&session).expect("save session");
+        db.save_message(
+            "sess-alpha-123456",
+            &edgecrab_types::Message::user("Review the OAuth callback regression."),
+            1_720_000_010.0,
+        )
+        .expect("save message");
+
+        let agent = mock_agent_with_state_db(db);
+        let mut app = App::new();
+        app.set_agent(agent);
+        app.open_session_browser();
+
+        assert!(app.session_browser.active);
+        let entry = app
+            .session_browser
+            .items
+            .iter()
+            .find(|entry| entry.id == "sess-alpha-123456")
+            .expect("session entry");
+        assert_eq!(entry.display, "Debug auth flow");
+        assert_eq!(entry.preview, "Review the OAuth callback regression.");
+        assert!(entry.detail_view.contains("Model:     openai/gpt-4o"));
+        assert!(entry.detail_view.contains("Actions: Enter inspect"));
+    }
+
+    #[tokio::test]
+    async fn session_browser_query_surfaces_archived_message_content_hits() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(
+            edgecrab_state::SessionDb::open(&dir.path().join("sessions.db")).expect("session db"),
+        );
+
+        let session = sample_browser_session(
+            "sess-beta-654321",
+            "Support triage",
+            1_720_000_100.0,
+            "anthropic/claude-opus-4.6",
+        );
+        db.save_session(&session).expect("save session");
+        db.save_message(
+            "sess-beta-654321",
+            &edgecrab_types::Message::user("Need help tracing websocket reconnect jitter"),
+            1_720_000_110.0,
+        )
+        .expect("save message");
+
+        let agent = mock_agent_with_state_db(db);
+        let mut app = App::new();
+        app.set_agent(agent);
+        app.open_session_browser();
+        app.session_browser.query = "websocket jitter".into();
+        app.refresh_session_browser();
+
+        assert!(app.session_browser.active);
+        assert!(app.session_browser.items.iter().any(|entry| {
+            entry.id == "sess-beta-654321"
+                && entry.matched_snippet.is_some()
+                && entry
+                    .matched_snippet
+                    .as_deref()
+                    .is_some_and(|snippet| snippet.contains("websocket"))
+        }));
+        assert_eq!(
+            app.session_browser.current().map(|entry| entry.id.as_str()),
+            Some("sess-beta-654321")
+        );
+    }
+
+    #[tokio::test]
+    async fn session_inspector_opens_and_escape_returns_to_browser() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(
+            edgecrab_state::SessionDb::open(&dir.path().join("sessions.db")).expect("session db"),
+        );
+
+        let session = sample_browser_session(
+            "sess-gamma-222222",
+            "Tool chain debug",
+            1_720_000_200.0,
+            "openai/gpt-4.1",
+        );
+        db.save_session(&session).expect("save session");
+        db.save_message(
+            "sess-gamma-222222",
+            &edgecrab_types::Message::user("Run cargo clippy on the CLI crate"),
+            1_720_000_210.0,
+        )
+        .expect("save user");
+        db.save_message(
+            "sess-gamma-222222",
+            &edgecrab_types::Message::assistant("I will inspect the warnings first."),
+            1_720_000_220.0,
+        )
+        .expect("save assistant");
+
+        let agent = mock_agent_with_state_db(db);
+        let mut app = App::new();
+        app.set_agent(agent);
+        app.open_session_browser();
+
+        let entry = app
+            .session_browser
+            .items
+            .iter()
+            .find(|entry| entry.id == "sess-gamma-222222")
+            .cloned()
+            .expect("session entry");
+        app.open_session_inspector(entry);
+
+        assert!(app.session_inspector.active());
+        assert!(!app.session_browser.active);
+        assert_eq!(app.session_inspector.selector.items.len(), 2);
+        assert_eq!(
+            app.session_inspector
+                .session
+                .as_ref()
+                .map(|session| session.id.as_str()),
+            Some("sess-gamma-222222")
+        );
+
+        app.handle_key_event(event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(!app.session_inspector.active());
+        assert!(app.session_browser.active);
+    }
+
+    #[tokio::test]
+    async fn session_browser_lowercase_letters_stay_in_filter() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(
+            edgecrab_state::SessionDb::open(&dir.path().join("sessions.db")).expect("session db"),
+        );
+
+        let session = sample_browser_session(
+            "sess-delta-333333",
+            "Resume rehearsal",
+            1_720_000_300.0,
+            "anthropic/claude-3-5-sonnet",
+        );
+        db.save_session(&session).expect("save session");
+        db.save_message(
+            "sess-delta-333333",
+            &edgecrab_types::Message::user("Resume this later after lunch"),
+            1_720_000_310.0,
+        )
+        .expect("save message");
+
+        let agent = mock_agent_with_state_db(db);
+        let mut app = App::new();
+        app.set_agent(agent);
+        app.open_session_browser();
+
+        app.handle_key_event(event::KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+
+        assert!(app.session_browser.active);
+        assert_eq!(app.session_browser.query, "r");
+        assert!(!app.session_inspector.active());
     }
 
     #[test]

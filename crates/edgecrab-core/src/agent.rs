@@ -826,6 +826,11 @@ impl Agent {
         self.state_db.clone()
     }
 
+    /// Return a clone of the state DB handle without requiring an async hop.
+    pub fn state_db_handle(&self) -> Option<Arc<SessionDb>> {
+        self.state_db.clone()
+    }
+
     /// Return a clone of the current provider handle.
     ///
     /// Used by the gateway for deterministic pre-processing steps such as

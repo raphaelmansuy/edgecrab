@@ -115,6 +115,10 @@ impl<T: Clone + FuzzyItem> FuzzySelector<T> {
     /// Recompute `filtered` based on the current `query`.
     pub fn update_filter(&mut self) {
         let q = self.query.to_lowercase();
+        let tokens: Vec<&str> = q
+            .split_whitespace()
+            .filter(|token| !token.is_empty())
+            .collect();
         self.filtered = self
             .items
             .iter()
@@ -123,9 +127,17 @@ impl<T: Clone + FuzzyItem> FuzzySelector<T> {
                 if q.is_empty() {
                     return true;
                 }
-                item.primary().to_lowercase().contains(&q)
-                    || item.secondary().to_lowercase().contains(&q)
-                    || item.tag().to_lowercase().contains(&q)
+                let primary = item.primary().to_lowercase();
+                let secondary = item.secondary().to_lowercase();
+                let tag = item.tag().to_lowercase();
+                if primary.contains(&q) || secondary.contains(&q) || tag.contains(&q) {
+                    return true;
+                }
+                if tokens.is_empty() {
+                    return false;
+                }
+                let haystack = format!("{primary} {secondary} {tag}");
+                tokens.iter().all(|token| haystack.contains(token))
             })
             .map(|(i, _)| i)
             .collect();
@@ -272,6 +284,25 @@ mod tests {
         assert_eq!(
             selector.current().map(|item| item.primary()),
             Some("bedrock/anthropic.claude-4-sonnet-20250514-v1:0")
+        );
+    }
+
+    #[test]
+    fn update_filter_matches_multi_word_queries_by_token() {
+        let mut selector = FuzzySelector::new();
+        selector.set_items(vec![TestItem {
+            primary: "support triage",
+            secondary: "trace websocket reconnect jitter",
+            tag: "cli",
+        }]);
+
+        selector.query = "websocket jitter".into();
+        selector.update_filter();
+
+        assert_eq!(selector.filtered.len(), 1);
+        assert_eq!(
+            selector.current().map(|item| item.primary()),
+            Some("support triage")
         );
     }
 }
