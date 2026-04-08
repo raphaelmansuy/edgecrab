@@ -1,3 +1,4 @@
+#[cfg(unix)]
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -266,6 +267,10 @@ fn resolve_project_local_binary(command: &str, cwd: Option<&Path>) -> Option<Pat
     None
 }
 
+/// On Unix, ask a login shell to locate the binary (handles nvm, pyenv, etc.).
+/// On Windows, `SHELL` semantics do not apply; binary discovery relies on PATH
+/// and the common-dirs scan, so this is a deliberate no-op.
+#[cfg(unix)]
 fn resolve_via_login_shell(command: &str) -> Option<PathBuf> {
     let shell = std::env::var_os("SHELL").unwrap_or_else(|| OsStr::new("/bin/sh").to_os_string());
     let quoted = shell_quote(command);
@@ -283,6 +288,12 @@ fn resolve_via_login_shell(command: &str) -> Option<PathBuf> {
     is_file(&candidate).then_some(candidate)
 }
 
+#[cfg(not(unix))]
+fn resolve_via_login_shell(_command: &str) -> Option<PathBuf> {
+    None
+}
+
+#[cfg(unix)]
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
