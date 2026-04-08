@@ -1990,6 +1990,18 @@ impl FuzzyItem for McpPresetEntry {
 }
 
 impl McpPresetEntry {
+    fn is_configured_server(&self) -> bool {
+        self.kind == McpEntryKind::ConfiguredServer
+    }
+
+    fn display_title(&self) -> String {
+        if self.is_configured_server() {
+            format!("[{}] {}", if self.enabled { "x" } else { " " }, self.title)
+        } else {
+            self.title.clone()
+        }
+    }
+
     fn default_command(&self) -> String {
         match self.kind {
             McpEntryKind::CatalogEntry => {
@@ -2033,13 +2045,24 @@ impl McpPresetEntry {
     }
 
     fn toggle_command(&self) -> Option<String> {
-        (self.kind == McpEntryKind::ConfiguredServer).then(|| {
+        self.is_configured_server().then(|| {
             if self.enabled {
                 self.disable_command()
             } else {
                 self.enable_command()
             }
         })
+    }
+
+    fn detail_actions_line(&self) -> &'static str {
+        if !self.is_configured_server() {
+            return "Actions: Enter default, I install when available, V view, R refresh catalog";
+        }
+        if self.enabled {
+            "Actions: Space disable, Enter test, C doctor, V view, D remove, R refresh catalog"
+        } else {
+            "Actions: Space enable, Enter enable, C doctor, V view, D remove, R refresh catalog"
+        }
     }
 
     fn view_command(&self) -> String {
@@ -2065,15 +2088,15 @@ fn format_mcp_transport(server: &edgecrab_tools::tools::mcp_client::ConfiguredMc
     mcp_support::transport_summary(server)
 }
 
+fn mcp_enabled_label(enabled: bool) -> &'static str {
+    if enabled { "enabled" } else { "disabled" }
+}
+
 fn build_configured_mcp_entry(
     server: &edgecrab_tools::tools::mcp_client::ConfiguredMcpServer,
 ) -> McpPresetEntry {
     let transport = format_mcp_transport(server);
-    let state_label = if server.enabled {
-        "enabled"
-    } else {
-        "disabled"
-    };
+    let state_label = mcp_enabled_label(server.enabled);
     let mut detail = format!("{transport} | {state_label}");
     let detail_view = mcp_support::render_configured_server_detail(server);
     let auth = mcp_support::auth_summary(server);
@@ -9835,8 +9858,7 @@ impl App {
     }
 
     fn open_mcp_selector(&mut self, initial_query: Option<&str>, refresh_catalog: bool) -> usize {
-        let configured = edgecrab_tools::tools::mcp_client::configured_servers_with_disabled()
-            .unwrap_or_default();
+        let configured = self.configured_mcp_servers(true).unwrap_or_default();
         let official_entries = if refresh_catalog {
             self.rt_handle
                 .block_on(crate::mcp_catalog::load_official_catalog(true))
@@ -9855,6 +9877,28 @@ impl App {
         }
         self.needs_redraw = true;
         self.mcp_selector.filtered.len()
+    }
+
+    fn configured_mcp_servers(
+        &self,
+        include_disabled: bool,
+    ) -> Result<Vec<edgecrab_tools::tools::mcp_client::ConfiguredMcpServer>, String> {
+        let servers = if include_disabled {
+            edgecrab_tools::tools::mcp_client::configured_servers_with_disabled()
+        } else {
+            edgecrab_tools::tools::mcp_client::configured_servers()
+        };
+        servers.map_err(|err| format!("Failed to read MCP configuration: {err}"))
+    }
+
+    fn configured_mcp_server(
+        &self,
+        name: &str,
+    ) -> Result<edgecrab_tools::tools::mcp_client::ConfiguredMcpServer, String> {
+        self.configured_mcp_servers(true)?
+            .into_iter()
+            .find(|server| server.name == name)
+            .ok_or_else(|| format!("Unknown MCP preset or configured server '{name}'."))
     }
 
     fn set_mcp_server_enabled(&mut self, name: &str, enabled: bool) {
@@ -12238,7 +12282,7 @@ impl App {
         };
 
         match parts.first().map(String::as_str).unwrap_or_default() {
-            "list" => match edgecrab_tools::tools::mcp_client::configured_servers_with_disabled() {
+            "list" => match self.configured_mcp_servers(true) {
                 Ok(servers) if !servers.is_empty() => {
                     let mut lines = Vec::new();
                     lines.push("Configured MCP servers:".to_string());
@@ -12247,21 +12291,14 @@ impl App {
                         lines.push(format!(
                             "- {}  [{}]  {}",
                             server.name,
-                            if server.enabled {
-                                "enabled"
-                            } else {
-                                "disabled"
-                            },
+                            mcp_enabled_label(server.enabled),
                             transport
                         ));
                     }
                     self.push_output(lines.join("\n"), OutputRole::System);
                 }
                 Ok(_) => self.push_output("No MCP servers configured.", OutputRole::System),
-                Err(err) => self.push_output(
-                    format!("Failed to read MCP configuration: {err}"),
-                    OutputRole::Error,
-                ),
+                Err(err) => self.push_output(err, OutputRole::Error),
             },
             "refresh" => {
                 match self
@@ -12310,27 +12347,12 @@ impl App {
                     );
                     return;
                 }
-                match edgecrab_tools::tools::mcp_client::configured_servers_with_disabled() {
-                    Ok(servers) => {
-                        let Some(server) = servers
-                            .into_iter()
-                            .find(|server| server.name == preset_name)
-                        else {
-                            self.push_output(
-                                format!("Unknown MCP preset or configured server '{preset_name}'."),
-                                OutputRole::Error,
-                            );
-                            return;
-                        };
-                        self.push_output(
-                            mcp_support::render_configured_server_detail(&server),
-                            OutputRole::System,
-                        );
-                    }
-                    Err(err) => self.push_output(
-                        format!("Failed to read MCP configuration: {err}"),
-                        OutputRole::Error,
+                match self.configured_mcp_server(preset_name) {
+                    Ok(server) => self.push_output(
+                        mcp_support::render_configured_server_detail(&server),
+                        OutputRole::System,
                     ),
+                    Err(err) => self.push_output(err, OutputRole::Error),
                 }
             }
             "enable" | "activate" => {
@@ -14619,19 +14641,10 @@ impl App {
                     } else {
                         Style::default().fg(Color::Rgb(120, 140, 140))
                     };
-                    let title = if entry.kind == McpEntryKind::ConfiguredServer {
-                        format!(
-                            "[{}] {}",
-                            if entry.enabled { "x" } else { " " },
-                            entry.title
-                        )
-                    } else {
-                        entry.title.clone()
-                    };
                     ListItem::new(Line::from(vec![
                         Span::styled(format!("  {:<12}", entry.source), source_style),
                         Span::styled(format!("{:<9}", entry.action_label), action_style),
-                        Span::styled(unicode_trunc(&title, 38), row_style),
+                        Span::styled(unicode_trunc(&entry.display_title(), 38), row_style),
                         Span::raw("  "),
                         Span::styled(unicode_trunc(&entry.detail, 38), detail_style),
                     ]))
@@ -14667,19 +14680,8 @@ impl App {
             for line in entry.detail_view.lines() {
                 detail_lines.push(Line::from(line.to_string()));
             }
-            if entry.kind == McpEntryKind::ConfiguredServer {
-                detail_lines.push(Line::from(""));
-                detail_lines.push(Line::from(if entry.enabled {
-                    "Actions: Space disable, Enter test, C doctor, V view, D remove, R refresh catalog"
-                } else {
-                    "Actions: Space enable, Enter enable, C doctor, V view, D remove, R refresh catalog"
-                }));
-            } else {
-                detail_lines.push(Line::from(""));
-                detail_lines.push(Line::from(
-                    "Actions: Enter default, I install when available, V view, R refresh catalog",
-                ));
-            }
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(entry.detail_actions_line()));
         } else if self.mcp_selector.query.trim().is_empty() {
             detail_lines.push(Line::from(Span::styled(
                 "MCP Browser",
