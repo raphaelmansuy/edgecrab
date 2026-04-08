@@ -16277,6 +16277,7 @@ mod tests {
     #[tokio::test]
     async fn first_token_transitions_awaiting_state_to_streaming() {
         let mut app = App::new();
+        app.streaming_enabled = true;
         app.display_state = DisplayState::AwaitingFirstToken {
             frame: 0,
             started: Instant::now(),

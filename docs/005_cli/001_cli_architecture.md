@@ -81,6 +81,14 @@ but does not implement the thoughts.*
    │    └── disable
    ├── mcp
    │    ├── list
+   │    ├── refresh
+   │    ├── search
+   │    ├── view
+   │    ├── install
+   │    ├── test
+   │    ├── doctor
+   │    ├── auth
+   │    ├── login
    │    ├── add
    │    └── remove
    ├── plugins
@@ -93,6 +101,7 @@ but does not implement the thoughts.*
    │    ├── view
    │    ├── search
    │    ├── install
+   │    ├── update
    │    └── remove
    ├── cron
    │    ├── list
@@ -138,6 +147,10 @@ Options:
   -S, --skill <SKILL,...>         Pre-load skills by name
   -p, --profile <PROFILE>         Use a named profile
 ```
+
+`--config <PATH>` is not just a file override. The parent directory of that
+config file becomes the effective runtime home for sibling `.env`, `state.db`,
+plugins, skills, and other binary-command state.
 
 ---
 

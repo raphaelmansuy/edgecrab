@@ -11,9 +11,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 #### CLI & TUI
 - **ADR-backed CLI/TUI audit spec set** — new documents under `specs/cli_improve/` cross-reference the clap subcommand tree, slash-command registry, TUI handlers, config UX, and verification plan.
+- **ADR-backed binary CLI audit spec set** — new documents under `specs/cli_command_improve/` audit the full terminal command surface, from clap entry/help/version behavior through nested subcommand wiring and runtime-home semantics.
 - **TUI config center** — `/config` now opens a searchable control surface that summarizes runtime configuration, exposes important paths, and routes directly into model, vision, image, display, skin, voice, gateway-home, and update actions.
 - **Selector-grade cheap-model routing UX** — `/cheap_model` now matches `/model` with a fast model picker, persisted smart-routing state, `status`, and `off` flows instead of relying on manual YAML edits.
 - **First-class MoA configuration UX** — `/moa` now exposes live status, aggregator selection, searchable reference-roster editing, reset behavior, and config-center entry points; the `mixture_of_agents` tool now consumes persisted `moa` defaults when per-call overrides are omitted.
+- **Binary command contract hardening** — `--config` now rebases the effective runtime home for binary commands, `config edit` supports argument-bearing `$EDITOR` values such as `code --wait`, `config env-path` respects the active config root, and `version` now reflects the model catalog provider inventory instead of a hardcoded subset.
+- **Browser launch tests are explicit opt-in** — real-Chrome launch paths are now suppressed under Rust test harnesses unless `EDGECRAB_RUN_BROWSER_LAUNCH_TESTS=1` is set, so `cargo test -- --include-ignored` no longer opens Chrome by side effect.
 
 #### Model Discovery
 - **Dynamic provider discovery with principled fallback** — `edgecrab-core` now supports provider-scoped live model discovery for OpenRouter, Ollama, LM Studio, Google Gemini, GitHub Copilot, and AWS Bedrock, with per-provider cache plus static catalog fallback instead of generic `/v1/models` heuristics.

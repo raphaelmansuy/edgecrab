@@ -48,6 +48,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use clap::Parser;
+use shell_words::split as shell_split;
 use tokio_util::sync::CancellationToken;
 
 use app::App;
@@ -238,6 +239,8 @@ async fn main() -> anyhow::Result<()> {
     }
     if args.config.is_none() && !manages_profiles {
         profile::activate_profile(args.profile.as_deref())?;
+    } else if !manages_profiles {
+        activate_runtime_home_from_config(args.config.as_deref())?;
     }
 
     // Route to subcommand if one was given
@@ -585,38 +588,7 @@ async fn run_acp(args: &CliArgs) -> anyhow::Result<()> {
 
 /// Print detailed version and provider information.
 fn run_version() {
-    let version = env!("CARGO_PKG_VERSION");
-    println!("EdgeCrab v{version}");
-    println!("Rust {}", env!("CARGO_PKG_RUST_VERSION", "unknown"));
-    println!();
-    println!("Supported providers (via edgequake-llm):");
-    let providers = [
-        ("copilot", "GitHub Copilot (GITHUB_TOKEN)"),
-        ("openai", "OpenAI (OPENAI_API_KEY)"),
-        ("anthropic", "Anthropic (ANTHROPIC_API_KEY)"),
-        ("gemini", "Google Gemini (GOOGLE_API_KEY)"),
-        ("openrouter", "OpenRouter (OPENROUTER_API_KEY)"),
-        ("xai", "xAI Grok (XAI_API_KEY)"),
-        ("mistral", "Mistral AI (MISTRAL_API_KEY)"),
-        ("ollama", "Ollama (local, no key)"),
-        ("lmstudio", "LMStudio (local, no key)"),
-        ("azure", "Azure OpenAI (AZURE_OPENAI_API_KEY)"),
-        ("bedrock", "AWS Bedrock (AWS_ACCESS_KEY_ID)"),
-        ("huggingface", "HuggingFace (HUGGINGFACE_API_KEY)"),
-    ];
-    for (id, desc) in providers {
-        println!("  {id:<14} — {desc}");
-    }
-    println!();
-    println!("Home:   {}", setup::edgecrab_home().display());
-    println!(
-        "Config: {}",
-        setup::edgecrab_home().join("config.yaml").display()
-    );
-    println!();
-    println!("Links:");
-    println!("  Docs:    https://github.com/raphaelmansuy/edgecrab");
-    println!("  Issues:  https://github.com/raphaelmansuy/edgecrab/issues");
+    print!("{}", render_version_report());
 }
 
 fn run_sessions(command: SessionCommand, args: &CliArgs) -> anyhow::Result<()> {
@@ -825,13 +797,22 @@ fn run_config(command: ConfigCommand, args: &CliArgs) -> anyhow::Result<()> {
             println!("{}", serde_yml::to_string(&runtime.config)?);
         }
         ConfigCommand::Edit => {
-            let editor = std::env::var("EDITOR")
-                .or_else(|_| std::env::var("VISUAL"))
-                .unwrap_or_else(|_| "vi".to_string());
-            let status = std::process::Command::new(&editor)
+            let mut editor = editor_command_from_env()?;
+            let config_parent = runtime
+                .config_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."));
+            std::fs::create_dir_all(config_parent).with_context(|| {
+                format!(
+                    "failed to create config directory {}",
+                    config_parent.display()
+                )
+            })?;
+            let display_editor = format_command_for_display(&editor);
+            let status = editor
                 .arg(&runtime.config_path)
                 .status()
-                .with_context(|| format!("failed to launch editor: {editor}"))?;
+                .with_context(|| format!("failed to launch editor: {display_editor}"))?;
             if !status.success() {
                 anyhow::bail!("editor exited with status: {status}");
             }
@@ -840,7 +821,12 @@ fn run_config(command: ConfigCommand, args: &CliArgs) -> anyhow::Result<()> {
             println!("{}", runtime.config_path.display());
         }
         ConfigCommand::EnvPath => {
-            println!("{}", setup::edgecrab_home().join(".env").display());
+            let env_path = runtime
+                .config_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join(".env");
+            println!("{}", env_path.display());
         }
         ConfigCommand::Set { key, value } => {
             let mut config = runtime.config;
@@ -1566,6 +1552,100 @@ fn parse_csv(value: &str) -> Vec<String> {
         .collect()
 }
 
+fn runtime_home_for_config_override(config_override: Option<&str>) -> Option<PathBuf> {
+    config_override.map(|path| {
+        std::path::Path::new(path)
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .to_path_buf()
+    })
+}
+
+fn activate_runtime_home_from_config(config_override: Option<&str>) -> anyhow::Result<()> {
+    let Some(home) = runtime_home_for_config_override(config_override) else {
+        return Ok(());
+    };
+    #[allow(unsafe_code)]
+    unsafe {
+        std::env::set_var("EDGECRAB_HOME", &home);
+    }
+    Ok(())
+}
+
+fn editor_command_from_env() -> anyhow::Result<std::process::Command> {
+    let editor = std::env::var("EDITOR")
+        .or_else(|_| std::env::var("VISUAL"))
+        .unwrap_or_else(|_| "vi".to_string());
+    parse_editor_command(&editor)
+}
+
+fn parse_editor_command(editor: &str) -> anyhow::Result<std::process::Command> {
+    let parts = shell_split(editor)
+        .map_err(|e| anyhow::anyhow!("invalid $EDITOR/$VISUAL command '{}': {e}", editor))?;
+    let (program, args) = parts
+        .split_first()
+        .ok_or_else(|| anyhow::anyhow!("$EDITOR/$VISUAL is empty"))?;
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args);
+    Ok(cmd)
+}
+
+fn format_command_for_display(cmd: &std::process::Command) -> String {
+    let mut rendered = cmd.get_program().to_string_lossy().to_string();
+    for arg in cmd.get_args() {
+        rendered.push(' ');
+        rendered.push_str(&arg.to_string_lossy());
+    }
+    rendered
+}
+
+fn provider_environment_hint(provider: &str) -> &'static str {
+    match provider {
+        "anthropic" => "ANTHROPIC_API_KEY",
+        "azure" => "AZURE_OPENAI_API_KEY",
+        "bedrock" => "AWS_ACCESS_KEY_ID",
+        "copilot" => "GITHUB_TOKEN",
+        "gemini" => "GOOGLE_API_KEY",
+        "huggingface" => "HUGGINGFACE_API_KEY",
+        "lmstudio" => "local, no key",
+        "mistral" => "MISTRAL_API_KEY",
+        "ollama" => "local, no key",
+        "openai" => "OPENAI_API_KEY",
+        "openrouter" => "OPENROUTER_API_KEY",
+        "vertexai" => "GOOGLE_CLOUD_PROJECT + ADC",
+        "xai" => "XAI_API_KEY",
+        _ => "Provider configured via model catalog/runtime integration",
+    }
+}
+
+fn render_version_report() -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    let version = env!("CARGO_PKG_VERSION");
+    let _ = writeln!(out, "EdgeCrab v{version}");
+    let _ = writeln!(out, "Rust {}", env!("CARGO_PKG_RUST_VERSION", "unknown"));
+    let _ = writeln!(out);
+    let _ = writeln!(out, "Supported providers (from model catalog):");
+    for provider in edgecrab_core::ModelCatalog::provider_ids() {
+        let label = edgecrab_core::ModelCatalog::provider_label(&provider);
+        let hint = provider_environment_hint(&provider);
+        let _ = writeln!(out, "  {provider:<14} — {label} ({hint})");
+    }
+    let _ = writeln!(out);
+    let home = setup::edgecrab_home();
+    let _ = writeln!(out, "Home:   {}", home.display());
+    let _ = writeln!(out, "Config: {}", home.join("config.yaml").display());
+    let _ = writeln!(out);
+    let _ = writeln!(out, "Links:");
+    let _ = writeln!(out, "  Docs:    https://github.com/raphaelmansuy/edgecrab");
+    let _ = writeln!(
+        out,
+        "  Issues:  https://github.com/raphaelmansuy/edgecrab/issues"
+    );
+    out
+}
+
 fn set_config_value(
     config: &mut edgecrab_core::AppConfig,
     key: &str,
@@ -1743,7 +1823,13 @@ fn setup_worktree() -> anyhow::Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::set_config_value;
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    use super::{
+        activate_runtime_home_from_config, parse_editor_command, render_version_report,
+        runtime_home_for_config_override, set_config_value,
+    };
 
     #[test]
     fn set_config_value_supports_smart_routing_and_moa_keys() {
@@ -1787,5 +1873,55 @@ mod tests {
         let mut config = edgecrab_core::AppConfig::default();
         set_config_value(&mut config, "display.show_status_bar", "false").expect("set status bar");
         assert!(!config.display.show_status_bar);
+    }
+
+    #[test]
+    fn runtime_home_for_config_override_uses_parent_directory() {
+        let home = runtime_home_for_config_override(Some("/tmp/edgecrab-custom/config.yaml"))
+            .expect("home from config");
+        assert_eq!(home, PathBuf::from("/tmp/edgecrab-custom"));
+    }
+
+    #[test]
+    fn activate_runtime_home_from_config_sets_edgecrab_home() {
+        let previous = std::env::var_os("EDGECRAB_HOME");
+        activate_runtime_home_from_config(Some("/tmp/edgecrab-runtime/config.yaml"))
+            .expect("activate runtime home");
+        assert_eq!(
+            std::env::var_os("EDGECRAB_HOME"),
+            Some(OsString::from("/tmp/edgecrab-runtime"))
+        );
+        #[allow(unsafe_code)]
+        unsafe {
+            if let Some(value) = previous {
+                std::env::set_var("EDGECRAB_HOME", value);
+            } else {
+                std::env::remove_var("EDGECRAB_HOME");
+            }
+        }
+    }
+
+    #[test]
+    fn parse_editor_command_supports_editor_arguments() {
+        let cmd = parse_editor_command("code --wait").expect("editor command");
+        assert_eq!(cmd.get_program().to_string_lossy(), "code");
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(args, vec!["--wait"]);
+    }
+
+    #[test]
+    fn version_report_covers_catalog_providers() {
+        let report = render_version_report();
+        for provider in edgecrab_core::ModelCatalog::provider_ids() {
+            assert!(
+                report.contains(&provider),
+                "version report missing provider {provider}"
+            );
+        }
+        assert!(report.contains("EdgeCrab v"));
+        assert!(report.contains("Supported providers (from model catalog):"));
     }
 }
