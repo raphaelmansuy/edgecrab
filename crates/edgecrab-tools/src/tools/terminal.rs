@@ -101,8 +101,14 @@ pub struct TerminalTool;
 #[derive(Deserialize)]
 struct Args {
     command: String,
+    #[serde(default)]
+    background: bool,
     #[serde(default = "default_timeout")]
     timeout_seconds: u64,
+    #[serde(default)]
+    timeout: Option<u64>,
+    #[serde(default)]
+    pty: bool,
     /// Optional per-command working directory override.
     ///
     /// If relative, resolved against the task working directory (ctx.cwd).
@@ -112,6 +118,10 @@ struct Args {
 
 fn default_timeout() -> u64 {
     120
+}
+
+fn effective_timeout_seconds(args: &Args) -> u64 {
+    args.timeout.unwrap_or(args.timeout_seconds)
 }
 
 #[async_trait]
@@ -134,8 +144,17 @@ impl ToolHandler for TerminalTool {
             description: "Execute a shell command and return combined stdout+stderr output. \
                           Commands run in a persistent bash shell, so state like environment \
                           variables, `cd`, and shell functions persist across consecutive calls. \
+                          Do not use cat/head/tail to read files — use `read_file` instead. \
+                          Do not use grep/rg/find/ls for repo discovery — use `search_files` instead. \
+                          Do not use sed/awk for file edits — use `patch`/`apply_patch` instead. \
                           Use `workdir` to override the working directory for a single call. \
-                          For long-running processes (servers, watchers) use `run_process` instead. \
+                          Supports legacy background=true calls, which delegate to the shared background process path. \
+                          For long-running processes (servers, watchers) use background=true or `run_process`. \
+                          Do not use shell heredocs (`<<EOF`) in terminal. For file creation or edits, \
+                          use `write_file`, `patch`, or `apply_patch` instead of embedding file content \
+                          inside the command string. \
+                          PTY mode is available on the local backend for line-oriented interactive CLIs that need TTY semantics or prompt-style output. \
+                          PTY calls are per-command and do not reuse the persistent shell. Full-screen terminal UIs remain unsupported because the agent does not observe screen state. \
                           The exit code is appended to the output as `exit code: N`; non-zero \
                           means the command failed."
                 .into(),
@@ -146,9 +165,21 @@ impl ToolHandler for TerminalTool {
                         "type": "string",
                         "description": "Shell command to execute. Multi-line scripts are supported."
                     },
+                    "background": {
+                        "type": "boolean",
+                        "description": "Background mode for servers/watchers. Returns immediately with a process id."
+                    },
                     "timeout_seconds": {
                         "type": "integer",
                         "description": "Maximum seconds to wait for the command to finish (default: 120, max: 600)."
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "description": "Timeout alias in seconds."
+                    },
+                    "pty": {
+                        "type": "boolean",
+                        "description": "Allocate a PTY for local interactive CLI commands that need TTY semantics or prompt-style output. Local backend only. Full-screen TUIs remain unsupported."
                     },
                     "workdir": {
                         "type": "string",
@@ -173,6 +204,26 @@ impl ToolHandler for TerminalTool {
             message: e.to_string(),
         })?;
 
+        if args.background {
+            let started = crate::tools::process::start_background_process(
+                "terminal",
+                &args.command,
+                args.workdir.as_deref(),
+                args.pty,
+                ctx,
+            )
+            .await?;
+            return Ok(
+                if args.timeout.is_some() || args.timeout_seconds != default_timeout() {
+                    format!(
+                        "{started}\n[terminal note] background mode ignores terminal timeout; use process(action=\"wait\", session_id=..., timeout=...) to block for completion."
+                    )
+                } else {
+                    started
+                },
+            );
+        }
+
         // Auto-checkpoint before potentially destructive commands
         if is_destructive_command(&args.command) {
             ensure_checkpoint(ctx, &destructive_checkpoint_label(&args.command));
@@ -187,19 +238,35 @@ impl ToolHandler for TerminalTool {
         crate::command_interaction::guard_terminal_command(
             &args.command,
             &ctx.config.terminal_backend,
+            args.pty,
         )?;
 
-        let timeout = Duration::from_secs(args.timeout_seconds.min(600)); // hard cap 10 min
+        let timeout = Duration::from_secs(effective_timeout_seconds(&args).min(600)); // hard cap 10 min
+
+        if args.pty && ctx.config.terminal_backend != crate::tools::backends::BackendKind::Local {
+            return Err(
+                ToolError::capability_denied(
+                    "terminal",
+                    "pty_backend_unsupported",
+                    format!(
+                        "PTY mode is only available on the local terminal backend. The active backend is {}.",
+                        ctx.config.terminal_backend
+                    ),
+                )
+                .with_suggested_action(
+                    "Switch to the local backend for PTY commands, or rerun the command without PTY."
+                        .to_string(),
+                ),
+            );
+        }
 
         // Resolve the working directory: per-command workdir overrides ctx.cwd.
         let cwd = resolve_workdir(ctx, args.workdir.as_deref());
         validate_backend_workdir_visibility(&ctx.config.terminal_backend, &cwd)?;
 
         // Get or create backend for this task
-        let backend = get_or_create_backend(ctx).await?;
-
         // Sudo transform: rewrite `sudo` → `sudo -S -p ''` when SUDO_PASSWORD
-        // is set so commands can run non-interactively.  Mirrors hermes-agent's
+        // is set so commands can run non-interactively. This matches the
         // `_transform_sudo_command()`.  The persistent shell cannot pipe an
         // arbitrary stdin mid-execution, so we wrap the password delivery in a
         // process-substitution heredoc that is invisible in /proc cmdline args.
@@ -219,35 +286,47 @@ impl ToolHandler for TerminalTool {
         };
 
         // Execute via backend with up to 3 retries on transient infrastructure
-        // errors.  Mirrors hermes-agent terminal_tool.py retry logic: wait
+        // errors. This matches the existing exponential-backoff retry logic: wait
         // 2^attempt seconds between attempts (2 s, 4 s, 8 s).
         const MAX_RETRIES: u32 = 3;
         let mut attempt = 0u32;
-        let exec_output = loop {
-            let result = backend
-                .execute(&final_command, &cwd, timeout, ctx.cancel.clone())
-                .await;
+        let exec_output = if args.pty {
+            crate::local_pty::execute_foreground(
+                "terminal",
+                &final_command,
+                &cwd,
+                timeout,
+                ctx.cancel.clone(),
+            )
+            .await?
+        } else {
+            let backend = get_or_create_backend(ctx).await?;
+            loop {
+                let result = backend
+                    .execute(&final_command, &cwd, timeout, ctx.cancel.clone())
+                    .await;
 
-            // Check for retryable errors before consuming the value.
-            if let Err(ref e) = result {
-                if attempt < MAX_RETRIES && is_backend_retryable(e) {
-                    let wait = Duration::from_secs(1u64 << (attempt + 1)); // 2, 4, 8 s
-                    tracing::warn!(
-                        task_id = %ctx.task_id,
-                        attempt = attempt + 1,
-                        wait_secs = wait.as_secs(),
-                        error = %e,
-                        "terminal backend error; retrying",
-                    );
-                    attempt += 1;
-                    tokio::time::sleep(wait).await;
-                    continue;
+                // Check for retryable errors before consuming the value.
+                if let Err(ref e) = result {
+                    if attempt < MAX_RETRIES && is_backend_retryable(e) {
+                        let wait = Duration::from_secs(1u64 << (attempt + 1)); // 2, 4, 8 s
+                        tracing::warn!(
+                            task_id = %ctx.task_id,
+                            attempt = attempt + 1,
+                            wait_secs = wait.as_secs(),
+                            error = %e,
+                            "terminal backend error; retrying",
+                        );
+                        attempt += 1;
+                        tokio::time::sleep(wait).await;
+                        continue;
+                    }
                 }
-            }
 
-            match result {
-                Ok(out) => break out,
-                Err(e) => return Err(e),
+                match result {
+                    Ok(out) => break out,
+                    Err(e) => return Err(e),
+                }
             }
         };
 
@@ -267,7 +346,7 @@ impl ToolHandler for TerminalTool {
         result = strip_ansi_escapes::strip_str(&result);
 
         // Redact secrets and credentials before the output reaches the LLM.
-        // Mirrors hermes-agent terminal_tool.py: `redact_sensitive_text(output)`.
+        // This keeps terminal output handling aligned with the shared redaction policy.
         result = redact_output(&result);
 
         let header =
@@ -338,6 +417,7 @@ inventory::submit!(&TerminalTool as &dyn ToolHandler);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::process_table::ProcessTable;
     use crate::registry::{ApprovalRequest, ApprovalResponse};
     use crate::tools::backend_pool::{
         BackendCacheEntry, backend_cache, now_epoch_secs, prepare_backend_config,
@@ -432,6 +512,55 @@ mod tests {
     fn destructive_checkpoint_label_normalizes_whitespace() {
         let label = destructive_checkpoint_label("rm   -rf\t./tmp\nand-more");
         assert_eq!(label, "before terminal: rm -rf ./tmp and-more");
+    }
+
+    #[tokio::test]
+    async fn terminal_pty_reports_tty_to_child() {
+        let dir = TempDir::new().expect("tmpdir");
+        let ctx = ctx_in(dir.path());
+
+        let result = TerminalTool
+            .execute(
+                json!({"command": "[ -t 0 ] && [ -t 1 ] && printf tty-ok || printf no-tty", "pty": true}),
+                &ctx,
+            )
+            .await;
+
+        let output = result.expect("pty terminal");
+        assert!(output.contains("tty-ok"), "got: {output}");
+    }
+
+    #[tokio::test]
+    async fn terminal_background_delegates_to_shared_process_path() {
+        let dir = TempDir::new().expect("tmpdir");
+        let mut ctx = ctx_in(dir.path());
+        ctx.process_table = Some(Arc::new(ProcessTable::new()));
+
+        let result = TerminalTool
+            .execute(json!({"command": "echo hello", "background": true}), &ctx)
+            .await
+            .expect("background process");
+
+        assert!(result.contains("Process started"), "got: {result}");
+        assert!(result.contains("id=proc-"), "got: {result}");
+    }
+
+    #[tokio::test]
+    async fn terminal_pty_rejects_remote_backend() {
+        let dir = TempDir::new().expect("tmpdir");
+        let mut ctx = ctx_in(dir.path());
+        ctx.config.terminal_backend = crate::tools::backends::BackendKind::Modal;
+
+        let result = TerminalTool
+            .execute(json!({"command": "printf ok", "pty": true}), &ctx)
+            .await;
+
+        let err = result.expect_err("remote PTY should fail");
+        let ToolError::CapabilityDenied { code, message, .. } = err else {
+            panic!("expected capability denied");
+        };
+        assert_eq!(code, "pty_backend_unsupported");
+        assert!(message.contains("local terminal backend"));
     }
 
     #[tokio::test]

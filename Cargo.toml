@@ -91,6 +91,7 @@ which = "7"
 dotenvy = "0.15"
 mockall = "0.13"
 libc = "0.2"
+portable-pty = "0.9"
 
 # Execution backends
 bollard = { version = "0.18", features = ["ssl"] }

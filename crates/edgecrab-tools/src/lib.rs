@@ -18,9 +18,11 @@
 mod approval_runtime;
 mod command_interaction;
 pub mod config_ref;
+pub mod edit_contract;
 pub mod execution_fs;
 pub mod execution_tmp;
 pub mod fuzzy_match;
+mod local_pty;
 #[cfg(target_os = "macos")]
 pub mod macos_permissions;
 #[cfg(not(target_os = "macos"))]
@@ -31,6 +33,7 @@ pub mod process_table;
 pub mod provider_factory;
 pub mod read_tracker;
 pub mod registry;
+mod shell_syntax;
 pub mod tools;
 pub mod toolsets;
 pub mod vision_models;
@@ -52,7 +55,7 @@ pub(crate) fn safe_truncate(s: &str, max_bytes: usize) -> &str {
 pub use config_ref::AppConfigRef;
 pub use execution_fs::{ExecutionFilesystemView, describe_execution_filesystem};
 pub use process_table::ProcessTable;
-pub use provider_factory::create_provider_for_model;
+pub use provider_factory::{build_copilot_provider, create_provider_for_model};
 pub use registry::{
     SubAgentResult, SubAgentRunner, ToolContext, ToolHandler, ToolProgressUpdate, ToolRegistry,
     to_llm_definitions,
