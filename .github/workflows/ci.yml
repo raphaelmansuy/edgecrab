@@ -19,6 +19,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --workspace
+      - run: cargo build -p edgecrab-lsp --examples  # pre-build mock server used by integration tests
       - run: cargo test -p edgecrab-lsp
       - run: cargo test --workspace
       - run: cargo clippy --workspace --all-targets -- -D warnings
