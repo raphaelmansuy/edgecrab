@@ -285,7 +285,7 @@ pub fn tool_label(tool_name: &str) -> String {
         "browser_select" => "select".into(),
         "browser_hover" => "hover".into(),
         "browser_close" => "close".into(),
-        "todo" => "plan".into(),
+        "todo" | "manage_todo_list" => "plan".into(),
         "session_search" => "recall".into(),
         "memory" => "memory".into(),
         "skills_list" => "skills".into(),
@@ -417,7 +417,7 @@ pub fn extract_tool_preview(tool_name: &str, args_json: &str) -> String {
             };
             (!detail.is_empty()).then_some(detail)
         }
-        "todo" => match obj.get("todos") {
+        "todo" | "manage_todo_list" => match obj.get("todos").or_else(|| obj.get("items")) {
             None => Some("read task list".into()),
             Some(serde_json::Value::Array(items)) => Some(
                 if obj.get("merge").and_then(|v| v.as_bool()).unwrap_or(false) {
@@ -980,6 +980,9 @@ pub fn tool_icon(name: &str) -> &'static str {
     if n.contains("memory") || n.contains("store") {
         return "⊞";
     }
+    if n.contains("todo") || n.contains("task") || n.contains("plan") {
+        return "☑";
+    }
     if n.contains("delegate") || n.contains("spawn") || n.contains("agent") {
         return "⊛";
     }
@@ -1073,6 +1076,15 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_tool_preview_supports_manage_todo_list_alias() {
+        let preview = extract_tool_preview(
+            "manage_todo_list",
+            r#"{"items":[{"id":1,"title":"Audit","status":"in-progress"}],"merge":true}"#,
+        );
+        assert_eq!(preview, "update 1 task(s)");
+    }
+
+    #[test]
     fn test_tool_emoji_search_variants() {
         assert_eq!(tool_emoji("grep_files"), "🔍");
         assert_eq!(tool_emoji("find_in_dir"), "🔍");
@@ -1142,6 +1154,7 @@ mod tests {
         assert_eq!(tool_icon("write_file"), "✎");
         assert_eq!(tool_icon("read_file"), "≡"); // matches "read" check
         assert_eq!(tool_icon("mcp_call"), "◎");
+        assert_eq!(tool_icon("manage_todo_list"), "☑");
         assert_eq!(tool_icon("unknown_op"), "⚙"); // no pattern matches → gear fallback
     }
 

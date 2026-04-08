@@ -1685,7 +1685,7 @@ fn summarize_tool_result_preview(name: &str, tool_result: &str, is_error: bool) 
                 }
                 None
             }
-            "todo" => {
+            "todo" | "manage_todo_list" => {
                 let summary = obj.get("summary")?.as_object()?;
                 let total = summary.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
                 let completed = summary
@@ -4255,6 +4255,17 @@ mod tests {
         )
         .expect("preview");
         assert_eq!(preview, "2/4 done, 1 in progress");
+    }
+
+    #[test]
+    fn summarize_tool_result_preview_supports_manage_todo_list_alias() {
+        let preview = summarize_tool_result_preview(
+            "manage_todo_list",
+            r#"{"todos":[],"summary":{"total":3,"completed":1,"in_progress":1,"not_started":1,"cancelled":0}}"#,
+            false,
+        )
+        .expect("preview");
+        assert_eq!(preview, "1/3 done, 1 in progress");
     }
 
     #[test]

@@ -2970,6 +2970,8 @@ pub struct App {
     progress_seq: u64,
     /// Active isolated `/background` sessions keyed by task ID.
     background_tasks_active: std::collections::HashMap<String, BackgroundTaskStatus>,
+    /// Active foreground tool calls keyed by tool_call_id for parallel status summaries.
+    active_tools: std::collections::HashMap<String, ActiveToolStatus>,
     /// Active delegated child tasks for the foreground agent turn.
     active_subagents: std::collections::HashMap<usize, ActiveSubagentStatus>,
     /// Channel for cron job completion notifications from the background ticker.
@@ -3329,6 +3331,23 @@ struct ActiveSubagentStatus {
     last_seq: u64,
 }
 
+#[derive(Clone, Debug)]
+struct ActiveToolStatus {
+    name: String,
+    args_json: String,
+    last_detail: Option<String>,
+    started_at: Instant,
+    last_seq: u64,
+}
+
+#[derive(Clone, Debug)]
+struct ActiveToolSummary {
+    verb: String,
+    icon: String,
+    detail: String,
+    elapsed_secs: u64,
+}
+
 fn background_progress_text(task_num: u64, event: &edgecrab_core::StreamEvent) -> Option<String> {
     match event {
         edgecrab_core::StreamEvent::ToolExec {
@@ -3420,6 +3439,49 @@ fn format_subagent_status_summary(
     ))
 }
 
+fn latest_active_tool_entry(
+    active: &std::collections::HashMap<String, ActiveToolStatus>,
+) -> Option<(&String, &ActiveToolStatus)> {
+    active.iter().max_by_key(|(_, status)| status.last_seq)
+}
+
+fn summarize_active_tools(
+    active: &std::collections::HashMap<String, ActiveToolStatus>,
+) -> Option<ActiveToolSummary> {
+    let (_, current) = latest_active_tool_entry(active)?;
+    let mut detail = current
+        .last_detail
+        .as_deref()
+        .filter(|text| !text.trim().is_empty())
+        .map(|text| edgecrab_core::safe_truncate(text.trim(), 52).to_string())
+        .unwrap_or_else(|| {
+            edgecrab_core::safe_truncate(
+                &tool_status_preview(&current.name, &current.args_json),
+                52,
+            )
+            .to_string()
+        });
+    let count = active.len();
+    if count > 1 {
+        detail.push_str(&format!("  +{} more", count - 1));
+    }
+    let elapsed_secs = active
+        .values()
+        .map(|status| status.started_at.elapsed().as_secs())
+        .max()
+        .unwrap_or(0);
+    Some(ActiveToolSummary {
+        verb: if count > 1 {
+            "running".into()
+        } else {
+            tool_action_verb(&current.name).into()
+        },
+        icon: tool_icon(&current.name).into(),
+        detail,
+        elapsed_secs,
+    })
+}
+
 impl App {
     pub fn new() -> Self {
         let (response_tx, response_rx) = mpsc::unbounded_channel();
@@ -3485,6 +3547,7 @@ impl App {
             background_task_seq: 0,
             progress_seq: 0,
             background_tasks_active: std::collections::HashMap::new(),
+            active_tools: std::collections::HashMap::new(),
             active_subagents: std::collections::HashMap::new(),
             cron_rx,
             cron_tx,
@@ -3715,6 +3778,7 @@ impl App {
         self.reasoning_line = None;
         self.pending_tool_lines.clear();
         self.hidden_tool_calls.clear();
+        self.active_tools.clear();
         self.seen_tool_signatures.clear();
         // Request a full terminal repaint.  ratatui's diff-based renderer
         // normally skips unchanged cells; if any out-of-band bytes reached the
@@ -7214,6 +7278,7 @@ impl App {
         self.active_subagents.clear();
         self.turn_stream_tokens = 0;
         self.hidden_tool_calls.clear();
+        self.active_tools.clear();
         self.seen_tool_signatures.clear();
         // Reset the response accumulator for the new turn (voice mode uses it).
         self.last_agent_response_text.clear();
@@ -8127,13 +8192,25 @@ impl App {
                     // Track parallel in-flight tools — multiple ToolExec events
                     // may arrive before any ToolDone (parallel tool dispatch).
                     self.in_flight_tool_count = self.in_flight_tool_count.saturating_add(1);
+                    self.progress_seq = self.progress_seq.saturating_add(1);
+                    let started_at = Instant::now();
+                    self.active_tools.insert(
+                        tool_call_id.clone(),
+                        ActiveToolStatus {
+                            name: name.clone(),
+                            args_json: args_json.clone(),
+                            last_detail: None,
+                            started_at,
+                            last_seq: self.progress_seq,
+                        },
+                    );
                     self.display_state = DisplayState::ToolExec {
                         tool_call_id: tool_call_id.clone(),
                         name: name.clone(),
                         args_json: args_json.clone(),
                         detail: None,
                         frame: 0,
-                        started: Instant::now(),
+                        started: started_at,
                     };
                     if self.should_render_tool_call(&name, &args_json) {
                         // Push a live "in-flight" placeholder line to the output area.
@@ -8184,6 +8261,11 @@ impl App {
                     let detail = message.trim().to_string();
                     if detail.is_empty() {
                         continue;
+                    }
+                    self.progress_seq = self.progress_seq.saturating_add(1);
+                    if let Some(status) = self.active_tools.get_mut(&tool_call_id) {
+                        status.last_detail = Some(detail.clone());
+                        status.last_seq = self.progress_seq;
                     }
                     if let DisplayState::ToolExec {
                         tool_call_id: active_tool_call_id,
@@ -8240,6 +8322,7 @@ impl App {
                     let hidden = self.hidden_tool_calls.remove(&tool_call_id);
                     // Build the final styled completion spans.
                     let pending = self.pending_tool_lines.remove(&tool_call_id);
+                    self.active_tools.remove(&tool_call_id);
                     if !hidden {
                         let spans = build_tool_done_line(
                             &name,
@@ -8299,6 +8382,17 @@ impl App {
                         self.display_state = DisplayState::AwaitingFirstToken {
                             frame: 0,
                             started: Instant::now(),
+                        };
+                    } else if let Some((active_tool_call_id, active)) =
+                        latest_active_tool_entry(&self.active_tools)
+                    {
+                        self.display_state = DisplayState::ToolExec {
+                            tool_call_id: active_tool_call_id.clone(),
+                            name: active.name.clone(),
+                            args_json: active.args_json.clone(),
+                            detail: active.last_detail.clone(),
+                            frame: 0,
+                            started: active.started_at,
                         };
                     }
                     self.needs_redraw = true;
@@ -8439,6 +8533,7 @@ impl App {
                     self.turn_stream_tokens = 0;
                     self.pending_tool_lines.clear();
                     self.hidden_tool_calls.clear();
+                    self.active_tools.clear();
                     self.seen_tool_signatures.clear();
                     self.display_state = DisplayState::Idle;
                     self.last_response_time = Some(Instant::now());
@@ -8475,6 +8570,7 @@ impl App {
                     self.turn_stream_tokens = 0;
                     self.pending_tool_lines.clear();
                     self.hidden_tool_calls.clear();
+                    self.active_tools.clear();
                     self.seen_tool_signatures.clear();
                     self.display_state = DisplayState::Idle;
                     self.push_output(err, OutputRole::Error);
@@ -15228,7 +15324,11 @@ impl App {
                 ..
             } => {
                 let spinner = SPINNER_FRAMES[*f % SPINNER_FRAMES.len()];
-                let elapsed_secs = started.elapsed().as_secs();
+                let summary = summarize_active_tools(&self.active_tools);
+                let elapsed_secs = summary
+                    .as_ref()
+                    .map(|active| active.elapsed_secs)
+                    .unwrap_or_else(|| started.elapsed().as_secs());
                 // Show elapsed time after 3 s (mirrors Thinking state behaviour).
                 // Show the stop hint after 10 s for long-running tools.
                 let time_part = if elapsed_secs >= 3 {
@@ -15237,18 +15337,13 @@ impl App {
                     String::new()
                 };
                 let stop_hint = if elapsed_secs >= 10 { "  ^C=stop" } else { "" };
-                // When multiple tools are in-flight (parallel dispatch), show
-                // the count rather than a single name — prevents misleading display
-                // (e.g. showing only the last-dispatched tool while 3 run in parallel).
-                let content = if self.in_flight_tool_count > 1 {
+                let content = if let Some(active) = summary {
                     format!(
-                        " {spinner} {} tools in parallel{time_part}{stop_hint} ",
-                        self.in_flight_tool_count
+                        " {spinner} {} {} {}{time_part}{stop_hint} ",
+                        active.verb, active.icon, active.detail
                     )
                 } else {
                     let icon = tool_icon(name);
-                    // Tool-specific verb ("searching", "executing", "reading", …)
-                    // gives more context than a generic spinner label.
                     let verb = tool_action_verb(name);
                     let preview = detail
                         .as_deref()
@@ -19343,6 +19438,47 @@ mod tests {
     }
 
     #[test]
+    fn active_tool_status_summary_prefers_latest_detail_and_parallel_count() {
+        let mut tools = std::collections::HashMap::new();
+        tools.insert(
+            "call_1".into(),
+            ActiveToolStatus {
+                name: "read_file".into(),
+                args_json: r#"{"path":"src/lib.rs"}"#.into(),
+                last_detail: None,
+                started_at: Instant::now(),
+                last_seq: 1,
+            },
+        );
+        tools.insert(
+            "call_2".into(),
+            ActiveToolStatus {
+                name: "manage_todo_list".into(),
+                args_json:
+                    r#"{"items":[{"id":1,"title":"Audit","status":"in-progress"}],"merge":true}"#
+                        .into(),
+                last_detail: Some("1/3 completed; updating remaining tasks".into()),
+                started_at: Instant::now(),
+                last_seq: 2,
+            },
+        );
+
+        let summary = summarize_active_tools(&tools).expect("summary");
+        assert_eq!(summary.verb, "running");
+        assert_eq!(summary.icon, "☑");
+        assert!(
+            summary.detail.contains("1/3 completed"),
+            "got: {}",
+            summary.detail
+        );
+        assert!(
+            summary.detail.contains("+1 more"),
+            "got: {}",
+            summary.detail
+        );
+    }
+
+    #[test]
     fn background_progress_text_formats_subagent_reasoning() {
         let event = edgecrab_core::StreamEvent::SubAgentReasoning {
             task_index: 0,
@@ -21238,6 +21374,7 @@ mod tests {
     #[tokio::test]
     async fn tool_done_updates_matching_placeholder_even_when_completions_arrive_out_of_order() {
         let mut app = App::new();
+        app.tool_progress_mode = ToolProgressMode::All;
         app.response_tx
             .send(AgentResponse::ToolExec {
                 tool_call_id: "call_1".into(),
@@ -21308,6 +21445,64 @@ mod tests {
             }
             other => panic!("expected ToolExec state, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn tool_done_retargets_status_to_remaining_parallel_tool() {
+        let mut app = App::new();
+        app.response_tx
+            .send(AgentResponse::ToolExec {
+                tool_call_id: "call_read".into(),
+                name: "read_file".into(),
+                args_json: r#"{"path":"src/main.rs"}"#.into(),
+            })
+            .expect("send read tool exec");
+        app.response_tx
+            .send(AgentResponse::ToolExec {
+                tool_call_id: "call_todo".into(),
+                name: "manage_todo_list".into(),
+                args_json:
+                    r#"{"items":[{"id":1,"title":"Audit","status":"in-progress"}],"merge":true}"#
+                        .into(),
+            })
+            .expect("send todo tool exec");
+        app.response_tx
+            .send(AgentResponse::ToolProgress {
+                tool_call_id: "call_read".into(),
+                name: "read_file".into(),
+                message: "line window 1-120 loaded".into(),
+            })
+            .expect("send read progress");
+        app.response_tx
+            .send(AgentResponse::ToolDone {
+                tool_call_id: "call_todo".into(),
+                name: "manage_todo_list".into(),
+                args_json:
+                    r#"{"items":[{"id":1,"title":"Audit","status":"in-progress"}],"merge":true}"#
+                        .into(),
+                result_preview: Some("1/3 done, 1 in progress".into()),
+                duration_ms: 6,
+                is_error: false,
+            })
+            .expect("send todo done");
+        app.check_responses();
+
+        match &app.display_state {
+            DisplayState::ToolExec {
+                tool_call_id,
+                name,
+                detail,
+                ..
+            } => {
+                assert_eq!(tool_call_id, "call_read");
+                assert_eq!(name, "read_file");
+                assert_eq!(detail.as_deref(), Some("line window 1-120 loaded"));
+            }
+            other => panic!("expected ToolExec state, got {other:?}"),
+        }
+        assert_eq!(app.in_flight_tool_count, 1);
+        assert!(app.active_tools.contains_key("call_read"));
+        assert!(!app.active_tools.contains_key("call_todo"));
     }
 
     #[tokio::test]
