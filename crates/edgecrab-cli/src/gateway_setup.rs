@@ -1839,12 +1839,12 @@ fn print_platform_status(config: &edgecrab_core::AppConfig) {
 
 // ─── .env file management ─────────────────────────────────────────────
 
-fn env_file_path() -> PathBuf {
+pub(crate) fn env_file_path() -> PathBuf {
     edgecrab_core::config::edgecrab_home().join(".env")
 }
 
 /// Save a key to ~/.edgecrab/.env, creating or updating as needed.
-fn save_env_key(env_var: &str, value: &str) -> anyhow::Result<()> {
+pub(crate) fn save_env_key(env_var: &str, value: &str) -> anyhow::Result<()> {
     let env_path = env_file_path();
     let home = edgecrab_core::config::edgecrab_home();
     std::fs::create_dir_all(&home)?;
@@ -1891,7 +1891,7 @@ fn save_env_key(env_var: &str, value: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn remove_env_key(env_var: &str) -> anyhow::Result<()> {
+pub(crate) fn remove_env_key(env_var: &str) -> anyhow::Result<()> {
     let env_path = env_file_path();
     if !env_path.exists() {
         unsafe { std::env::remove_var(env_var) };
@@ -1917,6 +1917,24 @@ fn remove_env_key(env_var: &str) -> anyhow::Result<()> {
 
     unsafe { std::env::remove_var(env_var) };
     Ok(())
+}
+
+pub(crate) fn read_env_key(env_var: &str) -> Option<String> {
+    if let Ok(value) = std::env::var(env_var) {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    let env_path = env_file_path();
+    let content = std::fs::read_to_string(env_path).ok()?;
+    content.lines().find_map(|line| {
+        line.strip_prefix(env_var)
+            .filter(|rest| rest.starts_with('='))
+            .map(|rest| rest[1..].trim().to_string())
+            .filter(|value| !value.is_empty())
+    })
 }
 
 // ─── Interactive helpers ──────────────────────────────────────────────

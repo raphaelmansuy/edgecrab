@@ -21,6 +21,7 @@ mod cron_cmd;
 mod doctor;
 mod edit_diff;
 mod fuzzy_selector;
+mod gateway_browser;
 mod gateway_catalog;
 mod gateway_cmd;
 mod gateway_presentation;

@@ -1,8 +1,11 @@
 use crate::gateway_catalog::{PlatformDiagnostic, PlatformState};
 use edgecrab_core::AppConfig;
+#[cfg(test)]
 use edgecrab_gateway::channel_directory::{ChannelDirectory, load_directory};
 
+#[cfg(test)]
 pub type PendingPairingSummary = (String, String, String, String, u64);
+#[cfg(test)]
 pub type ApprovedPairingSummary = (String, String, String);
 
 struct DeliveryProfile {
@@ -51,6 +54,7 @@ pub fn render_gateway_home_channel_summary(config: &AppConfig) -> String {
     }
 }
 
+#[cfg(test)]
 pub fn render_gateway_platforms_panel(
     config: &AppConfig,
     diagnostics: &[PlatformDiagnostic],
@@ -106,6 +110,7 @@ pub fn render_gateway_platforms_panel(
     text
 }
 
+#[cfg(test)]
 fn format_gateway_runtime_summary(
     config: &AppConfig,
     diagnostics: &[PlatformDiagnostic],
@@ -144,6 +149,7 @@ fn format_gateway_runtime_summary(
     )
 }
 
+#[cfg(test)]
 fn format_gateway_pairing_summary(
     pending_pairings: &[PendingPairingSummary],
     approved_pairings: &[ApprovedPairingSummary],
@@ -172,6 +178,7 @@ fn format_gateway_pairing_summary(
     text
 }
 
+#[cfg(test)]
 fn append_gateway_platform_group(
     text: &mut String,
     heading: &str,
@@ -200,6 +207,7 @@ fn append_gateway_platform_group(
     text.truncate(text.trim_end_matches('\n').len());
 }
 
+#[cfg(test)]
 fn format_gateway_platform_line(diagnostic: &PlatformDiagnostic) -> String {
     let marker = match diagnostic.state {
         PlatformState::Ready => "✓",
@@ -210,7 +218,7 @@ fn format_gateway_platform_line(diagnostic: &PlatformDiagnostic) -> String {
     format!("  {marker} {:<12} {}", diagnostic.name, diagnostic.detail)
 }
 
-fn format_gateway_delivery_line(platform_id: &str) -> String {
+pub(crate) fn format_gateway_delivery_line(platform_id: &str) -> String {
     let profile = delivery_profile(platform_id);
     format!(
         "{}; {}; {}; {} chars max",
@@ -218,6 +226,7 @@ fn format_gateway_delivery_line(platform_id: &str) -> String {
     )
 }
 
+#[cfg(test)]
 fn discovered_target_count(directory: &ChannelDirectory, platform_id: &str) -> usize {
     directory
         .platforms
@@ -226,7 +235,7 @@ fn discovered_target_count(directory: &ChannelDirectory, platform_id: &str) -> u
         .unwrap_or(0)
 }
 
-fn gateway_platform_next_step(diagnostic: &PlatformDiagnostic) -> Option<String> {
+pub(crate) fn gateway_platform_next_step(diagnostic: &PlatformDiagnostic) -> Option<String> {
     match diagnostic.state {
         PlatformState::Incomplete => Some(match diagnostic.id {
             "whatsapp" => {

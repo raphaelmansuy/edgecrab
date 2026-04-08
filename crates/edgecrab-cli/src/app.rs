@@ -56,6 +56,9 @@ use unicode_width::UnicodeWidthStr;
 use crate::commands::{CommandRegistry, CommandResult, ToolManagerMode};
 use crate::edit_diff::{LocalEditSnapshot, capture_local_edit_snapshot, render_edit_diff_lines};
 use crate::fuzzy_selector::{FuzzyItem, FuzzySelector};
+use crate::gateway_browser::{
+    GatewayPlatformEntry, build_gateway_platform_entries, supports_allowlist, supports_home_channel,
+};
 use crate::gateway_catalog::collect_platform_diagnostics;
 use crate::image_models as cli_image_models;
 use crate::markdown_render;
@@ -75,7 +78,6 @@ use edgecrab_core::{
     discovery_provider_statuses, live_discovery_availability, live_discovery_providers,
     merge_grouped_catalog_with_dynamic, normalize_discovery_provider,
 };
-use edgecrab_gateway::pairing::PairingStore;
 use edgecrab_tools::registry::{ToolHandler, ToolInventoryEntry};
 use edgecrab_tools::tools::transcribe::TranscribeAudioTool;
 use edgecrab_tools::tools::tts::{TextToSpeechTool, sanitize_text_for_tts};
@@ -1598,6 +1600,23 @@ enum DisplayState {
         /// Currently typed buffer (never stored in history or output).
         buffer: String,
     },
+    /// Local inline configuration prompt used by the gateway browser.
+    ValueCapture {
+        title: String,
+        prompt: String,
+        placeholder: String,
+        masked: bool,
+        buffer: String,
+        action: ValueCaptureAction,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ValueCaptureAction {
+    BindAddress,
+    HomeChannel(String),
+    AllowedUsers(String),
+    PrimaryField(String),
 }
 
 /// Result payload delivered back to the main loop via `AgentResponse::BgOp`
@@ -1955,6 +1974,7 @@ enum DetailSurface {
     ModelSelector,
     VisionModelSelector,
     ImageModelSelector,
+    GatewayBrowser,
     McpSelector,
     RemoteMcpBrowser,
     SkillSelector,
@@ -2784,6 +2804,7 @@ enum ConfigAction {
     ToggleStatusBar,
     OpenSkins,
     ShowVoice,
+    OpenGatewayBrowser,
     ShowGatewayHomes,
     ShowUpdateStatus,
 }
@@ -3055,6 +3076,10 @@ pub struct App {
     session_inspector: SessionInspector,
     /// Config center overlay (activated by `/config`)
     config_selector: FuzzySelector<ConfigEntry>,
+    /// Gateway platform browser overlay (activated by `/platforms`)
+    gateway_browser: FuzzySelector<GatewayPlatformEntry>,
+    /// Focus and scroll state for the gateway browser detail pane.
+    gateway_browser_pane: DetailPaneState,
     /// Skin browser overlay (activated by `/skin list`)
     skin_browser: FuzzySelector<SkinEntry>,
     /// Cached skill names (without leading /) for completion suggestions
@@ -3602,6 +3627,8 @@ impl App {
             detail_fullscreen: None,
             session_inspector: SessionInspector::new(),
             config_selector: FuzzySelector::new(),
+            gateway_browser: FuzzySelector::new(),
+            gateway_browser_pane: DetailPaneState::default(),
             skin_browser: FuzzySelector::new(),
             skills_completion_names: Vec::new(),
             active_skills: Vec::new(),
@@ -6166,6 +6193,11 @@ impl App {
             return;
         }
 
+        if matches!(self.display_state, DisplayState::ValueCapture { .. }) {
+            self.handle_value_capture_key(key);
+            return;
+        }
+
         // Model selector overlay active — intercept all keys
         if self.model_selector.active {
             match key.code {
@@ -6222,6 +6254,106 @@ impl App {
                 }
                 _ => {}
             }
+            return;
+        }
+
+        if self.gateway_browser.active {
+            match key.code {
+                KeyCode::Esc => {
+                    if !self.close_detail_fullscreen(DetailSurface::GatewayBrowser) {
+                        self.gateway_browser.active = false;
+                    }
+                }
+                _ if selector_action_key(&key, 'z') => {
+                    self.toggle_detail_fullscreen(
+                        DetailSurface::GatewayBrowser,
+                        self.gateway_browser_pane.scroll,
+                    );
+                }
+                KeyCode::Enter => {
+                    self.open_gateway_primary_editor();
+                }
+                KeyCode::Char(' ') => {
+                    self.toggle_selected_gateway_platform();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::GatewayBrowser);
+                }
+                _ if selector_action_key(&key, 'a') => {
+                    self.open_gateway_allowlist_editor();
+                }
+                _ if selector_action_key(&key, 'h') => {
+                    self.open_gateway_home_channel_editor();
+                }
+                _ if selector_action_key(&key, 'b') => {
+                    self.open_gateway_bind_editor();
+                }
+                _ if selector_action_key(&key, 'r') => {
+                    self.refresh_gateway_browser();
+                }
+                KeyCode::Tab | KeyCode::BackTab
+                    if !self.detail_fullscreen_active(DetailSurface::GatewayBrowser) =>
+                {
+                    self.gateway_browser_pane.focus = self.gateway_browser_pane.focus.toggle();
+                }
+                KeyCode::Up => {
+                    self.gateway_browser.move_up();
+                    self.gateway_browser_pane.reset_scroll();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::GatewayBrowser);
+                }
+                KeyCode::Down => {
+                    self.gateway_browser.move_down();
+                    self.gateway_browser_pane.reset_scroll();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::GatewayBrowser);
+                }
+                KeyCode::PageUp if self.detail_fullscreen_active(DetailSurface::GatewayBrowser) => {
+                    self.page_up_detail_fullscreen(DetailSurface::GatewayBrowser);
+                }
+                KeyCode::PageUp => {
+                    if self.gateway_browser_pane.focus == SplitPaneFocus::Detail {
+                        self.gateway_browser_pane.page_up(8);
+                    } else {
+                        self.gateway_browser.page_up();
+                        self.gateway_browser_pane.reset_scroll();
+                        self.reset_detail_fullscreen_scroll(DetailSurface::GatewayBrowser);
+                    }
+                }
+                KeyCode::PageDown
+                    if self.detail_fullscreen_active(DetailSurface::GatewayBrowser) =>
+                {
+                    self.page_down_detail_fullscreen(DetailSurface::GatewayBrowser);
+                }
+                KeyCode::PageDown => {
+                    if self.gateway_browser_pane.focus == SplitPaneFocus::Detail {
+                        self.gateway_browser_pane.page_down(8);
+                    } else {
+                        self.gateway_browser.page_down();
+                        self.gateway_browser_pane.reset_scroll();
+                        self.reset_detail_fullscreen_scroll(DetailSurface::GatewayBrowser);
+                    }
+                }
+                KeyCode::Home => {
+                    self.gateway_browser.selected = 0;
+                    self.gateway_browser_pane.reset_scroll();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::GatewayBrowser);
+                }
+                KeyCode::End => {
+                    self.gateway_browser.selected =
+                        self.gateway_browser.filtered.len().saturating_sub(1);
+                    self.gateway_browser_pane.reset_scroll();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::GatewayBrowser);
+                }
+                KeyCode::Backspace => {
+                    self.gateway_browser.pop_char();
+                    self.gateway_browser_pane.reset_scroll();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::GatewayBrowser);
+                }
+                KeyCode::Char(c) if selector_search_char(&key) == Some(c) => {
+                    self.gateway_browser.push_char(c);
+                    self.gateway_browser_pane.reset_scroll();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::GatewayBrowser);
+                }
+                _ => {}
+            }
+            self.needs_redraw = true;
             return;
         }
 
@@ -9017,6 +9149,251 @@ impl App {
         self.needs_redraw = true;
     }
 
+    fn handle_value_capture_key(&mut self, key: crossterm::event::KeyEvent) {
+        match key.code {
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                if let DisplayState::ValueCapture { ref mut buffer, .. } = self.display_state {
+                    buffer.push(c);
+                }
+            }
+            KeyCode::Backspace => {
+                if let DisplayState::ValueCapture { ref mut buffer, .. } = self.display_state {
+                    buffer.pop();
+                }
+            }
+            KeyCode::Enter => {
+                let (action, value) = match &mut self.display_state {
+                    DisplayState::ValueCapture { action, buffer, .. } => {
+                        (action.clone(), buffer.trim().to_string())
+                    }
+                    _ => return,
+                };
+                self.display_state = DisplayState::Idle;
+                self.apply_value_capture_action(action, value);
+            }
+            KeyCode::Esc => {
+                self.display_state = DisplayState::Idle;
+                self.needs_redraw = true;
+            }
+            _ => {}
+        }
+        self.needs_redraw = true;
+    }
+
+    fn apply_value_capture_action(&mut self, action: ValueCaptureAction, value: String) {
+        match action {
+            ValueCaptureAction::BindAddress => {
+                let trimmed = value.trim();
+                let bind = if trimmed.eq_ignore_ascii_case("clear") || trimmed.is_empty() {
+                    "127.0.0.1:8080".to_string()
+                } else {
+                    trimmed.to_string()
+                };
+                let Some((host, port)) = bind.rsplit_once(':') else {
+                    self.push_output(
+                        "Bind must use host:port format, for example 127.0.0.1:8080",
+                        OutputRole::Error,
+                    );
+                    return;
+                };
+                let Ok(port) = port.parse::<u16>() else {
+                    self.push_output("Gateway port must be a valid TCP port.", OutputRole::Error);
+                    return;
+                };
+                if port == 0 {
+                    self.push_output(
+                        "Gateway port must be between 1 and 65535.",
+                        OutputRole::Error,
+                    );
+                    return;
+                }
+                let mut config = self.load_runtime_config();
+                config.gateway.host = host.trim().to_string();
+                config.gateway.port = port;
+                match config.save() {
+                    Ok(()) => self.push_output(
+                        format!(
+                            "Gateway bind set to {}:{}",
+                            config.gateway.host, config.gateway.port
+                        ),
+                        OutputRole::System,
+                    ),
+                    Err(error) => self.push_output(
+                        format!("Failed to save gateway bind: {error}"),
+                        OutputRole::Error,
+                    ),
+                }
+            }
+            ValueCaptureAction::HomeChannel(platform) => {
+                let mut config = self.load_runtime_config();
+                let channel = if value.is_empty() || value.eq_ignore_ascii_case("clear") {
+                    None
+                } else {
+                    Some(value)
+                };
+                match self.set_home_channel_in_config(&mut config, &platform, channel.clone()) {
+                    Ok(()) => match config.save() {
+                        Ok(()) => self.push_output(
+                            match channel {
+                                Some(channel) => {
+                                    format!("Home channel for {platform} set to: {channel}")
+                                }
+                                None => format!("Home channel for {platform} cleared."),
+                            },
+                            OutputRole::System,
+                        ),
+                        Err(error) => self.push_output(
+                            format!("Failed to save {platform} home channel: {error}"),
+                            OutputRole::Error,
+                        ),
+                    },
+                    Err(error) => self.push_output(error.to_string(), OutputRole::Error),
+                }
+            }
+            ValueCaptureAction::AllowedUsers(platform) => {
+                let values = if value.is_empty() || value.eq_ignore_ascii_case("clear") {
+                    Vec::new()
+                } else {
+                    value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|entry| !entry.is_empty())
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                };
+                let mut config = self.load_runtime_config();
+                let env_key = format!("{}_ALLOWED_USERS", platform.to_ascii_uppercase());
+                let save_result: Result<(), String> = match platform.as_str() {
+                    "telegram" => {
+                        config.gateway.telegram.allowed_users = values.clone();
+                        config.save().map_err(|error| error.to_string())
+                    }
+                    "discord" => {
+                        config.gateway.discord.allowed_users = values.clone();
+                        config.save().map_err(|error| error.to_string())
+                    }
+                    "slack" => {
+                        config.gateway.slack.allowed_users = values.clone();
+                        config.save().map_err(|error| error.to_string())
+                    }
+                    "signal" => {
+                        config.gateway.signal.allowed_users = values.clone();
+                        config.save().map_err(|error| error.to_string())
+                    }
+                    "whatsapp" => {
+                        config.gateway.whatsapp.allowed_users = values.clone();
+                        config.save().map_err(|error| error.to_string())
+                    }
+                    _ => if values.is_empty() {
+                        crate::gateway_setup::remove_env_key(&env_key)
+                    } else {
+                        crate::gateway_setup::save_env_key(&env_key, &values.join(","))
+                    }
+                    .map_err(|error| error.to_string()),
+                };
+                match save_result {
+                    Ok(()) => self.push_output(
+                        if values.is_empty() {
+                            format!("{platform} allowlist cleared.")
+                        } else {
+                            format!("{platform} allowlist updated ({} entrie(s)).", values.len())
+                        },
+                        OutputRole::System,
+                    ),
+                    Err(error) => self.push_output(
+                        format!("Failed to save {platform} allowlist: {error}"),
+                        OutputRole::Error,
+                    ),
+                }
+            }
+            ValueCaptureAction::PrimaryField(field) => {
+                if !self.save_gateway_primary_field(&field, &value) {
+                    return;
+                }
+            }
+        }
+        self.refresh_gateway_browser();
+    }
+
+    fn save_gateway_primary_field(&mut self, field: &str, value: &str) -> bool {
+        let clear = value.is_empty() || value.eq_ignore_ascii_case("clear");
+        let result: Result<(), String> = match field {
+            "SIGNAL_HTTP_URL" => {
+                let mut config = self.load_runtime_config();
+                config.gateway.signal.http_url = (!clear).then_some(value.to_string());
+                config.save().map_err(|error| error.to_string())
+            }
+            "SIGNAL_ACCOUNT" => {
+                let mut config = self.load_runtime_config();
+                config.gateway.signal.account = (!clear).then_some(value.to_string());
+                config.save().map_err(|error| error.to_string())
+            }
+            "WHATSAPP_MODE" => {
+                let normalized = if clear {
+                    "self-chat".to_string()
+                } else {
+                    value.trim().to_ascii_lowercase()
+                };
+                if normalized != "bot" && normalized != "self-chat" {
+                    self.push_output(
+                        "WhatsApp mode must be `bot` or `self-chat`.",
+                        OutputRole::Error,
+                    );
+                    return false;
+                }
+                let mut config = self.load_runtime_config();
+                config.gateway.whatsapp.mode = normalized.clone();
+                match config.save() {
+                    Ok(()) => {
+                        self.push_output(
+                            format!("WhatsApp mode set to: {}", config.gateway.whatsapp.mode),
+                            OutputRole::System,
+                        );
+                        return true;
+                    }
+                    Err(error) => {
+                        self.push_output(
+                            format!("Failed to save WhatsApp mode: {error}"),
+                            OutputRole::Error,
+                        );
+                        return false;
+                    }
+                }
+            }
+            key => if clear {
+                crate::gateway_setup::remove_env_key(key)
+            } else {
+                crate::gateway_setup::save_env_key(key, value)
+            }
+            .map_err(|error| error.to_string()),
+        };
+
+        match result {
+            Ok(()) => {
+                self.push_output(
+                    if clear {
+                        format!("{field} cleared.")
+                    } else {
+                        format!("{field} updated.")
+                    },
+                    OutputRole::System,
+                );
+                true
+            }
+            Err(error) => {
+                self.push_output(
+                    format!("Failed to save {field}: {error}"),
+                    OutputRole::Error,
+                );
+                false
+            }
+        }
+    }
+
     /// Advance spinner frame (called on every tick).
     fn tick_spinner(&mut self) {
         self.poll_voice_recording_completion();
@@ -9050,7 +9427,8 @@ impl App {
             DisplayState::Idle
             | DisplayState::WaitingForClarify
             | DisplayState::WaitingForApproval { .. }
-            | DisplayState::SecretCapture { .. } => false,
+            | DisplayState::SecretCapture { .. }
+            | DisplayState::ValueCapture { .. } => false,
         };
         if self.voice_recording.is_some()
             || self.voice_playback_active
@@ -10587,22 +10965,6 @@ impl App {
         crate::gateway_presentation::render_gateway_home_channel_summary(config)
     }
 
-    fn render_gateway_platforms_panel(&self, config: &edgecrab_core::AppConfig) -> String {
-        let diagnostics = collect_platform_diagnostics(config);
-        let gateway_status = crate::gateway_cmd::snapshot().ok();
-        let pairing_store = PairingStore::new();
-        let pending_pairings = pairing_store.list_pending(None);
-        let approved_pairings = pairing_store.list_approved(None);
-
-        crate::gateway_presentation::render_gateway_platforms_panel(
-            config,
-            &diagnostics,
-            gateway_status.as_ref(),
-            &pending_pairings,
-            &approved_pairings,
-        )
-    }
-
     fn build_config_entries(&self) -> Vec<ConfigEntry> {
         let config = self.load_runtime_config();
         vec![
@@ -10757,6 +11119,13 @@ impl App {
                 action: ConfigAction::ShowVoice,
             },
             ConfigEntry {
+                title: "Gateway Platforms".into(),
+                detail: "Browse platform state, delivery semantics, and inline gateway controls"
+                    .into(),
+                tag: "gateway".into(),
+                action: ConfigAction::OpenGatewayBrowser,
+            },
+            ConfigEntry {
                 title: "Gateway Home Channels".into(),
                 detail: "Review or edit Telegram, Discord, and Slack home-channel routing".into(),
                 tag: "gateway".into(),
@@ -10836,6 +11205,9 @@ impl App {
             ConfigAction::ShowVoice => {
                 self.handle_voice_mode("status".into());
             }
+            ConfigAction::OpenGatewayBrowser => {
+                self.open_gateway_browser();
+            }
             ConfigAction::ShowGatewayHomes => {
                 let config = self.load_runtime_config();
                 self.push_output(
@@ -10867,11 +11239,7 @@ impl App {
             }
             "voice" => self.handle_voice_mode("status".into()),
             "gateway" | "homes" => {
-                let config = self.load_runtime_config();
-                self.push_output(
-                    self.render_gateway_home_channel_summary(&config),
-                    OutputRole::System,
-                );
+                self.open_gateway_browser();
             }
             "update" => self.handle_update_status(),
             "edit" => {
@@ -12756,11 +13124,316 @@ impl App {
     }
 
     fn handle_show_platforms(&mut self) {
+        self.open_gateway_browser();
+    }
+
+    fn open_gateway_browser(&mut self) {
+        self.gateway_browser.query.clear();
+        self.gateway_browser.selected = 0;
+        self.gateway_browser.active = true;
+        self.gateway_browser_pane.reset();
+        self.refresh_gateway_browser();
+    }
+
+    fn refresh_gateway_browser(&mut self) {
         let config = self.load_runtime_config();
-        self.push_output(
-            self.render_gateway_platforms_panel(&config),
-            OutputRole::System,
-        );
+        let diagnostics = collect_platform_diagnostics(&config);
+        let entries = build_gateway_platform_entries(&config, &diagnostics);
+        self.gateway_browser.replace_items_preserving_state(entries);
+        self.needs_redraw = true;
+    }
+
+    fn gateway_browser_current(&self) -> Option<&GatewayPlatformEntry> {
+        self.gateway_browser.current()
+    }
+
+    fn toggle_selected_gateway_platform(&mut self) {
+        let Some(platform_id) = self
+            .gateway_browser_current()
+            .map(|entry| entry.diagnostic.id)
+        else {
+            return;
+        };
+
+        let mut config = self.load_runtime_config();
+        let enabled_now = match platform_id {
+            "telegram" => config
+                .gateway
+                .platform_requested(platform_id, config.gateway.telegram.enabled),
+            "discord" => config
+                .gateway
+                .platform_requested(platform_id, config.gateway.discord.enabled),
+            "slack" => config
+                .gateway
+                .platform_requested(platform_id, config.gateway.slack.enabled),
+            "signal" => config
+                .gateway
+                .platform_requested(platform_id, config.gateway.signal.enabled),
+            "whatsapp" => config
+                .gateway
+                .platform_requested(platform_id, config.gateway.whatsapp.enabled),
+            "webhook" => config.gateway.webhook_enabled,
+            _ => config.gateway.platform_enabled(platform_id),
+        };
+
+        if platform_id == "webhook" {
+            config.gateway.webhook_enabled = !enabled_now;
+        } else {
+            if !enabled_now {
+                config.gateway.enable_platform(platform_id);
+            } else {
+                config.gateway.disable_platform(platform_id);
+            }
+            match platform_id {
+                "telegram" => config.gateway.telegram.enabled = !enabled_now,
+                "discord" => config.gateway.discord.enabled = !enabled_now,
+                "slack" => config.gateway.slack.enabled = !enabled_now,
+                "signal" => config.gateway.signal.enabled = !enabled_now,
+                "whatsapp" => config.gateway.whatsapp.enabled = !enabled_now,
+                _ => {}
+            }
+        }
+
+        match config.save() {
+            Ok(()) => self.push_output(
+                format!(
+                    "{} {}.",
+                    platform_id,
+                    if enabled_now { "disabled" } else { "enabled" }
+                ),
+                OutputRole::System,
+            ),
+            Err(error) => self.push_output(
+                format!("Updated {platform_id} in memory, but saving config failed: {error}"),
+                OutputRole::Error,
+            ),
+        }
+        self.refresh_gateway_browser();
+    }
+
+    fn open_gateway_bind_editor(&mut self) {
+        let config = self.load_runtime_config();
+        self.display_state = DisplayState::ValueCapture {
+            title: "Gateway Bind".into(),
+            prompt: "Edit the bind address as host:port. Use `clear` to reset to 127.0.0.1:8080."
+                .into(),
+            placeholder: "127.0.0.1:8080".into(),
+            masked: false,
+            buffer: format!("{}:{}", config.gateway.host, config.gateway.port),
+            action: ValueCaptureAction::BindAddress,
+        };
+        self.needs_redraw = true;
+    }
+
+    fn open_gateway_home_channel_editor(&mut self) {
+        let Some(entry) = self.gateway_browser_current() else {
+            return;
+        };
+        if !supports_home_channel(entry.diagnostic.id) {
+            self.push_output(
+                format!(
+                    "{} does not use a home-channel route.",
+                    entry.diagnostic.name
+                ),
+                OutputRole::System,
+            );
+            return;
+        }
+
+        let config = self.load_runtime_config();
+        let current = match entry.diagnostic.id {
+            "telegram" => config.gateway.telegram.home_channel.unwrap_or_default(),
+            "discord" => config.gateway.discord.home_channel.unwrap_or_default(),
+            "slack" => config.gateway.slack.home_channel.unwrap_or_default(),
+            _ => String::new(),
+        };
+        self.display_state = DisplayState::ValueCapture {
+            title: format!("{} Home Channel", entry.diagnostic.name),
+            prompt: "Set the proactive delivery target. Use `clear` to remove it.".into(),
+            placeholder: "chat-id, channel-id, or thread target".into(),
+            masked: false,
+            buffer: current,
+            action: ValueCaptureAction::HomeChannel(entry.diagnostic.id.into()),
+        };
+        self.needs_redraw = true;
+    }
+
+    fn open_gateway_allowlist_editor(&mut self) {
+        let Some(entry) = self.gateway_browser_current() else {
+            return;
+        };
+        if !supports_allowlist(entry.diagnostic.id) {
+            self.push_output(
+                format!(
+                    "{} has no allowlist field to edit here.",
+                    entry.diagnostic.name
+                ),
+                OutputRole::System,
+            );
+            return;
+        }
+
+        let config = self.load_runtime_config();
+        let current = match entry.diagnostic.id {
+            "telegram" => config.gateway.telegram.allowed_users.join(","),
+            "discord" => config.gateway.discord.allowed_users.join(","),
+            "slack" => config.gateway.slack.allowed_users.join(","),
+            "signal" => config.gateway.signal.allowed_users.join(","),
+            "whatsapp" => config.gateway.whatsapp.allowed_users.join(","),
+            _ => crate::gateway_setup::read_env_key(&format!(
+                "{}_ALLOWED_USERS",
+                entry.diagnostic.id.to_ascii_uppercase()
+            ))
+            .unwrap_or_default(),
+        };
+
+        self.display_state = DisplayState::ValueCapture {
+            title: format!("{} Allowlist", entry.diagnostic.name),
+            prompt: "Comma-separated IDs. Leave blank or use `clear` for open access.".into(),
+            placeholder: "user-1,user-2".into(),
+            masked: false,
+            buffer: current,
+            action: ValueCaptureAction::AllowedUsers(entry.diagnostic.id.into()),
+        };
+        self.needs_redraw = true;
+    }
+
+    fn open_gateway_primary_editor(&mut self) {
+        let Some(entry) = self.gateway_browser_current().cloned() else {
+            return;
+        };
+
+        if let Some((title, prompt, placeholder, masked, current, action)) =
+            self.gateway_primary_capture_for(&entry)
+        {
+            self.display_state = DisplayState::ValueCapture {
+                title,
+                prompt,
+                placeholder,
+                masked,
+                buffer: current,
+                action,
+            };
+            self.needs_redraw = true;
+        } else {
+            self.push_output(
+                format!(
+                    "{} does not expose a single-step inline editor yet. Use `edgecrab gateway configure {}` for the full workflow.",
+                    entry.diagnostic.name, entry.diagnostic.id
+                ),
+                OutputRole::System,
+            );
+        }
+    }
+
+    fn gateway_primary_capture_for(
+        &self,
+        entry: &GatewayPlatformEntry,
+    ) -> Option<(String, String, String, bool, String, ValueCaptureAction)> {
+        let config = self.load_runtime_config();
+        match entry.diagnostic.id {
+            "telegram" => Some((
+                "Telegram Bot Token".into(),
+                "Paste the bot token. Use `clear` to remove it.".into(),
+                "123456:ABCDEF...".into(),
+                true,
+                String::new(),
+                ValueCaptureAction::PrimaryField("TELEGRAM_BOT_TOKEN".into()),
+            )),
+            "discord" => Some((
+                "Discord Bot Token".into(),
+                "Paste the bot token. Use `clear` to remove it.".into(),
+                "discord bot token".into(),
+                true,
+                String::new(),
+                ValueCaptureAction::PrimaryField("DISCORD_BOT_TOKEN".into()),
+            )),
+            "slack" => {
+                let key = if entry
+                    .diagnostic
+                    .missing_required
+                    .contains(&"SLACK_APP_TOKEN")
+                    && !entry
+                        .diagnostic
+                        .missing_required
+                        .contains(&"SLACK_BOT_TOKEN")
+                {
+                    "SLACK_APP_TOKEN"
+                } else {
+                    "SLACK_BOT_TOKEN"
+                };
+                Some((
+                    format!("Slack {}", key.strip_prefix("SLACK_").unwrap_or(key)),
+                    "Paste the token. Use `clear` to remove it.".into(),
+                    key.to_ascii_lowercase(),
+                    true,
+                    String::new(),
+                    ValueCaptureAction::PrimaryField(key.into()),
+                ))
+            }
+            "signal" => {
+                let missing_url = entry
+                    .diagnostic
+                    .missing_required
+                    .contains(&"SIGNAL_HTTP_URL");
+                if missing_url || config.gateway.signal.http_url.is_none() {
+                    Some((
+                        "Signal Daemon URL".into(),
+                        "Set the signal-cli HTTP endpoint. Use `clear` to remove it.".into(),
+                        "http://127.0.0.1:8081".into(),
+                        false,
+                        config.gateway.signal.http_url.unwrap_or_default(),
+                        ValueCaptureAction::PrimaryField("SIGNAL_HTTP_URL".into()),
+                    ))
+                } else {
+                    Some((
+                        "Signal Account".into(),
+                        "Set the registered Signal account number. Use `clear` to remove it."
+                            .into(),
+                        "+15551234567".into(),
+                        false,
+                        config.gateway.signal.account.unwrap_or_default(),
+                        ValueCaptureAction::PrimaryField("SIGNAL_ACCOUNT".into()),
+                    ))
+                }
+            }
+            "whatsapp" => Some((
+                "WhatsApp Mode".into(),
+                "Set `bot` or `self-chat`. Use `clear` to reset to self-chat.".into(),
+                "bot or self-chat".into(),
+                false,
+                config.gateway.whatsapp.mode,
+                ValueCaptureAction::PrimaryField("WHATSAPP_MODE".into()),
+            )),
+            "webhook" => None,
+            other => {
+                let def = crate::gateway_catalog::find_platform(other)?;
+                let field = def
+                    .env_fields
+                    .iter()
+                    .find(|field| {
+                        entry
+                            .diagnostic
+                            .missing_required
+                            .iter()
+                            .any(|missing| missing == &field.key)
+                    })
+                    .or_else(|| def.env_fields.iter().find(|field| field.required))
+                    .or_else(|| def.env_fields.first())?;
+                Some((
+                    field.prompt.into(),
+                    format!("{} Use `clear` to remove it.", field.help),
+                    field.default_value.unwrap_or("").into(),
+                    field.kind == crate::gateway_catalog::FieldKind::Secret,
+                    if field.kind == crate::gateway_catalog::FieldKind::Secret {
+                        String::new()
+                    } else {
+                        crate::gateway_setup::read_env_key(field.key).unwrap_or_default()
+                    },
+                    ValueCaptureAction::PrimaryField(field.key.into()),
+                ))
+            }
+        }
     }
 
     fn handle_show_personality(&mut self) {
@@ -15028,6 +15701,10 @@ impl App {
             self.render_config_selector(frame, frame.area());
         }
 
+        if self.gateway_browser.active {
+            self.render_gateway_browser(frame, frame.area());
+        }
+
         // Session browser overlay (full screen, same precedence as skill browser)
         if self.session_browser.active {
             self.render_session_browser(frame, frame.area());
@@ -15050,6 +15727,9 @@ impl App {
         // Secret capture overlay (full screen, highest precedence — masks the secret)
         if matches!(self.display_state, DisplayState::SecretCapture { .. }) {
             self.render_secret_capture_overlay(frame, frame.area());
+        }
+        if matches!(self.display_state, DisplayState::ValueCapture { .. }) {
+            self.render_value_capture_overlay(frame, frame.area());
         }
     }
 
@@ -15400,6 +16080,14 @@ impl App {
                     label,
                     Style::default()
                         .fg(Color::Rgb(255, 80, 80))
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            DisplayState::ValueCapture { title, .. } => {
+                left_spans.push(Span::styled(
+                    format!(" ⛵ Editing: {title} "),
+                    Style::default()
+                        .fg(Color::Rgb(120, 220, 200))
                         .add_modifier(Modifier::BOLD),
                 ));
             }
@@ -17687,6 +18375,9 @@ impl App {
                 ConfigAction::OpenTools => {
                     "Press Enter to open the live tool manager. Use Space to toggle toolsets or individual tools, Tab to switch scopes, and R to restore defaults.".into()
                 }
+                ConfigAction::OpenGatewayBrowser => {
+                    "Press Enter to open the gateway control browser. From there you can toggle platforms, edit bind settings, change allowlists, and update home channels without leaving the TUI.".into()
+                }
                 ConfigAction::ShowGatewayHomes => {
                     let config = self.load_runtime_config();
                     self.render_gateway_home_channel_summary(&config)
@@ -17806,6 +18497,201 @@ impl App {
             Span::styled(
                 format!("{} item(s)", filtered.len()),
                 Style::default().fg(Color::Rgb(100, 120, 130)),
+            ),
+        ]));
+        frame.render_widget(help, chunks[2]);
+    }
+
+    fn render_gateway_browser(&self, frame: &mut Frame, area: Rect) {
+        frame.render_widget(Clear, area);
+
+        let chunks = Self::browser_overlay_chunks(area);
+        let body = Self::browser_body_chunks(chunks[1]);
+        self.render_browser_header(
+            frame,
+            chunks[0],
+            &self.gateway_browser.query,
+            BrowserChrome {
+                title: "Gateway Control",
+                placeholder:
+                    "Search platforms by name, state, delivery mode, or missing setup fields.",
+                icon: "⛵",
+                icon_color: Color::Rgb(120, 220, 200),
+                border_color: Color::Rgb(120, 220, 200),
+            },
+        );
+
+        let filtered = &self.gateway_browser.filtered;
+        let selected = self.gateway_browser.selected;
+        let max_visible = body[0].height as usize;
+        let scroll_start = Self::browser_scroll_start(selected, max_visible);
+
+        let items: Vec<ListItem> = if filtered.is_empty() {
+            vec![ListItem::new(Line::from(Span::styled(
+                "  No gateway platforms matched this filter.".to_string(),
+                Style::default().fg(Color::Rgb(120, 120, 135)),
+            )))]
+        } else {
+            filtered
+                .iter()
+                .skip(scroll_start)
+                .take(max_visible)
+                .enumerate()
+                .map(|(vis_idx, &entry_idx)| {
+                    let entry = &self.gateway_browser.items[entry_idx];
+                    let is_selected = vis_idx + scroll_start == selected;
+                    let bg = if is_selected {
+                        Color::Rgb(18, 42, 42)
+                    } else {
+                        Color::Rgb(18, 22, 28)
+                    };
+                    let accent = match entry.diagnostic.state {
+                        crate::gateway_catalog::PlatformState::Ready => Color::Rgb(120, 220, 160),
+                        crate::gateway_catalog::PlatformState::Available => {
+                            Color::Rgb(170, 210, 120)
+                        }
+                        crate::gateway_catalog::PlatformState::Incomplete => {
+                            Color::Rgb(255, 180, 110)
+                        }
+                        crate::gateway_catalog::PlatformState::NotConfigured => {
+                            Color::Rgb(120, 140, 150)
+                        }
+                    };
+                    let tag_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(155, 185, 175))
+                    } else {
+                        Style::default().fg(Color::Rgb(105, 125, 118))
+                    };
+                    let title_style = if is_selected {
+                        Style::default()
+                            .bg(bg)
+                            .fg(accent)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(accent)
+                    };
+                    let detail_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(175, 195, 188))
+                    } else {
+                        Style::default().fg(Color::Rgb(125, 140, 150))
+                    };
+
+                    ListItem::new(Line::from(vec![
+                        selector_marker(is_selected, accent, Some(bg)),
+                        Span::styled(
+                            format!("  {:<16}", entry.diagnostic.state.label()),
+                            tag_style,
+                        ),
+                        Span::styled(unicode_pad_right(entry.diagnostic.name, 12), title_style),
+                        Span::raw("  "),
+                        Span::styled(unicode_trunc(&entry.summary, 64), detail_style),
+                    ]))
+                })
+                .collect()
+        };
+        frame.render_widget(
+            List::new(items).style(Style::default().bg(Color::Rgb(18, 22, 28))),
+            body[0],
+        );
+
+        let mut detail_lines = Vec::new();
+        if let Some(entry) = self.gateway_browser.current() {
+            for line in entry.detail_view.lines() {
+                detail_lines.push(Line::from(line.to_string()));
+            }
+        } else {
+            detail_lines.push(Line::from(Span::styled(
+                "Gateway Control",
+                Style::default()
+                    .fg(Color::Rgb(120, 220, 200))
+                    .add_modifier(Modifier::BOLD),
+            )));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(
+                "This browser turns `/platforms` into an operator cockpit instead of a text dump.",
+            ));
+            detail_lines.push(Line::from(
+                "Use Enter for the next setup field, Space to toggle enablement, and B to edit the gateway bind address without leaving the TUI.",
+            ));
+        }
+
+        if self.detail_fullscreen_active(DetailSurface::GatewayBrowser) {
+            self.render_fullscreen_browser_detail(
+                frame,
+                area,
+                FullscreenBrowserChrome {
+                    query: &self.gateway_browser.query,
+                    header: BrowserChrome {
+                        title: "Gateway Control",
+                        placeholder:
+                            "Search platforms by name, state, delivery mode, or missing setup fields.",
+                        icon: "⛵",
+                        icon_color: Color::Rgb(120, 220, 200),
+                        border_color: Color::Rgb(120, 220, 200),
+                    },
+                    detail: ScrollableDetailChrome {
+                        title: "Details",
+                        border_color: Color::Rgb(120, 220, 200),
+                        focused: true,
+                        requested_scroll: self
+                            .detail_fullscreen_scroll(DetailSurface::GatewayBrowser),
+                    },
+                    help: Line::from(vec![
+                        Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(120, 220, 200))),
+                        Span::styled("change item  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("type ", Style::default().fg(Color::Rgb(120, 220, 200))),
+                        Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(120, 220, 200))),
+                        Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Enter ", Style::default().fg(Color::Rgb(120, 220, 200))),
+                        Span::styled("edit setup  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Space ", Style::default().fg(Color::Rgb(120, 220, 200))),
+                        Span::styled("toggle  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Z ", Style::default().fg(Color::Rgb(120, 220, 200))),
+                        Span::styled("split view  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Esc ", Style::default().fg(Color::Rgb(120, 220, 200))),
+                        Span::styled("close  ", Style::default().fg(Color::DarkGray)),
+                    ]),
+                },
+                detail_lines,
+            );
+            return;
+        }
+
+        self.render_scrollable_browser_detail(
+            frame,
+            body[1],
+            ScrollableDetailChrome {
+                title: "Details",
+                border_color: Color::Rgb(120, 220, 200),
+                focused: self.gateway_browser_pane.focus == SplitPaneFocus::Detail,
+                requested_scroll: self.gateway_browser_pane.scroll,
+            },
+            detail_lines,
+        );
+
+        let help = Paragraph::new(Line::from(vec![
+            Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(120, 220, 200))),
+            Span::styled("browse  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Enter ", Style::default().fg(Color::Rgb(120, 220, 200))),
+            Span::styled("edit key field  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Space ", Style::default().fg(Color::Rgb(120, 220, 200))),
+            Span::styled("toggle  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("A ", Style::default().fg(Color::Rgb(120, 220, 200))),
+            Span::styled("allowlist  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("H ", Style::default().fg(Color::Rgb(120, 220, 200))),
+            Span::styled("home  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("B ", Style::default().fg(Color::Rgb(120, 220, 200))),
+            Span::styled("bind  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("R ", Style::default().fg(Color::Rgb(120, 220, 200))),
+            Span::styled("refresh  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Z ", Style::default().fg(Color::Rgb(120, 220, 200))),
+            Span::styled("detail  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Esc ", Style::default().fg(Color::Rgb(120, 220, 200))),
+            Span::styled("close  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{} platform(s)", filtered.len()),
+                Style::default().fg(Color::Rgb(95, 120, 112)),
             ),
         ]));
         frame.render_widget(help, chunks[2]);
@@ -18422,6 +19308,96 @@ impl App {
             Span::styled("submit  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Esc ", Style::default().fg(accent)),
             Span::styled("abort", Style::default().fg(Color::DarkGray)),
+        ]));
+        frame.render_widget(help, chunks[2]);
+    }
+
+    fn render_value_capture_overlay(&self, frame: &mut Frame, area: Rect) {
+        let (title, prompt, placeholder, masked, buffer) = if let DisplayState::ValueCapture {
+            ref title,
+            ref prompt,
+            ref placeholder,
+            masked,
+            ref buffer,
+            ..
+        } = self.display_state
+        {
+            (
+                title.as_str(),
+                prompt.as_str(),
+                placeholder.as_str(),
+                masked,
+                buffer.as_str(),
+            )
+        } else {
+            return;
+        };
+
+        frame.render_widget(Clear, area);
+
+        let dlg_w = area.width.min(84);
+        let dlg_h = 8u16;
+        let x = area.x + (area.width.saturating_sub(dlg_w)) / 2;
+        let y = area.y + (area.height.saturating_sub(dlg_h)) / 2;
+        let dlg = Rect::new(x, y, dlg_w, dlg_h);
+        let accent = Color::Rgb(120, 220, 200);
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2),
+                Constraint::Length(3),
+                Constraint::Length(1),
+            ])
+            .split(dlg);
+
+        let prompt_para = Paragraph::new(Line::from(vec![
+            Span::styled("  ⛵ ", Style::default().fg(accent)),
+            Span::styled(
+                prompt,
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]))
+        .wrap(Wrap { trim: false })
+        .block(
+            Block::default()
+                .borders(Borders::LEFT | Borders::TOP | Borders::RIGHT)
+                .border_style(Style::default().fg(accent))
+                .title(format!(" {} ", title)),
+        );
+        frame.render_widget(prompt_para, chunks[0]);
+
+        let visible = if buffer.is_empty() {
+            placeholder.to_string()
+        } else if masked {
+            "•".repeat(buffer.chars().count())
+        } else {
+            buffer.to_string()
+        };
+        let input_style = if buffer.is_empty() {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let input_para = Paragraph::new(Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(visible, input_style),
+            Span::styled("█", Style::default().fg(accent)),
+        ]))
+        .block(
+            Block::default()
+                .borders(Borders::LEFT | Borders::BOTTOM | Borders::RIGHT)
+                .border_style(Style::default().fg(accent)),
+        );
+        frame.render_widget(input_para, chunks[1]);
+
+        let help = Paragraph::new(Line::from(vec![
+            Span::styled("  Enter ", Style::default().fg(accent)),
+            Span::styled("save  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Esc ", Style::default().fg(accent)),
+            Span::styled("cancel", Style::default().fg(Color::DarkGray)),
         ]));
         frame.render_widget(help, chunks[2]);
     }
@@ -19360,6 +20336,63 @@ mod tests {
             std::env::remove_var("EDGECRAB_HOME");
             std::env::remove_var("TELEGRAM_BOT_TOKEN");
             std::env::remove_var("DISCORD_BOT_TOKEN");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(edgecrab_home_env)]
+    async fn platforms_command_opens_gateway_browser_overlay() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+            std::env::set_var("TELEGRAM_BOT_TOKEN", "telegram-token");
+        }
+
+        let mut app = App::new();
+        app.handle_show_platforms();
+
+        assert!(app.gateway_browser.active);
+        let current = app
+            .gateway_browser
+            .current()
+            .expect("selected gateway entry");
+        assert!(current.detail_view.contains("Enter  primary setup field"));
+        assert!(
+            current
+                .detail_view
+                .contains("Space  enable or disable this platform")
+        );
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+            std::env::remove_var("TELEGRAM_BOT_TOKEN");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(edgecrab_home_env)]
+    async fn gateway_bind_editor_persists_from_tui_flow() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+
+        let mut app = App::new();
+        app.apply_value_capture_action(ValueCaptureAction::BindAddress, "0.0.0.0:9091".into());
+
+        let config = edgecrab_core::AppConfig::load_from(&dir.path().join("config.yaml"))
+            .expect("load config");
+        assert_eq!(config.gateway.host, "0.0.0.0");
+        assert_eq!(config.gateway.port, 9091);
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
         }
     }
 
