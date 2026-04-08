@@ -16,7 +16,7 @@
 //!   Analysis      /cost /usage /compress /insights
 //!   Appearance    /theme /paste
 //!   Advanced      /queue /background /rollback
-//!   Gateway       /platforms /approve /deny /sethome /update
+//!   Gateway       /platforms /gateway /approve /deny /sethome /update
 //!   Scheduling    /cron
 //!   Media         /voice
 //!   Diagnostics   /doctor [/permissions on macOS]
@@ -196,6 +196,8 @@ pub enum CommandResult {
     BrowserCommand(String),
     /// Show or update gateway home-channel configuration.
     SetHomeChannel(String),
+    /// Start, stop, restart, or inspect the gateway runtime.
+    GatewayControl(String),
     /// Show local upgrade status and actionable update guidance.
     CheckUpdates,
 }
@@ -994,6 +996,21 @@ impl CommandRegistry {
         });
 
         self.register(Command {
+            name: "gateway",
+            aliases: &["gatewayctl"],
+            description: "Manage gateway runtime: /gateway [start|stop|restart|status]",
+            handler: |args| match args.trim().to_ascii_lowercase().as_str() {
+                "" | "status" => CommandResult::GatewayControl("status".into()),
+                "start" => CommandResult::GatewayControl("start".into()),
+                "stop" => CommandResult::GatewayControl("stop".into()),
+                "restart" => CommandResult::GatewayControl("restart".into()),
+                other => CommandResult::Output(format!(
+                    "Unknown gateway action '{other}'. Use: /gateway [start|stop|restart|status]"
+                )),
+            },
+        });
+
+        self.register(Command {
             name: "approve",
             aliases: &["yes"],
             description: "Approve the current prompt: /approve [once|session|always]",
@@ -1203,6 +1220,7 @@ fn help_text() -> String {
          \n\
          Gateway:\n\
            /platforms            — Show gateway platform status\n\
+           /gateway [action]     — Start, stop, restart, or inspect the gateway runtime\n\
            /approve [scope]      — Approve pending action (once/session/always)\n\
            /deny                 — Deny pending approval or clarify prompt\n\
            /sethome [args]       — Show or set gateway home channels\n\
@@ -1638,6 +1656,15 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_gateway_restart() {
+        let reg = CommandRegistry::new();
+        assert!(matches!(
+            reg.dispatch("/gateway restart"),
+            Some(CommandResult::GatewayControl(action)) if action == "restart"
+        ));
+    }
+
+    #[test]
     fn dispatch_voice_toggle() {
         let reg = CommandRegistry::new();
         match reg.dispatch("/voice status") {
@@ -1735,6 +1762,7 @@ mod tests {
             "/background",
             "/rollback",
             "/platforms",
+            "/gateway",
             "/approve",
             "/deny",
             "/sethome",

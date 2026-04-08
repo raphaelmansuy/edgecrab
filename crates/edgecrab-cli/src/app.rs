@@ -35,6 +35,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::TimeZone;
+use clap::Parser;
 use crossterm::event::{
     self, Event, KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton,
     MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
@@ -53,6 +54,7 @@ use tokio::sync::mpsc;
 use tui_textarea::{CursorMove, TextArea};
 use unicode_width::UnicodeWidthStr;
 
+use crate::cli_args::CliArgs;
 use crate::commands::{CommandRegistry, CommandResult, ToolManagerMode};
 use crate::edit_diff::{LocalEditSnapshot, capture_local_edit_snapshot, render_edit_diff_lines};
 use crate::fuzzy_selector::{FuzzyItem, FuzzySelector};
@@ -765,6 +767,11 @@ fn key_matches_binding(key: &event::KeyEvent, binding: &str) -> bool {
     };
 
     code_matches && key.modifiers == expected_modifiers
+}
+
+fn current_launch_cli_args() -> CliArgs {
+    CliArgs::try_parse_from(std::env::args_os())
+        .unwrap_or_else(|_| CliArgs::parse_from(["edgecrab"]))
 }
 
 fn voice_readback_ready() -> Result<AudioPlayerSpec, String> {
@@ -1629,6 +1636,8 @@ enum BackgroundOpResult {
     },
     /// Free-form text to push to the output pane (System role).
     SystemMsg(String),
+    /// Gateway runtime command completed and the browser should refresh.
+    GatewayCommandDone { report: String },
     /// Provider swap succeeded — update model name and persist config.
     ModelSwitchDone { model: String },
     /// Context compression finished — show summary message.
@@ -6289,6 +6298,9 @@ impl App {
                 _ if selector_action_key(&key, 'r') => {
                     self.refresh_gateway_browser();
                 }
+                _ if selector_action_key(&key, 'x') => {
+                    self.handle_gateway_control("restart".into());
+                }
                 KeyCode::Tab | KeyCode::BackTab
                     if !self.detail_fullscreen_active(DetailSurface::GatewayBrowser) =>
                 {
@@ -7964,6 +7976,9 @@ impl App {
             CommandResult::SetHomeChannel(args) => {
                 self.handle_set_home_channel(args);
             }
+            CommandResult::GatewayControl(args) => {
+                self.handle_gateway_control(args);
+            }
             CommandResult::CheckUpdates => {
                 self.handle_update_status();
             }
@@ -8211,6 +8226,48 @@ impl App {
                 .await
                 .unwrap_or_else(|err| format!("Update check failed: {err}"));
             let _ = tx.send(AgentResponse::BgOp(BackgroundOpResult::SystemMsg(report)));
+        });
+    }
+
+    fn handle_gateway_control(&mut self, args: String) {
+        let action = match args.trim().to_ascii_lowercase().as_str() {
+            "" | "status" => crate::gateway_cmd::GatewayAction::Status,
+            "start" => crate::gateway_cmd::GatewayAction::Start { foreground: false },
+            "stop" => crate::gateway_cmd::GatewayAction::Stop,
+            "restart" => crate::gateway_cmd::GatewayAction::Restart,
+            other => {
+                self.push_output(
+                    format!(
+                        "Unknown gateway action '{other}'. Use: /gateway [start|stop|restart|status]"
+                    ),
+                    OutputRole::System,
+                );
+                return;
+            }
+        };
+
+        let label = match action {
+            crate::gateway_cmd::GatewayAction::Start { .. } => "Starting gateway…",
+            crate::gateway_cmd::GatewayAction::Stop => "Stopping gateway…",
+            crate::gateway_cmd::GatewayAction::Restart => "Restarting gateway…",
+            crate::gateway_cmd::GatewayAction::Status => "Inspecting gateway…",
+        };
+
+        let tx = self.response_tx.clone();
+        let cli_args = current_launch_cli_args();
+        self.display_state = DisplayState::BgOp {
+            label: label.into(),
+            frame: 0,
+            started: Instant::now(),
+        };
+        self.needs_redraw = true;
+        self.rt_handle.spawn(async move {
+            let result = crate::gateway_cmd::run_capture(action, &cli_args).await;
+            let payload = match result {
+                Ok(report) => BackgroundOpResult::GatewayCommandDone { report },
+                Err(err) => BackgroundOpResult::SystemMsg(format!("Gateway command failed: {err}")),
+            };
+            let _ = tx.send(AgentResponse::BgOp(payload));
         });
     }
 
@@ -8821,6 +8878,10 @@ impl App {
                         }
                         BackgroundOpResult::SystemMsg(text) => {
                             self.push_output(text, OutputRole::System);
+                        }
+                        BackgroundOpResult::GatewayCommandDone { report } => {
+                            self.push_output(report, OutputRole::System);
+                            self.refresh_gateway_browser();
                         }
                         BackgroundOpResult::ModelSwitchDone { model } => {
                             self.model_name = model.clone();
@@ -18376,7 +18437,7 @@ impl App {
                     "Press Enter to open the live tool manager. Use Space to toggle toolsets or individual tools, Tab to switch scopes, and R to restore defaults.".into()
                 }
                 ConfigAction::OpenGatewayBrowser => {
-                    "Press Enter to open the gateway control browser. From there you can toggle platforms, edit bind settings, change allowlists, and update home channels without leaving the TUI.".into()
+                    "Press Enter to open the gateway control browser. From there you can toggle platforms, edit bind settings, change allowlists, update home channels, and restart the gateway runtime without leaving the TUI.".into()
                 }
                 ConfigAction::ShowGatewayHomes => {
                     let config = self.load_runtime_config();
@@ -18647,6 +18708,8 @@ impl App {
                         Span::styled("edit setup  ", Style::default().fg(Color::DarkGray)),
                         Span::styled("Space ", Style::default().fg(Color::Rgb(120, 220, 200))),
                         Span::styled("toggle  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("X ", Style::default().fg(Color::Rgb(120, 220, 200))),
+                        Span::styled("restart  ", Style::default().fg(Color::DarkGray)),
                         Span::styled("Z ", Style::default().fg(Color::Rgb(120, 220, 200))),
                         Span::styled("split view  ", Style::default().fg(Color::DarkGray)),
                         Span::styled("Esc ", Style::default().fg(Color::Rgb(120, 220, 200))),
@@ -18685,6 +18748,8 @@ impl App {
             Span::styled("bind  ", Style::default().fg(Color::DarkGray)),
             Span::styled("R ", Style::default().fg(Color::Rgb(120, 220, 200))),
             Span::styled("refresh  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("X ", Style::default().fg(Color::Rgb(120, 220, 200))),
+            Span::styled("restart  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Z ", Style::default().fg(Color::Rgb(120, 220, 200))),
             Span::styled("detail  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Esc ", Style::default().fg(Color::Rgb(120, 220, 200))),

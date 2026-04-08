@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::fs::OpenOptions;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -48,24 +49,37 @@ pub async fn attach_gateway_sender_if_running(
 }
 
 pub async fn run(action: GatewayAction, args: &CliArgs) -> anyhow::Result<()> {
-    let result = match action {
-        GatewayAction::Start { foreground } => {
-            if foreground {
-                run_foreground(args).await
-            } else {
-                start_background(args)
-            }
-        }
-        GatewayAction::Stop => stop_background(),
-        GatewayAction::Restart => restart_background(args),
-        GatewayAction::Status => status(args),
-    };
+    let result = run_capture(action, args).await;
 
     if let Err(ref err) = result {
         print_gateway_failure_guidance(action, args, err);
     }
 
-    result
+    match result {
+        Ok(report) => {
+            if !report.trim().is_empty() {
+                println!("{report}");
+            }
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
+}
+
+pub async fn run_capture(action: GatewayAction, args: &CliArgs) -> anyhow::Result<String> {
+    match action {
+        GatewayAction::Start { foreground } => {
+            if foreground {
+                run_foreground(args).await?;
+                Ok(String::new())
+            } else {
+                start_background_report(args)
+            }
+        }
+        GatewayAction::Stop => stop_background_report(),
+        GatewayAction::Restart => restart_background_report(args),
+        GatewayAction::Status => status_report(args),
+    }
 }
 
 fn build_standalone_gateway_sender(
@@ -376,7 +390,7 @@ async fn run_foreground(args: &CliArgs) -> anyhow::Result<()> {
     result
 }
 
-fn start_background(args: &CliArgs) -> anyhow::Result<()> {
+fn start_background_report(args: &CliArgs) -> anyhow::Result<String> {
     // Guard: refuse to start a second instance
     if let Ok(status) = snapshot() {
         if status.running {
@@ -420,11 +434,10 @@ fn start_background(args: &CliArgs) -> anyhow::Result<()> {
         .spawn()
         .context("failed to start gateway background process")?;
     write_pid(child.id())?;
-    print_success_panel(child.id(), &log_path, args);
-    Ok(())
+    Ok(format_success_panel(child.id(), &log_path, args))
 }
 
-fn stop_background() -> anyhow::Result<()> {
+fn stop_background_report() -> anyhow::Result<String> {
     let pid = read_pid()?;
     // TERM first — give time for clean shutdown
     let _ = if cfg!(windows) {
@@ -461,40 +474,65 @@ fn stop_background() -> anyhow::Result<()> {
     }
 
     remove_pid()?;
-    println!("Stopped gateway pid {pid}");
-    Ok(())
+    Ok(format!("Stopped gateway pid {pid}"))
 }
 
 /// Stop the running gateway (if any) then start a fresh background process.
-fn restart_background(args: &CliArgs) -> anyhow::Result<()> {
+fn restart_background_report(args: &CliArgs) -> anyhow::Result<String> {
+    let mut report = String::new();
     match snapshot() {
         Ok(status) if status.running => {
-            println!("↻ Restarting gateway");
-            println!(
+            writeln!(&mut report, "↻ Restarting gateway").ok();
+            writeln!(
+                &mut report,
                 "  Stopping current process (pid {})…",
                 status.pid.unwrap_or(0)
-            );
-            stop_background()?;
+            )
+            .ok();
+            let stop_report = stop_background_report()?;
+            writeln!(&mut report, "{stop_report}").ok();
             // Brief pause so the OS releases the TCP port before we re-bind it
             std::thread::sleep(std::time::Duration::from_millis(500));
         }
         _ => {
-            println!("↻ Restart requested, but gateway is not running.");
-            println!("  Starting a fresh background process instead.");
+            writeln!(
+                &mut report,
+                "↻ Restart requested, but gateway is not running."
+            )
+            .ok();
+            writeln!(
+                &mut report,
+                "  Starting a fresh background process instead."
+            )
+            .ok();
         }
     }
-    start_background(args)
+    report.push_str(&start_background_report(args)?);
+    Ok(report)
 }
 
-fn status(args: &CliArgs) -> anyhow::Result<()> {
+fn status_report(args: &CliArgs) -> anyhow::Result<String> {
     let status = snapshot()?;
     let runtime = load_gateway_runtime_snapshot(args);
+    let mut report = String::new();
 
-    println!();
-    println!("╔══════════════════════════════════════════════╗");
-    println!("║   EdgeCrab Gateway — Runtime Status         ║");
-    println!("╚══════════════════════════════════════════════╝");
-    println!();
+    writeln!(&mut report).ok();
+    writeln!(
+        &mut report,
+        "╔══════════════════════════════════════════════╗"
+    )
+    .ok();
+    writeln!(
+        &mut report,
+        "║   EdgeCrab Gateway — Runtime Status         ║"
+    )
+    .ok();
+    writeln!(
+        &mut report,
+        "╚══════════════════════════════════════════════╝"
+    )
+    .ok();
+    writeln!(&mut report).ok();
 
     let process_state = if status.running {
         "✓ running"
@@ -503,14 +541,14 @@ fn status(args: &CliArgs) -> anyhow::Result<()> {
     } else {
         "○ stopped"
     };
-    println!("  Process: {process_state}");
+    writeln!(&mut report, "  Process: {process_state}").ok();
 
     if let Some(pid) = status.pid {
-        println!("  PID: {pid}");
+        writeln!(&mut report, "  PID: {pid}").ok();
     }
 
     if let Some(rt) = &runtime {
-        println!("  Bind: {}", rt.base_url);
+        writeln!(&mut report, "  Bind: {}", rt.base_url).ok();
         if status.running {
             let health = check_http_health(&format!("{}/health", rt.base_url));
             let health_label = match health {
@@ -518,38 +556,45 @@ fn status(args: &CliArgs) -> anyhow::Result<()> {
                 Some(false) => "⚠ not responding",
                 None => "○ unknown",
             };
-            println!("  HTTP health: {health_label}");
+            writeln!(&mut report, "  HTTP health: {health_label}").ok();
         }
 
         if !rt.enabled_platforms.is_empty() {
-            println!("  Enabled platforms: {}", rt.enabled_platforms.join(", "));
+            writeln!(
+                &mut report,
+                "  Enabled platforms: {}",
+                rt.enabled_platforms.join(", ")
+            )
+            .ok();
         } else {
-            println!("  Enabled platforms: (none)");
+            writeln!(&mut report, "  Enabled platforms: (none)").ok();
         }
 
         if !rt.attention_items.is_empty() {
-            println!();
-            println!("  Attention needed:");
+            writeln!(&mut report).ok();
+            writeln!(&mut report, "  Attention needed:").ok();
             for item in &rt.attention_items {
-                println!("    - {item}");
+                writeln!(&mut report, "    - {item}").ok();
             }
         }
 
-        println!();
-        println!("  Diagnostics:");
+        writeln!(&mut report).ok();
+        writeln!(&mut report, "  Diagnostics:").ok();
 
         let gw_health = if status.running {
             check_http_health(&format!("{}/health", rt.base_url))
         } else {
             None
         };
-        print_check_line(
+        append_check_line(
+            &mut report,
             "gateway_http",
             gw_health,
             &format!("{}/health", rt.base_url),
         );
 
-        print_check_line(
+        append_check_line(
+            &mut report,
             "gateway_log",
             Some(status.log_path.exists()),
             &status.log_path.display().to_string(),
@@ -557,33 +602,53 @@ fn status(args: &CliArgs) -> anyhow::Result<()> {
 
         if let Some(signal_url) = &rt.signal_http_url {
             let signal_ok = check_http_health(&format!("{}/api/v1/check", signal_url));
-            print_check_line("signal_daemon", signal_ok, signal_url);
+            append_check_line(&mut report, "signal_daemon", signal_ok, signal_url);
         }
 
         let alerts = recent_log_alerts(&status.log_path, 3);
         if !alerts.is_empty() {
-            println!();
-            println!("  Recent alerts:");
+            writeln!(&mut report).ok();
+            writeln!(&mut report, "  Recent alerts:").ok();
             for alert in alerts {
-                println!("    - {alert}");
+                writeln!(&mut report, "    - {alert}").ok();
             }
         }
     }
 
-    println!("  Log file: {}", status.log_path.display());
-    println!();
-    println!("  Next steps:");
+    writeln!(&mut report, "  Log file: {}", status.log_path.display()).ok();
+    writeln!(&mut report).ok();
+    writeln!(&mut report, "  Next steps:").ok();
     if status.running {
-        println!("    edgecrab gateway restart    ← apply new config safely");
-        println!("    edgecrab gateway stop       ← stop background process");
+        writeln!(
+            &mut report,
+            "    edgecrab gateway restart    ← apply new config safely"
+        )
+        .ok();
+        writeln!(
+            &mut report,
+            "    edgecrab gateway stop       ← stop background process"
+        )
+        .ok();
     } else {
-        println!("    edgecrab gateway start      ← launch gateway");
+        writeln!(
+            &mut report,
+            "    edgecrab gateway start      ← launch gateway"
+        )
+        .ok();
     }
-    println!("    edgecrab gateway configure  ← manage platform setup");
-    println!("    edgecrab gateway --help     ← command reference");
-    println!("    tail -f {}", status.log_path.display());
+    writeln!(
+        &mut report,
+        "    edgecrab gateway configure  ← manage platform setup"
+    )
+    .ok();
+    writeln!(
+        &mut report,
+        "    edgecrab gateway --help     ← command reference"
+    )
+    .ok();
+    writeln!(&mut report, "    tail -f {}", status.log_path.display()).ok();
 
-    Ok(())
+    Ok(report)
 }
 
 #[derive(Debug, Clone)]
@@ -647,13 +712,13 @@ fn check_http_health(url: &str) -> Option<bool> {
     Some(code == "200")
 }
 
-fn print_check_line(name: &str, state: Option<bool>, detail: &str) {
+fn append_check_line(report: &mut String, name: &str, state: Option<bool>, detail: &str) {
     let marker = match state {
         Some(true) => "✓",
         Some(false) => "✗",
         None => "○",
     };
-    println!("    {marker} {name:<14} {detail}");
+    writeln!(report, "    {marker} {name:<14} {detail}").ok();
 }
 
 fn recent_log_alerts(log_path: &std::path::Path, limit: usize) -> Vec<String> {
@@ -721,21 +786,23 @@ fn print_gateway_failure_guidance(action: GatewayAction, args: &CliArgs, err: &a
     }
 }
 
-fn print_success_panel(pid: u32, log_path: &std::path::Path, args: &CliArgs) {
-    println!();
-    println!("✅ Gateway started");
-    println!("   PID: {pid}");
+fn format_success_panel(pid: u32, log_path: &std::path::Path, args: &CliArgs) -> String {
+    let mut report = String::new();
+    writeln!(&mut report).ok();
+    writeln!(&mut report, "✅ Gateway started").ok();
+    writeln!(&mut report, "   PID: {pid}").ok();
     if let Some(rt) = load_gateway_runtime_snapshot(args) {
-        println!("   URL: {}", rt.base_url);
+        writeln!(&mut report, "   URL: {}", rt.base_url).ok();
         if !rt.attention_items.is_empty() {
-            println!("   Attention:");
+            writeln!(&mut report, "   Attention:").ok();
             for item in rt.attention_items {
-                println!("     - {item}");
+                writeln!(&mut report, "     - {item}").ok();
             }
         }
     }
-    println!("   Logs: {}", log_path.display());
-    println!("   Next: edgecrab gateway status");
+    writeln!(&mut report, "   Logs: {}", log_path.display()).ok();
+    writeln!(&mut report, "   Next: edgecrab gateway status").ok();
+    report
 }
 
 pub fn snapshot() -> anyhow::Result<GatewayStatus> {

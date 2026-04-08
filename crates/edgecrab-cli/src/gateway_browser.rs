@@ -88,8 +88,11 @@ pub(crate) fn build_gateway_platform_entries(
             }
             detail_lines.push("  B      edit gateway bind address".into());
             detail_lines.push("  R      refresh runtime and diagnostics".into());
+            detail_lines.push("  X      restart the gateway to apply changes".into());
             detail_lines.push(String::new());
             detail_lines.push(format!("Next: {next_step}"));
+            detail_lines
+                .push("Runtime: `/gateway restart` is available directly from the TUI.".into());
 
             GatewayPlatformEntry {
                 diagnostic: diagnostic.clone(),
@@ -164,5 +167,6 @@ mod tests {
                 .detail_view
                 .contains("Space  enable or disable this platform")
         );
+        assert!(telegram.detail_view.contains("X      restart the gateway"));
     }
 }
