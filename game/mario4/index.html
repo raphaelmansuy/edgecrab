@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Super Mario 4 — EdgeCrab Edition</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #0d0d1f;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    font-family: 'Courier New', monospace;
+    overflow: hidden;
+    touch-action: none;
+  }
+  #ui-bar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    width: 900px;
+    padding: 7px 14px;
+    background: linear-gradient(90deg, #0f3460, #1a1a4a, #0f3460);
+    border-radius: 10px 10px 0 0;
+    color: #fff;
+    font-size: 11px;
+    letter-spacing: 1px;
+    user-select: none;
+    border-bottom: 2px solid #ffd700;
+  }
+  #ui-bar span { min-width: 130px; }
+  #lives-display { color: #ff6b6b; font-size: 14px; }
+  #score-display { color: #ffd700; text-align: center; flex: 1; font-size: 13px; font-weight: bold; }
+  #level-display { color: #7efff5; text-align: right; font-size: 11px; }
+  #canvas-wrapper { position: relative; border: 3px solid #0f3460; border-top: none; box-shadow: 0 8px 32px rgba(0,0,0,0.8); }
+  canvas { display: block; background: #5c94fc; touch-action: none; }
+  #overlay {
+    position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+    background: rgba(8,8,25,0.92);
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    color: #fff; z-index: 10;
+  }
+  #overlay h1 {
+    font-size: 32px; color: #ffd700;
+    text-shadow: 3px 3px #e74c3c, -1px -1px #000, 0 0 20px rgba(255,215,0,0.5);
+    margin-bottom: 10px; letter-spacing: 4px;
+    animation: titlePop 0.6s ease;
+  }
+  @keyframes titlePop {
+    0% { transform: scale(0.5); opacity: 0; }
+    80% { transform: scale(1.05); }
+    100% { transform: scale(1); opacity: 1; }
+  }
+  #overlay .sub { font-size: 11px; color: #aed6f1; margin: 4px 0; }
+  #overlay .ctrl-grid {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 6px 28px;
+    margin: 14px 0; font-size: 10px; color: #ccc;
+    background: rgba(255,255,255,0.06); padding: 12px 18px; border-radius: 8px;
+  }
+  #overlay .ctrl-grid .k { color: #ffd700; font-weight: bold; }
+  #overlay .powerups-info {
+    display: flex; gap: 18px; margin: 10px 0; font-size: 10px; color: #ccc;
+    background: rgba(255,255,255,0.06); padding: 10px 16px; border-radius: 8px;
+  }
+  #overlay .powerups-info span { text-align: center; }
+  #overlay .powerups-info .icon { font-size: 18px; display: block; }
+  #overlay button {
+    margin-top: 12px; padding: 12px 36px;
+    background: linear-gradient(180deg, #e74c3c, #c0392b);
+    color: #fff; border: none; border-radius: 8px;
+    font-size: 14px; cursor: pointer; font-family: inherit; letter-spacing: 1px;
+    transition: transform 0.1s, box-shadow 0.1s;
+    box-shadow: 0 5px 0 #7b241c, 0 0 20px rgba(231,76,60,0.4);
+  }
+  #overlay button:hover { transform: translateY(2px); box-shadow: 0 3px 0 #7b241c; }
+  #overlay button:active { transform: translateY(4px); box-shadow: 0 1px 0 #7b241c; }
+  #hint-bar {
+    width: 900px; padding: 5px 12px;
+    background: linear-gradient(90deg, #0f3460, #1a1a4a, #0f3460);
+    border-radius: 0 0 10px 10px;
+    color: #7efff5; font-size: 9px; text-align: center; letter-spacing: 1px; user-select: none;
+  }
+  /* Responsive scaling */
+  @media (max-width: 940px) {
+    #ui-bar, #hint-bar { width: 100vw; border-radius: 0; }
+    #canvas-wrapper { border-left: none; border-right: none; border-radius: 0; }
+    canvas { width: 100vw !important; height: auto !important; }
+  }
+</style>
+</head>
+<body>
+
+<div id="ui-bar">
+  <span id="lives-display">♥ ♥ ♥</span>
+  <span id="score-display">SCORE: 0000000</span>
+  <span id="level-display">GRASSY PLAINS</span>
+</div>
+<div id="canvas-wrapper">
+  <canvas id="gameCanvas" width="900" height="520"></canvas>
+  <div id="overlay">
+    <h1>SUPER MARIO 4</h1>
+    <p class="sub">⭐ EdgeCrab Edition — 3 Levels ⭐</p>
+    <div class="ctrl-grid">
+      <span><span class="k">← → / A D</span> Move</span>
+      <span><span class="k">Space / ↑ / W</span> Jump</span>
+      <span><span class="k">Shift / Z</span> Run fast</span>
+      <span><span class="k">X / F</span> Shoot fire</span>
+      <span><span class="k">P</span> Pause</span>
+      <span><span class="k">Touch A</span> Jump · <span class="k">B</span> Run</span>
+    </div>
+    <div class="powerups-info">
+      <span><span class="icon">🍄</span>Mushroom<br>Grow big</span>
+      <span><span class="icon">🌸</span>Fire Flower<br>Shoot fire</span>
+      <span><span class="icon">⭐</span>Star<br>Invincible!</span>
+    </div>
+    <p class="sub">Stomp enemies · Collect coins · Hit ? blocks · Reach the flag!</p>
+    <p class="sub">Build <b style="color:#ffd700">COMBOS</b> by stomping multiple enemies in a row!</p>
+    <button id="startBtn">▶  START GAME</button>
+  </div>
+</div>
+<div id="hint-bar">
+  ← → Move · Space Jump · Shift Run · X Fire · Stomp enemies · Hit ? blocks · Reach the 🚩 flag!
+</div>
+
+<script src="constants.js"></script>
+<script src="levels.js"></script>
+<script src="physics.js"></script>
+<script src="entities.js"></script>
+<script src="render.js"></script>
+<script src="game.js"></script>
+</body>
+</html>

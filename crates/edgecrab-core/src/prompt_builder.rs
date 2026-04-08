@@ -18,6 +18,7 @@ use std::borrow::Cow;
 use std::path::Path;
 use std::sync::Mutex;
 
+use edgecrab_tools::edit_contract::{MAX_MUTATION_PAYLOAD_BYTES, MAX_MUTATION_PAYLOAD_KIB};
 use edgecrab_types::Platform;
 
 // ─── Skills cache ─────────────────────────────────────────────────────
@@ -250,6 +251,26 @@ Operational rules:
   - Use search_files or read_file as fallback when the file type is unsupported, no server is configured, or the task is purely textual rather than semantic.
 
 EdgeCrab's LSP surface exceeds the common 9-operation baseline: it includes navigation plus code actions, rename, formatting, inlay hints, semantic tokens, signature help, type hierarchy, diagnostics pull, linked editing, LLM-enriched diagnostics, guided action selection, and workspace-wide type-error scans.";
+
+fn code_editing_guidance() -> String {
+    format!(
+        "\
+## Code Editing Execution
+
+When the user asks for a concrete code or file change and the necessary tools are available, inspect the relevant files and apply the edit in the same turn.
+
+Rules:
+  - Do not stop at a plan, draft diff, or 'ready for a patch?' unless the user explicitly asked for a plan/options or the requirements are materially ambiguous.
+  - Use read/search/LSP tools to gather the minimum context needed, then mutate files with apply_patch or write_file.
+  - Create new files directly when the request requires them, but keep the first write small when the file will be substantial.
+  - The file-mutation contract is hard-bounded: each write_file content payload and each apply_patch patch payload must stay at or under {MAX_MUTATION_PAYLOAD_BYTES} bytes ({MAX_MUTATION_PAYLOAD_KIB} KiB) per call.
+  - For large files, full game engines, long scripts, or other substantial code artifacts, do NOT attempt a single giant write_file or execute_code payload. Create a minimal scaffold first, then add the implementation with focused patch/apply_patch steps.
+  - Do not call execute_code as a placeholder plan. Only call it when you already have a concrete code payload to run.
+  - Once the requested edit or artifact is complete, stop expanding scope. Do not add bonus summary files, quick-reference docs, start-here files, or repeated verification passes unless the user explicitly asked for them.
+  - After editing, report what changed and any verification you ran.
+  - Ask before destructive changes outside the user's stated scope."
+    )
+}
 
 const SKILLS_GUIDANCE: &str = "\
 After completing a complex task (5+ tool calls), fixing a tricky error, or discovering \
@@ -669,7 +690,12 @@ impl PromptBuilder {
             sections.push(Cow::Borrowed(LSP_GUIDANCE));
         }
 
-        // 15. Skills prompt (available skill descriptions)
+        // 16. Direct code-editing guidance — only when file-mutation tools are present.
+        if self.has_any_tool(&["apply_patch", "write_file"]) {
+            sections.push(Cow::Owned(code_editing_guidance()));
+        }
+
+        // 17. Skills prompt (available skill descriptions)
         if let Some(sp) = skill_prompt {
             if !sp.is_empty() {
                 sections.push(Cow::Borrowed(sp));
@@ -1289,8 +1315,9 @@ fn load_skill_summary_inner(
 
     let mut output = String::from(
         "## Skills (mandatory)\n\
-         Before replying, scan the skills below. If one clearly matches your task, \
+         Before replying, scan the skills below. If one specifically matches your task's architecture, platform, and task shape, \
          load it with skill_view(name) and follow its instructions. \
+         Do not load a vaguely related skill when the codebase shape or implementation style differs materially. \
          If a skill has issues, fix it with skill_manage(action='edit') — don't wait to be asked.\n\
          After difficult/iterative tasks, save the approach as a skill. \
          If a skill you loaded was missing steps, had wrong commands, or needed \
@@ -2284,6 +2311,50 @@ mod tests {
         assert!(
             !prompt.contains("## Language Server Usage"),
             "LSP guidance must not be injected when no LSP tools are available"
+        );
+    }
+
+    #[test]
+    fn code_editing_guidance_present_when_mutation_tools_are_available() {
+        let builder = PromptBuilder::new(Platform::Cli)
+            .skip_context_files(true)
+            .available_tools(vec![
+                "read_file".to_string(),
+                "apply_patch".to_string(),
+                "write_file".to_string(),
+            ]);
+        let prompt = builder.build(None, None, &[], None);
+        assert!(
+            prompt.contains("## Code Editing Execution"),
+            "code-editing guidance must be injected when mutation tools are available"
+        );
+        assert!(
+            prompt.contains("ready for a patch?"),
+            "guidance must explicitly prohibit waiting for patch approval when not requested"
+        );
+        assert!(
+            prompt.contains("Do not add bonus summary files"),
+            "guidance must explicitly forbid scope creep after the requested artifact is complete"
+        );
+        assert!(
+            prompt.contains("do NOT attempt a single giant write_file or execute_code payload"),
+            "guidance must forbid monolithic payload writes for large artifacts"
+        );
+        assert!(
+            prompt.contains("32768 bytes (32 KiB)"),
+            "guidance must surface the hard mutation payload limit"
+        );
+    }
+
+    #[test]
+    fn code_editing_guidance_absent_without_mutation_tools() {
+        let builder = PromptBuilder::new(Platform::Cli)
+            .skip_context_files(true)
+            .available_tools(vec!["read_file".to_string(), "search_files".to_string()]);
+        let prompt = builder.build(None, None, &[], None);
+        assert!(
+            !prompt.contains("## Code Editing Execution"),
+            "code-editing guidance must not appear without mutation tools"
         );
     }
 

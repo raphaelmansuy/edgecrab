@@ -11032,8 +11032,39 @@ impl App {
             return;
         };
 
-        let snapshot = agent.session_snapshot_blocking();
-        let messages = agent.messages_blocking();
+        let (snapshot, messages) = match tokio::runtime::Handle::try_current()
+            .map(|handle| handle.runtime_flavor())
+        {
+            Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(|| {
+                self.rt_handle.block_on(async {
+                    let snapshot = agent.session_snapshot().await;
+                    let messages = agent.messages().await;
+                    (snapshot, messages)
+                })
+            }),
+            Ok(_) => {
+                let Some(snapshot) = agent.try_session_snapshot() else {
+                    self.push_output(
+                        "Current session is busy; try again after the current turn.",
+                        OutputRole::System,
+                    );
+                    return;
+                };
+                let Some(messages) = agent.try_messages() else {
+                    self.push_output(
+                        "Current session is busy; try again after the current turn.",
+                        OutputRole::System,
+                    );
+                    return;
+                };
+                (snapshot, messages)
+            }
+            Err(_) => self.rt_handle.block_on(async {
+                let snapshot = agent.session_snapshot().await;
+                let messages = agent.messages().await;
+                (snapshot, messages)
+            }),
+        };
         let preview = messages
             .iter()
             .map(message_preview)

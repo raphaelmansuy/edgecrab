@@ -16,6 +16,8 @@ use std::sync::OnceLock;
 
 use regex::Regex;
 
+use crate::shell_syntax::parse_heredoc_marker;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MacosConsentState {
     Granted,
@@ -170,30 +172,6 @@ fn extract_osascript_heredoc(command: &str) -> Option<String> {
         return None;
     }
     Some(body.to_string())
-}
-
-fn parse_heredoc_marker(opener: &str) -> Option<String> {
-    let idx = opener.find("<<")?;
-    let mut marker = opener.get(idx + 2..)?.trim_start();
-    if let Some(stripped) = marker.strip_prefix('-') {
-        marker = stripped.trim_start();
-    }
-    if marker.is_empty() {
-        return None;
-    }
-
-    if let Some(quoted) = marker.strip_prefix('\'') {
-        return quoted.split('\'').next().map(str::to_string);
-    }
-    if let Some(quoted) = marker.strip_prefix('"') {
-        return quoted.split('"').next().map(str::to_string);
-    }
-
-    let end = marker
-        .find(|ch: char| ch.is_whitespace() || matches!(ch, '|' | ';'))
-        .unwrap_or(marker.len());
-    let marker = marker[..end].trim();
-    (!marker.is_empty()).then(|| marker.to_string())
 }
 
 fn extract_piped_literal_osascript(command: &str) -> Option<String> {

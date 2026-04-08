@@ -11,10 +11,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use async_trait::async_trait;
+use edgecrab_tools::build_copilot_provider;
 use edgequake_llm::providers::gemini::GeminiModelsResponse;
 use edgequake_llm::{
     CopilotModel, CopilotModelsResponse, GeminiProvider, LMStudioProvider, OllamaProvider,
-    OpenRouterProvider, VsCodeCopilotProvider,
+    OpenRouterProvider,
 };
 use futures::future::join_all;
 use serde::{Deserialize, Serialize};
@@ -550,7 +551,7 @@ impl ModelDiscoveryAdapter for CopilotDiscovery {
     }
 
     async fn fetch_models(&self) -> anyhow::Result<Vec<String>> {
-        let provider = VsCodeCopilotProvider::new().build()?;
+        let provider = build_copilot_provider("gpt-4o-mini", false).map_err(anyhow::Error::msg)?;
         let response = provider.list_models().await?;
         Ok(extract_copilot_models(response))
     }

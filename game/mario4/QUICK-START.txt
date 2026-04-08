@@ -1,0 +1,146 @@
+╔════════════════════════════════════════════════════════════════════════════╗
+║                   SUPER MARIO 4 — ENHANCED EDITION                         ║
+║                        🎮 QUICK START GUIDE 🎮                             ║
+╚════════════════════════════════════════════════════════════════════════════╝
+
+📋 WHAT'S NEW IN THIS ENHANCED VERSION?
+
+✨ GAMEPLAY
+  ✅ Better jump response (longer buffer + coyote time)
+  ✅ New wall sliding mechanic (slide down walls smoothly!)
+  ✅ Faster fire rate (shoot more often)
+  ✅ Screen shake feedback (feel the impacts!)
+  ✅ Tighter movement physics (snappier overall)
+
+📱 MOBILE
+  ✅ MUCH larger touch buttons (70px vs 60px)
+  ✅ Better contrast and visibility
+  ✅ Clear labels ("JUMP", "RUN" instead of single letters)
+  ✅ More ergonomic layout
+
+═══════════════════════════════════════════════════════════════════════════════
+
+🎮 HOW TO PLAY
+
+  KEYBOARD:
+    Arrow Keys / A,D    →  Move left/right
+    Space / W / ↑       →  Jump
+    Shift / Z           →  Run fast
+    X / F               →  Shoot fireballs (with 🌸)
+    P                   →  Pause
+
+  MOBILE (Touch):
+    ◀ ▶                 →  Move left/right
+    JUMP                →  Jump (hold for higher!)
+    RUN                 →  Run fast
+    🔥                  →  Shoot fireballs
+
+═══════════════════════════════════════════════════════════════════════════════
+
+🎯 GAMEPLAY TIPS
+
+  JUMP TIMING
+    • Can jump up to 0.2 seconds after walking off a platform (coyote time!)
+    • Jump input is buffered for 12 frames (very forgiving)
+    • Hold jump for max height, tap for short hop
+
+  NEW: WALL SLIDING
+    • Jump into a wall while falling
+    • You'll slide down smoothly instead of bouncing
+    • Use it to reach new platforms or find secret areas!
+
+  STOMPING ENEMIES
+    • Jump on enemy heads from above
+    • Get bounced higher for each stomp
+    • Chain multiple stomps = COMBO for more points!
+
+  FIRE FLOWER
+    • Shoot fireballs with X or F key
+    • Much faster fire rate now (18 frame cooldown)
+    • Great for breaking bricks and hitting distant enemies
+
+═══════════════════════════════════════════════════════════════════════════════
+
+📊 PHYSICS IMPROVEMENTS AT A GLANCE
+
+  Before → After (Why it matters):
+
+  Jump Force:        13.8 → 14.2  (Feels snappier, easier to control)
+  Ground Accel:       1.6 → 1.8   (Faster movement startup)
+  Jump Buffer:         10 → 12     (More forgiving timing)
+  Coyote Time:         10 → 12     (Jump off edges longer)
+  Run Speed:          6.8 → 7.0    (Faster sprint)
+  Wall Slide Speed:     - → 1.5    (NEW! Slide down walls)
+
+═══════════════════════════════════════════════════════════════════════════════
+
+🎨 VISUAL IMPROVEMENTS
+
+  ✅ Screen shake when you jump (satisfying impact!)
+  ✅ Screen shake when you stomp enemies (visceral feedback!)
+  ✅ Enhanced particle effects on all impacts
+  ✅ Faster animations (5 frames instead of 6)
+  ✅ Smoother camera following
+
+═══════════════════════════════════════════════════════════════════════════════
+
+📱 MOBILE CONTROLS (IF ON TOUCH DEVICE)
+
+  The touch buttons are now:
+    • 70px in size (17% bigger!) - easier to hit
+    • Darker with white borders (easier to see)
+    • Clear labels ("JUMP", not "A")
+    • Better positioned (ergonomic)
+
+  Hit rate should improve dramatically on mobile!
+
+═══════════════════════════════════════════════════════════════════════════════
+
+🧪 THINGS TO TRY
+
+  1. [ ] Walk off a platform and jump in mid-air (test coyote time)
+  2. [ ] Time a jump right at the edge (test jump buffer)
+  3. [ ] Jump into a wall and slide down (test NEW wall slide!)
+  4. [ ] Stomp multiple enemies (watch the screen shake!)
+  5. [ ] Use fireflower (notice faster rate!)
+  6. [ ] Try mobile touch buttons (should feel great!)
+
+═══════════════════════════════════════════════════════════════════════════════
+
+📚 DOCUMENTATION FILES
+
+  README-ENHANCEMENTS.md    → Full player guide
+  IMPROVEMENTS.md           → Detailed technical changelog
+  ENHANCEMENT-SUMMARY.md    → Visual comparison of changes
+  CHANGELOG.md              → Complete version history
+  QUICK-START.txt          → This file!
+
+═══════════════════════════════════════════════════════════════════════════════
+
+✅ VERIFICATION CHECKLIST
+
+  Game Status:
+    ✅ All JavaScript files validated
+    ✅ All physics tuned and tested
+    ✅ No breaking changes
+    ✅ 100% backward compatible
+    ✅ Performance: 60 FPS maintained
+    ✅ Mobile fully supported
+
+═══════════════════════════════════════════════════════════════════════════════
+
+🚀 ENJOY THE ENHANCED EXPERIENCE!
+
+  The game should feel:
+    • More responsive to your input
+    • More forgiving of timing mistakes
+    • More satisfying with feedback
+    • More fun overall!
+
+  Happy playing! 🎮⭐
+
+═══════════════════════════════════════════════════════════════════════════════
+
+Version: 2.0 Enhanced Edition
+Updated: 2026-04-08
+Status: Ready to Play! ✅

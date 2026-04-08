@@ -287,7 +287,7 @@ async fn run_foreground(args: &CliArgs) -> anyhow::Result<()> {
         args.model.as_deref(),
         args.toolset.as_deref(),
     )?;
-    let provider = create_provider(&runtime.config.model.default_model);
+    let provider = create_provider(&runtime.config.model.default_model)?;
     let state_db = open_state_db(&runtime.state_db_path)?;
     let tool_registry = build_tool_registry_with_mcp_discovery(&runtime.config).await;
     let agent = build_agent(

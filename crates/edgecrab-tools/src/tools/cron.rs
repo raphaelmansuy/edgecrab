@@ -79,6 +79,10 @@ impl ToolHandler for ManageCronJobsTool {
         "manage_cron_jobs"
     }
 
+    fn aliases(&self) -> &'static [&'static str] {
+        &["cronjob"]
+    }
+
     fn toolset(&self) -> &'static str {
         "scheduling"
     }

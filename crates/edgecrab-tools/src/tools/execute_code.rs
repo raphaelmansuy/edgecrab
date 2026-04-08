@@ -1651,9 +1651,17 @@ impl ToolHandler for ExecuteCodeToolReal {
         ctx: &ToolContext,
     ) -> Result<String, ToolError> {
         let args: ExecuteCodeArgs =
-            serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs {
-                tool: "execute_code".into(),
-                message: format!("Invalid execute_code args: {e}"),
+            serde_json::from_value(args).map_err(|e| {
+                let raw = e.to_string();
+                let message = if raw.contains("missing field `code`") {
+                    "Invalid execute_code args: missing field `code`. Only call execute_code when you already have a concrete code payload to run; do not use it as a planning placeholder.".to_string()
+                } else {
+                    format!("Invalid execute_code args: {raw}")
+                };
+                ToolError::InvalidArgs {
+                    tool: "execute_code".into(),
+                    message,
+                }
             })?;
 
         if args.code.trim().is_empty() {

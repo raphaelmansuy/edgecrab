@@ -46,7 +46,7 @@ mod whatsapp_cmd;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::Context;
+use anyhow::{Context, anyhow};
 use clap::Parser;
 use shell_words::split as shell_split;
 use tokio_util::sync::CancellationToken;
@@ -59,7 +59,7 @@ use cli_args::{
 use edgecrab_core::config::McpServerConfig;
 use edgecrab_state::SessionDb;
 use edgecrab_tools::vision_models::normalize_provider_name;
-use edgecrab_tools::{ToolRegistry, resolve_alias};
+use edgecrab_tools::{ToolRegistry, create_provider_for_model, resolve_alias};
 use runtime::{
     build_agent, build_tool_registry, build_tool_registry_with_mcp_discovery, default_export_path,
     load_runtime, open_state_db, render_markdown_export,
@@ -77,141 +77,61 @@ use runtime::{
 ///       ↓ fails
 ///   MockProvider                        ← fallback for dev/test
 /// ```
-pub(crate) fn create_provider(model: &str) -> Arc<dyn edgequake_llm::LLMProvider> {
-    // If model string contains provider/model, honour it explicitly first.
-    // This ensures "copilot/gpt-4.1-mini" always uses copilot even when
-    // OPENAI_API_KEY, ANTHROPIC_API_KEY etc. are also set.
-    if let Some((provider_name, model_name)) = model.split_once('/') {
+pub(crate) fn create_provider(model: &str) -> anyhow::Result<Arc<dyn edgequake_llm::LLMProvider>> {
+    if let Some((provider_name, model_name)) = explicit_provider_request(model) {
         let canonical = normalize_provider_name(provider_name);
         tracing::info!(
             provider = canonical,
             model = model_name,
             "creating provider from model string"
         );
-
-        // Special-case vscode-copilot: create_llm_provider always forces proxy mode
-        // (localhost:4141). Instead, build the provider directly so it uses the default
-        // direct mode (api.githubcopilot.com) and respects VSCODE_COPILOT_DIRECT env var.
-        if canonical == "vscode-copilot" {
-            match edgequake_llm::VsCodeCopilotProvider::new()
-                .model(model_name)
-                .with_vision(true) // Enable vision so copilot-vision-request header is sent
-                .build()
-            {
-                Ok(provider) => return Arc::new(provider),
-                Err(e) => {
-                    tracing::warn!(error = %e, model = model_name, "copilot direct mode failed, trying env auto-detect");
-                }
-            }
-        } else if canonical == "vertexai" {
-            // ── Hard VertexAI route ──────────────────────────────────────────────────
-            // The user explicitly said "vertexai/<model>".  We MUST NOT silently fall
-            // through to from_env() (which would pick up GEMINI_API_KEY and route to
-            // Google AI Studio instead) or to MockProvider.  Any failure is surfaced
-            // immediately with actionable guidance.
-            //
-            // Why "vertexai:" prefix: edgequake-llm's factory only calls
-            // GeminiProvider::from_env_vertex_ai() when the model string starts with
-            // "vertexai:".  split_once('/') strips that context, so we restore it here.
-            //
-            // Why auto-detect GOOGLE_CLOUD_PROJECT: `gcloud auth login` does NOT export
-            // it; from_env_vertex_ai() treats it as required.
-
-            if std::env::var("GOOGLE_CLOUD_PROJECT").is_err() {
-                match std::process::Command::new("gcloud")
-                    .args(["config", "get-value", "project"])
-                    .output()
-                {
-                    Ok(output) if output.status.success() => {
-                        let raw = String::from_utf8_lossy(&output.stdout);
-                        let project = raw.trim();
-                        if !project.is_empty() && project != "(unset)" {
-                            // SAFETY: called before the tokio worker pool is spawned;
-                            // no other thread reads env vars at this point.
-                            unsafe { std::env::set_var("GOOGLE_CLOUD_PROJECT", project) };
-                            tracing::info!(
-                                project,
-                                "auto-detected GOOGLE_CLOUD_PROJECT from gcloud config"
-                            );
-                        } else {
-                            eprintln!(
-                                "error: VertexAI requires a GCP project but gcloud returned \
-                                 empty/unset.\n  Fix: gcloud config set project <your-project-id>\n\
-                                        or: export GOOGLE_CLOUD_PROJECT=<your-project-id>"
-                            );
-                            std::process::exit(1);
-                        }
-                    }
-                    Ok(_) => {
-                        eprintln!(
-                            "error: gcloud exited with a non-zero status while detecting \
-                             GOOGLE_CLOUD_PROJECT.\n  Fix: export GOOGLE_CLOUD_PROJECT=<your-project-id>"
-                        );
-                        std::process::exit(1);
-                    }
-                    Err(_) => {
-                        eprintln!(
-                            "error: GOOGLE_CLOUD_PROJECT is not set and gcloud was not found \
-                             in PATH.\n  Fix: export GOOGLE_CLOUD_PROJECT=<your-project-id>\n\
-                                    or: install the Google Cloud SDK and run gcloud auth login"
-                        );
-                        std::process::exit(1);
-                    }
-                }
-            }
-
-            let vertex_model = format!("vertexai:{model_name}");
-
-            // Gemini 3.x Preview models (gemini-3-flash-preview, gemini-3.1-pro-preview,
-            // gemini-3.1-flash-lite-preview, …) are ONLY available on the Vertex AI
-            // global endpoint.  The 2.x GA models work on regional endpoints like
-            // us-central1.  edgequake-llm reads GOOGLE_CLOUD_REGION to build the
-            // endpoint URL; auto-set it to "global" when the user hasn't set it
-            // and the model name indicates a Gemini 3 generation.
-            // Source: https://cloud.google.com/vertex-ai/generative-ai/docs/learn/locations
-            if model_name.starts_with("gemini-3") && std::env::var("GOOGLE_CLOUD_REGION").is_err() {
-                // SAFETY: single-threaded startup, no concurrent env reads.
-                unsafe { std::env::set_var("GOOGLE_CLOUD_REGION", "global") };
-                tracing::info!(
-                    model = model_name,
-                    "auto-set GOOGLE_CLOUD_REGION=global (Gemini 3.x is global-endpoint-only)"
-                );
-            }
-
-            match edgequake_llm::ProviderFactory::create_llm_provider(&canonical, &vertex_model) {
-                Ok(provider) => return provider,
-                Err(e) => {
-                    eprintln!(
-                        "error: VertexAI provider failed for model '{model_name}': {e}\n\
-                         Fix:\n\
-                         \x20  • gcloud auth application-default login\n\
-                         \x20  • export GOOGLE_CLOUD_PROJECT=<your-project-id>\n\
-                         \x20  • edgecrab doctor    ← full diagnostics"
-                    );
-                    std::process::exit(1);
-                }
-            }
-        } else if let Ok(provider) =
-            edgequake_llm::ProviderFactory::create_llm_provider(&canonical, model_name)
-        {
-            return provider;
-        } else {
-            tracing::warn!(
-                provider = canonical,
-                model = model_name,
-                "explicit provider failed, trying env auto-detect"
-            );
-        }
+        return create_explicit_provider(&canonical, model_name);
     }
 
-    // Fallback: environment auto-detection (only reached when no "provider/model" slash
-    // syntax was used, or a non-vertexai explicit provider soft-failed).
+    // Fallback: environment auto-detection (only reached when no explicit
+    // "provider/model" syntax was used).
     if let Ok((llm, _embedding)) = edgequake_llm::ProviderFactory::from_env() {
-        return llm;
+        return Ok(llm);
     }
 
     tracing::warn!("no provider configured, falling back to mock");
-    Arc::new(edgequake_llm::MockProvider::new())
+    Ok(Arc::new(edgequake_llm::MockProvider::new()))
+}
+
+fn explicit_provider_request(model: &str) -> Option<(&str, &str)> {
+    model.split_once('/')
+}
+
+fn create_explicit_provider(
+    provider_name: &str,
+    model_name: &str,
+) -> anyhow::Result<Arc<dyn edgequake_llm::LLMProvider>> {
+    create_provider_for_model(provider_name, model_name).map_err(|e| {
+        let guidance = match provider_name {
+            "vscode-copilot" => {
+                "Fix:\n\
+                 \x20  • ensure VS Code Copilot is authenticated\n\
+                 \x20  • set VSCODE_COPILOT_DIRECT=false to force proxy mode\n\
+                 \x20  • or set VSCODE_COPILOT_PROXY_URL for a custom proxy"
+            }
+            "vertexai" => {
+                "Fix:\n\
+                 \x20  • gcloud auth application-default login\n\
+                 \x20  • export GOOGLE_CLOUD_PROJECT=<your-project-id>\n\
+                 \x20  • edgecrab doctor"
+            }
+            _ => {
+                "Refusing to fall back to a different provider because the model was selected explicitly.\n\
+                 Fix the named provider configuration or choose a different provider/model."
+            }
+        };
+        anyhow!(
+            "explicit provider '{}' failed for model '{}': {e}\n{}",
+            provider_name,
+            model_name,
+            guidance
+        )
+    })
 }
 
 #[tokio::main]
@@ -278,7 +198,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let model = runtime.config.model.default_model.clone();
-    let provider = create_provider(&model);
+    let provider = create_provider(&model)?;
     let state_db = open_state_db(&runtime.state_db_path)?;
     let tool_registry = build_tool_registry_with_mcp_discovery(&runtime.config).await;
 
@@ -566,7 +486,7 @@ async fn run_acp(args: &CliArgs) -> anyhow::Result<()> {
         args.toolset.as_deref(),
     )?;
     let model_str = runtime.config.model.default_model.clone();
-    let provider = create_provider(&model_str);
+    let provider = create_provider(&model_str)?;
     let state_db = open_state_db(&runtime.state_db_path)?;
     let tool_registry = build_tool_registry_with_mcp_discovery(&runtime.config).await;
     let agent = build_agent(
@@ -1816,8 +1736,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        activate_runtime_home_from_config, parse_editor_command, render_version_report,
-        runtime_home_for_config_override, set_config_value,
+        activate_runtime_home_from_config, explicit_provider_request, parse_editor_command,
+        render_version_report, runtime_home_for_config_override, set_config_value,
     };
 
     #[test]
@@ -1914,5 +1834,23 @@ mod tests {
         }
         assert!(report.contains("EdgeCrab v"));
         assert!(report.contains("Supported providers (from model catalog):"));
+    }
+
+    #[test]
+    fn explicit_provider_request_detects_provider_model_syntax() {
+        assert_eq!(
+            explicit_provider_request("openai/gpt-5-nano"),
+            Some(("openai", "gpt-5-nano"))
+        );
+        assert_eq!(
+            explicit_provider_request("vscode-copilot/gpt-4.1"),
+            Some(("vscode-copilot", "gpt-4.1"))
+        );
+    }
+
+    #[test]
+    fn explicit_provider_request_ignores_implicit_model_names() {
+        assert_eq!(explicit_provider_request("gpt-5-nano"), None);
+        assert_eq!(explicit_provider_request(""), None);
     }
 }

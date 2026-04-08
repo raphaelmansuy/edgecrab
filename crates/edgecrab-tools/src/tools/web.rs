@@ -4,7 +4,7 @@
 //! - `web_search` → structured query results (list of links + snippets)
 //! - `web_extract` → full readable content from a known URL
 //!
-//! This matches the hermes-agent pattern (parallel_search + firecrawl).
+//! This matches the established split between search and extraction.
 //!
 //! ## web_search backend priority
 //!
@@ -261,7 +261,7 @@ fn is_pdf_response(url: &Url, content_type: &str, bytes: &[u8]) -> bool {
         || looks_like_pdf(bytes)
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct ExtractedDocument {
     url: String,
     title: String,
@@ -1479,7 +1479,10 @@ pub struct WebCrawlTool;
 
 #[derive(Deserialize)]
 struct ExtractArgs {
-    url: String,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    urls: Option<Vec<String>>,
     /// Maximum characters of content to return
     #[serde(default)]
     max_chars: Option<usize>,
@@ -1487,6 +1490,114 @@ struct ExtractArgs {
     backend: Option<String>,
     #[serde(default)]
     render_js_fallback: Option<bool>,
+}
+
+#[derive(Serialize)]
+struct ExtractBatchEntry {
+    url: String,
+    success: bool,
+    result: Option<ExtractedDocument>,
+    error: Option<String>,
+}
+
+fn requested_extract_urls(args: &ExtractArgs) -> Result<Vec<String>, ToolError> {
+    let mut requested = Vec::new();
+
+    if let Some(url) = args.url.as_ref().filter(|url| !url.trim().is_empty()) {
+        requested.push(url.trim().to_string());
+    }
+
+    if let Some(urls) = &args.urls {
+        for url in urls {
+            let trimmed = url.trim();
+            if trimmed.is_empty() || requested.iter().any(|existing| existing == trimmed) {
+                continue;
+            }
+            requested.push(trimmed.to_string());
+        }
+    }
+
+    if requested.is_empty() {
+        return Err(ToolError::InvalidArgs {
+            tool: "web_extract".into(),
+            message: "Provide either 'url' or 'urls'.".into(),
+        });
+    }
+
+    requested.truncate(5);
+    Ok(requested)
+}
+
+fn parse_extract_url(requested: &str) -> Result<Url, ToolError> {
+    validate_url(requested, "web_extract")?;
+    Url::parse(requested).map_err(|e| ToolError::InvalidArgs {
+        tool: "web_extract".into(),
+        message: format!("Invalid URL: {e}"),
+    })
+}
+
+async fn extract_document_for_url(
+    requested_url: &Url,
+    backend: ContentBackend,
+    max_chars: usize,
+    render_js_fallback: bool,
+    ctx: &ToolContext,
+) -> Result<ExtractedDocument, ToolError> {
+    match backend {
+        ContentBackend::Firecrawl => extract_via_firecrawl(requested_url.as_str(), max_chars).await,
+        ContentBackend::Tavily => extract_via_tavily(requested_url.as_str(), max_chars).await,
+        ContentBackend::Browser => {
+            fetch_browser_document(requested_url, "text/html", max_chars, ctx, "web_extract")
+                .await
+                .map(|page| page.document)
+        }
+        ContentBackend::Native => {
+            let client = build_client()?;
+            let resp = client
+                .get(requested_url.as_str())
+                .header(
+                    "User-Agent",
+                    "EdgeCrab/0.1 (agent; +https://github.com/raphaelmansuy/edgecrab)",
+                )
+                .send()
+                .await
+                .map_err(|e| ToolError::ExecutionFailed {
+                    tool: "web_extract".into(),
+                    message: format!("HTTP error: {e}"),
+                })?;
+
+            if !resp.status().is_success() {
+                return Err(ToolError::ExecutionFailed {
+                    tool: "web_extract".into(),
+                    message: format!("HTTP {}: {}", resp.status(), requested_url),
+                });
+            }
+
+            let final_url = resp.url().clone();
+            let content_type = resp
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            let body = resp.bytes().await.map_err(|e| ToolError::ExecutionFailed {
+                tool: "web_extract".into(),
+                message: format!("Body read error: {e}"),
+            })?;
+
+            fetch_native_document(
+                &final_url,
+                &content_type,
+                body.as_ref(),
+                max_chars,
+                "web_extract",
+                ctx,
+                render_js_fallback,
+            )
+            .await
+            .map(|page| page.document)
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -1539,13 +1650,19 @@ impl ToolHandler for WebExtractTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "web_extract".into(),
-            description: "Extract readable content from a URL. Returns structured JSON with content, metadata, backend selection, PDF extraction via EdgeParse, and browser-rendered fallback for JS-heavy pages.".into(),
+            description: "Extract readable content from one or more URLs. Accepts EdgeCrab's single `url` form and `urls` arrays (up to 5 URLs). Returns structured JSON with content, metadata, backend selection, PDF extraction via EdgeParse, and browser-rendered fallback for JS-heavy pages.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "url": {
                         "type": "string",
-                        "description": "URL to extract content from"
+                        "description": "Single URL to extract content from. Provide this or `urls`."
+                    },
+                    "urls": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "List of URLs to extract (max 5 per call). Provide this or `url`.",
+                        "maxItems": 5
                     },
                     "max_chars": {
                         "type": "integer",
@@ -1559,8 +1676,7 @@ impl ToolHandler for WebExtractTool {
                         "type": "boolean",
                         "description": "When true (default), try a browser-rendered fallback for JS-heavy pages when native extraction is too thin"
                     }
-                },
-                "required": ["url"]
+                }
             }),
             strict: None,
         }
@@ -1581,80 +1697,69 @@ impl ToolHandler for WebExtractTool {
                 message: e.to_string(),
             })?;
 
+        let requested_urls = requested_extract_urls(&args)?;
         let max_chars = args.max_chars.unwrap_or(8_000).min(50_000);
         let backend = resolve_content_backend(args.backend.as_deref(), "web_extract")?;
         let render_js_fallback = args.render_js_fallback.unwrap_or(true);
         let backend_name = content_backend_name(backend);
+        let batch_mode = requested_urls.len() > 1 || args.urls.is_some();
 
-        // SSRF prevention — blocks private ranges (10.x, 192.168.x, etc.)
-        validate_url(&args.url, "web_extract")?;
-        let requested_url = Url::parse(&args.url).map_err(|e| ToolError::InvalidArgs {
-            tool: "web_extract".into(),
-            message: format!("Invalid URL: {e}"),
-        })?;
+        if !batch_mode {
+            let only_url = &requested_urls[0];
+            let parsed = parse_extract_url(only_url)?;
+            let document =
+                extract_document_for_url(&parsed, backend, max_chars, render_js_fallback, ctx)
+                    .await?;
 
-        let document = match backend {
-            ContentBackend::Firecrawl => {
-                extract_via_firecrawl(requested_url.as_str(), max_chars).await?
-            }
-            ContentBackend::Tavily => extract_via_tavily(requested_url.as_str(), max_chars).await?,
-            ContentBackend::Browser => {
-                fetch_browser_document(&requested_url, "text/html", max_chars, ctx, "web_extract")
-                    .await?
-                    .document
-            }
-            ContentBackend::Native => {
-                let client = build_client()?;
-                let resp = client
-                    .get(&args.url)
-                    .header(
-                        "User-Agent",
-                        "EdgeCrab/0.1 (agent; +https://github.com/raphaelmansuy/edgecrab)",
-                    )
-                    .send()
-                    .await
-                    .map_err(|e| ToolError::ExecutionFailed {
-                        tool: "web_extract".into(),
-                        message: format!("HTTP error: {e}"),
-                    })?;
+            return Ok(json!({
+                "success": true,
+                "backend": backend_name,
+                "result": document.clone(),
+                "results": [document],
+            })
+            .to_string());
+        }
 
-                if !resp.status().is_success() {
-                    return Err(ToolError::ExecutionFailed {
-                        tool: "web_extract".into(),
-                        message: format!("HTTP {}: {}", resp.status(), args.url),
-                    });
-                }
-
-                let final_url = resp.url().clone();
-                let content_type = resp
-                    .headers()
-                    .get(reqwest::header::CONTENT_TYPE)
-                    .and_then(|value| value.to_str().ok())
-                    .unwrap_or("")
-                    .to_string();
-                let body = resp.bytes().await.map_err(|e| ToolError::ExecutionFailed {
-                    tool: "web_extract".into(),
-                    message: format!("Body read error: {e}"),
-                })?;
-
-                fetch_native_document(
-                    &final_url,
-                    &content_type,
-                    body.as_ref(),
+        let mut results = Vec::with_capacity(requested_urls.len());
+        for requested in requested_urls {
+            let entry = match parse_extract_url(&requested) {
+                Ok(parsed) => match extract_document_for_url(
+                    &parsed,
+                    backend,
                     max_chars,
-                    "web_extract",
-                    ctx,
                     render_js_fallback,
+                    ctx,
                 )
-                .await?
-                .document
-            }
-        };
+                .await
+                {
+                    Ok(document) => ExtractBatchEntry {
+                        url: requested,
+                        success: true,
+                        result: Some(document),
+                        error: None,
+                    },
+                    Err(error) => ExtractBatchEntry {
+                        url: requested,
+                        success: false,
+                        result: None,
+                        error: Some(error.to_string()),
+                    },
+                },
+                Err(error) => ExtractBatchEntry {
+                    url: requested,
+                    success: false,
+                    result: None,
+                    error: Some(error.to_string()),
+                },
+            };
+            results.push(entry);
+        }
 
+        let success_count = results.iter().filter(|entry| entry.success).count();
         Ok(json!({
-            "success": true,
+            "success": success_count > 0,
             "backend": backend_name,
-            "result": document,
+            "results": results,
         })
         .to_string())
     }
@@ -1971,7 +2076,7 @@ fn validate_url(url: &str, tool: &str) -> Result<(), ToolError> {
 /// Build a shared reqwest client with a sensible timeout.
 ///
 /// WHY 15-second timeout: Balances responsiveness vs. slow websites.
-/// This is the same default as hermes-agent's aiohttp session timeout.
+/// This timeout balances responsiveness against slow websites.
 fn build_client() -> Result<reqwest::Client, ToolError> {
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
@@ -2178,6 +2283,83 @@ mod tests {
     #[test]
     fn web_extract_available() {
         assert!(WebExtractTool.is_available());
+    }
+
+    #[test]
+    fn web_extract_schema_avoids_top_level_combinators() {
+        let schema = WebExtractTool.schema();
+        let params = schema.parameters;
+        assert_eq!(params["type"], "object");
+        assert!(
+            params.get("anyOf").is_none(),
+            "top-level anyOf is unsupported"
+        );
+        assert!(
+            params.get("oneOf").is_none(),
+            "top-level oneOf is unsupported"
+        );
+        assert!(
+            params.get("allOf").is_none(),
+            "top-level allOf is unsupported"
+        );
+        assert!(params.get("not").is_none(), "top-level not is unsupported");
+    }
+
+    #[test]
+    fn requested_extract_urls_accepts_single_or_batch_contracts() {
+        let single = requested_extract_urls(&ExtractArgs {
+            url: Some("https://example.com/a".into()),
+            urls: None,
+            max_chars: None,
+            backend: None,
+            render_js_fallback: None,
+        })
+        .expect("single url");
+        assert_eq!(single, vec!["https://example.com/a"]);
+
+        let batch = requested_extract_urls(&ExtractArgs {
+            url: Some("https://example.com/a".into()),
+            urls: Some(vec![
+                "https://example.com/a".into(),
+                "https://example.com/b".into(),
+                " https://example.com/c ".into(),
+            ]),
+            max_chars: None,
+            backend: None,
+            render_js_fallback: None,
+        })
+        .expect("batch urls");
+        assert_eq!(
+            batch,
+            vec![
+                "https://example.com/a",
+                "https://example.com/b",
+                "https://example.com/c",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn web_extract_batch_returns_per_url_errors_without_network() {
+        let ctx = crate::registry::ToolContext::test_context();
+        let result = WebExtractTool
+            .execute(
+                json!({
+                    "urls": [
+                        "notaurl",
+                        "http://127.0.0.1:8080/private"
+                    ]
+                }),
+                &ctx,
+            )
+            .await
+            .expect("batch response");
+
+        let parsed: serde_json::Value = serde_json::from_str(&result).expect("json");
+        let results = parsed["results"].as_array().expect("results array");
+        assert_eq!(results.len(), 2);
+        assert_eq!(parsed["success"], false);
+        assert!(results.iter().all(|entry| entry["success"] == false));
     }
 
     #[test]

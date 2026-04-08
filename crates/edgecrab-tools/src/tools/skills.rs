@@ -1371,7 +1371,9 @@ impl ToolHandler for SkillManageTool {
                            Use action='patch' with old_string and new_string for targeted replacement. \
                            Use action='delete' to remove the skill directory. \
                            Use action='write_file' with file_path and file_content to add/overwrite a supporting file. \
-                           Use action='remove_file' with file_path to remove a supporting file."
+                           Use action='remove_file' with file_path to remove a supporting file. \
+                           Skills are procedural memory: save non-trivial reusable workflows, and \
+                           patch a skill when you discover missing steps or pitfalls."
                 .into(),
             parameters: json!({
                 "type": "object",

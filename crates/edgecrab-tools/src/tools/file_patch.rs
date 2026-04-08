@@ -30,6 +30,10 @@ use std::path::PathBuf;
 
 use edgecrab_types::{ToolError, ToolSchema};
 
+use crate::edit_contract::{
+    MAX_MUTATION_PAYLOAD_BYTES, MAX_MUTATION_PAYLOAD_KIB, enforce_apply_patch_payload_limit,
+    enforce_patch_payload_limit,
+};
 use crate::fuzzy_match::fuzzy_find_and_replace;
 use crate::path_utils::jail_read_path;
 use crate::registry::{ToolContext, ToolHandler};
@@ -38,7 +42,7 @@ use crate::tools::checkpoint::ensure_checkpoint;
 pub struct PatchTool;
 
 #[derive(Deserialize)]
-struct Args {
+struct ReplaceArgs {
     path: String,
     /// String to find (8-strategy fuzzy matching is applied if exact fails)
     old_string: String,
@@ -47,6 +51,75 @@ struct Args {
     /// Replace all occurrences (default: false — require unique match)
     #[serde(default)]
     replace_all: bool,
+}
+
+#[derive(Deserialize)]
+struct PatchArgs {
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    old_string: Option<String>,
+    #[serde(default)]
+    new_string: Option<String>,
+    #[serde(default)]
+    replace_all: bool,
+    #[serde(default)]
+    patch: Option<String>,
+}
+
+fn should_use_v4a_mode(args: &PatchArgs) -> bool {
+    match args.mode.as_deref() {
+        Some("patch") => true,
+        Some("replace") => false,
+        Some(_) => false,
+        None => args.patch.is_some() && args.old_string.is_none() && args.new_string.is_none(),
+    }
+}
+
+async fn execute_replace_patch(args: ReplaceArgs, ctx: &ToolContext) -> Result<String, ToolError> {
+    enforce_patch_payload_limit(
+        "patch",
+        &args.path,
+        args.old_string.len() + args.new_string.len(),
+    )?;
+
+    // Auto-checkpoint before mutation
+    ensure_checkpoint(ctx, &format!("before patch: {}", args.path));
+
+    let path_policy = ctx.config.file_path_policy(&ctx.cwd);
+    let resolved = jail_read_path(&args.path, &path_policy)?;
+
+    let content = tokio::fs::read_to_string(&resolved)
+        .await
+        .map_err(|e| ToolError::Other(format!("Cannot read '{}': {}", args.path, e)))?;
+
+    // 8-strategy fuzzy replacement (mirrors hermes fuzzy_match.py)
+    let (new_content, count) = fuzzy_find_and_replace(
+        &content,
+        &args.old_string,
+        &args.new_string,
+        args.replace_all,
+    )
+    .map_err(|msg| {
+        ToolError::Other(format!(
+            "{msg}\n[Hint: Use read_file to verify the current content of '{}']",
+            args.path
+        ))
+    })?;
+
+    tokio::fs::write(&resolved, &new_content)
+        .await
+        .map_err(|e| ToolError::Other(format!("Cannot write '{}': {}", args.path, e)))?;
+
+    Ok(format!(
+        "Patched '{}': {} replacement(s), {} → {} bytes",
+        args.path,
+        count,
+        args.old_string.len(),
+        args.new_string.len()
+    ))
 }
 
 #[async_trait]
@@ -66,33 +139,45 @@ impl ToolHandler for PatchTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "patch".into(),
-            description: "Apply a targeted edit to a file. Uses an 8-strategy fuzzy matching \
-                          chain (exact → line-trimmed → whitespace-norm → indent-flexible → \
-                          escape-norm → trimmed-boundary → block-anchor → context-aware) to \
-                          locate old_string, tolerating common LLM-induced whitespace and \
-                          indentation drift. More precise than write_file for localized changes."
-                .into(),
+            description: format!(
+                "Patch files in two modes. Replace mode: targeted find-and-replace \
+                 using path + old_string + new_string with 8-strategy fuzzy matching \
+                 (exact → line-trimmed → whitespace-norm → indent-flexible → \
+                 escape-norm → trimmed-boundary → block-anchor → context-aware). \
+                 Patch mode: pass a V4A multi-file patch block in the patch field \
+                 (hermes-compatible). Replace-mode hard limit: combined old_string + \
+                 new_string payload must stay at or under {MAX_MUTATION_PAYLOAD_BYTES} \
+                 bytes ({MAX_MUTATION_PAYLOAD_KIB} KiB) per call."
+            ),
             parameters: json!({
                 "type": "object",
                 "properties": {
+                    "mode": {
+                        "type": "string",
+                        "enum": ["replace", "patch"],
+                        "description": "replace = targeted find-and-replace, patch = V4A multi-file patch block"
+                    },
                     "path": {
                         "type": "string",
-                        "description": "File path relative to working directory"
+                        "description": "File path relative to working directory (required for replace mode)"
                     },
                     "old_string": {
                         "type": "string",
-                        "description": "String to find and replace (fuzzy-matched)"
+                        "description": "String to find and replace (required for replace mode; fuzzy-matched)"
                     },
                     "new_string": {
                         "type": "string",
-                        "description": "String to replace old_string with"
+                        "description": "String to replace old_string with (required for replace mode)"
                     },
                     "replace_all": {
                         "type": "boolean",
                         "description": "Replace all occurrences (default false — require unique match)"
+                    },
+                    "patch": {
+                        "type": "string",
+                        "description": "V4A patch block for patch mode, starting with '*** Begin Patch'"
                     }
-                },
-                "required": ["path", "old_string", "new_string"]
+                }
             }),
             strict: None,
         }
@@ -103,46 +188,39 @@ impl ToolHandler for PatchTool {
         args: serde_json::Value,
         ctx: &ToolContext,
     ) -> Result<String, ToolError> {
-        let args: Args = serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs {
+        let args: PatchArgs = serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs {
             tool: "patch".into(),
             message: e.to_string(),
         })?;
 
-        // Auto-checkpoint before mutation
-        ensure_checkpoint(ctx, &format!("before patch: {}", args.path));
+        if should_use_v4a_mode(&args) {
+            let patch_text = args
+                .patch
+                .as_deref()
+                .ok_or_else(|| ToolError::InvalidArgs {
+                    tool: "patch".into(),
+                    message: "patch mode requires the 'patch' field with a V4A patch block".into(),
+                })?;
+            return execute_v4a_patch(patch_text, ctx).await;
+        }
 
-        let path_policy = ctx.config.file_path_policy(&ctx.cwd);
-        let resolved = jail_read_path(&args.path, &path_policy)?;
+        let replace_args = ReplaceArgs {
+            path: args.path.ok_or_else(|| ToolError::InvalidArgs {
+                tool: "patch".into(),
+                message: "replace mode requires 'path'. If you intended a V4A patch block, call apply_patch or patch(mode='patch', patch=...)".into(),
+            })?,
+            old_string: args.old_string.ok_or_else(|| ToolError::InvalidArgs {
+                tool: "patch".into(),
+                message: "replace mode requires 'old_string'. If you intended a V4A patch block, call apply_patch or patch(mode='patch', patch=...)".into(),
+            })?,
+            new_string: args.new_string.ok_or_else(|| ToolError::InvalidArgs {
+                tool: "patch".into(),
+                message: "replace mode requires 'new_string'. Use empty string to delete text. If you intended a V4A patch block, call apply_patch or patch(mode='patch', patch=...)".into(),
+            })?,
+            replace_all: args.replace_all,
+        };
 
-        let content = tokio::fs::read_to_string(&resolved)
-            .await
-            .map_err(|e| ToolError::Other(format!("Cannot read '{}': {}", args.path, e)))?;
-
-        // 8-strategy fuzzy replacement (mirrors hermes fuzzy_match.py)
-        let (new_content, count) = fuzzy_find_and_replace(
-            &content,
-            &args.old_string,
-            &args.new_string,
-            args.replace_all,
-        )
-        .map_err(|msg| {
-            ToolError::Other(format!(
-                "{msg}\n[Hint: Use read_file to verify the current content of '{}']",
-                args.path
-            ))
-        })?;
-
-        tokio::fs::write(&resolved, &new_content)
-            .await
-            .map_err(|e| ToolError::Other(format!("Cannot write '{}': {}", args.path, e)))?;
-
-        Ok(format!(
-            "Patched '{}': {} replacement(s), {} → {} bytes",
-            args.path,
-            count,
-            args.old_string.len(),
-            args.new_string.len()
-        ))
+        execute_replace_patch(replace_args, ctx).await
     }
 }
 
@@ -456,6 +534,209 @@ async fn restore_backups(backups: &BTreeMap<PathBuf, Option<Vec<u8>>>) {
     }
 }
 
+async fn execute_v4a_patch(patch_text: &str, ctx: &ToolContext) -> Result<String, ToolError> {
+    enforce_apply_patch_payload_limit(patch_text)?;
+
+    let (ops, parse_err) = parse_v4a(patch_text);
+    if let Some(e) = parse_err {
+        return Err(ToolError::InvalidArgs {
+            tool: "apply_patch".into(),
+            message: e,
+        });
+    }
+    if ops.is_empty() {
+        return Err(ToolError::InvalidArgs {
+            tool: "apply_patch".into(),
+            message: "No V4A operations found. Ensure the patch starts with '*** Begin Patch'."
+                .into(),
+        });
+    }
+
+    // Auto-checkpoint before any mutations
+    ensure_checkpoint(ctx, "before apply_patch");
+
+    // Validate + resolve all paths upfront (fail-fast before touching any file)
+    let path_policy = ctx.config.file_path_policy(&ctx.cwd);
+    let mut prepared: Vec<PreparedOp> = Vec::new();
+    for op in &ops {
+        match &op.kind {
+            V4AOpKind::Update | V4AOpKind::Delete => {
+                let source = jail_read_path(&op.file_path, &path_policy)
+                    .map_err(|e| ToolError::Other(e.to_string()))?;
+                prepared.push(PreparedOp {
+                    op: op.clone(),
+                    source,
+                    target: None,
+                });
+            }
+            V4AOpKind::Add => {
+                let source = crate::path_utils::jail_write_path(&op.file_path, &path_policy)
+                    .map_err(|e| ToolError::Other(e.to_string()))?;
+                if source.exists() {
+                    return Err(ToolError::Other(format!(
+                        "Add File '{}' failed: destination already exists",
+                        op.file_path
+                    )));
+                }
+                prepared.push(PreparedOp {
+                    op: op.clone(),
+                    source,
+                    target: None,
+                });
+            }
+            V4AOpKind::Move { new_path } => {
+                let source = jail_read_path(&op.file_path, &path_policy)
+                    .map_err(|e| ToolError::Other(e.to_string()))?;
+                let target = crate::path_utils::jail_write_path(new_path, &path_policy)
+                    .map_err(|e| ToolError::Other(e.to_string()))?;
+                if target.exists() {
+                    return Err(ToolError::Other(format!(
+                        "Move File '{}' -> '{}' failed: destination already exists",
+                        op.file_path, new_path
+                    )));
+                }
+                prepared.push(PreparedOp {
+                    op: op.clone(),
+                    source,
+                    target: Some(target),
+                });
+            }
+        }
+    }
+
+    // Snapshot original bytes for every touched path so failures can rollback.
+    let mut backups: BTreeMap<PathBuf, Option<Vec<u8>>> = BTreeMap::new();
+    for p in &prepared {
+        backups
+            .entry(p.source.clone())
+            .or_insert_with(|| std::fs::read(&p.source).ok());
+        if let Some(target) = &p.target {
+            backups
+                .entry(target.clone())
+                .or_insert_with(|| std::fs::read(target).ok());
+        }
+    }
+
+    let mut files_modified: Vec<String> = Vec::new();
+    let mut files_created: Vec<String> = Vec::new();
+    let mut files_deleted: Vec<String> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+
+    for p in &prepared {
+        let op = &p.op;
+        let resolved = &p.source;
+
+        match &op.kind {
+            V4AOpKind::Update => {
+                let content = match tokio::fs::read_to_string(resolved).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        errors.push(format!("Cannot read '{}': {}", op.file_path, e));
+                        break;
+                    }
+                };
+                let mut new_content = content;
+                let mut hunk_ok = true;
+                for hunk in &op.hunks {
+                    match apply_update_hunk(&new_content, hunk) {
+                        Ok(updated) => new_content = updated,
+                        Err(e) => {
+                            errors.push(format!("Update '{}': {}", op.file_path, e));
+                            hunk_ok = false;
+                            break;
+                        }
+                    }
+                }
+                if hunk_ok {
+                    if let Err(e) = tokio::fs::write(resolved, &new_content).await {
+                        errors.push(format!("Cannot write '{}': {}", op.file_path, e));
+                        break;
+                    } else {
+                        files_modified.push(op.file_path.clone());
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            V4AOpKind::Add => {
+                let content_lines: Vec<String> = op
+                    .hunks
+                    .iter()
+                    .flat_map(|h| h.lines.iter())
+                    .filter(|l| l.prefix == '+')
+                    .map(|l| l.content.clone())
+                    .collect();
+                let content = content_lines.join("\n");
+
+                if let Some(parent) = resolved.parent() {
+                    if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                        errors.push(format!("Cannot create dirs for '{}': {}", op.file_path, e));
+                        break;
+                    }
+                }
+                if let Err(e) = tokio::fs::write(resolved, &content).await {
+                    errors.push(format!("Cannot write '{}': {}", op.file_path, e));
+                    break;
+                } else {
+                    files_created.push(op.file_path.clone());
+                }
+            }
+
+            V4AOpKind::Delete => match tokio::fs::remove_file(resolved).await {
+                Ok(()) => files_deleted.push(op.file_path.clone()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    files_deleted.push(op.file_path.clone());
+                }
+                Err(e) => {
+                    errors.push(format!("Cannot delete '{}': {}", op.file_path, e));
+                    break;
+                }
+            },
+
+            V4AOpKind::Move { new_path } => {
+                let new_resolved = p.target.as_ref().expect("move target prepared");
+                if let Some(parent) = new_resolved.parent() {
+                    let _ = tokio::fs::create_dir_all(parent).await;
+                }
+                if let Err(e) = tokio::fs::rename(resolved, new_resolved).await {
+                    errors.push(format!(
+                        "Cannot move '{}' → '{}': {}",
+                        op.file_path, new_path, e
+                    ));
+                    break;
+                } else {
+                    files_modified.push(format!("{} → {}", op.file_path, new_path));
+                }
+            }
+        }
+    }
+
+    let mut summary_parts: Vec<String> = Vec::new();
+    if !files_modified.is_empty() {
+        summary_parts.push(format!("Modified: {}", files_modified.join(", ")));
+    }
+    if !files_created.is_empty() {
+        summary_parts.push(format!("Created: {}", files_created.join(", ")));
+    }
+    if !files_deleted.is_empty() {
+        summary_parts.push(format!("Deleted: {}", files_deleted.join(", ")));
+    }
+
+    if errors.is_empty() {
+        Ok(format!(
+            "apply_patch succeeded. {}",
+            summary_parts.join("; ")
+        ))
+    } else {
+        restore_backups(&backups).await;
+        Err(ToolError::Other(format!(
+            "apply_patch failed and was rolled back. Errors:\n{}",
+            errors.join("\n")
+        )))
+    }
+}
+
 #[async_trait]
 impl ToolHandler for ApplyPatchTool {
     fn name(&self) -> &'static str {
@@ -473,9 +754,12 @@ impl ToolHandler for ApplyPatchTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "apply_patch".into(),
-            description: "\
+            description: format!(
+                "\
 Apply a V4A multi-file patch atomically. Supports Update, Add, Delete, and Move operations \
-on multiple files in a single call. Use this for complex refactors spanning many files.\n\n\
+on multiple files in a single call. Use this for complex refactors spanning many files. \
+Hard patch limit: {MAX_MUTATION_PAYLOAD_BYTES} bytes ({MAX_MUTATION_PAYLOAD_KIB} KiB) per call. \
+Split larger refactors into multiple focused apply_patch calls.\n\n\
 Format:\n\
 ```\n\
 *** Begin Patch\n\
@@ -490,7 +774,7 @@ Format:\n\
 *** Move File: old/path.py -> new/path.py\n\
 *** End Patch\n\
 ```"
-            .into(),
+            ),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -517,212 +801,7 @@ Format:\n\
                     tool: "apply_patch".into(),
                     message: "missing 'patch' field".into(),
                 })?;
-
-        let (ops, parse_err) = parse_v4a(patch_text);
-        if let Some(e) = parse_err {
-            return Err(ToolError::InvalidArgs {
-                tool: "apply_patch".into(),
-                message: e,
-            });
-        }
-        if ops.is_empty() {
-            return Err(ToolError::InvalidArgs {
-                tool: "apply_patch".into(),
-                message: "No V4A operations found. Ensure the patch starts with '*** Begin Patch'."
-                    .into(),
-            });
-        }
-
-        // Auto-checkpoint before any mutations
-        ensure_checkpoint(ctx, "before apply_patch");
-
-        // Validate + resolve all paths upfront (fail-fast before touching any file)
-        let path_policy = ctx.config.file_path_policy(&ctx.cwd);
-        let mut prepared: Vec<PreparedOp> = Vec::new();
-        for op in &ops {
-            match &op.kind {
-                V4AOpKind::Update | V4AOpKind::Delete => {
-                    let source = jail_read_path(&op.file_path, &path_policy)
-                        .map_err(|e| ToolError::Other(e.to_string()))?;
-                    prepared.push(PreparedOp {
-                        op: op.clone(),
-                        source,
-                        target: None,
-                    });
-                }
-                V4AOpKind::Add => {
-                    let source = crate::path_utils::jail_write_path(&op.file_path, &path_policy)
-                        .map_err(|e| ToolError::Other(e.to_string()))?;
-                    if source.exists() {
-                        return Err(ToolError::Other(format!(
-                            "Add File '{}' failed: destination already exists",
-                            op.file_path
-                        )));
-                    }
-                    prepared.push(PreparedOp {
-                        op: op.clone(),
-                        source,
-                        target: None,
-                    });
-                }
-                V4AOpKind::Move { new_path } => {
-                    let source = jail_read_path(&op.file_path, &path_policy)
-                        .map_err(|e| ToolError::Other(e.to_string()))?;
-                    let target = crate::path_utils::jail_write_path(new_path, &path_policy)
-                        .map_err(|e| ToolError::Other(e.to_string()))?;
-                    if target.exists() {
-                        return Err(ToolError::Other(format!(
-                            "Move File '{}' -> '{}' failed: destination already exists",
-                            op.file_path, new_path
-                        )));
-                    }
-                    prepared.push(PreparedOp {
-                        op: op.clone(),
-                        source,
-                        target: Some(target),
-                    });
-                }
-            }
-        }
-
-        // Snapshot original bytes for every touched path so failures can rollback.
-        let mut backups: BTreeMap<PathBuf, Option<Vec<u8>>> = BTreeMap::new();
-        for p in &prepared {
-            backups
-                .entry(p.source.clone())
-                .or_insert_with(|| std::fs::read(&p.source).ok());
-            if let Some(target) = &p.target {
-                backups
-                    .entry(target.clone())
-                    .or_insert_with(|| std::fs::read(target).ok());
-            }
-        }
-
-        let mut files_modified: Vec<String> = Vec::new();
-        let mut files_created: Vec<String> = Vec::new();
-        let mut files_deleted: Vec<String> = Vec::new();
-        let mut errors: Vec<String> = Vec::new();
-
-        for p in &prepared {
-            let op = &p.op;
-            let resolved = &p.source;
-
-            match &op.kind {
-                V4AOpKind::Update => {
-                    let content = match tokio::fs::read_to_string(resolved).await {
-                        Ok(c) => c,
-                        Err(e) => {
-                            errors.push(format!("Cannot read '{}': {}", op.file_path, e));
-                            break;
-                        }
-                    };
-                    let mut new_content = content;
-                    let mut hunk_ok = true;
-                    for hunk in &op.hunks {
-                        match apply_update_hunk(&new_content, hunk) {
-                            Ok(updated) => new_content = updated,
-                            Err(e) => {
-                                errors.push(format!("Update '{}': {}", op.file_path, e));
-                                hunk_ok = false;
-                                break;
-                            }
-                        }
-                    }
-                    if hunk_ok {
-                        if let Err(e) = tokio::fs::write(resolved, &new_content).await {
-                            errors.push(format!("Cannot write '{}': {}", op.file_path, e));
-                            break;
-                        } else {
-                            files_modified.push(op.file_path.clone());
-                        }
-                    } else {
-                        break;
-                    }
-                }
-
-                V4AOpKind::Add => {
-                    // Build content from all '+' lines across all hunks
-                    let content_lines: Vec<String> = op
-                        .hunks
-                        .iter()
-                        .flat_map(|h| h.lines.iter())
-                        .filter(|l| l.prefix == '+')
-                        .map(|l| l.content.clone())
-                        .collect();
-                    let content = content_lines.join("\n");
-
-                    if let Some(parent) = resolved.parent() {
-                        if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                            errors
-                                .push(format!("Cannot create dirs for '{}': {}", op.file_path, e));
-                            break;
-                        }
-                    }
-                    if let Err(e) = tokio::fs::write(resolved, &content).await {
-                        errors.push(format!("Cannot write '{}': {}", op.file_path, e));
-                        break;
-                    } else {
-                        files_created.push(op.file_path.clone());
-                    }
-                }
-
-                V4AOpKind::Delete => {
-                    match tokio::fs::remove_file(resolved).await {
-                        Ok(()) => files_deleted.push(op.file_path.clone()),
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                            // Idempotent — file already gone is fine
-                            files_deleted.push(op.file_path.clone());
-                        }
-                        Err(e) => {
-                            errors.push(format!("Cannot delete '{}': {}", op.file_path, e));
-                            break;
-                        }
-                    }
-                }
-
-                V4AOpKind::Move { new_path } => {
-                    let new_resolved = p.target.as_ref().expect("move target prepared");
-                    if let Some(parent) = new_resolved.parent() {
-                        let _ = tokio::fs::create_dir_all(parent).await;
-                    }
-                    if let Err(e) = tokio::fs::rename(resolved, new_resolved).await {
-                        errors.push(format!(
-                            "Cannot move '{}' → '{}': {}",
-                            op.file_path, new_path, e
-                        ));
-                        break;
-                    } else {
-                        files_modified.push(format!("{} → {}", op.file_path, new_path));
-                    }
-                }
-            }
-        }
-
-        // Build result summary
-        let mut summary_parts: Vec<String> = Vec::new();
-        if !files_modified.is_empty() {
-            summary_parts.push(format!("Modified: {}", files_modified.join(", ")));
-        }
-        if !files_created.is_empty() {
-            summary_parts.push(format!("Created: {}", files_created.join(", ")));
-        }
-        if !files_deleted.is_empty() {
-            summary_parts.push(format!("Deleted: {}", files_deleted.join(", ")));
-        }
-
-        if errors.is_empty() {
-            Ok(format!(
-                "apply_patch succeeded. {}",
-                summary_parts.join("; ")
-            ))
-        } else {
-            // Transactional rollback: all-or-nothing semantics.
-            restore_backups(&backups).await;
-            Err(ToolError::Other(format!(
-                "apply_patch failed and was rolled back. Errors:\n{}",
-                errors.join("\n")
-            )))
-        }
+        execute_v4a_patch(patch_text, ctx).await
     }
 
     fn parallel_safe(&self) -> bool {
@@ -844,6 +923,87 @@ mod tests {
 
         let content = std::fs::read_to_string(&mapped).expect("read mapped tmp");
         assert!(content.contains("new value"));
+    }
+
+    #[tokio::test]
+    async fn patch_rejects_oversized_payloads() {
+        let dir = TempDir::new().expect("workspace");
+        std::fs::write(dir.path().join("code.rs"), "fn main() {}\n").expect("seed");
+        let ctx = ctx_in(dir.path());
+        let oversized = "x".repeat(MAX_MUTATION_PAYLOAD_BYTES);
+
+        let result = PatchTool
+            .execute(
+                json!({
+                    "path": "code.rs",
+                    "old_string": oversized,
+                    "new_string": "y"
+                }),
+                &ctx,
+            )
+            .await;
+
+        let err = result.expect_err("oversized patch must be rejected");
+        assert!(
+            err.to_string()
+                .contains("Large single-call edit payloads are unreliable")
+        );
+    }
+
+    #[tokio::test]
+    async fn patch_accepts_v4a_payload_without_mode() {
+        let dir = TempDir::new().expect("workspace");
+        std::fs::write(
+            dir.path().join("code.rs"),
+            "fn main() {\n    println!(\"old\");\n}\n",
+        )
+        .expect("seed");
+        let ctx = ctx_in(dir.path());
+        let patch = concat!(
+            "*** Begin Patch\n",
+            "*** Update File: code.rs\n",
+            " fn main() {\n",
+            "-    println!(\"old\");\n",
+            "+    println!(\"new\");\n",
+            " }\n",
+            "*** End Patch",
+        );
+
+        let result = PatchTool.execute(json!({"patch": patch}), &ctx).await;
+
+        assert!(
+            result
+                .expect("v4a patch via patch tool")
+                .contains("apply_patch succeeded")
+        );
+        let content = std::fs::read_to_string(dir.path().join("code.rs")).expect("read");
+        assert!(content.contains("println!(\"new\")"));
+    }
+
+    #[tokio::test]
+    async fn patch_accepts_v4a_payload_with_stray_path() {
+        let dir = TempDir::new().expect("workspace");
+        std::fs::write(dir.path().join("code.rs"), "const N: i32 = 1;\n").expect("seed");
+        let ctx = ctx_in(dir.path());
+        let patch = concat!(
+            "*** Begin Patch\n",
+            "*** Update File: code.rs\n",
+            "-const N: i32 = 1;\n",
+            "+const N: i32 = 2;\n",
+            "*** End Patch",
+        );
+
+        let result = PatchTool
+            .execute(json!({"path": "code.rs", "patch": patch}), &ctx)
+            .await;
+
+        assert!(
+            result
+                .expect("legacy mixed patch args")
+                .contains("apply_patch succeeded")
+        );
+        let content = std::fs::read_to_string(dir.path().join("code.rs")).expect("read");
+        assert!(content.contains("const N: i32 = 2;"));
     }
 
     // ─── V4A parse / apply unit tests ────────────────────────────────────
@@ -1114,5 +1274,27 @@ mod tests {
         let content = std::fs::read_to_string(edgecrab_home.path().join("tmp/files/generated.txt"))
             .expect("read mapped tmp file");
         assert_eq!(content, "generated");
+    }
+
+    #[tokio::test]
+    async fn apply_patch_rejects_oversized_payloads() {
+        let dir = TempDir::new().expect("workspace");
+        let ctx = ctx_in(dir.path());
+        let oversized_body = "x".repeat(MAX_MUTATION_PAYLOAD_BYTES);
+        let patch = format!(
+            "*** Begin Patch\n*** Add File: huge.txt\n+{}\n*** End Patch",
+            oversized_body
+        );
+
+        let result = ApplyPatchTool
+            .execute(json!({ "patch": patch }), &ctx)
+            .await;
+
+        let err = result.expect_err("oversized apply_patch must be rejected");
+        assert!(
+            err.to_string()
+                .contains("Split the refactor into multiple focused apply_patch calls")
+        );
+        assert!(!dir.path().join("huge.txt").exists());
     }
 }

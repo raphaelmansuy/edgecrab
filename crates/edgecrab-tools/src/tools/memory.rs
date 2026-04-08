@@ -123,14 +123,16 @@ pub struct MemoryWriteTool;
 #[derive(Deserialize)]
 struct WriteArgs {
     /// Action: "add" (default), "replace", or "remove"
-    #[serde(default = "default_action")]
-    action: String,
+    #[serde(default)]
+    action: Option<String>,
     /// Content to add, or new content for replace
     #[serde(default)]
     content: Option<String>,
     /// Substring to match for replace/remove actions
     #[serde(default)]
     old_content: Option<String>,
+    #[serde(default)]
+    old_text: Option<String>,
     #[serde(default = "default_target")]
     target: String,
 }
@@ -143,6 +145,10 @@ fn default_action() -> String {
 impl ToolHandler for MemoryWriteTool {
     fn name(&self) -> &'static str {
         "memory_write"
+    }
+
+    fn aliases(&self) -> &'static [&'static str] {
+        &["memory"]
     }
 
     fn toolset(&self) -> &'static str {
@@ -162,7 +168,8 @@ impl ToolHandler for MemoryWriteTool {
             name: "memory_write".into(),
             description: "Manage the agent's persistent memory. Actions: 'add' appends a new \
                            entry, 'replace' swaps old_content with content, 'remove' deletes \
-                           the entry matching old_content."
+                           the entry matching old_content. Hermes-compatible calls using \
+                           `memory` and `old_text` are also accepted."
                 .into(),
             parameters: json!({
                 "type": "object",
@@ -179,6 +186,10 @@ impl ToolHandler for MemoryWriteTool {
                     "old_content": {
                         "type": "string",
                         "description": "Substring to match for replace/remove actions"
+                    },
+                    "old_text": {
+                        "type": "string",
+                        "description": "Backward-compatible alias for old_content"
                     },
                     "target": {
                         "type": "string",
@@ -200,6 +211,14 @@ impl ToolHandler for MemoryWriteTool {
             tool: "memory_write".into(),
             message: e.to_string(),
         })?;
+        let action = args.action.clone().unwrap_or_else(default_action);
+        let old_content = args.old_content.clone().or(args.old_text.clone());
+
+        if args.action.is_none() && args.content.is_none() && old_content.is_none() {
+            return MemoryReadTool
+                .execute(json!({ "target": args.target }), ctx)
+                .await;
+        }
 
         let (filename, max_chars) = resolve_memory_target(&args.target);
 
@@ -211,7 +230,7 @@ impl ToolHandler for MemoryWriteTool {
 
         let existing = tokio::fs::read_to_string(&path).await.unwrap_or_default();
 
-        let new_content = match args.action.as_str() {
+        let new_content = match action.as_str() {
             "add" => {
                 let content = args.content.as_deref().unwrap_or("").trim();
                 if content.is_empty() {
@@ -262,7 +281,7 @@ impl ToolHandler for MemoryWriteTool {
                 result
             }
             "replace" => {
-                let old = args.old_content.as_deref().unwrap_or("").trim();
+                let old = old_content.as_deref().unwrap_or("").trim();
                 let new = args.content.as_deref().unwrap_or("").trim();
                 if old.is_empty() {
                     return Err(ToolError::InvalidArgs {
@@ -332,7 +351,7 @@ impl ToolHandler for MemoryWriteTool {
                 result
             }
             "remove" => {
-                let old = args.old_content.as_deref().unwrap_or("").trim();
+                let old = old_content.as_deref().unwrap_or("").trim();
                 if old.is_empty() {
                     return Err(ToolError::InvalidArgs {
                         tool: "memory_write".into(),
@@ -410,7 +429,7 @@ impl ToolHandler for MemoryWriteTool {
             ToolError::Other(format!("Cannot commit {} (rename failed): {}", filename, e))
         })?;
 
-        let action_past = match args.action.as_str() {
+        let action_past = match action.as_str() {
             "add" => "Added entry to",
             "replace" => "Replaced entry in",
             "remove" => "Removed entry from",
@@ -675,5 +694,44 @@ mod tests {
             .await
             .expect("read user");
         assert!(result.contains("Name: Alice"));
+    }
+
+    #[tokio::test]
+    async fn memory_compat_read_without_action() {
+        let dir = TempDir::new().expect("tmpdir");
+        let ctx = ctx_in(dir.path());
+
+        MemoryWriteTool
+            .execute(json!({"content": "Shell: zsh"}), &ctx)
+            .await
+            .expect("write");
+
+        let result = MemoryWriteTool
+            .execute(json!({"target": "memory"}), &ctx)
+            .await
+            .expect("compat read");
+        assert!(result.contains("Shell: zsh"));
+    }
+
+    #[tokio::test]
+    async fn memory_compat_old_text_alias() {
+        let dir = TempDir::new().expect("tmpdir");
+        let ctx = ctx_in(dir.path());
+
+        MemoryWriteTool
+            .execute(json!({"content": "Editor: helix"}), &ctx)
+            .await
+            .expect("write");
+
+        MemoryWriteTool
+            .execute(
+                json!({"action": "replace", "old_text": "Editor: helix", "content": "Editor: vscode"}),
+                &ctx,
+            )
+            .await
+            .expect("replace");
+
+        let result = MemoryReadTool.execute(json!({}), &ctx).await.expect("read");
+        assert!(result.contains("Editor: vscode"));
     }
 }

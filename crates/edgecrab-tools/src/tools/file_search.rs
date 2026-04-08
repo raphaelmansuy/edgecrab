@@ -19,16 +19,36 @@ pub struct SearchFilesTool;
 #[derive(Deserialize)]
 struct Args {
     pattern: String,
+    #[serde(default = "default_target")]
+    target: String,
     #[serde(default)]
     path: Option<String>,
     #[serde(default)]
     include: Option<String>,
+    #[serde(default)]
+    file_glob: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    offset: Option<usize>,
+    #[serde(default = "default_output_mode")]
+    output_mode: String,
+    #[serde(default)]
+    context: Option<usize>,
     #[serde(default = "default_max_results")]
     max_results: usize,
 }
 
 fn default_max_results() -> usize {
     50
+}
+
+fn default_target() -> String {
+    "content".into()
+}
+
+fn default_output_mode() -> String {
+    "content".into()
 }
 
 #[async_trait]
@@ -52,13 +72,21 @@ impl ToolHandler for SearchFilesTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "search_files".into(),
-            description: "Search for a pattern in files (regex supported). Returns matching lines with file paths and line numbers.".into(),
+            description: "Search file contents or find files by name. Use this instead of grep/rg/find/ls in terminal. \
+                          Content search (target='content') supports regex, pagination, file filtering, and output modes. \
+                          File search (target='files') finds files by glob-like pattern.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "pattern": {
                         "type": "string",
-                        "description": "Search pattern (regex supported)"
+                        "description": "Regex pattern for content search, or file-name glob pattern for file search"
+                    },
+                    "target": {
+                        "type": "string",
+                        "enum": ["content", "files"],
+                        "description": "content = search inside files, files = list matching file paths",
+                        "default": "content"
                     },
                     "path": {
                         "type": "string",
@@ -67,6 +95,29 @@ impl ToolHandler for SearchFilesTool {
                     "include": {
                         "type": "string",
                         "description": "File glob pattern to include (e.g., '*.rs', '*.py')"
+                    },
+                    "file_glob": {
+                        "type": "string",
+                        "description": "Backward-compatible alias for include"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of results to return (Hermes-compatible alias)"
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Skip the first N matches or file paths"
+                    },
+                    "output_mode": {
+                        "type": "string",
+                        "enum": ["content", "files_only", "count"],
+                        "description": "For content search: full lines, matching file paths only, or per-file match counts",
+                        "default": "content"
+                    },
+                    "context": {
+                        "type": "integer",
+                        "description": "Number of surrounding lines to include around each content match",
+                        "default": 0
                     },
                     "max_results": {
                         "type": "integer",
@@ -94,52 +145,66 @@ impl ToolHandler for SearchFilesTool {
             Some(p) => jail_read_path(p, &path_policy)?,
             None => ctx.cwd.clone(),
         };
-
-        let regex = regex::Regex::new(&args.pattern).map_err(|e| ToolError::InvalidArgs {
-            tool: "search_files".into(),
-            message: format!("Invalid regex: {}", e),
-        })?;
-
-        let max = args.max_results.min(200); // hard cap
-        let mut results = Vec::new();
-
-        // Walk directory tree (blocking — wrapped in spawn_blocking)
-        let include_glob = args.include.clone();
+        let include_glob = args.include.clone().or(args.file_glob.clone());
+        let include_glob_for_key = include_glob.clone();
+        let pattern_for_key = args.pattern.clone();
+        let max = args.limit.unwrap_or(args.max_results).min(200);
+        let offset = args.offset.unwrap_or(0);
+        let context = args.context.unwrap_or(0).min(20);
+        let target = args.target.to_ascii_lowercase();
+        let output_mode = args.output_mode.to_ascii_lowercase();
         let cwd = ctx.cwd.clone();
 
-        let matches = tokio::task::spawn_blocking(move || {
-            let mut hits = Vec::new();
-            walk_and_search(&search_root, &regex, &include_glob, &cwd, max, &mut hits);
-            hits
-        })
-        .await
-        .map_err(|e| ToolError::Other(format!("Search task failed: {}", e)))?;
+        let output = if target == "files" {
+            let pattern = args.pattern.clone();
+            let include_glob_for_walk = include_glob.clone();
+            let matches = tokio::task::spawn_blocking(move || {
+                let mut hits = Vec::new();
+                walk_and_find_files(
+                    &search_root,
+                    &pattern,
+                    &include_glob_for_walk,
+                    &cwd,
+                    &mut hits,
+                );
+                hits.sort();
+                hits
+            })
+            .await
+            .map_err(|e| ToolError::Other(format!("Search task failed: {}", e)))?;
 
-        for (path, line_num, line) in matches {
-            results.push(format!("{}:{}: {}", path, line_num, line));
-        }
-
-        let output = if results.is_empty() {
-            "No matches found.".to_string()
+            format_file_results(matches, offset, max)
         } else {
-            let count = results.len();
-            let truncated = if count >= max {
-                format!(
-                    "\n\n(showing first {} results, use max_results to see more)",
-                    max
-                )
-            } else {
-                String::new()
-            };
-            format!("{}{}", results.join("\n"), truncated)
+            let regex = regex::Regex::new(&args.pattern).map_err(|e| ToolError::InvalidArgs {
+                tool: "search_files".into(),
+                message: format!("Invalid regex: {}", e),
+            })?;
+            let include_glob_for_walk = include_glob.clone();
+
+            let matches = tokio::task::spawn_blocking(move || {
+                let mut hits = Vec::new();
+                walk_and_search(
+                    &search_root,
+                    &regex,
+                    &include_glob_for_walk,
+                    &cwd,
+                    context,
+                    &mut hits,
+                );
+                hits
+            })
+            .await
+            .map_err(|e| ToolError::Other(format!("Search task failed: {}", e)))?;
+
+            format_content_results(matches, &output_mode, offset, max)
         };
 
         // Consecutive re-search loop detection — mirrors hermes-agent file_tools.py.
         // Warn at 3 identical consecutive searches; hard-block at 4.
         let key = read_tracker::search_key(
-            &args.pattern,
+            &pattern_for_key,
             args.path.as_deref(),
-            args.include.as_deref(),
+            include_glob_for_key.as_deref(),
             max,
         );
         let repeat = read_tracker::check_and_update(&ctx.session_id, key);
@@ -170,23 +235,15 @@ fn walk_and_search(
     regex: &regex::Regex,
     include_glob: &Option<String>,
     cwd: &std::path::Path,
-    max: usize,
-    results: &mut Vec<(String, usize, String)>,
+    context: usize,
+    results: &mut Vec<(String, usize, String, usize)>,
 ) {
-    if results.len() >= max {
-        return;
-    }
-
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return,
     };
 
     for entry in entries.flatten() {
-        if results.len() >= max {
-            return;
-        }
-
         let path = entry.path();
 
         // Skip hidden dirs and common large dirs
@@ -201,7 +258,7 @@ fn walk_and_search(
         }
 
         if path.is_dir() {
-            walk_and_search(&path, regex, include_glob, cwd, max, results);
+            walk_and_search(&path, regex, include_glob, cwd, context, results);
         } else if path.is_file() {
             // Check glob filter
             if let Some(glob) = include_glob {
@@ -214,25 +271,157 @@ fn walk_and_search(
 
             // Read and search (skip binary files)
             if let Ok(content) = std::fs::read_to_string(&path) {
+                let lines: Vec<&str> = content.lines().collect();
                 let rel_path = path
                     .strip_prefix(cwd)
                     .unwrap_or(&path)
                     .display()
                     .to_string();
 
-                for (i, line) in content.lines().enumerate() {
-                    if results.len() >= max {
-                        return;
-                    }
+                for (i, line) in lines.iter().enumerate() {
                     if regex.is_match(line) {
-                        let trimmed = if line.len() > 200 {
-                            format!("{}...", crate::safe_truncate(line, 200))
+                        let snippet = if context == 0 {
+                            if line.len() > 200 {
+                                format!("{}...", crate::safe_truncate(line, 200))
+                            } else {
+                                (*line).to_string()
+                            }
                         } else {
-                            line.to_string()
+                            let start = i.saturating_sub(context);
+                            let end = (i + context + 1).min(lines.len());
+                            lines[start..end]
+                                .iter()
+                                .enumerate()
+                                .map(|(delta, text)| {
+                                    let line_no = start + delta + 1;
+                                    format!("{line_no}: {}", text)
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n")
                         };
-                        results.push((rel_path.clone(), i + 1, trimmed));
+                        results.push((rel_path.clone(), i + 1, snippet, 1));
                     }
                 }
+            }
+        }
+    }
+}
+
+fn walk_and_find_files(
+    dir: &std::path::Path,
+    pattern: &str,
+    include_glob: &Option<String>,
+    cwd: &std::path::Path,
+    results: &mut Vec<String>,
+) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if name.starts_with('.')
+                || name == "node_modules"
+                || name == "target"
+                || name == "__pycache__"
+            {
+                continue;
+            }
+        }
+
+        if path.is_dir() {
+            walk_and_find_files(&path, pattern, include_glob, cwd, results);
+        } else if path.is_file() {
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if let Some(glob) = include_glob {
+                if !simple_glob_match(glob, name) {
+                    continue;
+                }
+            }
+            if simple_glob_match(pattern, name) || name.contains(pattern) {
+                results.push(
+                    path.strip_prefix(cwd)
+                        .unwrap_or(&path)
+                        .display()
+                        .to_string(),
+                );
+            }
+        }
+    }
+}
+
+fn format_file_results(matches: Vec<String>, offset: usize, limit: usize) -> String {
+    let page: Vec<String> = matches.into_iter().skip(offset).take(limit).collect();
+    if page.is_empty() {
+        "No matches found.".to_string()
+    } else {
+        page.join("\n")
+    }
+}
+
+fn format_content_results(
+    matches: Vec<(String, usize, String, usize)>,
+    output_mode: &str,
+    offset: usize,
+    limit: usize,
+) -> String {
+    if matches.is_empty() {
+        return "No matches found.".to_string();
+    }
+
+    match output_mode {
+        "files_only" => {
+            let mut files = Vec::<String>::new();
+            for (path, _, _, _) in matches {
+                if !files.contains(&path) {
+                    files.push(path);
+                }
+            }
+            let page: Vec<String> = files.into_iter().skip(offset).take(limit).collect();
+            if page.is_empty() {
+                "No matches found.".to_string()
+            } else {
+                page.join("\n")
+            }
+        }
+        "count" => {
+            let mut counts = std::collections::BTreeMap::<String, usize>::new();
+            for (path, _, _, count) in matches {
+                *counts.entry(path).or_default() += count;
+            }
+            let page: Vec<String> = counts
+                .into_iter()
+                .skip(offset)
+                .take(limit)
+                .map(|(path, count)| format!("{path}: {count}"))
+                .collect();
+            if page.is_empty() {
+                "No matches found.".to_string()
+            } else {
+                page.join("\n")
+            }
+        }
+        _ => {
+            let page: Vec<String> = matches
+                .into_iter()
+                .skip(offset)
+                .take(limit)
+                .map(|(path, line_num, line, _)| {
+                    if line.contains('\n') {
+                        format!("{path}:{line_num}:\n{line}")
+                    } else {
+                        format!("{path}:{line_num}: {line}")
+                    }
+                })
+                .collect();
+            if page.is_empty() {
+                "No matches found.".to_string()
+            } else {
+                page.join("\n")
             }
         }
     }
@@ -290,6 +479,36 @@ mod tests {
 
         assert!(result.contains("code.rs"));
         assert!(!result.contains("code.py"));
+    }
+
+    #[tokio::test]
+    async fn search_files_mode_lists_matching_paths() {
+        let dir = TempDir::new().expect("tmpdir");
+        std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").expect("w");
+        std::fs::write(dir.path().join("lib.py"), "print('x')\n").expect("w");
+
+        let ctx = ctx_in(dir.path());
+        let result = SearchFilesTool
+            .execute(json!({"pattern": "*.rs", "target": "files"}), &ctx)
+            .await
+            .expect("search");
+
+        assert!(result.contains("main.rs"));
+        assert!(!result.contains("lib.py"));
+    }
+
+    #[tokio::test]
+    async fn search_count_mode_aggregates_matches() {
+        let dir = TempDir::new().expect("tmpdir");
+        std::fs::write(dir.path().join("a.rs"), "needle\nneedle\n").expect("w");
+
+        let ctx = ctx_in(dir.path());
+        let result = SearchFilesTool
+            .execute(json!({"pattern": "needle", "output_mode": "count"}), &ctx)
+            .await
+            .expect("search");
+
+        assert!(result.contains("a.rs: 2"));
     }
 
     #[tokio::test]
