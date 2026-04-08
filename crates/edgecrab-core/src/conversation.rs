@@ -110,8 +110,31 @@ fn is_retryable_nonvisible_stream_error(error: &edgequake_llm::LlmError) -> bool
             | edgequake_llm::LlmError::Timeout
             | edgequake_llm::LlmError::AuthError(_)
             | edgequake_llm::LlmError::ApiError(_)
+            | edgequake_llm::LlmError::InvalidRequest(_)
             | edgequake_llm::LlmError::ProviderError(_)
+            | edgequake_llm::LlmError::NotSupported(_)
     )
+}
+
+fn is_streamed_tool_capability_error(error: &edgequake_llm::LlmError) -> bool {
+    let message = match error {
+        edgequake_llm::LlmError::ApiError(message)
+        | edgequake_llm::LlmError::InvalidRequest(message)
+        | edgequake_llm::LlmError::ProviderError(message)
+        | edgequake_llm::LlmError::NotSupported(message) => message,
+        _ => return false,
+    };
+
+    let normalized = message.to_ascii_lowercase();
+    let mentions_streaming = normalized.contains("stream");
+    let mentions_tools = normalized.contains("tool")
+        || normalized.contains("function call")
+        || normalized.contains("function calling");
+    let rejects_capability = normalized.contains("not supported")
+        || normalized.contains("unsupported")
+        || normalized.contains("does not support");
+
+    mentions_streaming && mentions_tools && rejects_capability
 }
 
 fn completion_options_for(config: &crate::agent::AgentConfig) -> edgequake_llm::CompletionOptions {
@@ -986,8 +1009,9 @@ impl Agent {
                 &active_tool_defs,
                 config.streaming,
                 event_tx.is_some(),
-            );
-            let response = match api_call_with_retry(
+            ) && (!session.native_tool_streaming_disabled
+                || active_tool_defs.is_empty());
+            let api_outcome = match api_call_with_retry(
                 &effective_provider,
                 &chat_messages,
                 &active_tool_defs,
@@ -1001,7 +1025,7 @@ impl Agent {
             )
             .await
             {
-                Ok(r) => r,
+                Ok(outcome) => outcome,
                 // Cancellation during the API call — break cleanly without
                 // attempting the fallback provider (user wants to stop NOW).
                 Err(AgentError::Interrupted) => {
@@ -1059,7 +1083,7 @@ impl Agent {
                                 )
                                 .await
                                 {
-                                    Ok(r) => r,
+                                    Ok(outcome) => outcome,
                                     // Also handle cancellation during fallback call.
                                     Err(AgentError::Interrupted) => {
                                         interrupted = true;
@@ -1085,6 +1109,10 @@ impl Agent {
                     }
                 }
             };
+            if api_outcome.disabled_native_tool_streaming {
+                session.native_tool_streaming_disabled = true;
+            }
+            let response = api_outcome.response;
 
             // ── Post-call cancellation check ──────────────────────────────
             // The API call returned successfully but the token may have been
@@ -2063,8 +2091,10 @@ async fn api_call_with_retry(
     tool_defs: &[edgequake_llm::ToolDefinition],
     max_retries: u32,
     ctx: ApiCallContext<'_>,
-) -> Result<edgequake_llm::LLMResponse, AgentError> {
+) -> Result<ApiCallOutcome, AgentError> {
     let mut last_err = None;
+    let mut native_tool_streaming_enabled = ctx.use_native_streaming;
+    let mut disabled_native_tool_streaming = false;
     // WHY max_retries for both streaming and non-streaming:
     //
     // The old code used `retry_budget = 0` for native streaming to avoid
@@ -2083,7 +2113,7 @@ async fn api_call_with_retry(
     // We enforce this in the Err arm below.
     let retry_budget = max_retries;
 
-    for attempt in 0..=retry_budget {
+    'attempt_loop: for attempt in 0..=retry_budget {
         // ── Backoff sleep — interruptible ──────────────────────────────
         if attempt > 0 {
             let delay = BASE_BACKOFF * 2u32.saturating_pow(attempt - 1);
@@ -2104,94 +2134,117 @@ async fn api_call_with_retry(
         // before erroring. If tokens arrived, the error is mid-stream and
         // retrying would produce duplicate TUI content — so we abort instead.
         // A fresh AtomicBool for each attempt resets the flag correctly.
-        let tokens_sent = std::sync::atomic::AtomicBool::new(false);
+        let mut use_native_streaming_this_attempt = native_tool_streaming_enabled;
 
-        // ── API call — interruptible ────────────────────────────────────
-        // We race the provider future against the cancel token.
-        // Dropping the provider future is safe: HTTP futures in reqwest
-        // are cancel-safe (the TCP connection is simply closed).
+        loop {
+            let tokens_sent = std::sync::atomic::AtomicBool::new(false);
 
-        // Emit llm:pre hook event (fire-and-forget, informational)
-        if let Some(tx) = ctx.event_tx {
-            let ctx_json = serde_json::json!({
-                "event": "llm:pre",
-                "model": provider.model(),
-                "attempt": attempt,
-            })
-            .to_string();
-            let _ = tx.send(crate::StreamEvent::HookEvent {
-                event: "llm:pre".to_string(),
-                context_json: ctx_json,
-            });
-        }
-
-        let call_fut = async {
-            if ctx.use_native_streaming {
-                let tx = ctx
-                    .event_tx
-                    .expect("native streaming requires event channel");
-                api_call_streaming(provider, messages, tool_defs, ctx.options, tx, &tokens_sent)
-                    .await
-            } else if tool_defs.is_empty() {
-                provider.chat(messages, ctx.options).await
-            } else {
-                provider
-                    .chat_with_tools(messages, tool_defs, None, ctx.options)
-                    .await
+            // ── API call — interruptible ────────────────────────────────
+            // We race the provider future against the cancel token.
+            // Dropping the provider future is safe: HTTP futures in reqwest
+            // are cancel-safe (the TCP connection is simply closed).
+            if let Some(tx) = ctx.event_tx {
+                let ctx_json = serde_json::json!({
+                    "event": "llm:pre",
+                    "model": provider.model(),
+                    "attempt": attempt,
+                    "native_tool_streaming": use_native_streaming_this_attempt,
+                })
+                .to_string();
+                let _ = tx.send(crate::StreamEvent::HookEvent {
+                    event: "llm:pre".to_string(),
+                    context_json: ctx_json,
+                });
             }
-        };
 
-        let result = tokio::select! {
-            biased;
-            _ = ctx.cancel.cancelled() => {
-                tracing::debug!(attempt, "api_call_with_retry: cancelled during API call");
-                return Err(AgentError::Interrupted);
-            }
-            r = call_fut => r,
-        };
+            let call_fut = async {
+                if use_native_streaming_this_attempt {
+                    let tx = ctx
+                        .event_tx
+                        .expect("native streaming requires event channel");
+                    api_call_streaming(provider, messages, tool_defs, ctx.options, tx, &tokens_sent)
+                        .await
+                } else if tool_defs.is_empty() {
+                    provider.chat(messages, ctx.options).await
+                } else {
+                    provider
+                        .chat_with_tools(messages, tool_defs, None, ctx.options)
+                        .await
+                }
+            };
 
-        match result {
-            Ok(response) => {
-                // Emit llm:post hook event
-                if let Some(tx) = ctx.event_tx {
-                    let ctx_json = serde_json::json!({
-                        "event": "llm:post",
-                        "model": provider.model(),
-                        "prompt_tokens": response.prompt_tokens,
-                        "completion_tokens": response.completion_tokens,
-                    })
-                    .to_string();
-                    let _ = tx.send(crate::StreamEvent::HookEvent {
-                        event: "llm:post".to_string(),
-                        context_json: ctx_json,
+            let result = tokio::select! {
+                biased;
+                _ = ctx.cancel.cancelled() => {
+                    tracing::debug!(attempt, "api_call_with_retry: cancelled during API call");
+                    return Err(AgentError::Interrupted);
+                }
+                r = call_fut => r,
+            };
+
+            match result {
+                Ok(response) => {
+                    if let Some(tx) = ctx.event_tx {
+                        let ctx_json = serde_json::json!({
+                            "event": "llm:post",
+                            "model": provider.model(),
+                            "prompt_tokens": response.prompt_tokens,
+                            "completion_tokens": response.completion_tokens,
+                            "native_tool_streaming": use_native_streaming_this_attempt,
+                        })
+                        .to_string();
+                        let _ = tx.send(crate::StreamEvent::HookEvent {
+                            event: "llm:post".to_string(),
+                            context_json: ctx_json,
+                        });
+                    }
+                    return Ok(ApiCallOutcome {
+                        response,
+                        disabled_native_tool_streaming,
                     });
                 }
-                return Ok(response);
-            }
-            Err(e) => {
-                tracing::warn!(attempt, error = %e, "API call failed");
+                Err(e) => {
+                    tracing::warn!(attempt, error = %e, "API call failed");
 
-                let provider_handles_error = provider_manages_transport_retries(provider.as_ref())
-                    && is_transport_retry_error(&e);
+                    let provider_handles_error =
+                        provider_manages_transport_retries(provider.as_ref())
+                            && is_transport_retry_error(&e);
 
-                // For native streaming, only continue retrying if the error
-                // happened before any visible output was emitted. Tool-call
-                // deltas are buffered locally and are not user-visible, so a
-                // malformed streamed tool call can safely be retried.
-                if ctx.use_native_streaming {
-                    let visible_output_sent =
-                        tokens_sent.load(std::sync::atomic::Ordering::Relaxed);
-                    if visible_output_sent || !is_retryable_nonvisible_stream_error(&e) {
-                        let err = augment_provider_error(provider, e.to_string());
-                        return Err(AgentError::Llm(format!(
-                            "API call failed after {} retries: {}",
-                            attempt, err
-                        )));
+                    if use_native_streaming_this_attempt {
+                        let visible_output_sent =
+                            tokens_sent.load(std::sync::atomic::Ordering::Relaxed);
+                        if !visible_output_sent
+                            && !tool_defs.is_empty()
+                            && is_streamed_tool_capability_error(&e)
+                        {
+                            tracing::warn!(
+                                provider = provider.name(),
+                                model = provider.model(),
+                                "provider rejected streamed tool turns; downgrading this session to non-streaming tool calls"
+                            );
+                            use_native_streaming_this_attempt = false;
+                            native_tool_streaming_enabled = false;
+                            disabled_native_tool_streaming = true;
+                            continue;
+                        }
+
+                        // For native streaming, only continue retrying if the error
+                        // happened before any visible output was emitted. Tool-call
+                        // deltas are buffered locally and are not user-visible, so a
+                        // malformed streamed tool call can safely be retried.
+                        if visible_output_sent || !is_retryable_nonvisible_stream_error(&e) {
+                            let err = augment_provider_error(provider, e.to_string());
+                            return Err(AgentError::Llm(format!(
+                                "API call failed after {} retries: {}",
+                                attempt, err
+                            )));
+                        }
                     }
-                }
 
-                last_err = Some(e);
-                if provider_handles_error {
+                    last_err = Some(e);
+                    if provider_handles_error {
+                        break 'attempt_loop;
+                    }
                     break;
                 }
             }
@@ -2206,6 +2259,12 @@ async fn api_call_with_retry(
             |e| augment_provider_error(provider, e.to_string())
         )
     )))
+}
+
+#[derive(Debug)]
+struct ApiCallOutcome {
+    response: edgequake_llm::LLMResponse,
+    disabled_native_tool_streaming: bool,
 }
 
 // ─── Budget pressure warnings ─────────────────────────────────────────────
@@ -3032,6 +3091,12 @@ mod tests {
         attempts: Arc<std::sync::atomic::AtomicUsize>,
     }
 
+    #[derive(Clone)]
+    struct ToolStreamingRejectedProvider {
+        stream_attempts: Arc<std::sync::atomic::AtomicUsize>,
+        nonstream_attempts: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
     #[async_trait]
     impl LLMProvider for StreamingUsageProvider {
         fn name(&self) -> &str {
@@ -3305,6 +3370,79 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl LLMProvider for ToolStreamingRejectedProvider {
+        fn name(&self) -> &str {
+            "tool-streaming-rejected"
+        }
+
+        fn model(&self) -> &str {
+            "tool-streaming-rejected-model"
+        }
+
+        fn max_context_length(&self) -> usize {
+            8192
+        }
+
+        async fn complete(
+            &self,
+            prompt: &str,
+        ) -> edgequake_llm::Result<edgequake_llm::LLMResponse> {
+            Ok(edgequake_llm::LLMResponse::new(prompt, self.model()))
+        }
+
+        async fn complete_with_options(
+            &self,
+            prompt: &str,
+            _options: &CompletionOptions,
+        ) -> edgequake_llm::Result<edgequake_llm::LLMResponse> {
+            self.complete(prompt).await
+        }
+
+        async fn chat(
+            &self,
+            messages: &[ChatMessage],
+            options: Option<&CompletionOptions>,
+        ) -> edgequake_llm::Result<edgequake_llm::LLMResponse> {
+            self.chat_with_tools(messages, &[], None, options).await
+        }
+
+        async fn chat_with_tools(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[ToolDefinition],
+            _tool_choice: Option<ToolChoice>,
+            _options: Option<&CompletionOptions>,
+        ) -> edgequake_llm::Result<edgequake_llm::LLMResponse> {
+            self.nonstream_attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(edgequake_llm::LLMResponse::new(
+                "tool fallback",
+                self.model(),
+            ))
+        }
+
+        async fn chat_with_tools_stream(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[ToolDefinition],
+            _tool_choice: Option<ToolChoice>,
+            _options: Option<&CompletionOptions>,
+        ) -> edgequake_llm::Result<
+            futures::stream::BoxStream<'static, edgequake_llm::Result<StreamChunk>>,
+        > {
+            self.stream_attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(edgequake_llm::LlmError::InvalidRequest(
+                "Tool calling is not supported in streaming mode".into(),
+            ))
+        }
+
+        fn supports_tool_streaming(&self) -> bool {
+            true
+        }
+    }
+
     #[tokio::test]
     async fn api_call_streaming_preserves_authoritative_usage() {
         let provider: Arc<dyn LLMProvider> = Arc::new(StreamingUsageProvider {
@@ -3527,7 +3665,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let response = api_call_with_retry(
+        let outcome = api_call_with_retry(
             &provider,
             &[ChatMessage::user("hello")],
             &[],
@@ -3542,9 +3680,69 @@ mod tests {
         .await
         .expect("malformed tool stream should be retried once");
 
+        let response = outcome.response;
         assert_eq!(response.content, "recovered");
         assert_eq!(response.finish_reason.as_deref(), Some("stop"));
         assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn api_call_with_retry_falls_back_when_streamed_tools_are_rejected() {
+        let stream_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let nonstream_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider: Arc<dyn LLMProvider> = Arc::new(ToolStreamingRejectedProvider {
+            stream_attempts: stream_attempts.clone(),
+            nonstream_attempts: nonstream_attempts.clone(),
+        });
+        let cancel = CancellationToken::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let tool_defs = vec![ToolDefinition::function(
+            "write_file",
+            "Write a file",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"}
+                },
+                "required": ["path", "content"]
+            }),
+        )];
+
+        let outcome = api_call_with_retry(
+            &provider,
+            &[ChatMessage::user("hello")],
+            &tool_defs,
+            1,
+            ApiCallContext {
+                options: None,
+                cancel: &cancel,
+                event_tx: Some(&tx),
+                use_native_streaming: true,
+            },
+        )
+        .await
+        .expect("tool-stream capability miss should downgrade cleanly");
+
+        assert_eq!(outcome.response.content, "tool fallback");
+        assert!(outcome.disabled_native_tool_streaming);
+        assert_eq!(stream_attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            nonstream_attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[test]
+    fn streamed_tool_capability_error_detection_is_specific() {
+        assert!(is_streamed_tool_capability_error(
+            &edgequake_llm::LlmError::InvalidRequest(
+                "Tool calling is not supported in streaming mode".into(),
+            )
+        ));
+        assert!(!is_streamed_tool_capability_error(
+            &edgequake_llm::LlmError::InvalidRequest("temperature must be <= 2".into())
+        ));
     }
 
     #[test]

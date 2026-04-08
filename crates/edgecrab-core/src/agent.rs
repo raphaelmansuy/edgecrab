@@ -379,6 +379,13 @@ pub struct SessionState {
     /// This tracks current context pressure. Session token counters above track
     /// cumulative spend across the whole conversation.
     pub last_prompt_tokens: u64,
+    /// Disable native streamed tool turns after a provider rejects them once.
+    ///
+    /// WHY session-scoped: some provider/model combinations incorrectly
+    /// advertise streamed tool support, then reject the actual request at
+    /// runtime. Once observed, repeating the same request wastes latency and
+    /// spams users with avoidable 400s. Plain text streaming still remains on.
+    pub native_tool_streaming_disabled: bool,
     pub session_tool_call_count: u32,
 }
 
