@@ -155,6 +155,66 @@ pub fn auth_summary(server: &ConfiguredMcpServer) -> String {
     "none".into()
 }
 
+pub fn render_configured_server_detail(server: &ConfiguredMcpServer) -> String {
+    let mut lines = vec![
+        format!("Server: {}", server.name),
+        format!("Transport: {}", transport_summary(server)),
+    ];
+
+    if let Some(path) = &server.cwd {
+        lines.push(format!("Cwd: {}", path.display()));
+    }
+    if !server.include.is_empty() {
+        lines.push(format!("Include: {}", server.include.join(", ")));
+    }
+    if !server.exclude.is_empty() {
+        lines.push(format!("Exclude: {}", server.exclude.join(", ")));
+    }
+    if !server.env.is_empty() {
+        let mut env_keys: Vec<&str> = server.env.keys().map(String::as_str).collect();
+        env_keys.sort_unstable();
+        lines.push(format!("Env keys: {}", env_keys.join(", ")));
+    }
+    if !server.headers.is_empty() {
+        let mut header_names: Vec<&str> = server.headers.keys().map(String::as_str).collect();
+        header_names.sort_unstable();
+        lines.push(format!("Header keys: {}", header_names.join(", ")));
+    }
+
+    let auth = auth_summary(server);
+    if auth != "none" {
+        lines.push(format!("Auth: {auth}"));
+    }
+    if server.token_from_store {
+        lines.push("Token source: secure local token store".into());
+    } else if server.token_from_config {
+        lines.push("Token source: config file bearer token".into());
+    }
+
+    if let Some(oauth) = &server.oauth {
+        lines.push(format!(
+            "OAuth: {} via {}",
+            oauth.grant_type_label(),
+            oauth.auth_method_label()
+        ));
+        lines.push(format!("OAuth token URL: {}", oauth.token_url()));
+        if let Some(url) = oauth.device_authorization_url() {
+            lines.push(format!("OAuth device URL: {url}"));
+        }
+        if let Some(url) = oauth.authorization_url() {
+            lines.push(format!("OAuth authorize URL: {url}"));
+        }
+        if let Some(url) = oauth.redirect_url() {
+            lines.push(format!("OAuth redirect URL: {url}"));
+        }
+        if let Some(cache_state) = format_oauth_cache_state(&server.name) {
+            lines.push(cache_state);
+        }
+    }
+
+    lines.join("\n")
+}
+
 fn current_epoch_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -274,6 +334,47 @@ pub async fn render_mcp_doctor_report(server_name: Option<&str>) -> Result<Strin
     out.push(String::new());
     out.push(format!("Summary: pass={pass} warn={warn} fail={fail}"));
     Ok(out.join("\n"))
+}
+
+#[cfg(test)]
+mod render_detail_tests {
+    use super::*;
+    use edgecrab_tools::tools::mcp_client::ConfiguredMcpServer;
+
+    #[test]
+    fn render_configured_server_detail_includes_sorted_metadata() {
+        let mut env = std::collections::HashMap::new();
+        env.insert("ZETA_TOKEN".into(), "z".into());
+        env.insert("ALPHA_TOKEN".into(), "a".into());
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("X-Edge".into(), "edge".into());
+        headers.insert("Authorization".into(), "Bearer token".into());
+
+        let rendered = render_configured_server_detail(&ConfiguredMcpServer {
+            name: "github".into(),
+            url: Some("https://example.com/mcp".into()),
+            bearer_token: None,
+            oauth: None,
+            command: "ignored".into(),
+            args: vec![],
+            cwd: Some(PathBuf::from("/tmp/workspace")),
+            env,
+            headers,
+            timeout: None,
+            connect_timeout: None,
+            include: vec!["tools/*".into()],
+            exclude: vec!["admin/*".into()],
+            token_from_config: false,
+            token_from_store: true,
+        });
+
+        assert!(rendered.contains("Transport: http https://example.com/mcp"));
+        assert!(rendered.contains("Include: tools/*"));
+        assert!(rendered.contains("Exclude: admin/*"));
+        assert!(rendered.contains("Env keys: ALPHA_TOKEN, ZETA_TOKEN"));
+        assert!(rendered.contains("Header keys: Authorization, X-Edge"));
+        assert!(rendered.contains("Token source: secure local token store"));
+    }
 }
 
 pub fn render_mcp_auth_guide(server_name: &str) -> anyhow::Result<String> {

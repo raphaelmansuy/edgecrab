@@ -1966,6 +1966,7 @@ struct McpPresetEntry {
     source: String,
     action_label: String,
     detail: String,
+    detail_view: String,
     search_text: String,
 }
 
@@ -2044,6 +2045,7 @@ fn build_configured_mcp_entry(
 ) -> McpPresetEntry {
     let transport = format_mcp_transport(server);
     let mut detail = format!("{} | installed", transport);
+    let detail_view = mcp_support::render_configured_server_detail(server);
     let auth = mcp_support::auth_summary(server);
     if auth != "none" {
         detail.push_str(&format!(" | {auth}"));
@@ -2079,7 +2081,8 @@ fn build_configured_mcp_entry(
         source: "configured".into(),
         action_label: "test".into(),
         detail,
-        search_text,
+        detail_view: detail_view.clone(),
+        search_text: format!("{search_text} {}", detail_view.replace('\n', " ")),
     }
 }
 
@@ -2125,6 +2128,14 @@ fn build_catalog_mcp_entry(
             entry.description, install_state, entry.source_url
         ),
     };
+    let mut detail_view = crate::mcp_catalog::render_official_catalog_entry(entry);
+    if install_state == "already-installed" {
+        detail_view.push_str("\nStatus:  already installed in the local MCP configuration");
+    } else if install_state == "ready-to-install" {
+        detail_view.push_str("\nStatus:  ready to install into the local MCP configuration");
+    } else {
+        detail_view.push_str("\nStatus:  catalog only, inspect documentation before configuring");
+    }
     let search_text = format!(
         "{} {} {} {} {} {} {} {} {}",
         entry.id,
@@ -2147,7 +2158,8 @@ fn build_catalog_mcp_entry(
         source: mcp_catalog_source_label(entry).into(),
         action_label,
         detail,
-        search_text,
+        detail_view: detail_view.clone(),
+        search_text: format!("{search_text} {}", detail_view.replace('\n', " ")),
     }
 }
 
@@ -5515,6 +5527,10 @@ impl App {
             match key.code {
                 KeyCode::Esc => {
                     self.mcp_selector.active = false;
+                }
+                KeyCode::Char('r') | KeyCode::Char('R') => {
+                    let query = self.mcp_selector.query.clone();
+                    self.open_mcp_selector(Some(&query), true);
                 }
                 KeyCode::Enter => {
                     if let Some(entry) = self.mcp_selector.current() {
@@ -12184,21 +12200,10 @@ impl App {
                     return;
                 };
                 if let Some(preset) = crate::mcp_catalog::find_preset(preset_name) {
-                    let mut lines = vec![
-                        format!("Preset: {}", preset.id),
-                        format!("Name:   {}", preset.display_name),
-                        format!("Why:    {}", preset.description),
-                        format!("Pkg:    {}", preset.package_name),
-                        format!("Source: {}", preset.source_url),
-                        format!("Docs:   {}", preset.homepage),
-                        format!("Cmd:    {} {}", preset.command, preset.args.join(" ")),
-                        format!("Tags:   {}", preset.tags.join(", ")),
-                    ];
-                    if !preset.required_env.is_empty() {
-                        lines.push(format!("Env:    {}", preset.required_env.join(", ")));
-                    }
-                    lines.push(format!("Notes:  {}", preset.notes));
-                    self.push_output(lines.join("\n"), OutputRole::System);
+                    self.push_output(
+                        crate::mcp_catalog::render_preset_detail(preset),
+                        OutputRole::System,
+                    );
                     return;
                 }
                 if let Some(entry) = self.rt_handle.block_on(
@@ -12222,41 +12227,10 @@ impl App {
                             );
                             return;
                         };
-                        let mut lines = vec![
-                            format!("Server: {}", server.name),
-                            format!("Transport: {}", format_mcp_transport(&server)),
-                        ];
-                        if let Some(path) = &server.cwd {
-                            lines.push(format!("Cwd: {}", path.display()));
-                        }
-                        if !server.include.is_empty() {
-                            lines.push(format!("Include: {}", server.include.join(", ")));
-                        }
-                        if !server.exclude.is_empty() {
-                            lines.push(format!("Exclude: {}", server.exclude.join(", ")));
-                        }
-                        let auth = mcp_support::auth_summary(&server);
-                        if auth != "none" {
-                            lines.push(format!("Auth: {auth}"));
-                        }
-                        if let Some(oauth) = &server.oauth {
-                            lines.push(format!("OAuth token URL: {}", oauth.token_url()));
-                            lines.push(format!(
-                                "OAuth flow: {} via {}",
-                                oauth.grant_type_label(),
-                                oauth.auth_method_label()
-                            ));
-                            if let Some(url) = oauth.device_authorization_url() {
-                                lines.push(format!("OAuth device URL: {url}"));
-                            }
-                            if let Some(url) = oauth.authorization_url() {
-                                lines.push(format!("OAuth authorize URL: {url}"));
-                            }
-                            if let Some(url) = oauth.redirect_url() {
-                                lines.push(format!("OAuth redirect URL: {url}"));
-                            }
-                        }
-                        self.push_output(lines.join("\n"), OutputRole::System);
+                        self.push_output(
+                            mcp_support::render_configured_server_detail(&server),
+                            OutputRole::System,
+                        );
                     }
                     Err(err) => self.push_output(
                         format!("Failed to read MCP configuration: {err}"),
@@ -14453,9 +14427,13 @@ impl App {
                 Constraint::Length(1),
             ])
             .split(area);
+        let body = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
+            .split(chunks[1]);
 
         let search_text = if self.mcp_selector.query.is_empty() {
-            "Search official MCP catalog + configured servers... (Enter default action, i install, t test, c check, v view, d remove, Esc cancel)".to_string()
+            "Search configured MCP servers and the official catalog.".to_string()
         } else {
             self.mcp_selector.query.clone()
         };
@@ -14476,7 +14454,7 @@ impl App {
         );
         frame.render_widget(search, chunks[0]);
 
-        let max_visible = chunks[1].height as usize;
+        let max_visible = body[0].height as usize;
         let filtered = &self.mcp_selector.filtered;
         let selected = self.mcp_selector.selected;
         let scroll_start = if selected >= max_visible {
@@ -14485,50 +14463,139 @@ impl App {
             0
         };
 
-        let items: Vec<ListItem> = filtered
-            .iter()
-            .skip(scroll_start)
-            .take(max_visible)
-            .enumerate()
-            .map(|(vis_idx, &preset_idx)| {
-                let entry = &self.mcp_selector.items[preset_idx];
-                let is_selected = vis_idx + scroll_start == selected;
-                let row_style = if is_selected {
-                    Style::default()
-                        .bg(Color::Rgb(40, 56, 58))
-                        .fg(Color::Rgb(110, 220, 210))
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::Rgb(210, 220, 220))
-                };
-                let source_style = if is_selected {
-                    Style::default()
-                        .bg(Color::Rgb(40, 56, 58))
-                        .fg(Color::Rgb(145, 170, 170))
-                } else {
-                    Style::default().fg(Color::Rgb(100, 120, 120))
-                };
-                let action_style = if is_selected {
-                    Style::default()
-                        .bg(Color::Rgb(40, 56, 58))
-                        .fg(Color::Rgb(210, 240, 175))
-                } else {
-                    Style::default().fg(Color::Rgb(135, 165, 110))
-                };
-                ListItem::new(Line::from(vec![
-                    Span::styled(format!("  {:<12}", entry.source), source_style),
-                    Span::styled(format!("{:<9}", entry.action_label), action_style),
-                    Span::styled(entry.title.clone(), row_style),
-                    Span::raw("  "),
-                    Span::styled(entry.detail.clone(), source_style),
-                ]))
-            })
-            .collect();
+        let items: Vec<ListItem> = if filtered.is_empty() {
+            let empty_text = if self.mcp_selector.query.trim().is_empty() {
+                "  No configured servers or catalog entries are available."
+            } else {
+                "  No MCP entries matched this query."
+            };
+            vec![ListItem::new(Line::from(Span::styled(
+                empty_text.to_string(),
+                Style::default().fg(Color::Rgb(120, 120, 135)),
+            )))]
+        } else {
+            filtered
+                .iter()
+                .skip(scroll_start)
+                .take(max_visible)
+                .enumerate()
+                .map(|(vis_idx, &preset_idx)| {
+                    let entry = &self.mcp_selector.items[preset_idx];
+                    let is_selected = vis_idx + scroll_start == selected;
+                    let bg = if is_selected {
+                        Color::Rgb(24, 36, 44)
+                    } else {
+                        Color::Rgb(18, 24, 26)
+                    };
+                    let row_style = if is_selected {
+                        Style::default()
+                            .bg(bg)
+                            .fg(Color::Rgb(110, 220, 210))
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Rgb(210, 220, 220))
+                    };
+                    let source_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(145, 170, 170))
+                    } else {
+                        Style::default().fg(Color::Rgb(100, 120, 120))
+                    };
+                    let action_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(210, 240, 175))
+                    } else {
+                        Style::default().fg(Color::Rgb(135, 165, 110))
+                    };
+                    let detail_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(160, 180, 180))
+                    } else {
+                        Style::default().fg(Color::Rgb(120, 140, 140))
+                    };
+                    ListItem::new(Line::from(vec![
+                        Span::styled(format!("  {:<12}", entry.source), source_style),
+                        Span::styled(format!("{:<9}", entry.action_label), action_style),
+                        Span::styled(unicode_trunc(&entry.title, 38), row_style),
+                        Span::raw("  "),
+                        Span::styled(unicode_trunc(&entry.detail, 38), detail_style),
+                    ]))
+                })
+                .collect()
+        };
 
         frame.render_widget(
             List::new(items).style(Style::default().bg(Color::Rgb(18, 24, 26))),
-            chunks[1],
+            body[0],
         );
+
+        let mut detail_lines = Vec::new();
+        if let Some(entry) = self.mcp_selector.current() {
+            detail_lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{} ", entry.source),
+                    Style::default()
+                        .fg(Color::Rgb(110, 220, 210))
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(entry.title.clone()),
+            ]));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(vec![
+                Span::styled(
+                    "Default action: ",
+                    Style::default().fg(Color::Rgb(145, 170, 170)),
+                ),
+                Span::raw(entry.action_label.clone()),
+            ]));
+            detail_lines.push(Line::from(""));
+            for line in entry.detail_view.lines() {
+                detail_lines.push(Line::from(line.to_string()));
+            }
+            if entry.kind == McpEntryKind::ConfiguredServer {
+                detail_lines.push(Line::from(""));
+                detail_lines.push(Line::from(
+                    "Actions: Enter test, C doctor, V view, D remove, R refresh catalog",
+                ));
+            } else {
+                detail_lines.push(Line::from(""));
+                detail_lines.push(Line::from(
+                    "Actions: Enter default, I install when available, V view, R refresh catalog",
+                ));
+            }
+        } else if self.mcp_selector.query.trim().is_empty() {
+            detail_lines.push(Line::from(Span::styled(
+                "MCP Browser",
+                Style::default()
+                    .fg(Color::Rgb(110, 220, 210))
+                    .add_modifier(Modifier::BOLD),
+            )));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from("Browse two sources in one place:"));
+            detail_lines.push(Line::from(
+                "- configured MCP servers from your local config",
+            ));
+            detail_lines.push(Line::from(
+                "- the cached official MCP catalog with installable presets",
+            ));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(
+                "Use fuzzy search to jump by server name, package, tags, transport, env vars, or docs source.",
+            ));
+        } else {
+            detail_lines.push(Line::from("No results for the current query."));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(
+                "Try broader terms like github, browser, database, time, filesystem, oauth, or http.",
+            ));
+        }
+
+        let detail = Paragraph::new(Text::from(detail_lines))
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Rgb(60, 80, 84)))
+                    .title(" Details "),
+            );
+        frame.render_widget(detail, body[1]);
 
         let help = Paragraph::new(Line::from(vec![
             Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(110, 220, 210))),
@@ -14545,6 +14612,8 @@ impl App {
             Span::styled("view  ", Style::default().fg(Color::DarkGray)),
             Span::styled("d ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("remove  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("r ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("refresh  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Esc ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("cancel  ", Style::default().fg(Color::DarkGray)),
             Span::styled(
@@ -16929,6 +16998,87 @@ mod tests {
         assert_eq!(
             selector.current().map(|entry| entry.id.as_str()),
             Some("github")
+        );
+    }
+
+    #[test]
+    fn mcp_selector_builds_rich_detail_view_for_catalog_entries() {
+        let entries = build_mcp_selector_entries_from(
+            &[],
+            &[crate::mcp_catalog::OfficialCatalogEntry {
+                id: "github".into(),
+                display_name: "GitHub".into(),
+                description: "Official GitHub server.".into(),
+                source_url: "https://github.com/github/github-mcp-server".into(),
+                homepage: "https://modelcontextprotocol.io".into(),
+                tags: vec!["official".into(), "integration".into()],
+                installable_preset_id: Some("github".into()),
+            }],
+        );
+
+        let entry = entries
+            .into_iter()
+            .find(|entry| entry.id == "github")
+            .expect("github entry");
+
+        assert!(entry.detail_view.contains("Catalog: github"));
+        assert!(
+            entry
+                .detail_view
+                .contains("Pkg:     @modelcontextprotocol/server-github")
+        );
+        assert!(entry.detail_view.contains("Status:  ready to install"));
+    }
+
+    #[test]
+    fn mcp_selector_builds_rich_detail_view_for_configured_servers() {
+        let entries = build_mcp_selector_entries_from(
+            &[edgecrab_tools::tools::mcp_client::ConfiguredMcpServer {
+                name: "remote-http".into(),
+                url: Some("https://example.com/mcp".into()),
+                bearer_token: None,
+                oauth: None,
+                command: "ignored".into(),
+                args: vec![],
+                cwd: Some(std::path::PathBuf::from("/tmp/workspace")),
+                env: std::collections::HashMap::from([
+                    ("EDGE_API_KEY".into(), "value".into()),
+                    ("EDGE_PROJECT".into(), "demo".into()),
+                ]),
+                headers: std::collections::HashMap::from([
+                    ("X-Edge".into(), "1".into()),
+                    ("Authorization".into(), "Bearer token".into()),
+                ]),
+                timeout: None,
+                connect_timeout: None,
+                include: vec!["repo/*".into()],
+                exclude: vec!["admin/*".into()],
+                token_from_config: false,
+                token_from_store: true,
+            }],
+            &[],
+        );
+
+        let entry = entries
+            .into_iter()
+            .find(|entry| entry.id == "remote-http")
+            .expect("remote-http entry");
+
+        assert!(entry.detail_view.contains("Server: remote-http"));
+        assert!(
+            entry
+                .detail_view
+                .contains("Transport: http https://example.com/mcp")
+        );
+        assert!(
+            entry
+                .detail_view
+                .contains("Env keys: EDGE_API_KEY, EDGE_PROJECT")
+        );
+        assert!(
+            entry
+                .detail_view
+                .contains("Header keys: Authorization, X-Edge")
         );
     }
 

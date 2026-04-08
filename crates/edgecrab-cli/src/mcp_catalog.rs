@@ -1010,6 +1010,7 @@ pub async fn refresh_official_catalog() -> anyhow::Result<Vec<OfficialCatalogEnt
 }
 
 pub fn render_official_catalog_entry(entry: &OfficialCatalogEntry) -> String {
+    let preset = entry.installable_preset_id.as_deref().and_then(find_preset);
     let mut lines = vec![
         format!("Catalog: {}", entry.id),
         format!("Name:    {}", entry.display_name),
@@ -1018,12 +1019,104 @@ pub fn render_official_catalog_entry(entry: &OfficialCatalogEntry) -> String {
         format!("Docs:    {}", entry.homepage),
         format!("Tags:    {}", entry.tags.join(", ")),
     ];
-    if let Some(installable) = &entry.installable_preset_id {
-        lines.push(format!("Install: /mcp install {installable}"));
-    } else {
-        lines.push("Install: not available as a controlled preset yet".into());
+    match (&entry.installable_preset_id, preset) {
+        (Some(installable), Some(preset)) => {
+            lines.push(format!("Install: /mcp install {installable}"));
+            lines.push(format!("Preset:  {}", preset.display_name));
+            lines.push(format!("Pkg:     {}", preset.package_name));
+            lines.push(format!(
+                "Cmd:     {} {}",
+                preset.command,
+                preset.args.join(" ")
+            ));
+            if !preset.required_env.is_empty() {
+                lines.push(format!("Env:     {}", preset.required_env.join(", ")));
+            }
+            lines.push(format!("Notes:   {}", preset.notes));
+        }
+        (Some(installable), None) => {
+            lines.push(format!("Install: /mcp install {installable}"));
+            lines.push(
+                "Preset:  installable catalog entry, but no bundled preset metadata was found"
+                    .into(),
+            );
+        }
+        (None, _) => {
+            lines.push("Install: not available as a controlled preset yet".into());
+        }
     }
     lines.join("\n")
+}
+
+pub fn render_preset_detail(preset: &McpPreset) -> String {
+    let mut lines = vec![
+        format!("Preset: {}", preset.id),
+        format!("Name:   {}", preset.display_name),
+        format!("Why:    {}", preset.description),
+        format!("Pkg:    {}", preset.package_name),
+        format!("Source: {}", preset.source_url),
+        format!("Docs:   {}", preset.homepage),
+        format!("Cmd:    {} {}", preset.command, preset.args.join(" ")),
+        format!("Tags:   {}", preset.tags.join(", ")),
+    ];
+    if !preset.required_env.is_empty() {
+        lines.push(format!("Env:    {}", preset.required_env.join(", ")));
+    }
+    lines.push(format!("Notes:  {}", preset.notes));
+    lines.join("\n")
+}
+
+#[cfg(test)]
+mod render_tests {
+    use super::*;
+
+    #[test]
+    fn render_official_catalog_entry_includes_install_plan_metadata() {
+        let rendered = render_official_catalog_entry(&OfficialCatalogEntry {
+            id: "github".into(),
+            display_name: "GitHub".into(),
+            description: "Official GitHub server.".into(),
+            source_url: "https://github.com/github/github-mcp-server".into(),
+            homepage: "https://modelcontextprotocol.io".into(),
+            tags: vec!["official".into(), "integration".into()],
+            installable_preset_id: Some("github".into()),
+        });
+
+        assert!(rendered.contains("Install: /mcp install github"));
+        assert!(rendered.contains("Pkg:     @modelcontextprotocol/server-github"));
+        assert!(rendered.contains("Cmd:     npx -y @modelcontextprotocol/server-github"));
+        assert!(rendered.contains("Env:     GITHUB_PERSONAL_ACCESS_TOKEN, GITHUB_TOKEN"));
+    }
+
+    #[test]
+    fn render_preset_detail_includes_notes_and_command() {
+        let preset = find_preset("time").expect("time preset");
+        let rendered = render_preset_detail(preset);
+
+        assert!(rendered.contains("Preset: time"));
+        assert!(rendered.contains("Cmd:    uvx mcp-server-time"));
+        assert!(rendered.contains("Notes:"));
+    }
+}
+
+#[cfg(test)]
+mod detail_render_tests {
+    use super::*;
+
+    #[test]
+    fn render_official_catalog_entry_without_install_plan_mentions_catalog_only_state() {
+        let rendered = render_official_catalog_entry(&OfficialCatalogEntry {
+            id: "custom-http".into(),
+            display_name: "Custom HTTP".into(),
+            description: "HTTP-only catalog entry.".into(),
+            source_url: "https://example.com/custom-http".into(),
+            homepage: "https://example.com/docs".into(),
+            tags: vec!["community".into()],
+            installable_preset_id: None,
+        });
+
+        assert!(rendered.contains("Install: not available as a controlled preset yet"));
+    }
 }
 
 pub fn install_preset(
