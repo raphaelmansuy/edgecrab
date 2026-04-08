@@ -1328,6 +1328,7 @@ pub struct DisplayConfig {
     pub personality: String,
     pub show_reasoning: bool,
     pub streaming: bool,
+    pub show_status_bar: bool,
     pub show_cost: bool,
     pub skin: String,
 }
@@ -1339,6 +1340,7 @@ impl Default for DisplayConfig {
             personality: "default".into(),
             show_reasoning: false,
             streaming: true,
+            show_status_bar: true,
             show_cost: true,
             skin: "default".into(),
         }

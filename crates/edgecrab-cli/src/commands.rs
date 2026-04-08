@@ -80,6 +80,8 @@ pub enum CommandResult {
     ShowUsage,
     /// Show the assembled system prompt
     ShowPrompt,
+    /// Open or query the configuration surface
+    ShowConfig(String),
     /// Show message history summary
     ShowHistory,
     /// Toggle verbose tool output
@@ -106,10 +108,6 @@ pub enum CommandResult {
     QueuePrompt(String),
     /// Run a prompt in the background
     BackgroundPrompt(String),
-    /// Approve a pending gateway action
-    Approve,
-    /// Deny a pending gateway action
-    Deny,
     /// Show/manage skills
     ShowSkills(String),
     /// Show/manage MCP servers and presets
@@ -124,6 +122,8 @@ pub enum CommandResult {
     SetReasoning(String),
     /// Toggle live token streaming (on/off/toggle/status)
     SetStreaming(String),
+    /// Toggle the TUI status bar visibility (on/off/toggle/status)
+    SetStatusBar(String),
     /// List available models for the current or specified provider
     ListModels(String),
     /// Show cron job status (args: "list" or "")
@@ -146,6 +146,8 @@ pub enum CommandResult {
     CopilotAuth,
     /// Manage terminal mouse capture mode (on/off/toggle/status)
     MouseMode(String),
+    /// Resolve the current approval prompt from a slash command.
+    ApprovalChoice(edgecrab_core::ApprovalChoice),
     /// macOS permission diagnostics and bootstrap workflow.
     #[cfg(target_os = "macos")]
     MacosPermissions(String),
@@ -160,6 +162,10 @@ pub enum CommandResult {
     McpToken(String),
     /// Manage browser CDP connection (connect/disconnect/status).
     BrowserCommand(String),
+    /// Show or update gateway home-channel configuration.
+    SetHomeChannel(String),
+    /// Show local upgrade status and actionable update guidance.
+    CheckUpdates,
 }
 
 /// A registered slash command.
@@ -498,19 +504,8 @@ impl CommandRegistry {
         self.register(Command {
             name: "config",
             aliases: &["cfg"],
-            description: "Show current configuration",
-            handler: |_| {
-                let config_path =
-                    std::env::var("EDGECRAB_HOME").unwrap_or_else(|_| "~/.edgecrab".to_string());
-                CommandResult::Output(format!(
-                    "EdgeCrab configuration:\n\
-                     Config dir: {config_path}/config.yaml\n\
-                     State DB:   {config_path}/state.db\n\
-                     Memories:   {config_path}/memories/\n\
-                     Skills:     {config_path}/skills/\n\
-                     \nRun `edgecrab doctor` to verify all paths and connectivity."
-                ))
-            },
+            description: "Open the config center or inspect paths/settings (/config, /config show, /config paths)",
+            handler: |args| CommandResult::ShowConfig(args.trim().to_string()),
         });
 
         self.register(Command {
@@ -610,10 +605,10 @@ impl CommandRegistry {
         self.register(Command {
             name: "theme",
             aliases: &["skin"],
-            description: "Show or switch skin: /skin [name]. No args: list available skins.",
+            description: "Browse, reload, or switch skins: /theme, /theme reload, /theme <name>",
             handler: |args| {
                 let name = args.trim();
-                if name.is_empty() {
+                if name.eq_ignore_ascii_case("reload") {
                     CommandResult::ReloadTheme
                 } else {
                     CommandResult::SwitchSkin(name.to_string())
@@ -726,8 +721,8 @@ impl CommandRegistry {
         self.register(Command {
             name: "statusbar",
             aliases: &["sb"],
-            description: "Toggle the status bar display",
-            handler: |_| CommandResult::Output("Status bar toggled. (Requires TUI redraw.)".into()),
+            description: "Status bar visibility: /statusbar [on|off|toggle|status]",
+            handler: |args| CommandResult::SetStatusBar(args.trim().to_string()),
         });
 
         // ── Tools (extended) ──────────────────────────────────────────
@@ -818,41 +813,41 @@ impl CommandRegistry {
         self.register(Command {
             name: "approve",
             aliases: &["yes"],
-            description: "Approve a pending tool action (gateway mode)",
-            handler: |_| CommandResult::Approve,
+            description: "Approve the current prompt: /approve [once|session|always]",
+            handler: |args| {
+                let choice = match args.trim().to_ascii_lowercase().as_str() {
+                    "" | "once" => edgecrab_core::ApprovalChoice::Once,
+                    "session" => edgecrab_core::ApprovalChoice::Session,
+                    "always" => edgecrab_core::ApprovalChoice::Always,
+                    other => {
+                        return CommandResult::Output(format!(
+                            "Unknown approve scope '{other}'. Use: /approve [once|session|always]"
+                        ));
+                    }
+                };
+                CommandResult::ApprovalChoice(choice)
+            },
         });
 
         self.register(Command {
             name: "deny",
             aliases: &["no"],
-            description: "Deny a pending tool action (gateway mode)",
-            handler: |_| CommandResult::Deny,
+            description: "Deny the current approval or clarify prompt",
+            handler: |_| CommandResult::ApprovalChoice(edgecrab_core::ApprovalChoice::Deny),
         });
 
         self.register(Command {
             name: "sethome",
             aliases: &[],
-            description: "Set the home channel for gateway notifications",
-            handler: |args| {
-                if args.is_empty() {
-                    CommandResult::Output("Usage: /sethome <channel-id>".into())
-                } else {
-                    CommandResult::Output(format!("Home channel set to: {args}"))
-                }
-            },
+            description: "Show or set gateway home channels: /sethome [platform] <channel|clear>",
+            handler: |args| CommandResult::SetHomeChannel(args.trim().to_string()),
         });
 
         self.register(Command {
             name: "update",
             aliases: &[],
-            description: "Check for and apply EdgeCrab updates",
-            handler: |_| {
-                CommandResult::Output(format!(
-                    "EdgeCrab v{} — you are running the latest version.\n\
-                     (Auto-update from gateway deferred)",
-                    env!("CARGO_PKG_VERSION"),
-                ))
-            },
+            description: "Check local upgrade status and show update guidance",
+            handler: |_| CommandResult::CheckUpdates,
         });
 
         // ── Scheduling ────────────────────────────────────────────────
@@ -992,11 +987,11 @@ fn help_text() -> String {
            /resume [id]          — Resume a previous session\n\
          \n\
          Config:\n\
-           /config               — Show current configuration\n\
+           /config               — Open config center or inspect config\n\
            /prompt               — Show the current system prompt\n\
            /verbose              — Toggle verbose tool output\n\
            /personality [name]   — Show or switch personality preset\n\
-           /statusbar            — Toggle status bar display\n\
+           /statusbar [mode]     — Show or set status bar visibility\n\
          \n\
          Tools:\n\
            /tools                — List registered tools\n\
@@ -1022,10 +1017,10 @@ fn help_text() -> String {
          \n\
          Gateway:\n\
            /platforms            — Show gateway platform status\n\
-           /approve              — Approve a pending tool action\n\
-           /deny                 — Deny a pending tool action\n\
-           /sethome [channel]    — Set home channel for notifications\n\
-           /update               — Check for EdgeCrab updates\n\
+           /approve [scope]      — Approve pending action (once/session/always)\n\
+           /deny                 — Deny pending approval or clarify prompt\n\
+           /sethome [args]       — Show or set gateway home channels\n\
+           /update               — Check local upgrade status\n\
          \n\
         Scheduling & Media:\n\
           /cron [subcommand]    — Manage scheduled tasks\n\
@@ -1033,9 +1028,9 @@ fn help_text() -> String {
           /browser [sub]        — Chrome CDP: connect, disconnect, status, tabs, recording on|off\n\
          \n\
          Appearance:\n\
-           /theme, /skin [name]  — Switch skin preset (or list available)\n\
+           /theme, /skin [name]  — Browse, reload, or switch skins\n\
                                  /mouse [mode]         — Mouse capture: on/off/toggle/status\n\
-           /paste                — Paste clipboard image\n\
+           /paste                — Paste clipboard text/image into the next prompt\n\
          \n\
          Diagnostics:\n\
            /doctor, /diag        — Run diagnostics\n\
@@ -1396,9 +1391,52 @@ mod tests {
         let reg = CommandRegistry::new();
         assert!(matches!(
             reg.dispatch("/approve"),
-            Some(CommandResult::Approve)
+            Some(CommandResult::ApprovalChoice(
+                edgecrab_core::ApprovalChoice::Once
+            ))
         ));
-        assert!(matches!(reg.dispatch("/deny"), Some(CommandResult::Deny)));
+        assert!(matches!(
+            reg.dispatch("/approve session"),
+            Some(CommandResult::ApprovalChoice(
+                edgecrab_core::ApprovalChoice::Session
+            ))
+        ));
+        assert!(matches!(
+            reg.dispatch("/deny"),
+            Some(CommandResult::ApprovalChoice(
+                edgecrab_core::ApprovalChoice::Deny
+            ))
+        ));
+    }
+
+    #[test]
+    fn dispatch_config_and_statusbar_commands() {
+        let reg = CommandRegistry::new();
+        assert!(matches!(
+            reg.dispatch("/config"),
+            Some(CommandResult::ShowConfig(args)) if args.is_empty()
+        ));
+        assert!(matches!(
+            reg.dispatch("/config paths"),
+            Some(CommandResult::ShowConfig(args)) if args == "paths"
+        ));
+        assert!(matches!(
+            reg.dispatch("/statusbar off"),
+            Some(CommandResult::SetStatusBar(args)) if args == "off"
+        ));
+    }
+
+    #[test]
+    fn dispatch_theme_no_args_opens_browser_and_reload_is_explicit() {
+        let reg = CommandRegistry::new();
+        assert!(matches!(
+            reg.dispatch("/theme"),
+            Some(CommandResult::SwitchSkin(name)) if name.is_empty()
+        ));
+        assert!(matches!(
+            reg.dispatch("/theme reload"),
+            Some(CommandResult::ReloadTheme)
+        ));
     }
 
     #[test]

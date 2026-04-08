@@ -157,6 +157,13 @@ by typing `/` followed by the command name:
 | Workflow | `/queue`, `/background`, `/rollback`, `/cron`, `/voice`, `/paste` |
 | Gateway | `/platforms`, `/approve`, `/deny`, `/sethome`, `/update` |
 
+Recent UX notes:
+
+- `/config` opens a searchable config center instead of only dumping paths.
+- `/theme` opens the skin browser by default; `/theme reload` is explicit.
+- `/statusbar` is a real persisted toggle.
+- `/approve`, `/deny`, `/sethome`, and `/update` now operate on live TUI or config state.
+
 ---
 
 ## Important source modules

@@ -15,8 +15,9 @@ EdgeCrab provides a **full-featured TUI** (built with `ratatui`), a CLI-driven c
 
 - **Tab completion**: TUI supports fuzzy-matched tab completion for all slash commands.
 - **Setup wizard**: Interactive, sectioned, with env var detection for provider keys.
-- **Skins**: User can switch skins at runtime (`/theme`), or install custom YAML skins.
-- **No `inquire` menus**: Unlike EdgeCode, EdgeCrab does not use `inquire` for config menus; all interaction is via TUI overlays and CLI prompts.
+- **Skins**: User can switch skins at runtime (`/theme` opens the browser, `/theme reload` explicitly reloads `skin.yaml`), or install custom YAML skins.
+- **Config Center**: `/config` opens a searchable TUI control surface for state summary, paths, model routing, display toggles, voice status, gateway home channels, and update checks.
+- **No `inquire` menus**: Unlike EdgeCode, EdgeCrab does not use `inquire` for config menus; all interaction stays in TUI overlays and CLI prompts.
 - **User-focused UX**: TUI is designed for speed (60+ FPS), minimal memory (<5MB), and keyboard-driven workflows.
 
 ## Key Code & Docs
@@ -31,10 +32,10 @@ EdgeCrab provides a **full-featured TUI** (built with `ratatui`), a CLI-driven c
 
 ## Limitations & TODOs
 
-- **No interactive multi-select config menus**: Unlike EdgeCode's `/config` menus (with `inquire`), EdgeCrab's config is CLI/TUI-driven only; consider adding interactive menus for config subcommands.
+- **Config Center is orchestration-first**: `/config` launches existing handlers and selectors, but it is not yet a full inline form editor for every structured config block.
 - **No web-based config UI**: All configuration is terminal-based.
 
 ---
 **TODOs:**
-- Add interactive multi-select menus for config subcommands (skills, tools, etc.)
+- Add editable config forms for common structured settings inside the config center
 - Add web-based config UI (optional)

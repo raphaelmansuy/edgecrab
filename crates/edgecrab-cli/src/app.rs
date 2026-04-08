@@ -110,6 +110,115 @@ fn context_usage_ratio(tokens: u64, context_window: Option<u64>) -> Option<f64> 
         .map(|cw| (tokens as f64 / cw as f64).clamp(0.0, 1.0))
 }
 
+fn find_git_repo_root(mut start: std::path::PathBuf) -> Option<std::path::PathBuf> {
+    loop {
+        if start.join(".git").exists() {
+            return Some(start);
+        }
+        if !start.pop() {
+            return None;
+        }
+    }
+}
+
+fn git_output(repo: &std::path::Path, args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    Some(text.trim().to_string())
+}
+
+fn render_update_status_report() -> String {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| edgecrab_core::edgecrab_home());
+    let Some(repo_root) = find_git_repo_root(cwd) else {
+        return format!(
+            "EdgeCrab v{}\nNo git checkout detected from the current working directory.\nIf you installed from source, run /update from inside the EdgeCrab repo.\nIf you installed from a package manager or `cargo install`, upgrade using that same channel.",
+            env!("CARGO_PKG_VERSION")
+        );
+    };
+
+    let branch = git_output(&repo_root, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .unwrap_or_else(|| "(unknown)".into());
+    let commit = git_output(&repo_root, &["rev-parse", "--short", "HEAD"])
+        .unwrap_or_else(|| "(unknown)".into());
+    let dirty = git_output(&repo_root, &["status", "--short"])
+        .map(|out| if out.is_empty() { "clean" } else { "dirty" })
+        .unwrap_or("unknown");
+    let upstream = git_output(
+        &repo_root,
+        &[
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "@{upstream}",
+        ],
+    );
+
+    let mut lines = vec![
+        format!("EdgeCrab v{}", env!("CARGO_PKG_VERSION")),
+        format!("Repo:   {}", repo_root.display()),
+        format!("Branch: {branch}"),
+        format!("Commit: {commit} ({dirty})"),
+    ];
+
+    if let Some(upstream_ref) = upstream {
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo_root)
+            .args(["fetch", "--quiet"])
+            .status();
+
+        let ahead_behind = git_output(
+            &repo_root,
+            &[
+                "rev-list",
+                "--left-right",
+                "--count",
+                &format!("HEAD...{upstream_ref}"),
+            ],
+        );
+        if let Some(counts) = ahead_behind {
+            let mut parts = counts.split_whitespace();
+            let ahead = parts
+                .next()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            let behind = parts
+                .next()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            lines.push(format!("Upstream: {upstream_ref}"));
+            lines.push(format!("Ahead:    {ahead}"));
+            lines.push(format!("Behind:   {behind}"));
+            if behind > 0 {
+                lines.push(format!(
+                    "Action:   run `git -C {} pull --ff-only` to update",
+                    repo_root.display()
+                ));
+            } else if ahead > 0 {
+                lines.push("Action:   local checkout is ahead of upstream; push or keep your local commits.".into());
+            } else {
+                lines.push("Action:   checkout is up to date with its upstream branch.".into());
+            }
+        } else {
+            lines.push(format!("Upstream: {upstream_ref}"));
+            lines.push("Action:   unable to compare with upstream after fetch.".into());
+        }
+    } else {
+        lines.push("Upstream: none".into());
+        lines.push("Action:   no upstream branch is configured; set one with `git branch --set-upstream-to origin/<branch>`.".into());
+    }
+
+    lines.join("\n")
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AudioPlayerSpec {
     program: &'static str,
@@ -834,6 +943,7 @@ fn persist_voice_preferences_to_config(
 struct DisplayPreferences {
     show_reasoning: bool,
     streaming_enabled: bool,
+    show_status_bar: bool,
 }
 
 impl Default for DisplayPreferences {
@@ -841,6 +951,7 @@ impl Default for DisplayPreferences {
         Self {
             show_reasoning: false,
             streaming_enabled: true,
+            show_status_bar: true,
         }
     }
 }
@@ -851,6 +962,7 @@ fn load_display_preferences() -> DisplayPreferences {
         .map(|cfg| DisplayPreferences {
             show_reasoning: cfg.display.show_reasoning,
             streaming_enabled: cfg.model.streaming && cfg.display.streaming,
+            show_status_bar: cfg.display.show_status_bar,
         })
         .unwrap_or_default()
 }
@@ -865,6 +977,7 @@ fn load_voice_mode_enabled() -> bool {
 fn persist_display_preferences(
     show_reasoning: Option<bool>,
     streaming_enabled: Option<bool>,
+    show_status_bar: Option<bool>,
 ) -> anyhow::Result<()> {
     let mut config = edgecrab_core::AppConfig::load().unwrap_or_default();
     if let Some(enabled) = show_reasoning {
@@ -873,6 +986,9 @@ fn persist_display_preferences(
     if let Some(enabled) = streaming_enabled {
         config.model.streaming = enabled;
         config.display.streaming = enabled;
+    }
+    if let Some(enabled) = show_status_bar {
+        config.display.show_status_bar = enabled;
     }
     config.save()?;
     Ok(())
@@ -1926,6 +2042,44 @@ impl FuzzyItem for SkinEntry {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConfigAction {
+    ShowSummary,
+    ShowPaths,
+    OpenModel,
+    OpenVisionModel,
+    OpenImageModel,
+    ToggleStreaming,
+    ToggleReasoning,
+    ToggleStatusBar,
+    OpenSkins,
+    ShowVoice,
+    ShowGatewayHomes,
+    ShowUpdateStatus,
+}
+
+#[derive(Clone)]
+struct ConfigEntry {
+    title: String,
+    detail: String,
+    tag: String,
+    action: ConfigAction,
+}
+
+impl FuzzyItem for ConfigEntry {
+    fn primary(&self) -> &str {
+        &self.title
+    }
+
+    fn secondary(&self) -> &str {
+        &self.detail
+    }
+
+    fn tag(&self) -> &str {
+        &self.tag
+    }
+}
+
 /// Convert a Unix-epoch timestamp (seconds) to (year, month, day).
 /// Simple Gregorian calendar implementation without external crates.
 fn time_secs_to_date(secs: i64) -> (i32, u32, u32) {
@@ -2008,6 +2162,8 @@ pub struct App {
     show_reasoning: bool,
     /// Whether live token streaming is enabled for future turns.
     streaming_enabled: bool,
+    /// Whether the status bar is visible.
+    show_status_bar: bool,
     /// Verbose mode — show tool call details
     verbose: bool,
     /// Queued prompts to run after the current one completes
@@ -2046,6 +2202,8 @@ pub struct App {
     remote_skill_browser: RemoteSkillBrowser,
     /// Session browser overlay (activated by F5 or `/session` with no args)
     session_browser: FuzzySelector<SessionBrowserEntry>,
+    /// Config center overlay (activated by `/config`)
+    config_selector: FuzzySelector<ConfigEntry>,
     /// Skin browser overlay (activated by `/skin list`)
     skin_browser: FuzzySelector<SkinEntry>,
     /// Cached skill names (without leading /) for completion suggestions
@@ -2468,6 +2626,7 @@ impl App {
             reasoning_line: None,
             show_reasoning: display_preferences.show_reasoning,
             streaming_enabled: display_preferences.streaming_enabled,
+            show_status_bar: display_preferences.show_status_bar,
             verbose: false,
             prompt_queue: Vec::new(),
             display_state: DisplayState::Idle,
@@ -2499,6 +2658,7 @@ impl App {
             skill_selector: FuzzySelector::new(),
             remote_skill_browser: RemoteSkillBrowser::new(),
             session_browser: FuzzySelector::new(),
+            config_selector: FuzzySelector::new(),
             skin_browser: FuzzySelector::new(),
             skills_completion_names: Vec::new(),
             active_skills: Vec::new(),
@@ -5133,6 +5293,35 @@ impl App {
             return;
         }
 
+        if self.config_selector.active {
+            match key.code {
+                KeyCode::Esc => {
+                    self.config_selector.active = false;
+                }
+                KeyCode::Enter => {
+                    if let Some(entry) = self.config_selector.current() {
+                        let action = entry.action;
+                        self.config_selector.active = false;
+                        self.handle_config_selector_action(action);
+                    }
+                }
+                KeyCode::Up => self.config_selector.move_up(),
+                KeyCode::Down => self.config_selector.move_down(),
+                KeyCode::PageUp => self.config_selector.page_up(),
+                KeyCode::PageDown => self.config_selector.page_down(),
+                KeyCode::Backspace => self.config_selector.pop_char(),
+                KeyCode::Char(c)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    self.config_selector.push_char(c);
+                }
+                _ => {}
+            }
+            return;
+        }
+
         // Skin browser overlay active — select with Enter to hot-reload skin
         if self.skin_browser.active {
             match key.code {
@@ -5739,6 +5928,9 @@ impl App {
             CommandResult::ShowPrompt => {
                 self.handle_show_prompt();
             }
+            CommandResult::ShowConfig(args) => {
+                self.handle_config_command(args);
+            }
             CommandResult::ShowHistory => {
                 self.handle_show_history();
             }
@@ -5786,12 +5978,6 @@ impl App {
             CommandResult::BackgroundPrompt(prompt) => {
                 self.handle_background_prompt(prompt);
             }
-            CommandResult::Approve => {
-                self.push_output("Approved. (No pending actions.)", OutputRole::System);
-            }
-            CommandResult::Deny => {
-                self.push_output("Denied. (No pending actions.)", OutputRole::System);
-            }
             CommandResult::ShowSkills(args) => {
                 self.handle_show_skills(args);
             }
@@ -5811,6 +5997,9 @@ impl App {
             }
             CommandResult::SetStreaming(mode) => {
                 self.handle_set_streaming(mode);
+            }
+            CommandResult::SetStatusBar(mode) => {
+                self.handle_status_bar_command(mode);
             }
             CommandResult::ListModels(filter) => {
                 self.handle_list_models(filter);
@@ -5845,6 +6034,9 @@ impl App {
             CommandResult::MouseMode(mode) => {
                 self.handle_mouse_mode(mode);
             }
+            CommandResult::ApprovalChoice(choice) => {
+                self.handle_approval_choice_command(choice);
+            }
             #[cfg(target_os = "macos")]
             CommandResult::MacosPermissions(args) => {
                 let report = crate::permissions::run_permissions_command(&args);
@@ -5864,6 +6056,12 @@ impl App {
             }
             CommandResult::BrowserCommand(args) => {
                 self.handle_browser_command(args);
+            }
+            CommandResult::SetHomeChannel(args) => {
+                self.handle_set_home_channel(args);
+            }
+            CommandResult::CheckUpdates => {
+                self.handle_update_status();
             }
         }
     }
@@ -5911,6 +6109,205 @@ impl App {
                 self.push_output("Usage: /mouse [on|off|toggle|status]", OutputRole::System);
             }
         }
+    }
+
+    fn apply_approval_choice(&mut self, choice: edgecrab_core::ApprovalChoice) {
+        let full_command =
+            if let DisplayState::WaitingForApproval { full_command, .. } = &self.display_state {
+                Some(full_command.clone())
+            } else {
+                None
+            };
+
+        if matches!(
+            choice,
+            edgecrab_core::ApprovalChoice::Session | edgecrab_core::ApprovalChoice::Always
+        ) {
+            if let Some(full_command) = full_command.as_deref() {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                full_command.hash(&mut hasher);
+                self.session_approvals
+                    .insert(format!("{:x}", hasher.finish()));
+            }
+        }
+
+        if let Some(tx) = self.approval_pending_tx.take() {
+            let is_deny = choice == edgecrab_core::ApprovalChoice::Deny;
+            let _ = tx.send(choice);
+            self.display_state = if is_deny {
+                DisplayState::Idle
+            } else {
+                DisplayState::AwaitingFirstToken {
+                    frame: 0,
+                    started: Instant::now(),
+                }
+            };
+            self.needs_redraw = true;
+        }
+    }
+
+    fn handle_approval_choice_command(&mut self, choice: edgecrab_core::ApprovalChoice) {
+        if self.approval_pending_tx.is_some() {
+            let text = match &choice {
+                edgecrab_core::ApprovalChoice::Once => "Approved current command once.",
+                edgecrab_core::ApprovalChoice::Session => {
+                    "Approved current command for the rest of this session."
+                }
+                edgecrab_core::ApprovalChoice::Always => "Approved current command permanently.",
+                edgecrab_core::ApprovalChoice::Deny => "Denied current command.",
+            };
+            self.apply_approval_choice(choice);
+            self.push_output(text, OutputRole::System);
+            return;
+        }
+
+        if choice == edgecrab_core::ApprovalChoice::Deny
+            && let Some(tx) = self.clarify_pending_tx.take()
+        {
+            let _ = tx.send(String::new());
+            self.display_state = DisplayState::Idle;
+            self.push_output(
+                "Cancelled the pending clarification prompt.",
+                OutputRole::System,
+            );
+            self.needs_redraw = true;
+            return;
+        }
+
+        self.push_output(
+            "No pending approval prompt. Use /deny only when EdgeCrab is explicitly waiting for approval or clarification.",
+            OutputRole::System,
+        );
+    }
+
+    fn configured_home_channel_platforms(
+        &self,
+        config: &edgecrab_core::AppConfig,
+    ) -> Vec<&'static str> {
+        let mut platforms = Vec::new();
+        if config.gateway.platform_enabled("telegram") || config.gateway.telegram.enabled {
+            platforms.push("telegram");
+        }
+        if config.gateway.platform_enabled("discord") || config.gateway.discord.enabled {
+            platforms.push("discord");
+        }
+        if config.gateway.platform_enabled("slack") || config.gateway.slack.enabled {
+            platforms.push("slack");
+        }
+        platforms
+    }
+
+    fn set_home_channel_in_config(
+        &self,
+        config: &mut edgecrab_core::AppConfig,
+        platform: &str,
+        channel: Option<String>,
+    ) -> anyhow::Result<()> {
+        match platform {
+            "telegram" => {
+                config.gateway.telegram.enabled = true;
+                config.gateway.enable_platform("telegram");
+                config.gateway.telegram.home_channel = channel;
+            }
+            "discord" => {
+                config.gateway.discord.enabled = true;
+                config.gateway.enable_platform("discord");
+                config.gateway.discord.home_channel = channel;
+            }
+            "slack" => {
+                config.gateway.slack.enabled = true;
+                config.gateway.enable_platform("slack");
+                config.gateway.slack.home_channel = channel;
+            }
+            _ => anyhow::bail!(
+                "Unsupported platform '{platform}'. Supported platforms: telegram, discord, slack"
+            ),
+        }
+        Ok(())
+    }
+
+    fn handle_set_home_channel(&mut self, args: String) {
+        let trimmed = args.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("status") {
+            let config = self.load_runtime_config();
+            self.push_output(
+                self.render_gateway_home_channel_summary(&config),
+                OutputRole::System,
+            );
+            return;
+        }
+
+        let mut parts = trimmed.split_whitespace();
+        let first = parts.next().unwrap_or_default();
+        let supported = ["telegram", "discord", "slack"];
+
+        let (platform, value) = if supported.contains(&first) {
+            let rest = parts.collect::<Vec<_>>().join(" ");
+            if rest.is_empty() {
+                self.push_output(
+                    "Usage: /sethome <platform> <channel|clear>",
+                    OutputRole::System,
+                );
+                return;
+            }
+            (first.to_string(), rest)
+        } else {
+            let config = self.load_runtime_config();
+            let enabled = self.configured_home_channel_platforms(&config);
+            if enabled.len() != 1 {
+                self.push_output(
+                    "Ambiguous home-channel target. Use: /sethome <telegram|discord|slack> <channel|clear>",
+                    OutputRole::System,
+                );
+                return;
+            }
+            (enabled[0].to_string(), trimmed.to_string())
+        };
+
+        let channel = if value.eq_ignore_ascii_case("clear") {
+            None
+        } else {
+            Some(value)
+        };
+
+        let mut config = self.load_runtime_config();
+        match self.set_home_channel_in_config(&mut config, &platform, channel.clone()) {
+            Ok(()) => match config.save() {
+                Ok(()) => {
+                    let text = match channel {
+                        Some(channel) => {
+                            format!("Home channel for {platform} set to: {channel}")
+                        }
+                        None => format!("Home channel for {platform} cleared."),
+                    };
+                    self.push_output(text, OutputRole::System);
+                }
+                Err(err) => self.push_output(
+                    format!(
+                        "Updated {platform} home channel in memory, but saving config failed: {err}"
+                    ),
+                    OutputRole::Error,
+                ),
+            },
+            Err(err) => self.push_output(err.to_string(), OutputRole::Error),
+        }
+    }
+
+    fn handle_update_status(&mut self) {
+        let tx = self.response_tx.clone();
+        self.display_state = DisplayState::BgOp {
+            label: "Checking update status…".into(),
+            frame: 0,
+            started: Instant::now(),
+        };
+        self.needs_redraw = true;
+        self.rt_handle.spawn(async move {
+            let report = tokio::task::spawn_blocking(render_update_status_report)
+                .await
+                .unwrap_or_else(|err| format!("Update check failed: {err}"));
+            let _ = tx.send(AgentResponse::BgOp(BackgroundOpResult::SystemMsg(report)));
+        });
     }
 
     fn take_mouse_capture_request(&mut self) -> Option<bool> {
@@ -6607,15 +7004,13 @@ impl App {
         const CHOICES: usize = 4; // Once / Session / Always / Deny
 
         // Extract mutable fields we need while avoiding the borrow-checker
-        let (selected, show_full, full_cmd_clone) = if let DisplayState::WaitingForApproval {
+        let (selected, show_full) = if let DisplayState::WaitingForApproval {
             ref mut selected,
             ref mut show_full,
-            ref full_command,
             ..
         } = self.display_state
         {
-            let full_cmd_clone = full_command.clone();
-            (*selected, *show_full, full_cmd_clone)
+            (*selected, *show_full)
         } else {
             return;
         };
@@ -6656,31 +7051,10 @@ impl App {
                     2 => edgecrab_core::ApprovalChoice::Always,
                     _ => edgecrab_core::ApprovalChoice::Deny,
                 };
-
-                // Cache session-level approvals so subsequent identical commands skip
-                // the dialog for the rest of this session.
-                if choice == edgecrab_core::ApprovalChoice::Session {
-                    use std::hash::{Hash, Hasher};
-                    let mut h = std::collections::hash_map::DefaultHasher::new();
-                    full_cmd_clone.hash(&mut h);
-                    let cache_key = format!("{:x}", h.finish());
-                    self.session_approvals.insert(cache_key);
-                }
-
-                if let Some(tx) = self.approval_pending_tx.take() {
-                    let _ = tx.send(choice);
-                }
-                self.display_state = DisplayState::AwaitingFirstToken {
-                    frame: 0,
-                    started: std::time::Instant::now(),
-                };
+                self.apply_approval_choice(choice);
             }
             KeyCode::Esc => {
-                // Esc = deny
-                if let Some(tx) = self.approval_pending_tx.take() {
-                    let _ = tx.send(edgecrab_core::ApprovalChoice::Deny);
-                }
-                self.display_state = DisplayState::Idle;
+                self.apply_approval_choice(edgecrab_core::ApprovalChoice::Deny);
             }
             _ => {}
         }
@@ -7248,6 +7622,323 @@ impl App {
                     OutputRole::System,
                 );
             }
+        }
+    }
+
+    fn render_config_summary(&self) -> String {
+        let config = self.load_runtime_config();
+        let voice_mode = if self.voice_mode_enabled { "on" } else { "off" };
+        let session_personality = self
+            .session_personality
+            .as_deref()
+            .unwrap_or("(config default)");
+        let session_skin = self.session_skin.as_deref().unwrap_or("(config default)");
+        let model = if self.model_name == "none" {
+            config.model.default_model.clone()
+        } else {
+            self.model_name.clone()
+        };
+        format!(
+            "EdgeCrab config summary:\n\
+             Model:           {}\n\
+             Reasoning pane:  {}\n\
+             Streaming:       {}\n\
+             Status bar:      {}\n\
+             Voice readback:  {}\n\
+             Personality:     {} (session: {})\n\
+             Skin:            {} (session: {})\n\
+             Toolsets:        {}\n\
+             Gateway host:    {}:{}\n\
+             MCP servers:     {}\n\
+             Skills preload:  {}\n\
+             \n{}",
+            model,
+            if self.show_reasoning {
+                "shown"
+            } else {
+                "hidden"
+            },
+            if self.streaming_enabled { "on" } else { "off" },
+            if self.show_status_bar {
+                "visible"
+            } else {
+                "hidden"
+            },
+            voice_mode,
+            config.display.personality,
+            session_personality,
+            config.display.skin,
+            session_skin,
+            config
+                .tools
+                .enabled_toolsets
+                .as_ref()
+                .filter(|sets| !sets.is_empty())
+                .map(|sets| sets.join(", "))
+                .unwrap_or_else(|| "(default)".into()),
+            config.gateway.host,
+            config.gateway.port,
+            config.mcp_servers.len(),
+            if config.skills.preloaded.is_empty() {
+                "(none)".into()
+            } else {
+                config.skills.preloaded.join(", ")
+            },
+            self.render_gateway_home_channel_summary(&config),
+        )
+    }
+
+    fn render_config_paths(&self) -> String {
+        let home = edgecrab_core::edgecrab_home();
+        format!(
+            "EdgeCrab paths:\n\
+             Config:      {}\n\
+             Env:         {}\n\
+             Memories:    {}\n\
+             Skills:      {}\n\
+             Sessions DB: {}\n\
+             Skins:       {}\n\
+             MCP tokens:  {}\n\
+             Images:      {}\n\
+             \nUse `edgecrab config edit` for editor-based changes or `/config` for the in-TUI control center.",
+            home.join("config.yaml").display(),
+            home.join(".env").display(),
+            home.join("memories").display(),
+            home.join("skills").display(),
+            home.join("sessions.db").display(),
+            home.join("skin.yaml").display(),
+            home.join("mcp-tokens").display(),
+            home.join("images").display(),
+        )
+    }
+
+    fn render_gateway_home_channel_summary(&self, config: &edgecrab_core::AppConfig) -> String {
+        let entries = [
+            (
+                "telegram",
+                config.gateway.platform_enabled("telegram") || config.gateway.telegram.enabled,
+                config.gateway.telegram.home_channel.as_deref(),
+            ),
+            (
+                "discord",
+                config.gateway.platform_enabled("discord") || config.gateway.discord.enabled,
+                config.gateway.discord.home_channel.as_deref(),
+            ),
+            (
+                "slack",
+                config.gateway.platform_enabled("slack") || config.gateway.slack.enabled,
+                config.gateway.slack.home_channel.as_deref(),
+            ),
+        ];
+
+        let mut lines = Vec::new();
+        for (platform, enabled, home_channel) in entries {
+            if enabled || home_channel.is_some() {
+                lines.push(format!(
+                    "  {platform:<9} {}",
+                    home_channel.unwrap_or("(not set)")
+                ));
+            }
+        }
+
+        if lines.is_empty() {
+            "Gateway homes: no supported home-channel platform is configured yet.\nSet one with: /sethome <platform> <channel>".into()
+        } else {
+            format!(
+                "Gateway homes:\n{}\nSet with: /sethome <platform> <channel>  or /sethome <channel> when exactly one supported platform is enabled.",
+                lines.join("\n")
+            )
+        }
+    }
+
+    fn build_config_entries(&self) -> Vec<ConfigEntry> {
+        let config = self.load_runtime_config();
+        vec![
+            ConfigEntry {
+                title: "Session Summary".into(),
+                detail: "Current model, display state, toolsets, gateway host, skills preload"
+                    .into(),
+                tag: "overview".into(),
+                action: ConfigAction::ShowSummary,
+            },
+            ConfigEntry {
+                title: "Paths".into(),
+                detail: "Config, env, memories, skills, sessions DB, skin and image directories"
+                    .into(),
+                tag: "files".into(),
+                action: ConfigAction::ShowPaths,
+            },
+            ConfigEntry {
+                title: format!("Model  [{}]", self.model_name),
+                detail: "Open the live model selector".into(),
+                tag: "model".into(),
+                action: ConfigAction::OpenModel,
+            },
+            ConfigEntry {
+                title: "Vision Backend".into(),
+                detail: "Inspect or switch the dedicated vision routing".into(),
+                tag: "model".into(),
+                action: ConfigAction::OpenVisionModel,
+            },
+            ConfigEntry {
+                title: "Image Backend".into(),
+                detail: "Inspect or switch the default image generation backend".into(),
+                tag: "model".into(),
+                action: ConfigAction::OpenImageModel,
+            },
+            ConfigEntry {
+                title: format!(
+                    "Streaming  [{}]",
+                    if self.streaming_enabled { "on" } else { "off" }
+                ),
+                detail: "Toggle token-by-token rendering for future turns".into(),
+                tag: "display".into(),
+                action: ConfigAction::ToggleStreaming,
+            },
+            ConfigEntry {
+                title: format!(
+                    "Reasoning Pane  [{}]",
+                    if self.show_reasoning {
+                        "shown"
+                    } else {
+                        "hidden"
+                    }
+                ),
+                detail: "Toggle visible reasoning blocks in the transcript".into(),
+                tag: "display".into(),
+                action: ConfigAction::ToggleReasoning,
+            },
+            ConfigEntry {
+                title: format!(
+                    "Status Bar  [{}]",
+                    if self.show_status_bar {
+                        "visible"
+                    } else {
+                        "hidden"
+                    }
+                ),
+                detail: "Toggle the live status strip below the transcript".into(),
+                tag: "display".into(),
+                action: ConfigAction::ToggleStatusBar,
+            },
+            ConfigEntry {
+                title: format!("Skin  [{}]", config.display.skin),
+                detail: "Browse installed skins and apply one without leaving the TUI".into(),
+                tag: "display".into(),
+                action: ConfigAction::OpenSkins,
+            },
+            ConfigEntry {
+                title: format!(
+                    "Voice  [{}]",
+                    if self.voice_mode_enabled {
+                        "readback on"
+                    } else {
+                        "readback off"
+                    }
+                ),
+                detail: "Show voice/TTS status and configuration".into(),
+                tag: "voice".into(),
+                action: ConfigAction::ShowVoice,
+            },
+            ConfigEntry {
+                title: "Gateway Home Channels".into(),
+                detail: "Review or edit Telegram, Discord, and Slack home-channel routing".into(),
+                tag: "gateway".into(),
+                action: ConfigAction::ShowGatewayHomes,
+            },
+            ConfigEntry {
+                title: "Update Status".into(),
+                detail: "Check git-based upgrade status and show actionable local guidance".into(),
+                tag: "ops".into(),
+                action: ConfigAction::ShowUpdateStatus,
+            },
+        ]
+    }
+
+    fn open_config_selector(&mut self) {
+        self.config_selector.set_items(self.build_config_entries());
+        self.config_selector.activate();
+        self.needs_redraw = true;
+    }
+
+    fn handle_config_selector_action(&mut self, action: ConfigAction) {
+        match action {
+            ConfigAction::ShowSummary => {
+                self.push_output(self.render_config_summary(), OutputRole::System);
+            }
+            ConfigAction::ShowPaths => {
+                self.push_output(self.render_config_paths(), OutputRole::System);
+            }
+            ConfigAction::OpenModel => {
+                self.refresh_model_selector_catalog();
+            }
+            ConfigAction::OpenVisionModel => {
+                self.open_vision_model_selector();
+            }
+            ConfigAction::OpenImageModel => {
+                self.open_image_model_selector();
+            }
+            ConfigAction::ToggleStreaming => {
+                self.handle_set_streaming("toggle".into());
+            }
+            ConfigAction::ToggleReasoning => {
+                let next = if self.show_reasoning { "hide" } else { "show" };
+                self.handle_set_reasoning(next.into());
+            }
+            ConfigAction::ToggleStatusBar => {
+                self.handle_status_bar_command("toggle".into());
+            }
+            ConfigAction::OpenSkins => {
+                self.open_skin_browser();
+            }
+            ConfigAction::ShowVoice => {
+                self.handle_voice_mode("status".into());
+            }
+            ConfigAction::ShowGatewayHomes => {
+                let config = self.load_runtime_config();
+                self.push_output(
+                    self.render_gateway_home_channel_summary(&config),
+                    OutputRole::System,
+                );
+            }
+            ConfigAction::ShowUpdateStatus => {
+                self.handle_update_status();
+            }
+        }
+    }
+
+    fn handle_config_command(&mut self, args: String) {
+        let normalized = args.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "" | "open" | "browse" => self.open_config_selector(),
+            "show" | "summary" | "status" => {
+                self.push_output(self.render_config_summary(), OutputRole::System);
+            }
+            "paths" | "path" => {
+                self.push_output(self.render_config_paths(), OutputRole::System);
+            }
+            "voice" => self.handle_voice_mode("status".into()),
+            "gateway" | "homes" => {
+                let config = self.load_runtime_config();
+                self.push_output(
+                    self.render_gateway_home_channel_summary(&config),
+                    OutputRole::System,
+                );
+            }
+            "update" => self.handle_update_status(),
+            "edit" => {
+                self.push_output(
+                    format!(
+                        "Edit the config file with your editor of choice:\n{}\n\nCLI shortcut: edgecrab config edit",
+                        edgecrab_core::edgecrab_home().join("config.yaml").display()
+                    ),
+                    OutputRole::System,
+                );
+            }
+            _ => self.push_output(
+                "Usage: /config [open|show|paths|voice|gateway|update|edit]",
+                OutputRole::System,
+            ),
         }
     }
 
@@ -8119,7 +8810,7 @@ impl App {
         if !enabled {
             self.remove_reasoning_output_block();
         }
-        persist_display_preferences(Some(enabled), None)
+        persist_display_preferences(Some(enabled), None, None)
     }
 
     fn set_streaming_preference(&mut self, enabled: bool) -> anyhow::Result<()> {
@@ -8129,7 +8820,13 @@ impl App {
                 agent.set_streaming(enabled).await;
             });
         }
-        persist_display_preferences(None, Some(enabled))
+        persist_display_preferences(None, Some(enabled), None)
+    }
+
+    fn set_status_bar_visibility(&mut self, enabled: bool) -> anyhow::Result<()> {
+        self.show_status_bar = enabled;
+        self.needs_redraw = true;
+        persist_display_preferences(None, None, Some(enabled))
     }
 
     fn handle_set_reasoning(&mut self, level: String) {
@@ -8229,6 +8926,45 @@ impl App {
                 }
             }
             _ => "Unknown streaming option. Use: on, off, toggle, status".into(),
+        };
+        self.push_output(msg, OutputRole::System);
+    }
+
+    fn handle_status_bar_command(&mut self, mode: String) {
+        let normalized = mode.trim().to_ascii_lowercase();
+        let msg = match normalized.as_str() {
+            "" | "status" => format!(
+                "Status bar: {}. Usage: /statusbar <on|off|toggle|status>",
+                if self.show_status_bar {
+                    "visible"
+                } else {
+                    "hidden"
+                }
+            ),
+            "on" | "show" | "enable" | "enabled" => match self.set_status_bar_visibility(true) {
+                Ok(()) => "Status bar: visible.".into(),
+                Err(err) => {
+                    format!("Status bar enabled for this session, but saving config failed: {err}")
+                }
+            },
+            "off" | "hide" | "disable" | "disabled" => {
+                match self.set_status_bar_visibility(false) {
+                    Ok(()) => "Status bar: hidden.".into(),
+                    Err(err) => format!(
+                        "Status bar disabled for this session, but saving config failed: {err}"
+                    ),
+                }
+            }
+            "toggle" => {
+                let next = !self.show_status_bar;
+                match self.set_status_bar_visibility(next) {
+                    Ok(()) => format!("Status bar: {}.", if next { "visible" } else { "hidden" }),
+                    Err(err) => format!(
+                        "Status bar changed for this session, but saving config failed: {err}"
+                    ),
+                }
+            }
+            _ => "Unknown status bar option. Use: on, off, toggle, status".into(),
         };
         self.push_output(msg, OutputRole::System);
     }
@@ -11026,9 +11762,9 @@ impl App {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Min(1),                  // output area
-                Constraint::Length(1),               // separator
-                Constraint::Length(1),               // status bar
+                Constraint::Min(1),                                           // output area
+                Constraint::Length(1),                                        // separator
+                Constraint::Length(if self.show_status_bar { 1 } else { 0 }), // status bar
                 Constraint::Length(textarea_height), // input area (dynamic height)
             ])
             .split(frame.area());
@@ -11038,7 +11774,9 @@ impl App {
         let sep = Paragraph::new(Line::from("─".repeat(chunks[1].width as usize)))
             .style(Style::default().fg(Color::Rgb(60, 60, 70)));
         frame.render_widget(sep, chunks[1]);
-        self.render_status_bar(frame, chunks[2]);
+        if self.show_status_bar {
+            self.render_status_bar(frame, chunks[2]);
+        }
         self.render_input(frame, chunks[3]);
 
         // Model selector overlay (full screen)
@@ -11072,6 +11810,10 @@ impl App {
 
         if self.remote_skill_browser.selector.active {
             self.render_remote_skill_selector(frame, frame.area());
+        }
+
+        if self.config_selector.active {
+            self.render_config_selector(frame, frame.area());
         }
 
         // Session browser overlay (full screen, same precedence as skill browser)
@@ -12650,6 +13392,183 @@ impl App {
             Style::default().fg(Color::Rgb(100, 120, 120)),
         ));
         let help = Paragraph::new(Line::from(help_spans));
+        frame.render_widget(help, chunks[2]);
+    }
+
+    fn render_config_selector(&self, frame: &mut Frame, area: Rect) {
+        frame.render_widget(Clear, area);
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ])
+            .split(area);
+        let body = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+            .split(chunks[1]);
+
+        let search_text = if self.config_selector.query.is_empty() {
+            "Type to filter settings and controls…".to_string()
+        } else {
+            self.config_selector.query.clone()
+        };
+        let search_style = if self.config_selector.query.is_empty() {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let search = Paragraph::new(Line::from(vec![
+            Span::styled("  ⚙ ", Style::default().fg(Color::Rgb(130, 210, 255))),
+            Span::styled(search_text, search_style),
+        ]))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Rgb(130, 210, 255)))
+                .title(" Config Center  [/config] "),
+        );
+        frame.render_widget(search, chunks[0]);
+
+        let filtered = &self.config_selector.filtered;
+        let selected = self.config_selector.selected;
+        let max_visible = body[0].height as usize;
+        let scroll_start = if selected >= max_visible {
+            selected - max_visible + 1
+        } else {
+            0
+        };
+
+        let items: Vec<ListItem> = if filtered.is_empty() {
+            vec![ListItem::new(Line::from(Span::styled(
+                "  No settings matched the current filter.",
+                Style::default().fg(Color::Rgb(120, 120, 135)),
+            )))]
+        } else {
+            filtered
+                .iter()
+                .skip(scroll_start)
+                .take(max_visible)
+                .enumerate()
+                .map(|(vis_idx, &entry_idx)| {
+                    let entry = &self.config_selector.items[entry_idx];
+                    let is_selected = vis_idx + scroll_start == selected;
+                    let bg = if is_selected {
+                        Color::Rgb(22, 36, 44)
+                    } else {
+                        Color::Rgb(18, 22, 28)
+                    };
+                    let tag_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(150, 180, 200))
+                    } else {
+                        Style::default().fg(Color::Rgb(105, 125, 140))
+                    };
+                    let title_style = if is_selected {
+                        Style::default()
+                            .bg(bg)
+                            .fg(Color::Rgb(130, 210, 255))
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Rgb(220, 232, 240))
+                    };
+                    let detail_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(172, 190, 204))
+                    } else {
+                        Style::default().fg(Color::Rgb(125, 140, 150))
+                    };
+                    ListItem::new(Line::from(vec![
+                        Span::styled(format!("  {:<9}", entry.tag), tag_style),
+                        Span::styled(unicode_pad_right(&entry.title, 28), title_style),
+                        Span::raw("  "),
+                        Span::styled(unicode_trunc(&entry.detail, 54), detail_style),
+                    ]))
+                })
+                .collect()
+        };
+        frame.render_widget(
+            List::new(items).style(Style::default().bg(Color::Rgb(18, 22, 28))),
+            body[0],
+        );
+
+        let mut detail_lines = Vec::new();
+        if let Some(entry) = self.config_selector.current() {
+            detail_lines.push(Line::from(Span::styled(
+                &entry.title,
+                Style::default()
+                    .fg(Color::Rgb(130, 210, 255))
+                    .add_modifier(Modifier::BOLD),
+            )));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(entry.detail.clone()));
+            detail_lines.push(Line::from(""));
+            let detail_body = match entry.action {
+                ConfigAction::ShowSummary => self.render_config_summary(),
+                ConfigAction::ShowPaths => self.render_config_paths(),
+                ConfigAction::ShowGatewayHomes => {
+                    let config = self.load_runtime_config();
+                    self.render_gateway_home_channel_summary(&config)
+                }
+                ConfigAction::ShowVoice => format!(
+                    "Voice readback is {}.\nRun `/voice status` for recorder, provider, and push-to-talk details.",
+                    if self.voice_mode_enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                ),
+                ConfigAction::ShowUpdateStatus => {
+                    "Runs the local git-based update check and prints ahead/behind guidance.".into()
+                }
+                ConfigAction::OpenModel => "Press Enter to open the model selector overlay.".into(),
+                ConfigAction::OpenVisionModel => {
+                    "Press Enter to open the dedicated vision-model selector.".into()
+                }
+                ConfigAction::OpenImageModel => {
+                    "Press Enter to open the image-model selector.".into()
+                }
+                ConfigAction::ToggleStreaming => {
+                    "Press Enter to toggle live token streaming.".into()
+                }
+                ConfigAction::ToggleReasoning => {
+                    "Press Enter to toggle visible reasoning output.".into()
+                }
+                ConfigAction::ToggleStatusBar => {
+                    "Press Enter to show or hide the status bar.".into()
+                }
+                ConfigAction::OpenSkins => {
+                    "Press Enter to browse installed skins and apply one live.".into()
+                }
+            };
+            for line in detail_body.lines().take(18) {
+                detail_lines.push(Line::from(line.to_string()));
+            }
+        }
+
+        let detail = Paragraph::new(Text::from(detail_lines))
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Rgb(64, 88, 98)))
+                    .title(" Details "),
+            );
+        frame.render_widget(detail, body[1]);
+
+        let help = Paragraph::new(Line::from(vec![
+            Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(130, 210, 255))),
+            Span::styled("browse  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Enter ", Style::default().fg(Color::Rgb(130, 210, 255))),
+            Span::styled("run action  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Esc ", Style::default().fg(Color::Rgb(130, 210, 255))),
+            Span::styled("cancel  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{} item(s)", filtered.len()),
+                Style::default().fg(Color::Rgb(100, 120, 130)),
+            ),
+        ]));
         frame.render_widget(help, chunks[2]);
     }
 
@@ -14290,6 +15209,94 @@ mod tests {
         unsafe {
             std::env::remove_var("EDGECRAB_HOME");
         }
+    }
+
+    #[test]
+    #[serial_test::serial(edgecrab_home_env)]
+    fn persist_display_preferences_round_trip_includes_status_bar() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+
+        persist_display_preferences(Some(true), Some(false), Some(false))
+            .expect("persist display prefs");
+
+        let cfg = edgecrab_core::AppConfig::load().expect("load config");
+        assert!(cfg.display.show_reasoning);
+        assert!(!cfg.display.streaming);
+        assert!(!cfg.model.streaming);
+        assert!(!cfg.display.show_status_bar);
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[tokio::test]
+    async fn approve_command_resolves_pending_overlay() {
+        let mut app = App::new();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.approval_pending_tx = Some(tx);
+        app.display_state = DisplayState::WaitingForApproval {
+            command: "rm".into(),
+            full_command: "rm -rf /tmp/demo".into(),
+            selected: 0,
+            show_full: false,
+        };
+
+        app.handle_approval_choice_command(edgecrab_core::ApprovalChoice::Session);
+
+        assert_eq!(
+            rx.await.expect("approval choice"),
+            edgecrab_core::ApprovalChoice::Session
+        );
+        assert!(matches!(
+            app.display_state,
+            DisplayState::AwaitingFirstToken { .. }
+        ));
+        assert_eq!(app.session_approvals.len(), 1);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(edgecrab_home_env)]
+    async fn sethome_updates_single_enabled_platform_without_explicit_platform_arg() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+
+        let mut cfg = edgecrab_core::AppConfig::default();
+        cfg.gateway.telegram.enabled = true;
+        cfg.gateway.enable_platform("telegram");
+        cfg.save().expect("save config");
+
+        let mut app = App::new();
+        app.handle_set_home_channel("123456".into());
+
+        let reloaded = edgecrab_core::AppConfig::load().expect("load config");
+        assert_eq!(
+            reloaded.gateway.telegram.home_channel.as_deref(),
+            Some("123456")
+        );
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[tokio::test]
+    async fn config_command_opens_overlay() {
+        let mut app = App::new();
+        app.handle_config_command(String::new());
+        assert!(app.config_selector.active);
+        assert!(!app.config_selector.filtered.is_empty());
     }
 
     #[test]
