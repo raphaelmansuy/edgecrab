@@ -61,8 +61,8 @@ use crate::markdown_render;
 use crate::mcp_support;
 use crate::theme::{SkinConfig, Theme};
 use crate::tool_display::{
-    build_subagent_event_line, build_tool_done_line, build_tool_running_line, tool_action_verb,
-    tool_icon, tool_status_preview,
+    build_subagent_event_line, build_tool_done_line, build_tool_running_line,
+    build_tool_verbose_lines, tool_action_verb, tool_icon, tool_signature, tool_status_preview,
 };
 use crate::vision_models::{
     available_vision_model_options_with_dynamic, canonical_provider, current_model_supports_vision,
@@ -70,9 +70,9 @@ use crate::vision_models::{
 };
 use edgecrab_core::{
     Agent, DiscoveryAvailability, DiscoverySource, IsolatedAgentOptions, ModelCatalog,
-    ProviderModels, discover_multiple, discover_provider_models, discovery_provider_statuses,
-    live_discovery_availability, live_discovery_providers, merge_grouped_catalog_with_dynamic,
-    normalize_discovery_provider,
+    ProviderModels, ToolProgressMode, discover_multiple, discover_provider_models,
+    discovery_provider_statuses, live_discovery_availability, live_discovery_providers,
+    merge_grouped_catalog_with_dynamic, normalize_discovery_provider,
 };
 use edgecrab_tools::registry::{ToolHandler, ToolInventoryEntry};
 use edgecrab_tools::tools::transcribe::TranscribeAudioTool;
@@ -1222,6 +1222,7 @@ fn persist_voice_preferences_to_config(
 struct DisplayPreferences {
     show_reasoning: bool,
     streaming_enabled: bool,
+    tool_progress_mode: ToolProgressMode,
     show_status_bar: bool,
 }
 
@@ -1230,6 +1231,7 @@ impl Default for DisplayPreferences {
         Self {
             show_reasoning: false,
             streaming_enabled: true,
+            tool_progress_mode: ToolProgressMode::All,
             show_status_bar: true,
         }
     }
@@ -1241,6 +1243,7 @@ fn load_display_preferences() -> DisplayPreferences {
         .map(|cfg| DisplayPreferences {
             show_reasoning: cfg.display.show_reasoning,
             streaming_enabled: cfg.model.streaming && cfg.display.streaming,
+            tool_progress_mode: cfg.display.tool_progress,
             show_status_bar: cfg.display.show_status_bar,
         })
         .unwrap_or_default()
@@ -1256,6 +1259,7 @@ fn load_voice_mode_enabled() -> bool {
 fn persist_display_preferences(
     show_reasoning: Option<bool>,
     streaming_enabled: Option<bool>,
+    tool_progress_mode: Option<ToolProgressMode>,
     show_status_bar: Option<bool>,
 ) -> anyhow::Result<()> {
     let mut config = edgecrab_core::AppConfig::load().unwrap_or_default();
@@ -1265,6 +1269,9 @@ fn persist_display_preferences(
     if let Some(enabled) = streaming_enabled {
         config.model.streaming = enabled;
         config.display.streaming = enabled;
+    }
+    if let Some(mode) = tool_progress_mode {
+        config.display.tool_progress = mode;
     }
     if let Some(enabled) = show_status_bar {
         config.display.show_status_bar = enabled;
@@ -2980,10 +2987,10 @@ pub struct App {
     show_reasoning: bool,
     /// Whether live token streaming is enabled for future turns.
     streaming_enabled: bool,
+    /// Persisted tool-progress display policy.
+    tool_progress_mode: ToolProgressMode,
     /// Whether the status bar is visible.
     show_status_bar: bool,
-    /// Verbose mode — show tool call details
-    verbose: bool,
     /// Queued prompts to run after the current one completes
     prompt_queue: Vec<String>,
     /// Display state machine (spinner animation)
@@ -3129,6 +3136,10 @@ pub struct App {
     /// out of order. Matching by `tool_call_id` avoids upgrading the wrong line
     /// when completion events race.
     pending_tool_lines: std::collections::HashMap<String, PendingToolLine>,
+    /// Tool call ids deliberately suppressed from the transcript by display policy.
+    hidden_tool_calls: HashSet<String>,
+    /// Signatures already rendered in the current turn for `tool_progress: new`.
+    seen_tool_signatures: HashSet<String>,
     /// Active local microphone recording session for push-to-talk voice input.
     voice_recording: Option<VoiceRecordingSession>,
     /// Configured push-to-talk key binding loaded from config.yaml.
@@ -3482,8 +3493,8 @@ impl App {
             reasoning_line: None,
             show_reasoning: display_preferences.show_reasoning,
             streaming_enabled: display_preferences.streaming_enabled,
+            tool_progress_mode: display_preferences.tool_progress_mode,
             show_status_bar: display_preferences.show_status_bar,
-            verbose: false,
             prompt_queue: Vec::new(),
             display_state: DisplayState::Idle,
             completion: CompletionState {
@@ -3552,6 +3563,8 @@ impl App {
             in_flight_tool_count: 0,
             turn_stream_tokens: 0,
             pending_tool_lines: std::collections::HashMap::new(),
+            hidden_tool_calls: HashSet::new(),
+            seen_tool_signatures: HashSet::new(),
             voice_recording: None,
             voice_push_to_talk_key: runtime_config.voice.push_to_talk_key,
             voice_input_device: runtime_config.voice.input_device,
@@ -3701,6 +3714,8 @@ impl App {
         self.streaming_line = None;
         self.reasoning_line = None;
         self.pending_tool_lines.clear();
+        self.hidden_tool_calls.clear();
+        self.seen_tool_signatures.clear();
         // Request a full terminal repaint.  ratatui's diff-based renderer
         // normally skips unchanged cells; if any out-of-band bytes reached the
         // alternate screen (e.g. tracing::warn! from a background task) those
@@ -6065,7 +6080,7 @@ impl App {
                 self.process_input("/retry");
                 return;
             }
-            // F10 — toggle verbose mode
+            // F10 - cycle tool progress mode
             (_, KeyCode::F(10)) => {
                 self.process_input("/verbose");
                 return;
@@ -7198,6 +7213,8 @@ impl App {
         self.in_flight_tool_count = 0;
         self.active_subagents.clear();
         self.turn_stream_tokens = 0;
+        self.hidden_tool_calls.clear();
+        self.seen_tool_signatures.clear();
         // Reset the response accumulator for the new turn (voice mode uses it).
         self.last_agent_response_text.clear();
         self.display_state = DisplayState::AwaitingFirstToken {
@@ -7617,9 +7634,8 @@ impl App {
                 self.handle_show_history();
             }
             CommandResult::ToggleVerbose => {
-                self.verbose = !self.verbose;
-                let state = if self.verbose { "ON" } else { "OFF" };
-                self.push_output(format!("Verbose mode: {state}"), OutputRole::System);
+                let msg = self.cycle_tool_progress_mode();
+                self.push_output(msg, OutputRole::System);
             }
             CommandResult::SaveSession(path) => {
                 self.handle_save_session(path);
@@ -8119,34 +8135,42 @@ impl App {
                         frame: 0,
                         started: Instant::now(),
                     };
-                    // Push a live "in-flight" placeholder line to the output area.
-                    //
-                    // WHY immediately: Long tool operations (web fetch, terminal,
-                    // delegate) can take 10-60 s.  Without this placeholder the
-                    // output area appears frozen — only the status-bar spinner
-                    // moves.  The placeholder gives the user a place in the
-                    // scrollable transcript to see that work is happening, and
-                    // ToolDone later upgrades it in-place with timing/result
-                    // info (no layout shift).
-                    let edit_snapshot = capture_local_edit_snapshot(&name, &args_json);
-                    let running_spans =
-                        build_tool_running_line(&name, &args_json, None, &self.theme.tool_emojis);
-                    let line_idx = self.output.len();
-                    self.output.push(OutputLine {
-                        text: String::new(),
-                        role: OutputRole::Tool,
-                        prebuilt_spans: Some(running_spans),
-                        rendered: None,
-                    });
-                    self.pending_tool_lines.insert(
-                        tool_call_id,
-                        PendingToolLine {
-                            tool_name: name,
-                            args_json,
-                            line_idx,
-                            edit_snapshot,
-                        },
-                    );
+                    if self.should_render_tool_call(&name, &args_json) {
+                        // Push a live "in-flight" placeholder line to the output area.
+                        //
+                        // WHY immediately: Long tool operations (web fetch, terminal,
+                        // delegate) can take 10-60 s.  Without this placeholder the
+                        // output area appears frozen — only the status-bar spinner
+                        // moves.  The placeholder gives the user a place in the
+                        // scrollable transcript to see that work is happening, and
+                        // ToolDone later upgrades it in-place with timing/result
+                        // info (no layout shift).
+                        let edit_snapshot = capture_local_edit_snapshot(&name, &args_json);
+                        let running_spans = build_tool_running_line(
+                            &name,
+                            &args_json,
+                            None,
+                            &self.theme.tool_emojis,
+                        );
+                        let line_idx = self.output.len();
+                        self.output.push(OutputLine {
+                            text: String::new(),
+                            role: OutputRole::Tool,
+                            prebuilt_spans: Some(running_spans),
+                            rendered: None,
+                        });
+                        self.pending_tool_lines.insert(
+                            tool_call_id,
+                            PendingToolLine {
+                                tool_name: name,
+                                args_json,
+                                line_idx,
+                                edit_snapshot,
+                            },
+                        );
+                    } else {
+                        self.hidden_tool_calls.insert(tool_call_id);
+                    }
                     if self.at_bottom {
                         self.scroll_offset = 0;
                     }
@@ -8170,6 +8194,13 @@ impl App {
                         if active_tool_call_id == &tool_call_id {
                             *active_detail = Some(detail.clone());
                         }
+                    }
+                    if self.hidden_tool_calls.contains(&tool_call_id) {
+                        if self.at_bottom {
+                            self.scroll_offset = 0;
+                        }
+                        self.needs_redraw = true;
+                        continue;
                     }
                     if let Some(PendingToolLine {
                         line_idx,
@@ -8206,45 +8237,58 @@ impl App {
                     duration_ms,
                     is_error,
                 } => {
+                    let hidden = self.hidden_tool_calls.remove(&tool_call_id);
                     // Build the final styled completion spans.
-                    let spans = build_tool_done_line(
-                        &name,
-                        &args_json,
-                        result_preview.as_deref(),
-                        duration_ms,
-                        is_error,
-                        &self.theme.tool_emojis,
-                    );
-                    // Upgrade the in-flight placeholder in-place (if present).
-                    //
-                    // WHY in-place: replacing the placeholder avoids appending a
-                    // second line for the same tool call — the layout stays stable
-                    // (no shift), and the cyan "···" naturally becomes the gold
-                    // timing string without any visual flash.
                     let pending = self.pending_tool_lines.remove(&tool_call_id);
-                    if let Some(PendingToolLine { line_idx, .. }) = pending.as_ref() {
-                        if *line_idx < self.output.len() {
-                            self.output[*line_idx].prebuilt_spans = Some(spans);
-                            self.output[*line_idx].rendered = None; // invalidate cache
+                    if !hidden {
+                        let spans = build_tool_done_line(
+                            &name,
+                            &args_json,
+                            result_preview.as_deref(),
+                            duration_ms,
+                            is_error,
+                            &self.theme.tool_emojis,
+                        );
+                        // Upgrade the in-flight placeholder in-place (if present).
+                        //
+                        // WHY in-place: replacing the placeholder avoids appending a
+                        // second line for the same tool call — the layout stays stable
+                        // (no shift), and the cyan "···" naturally becomes the gold
+                        // timing string without any visual flash.
+                        if let Some(PendingToolLine { line_idx, .. }) = pending.as_ref() {
+                            if *line_idx < self.output.len() {
+                                self.output[*line_idx].prebuilt_spans = Some(spans);
+                                self.output[*line_idx].rendered = None; // invalidate cache
+                            } else {
+                                // Index out of range — fall back to append (shouldn't happen).
+                                self.push_output_spans(spans, OutputRole::Tool);
+                            }
                         } else {
-                            // Index out of range — fall back to append (shouldn't happen).
+                            // No pending placeholder (e.g. streaming disabled, or the
+                            // tool fired before the feature was introduced) — append.
                             self.push_output_spans(spans, OutputRole::Tool);
                         }
-                    } else {
-                        // No pending placeholder (e.g. streaming disabled, or the
-                        // tool fired before the feature was introduced) — append.
-                        self.push_output_spans(spans, OutputRole::Tool);
-                    }
-                    if let Some(diff_lines) = render_edit_diff_lines(
-                        &name,
-                        &args_json,
-                        is_error,
-                        pending
-                            .as_ref()
-                            .and_then(|entry| entry.edit_snapshot.as_ref()),
-                    ) {
-                        for line in diff_lines {
-                            self.push_output_spans(line, OutputRole::Tool);
+                        if self.tool_progress_mode == ToolProgressMode::Verbose {
+                            for line in build_tool_verbose_lines(
+                                &name,
+                                &args_json,
+                                result_preview.as_deref(),
+                                is_error,
+                            ) {
+                                self.push_output_spans(line, OutputRole::Tool);
+                            }
+                        }
+                        if let Some(diff_lines) = render_edit_diff_lines(
+                            &name,
+                            &args_json,
+                            is_error,
+                            pending
+                                .as_ref()
+                                .and_then(|entry| entry.edit_snapshot.as_ref()),
+                        ) {
+                            for line in diff_lines {
+                                self.push_output_spans(line, OutputRole::Tool);
+                            }
                         }
                     }
                     // Decrement the in-flight counter. Only transition back to
@@ -8394,6 +8438,8 @@ impl App {
                     self.active_subagents.clear();
                     self.turn_stream_tokens = 0;
                     self.pending_tool_lines.clear();
+                    self.hidden_tool_calls.clear();
+                    self.seen_tool_signatures.clear();
                     self.display_state = DisplayState::Idle;
                     self.last_response_time = Some(Instant::now());
                     self.turn_count += 1;
@@ -8428,6 +8474,8 @@ impl App {
                     self.active_subagents.clear();
                     self.turn_stream_tokens = 0;
                     self.pending_tool_lines.clear();
+                    self.hidden_tool_calls.clear();
+                    self.seen_tool_signatures.clear();
                     self.display_state = DisplayState::Idle;
                     self.push_output(err, OutputRole::Error);
                     if self.voice_continuous_active {
@@ -10352,6 +10400,7 @@ impl App {
              MoA refs:        {}\n\
              Reasoning pane:  {}\n\
              Streaming:       {}\n\
+             Tool progress:   {}\n\
              Status bar:      {}\n\
              Voice readback:  {}\n\
              Personality:     {} (session: {})\n\
@@ -10378,6 +10427,7 @@ impl App {
                 "hidden"
             },
             if self.streaming_enabled { "on" } else { "off" },
+            self.tool_progress_mode.label(),
             if self.show_status_bar {
                 "visible"
             } else {
@@ -11876,7 +11926,7 @@ impl App {
         if !enabled {
             self.remove_reasoning_output_block();
         }
-        persist_display_preferences(Some(enabled), None, None)
+        persist_display_preferences(Some(enabled), None, None, None)
     }
 
     fn set_streaming_preference(&mut self, enabled: bool) -> anyhow::Result<()> {
@@ -11886,13 +11936,44 @@ impl App {
                 agent.set_streaming(enabled).await;
             });
         }
-        persist_display_preferences(None, Some(enabled), None)
+        persist_display_preferences(None, Some(enabled), None, None)
+    }
+
+    fn set_tool_progress_mode(&mut self, mode: ToolProgressMode) -> anyhow::Result<()> {
+        self.tool_progress_mode = mode;
+        persist_display_preferences(None, None, Some(mode), None)
     }
 
     fn set_status_bar_visibility(&mut self, enabled: bool) -> anyhow::Result<()> {
         self.show_status_bar = enabled;
         self.needs_redraw = true;
-        persist_display_preferences(None, None, Some(enabled))
+        persist_display_preferences(None, None, None, Some(enabled))
+    }
+
+    fn should_render_tool_call(&mut self, tool_name: &str, args_json: &str) -> bool {
+        match self.tool_progress_mode {
+            ToolProgressMode::Off => false,
+            ToolProgressMode::All | ToolProgressMode::Verbose => true,
+            ToolProgressMode::New => {
+                let signature = tool_signature(tool_name, args_json);
+                self.seen_tool_signatures.insert(signature)
+            }
+        }
+    }
+
+    fn cycle_tool_progress_mode(&mut self) -> String {
+        let next = self.tool_progress_mode.cycle();
+        let save_note = match self.set_tool_progress_mode(next) {
+            Ok(()) => String::new(),
+            Err(err) => format!(" Saving config failed: {err}"),
+        };
+        let detail = match next {
+            ToolProgressMode::Off => "silent transcript; status bar still shows active work.",
+            ToolProgressMode::New => "show each distinct tool call once per turn.",
+            ToolProgressMode::All => "show every tool call in the transcript.",
+            ToolProgressMode::Verbose => "show every tool call plus arg/result detail lines.",
+        };
+        format!("Tool progress: {} - {detail}{save_note}", next.label())
     }
 
     fn handle_set_reasoning(&mut self, level: String) {
@@ -19186,7 +19267,8 @@ mod tests {
         };
         let text = background_progress_text(2, &event).expect("progress text");
         assert!(text.contains("bg#2"));
-        assert!(text.contains("terminal"));
+        assert!(text.contains("$"));
+        assert!(text.contains("cargo test -p edgecrab-core"));
     }
 
     #[test]
@@ -20521,7 +20603,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial(edgecrab_home_env)]
-    fn persist_display_preferences_round_trip_includes_status_bar() {
+    fn persist_display_preferences_round_trip_includes_tool_progress_and_status_bar() {
         let _guard = crate::gateway_catalog::TEST_ENV_LOCK
             .lock()
             .expect("env lock");
@@ -20530,13 +20612,19 @@ mod tests {
             std::env::set_var("EDGECRAB_HOME", dir.path());
         }
 
-        persist_display_preferences(Some(true), Some(false), Some(false))
-            .expect("persist display prefs");
+        persist_display_preferences(
+            Some(true),
+            Some(false),
+            Some(ToolProgressMode::Verbose),
+            Some(false),
+        )
+        .expect("persist display prefs");
 
         let cfg = edgecrab_core::AppConfig::load().expect("load config");
         assert!(cfg.display.show_reasoning);
         assert!(!cfg.display.streaming);
         assert!(!cfg.model.streaming);
+        assert_eq!(cfg.display.tool_progress, ToolProgressMode::Verbose);
         assert!(!cfg.display.show_status_bar);
 
         unsafe {
@@ -21179,13 +21267,11 @@ mod tests {
         assert_eq!(app.output.len(), 2);
         let first = line_spans_text(&app.output[0]);
         let second = line_spans_text(&app.output[1]);
-        assert!(
-            first.contains("read file"),
-            "unexpected first line: {first}"
-        );
+        assert!(first.contains("read"), "unexpected first line: {first}");
         assert!(first.contains("···"), "unexpected first line: {first}");
+        assert!(second.contains("$"), "unexpected second line: {second}");
         assert!(
-            second.contains("terminal"),
+            second.contains("echo hi"),
             "unexpected second line: {second}"
         );
         assert!(second.contains("12ms"), "unexpected second line: {second}");
@@ -21221,6 +21307,125 @@ mod tests {
                 );
             }
             other => panic!("expected ToolExec state, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_progress_off_hides_transcript_lines() {
+        let mut app = App::new();
+        app.tool_progress_mode = ToolProgressMode::Off;
+        app.response_tx
+            .send(AgentResponse::ToolExec {
+                tool_call_id: "call_hidden".into(),
+                name: "read_file".into(),
+                args_json: r#"{"path":"src/main.rs"}"#.into(),
+            })
+            .expect("send tool exec");
+        app.response_tx
+            .send(AgentResponse::ToolDone {
+                tool_call_id: "call_hidden".into(),
+                name: "read_file".into(),
+                args_json: r#"{"path":"src/main.rs"}"#.into(),
+                result_preview: Some("loaded".into()),
+                duration_ms: 8,
+                is_error: false,
+            })
+            .expect("send tool done");
+        app.check_responses();
+
+        assert!(
+            app.output.is_empty(),
+            "unexpected output: {:?}",
+            app.output.len()
+        );
+        assert!(app.pending_tool_lines.is_empty());
+        assert!(app.hidden_tool_calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn tool_progress_new_suppresses_repeated_signatures() {
+        let mut app = App::new();
+        app.tool_progress_mode = ToolProgressMode::New;
+        for tool_call_id in ["call_1", "call_2"] {
+            app.response_tx
+                .send(AgentResponse::ToolExec {
+                    tool_call_id: tool_call_id.into(),
+                    name: "read_file".into(),
+                    args_json: r#"{"path":"src/main.rs"}"#.into(),
+                })
+                .expect("send tool exec");
+            app.response_tx
+                .send(AgentResponse::ToolDone {
+                    tool_call_id: tool_call_id.into(),
+                    name: "read_file".into(),
+                    args_json: r#"{"path":"src/main.rs"}"#.into(),
+                    result_preview: Some("loaded".into()),
+                    duration_ms: 5,
+                    is_error: false,
+                })
+                .expect("send tool done");
+        }
+        app.check_responses();
+
+        assert_eq!(app.output.len(), 1);
+        let rendered = line_spans_text(&app.output[0]);
+        assert!(
+            rendered.contains("src/main.rs"),
+            "unexpected line: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_progress_verbose_adds_detail_lines() {
+        let mut app = App::new();
+        app.tool_progress_mode = ToolProgressMode::Verbose;
+        app.response_tx
+            .send(AgentResponse::ToolExec {
+                tool_call_id: "call_verbose".into(),
+                name: "terminal".into(),
+                args_json: r#"{"command":"cargo test -p edgecrab-cli"}"#.into(),
+            })
+            .expect("send tool exec");
+        app.response_tx
+            .send(AgentResponse::ToolDone {
+                tool_call_id: "call_verbose".into(),
+                name: "terminal".into(),
+                args_json: r#"{"command":"cargo test -p edgecrab-cli"}"#.into(),
+                result_preview: Some("test result: ok".into()),
+                duration_ms: 42,
+                is_error: false,
+            })
+            .expect("send tool done");
+        app.check_responses();
+
+        assert_eq!(app.output.len(), 3);
+        assert!(line_spans_text(&app.output[1]).contains("args"));
+        assert!(line_spans_text(&app.output[2]).contains("test result: ok"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(edgecrab_home_env)]
+    async fn cycle_tool_progress_mode_follows_hermes_order() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+        let mut app = App::new();
+        app.tool_progress_mode = ToolProgressMode::Off;
+        assert!(app.cycle_tool_progress_mode().contains("NEW"));
+        assert_eq!(app.tool_progress_mode, ToolProgressMode::New);
+        assert!(app.cycle_tool_progress_mode().contains("ALL"));
+        assert_eq!(app.tool_progress_mode, ToolProgressMode::All);
+        assert!(app.cycle_tool_progress_mode().contains("VERBOSE"));
+        assert_eq!(app.tool_progress_mode, ToolProgressMode::Verbose);
+        assert!(app.cycle_tool_progress_mode().contains("OFF"));
+        assert_eq!(app.tool_progress_mode, ToolProgressMode::Off);
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
         }
     }
 

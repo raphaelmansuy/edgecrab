@@ -25,8 +25,8 @@ pub use agent::{
 };
 pub use compression::{PRUNED_TOOL_PLACEHOLDER, SUMMARY_PREFIX};
 pub use config::{
-    AppConfig, CliOverrides, SmartRoutingYaml, edgecrab_home, ensure_edgecrab_home,
-    gateway_image_cache_dir, gateway_media_dir,
+    AppConfig, CliOverrides, SmartRoutingYaml, ToolProgressMode, edgecrab_home,
+    ensure_edgecrab_home, gateway_image_cache_dir, gateway_media_dir,
 };
 pub use context_references::{ContextRef, ExpansionResult, expand_context_refs};
 pub use model_catalog::{

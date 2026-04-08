@@ -46,6 +46,18 @@ fn unicode_trunc(s: &str, max_cols: usize) -> String {
     out
 }
 
+fn oneline(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn parse_args_json(args_json: &str) -> Option<serde_json::Value> {
+    serde_json::from_str(args_json).ok()
+}
+
+fn args_object(args_json: &str) -> Option<serde_json::Map<String, serde_json::Value>> {
+    parse_args_json(args_json)?.as_object().cloned()
+}
+
 // ── tool_emoji ───────────────────────────────────────────────────────────────
 
 /// Map a tool name to a display emoji using keyword pattern matching.
@@ -150,7 +162,7 @@ fn json_value_preview(val: &serde_json::Value) -> Option<String> {
 ///  1. Try keys in a priority order that covers the most "meaningful" args.
 ///  2. Show `key: value` so the display is self-documenting for any tool.
 ///  3. Fall back to the first non-trivial key-value pair in the object.
-pub fn extract_tool_preview(_tool_name: &str, args_json: &str) -> String {
+fn extract_generic_preview(obj: &serde_json::Map<String, serde_json::Value>) -> String {
     const PRIORITY: &[&str] = &[
         "query",
         "url",
@@ -184,13 +196,6 @@ pub fn extract_tool_preview(_tool_name: &str, args_json: &str) -> String {
         "output_format",
     ];
 
-    let args: serde_json::Value =
-        serde_json::from_str(args_json).unwrap_or(serde_json::Value::Null);
-    let obj = match args.as_object() {
-        Some(o) => o,
-        None => return String::new(),
-    };
-
     for &key in PRIORITY {
         if let Some(val) = obj.get(key) {
             if let Some(preview) = json_value_preview(val) {
@@ -209,6 +214,259 @@ pub fn extract_tool_preview(_tool_name: &str, args_json: &str) -> String {
     }
 
     String::new()
+}
+
+pub fn tool_label(tool_name: &str) -> String {
+    match tool_name {
+        "web_search" => "search".into(),
+        "web_extract" => "fetch".into(),
+        "web_crawl" => "crawl".into(),
+        "terminal" => "$".into(),
+        "process" => "proc".into(),
+        "read_file" => "read".into(),
+        "write_file" => "write".into(),
+        "patch" | "apply_patch" => "patch".into(),
+        "search_files" => "grep".into(),
+        "browser_navigate" => "navigate".into(),
+        "browser_snapshot" => "snapshot".into(),
+        "browser_click" => "click".into(),
+        "browser_type" => "type".into(),
+        "browser_scroll" => "scroll".into(),
+        "browser_back" => "back".into(),
+        "browser_press" => "press".into(),
+        "browser_get_images" => "images".into(),
+        "browser_vision" => "vision".into(),
+        "todo" => "plan".into(),
+        "session_search" => "recall".into(),
+        "memory" => "memory".into(),
+        "skills_list" => "skills".into(),
+        "skill_view" => "skill".into(),
+        "image_generate" => "create".into(),
+        "text_to_speech" => "speak".into(),
+        "vision_analyze" => "vision".into(),
+        "mixture_of_agents" | "moa" => "reason".into(),
+        "send_message" => "send".into(),
+        "cronjob" | "cron" => "cron".into(),
+        "execute_code" => "exec".into(),
+        "delegate_task" => "delegate".into(),
+        _ => tool_name.replace('_', " "),
+    }
+}
+
+pub fn extract_tool_preview(tool_name: &str, args_json: &str) -> String {
+    let Some(obj) = args_object(args_json) else {
+        return String::new();
+    };
+
+    let preview = match tool_name {
+        "web_search" => obj.get("query").and_then(|v| v.as_str()).map(oneline),
+        "web_extract" => obj.get("urls").and_then(|v| match v {
+            serde_json::Value::Array(urls) if !urls.is_empty() => {
+                let first = urls.first()?.as_str()?;
+                let domain = first
+                    .trim()
+                    .trim_start_matches("https://")
+                    .trim_start_matches("http://")
+                    .split('/')
+                    .next()
+                    .unwrap_or(first);
+                Some(if urls.len() > 1 {
+                    format!("{domain} +{}", urls.len() - 1)
+                } else {
+                    domain.to_string()
+                })
+            }
+            serde_json::Value::String(url) if !url.is_empty() => Some(
+                url.trim()
+                    .trim_start_matches("https://")
+                    .trim_start_matches("http://")
+                    .split('/')
+                    .next()
+                    .unwrap_or(url)
+                    .to_string(),
+            ),
+            _ => None,
+        }),
+        "web_crawl" | "browser_navigate" => obj.get("url").and_then(|v| v.as_str()).map(|url| {
+            url.trim()
+                .trim_start_matches("https://")
+                .trim_start_matches("http://")
+                .split('/')
+                .next()
+                .unwrap_or(url)
+                .to_string()
+        }),
+        "terminal" => obj.get("command").and_then(|v| v.as_str()).map(oneline),
+        "process" => {
+            let action = obj
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let sid = obj
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .map(|s| edgecrab_core::safe_truncate(s, 12).to_string())
+                .unwrap_or_default();
+            let detail = match action {
+                "list" => "list".to_string(),
+                "poll" | "log" | "wait" | "kill" | "write" | "submit" if !sid.is_empty() => {
+                    format!("{action} {sid}")
+                }
+                _ if !action.is_empty() => action.to_string(),
+                _ => String::new(),
+            };
+            (!detail.is_empty()).then_some(detail)
+        }
+        "todo" => match obj.get("todos") {
+            None => Some("read task list".into()),
+            Some(serde_json::Value::Array(items)) => Some(
+                if obj.get("merge").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    format!("update {} task(s)", items.len())
+                } else {
+                    format!("{} task(s)", items.len())
+                },
+            ),
+            _ => None,
+        },
+        "session_search" => obj
+            .get("query")
+            .and_then(|v| v.as_str())
+            .map(|q| format!("\"{}\"", oneline(q))),
+        "memory" => {
+            let action = obj
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let target = obj
+                .get("target")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            match action {
+                "add" => obj
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .map(|content| format!("+{target}: \"{}\"", oneline(content))),
+                "replace" | "remove" => {
+                    obj.get("old_text").and_then(|v| v.as_str()).map(|content| {
+                        format!(
+                            "{}{}: \"{}\"",
+                            if action == "replace" { "~" } else { "-" },
+                            target,
+                            oneline(content)
+                        )
+                    })
+                }
+                _ if !action.is_empty() => Some(action.to_string()),
+                _ => None,
+            }
+        }
+        "send_message" => {
+            let target = obj.get("target").and_then(|v| v.as_str()).unwrap_or("?");
+            obj.get("message")
+                .and_then(|v| v.as_str())
+                .map(|msg| format!("{target}: \"{}\"", oneline(msg)))
+        }
+        "cronjob" | "cron" => {
+            let action = obj
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            if action == "create" {
+                obj.get("name")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| obj.get("prompt").and_then(|v| v.as_str()))
+                    .map(oneline)
+            } else if !action.is_empty() {
+                Some(action.to_string())
+            } else {
+                None
+            }
+        }
+        "execute_code" => obj
+            .get("code")
+            .and_then(|v| v.as_str())
+            .map(|code| oneline(code.lines().next().unwrap_or_default())),
+        "delegate_task" => match obj.get("tasks") {
+            Some(serde_json::Value::Array(tasks)) => {
+                Some(format!("{} parallel task(s)", tasks.len()))
+            }
+            _ => obj.get("goal").and_then(|v| v.as_str()).map(oneline),
+        },
+        _ => None,
+    };
+
+    preview
+        .filter(|text| !text.trim().is_empty())
+        .map(|text| unicode_trunc(&text, 44))
+        .unwrap_or_else(|| extract_generic_preview(&obj))
+}
+
+pub fn tool_signature(tool_name: &str, args_json: &str) -> String {
+    let preview = extract_tool_preview(tool_name, args_json);
+    if preview.is_empty() {
+        tool_name.to_ascii_lowercase()
+    } else {
+        format!("{}::{preview}", tool_name.to_ascii_lowercase())
+    }
+}
+
+pub fn build_tool_verbose_lines(
+    tool_name: &str,
+    args_json: &str,
+    result_preview: Option<&str>,
+    is_error: bool,
+) -> Vec<Vec<Span<'static>>> {
+    let mut lines = Vec::new();
+    let label = tool_label(tool_name);
+    let args_line = unicode_trunc(&format!("args  {args_json}"), 108);
+    lines.push(vec![
+        Span::styled(
+            "     ",
+            Style::default()
+                .fg(Color::Rgb(52, 56, 66))
+                .add_modifier(Modifier::DIM),
+        ),
+        Span::styled(
+            unicode_pad_right(&label, 9),
+            Style::default()
+                .fg(Color::Rgb(108, 118, 138))
+                .add_modifier(Modifier::DIM),
+        ),
+        Span::styled(
+            args_line,
+            Style::default()
+                .fg(Color::Rgb(120, 132, 152))
+                .add_modifier(Modifier::DIM),
+        ),
+    ]);
+    if let Some(result) = result_preview
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        lines.push(vec![
+            Span::styled(
+                "     ",
+                Style::default()
+                    .fg(Color::Rgb(52, 56, 66))
+                    .add_modifier(Modifier::DIM),
+            ),
+            Span::styled(
+                unicode_pad_right("result", 9),
+                Style::default()
+                    .fg(Color::Rgb(108, 118, 138))
+                    .add_modifier(Modifier::DIM),
+            ),
+            Span::styled(
+                unicode_trunc(result, 108),
+                if is_error {
+                    Style::default().fg(Color::Rgb(235, 170, 170))
+                } else {
+                    Style::default().fg(Color::Rgb(148, 198, 164))
+                },
+            ),
+        ]);
+    }
+    lines
 }
 
 // ── Span builders ─────────────────────────────────────────────────────────────
@@ -243,8 +501,8 @@ pub fn build_tool_done_line(
             .unwrap_or_else(|| tool_emoji(tool_name))
     };
 
-    let display_name = tool_name.replace('_', " ");
-    let name_padded = unicode_pad_right(&display_name, 18);
+    let label = tool_label(tool_name);
+    let name_padded = unicode_pad_right(&label, 18);
 
     let preview_part = if preview.is_empty() {
         String::new()
@@ -307,8 +565,8 @@ pub fn build_tool_running_line(
         .get(tool_name)
         .map(|s| s.as_str())
         .unwrap_or_else(|| tool_emoji(tool_name));
-    let display_name = tool_name.replace('_', " ");
-    let name_padded = unicode_pad_right(&display_name, 18);
+    let label = tool_label(tool_name);
+    let name_padded = unicode_pad_right(&label, 18);
     let preview_part = if preview.is_empty() {
         String::new()
     } else {
@@ -486,7 +744,7 @@ pub fn tool_icon(name: &str) -> &'static str {
 /// Short preview for the live status bar during tool execution.
 /// Format: `tool name · key: value` (single line, truncated).
 pub fn tool_status_preview(tool_name: &str, args_json: &str) -> String {
-    let display_name = tool_name.replace('_', " ");
+    let display_name = tool_label(tool_name);
     let preview = extract_tool_preview(tool_name, args_json);
     let full = if preview.is_empty() {
         display_name
@@ -515,6 +773,20 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_tool_preview_uses_specialized_terminal_summary() {
+        let preview =
+            extract_tool_preview("terminal", r#"{"command":"cargo test -p edgecrab-cli"}"#);
+        assert_eq!(preview, "cargo test -p edgecrab-cli");
+    }
+
+    #[test]
+    fn test_tool_signature_tracks_preview_not_raw_json_order() {
+        let left = tool_signature("read_file", r#"{"path":"src/main.rs","offset":0}"#);
+        let right = tool_signature("read_file", r#"{"offset":25,"path":"src/main.rs"}"#);
+        assert_eq!(left, right);
+    }
+
+    #[test]
     fn test_tool_emoji_search_variants() {
         assert_eq!(tool_emoji("grep_files"), "🔍");
         assert_eq!(tool_emoji("find_in_dir"), "🔍");
@@ -533,8 +805,8 @@ mod tests {
         let args = r#"{"query": "rust async", "verbose": true}"#;
         let preview = extract_tool_preview("web_search", args);
         assert!(
-            preview.contains("query:"),
-            "expected 'query:' in '{preview}'"
+            !preview.contains("query:"),
+            "expected concise preview in '{preview}'"
         );
         assert!(
             preview.contains("rust async"),
@@ -591,7 +863,7 @@ mod tests {
     fn test_tool_status_preview_format() {
         let args = r#"{"query": "hello"}"#;
         let preview = tool_status_preview("web_search", args);
-        assert!(preview.contains("web search"), "should contain human name");
+        assert!(preview.contains("search"), "should contain tool label");
         assert!(preview.contains("hello"), "should contain query value");
     }
 

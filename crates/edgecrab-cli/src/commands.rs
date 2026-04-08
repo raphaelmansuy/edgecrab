@@ -112,7 +112,7 @@ pub enum CommandResult {
     ShowConfig(String),
     /// Show message history summary
     ShowHistory,
-    /// Toggle verbose tool output
+    /// Cycle tool progress display
     ToggleVerbose,
     /// Save session to a JSON file (optional path)
     SaveSession(Option<String>),
@@ -686,7 +686,7 @@ impl CommandRegistry {
         self.register(Command {
             name: "verbose",
             aliases: &["v"],
-            description: "Toggle verbose tool output display",
+            description: "Cycle tool progress: off -> new -> all -> verbose",
             handler: |_| CommandResult::ToggleVerbose,
         });
 
@@ -1166,7 +1166,7 @@ fn help_text() -> String {
          Config:\n\
            /config               — Open config center or inspect config\n\
            /prompt               — Show the current system prompt\n\
-           /verbose              — Toggle verbose tool output\n\
+           /verbose              — Cycle tool progress display\n\
            /personality [name]   — Show or switch personality preset\n\
            /statusbar [mode]     — Show or set status bar visibility\n\
          \n\

@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use edgecrab_tools::tools::backends::{
     BackendKind, DaytonaBackendConfig, DockerBackendConfig, ModalBackendConfig,
@@ -1337,6 +1337,7 @@ pub struct DisplayConfig {
     pub personality: String,
     pub show_reasoning: bool,
     pub streaming: bool,
+    pub tool_progress: ToolProgressMode,
     pub show_status_bar: bool,
     pub show_cost: bool,
     pub skin: String,
@@ -1349,9 +1350,69 @@ impl Default for DisplayConfig {
             personality: "default".into(),
             show_reasoning: false,
             streaming: true,
+            tool_progress: ToolProgressMode::All,
             show_status_bar: true,
             show_cost: true,
             skin: "default".into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolProgressMode {
+    Off,
+    New,
+    #[default]
+    All,
+    Verbose,
+}
+
+impl ToolProgressMode {
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::Off => Self::New,
+            Self::New => Self::All,
+            Self::All => Self::Verbose,
+            Self::Verbose => Self::Off,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "OFF",
+            Self::New => "NEW",
+            Self::All => "ALL",
+            Self::Verbose => "VERBOSE",
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolProgressMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Bool(bool),
+            Text(String),
+        }
+
+        let repr = Repr::deserialize(deserializer)?;
+        match repr {
+            Repr::Bool(false) => Ok(ToolProgressMode::Off),
+            Repr::Bool(true) => Ok(ToolProgressMode::All),
+            Repr::Text(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+                "off" => Ok(ToolProgressMode::Off),
+                "new" => Ok(ToolProgressMode::New),
+                "all" => Ok(ToolProgressMode::All),
+                "verbose" => Ok(ToolProgressMode::Verbose),
+                other => Err(serde::de::Error::custom(format!(
+                    "invalid tool progress mode '{other}'"
+                ))),
+            },
         }
     }
 }
