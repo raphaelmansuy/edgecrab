@@ -93,6 +93,82 @@ fn line_range_suffix(obj: &serde_json::Map<String, serde_json::Value>) -> String
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TodoDisplayItem {
+    id: Option<String>,
+    title: String,
+    status: String,
+}
+
+fn normalize_todo_status(status: &str) -> String {
+    match status.trim() {
+        "pending" => "not-started".into(),
+        "in_progress" => "in-progress".into(),
+        "not-started" | "in-progress" | "completed" | "cancelled" => status.trim().into(),
+        _ => "not-started".into(),
+    }
+}
+
+fn extract_todo_items(obj: &serde_json::Map<String, serde_json::Value>) -> Vec<TodoDisplayItem> {
+    let Some(items) = obj
+        .get("items")
+        .or_else(|| obj.get("todos"))
+        .and_then(|v| v.as_array())
+    else {
+        return Vec::new();
+    };
+
+    items
+        .iter()
+        .filter_map(|item| {
+            let item = item.as_object()?;
+            let title = item
+                .get("title")
+                .or_else(|| item.get("content"))
+                .and_then(|v| v.as_str())
+                .map(oneline)
+                .filter(|text| !text.is_empty())?;
+            let id = item
+                .get("id")
+                .and_then(|v| match v {
+                    serde_json::Value::String(text) => Some(text.clone()),
+                    serde_json::Value::Number(num) => Some(num.to_string()),
+                    _ => None,
+                })
+                .filter(|text| !text.is_empty());
+            let status = item
+                .get("status")
+                .and_then(|v| v.as_str())
+                .map(normalize_todo_status)
+                .unwrap_or_else(|| "not-started".into());
+            Some(TodoDisplayItem { id, title, status })
+        })
+        .collect()
+}
+
+fn todo_preview(obj: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    let items = extract_todo_items(obj);
+    if items.is_empty() {
+        return Some("review current plan".into());
+    }
+
+    let action = if obj.get("merge").and_then(|v| v.as_bool()).unwrap_or(false) {
+        "update"
+    } else {
+        "set"
+    };
+    let first = unicode_trunc(&items[0].title, 20);
+    Some(if items.len() == 1 {
+        format!("{action} 1 task · {first}")
+    } else {
+        format!(
+            "{action} {} tasks · {first} +{}",
+            items.len(),
+            items.len() - 1
+        )
+    })
+}
+
 fn parse_args_json(args_json: &str) -> Option<serde_json::Value> {
     serde_json::from_str(args_json).ok()
 }
@@ -417,17 +493,7 @@ pub fn extract_tool_preview(tool_name: &str, args_json: &str) -> String {
             };
             (!detail.is_empty()).then_some(detail)
         }
-        "todo" | "manage_todo_list" => match obj.get("todos").or_else(|| obj.get("items")) {
-            None => Some("read task list".into()),
-            Some(serde_json::Value::Array(items)) => Some(
-                if obj.get("merge").and_then(|v| v.as_bool()).unwrap_or(false) {
-                    format!("update {} task(s)", items.len())
-                } else {
-                    format!("{} task(s)", items.len())
-                },
-            ),
-            _ => None,
-        },
+        "todo" | "manage_todo_list" => todo_preview(&obj),
         "session_search" => obj
             .get("query")
             .and_then(|v| v.as_str())
@@ -666,6 +732,10 @@ pub fn build_tool_verbose_lines(
     result_preview: Option<&str>,
     is_error: bool,
 ) -> Vec<Vec<Span<'static>>> {
+    if matches!(tool_name, "todo" | "manage_todo_list") {
+        return build_todo_verbose_lines(args_json, result_preview, is_error);
+    }
+
     let mut lines = Vec::new();
     let label = tool_label(tool_name);
     let args_line = unicode_trunc(&format!("args  {args_json}"), 108);
@@ -716,6 +786,111 @@ pub fn build_tool_verbose_lines(
             ),
         ]);
     }
+    lines
+}
+
+fn build_todo_verbose_lines(
+    args_json: &str,
+    result_preview: Option<&str>,
+    is_error: bool,
+) -> Vec<Vec<Span<'static>>> {
+    let mut lines = Vec::new();
+    let obj = args_object(args_json).unwrap_or_default();
+    let items = extract_todo_items(&obj);
+    let mode = if obj.get("merge").and_then(|v| v.as_bool()).unwrap_or(false) {
+        "merge update"
+    } else if items.is_empty() {
+        "read current plan"
+    } else {
+        "replace plan"
+    };
+    let summary = result_preview
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .unwrap_or(mode);
+
+    lines.push(vec![
+        Span::styled(
+            "     ",
+            Style::default()
+                .fg(Color::Rgb(52, 56, 66))
+                .add_modifier(Modifier::DIM),
+        ),
+        Span::styled(
+            unicode_pad_right("plan", 9),
+            Style::default()
+                .fg(Color::Rgb(108, 118, 138))
+                .add_modifier(Modifier::DIM),
+        ),
+        Span::styled(
+            unicode_trunc(summary, 108),
+            if is_error {
+                Style::default().fg(Color::Rgb(235, 170, 170))
+            } else {
+                Style::default().fg(Color::Rgb(156, 208, 188))
+            },
+        ),
+    ]);
+
+    for item in items.iter().take(6) {
+        let (badge, badge_style, text_style) = match item.status.as_str() {
+            "completed" => (
+                "[x]",
+                Style::default().fg(Color::Rgb(104, 196, 129)),
+                Style::default().fg(Color::Rgb(168, 215, 184)),
+            ),
+            "in-progress" => (
+                "[>]",
+                Style::default().fg(Color::Rgb(77, 208, 225)),
+                Style::default().fg(Color::Rgb(176, 220, 236)),
+            ),
+            "cancelled" => (
+                "[-]",
+                Style::default().fg(Color::Rgb(220, 120, 120)),
+                Style::default()
+                    .fg(Color::Rgb(175, 145, 145))
+                    .add_modifier(Modifier::DIM),
+            ),
+            _ => (
+                "[ ]",
+                Style::default().fg(Color::Rgb(150, 160, 180)),
+                Style::default().fg(Color::Rgb(205, 212, 224)),
+            ),
+        };
+        let title = if let Some(id) = &item.id {
+            format!("{id}. {}", item.title)
+        } else {
+            item.title.clone()
+        };
+        lines.push(vec![
+            Span::styled(
+                "     ",
+                Style::default()
+                    .fg(Color::Rgb(52, 56, 66))
+                    .add_modifier(Modifier::DIM),
+            ),
+            Span::styled(format!("{badge} "), badge_style),
+            Span::styled(unicode_trunc(&title, 92), text_style),
+        ]);
+    }
+
+    if items.len() > 6 {
+        lines.push(vec![
+            Span::styled(
+                "     ",
+                Style::default()
+                    .fg(Color::Rgb(52, 56, 66))
+                    .add_modifier(Modifier::DIM),
+            ),
+            Span::styled(
+                format!("+{} more task(s)", items.len() - 6),
+                Style::default()
+                    .fg(Color::Rgb(120, 132, 152))
+                    .add_modifier(Modifier::DIM),
+            ),
+        ]);
+    }
+
     lines
 }
 
@@ -954,7 +1129,10 @@ pub fn tool_action_verb(name: &str) -> &'static str {
     if n.contains("clarify") {
         return "asking";
     }
-    if n.contains("skill") || n.contains("session_search") || n.contains("todo") {
+    if n.contains("todo") || n.contains("task") || n.contains("plan") {
+        return "planning";
+    }
+    if n.contains("skill") || n.contains("session_search") {
         return "fetching";
     }
     "running"
@@ -1081,7 +1259,7 @@ mod tests {
             "manage_todo_list",
             r#"{"items":[{"id":1,"title":"Audit","status":"in-progress"}],"merge":true}"#,
         );
-        assert_eq!(preview, "update 1 task(s)");
+        assert_eq!(preview, "update 1 task · Audit");
     }
 
     #[test]
@@ -1143,8 +1321,32 @@ mod tests {
         assert_eq!(tool_action_verb("bash_exec"), "executing");
         assert_eq!(tool_action_verb("read_file"), "reading");
         assert_eq!(tool_action_verb("write_file"), "writing");
+        assert_eq!(tool_action_verb("manage_todo_list"), "planning");
         assert_eq!(tool_action_verb("mcp_call"), "calling");
         assert_eq!(tool_action_verb("unknown_op"), "running");
+    }
+
+    #[test]
+    fn test_build_tool_verbose_lines_renders_todo_plan_board() {
+        let lines = build_tool_verbose_lines(
+            "manage_todo_list",
+            r#"{"items":[{"id":1,"title":"Audit Hermes display","status":"completed"},{"id":2,"title":"Improve todo renderer","status":"in-progress"},{"id":3,"title":"Reassess UX","status":"not-started"}],"merge":true}"#,
+            Some("1/3 done, 1 in progress"),
+            false,
+        );
+        assert_eq!(lines.len(), 4);
+        let joined = lines
+            .iter()
+            .map(|line| {
+                line.iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert!(joined[0].contains("1/3 done, 1 in progress"));
+        assert!(joined[1].contains("[x]"));
+        assert!(joined[2].contains("[>]"));
+        assert!(joined[3].contains("[ ]"));
     }
 
     #[test]

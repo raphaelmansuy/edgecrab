@@ -114,6 +114,8 @@ pub enum CommandResult {
     ShowHistory,
     /// Cycle tool progress display
     ToggleVerbose,
+    /// Set or inspect tool progress display mode
+    SetToolProgress(String),
     /// Save session to a JSON file (optional path)
     SaveSession(Option<String>),
     /// Export session as Markdown (optional path)
@@ -686,8 +688,15 @@ impl CommandRegistry {
         self.register(Command {
             name: "verbose",
             aliases: &["v"],
-            description: "Cycle tool progress: off -> new -> all -> verbose",
-            handler: |_| CommandResult::ToggleVerbose,
+            description: "Cycle or set tool progress: /verbose [off|new|all|verbose|status]",
+            handler: |args| {
+                let args = args.trim();
+                if args.is_empty() {
+                    CommandResult::ToggleVerbose
+                } else {
+                    CommandResult::SetToolProgress(args.to_string())
+                }
+            },
         });
 
         self.register(Command {
@@ -1807,6 +1816,14 @@ mod tests {
         assert!(matches!(
             reg.dispatch("/v"),
             Some(CommandResult::ToggleVerbose)
+        ));
+        assert!(matches!(
+            reg.dispatch("/verbose status"),
+            Some(CommandResult::SetToolProgress(mode)) if mode == "status"
+        ));
+        assert!(matches!(
+            reg.dispatch("/verbose all"),
+            Some(CommandResult::SetToolProgress(mode)) if mode == "all"
         ));
     }
 

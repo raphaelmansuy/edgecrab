@@ -7702,6 +7702,10 @@ impl App {
                 let msg = self.cycle_tool_progress_mode();
                 self.push_output(msg, OutputRole::System);
             }
+            CommandResult::SetToolProgress(mode) => {
+                let msg = self.handle_tool_progress_command(mode);
+                self.push_output(msg, OutputRole::System);
+            }
             CommandResult::SaveSession(path) => {
                 self.handle_save_session(path);
             }
@@ -12057,19 +12061,63 @@ impl App {
         }
     }
 
+    fn tool_progress_mode_detail(mode: ToolProgressMode) -> &'static str {
+        match mode {
+            ToolProgressMode::Off => "silent transcript; status bar still shows active work.",
+            ToolProgressMode::New => "show each distinct tool call once per turn.",
+            ToolProgressMode::All => "show every tool call in the transcript.",
+            ToolProgressMode::Verbose => {
+                "show every tool call plus curated detail lines for plan and result context."
+            }
+        }
+    }
+
+    fn format_tool_progress_status(&self) -> String {
+        format!(
+            "Tool progress: {} - {} Modes: off, new, all, verbose.",
+            self.tool_progress_mode.label(),
+            Self::tool_progress_mode_detail(self.tool_progress_mode)
+        )
+    }
+
     fn cycle_tool_progress_mode(&mut self) -> String {
         let next = self.tool_progress_mode.cycle();
         let save_note = match self.set_tool_progress_mode(next) {
             Ok(()) => String::new(),
             Err(err) => format!(" Saving config failed: {err}"),
         };
-        let detail = match next {
-            ToolProgressMode::Off => "silent transcript; status bar still shows active work.",
-            ToolProgressMode::New => "show each distinct tool call once per turn.",
-            ToolProgressMode::All => "show every tool call in the transcript.",
-            ToolProgressMode::Verbose => "show every tool call plus arg/result detail lines.",
-        };
+        let detail = Self::tool_progress_mode_detail(next);
         format!("Tool progress: {} - {detail}{save_note}", next.label())
+    }
+
+    fn handle_tool_progress_command(&mut self, raw: String) -> String {
+        let normalized = raw.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "" | "cycle" | "next" => self.cycle_tool_progress_mode(),
+            "status" => self.format_tool_progress_status(),
+            "off" => self.set_tool_progress_mode_explicit(ToolProgressMode::Off),
+            "new" => self.set_tool_progress_mode_explicit(ToolProgressMode::New),
+            "all" => self.set_tool_progress_mode_explicit(ToolProgressMode::All),
+            "verbose" => self.set_tool_progress_mode_explicit(ToolProgressMode::Verbose),
+            _ => "Usage: /verbose [off|new|all|verbose|status]".into(),
+        }
+    }
+
+    fn set_tool_progress_mode_explicit(&mut self, mode: ToolProgressMode) -> String {
+        let already_active = self.tool_progress_mode == mode;
+        let save_note = match self.set_tool_progress_mode(mode) {
+            Ok(()) => String::new(),
+            Err(err) => format!(" Saving config failed: {err}"),
+        };
+        let detail = Self::tool_progress_mode_detail(mode);
+        if already_active {
+            format!(
+                "Tool progress: {} - already active. {detail}{save_note}",
+                mode.label()
+            )
+        } else {
+            format!("Tool progress: {} - {detail}{save_note}", mode.label())
+        }
     }
 
     fn handle_set_reasoning(&mut self, level: String) {
@@ -21599,6 +21647,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tool_progress_verbose_renders_todo_plan_board() {
+        let mut app = App::new();
+        app.tool_progress_mode = ToolProgressMode::Verbose;
+        app.response_tx
+            .send(AgentResponse::ToolExec {
+                tool_call_id: "call_todo_verbose".into(),
+                name: "manage_todo_list".into(),
+                args_json: r#"{"items":[{"id":1,"title":"Audit Hermes display","status":"completed"},{"id":2,"title":"Improve todo renderer","status":"in-progress"},{"id":3,"title":"Reassess UX","status":"not-started"}],"merge":true}"#.into(),
+            })
+            .expect("send todo tool exec");
+        app.response_tx
+            .send(AgentResponse::ToolDone {
+                tool_call_id: "call_todo_verbose".into(),
+                name: "manage_todo_list".into(),
+                args_json: r#"{"items":[{"id":1,"title":"Audit Hermes display","status":"completed"},{"id":2,"title":"Improve todo renderer","status":"in-progress"},{"id":3,"title":"Reassess UX","status":"not-started"}],"merge":true}"#.into(),
+                result_preview: Some("1/3 done, 1 in progress".into()),
+                duration_ms: 19,
+                is_error: false,
+            })
+            .expect("send todo tool done");
+        app.check_responses();
+
+        assert_eq!(app.output.len(), 5);
+        assert!(line_spans_text(&app.output[0]).contains("plan"));
+        assert!(line_spans_text(&app.output[1]).contains("1/3 done, 1 in progress"));
+        assert!(line_spans_text(&app.output[2]).contains("[x]"));
+        assert!(line_spans_text(&app.output[3]).contains("[>]"));
+        assert!(line_spans_text(&app.output[4]).contains("[ ]"));
+    }
+
+    #[tokio::test]
     #[serial_test::serial(edgecrab_home_env)]
     async fn cycle_tool_progress_mode_follows_hermes_order() {
         let _guard = crate::gateway_catalog::TEST_ENV_LOCK
@@ -21622,6 +21701,25 @@ mod tests {
         unsafe {
             std::env::remove_var("EDGECRAB_HOME");
         }
+    }
+
+    #[tokio::test]
+    async fn explicit_tool_progress_command_sets_and_reports_status() {
+        let mut app = App::new();
+        app.tool_progress_mode = ToolProgressMode::All;
+        assert!(
+            app.handle_tool_progress_command("status".into())
+                .contains("ALL")
+        );
+        assert!(
+            app.handle_tool_progress_command("verbose".into())
+                .contains("VERBOSE")
+        );
+        assert_eq!(app.tool_progress_mode, ToolProgressMode::Verbose);
+        assert!(
+            app.handle_tool_progress_command("bogus".into())
+                .contains("Usage: /verbose")
+        );
     }
 
     #[tokio::test]
