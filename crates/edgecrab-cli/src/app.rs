@@ -791,6 +791,83 @@ fn persist_model_to_config(model: &str) -> anyhow::Result<()> {
     write_config_root(&config_path, &root)
 }
 
+/// Persist smart-routing cheap-model defaults to ~/.edgecrab/config.yaml.
+fn persist_smart_routing_to_config(
+    smart_routing: &edgecrab_core::config::SmartRoutingYaml,
+) -> anyhow::Result<()> {
+    let (config_path, mut root) = load_config_root_for_edit()?;
+
+    if let serde_yml::Value::Mapping(ref mut map) = root {
+        let model_key = serde_yml::Value::String("model".into());
+        let smart_routing_key = serde_yml::Value::String("smart_routing".into());
+        let enabled_key = serde_yml::Value::String("enabled".into());
+        let cheap_model_key = serde_yml::Value::String("cheap_model".into());
+        let cheap_base_url_key = serde_yml::Value::String("cheap_base_url".into());
+        let cheap_api_key_env_key = serde_yml::Value::String("cheap_api_key_env".into());
+
+        let model_section = map
+            .entry(model_key)
+            .or_insert_with(|| serde_yml::Value::Mapping(Default::default()));
+        if let serde_yml::Value::Mapping(model_map) = model_section {
+            let has_smart_routing = smart_routing.enabled
+                || !smart_routing.cheap_model.trim().is_empty()
+                || smart_routing
+                    .cheap_base_url
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty())
+                || smart_routing
+                    .cheap_api_key_env
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty());
+
+            if has_smart_routing {
+                let section = model_map
+                    .entry(smart_routing_key.clone())
+                    .or_insert_with(|| serde_yml::Value::Mapping(Default::default()));
+                if let serde_yml::Value::Mapping(sr_map) = section {
+                    sr_map.insert(enabled_key, serde_yml::Value::Bool(smart_routing.enabled));
+                    if smart_routing.cheap_model.trim().is_empty() {
+                        sr_map.remove(&cheap_model_key);
+                    } else {
+                        sr_map.insert(
+                            cheap_model_key,
+                            serde_yml::Value::String(smart_routing.cheap_model.clone()),
+                        );
+                    }
+                    if let Some(base_url) = smart_routing
+                        .cheap_base_url
+                        .as_deref()
+                        .filter(|value| !value.trim().is_empty())
+                    {
+                        sr_map.insert(
+                            cheap_base_url_key,
+                            serde_yml::Value::String(base_url.to_string()),
+                        );
+                    } else {
+                        sr_map.remove(&cheap_base_url_key);
+                    }
+                    if let Some(api_key_env) = smart_routing
+                        .cheap_api_key_env
+                        .as_deref()
+                        .filter(|value| !value.trim().is_empty())
+                    {
+                        sr_map.insert(
+                            cheap_api_key_env_key,
+                            serde_yml::Value::String(api_key_env.to_string()),
+                        );
+                    } else {
+                        sr_map.remove(&cheap_api_key_env_key);
+                    }
+                }
+            } else {
+                model_map.remove(&smart_routing_key);
+            }
+        }
+    }
+
+    write_config_root(&config_path, &root)
+}
+
 /// Persist the auxiliary vision-model routing to ~/.edgecrab/config.yaml.
 fn persist_vision_model_to_config(
     auxiliary: &edgecrab_core::config::AuxiliaryConfig,
@@ -892,6 +969,38 @@ fn persist_image_generation_to_config(
             image_map.insert(
                 model_key,
                 serde_yml::Value::String(image_generation.model.clone()),
+            );
+        }
+    }
+
+    write_config_root(&config_path, &root)
+}
+
+/// Persist Mixture-of-Agents defaults to ~/.edgecrab/config.yaml.
+fn persist_moa_config_to_config(moa: &edgecrab_core::config::MoaConfig) -> anyhow::Result<()> {
+    let (config_path, mut root) = load_config_root_for_edit()?;
+
+    if let serde_yml::Value::Mapping(ref mut map) = root {
+        let section_key = serde_yml::Value::String("moa".into());
+        let reference_models_key = serde_yml::Value::String("reference_models".into());
+        let aggregator_model_key = serde_yml::Value::String("aggregator_model".into());
+
+        let section = map
+            .entry(section_key)
+            .or_insert_with(|| serde_yml::Value::Mapping(Default::default()));
+        if let serde_yml::Value::Mapping(moa_map) = section {
+            moa_map.insert(
+                aggregator_model_key,
+                serde_yml::Value::String(moa.aggregator_model.clone()),
+            );
+            moa_map.insert(
+                reference_models_key,
+                serde_yml::Value::Sequence(
+                    moa.reference_models
+                        .iter()
+                        .map(|model| serde_yml::Value::String(model.clone()))
+                        .collect(),
+                ),
             );
         }
     }
@@ -1418,6 +1527,13 @@ impl FuzzyItem for ModelEntry {
     fn tag(&self) -> &str {
         &self.provider
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModelSelectorTarget {
+    Primary,
+    Cheap,
+    MoaAggregator,
 }
 
 fn discovery_source_label(source: DiscoverySource) -> &'static str {
@@ -2047,8 +2163,11 @@ enum ConfigAction {
     ShowSummary,
     ShowPaths,
     OpenModel,
+    OpenCheapModel,
     OpenVisionModel,
     OpenImageModel,
+    OpenMoaAggregator,
+    OpenMoaReferences,
     ToggleStreaming,
     ToggleReasoning,
     ToggleStatusBar,
@@ -2186,12 +2305,18 @@ pub struct App {
     command_descriptions: std::collections::HashMap<String, String>,
     /// Model selector overlay (activated by `/model` with no args)
     model_selector: FuzzySelector<ModelEntry>,
+    /// Which model-setting flow is currently using the shared selector.
+    model_selector_target: ModelSelectorTarget,
     /// True while background live model discovery is refreshing the selector.
     model_selector_refresh_in_flight: bool,
     /// Vision-model selector overlay (activated by `/vision_model`)
     vision_model_selector: FuzzySelector<ModelEntry>,
     /// Image-model selector overlay (activated by `/image_model`)
     image_model_selector: FuzzySelector<ModelEntry>,
+    /// MoA reference-model selector overlay (activated by `/moa references`)
+    moa_reference_selector: FuzzySelector<ModelEntry>,
+    /// Currently selected default reference models in the MoA selector.
+    moa_reference_selected: BTreeSet<String>,
     /// Official MCP preset selector overlay (activated by `/mcp` with no args).
     mcp_selector: FuzzySelector<McpPresetEntry>,
     /// Remote MCP browser overlay (activated by `/mcp search`).
@@ -2650,9 +2775,12 @@ impl App {
                 ));
                 ms
             },
+            model_selector_target: ModelSelectorTarget::Primary,
             model_selector_refresh_in_flight: false,
             vision_model_selector: FuzzySelector::new(),
             image_model_selector: FuzzySelector::new(),
+            moa_reference_selector: FuzzySelector::new(),
+            moa_reference_selected: BTreeSet::new(),
             mcp_selector: FuzzySelector::new(),
             remote_mcp_browser: RemoteMcpBrowser::new(),
             skill_selector: FuzzySelector::new(),
@@ -3863,6 +3991,14 @@ impl App {
                 ("copilot", "List GitHub Copilot models"),
                 ("ollama", "List locally running Ollama models"),
             ],
+            "cheap_model" | "cheap-model" => &[
+                ("status", "Show the current cheap-model routing policy"),
+                ("off", "Disable smart routing and clear the cheap model"),
+                (
+                    "copilot/gpt-4.1-mini",
+                    "Route simple turns to a fast cheap model",
+                ),
+            ],
             "vision_model" | "vision-model" => &[
                 ("status", "Show the current vision-routing policy"),
                 ("auto", "Use the current chat model when vision-capable"),
@@ -3881,6 +4017,14 @@ impl App {
                     "imagen/imagen-4.0-fast-generate-001",
                     "Use Vertex Imagen fast",
                 ),
+            ],
+            "moa" => &[
+                ("status", "Show the current Mixture-of-Agents defaults"),
+                ("aggregator", "Open the MoA aggregator selector"),
+                ("references", "Open the MoA reference roster selector"),
+                ("reset", "Restore the built-in MoA roster"),
+                ("add", "Add one reference model"),
+                ("remove", "Remove one reference model"),
             ],
             // All other commands accept free-form arguments; fall through.
             _ => &[],
@@ -4755,6 +4899,7 @@ impl App {
                 self.model_selector.active = false;
                 self.vision_model_selector.active = false;
                 self.image_model_selector.active = false;
+                self.moa_reference_selector.active = false;
                 self.mcp_selector.active = false;
                 self.remote_mcp_browser.selector.active = false;
                 self.skill_selector.active = false;
@@ -4975,7 +5120,13 @@ impl App {
                 KeyCode::Enter => {
                     if let Some(model) = self.model_selector.current().map(|e| e.display.clone()) {
                         self.model_selector.active = false;
-                        self.handle_model_switch(model);
+                        match self.model_selector_target {
+                            ModelSelectorTarget::Primary => self.handle_model_switch(model),
+                            ModelSelectorTarget::Cheap => self.handle_set_cheap_model(model),
+                            ModelSelectorTarget::MoaAggregator => {
+                                self.handle_set_moa_aggregator(model);
+                            }
+                        }
                     }
                 }
                 KeyCode::Up => self.model_selector.move_up(),
@@ -4989,6 +5140,50 @@ impl App {
                         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                 {
                     self.model_selector.push_char(c);
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        if self.moa_reference_selector.active {
+            match key.code {
+                KeyCode::Esc => {
+                    self.moa_reference_selector.active = false;
+                }
+                KeyCode::Enter => {
+                    self.moa_reference_selector.active = false;
+                    let selected: Vec<String> =
+                        self.moa_reference_selected.iter().cloned().collect();
+                    self.handle_save_moa_reference_selection(selected);
+                }
+                KeyCode::Char(' ')
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    if let Some(model) = self
+                        .moa_reference_selector
+                        .current()
+                        .map(|entry| entry.display.clone())
+                    {
+                        if !self.moa_reference_selected.insert(model.clone()) {
+                            self.moa_reference_selected.remove(&model);
+                        }
+                        self.needs_redraw = true;
+                    }
+                }
+                KeyCode::Up => self.moa_reference_selector.move_up(),
+                KeyCode::Down => self.moa_reference_selector.move_down(),
+                KeyCode::PageUp => self.moa_reference_selector.page_up(),
+                KeyCode::PageDown => self.moa_reference_selector.page_down(),
+                KeyCode::Backspace => self.moa_reference_selector.pop_char(),
+                KeyCode::Char(c)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    self.moa_reference_selector.push_char(c);
                 }
                 _ => {}
             }
@@ -5797,14 +5992,29 @@ impl App {
             CommandResult::ModelSelector => {
                 self.refresh_model_selector_catalog();
             }
+            CommandResult::CheapModelSelector => {
+                self.open_cheap_model_selector();
+            }
             CommandResult::VisionModelSelector => {
                 self.open_vision_model_selector();
             }
             CommandResult::ImageModelSelector => {
                 self.open_image_model_selector();
             }
+            CommandResult::MoaAggregatorSelector => {
+                self.open_moa_aggregator_selector();
+            }
+            CommandResult::MoaReferenceSelector => {
+                self.open_moa_reference_selector();
+            }
+            CommandResult::ShowCheapModel => {
+                self.handle_show_cheap_model();
+            }
             CommandResult::ShowVisionModel => {
                 self.handle_show_vision_model();
+            }
+            CommandResult::SetCheapModel(spec) => {
+                self.handle_set_cheap_model(spec);
             }
             CommandResult::SetVisionModel(spec) => {
                 self.handle_set_vision_model(spec);
@@ -5814,6 +6024,21 @@ impl App {
             }
             CommandResult::SetImageModel(spec) => {
                 self.handle_set_image_model(spec);
+            }
+            CommandResult::ShowMoaConfig => {
+                self.handle_show_moa_config();
+            }
+            CommandResult::SetMoaAggregator(spec) => {
+                self.handle_set_moa_aggregator(spec);
+            }
+            CommandResult::AddMoaReference(spec) => {
+                self.handle_add_moa_reference(spec);
+            }
+            CommandResult::RemoveMoaReference(spec) => {
+                self.handle_remove_moa_reference(spec);
+            }
+            CommandResult::ResetMoaConfig => {
+                self.handle_reset_moa_config();
             }
             CommandResult::ShowMcp(args) => {
                 self.handle_mcp_command(args);
@@ -6787,7 +7012,12 @@ impl App {
                             current_model,
                         } => {
                             self.model_selector_refresh_in_flight = false;
-                            self.apply_model_selector_catalog(models, &current_model, true);
+                            self.apply_model_selector_catalog(
+                                models,
+                                &current_model,
+                                true,
+                                self.model_selector_target,
+                            );
                         }
                         BackgroundOpResult::SystemMsg(text) => {
                             self.push_output(text, OutputRole::System);
@@ -7255,6 +7485,382 @@ impl App {
         });
     }
 
+    fn open_cheap_model_selector(&mut self) {
+        let smart_routing = self
+            .agent
+            .as_ref()
+            .map(|agent| self.rt_handle.block_on(agent.smart_routing_config()))
+            .unwrap_or_else(|| self.load_runtime_config().model.smart_routing);
+        let current_model = smart_routing.cheap_model.trim().to_string();
+        self.refresh_shared_model_selector_catalog(current_model, ModelSelectorTarget::Cheap);
+    }
+
+    fn handle_show_cheap_model(&mut self) {
+        let Some(agent) = self.require_agent() else {
+            return;
+        };
+
+        let primary_model = self.rt_handle.block_on(agent.model());
+        let smart_routing = self.rt_handle.block_on(agent.smart_routing_config());
+        let text = if smart_routing.enabled && !smart_routing.cheap_model.trim().is_empty() {
+            format!(
+                "Smart routing:\n\
+                 Enabled:          yes\n\
+                 Primary model:    {primary_model}\n\
+                 Cheap model:      {}\n\
+                 Route policy:     short/simple turns prefer the cheap model\n\
+                 Usage:            /cheap_model | /cheap_model status | /cheap_model off | /cheap_model <provider/model>",
+                smart_routing.cheap_model,
+            )
+        } else {
+            format!(
+                "Smart routing:\n\
+                 Enabled:          no\n\
+                 Primary model:    {primary_model}\n\
+                 Cheap model:      (not configured)\n\
+                 Usage:            /cheap_model to pick a cheap model, then EdgeCrab will auto-route obviously simple turns."
+            )
+        };
+        self.push_output(text, OutputRole::System);
+    }
+
+    fn handle_set_cheap_model(&mut self, spec: String) {
+        let Some(agent) = self.require_agent() else {
+            return;
+        };
+
+        let trimmed = spec.trim();
+        if trimmed.is_empty()
+            || trimmed.eq_ignore_ascii_case("open")
+            || trimmed.eq_ignore_ascii_case("list")
+        {
+            self.open_cheap_model_selector();
+            return;
+        }
+
+        let mut smart_routing = self.rt_handle.block_on(agent.smart_routing_config());
+
+        if trimmed.eq_ignore_ascii_case("status") {
+            self.handle_show_cheap_model();
+            return;
+        }
+
+        if matches!(
+            trimmed.to_ascii_lowercase().as_str(),
+            "off" | "disable" | "disabled" | "reset" | "clear"
+        ) {
+            smart_routing.enabled = false;
+            smart_routing.cheap_model.clear();
+            smart_routing.cheap_base_url = None;
+            smart_routing.cheap_api_key_env = None;
+            let persisted = smart_routing.clone();
+            let agent_clone = Arc::clone(&agent);
+            self.rt_handle.block_on(async move {
+                agent_clone.set_smart_routing_config(persisted).await;
+            });
+            match persist_smart_routing_to_config(&smart_routing) {
+                Ok(()) => self.push_output(
+                    "Smart routing disabled. Future turns will stay on the primary model until a cheap model is configured again.",
+                    OutputRole::System,
+                ),
+                Err(err) => self.push_output(
+                    format!("Smart routing disabled for this session, but config save failed: {err}"),
+                    OutputRole::Error,
+                ),
+            }
+            return;
+        }
+
+        let Some((parsed_provider, canonical_model)) = parse_selection_spec(trimmed) else {
+            self.push_output(
+                format!("Invalid format: use 'provider/model-name' or 'off'. Got: '{trimmed}'"),
+                OutputRole::Error,
+            );
+            return;
+        };
+
+        let provider = canonical_provider(&parsed_provider);
+        smart_routing.enabled = true;
+        smart_routing.cheap_model = format!("{provider}/{canonical_model}");
+        let persisted = smart_routing.clone();
+        let agent_clone = Arc::clone(&agent);
+        self.rt_handle.block_on(async move {
+            agent_clone.set_smart_routing_config(persisted).await;
+        });
+        match persist_smart_routing_to_config(&smart_routing) {
+            Ok(()) => self.push_output(
+                format!(
+                    "Cheap model set to {}. EdgeCrab will auto-route obviously simple turns to this model.",
+                    smart_routing.cheap_model
+                ),
+                OutputRole::System,
+            ),
+            Err(err) => self.push_output(
+                format!("Cheap model updated for this session, but config save failed: {err}"),
+                OutputRole::Error,
+            ),
+        }
+    }
+
+    fn open_moa_aggregator_selector(&mut self) {
+        let moa = self
+            .agent
+            .as_ref()
+            .map(|agent| self.rt_handle.block_on(agent.moa_config()))
+            .unwrap_or_else(|| self.load_runtime_config().moa);
+        self.refresh_shared_model_selector_catalog(
+            moa.aggregator_model,
+            ModelSelectorTarget::MoaAggregator,
+        );
+    }
+
+    fn open_moa_reference_selector(&mut self) {
+        let moa = self
+            .agent
+            .as_ref()
+            .map(|agent| self.rt_handle.block_on(agent.moa_config()))
+            .unwrap_or_else(|| self.load_runtime_config().moa);
+        self.moa_reference_selected = moa.reference_models.iter().cloned().collect();
+        self.moa_reference_selector
+            .set_items(build_model_selector_entries(
+                &ModelCatalog::grouped_catalog(),
+                None,
+            ));
+        let primary = moa.reference_models.first().cloned().unwrap_or_default();
+        self.moa_reference_selector.activate_with_primary(&primary);
+        self.needs_redraw = true;
+    }
+
+    fn handle_show_moa_config(&mut self) {
+        let Some(agent) = self.require_agent() else {
+            return;
+        };
+
+        let moa = self.rt_handle.block_on(agent.moa_config());
+        let references = if moa.reference_models.is_empty() {
+            "(none)".to_string()
+        } else {
+            moa.reference_models
+                .iter()
+                .map(|model| format!("  - {model}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let text = format!(
+            "Mixture-of-Agents defaults:\n\
+             Aggregator:       {}\n\
+             Reference count:  {}\n\
+             Reference roster:\n{}\n\
+             \nUsage:\n\
+              /moa aggregator            open the aggregator selector\n\
+              /moa references            open the reference roster selector\n\
+              /moa add <provider/model>  add one reference model\n\
+              /moa remove <provider/model>\n\
+              /moa reset                 restore built-in defaults",
+            moa.aggregator_model,
+            moa.reference_models.len(),
+            references,
+        );
+        self.push_output(text, OutputRole::System);
+    }
+
+    fn handle_set_moa_aggregator(&mut self, spec: String) {
+        let Some(agent) = self.require_agent() else {
+            return;
+        };
+
+        let trimmed = spec.trim();
+        if trimmed.is_empty()
+            || trimmed.eq_ignore_ascii_case("open")
+            || trimmed.eq_ignore_ascii_case("list")
+        {
+            self.open_moa_aggregator_selector();
+            return;
+        }
+
+        let mut moa = self.rt_handle.block_on(agent.moa_config());
+        if matches!(trimmed.to_ascii_lowercase().as_str(), "default" | "reset") {
+            moa.aggregator_model =
+                edgecrab_tools::tools::mixture_of_agents::DEFAULT_AGGREGATOR_MODEL.to_string();
+        } else {
+            let Some((provider, model)) = parse_selection_spec(trimmed) else {
+                self.push_output(
+                    format!("Invalid format: use 'provider/model-name'. Got: '{trimmed}'"),
+                    OutputRole::Error,
+                );
+                return;
+            };
+            moa.aggregator_model = format!("{}/{}", canonical_provider(&provider), model);
+        }
+
+        let persisted = moa.clone();
+        let agent_clone = Arc::clone(&agent);
+        self.rt_handle.block_on(async move {
+            agent_clone.set_moa_config(persisted).await;
+        });
+        match persist_moa_config_to_config(&moa) {
+            Ok(()) => self.push_output(
+                format!("MoA aggregator set to {}.", moa.aggregator_model),
+                OutputRole::System,
+            ),
+            Err(err) => self.push_output(
+                format!("MoA aggregator updated for this session, but config save failed: {err}"),
+                OutputRole::Error,
+            ),
+        }
+    }
+
+    fn handle_save_moa_reference_selection(&mut self, selected: Vec<String>) {
+        let Some(agent) = self.require_agent() else {
+            return;
+        };
+
+        if selected.is_empty() {
+            self.push_output(
+                "MoA needs at least one reference model. Use Space to select one or more entries before pressing Enter.",
+                OutputRole::Error,
+            );
+            return;
+        }
+
+        let mut moa = self.rt_handle.block_on(agent.moa_config());
+        moa.reference_models = selected;
+        let persisted = moa.clone();
+        let agent_clone = Arc::clone(&agent);
+        self.rt_handle.block_on(async move {
+            agent_clone.set_moa_config(persisted).await;
+        });
+        match persist_moa_config_to_config(&moa) {
+            Ok(()) => self.push_output(
+                format!(
+                    "MoA reference roster updated ({} models).",
+                    moa.reference_models.len()
+                ),
+                OutputRole::System,
+            ),
+            Err(err) => self.push_output(
+                format!("MoA references updated for this session, but config save failed: {err}"),
+                OutputRole::Error,
+            ),
+        }
+    }
+
+    fn handle_add_moa_reference(&mut self, spec: String) {
+        let Some(agent) = self.require_agent() else {
+            return;
+        };
+
+        let trimmed = spec.trim();
+        if trimmed.is_empty() {
+            self.open_moa_reference_selector();
+            return;
+        }
+
+        let Some((provider, model)) = parse_selection_spec(trimmed) else {
+            self.push_output(
+                format!("Invalid format: use 'provider/model-name'. Got: '{trimmed}'"),
+                OutputRole::Error,
+            );
+            return;
+        };
+
+        let mut moa = self.rt_handle.block_on(agent.moa_config());
+        let selection = format!("{}/{}", canonical_provider(&provider), model);
+        if !moa
+            .reference_models
+            .iter()
+            .any(|candidate| candidate == &selection)
+        {
+            moa.reference_models.push(selection.clone());
+        }
+        let persisted = moa.clone();
+        let agent_clone = Arc::clone(&agent);
+        self.rt_handle.block_on(async move {
+            agent_clone.set_moa_config(persisted).await;
+        });
+        match persist_moa_config_to_config(&moa) {
+            Ok(()) => self.push_output(
+                format!("Added {selection} to the MoA reference roster."),
+                OutputRole::System,
+            ),
+            Err(err) => self.push_output(
+                format!("MoA reference updated for this session, but config save failed: {err}"),
+                OutputRole::Error,
+            ),
+        }
+    }
+
+    fn handle_remove_moa_reference(&mut self, spec: String) {
+        let Some(agent) = self.require_agent() else {
+            return;
+        };
+
+        let trimmed = spec.trim();
+        if trimmed.is_empty() {
+            self.open_moa_reference_selector();
+            return;
+        }
+
+        let Some((provider, model)) = parse_selection_spec(trimmed) else {
+            self.push_output(
+                format!("Invalid format: use 'provider/model-name'. Got: '{trimmed}'"),
+                OutputRole::Error,
+            );
+            return;
+        };
+
+        let selection = format!("{}/{}", canonical_provider(&provider), model);
+        let mut moa = self.rt_handle.block_on(agent.moa_config());
+        moa.reference_models
+            .retain(|candidate| candidate != &selection);
+        if moa.reference_models.is_empty() {
+            self.push_output(
+                "MoA needs at least one reference model. Use /moa references to pick a replacement before removing the last entry.",
+                OutputRole::Error,
+            );
+            return;
+        }
+
+        let persisted = moa.clone();
+        let agent_clone = Arc::clone(&agent);
+        self.rt_handle.block_on(async move {
+            agent_clone.set_moa_config(persisted).await;
+        });
+        match persist_moa_config_to_config(&moa) {
+            Ok(()) => self.push_output(
+                format!("Removed {selection} from the MoA reference roster."),
+                OutputRole::System,
+            ),
+            Err(err) => self.push_output(
+                format!("MoA reference updated for this session, but config save failed: {err}"),
+                OutputRole::Error,
+            ),
+        }
+    }
+
+    fn handle_reset_moa_config(&mut self) {
+        let Some(agent) = self.require_agent() else {
+            return;
+        };
+
+        let moa = edgecrab_core::config::MoaConfig::default();
+        let persisted = moa.clone();
+        let agent_clone = Arc::clone(&agent);
+        self.rt_handle.block_on(async move {
+            agent_clone.set_moa_config(persisted).await;
+        });
+        match persist_moa_config_to_config(&moa) {
+            Ok(()) => self.push_output(
+                "MoA defaults restored to the built-in frontier roster.",
+                OutputRole::System,
+            ),
+            Err(err) => self.push_output(
+                format!("MoA defaults restored for this session, but config save failed: {err}"),
+                OutputRole::Error,
+            ),
+        }
+    }
+
     fn handle_show_vision_model(&mut self) {
         let Some(agent) = self.require_agent() else {
             return;
@@ -7522,6 +8128,7 @@ impl App {
         };
         let snap = self.agent_snapshot(&agent);
         let auxiliary = self.rt_handle.block_on(agent.auxiliary_config());
+        let smart_routing = self.rt_handle.block_on(agent.smart_routing_config());
         let (_, _, image_generation) = self.rt_handle.block_on(agent.media_config());
         let vision_routing = match (auxiliary.provider.as_deref(), auxiliary.model.as_deref()) {
             (Some(provider), Some(model)) => format!("{provider}/{model}"),
@@ -7531,6 +8138,7 @@ impl App {
             "Session status:\n\
              Session ID:  {}\n\
              Model:       {}\n\
+             Cheap:       {}\n\
              Vision:      {}\n\
              Image:       {}/{}\n\
              Messages:    {}\n\
@@ -7539,6 +8147,11 @@ impl App {
              Budget:      {}/{} iterations remaining",
             snap.session_id.as_deref().unwrap_or("(none)"),
             snap.model,
+            if smart_routing.enabled && !smart_routing.cheap_model.trim().is_empty() {
+                smart_routing.cheap_model
+            } else {
+                "off".to_string()
+            },
             vision_routing,
             image_generation.provider,
             image_generation.model,
@@ -7641,6 +8254,9 @@ impl App {
         format!(
             "EdgeCrab config summary:\n\
              Model:           {}\n\
+             Cheap model:     {}\n\
+             MoA aggregator:  {}\n\
+             MoA refs:        {}\n\
              Reasoning pane:  {}\n\
              Streaming:       {}\n\
              Status bar:      {}\n\
@@ -7651,8 +8267,17 @@ impl App {
              Gateway host:    {}:{}\n\
              MCP servers:     {}\n\
              Skills preload:  {}\n\
-             \n{}",
+            \n{}",
             model,
+            if config.model.smart_routing.enabled
+                && !config.model.smart_routing.cheap_model.is_empty()
+            {
+                config.model.smart_routing.cheap_model.clone()
+            } else {
+                "off".into()
+            },
+            config.moa.aggregator_model,
+            config.moa.reference_models.len(),
             if self.show_reasoning {
                 "shown"
             } else {
@@ -7775,6 +8400,21 @@ impl App {
                 action: ConfigAction::OpenModel,
             },
             ConfigEntry {
+                title: format!(
+                    "Cheap Model  [{}]",
+                    if config.model.smart_routing.enabled
+                        && !config.model.smart_routing.cheap_model.trim().is_empty()
+                    {
+                        config.model.smart_routing.cheap_model.as_str()
+                    } else {
+                        "off"
+                    }
+                ),
+                detail: "Pick the model used for obviously simple turns".into(),
+                tag: "model".into(),
+                action: ConfigAction::OpenCheapModel,
+            },
+            ConfigEntry {
                 title: "Vision Backend".into(),
                 detail: "Inspect or switch the dedicated vision routing".into(),
                 tag: "model".into(),
@@ -7785,6 +8425,21 @@ impl App {
                 detail: "Inspect or switch the default image generation backend".into(),
                 tag: "model".into(),
                 action: ConfigAction::OpenImageModel,
+            },
+            ConfigEntry {
+                title: format!("MoA Aggregator  [{}]", config.moa.aggregator_model),
+                detail: "Choose the synthesizer model for mixture_of_agents".into(),
+                tag: "moa".into(),
+                action: ConfigAction::OpenMoaAggregator,
+            },
+            ConfigEntry {
+                title: format!(
+                    "MoA References  [{} models]",
+                    config.moa.reference_models.len()
+                ),
+                detail: "Edit the default frontier roster for mixture_of_agents".into(),
+                tag: "moa".into(),
+                action: ConfigAction::OpenMoaReferences,
             },
             ConfigEntry {
                 title: format!(
@@ -7872,11 +8527,20 @@ impl App {
             ConfigAction::OpenModel => {
                 self.refresh_model_selector_catalog();
             }
+            ConfigAction::OpenCheapModel => {
+                self.open_cheap_model_selector();
+            }
             ConfigAction::OpenVisionModel => {
                 self.open_vision_model_selector();
             }
             ConfigAction::OpenImageModel => {
                 self.open_image_model_selector();
+            }
+            ConfigAction::OpenMoaAggregator => {
+                self.open_moa_aggregator_selector();
+            }
+            ConfigAction::OpenMoaReferences => {
+                self.open_moa_reference_selector();
             }
             ConfigAction::ToggleStreaming => {
                 self.handle_set_streaming("toggle".into());
@@ -7914,6 +8578,11 @@ impl App {
             "show" | "summary" | "status" => {
                 self.push_output(self.render_config_summary(), OutputRole::System);
             }
+            "model" => self.refresh_model_selector_catalog(),
+            "cheap" | "cheap_model" | "cheap-model" | "routing" => {
+                self.open_cheap_model_selector();
+            }
+            "moa" => self.handle_show_moa_config(),
             "paths" | "path" => {
                 self.push_output(self.render_config_paths(), OutputRole::System);
             }
@@ -7936,7 +8605,7 @@ impl App {
                 );
             }
             _ => self.push_output(
-                "Usage: /config [open|show|paths|voice|gateway|update|edit]",
+                "Usage: /config [open|show|model|cheap|moa|paths|voice|gateway|update|edit]",
                 OutputRole::System,
             ),
         }
@@ -8974,7 +9643,9 @@ impl App {
         models: Vec<ModelEntry>,
         current_model: &str,
         preserve_state: bool,
+        target: ModelSelectorTarget,
     ) {
+        self.model_selector_target = target;
         if preserve_state {
             if self.model_selector.active {
                 self.model_selector.replace_items_preserving_state(models);
@@ -8991,15 +9662,17 @@ impl App {
         self.needs_redraw = true;
     }
 
-    fn open_model_selector(&mut self) {
-        let current_model = self.model_name.clone();
+    fn open_model_selector_for(&mut self, current_model: &str, target: ModelSelectorTarget) {
         let static_entries = build_model_selector_entries(&ModelCatalog::grouped_catalog(), None);
-        self.apply_model_selector_catalog(static_entries, &current_model, false);
+        self.apply_model_selector_catalog(static_entries, current_model, false, target);
     }
 
-    /// Spawn background live discovery while keeping the selector interactive.
-    fn refresh_model_selector_catalog(&mut self) {
-        self.open_model_selector();
+    fn refresh_shared_model_selector_catalog(
+        &mut self,
+        current_model: String,
+        target: ModelSelectorTarget,
+    ) {
+        self.open_model_selector_for(&current_model, target);
         if self.model_selector_refresh_in_flight {
             return;
         }
@@ -9010,7 +9683,7 @@ impl App {
                 matches!(availability, DiscoveryAvailability::Supported).then_some(provider)
             })
             .collect();
-        if let Some((provider, _)) = self.model_name.split_once('/') {
+        if let Some((provider, _)) = current_model.split_once('/') {
             let provider = normalize_discovery_provider(provider);
             if matches!(
                 live_discovery_availability(&provider),
@@ -9020,7 +9693,6 @@ impl App {
                 providers.push(provider);
             }
         }
-        let current_model = self.model_name.clone();
         let tx = self.response_tx.clone();
 
         self.model_selector_refresh_in_flight = true;
@@ -9044,6 +9716,14 @@ impl App {
                 current_model,
             }));
         });
+    }
+
+    /// Spawn background live discovery while keeping the selector interactive.
+    fn refresh_model_selector_catalog(&mut self) {
+        self.refresh_shared_model_selector_catalog(
+            self.model_name.clone(),
+            ModelSelectorTarget::Primary,
+        );
     }
 
     fn open_vision_model_selector(&mut self) {
@@ -11794,6 +12474,10 @@ impl App {
             self.render_image_model_selector(frame, frame.area());
         }
 
+        if self.moa_reference_selector.active {
+            self.render_moa_reference_selector(frame, frame.area());
+        }
+
         // MCP selector overlay (full screen, same family as /model)
         if self.mcp_selector.active {
             self.render_mcp_selector(frame, frame.area());
@@ -12571,10 +13255,15 @@ impl App {
 
     /// Render the full-screen model selector overlay.
     fn render_model_selector(&self, frame: &mut Frame, area: Rect) {
+        let base_title = match self.model_selector_target {
+            ModelSelectorTarget::Primary => "Select Model",
+            ModelSelectorTarget::Cheap => "Select Cheap Model",
+            ModelSelectorTarget::MoaAggregator => "Select MoA Aggregator",
+        };
         let title = if self.model_selector_refresh_in_flight {
-            "Select Model · refreshing live inventory"
+            format!("{base_title} · refreshing live inventory")
         } else {
-            "Select Model"
+            base_title.to_string()
         };
         let placeholder = if self.model_selector_refresh_in_flight {
             "Type to filter models... live discovery updates in place (Esc to cancel)"
@@ -12586,7 +13275,7 @@ impl App {
             area,
             &self.model_selector,
             SelectorChrome {
-                title,
+                title: &title,
                 placeholder,
                 count_label: "models",
                 status_note: self
@@ -12623,6 +13312,109 @@ impl App {
                 status_note: None,
             },
         );
+    }
+
+    fn render_moa_reference_selector(&self, frame: &mut Frame, area: Rect) {
+        frame.render_widget(Clear, area);
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ])
+            .split(area);
+
+        let search_text = if self.moa_reference_selector.query.is_empty() {
+            "Type to filter reference models…".to_string()
+        } else {
+            self.moa_reference_selector.query.clone()
+        };
+        let search_style = if self.moa_reference_selector.query.is_empty() {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let search = Paragraph::new(Line::from(vec![
+            Span::styled("  🧠 ", Style::default().fg(Color::Rgb(130, 210, 255))),
+            Span::styled(search_text, search_style),
+        ]))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Rgb(130, 210, 255)))
+                .title(" Select MoA References "),
+        );
+        frame.render_widget(search, chunks[0]);
+
+        let filtered = &self.moa_reference_selector.filtered;
+        let selected = self.moa_reference_selector.selected;
+        let max_visible = chunks[1].height as usize;
+        let scroll_start = if selected >= max_visible {
+            selected - max_visible + 1
+        } else {
+            0
+        };
+
+        let items: Vec<ListItem> = filtered
+            .iter()
+            .skip(scroll_start)
+            .take(max_visible)
+            .enumerate()
+            .map(|(vis_idx, &entry_idx)| {
+                let entry = &self.moa_reference_selector.items[entry_idx];
+                let is_selected = vis_idx + scroll_start == selected;
+                let is_checked = self.moa_reference_selected.contains(&entry.display);
+                let bg = if is_selected {
+                    Color::Rgb(22, 36, 44)
+                } else {
+                    Color::Rgb(18, 22, 28)
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!("  [{}] ", if is_checked { "x" } else { " " }),
+                        Style::default().bg(bg).fg(if is_checked {
+                            Color::Green
+                        } else {
+                            Color::DarkGray
+                        }),
+                    ),
+                    Span::styled(
+                        unicode_pad_right(&entry.display, 38),
+                        Style::default().bg(bg).fg(if is_selected {
+                            Color::Rgb(130, 210, 255)
+                        } else {
+                            Color::Rgb(220, 232, 240)
+                        }),
+                    ),
+                    Span::styled(
+                        unicode_trunc(&entry.detail, 44),
+                        Style::default().bg(bg).fg(Color::Rgb(125, 140, 150)),
+                    ),
+                ]))
+            })
+            .collect();
+        frame.render_widget(
+            List::new(items).style(Style::default().bg(Color::Rgb(18, 22, 28))),
+            chunks[1],
+        );
+
+        let help = Paragraph::new(Line::from(vec![
+            Span::styled(" ↑↓ ", Style::default().fg(Color::Cyan)),
+            Span::styled("navigate  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Space ", Style::default().fg(Color::Cyan)),
+            Span::styled("toggle  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Enter ", Style::default().fg(Color::Cyan)),
+            Span::styled("save  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Esc ", Style::default().fg(Color::Cyan)),
+            Span::styled("cancel  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{} selected", self.moa_reference_selected.len()),
+                Style::default().fg(Color::Rgb(80, 80, 100)),
+            ),
+        ]));
+        frame.render_widget(help, chunks[2]);
     }
 
     fn render_mcp_selector(&self, frame: &mut Frame, area: Rect) {
@@ -13523,11 +14315,20 @@ impl App {
                     "Runs the local git-based update check and prints ahead/behind guidance.".into()
                 }
                 ConfigAction::OpenModel => "Press Enter to open the model selector overlay.".into(),
+                ConfigAction::OpenCheapModel => {
+                    "Press Enter to open the cheap-model selector. Selecting a model enables smart routing for obviously simple turns.".into()
+                }
                 ConfigAction::OpenVisionModel => {
                     "Press Enter to open the dedicated vision-model selector.".into()
                 }
                 ConfigAction::OpenImageModel => {
                     "Press Enter to open the image-model selector.".into()
+                }
+                ConfigAction::OpenMoaAggregator => {
+                    "Press Enter to pick the default aggregator model used by mixture_of_agents.".into()
+                }
+                ConfigAction::OpenMoaReferences => {
+                    "Press Enter to edit the default MoA reference roster. Use Space to toggle models and Enter to save.".into()
                 }
                 ConfigAction::ToggleStreaming => {
                     "Press Enter to toggle live token streaming.".into()
@@ -14557,6 +15358,17 @@ fn png_crc32(data: &[u8]) -> u32 {
 mod tests {
     use super::*;
 
+    fn mock_agent() -> Arc<edgecrab_core::Agent> {
+        let provider: Arc<dyn edgequake_llm::LLMProvider> =
+            Arc::new(edgequake_llm::MockProvider::new());
+        Arc::new(
+            edgecrab_core::AgentBuilder::new("mock")
+                .provider(provider)
+                .build()
+                .expect("build agent"),
+        )
+    }
+
     #[tokio::test]
     async fn app_init() {
         let app = App::new();
@@ -15236,6 +16048,60 @@ mod tests {
         }
     }
 
+    #[test]
+    #[serial_test::serial(edgecrab_home_env)]
+    fn persist_smart_routing_round_trip() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+
+        persist_smart_routing_to_config(&edgecrab_core::config::SmartRoutingYaml {
+            enabled: true,
+            cheap_model: "copilot/gpt-4.1-mini".into(),
+            cheap_base_url: None,
+            cheap_api_key_env: None,
+        })
+        .expect("persist smart routing");
+
+        let cfg = edgecrab_core::AppConfig::load().expect("load config");
+        assert!(cfg.model.smart_routing.enabled);
+        assert_eq!(cfg.model.smart_routing.cheap_model, "copilot/gpt-4.1-mini");
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(edgecrab_home_env)]
+    fn persist_moa_config_round_trip() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+
+        persist_moa_config_to_config(&edgecrab_core::config::MoaConfig {
+            aggregator_model: "anthropic/claude-opus-4.6".into(),
+            reference_models: vec!["anthropic/claude-opus-4.6".into(), "openai/gpt-4.1".into()],
+        })
+        .expect("persist moa");
+
+        let cfg = edgecrab_core::AppConfig::load().expect("load config");
+        assert_eq!(cfg.moa.aggregator_model, "anthropic/claude-opus-4.6");
+        assert_eq!(cfg.moa.reference_models.len(), 2);
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
     #[tokio::test]
     async fn approve_command_resolves_pending_overlay() {
         let mut app = App::new();
@@ -15297,6 +16163,85 @@ mod tests {
         app.handle_config_command(String::new());
         assert!(app.config_selector.active);
         assert!(!app.config_selector.filtered.is_empty());
+    }
+
+    #[test]
+    #[serial_test::serial(edgecrab_home_env)]
+    fn cheap_model_command_updates_agent_and_config() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let _enter = rt.enter();
+        let mut app = App::new();
+        let agent = mock_agent();
+        drop(_enter);
+        app.set_agent(agent.clone());
+
+        app.handle_set_cheap_model("copilot/gpt-4.1-mini".into());
+
+        let smart_routing = rt.block_on(agent.smart_routing_config());
+        assert!(smart_routing.enabled);
+        assert_eq!(smart_routing.cheap_model, "vscode-copilot/gpt-4.1-mini");
+
+        let cfg = edgecrab_core::AppConfig::load().expect("load config");
+        assert!(cfg.model.smart_routing.enabled);
+        assert_eq!(
+            cfg.model.smart_routing.cheap_model,
+            "vscode-copilot/gpt-4.1-mini"
+        );
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(edgecrab_home_env)]
+    fn moa_reference_selector_tracks_saved_selection() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let _enter = rt.enter();
+        let mut app = App::new();
+        let agent = mock_agent();
+        drop(_enter);
+        app.set_agent(agent.clone());
+
+        app.handle_save_moa_reference_selection(vec![
+            "anthropic/claude-opus-4.6".into(),
+            "openai/gpt-4.1".into(),
+        ]);
+
+        let moa = rt.block_on(agent.moa_config());
+        assert_eq!(moa.reference_models.len(), 2);
+        assert!(
+            moa.reference_models
+                .iter()
+                .any(|model| model == "openai/gpt-4.1")
+        );
+
+        let cfg = edgecrab_core::AppConfig::load().expect("load config");
+        assert_eq!(cfg.moa.reference_models.len(), 2);
+
+        app.open_moa_reference_selector();
+        assert!(app.moa_reference_selector.active);
+        assert_eq!(app.moa_reference_selected.len(), 2);
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
     }
 
     #[test]

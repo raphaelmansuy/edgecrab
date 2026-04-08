@@ -37,7 +37,7 @@ use crate::registry::{ToolContext, ToolHandler};
 
 /// Reference models that provide diverse initial responses.
 /// These must be available via the active provider (gateway/openrouter).
-const DEFAULT_REFERENCE_MODELS: &[&str] = &[
+pub const DEFAULT_REFERENCE_MODELS: &[&str] = &[
     "anthropic/claude-opus-4.6",
     "google/gemini-2.5-pro",
     "openai/gpt-4.1",
@@ -45,7 +45,14 @@ const DEFAULT_REFERENCE_MODELS: &[&str] = &[
 ];
 
 /// Aggregator model — synthesizes reference responses.
-const DEFAULT_AGGREGATOR_MODEL: &str = "anthropic/claude-opus-4.6";
+pub const DEFAULT_AGGREGATOR_MODEL: &str = "anthropic/claude-opus-4.6";
+
+pub fn default_reference_models() -> Vec<String> {
+    DEFAULT_REFERENCE_MODELS
+        .iter()
+        .map(|model| (*model).to_string())
+        .collect()
+}
 
 /// Temperature for reference models — higher for diversity.
 const REFERENCE_TEMPERATURE: f32 = 0.6;
@@ -159,14 +166,16 @@ impl ToolHandler for MixtureOfAgentsTool {
             })?;
 
         let reference_models: Vec<String> = args.reference_models.unwrap_or_else(|| {
-            DEFAULT_REFERENCE_MODELS
-                .iter()
-                .map(|s| s.to_string())
-                .collect()
+            if !ctx.config.moa_reference_models.is_empty() {
+                ctx.config.moa_reference_models.clone()
+            } else {
+                default_reference_models()
+            }
         });
 
         let aggregator_model_id = args
             .aggregator_model
+            .or_else(|| ctx.config.moa_aggregator_model.clone())
             .unwrap_or_else(|| DEFAULT_AGGREGATOR_MODEL.to_string());
 
         if reference_models.is_empty() {

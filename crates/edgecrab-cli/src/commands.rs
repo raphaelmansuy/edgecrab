@@ -4,11 +4,11 @@
 //! session management, and configuration. Mirrors hermes-agent's
 //! 40+ command set.
 //!
-//! Full command map (44 commands, 52+ aliases):
+//! Full command map (46 commands, 54+ aliases):
 //!
 //! ```text
 //!   Navigation    /help /quit /clear /new /status /version
-//!   Model         /model /vision_model /image_model /provider /reasoning /stream
+//!   Model         /model /cheap_model /vision_model /image_model /moa /provider /reasoning /stream
 //!   Session       /session /retry /undo /stop /history /save /export /title /resume
 //!   Config        /config /prompt /verbose /personality /statusbar
 //!   Tools         /tools /toolsets /mcp /reload-mcp /plugins
@@ -46,18 +46,38 @@ pub enum CommandResult {
     ModelSwitch(String),
     /// Activate the interactive model selector overlay
     ModelSelector,
+    /// Activate the interactive cheap-model selector overlay.
+    CheapModelSelector,
     /// Activate the interactive vision-model selector overlay.
     VisionModelSelector,
     /// Activate the interactive image-model selector overlay.
     ImageModelSelector,
+    /// Activate the interactive MoA aggregator selector overlay.
+    MoaAggregatorSelector,
+    /// Activate the interactive MoA reference-model selector overlay.
+    MoaReferenceSelector,
+    /// Show the current cheap-model routing state.
+    ShowCheapModel,
     /// Show the current auxiliary vision-model routing state.
     ShowVisionModel,
+    /// Update the cheap-model routing state.
+    SetCheapModel(String),
     /// Update the auxiliary vision-model routing state.
     SetVisionModel(String),
     /// Show the current image-generation routing state.
     ShowImageModel,
     /// Update the default image-generation routing state.
     SetImageModel(String),
+    /// Show the current Mixture-of-Agents defaults.
+    ShowMoaConfig,
+    /// Update the default MoA aggregator model.
+    SetMoaAggregator(String),
+    /// Add a reference model to the default MoA roster.
+    AddMoaReference(String),
+    /// Remove a reference model from the default MoA roster.
+    RemoveMoaReference(String),
+    /// Reset the default MoA roster and aggregator.
+    ResetMoaConfig,
     /// Start a fresh session (app clears messages + session state)
     SessionNew,
     /// Load a theme from YAML skin file and redraw
@@ -336,6 +356,25 @@ impl CommandRegistry {
         });
 
         self.register(Command {
+            name: "cheap_model",
+            aliases: &["cheap-model"],
+            description: "Open, show, or set the smart-routing cheap model (/cheap_model, /cheap_model status, /cheap_model off)",
+            handler: |args| {
+                let trimmed = args.trim();
+                if trimmed.is_empty()
+                    || trimmed.eq_ignore_ascii_case("open")
+                    || trimmed.eq_ignore_ascii_case("list")
+                {
+                    CommandResult::CheapModelSelector
+                } else if trimmed.eq_ignore_ascii_case("status") {
+                    CommandResult::ShowCheapModel
+                } else {
+                    CommandResult::SetCheapModel(trimmed.to_string())
+                }
+            },
+        });
+
+        self.register(Command {
             name: "vision_model",
             aliases: &["vision-model"],
             description: "Open, show, or set the dedicated vision backend (/vision_model, /vision_model status, /vision_model auto)",
@@ -367,6 +406,58 @@ impl CommandRegistry {
                 } else {
                     CommandResult::SetImageModel(trimmed.to_string())
                 }
+            },
+        });
+
+        self.register(Command {
+            name: "moa",
+            aliases: &[],
+            description: "Inspect or configure Mixture-of-Agents defaults (/moa status, /moa aggregator, /moa references)",
+            handler: |args| {
+                let trimmed = args.trim();
+                if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("status") {
+                    return CommandResult::ShowMoaConfig;
+                }
+
+                if trimmed.eq_ignore_ascii_case("reset")
+                    || trimmed.eq_ignore_ascii_case("default")
+                {
+                    return CommandResult::ResetMoaConfig;
+                }
+
+                if trimmed.eq_ignore_ascii_case("references")
+                    || trimmed.eq_ignore_ascii_case("refs")
+                    || trimmed.eq_ignore_ascii_case("roster")
+                {
+                    return CommandResult::MoaReferenceSelector;
+                }
+
+                if trimmed.eq_ignore_ascii_case("aggregator")
+                    || trimmed.eq_ignore_ascii_case("agg")
+                {
+                    return CommandResult::MoaAggregatorSelector;
+                }
+
+                if let Some(model) = trimmed.strip_prefix("aggregator ") {
+                    return CommandResult::SetMoaAggregator(model.trim().to_string());
+                }
+                if let Some(model) = trimmed.strip_prefix("agg ") {
+                    return CommandResult::SetMoaAggregator(model.trim().to_string());
+                }
+                if let Some(model) = trimmed.strip_prefix("add ") {
+                    return CommandResult::AddMoaReference(model.trim().to_string());
+                }
+                if let Some(model) = trimmed.strip_prefix("remove ") {
+                    return CommandResult::RemoveMoaReference(model.trim().to_string());
+                }
+                if let Some(model) = trimmed.strip_prefix("rm ") {
+                    return CommandResult::RemoveMoaReference(model.trim().to_string());
+                }
+
+                CommandResult::Output(
+                    "Usage: /moa [status|reset|aggregator [provider/model]|references|add <provider/model>|remove <provider/model>]"
+                        .into(),
+                )
             },
         });
 
@@ -968,8 +1059,10 @@ fn help_text() -> String {
          \n\
          Model:\n\
           /model [name]         — Show or switch model\n\
+          /cheap_model [spec]   — Open, show, or set smart-routing cheap model\n\
           /vision_model [spec]  — Open, show, or set dedicated vision model\n\
           /image_model [spec]   — Open, show, or set default image generation model\n\
+          /moa [subcommand]     — Configure Mixture-of-Agents defaults\n\
           /provider             — List available providers\n\
           /reasoning [mode]     — Set reasoning effort or think mode\n\
           /stream [mode]        — Toggle live token streaming\n\
@@ -1161,6 +1254,25 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_cheap_model_commands() {
+        let reg = CommandRegistry::new();
+        assert!(matches!(
+            reg.dispatch("/cheap_model"),
+            Some(CommandResult::CheapModelSelector)
+        ));
+        assert!(matches!(
+            reg.dispatch("/cheap_model status"),
+            Some(CommandResult::ShowCheapModel)
+        ));
+        match reg.dispatch("/cheap_model copilot/gpt-4.1-mini") {
+            Some(CommandResult::SetCheapModel(model)) => {
+                assert_eq!(model, "copilot/gpt-4.1-mini")
+            }
+            _ => panic!("expected cheap model override"),
+        }
+    }
+
+    #[test]
     fn dispatch_vision_model_with_name_updates_override() {
         let reg = CommandRegistry::new();
         match reg.dispatch("/vision_model openai/gpt-4o") {
@@ -1220,6 +1332,41 @@ mod tests {
                 assert_eq!(model, "gemini/gemini-2.5-flash-image")
             }
             _ => panic!("expected image model override"),
+        }
+    }
+
+    #[test]
+    fn dispatch_moa_commands() {
+        let reg = CommandRegistry::new();
+        assert!(matches!(
+            reg.dispatch("/moa"),
+            Some(CommandResult::ShowMoaConfig)
+        ));
+        assert!(matches!(
+            reg.dispatch("/moa aggregator"),
+            Some(CommandResult::MoaAggregatorSelector)
+        ));
+        assert!(matches!(
+            reg.dispatch("/moa references"),
+            Some(CommandResult::MoaReferenceSelector)
+        ));
+        match reg.dispatch("/moa aggregator anthropic/claude-opus-4.6") {
+            Some(CommandResult::SetMoaAggregator(model)) => {
+                assert_eq!(model, "anthropic/claude-opus-4.6")
+            }
+            _ => panic!("expected moa aggregator override"),
+        }
+        match reg.dispatch("/moa add openai/gpt-4.1") {
+            Some(CommandResult::AddMoaReference(model)) => {
+                assert_eq!(model, "openai/gpt-4.1")
+            }
+            _ => panic!("expected moa add"),
+        }
+        match reg.dispatch("/moa remove openai/gpt-4.1") {
+            Some(CommandResult::RemoveMoaReference(model)) => {
+                assert_eq!(model, "openai/gpt-4.1")
+            }
+            _ => panic!("expected moa remove"),
         }
     }
 
@@ -1457,6 +1604,8 @@ mod tests {
             "/resume",
             "/reasoning",
             "/stream",
+            "/cheap_model",
+            "/moa",
             "/statusbar",
             "/reload-mcp",
             "/plugins",

@@ -141,7 +141,7 @@ Options:
 
 ---
 
-## The 53 slash commands
+## The 46 slash commands
 
 Slash commands are registered in `commands.rs` and available inside the TUI
 by typing `/` followed by the command name:
@@ -150,16 +150,20 @@ by typing `/` followed by the command name:
 |---|---|
 | Navigation | `/help`, `/quit`, `/clear`, `/version`, `/status`, `/new` |
 | Session | `/session`, `/retry`, `/undo`, `/stop`, `/history`, `/save`, `/export`, `/title`, `/resume` |
-| Model | `/model`, `/models`, `/provider`, `/reasoning`, `/stream`, `/vision_model` |
-| Config | `/config`, `/prompt`, `/verbose`, `/personality`, `/theme`, `/statusbar`, `/mouse` |
-| Tools | `/tools`, `/toolsets`, `/reload-mcp`, `/mcp-token`, `/plugins`, `/skills`, `/browser` |
+| Model | `/model`, `/cheap_model`, `/vision_model`, `/image_model`, `/moa`, `/models`, `/provider`, `/reasoning`, `/stream` |
+| Config | `/config`, `/prompt`, `/verbose`, `/personality`, `/statusbar`, `/mouse` |
+| Tools | `/tools`, `/toolsets`, `/mcp`, `/reload-mcp`, `/mcp-token`, `/plugins`, `/skills`, `/browser`, `/memory` |
 | Analysis | `/cost`, `/usage`, `/compress`, `/insights` |
-| Workflow | `/queue`, `/background`, `/rollback`, `/cron`, `/voice`, `/paste` |
+| Appearance | `/theme`, `/paste` |
+| Workflow | `/queue`, `/background`, `/rollback`, `/cron`, `/voice` |
 | Gateway | `/platforms`, `/approve`, `/deny`, `/sethome`, `/update` |
+| Diagnostics | `/doctor` and `/permissions` on macOS |
 
 Recent UX notes:
 
 - `/config` opens a searchable config center instead of only dumping paths.
+- `/cheap_model` and `/moa aggregator` reuse the same fast selector pattern as `/model`.
+- `/moa references` uses a searchable multi-select overlay instead of raw text editing.
 - `/theme` opens the skin browser by default; `/theme reload` is explicit.
 - `/statusbar` is a real persisted toggle.
 - `/approve`, `/deny`, `/sethome`, and `/update` now operate on live TUI or config state.

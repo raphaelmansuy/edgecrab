@@ -148,6 +148,8 @@ pub struct AgentConfig {
     pub compression: crate::config::CompressionConfig,
     /// Auxiliary side-task routing (vision, compression, other helper calls).
     pub auxiliary: crate::config::AuxiliaryConfig,
+    /// Default Mixture-of-Agents roster and aggregator.
+    pub moa: crate::config::MoaConfig,
     /// Voice output configuration projected from AppConfig.
     pub tts: crate::config::TtsConfig,
     /// Voice input configuration projected from AppConfig.
@@ -206,6 +208,7 @@ impl Default for AgentConfig {
                 edgecrab_tools::tools::backends::SingularityBackendConfig::default(),
             compression: crate::config::CompressionConfig::default(),
             auxiliary: crate::config::AuxiliaryConfig::default(),
+            moa: crate::config::MoaConfig::default(),
             tts: crate::config::TtsConfig::default(),
             stt: crate::config::SttConfig::default(),
             image_generation: crate::config::ImageGenerationConfig::default(),
@@ -831,6 +834,16 @@ impl Agent {
         self.config.read().await.auxiliary.clone()
     }
 
+    /// Return the current smart-routing configuration for future turns.
+    pub async fn smart_routing_config(&self) -> crate::config::SmartRoutingYaml {
+        self.config.read().await.model_config.smart_routing.clone()
+    }
+
+    /// Return the current Mixture-of-Agents defaults for future tool calls.
+    pub async fn moa_config(&self) -> crate::config::MoaConfig {
+        self.config.read().await.moa.clone()
+    }
+
     /// Return the current voice/media configuration used by direct tools.
     pub async fn media_config(
         &self,
@@ -886,6 +899,12 @@ impl Agent {
         config.auxiliary = auxiliary;
     }
 
+    /// Update smart routing for future turns.
+    pub async fn set_smart_routing_config(&self, smart_routing: crate::config::SmartRoutingYaml) {
+        let mut config = self.config.write().await;
+        config.model_config.smart_routing = smart_routing;
+    }
+
     /// Update the default image generation routing for future turns.
     pub async fn set_image_generation_config(
         &self,
@@ -893,6 +912,12 @@ impl Agent {
     ) {
         let mut config = self.config.write().await;
         config.image_generation = image_generation;
+    }
+
+    /// Update the default Mixture-of-Agents roster and aggregator.
+    pub async fn set_moa_config(&self, moa: crate::config::MoaConfig) {
+        let mut config = self.config.write().await;
+        config.moa = moa;
     }
 }
 
@@ -1251,6 +1276,7 @@ impl AgentBuilder {
                 terminal_singularity: config.terminal.singularity.clone(),
                 compression: config.compression.clone(),
                 auxiliary: config.auxiliary.clone(),
+                moa: config.moa.clone(),
                 tts: config.tts.clone(),
                 stt: config.stt.clone(),
                 image_generation: config.image_generation.clone(),

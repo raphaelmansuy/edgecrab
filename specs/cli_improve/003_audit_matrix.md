@@ -27,6 +27,17 @@ Legend:
 | `config edit` | yellow | Useful, but editor launch behavior is outside the TUI and not mirrored interactively. |
 | `mcp` operator surface | green | Particularly strong: list/search/install/test/doctor/auth/login/remove. |
 
+## Binary CLI Entry, Help, and Global Flags
+
+| Surface | Status | Notes |
+|---|---|---|
+| `edgecrab --help` | green | Observed against the built binary; top-level subcommands and global flags match the clap tree in `cli_args.rs`. |
+| `edgecrab --version` and `edgecrab version` | green | Two different but coherent contracts: clap short version and richer runtime/provider report. |
+| `edgecrab status` | green | Observed against the built binary; reports live profile, config path, DB, model, gateway, and cron state. |
+| `edgecrab <top-level-subcommand> --help` | green | Observed for every documented top-level terminal command: `profile`, `completion`, `setup`, `doctor`, `migrate`, `acp`, `version`, `whatsapp`, `status`, `sessions`, `config`, `tools`, `mcp`, `plugins`, `cron`, `gateway`, `skills`. |
+| Global runtime flags: `--model`, `--toolset`, `--session`, `--continue`, `--resume`, `--quiet`, `--config`, `--debug`, `--no-banner`, `--profile` | green | Parsed centrally and fed into startup or subcommand routing with explicit conflict handling for `--profile` + `--config`. |
+| Session/bootstrap flags: `--worktree`, `--skill` | green | Genuinely implemented rather than decorative; worktree is best-effort and degrades with an explicit warning instead of aborting startup. |
+
 ## TUI Slash Commands: Navigation and Session
 
 | Commands | Status | Notes |
@@ -39,6 +50,8 @@ Legend:
 | Commands | Status | Notes |
 |---|---|---|
 | `/model`, `/models`, `/vision_model`, `/image_model`, `/provider`, `/reasoning`, `/stream`, `/cost`, `/usage`, `/compress`, `/insights` | green | Wired to live selectors, routing state, or agent snapshots. |
+| `/cheap_model` | green | Now uses the same selector-first UX as `/model`, persists `model.smart_routing.*`, and supports status plus disable flows. |
+| `/moa` | green | Now exposes real MoA aggregator and reference-roster management; runtime and persisted config stay aligned. |
 
 ## TUI Slash Commands: Config and Appearance
 
@@ -70,4 +83,6 @@ Legend:
 2. Add a proper non-git update strategy for packaged installs.
 3. Move gateway home-channel editing into a richer selector with platform-aware validation.
 4. Unify CLI `config edit` and TUI `/config edit` around a terminal-safe editor handoff flow.
-5. Audit persistence helpers that currently serialize env-resolved values back into YAML.
+5. Add inline editing for smart-routing transport fields such as `cheap_base_url` and `cheap_api_key_env`.
+6. Audit persistence helpers that currently serialize env-resolved values back into YAML.
+7. Add snapshot or smoke tests for clap-generated `--help` output so documented entry UX cannot drift silently.

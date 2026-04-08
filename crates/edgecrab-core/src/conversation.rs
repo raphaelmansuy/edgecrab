@@ -328,6 +328,8 @@ impl Agent {
             auxiliary_model: config.auxiliary.model.clone(),
             auxiliary_base_url: config.auxiliary.base_url.clone(),
             auxiliary_api_key_env: config.auxiliary.api_key_env.clone(),
+            moa_reference_models: config.moa.reference_models.clone(),
+            moa_aggregator_model: Some(config.moa.aggregator_model.clone()),
             tts_provider: Some(config.tts.provider.clone()),
             tts_voice: Some(config.tts.voice.clone()),
             tts_rate: config.tts.rate.clone(),

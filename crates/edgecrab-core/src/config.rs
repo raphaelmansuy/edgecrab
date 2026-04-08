@@ -57,6 +57,7 @@ pub struct AppConfig {
     pub voice: VoiceConfig,
     pub honcho: HonchoConfig,
     pub auxiliary: AuxiliaryConfig,
+    pub moa: MoaConfig,
     pub reasoning_effort: Option<String>,
 }
 
@@ -1790,6 +1791,27 @@ pub struct AuxiliaryConfig {
     pub api_key_env: Option<String>,
 }
 
+/// Default Mixture-of-Agents configuration.
+///
+/// These values are used when the `mixture_of_agents` tool is called without
+/// explicit `reference_models` or `aggregator_model` arguments.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct MoaConfig {
+    pub reference_models: Vec<String>,
+    pub aggregator_model: String,
+}
+
+impl Default for MoaConfig {
+    fn default() -> Self {
+        Self {
+            reference_models: edgecrab_tools::tools::mixture_of_agents::default_reference_models(),
+            aggregator_model: edgecrab_tools::tools::mixture_of_agents::DEFAULT_AGGREGATOR_MODEL
+                .to_string(),
+        }
+    }
+}
+
 // ─── Home directory resolution ────────────────────────────────────────
 
 /// Resolve the EdgeCrab home directory.
@@ -2217,5 +2239,35 @@ model:
         let cfg: AppConfig = serde_yml::from_str(yaml).expect("parse");
         assert!(cfg.model.smart_routing.enabled);
         assert_eq!(cfg.model.smart_routing.cheap_model, "copilot/gpt-4.1-mini");
+    }
+
+    #[test]
+    fn moa_defaults_match_tool_defaults() {
+        let moa = MoaConfig::default();
+        assert_eq!(
+            moa.aggregator_model,
+            edgecrab_tools::tools::mixture_of_agents::DEFAULT_AGGREGATOR_MODEL
+        );
+        assert_eq!(
+            moa.reference_models,
+            edgecrab_tools::tools::mixture_of_agents::default_reference_models()
+        );
+    }
+
+    #[test]
+    fn moa_config_deserializes() {
+        let yaml = r#"
+moa:
+  aggregator_model: "anthropic/claude-opus-4.6"
+  reference_models:
+    - "anthropic/claude-opus-4.6"
+    - "openai/gpt-4.1"
+"#;
+        let cfg: AppConfig = serde_yml::from_str(yaml).expect("parse");
+        assert_eq!(cfg.moa.aggregator_model, "anthropic/claude-opus-4.6");
+        assert_eq!(
+            cfg.moa.reference_models,
+            vec!["anthropic/claude-opus-4.6", "openai/gpt-4.1"]
+        );
     }
 }

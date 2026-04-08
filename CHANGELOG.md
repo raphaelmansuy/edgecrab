@@ -12,6 +12,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 #### CLI & TUI
 - **ADR-backed CLI/TUI audit spec set** — new documents under `specs/cli_improve/` cross-reference the clap subcommand tree, slash-command registry, TUI handlers, config UX, and verification plan.
 - **TUI config center** — `/config` now opens a searchable control surface that summarizes runtime configuration, exposes important paths, and routes directly into model, vision, image, display, skin, voice, gateway-home, and update actions.
+- **Selector-grade cheap-model routing UX** — `/cheap_model` now matches `/model` with a fast model picker, persisted smart-routing state, `status`, and `off` flows instead of relying on manual YAML edits.
+- **First-class MoA configuration UX** — `/moa` now exposes live status, aggregator selection, searchable reference-roster editing, reset behavior, and config-center entry points; the `mixture_of_agents` tool now consumes persisted `moa` defaults when per-call overrides are omitted.
 
 #### Model Discovery
 - **Dynamic provider discovery with principled fallback** — `edgecrab-core` now supports provider-scoped live model discovery for OpenRouter, Ollama, LM Studio, Google Gemini, GitHub Copilot, and AWS Bedrock, with per-provider cache plus static catalog fallback instead of generic `/v1/models` heuristics.
@@ -48,6 +50,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **LSP integration and surface regressions** — integration coverage exercises the mock LSP server end to end, and surface tests now prove EdgeCrab exposes more than Claude Code's 9 documented LSP operations on both core and ACP surfaces.
 - **Build and release automation updated for `edgecrab-lsp`** — Makefile and crates.io release workflow now include the new crate in publish order, and CI runs the dedicated `edgecrab-lsp` package tests explicitly.
 - **Documentation refresh for semantic coding** — README, docs, site pages, configuration reference, and changelog now document LSP setup, capabilities, and the expanded coding toolset.
+- **CLI/model-routing documentation refresh** — the CLI architecture, config/TUI deep dive, smart-routing docs, tool catalogue, and config reference now document `/cheap_model`, `/moa`, and the new `moa:` config block consistently.
 
 ---
 

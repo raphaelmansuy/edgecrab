@@ -181,6 +181,10 @@ pub struct AppConfigRef {
     pub image_provider: Option<String>,
     /// Preferred image-generation model from config (`image_generation.model`).
     pub image_model: Option<String>,
+    /// Default reference models for the `mixture_of_agents` tool.
+    pub moa_reference_models: Vec<String>,
+    /// Default aggregator model for the `mixture_of_agents` tool.
+    pub moa_aggregator_model: Option<String>,
 }
 
 impl Default for AppConfigRef {
@@ -234,6 +238,8 @@ impl Default for AppConfigRef {
             stt_whisper_model: None,
             image_provider: None,
             image_model: None,
+            moa_reference_models: Vec::new(),
+            moa_aggregator_model: None,
         }
     }
 }

@@ -141,7 +141,7 @@ These tools work when `HA_URL` and `HA_TOKEN` are configured.
 |---|---|---|
 | `execute_code` | `code_execution` | Execute code in an isolated sandbox (Docker or local) |
 | `delegate_task` | `delegation` | Spawn a sub-agent with a specific goal and toolset |
-| `mixture_of_agents` | `delegation` | Run N agents in parallel, synthesise results |
+| `mixture_of_agents` | `moa` | Run N reference models in parallel, then synthesise with the configured or overridden aggregator |
 
 > `delegate_depth` in `ToolContext` is capped at 2. A sub-agent cannot spawn
 > another sub-agent that spawns a third — recursion protection.

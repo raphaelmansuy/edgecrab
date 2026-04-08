@@ -58,8 +58,10 @@
 | `browser` | Playwright/CDP settings |
 | `checkpoints` | Frequency, storage path |
 | `tts` / `stt` / `voice` | Audio I/O settings |
+| `image_generation` | Default image-generation backend and settings |
 | `honcho` | Honcho user-model memory service |
-| `auxiliary` | Spare bag for extension settings |
+| `auxiliary` | Auxiliary model settings such as vision overrides |
+| `moa` | Default Mixture-of-Agents aggregator and reference roster |
 
 Top-level runtime flags (not nested in a section):
 
@@ -159,6 +161,9 @@ edgecrab --profile personal "summarise my notes"
 model:
   default: "anthropic/claude-sonnet-4-20250514"
   temperature: 0.3
+  smart_routing:
+    enabled: true
+    cheap_model: "anthropic/claude-haiku-4-5-20251001"
 
 agent:
   max_iterations: 30
@@ -173,6 +178,12 @@ compression:
 memory:
   enabled: true
   max_inject_tokens: 4000
+
+moa:
+  aggregator_model: "anthropic/claude-opus-4.6"
+  reference_models:
+    - "anthropic/claude-opus-4.6"
+    - "openai/gpt-4.1"
 ```
 
 ---

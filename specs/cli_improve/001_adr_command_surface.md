@@ -9,6 +9,7 @@ EdgeCrab already has a rich command surface, but richness alone is not quality.
 The project exposes two operator-facing layers:
 
 - binary subcommands through clap
+- clap-generated entry/help/version surfaces and global runtime flags
 - interactive slash commands inside the TUI
 
 Those layers are user interface, not internal implementation detail. A command that is registered but shallow, misleading, or inconsistent is a UX bug.
@@ -36,6 +37,7 @@ The audit found several command-surface failures that were not type-safety failu
 ## Consequences
 
 - Slash commands should prefer specific `CommandResult` variants over generic string output when the TUI has real state to mutate.
+- Clap-generated `--help` and `--version` output are part of the product contract and should be reviewed like any hand-written command output.
 - Help text must describe actual behavior, not intended behavior.
 - Commands that bridge into persistent config must persist and reflect runtime state where safe.
 - The audit matrix becomes part of the maintenance model: adding a command now implies checking docs, registry, handler, persistence, and tests together.

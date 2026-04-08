@@ -1583,11 +1583,24 @@ fn set_config_value(
         "display.skin" => config.display.skin = value.to_string(),
         "display.personality" => config.display.personality = value.to_string(),
         "display.show_reasoning" => config.display.show_reasoning = parse_bool(value)?,
+        "display.show_status_bar" => config.display.show_status_bar = parse_bool(value)?,
         "display.streaming" => {
             let enabled = parse_bool(value)?;
             config.display.streaming = enabled;
             config.model.streaming = enabled;
         }
+        "model.smart_routing.enabled" => config.model.smart_routing.enabled = parse_bool(value)?,
+        "model.smart_routing.cheap_model" => {
+            config.model.smart_routing.cheap_model = value.to_string()
+        }
+        "model.smart_routing.cheap_base_url" => {
+            config.model.smart_routing.cheap_base_url = Some(value.to_string())
+        }
+        "model.smart_routing.cheap_api_key_env" => {
+            config.model.smart_routing.cheap_api_key_env = Some(value.to_string())
+        }
+        "moa.aggregator_model" => config.moa.aggregator_model = value.to_string(),
+        "moa.reference_models" => config.moa.reference_models = parse_csv(value),
         "memory.enabled" => config.memory.enabled = parse_bool(value)?,
         "skills.enabled" => config.skills.enabled = parse_bool(value)?,
         "timezone" => config.timezone = Some(value.to_string()),
@@ -1726,4 +1739,53 @@ fn setup_worktree() -> anyhow::Result<PathBuf> {
     }
 
     Ok(wt_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::set_config_value;
+
+    #[test]
+    fn set_config_value_supports_smart_routing_and_moa_keys() {
+        let mut config = edgecrab_core::AppConfig::default();
+
+        set_config_value(&mut config, "model.smart_routing.enabled", "true")
+            .expect("enable smart routing");
+        set_config_value(
+            &mut config,
+            "model.smart_routing.cheap_model",
+            "copilot/gpt-4.1-mini",
+        )
+        .expect("set cheap model");
+        set_config_value(
+            &mut config,
+            "moa.aggregator_model",
+            "anthropic/claude-opus-4.6",
+        )
+        .expect("set moa aggregator");
+        set_config_value(
+            &mut config,
+            "moa.reference_models",
+            "anthropic/claude-opus-4.6,openai/gpt-4.1",
+        )
+        .expect("set moa refs");
+
+        assert!(config.model.smart_routing.enabled);
+        assert_eq!(
+            config.model.smart_routing.cheap_model,
+            "copilot/gpt-4.1-mini"
+        );
+        assert_eq!(config.moa.aggregator_model, "anthropic/claude-opus-4.6");
+        assert_eq!(
+            config.moa.reference_models,
+            vec!["anthropic/claude-opus-4.6", "openai/gpt-4.1"]
+        );
+    }
+
+    #[test]
+    fn set_config_value_supports_status_bar_visibility() {
+        let mut config = edgecrab_core::AppConfig::default();
+        set_config_value(&mut config, "display.show_status_bar", "false").expect("set status bar");
+        assert!(!config.display.show_status_bar);
+    }
 }

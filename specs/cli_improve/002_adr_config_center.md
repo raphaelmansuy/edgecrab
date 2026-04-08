@@ -35,8 +35,11 @@ It gives the user:
 - session/config summary
 - important filesystem paths
 - model selector
+- cheap-model selector
 - vision model selector
 - image model selector
+- MoA aggregator selector
+- MoA reference-roster selector
 - streaming toggle
 - reasoning-pane toggle
 - status-bar toggle

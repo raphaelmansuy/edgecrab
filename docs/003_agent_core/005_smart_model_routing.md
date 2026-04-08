@@ -126,6 +126,43 @@ edgecrab --model anthropic/claude-opus-4-20250514 "refactor auth.rs"
 
 The `--model` flag overrides smart routing for the entire session.
 
+Inside the TUI:
+
+```sh
+/cheap_model                  # open the same selector-style UX as /model
+/cheap_model status           # inspect current smart-routing state
+/cheap_model off              # disable cheap-model routing and clear its override
+/config cheap                 # jump there from the config center
+```
+
+The cheap-model selector persists `model.smart_routing.enabled` and
+`model.smart_routing.cheap_model` back to `config.yaml`.
+
+## Related multi-model defaults
+
+EdgeCrab also exposes a separate top-level `moa` block for the
+`mixture_of_agents` tool:
+
+```yaml
+moa:
+  aggregator_model: anthropic/claude-opus-4.6
+  reference_models:
+    - anthropic/claude-opus-4.6
+    - google/gemini-2.5-pro
+    - openai/gpt-4.1
+    - deepseek/deepseek-r1
+```
+
+These defaults are used when the MoA tool call omits explicit
+`aggregator_model` or `reference_models` arguments. The TUI exposes:
+
+```sh
+/moa status
+/moa aggregator
+/moa references
+/config moa
+```
+
 ---
 
 ## Model catalog
@@ -248,3 +285,4 @@ automatically.
 - How routing integrates in the loop → [Conversation Loop](./002_conversation_loop.md)
 - Model config in `AppConfig` → [Config and State](../009_config_state/001_config_state.md)
 - Model pricing and cost tracking → [Data Models](../010_data_models/001_data_models.md)
+- MoA tool behavior → [Tool Catalogue](../004_tools_system/002_tool_catalogue.md)
