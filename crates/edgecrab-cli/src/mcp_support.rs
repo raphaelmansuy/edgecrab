@@ -9,7 +9,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::mcp_oauth::{LoopbackPortMode, analyze_loopback_redirect_url};
 use edgecrab_tools::tools::mcp_client::{
-    ConfiguredMcpServer, configured_servers, probe_configured_server, read_mcp_token_status,
+    ConfiguredMcpServer, configured_servers_with_disabled, probe_configured_server,
+    read_mcp_token_status,
 };
 use edgecrab_types::ToolError;
 
@@ -158,6 +159,14 @@ pub fn auth_summary(server: &ConfiguredMcpServer) -> String {
 pub fn render_configured_server_detail(server: &ConfiguredMcpServer) -> String {
     let mut lines = vec![
         format!("Server: {}", server.name),
+        format!(
+            "State: {}",
+            if server.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        ),
         format!("Transport: {}", transport_summary(server)),
     ];
 
@@ -261,7 +270,7 @@ fn contains_unresolved_env_template(value: &str) -> bool {
 }
 
 pub async fn render_mcp_doctor_report(server_name: Option<&str>) -> Result<String, ToolError> {
-    let servers = configured_servers()?;
+    let servers = configured_servers_with_disabled()?;
     if servers.is_empty() {
         return Ok("No MCP servers configured.".into());
     }
@@ -289,32 +298,38 @@ pub async fn render_mcp_doctor_report(server_name: Option<&str>) -> Result<Strin
 
     for server in selected {
         let mut report = analyze_server(&server);
-        match probe_configured_server(&server.name).await {
-            Ok(result) => {
-                if result.tool_count == 0 {
-                    report.status = report.status.max(McpDoctorStatus::Warn);
-                    report.lines.push("probe: ok | visible-tools=0".to_string());
-                } else {
-                    report.lines.push(format!(
-                        "probe: ok | transport={} | visible-tools={}",
-                        result.transport, result.tool_count
-                    ));
+        if !server.enabled {
+            report
+                .lines
+                .push("probe: skipped | server disabled in config".to_string());
+        } else {
+            match probe_configured_server(&server.name).await {
+                Ok(result) => {
+                    if result.tool_count == 0 {
+                        report.status = report.status.max(McpDoctorStatus::Warn);
+                        report.lines.push("probe: ok | visible-tools=0".to_string());
+                    } else {
+                        report.lines.push(format!(
+                            "probe: ok | transport={} | visible-tools={}",
+                            result.transport, result.tool_count
+                        ));
+                    }
+                    let sample_tools = result
+                        .tools
+                        .iter()
+                        .take(3)
+                        .map(|(name, _)| name.as_str())
+                        .collect::<Vec<_>>();
+                    if !sample_tools.is_empty() {
+                        report
+                            .lines
+                            .push(format!("sample-tools: {}", sample_tools.join(", ")));
+                    }
                 }
-                let sample_tools = result
-                    .tools
-                    .iter()
-                    .take(3)
-                    .map(|(name, _)| name.as_str())
-                    .collect::<Vec<_>>();
-                if !sample_tools.is_empty() {
-                    report
-                        .lines
-                        .push(format!("sample-tools: {}", sample_tools.join(", ")));
+                Err(err) => {
+                    report.status = McpDoctorStatus::Fail;
+                    report.lines.push(format!("probe: fail | {err}"));
                 }
-            }
-            Err(err) => {
-                report.status = McpDoctorStatus::Fail;
-                report.lines.push(format!("probe: fail | {err}"));
             }
         }
 
@@ -352,6 +367,7 @@ mod render_detail_tests {
 
         let rendered = render_configured_server_detail(&ConfiguredMcpServer {
             name: "github".into(),
+            enabled: true,
             url: Some("https://example.com/mcp".into()),
             bearer_token: None,
             oauth: None,
@@ -378,7 +394,7 @@ mod render_detail_tests {
 }
 
 pub fn render_mcp_auth_guide(server_name: &str) -> anyhow::Result<String> {
-    let server = configured_servers()
+    let server = configured_servers_with_disabled()
         .map_err(|err| anyhow::anyhow!(err.to_string()))?
         .into_iter()
         .find(|server| server.name == server_name)
@@ -386,6 +402,14 @@ pub fn render_mcp_auth_guide(server_name: &str) -> anyhow::Result<String> {
 
     let mut lines = vec![
         format!("MCP Auth — {}", server.name),
+        format!(
+            "state: {}",
+            if server.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        ),
         format!("transport: {}", transport_summary(&server)),
         format!("auth: {}", auth_summary(&server)),
     ];
@@ -636,6 +660,13 @@ pub fn render_mcp_auth_guide(server_name: &str) -> anyhow::Result<String> {
 fn analyze_server(server: &ConfiguredMcpServer) -> StaticMcpReport {
     let mut status = McpDoctorStatus::Pass;
     let mut lines = Vec::new();
+
+    if !server.enabled {
+        status = McpDoctorStatus::Warn;
+        lines.push("state: disabled | enable this server before live MCP tool use".into());
+    } else {
+        lines.push("state: enabled".into());
+    }
 
     lines.push(format!("transport: {}", transport_summary(server)));
 
@@ -900,6 +931,7 @@ mod tests {
     fn configured_server(command: &str) -> ConfiguredMcpServer {
         ConfiguredMcpServer {
             name: "test".into(),
+            enabled: true,
             url: None,
             bearer_token: None,
             oauth: None,

@@ -1962,6 +1962,7 @@ struct McpPresetEntry {
     id: String,
     kind: McpEntryKind,
     install_preset_id: Option<String>,
+    enabled: bool,
     title: String,
     source: String,
     action_label: String,
@@ -1999,7 +2000,13 @@ impl McpPresetEntry {
                     self.view_command()
                 }
             }
-            McpEntryKind::ConfiguredServer => self.test_command(),
+            McpEntryKind::ConfiguredServer => {
+                if self.enabled {
+                    self.test_command()
+                } else {
+                    self.enable_command()
+                }
+            }
         }
     }
 
@@ -2015,6 +2022,24 @@ impl McpPresetEntry {
 
     fn doctor_command(&self) -> String {
         format!("doctor {}", self.id)
+    }
+
+    fn enable_command(&self) -> String {
+        format!("enable {}", self.id)
+    }
+
+    fn disable_command(&self) -> String {
+        format!("disable {}", self.id)
+    }
+
+    fn toggle_command(&self) -> Option<String> {
+        (self.kind == McpEntryKind::ConfiguredServer).then(|| {
+            if self.enabled {
+                self.disable_command()
+            } else {
+                self.enable_command()
+            }
+        })
     }
 
     fn view_command(&self) -> String {
@@ -2044,7 +2069,12 @@ fn build_configured_mcp_entry(
     server: &edgecrab_tools::tools::mcp_client::ConfiguredMcpServer,
 ) -> McpPresetEntry {
     let transport = format_mcp_transport(server);
-    let mut detail = format!("{} | installed", transport);
+    let state_label = if server.enabled {
+        "enabled"
+    } else {
+        "disabled"
+    };
+    let mut detail = format!("{transport} | {state_label}");
     let detail_view = mcp_support::render_configured_server_detail(server);
     let auth = mcp_support::auth_summary(server);
     if auth != "none" {
@@ -2077,9 +2107,10 @@ fn build_configured_mcp_entry(
         id: server.name.clone(),
         kind: McpEntryKind::ConfiguredServer,
         install_preset_id: None,
+        enabled: server.enabled,
         title: server.name.clone(),
         source: "configured".into(),
-        action_label: "test".into(),
+        action_label: if server.enabled { "test" } else { "enable" }.into(),
         detail,
         detail_view: detail_view.clone(),
         search_text: format!("{search_text} {}", detail_view.replace('\n', " ")),
@@ -2154,6 +2185,7 @@ fn build_catalog_mcp_entry(
         id: entry.id.clone(),
         kind: McpEntryKind::CatalogEntry,
         install_preset_id: entry.installable_preset_id.clone(),
+        enabled: true,
         title: format!("{}  {}", entry.id, entry.display_name),
         source: mcp_catalog_source_label(entry).into(),
         action_label,
@@ -5552,6 +5584,15 @@ impl App {
                 KeyCode::PageUp => self.mcp_selector.page_up(),
                 KeyCode::PageDown => self.mcp_selector.page_down(),
                 KeyCode::Backspace => self.mcp_selector.pop_char(),
+                KeyCode::Char(' ') => {
+                    if let Some(entry) = self.mcp_selector.current() {
+                        if let Some(command) = entry.toggle_command() {
+                            let query = self.mcp_selector.query.clone();
+                            self.handle_mcp_command(command);
+                            self.open_mcp_selector(Some(&query), false);
+                        }
+                    }
+                }
                 KeyCode::Char('v') | KeyCode::Char('V') => {
                     if let Some(entry) = self.mcp_selector.current() {
                         let command = entry.view_command();
@@ -9794,8 +9835,8 @@ impl App {
     }
 
     fn open_mcp_selector(&mut self, initial_query: Option<&str>, refresh_catalog: bool) -> usize {
-        let configured =
-            edgecrab_tools::tools::mcp_client::configured_servers().unwrap_or_default();
+        let configured = edgecrab_tools::tools::mcp_client::configured_servers_with_disabled()
+            .unwrap_or_default();
         let official_entries = if refresh_catalog {
             self.rt_handle
                 .block_on(crate::mcp_catalog::load_official_catalog(true))
@@ -9814,6 +9855,49 @@ impl App {
         }
         self.needs_redraw = true;
         self.mcp_selector.filtered.len()
+    }
+
+    fn set_mcp_server_enabled(&mut self, name: &str, enabled: bool) {
+        let mut config = self.load_runtime_config();
+        let Some(server) = config.mcp_servers.get_mut(name) else {
+            self.push_output(format!("Unknown MCP server '{name}'."), OutputRole::Error);
+            return;
+        };
+
+        if server.enabled == enabled {
+            self.push_output(
+                format!(
+                    "MCP server '{}' is already {}.",
+                    name,
+                    if enabled { "enabled" } else { "disabled" }
+                ),
+                OutputRole::System,
+            );
+            return;
+        }
+
+        server.enabled = enabled;
+        match config.save() {
+            Ok(()) => {
+                edgecrab_tools::tools::mcp_client::reload_mcp_connections();
+                self.push_output(
+                    format!(
+                        "{} MCP server '{}'.",
+                        if enabled { "Enabled" } else { "Disabled" },
+                        name
+                    ),
+                    OutputRole::System,
+                );
+            }
+            Err(err) => self.push_output(
+                format!(
+                    "Failed to save config after {} MCP server '{}': {err}",
+                    if enabled { "enabling" } else { "disabling" },
+                    name
+                ),
+                OutputRole::Error,
+            ),
+        }
     }
 
     fn handle_session_list(&mut self) {
@@ -12133,6 +12217,8 @@ impl App {
                  /mcp search [query]  (search official MCP sources + registry)\n\
                  /mcp view <preset-or-server>\n\
                  /mcp install <preset> [--name <server-name>|name=<server-name>] [--path <directory>|path=<directory>]\n\
+                 /mcp enable <server-name>\n\
+                 /mcp disable <server-name>\n\
                  /mcp test [server-name]\n\
                  /mcp doctor [server-name]\n\
                  /mcp auth <server-name>\n\
@@ -12152,13 +12238,22 @@ impl App {
         };
 
         match parts.first().map(String::as_str).unwrap_or_default() {
-            "list" => match edgecrab_tools::tools::mcp_client::configured_servers() {
+            "list" => match edgecrab_tools::tools::mcp_client::configured_servers_with_disabled() {
                 Ok(servers) if !servers.is_empty() => {
                     let mut lines = Vec::new();
                     lines.push("Configured MCP servers:".to_string());
                     for server in servers {
                         let transport = format_mcp_transport(&server);
-                        lines.push(format!("- {}  {}", server.name, transport));
+                        lines.push(format!(
+                            "- {}  [{}]  {}",
+                            server.name,
+                            if server.enabled {
+                                "enabled"
+                            } else {
+                                "disabled"
+                            },
+                            transport
+                        ));
                     }
                     self.push_output(lines.join("\n"), OutputRole::System);
                 }
@@ -12215,7 +12310,7 @@ impl App {
                     );
                     return;
                 }
-                match edgecrab_tools::tools::mcp_client::configured_servers() {
+                match edgecrab_tools::tools::mcp_client::configured_servers_with_disabled() {
                     Ok(servers) => {
                         let Some(server) = servers
                             .into_iter()
@@ -12237,6 +12332,20 @@ impl App {
                         OutputRole::Error,
                     ),
                 }
+            }
+            "enable" | "activate" => {
+                let Some(name) = parts.get(1).map(String::as_str) else {
+                    self.push_output("Usage: /mcp enable <server-name>", OutputRole::System);
+                    return;
+                };
+                self.set_mcp_server_enabled(name, true);
+            }
+            "disable" | "deactivate" => {
+                let Some(name) = parts.get(1).map(String::as_str) else {
+                    self.push_output("Usage: /mcp disable <server-name>", OutputRole::System);
+                    return;
+                };
+                self.set_mcp_server_enabled(name, false);
             }
             "install" => {
                 let Some(preset_name) = parts.get(1).map(String::as_str) else {
@@ -14450,7 +14559,7 @@ impl App {
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Rgb(110, 220, 210)))
-                .title(" Official MCP Catalog "),
+                .title(" MCP Browser "),
         );
         frame.render_widget(search, chunks[0]);
 
@@ -14510,10 +14619,19 @@ impl App {
                     } else {
                         Style::default().fg(Color::Rgb(120, 140, 140))
                     };
+                    let title = if entry.kind == McpEntryKind::ConfiguredServer {
+                        format!(
+                            "[{}] {}",
+                            if entry.enabled { "x" } else { " " },
+                            entry.title
+                        )
+                    } else {
+                        entry.title.clone()
+                    };
                     ListItem::new(Line::from(vec![
                         Span::styled(format!("  {:<12}", entry.source), source_style),
                         Span::styled(format!("{:<9}", entry.action_label), action_style),
-                        Span::styled(unicode_trunc(&entry.title, 38), row_style),
+                        Span::styled(unicode_trunc(&title, 38), row_style),
                         Span::raw("  "),
                         Span::styled(unicode_trunc(&entry.detail, 38), detail_style),
                     ]))
@@ -14551,9 +14669,11 @@ impl App {
             }
             if entry.kind == McpEntryKind::ConfiguredServer {
                 detail_lines.push(Line::from(""));
-                detail_lines.push(Line::from(
-                    "Actions: Enter test, C doctor, V view, D remove, R refresh catalog",
-                ));
+                detail_lines.push(Line::from(if entry.enabled {
+                    "Actions: Space disable, Enter test, C doctor, V view, D remove, R refresh catalog"
+                } else {
+                    "Actions: Space enable, Enter enable, C doctor, V view, D remove, R refresh catalog"
+                }));
             } else {
                 detail_lines.push(Line::from(""));
                 detail_lines.push(Line::from(
@@ -14602,6 +14722,8 @@ impl App {
             Span::styled("browse  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Enter ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("default action  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Space ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("toggle active  ", Style::default().fg(Color::DarkGray)),
             Span::styled("i ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("install  ", Style::default().fg(Color::DarkGray)),
             Span::styled("t ", Style::default().fg(Color::Rgb(110, 220, 210))),
@@ -16930,6 +17052,7 @@ mod tests {
     fn mcp_selector_builder_merges_configured_and_official_entries() {
         let configured = vec![edgecrab_tools::tools::mcp_client::ConfiguredMcpServer {
             name: "local-git".into(),
+            enabled: true,
             url: None,
             bearer_token: None,
             oauth: None,
@@ -17035,6 +17158,7 @@ mod tests {
         let entries = build_mcp_selector_entries_from(
             &[edgecrab_tools::tools::mcp_client::ConfiguredMcpServer {
                 name: "remote-http".into(),
+                enabled: true,
                 url: Some("https://example.com/mcp".into()),
                 bearer_token: None,
                 oauth: None,
@@ -17082,6 +17206,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn mcp_selector_uses_enable_as_default_action_for_disabled_servers() {
+        let entries = build_mcp_selector_entries_from(
+            &[edgecrab_tools::tools::mcp_client::ConfiguredMcpServer {
+                name: "disabled-http".into(),
+                enabled: false,
+                url: Some("https://example.com/mcp".into()),
+                bearer_token: None,
+                oauth: None,
+                command: "ignored".into(),
+                args: vec![],
+                cwd: None,
+                env: std::collections::HashMap::new(),
+                headers: std::collections::HashMap::new(),
+                timeout: None,
+                connect_timeout: None,
+                include: Vec::new(),
+                exclude: Vec::new(),
+                token_from_config: false,
+                token_from_store: false,
+            }],
+            &[],
+        );
+
+        let entry = entries
+            .into_iter()
+            .find(|entry| entry.id == "disabled-http")
+            .expect("disabled entry");
+
+        assert_eq!(entry.action_label, "enable");
+        assert_eq!(entry.default_command(), "enable disabled-http");
+        assert!(entry.detail.contains("disabled"));
+        assert!(entry.detail_view.contains("State: disabled"));
+    }
+
     #[tokio::test]
     async fn mcp_command_without_args_opens_selector_overlay() {
         let mut app = App::new();
@@ -17090,6 +17249,80 @@ mod tests {
 
         assert!(app.mcp_selector.active);
         assert!(!app.mcp_selector.filtered.is_empty());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(edgecrab_home_env)]
+    async fn mcp_selector_shows_disabled_servers_from_config() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+        std::fs::write(
+            dir.path().join("config.yaml"),
+            "mcp_servers:\n  disabled-http:\n    url: https://example.com/mcp\n    enabled: false\n",
+        )
+        .expect("config");
+
+        let mut app = App::new();
+        app.handle_mcp_command(String::new());
+
+        assert!(app.mcp_selector.active);
+        assert!(
+            app.mcp_selector
+                .items
+                .iter()
+                .any(|entry| entry.id == "disabled-http" && !entry.enabled)
+        );
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(edgecrab_home_env)]
+    async fn mcp_enable_and_disable_commands_persist_server_state() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+        std::fs::write(
+            dir.path().join("config.yaml"),
+            "mcp_servers:\n  github:\n    url: https://example.com/mcp\n    enabled: false\n",
+        )
+        .expect("config");
+
+        let mut app = App::new();
+        app.handle_mcp_command("enable github".into());
+
+        let cfg = edgecrab_core::AppConfig::load_from(&dir.path().join("config.yaml"))
+            .expect("config after enable");
+        assert!(
+            cfg.mcp_servers
+                .get("github")
+                .is_some_and(|server| server.enabled)
+        );
+
+        app.handle_mcp_command("disable github".into());
+
+        let cfg = edgecrab_core::AppConfig::load_from(&dir.path().join("config.yaml"))
+            .expect("config after disable");
+        assert!(
+            cfg.mcp_servers
+                .get("github")
+                .is_some_and(|server| !server.enabled)
+        );
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
     }
 
     #[tokio::test]

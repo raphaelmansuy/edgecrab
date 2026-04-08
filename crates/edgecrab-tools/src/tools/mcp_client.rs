@@ -1238,6 +1238,10 @@ fn parse_configured_server(name: &str, server_config: &serde_json::Value) -> Con
     let token_from_store = read_mcp_token(name).is_some();
     ConfiguredMcpServer {
         name: name.to_string(),
+        enabled: server_config
+            .get("enabled")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(true),
         url: parse_expanded_string(server_config.get("url")),
         bearer_token: parse_expanded_string(server_config.get("bearer_token")),
         oauth: parse_oauth_config(server_config.get("oauth")),
@@ -1328,7 +1332,7 @@ fn extract_tool_filter(server_config: &serde_json::Value) -> (Vec<String>, Vec<S
     (include, exclude)
 }
 
-fn load_mcp_config() -> Result<serde_json::Value, ToolError> {
+fn load_mcp_config(include_disabled: bool) -> Result<serde_json::Value, ToolError> {
     if let Some(path) = yaml_config_path() {
         if path.is_file() {
             let content =
@@ -1345,7 +1349,7 @@ fn load_mcp_config() -> Result<serde_json::Value, ToolError> {
             if !config.mcp_servers.is_empty() {
                 let mut servers = serde_json::Map::new();
                 for (name, server) in config.mcp_servers {
-                    if !server.enabled {
+                    if !include_disabled && !server.enabled {
                         continue;
                     }
                     // HTTP server: url must be present
@@ -1360,6 +1364,7 @@ fn load_mcp_config() -> Result<serde_json::Value, ToolError> {
                             "args": server.args,
                             "env": server.env,
                             "cwd": server.cwd,
+                            "enabled": server.enabled,
                             "url": server.url,
                             "bearer_token": server.bearer_token,
                             "oauth": server.oauth,
@@ -1395,8 +1400,10 @@ fn load_mcp_config() -> Result<serde_json::Value, ToolError> {
     Ok(json!({ "mcpServers": {} }))
 }
 
-pub fn configured_servers() -> Result<Vec<ConfiguredMcpServer>, ToolError> {
-    let config = load_mcp_config()?;
+fn configured_servers_internal(
+    include_disabled: bool,
+) -> Result<Vec<ConfiguredMcpServer>, ToolError> {
+    let config = load_mcp_config(include_disabled)?;
     let servers = config
         .get("mcpServers")
         .and_then(|s| s.as_object())
@@ -1413,14 +1420,29 @@ pub fn configured_servers() -> Result<Vec<ConfiguredMcpServer>, ToolError> {
     Ok(parsed)
 }
 
+pub fn configured_servers() -> Result<Vec<ConfiguredMcpServer>, ToolError> {
+    configured_servers_internal(false)
+}
+
+pub fn configured_servers_with_disabled() -> Result<Vec<ConfiguredMcpServer>, ToolError> {
+    configured_servers_internal(true)
+}
+
 pub async fn probe_configured_server(server_name: &str) -> Result<McpProbeResult, ToolError> {
-    let server = configured_servers()?
+    let server = configured_servers_with_disabled()?
         .into_iter()
         .find(|server| server.name == server_name)
         .ok_or_else(|| ToolError::InvalidArgs {
             tool: "mcp_client".into(),
             message: format!("Unknown MCP server '{server_name}'"),
         })?;
+
+    if !server.enabled {
+        return Err(ToolError::InvalidArgs {
+            tool: "mcp_client".into(),
+            message: format!("MCP server '{server_name}' is disabled. Enable it before testing."),
+        });
+    }
 
     get_or_connect(server_name, to_runtime_server_config(&server)).await?;
 
@@ -1660,7 +1682,7 @@ impl ToolHandler for McpCallToolTool {
         })?;
 
         // Ensure server is connected
-        let config = load_mcp_config()?;
+        let config = load_mcp_config(false)?;
         let servers = config
             .get("mcpServers")
             .and_then(|s| s.as_object())
@@ -1790,6 +1812,7 @@ pub fn reload_mcp_connections() {
 #[derive(Debug, Clone)]
 pub struct ConfiguredMcpServer {
     pub name: String,
+    pub enabled: bool,
     pub url: Option<String>,
     pub bearer_token: Option<String>,
     pub oauth: Option<OAuthConfig>,
@@ -1994,7 +2017,7 @@ impl ToolHandler for McpDynamicTool {
 /// Errors from individual servers are logged as warnings but do not prevent
 /// other servers from being registered.
 pub async fn discover_and_register_mcp_tools(registry: &mut crate::registry::ToolRegistry) {
-    let config = match load_mcp_config() {
+    let config = match load_mcp_config(false) {
         Ok(c) => c,
         Err(e) => {
             tracing::debug!(
@@ -2734,9 +2757,32 @@ mod tests {
 
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].name, "filesystem");
+        assert!(servers[0].enabled);
         assert_eq!(
             servers[0].cwd.as_deref(),
             Some(std::path::Path::new("/tmp"))
+        );
+    }
+
+    #[test]
+    fn configured_servers_with_disabled_includes_disabled_entries() {
+        let _guard = EDGECRAB_HOME_LOCK.lock().expect("lock");
+        let home = TestEdgecrabHome::new();
+        std::fs::write(
+            home.path().join("config.yaml"),
+            "mcp_servers:\n  enabled-http:\n    url: https://example.com/mcp\n    enabled: true\n  disabled-http:\n    url: https://example.com/mcp\n    enabled: false\n",
+        )
+        .expect("config");
+
+        let active = configured_servers().expect("active servers");
+        let all = configured_servers_with_disabled().expect("all servers");
+
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].name, "enabled-http");
+        assert_eq!(all.len(), 2);
+        assert!(
+            all.iter()
+                .any(|server| server.name == "disabled-http" && !server.enabled)
         );
     }
 
