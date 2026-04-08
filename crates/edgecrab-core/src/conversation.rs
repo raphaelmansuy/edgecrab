@@ -3747,10 +3747,15 @@ mod tests {
 
     #[test]
     fn completion_options_include_model_budget_and_reasoning_policy() {
-        let mut config = crate::agent::AgentConfig::default();
-        config.temperature = Some(0.2);
-        config.reasoning_effort = Some("medium".into());
-        config.model_config.max_tokens = Some(3072);
+        let config = crate::agent::AgentConfig {
+            temperature: Some(0.2),
+            reasoning_effort: Some("medium".into()),
+            model_config: crate::config::ModelConfig {
+                max_tokens: Some(3072),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
 
         let options = completion_options_for(&config);
 
