@@ -120,8 +120,10 @@ pub enum CommandResult {
     ExportSession(Option<String>),
     /// Set the session title
     SetTitle(String),
-    /// List all persisted sessions
-    SessionList,
+    /// Open a debugger/inspector for the current in-memory session.
+    InspectCurrentSession,
+    /// Open the session browser overlay, optionally seeded with a query.
+    SessionBrowse(Option<String>),
     /// Switch to a persisted session by ID prefix
     SessionSwitch(String),
     /// Delete a persisted session by ID prefix
@@ -214,6 +216,80 @@ pub struct CommandRegistry {
     commands: HashMap<&'static str, Command>,
     /// Alias → canonical command name. Built in `register()` alongside `commands`.
     alias_map: HashMap<&'static str, &'static str>,
+}
+
+fn parse_session_archive_command(args: &str) -> CommandResult {
+    match args.trim() {
+        "" | "list" | "ls" | "browse" => CommandResult::SessionBrowse(None),
+        s if s.starts_with("browse ") => {
+            let query = s
+                .strip_prefix("browse ")
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            CommandResult::SessionBrowse((!query.is_empty()).then_some(query))
+        }
+        s if s.starts_with("search ") => {
+            let query = s
+                .strip_prefix("search ")
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if query.is_empty() {
+                CommandResult::Output("Usage: /sessions search <query>".into())
+            } else {
+                CommandResult::SessionBrowse(Some(query))
+            }
+        }
+        s if s.starts_with("switch ") || s.starts_with("sw ") => {
+            let id = s.split_whitespace().nth(1).unwrap_or("").to_string();
+            if id.is_empty() {
+                CommandResult::Output("Usage: /sessions switch <id-prefix>".into())
+            } else {
+                CommandResult::SessionSwitch(id)
+            }
+        }
+        s if s.starts_with("delete ") || s.starts_with("del ") || s.starts_with("rm ") => {
+            let id = s.split_whitespace().nth(1).unwrap_or("").to_string();
+            if id.is_empty() {
+                CommandResult::Output("Usage: /sessions delete <id-prefix>".into())
+            } else {
+                CommandResult::SessionDelete(id)
+            }
+        }
+        s if s.starts_with("rename ") || s.starts_with("mv ") => {
+            let mut parts = s.splitn(3, ' ');
+            let _cmd = parts.next();
+            let id = parts.next().unwrap_or("").to_string();
+            let title = parts.next().unwrap_or("").to_string();
+            if id.is_empty() || title.is_empty() {
+                CommandResult::Output("Usage: /sessions rename <id-prefix> <new title>".into())
+            } else {
+                CommandResult::SessionRename(id, title)
+            }
+        }
+        "prune" => CommandResult::SessionPrune(90),
+        s if s.starts_with("prune ") => {
+            let days: u32 = s
+                .split_whitespace()
+                .nth(1)
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(90);
+            CommandResult::SessionPrune(days)
+        }
+        "new" | "reset" => CommandResult::SessionNew,
+        _ => CommandResult::Output(
+            "Usage: /sessions [browse|search <query>|switch <id>|delete <id>|rename <id> <title>|prune [days]|new]".into(),
+        ),
+    }
+}
+
+fn parse_current_session_command(args: &str) -> CommandResult {
+    match args.trim() {
+        "" | "current" | "inspect" | "debug" => CommandResult::InspectCurrentSession,
+        "new" | "reset" => CommandResult::SessionNew,
+        other => parse_session_archive_command(other),
+    }
 }
 
 impl CommandRegistry {
@@ -523,52 +599,16 @@ impl CommandRegistry {
 
         self.register(Command {
             name: "session",
-            aliases: &["sessions"],
-            description: "Session management (list/switch/delete/rename/prune/new)",
-            handler: |args| match args.trim() {
-                "new" | "reset" => CommandResult::SessionNew,
-                "list" | "ls" | "" => CommandResult::SessionList,
-                s if s.starts_with("switch ") || s.starts_with("sw ") => {
-                    let id = s.split_whitespace().nth(1).unwrap_or("").to_string();
-                    if id.is_empty() {
-                        CommandResult::Output("Usage: /session switch <id-prefix>".into())
-                    } else {
-                        CommandResult::SessionSwitch(id)
-                    }
-                }
-                s if s.starts_with("delete ") || s.starts_with("del ") || s.starts_with("rm ") => {
-                    let id = s.split_whitespace().nth(1).unwrap_or("").to_string();
-                    if id.is_empty() {
-                        CommandResult::Output("Usage: /session delete <id-prefix>".into())
-                    } else {
-                        CommandResult::SessionDelete(id)
-                    }
-                }
-                s if s.starts_with("rename ") || s.starts_with("mv ") => {
-                    let mut parts = s.splitn(3, ' ');
-                    let _cmd = parts.next();
-                    let id = parts.next().unwrap_or("").to_string();
-                    let title = parts.next().unwrap_or("").to_string();
-                    if id.is_empty() || title.is_empty() {
-                        CommandResult::Output("Usage: /session rename <id-prefix> <new title>".into())
-                    } else {
-                        CommandResult::SessionRename(id, title)
-                    }
-                }
-                "prune" => CommandResult::SessionPrune(90),
-                s if s.starts_with("prune ") => {
-                    let days: u32 = s.split_whitespace()
-                        .nth(1)
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(90);
-                    CommandResult::SessionPrune(days)
-                }
-                other => CommandResult::Output(format!(
-                    "Unknown session subcommand: '{}'\n\
-                     Usage: /session [list | switch <id> | delete <id> | rename <id> <title> | prune [days] | new]",
-                    other
-                )),
-            },
+            aliases: &[],
+            description: "Inspect and debug the live current session",
+            handler: parse_current_session_command,
+        });
+
+        self.register(Command {
+            name: "sessions",
+            aliases: &[],
+            description: "Browse, search, and manage saved sessions",
+            handler: parse_session_archive_command,
         });
 
         self.register(Command {
@@ -1112,7 +1152,8 @@ fn help_text() -> String {
          \n\
          Session:\n\
            /new, /reset          — Start a fresh conversation\n\
-           /session [new]        — Session management\n\
+           /session              — Inspect and debug the live current session\n\
+           /sessions [browse]    — Browse and manage saved sessions\n\
            /retry                — Re-send the last user message\n\
            /undo                 — Remove last message pair from history\n\
            /stop                 — Cancel the current agent request\n\
@@ -1796,27 +1837,58 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_session_list() {
+    fn dispatch_session_defaults_to_current_inspector() {
         let reg = CommandRegistry::new();
         assert!(matches!(
-            reg.dispatch("/session list"),
-            Some(CommandResult::SessionList)
-        ));
-        assert!(matches!(
-            reg.dispatch("/session ls"),
-            Some(CommandResult::SessionList)
-        ));
-        // empty args also shows list
-        assert!(matches!(
             reg.dispatch("/session"),
-            Some(CommandResult::SessionList)
+            Some(CommandResult::InspectCurrentSession)
         ));
+        assert!(matches!(
+            reg.dispatch("/session debug"),
+            Some(CommandResult::InspectCurrentSession)
+        ));
+    }
+
+    #[test]
+    fn dispatch_sessions_list() {
+        let reg = CommandRegistry::new();
+        assert!(matches!(
+            reg.dispatch("/sessions"),
+            Some(CommandResult::SessionBrowse(None))
+        ));
+        assert!(matches!(
+            reg.dispatch("/sessions list"),
+            Some(CommandResult::SessionBrowse(None))
+        ));
+        assert!(matches!(
+            reg.dispatch("/sessions ls"),
+            Some(CommandResult::SessionBrowse(None))
+        ));
+    }
+
+    #[test]
+    fn dispatch_session_browse_and_search() {
+        let reg = CommandRegistry::new();
+        assert!(matches!(
+            reg.dispatch("/sessions browse"),
+            Some(CommandResult::SessionBrowse(None))
+        ));
+        match reg.dispatch("/sessions browse websocket jitter") {
+            Some(CommandResult::SessionBrowse(Some(query))) => {
+                assert_eq!(query, "websocket jitter");
+            }
+            _ => panic!("expected SessionBrowse with query"),
+        }
+        match reg.dispatch("/sessions search oauth") {
+            Some(CommandResult::SessionBrowse(Some(query))) => assert_eq!(query, "oauth"),
+            _ => panic!("expected SessionBrowse with query"),
+        }
     }
 
     #[test]
     fn dispatch_session_switch() {
         let reg = CommandRegistry::new();
-        match reg.dispatch("/session switch abc123") {
+        match reg.dispatch("/sessions switch abc123") {
             Some(CommandResult::SessionSwitch(id)) => assert_eq!(id, "abc123"),
             _ => panic!("expected SessionSwitch"),
         }
@@ -1825,7 +1897,7 @@ mod tests {
     #[test]
     fn dispatch_session_delete() {
         let reg = CommandRegistry::new();
-        match reg.dispatch("/session delete abc123") {
+        match reg.dispatch("/sessions delete abc123") {
             Some(CommandResult::SessionDelete(id)) => assert_eq!(id, "abc123"),
             _ => panic!("expected SessionDelete"),
         }

@@ -644,6 +644,33 @@ impl Agent {
         }
     }
 
+    /// Synchronous snapshot accessor for TUI code that cannot `await`.
+    pub fn session_snapshot_blocking(&self) -> SessionSnapshot {
+        let session = self
+            .session
+            .try_read()
+            .expect("session lock should be uncontended");
+        let config = self
+            .config
+            .try_read()
+            .expect("config lock should be uncontended");
+        SessionSnapshot {
+            session_id: session.session_id.clone(),
+            model: config.model.clone(),
+            message_count: session.messages.len(),
+            user_turn_count: session.user_turn_count,
+            api_call_count: session.api_call_count,
+            input_tokens: session.session_input_tokens,
+            output_tokens: session.session_output_tokens,
+            cache_read_tokens: session.session_cache_read_tokens,
+            cache_write_tokens: session.session_cache_write_tokens,
+            reasoning_tokens: session.session_reasoning_tokens,
+            last_prompt_tokens: session.last_prompt_tokens,
+            budget_remaining: self.budget.remaining(),
+            budget_max: self.budget.max(),
+        }
+    }
+
     /// Get the currently assembled system prompt (if cached).
     pub async fn system_prompt(&self) -> Option<String> {
         self.session.read().await.cached_system_prompt.clone()
@@ -697,6 +724,15 @@ impl Agent {
     /// Get full message history for export.
     pub async fn messages(&self) -> Vec<Message> {
         self.session.read().await.messages.clone()
+    }
+
+    /// Synchronous message accessor for TUI inspection paths.
+    pub fn messages_blocking(&self) -> Vec<Message> {
+        self.session
+            .try_read()
+            .expect("session lock should be uncontended")
+            .messages
+            .clone()
     }
 
     /// Remove the last user + assistant turn from history (undo).

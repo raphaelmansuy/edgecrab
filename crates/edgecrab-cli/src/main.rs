@@ -597,50 +597,16 @@ fn run_sessions(command: SessionCommand, args: &CliArgs) -> anyhow::Result<()> {
 
     match command {
         SessionCommand::List { limit, source } => {
-            let sessions = if let Some(ref src) = source {
-                db.list_sessions_by_source(src, limit)?
-            } else {
-                db.list_sessions(limit)?
-            };
+            let sessions = db.list_sessions_rich(source.as_deref(), limit)?;
             if sessions.is_empty() {
                 println!("No persisted sessions.");
                 return Ok(());
             }
-            // Check if any session has a title — use rich format if so
-            let has_titles = sessions.iter().any(|s| s.title.is_some());
-            if has_titles {
-                println!("{:<22} {:<14} {:<6} ID", "Title", "Last Active", "Src");
-                println!("{}", "─".repeat(70));
-            } else {
-                println!("{:<14} {:<6} ID", "Last Active", "Src");
-                println!("{}", "─".repeat(40));
-            }
-            for session in &sessions {
-                let last_active = format_timestamp(session.started_at);
-                let src = &session.source.chars().take(5).collect::<String>();
-                if has_titles {
-                    let title = session.title.as_deref().unwrap_or("—");
-                    let title_short: String = title.chars().take(21).collect();
-                    println!(
-                        "{:<22} {:<14} {:<6} {}",
-                        title_short,
-                        last_active,
-                        src,
-                        &session.id[..session.id.len().min(12)],
-                    );
-                } else {
-                    println!(
-                        "{:<14} {:<6} {}",
-                        last_active,
-                        src,
-                        &session.id[..session.id.len().min(12)],
-                    );
-                }
-            }
+            print_session_rich_list(&sessions);
         }
         SessionCommand::Browse { query, limit } => {
             if let Some(query) = query {
-                let results = db.search(&query, limit)?;
+                let results = db.search_sessions_rich(&query, limit)?;
                 if results.is_empty() {
                     println!("No sessions matched '{}'.", query);
                     return Ok(());
@@ -648,28 +614,29 @@ fn run_sessions(command: SessionCommand, args: &CliArgs) -> anyhow::Result<()> {
                 for result in results {
                     println!(
                         "{}  {}  score={:.3}",
-                        &result.session_id[..result.session_id.len().min(12)],
+                        edgecrab_core::safe_truncate(&result.session.id, 12),
                         result.role,
                         result.score,
                     );
-                    println!("  {}", result.snippet);
+                    println!(
+                        "  {}  model={}  msgs={}  last_active={}",
+                        result.session.title.as_deref().unwrap_or("—"),
+                        result.session.model.as_deref().unwrap_or("?"),
+                        result.session.message_count,
+                        format_timestamp(result.session.last_active),
+                    );
+                    println!("  match: {}", result.snippet);
+                    if !result.session.preview.is_empty() {
+                        println!("  preview: {}", result.session.preview);
+                    }
                 }
             } else {
-                let sessions = db.list_sessions(limit)?;
+                let sessions = db.list_sessions_rich(None, limit)?;
                 if sessions.is_empty() {
                     println!("No persisted sessions.");
                     return Ok(());
                 }
-                for session in sessions {
-                    println!(
-                        "{}  {}  model={}  msgs={}  started={}",
-                        &session.id[..session.id.len().min(12)],
-                        session.title.as_deref().unwrap_or("-"),
-                        session.model.as_deref().unwrap_or("?"),
-                        session.message_count,
-                        format_timestamp(session.started_at),
-                    );
-                }
+                print_session_rich_list(&sessions);
                 println!(
                     "Hint: use `edgecrab sessions browse --query <text>` to search message history."
                 );
@@ -788,6 +755,27 @@ fn run_sessions(command: SessionCommand, args: &CliArgs) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn print_session_rich_list(sessions: &[edgecrab_state::SessionRichSummary]) {
+    println!(
+        "{:<22} {:<16} {:<10} {:<6} {:<14} Preview",
+        "Title", "Model", "Source", "Msgs", "Last Active"
+    );
+    println!("{}", "─".repeat(104));
+    for session in sessions {
+        let title = session.title.as_deref().unwrap_or("—");
+        println!(
+            "{:<22} {:<16} {:<10} {:<6} {:<14} {}",
+            edgecrab_core::safe_truncate(title, 22),
+            edgecrab_core::safe_truncate(session.model.as_deref().unwrap_or("?"), 16),
+            edgecrab_core::safe_truncate(&session.source, 10),
+            session.message_count,
+            edgecrab_core::safe_truncate(&format_timestamp(session.last_active), 14),
+            edgecrab_core::safe_truncate(&session.preview, 42),
+        );
+        println!("  id={}", edgecrab_core::safe_truncate(&session.id, 12));
+    }
 }
 
 fn run_config(command: ConfigCommand, args: &CliArgs) -> anyhow::Result<()> {

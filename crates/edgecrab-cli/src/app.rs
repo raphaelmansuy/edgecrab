@@ -109,8 +109,67 @@ fn selector_action_key(key: &event::KeyEvent, ch: char) -> bool {
     }
 }
 
+fn selector_marker(is_selected: bool, accent: Color, bg: Option<Color>) -> Span<'static> {
+    let mut style = Style::default().fg(if is_selected { accent } else { Color::DarkGray });
+    if let Some(bg) = bg {
+        style = style.bg(bg);
+    }
+    if is_selected {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    Span::styled(if is_selected { "▶ " } else { "  " }, style)
+}
+
 const SESSION_BROWSER_LIMIT: usize = 250;
 const SESSION_BROWSER_SEARCH_LIMIT: usize = 120;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SplitPaneFocus {
+    List,
+    Detail,
+}
+
+impl SplitPaneFocus {
+    fn toggle(self) -> Self {
+        match self {
+            Self::List => Self::Detail,
+            Self::Detail => Self::List,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DetailPaneState {
+    focus: SplitPaneFocus,
+    scroll: u16,
+}
+
+impl Default for DetailPaneState {
+    fn default() -> Self {
+        Self {
+            focus: SplitPaneFocus::List,
+            scroll: 0,
+        }
+    }
+}
+
+impl DetailPaneState {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn reset_scroll(&mut self) {
+        self.scroll = 0;
+    }
+
+    fn page_up(&mut self, step: u16) {
+        self.scroll = self.scroll.saturating_sub(step.max(1));
+    }
+
+    fn page_down(&mut self, step: u16) {
+        self.scroll = self.scroll.saturating_add(step.max(1));
+    }
+}
 
 fn format_context_pressure_notice(estimated_tokens: usize, threshold_tokens: usize) -> String {
     let ratio = if threshold_tokens == 0 {
@@ -1868,6 +1927,13 @@ struct BrowserChrome<'a> {
     border_color: Color,
 }
 
+struct ScrollableDetailChrome<'a> {
+    title: &'a str,
+    border_color: Color,
+    focused: bool,
+    requested_scroll: u16,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RemoteSkillAction {
     Install,
@@ -2539,6 +2605,8 @@ struct SessionInspectorMeta {
     preview: String,
     matched_role: Option<String>,
     matched_snippet: Option<String>,
+    is_live: bool,
+    debug_lines: Vec<String>,
 }
 
 impl SessionInspectorMeta {
@@ -2554,6 +2622,8 @@ impl SessionInspectorMeta {
             preview: entry.preview.clone(),
             matched_role: entry.matched_role.clone(),
             matched_snippet: entry.matched_snippet.clone(),
+            is_live: false,
+            debug_lines: Vec::new(),
         }
     }
 }
@@ -2561,6 +2631,8 @@ impl SessionInspectorMeta {
 struct SessionInspector {
     selector: FuzzySelector<SessionMessageEntry>,
     session: Option<SessionInspectorMeta>,
+    pane: DetailPaneState,
+    return_to_browser: bool,
 }
 
 impl SessionInspector {
@@ -2568,6 +2640,8 @@ impl SessionInspector {
         Self {
             selector: FuzzySelector::new(),
             session: None,
+            pane: DetailPaneState::default(),
+            return_to_browser: false,
         }
     }
 
@@ -2578,6 +2652,8 @@ impl SessionInspector {
     fn close(&mut self) {
         self.selector.active = false;
         self.session = None;
+        self.pane.reset();
+        self.return_to_browser = false;
     }
 }
 
@@ -2932,6 +3008,8 @@ pub struct App {
     session_browser: FuzzySelector<SessionBrowserEntry>,
     /// Last non-error status note shown in the session browser footer.
     session_browser_status_note: Option<String>,
+    /// Focus and scroll state for the session browser detail pane.
+    session_browser_pane: DetailPaneState,
     /// Drill-down inspector for a single saved session.
     session_inspector: SessionInspector,
     /// Config center overlay (activated by `/config`)
@@ -3414,6 +3492,7 @@ impl App {
             remote_skill_browser: RemoteSkillBrowser::new(),
             session_browser: FuzzySelector::new(),
             session_browser_status_note: None,
+            session_browser_pane: DetailPaneState::default(),
             session_inspector: SessionInspector::new(),
             config_selector: FuzzySelector::new(),
             skin_browser: FuzzySelector::new(),
@@ -4700,8 +4779,21 @@ impl App {
     fn command_arg_hints(cmd_token: &str) -> &'static [(&'static str, &'static str)] {
         match cmd_token {
             // ── Session management ─────────────────────────────────────────────
-            "session" | "sessions" => &[
-                ("list", "List all saved sessions"),
+            "session" => &[
+                ("inspect", "Open the live current-session debugger"),
+                ("debug", "Open the live current-session debugger"),
+                ("browse", "Open the saved-session browser"),
+                ("search", "Search saved sessions with a seeded query"),
+                ("new", "Start a fresh session"),
+                ("switch", "Activate a saved session: switch <id-prefix>"),
+                ("delete", "Delete a saved session: delete <id-prefix>"),
+                ("rename", "Rename: rename <id-prefix> <new title>"),
+                ("prune", "Remove saved sessions older than N days"),
+            ],
+            "sessions" => &[
+                ("list", "Open the session browser"),
+                ("browse", "Open the session browser"),
+                ("search", "Open the session browser with a query"),
                 ("new", "Start a fresh session"),
                 ("switch", "Activate a session: switch <id-prefix>"),
                 ("delete", "Delete a session: delete <id-prefix>"),
@@ -6469,17 +6561,54 @@ impl App {
                 }
                 _ if selector_action_key(&key, 'r') => {
                     if let Some(session) = self.session_inspector.session.as_ref() {
-                        let session_id = session.id.clone();
-                        self.session_inspector.close();
-                        self.session_browser.active = false;
-                        self.handle_resume_session(Some(session_id));
+                        if session.is_live {
+                            self.push_output(
+                                "The current session is already active.",
+                                OutputRole::System,
+                            );
+                        } else {
+                            let session_id = session.id.clone();
+                            self.session_inspector.close();
+                            self.session_browser.active = false;
+                            self.handle_resume_session(Some(session_id));
+                        }
                     }
                 }
-                KeyCode::Up => self.session_inspector.selector.move_up(),
-                KeyCode::Down => self.session_inspector.selector.move_down(),
-                KeyCode::PageUp => self.session_inspector.selector.page_up(),
-                KeyCode::PageDown => self.session_inspector.selector.page_down(),
-                KeyCode::Home => self.session_inspector.selector.selected = 0,
+                KeyCode::Tab | KeyCode::BackTab => {
+                    self.session_inspector.pane.focus = self.session_inspector.pane.focus.toggle();
+                }
+                KeyCode::Up => {
+                    if self.session_inspector.pane.focus == SplitPaneFocus::List {
+                        self.session_inspector.selector.move_up();
+                        self.session_inspector.pane.reset_scroll();
+                    }
+                }
+                KeyCode::Down => {
+                    if self.session_inspector.pane.focus == SplitPaneFocus::List {
+                        self.session_inspector.selector.move_down();
+                        self.session_inspector.pane.reset_scroll();
+                    }
+                }
+                KeyCode::PageUp => {
+                    if self.session_inspector.pane.focus == SplitPaneFocus::Detail {
+                        self.session_inspector.pane.page_up(8);
+                    } else {
+                        self.session_inspector.selector.page_up();
+                        self.session_inspector.pane.reset_scroll();
+                    }
+                }
+                KeyCode::PageDown => {
+                    if self.session_inspector.pane.focus == SplitPaneFocus::Detail {
+                        self.session_inspector.pane.page_down(8);
+                    } else {
+                        self.session_inspector.selector.page_down();
+                        self.session_inspector.pane.reset_scroll();
+                    }
+                }
+                KeyCode::Home => {
+                    self.session_inspector.selector.selected = 0;
+                    self.session_inspector.pane.reset_scroll();
+                }
                 KeyCode::End => {
                     self.session_inspector.selector.selected = self
                         .session_inspector
@@ -6487,10 +6616,15 @@ impl App {
                         .filtered
                         .len()
                         .saturating_sub(1);
+                    self.session_inspector.pane.reset_scroll();
                 }
-                KeyCode::Backspace => self.session_inspector.selector.pop_char(),
+                KeyCode::Backspace => {
+                    self.session_inspector.selector.pop_char();
+                    self.session_inspector.pane.reset_scroll();
+                }
                 KeyCode::Char(c) if selector_search_char(&key) == Some(c) => {
                     self.session_inspector.selector.push_char(c);
+                    self.session_inspector.pane.reset_scroll();
                 }
                 _ => {}
             }
@@ -6523,21 +6657,54 @@ impl App {
                         self.delete_session_from_browser(&session_id);
                     }
                 }
-                KeyCode::Up => self.session_browser.move_up(),
-                KeyCode::Down => self.session_browser.move_down(),
-                KeyCode::PageUp => self.session_browser.page_up(),
-                KeyCode::PageDown => self.session_browser.page_down(),
-                KeyCode::Home => self.session_browser.selected = 0,
+                KeyCode::Tab | KeyCode::BackTab => {
+                    self.session_browser_pane.focus = self.session_browser_pane.focus.toggle();
+                }
+                KeyCode::Up => {
+                    if self.session_browser_pane.focus == SplitPaneFocus::List {
+                        self.session_browser.move_up();
+                        self.session_browser_pane.reset_scroll();
+                    }
+                }
+                KeyCode::Down => {
+                    if self.session_browser_pane.focus == SplitPaneFocus::List {
+                        self.session_browser.move_down();
+                        self.session_browser_pane.reset_scroll();
+                    }
+                }
+                KeyCode::PageUp => {
+                    if self.session_browser_pane.focus == SplitPaneFocus::Detail {
+                        self.session_browser_pane.page_up(8);
+                    } else {
+                        self.session_browser.page_up();
+                        self.session_browser_pane.reset_scroll();
+                    }
+                }
+                KeyCode::PageDown => {
+                    if self.session_browser_pane.focus == SplitPaneFocus::Detail {
+                        self.session_browser_pane.page_down(8);
+                    } else {
+                        self.session_browser.page_down();
+                        self.session_browser_pane.reset_scroll();
+                    }
+                }
+                KeyCode::Home => {
+                    self.session_browser.selected = 0;
+                    self.session_browser_pane.reset_scroll();
+                }
                 KeyCode::End => {
                     self.session_browser.selected =
-                        self.session_browser.filtered.len().saturating_sub(1)
+                        self.session_browser.filtered.len().saturating_sub(1);
+                    self.session_browser_pane.reset_scroll();
                 }
                 KeyCode::Backspace => {
                     self.session_browser.pop_char();
+                    self.session_browser_pane.reset_scroll();
                     self.refresh_session_browser();
                 }
                 KeyCode::Char(c) if selector_search_char(&key) == Some(c) => {
                     self.session_browser.push_char(c);
+                    self.session_browser_pane.reset_scroll();
                     self.refresh_session_browser();
                 }
                 _ => {}
@@ -7166,8 +7333,11 @@ impl App {
             CommandResult::SetTitle(title) => {
                 self.handle_set_title(title);
             }
-            CommandResult::SessionList => {
-                self.handle_session_list();
+            CommandResult::InspectCurrentSession => {
+                self.handle_inspect_current_session();
+            }
+            CommandResult::SessionBrowse(query) => {
+                self.handle_session_browser_command(query);
             }
             CommandResult::SessionSwitch(id) => {
                 self.handle_resume_session(Some(id));
@@ -10509,19 +10679,24 @@ impl App {
         }
     }
 
-    fn open_session_browser(&mut self) {
+    fn open_session_browser_with_query(&mut self, initial_query: Option<&str>) {
         self.session_inspector.close();
-        self.session_browser.query.clear();
+        self.session_browser_pane.reset();
+        self.session_browser.query = initial_query.unwrap_or_default().trim().to_string();
         self.session_browser.selected = 0;
         if !self.refresh_session_browser() {
             return;
         }
-        if self.session_browser.items.is_empty() {
+        if self.session_browser.items.is_empty() && self.session_browser.query.is_empty() {
             self.push_output("No saved sessions to browse.", OutputRole::System);
             return;
         }
         self.session_browser.active = true;
         self.needs_redraw = true;
+    }
+
+    fn open_session_browser(&mut self) {
+        self.open_session_browser_with_query(None);
     }
 
     fn open_session_inspector(&mut self, entry: SessionBrowserEntry) {
@@ -10541,6 +10716,8 @@ impl App {
                 self.session_inspector.selector.set_items(items);
                 self.session_inspector.session =
                     Some(SessionInspectorMeta::from_browser_entry(&entry));
+                self.session_inspector.pane.reset();
+                self.session_inspector.return_to_browser = true;
                 self.session_inspector.selector.active = true;
                 self.session_browser.active = false;
                 self.needs_redraw = true;
@@ -10549,9 +10726,90 @@ impl App {
         }
     }
 
+    fn open_current_session_inspector(&mut self) {
+        let Some(agent) = self.require_agent() else {
+            return;
+        };
+
+        let snapshot = agent.session_snapshot_blocking();
+        let messages = agent.messages_blocking();
+        let preview = messages
+            .iter()
+            .map(message_preview)
+            .find(|text| !text.trim().is_empty())
+            .unwrap_or_else(|| "No conversation content yet.".into());
+
+        let mut meta = SessionInspectorMeta {
+            id: snapshot
+                .session_id
+                .clone()
+                .unwrap_or_else(|| "current-session".into()),
+            title: "Current session".into(),
+            source: "live".into(),
+            model: snapshot.model.clone(),
+            started_label: "active now".into(),
+            last_active_label: "active now".into(),
+            message_count: messages.len() as i64,
+            preview,
+            matched_role: None,
+            matched_snippet: None,
+            is_live: true,
+            debug_lines: vec![
+                format!(
+                    "Live stats: {} user turn(s) · {} API call(s)",
+                    snapshot.user_turn_count, snapshot.api_call_count
+                ),
+                format!(
+                    "Tokens: prompt {} · output {} · reasoning {}",
+                    snapshot.prompt_tokens(),
+                    snapshot.output_tokens,
+                    snapshot.reasoning_tokens
+                ),
+                format!(
+                    "Budget: {} / {} remaining",
+                    snapshot.budget_remaining, snapshot.budget_max
+                ),
+            ],
+        };
+
+        if let Some(session_id) = snapshot.session_id.as_deref() {
+            if let Some(db) = agent.state_db_handle() {
+                match db.get_session(session_id) {
+                    Ok(Some(record)) => {
+                        meta.id = record.id;
+                        meta.title = record.title.unwrap_or_else(|| "Current session".into());
+                        meta.source = record.source;
+                        meta.model = record.model.unwrap_or(snapshot.model);
+                        meta.started_label = format_session_timestamp(record.started_at);
+                        meta.last_active_label = "active now".into();
+                    }
+                    Ok(None) => {}
+                    Err(e) => self.push_output(format!("DB error: {e}"), OutputRole::Error),
+                }
+            }
+        }
+
+        let items = messages
+            .iter()
+            .enumerate()
+            .map(|(index, message)| SessionMessageEntry::from_message(index, message))
+            .collect::<Vec<_>>();
+
+        self.session_browser.active = false;
+        self.session_inspector.selector.query.clear();
+        self.session_inspector.selector.selected = 0;
+        self.session_inspector.selector.set_items(items);
+        self.session_inspector.session = Some(meta);
+        self.session_inspector.pane.reset();
+        self.session_inspector.return_to_browser = false;
+        self.session_inspector.selector.active = true;
+        self.needs_redraw = true;
+    }
+
     fn close_session_inspector(&mut self) {
+        let return_to_browser = self.session_inspector.return_to_browser;
         self.session_inspector.close();
-        self.session_browser.active = true;
+        self.session_browser.active = return_to_browser;
         self.needs_redraw = true;
     }
 
@@ -10667,38 +10925,12 @@ impl App {
         }
     }
 
-    fn handle_session_list(&mut self) {
-        let Some(agent) = self.require_agent() else {
-            return;
-        };
-        if !agent.has_state_db() {
-            self.push_output(
-                "No state database configured (run with --session to enable)",
-                OutputRole::System,
-            );
-            return;
-        }
-        match agent.list_sessions(20) {
-            Ok(sessions) if sessions.is_empty() => {
-                self.push_output("No saved sessions.", OutputRole::System)
-            }
-            Ok(sessions) => {
-                let mut text = format!("Sessions ({} found):\n", sessions.len());
-                for s in &sessions {
-                    let title = s.title.as_deref().unwrap_or("-");
-                    let model = s.model.as_deref().unwrap_or("?");
-                    text.push_str(&format!(
-                        "  {}  {}  model={}  msgs={}\n",
-                        &s.id[..s.id.len().min(8)],
-                        title,
-                        model,
-                        s.message_count
-                    ));
-                }
-                self.push_output(text, OutputRole::System);
-            }
-            Err(e) => self.push_output(format!("DB error: {e}"), OutputRole::Error),
-        }
+    fn handle_session_browser_command(&mut self, query: Option<String>) {
+        self.open_session_browser_with_query(query.as_deref());
+    }
+
+    fn handle_inspect_current_session(&mut self) {
+        self.open_current_session_inspector();
     }
 
     fn handle_session_delete(&mut self, id_prefix: String) {
@@ -14974,30 +15206,32 @@ impl App {
                 let entry = &selector.items[model_idx];
                 let (display, provider) = (&entry.display, &entry.provider);
                 let is_selected = vis_idx + scroll_start == selected;
+                let bg = if is_selected {
+                    Color::Rgb(50, 50, 70)
+                } else {
+                    Color::Rgb(20, 20, 28)
+                };
                 let style = if is_selected {
                     Style::default()
-                        .bg(Color::Rgb(50, 50, 70))
+                        .bg(bg)
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::Rgb(200, 200, 200))
                 };
                 let provider_style = if is_selected {
-                    Style::default()
-                        .bg(Color::Rgb(50, 50, 70))
-                        .fg(Color::Rgb(120, 120, 150))
+                    Style::default().bg(bg).fg(Color::Rgb(120, 120, 150))
                 } else {
                     Style::default().fg(Color::Rgb(80, 80, 100))
                 };
                 let mut spans = vec![
+                    selector_marker(is_selected, Color::Cyan, Some(bg)),
                     Span::styled(format!("  {:<12}", provider), provider_style),
                     Span::styled(display.clone(), style),
                 ];
                 if !entry.detail.is_empty() && entry.detail != entry.model_name {
                     let detail_style = if is_selected {
-                        Style::default()
-                            .bg(Color::Rgb(50, 50, 70))
-                            .fg(Color::Rgb(160, 160, 180))
+                        Style::default().bg(bg).fg(Color::Rgb(160, 160, 180))
                     } else {
                         Style::default().fg(Color::Rgb(110, 110, 130))
                     };
@@ -15248,6 +15482,7 @@ impl App {
                     MoaReferenceSelectorMode::RemoveExpert => Color::Rgb(255, 130, 130),
                 };
                 ListItem::new(Line::from(vec![
+                    selector_marker(is_selected, Color::Rgb(130, 210, 255), Some(bg)),
                     Span::styled(prefix, Style::default().bg(bg).fg(prefix_color)),
                     Span::styled(
                         unicode_pad_right(&entry.display, 38),
@@ -15380,6 +15615,78 @@ impl App {
         frame.render_widget(detail, area);
     }
 
+    fn render_scrollable_browser_detail(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        chrome: ScrollableDetailChrome<'_>,
+        detail_lines: Vec<Line<'static>>,
+    ) {
+        let border_style = if chrome.focused {
+            Style::default()
+                .fg(chrome.border_color)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Rgb(60, 80, 84))
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(border_style)
+            .title(format!(" {} ", chrome.title));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+
+        let content_width = inner.width.saturating_sub(1).max(1) as usize;
+        let visual_rows: u16 = detail_lines
+            .iter()
+            .map(|line| {
+                let width = line.width();
+                if width == 0 {
+                    1
+                } else {
+                    width.div_ceil(content_width) as u16
+                }
+            })
+            .sum();
+        let max_scroll = visual_rows.saturating_sub(inner.height);
+        let scroll = chrome.requested_scroll.min(max_scroll);
+
+        let paragraph = Paragraph::new(Text::from(detail_lines))
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0));
+        let content_area = Rect {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width.saturating_sub(1),
+            height: inner.height,
+        };
+        frame.render_widget(paragraph, content_area);
+
+        if visual_rows > inner.height {
+            let mut scrollbar_state =
+                ScrollbarState::new(max_scroll as usize).position(scroll as usize);
+            let scrollbar_area = Rect {
+                x: inner.right().saturating_sub(1),
+                y: inner.y,
+                width: 1,
+                height: inner.height,
+            };
+            frame.render_stateful_widget(
+                Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .begin_symbol(None)
+                    .end_symbol(None)
+                    .track_symbol(Some("│"))
+                    .thumb_symbol("█"),
+                scrollbar_area,
+                &mut scrollbar_state,
+            );
+        }
+    }
+
     fn render_mcp_selector(&self, frame: &mut Frame, area: Rect) {
         frame.render_widget(Clear, area);
 
@@ -15451,6 +15758,7 @@ impl App {
                         Style::default().fg(Color::Rgb(120, 140, 140))
                     };
                     ListItem::new(Line::from(vec![
+                        selector_marker(is_selected, Color::Rgb(110, 220, 210), Some(bg)),
                         Span::styled(format!("  {:<12}", entry.source), source_style),
                         Span::styled(format!("{:<9}", entry.action_label), action_style),
                         Span::styled(unicode_trunc(&entry.display_title(), 38), row_style),
@@ -15635,6 +15943,7 @@ impl App {
                         Style::default().fg(Color::Rgb(120, 140, 140))
                     };
                     ListItem::new(Line::from(vec![
+                        selector_marker(is_selected, Color::Rgb(110, 220, 210), Some(bg)),
                         Span::styled(format!("  {:<12}", entry.source_label), source_style),
                         Span::styled(format!("{:<8}", entry.action().label()), action_style),
                         Span::styled(unicode_trunc(&entry.id, 40), main_style),
@@ -15844,6 +16153,7 @@ impl App {
                 };
 
                 ListItem::new(Line::from(vec![
+                    selector_marker(is_selected, Color::Rgb(255, 191, 0), Some(bg)),
                     Span::styled(
                         format!("  {:<7}", if entry.active { "active" } else { "ready" }),
                         state_style,
@@ -16016,6 +16326,7 @@ impl App {
                         Style::default().fg(Color::Rgb(120, 140, 140))
                     };
                     ListItem::new(Line::from(vec![
+                        selector_marker(is_selected, Color::Rgb(110, 220, 210), Some(bg)),
                         Span::styled(format!("  {:<11}", entry.source_label), source_style),
                         Span::styled(format!("{:<8}", entry.action.label()), action_style),
                         Span::styled(unicode_trunc(&entry.identifier, 44), main_style),
@@ -16287,6 +16598,7 @@ impl App {
                     };
 
                     ListItem::new(Line::from(vec![
+                        selector_marker(is_selected, Color::Rgb(110, 220, 210), Some(bg)),
                         Span::styled(format!("  {}", entry.check_state.glyph()), check_style),
                         Span::raw("  "),
                         Span::styled(unicode_pad_right(&entry.tag, 8), kind_style),
@@ -16486,6 +16798,7 @@ impl App {
                         Style::default().fg(Color::Rgb(125, 140, 150))
                     };
                     ListItem::new(Line::from(vec![
+                        selector_marker(is_selected, Color::Rgb(130, 210, 255), Some(bg)),
                         Span::styled(format!("  {:<9}", entry.tag), tag_style),
                         Span::styled(unicode_pad_right(&entry.title, 28), title_style),
                         Span::raw("  "),
@@ -16599,7 +16912,7 @@ impl App {
         frame.render_widget(help, chunks[2]);
     }
 
-    /// Render the session browser overlay (activated by F4 or `/session` with no args).
+    /// Render the session browser overlay (activated by F5 or `/sessions`).
     fn render_session_browser(&self, frame: &mut Frame, area: Rect) {
         frame.render_widget(Clear, area);
 
@@ -16672,6 +16985,7 @@ impl App {
                     };
 
                     ListItem::new(Line::from(vec![
+                        selector_marker(is_selected, Color::Rgb(110, 190, 255), Some(bg)),
                         Span::styled(format!("  {:<10}", entry.source), source_style),
                         Span::styled(unicode_trunc(&entry.display, 28), title_style),
                         Span::raw("  "),
@@ -16682,8 +16996,22 @@ impl App {
                 })
                 .collect()
         };
+        let list_border_style = if self.session_browser_pane.focus == SplitPaneFocus::List {
+            Style::default()
+                .fg(Color::Rgb(110, 190, 255))
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Rgb(60, 80, 84))
+        };
         frame.render_widget(
-            List::new(items).style(Style::default().bg(Color::Rgb(18, 22, 28))),
+            List::new(items)
+                .style(Style::default().bg(Color::Rgb(18, 22, 28)))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(list_border_style)
+                        .title(" Sessions "),
+                ),
             body[0],
         );
 
@@ -16723,17 +17051,30 @@ impl App {
                 "Try a title fragment, model name, source like cli or telegram, or terms from the conversation itself.",
             ));
         }
-        self.render_browser_detail(frame, body[1], detail_lines);
+        self.render_scrollable_browser_detail(
+            frame,
+            body[1],
+            ScrollableDetailChrome {
+                title: "Details",
+                border_color: Color::Rgb(110, 190, 255),
+                focused: self.session_browser_pane.focus == SplitPaneFocus::Detail,
+                requested_scroll: self.session_browser_pane.scroll,
+            },
+            detail_lines,
+        );
 
-        let note = self
-            .session_browser_status_note
-            .as_deref()
-            .unwrap_or("Search is keyboard-first: lowercase types, uppercase triggers actions.");
+        let note = self.session_browser_status_note.as_deref().unwrap_or(
+            "Lowercase keeps typing in the filter. Uppercase shortcuts trigger actions.",
+        );
         let help = Paragraph::new(Line::from(vec![
             Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(110, 190, 255))),
-            Span::styled("browse  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("list  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Tab ", Style::default().fg(Color::Rgb(110, 190, 255))),
+            Span::styled("focus pane  ", Style::default().fg(Color::DarkGray)),
             Span::styled("type ", Style::default().fg(Color::Rgb(110, 190, 255))),
             Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(110, 190, 255))),
+            Span::styled("page or scroll  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Enter ", Style::default().fg(Color::Rgb(110, 190, 255))),
             Span::styled("inspect  ", Style::default().fg(Color::DarkGray)),
             Span::styled("R ", Style::default().fg(Color::Rgb(110, 190, 255))),
@@ -16743,7 +17084,15 @@ impl App {
             Span::styled("Esc ", Style::default().fg(Color::Rgb(110, 190, 255))),
             Span::styled("close  ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format!("{} visible · {}", filtered.len(), note),
+                format!(
+                    "{} visible · {} pane · {}",
+                    filtered.len(),
+                    match self.session_browser_pane.focus {
+                        SplitPaneFocus::List => "list",
+                        SplitPaneFocus::Detail => "detail",
+                    },
+                    note
+                ),
                 Style::default().fg(Color::Rgb(100, 120, 130)),
             ),
         ]));
@@ -16831,6 +17180,7 @@ impl App {
                     };
 
                     ListItem::new(Line::from(vec![
+                        selector_marker(is_selected, role_color, Some(bg)),
                         Span::styled(format!("  {:>3}", entry.index + 1), index_style),
                         Span::raw("  "),
                         Span::styled(format!("{:<10}", entry.role_label), role_style),
@@ -16841,8 +17191,22 @@ impl App {
                 })
                 .collect()
         };
+        let list_border_style = if self.session_inspector.pane.focus == SplitPaneFocus::List {
+            Style::default()
+                .fg(Color::Rgb(120, 215, 185))
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Rgb(60, 80, 84))
+        };
         frame.render_widget(
-            List::new(items).style(Style::default().bg(Color::Rgb(18, 24, 24))),
+            List::new(items)
+                .style(Style::default().bg(Color::Rgb(18, 24, 24)))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(list_border_style)
+                        .title(" Timeline "),
+                ),
             body[0],
         );
 
@@ -16876,6 +17240,12 @@ impl App {
             }
             if !selector.query.trim().is_empty() {
                 detail_lines.push(Line::from(format!("Local filter: {}", selector.query)));
+            }
+            if session.is_live {
+                detail_lines.push(Line::from("Mode: live in-memory session debugger"));
+            }
+            for line in &session.debug_lines {
+                detail_lines.push(Line::from(line.clone()));
             }
             detail_lines.push(Line::from(""));
 
@@ -16944,21 +17314,42 @@ impl App {
                 ));
             }
         }
-        self.render_browser_detail(frame, body[1], detail_lines);
+        self.render_scrollable_browser_detail(
+            frame,
+            body[1],
+            ScrollableDetailChrome {
+                title: "Details",
+                border_color: Color::Rgb(120, 215, 185),
+                focused: self.session_inspector.pane.focus == SplitPaneFocus::Detail,
+                requested_scroll: self.session_inspector.pane.scroll,
+            },
+            detail_lines,
+        );
 
         let help = Paragraph::new(Line::from(vec![
             Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(120, 215, 185))),
             Span::styled("timeline  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Tab ", Style::default().fg(Color::Rgb(120, 215, 185))),
+            Span::styled("focus pane  ", Style::default().fg(Color::DarkGray)),
             Span::styled("type ", Style::default().fg(Color::Rgb(120, 215, 185))),
             Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(120, 215, 185))),
+            Span::styled("page or scroll  ", Style::default().fg(Color::DarkGray)),
             Span::styled("B ", Style::default().fg(Color::Rgb(120, 215, 185))),
             Span::styled("back  ", Style::default().fg(Color::DarkGray)),
             Span::styled("R ", Style::default().fg(Color::Rgb(120, 215, 185))),
-            Span::styled("resume  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("resume saved  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Esc ", Style::default().fg(Color::Rgb(120, 215, 185))),
             Span::styled("back  ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format!("{} visible", filtered.len()),
+                format!(
+                    "{} visible · {} pane",
+                    filtered.len(),
+                    match self.session_inspector.pane.focus {
+                        SplitPaneFocus::List => "list",
+                        SplitPaneFocus::Detail => "detail",
+                    }
+                ),
                 Style::default().fg(Color::Rgb(100, 120, 120)),
             ),
         ]));
@@ -17124,6 +17515,7 @@ impl App {
                 let badge_fg = Color::Rgb(100, 200, 100);
 
                 ListItem::new(Line::from(vec![
+                    selector_marker(is_selected, accent, Some(bg)),
                     Span::styled(
                         format!("  {name_cell}"),
                         Style::default().fg(name_fg).bg(bg),
@@ -18279,6 +18671,161 @@ mod tests {
         assert!(app.session_browser.active);
         assert_eq!(app.session_browser.query, "r");
         assert!(!app.session_inspector.active());
+    }
+
+    #[tokio::test]
+    async fn session_slash_command_opens_live_current_session_inspector() {
+        let agent = mock_agent();
+        agent
+            .inject_assistant_context("Live note for debugging")
+            .await;
+
+        let mut app = App::new();
+        app.set_agent(agent);
+
+        app.process_input("/session");
+
+        assert!(app.session_inspector.active());
+        assert!(!app.session_browser.active);
+        assert_eq!(app.session_inspector.selector.items.len(), 1);
+        assert_eq!(
+            app.session_inspector
+                .session
+                .as_ref()
+                .map(|session| session.title.as_str()),
+            Some("Current session")
+        );
+        assert!(
+            app.session_inspector
+                .session
+                .as_ref()
+                .is_some_and(|session| session.is_live)
+        );
+        assert!(
+            app.output.is_empty(),
+            "rich inspector should replace shallow dump"
+        );
+    }
+
+    #[tokio::test]
+    async fn sessions_slash_command_opens_rich_browser_overlay() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(
+            edgecrab_state::SessionDb::open(&dir.path().join("sessions.db")).expect("session db"),
+        );
+
+        let session = sample_browser_session(
+            "sess-epsilon-444444",
+            "Overlay test",
+            1_720_000_400.0,
+            "copilot/gpt-5-mini",
+        );
+        db.save_session(&session).expect("save session");
+        db.save_message(
+            "sess-epsilon-444444",
+            &edgecrab_types::Message::user("Inspect via slash command"),
+            1_720_000_410.0,
+        )
+        .expect("save message");
+
+        let agent = mock_agent_with_state_db(db);
+        let mut app = App::new();
+        app.set_agent(agent);
+
+        app.process_input("/sessions");
+
+        assert!(app.session_browser.active);
+        assert!(
+            app.output.is_empty(),
+            "rich browser should replace shallow dump"
+        );
+    }
+
+    #[tokio::test]
+    async fn sessions_alias_search_seeds_browser_query() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(
+            edgecrab_state::SessionDb::open(&dir.path().join("sessions.db")).expect("session db"),
+        );
+
+        let session = sample_browser_session(
+            "sess-zeta-555555",
+            "OAuth troubleshooting",
+            1_720_000_500.0,
+            "copilot/gpt-5-mini",
+        );
+        db.save_session(&session).expect("save session");
+        db.save_message(
+            "sess-zeta-555555",
+            &edgecrab_types::Message::user("oauth callback mismatch debugging"),
+            1_720_000_510.0,
+        )
+        .expect("save message");
+
+        let agent = mock_agent_with_state_db(db);
+        let mut app = App::new();
+        app.set_agent(agent);
+
+        app.process_input("/sessions search oauth mismatch");
+
+        assert!(app.session_browser.active);
+        assert_eq!(app.session_browser.query, "oauth mismatch");
+        assert_eq!(
+            app.session_browser.current().map(|entry| entry.id.as_str()),
+            Some("sess-zeta-555555")
+        );
+    }
+
+    #[tokio::test]
+    async fn session_browser_tab_and_page_down_drive_detail_pane() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(
+            edgecrab_state::SessionDb::open(&dir.path().join("sessions.db")).expect("session db"),
+        );
+
+        let session = sample_browser_session(
+            "sess-pane-666666",
+            "Pane focus",
+            1_720_000_600.0,
+            "copilot/gpt-5-mini",
+        );
+        db.save_session(&session).expect("save session");
+        db.save_message(
+            "sess-pane-666666",
+            &edgecrab_types::Message::user("One\nTwo\nThree\nFour\nFive\nSix\nSeven\nEight\nNine"),
+            1_720_000_610.0,
+        )
+        .expect("save message");
+
+        let agent = mock_agent_with_state_db(db);
+        let mut app = App::new();
+        app.set_agent(agent);
+        app.open_session_browser();
+
+        app.handle_key_event(event::KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.handle_key_event(event::KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+
+        assert_eq!(app.session_browser_pane.focus, SplitPaneFocus::Detail);
+        assert_eq!(app.session_browser_pane.scroll, 8);
+        assert_eq!(app.session_browser.query, "");
+    }
+
+    #[tokio::test]
+    async fn current_session_inspector_tab_and_page_down_scroll_detail() {
+        let agent = mock_agent();
+        agent
+            .inject_assistant_context("alpha\nbeta\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\niota")
+            .await;
+
+        let mut app = App::new();
+        app.set_agent(agent);
+        app.process_input("/session");
+
+        app.handle_key_event(event::KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.handle_key_event(event::KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+
+        assert_eq!(app.session_inspector.pane.focus, SplitPaneFocus::Detail);
+        assert_eq!(app.session_inspector.pane.scroll, 8);
     }
 
     #[test]
@@ -20238,6 +20785,15 @@ mod tests {
         assert!(app.pending_images.is_empty());
     }
 
+    #[test]
+    fn selector_marker_uses_explicit_selected_chevron() {
+        let selected = selector_marker(true, Color::Cyan, Some(Color::Black));
+        let idle = selector_marker(false, Color::Cyan, Some(Color::Black));
+
+        assert_eq!(selected.content, "▶ ");
+        assert_eq!(idle.content, "  ");
+    }
+
     // ── Subcommand / argument completion ────────────────────────────────────
 
     /// command_arg_hints should return non-empty slices for known commands.
@@ -20246,7 +20802,22 @@ mod tests {
         let hints = App::command_arg_hints("session");
         assert!(!hints.is_empty(), "session should have subcommand hints");
         let names: Vec<&str> = hints.iter().map(|(n, _)| *n).collect();
-        assert!(names.contains(&"list"), "session hints must include 'list'");
+        assert!(
+            names.contains(&"inspect"),
+            "session hints must include 'inspect'"
+        );
+        assert!(
+            names.contains(&"debug"),
+            "session hints must include 'debug'"
+        );
+        assert!(
+            names.contains(&"browse"),
+            "session hints must include 'browse'"
+        );
+        assert!(
+            names.contains(&"search"),
+            "session hints must include 'search'"
+        );
         assert!(
             names.contains(&"switch"),
             "session hints must include 'switch'"
@@ -20254,14 +20825,15 @@ mod tests {
         assert!(names.contains(&"new"), "session hints must include 'new'");
     }
 
-    /// Alias "sessions" and canonical "session" must return the same hints.
+    /// `/sessions` should expose archive-centric hints.
     #[test]
-    fn command_arg_hints_alias_sessions_matches_session() {
-        assert_eq!(
-            App::command_arg_hints("sessions"),
-            App::command_arg_hints("session"),
-            "alias 'sessions' must mirror 'session'"
-        );
+    fn command_arg_hints_sessions_returns_archive_actions() {
+        let hints = App::command_arg_hints("sessions");
+        let names: Vec<&str> = hints.iter().map(|(name, _)| *name).collect();
+        assert!(names.contains(&"list"));
+        assert!(names.contains(&"browse"));
+        assert!(names.contains(&"search"));
+        assert!(names.contains(&"switch"));
     }
 
     /// command_arg_hints for an unknown token should return an empty slice.
@@ -20279,19 +20851,19 @@ mod tests {
         assert!(names.contains(&"status"));
     }
 
-    /// After typing "/session " (with trailing space) update_completion should
+    /// After typing "/sessions " (with trailing space) update_completion should
     /// populate candidates with subcommands and set arg_start > 0.
     #[tokio::test]
     async fn update_completion_arg_context_populates_subcommands() {
         let mut app = App::new();
-        // "/session" must be a registered command for arg-context to fire.
+        // "/sessions" must be a registered command for archive arg-context.
         assert!(
             app.all_command_names
                 .iter()
                 .any(|c| c == "/session" || c == "/sessions"),
-            "/session must be a registered command"
+            "/sessions must be a registered command"
         );
-        for ch in "/session ".chars() {
+        for ch in "/sessions ".chars() {
             app.textarea.insert_char(ch);
         }
         app.update_completion();
@@ -20319,11 +20891,11 @@ mod tests {
         );
     }
 
-    /// Prefix "/session sw" should narrow candidates to those starting with "sw".
+    /// Prefix "/sessions sw" should narrow candidates to those starting with "sw".
     #[tokio::test]
     async fn update_completion_arg_prefix_filters_candidates() {
         let mut app = App::new();
-        for ch in "/session sw".chars() {
+        for ch in "/sessions sw".chars() {
             app.textarea.insert_char(ch);
         }
         app.update_completion();
@@ -20344,11 +20916,11 @@ mod tests {
         );
     }
 
-    /// Accepting a subcommand must produce "/session switch " (cmd preserved, arg appended).
+    /// Accepting a subcommand must produce "/sessions switch " (cmd preserved, arg appended).
     #[tokio::test]
     async fn accept_completion_arg_context_preserves_command_prefix() {
         let mut app = App::new();
-        for ch in "/session ".chars() {
+        for ch in "/sessions ".chars() {
             app.textarea.insert_char(ch);
         }
         app.update_completion();
@@ -20366,8 +20938,8 @@ mod tests {
         app.accept_completion();
         let result = app.textarea_text();
         assert!(
-            result.starts_with("/session "),
-            "command prefix '/session ' must be preserved, got: {result}"
+            result.starts_with("/sessions "),
+            "command prefix '/sessions ' must be preserved, got: {result}"
         );
         assert!(
             result.ends_with("switch "),
@@ -20375,11 +20947,11 @@ mod tests {
         );
     }
 
-    /// Fuzzy match: "/session lisst" should still surface "list" when score ≥ 0.65.
+    /// Fuzzy match: "/sessions lisst" should still surface "list" when score ≥ 0.65.
     #[tokio::test]
     async fn update_completion_arg_fuzzy_typo_matches_list() {
         let mut app = App::new();
-        for ch in "/session lisst".chars() {
+        for ch in "/sessions lisst".chars() {
             app.textarea.insert_char(ch);
         }
         app.update_completion();
