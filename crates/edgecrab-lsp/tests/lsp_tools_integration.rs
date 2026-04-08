@@ -300,6 +300,10 @@ async fn lsp_navigation_and_analysis_tools_work_end_to_end() {
 }
 
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "integration test spawns cargo run as mock LSP server which is not reliable on Windows CI"
+)]
 async fn lsp_mutation_tools_apply_workspace_edits() {
     let workspace = TempDir::new().expect("workspace");
     let home = TempDir::new().expect("home");
