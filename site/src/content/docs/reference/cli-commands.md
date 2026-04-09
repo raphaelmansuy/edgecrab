@@ -401,11 +401,16 @@ Manage installed plugins.
 edgecrab plugins list              # List discovered plugins
 edgecrab plugins info <name>       # Show one plugin in detail
 edgecrab plugins status            # Show plugin runtime state
-edgecrab plugins install <repo>    # Install a plugin from a git repository
+edgecrab plugins install <source>  # Install from GitHub, hub:, https://zip, or a local directory
 edgecrab plugins enable <name>     # Enable without reinstalling
 edgecrab plugins disable <name>    # Disable without uninstalling
-edgecrab plugins toggle <name>     # Flip enabled/disabled state
-edgecrab plugins update <name>     # Update an installed plugin
+edgecrab plugins toggle [<name>]   # Flip enabled/disabled state or print TUI guidance
+edgecrab plugins audit --lines 20  # Show recent install/remove audit entries
+edgecrab plugins search <query>    # Search remote plugin registries
+edgecrab plugins search --source hermes <query> # Search Hermes-oriented registries only
+edgecrab plugins browse            # List plugin search sources and examples
+edgecrab plugins refresh           # Clear cached plugin hub indices
+edgecrab plugins update [name]     # Update one plugin or all git-backed plugins
 edgecrab plugins remove <name>     # Remove an installed plugin
 ```
 

@@ -3,6 +3,7 @@ use std::path::Path;
 
 use regex::Regex;
 use serde::Deserialize;
+use toml::Value;
 
 use crate::error::PluginError;
 use crate::types::{PluginKind, TrustLevel};
@@ -80,6 +81,8 @@ pub struct PluginToolDefinition {
 pub struct PluginCapabilities {
     #[serde(default)]
     pub host: Vec<String>,
+    #[serde(default)]
+    pub secrets: Vec<String>,
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
     #[serde(default)]
@@ -214,6 +217,14 @@ fn validate_plugin_manifest(path: &Path, manifest: &PluginManifest) -> Result<()
                 return invalid_manifest(path, "script.file is required");
             }
         }
+        PluginKind::Hermes => {
+            let Some(exec) = manifest.exec.as_ref() else {
+                return invalid_manifest(path, "Hermes compatibility plugins require [exec]");
+            };
+            if exec.command.trim().is_empty() {
+                return invalid_manifest(path, "exec.command is required");
+            }
+        }
     }
 
     if !matches!(manifest.plugin.kind, PluginKind::Skill) && manifest.tools.is_empty() {
@@ -223,6 +234,61 @@ fn validate_plugin_manifest(path: &Path, manifest: &PluginManifest) -> Result<()
         );
     }
 
+    Ok(())
+}
+
+pub fn write_install_metadata(
+    path: &Path,
+    trust_level: TrustLevel,
+    source: &str,
+    checksum: &str,
+) -> Result<(), PluginError> {
+    let content = std::fs::read_to_string(path)?;
+    let mut value: Value = toml::from_str(&content)?;
+    let root = value
+        .as_table_mut()
+        .ok_or_else(|| PluginError::InvalidManifest {
+            path: path.to_path_buf(),
+            message: "plugin manifest must be a TOML table".into(),
+        })?;
+
+    let trust = root
+        .entry("trust")
+        .or_insert_with(|| Value::Table(Default::default()))
+        .as_table_mut()
+        .ok_or_else(|| PluginError::InvalidManifest {
+            path: path.to_path_buf(),
+            message: "[trust] must be a TOML table".into(),
+        })?;
+    trust.insert(
+        "level".into(),
+        Value::String(match trust_level {
+            TrustLevel::Official => "official",
+            TrustLevel::Trusted => "trusted",
+            TrustLevel::Community => "community",
+            TrustLevel::AgentCreated => "agent-created",
+            TrustLevel::Unverified => "unverified",
+        }
+        .into()),
+    );
+    trust.insert("source".into(), Value::String(source.to_string()));
+
+    let integrity = root
+        .entry("integrity")
+        .or_insert_with(|| Value::Table(Default::default()))
+        .as_table_mut()
+        .ok_or_else(|| PluginError::InvalidManifest {
+            path: path.to_path_buf(),
+            message: "[integrity] must be a TOML table".into(),
+        })?;
+    integrity.insert("checksum".into(), Value::String(checksum.to_string()));
+
+    let rendered =
+        toml::to_string_pretty(&value).map_err(|error| PluginError::InvalidManifest {
+            path: path.to_path_buf(),
+            message: error.to_string(),
+        })?;
+    std::fs::write(path, rendered)?;
     Ok(())
 }
 

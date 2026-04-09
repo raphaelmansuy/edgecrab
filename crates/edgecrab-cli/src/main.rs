@@ -974,9 +974,17 @@ fn run_plugins(command: PluginsCommand) -> anyhow::Result<()> {
         PluginsCommand::Info { name } => {
             plugins_cmd::run(plugins_cmd::PluginAction::Info { name })?
         }
-        PluginsCommand::Install { repo, name } => {
-            plugins_cmd::run(plugins_cmd::PluginAction::Install { repo, name })?
-        }
+        PluginsCommand::Install {
+            source,
+            name,
+            force,
+            no_enable,
+        } => plugins_cmd::run(plugins_cmd::PluginAction::Install {
+            source,
+            name,
+            force,
+            no_enable,
+        })?,
         PluginsCommand::Enable { name } => {
             plugins_cmd::run(plugins_cmd::PluginAction::Enable { name })?
         }
@@ -984,7 +992,11 @@ fn run_plugins(command: PluginsCommand) -> anyhow::Result<()> {
             plugins_cmd::run(plugins_cmd::PluginAction::Disable { name })?
         }
         PluginsCommand::Toggle { name } => {
-            plugins_cmd::run(plugins_cmd::PluginAction::Toggle { name })?
+            if let Some(name) = name {
+                plugins_cmd::run(plugins_cmd::PluginAction::Toggle { name })?
+            } else {
+                plugins_cmd::run(plugins_cmd::PluginAction::Browse)?
+            }
         }
         PluginsCommand::Status => plugins_cmd::run(plugins_cmd::PluginAction::Status)?,
         PluginsCommand::Update { name } => {
@@ -993,6 +1005,17 @@ fn run_plugins(command: PluginsCommand) -> anyhow::Result<()> {
         PluginsCommand::Remove { name } => {
             plugins_cmd::run(plugins_cmd::PluginAction::Remove { name })?
         }
+        PluginsCommand::Audit { lines } => {
+            plugins_cmd::run(plugins_cmd::PluginAction::Audit { lines })?
+        }
+        PluginsCommand::Search { query, source } => {
+            plugins_cmd::run(plugins_cmd::PluginAction::Search {
+                query: query.join(" "),
+                source,
+            })?
+        }
+        PluginsCommand::Browse => plugins_cmd::run(plugins_cmd::PluginAction::Browse)?,
+        PluginsCommand::Refresh => plugins_cmd::run(plugins_cmd::PluginAction::Refresh)?,
     }
     Ok(())
 }

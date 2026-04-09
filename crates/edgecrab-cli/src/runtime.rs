@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use edgecrab_core::{Agent, AgentBuilder, AppConfig, ensure_edgecrab_home};
 use edgecrab_plugins::script::engine::ScriptRuntime;
 use edgecrab_plugins::tool_server::client::ToolServerClient;
-use edgecrab_plugins::{DiscoveredPlugin, PluginKind, discover_plugins};
+use edgecrab_plugins::{DiscoveredPlugin, PluginKind, PluginStatus, discover_plugins};
 use edgecrab_state::SessionDb;
 use edgecrab_tools::ToolRegistry;
 use edgecrab_tools::registry::{ToolContext, ToolHandler};
@@ -161,7 +161,7 @@ impl ToolHandler for PluginToolProxy {
 
         match &self.backend {
             PluginToolBackend::ToolServer(client) => client
-                .tool_call(self.tool_name, args)
+                .tool_call(self.tool_name, args, ctx)
                 .await
                 .map(|value| value.to_string())
                 .map_err(|error| ToolError::ExecutionFailed {
@@ -169,12 +169,23 @@ impl ToolHandler for PluginToolProxy {
                     message: error.to_string(),
                 }),
             PluginToolBackend::Script(runtime) => {
-                runtime.call_tool(self.tool_name, &args).map_err(|error| {
-                    ToolError::ExecutionFailed {
-                        tool: self.tool_name.into(),
-                        message: error.to_string(),
+                let output =
+                    runtime
+                        .call_tool(self.tool_name, &args)
+                        .map_err(|error| ToolError::ExecutionFailed {
+                            tool: self.tool_name.into(),
+                            message: error.to_string(),
+                        })?;
+                if let Some(queue) = &ctx.injected_messages {
+                    let emitted = runtime.take_emitted_messages();
+                    if !emitted.is_empty() {
+                        let mut guard = queue.blocking_lock();
+                        for message in emitted {
+                            guard.push(Message::assistant(&message));
+                        }
                     }
-                })
+                }
+                Ok(output)
             }
         }
     }
@@ -199,15 +210,28 @@ fn register_plugin_tools(registry: &mut ToolRegistry, config: &AppConfig) {
 }
 
 fn register_plugin(registry: &mut ToolRegistry, plugin: DiscoveredPlugin) {
+    if !should_register_runtime_plugin(&plugin) {
+        tracing::debug!(
+            plugin = %plugin.name,
+            status = ?plugin.status,
+            "skipping non-available plugin during runtime tool registration"
+        );
+        return;
+    }
     let Some(manifest) = plugin.manifest.as_ref() else {
         return;
     };
     match manifest.plugin.kind {
-        PluginKind::ToolServer => {
+        PluginKind::ToolServer | PluginKind::Hermes => {
             let Some(exec) = manifest.exec.clone() else {
                 return;
             };
-            let client = Arc::new(ToolServerClient::new(plugin.path.clone(), exec));
+            let client = Arc::new(ToolServerClient::new(
+                plugin.path.clone(),
+                plugin.name.clone(),
+                exec,
+                manifest.capabilities.clone(),
+            ));
             for tool in &manifest.tools {
                 registry.register_dynamic(Box::new(PluginToolProxy {
                     tool_name: Box::leak(tool.name.clone().into_boxed_str()),
@@ -242,6 +266,37 @@ fn register_plugin(registry: &mut ToolRegistry, plugin: DiscoveredPlugin) {
             }
         }
         PluginKind::Skill => {}
+    }
+}
+
+fn should_register_runtime_plugin(plugin: &DiscoveredPlugin) -> bool {
+    plugin.status == PluginStatus::Available
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_registration_requires_available_status() {
+        let plugin = DiscoveredPlugin {
+            name: "demo".into(),
+            version: "1.0.0".into(),
+            description: "Demo".into(),
+            kind: PluginKind::Hermes,
+            status: PluginStatus::SetupNeeded,
+            path: PathBuf::from("/tmp/demo"),
+            manifest: None,
+            skill: None,
+            tools: Vec::new(),
+            hooks: Vec::new(),
+            trust_level: edgecrab_plugins::TrustLevel::Unverified,
+            enabled: true,
+            source: edgecrab_plugins::SkillSource::User,
+            missing_env: vec!["API_KEY".into()],
+        };
+
+        assert!(!should_register_runtime_plugin(&plugin));
     }
 }
 

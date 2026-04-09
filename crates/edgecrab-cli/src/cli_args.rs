@@ -408,24 +408,47 @@ pub enum PluginsCommand {
     List,
     /// Show detailed info for one plugin
     Info { name: String },
-    /// Install a plugin from a git repository
+    /// Install a plugin from the hub, GitHub, or a local directory
     Install {
-        repo: String,
+        source: String,
         #[arg(long)]
         name: Option<String>,
+        #[arg(long)]
+        force: bool,
+        #[arg(long = "no-enable")]
+        no_enable: bool,
     },
     /// Enable a plugin in config without reinstalling it
     Enable { name: String },
     /// Disable a plugin in config without uninstalling it
     Disable { name: String },
     /// Toggle a plugin in config without reinstalling it
-    Toggle { name: String },
+    Toggle { name: Option<String> },
     /// Show current plugin runtime status
     Status,
-    /// Update an installed plugin
-    Update { name: String },
+    /// Update one installed plugin or all git-backed plugins
+    #[command(visible_alias = "upgrade")]
+    Update { name: Option<String> },
     /// Remove an installed plugin
     Remove { name: String },
+    /// Show the plugin install/remove audit trail
+    Audit {
+        #[arg(long, default_value_t = 20)]
+        lines: usize,
+    },
+    /// Search remote plugin registries
+    #[command(visible_alias = "hub-search")]
+    Search {
+        #[arg(long)]
+        source: Option<String>,
+        query: Vec<String>,
+    },
+    /// List remote plugin registries and search examples
+    #[command(visible_alias = "hub-browse")]
+    Browse,
+    /// Clear cached plugin registry indices
+    #[command(visible_alias = "hub-refresh")]
+    Refresh,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -924,6 +947,24 @@ mod tests {
             args.command,
             Some(Command::Plugins {
                 command: PluginsCommand::List
+            })
+        ));
+    }
+
+    #[test]
+    fn parse_plugins_search_subcommand_with_source() {
+        let args = CliArgs::parse_from([
+            "edgecrab",
+            "plugins",
+            "search",
+            "--source",
+            "hermes",
+            "weather",
+        ]);
+        assert!(matches!(
+            args.command,
+            Some(Command::Plugins {
+                command: PluginsCommand::Search { source: Some(_), .. }
             })
         ));
     }

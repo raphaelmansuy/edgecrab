@@ -1131,6 +1131,7 @@ impl Agent {
             todo_store: Some(self.todo_store.clone()),
             current_tool_call_id: None,
             current_tool_name: None,
+            injected_messages: None,
             tool_progress_tx: None,
         };
         registry.tool_inventory(&ctx)

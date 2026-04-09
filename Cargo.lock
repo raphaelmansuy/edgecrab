@@ -1696,7 +1696,7 @@ dependencies = [
 
 [[package]]
 name = "edgecrab-acp"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1716,7 +1716,7 @@ dependencies = [
 
 [[package]]
 name = "edgecrab-cli"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "arboard",
@@ -1766,7 +1766,7 @@ dependencies = [
 
 [[package]]
 name = "edgecrab-core"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1798,7 +1798,7 @@ dependencies = [
 
 [[package]]
 name = "edgecrab-cron"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1817,7 +1817,7 @@ dependencies = [
 
 [[package]]
 name = "edgecrab-gateway"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1854,7 +1854,7 @@ dependencies = [
 
 [[package]]
 name = "edgecrab-lsp"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "async-lsp",
@@ -1883,7 +1883,7 @@ dependencies = [
 
 [[package]]
 name = "edgecrab-migrate"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "dirs 5.0.1",
@@ -1900,12 +1900,15 @@ dependencies = [
 
 [[package]]
 name = "edgecrab-plugins"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
  "dirs 5.0.1",
+ "edgecrab-security",
+ "edgecrab-state",
+ "edgecrab-tools",
  "edgecrab-types",
  "regex",
  "reqwest",
@@ -1917,13 +1920,15 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "toml",
  "tracing",
+ "zip",
 ]
 
 [[package]]
 name = "edgecrab-security"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "aho-corasick",
  "edgecrab-types",
@@ -1942,7 +1947,7 @@ dependencies = [
 
 [[package]]
 name = "edgecrab-state"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "chrono",
  "dirs 5.0.1",
@@ -1959,7 +1964,7 @@ dependencies = [
 
 [[package]]
 name = "edgecrab-tools"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2003,7 +2008,7 @@ dependencies = [
 
 [[package]]
 name = "edgecrab-types"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "chrono",
  "edgequake-llm",

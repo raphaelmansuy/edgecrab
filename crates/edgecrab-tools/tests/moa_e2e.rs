@@ -45,6 +45,7 @@ fn live_tool_context(provider: Arc<dyn edgequake_llm::LLMProvider>) -> ToolConte
         todo_store: None,
         current_tool_call_id: None,
         current_tool_name: None,
+        injected_messages: None,
         tool_progress_tx: None,
     }
 }

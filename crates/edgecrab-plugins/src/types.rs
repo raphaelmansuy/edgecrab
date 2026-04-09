@@ -6,6 +6,7 @@ pub enum PluginKind {
     Skill,
     ToolServer,
     Script,
+    Hermes,
 }
 
 impl PluginKind {
@@ -14,6 +15,7 @@ impl PluginKind {
             Self::Skill => "skill",
             Self::ToolServer => "tool-server",
             Self::Script => "script",
+            Self::Hermes => "hermes",
         }
     }
 }

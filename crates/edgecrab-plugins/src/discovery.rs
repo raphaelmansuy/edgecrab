@@ -5,6 +5,10 @@ use edgecrab_types::Platform;
 
 use crate::config::PluginsConfig;
 use crate::error::PluginError;
+use crate::hermes::{
+    looks_like_hermes_plugin, missing_required_env as missing_hermes_env,
+    parse_hermes_manifest, synthesize_manifest as synthesize_hermes_manifest,
+};
 use crate::manifest::{PluginManifest, parse_plugin_manifest};
 use crate::skill::inject::build_prompt_fragment;
 use crate::skill::loader::{LoadedSkill, scan_skills_dir};
@@ -21,9 +25,11 @@ pub struct DiscoveredPlugin {
     pub manifest: Option<PluginManifest>,
     pub skill: Option<LoadedSkill>,
     pub tools: Vec<String>,
+    pub hooks: Vec<String>,
     pub trust_level: TrustLevel,
     pub enabled: bool,
     pub source: SkillSource,
+    pub missing_env: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -50,6 +56,8 @@ pub fn discover_plugins(
             let manifest_path = path.join("plugin.toml");
             let plugin = if manifest_path.is_file() {
                 load_plugin_from_manifest(config, &path, source, platform, &manifest_path)?
+            } else if looks_like_hermes_plugin(&path) {
+                load_hermes_plugin(config, &path, source, platform)?
             } else if path.join("SKILL.md").is_file() {
                 load_skill_only_plugin(config, &path, source, platform)?
             } else {
@@ -130,6 +138,7 @@ fn load_plugin_from_manifest(
             .iter()
             .map(|tool| tool.name.clone())
             .collect(),
+        hooks: Vec::new(),
         trust_level: manifest
             .trust
             .as_ref()
@@ -139,6 +148,7 @@ fn load_plugin_from_manifest(
         skill,
         enabled,
         source,
+        missing_env: Vec::new(),
     })
 }
 
@@ -155,6 +165,7 @@ fn load_skill_only_plugin(
             path: path.join("SKILL.md"),
             message: "failed to load skill plugin".into(),
         })?;
+    let missing_env = skill_missing_env(&loaded);
     let enabled = config.is_plugin_enabled(&loaded.manifest.name, Some(&platform.to_string()));
     Ok(DiscoveredPlugin {
         name: loaded.manifest.name.clone(),
@@ -170,9 +181,11 @@ fn load_skill_only_plugin(
         manifest: None,
         skill: Some(loaded),
         tools: Vec::new(),
+        hooks: Vec::new(),
         trust_level: TrustLevel::Unverified,
         enabled,
         source,
+        missing_env,
     })
 }
 
@@ -187,10 +200,17 @@ fn plugin_dirs(config: &PluginsConfig) -> Vec<(PathBuf, SkillSource)> {
     };
 
     push_dir(config.install_dir.clone(), SkillSource::User);
+    let legacy_user_plugins = dirs::home_dir()
+        .map(|home| home.join(".hermes").join("plugins"))
+        .unwrap_or_else(|| PathBuf::from("~/.hermes/plugins"));
+    push_dir(legacy_user_plugins, SkillSource::User);
     for path in config.expanded_external_dirs() {
         push_dir(path, SkillSource::User);
     }
     push_dir(PathBuf::from(".edgecrab/plugins"), SkillSource::Project);
+    if env_var_enabled("HERMES_ENABLE_PROJECT_PLUGINS") {
+        push_dir(PathBuf::from(".hermes/plugins"), SkillSource::Project);
+    }
     #[cfg(unix)]
     push_dir(
         PathBuf::from("/usr/share/edgecrab/plugins"),
@@ -216,6 +236,7 @@ fn status_for_skill(enabled: bool, loaded: &LoadedSkill) -> PluginStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     #[test]
     fn builds_prompt_only_for_enabled_available_skills() {
@@ -241,14 +262,114 @@ mod tests {
                     platform_visible: true,
                 }),
                 tools: Vec::new(),
+                hooks: Vec::new(),
                 trust_level: TrustLevel::Unverified,
                 enabled: true,
                 source: SkillSource::User,
+                missing_env: Vec::new(),
             }],
         };
 
         let prompt = build_plugin_skill_prompt(&discovery).expect("prompt exists");
         assert!(prompt.contains("# Plugin Skills"));
         assert!(prompt.contains("Follow demo steps."));
+    }
+
+    #[test]
+    fn hermes_plugin_with_missing_env_is_setup_needed() {
+        let temp = TempDir::new().expect("tempdir");
+        let plugin_dir = temp.path().join("demo");
+        std::fs::create_dir_all(&plugin_dir).expect("plugin dir");
+        std::fs::write(
+            plugin_dir.join("plugin.yaml"),
+            r#"
+name: hermes-demo
+version: "1.0.0"
+description: Demo Hermes plugin
+provides_tools:
+  - hello_world
+requires_env:
+  - EDGECRAB_TEST_HERMES_TOKEN
+"#,
+        )
+        .expect("manifest");
+        std::fs::write(
+            plugin_dir.join("__init__.py"),
+            "def register(ctx):\n    pass\n",
+        )
+        .expect("plugin");
+
+        let config = PluginsConfig {
+            install_dir: temp.path().join("empty-install-root"),
+            external_dirs: vec![plugin_dir
+                .parent()
+                .expect("parent")
+                .to_string_lossy()
+                .to_string()],
+            ..PluginsConfig::default()
+        };
+
+        let discovery = discover_plugins(&config, Platform::Cli).expect("discovery");
+        let plugin = discovery
+            .plugins
+            .iter()
+            .find(|plugin| plugin.name == "hermes-demo")
+            .expect("plugin discovered");
+
+        assert_eq!(plugin.status, PluginStatus::SetupNeeded);
+        assert_eq!(plugin.missing_env, vec!["EDGECRAB_TEST_HERMES_TOKEN"]);
+    }
+}
+
+fn env_var_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn load_hermes_plugin(
+    config: &PluginsConfig,
+    path: &Path,
+    source: SkillSource,
+    platform: Platform,
+) -> Result<DiscoveredPlugin, PluginError> {
+    let hermes_manifest = parse_hermes_manifest(path)?;
+    let manifest = synthesize_hermes_manifest(path, &hermes_manifest);
+    let enabled = config.is_plugin_enabled(&manifest.plugin.name, Some(&platform.to_string()));
+    let missing_env = missing_hermes_env(&hermes_manifest);
+    Ok(DiscoveredPlugin {
+        name: manifest.plugin.name.clone(),
+        version: manifest.plugin.version.clone(),
+        description: manifest.plugin.description.clone(),
+        kind: manifest.plugin.kind,
+        status: if !enabled {
+            PluginStatus::Disabled
+        } else if missing_env.is_empty() {
+            PluginStatus::Available
+        } else {
+            PluginStatus::SetupNeeded
+        },
+        path: path.to_path_buf(),
+        manifest: Some(manifest),
+        skill: None,
+        tools: hermes_manifest.provides_tools,
+        hooks: hermes_manifest.provides_hooks,
+        trust_level: TrustLevel::Unverified,
+        enabled,
+        source,
+        missing_env,
+    })
+}
+
+fn skill_missing_env(loaded: &LoadedSkill) -> Vec<String> {
+    match &loaded.readiness {
+        SkillReadinessStatus::SetupNeeded { missing } => missing.clone(),
+        _ => Vec::new(),
     }
 }

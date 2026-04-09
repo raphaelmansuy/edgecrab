@@ -1519,6 +1519,7 @@ async fn execute_remote(
                 todo_store: ctx.todo_store.clone(),
                 current_tool_call_id: None,
                 current_tool_name: None,
+                injected_messages: ctx.injected_messages.clone(),
                 tool_progress_tx: None,
             };
             let rpc_dir = format!("{sandbox_dir}/rpc");
@@ -1770,6 +1771,7 @@ impl ToolHandler for ExecuteCodeToolReal {
                     todo_store: ctx.todo_store.clone(),
                     current_tool_call_id: None,
                     current_tool_name: None,
+                    injected_messages: ctx.injected_messages.clone(),
                     tool_progress_tx: None,
                 };
                 let counter = tool_call_counter.clone();

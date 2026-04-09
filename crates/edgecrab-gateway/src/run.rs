@@ -366,6 +366,7 @@ async fn build_effective_text(agent: &Agent, msg: &IncomingMessage) -> String {
             todo_store: None,
             current_tool_call_id: None,
             current_tool_name: None,
+            injected_messages: None,
             tool_progress_tx: None,
         };
 
@@ -428,6 +429,7 @@ async fn build_effective_text(agent: &Agent, msg: &IncomingMessage) -> String {
             todo_store: None,
             current_tool_call_id: None,
             current_tool_name: None,
+            injected_messages: None,
             tool_progress_tx: None,
         };
 
@@ -652,6 +654,7 @@ async fn maybe_send_voice_reply(
         todo_store: None,
         current_tool_call_id: None,
         current_tool_name: None,
+        injected_messages: None,
         tool_progress_tx: None,
     };
 

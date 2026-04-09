@@ -102,7 +102,7 @@ MCP          /mcp /mcp-token
 | `/toolsets` | List toolset aliases and their member tools |
 | `/mcp [subcommand]` | Browse, install, test, diagnose, or remove MCP servers |
 | `/reload-mcp` | Drop and reconnect all MCP server connections |
-| `/plugins` | Discover and list installed plugins |
+| `/plugins [list\|info\|status\|install\|enable\|disable\|toggle\|audit\|hub search\|hub browse\|hub refresh]` | Manage plugins, toggle activation, search hubs, inspect audit history, and jump into hub browsing flows |
 | `/mcp-token [set\|remove\|list] <name> [token]` | Manage MCP OAuth Bearer tokens |
 
 ---
