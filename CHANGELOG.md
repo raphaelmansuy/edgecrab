@@ -9,6 +9,41 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.1.4] — 2026-04-09
+
+### Added
+
+#### TUI Picker Overlays — Settings Now Have First-Class UX
+
+Four commands that previously printed plain text now open rich interactive picker overlays when invoked with no arguments. Non-empty arguments still apply directly for scripting and power users.
+
+- **`/reasoning` → full picker** — five-option picker (Low / Medium / High effort plus Show / Hide reasoning trace). Pre-selects the last-set effort level. Displays a detail panel with description, cost/speed tradeoffs, and current status badge. Args still work: `/reasoning high`, `/reasoning show`.
+- **`/personality` → searchable picker** — scrolling list of all available personality presets drawn from config at open time, with a live preview pane showing the persona description. Pre-selects the currently active personality. Args still work: `/personality kawaii`, `/personality clear`.
+- **`/stream` → binary picker** — two-option picker (ON / OFF) pre-selected to the current streaming state with a one-line description of each mode. Args still work: `/stream off`.
+- **`/statusbar` → binary picker** — two-option picker (Visible / Hidden) pre-selected to the current bar state. Args still work: `/statusbar hidden`.
+
+All four pickers share the same keyboard contract as `/verbose`: ↑↓ or Tab to navigate, Enter to apply, Esc to cancel, and any left-click outside the popup to dismiss.
+
+#### Documentation
+- **Config reference** — `display.tool_progress`, `display.show_status_bar`, `display.show_cost`, `display.compact`, `display.streaming`, `display.show_reasoning`, and `display.skin` are now documented in `reference/configuration.md` with types and defaults.
+- **User guide** — `user-guide/configuration.md` now documents the `tool_progress` table (`off | new | all | verbose`) and explains live TUI toggling with `/verbose`.
+
+### Changed
+
+- **Tool progress defaults to `verbose`** — the out-of-the-box experience now shows every tool call plus curated plan/result detail lines. Previously the default was `all`. Existing configs are unaffected; only new installations change behaviour. Live-toggle with `/verbose` or `/verbose <off|new|all|verbose>`.
+- **`/verbose` command description updated** — now reads "Open tool-progress picker (TUI); or set directly: /verbose [off|new|all|verbose]" to reflect picker-first UX.
+
+### Fixed
+
+- **`edgecrab-lsp` crates.io publish** — the `description` field was missing from the crate manifest, blocking the Rust release workflow. Added description and re-released.
+
+### Internal
+
+- **DRY picker helpers** — four module-level free functions (`popup_rect`, `picker_three_layout`, `picker_two_cols`, `picker_help_line`) replace ~140 lines of repeated boilerplate across five picker render methods, satisfying the Open/Closed Principle: adding a new picker touches only its own render function.
+- **`reasoning_effort_hint` caching** — `handle_set_reasoning` now records the last-applied low/medium/high effort so the `/reasoning` picker can pre-select it on re-open.
+
+---
+
 ## [0.1.3] — 2026-04-09
 
 ### Added

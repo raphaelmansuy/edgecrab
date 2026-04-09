@@ -690,7 +690,7 @@ impl CommandRegistry {
         self.register(Command {
             name: "verbose",
             aliases: &["v"],
-            description: "Cycle or set tool progress: /verbose [off|new|all|verbose|status]",
+            description: "Open tool-progress picker (TUI); or set directly: /verbose [off|new|all|verbose]",
             handler: |args| {
                 let args = args.trim();
                 if args.is_empty() {

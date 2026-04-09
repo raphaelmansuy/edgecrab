@@ -375,11 +375,24 @@ display:
   personality: "helpful"       # default personality preset
   show_reasoning: false        # show model thinking tokens
   streaming: true              # stream response tokens
+  tool_progress: verbose       # off | new | all | verbose (default: verbose)
   show_cost: true              # show cost in status bar
+  show_status_bar: true        # show the bottom status bar
   skin: "default"              # skin name from ~/.edgecrab/skin.yaml
 ```
 
 Built-in personalities: `helpful`, `concise`, `technical`, `kawaii`, `pirate`, `philosopher`, `hype`, `shakespeare`, `noir`, `catgirl`, `creative`, `teacher`, `surfer`, `uwu`.
+
+`tool_progress` controls how much tool activity appears in the transcript:
+
+| Value | Behaviour |
+|-------|----------|
+| `off` | Silent — no tool lines in transcript (status bar still shows active work) |
+| `new` | Show each distinct tool call once per turn |
+| `all` | Show every tool call |
+| `verbose` | Show every tool call plus curated detail lines for plan/result context (**default**) |
+
+You can also toggle live in the TUI with `/verbose` (cycles) or `/verbose <mode>` (set directly).
 
 ---
 

@@ -220,7 +220,9 @@ display:
   personality: "helpful"
   show_reasoning: false
   streaming: true
+  tool_progress: verbose     # off | new | all | verbose (default: verbose)
   show_cost: true
+  show_status_bar: true
   skin: "default"
 
 # ── Privacy ────────────────────────────────────────────────────────────
@@ -332,6 +334,13 @@ When `enabled_toolsets` includes `core` or `coding`, the `lsp` toolset is also e
 | `compression.threshold` | float | `0.50` | — |
 | `compression.protect_last_n` | integer | `20` | — |
 | `checkpoints.max_snapshots` | integer | `50` | — |
+| `display.tool_progress` | string | `verbose` | — |
+| `display.show_status_bar` | bool | `true` | — |
+| `display.show_cost` | bool | `true` | — |
+| `display.compact` | bool | `false` | — |
+| `display.streaming` | bool | `true` | — |
+| `display.show_reasoning` | bool | `false` | — |
+| `display.skin` | string | `default` | — |
 | `tts.provider` | string | `edge-tts` | `EDGECRAB_TTS_PROVIDER` |
 | `tts.voice` | string | `en-US-AriaNeural` | `EDGECRAB_TTS_VOICE` |
 | `stt.whisper_model` | string | `base` | — |

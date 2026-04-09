@@ -1350,7 +1350,7 @@ impl Default for DisplayConfig {
             personality: "default".into(),
             show_reasoning: false,
             streaming: true,
-            tool_progress: ToolProgressMode::All,
+            tool_progress: ToolProgressMode::Verbose,
             show_status_bar: true,
             show_cost: true,
             skin: "default".into(),
@@ -1363,8 +1363,8 @@ impl Default for DisplayConfig {
 pub enum ToolProgressMode {
     Off,
     New,
-    #[default]
     All,
+    #[default]
     Verbose,
 }
 
