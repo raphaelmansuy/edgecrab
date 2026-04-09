@@ -78,6 +78,7 @@ jobs:
           TAG="${INPUT_TAG:-$GITHUB_REF_NAME}"
           git-cliff --tag "$TAG" --latest -o RELEASE_NOTES.md
 
+      # Keep this in topological dependency order for crates.io publication.
       - name: Publish edgecrab-types
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
@@ -102,20 +103,20 @@ jobs:
       - name: Wait for crates.io index (state)
         run: sleep 30
 
-      - name: Publish edgecrab-tools
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: publish_crate edgecrab-tools --no-verify
-
-      - name: Wait for crates.io index (tools)
-        run: sleep 30
-
       - name: Publish edgecrab-cron
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: publish_crate edgecrab-cron --no-verify
 
       - name: Wait for crates.io index (cron)
+        run: sleep 30
+
+      - name: Publish edgecrab-tools
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: publish_crate edgecrab-tools --no-verify
+
+      - name: Wait for crates.io index (tools)
         run: sleep 30
 
       - name: Publish edgecrab-lsp

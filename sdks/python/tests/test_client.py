@@ -140,7 +140,7 @@ class TestHealth:
             with EdgeCrabClient() as client:
                 h = client.health()
                 assert h.status == "ok"
-                assert h.version == "0.1.0"
+                assert h.version == edgecrab.__version__
 
 
 class TestErrorHandling:

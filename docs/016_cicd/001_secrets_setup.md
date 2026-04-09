@@ -1,6 +1,6 @@
 # 🦀 CI/CD Secrets Setup
 
-> **WHY**: A Rust workspace publishing 10 crates to crates.io, two SDK packages (npm + PyPI), one Docker image, and a documentation site needs disciplined secret hygiene — the wrong token in the wrong workflow is a supply-chain incident.
+> **WHY**: A Rust workspace publishing 11 crates to crates.io, two SDK packages (npm + PyPI), one Docker image, and a documentation site needs disciplined secret hygiene — the wrong token in the wrong workflow is a supply-chain incident.
 
 **Source**: `.github/workflows/`
 
@@ -11,9 +11,12 @@
 | File | Trigger | Purpose |
 |---|---|---|
 | `ci.yml` | Push / PR | Build, test, clippy, fmt check |
-| `release-rust.yml` | Tag push (`v*`) | Publish all 10 crates to crates.io in dependency order |
+| `release-binaries.yml` | Tag push (`v*`) | Build native binaries, upload checksums, publish GitHub Release |
+| `release-rust.yml` | Tag push (`v*`) | Publish all 11 crates to crates.io in dependency order |
 | `release-node.yml` | Tag push (`v*`) | Publish npm package (JS/TS SDK) |
 | `release-python.yml` | Tag push (`v*`) | Publish Python SDK to PyPI |
+| `release-npm-cli.yml` | GitHub release `published` | Publish `edgecrab-cli` npm wrapper after binaries are public |
+| `release-pypi-cli.yml` | GitHub release `published` | Publish `edgecrab-cli` PyPI wrapper after binaries are public |
 | `release-docker.yml` | Tag push (`v*`) | Build and push Docker image to GHCR |
 | `deploy-site.yml` | Push to `main` touching `site/` | Build Astro docs site → GitHub Pages |
 
@@ -28,11 +31,22 @@ ci.yml
 release-rust.yml
   └── CARGO_REGISTRY_TOKEN     (repo secret)
 
+release-binaries.yml
+  └── GITHUB_TOKEN             (built-in — contents:write for release upload/publish)
+
 release-node.yml
   └── environment: npm
       └── NPM_TOKEN             (environment secret — npm environment)
 
 release-python.yml
+  └── environment: pypi
+      └── (OIDC trusted publishing — no long-lived token needed)
+
+release-npm-cli.yml
+  └── environment: npm
+      └── NPM_TOKEN             (environment secret — npm environment)
+
+release-pypi-cli.yml
   └── environment: pypi
       └── (OIDC trusted publishing — no long-lived token needed)
 
@@ -62,10 +76,13 @@ edgecrab-security
 edgecrab-state
       │
       ▼
+edgecrab-cron
+      │
+      ▼
 edgecrab-tools
       │
       ▼
-edgecrab-cron
+edgecrab-lsp
       │
       ▼
 edgecrab-core

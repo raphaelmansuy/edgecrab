@@ -74,7 +74,8 @@ jobs:
             sdks/node/package.json \
             sdks/npm-cli/package.json \
             sdks/pypi-cli/edgecrab_cli/_version.py \
-            sdks/python/pyproject.toml
+            sdks/python/pyproject.toml \
+            sdks/python/edgecrab/_version.py
 
           git commit -m "chore: bump version to $VERSION"
           git tag "v$VERSION"

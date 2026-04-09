@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "edgecrab-sdk"
-version = "0.2.1"
+dynamic = ["version"]
 requires-python = ">=3.10"
 readme = "README.md"
 classifiers = [
@@ -45,6 +45,9 @@ edgecrab = "edgecrab.cli:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["edgecrab*"]
+
+[tool.setuptools.dynamic]
+version = { attr = "edgecrab._version.__version__" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

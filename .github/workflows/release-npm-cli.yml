@@ -4,16 +4,15 @@ name: Release — npm CLI (edgecrab-cli)
 # native binary from GitHub Releases at postinstall time) to the npm registry.
 #
 # Requires the GitHub Release binaries to be available BEFORE end-users run
-# `npm install edgecrab-cli`.  If this workflow runs before release-binaries.yml
-# finishes, the npm package will still be published correctly — the binary is
-# downloaded lazily at install time (postinstall hook), not at publish time.
+# `npm install edgecrab-cli`, so this workflow is gated on the GitHub Release
+# being published.
 #
 # Secret required:
 #   NPM_TOKEN  (environment secret on the "npm" GitHub environment)
 
 on:
-  push:
-    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+  release:
+    types: [published]
   workflow_dispatch:
     inputs:
       tag_name:
@@ -34,6 +33,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag_name || github.event.release.tag_name || github.ref }}
 
       - uses: actions/setup-node@v4
         with:
@@ -43,9 +44,10 @@ jobs:
       - name: Resolve version from tag
         id: version
         env:
+          RELEASE_TAG_NAME: ${{ github.event.release.tag_name }}
           INPUT_TAG_NAME: ${{ inputs.tag_name }}
         run: |
-          TAG="${INPUT_TAG_NAME:-$GITHUB_REF_NAME}"
+          TAG="${INPUT_TAG_NAME:-${RELEASE_TAG_NAME:-$GITHUB_REF_NAME}}"
           VERSION="${TAG#v}"
           echo "tag=$TAG"       >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"

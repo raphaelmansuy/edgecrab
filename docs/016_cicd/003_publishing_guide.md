@@ -1,6 +1,6 @@
 # EdgeCrab — Publication Guide
 
-> **Single authoritative reference** for every release artifact: 10 Rust crates, 2 npm packages, 2 PyPI packages, 1 Docker image, pre-built native binaries for 5 platforms, and the docs site.  
+> **Single authoritative reference** for every release artifact: 11 Rust crates, 2 npm packages, 2 PyPI packages, 1 Docker image, pre-built native binaries for 4 platforms, and the docs site.  
 > Read [001_secrets_setup.md](001_secrets_setup.md) before your very first release — every secret must be configured or CI will fail silently.
 
 ---
@@ -13,8 +13,8 @@
 | Rust crates (×10) | [crates.io](https://crates.io) | `release-rust.yml` | `make publish-rust` | tag `v*` |
 | Python SDK (`edgecrab-sdk`) | [PyPI](https://pypi.org) | `release-python.yml` | `make publish-python` | tag `v*` |
 | Node.js SDK (`edgecrab-sdk`) | [npm](https://npmjs.com) | `release-node.yml` | `make publish-node` | tag `v*` |
-| npm CLI wrapper (`edgecrab-cli`) | [npm](https://npmjs.com) | `release-npm-cli.yml` | `make publish-npm-cli` | tag `v*` |
-| PyPI CLI wrapper (`edgecrab-cli`) | [PyPI](https://pypi.org) | `release-pypi-cli.yml` | `make publish-pypi-cli` | tag `v*` |
+| npm CLI wrapper (`edgecrab-cli`) | [npm](https://npmjs.com) | `release-npm-cli.yml` | `make publish-npm-cli` | GitHub release `published` |
+| PyPI CLI wrapper (`edgecrab-cli`) | [PyPI](https://pypi.org) | `release-pypi-cli.yml` | `make publish-pypi-cli` | GitHub release `published` |
 | Docker image | [GHCR](https://ghcr.io) | `release-docker.yml` | *(CI only)* | tag `v*` |
 | Docs site | GitHub Pages / www.edgecrab.com | `deploy-site.yml` | `make site-deploy` | push to `main` |
 
@@ -42,7 +42,7 @@ git add -A && git commit -m "chore: bump version to 0.2.0" && git push
 
 This updates the canonical workspace version in `Cargo.toml` and then syncs
 the derived package versions in `sdks/node/package.json`,
-`sdks/npm-cli/package.json`, `sdks/python/pyproject.toml`, and
+`sdks/npm-cli/package.json`, `sdks/python/edgecrab/_version.py`, and
 `sdks/pypi-cli/edgecrab_cli/_version.py`.
 
 First principle: every release channel should derive from the smallest possible
@@ -54,6 +54,7 @@ set of version-bearing files.
 
 - Node SDK package version derives from `sdks/node/package.json`
 - npm CLI wrapper binary tag derives from `sdks/npm-cli/package.json`
+- Python SDK package metadata derives from `sdks/python/edgecrab/_version.py`
 - PyPI CLI wrapper package version and binary tag derive from `sdks/pypi-cli/edgecrab_cli/_version.py`
 - generated build output does not participate in release bookkeeping
 
@@ -64,17 +65,20 @@ make tag-release VERSION=0.2.0
 # equivalent: git tag -a v0.2.0 -m "Release v0.2.0" && git push origin v0.2.0
 ```
 
-One annotated tag triggers **seven** workflows in parallel:
+One annotated tag triggers the binary, Rust, SDK, and Docker publishers. When
+the native binaries finish and the GitHub Release is published, that release
+event then triggers the CLI wrapper publishers:
 
 ```
 git push origin v0.2.0
     │
     ├── release-binaries.yml   → cross-compile + upload native bins to GH Release
-    ├── release-rust.yml       → publish 10 crates to crates.io
+    │                            └── publishes GitHub Release
+    │                                  ├── release-npm-cli.yml  → publish edgecrab-cli to npm
+    │                                  └── release-pypi-cli.yml → publish edgecrab-cli to PyPI
+    ├── release-rust.yml       → publish 11 crates to crates.io + update GH release notes
     ├── release-python.yml     → publish edgecrab-sdk to PyPI (multi-platform wheels)
     ├── release-node.yml       → publish edgecrab-sdk to npm
-    ├── release-npm-cli.yml    → publish edgecrab-cli to npm
-    ├── release-pypi-cli.yml   → publish edgecrab-cli to PyPI
     └── release-docker.yml     → push multi-arch Docker image to GHCR
 ```
 
@@ -95,6 +99,27 @@ pip index versions edgecrab-cli     # must include 0.2.0
 docker pull ghcr.io/raphaelmansuy/edgecrab:0.2.0
 gh release download v0.2.0 --pattern edgecrab-checksums.txt --repo raphaelmansuy/edgecrab
 curl -I https://www.edgecrab.com    # HTTP 200
+```
+
+### Step 6 — Update Homebrew tap
+
+After the GitHub Release is published, update the external tap formula with the
+new version and the macOS checksum from `edgecrab-checksums.txt`.
+
+```bash
+gh release download v0.2.0 --pattern edgecrab-checksums.txt --repo raphaelmansuy/edgecrab
+grep 'edgecrab-aarch64-apple-darwin.tar.gz' edgecrab-checksums.txt
+grep 'edgecrab-x86_64-apple-darwin.tar.gz' edgecrab-checksums.txt
+```
+
+Then update `raphaelmansuy/homebrew-tap` `Formula/edgecrab.rb`, push that
+change, and verify:
+
+```bash
+brew update
+brew upgrade edgecrab
+edgecrab version
+edgecrab update --check
 ```
 
 ---
@@ -141,6 +166,7 @@ cargo publish -p edgecrab-security --no-verify && sleep 30
 cargo publish -p edgecrab-state    --no-verify && sleep 30
 cargo publish -p edgecrab-cron     --no-verify && sleep 30
 cargo publish -p edgecrab-tools    --no-verify && sleep 30
+cargo publish -p edgecrab-lsp      --no-verify && sleep 30
 cargo publish -p edgecrab-core     --no-verify && sleep 30
 cargo publish -p edgecrab-gateway  --no-verify && sleep 30
 cargo publish -p edgecrab-acp      --no-verify && sleep 30
@@ -228,12 +254,12 @@ npm list -g --depth=0 | grep edgecrab
 | File | Trigger | Purpose |
 |---|---|---|
 | `ci.yml` | push/PR to `main` | Build, test, clippy, fmt, audit, site build |
-| `release-binaries.yml` | tag `v*` | Cross-compile 5 platform binaries → GH Release |
-| `release-rust.yml` | tag `v*` | Publish 10 crates in dependency order → GH Release |
+| `release-binaries.yml` | tag `v*` | Cross-compile 4 platform binaries, upload checksums, publish GitHub Release |
+| `release-rust.yml` | tag `v*` | Publish 11 crates in dependency order, then update GitHub release notes |
 | `release-node.yml` | tag `v*` | Publish `edgecrab-sdk` to npm |
 | `release-python.yml` | tag `v*` | Build multi-platform wheels + publish `edgecrab-sdk` to PyPI |
-| `release-npm-cli.yml` | tag `v*` | Publish `edgecrab-cli` to npm |
-| `release-pypi-cli.yml` | tag `v*` | Publish `edgecrab-cli` to PyPI |
+| `release-npm-cli.yml` | release `published` | Publish `edgecrab-cli` to npm after binaries are public |
+| `release-pypi-cli.yml` | release `published` | Publish `edgecrab-cli` to PyPI after binaries are public |
 | `release-docker.yml` | tag `v*` | Build multi-arch Docker image → GHCR |
 | `deploy-site.yml` | push to `main` touching `site/` | Astro build → GitHub Pages |
 
@@ -260,9 +286,8 @@ GitHub environments to configure at **Repo → Settings → Environments**:
 |---|---|---|
 | `ubuntu-latest` | `x86_64-unknown-linux-gnu` | `edgecrab-x86_64-unknown-linux-gnu.tar.gz` |
 | `ubuntu-latest` + `cross` | `aarch64-unknown-linux-gnu` | `edgecrab-aarch64-unknown-linux-gnu.tar.gz` |
-| `macos-13` (Intel) | `x86_64-apple-darwin` | `edgecrab-x86_64-apple-darwin.tar.gz` |
+| `macos-14` (Apple Silicon runner, cross-compiles Intel target) | `x86_64-apple-darwin` | `edgecrab-x86_64-apple-darwin.tar.gz` |
 | `macos-14` (M1) | `aarch64-apple-darwin` | `edgecrab-aarch64-apple-darwin.tar.gz` |
-| `windows-latest` | `x86_64-pc-windows-msvc` | `edgecrab-x86_64-pc-windows-msvc.zip` |
 
 These archive names are hardcoded in `sdks/npm-cli/scripts/install.js` and
 `sdks/pypi-cli/edgecrab_cli/_binary.py`. Do not rename them without updating both.
@@ -271,8 +296,9 @@ These archive names are hardcoded in `sdks/npm-cli/scripts/install.js` and
 
 ```
 edgecrab-types → edgecrab-security → edgecrab-state → edgecrab-cron
-      → edgecrab-tools → edgecrab-core → edgecrab-gateway
-      → edgecrab-acp → edgecrab-migrate → edgecrab-cli (last)
+      → edgecrab-tools → edgecrab-lsp → edgecrab-core
+      → edgecrab-gateway → edgecrab-acp → edgecrab-migrate
+      → edgecrab-cli (last)
 ```
 
 `release-rust.yml` enforces that the tag version equals the `edgecrab-core` version in
@@ -282,7 +308,7 @@ edgecrab-types → edgecrab-security → edgecrab-state → edgecrab-cron
 
 ## Versioning policy
 
-All 10 Rust crates, both SDKs, and both CLI wrappers share the **same version number** always.
+All 11 Rust crates, both SDKs, and both CLI wrappers share the **same version number** always.
 Use `make version-bump VERSION=x.y.z` or `./scripts/release-version.sh set x.y.z` to keep them in sync.
 
 | Change | Bump | Example |
@@ -318,7 +344,8 @@ behaviour; safe to ignore.
 **PyPI `skip-existing: true`** — duplicate uploads are silently skipped by the workflow.
 
 **Binary missing from GitHub Release after npm/PyPI CLI install fails** — re-run
-`release-binaries.yml` via `workflow_dispatch` or upload manually:
+`release-binaries.yml` via `workflow_dispatch` or upload manually, then verify
+the GitHub Release is published before retrying the wrapper package:
 
 ```bash
 cargo build --release --target aarch64-apple-darwin -p edgecrab-cli

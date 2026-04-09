@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 
-import pytest
 import httpx
+import pytest
+
+import edgecrab
 
 MOCK_COMPLETION_RESPONSE = {
     "id": "chatcmpl-test123",
@@ -29,7 +31,7 @@ MOCK_MODELS_RESPONSE = {
     ]
 }
 
-MOCK_HEALTH_RESPONSE = {"status": "ok", "version": "0.1.0"}
+MOCK_HEALTH_RESPONSE = {"status": "ok", "version": edgecrab.__version__}
 
 
 MOCK_STREAM_LINES = [

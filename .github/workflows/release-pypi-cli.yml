@@ -8,8 +8,8 @@ name: Release — PyPI CLI (edgecrab-cli)
 # publisher entry pointing to this repository and this workflow file.
 #
 # The binary download happens lazily at runtime (on first `edgecrab` invocation),
-# not at pip-install time.  Therefore this workflow can run in parallel with
-# release-binaries.yml without risk of shipping a broken package.
+# so this workflow is gated on the GitHub Release being published. That avoids
+# advertising a PyPI version before the release assets are public.
 #
 # PyPI environment setup:
 #   pypi.org → Account Settings → Publishing → Add trusted publisher
@@ -19,8 +19,8 @@ name: Release — PyPI CLI (edgecrab-cli)
 #     Env:      pypi
 
 on:
-  push:
-    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+  release:
+    types: [published]
   workflow_dispatch:
     inputs:
       tag_name:
@@ -39,6 +39,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag_name || github.event.release.tag_name || github.ref }}
 
       - uses: actions/setup-python@v5
         with:
@@ -47,9 +49,10 @@ jobs:
       - name: Resolve version from tag
         id: version
         env:
+          RELEASE_TAG_NAME: ${{ github.event.release.tag_name }}
           INPUT_TAG_NAME: ${{ inputs.tag_name }}
         run: |
-          TAG="${INPUT_TAG_NAME:-$GITHUB_REF_NAME}"
+          TAG="${INPUT_TAG_NAME:-${RELEASE_TAG_NAME:-$GITHUB_REF_NAME}}"
           VERSION="${TAG#v}"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Publishing edgecrab-cli==$VERSION"

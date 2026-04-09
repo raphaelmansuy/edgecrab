@@ -150,3 +150,12 @@ jobs:
           gh release upload "$TAG" release-assets/* \
             --repo "${{ github.repository }}" \
             --clobber
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.tag.outputs.name }}"
+          gh release edit "$TAG" \
+            --repo "${{ github.repository }}" \
+            --draft=false

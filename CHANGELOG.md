@@ -9,6 +9,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.2.2] — 2026-04-09
+
+### Fixed
+
+- **Python SDK runtime version drift** — `edgecrab-sdk` now derives its published package metadata and runtime `edgecrab.__version__` from `sdks/python/edgecrab/_version.py`, and release automation syncs that file directly so PyPI metadata and the installed SDK cannot diverge.
+- **Rust release publish order** — `release-rust.yml` now publishes `edgecrab-cron` before `edgecrab-tools` and keeps the workspace crates in dependency order, preventing crates.io resolution failures during tagged releases.
+- **CLI wrapper publication timing** — `release-binaries.yml` now publishes the GitHub Release once native assets and checksums are attached, and the npm/PyPI CLI wrapper workflows now trigger from the `published` release event so users do not get wrapper packages before their GitHub binary assets are public.
+- **Release operator documentation** — the CI/CD publication guides now document the corrected trigger topology, the Python SDK version source, the Rust crate order including `edgecrab-lsp`, and the post-release Homebrew tap update flow.
+
+---
+
 ## [0.2.1] — 2026-04-09
 
 ### Fixed

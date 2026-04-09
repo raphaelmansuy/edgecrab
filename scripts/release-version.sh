@@ -68,8 +68,7 @@ sync_versions() {
 
   printf '__version__ = "%s"\n' "$version" > sdks/pypi-cli/edgecrab_cli/_version.py
 
-  perl -0pi -e 's/^version = "[^"]+"/version = "'"$version"'"/m' \
-    sdks/python/pyproject.toml
+  printf '__version__ = "%s"\n' "$version" > sdks/python/edgecrab/_version.py
 }
 
 read_npm_version() {
@@ -85,16 +84,7 @@ read_pypi_cli_version() {
 }
 
 read_python_sdk_version() {
-  awk '
-    /^\[project\]/ { in_section=1; next }
-    /^\[/ { in_section=0 }
-    in_section && /^[[:space:]]*version = "/ {
-      gsub(/^[^"]*"/, "", $0)
-      gsub(/".*$/, "", $0)
-      print
-      exit
-    }
-  ' sdks/python/pyproject.toml
+  sed -n 's/^__version__ = "\([^"]*\)"$/\1/p' sdks/python/edgecrab/_version.py
 }
 
 check_synced() {
@@ -144,7 +134,7 @@ check_synced() {
   local python_sdk_version
   python_sdk_version="$(read_python_sdk_version)"
   if [[ "$python_sdk_version" != "$version" ]]; then
-    echo "Version drift: sdks/python/pyproject.toml is $python_sdk_version, expected $version" >&2
+    echo "Version drift: sdks/python/edgecrab/_version.py is $python_sdk_version, expected $version" >&2
     failed=1
   fi
 
