@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
+use edgecrab_plugins::{discover_plugins, hermes_supports_hook, invoke_hermes_hook};
 use edgecrab_state::SessionDb;
 use edgecrab_tools::ProcessTable;
 use edgecrab_tools::TodoStore;
@@ -46,7 +47,7 @@ pub struct Agent {
     pub(crate) provider: RwLock<Arc<dyn LLMProvider>>,
     #[allow(dead_code)] // Used in Phase 1.6 conversation loop
     pub(crate) state_db: Option<Arc<SessionDb>>,
-    pub(crate) tool_registry: Option<Arc<ToolRegistry>>,
+    pub(crate) tool_registry: RwLock<Option<Arc<ToolRegistry>>>,
     /// Gateway-backed outbound sender for `send_message`.
     ///
     /// None in plain CLI / cron sessions. Set by the messaging gateway runtime
@@ -497,7 +498,7 @@ impl Agent {
             config: RwLock::new(config),
             provider: RwLock::new(provider),
             state_db,
-            tool_registry,
+            tool_registry: RwLock::new(tool_registry),
             gateway_sender: RwLock::new(None),
             process_table,
             conversation_lock: Mutex::new(()),
@@ -728,7 +729,7 @@ impl Agent {
             config,
             provider,
             self.state_db.clone(),
-            self.tool_registry.clone(),
+            self.tool_registry.read().await.clone(),
         );
         if let Some(sender) = gateway_sender {
             child.set_gateway_sender(sender).await;
@@ -754,14 +755,23 @@ impl Agent {
 
     /// Reset session state for a new conversation.
     pub async fn new_session(&self) {
+        let previous_session_id = self.session.read().await.session_id.clone();
+        let config = self.config.read().await.clone();
+        if let Some(session_id) = previous_session_id.as_deref() {
+            self.fire_session_boundary_hooks(
+                &config,
+                "on_session_finalize",
+                session_id,
+                config.platform,
+            )
+            .await;
+        }
+
         // Clear the per-session env passthrough registry so stale skill
         // registrations from the previous session don't leak.  Re-register
         // config-level passthrough entries immediately so they remain
         // available for the new session's very first PersistentShell spawn.
-        let passthrough = {
-            let cfg = self.config.read().await;
-            cfg.terminal_env_passthrough.clone()
-        };
+        let passthrough = { config.terminal_env_passthrough.clone() };
         edgecrab_tools::tools::backends::local::clear_env_passthrough();
         if !passthrough.is_empty() {
             edgecrab_tools::tools::backends::local::register_env_passthrough(&passthrough);
@@ -769,7 +779,32 @@ impl Agent {
 
         let mut session = self.session.write().await;
         *session = SessionState::default();
+        let new_session_id = uuid::Uuid::new_v4().to_string();
+        session.session_id = Some(new_session_id.clone());
         self.budget.reset();
+        drop(session);
+
+        self.fire_session_boundary_hooks(
+            &config,
+            "on_session_reset",
+            &new_session_id,
+            config.platform,
+        )
+        .await;
+    }
+
+    pub async fn finalize_session(&self) {
+        let session_id = self.session.read().await.session_id.clone();
+        let config = self.config.read().await.clone();
+        if let Some(session_id) = session_id.as_deref() {
+            self.fire_session_boundary_hooks(
+                &config,
+                "on_session_finalize",
+                session_id,
+                config.platform,
+            )
+            .await;
+        }
     }
 
     /// Hot-swap the LLM model and provider at runtime.
@@ -791,6 +826,36 @@ impl Agent {
     /// Get the current model name.
     pub async fn model(&self) -> String {
         self.config.read().await.model.clone()
+    }
+
+    async fn fire_session_boundary_hooks(
+        &self,
+        config: &AgentConfig,
+        hook_name: &str,
+        session_id: &str,
+        platform: Platform,
+    ) {
+        let Ok(discovery) = discover_plugins(&config.plugins_config, platform) else {
+            return;
+        };
+        for plugin in discovery
+            .plugins
+            .iter()
+            .filter(|plugin| hermes_supports_hook(plugin, hook_name))
+        {
+            if let Err(error) = invoke_hermes_hook(
+                plugin,
+                hook_name,
+                serde_json::json!({
+                    "session_id": session_id,
+                    "platform": platform.to_string(),
+                }),
+            )
+            .await
+            {
+                tracing::warn!(plugin = %plugin.name, ?error, hook = hook_name, "Hermes session-boundary hook failed");
+            }
+        }
     }
 
     /// Snapshot of live session stats for `/status`, `/cost`, `/history` commands.
@@ -1077,7 +1142,7 @@ impl Agent {
 
     /// List all registered tool names.
     pub async fn tool_names(&self) -> Vec<String> {
-        match &self.tool_registry {
+        match self.tool_registry.read().await.as_ref() {
             Some(reg) => reg
                 .tool_names()
                 .into_iter()
@@ -1089,7 +1154,7 @@ impl Agent {
 
     /// List toolsets with their tool counts.
     pub async fn toolset_summary(&self) -> Vec<(String, usize)> {
-        match &self.tool_registry {
+        match self.tool_registry.read().await.as_ref() {
             Some(reg) => reg.toolset_summary(),
             None => Vec::new(),
         }
@@ -1097,7 +1162,8 @@ impl Agent {
 
     /// Rich tool inventory for UI selectors and diagnostics.
     pub async fn tool_inventory(&self) -> Vec<ToolInventoryEntry> {
-        let Some(registry) = &self.tool_registry else {
+        let registry = self.tool_registry.read().await.clone();
+        let Some(registry) = registry else {
             return Vec::new();
         };
         let config = self.config.read().await.clone();
@@ -1118,7 +1184,7 @@ impl Agent {
             platform: config.platform,
             process_table: Some(self.process_table.clone()),
             provider: Some(self.provider.read().await.clone()),
-            tool_registry: self.tool_registry.clone(),
+            tool_registry: Some(registry.clone()),
             delegate_depth: 0,
             sub_agent_runner: None,
             delegation_event_tx: None,
@@ -1135,6 +1201,17 @@ impl Agent {
             tool_progress_tx: None,
         };
         registry.tool_inventory(&ctx)
+    }
+
+    /// Hot-swap the runtime tool registry for future turns.
+    pub async fn set_tool_registry(&self, registry: Arc<ToolRegistry>) {
+        *self.tool_registry.write().await = Some(registry);
+    }
+
+    /// Update the plugins config used by runtime tool gating.
+    pub async fn set_plugins_config(&self, plugins_config: edgecrab_plugins::PluginsConfig) {
+        let mut config = self.config.write().await;
+        config.plugins_config = plugins_config;
     }
 
     /// Set reasoning effort on the agent config.
@@ -1878,6 +1955,38 @@ mod tests {
         }
     }
 
+    fn write_session_hook_plugin(dir: &Path) {
+        std::fs::write(
+            dir.join("plugin.yaml"),
+            r#"
+name: session-hooks
+version: "1.0.0"
+description: Session boundary recorder
+provides_hooks:
+  - on_session_finalize
+  - on_session_reset
+"#,
+        )
+        .expect("manifest");
+        std::fs::write(
+            dir.join("__init__.py"),
+            r#"
+import json
+from pathlib import Path
+
+def _append(event_name, session_id, platform, **kwargs):
+    target = Path(__file__).with_name("session-hooks.jsonl")
+    with target.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"event": event_name, "session_id": session_id, "platform": platform}) + "\n")
+
+def register(ctx):
+    ctx.register_hook("on_session_finalize", lambda **kwargs: _append("on_session_finalize", **kwargs))
+    ctx.register_hook("on_session_reset", lambda **kwargs: _append("on_session_reset", **kwargs))
+"#,
+        )
+        .expect("plugin");
+    }
+
     #[test]
     fn iteration_budget_counts_down() {
         let budget = IterationBudget::new(3);
@@ -2055,6 +2164,42 @@ mod tests {
         assert_eq!(agent.budget.remaining(), 5);
         let session = agent.session.read().await;
         assert!(session.messages.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_boundary_hooks_fire_on_new_and_finalize() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let plugin_dir = temp.path().join("session-hooks");
+        std::fs::create_dir_all(&plugin_dir).expect("plugin dir");
+        write_session_hook_plugin(&plugin_dir);
+
+        let provider: Arc<dyn LLMProvider> = Arc::new(edgequake_llm::MockProvider::new());
+        let mut config = AppConfig::default();
+        config.plugins.external_dirs = vec![temp.path().to_string_lossy().to_string()];
+
+        let agent = AgentBuilder::from_config(&config)
+            .provider(provider)
+            .build()
+            .expect("build agent");
+
+        let old_session_id = "existing-session".to_string();
+        agent.session.write().await.session_id = Some(old_session_id.clone());
+
+        agent.new_session().await;
+        let new_session_id = agent
+            .session
+            .read()
+            .await
+            .session_id
+            .clone()
+            .expect("new session id");
+        agent.finalize_session().await;
+
+        let log = std::fs::read_to_string(plugin_dir.join("session-hooks.jsonl")).expect("log");
+        assert!(log.contains("on_session_finalize"));
+        assert!(log.contains("on_session_reset"));
+        assert!(log.contains(&old_session_id));
+        assert!(log.contains(&new_session_id));
     }
 
     #[tokio::test]

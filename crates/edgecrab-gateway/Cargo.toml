@@ -41,3 +41,4 @@ md5 = "0.7"
 tokio = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
 tempfile = { workspace = true }
+edgequake-llm = { workspace = true }

@@ -1882,6 +1882,7 @@ enum DetailSurface {
     RemoteMcpBrowser,
     SkillSelector,
     RemoteSkillBrowser,
+    RemotePluginBrowser,
     ToolManager,
     PluginToggle,
     ConfigSelector,
@@ -1940,8 +1941,58 @@ impl FuzzyItem for RemoteSkillEntry {
     }
 }
 
-struct RemoteSkillBrowser {
-    selector: FuzzySelector<RemoteSkillEntry>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemotePluginAction {
+    Install,
+    Update,
+    Replace,
+}
+
+impl RemotePluginAction {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Install => "install",
+            Self::Update => "update",
+            Self::Replace => "replace",
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RemotePluginEntry {
+    name: String,
+    identifier: String,
+    description: String,
+    source_label: String,
+    origin: String,
+    trust_level: String,
+    kind: String,
+    tags: Vec<String>,
+    requires_env: Vec<String>,
+    installed_name: Option<String>,
+    action: RemotePluginAction,
+    search_text: String,
+}
+
+impl FuzzyItem for RemotePluginEntry {
+    fn primary(&self) -> &str {
+        &self.identifier
+    }
+
+    fn secondary(&self) -> &str {
+        &self.search_text
+    }
+
+    fn tag(&self) -> &str {
+        &self.source_label
+    }
+}
+
+struct RemoteBrowserState<T>
+where
+    T: Clone + FuzzyItem,
+{
+    selector: FuzzySelector<T>,
     notices: Vec<String>,
     last_completed_query: Option<String>,
     search_due_at: Option<Instant>,
@@ -1949,9 +2000,13 @@ struct RemoteSkillBrowser {
     next_request_id: u64,
     loading_query: Option<String>,
     action_in_flight: Option<String>,
+    source_filter: Option<String>,
 }
 
-impl RemoteSkillBrowser {
+impl<T> RemoteBrowserState<T>
+where
+    T: Clone + FuzzyItem,
+{
     fn new() -> Self {
         Self {
             selector: FuzzySelector::new(),
@@ -1962,13 +2017,43 @@ impl RemoteSkillBrowser {
             next_request_id: 0,
             loading_query: None,
             action_in_flight: None,
+            source_filter: None,
         }
     }
 
     fn current_query(&self) -> String {
         self.selector.query.trim().to_string()
     }
+
+    fn activate(&mut self, initial_query: Option<&str>, source_filter: Option<&str>) {
+        self.selector.active = true;
+        self.selector.query = initial_query.map(str::trim).unwrap_or_default().to_string();
+        self.selector.selected = 0;
+        self.selector.update_filter();
+        self.notices.clear();
+        self.last_completed_query = None;
+        self.search_due_at = None;
+        self.inflight_request_id = None;
+        self.loading_query = None;
+        self.action_in_flight = None;
+        self.source_filter = source_filter
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+    }
+
+    fn reset_results(&mut self) {
+        self.search_due_at = None;
+        self.inflight_request_id = None;
+        self.loading_query = None;
+        self.last_completed_query = None;
+        self.notices.clear();
+        self.selector.set_items(Vec::new());
+    }
 }
+
+type RemoteSkillBrowser = RemoteBrowserState<RemoteSkillEntry>;
+type RemotePluginBrowser = RemoteBrowserState<RemotePluginEntry>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RemoteMcpAction {
@@ -2022,33 +2107,7 @@ impl FuzzyItem for RemoteMcpEntry {
     }
 }
 
-struct RemoteMcpBrowser {
-    selector: FuzzySelector<RemoteMcpEntry>,
-    notices: Vec<String>,
-    last_completed_query: Option<String>,
-    search_due_at: Option<Instant>,
-    inflight_request_id: Option<u64>,
-    next_request_id: u64,
-    loading_query: Option<String>,
-}
-
-impl RemoteMcpBrowser {
-    fn new() -> Self {
-        Self {
-            selector: FuzzySelector::new(),
-            notices: Vec::new(),
-            last_completed_query: None,
-            search_due_at: None,
-            inflight_request_id: None,
-            next_request_id: 0,
-            loading_query: None,
-        }
-    }
-
-    fn current_query(&self) -> String {
-        self.selector.query.trim().to_string()
-    }
-}
+type RemoteMcpBrowser = RemoteBrowserState<RemoteMcpEntry>;
 
 /// A single MCP preset entry for the MCP browser overlay.
 #[derive(Clone)]
@@ -2972,6 +3031,8 @@ pub struct App {
     plugin_toggle_scope: PluginScope,
     /// Last non-error status note shown in the plugin toggle footer.
     plugin_toggle_status_note: Option<String>,
+    /// Remote plugin browser overlay (activated by `/plugins search` or `/plugins browse`)
+    remote_plugin_browser: RemotePluginBrowser,
     /// Remote skill browser overlay (activated by `/skills search` or `/skills hub`)
     remote_skill_browser: RemoteSkillBrowser,
     /// Session browser overlay (activated by F5 or `/session` with no args)
@@ -3232,11 +3293,28 @@ enum AgentResponse {
         query: String,
         report: edgecrab_tools::tools::skills_hub::SearchReport,
     },
+    /// A remote plugin search completed for the given request id and query.
+    RemotePluginSearchReady {
+        request_id: u64,
+        query: String,
+        report: edgecrab_plugins::PluginSearchReport,
+    },
     /// A remote MCP search completed for the given request id and query.
     RemoteMcpSearchReady {
         request_id: u64,
         query: String,
         report: crate::mcp_catalog::McpSearchReport,
+    },
+    /// A remote plugin install/update action completed.
+    RemotePluginActionComplete {
+        message: String,
+        plugin_name: String,
+    },
+    /// A remote plugin install/update action failed.
+    RemotePluginActionFailed {
+        action_label: String,
+        identifier: String,
+        error: String,
     },
     /// A remote skill install/update action completed.
     RemoteSkillActionComplete { message: String, skill_name: String },
@@ -3611,6 +3689,7 @@ impl App {
             plugin_toggle: FuzzySelector::new(),
             plugin_toggle_scope: PluginScope::Global,
             plugin_toggle_status_note: None,
+            remote_plugin_browser: RemotePluginBrowser::new(),
             remote_skill_browser: RemoteSkillBrowser::new(),
             session_browser: FuzzySelector::new(),
             session_browser_status_note: None,
@@ -4512,6 +4591,71 @@ impl App {
         (entries, notices)
     }
 
+    fn build_remote_plugin_entries(
+        report: &edgecrab_plugins::PluginSearchReport,
+    ) -> (Vec<RemotePluginEntry>, Vec<String>) {
+        let mut manager = crate::plugins::PluginManager::new();
+        manager.discover_all();
+        let mut installed_by_source = HashMap::new();
+        let mut installed_by_name = HashMap::new();
+        for plugin in manager.plugins() {
+            installed_by_name.insert(plugin.name.clone(), plugin.name.clone());
+            if let Some(source) = &plugin.install_source {
+                installed_by_source.insert(source.clone(), plugin.name.clone());
+            }
+        }
+
+        let mut entries = Vec::new();
+        let mut notices = Vec::new();
+        for group in &report.groups {
+            if let Some(notice) = &group.notice {
+                notices.push(format!("{}: {}", group.source.label, notice));
+            }
+
+            for plugin in &group.results {
+                let installed_name = installed_by_source.get(&plugin.identifier).cloned();
+                let action = if installed_name.is_some() {
+                    RemotePluginAction::Update
+                } else if installed_by_name.contains_key(&plugin.name) {
+                    RemotePluginAction::Replace
+                } else {
+                    RemotePluginAction::Install
+                };
+                let description = if plugin.description.trim().is_empty() {
+                    "No description available".to_string()
+                } else {
+                    unicode_trunc(plugin.description.trim(), 120)
+                };
+                let search_text = format!(
+                    "{} {} {} {} {} {} {}",
+                    plugin.name,
+                    plugin.identifier,
+                    description,
+                    plugin.origin,
+                    plugin.kind.as_tag(),
+                    plugin.trust_level,
+                    plugin.tags.join(" ")
+                );
+                entries.push(RemotePluginEntry {
+                    name: plugin.name.clone(),
+                    identifier: plugin.identifier.clone(),
+                    description,
+                    source_label: group.source.label.clone(),
+                    origin: plugin.origin.clone(),
+                    trust_level: plugin.trust_level.clone(),
+                    kind: plugin.kind.as_tag().to_string(),
+                    tags: plugin.tags.clone(),
+                    requires_env: plugin.requires_env.clone(),
+                    installed_name,
+                    action,
+                    search_text,
+                });
+            }
+        }
+
+        (entries, notices)
+    }
+
     fn build_remote_mcp_entries(
         report: &crate::mcp_catalog::McpSearchReport,
     ) -> (Vec<RemoteMcpEntry>, Vec<String>) {
@@ -4559,15 +4703,7 @@ impl App {
 
     fn open_remote_mcp_selector(&mut self, initial_query: Option<&str>) {
         self.mcp_selector.active = false;
-        self.remote_mcp_browser.selector.active = true;
-        self.remote_mcp_browser.selector.query =
-            initial_query.map(str::trim).unwrap_or_default().to_string();
-        self.remote_mcp_browser.selector.selected = 0;
-        self.remote_mcp_browser.selector.update_filter();
-        self.remote_mcp_browser.notices.clear();
-        self.remote_mcp_browser.last_completed_query = None;
-        self.remote_mcp_browser.loading_query = None;
-        self.remote_mcp_browser.inflight_request_id = None;
+        self.remote_mcp_browser.activate(initial_query, None);
         self.schedule_remote_mcp_search(true);
         self.needs_redraw = true;
     }
@@ -4575,12 +4711,7 @@ impl App {
     fn schedule_remote_mcp_search(&mut self, immediate: bool) {
         let query = self.remote_mcp_browser.current_query();
         if query.is_empty() {
-            self.remote_mcp_browser.search_due_at = None;
-            self.remote_mcp_browser.inflight_request_id = None;
-            self.remote_mcp_browser.loading_query = None;
-            self.remote_mcp_browser.last_completed_query = None;
-            self.remote_mcp_browser.notices.clear();
-            self.remote_mcp_browser.selector.set_items(Vec::new());
+            self.remote_mcp_browser.reset_results();
             self.needs_redraw = true;
             return;
         }
@@ -4732,16 +4863,7 @@ impl App {
 
     fn open_remote_skill_selector(&mut self, initial_query: Option<&str>) {
         self.skill_selector.active = false;
-        self.remote_skill_browser.selector.active = true;
-        self.remote_skill_browser.selector.query =
-            initial_query.map(str::trim).unwrap_or_default().to_string();
-        self.remote_skill_browser.selector.selected = 0;
-        self.remote_skill_browser.selector.update_filter();
-        self.remote_skill_browser.action_in_flight = None;
-        self.remote_skill_browser.notices.clear();
-        self.remote_skill_browser.last_completed_query = None;
-        self.remote_skill_browser.loading_query = None;
-        self.remote_skill_browser.inflight_request_id = None;
+        self.remote_skill_browser.activate(initial_query, None);
         self.schedule_remote_skill_search(true);
         self.needs_redraw = true;
     }
@@ -4749,12 +4871,7 @@ impl App {
     fn schedule_remote_skill_search(&mut self, immediate: bool) {
         let query = self.remote_skill_browser.current_query();
         if query.is_empty() {
-            self.remote_skill_browser.search_due_at = None;
-            self.remote_skill_browser.inflight_request_id = None;
-            self.remote_skill_browser.loading_query = None;
-            self.remote_skill_browser.last_completed_query = None;
-            self.remote_skill_browser.notices.clear();
-            self.remote_skill_browser.selector.set_items(Vec::new());
+            self.remote_skill_browser.reset_results();
             self.needs_redraw = true;
             return;
         }
@@ -4803,6 +4920,168 @@ impl App {
             });
         });
         self.needs_redraw = true;
+    }
+
+    fn open_remote_plugin_selector(
+        &mut self,
+        initial_query: Option<&str>,
+        source_filter: Option<&str>,
+    ) {
+        self.plugin_toggle.active = false;
+        self.remote_plugin_browser
+            .activate(initial_query, source_filter);
+        self.schedule_remote_plugin_search(true);
+        self.needs_redraw = true;
+    }
+
+    fn schedule_remote_plugin_search(&mut self, immediate: bool) {
+        let query = self.remote_plugin_browser.current_query();
+        if query.is_empty() {
+            self.remote_plugin_browser.reset_results();
+            self.needs_redraw = true;
+            return;
+        }
+
+        self.remote_plugin_browser.search_due_at = Some(if immediate {
+            Instant::now()
+        } else {
+            Instant::now() + Duration::from_millis(250)
+        });
+        self.needs_redraw = true;
+    }
+
+    fn poll_remote_plugin_search(&mut self) {
+        if !self.remote_plugin_browser.selector.active {
+            return;
+        }
+
+        let Some(deadline) = self.remote_plugin_browser.search_due_at else {
+            return;
+        };
+        if Instant::now() < deadline {
+            return;
+        }
+
+        let query = self.remote_plugin_browser.current_query();
+        self.remote_plugin_browser.search_due_at = None;
+        if query.is_empty() {
+            return;
+        }
+        if self.remote_plugin_browser.loading_query.as_deref() == Some(query.as_str()) {
+            return;
+        }
+
+        self.remote_plugin_browser.next_request_id =
+            self.remote_plugin_browser.next_request_id.saturating_add(1);
+        let request_id = self.remote_plugin_browser.next_request_id;
+        let source_filter = self.remote_plugin_browser.source_filter.clone();
+        self.remote_plugin_browser.inflight_request_id = Some(request_id);
+        self.remote_plugin_browser.loading_query = Some(query.clone());
+        let tx = self.response_tx.clone();
+        self.rt_handle.spawn(async move {
+            let config_path = edgecrab_core::edgecrab_home().join("config.yaml");
+            let config = edgecrab_core::AppConfig::load_from(&config_path).unwrap_or_default();
+            let report = edgecrab_plugins::search_hub_report(
+                &config.plugins,
+                &query,
+                source_filter.as_deref(),
+                12,
+            )
+            .await
+            .unwrap_or_default();
+            let _ = tx.send(AgentResponse::RemotePluginSearchReady {
+                request_id,
+                query,
+                report,
+            });
+        });
+        self.needs_redraw = true;
+    }
+
+    fn apply_remote_plugin_search_result(
+        &mut self,
+        request_id: u64,
+        query: String,
+        report: edgecrab_plugins::PluginSearchReport,
+    ) {
+        if self.remote_plugin_browser.inflight_request_id != Some(request_id) {
+            return;
+        }
+        if self.remote_plugin_browser.current_query() != query {
+            return;
+        }
+
+        let (entries, notices) = Self::build_remote_plugin_entries(&report);
+        self.remote_plugin_browser.inflight_request_id = None;
+        self.remote_plugin_browser.loading_query = None;
+        self.remote_plugin_browser.last_completed_query = Some(query);
+        self.remote_plugin_browser.notices = notices;
+        self.remote_plugin_browser.selector.set_items(entries);
+        self.remote_plugin_browser.selector.selected = 0;
+        self.needs_redraw = true;
+    }
+
+    fn run_remote_plugin_action(&mut self, entry: RemotePluginEntry) {
+        if self.remote_plugin_browser.action_in_flight.is_some() {
+            self.push_output(
+                "A remote plugin action is already running. Wait for it to finish.",
+                OutputRole::System,
+            );
+            return;
+        }
+
+        let action_label = entry.action.label().to_string();
+        self.remote_plugin_browser.action_in_flight =
+            Some(format!("{} {}", action_label, entry.identifier));
+        self.needs_redraw = true;
+
+        let tx = self.response_tx.clone();
+        let action_identifier = entry.identifier.clone();
+        self.rt_handle.spawn(async move {
+            let result = match entry.action {
+                RemotePluginAction::Install | RemotePluginAction::Replace => {
+                    tokio::task::spawn_blocking(move || {
+                        crate::plugins_cmd::install_plugin_capture(
+                            &entry.identifier,
+                            None,
+                            false,
+                            false,
+                        )
+                    })
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result.map_err(|error| error.to_string()))
+                }
+                RemotePluginAction::Update => {
+                    let plugin_name = entry
+                        .installed_name
+                        .clone()
+                        .unwrap_or_else(|| entry.name.clone());
+                    tokio::task::spawn_blocking(move || {
+                        crate::plugins_cmd::update_plugin_capture(&plugin_name)
+                    })
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result.map_err(|error| error.to_string()))
+                }
+            };
+
+            match result {
+                Ok(outcome) => {
+                    let _ = tx.send(AgentResponse::RemotePluginActionComplete {
+                        message: outcome.message,
+                        plugin_name: outcome.plugin_name,
+                    });
+                }
+                Err(error) => {
+                    let _ = tx.send(AgentResponse::RemotePluginActionFailed {
+                        action_label,
+                        identifier: action_identifier,
+                        error,
+                    });
+                }
+            }
+        });
     }
 
     fn apply_remote_skill_search_result(
@@ -6970,6 +7249,87 @@ impl App {
             return;
         }
 
+        if self.remote_plugin_browser.selector.active {
+            match key.code {
+                KeyCode::Esc => {
+                    if !self.close_detail_fullscreen(DetailSurface::RemotePluginBrowser) {
+                        self.remote_plugin_browser.selector.active = false;
+                        self.remote_plugin_browser.action_in_flight = None;
+                        self.needs_redraw = true;
+                    }
+                }
+                _ if selector_action_key(&key, 'z') => {
+                    self.toggle_detail_fullscreen(DetailSurface::RemotePluginBrowser, 0);
+                }
+                KeyCode::Enter => {
+                    if let Some(entry) = self.remote_plugin_browser.selector.current().cloned() {
+                        self.run_remote_plugin_action(entry);
+                    }
+                }
+                _ if selector_action_key(&key, 'i') => {
+                    if let Some(entry) = self.remote_plugin_browser.selector.current().cloned() {
+                        self.run_remote_plugin_action(entry);
+                    }
+                }
+                _ if selector_action_key(&key, 'u') => {
+                    if let Some(mut entry) = self.remote_plugin_browser.selector.current().cloned()
+                    {
+                        if entry.installed_name.is_some() {
+                            entry.action = RemotePluginAction::Update;
+                            self.run_remote_plugin_action(entry);
+                        } else {
+                            self.push_output(
+                                "This remote plugin is not hub-installed yet. Use Enter or I to install it.",
+                                OutputRole::System,
+                            );
+                        }
+                    }
+                }
+                _ if selector_action_key(&key, 'r') => {
+                    self.schedule_remote_plugin_search(true);
+                }
+                _ if selector_action_key(&key, 'l') => {
+                    let scope = self.plugin_toggle_scope.clone();
+                    self.remote_plugin_browser.selector.active = false;
+                    self.close_detail_fullscreen(DetailSurface::RemotePluginBrowser);
+                    self.open_plugin_toggle(scope);
+                    self.needs_redraw = true;
+                }
+                KeyCode::Up => {
+                    self.remote_plugin_browser.selector.move_up();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::RemotePluginBrowser);
+                }
+                KeyCode::Down => {
+                    self.remote_plugin_browser.selector.move_down();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::RemotePluginBrowser);
+                }
+                KeyCode::PageUp
+                    if self.detail_fullscreen_active(DetailSurface::RemotePluginBrowser) =>
+                {
+                    self.page_up_detail_fullscreen(DetailSurface::RemotePluginBrowser);
+                }
+                KeyCode::PageDown
+                    if self.detail_fullscreen_active(DetailSurface::RemotePluginBrowser) =>
+                {
+                    self.page_down_detail_fullscreen(DetailSurface::RemotePluginBrowser);
+                }
+                KeyCode::PageUp => self.remote_plugin_browser.selector.page_up(),
+                KeyCode::PageDown => self.remote_plugin_browser.selector.page_down(),
+                KeyCode::Backspace => {
+                    self.remote_plugin_browser.selector.pop_char();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::RemotePluginBrowser);
+                    self.schedule_remote_plugin_search(false);
+                }
+                KeyCode::Char(c) if selector_search_char(&key) == Some(c) => {
+                    self.remote_plugin_browser.selector.push_char(c);
+                    self.reset_detail_fullscreen_scroll(DetailSurface::RemotePluginBrowser);
+                    self.schedule_remote_plugin_search(false);
+                }
+                _ => {}
+            }
+            return;
+        }
+
         // Skill selector overlay active — same key scheme as model selector
         if self.skill_selector.active {
             match key.code {
@@ -7123,6 +7483,9 @@ impl App {
                 }
                 KeyCode::PageUp => self.plugin_toggle.page_up(),
                 KeyCode::PageDown => self.plugin_toggle.page_down(),
+                _ if selector_action_key(&key, 'r') => {
+                    self.open_remote_plugin_selector(None, None);
+                }
                 KeyCode::Backspace => {
                     self.plugin_toggle.pop_char();
                     self.reset_detail_fullscreen_scroll(DetailSurface::PluginToggle);
@@ -9157,12 +9520,50 @@ impl App {
                 } => {
                     self.apply_remote_skill_search_result(request_id, query, report);
                 }
+                AgentResponse::RemotePluginSearchReady {
+                    request_id,
+                    query,
+                    report,
+                } => {
+                    self.apply_remote_plugin_search_result(request_id, query, report);
+                }
                 AgentResponse::RemoteMcpSearchReady {
                     request_id,
                     query,
                     report,
                 } => {
                     self.apply_remote_mcp_search_result(request_id, query, report);
+                }
+                AgentResponse::RemotePluginActionComplete {
+                    message,
+                    plugin_name,
+                } => {
+                    self.remote_plugin_browser.action_in_flight = None;
+                    if let Err(error) = self.refresh_agent_plugin_runtime() {
+                        self.push_output(
+                            format!("Plugin runtime refresh failed: {error}"),
+                            OutputRole::Error,
+                        );
+                    }
+                    self.push_output(
+                        format!("{message}\nInspect with: /plugins info {plugin_name}"),
+                        OutputRole::System,
+                    );
+                    if self.remote_plugin_browser.selector.active {
+                        self.schedule_remote_plugin_search(true);
+                    }
+                }
+                AgentResponse::RemotePluginActionFailed {
+                    action_label,
+                    identifier,
+                    error,
+                } => {
+                    self.remote_plugin_browser.action_in_flight = None;
+                    self.push_output(
+                        format!("Remote {action_label} failed for '{identifier}': {error}"),
+                        OutputRole::Error,
+                    );
+                    self.needs_redraw = true;
                 }
                 AgentResponse::RemoteSkillActionComplete {
                     message,
@@ -10208,6 +10609,32 @@ impl App {
         .map_err(|err| err.to_string())
     }
 
+    fn refresh_agent_plugin_runtime(&mut self) -> Result<(), String> {
+        let Some(agent) = self.agent.as_ref().cloned() else {
+            return Ok(());
+        };
+
+        let config = self.load_runtime_config();
+        let registry =
+            self.rt_handle
+                .block_on(crate::runtime::build_tool_registry_with_mcp_discovery(
+                    &config,
+                ));
+        let plugins_config = config.plugins.clone();
+        self.rt_handle.block_on(async move {
+            agent.set_plugins_config(plugins_config).await;
+            agent.set_tool_registry(registry).await;
+        });
+
+        if self.tool_manager.active {
+            let _ = self.refresh_tool_manager_entries();
+        }
+        if self.plugin_toggle.active {
+            let _ = self.refresh_plugin_toggle_entries();
+        }
+        Ok(())
+    }
+
     fn toggle_tool_manager_selected(&mut self) {
         let Some(entry) = self.tool_manager.current().cloned() else {
             return;
@@ -10364,7 +10791,12 @@ impl App {
                 )
             })
             .collect::<Vec<_>>();
-        entries.sort_by(|left, right| left.name.cmp(&right.name));
+        entries.sort_by(|left, right| {
+            matches!(right.check_state, PluginCheckState::On)
+                .cmp(&matches!(left.check_state, PluginCheckState::On))
+                .then_with(|| left.runtime_status.cmp(&right.runtime_status))
+                .then_with(|| left.name.cmp(&right.name))
+        });
         entries
     }
 
@@ -10380,11 +10812,14 @@ impl App {
     }
 
     fn open_plugin_toggle(&mut self, scope: PluginScope) {
+        self.remote_plugin_browser.selector.active = false;
+        self.remote_plugin_browser.action_in_flight = None;
         self.plugin_toggle_scope = scope;
         let _ = self.refresh_plugin_toggle_entries();
-        self.plugin_toggle_status_note =
-            Some("Space stages changes. Enter saves. Tab switches platform scope.".into());
-        self.plugin_toggle.active = true;
+        self.plugin_toggle_status_note = Some(
+            "Space stages changes. Enter saves. Tab switches scope. R opens remote search.".into(),
+        );
+        self.plugin_toggle.activate();
         self.needs_redraw = true;
     }
 
@@ -10405,6 +10840,17 @@ impl App {
     }
 
     fn confirm_plugin_toggle(&mut self) {
+        if !self
+            .plugin_toggle
+            .items
+            .iter()
+            .any(PluginToggleEntry::has_pending_change)
+        {
+            self.plugin_toggle.active = false;
+            self.plugin_toggle_status_note = Some("No plugin changes to save.".into());
+            self.needs_redraw = true;
+            return;
+        }
         let config_path = edgecrab_core::edgecrab_home().join("config.yaml");
         let mut config = self.load_runtime_config();
         let target_names = self
@@ -10451,6 +10897,12 @@ impl App {
                     "Saved plugin state for {} scope.",
                     self.plugin_toggle_scope.title()
                 ));
+                if let Err(error) = self.refresh_agent_plugin_runtime() {
+                    self.push_output(
+                        format!("Plugin runtime refresh failed: {error}"),
+                        OutputRole::Error,
+                    );
+                }
                 self.plugin_toggle.active = false;
                 self.push_output("Plugin configuration saved.", OutputRole::System);
             }
@@ -10497,17 +10949,25 @@ impl App {
         }
 
         match config.save_to(&config_path) {
-            Ok(()) => self.push_output(
-                format!(
-                    "{} plugin `{name}`{}.",
-                    if enabled { "Disabled" } else { "Enabled" },
-                    platform
-                        .as_ref()
-                        .map(|scope| format!(" for `{scope}`"))
-                        .unwrap_or_default()
-                ),
-                OutputRole::System,
-            ),
+            Ok(()) => {
+                if let Err(error) = self.refresh_agent_plugin_runtime() {
+                    self.push_output(
+                        format!("Plugin runtime refresh failed: {error}"),
+                        OutputRole::Error,
+                    );
+                }
+                self.push_output(
+                    format!(
+                        "{} plugin `{name}`{}.",
+                        if enabled { "Disabled" } else { "Enabled" },
+                        platform
+                            .as_ref()
+                            .map(|scope| format!(" for `{scope}`"))
+                            .unwrap_or_default()
+                    ),
+                    OutputRole::System,
+                );
+            }
             Err(error) => self.push_output(
                 format!("Failed to update plugin `{name}`: {error}"),
                 OutputRole::Error,
@@ -13620,11 +14080,44 @@ impl App {
     }
 
     fn handle_show_plugins(&mut self, args: String) {
+        let trimmed = args.trim();
+        if trimmed.is_empty() || matches!(trimmed, "list" | "ls") {
+            self.open_plugin_toggle(PluginScope::Global);
+            return;
+        }
         let action = crate::plugins_cmd::action_from_slash_args(&args)
             .unwrap_or(crate::plugins_cmd::PluginAction::List);
-        match crate::plugins_cmd::run_capture(action) {
-            Ok(text) => self.push_output(text, OutputRole::Assistant),
-            Err(error) => self.push_output(format!("plugins: {error}"), OutputRole::Error),
+        let refresh_runtime = matches!(
+            &action,
+            crate::plugins_cmd::PluginAction::Install { .. }
+                | crate::plugins_cmd::PluginAction::Enable { .. }
+                | crate::plugins_cmd::PluginAction::Disable { .. }
+                | crate::plugins_cmd::PluginAction::Toggle { .. }
+                | crate::plugins_cmd::PluginAction::Update { .. }
+                | crate::plugins_cmd::PluginAction::Remove { .. }
+        );
+        match action {
+            crate::plugins_cmd::PluginAction::Search { query, source } => {
+                self.open_remote_plugin_selector(
+                    (!query.is_empty()).then_some(query.trim()),
+                    source.as_deref(),
+                );
+            }
+            crate::plugins_cmd::PluginAction::Browse => {
+                self.open_remote_plugin_selector(None, None);
+            }
+            other => match crate::plugins_cmd::run_capture(other) {
+                Ok(text) => {
+                    if refresh_runtime && let Err(error) = self.refresh_agent_plugin_runtime() {
+                        self.push_output(
+                            format!("Plugin runtime refresh failed: {error}"),
+                            OutputRole::Error,
+                        );
+                    }
+                    self.push_output(text, OutputRole::Assistant);
+                }
+                Err(error) => self.push_output(format!("plugins: {error}"), OutputRole::Error),
+            },
         }
     }
 
@@ -16203,6 +16696,10 @@ impl App {
             self.render_plugin_toggle(frame, frame.area());
         }
 
+        if self.remote_plugin_browser.selector.active {
+            self.render_remote_plugin_selector(frame, frame.area());
+        }
+
         if self.remote_skill_browser.selector.active {
             self.render_remote_skill_selector(frame, frame.area());
         }
@@ -18523,6 +19020,326 @@ impl App {
         frame.render_widget(help, chunks[2]);
     }
 
+    fn render_remote_plugin_selector(&self, frame: &mut Frame, area: Rect) {
+        frame.render_widget(Clear, area);
+
+        let chunks = Self::browser_overlay_chunks(area);
+        let body = Self::browser_body_chunks(chunks[1]);
+
+        let browser = &self.remote_plugin_browser;
+        let query = browser.current_query();
+        let title = if let Some(source) = browser.source_filter.as_deref() {
+            if browser.inflight_request_id.is_some() {
+                format!("Remote Plugins · {source} · Searching…")
+            } else {
+                format!("Remote Plugins · {source}")
+            }
+        } else if browser.inflight_request_id.is_some() {
+            "Remote Plugins · Searching…".to_string()
+        } else {
+            "Remote Plugins".to_string()
+        };
+        self.render_browser_header(
+            frame,
+            chunks[0],
+            &browser.selector.query,
+            BrowserChrome {
+                title: &title,
+                placeholder:
+                    "Type to search official and configured plugin registries, or use /plugins search --source <name> <query>",
+                icon: "🔌",
+                icon_color: Color::Rgb(210, 190, 110),
+                border_color: if browser.inflight_request_id.is_some() {
+                    Color::Rgb(210, 190, 110)
+                } else {
+                    Color::Rgb(255, 191, 0)
+                },
+            },
+        );
+
+        let filtered = &browser.selector.filtered;
+        let selected = browser.selector.selected;
+        let max_visible = body[0].height as usize;
+        let scroll_start = Self::browser_scroll_start(selected, max_visible);
+
+        let items: Vec<ListItem> = if filtered.is_empty() {
+            let empty_text = if query.is_empty() {
+                "  Start typing to search remote plugins."
+            } else if browser.inflight_request_id.is_some() {
+                "  Searching remote plugin registries…"
+            } else {
+                "  No remote plugins matched this query."
+            };
+            vec![ListItem::new(Line::from(Span::styled(
+                empty_text.to_string(),
+                Style::default().fg(Color::Rgb(120, 120, 135)),
+            )))]
+        } else {
+            filtered
+                .iter()
+                .skip(scroll_start)
+                .take(max_visible)
+                .enumerate()
+                .map(|(vis_idx, &entry_idx)| {
+                    let entry = &browser.selector.items[entry_idx];
+                    let is_selected = vis_idx + scroll_start == selected;
+                    let bg = if is_selected {
+                        Color::Rgb(42, 34, 18)
+                    } else {
+                        Color::Rgb(24, 22, 16)
+                    };
+                    let source_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(205, 190, 140))
+                    } else {
+                        Style::default().fg(Color::Rgb(155, 140, 105))
+                    };
+                    let action_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(210, 240, 175))
+                    } else {
+                        Style::default().fg(Color::Rgb(135, 165, 110))
+                    };
+                    let kind_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(150, 165, 205))
+                    } else {
+                        Style::default().fg(Color::Rgb(110, 125, 160))
+                    };
+                    let main_style = if is_selected {
+                        Style::default()
+                            .bg(bg)
+                            .fg(Color::Rgb(255, 236, 175))
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Rgb(220, 220, 210))
+                    };
+                    let desc_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(185, 180, 165))
+                    } else {
+                        Style::default().fg(Color::Rgb(140, 135, 125))
+                    };
+                    ListItem::new(Line::from(vec![
+                        selector_marker(is_selected, Color::Rgb(255, 210, 110), Some(bg)),
+                        Span::styled(format!("  {:<11}", entry.source_label), source_style),
+                        Span::styled(format!("{:<8}", entry.action.label()), action_style),
+                        Span::styled(unicode_pad_right(&entry.kind, 8), kind_style),
+                        Span::raw("  "),
+                        Span::styled(unicode_trunc(&entry.identifier, 40), main_style),
+                        Span::raw("  "),
+                        Span::styled(unicode_trunc(&entry.description, 28), desc_style),
+                    ]))
+                })
+                .collect()
+        };
+
+        frame.render_widget(
+            List::new(items).style(Style::default().bg(Color::Rgb(24, 22, 16))),
+            body[0],
+        );
+
+        let mut detail_lines = Vec::new();
+        if let Some(entry) = browser.selector.current() {
+            let status_line = match entry.action {
+                RemotePluginAction::Install => "Default action: install".to_string(),
+                RemotePluginAction::Update => format!(
+                    "Default action: update ({})",
+                    entry.installed_name.as_deref().unwrap_or(&entry.name)
+                ),
+                RemotePluginAction::Replace => {
+                    "Default action: replace existing local plugin".to_string()
+                }
+            };
+            detail_lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{} ", entry.source_label),
+                    Style::default()
+                        .fg(Color::Rgb(255, 236, 175))
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("[{}]", entry.trust_level),
+                    Style::default().fg(Color::Rgb(185, 180, 165)),
+                ),
+            ]));
+            detail_lines.push(Line::from(entry.identifier.clone()));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(entry.description.clone()));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(vec![
+                Span::styled("Kind: ", Style::default().fg(Color::Rgb(205, 190, 140))),
+                Span::raw(entry.kind.clone()),
+            ]));
+            detail_lines.push(Line::from(vec![
+                Span::styled("Origin: ", Style::default().fg(Color::Rgb(205, 190, 140))),
+                Span::raw(entry.origin.clone()),
+            ]));
+            detail_lines.push(Line::from(vec![
+                Span::styled("Action: ", Style::default().fg(Color::Rgb(205, 190, 140))),
+                Span::raw(status_line),
+            ]));
+            if !entry.requires_env.is_empty() {
+                detail_lines.push(Line::from(vec![
+                    Span::styled(
+                        "Requires env: ",
+                        Style::default().fg(Color::Rgb(205, 190, 140)),
+                    ),
+                    Span::raw(entry.requires_env.join(", ")),
+                ]));
+            }
+            if !entry.tags.is_empty() {
+                detail_lines.push(Line::from(vec![
+                    Span::styled("Tags: ", Style::default().fg(Color::Rgb(205, 190, 140))),
+                    Span::raw(entry.tags.join(", ")),
+                ]));
+            }
+            if entry.action == RemotePluginAction::Replace {
+                detail_lines.push(Line::from(""));
+                detail_lines.push(Line::from(Span::styled(
+                    "Warning: this source would replace an existing local plugin with the same name.",
+                    Style::default().fg(Color::Rgb(255, 180, 120)),
+                )));
+            }
+        } else if query.is_empty() {
+            detail_lines.push(Line::from(Span::styled(
+                "Registry Sources",
+                Style::default()
+                    .fg(Color::Rgb(255, 236, 175))
+                    .add_modifier(Modifier::BOLD),
+            )));
+            let config = self.load_runtime_config();
+            for source in edgecrab_plugins::hub_source_summaries(&config.plugins) {
+                detail_lines.push(Line::from(format!(
+                    "- {} [{}] — {}",
+                    source.label,
+                    format!("{:?}", source.trust_level).to_ascii_lowercase(),
+                    source.description
+                )));
+            }
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(
+                "Use /plugins search --source hermes <query> to constrain the browser to one registry family.",
+            ));
+        } else if browser.inflight_request_id.is_some() {
+            detail_lines.push(Line::from("Searching remote plugin registries…"));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(
+                "You can keep typing while results refresh. Source failures are surfaced as notes instead of blocking the browser.",
+            ));
+        } else {
+            detail_lines.push(Line::from("No results for the current query."));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(
+                "Try a broader term, a source name like 'edgecrab' or 'hermes', or use /plugins search --source <name> <query>.",
+            ));
+        }
+
+        if !browser.notices.is_empty() {
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(Span::styled(
+                "Source Notes",
+                Style::default()
+                    .fg(Color::Rgb(255, 191, 0))
+                    .add_modifier(Modifier::BOLD),
+            )));
+            for notice in browser.notices.iter().take(4) {
+                detail_lines.push(Line::from(format!("- {}", unicode_trunc(notice, 120))));
+            }
+            if browser.notices.len() > 4 {
+                detail_lines.push(Line::from(format!(
+                    "... {} more notice(s)",
+                    browser.notices.len() - 4
+                )));
+            }
+        }
+
+        if let Some(action) = &browser.action_in_flight {
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(Span::styled(
+                format!("Running: {action}"),
+                Style::default().fg(Color::Rgb(210, 240, 175)),
+            )));
+        }
+
+        if self.detail_fullscreen_active(DetailSurface::RemotePluginBrowser) {
+            self.render_fullscreen_browser_detail(
+                frame,
+                area,
+                FullscreenBrowserChrome {
+                    query: &browser.selector.query,
+                    header: BrowserChrome {
+                        title: &title,
+                        placeholder:
+                            "Type to search official and configured plugin registries, or use /plugins search --source <name> <query>",
+                        icon: "🔌",
+                        icon_color: Color::Rgb(255, 210, 110),
+                        border_color: if browser.inflight_request_id.is_some() {
+                            Color::Rgb(255, 210, 110)
+                        } else {
+                            Color::Rgb(255, 191, 0)
+                        },
+                    },
+                    detail: ScrollableDetailChrome {
+                        title: "Details",
+                        border_color: Color::Rgb(255, 191, 0),
+                        focused: true,
+                        requested_scroll: self
+                            .detail_fullscreen_scroll(DetailSurface::RemotePluginBrowser),
+                    },
+                    help: Line::from(vec![
+                        Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(255, 210, 110))),
+                        Span::styled("change item  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("type ", Style::default().fg(Color::Rgb(255, 210, 110))),
+                        Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(255, 210, 110))),
+                        Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Enter ", Style::default().fg(Color::Rgb(255, 210, 110))),
+                        Span::styled("default action  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Z ", Style::default().fg(Color::Rgb(255, 210, 110))),
+                        Span::styled("split view  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Esc ", Style::default().fg(Color::Rgb(255, 210, 110))),
+                        Span::styled("close  ", Style::default().fg(Color::DarkGray)),
+                    ]),
+                },
+                detail_lines,
+            );
+            return;
+        }
+
+        self.render_browser_detail(frame, body[1], detail_lines);
+
+        let mut help_spans = vec![
+            Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(255, 210, 110))),
+            Span::styled("browse  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("type ", Style::default().fg(Color::Rgb(255, 210, 110))),
+            Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Enter ", Style::default().fg(Color::Rgb(255, 210, 110))),
+            Span::styled("default action  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("I ", Style::default().fg(Color::Rgb(255, 210, 110))),
+            Span::styled("install/update  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("U ", Style::default().fg(Color::Rgb(255, 210, 110))),
+            Span::styled("update  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Z ", Style::default().fg(Color::Rgb(255, 210, 110))),
+            Span::styled("detail  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("R ", Style::default().fg(Color::Rgb(255, 210, 110))),
+            Span::styled("refresh  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("L ", Style::default().fg(Color::Rgb(255, 210, 110))),
+            Span::styled("local browser  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Esc ", Style::default().fg(Color::Rgb(255, 210, 110))),
+            Span::styled("cancel  ", Style::default().fg(Color::DarkGray)),
+        ];
+        let status_text = if browser.inflight_request_id.is_some() {
+            "searching"
+        } else if !query.is_empty() && filtered.is_empty() {
+            "no matches"
+        } else {
+            "matches"
+        };
+        help_spans.push(Span::styled(
+            format!("{} {}", filtered.len(), status_text),
+            Style::default().fg(Color::Rgb(155, 140, 105)),
+        ));
+        let help = Paragraph::new(Line::from(help_spans));
+        frame.render_widget(help, chunks[2]);
+    }
+
     fn render_tool_manager(&self, frame: &mut Frame, area: Rect) {
         frame.render_widget(Clear, area);
 
@@ -18797,60 +19614,38 @@ impl App {
     fn render_plugin_toggle(&self, frame: &mut Frame, area: Rect) {
         frame.render_widget(Clear, area);
 
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3),
-                Constraint::Min(1),
-                Constraint::Length(1),
-            ])
-            .split(area);
-        let body = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-            .split(chunks[1]);
-
-        let search_text = if self.plugin_toggle.query.is_empty() {
-            "Search plugins, descriptions, or kinds".to_string()
-        } else {
-            self.plugin_toggle.query.clone()
-        };
-        let search_style = if self.plugin_toggle.query.is_empty() {
-            Style::default().fg(Color::DarkGray)
-        } else {
-            Style::default().fg(Color::White)
-        };
-        let header = Paragraph::new(Line::from(vec![
-            Span::styled("  🔌 ", Style::default().fg(Color::Rgb(210, 190, 110))),
-            Span::styled(search_text, search_style),
-            Span::raw("   "),
-            Span::styled(
-                format!("[{}]", self.plugin_toggle_scope.title()),
-                Style::default()
-                    .fg(Color::Rgb(255, 238, 170))
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Rgb(210, 190, 110)))
-                .title(" Plugin Toggle "),
+        let chunks = Self::browser_overlay_chunks(area);
+        let body = Self::browser_body_chunks(chunks[1]);
+        let title = format!("Browse Plugins [{}]", self.plugin_toggle_scope.title());
+        self.render_browser_header(
+            frame,
+            chunks[0],
+            &self.plugin_toggle.query,
+            BrowserChrome {
+                title: &title,
+                placeholder:
+                    "Search installed plugins by name, tool, CLI command, status, source, or trust.",
+                icon: "🔌",
+                icon_color: Color::Rgb(210, 190, 110),
+                border_color: Color::Rgb(210, 190, 110),
+            },
         );
-        frame.render_widget(header, chunks[0]);
 
         let filtered = &self.plugin_toggle.filtered;
         let selected = self.plugin_toggle.selected;
         let max_visible = body[0].height as usize;
-        let scroll_start = if selected >= max_visible {
-            selected - max_visible + 1
-        } else {
-            0
-        };
+        let scroll_start = Self::browser_scroll_start(selected, max_visible);
 
         let items: Vec<ListItem> = if filtered.is_empty() {
+            let empty_text = if self.plugin_toggle.items.is_empty() {
+                "  No local plugins installed yet."
+            } else if self.plugin_toggle.query.trim().is_empty() {
+                "  No plugins available in this scope."
+            } else {
+                "  No plugins matched the current filter."
+            };
             vec![ListItem::new(Line::from(Span::styled(
-                "  No plugins matched the current filter.",
+                empty_text.to_string(),
                 Style::default().fg(Color::Rgb(120, 120, 135)),
             )))]
         } else {
@@ -18867,6 +19662,27 @@ impl App {
                     } else {
                         Color::Rgb(22, 22, 18)
                     };
+                    let state_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(210, 240, 175))
+                    } else {
+                        Style::default().fg(Color::Rgb(150, 180, 120))
+                    };
+                    let pending_style = if entry.has_pending_change() {
+                        if is_selected {
+                            Style::default().bg(bg).fg(Color::Rgb(255, 195, 120))
+                        } else {
+                            Style::default().fg(Color::Rgb(210, 150, 90))
+                        }
+                    } else if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(120, 110, 90))
+                    } else {
+                        Style::default().fg(Color::Rgb(90, 85, 70))
+                    };
+                    let kind_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(150, 165, 205))
+                    } else {
+                        Style::default().fg(Color::Rgb(110, 125, 160))
+                    };
                     let name_style = if is_selected {
                         Style::default()
                             .bg(bg)
@@ -18875,22 +19691,48 @@ impl App {
                     } else {
                         Style::default().fg(Color::Rgb(220, 220, 210))
                     };
+                    let trust_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(205, 190, 140))
+                    } else {
+                        Style::default().fg(Color::Rgb(155, 140, 105))
+                    };
+                    let detail_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(160, 160, 145))
+                    } else {
+                        Style::default().fg(Color::Rgb(120, 120, 110))
+                    };
                     ListItem::new(Line::from(vec![
                         selector_marker(is_selected, Color::Rgb(210, 190, 110), Some(bg)),
+                        Span::styled(format!("  {:<8}", entry.runtime_status), state_style),
+                        Span::raw("  "),
                         Span::styled(
-                            format!("  {}", entry.check_state.glyph()),
-                            Style::default().bg(bg).fg(Color::Rgb(180, 220, 150)),
+                            format!(
+                                "{:<7}",
+                                if entry.has_pending_change() {
+                                    "staged"
+                                } else {
+                                    ""
+                                }
+                            ),
+                            pending_style,
                         ),
                         Span::raw("  "),
-                        Span::styled(unicode_pad_right(&entry.kind, 12), Style::default().bg(bg)),
-                        Span::styled(unicode_pad_right(&entry.display_name, 26), name_style),
+                        Span::styled(unicode_pad_right(&entry.kind, 8), kind_style),
+                        Span::styled(unicode_trunc(&entry.display_name, 24), name_style),
+                        Span::raw("  "),
+                        Span::styled(unicode_pad_right(&entry.trust_level, 10), trust_style),
                         Span::raw("  "),
                         Span::styled(
                             unicode_trunc(
-                                &format!("v{} · ~{} tokens", entry.version, entry.estimated_tokens),
-                                28,
+                                &format!(
+                                    "{} {} tool{}",
+                                    entry.check_state.glyph(),
+                                    entry.tool_count,
+                                    if entry.tool_count == 1 { "" } else { "s" }
+                                ),
+                                18,
                             ),
-                            Style::default().bg(bg).fg(Color::Rgb(160, 160, 145)),
+                            detail_style,
                         ),
                     ]))
                 })
@@ -18910,38 +19752,144 @@ impl App {
                     .add_modifier(Modifier::BOLD),
             )));
             detail_lines.push(Line::from(""));
-            detail_lines.push(Line::from(format!("Kind: {}", entry.kind)));
-            detail_lines.push(Line::from(format!("Version: {}", entry.version)));
-            detail_lines.push(Line::from(format!("Source: {}", entry.source)));
-            detail_lines.push(Line::from(format!("Tools: {}", entry.tool_count)));
-            detail_lines.push(Line::from(format!(
-                "Estimated prompt cost: ~{} tokens",
-                entry.estimated_tokens
-            )));
-            if entry.needs_credentials {
-                detail_lines.push(Line::from(format!(
-                    "Credentials: {}",
-                    if entry.credentials_satisfied {
-                        "configured"
-                    } else {
-                        "missing required environment variables"
-                    }
+            detail_lines.push(Line::from(vec![
+                Span::styled(
+                    "Desired state: ",
+                    Style::default().fg(Color::Rgb(205, 190, 140)),
+                ),
+                Span::raw(entry.state_label()),
+            ]));
+            detail_lines.push(Line::from(vec![
+                Span::styled(
+                    "Runtime status: ",
+                    Style::default().fg(Color::Rgb(205, 190, 140)),
+                ),
+                Span::raw(entry.runtime_status.clone()),
+            ]));
+            detail_lines.push(Line::from(vec![
+                Span::styled("Scope: ", Style::default().fg(Color::Rgb(205, 190, 140))),
+                Span::raw(self.plugin_toggle_scope.title()),
+            ]));
+            detail_lines.push(Line::from(vec![
+                Span::styled("Kind: ", Style::default().fg(Color::Rgb(205, 190, 140))),
+                Span::raw(entry.kind.clone()),
+            ]));
+            detail_lines.push(Line::from(vec![
+                Span::styled("Trust: ", Style::default().fg(Color::Rgb(205, 190, 140))),
+                Span::raw(entry.trust_level.clone()),
+            ]));
+            detail_lines.push(Line::from(vec![
+                Span::styled("Version: ", Style::default().fg(Color::Rgb(205, 190, 140))),
+                Span::raw(entry.version.clone()),
+            ]));
+            detail_lines.push(Line::from(vec![
+                Span::styled("Source: ", Style::default().fg(Color::Rgb(205, 190, 140))),
+                Span::raw(entry.source.clone()),
+            ]));
+            if let Some(install_source) = entry.install_source.as_deref() {
+                detail_lines.push(Line::from(vec![
+                    Span::styled(
+                        "Install source: ",
+                        Style::default().fg(Color::Rgb(205, 190, 140)),
+                    ),
+                    Span::raw(install_source.to_string()),
+                ]));
+            }
+            detail_lines.push(Line::from(vec![
+                Span::styled("Tools: ", Style::default().fg(Color::Rgb(205, 190, 140))),
+                Span::raw(if entry.tools.is_empty() {
+                    "none".into()
+                } else {
+                    entry.tools.join(", ")
+                }),
+            ]));
+            if !entry.cli_commands.is_empty() {
+                detail_lines.push(Line::from(vec![
+                    Span::styled("CLI: ", Style::default().fg(Color::Rgb(205, 190, 140))),
+                    Span::raw(entry.cli_commands.join(", ")),
+                ]));
+            }
+            if let Some(compatibility) = entry.compatibility.as_deref() {
+                detail_lines.push(Line::from(vec![
+                    Span::styled(
+                        "Compatibility: ",
+                        Style::default().fg(Color::Rgb(205, 190, 140)),
+                    ),
+                    Span::raw(compatibility.to_string()),
+                ]));
+            }
+            if !entry.related_skills.is_empty() {
+                detail_lines.push(Line::from(vec![
+                    Span::styled(
+                        "Related skills: ",
+                        Style::default().fg(Color::Rgb(205, 190, 140)),
+                    ),
+                    Span::raw(entry.related_skills.join(", ")),
+                ]));
+            }
+            detail_lines.push(Line::from(vec![
+                Span::styled(
+                    "Estimated prompt cost: ",
+                    Style::default().fg(Color::Rgb(205, 190, 140)),
+                ),
+                Span::raw(format!("~{} tokens", entry.estimated_tokens)),
+            ]));
+            if !entry.missing_env.is_empty() {
+                detail_lines.push(Line::from(vec![
+                    Span::styled(
+                        "Missing env: ",
+                        Style::default().fg(Color::Rgb(255, 180, 120)),
+                    ),
+                    Span::raw(entry.missing_env.join(", ")),
+                ]));
+            }
+            if entry.has_pending_change() {
+                detail_lines.push(Line::from(""));
+                detail_lines.push(Line::from(Span::styled(
+                    "This plugin has staged changes that are not saved yet.",
+                    Style::default().fg(Color::Rgb(255, 195, 120)),
                 )));
             }
             detail_lines.push(Line::from(""));
             for line in entry.description.lines() {
                 detail_lines.push(Line::from(line.to_string()));
             }
+        } else if self.plugin_toggle.items.is_empty() {
+            detail_lines.push(Line::from(Span::styled(
+                "No Local Plugins",
+                Style::default()
+                    .fg(Color::Rgb(255, 236, 175))
+                    .add_modifier(Modifier::BOLD),
+            )));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(
+                "Install a local Hermes plugin with `edgecrab plugins install ./path`, or press R to search remote plugin registries.",
+            ));
+        } else if self.plugin_toggle.query.trim().is_empty() {
+            detail_lines.push(Line::from(Span::styled(
+                "Installed Plugins",
+                Style::default()
+                    .fg(Color::Rgb(255, 236, 175))
+                    .add_modifier(Modifier::BOLD),
+            )));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(
+                "Browse installed plugins by status, tool surface, trust, and source.",
+            ));
+            detail_lines.push(Line::from(
+                "Space stages enable or disable changes. Enter saves them for the active scope.",
+            ));
+            detail_lines.push(Line::from(
+                "Tab cycles between global policy and platform-specific policy.",
+            ));
+        } else {
+            detail_lines.push(Line::from("No plugins matched the current query."));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(
+                "Try a broader term, a tool name, a trust level, or press R to search remote sources.",
+            ));
         }
 
-        let detail = Paragraph::new(Text::from(detail_lines.clone()))
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Rgb(110, 96, 58)))
-                    .title(" Details "),
-            );
         if self.detail_fullscreen_active(DetailSurface::PluginToggle) {
             self.render_fullscreen_browser_detail(
                 frame,
@@ -18949,8 +19897,9 @@ impl App {
                 FullscreenBrowserChrome {
                     query: &self.plugin_toggle.query,
                     header: BrowserChrome {
-                        title: "Plugin Toggle",
-                        placeholder: "Search plugins, descriptions, or kinds",
+                        title: &title,
+                        placeholder:
+                            "Search installed plugins by name, tool, CLI command, status, source, or trust.",
                         icon: "🔌",
                         icon_color: Color::Rgb(210, 190, 110),
                         border_color: Color::Rgb(210, 190, 110),
@@ -18970,11 +19919,13 @@ impl App {
                         Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(210, 190, 110))),
                         Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
                         Span::styled("Space ", Style::default().fg(Color::Rgb(210, 190, 110))),
-                        Span::styled("toggle  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("stage change  ", Style::default().fg(Color::DarkGray)),
                         Span::styled("Enter ", Style::default().fg(Color::Rgb(210, 190, 110))),
                         Span::styled("save  ", Style::default().fg(Color::DarkGray)),
                         Span::styled("Tab ", Style::default().fg(Color::Rgb(210, 190, 110))),
                         Span::styled("scope  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("R ", Style::default().fg(Color::Rgb(210, 190, 110))),
+                        Span::styled("remote search  ", Style::default().fg(Color::DarkGray)),
                         Span::styled("Z ", Style::default().fg(Color::Rgb(210, 190, 110))),
                         Span::styled("split view  ", Style::default().fg(Color::DarkGray)),
                         Span::styled("Esc ", Style::default().fg(Color::Rgb(210, 190, 110))),
@@ -18985,7 +19936,7 @@ impl App {
             );
             return;
         }
-        frame.render_widget(detail, body[1]);
+        self.render_browser_detail(frame, body[1], detail_lines);
 
         let footer_note = self
             .plugin_toggle_status_note
@@ -18994,12 +19945,16 @@ impl App {
         let help = Paragraph::new(Line::from(vec![
             Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(210, 190, 110))),
             Span::styled("browse  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("type ", Style::default().fg(Color::Rgb(210, 190, 110))),
+            Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Space ", Style::default().fg(Color::Rgb(210, 190, 110))),
-            Span::styled("toggle  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("stage change  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Enter ", Style::default().fg(Color::Rgb(210, 190, 110))),
             Span::styled("save  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Tab ", Style::default().fg(Color::Rgb(210, 190, 110))),
             Span::styled("scope  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("R ", Style::default().fg(Color::Rgb(210, 190, 110))),
+            Span::styled("remote search  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Z ", Style::default().fg(Color::Rgb(210, 190, 110))),
             Span::styled("detail  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Esc ", Style::default().fg(Color::Rgb(210, 190, 110))),
@@ -21411,6 +22366,7 @@ fn event_loop(
         // Check for agent responses first (non-blocking)
         app.check_responses();
         app.poll_remote_skill_search();
+        app.poll_remote_plugin_search();
         app.poll_remote_mcp_search();
 
         // Advance spinner on each tick
@@ -21646,6 +22602,43 @@ mod tests {
                 .build()
                 .expect("build agent"),
         )
+    }
+
+    fn write_script_plugin(home: &std::path::Path, plugin_name: &str, tool_name: &str) {
+        let plugin_dir = home.join("plugins").join(plugin_name);
+        std::fs::create_dir_all(&plugin_dir).expect("plugin dir");
+        std::fs::write(
+            plugin_dir.join("plugin.toml"),
+            format!(
+                r#"[plugin]
+name = "{plugin_name}"
+version = "1.0.0"
+description = "Demo script plugin"
+kind = "script"
+
+[script]
+file = "main.rhai"
+
+[[tools]]
+name = "{tool_name}"
+description = "Demo plugin tool"
+"#
+            ),
+        )
+        .expect("plugin manifest");
+        std::fs::write(
+            plugin_dir.join("main.rhai"),
+            format!(
+                r#"fn tool_call(name, args_json) {{
+    if name == "{tool_name}" {{
+        return "{{\"ok\":true}}";
+    }}
+    return "{{}}";
+}}
+"#
+            ),
+        )
+        .expect("script file");
     }
 
     fn sample_browser_session(
@@ -23035,6 +24028,191 @@ mod tests {
         assert!(app.remote_skill_browser.selector.query.is_empty());
     }
 
+    #[test]
+    #[serial_test::serial(edgecrab_home_env)]
+    fn build_remote_plugin_entries_marks_update_replace_and_install() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+
+        let plugins_dir = dir.path().join("plugins");
+        std::fs::create_dir_all(plugins_dir.join("native-plugin")).expect("native plugin dir");
+        std::fs::create_dir_all(plugins_dir.join("local-only")).expect("local plugin dir");
+        std::fs::write(
+            plugins_dir.join("native-plugin").join("plugin.toml"),
+            r#"
+[plugin]
+name = "native-plugin"
+version = "1.0.0"
+description = "Native plugin"
+kind = "skill"
+
+[trust]
+level = "community"
+source = "hub:edgecrab-official/native-plugin"
+"#,
+        )
+        .expect("write plugin");
+        std::fs::write(
+            plugins_dir.join("local-only").join("plugin.toml"),
+            r#"
+[plugin]
+name = "local-only"
+version = "1.0.0"
+description = "Local plugin"
+kind = "skill"
+"#,
+        )
+        .expect("write local plugin");
+
+        let report = edgecrab_plugins::PluginSearchReport {
+            groups: vec![edgecrab_plugins::PluginSearchGroup {
+                source: edgecrab_plugins::PluginHubSourceInfo {
+                    name: "edgecrab-official".into(),
+                    label: "edgecrab-official".into(),
+                    trust_level: edgecrab_plugins::TrustLevel::Official,
+                    description: "Official EdgeCrab plugin registry".into(),
+                    url: "https://plugins.edgecrab.sh/index.json".into(),
+                },
+                results: vec![
+                    edgecrab_plugins::PluginMeta {
+                        name: "native-plugin".into(),
+                        identifier: "hub:edgecrab-official/native-plugin".into(),
+                        description: "Hub-managed plugin".into(),
+                        version: "1.1.0".into(),
+                        kind: edgecrab_plugins::PluginKind::Skill,
+                        origin: "https://plugins.edgecrab.sh/native-plugin".into(),
+                        trust_level: "official".into(),
+                        tags: vec!["official".into()],
+                        install_url: "https://plugins.edgecrab.sh/native-plugin.zip".into(),
+                        requires_env: vec![],
+                    },
+                    edgecrab_plugins::PluginMeta {
+                        name: "local-only".into(),
+                        identifier: "hub:edgecrab-official/local-only".into(),
+                        description: "Would replace local plugin".into(),
+                        version: "1.1.0".into(),
+                        kind: edgecrab_plugins::PluginKind::Skill,
+                        origin: "https://plugins.edgecrab.sh/local-only".into(),
+                        trust_level: "official".into(),
+                        tags: vec!["official".into()],
+                        install_url: "https://plugins.edgecrab.sh/local-only.zip".into(),
+                        requires_env: vec!["PLUGIN_TOKEN".into()],
+                    },
+                    edgecrab_plugins::PluginMeta {
+                        name: "fresh-remote".into(),
+                        identifier: "hub:edgecrab-official/fresh-remote".into(),
+                        description: "Brand new plugin".into(),
+                        version: "0.1.0".into(),
+                        kind: edgecrab_plugins::PluginKind::ToolServer,
+                        origin: "https://plugins.edgecrab.sh/fresh-remote".into(),
+                        trust_level: "official".into(),
+                        tags: vec!["tool-server".into()],
+                        install_url: "https://plugins.edgecrab.sh/fresh-remote.zip".into(),
+                        requires_env: vec![],
+                    },
+                ],
+                notice: Some("using cached index after source timeout".into()),
+            }],
+        };
+
+        let (entries, notices) = App::build_remote_plugin_entries(&report);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].action, RemotePluginAction::Update);
+        assert_eq!(entries[1].action, RemotePluginAction::Replace);
+        assert_eq!(entries[2].action, RemotePluginAction::Install);
+        assert_eq!(entries[1].requires_env, vec!["PLUGIN_TOKEN"]);
+        assert_eq!(notices.len(), 1);
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[tokio::test]
+    async fn plugins_search_opens_remote_browser_with_query() {
+        let mut app = App::new();
+
+        app.handle_show_plugins("search native plugin".into());
+
+        assert!(app.remote_plugin_browser.selector.active);
+        assert_eq!(app.remote_plugin_browser.selector.query, "native plugin");
+        assert!(!app.plugin_toggle.active);
+    }
+
+    #[tokio::test]
+    async fn plugins_search_with_source_filter_opens_remote_browser() {
+        let mut app = App::new();
+
+        app.handle_show_plugins("search --source hermes weather".into());
+
+        assert!(app.remote_plugin_browser.selector.active);
+        assert_eq!(app.remote_plugin_browser.selector.query, "weather");
+        assert_eq!(
+            app.remote_plugin_browser.source_filter.as_deref(),
+            Some("hermes")
+        );
+    }
+
+    #[tokio::test]
+    async fn plugins_browse_without_query_opens_remote_browser() {
+        let mut app = App::new();
+
+        app.handle_show_plugins("browse".into());
+
+        assert!(app.remote_plugin_browser.selector.active);
+        assert!(app.remote_plugin_browser.selector.query.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn plugins_without_args_open_local_overlay() {
+        let mut app = App::new();
+
+        app.handle_show_plugins(String::new());
+
+        assert!(app.plugin_toggle.active);
+        assert!(!app.remote_plugin_browser.selector.active);
+    }
+
+    #[tokio::test]
+    async fn plugin_selector_lowercase_letters_stay_in_filter() {
+        let mut app = App::new();
+        app.plugin_toggle.set_items(vec![PluginToggleEntry {
+            name: "json-toolbox".into(),
+            display_name: "json-toolbox".into(),
+            description: "JSON validation tools".into(),
+            version: "1.0.0".into(),
+            source: "user".into(),
+            kind: "hermes".into(),
+            tool_count: 2,
+            estimated_tokens: 0,
+            check_state: PluginCheckState::On,
+            original_check_state: PluginCheckState::On,
+            runtime_status: "running".into(),
+            trust_level: "official".into(),
+            tools: vec!["json_validate".into(), "json_pointer_get".into()],
+            cli_commands: vec!["json-toolbox".into()],
+            missing_env: Vec::new(),
+            related_skills: vec!["api-debugging".into()],
+            compatibility: Some("Requires json-toolbox plugin".into()),
+            install_source: Some("./plugins/developer/json-toolbox".into()),
+            credentials_satisfied: true,
+            search_text: "json-toolbox hermes running official json_validate json_pointer_get"
+                .into(),
+        }]);
+        app.plugin_toggle.activate();
+
+        app.handle_key_event(event::KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+
+        assert!(app.plugin_toggle.active);
+        assert_eq!(app.plugin_toggle.query, "j");
+        assert!(!app.remote_plugin_browser.selector.active);
+    }
+
     #[tokio::test]
     #[serial_test::serial(edgecrab_home_env)]
     async fn refresh_skills_list_builds_rich_entries_for_bundle_and_flat_skills() {
@@ -23866,6 +25044,66 @@ mod tests {
                 .unwrap_or_default()
                 .iter()
                 .any(|entry| entry == "terminal")
+        );
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(edgecrab_home_env)]
+    fn tool_manager_shows_plugin_tools_and_tracks_enable_disable() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+
+        write_script_plugin(dir.path(), "demo-script", "demo_plugin_tool");
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let _enter = rt.enter();
+        let mut app = App::new();
+        let agent = mock_agent();
+        drop(_enter);
+        app.set_agent(agent);
+
+        app.refresh_agent_plugin_runtime()
+            .expect("refresh plugin runtime");
+        app.open_tool_manager(ToolManagerMode::All);
+        app.tool_manager_scope = ToolManagerScope::Tools;
+        let _ = app.refresh_tool_manager_entries();
+
+        let plugin_tool = app
+            .tool_manager
+            .items
+            .iter()
+            .find(|entry| entry.name == "demo_plugin_tool")
+            .expect("plugin tool visible");
+        assert_eq!(plugin_tool.kind, ToolManagerItemKind::Tool);
+        assert_eq!(plugin_tool.toolset, "plugins");
+        assert!(plugin_tool.dynamic, "plugin tool should be dynamic");
+        assert!(plugin_tool.exposed, "enabled plugin tool should be exposed");
+
+        app.toggle_named_plugin("demo-script", None);
+        assert!(
+            app.tool_manager
+                .items
+                .iter()
+                .all(|entry| entry.name != "demo_plugin_tool"),
+            "disabled plugin tool should be removed from the live tool manager inventory"
+        );
+
+        app.toggle_named_plugin("demo-script", None);
+        assert!(
+            app.tool_manager
+                .items
+                .iter()
+                .any(|entry| entry.name == "demo_plugin_tool"),
+            "re-enabled plugin tool should return to the live tool manager inventory"
         );
 
         unsafe {

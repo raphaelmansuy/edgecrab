@@ -954,17 +954,15 @@ mod tests {
     #[test]
     fn parse_plugins_search_subcommand_with_source() {
         let args = CliArgs::parse_from([
-            "edgecrab",
-            "plugins",
-            "search",
-            "--source",
-            "hermes",
-            "weather",
+            "edgecrab", "plugins", "search", "--source", "hermes", "weather",
         ]);
         assert!(matches!(
             args.command,
             Some(Command::Plugins {
-                command: PluginsCommand::Search { source: Some(_), .. }
+                command: PluginsCommand::Search {
+                    source: Some(_),
+                    ..
+                }
             })
         ));
     }

@@ -10,10 +10,10 @@ use edgecrab_plugins::tool_server::client::ToolServerClient;
 use edgecrab_plugins::{DiscoveredPlugin, PluginKind, PluginStatus, discover_plugins};
 use edgecrab_state::SessionDb;
 use edgecrab_tools::ToolRegistry;
-use edgecrab_tools::registry::{ToolContext, ToolHandler};
+use edgecrab_tools::registry::{ToolContext, ToolHandler, normalize_json_schema};
 use edgecrab_types::{Message, ToolError, ToolSchema};
 use edgequake_llm::LLMProvider;
-use serde_json::json;
+use serde_json::{Value, json};
 
 pub struct RuntimeContext {
     pub config_path: PathBuf,
@@ -122,6 +122,7 @@ struct PluginToolProxy {
     tool_name: &'static str,
     plugin_name: String,
     description: String,
+    parameters: Value,
     backend: PluginToolBackend,
 }
 
@@ -139,10 +140,7 @@ impl ToolHandler for PluginToolProxy {
         ToolSchema {
             name: self.tool_name.into(),
             description: self.description.clone(),
-            parameters: json!({
-                "type": "object",
-                "additionalProperties": true
-            }),
+            parameters: normalize_json_schema(&self.parameters),
             strict: None,
         }
     }
@@ -169,13 +167,12 @@ impl ToolHandler for PluginToolProxy {
                     message: error.to_string(),
                 }),
             PluginToolBackend::Script(runtime) => {
-                let output =
-                    runtime
-                        .call_tool(self.tool_name, &args)
-                        .map_err(|error| ToolError::ExecutionFailed {
-                            tool: self.tool_name.into(),
-                            message: error.to_string(),
-                        })?;
+                let output = runtime.call_tool(self.tool_name, &args).map_err(|error| {
+                    ToolError::ExecutionFailed {
+                        tool: self.tool_name.into(),
+                        message: error.to_string(),
+                    }
+                })?;
                 if let Some(queue) = &ctx.injected_messages {
                     let emitted = runtime.take_emitted_messages();
                     if !emitted.is_empty() {
@@ -232,11 +229,31 @@ fn register_plugin(registry: &mut ToolRegistry, plugin: DiscoveredPlugin) {
                 exec,
                 manifest.capabilities.clone(),
             ));
-            for tool in &manifest.tools {
-                registry.register_dynamic(Box::new(PluginToolProxy {
-                    tool_name: Box::leak(tool.name.clone().into_boxed_str()),
-                    plugin_name: plugin.name.clone(),
+            let runtime_tools = runtime_tool_definitions(&client);
+            let fallback_tools: Vec<RuntimeToolDefinition> = manifest
+                .tools
+                .iter()
+                .map(|tool| RuntimeToolDefinition {
+                    name: tool.name.clone(),
                     description: tool.description.clone(),
+                    parameters: json!({
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": true
+                    }),
+                })
+                .collect();
+            let tool_definitions = if runtime_tools.is_empty() {
+                fallback_tools
+            } else {
+                runtime_tools
+            };
+            for tool in tool_definitions {
+                registry.register_dynamic(Box::new(PluginToolProxy {
+                    tool_name: Box::leak(tool.name.into_boxed_str()),
+                    plugin_name: plugin.name.clone(),
+                    description: tool.description,
+                    parameters: tool.parameters,
                     backend: PluginToolBackend::ToolServer(client.clone()),
                 }));
             }
@@ -261,6 +278,11 @@ fn register_plugin(registry: &mut ToolRegistry, plugin: DiscoveredPlugin) {
                     tool_name: Box::leak(tool.name.clone().into_boxed_str()),
                     plugin_name: plugin.name.clone(),
                     description: tool.description.clone(),
+                    parameters: json!({
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": true
+                    }),
                     backend: PluginToolBackend::Script(runtime.clone()),
                 }));
             }
@@ -273,7 +295,60 @@ fn should_register_runtime_plugin(plugin: &DiscoveredPlugin) -> bool {
     plugin.status == PluginStatus::Available
 }
 
+struct RuntimeToolDefinition {
+    name: String,
+    description: String,
+    parameters: Value,
+}
+
+fn parse_runtime_tool_definitions(tools: Vec<Value>) -> Vec<RuntimeToolDefinition> {
+    tools
+        .into_iter()
+        .filter_map(|tool| {
+            Some(RuntimeToolDefinition {
+                name: tool.get("name")?.as_str()?.to_string(),
+                description: tool
+                    .get("description")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                parameters: tool
+                    .get("inputSchema")
+                    .cloned()
+                    .map(|schema| normalize_json_schema(&schema))
+                    .unwrap_or_else(|| {
+                        json!({
+                            "type": "object",
+                            "properties": {},
+                            "additionalProperties": true
+                        })
+                    }),
+            })
+        })
+        .collect()
+}
+
+fn runtime_tool_definitions(client: &Arc<ToolServerClient>) -> Vec<RuntimeToolDefinition> {
+    let future = async {
+        client
+            .tool_list()
+            .await
+            .map(parse_runtime_tool_definitions)
+            .unwrap_or_default()
+    };
+
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        tokio::task::block_in_place(|| handle.block_on(future))
+    } else {
+        tokio::runtime::Runtime::new()
+            .ok()
+            .map(|runtime| runtime.block_on(future))
+            .unwrap_or_default()
+    }
+}
+
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 
@@ -283,6 +358,7 @@ mod tests {
             name: "demo".into(),
             version: "1.0.0".into(),
             description: "Demo".into(),
+            compatibility: None,
             kind: PluginKind::Hermes,
             status: PluginStatus::SetupNeeded,
             path: PathBuf::from("/tmp/demo"),
@@ -293,10 +369,67 @@ mod tests {
             trust_level: edgecrab_plugins::TrustLevel::Unverified,
             enabled: true,
             source: edgecrab_plugins::SkillSource::User,
+            install_source: None,
             missing_env: vec!["API_KEY".into()],
+            related_skills: Vec::new(),
+            cli_commands: Vec::new(),
         };
 
         assert!(!should_register_runtime_plugin(&plugin));
+    }
+
+    #[test]
+    fn plugin_tool_proxy_schema_preserves_and_normalizes_plugin_parameters() {
+        let proxy = PluginToolProxy {
+            tool_name: "secure_read",
+            plugin_name: "demo".into(),
+            description: "Read secure data".into(),
+            parameters: json!({
+                "type": "object",
+                "additionalProperties": true
+            }),
+            backend: PluginToolBackend::ToolServer(Arc::new(ToolServerClient::new(
+                PathBuf::from("."),
+                "demo".into(),
+                edgecrab_plugins::manifest::PluginExecConfig {
+                    command: "true".into(),
+                    args: Vec::new(),
+                    cwd: None,
+                    env: std::collections::HashMap::new(),
+                    startup_timeout_secs: 1,
+                    call_timeout_secs: 1,
+                    restart_policy: edgecrab_plugins::manifest::PluginRestartPolicy::Never,
+                    restart_max_attempts: 0,
+                    idle_timeout_secs: 1,
+                },
+                edgecrab_plugins::manifest::PluginCapabilities::default(),
+            ))),
+        };
+
+        let schema = proxy.schema();
+        assert_eq!(schema.parameters["type"], "object");
+        assert!(schema.parameters["properties"].is_object());
+    }
+
+    #[test]
+    fn parse_runtime_tool_definitions_preserves_real_plugin_input_schema() {
+        let definitions = parse_runtime_tool_definitions(vec![json!({
+            "name": "secure_read",
+            "description": "Read a whitelisted file",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "lines": { "type": "number" }
+                },
+                "required": ["path"]
+            }
+        })]);
+
+        assert_eq!(definitions.len(), 1);
+        assert_eq!(definitions[0].name, "secure_read");
+        assert!(definitions[0].parameters["properties"]["path"].is_object());
+        assert_eq!(definitions[0].parameters["required"][0], "path");
     }
 }
 

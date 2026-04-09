@@ -1,0 +1,6 @@
+name: json-toolbox
+version: 1.0.0
+description: Validate, format, and inspect JSON payloads with deterministic JSON Pointer lookups
+provides_tools:
+  - json_validate
+  - json_pointer_get

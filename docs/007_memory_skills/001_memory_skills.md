@@ -112,6 +112,34 @@ Files that fail the check are **skipped** with a warning — not loaded.
 
 ## Skills
 
+### Skills vs plugins
+
+From first principles:
+
+- A `skill` is prompt-level procedural knowledge.
+- A `plugin` is a runtime package EdgeCrab installs and manages.
+
+Use a skill when you need reusable instructions or a skill-local bundle of
+helper files and scripts that the agent uses through normal tools. Use a plugin
+when you need executable extension behavior such as tools, hooks, subprocesses,
+Python Hermes compatibility, readiness gating, or audited install/update lifecycle.
+
+Important overlap:
+
+- A plugin can bundle a `SKILL.md`.
+- That does not make standalone skills and plugins the same thing.
+- Standalone skills live under `~/.edgecrab/skills/` and are managed with
+  `edgecrab skills ...`.
+- Plugins live under `~/.edgecrab/plugins/` and are managed with
+  `edgecrab plugins ...`.
+- Standalone skills can also bundle helper files under directories such as
+  `scripts/`, `references/`, `templates/`, and `assets/`.
+
+Quick rule:
+
+- If the artifact only needs to tell the agent what to do, make it a skill.
+- If the artifact needs to make EdgeCrab do something new at runtime, make it a plugin.
+
 ### Layout
 
 ```
@@ -130,7 +158,7 @@ External skill directories can be added in config:
 ```yaml
 # ~/.edgecrab/config.yaml
 skills:
-  extra_dirs:
+  external_dirs:
     - /Users/me/shared-skills/
     - /work/team-skills/
 ```
@@ -149,6 +177,11 @@ skills:
 
 Full skill content is loaded on demand when the model invokes the skill
 (via `skill_view`) or when `preloaded_skills` config specifies it.
+
+Standalone skills do not create a new tool, hook, process, or plugin runtime.
+They can still carry helper files, and EdgeCrab now resolves Claude-style
+`${CLAUDE_SKILL_DIR}` and `${CLAUDE_SESSION_ID}` placeholders when a skill is
+loaded, but execution still happens through the normal tool surfaces.
 
 ### Viewing a skill
 
@@ -179,13 +212,25 @@ Conditional activation (from frontmatter):
 
 ```yaml
 # SKILL.md frontmatter
-required_tools: [terminal, write_file]
-required_toolsets: [coding]
-platforms: [cli, telegram]
+requires_tools: [terminal, write_file]
+requires_toolsets: [coding]
+platforms: [linux, windows]
 ```
 
 If the required tools are not in the active toolset, the skill is hidden from
 the summary — it won't appear as a suggestion to the model.
+
+Claude-style standalone skill bundles are partially compatible:
+
+- EdgeCrab renders `${CLAUDE_SKILL_DIR}` and `${CLAUDE_SESSION_ID}`.
+- EdgeCrab loads `read_files` and lists helper files from `references/`,
+  `templates/`, `scripts/`, and `assets/`.
+- EdgeCrab parses metadata such as `when_to_use`, `arguments`,
+  `argument-hint`, `allowed-tools`, `user-invocable`,
+  `disable-model-invocation`, `context`, and `shell`.
+- EdgeCrab does not automatically execute Claude prompt-shell blocks or
+  fork a dedicated sub-agent because those are Claude runtime semantics, not
+  portable skill-bundle semantics.
 
 ---
 

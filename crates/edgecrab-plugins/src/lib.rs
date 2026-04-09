@@ -24,19 +24,24 @@ pub use guard::{
     scan_plugin_bundle, should_allow_install,
 };
 pub use hermes::{
-    HermesPluginManifest, extract_pre_llm_context, invoke_hook as invoke_hermes_hook,
-    looks_like_hermes_plugin, parse_hermes_manifest, supports_hook as hermes_supports_hook,
+    HermesCliCommand, HermesEntrypointPlugin, HermesPluginManifest, discover_entrypoint_plugins,
+    extract_pre_llm_context, invoke_cli_command as invoke_hermes_cli_command,
+    invoke_hook as invoke_hermes_hook, looks_like_hermes_plugin, parse_hermes_manifest,
+    supports_hook as hermes_supports_hook, synthesize_entrypoint_manifest,
     synthesize_manifest as synthesize_hermes_manifest,
 };
 pub use host_api::{handle_host_request, is_host_method};
 pub use hub::{
-    HubIndex, HubIndexPlugin, InstallSourceKind, PluginAuditEntry, PluginSearchResult,
-    append_audit_entry, clear_hub_cache, hub_source_names, materialize_source_to_dir,
-    read_audit_entries, resolve_install_source, search_hub, sha256_dir,
+    HubIndex, HubIndexPlugin, InstallSourceKind, PluginAuditEntry, PluginHubSourceInfo, PluginMeta,
+    PluginSearchGroup, PluginSearchReport, PluginSearchResult, SharedInstallFile,
+    SharedInstallFileSource, append_audit_entry, clear_hub_cache, hub_source_names,
+    hub_source_summaries, install_shared_files, materialize_source_to_dir, read_audit_entries,
+    resolve_install_source, search_hub, search_hub_report, sha256_dir,
 };
 pub use manifest::{
-    PluginExecConfig, PluginManifest, PluginRestartPolicy, parse_plugin_manifest,
-    write_install_metadata,
+    INSTALL_METADATA_FILE, InstallMetadata, PluginExecConfig, PluginManifest, PluginRestartPolicy,
+    ensure_installable_manifest, parse_plugin_manifest, read_bundle_install_metadata,
+    write_bundle_install_metadata, write_install_metadata,
 };
 pub use skill::sync::{BundledSyncReport, BundledSyncStatus, bundled_skills_sync};
 pub use types::{PluginKind, PluginStatus, SkillReadinessStatus, SkillSource, TrustLevel};

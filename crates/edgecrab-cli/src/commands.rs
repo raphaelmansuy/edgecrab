@@ -160,9 +160,9 @@ pub enum CommandResult {
     ListModels(String),
     /// Show cron job status (args: "list" or "")
     ShowCronStatus(String),
-    /// Manage plugins and open the plugin toggle overlay.
+    /// Manage plugins and open the local plugin browser overlay.
     ShowPlugins(String),
-    /// Open the interactive plugin toggle overlay.
+    /// Open the interactive local plugin browser overlay.
     ShowPluginToggle {
         name: Option<String>,
         platform: Option<String>,
@@ -296,7 +296,10 @@ fn parse_session_archive_command(args: &str) -> CommandResult {
 fn parse_plugins_command(args: &str) -> CommandResult {
     let trimmed = args.trim();
     if trimmed.is_empty() || matches!(trimmed, "list" | "ls") {
-        return CommandResult::ShowPlugins(trimmed.to_string());
+        return CommandResult::ShowPluginToggle {
+            name: None,
+            platform: None,
+        };
     }
     if trimmed == "toggle" {
         return CommandResult::ShowPluginToggle {
@@ -968,7 +971,7 @@ impl CommandRegistry {
         self.register(Command {
             name: "plugins",
             aliases: &["plugin"],
-            description: "Manage plugins: list, info, status, install, enable, disable, toggle, audit, hub",
+            description: "Browse/manage plugins: overlay, info, status, install, enable, disable, toggle, audit, hub",
             handler: |args| parse_plugins_command(args),
         });
 
@@ -1233,7 +1236,7 @@ fn help_text() -> String {
            /toolsets             — Browse and configure toolsets\n\
            /mcp [args]           — Search, install, test, or remove MCP servers\n\
            /reload-mcp           — Reload MCP server connections\n\
-           /plugins              — Manage plugins (list/info/status/install/toggle/audit/hub)\n\
+           /plugins              — Browse installed plugins and manage plugin actions\n\
          \n\
          Memory & Skills:\n\
            /memory               — Show memory status\n\
@@ -1622,6 +1625,30 @@ mod tests {
     fn dispatch_plugins_toggle_opens_overlay() {
         let reg = CommandRegistry::new();
         match reg.dispatch("/plugins toggle") {
+            Some(CommandResult::ShowPluginToggle {
+                name: None,
+                platform: None,
+            }) => {}
+            other => panic!("expected ShowPluginToggle, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_plugins_without_args_opens_overlay() {
+        let reg = CommandRegistry::new();
+        match reg.dispatch("/plugins") {
+            Some(CommandResult::ShowPluginToggle {
+                name: None,
+                platform: None,
+            }) => {}
+            other => panic!("expected ShowPluginToggle, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_plugins_list_alias_opens_overlay() {
+        let reg = CommandRegistry::new();
+        match reg.dispatch("/plugins list") {
             Some(CommandResult::ShowPluginToggle {
                 name: None,
                 platform: None,

@@ -28,6 +28,19 @@ executes them without you having to teach it every time.*
 One directory, one file. That is the complete requirement. The directory name
 becomes the default skill name if no `name:` frontmatter is present.
 
+You can also bundle helper files alongside `SKILL.md`, for example:
+
+```text
+~/.edgecrab/skills/my-skill/
+  SKILL.md
+  scripts/
+    helper.py
+  references/
+    api.md
+  templates/
+    output.md
+```
+
 ---
 
 ## SKILL.md format
@@ -39,18 +52,32 @@ description: One-line summary for the skills list prompt injection
 category: devops             # Groups skills in skills_categories output
 version: 1.0.0
 license: MIT
-platforms:                   # Omit to show on all platforms
-  - cli
-  - telegram
+platforms:                   # Omit to show on all supported operating systems
+  - linux
+  - windows
 read_files:                  # Additional files loaded when skill is invoked
-  - ../config/release.yml
-required_tools:              # Skill hidden if these tools are absent
+  - references/release.yml
+requires_tools:              # Skill hidden if these tools are absent
   - terminal
   - write_file
-required_toolsets:           # Skill hidden if these toolsets aren't active
+requires_toolsets:           # Skill hidden if these toolsets aren't active
   - coding
-required_environment_variables:  # Hidden if these env vars aren't set
-  - GITHUB_TOKEN
+required_environment_variables:
+  - name: GITHUB_TOKEN
+    prompt: GitHub token
+    help: https://github.com/settings/tokens
+when_to_use: Use when preparing a release or validating release state.
+arguments:
+  - version
+  - channel
+argument-hint: <version> <channel>
+allowed-tools:
+  - read_file
+  - run_terminal
+user-invocable: true
+disable-model-invocation: false
+context: fork
+shell: bash
 ---
 
 # My Skill
@@ -86,11 +113,19 @@ required_environment_variables:  # Hidden if these env vars aren't set
 | `category` | string | Groups in `skills_categories` output |
 | `version` | string | Displayed in skill view; no version enforcement |
 | `license` | string | Metadata only |
-| `platforms` | list | If set, skill hidden on other platforms |
+| `platforms` | list | If set, skill hidden on other operating systems (`darwin`, `linux`, `windows`) |
 | `read_files` | list | Relative paths loaded alongside SKILL.md on invocation |
-| `required_tools` | list | Skill hidden if any listed tool is absent |
-| `required_toolsets` | list | Skill hidden if listed toolsets aren't active |
-| `required_environment_variables` | list | Skill hidden if env vars are unset |
+| `requires_tools` | list | Skill hidden if all listed tools are not available |
+| `requires_toolsets` | list | Skill hidden if all listed toolsets are not active |
+| `required_environment_variables` | list of objects | Env passthrough + guidance for missing credentials |
+| `when_to_use` | string | Claude-style fallback summary when `description` is absent |
+| `arguments` | list | Claude-style declared argument names; displayed in `skill_view` |
+| `argument-hint` | string | Claude-style invocation hint; displayed in `skill_view` |
+| `allowed-tools` | list | Claude-style advisory metadata; displayed in `skill_view` |
+| `user-invocable` | bool | Hidden from `skills_list` when `false` |
+| `disable-model-invocation` | bool | Parsed and displayed; not enforced by EdgeCrab |
+| `context` | string | Parsed and displayed; `fork` is not auto-executed |
+| `shell` | string | Parsed and displayed; prompt-shell blocks are not auto-executed |
 
 Frontmatter is **optional**. A `SKILL.md` with no frontmatter and just body
 text is a valid skill.
@@ -165,6 +200,25 @@ These files are loaded when the skill is invoked (via `skill_view`) and their
 content is included in the skill body. Use this to keep the `SKILL.md` brief
 while referencing detailed runbooks.
 
+For Claude-style helper scripts, EdgeCrab also supports:
+
+- `${CLAUDE_SKILL_DIR}` → substituted to the concrete skill directory
+- `${CLAUDE_SESSION_ID}` → substituted to the active session id
+
+That means a skill can safely refer to bundled CLI helpers, for example:
+
+```markdown
+Run `${CLAUDE_SKILL_DIR}/scripts/helper.py --session ${CLAUDE_SESSION_ID}` with the terminal tool.
+```
+
+Claude compatibility boundary:
+
+- Supported: skill-directory layout, `SKILL.md`, `read_files`, helper-file
+  discovery, `when_to_use` fallback, `${CLAUDE_SKILL_DIR}`, and
+  `${CLAUDE_SESSION_ID}`.
+- Not automatically executed: Claude inline prompt-shell expansion and
+  forked-skill runtime semantics.
+
 ---
 
 ## Installing from the skills hub
@@ -213,8 +267,10 @@ name: rust-release
 description: Publish Rust workspace crates to crates.io in dependency order
 category: release
 version: 1.0.0
-required_tools: [terminal]
-required_environment_variables: [CARGO_REGISTRY_TOKEN]
+requires_tools: [terminal]
+required_environment_variables:
+  - name: CARGO_REGISTRY_TOKEN
+    prompt: crates.io token
 ---
 
 # Rust Release
@@ -269,7 +325,7 @@ cargo publish -p edgecrab-security
 > Run the workflow manually in a session, note every edge case, then write the
 > skill based on what actually happened — not what you hoped would happen.
 
-> **Tip: Use `required_tools` to prevent the model from reading the skill
+> **Tip: Use `requires_tools` to prevent the model from reading the skill
 > when the right tools aren't available.** A skill that requires `terminal`
 > but is shown in a `--toolset safe` session wastes prompt tokens and
 > confuses the model.
@@ -288,7 +344,7 @@ X workflow" referring to another skill. The model will then request that skill.
 Use it for your own tracking; the runtime ignores it for activation purposes.
 
 **Q: Can skills be shared across team members?**
-Yes. Add the shared directory to `skills.extra_dirs` in each team member's
+Yes. Add the shared directory to `skills.external_dirs` in each team member's
 `~/.edgecrab/config.yaml`. Or publish to the skills hub.
 
 ---

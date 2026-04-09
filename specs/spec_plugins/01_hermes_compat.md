@@ -50,6 +50,10 @@ For EdgeCrab compatibility, the minimum supported Hermes behaviors are:
 - invoke `pre_llm_call`
 - accept `pre_llm_call` return values as ephemeral user-message context injection
 - support CLI-safe `inject_message`
+- load pip entry-point plugins from the `hermes_agent.plugins` group
+- support `ctx.register_cli_command(...)`
+- support memory-provider CLI trees from `cli.py register_cli(subparser)`
+- support the full Hermes hook set used by `VALID_HOOKS`
 
 ## Hook Semantics
 
@@ -66,11 +70,19 @@ Hermes defines these plugin hooks:
 - `on_session_finalize`
 - `on_session_reset`
 
-Current EdgeCrab parity target in this phase:
+Current EdgeCrab parity:
 
 - `requires_env` setup-needed gating
-- `on_session_start`
+- `pre_tool_call`
+- `post_tool_call`
 - `pre_llm_call`
+- `post_llm_call`
+- `pre_api_request`
+- `post_api_request`
+- `on_session_start`
+- `on_session_end`
+- `on_session_finalize`
+- `on_session_reset`
 
 `pre_llm_call` is the only hook whose return value affects prompt flow. If a callback returns a string, or a dict containing `context`, that text is appended to the current turn's user message rather than mutating the system prompt.
 
@@ -91,14 +103,20 @@ EdgeCrab compatibility behavior:
 To keep Hermes-compatible plugins practical to adopt, the CLI must support:
 
 - remote plugin search from the normal `plugins` command surface
+- official EdgeCrab repo examples indexed from the repository `plugins/` tree
 - explicit source selection for Hermes-oriented searches
 - install-ready `hub:<source>/<plugin>` references in search results
 
-## Non-goals For This Phase
+Implementation proof now includes:
 
-- full pip entry-point plugin loading parity
-- Hermes CLI subcommand registration parity
-- all Hermes hook types
+- official repo examples `plugins/productivity/calculator` and `plugins/developer/json-toolbox`
+- local end-to-end install and runtime execution for those examples
+- official search visibility for those examples through `edgecrab plugins search --source edgecrab ...`
+
+## Non-goals
+
+- automatic execution of Claude Code prompt-shell blocks embedded in standalone skills
+- automatic Claude-style forked skill-agent invocation from skill frontmatter
 - replacing EdgeCrab-native `skill`, `tool-server`, or `script` plugins
 
 This spec supersedes the earlier study doc as the compatibility baseline. `00_study.md` should be treated as example ideas, not the precise contract.

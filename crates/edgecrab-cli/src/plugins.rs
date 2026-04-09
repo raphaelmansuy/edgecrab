@@ -1,5 +1,7 @@
 use edgecrab_core::AppConfig;
-use edgecrab_plugins::{PluginKind, PluginStatus, SkillSource, TrustLevel, discover_plugins};
+use edgecrab_plugins::{
+    HermesCliCommand, PluginKind, PluginStatus, SkillSource, TrustLevel, discover_plugins,
+};
 use edgecrab_types::Platform;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,13 +31,17 @@ pub struct Plugin {
     pub name: String,
     pub version: String,
     pub description: String,
+    pub compatibility: Option<String>,
     pub source: PluginSource,
     pub kind: PluginKind,
     pub status: PluginStatus,
     pub enabled: bool,
     pub tools: Vec<PluginTool>,
     pub trust_level: TrustLevel,
+    pub install_source: Option<String>,
     pub missing_env: Vec<String>,
+    pub related_skills: Vec<String>,
+    pub cli_commands: Vec<HermesCliCommand>,
 }
 
 impl Plugin {
@@ -72,6 +78,7 @@ impl PluginManager {
                 name: plugin.name,
                 version: plugin.version,
                 description: plugin.description,
+                compatibility: plugin.compatibility,
                 source: match plugin.source {
                     SkillSource::User => PluginSource::User,
                     SkillSource::Project => PluginSource::Project,
@@ -86,7 +93,10 @@ impl PluginManager {
                     .map(|name| PluginTool { name })
                     .collect(),
                 trust_level: plugin.trust_level,
+                install_source: plugin.install_source,
                 missing_env: plugin.missing_env,
+                related_skills: plugin.related_skills,
+                cli_commands: plugin.cli_commands,
             })
             .collect()
     }

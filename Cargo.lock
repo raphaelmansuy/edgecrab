@@ -1831,6 +1831,7 @@ dependencies = [
  "edgecrab-state",
  "edgecrab-tools",
  "edgecrab-types",
+ "edgequake-llm",
  "futures",
  "lettre",
  "md5",

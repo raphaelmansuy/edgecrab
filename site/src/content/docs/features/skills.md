@@ -9,6 +9,28 @@ Skills are **portable, reusable procedural instructions** that EdgeCrab loads in
 
 Skills are compatible with [agentskills.io](https://agentskills.io) — the shared open-source skills registry used by all Nous Research agents.
 
+## Skills vs Plugins
+
+First-principles distinction:
+
+- A `skill` gives the model reusable instructions.
+- A `plugin` gives EdgeCrab an installable runtime extension.
+
+Use a skill when the problem is procedural guidance: checklists, step sequences,
+examples, task-specific prompting, or bundled helper files/scripts the agent
+uses through normal tools. Use a plugin when the problem is runtime capability:
+new tools, hooks, subprocesses, Hermes Python integrations, readiness checks,
+or install/audit lifecycle.
+
+This overlap matters:
+
+- A plugin can bundle a `SKILL.md`.
+- Standalone skills are still a separate concept from plugins.
+- `edgecrab skills ...` manages skills in `~/.edgecrab/skills/`.
+- `edgecrab plugins ...` manages plugins in `~/.edgecrab/plugins/`.
+- Standalone skills can bundle helper files under `scripts/`, `references/`,
+  `templates/`, and `assets/`.
+
 ---
 
 ## Directory Structure
@@ -27,6 +49,19 @@ Each skill is a **directory** containing a `SKILL.md` file — not a flat `.md` 
     └── examples/
         └── deployment.yaml
 ```
+
+Claude-style helper-script support is included for standalone skills:
+
+- `${CLAUDE_SKILL_DIR}` resolves to the concrete skill directory
+- `${CLAUDE_SESSION_ID}` resolves to the active EdgeCrab session id
+- `skill_view` and preloaded skills both render bundled `read_files` and list
+  helper files from `references/`, `templates/`, `scripts/`, and `assets/`
+- Claude-style frontmatter fields such as `when_to_use`, `arguments`,
+  `argument-hint`, `allowed-tools`, `user-invocable`,
+  `disable-model-invocation`, `context`, and `shell` are parsed and surfaced
+  in `skill_view`
+- EdgeCrab does not auto-execute Claude prompt-shell blocks or fork a
+  dedicated Claude skill sub-agent
 
 EdgeCrab resolves skills in this order:
 
@@ -48,10 +83,11 @@ name: security-audit
 description: Systematic OWASP Top 10 security audit for web applications.
 category: security
 platforms:
-  - cli
-  - telegram
+  - linux
+  - windows
 read_files:
-  - checklist.md
+  - references/checklist.md
+when_to_use: Use when reviewing a service before release or after an incident.
 ---
 
 # Security Audit Workflow
@@ -70,8 +106,13 @@ You are performing a security audit. Follow these steps:
 | `name` | `string` | yes | Unique identifier (becomes a slash command) |
 | `description` | `string` | yes | Short summary shown in `/skills` listing |
 | `category` | `string` | no | Hub category (e.g. `security`, `devops`, `coding`) |
-| `platforms` | `string[]` | no | Limit to platforms (e.g. `["cli", "telegram"]`). Omit = all. |
+| `platforms` | `string[]` | no | Limit to operating systems (`darwin`, `linux`, `windows`). Omit = all. |
 | `read_files` | `string[]` | no | Extra files in the skill dir to inject as context |
+| `when_to_use` | `string` | no | Claude-style fallback summary when `description` is absent |
+| `arguments` | `string[]` | no | Claude-style declared argument names |
+| `argument-hint` | `string` | no | Claude-style argument hint shown in `skill_view` |
+| `allowed-tools` | `string[]` | no | Claude-style advisory metadata |
+| `user-invocable` | `boolean` | no | Hidden from `skills_list` when `false` |
 
 ---
 
@@ -202,6 +243,11 @@ Supports `~` expansion and `${VAR}` substitution. External directories are read-
 
 Skills are loaded on demand. Memory is always loaded (unless `--skip-memory`). Context files are project-scoped.
 
+One more practical rule:
+
+- If you only need to tell the agent how to work, write a skill.
+- If you need EdgeCrab itself to expose new runtime behavior, build a plugin.
+
 ---
 
 ## Example: Writing a Security Audit Skill
@@ -234,6 +280,35 @@ Verify secrets are loaded from environment, not source code.
 ## Step 4 — Generate report
 Output a prioritized list: CRITICAL / HIGH / MEDIUM / LOW.
 Include file:line for each finding and a one-line fix suggestion.
+```
+
+## Example: Claude-Style Skill With Python Helper
+
+```text
+~/.edgecrab/skills/release-qa/
+├── SKILL.md
+├── scripts/
+│   └── check_release.py
+└── references/
+    └── runbook.md
+```
+
+```markdown
+---
+name: release-qa
+when_to_use: Use when validating a release candidate before publishing.
+read_files:
+  - references/runbook.md
+arguments:
+  - version
+argument-hint: <version>
+allowed-tools:
+  - read_file
+  - run_terminal
+---
+
+Run `${CLAUDE_SKILL_DIR}/scripts/check_release.py ${CLAUDE_SESSION_ID}` with the terminal tool.
+Then follow the runbook.
 ```
 
 Save as `~/.edgecrab/skills/security-audit/SKILL.md` and invoke with:
@@ -293,7 +368,7 @@ skills:
 
 **Q: How do I know if a skill from agentskills.io is safe?**
 
-Skills are Markdown files — they cannot execute code. Review the `SKILL.md` before installing. The edgecrab hub shows source links and contributor info.
+Skills are instruction bundles, and they may reference bundled helper files or scripts. They do not become plugins automatically, but they can still tell the agent to run commands through normal tools. Review both `SKILL.md` and any bundled helper files before installing. The EdgeCrab hub shows source links and contributor info.
 
 **Q: When should I use a plugin instead of a skill?**
 

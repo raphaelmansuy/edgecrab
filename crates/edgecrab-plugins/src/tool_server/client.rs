@@ -159,13 +159,9 @@ impl ToolServerClient {
                             "plugin requested {host_method} without a host context"
                         )));
                     };
-                    let host_response = handle_host_request(
-                        &self.plugin_name,
-                        &self.capabilities,
-                        &response,
-                        ctx,
-                    )
-                    .await;
+                    let host_response =
+                        handle_host_request(&self.plugin_name, &self.capabilities, &response, ctx)
+                            .await;
                     process
                         .stdin
                         .write_all(host_response.to_string().as_bytes())
@@ -183,7 +179,9 @@ impl ToolServerClient {
             if let Some(error) = response.get("error") {
                 return Err(PluginError::Rpc(error.to_string()));
             }
-            return Ok(extract_result_payload(response.get("result").cloned().unwrap_or(Value::Null)));
+            return Ok(extract_result_payload(
+                response.get("result").cloned().unwrap_or(Value::Null),
+            ));
         }
     }
 
@@ -321,7 +319,11 @@ fn extract_result_payload(result: serde_json::Value) -> serde_json::Value {
         let text = content
             .iter()
             .filter(|item| item.get("type").and_then(|value| value.as_str()) == Some("text"))
-            .map(|item| item.get("text").and_then(|value| value.as_str()).unwrap_or_default())
+            .map(|item| {
+                item.get("text")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+            })
             .collect::<Vec<_>>()
             .join("\n");
         if !text.is_empty() {

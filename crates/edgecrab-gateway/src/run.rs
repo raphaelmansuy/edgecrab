@@ -13,6 +13,7 @@
 //! ```
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -773,6 +774,8 @@ pub struct Gateway {
     pending_messages: Arc<tokio::sync::Mutex<HashMap<String, IncomingMessage>>>,
     /// Last user message text per session — enables the /retry command.
     last_messages: Arc<tokio::sync::Mutex<HashMap<String, String>>>,
+    /// Reset requests deferred until the current session task exits.
+    pending_session_resets: Arc<tokio::sync::Mutex<HashSet<String>>>,
     /// Pending approval / clarify interactions keyed by gateway session.
     interaction_broker: Arc<InteractionBroker>,
     /// Per-chat persisted voice reply mode, mirroring Hermes gateway semantics.
@@ -799,6 +802,7 @@ impl Gateway {
             running_sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             pending_messages: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             last_messages: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            pending_session_resets: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             interaction_broker: InteractionBroker::new(),
             voice_modes: Arc::new(tokio::sync::Mutex::new(load_gateway_voice_modes_from(
                 &gateway_voice_mode_path(),
@@ -1271,8 +1275,8 @@ impl Gateway {
                             }
                             "stop" => {
                                 let cancelled = {
-                                    let mut guard = self.running_sessions.lock().await;
-                                    if let Some(token) = guard.remove(&session_key) {
+                                    let guard = self.running_sessions.lock().await;
+                                    if let Some(token) = guard.get(&session_key) {
                                         token.cancel();
                                         true
                                     } else {
@@ -1293,12 +1297,15 @@ impl Gateway {
                             }
                             "new" | "reset" => {
                                 // Cancel any running agent for this session
-                                {
-                                    let mut guard = self.running_sessions.lock().await;
-                                    if let Some(token) = guard.remove(&session_key) {
+                                let cancelled = {
+                                    let guard = self.running_sessions.lock().await;
+                                    if let Some(token) = guard.get(&session_key) {
                                         token.cancel();
+                                        true
+                                    } else {
+                                        false
                                     }
-                                }
+                                };
                                 // Clear queued + retry state for this session.
                                 {
                                     let mut pending = self.pending_messages.lock().await;
@@ -1308,15 +1315,46 @@ impl Gateway {
                                     let mut last = self.last_messages.lock().await;
                                     last.remove(&session_key);
                                 }
-                                let _ = self.interaction_broker.cancel_session(&session_key).await;
-                                // Remove the LLM conversation history so the agent starts fresh.
                                 let sk = SessionKey::new(
                                     msg.platform,
                                     &msg.user_id,
                                     msg.channel_id.as_deref()
                                         .or(msg.metadata.channel_id.as_deref()),
                                 );
-                                self.session_manager.remove(&sk);
+                                let mut reset_deferred = false;
+                                if cancelled {
+                                    let deadline = tokio::time::Instant::now()
+                                        + std::time::Duration::from_secs(2);
+                                    while tokio::time::Instant::now() < deadline {
+                                        let still_running = {
+                                            let guard = self.running_sessions.lock().await;
+                                            guard.contains_key(&session_key)
+                                        };
+                                        if !still_running {
+                                            break;
+                                        }
+                                        tokio::time::sleep(std::time::Duration::from_millis(25))
+                                            .await;
+                                    }
+                                    reset_deferred = {
+                                        let guard = self.running_sessions.lock().await;
+                                        guard.contains_key(&session_key)
+                                    };
+                                }
+
+                                if reset_deferred {
+                                    let mut pending_resets =
+                                        self.pending_session_resets.lock().await;
+                                    pending_resets.insert(session_key.clone());
+                                } else if let Some(session) = self.session_manager.get(&sk) {
+                                    let agent = {
+                                        let mut guard = session.write().await;
+                                        guard.touch();
+                                        guard.agent.clone()
+                                    };
+                                    agent.new_session().await;
+                                }
+                                let _ = self.interaction_broker.cancel_session(&session_key).await;
                                 // Emit session:reset hook
                                 self.hook_registry.emit(
                                     "session:reset",
@@ -1870,8 +1908,8 @@ impl Gateway {
                     ).await;
 
                     // Dispatch to Agent
-                    if let Some(ref agent) = self.agent {
-                        let agent = agent.clone();
+                    if let Some(ref base_agent) = self.agent {
+                        let base_agent = base_agent.clone();
                         let hooks = self.hook_registry.clone();
                         let delivery = delivery_router.clone();
                         let msg_clone = msg.clone();
@@ -1929,8 +1967,37 @@ impl Gateway {
                             last.insert(session_key.clone(), msg.text.clone());
                         }
 
+                        let session_lookup = SessionKey::new(
+                            msg.platform,
+                            &msg.user_id,
+                            msg.channel_id.as_deref().or(msg.metadata.channel_id.as_deref()),
+                        );
+                        let session = self
+                            .session_manager
+                            .resolve(
+                                &session_lookup,
+                                &base_agent,
+                                (msg.platform.to_string(), origin_chat_id_for_key.clone()),
+                            )
+                            .await;
+                        let session: Arc<tokio::sync::RwLock<crate::session::GatewaySession>> =
+                            match session {
+                            Ok(session) => session,
+                            Err(error) => {
+                                let mut running = self.running_sessions.lock().await;
+                                running.remove(&session_key);
+                                return Err(anyhow::anyhow!("{error}"));
+                            }
+                        };
+                        let session_agent = {
+                            let mut guard = session.write().await;
+                            guard.touch();
+                            guard.agent.clone()
+                        };
+
                         let running_sessions = self.running_sessions.clone();
                         let pending_messages = self.pending_messages.clone();
+                        let pending_session_resets = self.pending_session_resets.clone();
                         let task_session_key = session_key.clone();
                         let gateway_voice_mode = self.voice_mode_for(&origin_chat_id_for_key).await;
                         // Clone the sender so the task can re-dispatch the pending message.
@@ -1955,7 +2022,8 @@ impl Gateway {
                                 // the *** ATTACHED IMAGES *** block here means every platform
                                 // triggers the VISION_GUIDANCE rules in the system prompt,
                                 // identical to the CLI pending_images path in app.rs.
-                                let effective_text = build_effective_text(&agent, &msg_clone).await;
+                                let effective_text =
+                                    build_effective_text(&session_agent, &msg_clone).await;
 
                                 // NOTE: chat_streaming_with_origin() handles origin context
                                 // internally, so we do NOT pre-set it here.
@@ -1963,7 +2031,7 @@ impl Gateway {
                                 let response_result = match origin_adapter {
                                     Some(adapter_arc) => {
                                         dispatch_streaming_arc(
-                                            &agent,
+                                            &session_agent,
                                             &effective_text,
                                             msg_clone.platform,
                                             &platform_name,
@@ -1977,7 +2045,7 @@ impl Gateway {
                                         )
                                         .await
                                     }
-                                    None => match agent
+                                    None => match session_agent
                                         .chat_with_origin(
                                             &effective_text,
                                             &platform_name,
@@ -1999,7 +2067,7 @@ impl Gateway {
 
                                 match response_result {
                                     Ok(response_len) => {
-                                        let response_text = agent
+                                        let response_text: Option<String> = session_agent
                                             .messages()
                                             .await
                                             .iter()
@@ -2009,7 +2077,7 @@ impl Gateway {
                                             .filter(|text| !text.trim().is_empty());
                                         if let Some(response_text) = response_text {
                                             maybe_send_voice_reply(
-                                                &agent,
+                                                &session_agent,
                                                 voice_adapter,
                                                 &msg_clone,
                                                 &response_text,
@@ -2050,15 +2118,22 @@ impl Gateway {
                                 );
                             }
 
-                            // Release the session guard.
-                            // Unconditional remove is safe: we own this slot exclusively
-                            // (queue-based guard prevents a second task from registering
-                            // for the same session while we are running).
+                            let reset_requested = {
+                                let mut pending = pending_session_resets.lock().await;
+                                pending.remove(&task_session_key)
+                            };
+                            if reset_requested {
+                                session_agent.new_session().await;
+                            }
+                            let _ = interaction_broker.cancel_session(&task_session_key).await;
+
+                            // Keep the session marked as running until all
+                            // deferred cleanup is complete so shutdown cannot
+                            // finalize the session while a reset is in flight.
                             {
                                 let mut guard = running_sessions.lock().await;
                                 guard.remove(&task_session_key);
                             }
-                            let _ = interaction_broker.cancel_session(&task_session_key).await;
 
                             // Re-dispatch any message that arrived while we were running.
                             let pending = {
@@ -2084,6 +2159,21 @@ impl Gateway {
             }
         }
 
+        let session_cancels = {
+            let mut running = self.running_sessions.lock().await;
+            running.drain().map(|(_, token)| token).collect::<Vec<_>>()
+        };
+        for token in session_cancels {
+            token.cancel();
+        }
+        let wait_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while tokio::time::Instant::now() < wait_deadline {
+            if self.running_sessions.lock().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        self.session_manager.finalize_all().await;
         let _ = edgecrab_tools::tools::terminal::cleanup_all_backends().await;
         Ok(())
     }
@@ -2190,7 +2280,13 @@ async fn webhook_incoming(
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use edgecrab_core::{AgentBuilder, AppConfig};
+    use edgequake_llm::traits::{
+        ChatMessage, ChatRole, CompletionOptions, ToolChoice, ToolDefinition,
+    };
     use std::sync::Mutex;
+    use tempfile::TempDir;
+    use tokio::sync::Notify;
     use tokio::sync::mpsc;
 
     #[derive(Default)]
@@ -2277,6 +2373,207 @@ mod tests {
                 .expect("voices lock")
                 .push(path.to_string());
             Ok(())
+        }
+    }
+
+    struct ScriptedAdapter {
+        incoming: Mutex<Vec<IncomingMessage>>,
+        sent: Mutex<Vec<String>>,
+        notify: Notify,
+        delay: std::time::Duration,
+    }
+
+    impl ScriptedAdapter {
+        fn with_delay(incoming: Vec<IncomingMessage>, delay: std::time::Duration) -> Self {
+            Self {
+                incoming: Mutex::new(incoming),
+                sent: Mutex::new(Vec::new()),
+                notify: Notify::new(),
+                delay,
+            }
+        }
+
+        async fn wait_for_sent(&self, count: usize) -> Vec<String> {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let current = self.sent.lock().expect("sent lock").clone();
+                if current.len() >= count {
+                    return current;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "timed out waiting for {count} sent messages, got {}",
+                    current.len()
+                );
+                self.notify.notified().await;
+            }
+        }
+    }
+
+    #[async_trait]
+    impl PlatformAdapter for ScriptedAdapter {
+        fn platform(&self) -> edgecrab_types::Platform {
+            edgecrab_types::Platform::Webhook
+        }
+
+        async fn start(&self, tx: mpsc::Sender<IncomingMessage>) -> anyhow::Result<()> {
+            let scripted = self
+                .incoming
+                .lock()
+                .expect("incoming lock")
+                .drain(..)
+                .collect::<Vec<_>>();
+            let scripted_len = scripted.len();
+            for (index, message) in scripted.into_iter().enumerate() {
+                tx.send(message).await.expect("send scripted message");
+                if !self.delay.is_zero() && index + 1 < scripted_len {
+                    tokio::time::sleep(self.delay).await;
+                }
+            }
+            futures::future::pending::<()>().await;
+            Ok(())
+        }
+
+        async fn send(&self, msg: crate::platform::OutgoingMessage) -> anyhow::Result<()> {
+            self.sent.lock().expect("sent lock").push(msg.text);
+            self.notify.notify_waiters();
+            Ok(())
+        }
+
+        fn format_response(
+            &self,
+            text: &str,
+            _metadata: &crate::platform::MessageMetadata,
+        ) -> String {
+            text.to_string()
+        }
+
+        fn max_message_length(&self) -> usize {
+            4096
+        }
+
+        fn supports_markdown(&self) -> bool {
+            false
+        }
+
+        fn supports_images(&self) -> bool {
+            false
+        }
+
+        fn supports_files(&self) -> bool {
+            false
+        }
+    }
+
+    struct HistoryEchoProvider;
+
+    #[async_trait]
+    impl edgequake_llm::LLMProvider for HistoryEchoProvider {
+        fn name(&self) -> &str {
+            "history-echo"
+        }
+
+        fn model(&self) -> &str {
+            "history-echo/mock"
+        }
+
+        fn max_context_length(&self) -> usize {
+            8192
+        }
+
+        async fn complete(
+            &self,
+            prompt: &str,
+        ) -> edgequake_llm::Result<edgequake_llm::LLMResponse> {
+            Ok(edgequake_llm::LLMResponse::new(prompt, self.model()))
+        }
+
+        async fn complete_with_options(
+            &self,
+            prompt: &str,
+            _options: &CompletionOptions,
+        ) -> edgequake_llm::Result<edgequake_llm::LLMResponse> {
+            self.complete(prompt).await
+        }
+
+        async fn chat(
+            &self,
+            messages: &[ChatMessage],
+            options: Option<&CompletionOptions>,
+        ) -> edgequake_llm::Result<edgequake_llm::LLMResponse> {
+            self.chat_with_tools(messages, &[], None, options).await
+        }
+
+        async fn chat_with_tools(
+            &self,
+            messages: &[ChatMessage],
+            _tools: &[ToolDefinition],
+            _tool_choice: Option<ToolChoice>,
+            _options: Option<&CompletionOptions>,
+        ) -> edgequake_llm::Result<edgequake_llm::LLMResponse> {
+            let user_messages = messages
+                .iter()
+                .filter(|message| message.role == ChatRole::User)
+                .map(|message| message.content.clone())
+                .collect::<Vec<_>>();
+            let current = user_messages.last().cloned().unwrap_or_default();
+            let prior = user_messages.len().saturating_sub(1);
+            let first_prior = user_messages
+                .first()
+                .filter(|_| prior > 0)
+                .cloned()
+                .unwrap_or_else(|| "-".into());
+            Ok(edgequake_llm::LLMResponse::new(
+                format!("current={current};prior_users={prior};first_prior={first_prior}"),
+                self.model(),
+            ))
+        }
+    }
+
+    fn write_gateway_session_hook_plugin(dir: &std::path::Path) {
+        std::fs::write(
+            dir.join("plugin.yaml"),
+            r#"
+name: gateway-session-hooks
+version: "1.0.0"
+description: Gateway session hook recorder
+provides_hooks:
+  - on_session_start
+  - on_session_end
+  - on_session_finalize
+  - on_session_reset
+"#,
+        )
+        .expect("write plugin manifest");
+        std::fs::write(
+            dir.join("__init__.py"),
+            r#"
+import json
+from pathlib import Path
+
+def _append(event_name, session_id, platform, **kwargs):
+    target = Path(__file__).with_name("gateway-session-hooks.jsonl")
+    with target.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"event": event_name, "session_id": session_id, "platform": platform}) + "\n")
+
+def register(ctx):
+    ctx.register_hook("on_session_start", lambda **kwargs: _append("on_session_start", **kwargs))
+    ctx.register_hook("on_session_end", lambda **kwargs: _append("on_session_end", **kwargs))
+    ctx.register_hook("on_session_finalize", lambda **kwargs: _append("on_session_finalize", **kwargs))
+    ctx.register_hook("on_session_reset", lambda **kwargs: _append("on_session_reset", **kwargs))
+"#,
+        )
+        .expect("write plugin");
+    }
+
+    fn webhook_message(user_id: &str, text: &str) -> IncomingMessage {
+        IncomingMessage {
+            platform: edgecrab_types::Platform::Webhook,
+            user_id: user_id.to_string(),
+            channel_id: None,
+            text: text.to_string(),
+            thread_id: None,
+            metadata: crate::platform::MessageMetadata::default(),
         }
     }
 
@@ -2802,5 +3099,109 @@ mod tests {
             adapter.voices.lock().expect("voices lock").as_slice(),
             &["/tmp/reply.mp3".to_string()]
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn gateway_keeps_agent_history_isolated_per_chat_session() {
+        let cancel = CancellationToken::new();
+        let mut gateway = Gateway::new(
+            GatewayConfig {
+                port: 0,
+                streaming: crate::config::GatewayStreamingConfig {
+                    enabled: false,
+                    ..crate::config::GatewayStreamingConfig::default()
+                },
+                ..GatewayConfig::default()
+            },
+            cancel.clone(),
+        );
+        let adapter = Arc::new(ScriptedAdapter::with_delay(
+            vec![
+                webhook_message("alice", "alpha"),
+                webhook_message("bob", "bravo"),
+                webhook_message("alice", "again"),
+            ],
+            std::time::Duration::from_millis(100),
+        ));
+        gateway.add_adapter(adapter.clone());
+        gateway.set_agent(Arc::new(
+            AgentBuilder::new("history-echo/mock")
+                .provider(Arc::new(HistoryEchoProvider))
+                .build()
+                .expect("build agent"),
+        ));
+
+        let task = tokio::spawn(async move { gateway.run().await });
+        let sent = adapter.wait_for_sent(4).await;
+        cancel.cancel();
+        task.await.expect("gateway join").expect("gateway run");
+
+        assert!(
+            sent.iter()
+                .any(|msg| msg.contains("current=alpha;prior_users=0;first_prior=-")),
+            "sent: {sent:?}"
+        );
+        assert!(
+            sent.iter()
+                .any(|msg| msg.contains("current=bravo;prior_users=0;first_prior=-")),
+            "sent: {sent:?}"
+        );
+        assert!(
+            sent.iter()
+                .any(|msg| msg.contains("current=again;prior_users=1;first_prior=alpha")),
+            "sent: {sent:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn gateway_session_hooks_fire_across_chat_reset_and_shutdown() {
+        let temp = TempDir::new().expect("tempdir");
+        let plugin_dir = temp.path().join("gateway-session-hooks");
+        std::fs::create_dir_all(&plugin_dir).expect("plugin dir");
+        write_gateway_session_hook_plugin(&plugin_dir);
+
+        let mut config = AppConfig::default();
+        config.plugins.external_dirs = vec![temp.path().to_string_lossy().to_string()];
+        let agent = Arc::new(
+            AgentBuilder::from_config(&config)
+                .provider(Arc::new(edgequake_llm::MockProvider::new()))
+                .build()
+                .expect("build agent"),
+        );
+
+        let cancel = CancellationToken::new();
+        let mut gateway = Gateway::new(
+            GatewayConfig {
+                port: 0,
+                streaming: crate::config::GatewayStreamingConfig {
+                    enabled: false,
+                    ..crate::config::GatewayStreamingConfig::default()
+                },
+                ..GatewayConfig::default()
+            },
+            cancel.clone(),
+        );
+        let adapter = Arc::new(ScriptedAdapter::with_delay(
+            vec![
+                webhook_message("alice", "hello"),
+                webhook_message("alice", "/new"),
+            ],
+            std::time::Duration::from_millis(1000),
+        ));
+        gateway.add_adapter(adapter.clone());
+        gateway.set_agent(agent);
+
+        let task = tokio::spawn(async move { gateway.run().await });
+        let _ = adapter.wait_for_sent(2).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        cancel.cancel();
+        task.await.expect("gateway join").expect("gateway run");
+
+        let log =
+            std::fs::read_to_string(plugin_dir.join("gateway-session-hooks.jsonl")).expect("log");
+        assert!(log.contains("on_session_start"), "log:\n{log}");
+        assert!(log.contains("on_session_end"), "log:\n{log}");
+        assert!(log.contains("on_session_reset"), "log:\n{log}");
+        assert!(log.contains("on_session_finalize"), "log:\n{log}");
     }
 }

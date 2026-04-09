@@ -98,11 +98,11 @@ MCP          /mcp /mcp-token
 
 | Command | Description |
 |---------|-------------|
-| `/tools` | List all registered tools and their status |
+| `/tools` | List all currently registered tools and their status, including live plugin tools under the `plugins` toolset |
 | `/toolsets` | List toolset aliases and their member tools |
 | `/mcp [subcommand]` | Browse, install, test, diagnose, or remove MCP servers |
 | `/reload-mcp` | Drop and reconnect all MCP server connections |
-| `/plugins [list\|info\|status\|install\|enable\|disable\|toggle\|audit\|hub search\|hub browse\|hub refresh]` | Manage plugins, toggle activation, search hubs, inspect audit history, and jump into hub browsing flows |
+| `/plugins [info\|status\|install\|enable\|disable\|toggle\|audit\|hub search\|hub browse\|hub refresh]` | Open the installed-plugin browser by default, stage enable/disable changes, search hubs, inspect audit history, and refresh the live runtime tool inventory |
 | `/mcp-token [set\|remove\|list] <name> [token]` | Manage MCP OAuth Bearer tokens |
 
 ---

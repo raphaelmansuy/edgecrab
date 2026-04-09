@@ -1,14 +1,35 @@
+use std::future::Future;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use chrono::Utc;
 use edgecrab_plugins::{
-    PluginAuditEntry, append_audit_entry, clear_hub_cache, materialize_source_to_dir,
-    hub_source_names, parse_plugin_manifest, read_audit_entries, resolve_install_source,
-    scan_plugin_bundle, search_hub, sha256_dir, should_allow_install, write_install_metadata,
+    InstallSourceKind, PluginAuditEntry, append_audit_entry, clear_hub_cache,
+    ensure_installable_manifest, hub_source_names, install_shared_files, materialize_source_to_dir,
+    parse_plugin_manifest, read_audit_entries, resolve_install_source, scan_plugin_bundle,
+    search_hub, sha256_dir, should_allow_install, write_install_metadata,
 };
 
 use crate::plugins::PluginManager;
+
+pub(crate) struct PluginActionOutcome {
+    pub plugin_name: String,
+    pub message: String,
+}
+
+fn block_on_plugin_future<F, T>(future: F, runtime_context: &str) -> anyhow::Result<T>
+where
+    F: Future<Output = Result<T, edgecrab_plugins::PluginError>>,
+{
+    let output = if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        tokio::task::block_in_place(|| handle.block_on(future))
+    } else {
+        tokio::runtime::Runtime::new()
+            .with_context(|| runtime_context.to_string())?
+            .block_on(future)
+    };
+    output.map_err(anyhow::Error::from)
+}
 
 pub enum PluginAction {
     List,
@@ -220,6 +241,10 @@ fn show_plugin_info(name: &str) -> anyhow::Result<String> {
         .find(|plugin| plugin.name == name)
         .with_context(|| format!("plugin '{name}' not found"))?;
 
+    Ok(render_plugin_info(plugin))
+}
+
+fn render_plugin_info(plugin: &crate::plugins::Plugin) -> String {
     let mut text = format!("PLUGIN: {}\n", plugin.name);
     text.push_str("─────────────────────────────────────────────────────────\n");
     text.push_str(&format!("Version:      {}\n", plugin.version));
@@ -229,6 +254,12 @@ fn show_plugin_info(name: &str) -> anyhow::Result<String> {
     text.push_str(&format!("Source:       {}\n", plugin.source));
     text.push_str(&format!("Enabled:      {}\n", plugin.enabled));
     text.push_str(&format!("Description:  {}\n", plugin.description));
+    if let Some(compatibility) = plugin.compatibility.as_deref() {
+        text.push_str(&format!(
+            "Compatibility:{}\n",
+            format_field_value(compatibility)
+        ));
+    }
     if plugin.tools.is_empty() {
         text.push_str("Tools:        none\n");
     } else {
@@ -248,7 +279,24 @@ fn show_plugin_info(name: &str) -> anyhow::Result<String> {
             plugin.missing_env.join(", ")
         ));
     }
-    Ok(text.trim_end().to_string())
+    if !plugin.related_skills.is_empty() {
+        text.push_str(&format!(
+            "Related:      {}\n",
+            plugin.related_skills.join(", ")
+        ));
+    }
+    if !plugin.cli_commands.is_empty() {
+        text.push_str(&format!(
+            "CLI:          {}\n",
+            plugin
+                .cli_commands
+                .iter()
+                .map(|command| command.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    text.trim_end().to_string()
 }
 
 fn show_plugin_status() -> anyhow::Result<String> {
@@ -292,6 +340,15 @@ fn install_plugin(
     force: bool,
     no_enable: bool,
 ) -> anyhow::Result<String> {
+    Ok(install_plugin_capture(source, explicit_name, force, no_enable)?.message)
+}
+
+pub(crate) fn install_plugin_capture(
+    source: &str,
+    explicit_name: Option<&str>,
+    force: bool,
+    no_enable: bool,
+) -> anyhow::Result<PluginActionOutcome> {
     let (config_path, mut config) = load_config()?;
     std::fs::create_dir_all(&config.plugins.install_dir)?;
     std::fs::create_dir_all(&config.plugins.quarantine_dir)?;
@@ -303,16 +360,18 @@ fn install_plugin(
     ));
     std::fs::create_dir_all(&quarantine)?;
 
-    let rt = tokio::runtime::Runtime::new().context("failed to create plugin install runtime")?;
-    let resolved = match rt.block_on(materialize_source_to_dir(&config.plugins, source, &quarantine))
-    {
+    let resolved = match block_on_plugin_future(
+        materialize_source_to_dir(&config.plugins, source, &quarantine),
+        "failed to create plugin install runtime",
+    ) {
         Ok(resolved) => resolved,
         Err(error) => {
             let _ = std::fs::remove_dir_all(&quarantine);
             return Err(anyhow::anyhow!(error));
         }
     };
-    let manifest_path = quarantine.join("plugin.toml");
+    let manifest_path = ensure_installable_manifest(&quarantine)
+        .with_context(|| format!("unsupported plugin bundle in {}", resolved.display))?;
     let manifest = parse_plugin_manifest(&manifest_path)
         .with_context(|| format!("invalid plugin manifest in {}", resolved.display))?;
     let plugin_name = explicit_name
@@ -365,6 +424,11 @@ fn install_plugin(
         &checksum,
     )
     .context("failed to stamp plugin manifest trust metadata")?;
+    block_on_plugin_future(
+        install_shared_files(&resolved.shared_files, &config.plugins.install_dir),
+        "failed to install shared plugin support files",
+    )
+    .context("failed to install shared plugin support files")?;
 
     std::fs::rename(&quarantine, &target)
         .with_context(|| format!("failed to install plugin to {}", target.display()))?;
@@ -399,16 +463,19 @@ fn install_plugin(
     } else {
         "installed and enabled"
     };
-    Ok(format!(
-        "Installing {}...\n- Source: {}\n- Security scan: {:?} ({} findings)\n- Checksum: {}\n\nPlugin '{}' {}.",
-        plugin_name,
-        resolved.display,
-        scan.verdict,
-        scan.findings.len(),
-        checksum,
-        plugin_name,
-        mode
-    ))
+    Ok(PluginActionOutcome {
+        plugin_name: plugin_name.clone(),
+        message: format!(
+            "Installing {}...\n- Source: {}\n- Security scan: {:?} ({} findings)\n- Checksum: {}\n\nPlugin '{}' {}.",
+            plugin_name,
+            resolved.display,
+            scan.verdict,
+            scan.findings.len(),
+            checksum,
+            plugin_name,
+            mode
+        ),
+    })
 }
 
 fn toggle_plugin_enabled(name: &str) -> anyhow::Result<String> {
@@ -444,10 +511,7 @@ fn update_plugins(name: Option<&str>) -> anyhow::Result<String> {
     let plugins_dir = user_plugins_dir()?;
     let mut messages = Vec::new();
     if let Some(name) = name {
-        messages.push(update_plugin_dir(
-            &safe_plugin_path(&plugins_dir, name)?,
-            name,
-        )?);
+        messages.push(update_plugin_capture(name)?.message);
     } else {
         for entry in std::fs::read_dir(&plugins_dir)
             .with_context(|| format!("failed to read {}", plugins_dir.display()))?
@@ -458,18 +522,48 @@ fn update_plugins(name: Option<&str>) -> anyhow::Result<String> {
                 continue;
             }
             let name = entry.file_name().to_string_lossy().to_string();
-            messages.push(update_plugin_dir(&path, &name)?);
+            messages.push(update_plugin_capture(&name)?.message);
         }
     }
     Ok(messages.join("\n"))
 }
 
-fn update_plugin_dir(path: &Path, name: &str) -> anyhow::Result<String> {
+pub(crate) fn update_plugin_capture(name: &str) -> anyhow::Result<PluginActionOutcome> {
+    let (_config_path, config) = load_config()?;
+    let path = safe_plugin_path(&config.plugins.install_dir, name)?;
     if !path.is_dir() {
         anyhow::bail!("plugin '{}' is not installed", name);
     }
+
+    let manifest_path = path.join("plugin.toml");
+    if manifest_path.is_file() {
+        let manifest = parse_plugin_manifest(&manifest_path)
+            .with_context(|| format!("invalid plugin manifest for '{}'", name))?;
+        if let Some(source) = manifest
+            .trust
+            .as_ref()
+            .and_then(|trust| trust.source.as_deref())
+            .filter(|source| {
+                matches!(
+                    resolve_install_source(source).kind,
+                    InstallSourceKind::Hub
+                        | InstallSourceKind::GitHub
+                        | InstallSourceKind::HttpsArchive
+                )
+            })
+        {
+            return update_plugin_from_source(&config.plugins, &path, name, source);
+        }
+    }
+
     if !path.join(".git").exists() {
-        return Ok(format!("Skipped plugin '{}' (not a git checkout)", name));
+        return Ok(PluginActionOutcome {
+            plugin_name: name.to_string(),
+            message: format!(
+                "Skipped plugin '{}' (no remote update source or git checkout)",
+                name
+            ),
+        });
     }
     let status = std::process::Command::new("git")
         .arg("-C")
@@ -480,7 +574,10 @@ fn update_plugin_dir(path: &Path, name: &str) -> anyhow::Result<String> {
     if !status.success() {
         anyhow::bail!("git pull failed for plugin '{}'", name);
     }
-    Ok(format!("Updated plugin '{}'", name))
+    Ok(PluginActionOutcome {
+        plugin_name: name.to_string(),
+        message: format!("Updated plugin '{}'", name),
+    })
 }
 
 fn remove_plugin(name: &str) -> anyhow::Result<String> {
@@ -538,10 +635,11 @@ fn show_plugin_audit(lines: usize) -> anyhow::Result<String> {
 
 fn search_plugin_hub(query: &str, source: Option<&str>) -> anyhow::Result<String> {
     let (_config_path, config) = load_config()?;
-    let rt = tokio::runtime::Runtime::new().context("failed to create hub runtime")?;
-    let results = rt
-        .block_on(search_hub(&config.plugins, query, source, 20))
-        .context("plugin hub search failed")?;
+    let results = block_on_plugin_future(
+        search_hub(&config.plugins, query, source, 20),
+        "failed to create hub runtime",
+    )
+    .context("plugin hub search failed")?;
     if results.is_empty() {
         let scope = source
             .map(|value| format!(" in source '{value}'"))
@@ -551,7 +649,6 @@ fn search_plugin_hub(query: &str, source: Option<&str>) -> anyhow::Result<String
     let mut text = String::from("PLUGIN SEARCH RESULTS\n");
     text.push_str("─────────────────────────────────────────────────────────\n");
     for result in results {
-        let install_ref = format!("hub:{}/{}", result.source_name, result.plugin.name);
         text.push_str(&format!(
             "{}  v{}  {:?}  {}  source={}  score={:.1}\n",
             result.plugin.name,
@@ -562,7 +659,10 @@ fn search_plugin_hub(query: &str, source: Option<&str>) -> anyhow::Result<String
             result.score
         ));
         text.push_str(&format!("  {}\n", result.plugin.description));
-        text.push_str(&format!("  install: edgecrab plugins install {}\n", install_ref));
+        text.push_str(&format!(
+            "  install: edgecrab plugins install {}\n",
+            result.identifier
+        ));
         text.push_str(&format!("  source url: {}\n", result.plugin.install_url));
         if !result.plugin.requires_env.is_empty() {
             text.push_str(&format!(
@@ -589,6 +689,10 @@ fn browse_plugin_hub() -> anyhow::Result<String> {
     text.push_str("  edgecrab plugins search github\n");
     text.push_str("  edgecrab plugins search --source hermes weather\n");
     Ok(text.trim_end().to_string())
+}
+
+fn format_field_value(value: &str) -> String {
+    format!("  {value}")
 }
 
 fn refresh_plugin_hub() -> anyhow::Result<String> {
@@ -638,6 +742,131 @@ fn resolved_trust_level(name: &str) -> edgecrab_plugins::TrustLevel {
         .unwrap_or(edgecrab_plugins::TrustLevel::Unverified)
 }
 
+fn update_plugin_from_source(
+    config: &edgecrab_plugins::PluginsConfig,
+    target: &Path,
+    plugin_name: &str,
+    source: &str,
+) -> anyhow::Result<PluginActionOutcome> {
+    std::fs::create_dir_all(&config.quarantine_dir)?;
+    let quarantine = config.quarantine_dir.join(format!(
+        "{}-update-{}",
+        plugin_name,
+        Utc::now().timestamp_nanos_opt().unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&quarantine)?;
+
+    let resolved = match block_on_plugin_future(
+        materialize_source_to_dir(config, source, &quarantine),
+        "failed to create plugin update runtime",
+    ) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&quarantine);
+            return Err(anyhow::anyhow!(error));
+        }
+    };
+
+    let manifest_path = ensure_installable_manifest(&quarantine)
+        .with_context(|| format!("unsupported plugin bundle in {}", resolved.display))?;
+    let manifest = parse_plugin_manifest(&manifest_path)
+        .with_context(|| format!("invalid plugin manifest in {}", resolved.display))?;
+    if manifest.plugin.name != plugin_name {
+        let _ = std::fs::remove_dir_all(&quarantine);
+        anyhow::bail!(
+            "plugin update source '{}' resolved to '{}', expected '{}'",
+            source,
+            manifest.plugin.name,
+            plugin_name
+        );
+    }
+
+    let scan = scan_plugin_bundle(
+        &quarantine,
+        plugin_name,
+        &resolved.display,
+        resolved.trust_level,
+    )
+    .context("plugin scan failed")?;
+    let verdict = should_allow_install(
+        resolved.trust_level,
+        &scan,
+        config.security.allow_caution,
+        false,
+    );
+    if !verdict.allowed {
+        let _ = std::fs::remove_dir_all(&quarantine);
+        anyhow::bail!(render_scan_block(&scan));
+    }
+
+    let checksum = sha256_dir(&quarantine).context("failed to hash plugin bundle")?;
+    if let Some(expected_checksum) = &resolved.expected_checksum
+        && &checksum != expected_checksum
+    {
+        let _ = std::fs::remove_dir_all(&quarantine);
+        anyhow::bail!(
+            "checksum mismatch for '{}': expected {}, got {}",
+            plugin_name,
+            expected_checksum,
+            checksum
+        );
+    }
+
+    write_install_metadata(
+        &manifest_path,
+        resolved.trust_level,
+        &resolved.display,
+        &checksum,
+    )
+    .context("failed to stamp plugin manifest trust metadata")?;
+    block_on_plugin_future(
+        install_shared_files(&resolved.shared_files, &config.install_dir),
+        "failed to install shared plugin support files",
+    )
+    .context("failed to install shared plugin support files")?;
+
+    let backup = config.quarantine_dir.join(format!(
+        "{}-backup-{}",
+        plugin_name,
+        Utc::now().timestamp_nanos_opt().unwrap_or(0)
+    ));
+    std::fs::rename(target, &backup)
+        .with_context(|| format!("failed to stage existing plugin '{}'", plugin_name))?;
+    if let Err(error) = std::fs::rename(&quarantine, target) {
+        let _ = std::fs::rename(&backup, target);
+        let _ = std::fs::remove_dir_all(&quarantine);
+        return Err(error).with_context(|| format!("failed to replace plugin '{}'", plugin_name));
+    }
+    let _ = std::fs::remove_dir_all(&backup);
+
+    append_audit_entry(
+        config,
+        &PluginAuditEntry {
+            timestamp: Utc::now().to_rfc3339(),
+            action: "update".into(),
+            plugin: plugin_name.to_string(),
+            source: resolved.display.clone(),
+            trust_level: resolved.trust_level,
+            checksum: checksum.clone(),
+            forced: verdict.forced,
+        },
+    )
+    .context("failed to append plugin audit entry")?;
+
+    Ok(PluginActionOutcome {
+        plugin_name: plugin_name.to_string(),
+        message: format!(
+            "Updating {}...\n- Source: {}\n- Security scan: {:?} ({} findings)\n- Checksum: {}\n\nPlugin '{}' updated.",
+            plugin_name,
+            resolved.display,
+            scan.verdict,
+            scan.findings.len(),
+            checksum,
+            plugin_name
+        ),
+    })
+}
+
 fn parse_search_action(input: &str) -> PluginAction {
     let trimmed = input.trim();
     let (source, query) = if let Some(rest) = trimmed.strip_prefix("--source ").map(str::trim) {
@@ -672,6 +901,7 @@ fn render_scan_block(scan: &edgecrab_plugins::ScanResult) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugins::{Plugin, PluginSource, PluginTool};
 
     #[test]
     fn render_scan_block_lists_findings() {
@@ -703,5 +933,30 @@ mod tests {
             }
             other => panic!("unexpected action: {:?}", std::mem::discriminant(&other)),
         }
+    }
+
+    #[test]
+    fn render_plugin_info_includes_related_skills() {
+        let text = render_plugin_info(&Plugin {
+            name: "github-issues".into(),
+            version: "1.1.0".into(),
+            description: "GitHub issue management".into(),
+            compatibility: Some("Requires gh CLI".into()),
+            source: PluginSource::User,
+            kind: edgecrab_plugins::PluginKind::Skill,
+            status: edgecrab_plugins::PluginStatus::Available,
+            enabled: true,
+            tools: vec![PluginTool {
+                name: "github_issue_create".into(),
+            }],
+            trust_level: edgecrab_plugins::TrustLevel::Unverified,
+            install_source: None,
+            missing_env: vec!["GITHUB_TOKEN".into()],
+            related_skills: vec!["github-auth".into(), "github-pr-workflow".into()],
+            cli_commands: Vec::new(),
+        });
+
+        assert!(text.contains("Related:      github-auth, github-pr-workflow"));
+        assert!(text.contains("Compatibility:  Requires gh CLI"));
     }
 }
