@@ -543,6 +543,11 @@ edgecrab plugins update
 edgecrab plugins remove github-tools
 ```
 
+Inside the TUI, `/plugins search ...` and `/plugins browse` now open the same
+kind of async remote browser EdgeCrab already uses for skills and MCP:
+fuzzy filtering, background search, split-detail view, and one-key install or
+replace from official registries.
+
 EdgeCrab now supports four plugin kinds:
 
 - `skill` plugins load `SKILL.md` content from `~/.edgecrab/plugins/<name>/` into the session prompt with Hermes-compatible frontmatter, readiness checks, and platform filtering.

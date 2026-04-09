@@ -314,6 +314,7 @@ fn mcp_auth_reports_dynamic_loopback_redirects_for_browser_flow() {
         .arg(&config_path)
         .args(["mcp", "auth", "oauth-browser"])
         .env("HOME", home.path())
+        .env("EDGECRAB_DISABLE_BROWSER_LAUNCH", "1")
         .output()
         .expect("run edgecrab");
 
