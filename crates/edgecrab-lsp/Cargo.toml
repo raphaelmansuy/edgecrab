@@ -1,5 +1,6 @@
 [package]
 name = "edgecrab-lsp"
+description = "LSP client tools for EdgeCrab: code navigation, diagnostics, and workspace edits via language servers"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
