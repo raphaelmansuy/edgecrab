@@ -7,6 +7,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+---
+
+## [0.2.0] — 2026-04-09
+
 ### Added
 
 - **Channel-aware `edgecrab update`** — EdgeCrab now detects whether it was installed via npm, PyPI/pipx, cargo, Homebrew, source checkout, or manual binary, then applies the correct upgrade path or prints safe guidance for non-package-managed installs.
@@ -26,7 +30,6 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **Cross-channel version drift** — release automation and CI now catch mismatches like stale wrapper package versions before npm/PyPI releases can diverge from the Rust workspace release.
 
 ---
-
 ## [0.1.4] — 2026-04-09
 
 ### Added

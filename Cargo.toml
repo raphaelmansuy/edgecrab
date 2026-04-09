@@ -14,7 +14,7 @@ members = [
     "crates/edgecrab-migrate",
 ]
 [workspace.package]
-version = "0.1.4"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.86.0"
 license = "Apache-2.0"

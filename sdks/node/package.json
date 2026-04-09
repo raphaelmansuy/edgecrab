@@ -1,6 +1,6 @@
 {
   "name": "edgecrab-sdk",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "description": "Node.js SDK for EdgeCrab — a Rust-native autonomous coding agent",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
