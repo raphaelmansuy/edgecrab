@@ -33,6 +33,7 @@ mod mcp_oauth;
 mod mcp_support;
 #[cfg(target_os = "macos")]
 mod permissions;
+mod plugin_toggle;
 mod plugins;
 mod plugins_cmd;
 mod profile;
@@ -970,9 +971,22 @@ async fn run_mcp(command: McpCommand, args: &CliArgs) -> anyhow::Result<()> {
 fn run_plugins(command: PluginsCommand) -> anyhow::Result<()> {
     match command {
         PluginsCommand::List => plugins_cmd::run(plugins_cmd::PluginAction::List)?,
+        PluginsCommand::Info { name } => {
+            plugins_cmd::run(plugins_cmd::PluginAction::Info { name })?
+        }
         PluginsCommand::Install { repo, name } => {
             plugins_cmd::run(plugins_cmd::PluginAction::Install { repo, name })?
         }
+        PluginsCommand::Enable { name } => {
+            plugins_cmd::run(plugins_cmd::PluginAction::Enable { name })?
+        }
+        PluginsCommand::Disable { name } => {
+            plugins_cmd::run(plugins_cmd::PluginAction::Disable { name })?
+        }
+        PluginsCommand::Toggle { name } => {
+            plugins_cmd::run(plugins_cmd::PluginAction::Toggle { name })?
+        }
+        PluginsCommand::Status => plugins_cmd::run(plugins_cmd::PluginAction::Status)?,
         PluginsCommand::Update { name } => {
             plugins_cmd::run(plugins_cmd::PluginAction::Update { name })?
         }

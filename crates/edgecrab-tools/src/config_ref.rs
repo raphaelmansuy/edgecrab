@@ -116,6 +116,10 @@ pub struct AppConfigRef {
     /// Skill names disabled globally or per-platform (merged).
     /// Tools (skills_list) should skip these.
     pub disabled_skills: Vec<String>,
+    /// Plugin names disabled globally or per-platform (merged for the current platform).
+    pub disabled_plugins: Vec<String>,
+    /// Install root used for plugin discovery and runtime assets.
+    pub plugin_install_dir: PathBuf,
     /// Record browser sessions as WebM video files when true.
     /// Mirrors `browser.record_sessions` in config.yaml.
     pub browser_record_sessions: bool,
@@ -223,6 +227,8 @@ impl Default for AppConfigRef {
             disabled_tools: Vec::new(),
             external_skill_dirs: Vec::new(),
             disabled_skills: Vec::new(),
+            disabled_plugins: Vec::new(),
+            plugin_install_dir: resolve_edgecrab_home().join("plugins"),
             browser_record_sessions: false,
             browser_command_timeout: 30,
             browser_recording_max_age_hours: 72,
@@ -279,6 +285,13 @@ impl AppConfigRef {
             tool_name,
             toolset,
         )
+    }
+
+    pub fn is_plugin_enabled(&self, plugin_name: &str) -> bool {
+        !self
+            .disabled_plugins
+            .iter()
+            .any(|candidate| candidate == plugin_name)
     }
 
     /// Build the effective file path policy for a session workspace.

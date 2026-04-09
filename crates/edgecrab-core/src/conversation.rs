@@ -41,6 +41,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use edgecrab_plugins::{build_plugin_skill_prompt, discover_plugins};
 use edgecrab_tools::config_ref::AppConfigRef;
 use edgecrab_tools::registry::{
     ApprovalRequest, ApprovalResponse, DelegationEvent, ToolContext, ToolRegistry,
@@ -455,12 +456,31 @@ impl Agent {
                 // and prepend their full content before the auto-discovered skill summary.
                 let preloaded_content =
                     load_preloaded_skills(&home, &config.skills_config.preloaded);
-                let combined_skill_prompt: Option<String> =
-                    match (preloaded_content.is_empty(), skill_summary) {
-                        (false, Some(summary)) => Some(format!("{preloaded_content}\n\n{summary}")),
-                        (false, None) => Some(preloaded_content),
-                        (true, summary) => summary,
-                    };
+                let plugin_skill_prompt = discover_plugins(&config.plugins_config, config.platform)
+                    .ok()
+                    .and_then(|discovery| build_plugin_skill_prompt(&discovery));
+                let combined_skill_prompt: Option<String> = match (
+                    preloaded_content.is_empty(),
+                    skill_summary,
+                    plugin_skill_prompt,
+                ) {
+                    (false, Some(summary), Some(plugin_summary)) => Some(format!(
+                        "{preloaded_content}\n\n{summary}\n\n{plugin_summary}"
+                    )),
+                    (false, Some(summary), None) => {
+                        Some(format!("{preloaded_content}\n\n{summary}"))
+                    }
+                    (false, None, Some(plugin_summary)) => {
+                        Some(format!("{preloaded_content}\n\n{plugin_summary}"))
+                    }
+                    (false, None, None) => Some(preloaded_content),
+                    (true, Some(summary), Some(plugin_summary)) => {
+                        Some(format!("{summary}\n\n{plugin_summary}"))
+                    }
+                    (true, Some(summary), None) => Some(summary),
+                    (true, None, Some(plugin_summary)) => Some(plugin_summary),
+                    (true, None, None) => None,
+                };
                 // Load global SOUL.md from ~/.edgecrab/SOUL.md as identity override (slot #1).
                 // WHY: hermes-agent loads SOUL.md from HERMES_HOME as the agent's baseline
                 // identity. We do the same here — the global SOUL.md replaces DEFAULT_IDENTITY.

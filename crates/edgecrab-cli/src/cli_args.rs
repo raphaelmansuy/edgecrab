@@ -406,12 +406,22 @@ pub enum McpCommand {
 pub enum PluginsCommand {
     /// List discovered plugins
     List,
+    /// Show detailed info for one plugin
+    Info { name: String },
     /// Install a plugin from a git repository
     Install {
         repo: String,
         #[arg(long)]
         name: Option<String>,
     },
+    /// Enable a plugin in config without reinstalling it
+    Enable { name: String },
+    /// Disable a plugin in config without uninstalling it
+    Disable { name: String },
+    /// Toggle a plugin in config without reinstalling it
+    Toggle { name: String },
+    /// Show current plugin runtime status
+    Status,
     /// Update an installed plugin
     Update { name: String },
     /// Remove an installed plugin

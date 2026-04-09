@@ -1,0 +1,28 @@
+[package]
+name = "edgecrab-plugins"
+description = "Shared plugin discovery, manifest parsing, skill loading, and runtime helpers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+edgecrab-types = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+dirs = { workspace = true }
+regex = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yml = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+rhai = { version = "1.20", default-features = true, features = ["sync", "serde"] }
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = { workspace = true }

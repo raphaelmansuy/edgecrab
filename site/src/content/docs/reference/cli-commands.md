@@ -399,10 +399,21 @@ Manage installed plugins.
 
 ```bash
 edgecrab plugins list              # List discovered plugins
+edgecrab plugins info <name>       # Show one plugin in detail
+edgecrab plugins status            # Show plugin runtime state
 edgecrab plugins install <repo>    # Install a plugin from a git repository
+edgecrab plugins enable <name>     # Enable without reinstalling
+edgecrab plugins disable <name>    # Disable without uninstalling
+edgecrab plugins toggle <name>     # Flip enabled/disabled state
 edgecrab plugins update <name>     # Update an installed plugin
 edgecrab plugins remove <name>     # Remove an installed plugin
 ```
+
+Supported kinds:
+
+- `skill` plugins inject `SKILL.md` into the system prompt
+- `tool-server` plugins expose subprocess tools over JSON-RPC
+- `script` plugins expose Rhai-powered local tools
 
 ---
 

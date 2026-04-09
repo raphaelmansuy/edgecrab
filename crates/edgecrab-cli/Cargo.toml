@@ -16,6 +16,7 @@ bedrock-model-discovery = ["edgecrab-core/bedrock-model-discovery"]
 
 [dependencies]
 edgecrab-core = { workspace = true }
+edgecrab-plugins = { workspace = true }
 edgecrab-types = { workspace = true }
 edgecrab-state = { workspace = true }
 edgecrab-tools = { workspace = true }
@@ -32,6 +33,7 @@ dialoguer = { workspace = true }
 strsim = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+async-trait = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_yml = { workspace = true }

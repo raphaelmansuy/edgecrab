@@ -4,6 +4,7 @@ members = [
     "crates/edgecrab-types",
     "crates/edgecrab-security",
     "crates/edgecrab-state",
+    "crates/edgecrab-plugins",
     "crates/edgecrab-cron",
     "crates/edgecrab-lsp",
     "crates/edgecrab-tools",
@@ -26,6 +27,7 @@ authors = ["Raphael Mansuy"]
 edgecrab-types = { path = "crates/edgecrab-types", version = "0.2.2" }
 edgecrab-security = { path = "crates/edgecrab-security", version = "0.2.2" }
 edgecrab-state = { path = "crates/edgecrab-state", version = "0.2.2" }
+edgecrab-plugins = { path = "crates/edgecrab-plugins", version = "0.2.2" }
 edgecrab-cron = { path = "crates/edgecrab-cron", version = "0.2.2" }
 edgecrab-lsp = { path = "crates/edgecrab-lsp", version = "0.2.2" }
 edgecrab-tools = { path = "crates/edgecrab-tools", version = "0.2.2" }

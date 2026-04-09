@@ -128,6 +128,8 @@ pub struct AgentConfig {
     pub model_config: crate::config::ModelConfig,
     /// Skills config — disabled skills, platform-specific disabled.
     pub skills_config: crate::config::SkillsConfig,
+    /// Plugin config — enable/disable state and install root.
+    pub plugins_config: crate::config::PluginsConfig,
     /// Delegation runtime controls mirrored from AppConfig.delegation.
     pub delegation_enabled: bool,
     pub delegation_model: Option<String>,
@@ -203,6 +205,7 @@ impl Default for AgentConfig {
             personality_addon: None,
             model_config: crate::config::ModelConfig::default(),
             skills_config: crate::config::SkillsConfig::default(),
+            plugins_config: crate::config::PluginsConfig::default(),
             delegation_enabled: true,
             delegation_model: None,
             delegation_provider: None,
@@ -299,6 +302,15 @@ impl AgentConfig {
         disabled
     }
 
+    fn disabled_plugins_for_platform(&self) -> Vec<String> {
+        let mut disabled = self.plugins_config.disabled.clone();
+        let platform_key = self.platform.to_string();
+        if let Some(platform_disabled) = self.plugins_config.platform_disabled.get(&platform_key) {
+            disabled.extend(platform_disabled.iter().cloned());
+        }
+        disabled
+    }
+
     pub(crate) fn to_app_config_ref(
         &self,
         gateway_running: bool,
@@ -322,6 +334,8 @@ impl AgentConfig {
             disabled_tools: self.disabled_tools.clone(),
             external_skill_dirs: self.skills_config.external_dirs.clone(),
             disabled_skills: self.disabled_skills_for_platform(),
+            disabled_plugins: self.disabled_plugins_for_platform(),
+            plugin_install_dir: self.plugins_config.install_dir.clone(),
             preloaded_skills: self.skills_config.preloaded.clone(),
             browser_record_sessions: self.browser.record_sessions,
             browser_command_timeout: self.browser.command_timeout,
@@ -1561,6 +1575,7 @@ impl AgentBuilder {
                 temperature: config.model.temperature,
                 model_config: config.model.clone(),
                 skills_config: config.skills.clone(),
+                plugins_config: config.plugins.clone(),
                 delegation_enabled: config.delegation.enabled,
                 delegation_model: config.delegation.model.clone(),
                 delegation_provider: config.delegation.provider.clone(),

@@ -295,6 +295,10 @@ skills:
 
 Skills are Markdown files — they cannot execute code. Review the `SKILL.md` before installing. The edgecrab hub shows source links and contributor info.
 
+**Q: When should I use a plugin instead of a skill?**
+
+Use a plain skill when all you need is prompt guidance from `~/.edgecrab/skills/`. Use a plugin when you also need enable/disable policy, subprocess tools, or Rhai script behavior under `~/.edgecrab/plugins/`.
+
 ---
 
 ## See Also
@@ -302,4 +306,5 @@ Skills are Markdown files — they cannot execute code. Review the `SKILL.md` be
 - [Building Your First Skill](/guides/first-skill/) — Step-by-step guide with testing
 - [Context Files](/features/context-files/) — How SOUL.md and AGENTS.md interact with skills
 - [Memory](/features/memory/) — Persistent facts versus procedural skills
+- [Plugin System](/features/plugins/) — Skill plugins, tool-server plugins, and script plugins
 - [CLI Commands](/reference/cli-commands/) — `edgecrab skills` subcommand
