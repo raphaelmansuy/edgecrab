@@ -76,6 +76,7 @@ edgecrab [GLOBAL FLAGS] [PROMPT]   -- interactive TUI (default)
   +-- migrate [--dry-run]          -- import from hermes-agent
   +-- acp [init]                   -- ACP stdio server / VS Code onboarding
   +-- version                      -- build info + provider list
+  +-- update [--check]             -- channel-aware update workflow
   +-- status                       -- runtime status summary
   +-- whatsapp                     -- pair WhatsApp bridge
   |
@@ -158,6 +159,27 @@ provider, and writes `~/.edgecrab/config.yaml`.
 ## `edgecrab doctor`
 
 Full diagnostic health check — no flags required.
+
+---
+
+## `edgecrab update`
+
+Check the latest release and apply the update through the install channel that
+owns the current EdgeCrab binary.
+
+```bash
+edgecrab update          # check and apply when supported
+edgecrab update --check  # report only
+```
+
+Channel behavior:
+
+- npm: `npm install -g edgecrab-cli@<latest>`
+- pipx: `pipx upgrade edgecrab-cli`
+- pip: `python -m pip install --upgrade edgecrab-cli==<latest>`
+- cargo: `cargo install edgecrab-cli --locked --force --version <latest>`
+- brew: `brew update && brew upgrade edgecrab`
+- source/manual binary: print safe manual guidance
 
 ```bash
 edgecrab doctor

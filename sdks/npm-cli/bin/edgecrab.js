@@ -12,10 +12,10 @@
 const { spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
-const os = require('node:os');
 
 const BINARY  = process.platform === 'win32' ? 'edgecrab.exe' : 'edgecrab';
 const BIN_DIR = path.join(__dirname, BINARY);
+const PACKAGE_VERSION = require('../package.json').version;
 
 if (!fs.existsSync(BIN_DIR)) {
   console.error(
@@ -28,7 +28,12 @@ if (!fs.existsSync(BIN_DIR)) {
 
 const result = spawnSync(BIN_DIR, process.argv.slice(2), {
   stdio: 'inherit',
-  env: process.env,
+  env: {
+    ...process.env,
+    EDGECRAB_INSTALL_METHOD: 'npm',
+    EDGECRAB_WRAPPER_VERSION: PACKAGE_VERSION,
+    EDGECRAB_BINARY_VERSION: PACKAGE_VERSION,
+  },
 });
 
 process.exit(result.status ?? 1);

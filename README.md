@@ -119,6 +119,7 @@ Most AI agents are either too constrained (coding agents that forget you exist a
 
 ```bash
 npm install -g edgecrab-cli
+edgecrab update              # channel-aware updater
 edgecrab setup               # interactive wizard — detects API keys, writes config
 edgecrab doctor              # verify health
 edgecrab                     # launch TUI
@@ -129,6 +130,7 @@ edgecrab                     # launch TUI
 ```bash
 pip install edgecrab-cli
 # OR: pipx install edgecrab-cli  (isolated install)
+edgecrab update
 edgecrab setup && edgecrab doctor && edgecrab
 ```
 
@@ -136,6 +138,7 @@ edgecrab setup && edgecrab doctor && edgecrab
 
 ```bash
 cargo install edgecrab-cli
+edgecrab update --check
 edgecrab setup && edgecrab doctor && edgecrab
 ```
 

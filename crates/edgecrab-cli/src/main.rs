@@ -42,6 +42,7 @@ mod skin_engine;
 mod status_cmd;
 mod theme;
 mod tool_display;
+mod update;
 mod vision_models;
 mod whatsapp_cmd;
 
@@ -306,6 +307,14 @@ async fn main() -> anyhow::Result<()> {
 
 /// Dispatch to a named subcommand.
 async fn run_subcommand(cmd: Command, args: &CliArgs) -> anyhow::Result<()> {
+    if !matches!(
+        &cmd,
+        Command::Update { .. } | Command::Profile { .. } | Command::Completion { .. }
+    ) && let Ok(config) = edgecrab_core::AppConfig::load()
+    {
+        update::print_cached_cli_notice(&config);
+    }
+
     match cmd {
         Command::Setup { section, force } => {
             setup::run_with_options(section.as_deref(), force)?;
@@ -332,6 +341,11 @@ async fn run_subcommand(cmd: Command, args: &CliArgs) -> anyhow::Result<()> {
         },
         Command::Version => {
             run_version();
+        }
+
+        Command::Update { check } => {
+            let config = edgecrab_core::AppConfig::load()?;
+            update::run_update_command(&config, check, &mut std::io::stdout()).await?;
         }
 
         Command::Whatsapp => {
@@ -1574,6 +1588,10 @@ fn set_config_value(
         "display.personality" => config.display.personality = value.to_string(),
         "display.show_reasoning" => config.display.show_reasoning = parse_bool(value)?,
         "display.show_status_bar" => config.display.show_status_bar = parse_bool(value)?,
+        "display.check_for_updates" => config.display.check_for_updates = parse_bool(value)?,
+        "display.update_check_interval_hours" => {
+            config.display.update_check_interval_hours = value.parse()?
+        }
         "display.streaming" => {
             let enabled = parse_bool(value)?;
             config.display.streaming = enabled;

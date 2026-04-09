@@ -11,6 +11,9 @@ Or via GitHub Actions (no local tools needed):
 
 Both methods do the exact same thing and are the recommended way to cut every release.
 
+The canonical release version lives in [`Cargo.toml`](/Users/raphaelmansuy/Github/03-working/edgecrab/Cargo.toml) under `[workspace.package].version`.
+Every published package version is derived from that source by `./scripts/release-version.sh`.
+
 ---
 
 ## What happens automatically
@@ -32,24 +35,33 @@ install time so there is no ordering dependency between workflows.
 
 ---
 
-## Files touched by every release
+## Version authority
 
-All version strings are kept in sync by `scripts/bump-version.sh` and the
-`release.yml` coordinator. Never edit them manually in isolation.
+All release automation now treats the workspace version in [`Cargo.toml`](/Users/raphaelmansuy/Github/03-working/edgecrab/Cargo.toml) as the single source of truth.
+Derived package versions are synced by [`scripts/release-version.sh`](/Users/raphaelmansuy/Github/03-working/edgecrab/scripts/release-version.sh), and CI rejects drift.
 
 | File | Field |
 |---|---|
-| `Cargo.toml` | `[workspace.package] version` |
-| `sdks/npm-cli/package.json` | `"version"` |
-| `sdks/npm-cli/scripts/install.js` | `BINARY_VERSION` |
-| `sdks/pypi-cli/pyproject.toml` | `version` |
-| `sdks/pypi-cli/edgecrab_cli/_version.py` | `__version__` |
-| `sdks/pypi-cli/edgecrab_cli/_binary.py` | `BINARY_VERSION` |
-| `sdks/python/pyproject.toml` | `version` |
+| `Cargo.toml` | canonical `[workspace.package] version` |
+| `sdks/node/package.json` | derived `"version"` |
+| `sdks/npm-cli/package.json` | derived `"version"` |
+| `sdks/pypi-cli/edgecrab_cli/_version.py` | derived `__version__` |
+| `sdks/pypi-cli/pyproject.toml` | dynamic version source (`edgecrab_cli._version.__version__`) |
+| `sdks/python/pyproject.toml` | derived `version` |
 
-> **`BINARY_VERSION`** (in npm and pip wrappers) controls which GitHub Release
-> tag the wrapper downloads the native binary from.  It must always match the
-> release tag so `npm install edgecrab-cli` gets the right binary.
+### Commands
+
+```bash
+./scripts/release-version.sh print
+./scripts/release-version.sh sync
+./scripts/release-version.sh check
+./scripts/release-version.sh set 0.2.0
+```
+
+> The npm CLI wrapper derives its binary tag from `package.json`, and the PyPI
+> CLI wrapper derives both package metadata and binary tag from
+> `edgecrab_cli._version.__version__`. Those files are derived state, not
+> independent release authorities.
 
 ---
 
@@ -61,21 +73,16 @@ If you can't use the script or the coordinator workflow:
 # 1. Ensure main is clean and up to date
 git checkout main && git pull
 
-# 2. Bump versions (replace 0.2.0 with the actual new version)
+# 2. Bump the canonical version and sync all derived package metadata
 VERSION=0.2.0
 
-sed -i "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
-sed -i "s/\"version\": \".*\"/\"version\": \"$VERSION\"/" sdks/npm-cli/package.json
-sed -i "s/const BINARY_VERSION = '[^']*'/const BINARY_VERSION = '$VERSION'/" sdks/npm-cli/scripts/install.js
-sed -i "s/^version = \".*\"/version = \"$VERSION\"/" sdks/pypi-cli/pyproject.toml
-printf '__version__ = "%s"\n' "$VERSION" > sdks/pypi-cli/edgecrab_cli/_version.py
-sed -i "s/^BINARY_VERSION = \".*\"/BINARY_VERSION = \"$VERSION\"/" sdks/pypi-cli/edgecrab_cli/_binary.py
-sed -i "s/^version = \".*\"/version = \"$VERSION\"/" sdks/python/pyproject.toml
+./scripts/release-version.sh set "$VERSION"
+./scripts/release-version.sh check
 
 # 3. Commit, tag, push
-git add Cargo.toml sdks/npm-cli/package.json sdks/npm-cli/scripts/install.js \
-        sdks/pypi-cli/pyproject.toml sdks/pypi-cli/edgecrab_cli/_version.py \
-        sdks/pypi-cli/edgecrab_cli/_binary.py sdks/python/pyproject.toml
+git add Cargo.toml sdks/npm-cli/package.json \
+        sdks/node/package.json sdks/pypi-cli/edgecrab_cli/_version.py \
+        sdks/python/pyproject.toml
 git commit -m "chore: bump version to $VERSION"
 git tag "v$VERSION"
 git push origin main
@@ -88,7 +95,18 @@ git push origin "v$VERSION"
 
 ### Update the Homebrew formula
 
-Once binaries are live on the GitHub Release, update the tap:
+Once binaries are live on the GitHub Release, update the tap. Prefer the
+published `edgecrab-checksums.txt` asset attached by `release-binaries.yml`:
+
+```bash
+gh release download "v${VERSION}" \
+  --repo raphaelmansuy/edgecrab \
+  --pattern edgecrab-checksums.txt
+
+cat edgecrab-checksums.txt
+```
+
+Manual fallback if needed:
 
 ```bash
 # Download both macOS archives and compute SHA256

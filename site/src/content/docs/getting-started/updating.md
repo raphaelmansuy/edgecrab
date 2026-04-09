@@ -7,6 +7,16 @@ sidebar:
 
 ## Updating EdgeCrab
 
+### Recommended
+
+```bash
+edgecrab update
+```
+
+`edgecrab update` is channel-aware. It detects whether the current install came
+from npm, PyPI/pipx, cargo, Homebrew, source, or a manual binary install, then
+either runs the right upgrade command or prints safe manual guidance.
+
 ### From crates.io
 
 ```bash
@@ -44,6 +54,13 @@ docker compose up -d
 cd edgecrab
 git pull origin main
 cargo build --release
+```
+
+### Homebrew
+
+```bash
+brew update
+brew upgrade edgecrab
 ```
 
 ---
@@ -121,7 +138,7 @@ EdgeCrab follows [semantic versioning](https://semver.org/). Breaking changes ar
 
 **Subscribe to releases:** Watch the [GitHub repository](https://github.com/raphaelmansuy/edgecrab) → "Releases only" to be notified of new versions.
 
-**Automated update check (coming soon):** EdgeCrab will optionally notify you when a new version is available on startup. Disable with `display.check_for_updates: false`.
+**Automated update check:** EdgeCrab can notify you on startup when a newer release exists. Disable with `display.check_for_updates: false`. Tune the refresh cadence with `display.update_check_interval_hours`.
 
 ---
 
@@ -142,6 +159,17 @@ cargo install edgecrab-cli --version 0.1.0 --force
 ```
 
 For pre-built binaries, download the specific tag from GitHub Releases.
+
+**Q: What does `edgecrab update` actually do?**
+
+It depends on how you installed EdgeCrab:
+
+- npm: runs `npm install -g edgecrab-cli@<version>`
+- pipx: runs `pipx upgrade edgecrab-cli`
+- pip: runs `python -m pip install --upgrade edgecrab-cli==<version>`
+- cargo: runs `cargo install edgecrab-cli --locked --force --version <version>`
+- brew: runs `brew update` then `brew upgrade edgecrab`
+- source or manual binary: prints safe manual steps instead of mutating the install blindly
 
 **Q: The new version has a new config option I want to use. How do I add it?**
 

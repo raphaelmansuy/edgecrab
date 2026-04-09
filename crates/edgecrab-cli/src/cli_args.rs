@@ -11,6 +11,7 @@
 //! edgecrab migrate [--dry-run]     ← hermes → edgecrab migration
 //! edgecrab acp                     ← ACP stdio server for editors
 //! edgecrab version                 ← detailed version info
+//! edgecrab update                  ← check/apply updates
 //! edgecrab whatsapp                ← pair and configure WhatsApp bridge
 //! ```
 
@@ -182,6 +183,13 @@ pub enum Command {
 
     /// Show detailed version and provider information
     Version,
+
+    /// Check for a newer EdgeCrab release and apply the update when possible
+    Update {
+        /// Check only; print the update report without executing any upgrade command
+        #[arg(long)]
+        check: bool,
+    },
 
     /// Pair and configure the WhatsApp bridge
     ///

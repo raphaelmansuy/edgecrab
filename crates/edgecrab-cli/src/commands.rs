@@ -1046,7 +1046,7 @@ impl CommandRegistry {
         self.register(Command {
             name: "update",
             aliases: &[],
-            description: "Check local upgrade status and show update guidance",
+            description: "Check release status and show channel-aware update guidance",
             handler: |_| CommandResult::CheckUpdates,
         });
 
@@ -1224,7 +1224,7 @@ fn help_text() -> String {
            /approve [scope]      — Approve pending action (once/session/always)\n\
            /deny                 — Deny pending approval or clarify prompt\n\
            /sethome [args]       — Show or set gateway home channels\n\
-           /update               — Check local upgrade status\n\
+           /update               — Check release status and update guidance\n\
          \n\
         Scheduling & Media:\n\
           /cron [subcommand]    — Manage scheduled tasks\n\

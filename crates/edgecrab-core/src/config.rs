@@ -1340,6 +1340,8 @@ pub struct DisplayConfig {
     pub tool_progress: ToolProgressMode,
     pub show_status_bar: bool,
     pub show_cost: bool,
+    pub check_for_updates: bool,
+    pub update_check_interval_hours: u64,
     pub skin: String,
 }
 
@@ -1353,6 +1355,8 @@ impl Default for DisplayConfig {
             tool_progress: ToolProgressMode::Verbose,
             show_status_bar: true,
             show_cost: true,
+            check_for_updates: true,
+            update_check_interval_hours: 24,
             skin: "default".into(),
         }
     }

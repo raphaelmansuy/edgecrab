@@ -27,14 +27,14 @@ jobs:
           node-version: '24'
           registry-url: 'https://registry.npmjs.org'
 
-      - name: Sync version from tag
+      - name: Sync release version
         env:
           INPUT_TAG_NAME: ${{ inputs.tag_name }}
         run: |
           TAG_NAME="${INPUT_TAG_NAME:-$GITHUB_REF_NAME}"
           VERSION="${TAG_NAME#v}"
-          cd sdks/node
-          npm version "$VERSION" --no-git-tag-version --allow-same-version
+          ./scripts/release-version.sh set "$VERSION"
+          ./scripts/release-version.sh check
           echo "Publishing edgecrab-sdk@$VERSION"
 
       - run: |

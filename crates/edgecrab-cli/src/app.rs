@@ -198,115 +198,6 @@ fn context_usage_ratio(tokens: u64, context_window: Option<u64>) -> Option<f64> 
         .map(|cw| (tokens as f64 / cw as f64).clamp(0.0, 1.0))
 }
 
-fn find_git_repo_root(mut start: std::path::PathBuf) -> Option<std::path::PathBuf> {
-    loop {
-        if start.join(".git").exists() {
-            return Some(start);
-        }
-        if !start.pop() {
-            return None;
-        }
-    }
-}
-
-fn git_output(repo: &std::path::Path, args: &[&str]) -> Option<String> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8(output.stdout).ok()?;
-    Some(text.trim().to_string())
-}
-
-fn render_update_status_report() -> String {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| edgecrab_core::edgecrab_home());
-    let Some(repo_root) = find_git_repo_root(cwd) else {
-        return format!(
-            "EdgeCrab v{}\nNo git checkout detected from the current working directory.\nIf you installed from source, run /update from inside the EdgeCrab repo.\nIf you installed from a package manager or `cargo install`, upgrade using that same channel.",
-            env!("CARGO_PKG_VERSION")
-        );
-    };
-
-    let branch = git_output(&repo_root, &["rev-parse", "--abbrev-ref", "HEAD"])
-        .unwrap_or_else(|| "(unknown)".into());
-    let commit = git_output(&repo_root, &["rev-parse", "--short", "HEAD"])
-        .unwrap_or_else(|| "(unknown)".into());
-    let dirty = git_output(&repo_root, &["status", "--short"])
-        .map(|out| if out.is_empty() { "clean" } else { "dirty" })
-        .unwrap_or("unknown");
-    let upstream = git_output(
-        &repo_root,
-        &[
-            "rev-parse",
-            "--abbrev-ref",
-            "--symbolic-full-name",
-            "@{upstream}",
-        ],
-    );
-
-    let mut lines = vec![
-        format!("EdgeCrab v{}", env!("CARGO_PKG_VERSION")),
-        format!("Repo:   {}", repo_root.display()),
-        format!("Branch: {branch}"),
-        format!("Commit: {commit} ({dirty})"),
-    ];
-
-    if let Some(upstream_ref) = upstream {
-        let _ = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&repo_root)
-            .args(["fetch", "--quiet"])
-            .status();
-
-        let ahead_behind = git_output(
-            &repo_root,
-            &[
-                "rev-list",
-                "--left-right",
-                "--count",
-                &format!("HEAD...{upstream_ref}"),
-            ],
-        );
-        if let Some(counts) = ahead_behind {
-            let mut parts = counts.split_whitespace();
-            let ahead = parts
-                .next()
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(0);
-            let behind = parts
-                .next()
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(0);
-            lines.push(format!("Upstream: {upstream_ref}"));
-            lines.push(format!("Ahead:    {ahead}"));
-            lines.push(format!("Behind:   {behind}"));
-            if behind > 0 {
-                lines.push(format!(
-                    "Action:   run `git -C {} pull --ff-only` to update",
-                    repo_root.display()
-                ));
-            } else if ahead > 0 {
-                lines.push("Action:   local checkout is ahead of upstream; push or keep your local commits.".into());
-            } else {
-                lines.push("Action:   checkout is up to date with its upstream branch.".into());
-            }
-        } else {
-            lines.push(format!("Upstream: {upstream_ref}"));
-            lines.push("Action:   unable to compare with upstream after fetch.".into());
-        }
-    } else {
-        lines.push("Upstream: none".into());
-        lines.push("Action:   no upstream branch is configured; set one with `git branch --set-upstream-to origin/<branch>`.".into());
-    }
-
-    lines.join("\n")
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AudioPlayerSpec {
     program: &'static str,
@@ -3561,7 +3452,11 @@ fn popup_rect(area: Rect, w: u16, h: u16) -> Rect {
 fn picker_three_layout(popup: Rect) -> std::rc::Rc<[Rect]> {
     Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(1), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
         .split(popup)
 }
 
@@ -4045,41 +3940,27 @@ impl App {
         self.push_output_spans(vec![Span::raw("")], OutputRole::System);
 
         // ── Async update check ──────────────────────────────────────────────────
-        // Fire-and-forget: check if there are upstream commits available.
-        // Result arrives as a SystemMsg only when updates are found.
-        let tx = self.response_tx.clone();
-        let home_dir = edgecrab_core::edgecrab_home();
-        self.rt_handle.spawn(async move {
-            let output = tokio::process::Command::new("git")
-                .args(["-C", &home_dir.to_string_lossy(), "fetch", "--quiet"])
-                .output()
-                .await;
-            if output.is_err() {
-                return; // git not available or not a git repo — silent
-            }
-            let count_out = tokio::process::Command::new("git")
-                .args([
-                    "-C",
-                    &home_dir.to_string_lossy(),
-                    "rev-list",
-                    "HEAD..origin/main",
-                    "--count",
-                ])
-                .output()
-                .await;
-            if let Ok(out) = count_out {
-                let count_str = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if let Ok(n) = count_str.parse::<u64>() {
-                    if n > 0 {
-                        let msg = format!(
-                            "  💡 {n} update{s} available — run `git -C ~/.edgecrab pull` to upgrade",
-                            s = if n == 1 { "" } else { "s" }
-                        );
-                        let _ = tx.send(AgentResponse::BgOp(BackgroundOpResult::SystemMsg(msg)));
-                    }
+        let runtime_config = self.load_runtime_config();
+        let update_state = crate::update::cached_startup_state(&runtime_config);
+        if let Some(notice) = update_state.cached_notice {
+            self.push_output(notice, OutputRole::System);
+        }
+        if update_state.should_refresh {
+            let tx = self.response_tx.clone();
+            let config = runtime_config.clone();
+            let previous_latest_version = update_state.known_latest_version;
+            self.rt_handle.spawn(async move {
+                if let Ok(outcome) = crate::update::refresh_update_status(
+                    &config,
+                    previous_latest_version.as_deref(),
+                )
+                .await
+                    && let Some(notice) = outcome.startup_notice
+                {
+                    let _ = tx.send(AgentResponse::BgOp(BackgroundOpResult::SystemMsg(notice)));
                 }
-            }
-        });
+            });
+        }
     }
 
     /// Push the goodbye message from the current skin into the output.
@@ -6318,7 +6199,8 @@ impl App {
                     self.needs_redraw = true;
                 }
                 KeyCode::Enter => {
-                    let arg = ["low", "medium", "high", "show", "hide"][self.reasoning_selector_cursor];
+                    let arg =
+                        ["low", "medium", "high", "show", "hide"][self.reasoning_selector_cursor];
                     self.reasoning_selector_active = false;
                     self.handle_set_reasoning(arg.to_string());
                     self.needs_redraw = true;
@@ -6349,12 +6231,17 @@ impl App {
                 KeyCode::Down | KeyCode::Tab => {
                     let n = self.personality_selector_entries.len();
                     if n > 0 {
-                        self.personality_selector_cursor = (self.personality_selector_cursor + 1) % n;
+                        self.personality_selector_cursor =
+                            (self.personality_selector_cursor + 1) % n;
                     }
                     self.needs_redraw = true;
                 }
                 KeyCode::Enter => {
-                    if let Some((name, _)) = self.personality_selector_entries.get(self.personality_selector_cursor).cloned() {
+                    if let Some((name, _)) = self
+                        .personality_selector_entries
+                        .get(self.personality_selector_cursor)
+                        .cloned()
+                    {
                         self.personality_selector_active = false;
                         self.handle_switch_personality(name);
                         self.needs_redraw = true;
@@ -6377,7 +6264,11 @@ impl App {
                     self.needs_redraw = true;
                 }
                 KeyCode::Enter => {
-                    let arg = if self.stream_selector_cursor == 0 { "on" } else { "off" };
+                    let arg = if self.stream_selector_cursor == 0 {
+                        "on"
+                    } else {
+                        "off"
+                    };
                     self.stream_selector_active = false;
                     self.handle_set_streaming(arg.to_string());
                     self.needs_redraw = true;
@@ -6399,7 +6290,11 @@ impl App {
                     self.needs_redraw = true;
                 }
                 KeyCode::Enter => {
-                    let arg = if self.statusbar_selector_cursor == 0 { "on" } else { "off" };
+                    let arg = if self.statusbar_selector_cursor == 0 {
+                        "on"
+                    } else {
+                        "off"
+                    };
                     self.statusbar_selector_active = false;
                     self.handle_status_bar_command(arg.to_string());
                     self.needs_redraw = true;
@@ -8158,14 +8053,12 @@ impl App {
             CommandResult::SetReasoning(level) => {
                 if level.trim().is_empty() {
                     // Open the TUI picker pre-selected to the current effort level.
-                    self.reasoning_selector_cursor = match self.reasoning_effort_hint
-                        .as_deref()
-                        .unwrap_or("medium")
-                    {
-                        "low"  => 0,
-                        "high" => 2,
-                        _      => 1, // "medium"
-                    };
+                    self.reasoning_selector_cursor =
+                        match self.reasoning_effort_hint.as_deref().unwrap_or("medium") {
+                            "low" => 0,
+                            "high" => 2,
+                            _ => 1, // "medium"
+                        };
                     self.reasoning_selector_active = true;
                     self.needs_redraw = true;
                 } else {
@@ -8206,10 +8099,8 @@ impl App {
                 // Open the TUI picker populated with all available personalities.
                 let entries = self.personality_arg_hints();
                 let cur = self.session_personality.as_deref().unwrap_or("clear");
-                self.personality_selector_cursor = entries
-                    .iter()
-                    .position(|(k, _)| k == cur)
-                    .unwrap_or(0);
+                self.personality_selector_cursor =
+                    entries.iter().position(|(k, _)| k == cur).unwrap_or(0);
                 self.personality_selector_entries = entries;
                 self.personality_selector_active = true;
                 self.needs_redraw = true;
@@ -8497,6 +8388,7 @@ impl App {
 
     fn handle_update_status(&mut self) {
         let tx = self.response_tx.clone();
+        let config = self.load_runtime_config();
         self.display_state = DisplayState::BgOp {
             label: "Checking update status…".into(),
             frame: 0,
@@ -8504,9 +8396,10 @@ impl App {
         };
         self.needs_redraw = true;
         self.rt_handle.spawn(async move {
-            let report = tokio::task::spawn_blocking(render_update_status_report)
-                .await
-                .unwrap_or_else(|err| format!("Update check failed: {err}"));
+            let report = match crate::update::resolve_update_status(&config, true).await {
+                Ok(status) => crate::update::render_update_report(&status),
+                Err(err) => format!("Update check failed: {err}"),
+            };
             let _ = tx.send(AgentResponse::BgOp(BackgroundOpResult::SystemMsg(report)));
         });
     }
@@ -19898,24 +19791,48 @@ impl App {
 
         // ── Modes metadata ───────────────────────────────────────
         const MODES: [(ToolProgressMode, &str, &str, &str); 4] = [
-            (ToolProgressMode::Off,     "OFF",     "⊘", "Silent — only the status bar shows active work."),
-            (ToolProgressMode::New,     "NEW",     "◑", "Show each distinct tool call once per turn."),
-            (ToolProgressMode::All,     "ALL",     "●", "Show every tool call in the transcript."),
-            (ToolProgressMode::Verbose, "VERBOSE", "◉", "Show every call + curated plan and result detail lines."),
+            (
+                ToolProgressMode::Off,
+                "OFF",
+                "⊘",
+                "Silent — only the status bar shows active work.",
+            ),
+            (
+                ToolProgressMode::New,
+                "NEW",
+                "◑",
+                "Show each distinct tool call once per turn.",
+            ),
+            (
+                ToolProgressMode::All,
+                "ALL",
+                "●",
+                "Show every tool call in the transcript.",
+            ),
+            (
+                ToolProgressMode::Verbose,
+                "VERBOSE",
+                "◉",
+                "Show every call + curated plan and result detail lines.",
+            ),
         ];
         let active_mode = self.tool_progress_mode;
         let cursor = self.verbose_selector_cursor;
 
         // ── Header block ─────────────────────────────────────────
-        let active_label = MODES.iter()
+        let active_label = MODES
+            .iter()
             .find(|(m, _, _, _)| *m == active_mode)
             .map(|(_, lbl, _, _)| *lbl)
             .unwrap_or("?");
         let header = Paragraph::new(Line::from(vec![
             Span::styled("  ◈  ", Style::default().fg(Color::Rgb(130, 210, 255))),
-            Span::styled("Tool Progress Display", Style::default()
-                .fg(Color::Rgb(200, 225, 255))
-                .add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "Tool Progress Display",
+                Style::default()
+                    .fg(Color::Rgb(200, 225, 255))
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw("  "),
             Span::styled(
                 format!("current: {active_label}"),
@@ -19931,47 +19848,52 @@ impl App {
         frame.render_widget(header, chunks[0]);
 
         // ── Mode list ────────────────────────────────────────────
-        let list_items: Vec<ListItem> = MODES.iter().enumerate().map(|(i, (mode, label, icon, _desc))| {
-            let is_cursor = i == cursor;
-            let is_active = *mode == active_mode;
-            let bg = if is_cursor { Color::Rgb(22, 38, 55) } else { Color::Rgb(15, 18, 24) };
+        let list_items: Vec<ListItem> = MODES
+            .iter()
+            .enumerate()
+            .map(|(i, (mode, label, icon, _desc))| {
+                let is_cursor = i == cursor;
+                let is_active = *mode == active_mode;
+                let bg = if is_cursor {
+                    Color::Rgb(22, 38, 55)
+                } else {
+                    Color::Rgb(15, 18, 24)
+                };
 
-            let marker = selector_marker(is_cursor, Color::Rgb(130, 210, 255), Some(bg));
+                let marker = selector_marker(is_cursor, Color::Rgb(130, 210, 255), Some(bg));
 
-            let active_badge = if is_active {
-                Span::styled(
-                    " ◉",
-                    Style::default().fg(Color::Rgb(100, 200, 130)),
-                )
-            } else {
-                Span::styled(
-                    " ○",
-                    Style::default().fg(Color::Rgb(55, 65, 80)),
-                )
-            };
+                let active_badge = if is_active {
+                    Span::styled(" ◉", Style::default().fg(Color::Rgb(100, 200, 130)))
+                } else {
+                    Span::styled(" ○", Style::default().fg(Color::Rgb(55, 65, 80)))
+                };
 
-            let icon_style = if is_cursor {
-                Style::default().bg(bg).fg(Color::Rgb(130, 210, 255))
-            } else if is_active {
-                Style::default().fg(Color::Rgb(100, 200, 130))
-            } else {
-                Style::default().fg(Color::Rgb(80, 95, 115))
-            };
-            let label_style = if is_cursor {
-                Style::default().bg(bg).fg(Color::Rgb(200, 225, 255)).add_modifier(Modifier::BOLD)
-            } else if is_active {
-                Style::default().fg(Color::Rgb(160, 210, 170))
-            } else {
-                Style::default().fg(Color::Rgb(155, 165, 185))
-            };
+                let icon_style = if is_cursor {
+                    Style::default().bg(bg).fg(Color::Rgb(130, 210, 255))
+                } else if is_active {
+                    Style::default().fg(Color::Rgb(100, 200, 130))
+                } else {
+                    Style::default().fg(Color::Rgb(80, 95, 115))
+                };
+                let label_style = if is_cursor {
+                    Style::default()
+                        .bg(bg)
+                        .fg(Color::Rgb(200, 225, 255))
+                        .add_modifier(Modifier::BOLD)
+                } else if is_active {
+                    Style::default().fg(Color::Rgb(160, 210, 170))
+                } else {
+                    Style::default().fg(Color::Rgb(155, 165, 185))
+                };
 
-            ListItem::new(Line::from(vec![
-                marker,
-                active_badge,
-                Span::styled(format!("  {icon} "), icon_style),
-                Span::styled(unicode_pad_right(label, 9), label_style),
-            ]))
-        }).collect();
+                ListItem::new(Line::from(vec![
+                    marker,
+                    active_badge,
+                    Span::styled(format!("  {icon} "), icon_style),
+                    Span::styled(unicode_pad_right(label, 9), label_style),
+                ]))
+            })
+            .collect();
 
         let list = List::new(list_items).style(Style::default().bg(Color::Rgb(15, 18, 24)));
         frame.render_widget(list, body[0]);
@@ -19990,10 +19912,7 @@ impl App {
                     .add_modifier(Modifier::BOLD),
             ),
             if is_active_cursor {
-                Span::styled(
-                    "  ◉ active",
-                    Style::default().fg(Color::Rgb(100, 200, 130)),
-                )
+                Span::styled("  ◉ active", Style::default().fg(Color::Rgb(100, 200, 130)))
             } else {
                 Span::raw("")
             },
@@ -20031,7 +19950,10 @@ impl App {
         frame.render_widget(detail, body[1]);
 
         // ── Help bar ─────────────────────────────────────────────
-        frame.render_widget(Paragraph::new(picker_help_line(Color::Rgb(130, 210, 255))), chunks[2]);
+        frame.render_widget(
+            Paragraph::new(picker_help_line(Color::Rgb(130, 210, 255))),
+            chunks[2],
+        );
     }
 
     /// Render the reasoning settings picker overlay.
@@ -20044,23 +19966,40 @@ impl App {
         let body = picker_two_cols(chunks[1], 42);
 
         const ENTRIES: [(&str, &str, &str, &str); 5] = [
-            ("low",    "LOW",    "◌", "Faster & cheaper. Less analytic depth."),
+            ("low", "LOW", "◌", "Faster & cheaper. Less analytic depth."),
             ("medium", "MEDIUM", "◎", "Balanced — good for most tasks."),
-            ("high",   "HIGH",   "●", "Deeper reasoning. Slower, more tokens."),
-            ("show",   "SHOW",   "o", "Reveal the reasoning trace above answers."),
-            ("hide",   "HIDE",   "x", "Keep the reasoning trace hidden."),
+            (
+                "high",
+                "HIGH",
+                "●",
+                "Deeper reasoning. Slower, more tokens.",
+            ),
+            (
+                "show",
+                "SHOW",
+                "o",
+                "Reveal the reasoning trace above answers.",
+            ),
+            ("hide", "HIDE", "x", "Keep the reasoning trace hidden."),
         ];
 
         let accent = Color::Rgb(130, 210, 255);
         let cursor = self.reasoning_selector_cursor;
         let cur_effort = self.reasoning_effort_hint.as_deref().unwrap_or("medium");
-        let cur_vis = if self.show_reasoning { "shown" } else { "hidden" };
+        let cur_vis = if self.show_reasoning {
+            "shown"
+        } else {
+            "hidden"
+        };
 
         let header = Paragraph::new(Line::from(vec![
             Span::styled("  ◈  ", Style::default().fg(accent)),
-            Span::styled("Reasoning Settings", Style::default()
-                .fg(Color::Rgb(200, 225, 255))
-                .add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "Reasoning Settings",
+                Style::default()
+                    .fg(Color::Rgb(200, 225, 255))
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw("  "),
             Span::styled(
                 format!("effort: {}  trace: {}", cur_effort.to_uppercase(), cur_vis),
@@ -20076,16 +20015,31 @@ impl App {
         frame.render_widget(header, chunks[0]);
 
         // ── List panel ───────────────────────────────────────────
-        let items: Vec<ListItem> = ENTRIES.iter().enumerate().map(|(i, (_, label, icon, _))| {
-            let is_cursor = i == cursor;
-            let bg = if is_cursor { Color::Rgb(40, 60, 80) } else { Color::Reset };
-            let fg = if is_cursor { Color::White } else { Color::Rgb(180, 200, 220) };
-            ListItem::new(Line::from(vec![
-                selector_marker(is_cursor, accent, Some(bg)),
-                Span::styled(format!(" {icon} "), Style::default().fg(accent).bg(bg)),
-                Span::styled(format!("{label:<8}", label = *label), Style::default().fg(fg).bg(bg)),
-            ]))
-        }).collect();
+        let items: Vec<ListItem> = ENTRIES
+            .iter()
+            .enumerate()
+            .map(|(i, (_, label, icon, _))| {
+                let is_cursor = i == cursor;
+                let bg = if is_cursor {
+                    Color::Rgb(40, 60, 80)
+                } else {
+                    Color::Reset
+                };
+                let fg = if is_cursor {
+                    Color::White
+                } else {
+                    Color::Rgb(180, 200, 220)
+                };
+                ListItem::new(Line::from(vec![
+                    selector_marker(is_cursor, accent, Some(bg)),
+                    Span::styled(format!(" {icon} "), Style::default().fg(accent).bg(bg)),
+                    Span::styled(
+                        format!("{label:<8}", label = *label),
+                        Style::default().fg(fg).bg(bg),
+                    ),
+                ]))
+            })
+            .collect();
         let list = List::new(items).block(Block::default().borders(Borders::LEFT | Borders::RIGHT));
         frame.render_widget(list, body[0]);
 
@@ -20100,12 +20054,18 @@ impl App {
             _ => false,
         };
         let _ = key; // used via cursor index
-        let action_hint = if current_active { "Already active" } else { "Press Enter to apply" };
+        let action_hint = if current_active {
+            "Already active"
+        } else {
+            "Press Enter to apply"
+        };
         let detail = Paragraph::new(vec![
             Line::from(""),
             Line::from(Span::styled(
                 format!("  {icon} {label}"),
-                Style::default().fg(Color::Rgb(200, 225, 255)).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Rgb(200, 225, 255))
+                    .add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
             Line::from(Span::styled(
@@ -20122,7 +20082,11 @@ impl App {
                 }),
             )),
         ])
-        .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Rgb(60, 90, 120))));
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Rgb(60, 90, 120))),
+        );
         frame.render_widget(detail, body[1]);
 
         // ── Help bar ─────────────────────────────────────────────
@@ -20147,9 +20111,12 @@ impl App {
         // ── Header ───────────────────────────────────────────────
         let header = Paragraph::new(Line::from(vec![
             Span::styled("  ◈  ", Style::default().fg(accent)),
-            Span::styled("Personality", Style::default()
-                .fg(Color::Rgb(225, 200, 255))
-                .add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "Personality",
+                Style::default()
+                    .fg(Color::Rgb(225, 200, 255))
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw("  "),
             Span::styled(
                 format!("active: {cur_personality}"),
@@ -20173,7 +20140,8 @@ impl App {
             0
         };
         let name_w = body[0].width.saturating_sub(6) as usize;
-        let items: Vec<ListItem> = entries.iter()
+        let items: Vec<ListItem> = entries
+            .iter()
             .enumerate()
             .skip(scroll_start)
             .take(list_height)
@@ -20181,8 +20149,16 @@ impl App {
                 let is_cursor = i == cursor;
                 let is_active = name == "clear" && self.session_personality.is_none()
                     || self.session_personality.as_deref() == Some(name.as_str());
-                let bg = if is_cursor { Color::Rgb(60, 30, 80) } else { Color::Reset };
-                let fg = if is_cursor { Color::White } else { Color::Rgb(200, 170, 230) };
+                let bg = if is_cursor {
+                    Color::Rgb(60, 30, 80)
+                } else {
+                    Color::Reset
+                };
+                let fg = if is_cursor {
+                    Color::White
+                } else {
+                    Color::Rgb(200, 170, 230)
+                };
                 let badge_fg = Color::Rgb(100, 200, 100);
                 let name_cell = unicode_trunc(name, name_w.max(1));
                 let badge = if is_active { " ✓" } else { "" };
@@ -20200,13 +20176,19 @@ impl App {
         if let Some((name, preview)) = entries.get(cursor) {
             let is_active = (name == "clear" && self.session_personality.is_none())
                 || self.session_personality.as_deref() == Some(name.as_str());
-            let action_hint = if is_active { "Already active" } else { "Press Enter to apply" };
+            let action_hint = if is_active {
+                "Already active"
+            } else {
+                "Press Enter to apply"
+            };
             let preview_short = edgecrab_core::safe_truncate(preview, 240);
             let detail = Paragraph::new(vec![
                 Line::from(""),
                 Line::from(Span::styled(
                     format!("  {name}"),
-                    Style::default().fg(Color::Rgb(225, 200, 255)).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Rgb(225, 200, 255))
+                        .add_modifier(Modifier::BOLD),
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
@@ -20224,7 +20206,11 @@ impl App {
                 )),
             ])
             .wrap(ratatui::widgets::Wrap { trim: true })
-            .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Rgb(90, 60, 120))));
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Rgb(90, 60, 120))),
+            );
             frame.render_widget(detail, body[1]);
         }
 
@@ -20240,7 +20226,7 @@ impl App {
         let body = picker_two_cols(chunks[1], 38);
 
         const ENTRIES: [(&str, &str, &str); 2] = [
-            ("on",  "ON",  "Tokens stream live as they are generated."),
+            ("on", "ON", "Tokens stream live as they are generated."),
             ("off", "OFF", "Replies appear as one complete message."),
         ];
 
@@ -20250,9 +20236,12 @@ impl App {
 
         let header = Paragraph::new(Line::from(vec![
             Span::styled("  ◈  ", Style::default().fg(accent)),
-            Span::styled("Token Streaming", Style::default()
-                .fg(Color::Rgb(255, 235, 160))
-                .add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "Token Streaming",
+                Style::default()
+                    .fg(Color::Rgb(255, 235, 160))
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw("  "),
             Span::styled(
                 format!("current: {cur_label}"),
@@ -20267,29 +20256,53 @@ impl App {
         );
         frame.render_widget(header, chunks[0]);
 
-        let items: Vec<ListItem> = ENTRIES.iter().enumerate().map(|(i, (key, label, _))| {
-            let is_cursor = i == cursor;
-            let is_active = *key == cur_label;
-            let bg = if is_cursor { Color::Rgb(70, 55, 20) } else { Color::Reset };
-            let fg = if is_cursor { Color::White } else { Color::Rgb(230, 200, 140) };
-            let badge_fg = Color::Rgb(100, 200, 100);
-            ListItem::new(Line::from(vec![
-                selector_marker(is_cursor, accent, Some(bg)),
-                Span::styled(format!("  {label:<5}", label = *label), Style::default().fg(fg).bg(bg)),
-                Span::styled(if is_active { " ✓" } else { "" }, Style::default().fg(badge_fg).bg(bg)),
-            ]))
-        }).collect();
+        let items: Vec<ListItem> = ENTRIES
+            .iter()
+            .enumerate()
+            .map(|(i, (key, label, _))| {
+                let is_cursor = i == cursor;
+                let is_active = *key == cur_label;
+                let bg = if is_cursor {
+                    Color::Rgb(70, 55, 20)
+                } else {
+                    Color::Reset
+                };
+                let fg = if is_cursor {
+                    Color::White
+                } else {
+                    Color::Rgb(230, 200, 140)
+                };
+                let badge_fg = Color::Rgb(100, 200, 100);
+                ListItem::new(Line::from(vec![
+                    selector_marker(is_cursor, accent, Some(bg)),
+                    Span::styled(
+                        format!("  {label:<5}", label = *label),
+                        Style::default().fg(fg).bg(bg),
+                    ),
+                    Span::styled(
+                        if is_active { " ✓" } else { "" },
+                        Style::default().fg(badge_fg).bg(bg),
+                    ),
+                ]))
+            })
+            .collect();
         let list = List::new(items).block(Block::default().borders(Borders::LEFT | Borders::RIGHT));
         frame.render_widget(list, body[0]);
 
         let (key, label, desc) = ENTRIES[cursor];
         let is_active_cur = key == cur_label;
-        let action_hint = if is_active_cur { "Already active" } else { "Press Enter to switch" };
+        let action_hint = if is_active_cur {
+            "Already active"
+        } else {
+            "Press Enter to switch"
+        };
         let detail = Paragraph::new(vec![
             Line::from(""),
             Line::from(Span::styled(
                 format!("  {label}"),
-                Style::default().fg(Color::Rgb(255, 235, 160)).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Rgb(255, 235, 160))
+                    .add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
             Line::from(Span::styled(
@@ -20306,7 +20319,11 @@ impl App {
                 }),
             )),
         ])
-        .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Rgb(100, 80, 30))));
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Rgb(100, 80, 30))),
+        );
         frame.render_widget(detail, body[1]);
 
         frame.render_widget(Paragraph::new(picker_help_line(accent)), chunks[2]);
@@ -20320,19 +20337,34 @@ impl App {
         let body = picker_two_cols(chunks[1], 38);
 
         const ENTRIES: [(&str, &str, &str); 2] = [
-            ("visible", "Visible", "Shows model, context pressure, and metrics."),
-            ("hidden",  "Hidden",  "Clean mode — full height for conversation."),
+            (
+                "visible",
+                "Visible",
+                "Shows model, context pressure, and metrics.",
+            ),
+            (
+                "hidden",
+                "Hidden",
+                "Clean mode — full height for conversation.",
+            ),
         ];
 
         let accent = Color::Rgb(120, 200, 200);
         let cursor = self.statusbar_selector_cursor;
-        let cur_label = if self.show_status_bar { "visible" } else { "hidden" };
+        let cur_label = if self.show_status_bar {
+            "visible"
+        } else {
+            "hidden"
+        };
 
         let header = Paragraph::new(Line::from(vec![
             Span::styled("  ◈  ", Style::default().fg(accent)),
-            Span::styled("Status Bar", Style::default()
-                .fg(Color::Rgb(180, 230, 230))
-                .add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "Status Bar",
+                Style::default()
+                    .fg(Color::Rgb(180, 230, 230))
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw("  "),
             Span::styled(
                 format!("current: {cur_label}"),
@@ -20347,29 +20379,50 @@ impl App {
         );
         frame.render_widget(header, chunks[0]);
 
-        let items: Vec<ListItem> = ENTRIES.iter().enumerate().map(|(i, (key, label, _))| {
-            let is_cursor = i == cursor;
-            let is_active = *key == cur_label;
-            let bg = if is_cursor { Color::Rgb(20, 60, 60) } else { Color::Reset };
-            let fg = if is_cursor { Color::White } else { Color::Rgb(160, 210, 210) };
-            let badge_fg = Color::Rgb(100, 200, 100);
-            ListItem::new(Line::from(vec![
-                selector_marker(is_cursor, accent, Some(bg)),
-                Span::styled(format!("  {label}"), Style::default().fg(fg).bg(bg)),
-                Span::styled(if is_active { " ✓" } else { "" }, Style::default().fg(badge_fg).bg(bg)),
-            ]))
-        }).collect();
+        let items: Vec<ListItem> = ENTRIES
+            .iter()
+            .enumerate()
+            .map(|(i, (key, label, _))| {
+                let is_cursor = i == cursor;
+                let is_active = *key == cur_label;
+                let bg = if is_cursor {
+                    Color::Rgb(20, 60, 60)
+                } else {
+                    Color::Reset
+                };
+                let fg = if is_cursor {
+                    Color::White
+                } else {
+                    Color::Rgb(160, 210, 210)
+                };
+                let badge_fg = Color::Rgb(100, 200, 100);
+                ListItem::new(Line::from(vec![
+                    selector_marker(is_cursor, accent, Some(bg)),
+                    Span::styled(format!("  {label}"), Style::default().fg(fg).bg(bg)),
+                    Span::styled(
+                        if is_active { " ✓" } else { "" },
+                        Style::default().fg(badge_fg).bg(bg),
+                    ),
+                ]))
+            })
+            .collect();
         let list = List::new(items).block(Block::default().borders(Borders::LEFT | Borders::RIGHT));
         frame.render_widget(list, body[0]);
 
         let (key, label, desc) = ENTRIES[cursor];
         let is_active_cur = key == cur_label;
-        let action_hint = if is_active_cur { "Already active" } else { "Press Enter to switch" };
+        let action_hint = if is_active_cur {
+            "Already active"
+        } else {
+            "Press Enter to switch"
+        };
         let detail = Paragraph::new(vec![
             Line::from(""),
             Line::from(Span::styled(
                 format!("  {label}"),
-                Style::default().fg(Color::Rgb(180, 230, 230)).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Rgb(180, 230, 230))
+                    .add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
             Line::from(Span::styled(
@@ -20386,7 +20439,11 @@ impl App {
                 }),
             )),
         ])
-        .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Rgb(50, 110, 110))));
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Rgb(50, 110, 110))),
+        );
         frame.render_widget(detail, body[1]);
 
         frame.render_widget(Paragraph::new(picker_help_line(accent)), chunks[2]);

@@ -114,6 +114,12 @@ jobs:
       - name: List downloaded assets
         run: ls -lh release-assets/
 
+      - name: Generate checksums manifest
+        run: |
+          cd release-assets
+          shasum -a 256 * > edgecrab-checksums.txt
+          cat edgecrab-checksums.txt
+
       - name: Resolve tag name
         id: tag
         env:

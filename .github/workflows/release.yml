@@ -52,30 +52,8 @@ jobs:
         id: bump
         run: |
           VERSION="${{ inputs.version }}"
-
-          # ── Rust workspace ───────────────────────────────────────────────────
-          sed -i "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
-
-          # ── npm CLI wrapper ──────────────────────────────────────────────────
-          # package.json  (jq-free: sed on the "version" line)
-          sed -i "s/\"version\": \".*\"/\"version\": \"$VERSION\"/" \
-            sdks/npm-cli/package.json
-          # install.js BINARY_VERSION
-          sed -i "s/const BINARY_VERSION = '[^']*'/const BINARY_VERSION = '$VERSION'/" \
-            sdks/npm-cli/scripts/install.js
-
-          # ── PyPI CLI wrapper ─────────────────────────────────────────────────
-          sed -i "s/^version = \".*\"/version = \"$VERSION\"/" \
-            sdks/pypi-cli/pyproject.toml
-          printf '__version__ = "%s"\n' "$VERSION" > \
-            sdks/pypi-cli/edgecrab_cli/_version.py
-          # _binary.py BINARY_VERSION
-          sed -i "s/^BINARY_VERSION = \".*\"/BINARY_VERSION = \"$VERSION\"/" \
-            sdks/pypi-cli/edgecrab_cli/_binary.py
-
-          # ── Python SDK ───────────────────────────────────────────────────────
-          sed -i "s/^version = \".*\"/version = \"$VERSION\"/" \
-            sdks/python/pyproject.toml
+          ./scripts/release-version.sh set "$VERSION"
+          ./scripts/release-version.sh check
 
           # ── Summary ─────────────────────────────────────────────────────────
           echo "=== Changed files ==="
@@ -93,11 +71,9 @@ jobs:
 
           git add \
             Cargo.toml \
+            sdks/node/package.json \
             sdks/npm-cli/package.json \
-            sdks/npm-cli/scripts/install.js \
-            sdks/pypi-cli/pyproject.toml \
             sdks/pypi-cli/edgecrab_cli/_version.py \
-            sdks/pypi-cli/edgecrab_cli/_binary.py \
             sdks/python/pyproject.toml
 
           git commit -m "chore: bump version to $VERSION"
