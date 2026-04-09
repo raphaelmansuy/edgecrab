@@ -40,9 +40,22 @@ make version-bump VERSION=0.2.0
 git add -A && git commit -m "chore: bump version to 0.2.0" && git push
 ```
 
-This updates `Cargo.toml`, `sdks/node/package.json`, `sdks/npm-cli/package.json`,
-`sdks/python/pyproject.toml`, `sdks/pypi-cli/pyproject.toml`, and
+This updates the canonical workspace version in `Cargo.toml` and then syncs
+the derived package versions in `sdks/node/package.json`,
+`sdks/npm-cli/package.json`, `sdks/python/pyproject.toml`, and
 `sdks/pypi-cli/edgecrab_cli/_version.py`.
+
+First principle: every release channel should derive from the smallest possible
+set of version-bearing files.
+
+- canonical release authority: `Cargo.toml` `[workspace.package].version`
+- sync command: `./scripts/release-version.sh set <version>`
+- CI guardrail: `./scripts/release-version.sh check`
+
+- Node SDK package version derives from `sdks/node/package.json`
+- npm CLI wrapper binary tag derives from `sdks/npm-cli/package.json`
+- PyPI CLI wrapper package version and binary tag derive from `sdks/pypi-cli/edgecrab_cli/_version.py`
+- generated build output does not participate in release bookkeeping
 
 ### Step 3 — Tag → CI publishes everything
 
@@ -80,6 +93,7 @@ npm view edgecrab-cli version       # must show 0.2.0
 pip index versions edgecrab-sdk     # must include 0.2.0
 pip index versions edgecrab-cli     # must include 0.2.0
 docker pull ghcr.io/raphaelmansuy/edgecrab:0.2.0
+gh release download v0.2.0 --pattern edgecrab-checksums.txt --repo raphaelmansuy/edgecrab
 curl -I https://www.edgecrab.com    # HTTP 200
 ```
 
@@ -269,7 +283,7 @@ edgecrab-types → edgecrab-security → edgecrab-state → edgecrab-cron
 ## Versioning policy
 
 All 10 Rust crates, both SDKs, and both CLI wrappers share the **same version number** always.
-Use `make version-bump VERSION=x.y.z` to keep them in sync.
+Use `make version-bump VERSION=x.y.z` or `./scripts/release-version.sh set x.y.z` to keep them in sync.
 
 | Change | Bump | Example |
 |---|---|---|

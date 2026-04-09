@@ -35,10 +35,10 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Publishing edgecrab-sdk==$VERSION"
 
-      - name: Sync pyproject.toml version
+      - name: Sync release version
         run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          sed -i "s/^version = \".*\"/version = \"$VERSION\"/" sdks/python/pyproject.toml
+          ./scripts/release-version.sh set "${{ steps.version.outputs.version }}"
+          ./scripts/release-version.sh check
 
       - run: pip install --upgrade build
 

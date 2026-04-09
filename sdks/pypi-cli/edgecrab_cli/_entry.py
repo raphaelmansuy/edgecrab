@@ -8,13 +8,23 @@ import sys
 
 def main() -> None:
     """Resolve the native binary and exec it with all CLI arguments."""
-    from edgecrab_cli._binary import resolve
+    os.environ["EDGECRAB_INSTALL_METHOD"] = "pypi"
+    from edgecrab_cli._binary import BINARY_VERSION, resolve
+    from edgecrab_cli._version import __version__
 
     try:
         binary = resolve()
     except RuntimeError as exc:
         print(f"[edgecrab-cli] {exc}", file=sys.stderr)
         sys.exit(1)
+
+    os.environ["EDGECRAB_WRAPPER_VERSION"] = __version__
+    os.environ["EDGECRAB_BINARY_VERSION"] = BINARY_VERSION
+    os.environ["EDGECRAB_PYTHON_EXECUTABLE"] = sys.executable
+    if "pipx" in sys.executable.lower() or os.environ.get("PIPX_HOME"):
+        os.environ["EDGECRAB_PYPI_INSTALLER"] = "pipx"
+    else:
+        os.environ["EDGECRAB_PYPI_INSTALLER"] = "pip"
 
     # Replace the current process with the native binary (Unix) or spawn it (Windows).
     args = [str(binary)] + sys.argv[1:]

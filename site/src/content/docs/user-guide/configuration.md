@@ -378,6 +378,8 @@ display:
   tool_progress: verbose       # off | new | all | verbose (default: verbose)
   show_cost: true              # show cost in status bar
   show_status_bar: true        # show the bottom status bar
+  check_for_updates: true      # show startup notice when a newer release exists
+  update_check_interval_hours: 24  # refresh cadence for background update checks
   skin: "default"              # skin name from ~/.edgecrab/skin.yaml
 ```
 

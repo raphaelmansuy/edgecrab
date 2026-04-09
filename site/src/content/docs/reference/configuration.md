@@ -223,6 +223,8 @@ display:
   tool_progress: verbose     # off | new | all | verbose (default: verbose)
   show_cost: true
   show_status_bar: true
+  check_for_updates: true
+  update_check_interval_hours: 24
   skin: "default"
 
 # ── Privacy ────────────────────────────────────────────────────────────
@@ -340,6 +342,8 @@ When `enabled_toolsets` includes `core` or `coding`, the `lsp` toolset is also e
 | `display.compact` | bool | `false` | — |
 | `display.streaming` | bool | `true` | — |
 | `display.show_reasoning` | bool | `false` | — |
+| `display.check_for_updates` | bool | `true` | — |
+| `display.update_check_interval_hours` | integer | `24` | — |
 | `display.skin` | string | `default` | — |
 | `tts.provider` | string | `edge-tts` | `EDGECRAB_TTS_PROVIDER` |
 | `tts.voice` | string | `en-US-AriaNeural` | `EDGECRAB_TTS_VOICE` |

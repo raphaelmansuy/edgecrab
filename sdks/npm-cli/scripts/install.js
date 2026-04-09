@@ -21,9 +21,10 @@ const { execSync } = require('node:child_process');
 const { createGunzip } = require('node:zlib');
 
 // ─── Config ──────────────────────────────────────────────────────────────────
-// BINARY_VERSION controls which GitHub Release tag is used to download binaries.
-// Decoupled from the package version so the wrapper can be patched independently.
-const BINARY_VERSION = '0.1.3';
+// First principle: the wrapper package version is the binary release version.
+// Release automation must change package.json only; every runtime consumer
+// derives the binary tag from that single value.
+const BINARY_VERSION = require('../package.json').version;
 const REPO    = 'raphaelmansuy/edgecrab';
 const BINARY  = process.platform === 'win32' ? 'edgecrab.exe' : 'edgecrab';
 const BIN_DIR = path.join(__dirname, '..', 'bin');

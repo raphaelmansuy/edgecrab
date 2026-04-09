@@ -44,35 +44,7 @@ fi
 
 echo "==> Bumping all versions to $VERSION"
 
-# ── Rust workspace ─────────────────────────────────────────────────────────────
-sed -i.bak "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
-rm -f Cargo.toml.bak
-
-# ── npm CLI wrapper ────────────────────────────────────────────────────────────
-sed -i.bak "s/\"version\": \".*\"/\"version\": \"$VERSION\"/" \
-  sdks/npm-cli/package.json
-rm -f sdks/npm-cli/package.json.bak
-
-sed -i.bak "s/const BINARY_VERSION = '[^']*'/const BINARY_VERSION = '$VERSION'/" \
-  sdks/npm-cli/scripts/install.js
-rm -f sdks/npm-cli/scripts/install.js.bak
-
-# ── PyPI CLI wrapper ───────────────────────────────────────────────────────────
-sed -i.bak "s/^version = \".*\"/version = \"$VERSION\"/" \
-  sdks/pypi-cli/pyproject.toml
-rm -f sdks/pypi-cli/pyproject.toml.bak
-
-printf '__version__ = "%s"\n' "$VERSION" > \
-  sdks/pypi-cli/edgecrab_cli/_version.py
-
-sed -i.bak "s/^BINARY_VERSION = \".*\"/BINARY_VERSION = \"$VERSION\"/" \
-  sdks/pypi-cli/edgecrab_cli/_binary.py
-rm -f sdks/pypi-cli/edgecrab_cli/_binary.py.bak
-
-# ── Python SDK ─────────────────────────────────────────────────────────────────
-sed -i.bak "s/^version = \".*\"/version = \"$VERSION\"/" \
-  sdks/python/pyproject.toml
-rm -f sdks/python/pyproject.toml.bak
+./scripts/release-version.sh set "$VERSION"
 
 # ── Summary ────────────────────────────────────────────────────────────────────
 echo ""
@@ -92,11 +64,9 @@ echo "==> Creating commit and tag v$VERSION"
 
 git add \
   Cargo.toml \
+  sdks/node/package.json \
   sdks/npm-cli/package.json \
-  sdks/npm-cli/scripts/install.js \
-  sdks/pypi-cli/pyproject.toml \
   sdks/pypi-cli/edgecrab_cli/_version.py \
-  sdks/pypi-cli/edgecrab_cli/_binary.py \
   sdks/python/pyproject.toml
 
 git commit -m "chore: bump version to $VERSION"

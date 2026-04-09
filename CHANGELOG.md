@@ -7,6 +7,24 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Channel-aware `edgecrab update`** — EdgeCrab now detects whether it was installed via npm, PyPI/pipx, cargo, Homebrew, source checkout, or manual binary, then applies the correct upgrade path or prints safe guidance for non-package-managed installs.
+- **Non-blocking release notices** — the TUI now surfaces cached or background-fetched release notices without blocking startup, and CLI subcommands can show cached upgrade hints when a newer release exists.
+- **ADR/spec set for updates** — new documents under `specs/update_command/` define the updater architecture, edge cases, roadblocks, and verification matrix.
+
+### Changed
+
+- **Version derivation is more centralized** — the npm CLI wrapper now derives its binary release tag from `sdks/npm-cli/package.json`, and the PyPI CLI wrapper now derives both package metadata and binary release tag from `sdks/pypi-cli/edgecrab_cli/_version.py`.
+- **Workspace version is now the single release authority** — `Cargo.toml` `[workspace.package].version` is the canonical release version, `scripts/release-version.sh` syncs the Node SDK, npm CLI wrapper, PyPI CLI wrapper, and Python SDK from it, and CI now rejects drift before release automation can publish mismatched artifacts.
+- **Generated PyPI build artifacts removed from source control** — `sdks/pypi-cli/build/lib/...` no longer participates in releases, reducing duplicate version-bearing files and eliminating stale generated metadata from the repo.
+- **Release binaries now publish checksums** — `release-binaries.yml` uploads an `edgecrab-checksums.txt` manifest alongside binary archives to simplify Homebrew tap updates and manual verification.
+
+### Fixed
+
+- **Wrapper/binary release drift** — the npm and PyPI CLI wrappers no longer depend on separately-maintained binary-version constants that could fall out of sync with the published wrapper version.
+- **Cross-channel version drift** — release automation and CI now catch mismatches like stale wrapper package versions before npm/PyPI releases can diverge from the Rust workspace release.
+
 ---
 
 ## [0.1.4] — 2026-04-09

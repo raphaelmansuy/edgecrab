@@ -43,8 +43,8 @@ RESET  := \033[0m
 # ── Paths ──────────────────────────────────────────────────────────────────────
 BINARY := target/release/edgecrab
 
-# ── Version (read from workspace Cargo.toml) ──────────────────────────────────
-VERSION := $(shell grep '^version' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+# ── Version (read from the canonical release-version helper) ──────────────────
+VERSION := $(shell ./scripts/release-version.sh print)
 
 # ── Helper macros ──────────────────────────────────────────────────────────────
 define log
@@ -281,22 +281,13 @@ publish-local: publish-python-local publish-node-local publish-npm-cli-local pub
 
 # ── Version bump ──────────────────────────────────────────────────────────────
 
-# Bump the version number consistently across every manifest.
+# Bump the canonical release version and sync every derived manifest.
 # Usage: make version-bump VERSION=0.2.0
 version-bump: ## Bump version in all manifests. Usage: make version-bump VERSION=0.2.0
 	@[ -n "$(VERSION)" ] || (printf "$(RED)ERROR: VERSION is required. Example: make version-bump VERSION=0.2.0$(RESET)\n"; exit 1)
-	$(call log,Bumping version to $(VERSION) in all manifests ...)
-	@# Workspace Cargo.toml (workspace.package.version)
-	@sed -i.bak 's/^version = "[^"]*"/version = "$(VERSION)"/' Cargo.toml && rm -f Cargo.toml.bak
-	@# Node.js SDK
-	@cd sdks/node   && npm version "$(VERSION)" --no-git-tag-version --allow-same-version --silent
-	@# npm CLI wrapper
-	@cd sdks/npm-cli && npm version "$(VERSION)" --no-git-tag-version --allow-same-version --silent
-	@# Python SDK
-	@cd sdks/python  && sed -i.bak 's/^version = "[^"]*"/version = "$(VERSION)"/' pyproject.toml && rm -f pyproject.toml.bak
-	@# PyPI CLI wrapper
-	@cd sdks/pypi-cli && sed -i.bak 's/^version = "[^"]*"/version = "$(VERSION)"/' pyproject.toml && rm -f pyproject.toml.bak
-	@printf '__version__ = "%s"\n' "$(VERSION)" > sdks/pypi-cli/edgecrab_cli/_version.py
+	$(call log,Setting canonical release version to $(VERSION) ...)
+	@./scripts/release-version.sh set "$(VERSION)"
+	@./scripts/release-version.sh check
 	$(call ok,Version bumped to $(VERSION))
 	@printf "$(DIM)  Next: git add -A && git commit -m 'chore: bump version to $(VERSION)' && make tag-release VERSION=$(VERSION)$(RESET)\n"
 

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "edgecrab-cli"
-version = "0.1.4"
+dynamic = ["version"]
 requires-python = ">=3.10"
 readme = "README.md"
 license = { text = "MIT" }
@@ -43,6 +43,9 @@ edgecrab = "edgecrab_cli._entry:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["edgecrab_cli*"]
+
+[tool.setuptools.dynamic]
+version = { attr = "edgecrab_cli._version.__version__" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

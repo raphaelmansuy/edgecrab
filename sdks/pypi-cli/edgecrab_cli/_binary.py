@@ -22,10 +22,9 @@ import httpx
 from edgecrab_cli._version import __version__
 
 REPO = "raphaelmansuy/edgecrab"
-# BINARY_VERSION controls which GitHub Release tag is used for binary downloads.
-# It is intentionally decoupled from __version__ so the package can be patched
-# independently of binary releases.
-BINARY_VERSION = "0.1.3"
+# First principle: the wrapper package version is the binary release version.
+# Release automation changes edgecrab_cli._version.__version__ only.
+BINARY_VERSION = __version__
 
 # ── Platform → asset name mapping ────────────────────────────────────────────
 _PLATFORM_MAP: dict[tuple[str, str], str] = {
