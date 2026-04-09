@@ -34,6 +34,13 @@ plugins:
 
 Plugin disable state is persistent. Disabled plugins stay installed on disk but are excluded from prompt injection and tool dispatch.
 
+## Security and Hub
+
+- Installs are staged in `~/.edgecrab/plugins/.quarantine/`
+- Every install is statically scanned before activation
+- Install and remove events are appended to `~/.edgecrab/plugins/.hub/audit.log`
+- `edgecrab plugins hub-search <query>` searches curated and configured plugin indices
+
 ## CLI
 
 ```bash
@@ -43,6 +50,10 @@ edgecrab plugins status
 edgecrab plugins enable github-tools
 edgecrab plugins disable github-tools
 edgecrab plugins toggle github-tools
-edgecrab plugins install owner/repo
+edgecrab plugins install github:edgecrab/plugins/github-tools
+edgecrab plugins install ./plugins/github-tools
+edgecrab plugins audit --lines 20
+edgecrab plugins hub-search github
+edgecrab plugins hub-refresh
 edgecrab plugins remove github-tools
 ```

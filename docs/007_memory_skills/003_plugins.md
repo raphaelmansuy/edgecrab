@@ -31,8 +31,12 @@ edgecrab plugins status
 edgecrab plugins enable <name>
 edgecrab plugins disable <name>
 edgecrab plugins toggle <name>
-edgecrab plugins install <repo>
+edgecrab plugins install github:owner/repo/path
+edgecrab plugins install ./local-plugin
+edgecrab plugins audit --lines 20
+edgecrab plugins hub-search github
+edgecrab plugins hub-refresh
 edgecrab plugins remove <name>
 ```
 
-Disabling a plugin hides it from prompt injection or tool exposure without deleting its files.
+Plugin installs now flow through quarantine, a static security scan, and an audit log at `~/.edgecrab/plugins/.hub/audit.log`. Disabling a plugin hides it from prompt injection or tool exposure without deleting its files.

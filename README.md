@@ -492,10 +492,14 @@ Plugins extend EdgeCrab beyond the built-in tool inventory without forking the r
 edgecrab plugins list
 edgecrab plugins info github-tools
 edgecrab plugins status
-edgecrab plugins install owner/repo
+edgecrab plugins install github:edgecrab/plugins/github-tools
+edgecrab plugins install ./plugins/github-tools
 edgecrab plugins enable github-tools
 edgecrab plugins disable github-tools
 edgecrab plugins toggle github-tools
+edgecrab plugins audit --lines 20
+edgecrab plugins hub-search github
+edgecrab plugins update
 edgecrab plugins remove github-tools
 ```
 
@@ -818,10 +822,14 @@ edgecrab mcp remove <name>
 
 # Plugins
 edgecrab plugins list
-edgecrab plugins install <path>
+edgecrab plugins info <name>
 edgecrab plugins status
+edgecrab plugins install <source>
+edgecrab plugins audit [--lines 20]
+edgecrab plugins hub-search <query>
+edgecrab plugins hub-refresh
 edgecrab plugins toggle <name>
-edgecrab plugins update <name>
+edgecrab plugins update [name]
 edgecrab plugins remove <name>
 
 # Cron
@@ -904,7 +912,7 @@ Type these inside the TUI (after `❯`):
 | `/mcp [subcommand]`                      | Browse, install, test, diagnose, or remove MCP servers |
 | `/reload-mcp`                            | Hot-reload MCP servers (no restart needed)      |
 | `/mcp-token <server> <token>`            | Set MCP bearer token at runtime                 |
-| `/plugins [list/install/remove]`         | Manage plugins                                  |
+| `/plugins [list/info/status/install/enable/disable/toggle/audit/hub]` | Manage plugins |
 | `/memory [show/edit]`                    | View or edit agent memory                       |
 | `/cost`                                  | Show token costs for this session               |
 | `/usage`                                 | Detailed usage breakdown                        |

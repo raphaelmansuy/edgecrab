@@ -12,6 +12,8 @@ pub enum PluginError {
     Process(String),
     #[error("plugin rpc error: {0}")]
     Rpc(String),
+    #[error("plugin hub error: {0}")]
+    Hub(String),
     #[error("script error: {0}")]
     Script(String),
     #[error("io error: {0}")]

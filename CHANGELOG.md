@@ -13,6 +13,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **Prompt-integrated skill plugins** — prompt assembly now appends enabled plugin-provided `SKILL.md` content from `~/.edgecrab/plugins/` so plugin skills behave like first-class session guidance instead of a CLI-only discovery feature.
 - **Runtime plugin tool registration** — CLI runtime registry construction now discovers installed tool-server and script plugins and registers their tools dynamically so plugin tools participate in the normal `ToolRegistry` flow.
 - **Persisted plugin config and CLI controls** — `config.yaml` now has a top-level `plugins:` section and the CLI now supports `edgecrab plugins info|enable|disable` in addition to listing/install/update/remove.
+- **Plugin hub search, quarantine installs, and audit log** — plugin installs can now stage from GitHub or local directories into quarantine, run a static scan before activation, search configured hub indices, and append install/remove actions to `~/.edgecrab/plugins/.hub/audit.log`.
 
 ### Changed
 

@@ -974,9 +974,17 @@ fn run_plugins(command: PluginsCommand) -> anyhow::Result<()> {
         PluginsCommand::Info { name } => {
             plugins_cmd::run(plugins_cmd::PluginAction::Info { name })?
         }
-        PluginsCommand::Install { repo, name } => {
-            plugins_cmd::run(plugins_cmd::PluginAction::Install { repo, name })?
-        }
+        PluginsCommand::Install {
+            source,
+            name,
+            force,
+            no_enable,
+        } => plugins_cmd::run(plugins_cmd::PluginAction::Install {
+            source,
+            name,
+            force,
+            no_enable,
+        })?,
         PluginsCommand::Enable { name } => {
             plugins_cmd::run(plugins_cmd::PluginAction::Enable { name })?
         }
@@ -993,6 +1001,15 @@ fn run_plugins(command: PluginsCommand) -> anyhow::Result<()> {
         PluginsCommand::Remove { name } => {
             plugins_cmd::run(plugins_cmd::PluginAction::Remove { name })?
         }
+        PluginsCommand::Audit { lines } => {
+            plugins_cmd::run(plugins_cmd::PluginAction::Audit { lines })?
+        }
+        PluginsCommand::HubSearch { query } => {
+            plugins_cmd::run(plugins_cmd::PluginAction::HubSearch {
+                query: query.join(" "),
+            })?
+        }
+        PluginsCommand::HubRefresh => plugins_cmd::run(plugins_cmd::PluginAction::HubRefresh)?,
     }
     Ok(())
 }

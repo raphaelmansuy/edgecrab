@@ -1,76 +1,196 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
+use chrono::Utc;
+use edgecrab_plugins::{
+    PluginAuditEntry, append_audit_entry, clear_hub_cache, materialize_source_to_dir,
+    read_audit_entries, resolve_install_source, scan_plugin_bundle, search_hub, sha256_dir,
+    should_allow_install,
+};
 
 use crate::plugins::PluginManager;
 
 pub enum PluginAction {
     List,
-    Info { name: String },
-    Install { repo: String, name: Option<String> },
-    Enable { name: String },
-    Disable { name: String },
-    Toggle { name: String },
+    Info {
+        name: String,
+    },
+    Install {
+        source: String,
+        name: Option<String>,
+        force: bool,
+        no_enable: bool,
+    },
+    Enable {
+        name: String,
+    },
+    Disable {
+        name: String,
+    },
+    Toggle {
+        name: String,
+    },
     Status,
-    Update { name: String },
-    Remove { name: String },
+    Update {
+        name: Option<String>,
+    },
+    Remove {
+        name: String,
+    },
+    Audit {
+        lines: usize,
+    },
+    HubSearch {
+        query: String,
+    },
+    HubRefresh,
 }
 
 pub fn run(action: PluginAction) -> anyhow::Result<()> {
+    let output = run_capture(action)?;
+    if !output.is_empty() {
+        println!("{output}");
+    }
+    Ok(())
+}
+
+pub fn action_from_slash_args(args: &str) -> Option<PluginAction> {
+    let trimmed = args.trim();
+    if trimmed.is_empty() || matches!(trimmed, "list" | "ls") {
+        return Some(PluginAction::List);
+    }
+    if let Some(name) = trimmed.strip_prefix("info ").map(str::trim) {
+        return Some(PluginAction::Info {
+            name: name.to_string(),
+        });
+    }
+    if matches!(trimmed, "status") {
+        return Some(PluginAction::Status);
+    }
+    if let Some(name) = trimmed.strip_prefix("enable ").map(str::trim) {
+        return Some(PluginAction::Enable {
+            name: name.to_string(),
+        });
+    }
+    if let Some(name) = trimmed.strip_prefix("disable ").map(str::trim) {
+        return Some(PluginAction::Disable {
+            name: name.to_string(),
+        });
+    }
+    if let Some(name) = trimmed.strip_prefix("remove ").map(str::trim) {
+        return Some(PluginAction::Remove {
+            name: name.to_string(),
+        });
+    }
+    if let Some(name) = trimmed.strip_prefix("update ").map(str::trim) {
+        return Some(PluginAction::Update {
+            name: if name.is_empty() {
+                None
+            } else {
+                Some(name.to_string())
+            },
+        });
+    }
+    if trimmed == "update" {
+        return Some(PluginAction::Update { name: None });
+    }
+    if let Some(query) = trimmed.strip_prefix("hub search ").map(str::trim) {
+        return Some(PluginAction::HubSearch {
+            query: query.to_string(),
+        });
+    }
+    if matches!(trimmed, "hub" | "hub search") {
+        return Some(PluginAction::HubSearch {
+            query: String::new(),
+        });
+    }
+    if matches!(trimmed, "hub refresh") {
+        return Some(PluginAction::HubRefresh);
+    }
+    if trimmed.starts_with("audit") {
+        let lines = trimmed
+            .split_whitespace()
+            .nth(1)
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(20);
+        return Some(PluginAction::Audit { lines });
+    }
+    if let Some(source) = trimmed.strip_prefix("install ").map(str::trim) {
+        return Some(PluginAction::Install {
+            source: source.to_string(),
+            name: None,
+            force: false,
+            no_enable: false,
+        });
+    }
+    None
+}
+
+pub fn run_capture(action: PluginAction) -> anyhow::Result<String> {
     match action {
         PluginAction::List => list_plugins(),
         PluginAction::Info { name } => show_plugin_info(&name),
-        PluginAction::Install { repo, name } => install_plugin(&repo, name.as_deref()),
+        PluginAction::Install {
+            source,
+            name,
+            force,
+            no_enable,
+        } => install_plugin(&source, name.as_deref(), force, no_enable),
         PluginAction::Enable { name } => set_plugin_enabled(&name, true),
         PluginAction::Disable { name } => set_plugin_enabled(&name, false),
         PluginAction::Toggle { name } => toggle_plugin_enabled(&name),
         PluginAction::Status => show_plugin_status(),
-        PluginAction::Update { name } => update_plugin(&name),
+        PluginAction::Update { name } => update_plugins(name.as_deref()),
         PluginAction::Remove { name } => remove_plugin(&name),
+        PluginAction::Audit { lines } => show_plugin_audit(lines),
+        PluginAction::HubSearch { query } => search_plugin_hub(&query),
+        PluginAction::HubRefresh => refresh_plugin_hub(),
     }
 }
 
-fn list_plugins() -> anyhow::Result<()> {
+fn list_plugins() -> anyhow::Result<String> {
     let mut manager = PluginManager::new();
     manager.discover_all();
     let plugins = manager.plugins();
     if plugins.is_empty() {
-        println!("No plugins discovered.");
-        return Ok(());
+        return Ok("No plugins discovered.".into());
     }
 
-    println!("INSTALLED PLUGINS");
-    println!("─────────────────────────────────────────────────────────");
+    let mut text = String::from("INSTALLED PLUGINS\n");
+    text.push_str("─────────────────────────────────────────────────────────\n");
     for plugin in plugins {
-        println!(
-            "{}  v{}  [{}]  {}  {:?}",
+        text.push_str(&format!(
+            "{}  v{}  [{}]  {}  {:?}\n",
             plugin.name,
             plugin.version,
             plugin.status_label().to_ascii_uppercase(),
             plugin.kind.as_tag(),
             plugin.trust_level,
-        );
-        println!("  {}", plugin.description);
+        ));
+        text.push_str(&format!("  {}\n", plugin.description));
         if !plugin.tools.is_empty() {
-            println!(
-                "  Tools: {}",
+            text.push_str(&format!(
+                "  Tools: {}\n",
                 plugin
                     .tools
                     .iter()
                     .map(|tool| tool.name.as_str())
                     .collect::<Vec<_>>()
                     .join(", ")
-            );
+            ));
         }
         if !plugin.missing_env.is_empty() {
-            println!("  Missing env: {}", plugin.missing_env.join(", "));
+            text.push_str(&format!(
+                "  Missing env: {}\n",
+                plugin.missing_env.join(", ")
+            ));
         }
-        println!();
+        text.push('\n');
     }
-    Ok(())
+    Ok(text.trim_end().to_string())
 }
 
-fn show_plugin_info(name: &str) -> anyhow::Result<()> {
+fn show_plugin_info(name: &str) -> anyhow::Result<String> {
     let mut manager = PluginManager::new();
     manager.discover_all();
     let plugin = manager
@@ -79,63 +199,73 @@ fn show_plugin_info(name: &str) -> anyhow::Result<()> {
         .find(|plugin| plugin.name == name)
         .with_context(|| format!("plugin '{name}' not found"))?;
 
-    println!("PLUGIN: {}", plugin.name);
-    println!("─────────────────────────────────────────────────────────");
-    println!("Version:      {}", plugin.version);
-    println!("Kind:         {}", plugin.kind.as_tag());
-    println!("State:        {}", plugin.status_label());
-    println!("Trust Level:  {:?}", plugin.trust_level);
-    println!("Source:       {}", plugin.source);
-    println!("Enabled:      {}", plugin.enabled);
-    println!("Description:  {}", plugin.description);
+    let mut text = format!("PLUGIN: {}\n", plugin.name);
+    text.push_str("─────────────────────────────────────────────────────────\n");
+    text.push_str(&format!("Version:      {}\n", plugin.version));
+    text.push_str(&format!("Kind:         {}\n", plugin.kind.as_tag()));
+    text.push_str(&format!("State:        {}\n", plugin.status_label()));
+    text.push_str(&format!("Trust Level:  {:?}\n", plugin.trust_level));
+    text.push_str(&format!("Source:       {}\n", plugin.source));
+    text.push_str(&format!("Enabled:      {}\n", plugin.enabled));
+    text.push_str(&format!("Description:  {}\n", plugin.description));
     if plugin.tools.is_empty() {
-        println!("Tools:        none");
+        text.push_str("Tools:        none\n");
     } else {
-        println!(
-            "Tools:        {}",
+        text.push_str(&format!(
+            "Tools:        {}\n",
             plugin
                 .tools
                 .iter()
                 .map(|tool| tool.name.as_str())
                 .collect::<Vec<_>>()
                 .join(", ")
-        );
+        ));
     }
     if !plugin.missing_env.is_empty() {
-        println!("Missing Env:  {}", plugin.missing_env.join(", "));
+        text.push_str(&format!(
+            "Missing Env:  {}\n",
+            plugin.missing_env.join(", ")
+        ));
     }
-    Ok(())
+    Ok(text.trim_end().to_string())
 }
 
-fn show_plugin_status() -> anyhow::Result<()> {
+fn show_plugin_status() -> anyhow::Result<String> {
     let mut manager = PluginManager::new();
     manager.discover_all();
     if manager.plugins().is_empty() {
-        println!("No plugins discovered.");
-        return Ok(());
+        return Ok("No plugins discovered.".into());
     }
 
+    let mut text = String::new();
     for plugin in manager.plugins() {
-        println!(
-            "{}: {} (kind={}, enabled={}, tools={})",
+        text.push_str(&format!(
+            "{}: {} (kind={}, enabled={}, tools={})\n",
             plugin.name,
             plugin.status_label(),
             plugin.kind.as_tag(),
             plugin.enabled,
             plugin.tools.len()
-        );
+        ));
     }
-    Ok(())
+    Ok(text.trim_end().to_string())
 }
 
-fn install_plugin(repo: &str, explicit_name: Option<&str>) -> anyhow::Result<()> {
-    let plugins_dir = user_plugins_dir()?;
-    std::fs::create_dir_all(&plugins_dir)?;
+fn install_plugin(
+    source: &str,
+    explicit_name: Option<&str>,
+    force: bool,
+    no_enable: bool,
+) -> anyhow::Result<String> {
+    let (config_path, mut config) = load_config()?;
+    std::fs::create_dir_all(&config.plugins.install_dir)?;
+    std::fs::create_dir_all(&config.plugins.quarantine_dir)?;
 
+    let resolved = resolve_install_source(source);
     let plugin_name = explicit_name
         .map(ToString::to_string)
-        .unwrap_or_else(|| infer_plugin_name(repo));
-    let target = safe_plugin_path(&plugins_dir, &plugin_name)?;
+        .unwrap_or_else(|| resolved.plugin_name_hint.clone());
+    let target = safe_plugin_path(&config.plugins.install_dir, &plugin_name)?;
     if target.exists() {
         anyhow::bail!(
             "plugin '{}' already exists at {}",
@@ -144,29 +274,82 @@ fn install_plugin(repo: &str, explicit_name: Option<&str>) -> anyhow::Result<()>
         );
     }
 
-    let repo_url = normalize_repo(repo);
-    let status = std::process::Command::new("git")
-        .args(["clone", "--depth", "1", &repo_url])
-        .arg(&target)
-        .status()
-        .with_context(|| format!("failed to run git clone for {}", repo_url))?;
-    if !status.success() {
-        anyhow::bail!("git clone failed for {}", repo_url);
+    let quarantine = config.plugins.quarantine_dir.join(format!(
+        "{}-{}",
+        plugin_name,
+        Utc::now().timestamp_nanos_opt().unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&quarantine)?;
+
+    let rt = tokio::runtime::Runtime::new().context("failed to create plugin install runtime")?;
+    let resolved = match rt.block_on(materialize_source_to_dir(source, &quarantine)) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&quarantine);
+            return Err(anyhow::anyhow!(error));
+        }
+    };
+
+    let scan = scan_plugin_bundle(
+        &quarantine,
+        &plugin_name,
+        &resolved.display,
+        resolved.trust_level,
+    )
+    .context("plugin scan failed")?;
+    let verdict = should_allow_install(
+        resolved.trust_level,
+        &scan,
+        config.plugins.security.allow_caution,
+        force,
+    );
+    if !verdict.allowed {
+        let _ = std::fs::remove_dir_all(&quarantine);
+        anyhow::bail!(render_scan_block(&scan));
     }
 
-    println!("Installed plugin '{}' to {}", plugin_name, target.display());
-    Ok(())
+    std::fs::rename(&quarantine, &target)
+        .with_context(|| format!("failed to install plugin to {}", target.display()))?;
+
+    config
+        .plugins
+        .disabled
+        .retain(|candidate| candidate != &plugin_name);
+    if no_enable {
+        config.plugins.disabled.push(plugin_name.clone());
+        config.plugins.disabled.sort();
+        config.plugins.disabled.dedup();
+    }
+    config.save_to(&config_path)?;
+
+    let checksum = sha256_dir(&target).context("failed to hash installed plugin")?;
+    append_audit_entry(
+        &config.plugins,
+        &PluginAuditEntry {
+            timestamp: Utc::now().to_rfc3339(),
+            action: "install".into(),
+            plugin: plugin_name.clone(),
+            source: resolved.display.clone(),
+            trust_level: resolved.trust_level,
+            checksum: checksum.clone(),
+            forced: verdict.forced,
+        },
+    )
+    .context("failed to append plugin audit entry")?;
+
+    let mode = if no_enable {
+        "installed but disabled"
+    } else {
+        "installed and enabled"
+    };
+    Ok(format!(
+        "{}\nSecurity scan: {:?}\nChecksum: {}\nPlugin '{}' {}.",
+        resolved.display, scan.verdict, checksum, plugin_name, mode
+    ))
 }
 
-fn toggle_plugin_enabled(name: &str) -> anyhow::Result<()> {
-    let home =
-        edgecrab_core::ensure_edgecrab_home().context("failed to initialize edgecrab home")?;
-    let config_path = home.join("config.yaml");
-    let config = if config_path.is_file() {
-        edgecrab_core::AppConfig::load_from(&config_path)?
-    } else {
-        edgecrab_core::AppConfig::default()
-    };
+fn toggle_plugin_enabled(name: &str) -> anyhow::Result<String> {
+    let (_config_path, config) = load_config()?;
     let enabled = !config
         .plugins
         .disabled
@@ -175,16 +358,8 @@ fn toggle_plugin_enabled(name: &str) -> anyhow::Result<()> {
     set_plugin_enabled(name, !enabled)
 }
 
-fn set_plugin_enabled(name: &str, enabled: bool) -> anyhow::Result<()> {
-    let home =
-        edgecrab_core::ensure_edgecrab_home().context("failed to initialize edgecrab home")?;
-    let config_path = home.join("config.yaml");
-    let mut config = if config_path.is_file() {
-        edgecrab_core::AppConfig::load_from(&config_path)?
-    } else {
-        edgecrab_core::AppConfig::default()
-    };
-
+fn set_plugin_enabled(name: &str, enabled: bool) -> anyhow::Result<String> {
+    let (config_path, mut config) = load_config()?;
     config
         .plugins
         .disabled
@@ -195,43 +370,160 @@ fn set_plugin_enabled(name: &str, enabled: bool) -> anyhow::Result<()> {
         config.plugins.disabled.dedup();
     }
     config.save_to(&config_path)?;
-    println!(
+    Ok(format!(
         "{} plugin '{}'",
         if enabled { "Enabled" } else { "Disabled" },
         name
-    );
-    Ok(())
+    ))
 }
 
-fn update_plugin(name: &str) -> anyhow::Result<()> {
+fn update_plugins(name: Option<&str>) -> anyhow::Result<String> {
     let plugins_dir = user_plugins_dir()?;
-    let target = safe_plugin_path(&plugins_dir, name)?;
-    if !target.is_dir() {
+    let mut messages = Vec::new();
+    if let Some(name) = name {
+        messages.push(update_plugin_dir(
+            &safe_plugin_path(&plugins_dir, name)?,
+            name,
+        )?);
+    } else {
+        for entry in std::fs::read_dir(&plugins_dir)
+            .with_context(|| format!("failed to read {}", plugins_dir.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            if !path.is_dir() || path.file_name().and_then(|name| name.to_str()) == Some(".hub") {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            messages.push(update_plugin_dir(&path, &name)?);
+        }
+    }
+    Ok(messages.join("\n"))
+}
+
+fn update_plugin_dir(path: &Path, name: &str) -> anyhow::Result<String> {
+    if !path.is_dir() {
         anyhow::bail!("plugin '{}' is not installed", name);
+    }
+    if !path.join(".git").exists() {
+        return Ok(format!("Skipped plugin '{}' (not a git checkout)", name));
     }
     let status = std::process::Command::new("git")
         .arg("-C")
-        .arg(&target)
+        .arg(path)
         .args(["pull", "--ff-only"])
         .status()
         .with_context(|| format!("failed to update plugin {}", name))?;
     if !status.success() {
         anyhow::bail!("git pull failed for plugin '{}'", name);
     }
-    println!("Updated plugin '{}'", name);
-    Ok(())
+    Ok(format!("Updated plugin '{}'", name))
 }
 
-fn remove_plugin(name: &str) -> anyhow::Result<()> {
-    let plugins_dir = user_plugins_dir()?;
-    let target = safe_plugin_path(&plugins_dir, name)?;
+fn remove_plugin(name: &str) -> anyhow::Result<String> {
+    let (config_path, mut config) = load_config()?;
+    let target = safe_plugin_path(&config.plugins.install_dir, name)?;
     if !target.exists() {
         anyhow::bail!("plugin '{}' is not installed", name);
     }
+    let checksum = sha256_dir(&target).unwrap_or_else(|_| "sha256:unavailable".into());
+    let trust_level = resolved_trust_level(name);
     std::fs::remove_dir_all(&target)
         .with_context(|| format!("failed to remove plugin {}", target.display()))?;
-    println!("Removed plugin '{}'", name);
-    Ok(())
+    config
+        .plugins
+        .disabled
+        .retain(|candidate| candidate != name);
+    config.save_to(&config_path)?;
+    append_audit_entry(
+        &config.plugins,
+        &PluginAuditEntry {
+            timestamp: Utc::now().to_rfc3339(),
+            action: "remove".into(),
+            plugin: name.to_string(),
+            source: target.display().to_string(),
+            trust_level,
+            checksum,
+            forced: false,
+        },
+    )
+    .ok();
+    Ok(format!("Removed plugin '{}'", name))
+}
+
+fn show_plugin_audit(lines: usize) -> anyhow::Result<String> {
+    let (_config_path, config) = load_config()?;
+    let entries =
+        read_audit_entries(&config.plugins, lines).context("failed to read plugin audit log")?;
+    if entries.is_empty() {
+        return Ok("No plugin audit entries found.".into());
+    }
+    let mut text = String::from("PLUGIN AUDIT\n");
+    text.push_str("─────────────────────────────────────────────────────────\n");
+    for entry in entries {
+        text.push_str(&format!(
+            "{}  {}  {}  {:?}  forced={}\n",
+            entry.timestamp, entry.action, entry.plugin, entry.trust_level, entry.forced
+        ));
+        text.push_str(&format!(
+            "  source: {}\n  checksum: {}\n",
+            entry.source, entry.checksum
+        ));
+    }
+    Ok(text.trim_end().to_string())
+}
+
+fn search_plugin_hub(query: &str) -> anyhow::Result<String> {
+    let (_config_path, config) = load_config()?;
+    let rt = tokio::runtime::Runtime::new().context("failed to create hub runtime")?;
+    let results = rt
+        .block_on(search_hub(&config.plugins, query, 20))
+        .context("plugin hub search failed")?;
+    if results.is_empty() {
+        return Ok(format!("No plugin hub results for '{}'.", query));
+    }
+    let mut text = String::from("PLUGIN HUB RESULTS\n");
+    text.push_str("─────────────────────────────────────────────────────────\n");
+    for result in results {
+        text.push_str(&format!(
+            "{}  v{}  {:?}  {}  score={:.1}\n",
+            result.plugin.name,
+            result.plugin.version,
+            result.trust_level,
+            result.plugin.kind.as_tag(),
+            result.score
+        ));
+        text.push_str(&format!("  {}\n", result.plugin.description));
+        text.push_str(&format!("  install: {}\n", result.plugin.install_url));
+        if !result.plugin.requires_env.is_empty() {
+            text.push_str(&format!(
+                "  requires env: {}\n",
+                result.plugin.requires_env.join(", ")
+            ));
+        }
+    }
+    Ok(text.trim_end().to_string())
+}
+
+fn refresh_plugin_hub() -> anyhow::Result<String> {
+    let (_config_path, config) = load_config()?;
+    let removed = clear_hub_cache(&config.plugins).context("failed to clear plugin hub cache")?;
+    Ok(format!(
+        "Cleared {} cached plugin hub index file(s).",
+        removed
+    ))
+}
+
+fn load_config() -> anyhow::Result<(PathBuf, edgecrab_core::AppConfig)> {
+    let home =
+        edgecrab_core::ensure_edgecrab_home().context("failed to initialize edgecrab home")?;
+    let config_path = home.join("config.yaml");
+    let config = if config_path.is_file() {
+        edgecrab_core::AppConfig::load_from(&config_path)?
+    } else {
+        edgecrab_core::AppConfig::default()
+    };
+    Ok((config_path, config))
 }
 
 fn user_plugins_dir() -> anyhow::Result<PathBuf> {
@@ -249,21 +541,33 @@ fn safe_plugin_path(plugins_dir: &Path, name: &str) -> anyhow::Result<PathBuf> {
     Ok(plugins_dir.join(name))
 }
 
-fn infer_plugin_name(repo: &str) -> String {
-    repo.trim_end_matches('/')
-        .rsplit('/')
-        .next()
-        .unwrap_or(repo)
-        .trim_end_matches(".git")
-        .to_string()
+fn resolved_trust_level(name: &str) -> edgecrab_plugins::TrustLevel {
+    let mut manager = PluginManager::new();
+    manager.discover_all();
+    manager
+        .plugins()
+        .iter()
+        .find(|plugin| plugin.name == name)
+        .map(|plugin| plugin.trust_level)
+        .unwrap_or(edgecrab_plugins::TrustLevel::Unverified)
 }
 
-fn normalize_repo(repo: &str) -> String {
-    if repo.contains("://") || repo.starts_with("git@") {
-        repo.to_string()
-    } else {
-        format!("https://github.com/{}.git", repo.trim_end_matches(".git"))
+fn render_scan_block(scan: &edgecrab_plugins::ScanResult) -> String {
+    let mut text = format!(
+        "Installation blocked. Security scan verdict: {:?}\n",
+        scan.verdict
+    );
+    for finding in &scan.findings {
+        text.push_str(&format!(
+            "- {:?} {:?} {}:{} {}\n",
+            finding.severity,
+            finding.category,
+            finding.file.display(),
+            finding.line,
+            finding.description
+        ));
     }
+    text.trim_end().to_string()
 }
 
 #[cfg(test)]
@@ -271,23 +575,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn infer_name_from_repo() {
-        assert_eq!(infer_plugin_name("owner/repo"), "repo");
-        assert_eq!(
-            infer_plugin_name("https://github.com/owner/repo.git"),
-            "repo"
-        );
-    }
-
-    #[test]
-    fn normalize_repo_shortcuts() {
-        assert_eq!(
-            normalize_repo("owner/repo"),
-            "https://github.com/owner/repo.git"
-        );
-        assert_eq!(
-            normalize_repo("https://github.com/owner/repo.git"),
-            "https://github.com/owner/repo.git"
-        );
+    fn render_scan_block_lists_findings() {
+        let scan = edgecrab_plugins::ScanResult {
+            plugin_name: "demo".into(),
+            source: "local".into(),
+            trust_level: edgecrab_plugins::TrustLevel::Unverified,
+            verdict: edgecrab_plugins::ScanVerdict::Dangerous,
+            findings: vec![edgecrab_plugins::ScanFinding {
+                pattern_id: "x".into(),
+                severity: edgecrab_plugins::Severity::High,
+                category: edgecrab_plugins::ThreatCategory::Execution,
+                file: PathBuf::from("plugin.py"),
+                line: 4,
+                excerpt: "subprocess.run".into(),
+                description: "spawns a subprocess".into(),
+            }],
+        };
+        assert!(render_scan_block(&scan).contains("plugin.py:4"));
     }
 }

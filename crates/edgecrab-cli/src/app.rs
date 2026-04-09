@@ -13620,72 +13620,11 @@ impl App {
     }
 
     fn handle_show_plugins(&mut self, args: String) {
-        let mut manager = crate::plugins::PluginManager::new();
-        manager.discover_all();
-        let plugins = manager.plugins();
-        if plugins.is_empty() {
-            self.push_output(
-                "No plugins discovered.\n\
-                 Install with: edgecrab plugins install <repo>",
-                OutputRole::System,
-            );
-        } else if let Some(name) = args.trim().strip_prefix("info ").map(str::trim) {
-            if let Some(plugin) = plugins.iter().find(|plugin| plugin.name == name) {
-                let mut text = format!("PLUGIN: {}\n", plugin.name);
-                text.push_str("─────────────────────────────────────────────────────────\n");
-                text.push_str(&format!("Version: {}\n", plugin.version));
-                text.push_str(&format!("Kind: {}\n", plugin.kind.as_tag()));
-                text.push_str(&format!("State: {}\n", plugin.status_label()));
-                text.push_str(&format!("Source: {}\n", plugin.source));
-                text.push_str(&format!("Trust: {:?}\n", plugin.trust_level));
-                text.push_str(&format!("Enabled: {}\n", plugin.enabled));
-                text.push_str(&format!("Description: {}\n", plugin.description));
-                if !plugin.tools.is_empty() {
-                    text.push_str(&format!(
-                        "Tools: {}\n",
-                        plugin
-                            .tools
-                            .iter()
-                            .map(|tool| tool.name.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ));
-                }
-                if !plugin.missing_env.is_empty() {
-                    text.push_str(&format!("Missing Env: {}\n", plugin.missing_env.join(", ")));
-                }
-                self.push_output(text, OutputRole::Assistant);
-            } else {
-                self.push_output(format!("Plugin `{name}` not found."), OutputRole::Error);
-            }
-        } else if matches!(args.trim(), "status") {
-            let mut text = String::from("PLUGIN STATUS\n");
-            text.push_str("─────────────────────────────────────────────────────────\n");
-            for plugin in plugins {
-                text.push_str(&format!(
-                    "{}: {} (kind={}, enabled={}, tools={})\n",
-                    plugin.name,
-                    plugin.status_label(),
-                    plugin.kind.as_tag(),
-                    plugin.enabled,
-                    plugin.tools.len()
-                ));
-            }
-            self.push_output(text, OutputRole::Assistant);
-        } else {
-            let mut text = format!("Plugins ({}):\n", plugins.len());
-            for p in plugins {
-                text.push_str(&format!(
-                    "  {} v{}  ({}, {}, status={}, {} tools)\n",
-                    p.name,
-                    p.version,
-                    p.source,
-                    p.kind.as_tag(),
-                    p.status_label(),
-                    p.tools.len(),
-                ));
-            }
-            self.push_output(text, OutputRole::Assistant);
+        let action = crate::plugins_cmd::action_from_slash_args(&args)
+            .unwrap_or(crate::plugins_cmd::PluginAction::List);
+        match crate::plugins_cmd::run_capture(action) {
+            Ok(text) => self.push_output(text, OutputRole::Assistant),
+            Err(error) => self.push_output(format!("plugins: {error}"), OutputRole::Error),
         }
     }
 

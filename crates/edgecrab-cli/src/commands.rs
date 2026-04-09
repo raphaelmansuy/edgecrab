@@ -968,7 +968,7 @@ impl CommandRegistry {
         self.register(Command {
             name: "plugins",
             aliases: &["plugin"],
-            description: "Manage plugins: list, info, enable, disable, status, toggle",
+            description: "Manage plugins: list, info, status, install, enable, disable, toggle, audit, hub",
             handler: |args| parse_plugins_command(args),
         });
 
@@ -1233,7 +1233,7 @@ fn help_text() -> String {
            /toolsets             — Browse and configure toolsets\n\
            /mcp [args]           — Search, install, test, or remove MCP servers\n\
            /reload-mcp           — Reload MCP server connections\n\
-           /plugins              — List installed plugins\n\
+           /plugins              — Manage plugins (list/info/status/install/toggle/audit/hub)\n\
          \n\
          Memory & Skills:\n\
            /memory               — Show memory status\n\
