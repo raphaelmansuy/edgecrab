@@ -4,6 +4,7 @@ use std::path::Path;
 use chrono::Utc;
 use edgecrab_security::{check_injection, check_memory_content};
 use edgecrab_tools::registry::ToolContext;
+use edgecrab_types::Message;
 use serde_json::{Value, json};
 
 use crate::manifest::PluginCapabilities;
@@ -159,6 +160,10 @@ async fn handle_host_request_inner(
         }
         "host:inject_message" => {
             require_capability(capabilities, &method)?;
+            let role = params
+                .get("role")
+                .and_then(Value::as_str)
+                .unwrap_or("user");
             let content = params
                 .get("content")
                 .and_then(Value::as_str)
@@ -169,10 +174,24 @@ async fn handle_host_request_inner(
             if let Some(message) = check_injection(content) {
                 return Err((-32004, message.into()));
             }
-            Err((
-                -32004,
-                "conversation injection is not available in the current runtime".into(),
-            ))
+            let Some(queue) = &ctx.injected_messages else {
+                return Err((
+                    -32004,
+                    "conversation injection is not available in the current runtime".into(),
+                ));
+            };
+            let message = match role {
+                "user" => Message::user(content),
+                "assistant" => Message::assistant(content),
+                _ => {
+                    return Err((
+                        -32602,
+                        "inject_message role must be 'user' or 'assistant'".into(),
+                    ))
+                }
+            };
+            queue.lock().await.push(message);
+            Ok(json!({ "ok": true, "role": role }))
         }
         "host:tool_call" => {
             require_capability(capabilities, &method)?;
@@ -326,6 +345,7 @@ mod tests {
             todo_store: None,
             current_tool_call_id: None,
             current_tool_name: Some("plugin_tool".into()),
+            injected_messages: None,
             tool_progress_tx: None,
         }
     }
@@ -414,5 +434,29 @@ mod tests {
         .await;
 
         assert_eq!(response["result"]["hits"].as_array().map(Vec::len), Some(1));
+    }
+
+    #[tokio::test]
+    async fn inject_message_enqueues_runtime_message() {
+        let home = TempDir::new().expect("tempdir");
+        let caps = PluginCapabilities {
+            host: vec!["host:inject_message".into()],
+            ..PluginCapabilities::default()
+        };
+        let queue = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let mut ctx = test_ctx(home.path());
+        ctx.injected_messages = Some(queue.clone());
+
+        let response = handle_host_request(
+            "demo",
+            &caps,
+            &json!({"jsonrpc":"2.0","id":"1","method":"host:inject_message","params":{"role":"assistant","content":"Created issue #42"}}),
+            &ctx,
+        )
+        .await;
+
+        assert_eq!(response["result"]["ok"], true);
+        let queued = queue.lock().await.clone();
+        assert_eq!(queued, vec![Message::assistant("Created issue #42")]);
     }
 }

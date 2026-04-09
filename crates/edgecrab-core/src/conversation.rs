@@ -41,7 +41,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use edgecrab_plugins::{build_plugin_skill_prompt, discover_plugins};
+use edgecrab_plugins::{
+    build_plugin_skill_prompt, discover_plugins, extract_pre_llm_context, hermes_supports_hook,
+    invoke_hermes_hook,
+};
 use edgecrab_tools::config_ref::AppConfigRef;
 use edgecrab_tools::registry::{
     ApprovalRequest, ApprovalResponse, DelegationEvent, ToolContext, ToolRegistry,
@@ -201,6 +204,7 @@ fn build_tool_context(
     conversation_session_id: &str,
     // Per-conversation todo store — survives context compression.
     todo_store: Option<Arc<edgecrab_tools::TodoStore>>,
+    injected_messages: Option<Arc<tokio::sync::Mutex<Vec<Message>>>>,
 ) -> ToolContext {
     ToolContext {
         task_id: uuid::Uuid::new_v4().to_string(),
@@ -239,6 +243,7 @@ fn build_tool_context(
         todo_store,
         current_tool_call_id,
         current_tool_name,
+        injected_messages,
         tool_progress_tx,
     }
 }
@@ -335,6 +340,15 @@ impl Agent {
             shared.clone()
         };
 
+        let conversation_session_id = session
+            .session_id
+            .clone()
+            .or_else(|| config.session_id.clone())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        if session.session_id.is_none() {
+            session.session_id = Some(conversation_session_id.clone());
+        }
+
         // Resolve cwd early — used by both PromptBuilder and @context expansion.
         let cwd = cwd_override
             .map(std::path::Path::to_path_buf)
@@ -388,6 +402,7 @@ impl Agent {
                     None,                // current_tool_name not needed for schema resolution
                     "schema-resolution", // placeholder — schemas are not browser-session-sensitive
                     Some(self.todo_store.clone()),
+                    None, // schema resolution never injects conversation messages
                 );
 
                 // "all" sentinel / genuinely empty → pass None (no filtering).
@@ -522,6 +537,32 @@ impl Agent {
             session.cached_system_prompt = Some(prompt);
         }
 
+        let is_first_turn = session.messages.is_empty();
+        let discovered_plugins = discover_plugins(&config.plugins_config, config.platform).ok();
+        if let Some(discovery) = discovered_plugins.as_ref() {
+            if is_first_turn {
+                for plugin in discovery
+                    .plugins
+                    .iter()
+                    .filter(|plugin| hermes_supports_hook(plugin, "on_session_start"))
+                {
+                    if let Err(error) = invoke_hermes_hook(
+                        plugin,
+                        "on_session_start",
+                        serde_json::json!({
+                            "session_id": &conversation_session_id,
+                            "model": &config.model,
+                            "platform": config.platform.to_string(),
+                        }),
+                    )
+                    .await
+                    {
+                        tracing::warn!(plugin = %plugin.name, ?error, "Hermes on_session_start hook failed");
+                    }
+                }
+            }
+        }
+
         // Expand @context references in the user message before appending.
         //
         // WHY before append: @file, @diff etc. inject raw content into the
@@ -581,6 +622,41 @@ impl Agent {
                     "@context injection exceeds 25% of context window — approaching budget limit"
                 );
                 expansion.budget_warning = true;
+            }
+        }
+
+        if let Some(discovery) = discovered_plugins.as_ref() {
+            let history_json =
+                serde_json::to_value(&session.messages).unwrap_or_else(|_| serde_json::json!([]));
+            let mut injected_context = Vec::new();
+            for plugin in discovery
+                .plugins
+                .iter()
+                .filter(|plugin| hermes_supports_hook(plugin, "pre_llm_call"))
+            {
+                match invoke_hermes_hook(
+                    plugin,
+                    "pre_llm_call",
+                    serde_json::json!({
+                        "session_id": &conversation_session_id,
+                        "user_message": &expansion.expanded,
+                        "conversation_history": history_json,
+                        "is_first_turn": is_first_turn,
+                        "model": &config.model,
+                        "platform": config.platform.to_string(),
+                    }),
+                )
+                .await
+                {
+                    Ok(results) => injected_context.extend(extract_pre_llm_context(&results)),
+                    Err(error) => {
+                        tracing::warn!(plugin = %plugin.name, ?error, "Hermes pre_llm_call hook failed");
+                    }
+                }
+            }
+            if !injected_context.is_empty() {
+                expansion.expanded =
+                    format!("{}\n\n{}", expansion.expanded, injected_context.join("\n\n"));
             }
         }
 
@@ -836,25 +912,8 @@ impl Agent {
         };
         let turn_started_at = std::time::Instant::now();
 
-        // Resolve a stable session_id early — BEFORE the main tool-dispatch loop.
-        //
-        // WHY early: `build_tool_context` is called once per tool invocation, and
-        // each call previously generated a fresh UUID for task_id, meaning every
-        // tool call in a session got a *different* browser session key. This caused
-        // browser_snapshot to operate on a *new blank tab* instead of the tab that
-        // browser_navigate just loaded. By resolving the session_id once here and
-        // passing it as `conversation_session_id` through DispatchContext, all tool
-        // calls within this user turn — and across sequential turns — share the same
-        // stable browser session (parity with hermes-agent's task_id="default" pattern).
-        let conversation_session_id = session
-            .session_id
-            .clone()
-            .or_else(|| config.session_id.clone())
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        // Persist so the next user turn reuses the same ID.
-        if session.session_id.is_none() {
-            session.session_id = Some(conversation_session_id.clone());
-        }
+        // Persist the stable conversation session id resolved before prompt
+        // assembly so later turns reuse the same browser/plugin session.
         self.publish_session_state(&session).await;
 
         // Main loop: each iteration = one API call
@@ -894,6 +953,7 @@ impl Agent {
                         None,
                         &conversation_session_id,
                         Some(self.todo_store.clone()),
+                        None,
                     );
                     let enabled_filter = if config.enabled_toolsets.is_empty()
                         || edgecrab_tools::toolsets::contains_all_sentinel(&config.enabled_toolsets)
@@ -2588,7 +2648,7 @@ async fn process_response(
             std::collections::HashSet::new();
         while let Some(join_result) = parallel_tasks.join_next().await {
             match join_result {
-                Ok((tc_id, tc_name, args_json, tool_result, duration_ms)) => {
+                Ok((tc_id, tc_name, args_json, (tool_result, injected_messages), duration_ms)) => {
                     let is_error = is_tool_error(&tool_result);
                     emit_tool_done(
                         dctx.event_tx,
@@ -2618,6 +2678,7 @@ async fn process_response(
                     session
                         .messages
                         .push(Message::tool_result(&tc_id, &tc_name, &tool_result));
+                    session.messages.extend(injected_messages);
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "parallel tool task panicked");
@@ -2649,8 +2710,9 @@ async fn process_response(
         // Dispatch sequential tools in order
         for tc in sequential_calls {
             let started = std::time::Instant::now();
-            let tool_result =
-                dispatch_single_tool(&tc.id, &tc.function.name, &tc.function.arguments, dctx).await;
+            let (tool_result, injected_messages) =
+                dispatch_single_tool(&tc.id, &tc.function.name, &tc.function.arguments, dctx)
+                    .await;
             let duration_ms = started.elapsed().as_millis() as u64;
 
             let is_error = is_tool_error(&tool_result);
@@ -2683,6 +2745,7 @@ async fn process_response(
                 &tc.function.name,
                 &tool_result,
             ));
+            session.messages.extend(injected_messages);
         }
 
         return Ok(LoopAction::Continue);
@@ -2738,11 +2801,14 @@ async fn dispatch_single_tool(
     name: &str,
     args_json: &str,
     dctx: &DispatchContext<'_>,
-) -> String {
+) -> (String, Vec<Message>) {
     let Some(reg) = dctx.registry else {
-        return format!(
-            "Tool '{}' execution is not yet wired (no ToolRegistry provided).",
-            name
+        return (
+            format!(
+                "Tool '{}' execution is not yet wired (no ToolRegistry provided).",
+                name
+            ),
+            Vec::new(),
         );
     };
 
@@ -2754,8 +2820,11 @@ async fn dispatch_single_tool(
         .get(&attempt_key)
         .cloned()
     {
-        return serde_json::to_string(&suppressed_retry_response(name, args_json, &prior))
-            .expect("suppressed retry payload serializes");
+        return (
+            serde_json::to_string(&suppressed_retry_response(name, args_json, &prior))
+                .expect("suppressed retry payload serializes"),
+            Vec::new(),
+        );
     }
 
     // Emit tool:pre hook event — informational (fire-and-forget, no cancellation)
@@ -2773,6 +2842,7 @@ async fn dispatch_single_tool(
         });
     }
 
+    let injected_messages = Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let ctx = build_tool_context(
         &dctx.cwd,
         dctx.app_config_ref.clone(),
@@ -2793,6 +2863,7 @@ async fn dispatch_single_tool(
         Some(name.to_string()),
         &dctx.conversation_session_id,
         dctx.todo_store.clone(),
+        Some(injected_messages.clone()),
     );
 
     let args: serde_json::Value = match serde_json::from_str(args_json) {
@@ -2802,11 +2873,14 @@ async fn dispatch_single_tool(
             // can self-correct (e.g. fix quoting or truncated output) rather
             // than silently receiving `{}` and producing nonsensical output.
             tracing::warn!(tool_name = %name, error = %e, args_json = %args_json, "malformed tool arguments JSON");
-            return ToolError::InvalidArgs {
-                tool: name.to_string(),
-                message: format!("invalid JSON arguments: {e}"),
-            }
-            .to_llm_response();
+            return (
+                ToolError::InvalidArgs {
+                    tool: name.to_string(),
+                    message: format!("invalid JSON arguments: {e}"),
+                }
+                .to_llm_response(),
+                Vec::new(),
+            );
         }
     };
 
@@ -2831,7 +2905,12 @@ async fn dispatch_single_tool(
         });
     }
 
-    result
+    let queued_messages = {
+        let mut guard = injected_messages.lock().await;
+        std::mem::take(&mut *guard)
+    };
+
+    (result, queued_messages)
 }
 
 // ─── Auto-title generation ───────────────────────────────────────────
@@ -4583,7 +4662,7 @@ mod tests {
         std::fs::write(workspace.path().join("proof.txt"), "dispatch cwd works").expect("write");
         dctx.cwd = workspace.path().to_path_buf();
 
-        let result = dispatch_single_tool(
+        let (result, injected_messages) = dispatch_single_tool(
             "call-read-file",
             "read_file",
             r#"{"path":"proof.txt","line_numbers":false}"#,
@@ -4591,6 +4670,7 @@ mod tests {
         )
         .await;
 
+        assert!(injected_messages.is_empty());
         assert!(result.contains("dispatch cwd works"), "got: {result}");
     }
 
@@ -4609,7 +4689,9 @@ mod tests {
             capability_suppressions,
         );
 
-        let result = dispatch_single_tool("call-read-file", "read_file", "{}", &dctx).await;
+        let (result, injected_messages) =
+            dispatch_single_tool("call-read-file", "read_file", "{}", &dctx).await;
+        assert!(injected_messages.is_empty());
         let parsed = parse_tool_error_response(&result).expect("structured tool error");
         assert_eq!(parsed.response_type, "tool_error");
         assert_eq!(parsed.category, "arguments");
@@ -4633,12 +4715,16 @@ mod tests {
         );
         let args_json = r#"{"command":"top"}"#;
 
-        let first = dispatch_single_tool("call-terminal-1", "terminal", args_json, &dctx).await;
+        let (first, first_injected) =
+            dispatch_single_tool("call-terminal-1", "terminal", args_json, &dctx).await;
+        assert!(first_injected.is_empty());
         let first_payload = parse_tool_error_response(&first).expect("structured error");
         assert_eq!(first_payload.code, "non_interactive_terminal_required");
         remember_tool_suppression(&capability_suppressions, "terminal", args_json, &first);
 
-        let second = dispatch_single_tool("call-terminal-2", "terminal", args_json, &dctx).await;
+        let (second, second_injected) =
+            dispatch_single_tool("call-terminal-2", "terminal", args_json, &dctx).await;
+        assert!(second_injected.is_empty());
         let second_payload = parse_tool_error_response(&second).expect("structured error");
         assert_eq!(second_payload.code, "suppressed_capability_retry");
         assert!(second_payload.error.contains("already blocked"));

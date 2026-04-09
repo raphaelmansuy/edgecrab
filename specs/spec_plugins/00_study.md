@@ -1,3 +1,6 @@
+> Note: this file is an example/study document, not the precise compatibility contract.
+> The current source-of-truth compatibility target is captured in `specs/spec_plugins/01_hermes_compat.md`, aligned to Hermes Agent's real plugin implementation.
+
 **Here are 5 genuinely useful, production-ready TypeScript WASM plugins** built exactly to the **EdgeCrab WASM Plugin System v1.0** specification I gave you earlier.
 
 Each one is complete, copy-paste ready, and demonstrates different parts of the system (capabilities, host functions, hooks, etc.). They are at the same level of power and cleanliness as real Hermes Agent plugins, but with EdgeCrab’s stronger security model.

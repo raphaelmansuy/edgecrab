@@ -995,7 +995,7 @@ fn run_plugins(command: PluginsCommand) -> anyhow::Result<()> {
             if let Some(name) = name {
                 plugins_cmd::run(plugins_cmd::PluginAction::Toggle { name })?
             } else {
-                plugins_cmd::run(plugins_cmd::PluginAction::HubBrowse)?
+                plugins_cmd::run(plugins_cmd::PluginAction::Browse)?
             }
         }
         PluginsCommand::Status => plugins_cmd::run(plugins_cmd::PluginAction::Status)?,
@@ -1008,13 +1008,14 @@ fn run_plugins(command: PluginsCommand) -> anyhow::Result<()> {
         PluginsCommand::Audit { lines } => {
             plugins_cmd::run(plugins_cmd::PluginAction::Audit { lines })?
         }
-        PluginsCommand::HubSearch { query } => {
-            plugins_cmd::run(plugins_cmd::PluginAction::HubSearch {
+        PluginsCommand::Search { query, source } => {
+            plugins_cmd::run(plugins_cmd::PluginAction::Search {
                 query: query.join(" "),
+                source,
             })?
         }
-        PluginsCommand::HubBrowse => plugins_cmd::run(plugins_cmd::PluginAction::HubBrowse)?,
-        PluginsCommand::HubRefresh => plugins_cmd::run(plugins_cmd::PluginAction::HubRefresh)?,
+        PluginsCommand::Browse => plugins_cmd::run(plugins_cmd::PluginAction::Browse)?,
+        PluginsCommand::Refresh => plugins_cmd::run(plugins_cmd::PluginAction::Refresh)?,
     }
     Ok(())
 }

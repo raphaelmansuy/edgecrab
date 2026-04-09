@@ -1,7 +1,5 @@
 use edgecrab_core::AppConfig;
-use edgecrab_plugins::{
-    PluginKind, PluginStatus, SkillReadinessStatus, SkillSource, TrustLevel, discover_plugins,
-};
+use edgecrab_plugins::{PluginKind, PluginStatus, SkillSource, TrustLevel, discover_plugins};
 use edgecrab_types::Platform;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,14 +86,7 @@ impl PluginManager {
                     .map(|name| PluginTool { name })
                     .collect(),
                 trust_level: plugin.trust_level,
-                missing_env: plugin
-                    .skill
-                    .as_ref()
-                    .and_then(|skill| match &skill.readiness {
-                        SkillReadinessStatus::SetupNeeded { missing } => Some(missing.clone()),
-                        _ => None,
-                    })
-                    .unwrap_or_default(),
+                missing_env: plugin.missing_env,
             })
             .collect()
     }

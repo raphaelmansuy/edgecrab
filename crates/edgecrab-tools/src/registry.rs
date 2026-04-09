@@ -309,6 +309,8 @@ pub struct ToolContext {
     pub current_tool_call_id: Option<String>,
     /// Canonical tool name for the current invocation.
     pub current_tool_name: Option<String>,
+    /// Per-tool-call queue for runtime-injected conversation messages.
+    pub injected_messages: Option<Arc<tokio::sync::Mutex<Vec<Message>>>>,
     /// Optional channel used by tools to emit structured progress updates.
     pub tool_progress_tx: Option<tokio::sync::mpsc::UnboundedSender<ToolProgressUpdate>>,
 }
@@ -383,6 +385,7 @@ impl ToolContext {
             todo_store: None,
             current_tool_call_id: None,
             current_tool_name: None,
+            injected_messages: None,
             tool_progress_tx: None,
         }
     }

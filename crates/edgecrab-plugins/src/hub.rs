@@ -133,12 +133,16 @@ pub struct ResolvedInstallSource {
 pub async fn search_hub(
     config: &PluginsConfig,
     query: &str,
+    source_filter: Option<&str>,
     limit: usize,
 ) -> Result<Vec<PluginSearchResult>, PluginError> {
     let sources = configured_sources(config);
     let client = hub_client()?;
     let mut results = Vec::new();
     for source in &sources {
+        if !source_matches_filter(source_filter, &source.name) {
+            continue;
+        }
         let index = fetch_index(config, &client, source).await?;
         for plugin in index.plugins {
             let mut score = search_score(query, &plugin);
@@ -166,6 +170,13 @@ pub async fn search_hub(
     results.dedup_by(|left, right| left.plugin.name == right.plugin.name);
     results.truncate(limit);
     Ok(results)
+}
+
+pub fn hub_source_names(config: &PluginsConfig) -> Vec<String> {
+    configured_sources(config)
+        .into_iter()
+        .map(|source| source.name)
+        .collect()
 }
 
 pub fn clear_hub_cache(config: &PluginsConfig) -> Result<usize, PluginError> {
@@ -371,6 +382,27 @@ struct RuntimeSource {
     name: String,
     url: String,
     trust_level: TrustLevel,
+}
+
+fn source_matches_filter(filter: Option<&str>, source_name: &str) -> bool {
+    let Some(filter) = filter.map(str::trim).filter(|value| !value.is_empty()) else {
+        return true;
+    };
+    let normalized_filter = normalize_source_name(filter);
+    let normalized_source = normalize_source_name(source_name);
+    normalized_filter == normalized_source
+        || normalized_source.contains(&normalized_filter)
+        || normalized_filter.contains(&normalized_source)
+}
+
+fn normalize_source_name(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "hermes" | "hermes-plugin" | "hermes-plugins" => "hermesplugins".into(),
+        other => other
+            .chars()
+            .filter(|ch| ch.is_ascii_alphanumeric())
+            .collect(),
+    }
 }
 
 async fn resolve_hub_source(
@@ -714,5 +746,12 @@ mod tests {
         let resolved = resolve_install_source("hub:community/demo");
         assert_eq!(resolved.kind, InstallSourceKind::Hub);
         assert_eq!(resolved.plugin_name_hint, "demo");
+    }
+
+    #[test]
+    fn source_filter_matches_hermes_aliases() {
+        assert!(source_matches_filter(Some("hermes"), "hermes-plugins"));
+        assert!(source_matches_filter(Some("hermes-plugins"), "hermes-plugins"));
+        assert!(!source_matches_filter(Some("edgecrab"), "hermes-plugins"));
     }
 }

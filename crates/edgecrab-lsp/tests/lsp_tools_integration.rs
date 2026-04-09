@@ -67,6 +67,7 @@ fn make_ctx(workspace: &TempDir, home: &TempDir) -> ToolContext {
         todo_store: None,
         current_tool_call_id: None,
         current_tool_name: None,
+        injected_messages: None,
         tool_progress_tx: None,
     };
     ctx.config.edgecrab_home = home.path().to_path_buf();

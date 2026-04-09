@@ -134,6 +134,7 @@ async fn browser_advantage_tools_dispatch_through_registry_with_edge_case_valida
         todo_store: None,
         current_tool_call_id: None,
         current_tool_name: None,
+        injected_messages: None,
         tool_progress_tx: None,
     };
 

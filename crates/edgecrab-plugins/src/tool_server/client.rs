@@ -100,6 +100,15 @@ impl ToolServerClient {
         .await
     }
 
+    pub async fn call_method(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        ctx: Option<&ToolContext>,
+    ) -> Result<serde_json::Value, PluginError> {
+        self.rpc(method, params, ctx).await
+    }
+
     async fn rpc(
         &self,
         method: &str,

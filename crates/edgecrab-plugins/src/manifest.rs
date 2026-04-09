@@ -217,6 +217,14 @@ fn validate_plugin_manifest(path: &Path, manifest: &PluginManifest) -> Result<()
                 return invalid_manifest(path, "script.file is required");
             }
         }
+        PluginKind::Hermes => {
+            let Some(exec) = manifest.exec.as_ref() else {
+                return invalid_manifest(path, "Hermes compatibility plugins require [exec]");
+            };
+            if exec.command.trim().is_empty() {
+                return invalid_manifest(path, "exec.command is required");
+            }
+        }
     }
 
     if !matches!(manifest.plugin.kind, PluginKind::Skill) && manifest.tools.is_empty() {

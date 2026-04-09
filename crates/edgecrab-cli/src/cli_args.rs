@@ -436,12 +436,19 @@ pub enum PluginsCommand {
         #[arg(long, default_value_t = 20)]
         lines: usize,
     },
-    /// Search the remote plugin hub
-    HubSearch { query: Vec<String> },
-    /// Print guidance for interactive hub browsing in the TUI
-    HubBrowse,
-    /// Clear cached plugin hub indices
-    HubRefresh,
+    /// Search remote plugin registries
+    #[command(visible_alias = "hub-search")]
+    Search {
+        #[arg(long)]
+        source: Option<String>,
+        query: Vec<String>,
+    },
+    /// List remote plugin registries and search examples
+    #[command(visible_alias = "hub-browse")]
+    Browse,
+    /// Clear cached plugin registry indices
+    #[command(visible_alias = "hub-refresh")]
+    Refresh,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -940,6 +947,24 @@ mod tests {
             args.command,
             Some(Command::Plugins {
                 command: PluginsCommand::List
+            })
+        ));
+    }
+
+    #[test]
+    fn parse_plugins_search_subcommand_with_source() {
+        let args = CliArgs::parse_from([
+            "edgecrab",
+            "plugins",
+            "search",
+            "--source",
+            "hermes",
+            "weather",
+        ]);
+        assert!(matches!(
+            args.command,
+            Some(Command::Plugins {
+                command: PluginsCommand::Search { source: Some(_), .. }
             })
         ));
     }

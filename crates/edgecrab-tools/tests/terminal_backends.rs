@@ -576,6 +576,7 @@ fn make_ctx(dir: &Path) -> ToolContext {
         todo_store: None,
         current_tool_call_id: None,
         current_tool_name: None,
+        injected_messages: None,
         tool_progress_tx: None,
     }
 }

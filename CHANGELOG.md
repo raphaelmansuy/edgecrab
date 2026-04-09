@@ -18,14 +18,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **Runtime plugin tool registration** — CLI runtime registry construction now discovers installed tool-server and script plugins and registers their tools dynamically so plugin tools participate in the normal `ToolRegistry` flow.
 - **Persisted plugin config and CLI controls** — `config.yaml` now has a top-level `plugins:` section and the CLI now supports `edgecrab plugins info|enable|disable` in addition to listing/install/update/remove.
 - **Plugin hub search, quarantine installs, and audit log** — plugin installs can now stage from GitHub or local directories into quarantine, run a static scan before activation, search configured hub indices, and append install/remove actions to `~/.edgecrab/plugins/.hub/audit.log`.
-- **Plugin host API and transport parity** — tool-server plugins now use an MCP-style stdio handshake (`initialize`, `notifications/initialized`, `tools/list`, `tools/call`) and can issue reverse `host:*` calls for platform info, logging, memory/session access, secret reads, and delegated host tool execution.
+- **Plugin host API and transport parity** — tool-server plugins now use an MCP-style stdio handshake (`initialize`, `notifications/initialized`, `tools/list`, `tools/call`) and can issue reverse `host:*` calls for platform info, logging, memory/session access, secret reads, safe conversation message injection, and delegated host tool execution.
 - **Hub/source resolution and manifest integrity stamping** — plugin installs now resolve `hub:<source>/<plugin>` entries against cached hub indices, accept direct `https://...zip` archives, support `gh auth token` as a GitHub auth fallback, verify expected checksums when hub metadata provides them, and stamp installed manifests with trust/source/checksum metadata.
+- **Hermes plugin compatibility bridge** — EdgeCrab now discovers Hermes-style `plugin.yaml` + `__init__.py` directory plugins, honors Hermes `requires_env` readiness gating, exposes their registered tools through a Python host bridge, discovers legacy `~/.hermes/plugins/` roots, and runs Hermes-compatible `on_session_start` and `pre_llm_call` hooks with user-message context injection semantics.
 
 ### Changed
 
 - **Wrapper release orchestration on `main` now follows the binaries workflow** — future npm/PyPI CLI wrapper publishes trigger from the successful completion of `Release — Native Binaries`, and the Node SDK workflow only creates a draft fallback release if it races ahead of binary publication. That avoids `GITHUB_TOKEN`-suppressed release-event fan-out and premature public releases before binary assets exist.
 - **Node SDK package entrypoints now match the built tarball** — `sdks/node/package.json` now points CommonJS consumers at `dist/index.js` and ESM consumers at `dist/index.mjs`, with packaging tests that fail if the manifest references artifacts that were not actually built.
 - **Plugin documentation and command references now match the implementation** — README, docs, and site pages now document `hub:` installs, archive installs, audit/checksum behavior, and the expanded `/plugins hub ...` surface.
+- **Plugin runtime exposure now matches plugin state** — disabled or setup-needed runtime plugins are no longer advertised to the model as callable tools.
+- **Plugin search UX now matches the rest of the platform** — the CLI now exposes first-class `plugins search|browse|refresh` commands with backward-compatible `hub-*` aliases, optional source targeting for Hermes registries, and install-ready `hub:<source>/<plugin>` search output.
 
 ---
 

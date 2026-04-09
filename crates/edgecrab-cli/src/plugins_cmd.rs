@@ -4,8 +4,8 @@ use anyhow::Context;
 use chrono::Utc;
 use edgecrab_plugins::{
     PluginAuditEntry, append_audit_entry, clear_hub_cache, materialize_source_to_dir,
-    parse_plugin_manifest, read_audit_entries, resolve_install_source, scan_plugin_bundle,
-    search_hub, sha256_dir, should_allow_install, write_install_metadata,
+    hub_source_names, parse_plugin_manifest, read_audit_entries, resolve_install_source,
+    scan_plugin_bundle, search_hub, sha256_dir, should_allow_install, write_install_metadata,
 };
 
 use crate::plugins::PluginManager;
@@ -40,11 +40,12 @@ pub enum PluginAction {
     Audit {
         lines: usize,
     },
-    HubSearch {
+    Search {
         query: String,
+        source: Option<String>,
     },
-    HubBrowse,
-    HubRefresh,
+    Browse,
+    Refresh,
 }
 
 pub fn run(action: PluginAction) -> anyhow::Result<()> {
@@ -95,21 +96,20 @@ pub fn action_from_slash_args(args: &str) -> Option<PluginAction> {
     if trimmed == "update" {
         return Some(PluginAction::Update { name: None });
     }
+    if let Some(rest) = trimmed.strip_prefix("search ").map(str::trim) {
+        return Some(parse_search_action(rest));
+    }
     if let Some(query) = trimmed.strip_prefix("hub search ").map(str::trim) {
-        return Some(PluginAction::HubSearch {
-            query: query.to_string(),
-        });
+        return Some(parse_search_action(query));
     }
-    if matches!(trimmed, "hub" | "hub search") {
-        return Some(PluginAction::HubSearch {
-            query: String::new(),
-        });
+    if matches!(trimmed, "hub" | "hub search" | "search") {
+        return Some(PluginAction::Browse);
     }
-    if matches!(trimmed, "hub browse") {
-        return Some(PluginAction::HubBrowse);
+    if matches!(trimmed, "hub browse" | "browse") {
+        return Some(PluginAction::Browse);
     }
-    if matches!(trimmed, "hub refresh") {
-        return Some(PluginAction::HubRefresh);
+    if matches!(trimmed, "hub refresh" | "refresh") {
+        return Some(PluginAction::Refresh);
     }
     if trimmed.starts_with("audit") {
         let lines = trimmed
@@ -147,9 +147,9 @@ pub fn run_capture(action: PluginAction) -> anyhow::Result<String> {
         PluginAction::Update { name } => update_plugins(name.as_deref()),
         PluginAction::Remove { name } => remove_plugin(&name),
         PluginAction::Audit { lines } => show_plugin_audit(lines),
-        PluginAction::HubSearch { query } => search_plugin_hub(&query),
-        PluginAction::HubBrowse => browse_plugin_hub(),
-        PluginAction::HubRefresh => refresh_plugin_hub(),
+        PluginAction::Search { query, source } => search_plugin_hub(&query, source.as_deref()),
+        PluginAction::Browse => browse_plugin_hub(),
+        PluginAction::Refresh => refresh_plugin_hub(),
     }
 }
 
@@ -159,7 +159,7 @@ fn list_plugins() -> anyhow::Result<String> {
     let plugins = manager.plugins();
     if plugins.is_empty() {
         return Ok(
-            "No plugins installed.\nUse /plugins hub search <query> to find plugins.".into(),
+            "No plugins installed.\nUse `/plugins search <query>` to find remote plugins, including Hermes-compatible registries.".into(),
         );
     }
 
@@ -536,28 +536,34 @@ fn show_plugin_audit(lines: usize) -> anyhow::Result<String> {
     Ok(text.trim_end().to_string())
 }
 
-fn search_plugin_hub(query: &str) -> anyhow::Result<String> {
+fn search_plugin_hub(query: &str, source: Option<&str>) -> anyhow::Result<String> {
     let (_config_path, config) = load_config()?;
     let rt = tokio::runtime::Runtime::new().context("failed to create hub runtime")?;
     let results = rt
-        .block_on(search_hub(&config.plugins, query, 20))
+        .block_on(search_hub(&config.plugins, query, source, 20))
         .context("plugin hub search failed")?;
     if results.is_empty() {
-        return Ok(format!("No plugin hub results for '{}'.", query));
+        let scope = source
+            .map(|value| format!(" in source '{value}'"))
+            .unwrap_or_default();
+        return Ok(format!("No plugin hub results for '{}'{}.", query, scope));
     }
-    let mut text = String::from("PLUGIN HUB RESULTS\n");
+    let mut text = String::from("PLUGIN SEARCH RESULTS\n");
     text.push_str("─────────────────────────────────────────────────────────\n");
     for result in results {
+        let install_ref = format!("hub:{}/{}", result.source_name, result.plugin.name);
         text.push_str(&format!(
-            "{}  v{}  {:?}  {}  score={:.1}\n",
+            "{}  v{}  {:?}  {}  source={}  score={:.1}\n",
             result.plugin.name,
             result.plugin.version,
             result.trust_level,
             result.plugin.kind.as_tag(),
+            result.source_name,
             result.score
         ));
         text.push_str(&format!("  {}\n", result.plugin.description));
-        text.push_str(&format!("  install: {}\n", result.plugin.install_url));
+        text.push_str(&format!("  install: edgecrab plugins install {}\n", install_ref));
+        text.push_str(&format!("  source url: {}\n", result.plugin.install_url));
         if !result.plugin.requires_env.is_empty() {
             text.push_str(&format!(
                 "  requires env: {}\n",
@@ -569,7 +575,20 @@ fn search_plugin_hub(query: &str) -> anyhow::Result<String> {
 }
 
 fn browse_plugin_hub() -> anyhow::Result<String> {
-    Ok("Interactive hub browsing is available from the TUI slash command: /plugins hub search <query> or /plugins toggle".into())
+    let (_config_path, config) = load_config()?;
+    let sources = hub_source_names(&config.plugins);
+    let mut text = String::from("PLUGIN SEARCH SOURCES\n");
+    text.push_str("─────────────────────────────────────────────────────────\n");
+    for source in sources {
+        text.push_str(&format!("- {source}\n"));
+    }
+    text.push_str("─────────────────────────────────────────────────────────\n");
+    text.push_str("Examples:\n");
+    text.push_str("  /plugins search github\n");
+    text.push_str("  /plugins search --source hermes weather\n");
+    text.push_str("  edgecrab plugins search github\n");
+    text.push_str("  edgecrab plugins search --source hermes weather\n");
+    Ok(text.trim_end().to_string())
 }
 
 fn refresh_plugin_hub() -> anyhow::Result<String> {
@@ -619,6 +638,19 @@ fn resolved_trust_level(name: &str) -> edgecrab_plugins::TrustLevel {
         .unwrap_or(edgecrab_plugins::TrustLevel::Unverified)
 }
 
+fn parse_search_action(input: &str) -> PluginAction {
+    let trimmed = input.trim();
+    let (source, query) = if let Some(rest) = trimmed.strip_prefix("--source ").map(str::trim) {
+        match rest.split_once(' ') {
+            Some((source, query)) => (Some(source.to_string()), query.trim().to_string()),
+            None => (Some(rest.to_string()), String::new()),
+        }
+    } else {
+        (None, trimmed.to_string())
+    };
+    PluginAction::Search { query, source }
+}
+
 fn render_scan_block(scan: &edgecrab_plugins::ScanResult) -> String {
     let mut text = format!(
         "Installation blocked. Security scan verdict: {:?}\n",
@@ -659,5 +691,17 @@ mod tests {
             }],
         };
         assert!(render_scan_block(&scan).contains("plugin.py:4"));
+    }
+
+    #[test]
+    fn slash_search_supports_source_flag() {
+        let action = action_from_slash_args("search --source hermes weather").expect("action");
+        match action {
+            PluginAction::Search { query, source } => {
+                assert_eq!(query, "weather");
+                assert_eq!(source.as_deref(), Some("hermes"));
+            }
+            other => panic!("unexpected action: {:?}", std::mem::discriminant(&other)),
+        }
     }
 }
