@@ -1906,6 +1906,9 @@ dependencies = [
  "async-trait",
  "chrono",
  "dirs 5.0.1",
+ "edgecrab-security",
+ "edgecrab-state",
+ "edgecrab-tools",
  "edgecrab-types",
  "regex",
  "reqwest",
@@ -1917,8 +1920,10 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "toml",
  "tracing",
+ "zip",
 ]
 
 [[package]]

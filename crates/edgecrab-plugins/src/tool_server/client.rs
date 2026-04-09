@@ -3,13 +3,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 
 use crate::error::PluginError;
-use crate::manifest::{PluginExecConfig, PluginRestartPolicy};
+use crate::host_api::{handle_host_request, is_host_method};
+use crate::manifest::{PluginCapabilities, PluginExecConfig, PluginRestartPolicy};
+use edgecrab_tools::registry::ToolContext;
 
 struct ProcessState {
     child: Child,
@@ -22,16 +24,25 @@ struct ProcessState {
 #[derive(Clone)]
 pub struct ToolServerClient {
     plugin_dir: PathBuf,
+    plugin_name: String,
     config: PluginExecConfig,
+    capabilities: PluginCapabilities,
     state: Arc<Mutex<Option<ProcessState>>>,
     next_id: Arc<AtomicU64>,
 }
 
 impl ToolServerClient {
-    pub fn new(plugin_dir: PathBuf, config: PluginExecConfig) -> Self {
+    pub fn new(
+        plugin_dir: PathBuf,
+        plugin_name: String,
+        config: PluginExecConfig,
+        capabilities: PluginCapabilities,
+    ) -> Self {
         Self {
             plugin_dir,
+            plugin_name,
             config,
+            capabilities,
             state: Arc::new(Mutex::new(None)),
             next_id: Arc::new(AtomicU64::new(1)),
         }
@@ -60,7 +71,7 @@ impl ToolServerClient {
     }
 
     pub async fn tool_list(&self) -> Result<Vec<serde_json::Value>, PluginError> {
-        let result = self.rpc("tools/list", json!({})).await?;
+        let result = self.rpc("tools/list", json!({}), None).await?;
         Ok(result
             .as_array()
             .cloned()
@@ -76,6 +87,7 @@ impl ToolServerClient {
         &self,
         name: &str,
         arguments: serde_json::Value,
+        ctx: &ToolContext,
     ) -> Result<serde_json::Value, PluginError> {
         self.rpc(
             "tools/call",
@@ -83,6 +95,7 @@ impl ToolServerClient {
                 "name": name,
                 "arguments": arguments,
             }),
+            Some(ctx),
         )
         .await
     }
@@ -91,6 +104,7 @@ impl ToolServerClient {
         &self,
         method: &str,
         params: serde_json::Value,
+        ctx: Option<&ToolContext>,
     ) -> Result<serde_json::Value, PluginError> {
         let mut state = self.state.lock().await;
         self.ensure_process(&mut state).await?;
@@ -113,27 +127,55 @@ impl ToolServerClient {
         process.stdin.flush().await?;
 
         let mut line = String::new();
-        let read = tokio::time::timeout(
-            Duration::from_secs(self.config.call_timeout_secs.max(1)),
-            process.stdout.read_line(&mut line),
-        )
-        .await
-        .map_err(|_| PluginError::Rpc(format!("timeout waiting for {method} response")))??;
-        if read == 0 {
-            self.handle_process_failure(&mut state, method).await?;
-            return Err(PluginError::Process(format!(
-                "plugin process closed stdout during {method}"
-            )));
+        loop {
+            line.clear();
+            let read = tokio::time::timeout(
+                Duration::from_secs(self.config.call_timeout_secs.max(1)),
+                process.stdout.read_line(&mut line),
+            )
+            .await
+            .map_err(|_| PluginError::Rpc(format!("timeout waiting for {method} response")))??;
+            if read == 0 {
+                self.handle_process_failure(&mut state, method).await?;
+                return Err(PluginError::Process(format!(
+                    "plugin process closed stdout during {method}"
+                )));
+            }
+            process.last_used_at = Instant::now();
+            let response: serde_json::Value = serde_json::from_str(line.trim())?;
+            if let Some(host_method) = response.get("method").and_then(|value| value.as_str()) {
+                if is_host_method(host_method) {
+                    let Some(ctx) = ctx else {
+                        return Err(PluginError::Rpc(format!(
+                            "plugin requested {host_method} without a host context"
+                        )));
+                    };
+                    let host_response = handle_host_request(
+                        &self.plugin_name,
+                        &self.capabilities,
+                        &response,
+                        ctx,
+                    )
+                    .await;
+                    process
+                        .stdin
+                        .write_all(host_response.to_string().as_bytes())
+                        .await?;
+                    process.stdin.write_all(b"\n").await?;
+                    process.stdin.flush().await?;
+                    continue;
+                }
+                tracing::debug!(plugin = %self.plugin_name, method = host_method, "ignoring plugin notification");
+                continue;
+            }
+            if response.get("id") != Some(&json!(id)) {
+                continue;
+            }
+            if let Some(error) = response.get("error") {
+                return Err(PluginError::Rpc(error.to_string()));
+            }
+            return Ok(extract_result_payload(response.get("result").cloned().unwrap_or(Value::Null)));
         }
-        process.last_used_at = Instant::now();
-        let response: serde_json::Value = serde_json::from_str(line.trim())?;
-        if let Some(error) = response.get("error") {
-            return Err(PluginError::Rpc(error.to_string()));
-        }
-        Ok(response
-            .get("result")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null))
     }
 
     async fn ensure_process(&self, state: &mut Option<ProcessState>) -> Result<(), PluginError> {
@@ -211,7 +253,14 @@ impl ToolServerClient {
             "jsonrpc": "2.0",
             "id": 0,
             "method": "initialize",
-            "params": { "protocol_version": "0.1" },
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "edgecrab",
+                    "version": env!("CARGO_PKG_VERSION"),
+                }
+            },
         });
         state.stdin.write_all(init.to_string().as_bytes()).await?;
         state.stdin.write_all(b"\n").await?;
@@ -229,9 +278,48 @@ impl ToolServerClient {
                 "tool server exited before initialize completed".into(),
             ));
         }
+        let init_response: serde_json::Value = serde_json::from_str(line.trim())?;
+        if let Some(error) = init_response.get("error") {
+            return Err(PluginError::Rpc(error.to_string()));
+        }
+        let initialized = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+        });
+        state
+            .stdin
+            .write_all(initialized.to_string().as_bytes())
+            .await?;
+        state.stdin.write_all(b"\n").await?;
+        state.stdin.flush().await?;
         state.last_used_at = Instant::now();
         Ok(state)
     }
+}
+
+fn extract_result_payload(result: serde_json::Value) -> serde_json::Value {
+    if result
+        .get("isError")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    {
+        return json!({
+            "isError": true,
+            "content": result.get("content").cloned().unwrap_or(Value::Null),
+        });
+    }
+    if let Some(content) = result.get("content").and_then(|value| value.as_array()) {
+        let text = content
+            .iter()
+            .filter(|item| item.get("type").and_then(|value| value.as_str()) == Some("text"))
+            .map(|item| item.get("text").and_then(|value| value.as_str()).unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !text.is_empty() {
+            return Value::String(text);
+        }
+    }
+    result
 }
 
 fn resolve_command(plugin_dir: &Path, command: &str) -> PathBuf {

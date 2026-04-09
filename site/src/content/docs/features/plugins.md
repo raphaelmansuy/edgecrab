@@ -38,8 +38,18 @@ Plugin disable state is persistent. Disabled plugins stay installed on disk but 
 
 - Installs are staged in `~/.edgecrab/plugins/.quarantine/`
 - Every install is statically scanned before activation
+- Installed manifests are stamped with trust metadata and a directory checksum
 - Install and remove events are appended to `~/.edgecrab/plugins/.hub/audit.log`
 - `edgecrab plugins hub-search <query>` searches curated and configured plugin indices
+- `hub:<source>/<plugin>` resolves through the configured hub index before install
+- Direct `https://...zip` plugin archives are supported in addition to GitHub and local paths
+
+## Host API
+
+Tool-server plugins now use MCP-style newline-delimited JSON-RPC over stdio in both directions.
+
+- Host requests: `initialize`, `notifications/initialized`, `tools/list`, `tools/call`
+- Plugin reverse-calls: `host:platform_info`, `host:log`, `host:memory_read`, `host:memory_write`, `host:session_search`, `host:secret_get`, `host:tool_call`
 
 ## CLI
 
@@ -49,11 +59,14 @@ edgecrab plugins info github-tools
 edgecrab plugins status
 edgecrab plugins enable github-tools
 edgecrab plugins disable github-tools
-edgecrab plugins toggle github-tools
+edgecrab plugins toggle [github-tools]
 edgecrab plugins install github:edgecrab/plugins/github-tools
+edgecrab plugins install hub:community/github-tools
+edgecrab plugins install https://example.com/github-tools.zip
 edgecrab plugins install ./plugins/github-tools
 edgecrab plugins audit --lines 20
 edgecrab plugins hub-search github
+edgecrab plugins hub-browse
 edgecrab plugins hub-refresh
 edgecrab plugins remove github-tools
 ```

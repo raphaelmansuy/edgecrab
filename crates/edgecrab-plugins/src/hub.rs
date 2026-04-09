@@ -1,5 +1,7 @@
 use std::cmp::Ordering;
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -20,7 +22,25 @@ const CURATED_SOURCES: &[CuratedSource] = &[
         name: "hermes-plugins",
         url: "https://raw.githubusercontent.com/hermes-agent/plugins/main/index.json",
         trust_level: TrustLevel::Official,
-        description: "Hermes-compatible plugins and skills",
+        description: "Hermes Agent compatible plugins and skills",
+    },
+    CuratedSource {
+        name: "clawhub",
+        url: "https://clawhub.io/index.json",
+        trust_level: TrustLevel::Community,
+        description: "ClaWHub plugin directory",
+    },
+    CuratedSource {
+        name: "claude-marketplace",
+        url: "https://marketplace.claude.ai/index.json",
+        trust_level: TrustLevel::Community,
+        description: "Claude marketplace plugin directory",
+    },
+    CuratedSource {
+        name: "lobehub",
+        url: "https://lobehub.com/mcp/plugins-store/index.json",
+        trust_level: TrustLevel::Community,
+        description: "LobeHub plugin registry",
     },
     CuratedSource {
         name: "community",
@@ -29,6 +49,9 @@ const CURATED_SOURCES: &[CuratedSource] = &[
         description: "EdgeCrab community plugin directory",
     },
 ];
+
+const GITHUB_SKIP_NAMES: &[&str] = &[".", "..", ".git", ".github", ".hub"];
+const MAX_ZIP_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy)]
 pub struct CuratedSource {
@@ -92,14 +115,19 @@ pub struct PluginAuditEntry {
 pub enum InstallSourceKind {
     GitHub,
     Local,
+    HttpsArchive,
+    Hub,
 }
 
 #[derive(Debug, Clone)]
 pub struct ResolvedInstallSource {
     pub kind: InstallSourceKind,
     pub display: String,
+    pub materialized_source: String,
     pub trust_level: TrustLevel,
     pub plugin_name_hint: String,
+    pub expected_checksum: Option<String>,
+    pub source_name: Option<String>,
 }
 
 pub async fn search_hub(
@@ -108,16 +136,15 @@ pub async fn search_hub(
     limit: usize,
 ) -> Result<Vec<PluginSearchResult>, PluginError> {
     let sources = configured_sources(config);
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(12))
-        .build()
-        .map_err(|error| PluginError::Hub(error.to_string()))?;
-
+    let client = hub_client()?;
     let mut results = Vec::new();
-    for source in sources {
-        let index = fetch_index(config, &client, &source).await?;
+    for source in &sources {
+        let index = fetch_index(config, &client, source).await?;
         for plugin in index.plugins {
-            let score = search_score(query, &plugin);
+            let mut score = search_score(query, &plugin);
+            if matches!(source.trust_level, TrustLevel::Official) {
+                score += 0.5;
+            }
             if score > 0.0 {
                 results.push(PluginSearchResult {
                     source_name: source.name.clone(),
@@ -128,6 +155,7 @@ pub async fn search_hub(
             }
         }
     }
+
     results.sort_by(|left, right| {
         right
             .score
@@ -135,6 +163,7 @@ pub async fn search_hub(
             .unwrap_or(Ordering::Equal)
             .then_with(|| left.plugin.name.cmp(&right.plugin.name))
     });
+    results.dedup_by(|left, right| left.plugin.name == right.plugin.name);
     results.truncate(limit);
     Ok(results)
 }
@@ -147,9 +176,8 @@ pub fn clear_hub_cache(config: &PluginsConfig) -> Result<usize, PluginError> {
     let mut removed = 0;
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
-        let path = entry.path();
-        if path.is_file() {
-            std::fs::remove_file(path)?;
+        if entry.path().is_file() {
+            std::fs::remove_file(entry.path())?;
             removed += 1;
         }
     }
@@ -199,11 +227,46 @@ pub fn read_audit_entries(
 
 pub fn resolve_install_source(source: &str) -> ResolvedInstallSource {
     let trimmed = source.trim();
+    if let Some(rest) = trimmed.strip_prefix("hub:") {
+        let plugin_name_hint = rest
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or("plugin")
+            .to_string();
+        return ResolvedInstallSource {
+            kind: InstallSourceKind::Hub,
+            display: trimmed.to_string(),
+            materialized_source: trimmed.to_string(),
+            trust_level: TrustLevel::Community,
+            plugin_name_hint,
+            expected_checksum: None,
+            source_name: None,
+        };
+    }
+    if trimmed.starts_with("https://") {
+        let plugin_name_hint = trimmed
+            .rsplit('/')
+            .next()
+            .unwrap_or("plugin.zip")
+            .trim_end_matches(".zip")
+            .to_string();
+        return ResolvedInstallSource {
+            kind: InstallSourceKind::HttpsArchive,
+            display: trimmed.to_string(),
+            materialized_source: trimmed.to_string(),
+            trust_level: TrustLevel::Unverified,
+            plugin_name_hint,
+            expected_checksum: None,
+            source_name: None,
+        };
+    }
     if trimmed.starts_with("github:") || looks_like_github_source(trimmed) {
         let path = trimmed.trim_start_matches("github:");
         return ResolvedInstallSource {
             kind: InstallSourceKind::GitHub,
             display: format!("github:{path}"),
+            materialized_source: format!("github:{path}"),
             trust_level: TrustLevel::Unverified,
             plugin_name_hint: path
                 .trim_end_matches('/')
@@ -211,6 +274,8 @@ pub fn resolve_install_source(source: &str) -> ResolvedInstallSource {
                 .next()
                 .unwrap_or("plugin")
                 .to_string(),
+            expected_checksum: None,
+            source_name: None,
         };
     }
 
@@ -223,26 +288,43 @@ pub fn resolve_install_source(source: &str) -> ResolvedInstallSource {
     ResolvedInstallSource {
         kind: InstallSourceKind::Local,
         display: trimmed.to_string(),
+        materialized_source: trimmed.to_string(),
         trust_level: TrustLevel::Unverified,
         plugin_name_hint,
+        expected_checksum: None,
+        source_name: None,
     }
 }
 
 pub async fn materialize_source_to_dir(
+    config: &PluginsConfig,
     source: &str,
     destination: &Path,
 ) -> Result<ResolvedInstallSource, PluginError> {
-    let resolved = resolve_install_source(source);
+    let parsed = resolve_install_source(source);
+    let resolved = match parsed.kind {
+        InstallSourceKind::Hub => resolve_hub_source(config, parsed.display.as_str()).await?,
+        _ => parsed,
+    };
+
     match resolved.kind {
         InstallSourceKind::Local => {
-            let raw = resolved.display.trim_start_matches("local:");
+            let raw = resolved.materialized_source.trim_start_matches("local:");
             copy_dir(Path::new(raw), destination)?;
         }
         InstallSourceKind::GitHub => {
-            let github_path = resolved.display.trim_start_matches("github:");
-            download_github_tree(github_path, destination).await?;
+            download_github_tree(
+                resolved.materialized_source.trim_start_matches("github:"),
+                destination,
+            )
+            .await?;
         }
+        InstallSourceKind::HttpsArchive => {
+            download_https_archive(&resolved.materialized_source, destination).await?;
+        }
+        InstallSourceKind::Hub => unreachable!("hub sources are resolved before download"),
     }
+
     Ok(resolved)
 }
 
@@ -291,6 +373,36 @@ struct RuntimeSource {
     trust_level: TrustLevel,
 }
 
+async fn resolve_hub_source(
+    config: &PluginsConfig,
+    source: &str,
+) -> Result<ResolvedInstallSource, PluginError> {
+    let spec = source.trim_start_matches("hub:");
+    let (source_name, plugin_name) = spec
+        .split_once('/')
+        .ok_or_else(|| PluginError::Hub("hub source must be hub:<source>/<plugin>".into()))?;
+    let runtime_source = configured_sources(config)
+        .into_iter()
+        .find(|candidate| candidate.name == source_name)
+        .ok_or_else(|| PluginError::Hub(format!("unknown plugin hub source: {source_name}")))?;
+    let client = hub_client()?;
+    let index = fetch_index(config, &client, &runtime_source).await?;
+    let plugin = index
+        .plugins
+        .into_iter()
+        .find(|candidate| candidate.name == plugin_name)
+        .ok_or_else(|| PluginError::Hub(format!("plugin '{plugin_name}' not found in {source_name}")))?;
+    Ok(ResolvedInstallSource {
+        kind: resolve_install_source(&plugin.install_url).kind,
+        display: format!("hub:{source_name}/{}", plugin.name),
+        materialized_source: plugin.install_url.clone(),
+        trust_level: runtime_source.trust_level,
+        plugin_name_hint: plugin.name,
+        expected_checksum: Some(plugin.checksum),
+        source_name: Some(source_name.to_string()),
+    })
+}
+
 async fn fetch_index(
     config: &PluginsConfig,
     client: &reqwest::Client,
@@ -310,14 +422,16 @@ async fn fetch_index(
         .get(&source.url)
         .send()
         .await
-        .map_err(|error| PluginError::Hub(error.to_string()))?;
-    let response = response
+        .map_err(|error| PluginError::Hub(error.to_string()))?
         .error_for_status()
         .map_err(|error| PluginError::Hub(error.to_string()))?;
-    let index = response
-        .json::<HubIndex>()
+    let bytes = response
+        .bytes()
         .await
         .map_err(|error| PluginError::Hub(error.to_string()))?;
+    let index = serde_json::from_slice::<HubIndex>(&bytes)
+        .map_err(|error| PluginError::Hub(error.to_string()))?;
+
     if let Some(parent) = cache_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -325,9 +439,10 @@ async fn fetch_index(
         fetched_at: chrono::Utc::now().timestamp(),
         index: index.clone(),
     };
-    let json =
-        serde_json::to_string(&cached).map_err(|error| PluginError::Hub(error.to_string()))?;
-    std::fs::write(cache_path, json)?;
+    std::fs::write(
+        cache_path,
+        serde_json::to_vec(&cached).map_err(|error| PluginError::Hub(error.to_string()))?,
+    )?;
     Ok(index)
 }
 
@@ -359,6 +474,14 @@ fn search_score(query: &str, plugin: &HubIndexPlugin) -> f32 {
     score
 }
 
+fn hub_client() -> Result<reqwest::Client, PluginError> {
+    reqwest::Client::builder()
+        .user_agent("edgecrab-plugin-hub/0.2")
+        .timeout(Duration::from_secs(12))
+        .build()
+        .map_err(|error| PluginError::Hub(error.to_string()))
+}
+
 fn hub_cache_dir(config: &PluginsConfig) -> PathBuf {
     config.install_dir.join(".hub").join("cache")
 }
@@ -388,18 +511,18 @@ async fn download_github_tree(path: &str, destination: &Path) -> Result<(), Plug
         .next()
         .ok_or_else(|| PluginError::Hub("github source missing path".into()))?;
 
-    let client = reqwest::Client::builder()
-        .user_agent("edgecrab-plugin-hub")
-        .build()
-        .map_err(|error| PluginError::Hub(error.to_string()))?;
+    let client = hub_client()?;
     let mut pending = vec![(root.to_string(), 0usize)];
     while let Some((dir, depth)) = pending.pop() {
         if depth > 2 {
             continue;
         }
         let url = format!("https://api.github.com/repos/{owner}/{repo}/contents/{dir}");
-        let entries = client
-            .get(url)
+        let mut request = client.get(url);
+        if let Some(token) = resolve_github_token() {
+            request = request.header("Authorization", format!("Bearer {token}"));
+        }
+        let entries = request
             .send()
             .await
             .map_err(|error| PluginError::Hub(error.to_string()))?
@@ -410,6 +533,9 @@ async fn download_github_tree(path: &str, destination: &Path) -> Result<(), Plug
             .map_err(|error| PluginError::Hub(error.to_string()))?;
 
         for entry in entries {
+            if GITHUB_SKIP_NAMES.contains(&entry.name.as_str()) {
+                continue;
+            }
             match entry.kind.as_str() {
                 "file" => {
                     let relative = entry
@@ -421,12 +547,13 @@ async fn download_github_tree(path: &str, destination: &Path) -> Result<(), Plug
                     if let Some(parent) = target.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
-                    let bytes = client
-                        .get(
-                            entry
-                                .download_url
-                                .ok_or_else(|| PluginError::Hub("missing download url".into()))?,
-                        )
+                    let mut download = client.get(entry.download_url.ok_or_else(|| {
+                        PluginError::Hub("missing GitHub download_url".into())
+                    })?);
+                    if let Some(token) = resolve_github_token() {
+                        download = download.header("Authorization", format!("Bearer {token}"));
+                    }
+                    let bytes = download
                         .send()
                         .await
                         .map_err(|error| PluginError::Hub(error.to_string()))?
@@ -445,12 +572,80 @@ async fn download_github_tree(path: &str, destination: &Path) -> Result<(), Plug
     Ok(())
 }
 
+async fn download_https_archive(url: &str, destination: &Path) -> Result<(), PluginError> {
+    let client = hub_client()?;
+    let bytes = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|error| PluginError::Hub(error.to_string()))?
+        .error_for_status()
+        .map_err(|error| PluginError::Hub(error.to_string()))?
+        .bytes()
+        .await
+        .map_err(|error| PluginError::Hub(error.to_string()))?;
+    if bytes.len() > MAX_ZIP_BYTES {
+        return Err(PluginError::Hub(format!(
+            "archive exceeds maximum size: {} bytes",
+            bytes.len()
+        )));
+    }
+
+    let cursor = Cursor::new(bytes);
+    let mut archive =
+        zip::ZipArchive::new(cursor).map_err(|error| PluginError::Hub(error.to_string()))?;
+    for index in 0..archive.len() {
+        let mut entry = archive
+            .by_index(index)
+            .map_err(|error| PluginError::Hub(error.to_string()))?;
+        let Some(path) = entry.enclosed_name().map(|path| path.to_path_buf()) else {
+            continue;
+        };
+        let components = path.components().collect::<Vec<_>>();
+        let relative = if components.len() > 1 {
+            components[1..].iter().collect::<PathBuf>()
+        } else {
+            path.clone()
+        };
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+        let target = destination.join(relative);
+        if entry.is_dir() {
+            std::fs::create_dir_all(&target)?;
+            continue;
+        }
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut out = std::fs::File::create(target)?;
+        std::io::copy(&mut entry, &mut out)?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Deserialize)]
 struct GitHubEntry {
     #[serde(rename = "type")]
     kind: String,
+    name: String,
     path: String,
     download_url: Option<String>,
+}
+
+fn resolve_github_token() -> Option<String> {
+    if let Ok(token) = std::env::var("GITHUB_TOKEN").or_else(|_| std::env::var("GH_TOKEN")) {
+        return Some(token);
+    }
+    if let Ok(output) = Command::new("gh").args(["auth", "token"]).output()
+        && output.status.success()
+    {
+        let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !token.is_empty() {
+            return Some(token);
+        }
+    }
+    None
 }
 
 fn copy_dir(source: &Path, destination: &Path) -> Result<(), PluginError> {
@@ -490,7 +685,7 @@ fn collect_files(
             .strip_prefix(root)
             .map_err(|error| PluginError::Hub(error.to_string()))?
             .to_string_lossy()
-            .to_string();
+            .replace('\\', "/");
         files.push((relative, path));
     }
     Ok(())
@@ -511,6 +706,13 @@ mod tests {
     fn resolves_local_sources() {
         let resolved = resolve_install_source("./plugins/demo");
         assert_eq!(resolved.kind, InstallSourceKind::Local);
+        assert_eq!(resolved.plugin_name_hint, "demo");
+    }
+
+    #[test]
+    fn resolves_hub_sources() {
+        let resolved = resolve_install_source("hub:community/demo");
+        assert_eq!(resolved.kind, InstallSourceKind::Hub);
         assert_eq!(resolved.plugin_name_hint, "demo");
     }
 }

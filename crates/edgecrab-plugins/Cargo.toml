@@ -7,6 +7,9 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+edgecrab-security = { workspace = true }
+edgecrab-state = { workspace = true }
+edgecrab-tools = { workspace = true }
 edgecrab-types = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
@@ -23,6 +26,8 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 rhai = { version = "1.20", default-features = true, features = ["sync", "serde"] }
 toml = "0.8"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+tokio-util = { workspace = true }

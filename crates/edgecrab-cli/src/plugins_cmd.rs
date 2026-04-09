@@ -4,8 +4,8 @@ use anyhow::Context;
 use chrono::Utc;
 use edgecrab_plugins::{
     PluginAuditEntry, append_audit_entry, clear_hub_cache, materialize_source_to_dir,
-    read_audit_entries, resolve_install_source, scan_plugin_bundle, search_hub, sha256_dir,
-    should_allow_install,
+    parse_plugin_manifest, read_audit_entries, resolve_install_source, scan_plugin_bundle,
+    search_hub, sha256_dir, should_allow_install, write_install_metadata,
 };
 
 use crate::plugins::PluginManager;
@@ -43,6 +43,7 @@ pub enum PluginAction {
     HubSearch {
         query: String,
     },
+    HubBrowse,
     HubRefresh,
 }
 
@@ -104,6 +105,9 @@ pub fn action_from_slash_args(args: &str) -> Option<PluginAction> {
             query: String::new(),
         });
     }
+    if matches!(trimmed, "hub browse") {
+        return Some(PluginAction::HubBrowse);
+    }
     if matches!(trimmed, "hub refresh") {
         return Some(PluginAction::HubRefresh);
     }
@@ -144,6 +148,7 @@ pub fn run_capture(action: PluginAction) -> anyhow::Result<String> {
         PluginAction::Remove { name } => remove_plugin(&name),
         PluginAction::Audit { lines } => show_plugin_audit(lines),
         PluginAction::HubSearch { query } => search_plugin_hub(&query),
+        PluginAction::HubBrowse => browse_plugin_hub(),
         PluginAction::HubRefresh => refresh_plugin_hub(),
     }
 }
@@ -153,14 +158,23 @@ fn list_plugins() -> anyhow::Result<String> {
     manager.discover_all();
     let plugins = manager.plugins();
     if plugins.is_empty() {
-        return Ok("No plugins discovered.".into());
+        return Ok(
+            "No plugins installed.\nUse /plugins hub search <query> to find plugins.".into(),
+        );
     }
 
     let mut text = String::from("INSTALLED PLUGINS\n");
     text.push_str("─────────────────────────────────────────────────────────\n");
+    let mut running = 0usize;
+    let mut disabled = 0usize;
     for plugin in plugins {
+        if plugin.enabled {
+            running += 1;
+        } else {
+            disabled += 1;
+        }
         text.push_str(&format!(
-            "{}  v{}  [{}]  {}  {:?}\n",
+            "{:<20} v{:<8} [{}]  {:<11}  {:?}\n",
             plugin.name,
             plugin.version,
             plugin.status_label().to_ascii_uppercase(),
@@ -187,6 +201,13 @@ fn list_plugins() -> anyhow::Result<String> {
         }
         text.push('\n');
     }
+    text.push_str("─────────────────────────────────────────────────────────\n");
+    text.push_str(&format!(
+        "{} plugins ({} running, {} disabled)",
+        running + disabled,
+        running,
+        disabled
+    ));
     Ok(text.trim_end().to_string())
 }
 
@@ -234,20 +255,34 @@ fn show_plugin_status() -> anyhow::Result<String> {
     let mut manager = PluginManager::new();
     manager.discover_all();
     if manager.plugins().is_empty() {
-        return Ok("No plugins discovered.".into());
+        return Ok("No plugins installed.".into());
     }
 
-    let mut text = String::new();
+    let mut text = String::from("PLUGIN RUNTIME STATUS\n");
+    text.push_str("─────────────────────────────────────────────────────────\n");
+    let mut runtime_tools = 0usize;
+    let mut skill_injections = 0usize;
     for plugin in manager.plugins() {
+        runtime_tools += plugin.tools.len();
+        if matches!(plugin.kind.as_tag(), "skill") && plugin.enabled {
+            skill_injections += 1;
+        }
         text.push_str(&format!(
-            "{}: {} (kind={}, enabled={}, tools={})\n",
+            "{:<20} {:<16} kind={} enabled={} tools={}\n",
             plugin.name,
-            plugin.status_label(),
+            plugin.status_label().to_ascii_uppercase(),
             plugin.kind.as_tag(),
             plugin.enabled,
             plugin.tools.len()
         ));
     }
+    text.push_str("─────────────────────────────────────────────────────────\n");
+    text.push_str(&format!(
+        "Runtime tools: {} | Skill injections: {} | Total: {} plugins",
+        runtime_tools,
+        skill_injections,
+        manager.plugins().len()
+    ));
     Ok(text.trim_end().to_string())
 }
 
@@ -261,34 +296,37 @@ fn install_plugin(
     std::fs::create_dir_all(&config.plugins.install_dir)?;
     std::fs::create_dir_all(&config.plugins.quarantine_dir)?;
 
-    let resolved = resolve_install_source(source);
-    let plugin_name = explicit_name
-        .map(ToString::to_string)
-        .unwrap_or_else(|| resolved.plugin_name_hint.clone());
-    let target = safe_plugin_path(&config.plugins.install_dir, &plugin_name)?;
-    if target.exists() {
-        anyhow::bail!(
-            "plugin '{}' already exists at {}",
-            plugin_name,
-            target.display()
-        );
-    }
-
     let quarantine = config.plugins.quarantine_dir.join(format!(
         "{}-{}",
-        plugin_name,
+        resolve_install_source(source).plugin_name_hint,
         Utc::now().timestamp_nanos_opt().unwrap_or(0)
     ));
     std::fs::create_dir_all(&quarantine)?;
 
     let rt = tokio::runtime::Runtime::new().context("failed to create plugin install runtime")?;
-    let resolved = match rt.block_on(materialize_source_to_dir(source, &quarantine)) {
+    let resolved = match rt.block_on(materialize_source_to_dir(&config.plugins, source, &quarantine))
+    {
         Ok(resolved) => resolved,
         Err(error) => {
             let _ = std::fs::remove_dir_all(&quarantine);
             return Err(anyhow::anyhow!(error));
         }
     };
+    let manifest_path = quarantine.join("plugin.toml");
+    let manifest = parse_plugin_manifest(&manifest_path)
+        .with_context(|| format!("invalid plugin manifest in {}", resolved.display))?;
+    let plugin_name = explicit_name
+        .map(ToString::to_string)
+        .unwrap_or_else(|| manifest.plugin.name.clone());
+    let target = safe_plugin_path(&config.plugins.install_dir, &plugin_name)?;
+    if target.exists() {
+        let _ = std::fs::remove_dir_all(&quarantine);
+        anyhow::bail!(
+            "plugin '{}' already exists at {}",
+            plugin_name,
+            target.display()
+        );
+    }
 
     let scan = scan_plugin_bundle(
         &quarantine,
@@ -308,6 +346,26 @@ fn install_plugin(
         anyhow::bail!(render_scan_block(&scan));
     }
 
+    let checksum = sha256_dir(&quarantine).context("failed to hash plugin bundle")?;
+    if let Some(expected_checksum) = &resolved.expected_checksum
+        && &checksum != expected_checksum
+    {
+        let _ = std::fs::remove_dir_all(&quarantine);
+        anyhow::bail!(
+            "checksum mismatch for '{}': expected {}, got {}",
+            plugin_name,
+            expected_checksum,
+            checksum
+        );
+    }
+    write_install_metadata(
+        &manifest_path,
+        resolved.trust_level,
+        &resolved.display,
+        &checksum,
+    )
+    .context("failed to stamp plugin manifest trust metadata")?;
+
     std::fs::rename(&quarantine, &target)
         .with_context(|| format!("failed to install plugin to {}", target.display()))?;
 
@@ -322,7 +380,6 @@ fn install_plugin(
     }
     config.save_to(&config_path)?;
 
-    let checksum = sha256_dir(&target).context("failed to hash installed plugin")?;
     append_audit_entry(
         &config.plugins,
         &PluginAuditEntry {
@@ -343,8 +400,14 @@ fn install_plugin(
         "installed and enabled"
     };
     Ok(format!(
-        "{}\nSecurity scan: {:?}\nChecksum: {}\nPlugin '{}' {}.",
-        resolved.display, scan.verdict, checksum, plugin_name, mode
+        "Installing {}...\n- Source: {}\n- Security scan: {:?} ({} findings)\n- Checksum: {}\n\nPlugin '{}' {}.",
+        plugin_name,
+        resolved.display,
+        scan.verdict,
+        scan.findings.len(),
+        checksum,
+        plugin_name,
+        mode
     ))
 }
 
@@ -503,6 +566,10 @@ fn search_plugin_hub(query: &str) -> anyhow::Result<String> {
         }
     }
     Ok(text.trim_end().to_string())
+}
+
+fn browse_plugin_hub() -> anyhow::Result<String> {
+    Ok("Interactive hub browsing is available from the TUI slash command: /plugins hub search <query> or /plugins toggle".into())
 }
 
 fn refresh_plugin_hub() -> anyhow::Result<String> {

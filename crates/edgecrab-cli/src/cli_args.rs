@@ -423,10 +423,11 @@ pub enum PluginsCommand {
     /// Disable a plugin in config without uninstalling it
     Disable { name: String },
     /// Toggle a plugin in config without reinstalling it
-    Toggle { name: String },
+    Toggle { name: Option<String> },
     /// Show current plugin runtime status
     Status,
     /// Update one installed plugin or all git-backed plugins
+    #[command(visible_alias = "upgrade")]
     Update { name: Option<String> },
     /// Remove an installed plugin
     Remove { name: String },
@@ -437,6 +438,8 @@ pub enum PluginsCommand {
     },
     /// Search the remote plugin hub
     HubSearch { query: Vec<String> },
+    /// Print guidance for interactive hub browsing in the TUI
+    HubBrowse,
     /// Clear cached plugin hub indices
     HubRefresh,
 }

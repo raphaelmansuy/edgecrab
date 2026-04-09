@@ -992,7 +992,11 @@ fn run_plugins(command: PluginsCommand) -> anyhow::Result<()> {
             plugins_cmd::run(plugins_cmd::PluginAction::Disable { name })?
         }
         PluginsCommand::Toggle { name } => {
-            plugins_cmd::run(plugins_cmd::PluginAction::Toggle { name })?
+            if let Some(name) = name {
+                plugins_cmd::run(plugins_cmd::PluginAction::Toggle { name })?
+            } else {
+                plugins_cmd::run(plugins_cmd::PluginAction::HubBrowse)?
+            }
         }
         PluginsCommand::Status => plugins_cmd::run(plugins_cmd::PluginAction::Status)?,
         PluginsCommand::Update { name } => {
@@ -1009,6 +1013,7 @@ fn run_plugins(command: PluginsCommand) -> anyhow::Result<()> {
                 query: query.join(" "),
             })?
         }
+        PluginsCommand::HubBrowse => plugins_cmd::run(plugins_cmd::PluginAction::HubBrowse)?,
         PluginsCommand::HubRefresh => plugins_cmd::run(plugins_cmd::PluginAction::HubRefresh)?,
     }
     Ok(())

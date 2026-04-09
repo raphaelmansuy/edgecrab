@@ -493,12 +493,15 @@ edgecrab plugins list
 edgecrab plugins info github-tools
 edgecrab plugins status
 edgecrab plugins install github:edgecrab/plugins/github-tools
+edgecrab plugins install hub:community/github-tools
+edgecrab plugins install https://example.com/github-tools.zip
 edgecrab plugins install ./plugins/github-tools
 edgecrab plugins enable github-tools
 edgecrab plugins disable github-tools
-edgecrab plugins toggle github-tools
+edgecrab plugins toggle [github-tools]
 edgecrab plugins audit --lines 20
 edgecrab plugins hub-search github
+edgecrab plugins hub-browse
 edgecrab plugins update
 edgecrab plugins remove github-tools
 ```
@@ -506,10 +509,10 @@ edgecrab plugins remove github-tools
 EdgeCrab now supports three plugin kinds:
 
 - `skill` plugins load `SKILL.md` content from `~/.edgecrab/plugins/<name>/` into the session prompt with Hermes-compatible frontmatter, readiness checks, and platform filtering.
-- `tool-server` plugins spawn a subprocess and proxy JSON-RPC `tools/list` and `tools/call` methods into the normal `ToolRegistry`, so plugin tools look like first-class tools to the model.
+- `tool-server` plugins spawn a subprocess and proxy MCP-compatible newline-delimited JSON-RPC over stdio, including reverse `host:*` calls for platform info, memory/session access, secret reads, logging, and delegated tool execution.
 - `script` plugins load Rhai code for lightweight local extension points and tool handlers without shipping a separate daemon.
 
-Plugin state persists in `config.yaml` under `plugins:`. Disabling a plugin removes it from tool exposure or prompt injection without uninstalling it.
+Plugin installs now stage in quarantine, run a static security scan, resolve trust from their source, and stamp `plugin.toml` with a directory checksum before activation. Plugin state persists in `config.yaml` under `plugins:`. Disabling a plugin removes it from tool exposure or prompt injection without uninstalling it.
 
 ---
 
@@ -827,8 +830,9 @@ edgecrab plugins status
 edgecrab plugins install <source>
 edgecrab plugins audit [--lines 20]
 edgecrab plugins hub-search <query>
+edgecrab plugins hub-browse
 edgecrab plugins hub-refresh
-edgecrab plugins toggle <name>
+edgecrab plugins toggle [name]
 edgecrab plugins update [name]
 edgecrab plugins remove <name>
 

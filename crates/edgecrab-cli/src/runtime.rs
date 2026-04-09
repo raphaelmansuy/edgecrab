@@ -161,7 +161,7 @@ impl ToolHandler for PluginToolProxy {
 
         match &self.backend {
             PluginToolBackend::ToolServer(client) => client
-                .tool_call(self.tool_name, args)
+                .tool_call(self.tool_name, args, ctx)
                 .await
                 .map(|value| value.to_string())
                 .map_err(|error| ToolError::ExecutionFailed {
@@ -207,7 +207,12 @@ fn register_plugin(registry: &mut ToolRegistry, plugin: DiscoveredPlugin) {
             let Some(exec) = manifest.exec.clone() else {
                 return;
             };
-            let client = Arc::new(ToolServerClient::new(plugin.path.clone(), exec));
+            let client = Arc::new(ToolServerClient::new(
+                plugin.path.clone(),
+                plugin.name.clone(),
+                exec,
+                manifest.capabilities.clone(),
+            ));
             for tool in &manifest.tools {
                 registry.register_dynamic(Box::new(PluginToolProxy {
                     tool_name: Box::leak(tool.name.clone().into_boxed_str()),
