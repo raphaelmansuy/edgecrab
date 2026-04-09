@@ -3,6 +3,12 @@ name: Release — Rust (crates.io)
 on:
   push:
     tags: ['v[0-9]+.[0-9]+.[0-9]+']
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Tag to publish from (e.g. v0.1.3)'
+        required: true
+        default: 'v0.1.3'
 
 permissions:
   contents: write
@@ -13,6 +19,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag_name || github.ref }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -50,8 +58,11 @@ jobs:
           chmod +x /usr/local/bin/publish_crate
 
       - name: Verify version consistency
+        env:
+          INPUT_TAG: ${{ inputs.tag_name }}
         run: |
-          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          TAG_VERSION="${INPUT_TAG:-$GITHUB_REF_NAME}"
+          TAG_VERSION="${TAG_VERSION#v}"
           CARGO_VERSION=$(cargo metadata --no-deps --format-version 1 \
             | jq -r '.packages[] | select(.name=="edgecrab-core") | .version')
           if [[ "$TAG_VERSION" != "$CARGO_VERSION" ]]; then
@@ -61,7 +72,11 @@ jobs:
 
       - name: Generate CHANGELOG
         uses: taiki-e/install-action@git-cliff
-      - run: git-cliff --tag "$GITHUB_REF_NAME" --latest -o RELEASE_NOTES.md
+      - env:
+          INPUT_TAG: ${{ inputs.tag_name }}
+        run: |
+          TAG="${INPUT_TAG:-$GITHUB_REF_NAME}"
+          git-cliff --tag "$TAG" --latest -o RELEASE_NOTES.md
 
       - name: Publish edgecrab-types
         env:
