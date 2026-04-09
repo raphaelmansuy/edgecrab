@@ -7,7 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-edgecrab-types = { path = "../edgecrab-types", version = "0.1.0" }
+edgecrab-types = { workspace = true }
 regex = { workspace = true }
 aho-corasick = { workspace = true }
 unicode-normalization = { workspace = true }

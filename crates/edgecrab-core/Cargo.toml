@@ -11,11 +11,11 @@ default = ["bedrock-model-discovery"]
 bedrock-model-discovery = ["dep:aws-config", "dep:aws-sdk-bedrock"]
 
 [dependencies]
-edgecrab-types = { path = "../edgecrab-types", version = "0.1.0" }
-edgecrab-lsp = { path = "../edgecrab-lsp", version = "0.1.0" }
-edgecrab-tools = { path = "../edgecrab-tools", version = "0.1.0" }
-edgecrab-state = { path = "../edgecrab-state", version = "0.1.0" }
-edgecrab-security = { path = "../edgecrab-security", version = "0.1.0" }
+edgecrab-types = { workspace = true }
+edgecrab-lsp = { workspace = true }
+edgecrab-tools = { workspace = true }
+edgecrab-state = { workspace = true }
+edgecrab-security = { workspace = true }
 edgequake-llm = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }

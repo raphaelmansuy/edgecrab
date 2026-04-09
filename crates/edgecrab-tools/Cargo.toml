@@ -8,10 +8,10 @@ license.workspace = true
 build = "build.rs"
 
 [dependencies]
-edgecrab-types = { path = "../edgecrab-types", version = "0.1.0" }
-edgecrab-security = { path = "../edgecrab-security", version = "0.1.0" }
-edgecrab-state = { path = "../edgecrab-state", version = "0.1.0" }
-edgecrab-cron = { path = "../edgecrab-cron", version = "0.1.0" }
+edgecrab-types = { workspace = true }
+edgecrab-security = { workspace = true }
+edgecrab-state = { workspace = true }
+edgecrab-cron = { workspace = true }
 edgequake-llm = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -54,4 +54,4 @@ mockall = { workspace = true }
 tempfile = { workspace = true }
 uuid = { workspace = true }
 serde_json = { workspace = true }
-edgecrab-types = { path = "../edgecrab-types", version = "0.1.0" }
+edgecrab-types = { workspace = true }

@@ -27,9 +27,9 @@ inventory = { workspace = true }
 edgequake-llm = { workspace = true }
 dirs = { workspace = true }
 
-edgecrab-types = { path = "../edgecrab-types", version = "0.1.0" }
-edgecrab-security = { path = "../edgecrab-security", version = "0.1.0" }
-edgecrab-tools = { path = "../edgecrab-tools", version = "0.1.0" }
+edgecrab-types = { workspace = true }
+edgecrab-security = { workspace = true }
+edgecrab-tools = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

@@ -9,6 +9,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.2.1] — 2026-04-09
+
+### Fixed
+
+- **Rust workspace release reproducibility** — internal crate dependencies now inherit from root `workspace.dependencies` instead of carrying stale per-crate `0.1.0` constraints, so crates.io, native binary, and Docker release builds resolve the same workspace graph as local development.
+- **Release version synchronization** — `scripts/release-version.sh` now syncs and validates the internal Rust workspace dependency versions alongside the package versions, preventing future partial releases caused by Cargo manifest drift.
+
+---
+
 ## [0.2.0] — 2026-04-09
 
 ### Added

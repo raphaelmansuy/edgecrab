@@ -15,14 +15,14 @@ default = ["bedrock-model-discovery"]
 bedrock-model-discovery = ["edgecrab-core/bedrock-model-discovery"]
 
 [dependencies]
-edgecrab-core = { path = "../edgecrab-core", version = "0.1.0" }
-edgecrab-types = { path = "../edgecrab-types", version = "0.1.0" }
-edgecrab-state = { path = "../edgecrab-state", version = "0.1.0" }
-edgecrab-tools = { path = "../edgecrab-tools", version = "0.1.0" }
-edgecrab-cron = { path = "../edgecrab-cron", version = "0.1.0" }
-edgecrab-acp = { path = "../edgecrab-acp", version = "0.1.0" }
-edgecrab-gateway = { path = "../edgecrab-gateway", version = "0.1.0" }
-edgecrab-migrate = { path = "../edgecrab-migrate", version = "0.1.0" }
+edgecrab-core = { workspace = true }
+edgecrab-types = { workspace = true }
+edgecrab-state = { workspace = true }
+edgecrab-tools = { workspace = true }
+edgecrab-cron = { workspace = true }
+edgecrab-acp = { workspace = true }
+edgecrab-gateway = { workspace = true }
+edgecrab-migrate = { workspace = true }
 edgequake-llm = { workspace = true }
 clap = { workspace = true }
 ratatui = { workspace = true }

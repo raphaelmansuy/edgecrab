@@ -1,6 +1,6 @@
 {
   "name": "edgecrab-cli",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "EdgeCrab — Super Powerful Personal Assistant inspired by NousHermes and OpenClaw. Single 15 MB static binary. Blazing-fast TUI, ReAct tool loop, multi-provider LLM.",
   "license": "MIT",
   "homepage": "https://www.edgecrab.com",

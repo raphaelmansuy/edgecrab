@@ -51,6 +51,12 @@ set_workspace_version() {
   perl -0pi -e 's/(\[workspace\.package\]\n(?:[^\[]*\n)*?version = )"[^"]+"/${1}"'"$version"'"/m' Cargo.toml
 }
 
+set_workspace_dependency_versions() {
+  local version="$1"
+  perl -0pi -e 's/^(edgecrab-(?:types|security|state|cron|lsp|tools|core|gateway|acp|migrate) = \{ path = "crates\/[^"]+", version = )"[^"]+"/${1}"'"$version"'"/mg' \
+    Cargo.toml
+}
+
 sync_versions() {
   local version="$1"
 
@@ -94,6 +100,25 @@ read_python_sdk_version() {
 check_synced() {
   local version="$1"
   local failed=0
+
+  local dependency_versions
+  dependency_versions="$(
+    awk '
+      /^\[workspace\.dependencies\]/ { in_section=1; next }
+      /^\[/ { in_section=0 }
+      in_section && /^edgecrab-(types|security|state|cron|lsp|tools|core|gateway|acp|migrate) = \{ path = "crates\// {
+        line=$0
+        sub(/^.*version = "/, "", line)
+        sub(/".*$/, "", line)
+        print line
+      }
+    ' Cargo.toml | sort -u
+  )"
+  if [[ "$dependency_versions" != "$version" ]]; then
+    echo "Version drift: workspace internal dependency versions do not all match $version" >&2
+    printf '%s\n' "$dependency_versions" >&2
+    failed=1
+  fi
 
   local node_sdk_version
   node_sdk_version="$(read_node_sdk_version)"
@@ -141,6 +166,7 @@ main() {
       local version
       version="$(workspace_version)"
       [[ -n "$version" ]] || die "failed to read workspace version from Cargo.toml"
+      set_workspace_dependency_versions "$version"
       sync_versions "$version"
       echo "Synced derived package versions to $version"
       ;;
@@ -149,6 +175,7 @@ main() {
       [[ -n "$version" ]] || die "missing version"
       validate_version "$version"
       set_workspace_version "$version"
+      set_workspace_dependency_versions "$version"
       sync_versions "$version"
       echo "Set workspace and derived package versions to $version"
       ;;
