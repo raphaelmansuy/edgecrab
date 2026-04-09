@@ -7,6 +7,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Shared plugin runtime foundation** — new `edgecrab-plugins` workspace crate now centralizes plugin config, manifest parsing, Hermes-compatible `SKILL.md` loading, platform/readiness filtering, tool-server JSON-RPC clients, and Rhai script runtime support.
+- **Prompt-integrated skill plugins** — prompt assembly now appends enabled plugin-provided `SKILL.md` content from `~/.edgecrab/plugins/` so plugin skills behave like first-class session guidance instead of a CLI-only discovery feature.
+- **Runtime plugin tool registration** — CLI runtime registry construction now discovers installed tool-server and script plugins and registers their tools dynamically so plugin tools participate in the normal `ToolRegistry` flow.
+- **Persisted plugin config and CLI controls** — `config.yaml` now has a top-level `plugins:` section and the CLI now supports `edgecrab plugins info|enable|disable` in addition to listing/install/update/remove.
+
+### Changed
+
+- **Wrapper release orchestration on `main` now follows the binaries workflow** — future npm/PyPI CLI wrapper publishes trigger from the successful completion of `Release — Native Binaries`, and the Node SDK workflow only creates a draft fallback release if it races ahead of binary publication. That avoids `GITHUB_TOKEN`-suppressed release-event fan-out and premature public releases before binary assets exist.
+- **Node SDK package entrypoints now match the built tarball** — `sdks/node/package.json` now points CommonJS consumers at `dist/index.js` and ESM consumers at `dist/index.mjs`, with packaging tests that fail if the manifest references artifacts that were not actually built.
+
 ---
 
 ## [0.2.3] — 2026-04-09

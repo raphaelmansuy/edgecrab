@@ -65,6 +65,9 @@ use crate::gateway_catalog::collect_platform_diagnostics;
 use crate::image_models as cli_image_models;
 use crate::markdown_render;
 use crate::mcp_support;
+use crate::plugin_toggle::{
+    PluginCheckState, PluginScope, PluginToggleEntry, plugin_toggle_status_line,
+};
 use crate::theme::{SkinConfig, Theme};
 use crate::tool_display::{
     build_subagent_event_line, build_tool_done_line, build_tool_running_line,
@@ -1880,6 +1883,7 @@ enum DetailSurface {
     SkillSelector,
     RemoteSkillBrowser,
     ToolManager,
+    PluginToggle,
     ConfigSelector,
     SessionBrowser,
     SessionInspector,
@@ -2962,6 +2966,12 @@ pub struct App {
     tool_manager_scope: ToolManagerScope,
     /// Last non-error status note shown in the tool manager footer.
     tool_manager_status_note: Option<String>,
+    /// Plugin toggle overlay (activated by `/plugins toggle`)
+    plugin_toggle: FuzzySelector<PluginToggleEntry>,
+    /// Current plugin toggle scope.
+    plugin_toggle_scope: PluginScope,
+    /// Last non-error status note shown in the plugin toggle footer.
+    plugin_toggle_status_note: Option<String>,
     /// Remote skill browser overlay (activated by `/skills search` or `/skills hub`)
     remote_skill_browser: RemoteSkillBrowser,
     /// Session browser overlay (activated by F5 or `/session` with no args)
@@ -3598,6 +3608,9 @@ impl App {
             tool_manager: FuzzySelector::new(),
             tool_manager_scope: ToolManagerScope::All,
             tool_manager_status_note: None,
+            plugin_toggle: FuzzySelector::new(),
+            plugin_toggle_scope: PluginScope::Global,
+            plugin_toggle_status_note: None,
             remote_skill_browser: RemoteSkillBrowser::new(),
             session_browser: FuzzySelector::new(),
             session_browser_status_note: None,
@@ -7073,6 +7086,56 @@ impl App {
             return;
         }
 
+        if self.plugin_toggle.active {
+            match key.code {
+                KeyCode::Esc => {
+                    if !self.close_detail_fullscreen(DetailSurface::PluginToggle) {
+                        self.plugin_toggle.active = false;
+                    }
+                }
+                KeyCode::Tab => {
+                    self.plugin_toggle_scope = self.next_plugin_toggle_scope();
+                    let _ = self.refresh_plugin_toggle_entries();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::PluginToggle);
+                }
+                _ if selector_action_key(&key, 'z') => {
+                    self.toggle_detail_fullscreen(DetailSurface::PluginToggle, 0);
+                }
+                KeyCode::Enter => {
+                    self.confirm_plugin_toggle();
+                }
+                KeyCode::Char(' ') => {
+                    self.toggle_plugin_selected();
+                }
+                KeyCode::Up => {
+                    self.plugin_toggle.move_up();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::PluginToggle);
+                }
+                KeyCode::Down => {
+                    self.plugin_toggle.move_down();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::PluginToggle);
+                }
+                KeyCode::PageUp if self.detail_fullscreen_active(DetailSurface::PluginToggle) => {
+                    self.page_up_detail_fullscreen(DetailSurface::PluginToggle);
+                }
+                KeyCode::PageDown if self.detail_fullscreen_active(DetailSurface::PluginToggle) => {
+                    self.page_down_detail_fullscreen(DetailSurface::PluginToggle);
+                }
+                KeyCode::PageUp => self.plugin_toggle.page_up(),
+                KeyCode::PageDown => self.plugin_toggle.page_down(),
+                KeyCode::Backspace => {
+                    self.plugin_toggle.pop_char();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::PluginToggle);
+                }
+                KeyCode::Char(c) if selector_search_char(&key) == Some(c) => {
+                    self.plugin_toggle.push_char(c);
+                    self.reset_detail_fullscreen_scroll(DetailSurface::PluginToggle);
+                }
+                _ => {}
+            }
+            return;
+        }
+
         if self.config_selector.active {
             match key.code {
                 KeyCode::Esc => {
@@ -8089,8 +8152,18 @@ impl App {
             CommandResult::ShowCronStatus(args) => {
                 self.handle_show_cron_status(args);
             }
-            CommandResult::ShowPlugins => {
-                self.handle_show_plugins();
+            CommandResult::ShowPlugins(args) => {
+                self.handle_show_plugins(args);
+            }
+            CommandResult::ShowPluginToggle { name, platform } => {
+                if let Some(name) = name {
+                    self.toggle_named_plugin(&name, platform);
+                } else {
+                    let scope = platform
+                        .map(PluginScope::Platform)
+                        .unwrap_or(PluginScope::Global);
+                    self.open_plugin_toggle(scope);
+                }
             }
             CommandResult::ShowPlatforms => {
                 self.handle_show_platforms();
@@ -10228,6 +10301,217 @@ impl App {
                     OutputRole::Error,
                 );
             }
+        }
+    }
+
+    fn plugin_toggle_platforms(&self) -> Vec<String> {
+        vec![
+            "cli".into(),
+            "telegram".into(),
+            "discord".into(),
+            "slack".into(),
+            "matrix".into(),
+            "whatsapp".into(),
+            "signal".into(),
+            "mattermost".into(),
+            "dingtalk".into(),
+            "homeassistant".into(),
+            "email".into(),
+            "webhook".into(),
+            "api_server".into(),
+        ]
+    }
+
+    fn next_plugin_toggle_scope(&self) -> PluginScope {
+        let platforms = self.plugin_toggle_platforms();
+        match &self.plugin_toggle_scope {
+            PluginScope::Global => platforms
+                .first()
+                .cloned()
+                .map(PluginScope::Platform)
+                .unwrap_or(PluginScope::Global),
+            PluginScope::Platform(current) => {
+                let next_idx = platforms
+                    .iter()
+                    .position(|platform| platform == current)
+                    .map(|idx| idx + 1)
+                    .unwrap_or(0);
+                platforms
+                    .get(next_idx)
+                    .cloned()
+                    .map(PluginScope::Platform)
+                    .unwrap_or(PluginScope::Global)
+            }
+        }
+    }
+
+    fn build_plugin_toggle_entries(&self, scope: &PluginScope) -> Vec<PluginToggleEntry> {
+        let config = self.load_runtime_config();
+        let mut manager = crate::plugins::PluginManager::new();
+        manager.discover_all();
+        let platform = match scope {
+            PluginScope::Global => None,
+            PluginScope::Platform(platform) => Some(platform.as_str()),
+        };
+
+        let mut entries = manager
+            .plugins()
+            .iter()
+            .map(|plugin| {
+                PluginToggleEntry::from_plugin(
+                    &plugin.clone(),
+                    config.is_plugin_enabled(&plugin.name, platform),
+                )
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.name.cmp(&right.name));
+        entries
+    }
+
+    fn refresh_plugin_toggle_entries(&mut self) -> bool {
+        let entries = self.build_plugin_toggle_entries(&self.plugin_toggle_scope);
+        if self.plugin_toggle.active {
+            self.plugin_toggle.replace_items_preserving_state(entries);
+        } else {
+            self.plugin_toggle.set_items(entries);
+        }
+        self.needs_redraw = true;
+        true
+    }
+
+    fn open_plugin_toggle(&mut self, scope: PluginScope) {
+        self.plugin_toggle_scope = scope;
+        let _ = self.refresh_plugin_toggle_entries();
+        self.plugin_toggle_status_note =
+            Some("Space stages changes. Enter saves. Tab switches platform scope.".into());
+        self.plugin_toggle.active = true;
+        self.needs_redraw = true;
+    }
+
+    fn toggle_plugin_selected(&mut self) {
+        let Some(entry_idx) = self
+            .plugin_toggle
+            .filtered
+            .get(self.plugin_toggle.selected)
+            .copied()
+        else {
+            return;
+        };
+        if let Some(entry) = self.plugin_toggle.items.get_mut(entry_idx) {
+            entry.check_state = entry.check_state.toggle();
+        }
+        self.plugin_toggle_status_note = Some(plugin_toggle_status_line(&self.plugin_toggle.items));
+        self.needs_redraw = true;
+    }
+
+    fn confirm_plugin_toggle(&mut self) {
+        let config_path = edgecrab_core::edgecrab_home().join("config.yaml");
+        let mut config = self.load_runtime_config();
+        let target_names = self
+            .plugin_toggle
+            .items
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect::<Vec<_>>();
+
+        match &self.plugin_toggle_scope {
+            PluginScope::Global => {
+                config
+                    .plugins
+                    .disabled
+                    .retain(|name| !target_names.iter().any(|candidate| candidate == name));
+                for entry in &self.plugin_toggle.items {
+                    if matches!(entry.check_state, PluginCheckState::Off) {
+                        config.plugins.disabled.push(entry.name.clone());
+                    }
+                }
+                config.plugins.disabled.sort();
+                config.plugins.disabled.dedup();
+            }
+            PluginScope::Platform(platform) => {
+                let disabled = config
+                    .plugins
+                    .platform_disabled
+                    .entry(platform.to_ascii_lowercase())
+                    .or_default();
+                disabled.retain(|name| !target_names.iter().any(|candidate| candidate == name));
+                for entry in &self.plugin_toggle.items {
+                    if matches!(entry.check_state, PluginCheckState::Off) {
+                        disabled.push(entry.name.clone());
+                    }
+                }
+                disabled.sort();
+                disabled.dedup();
+            }
+        }
+
+        match config.save_to(&config_path) {
+            Ok(()) => {
+                self.plugin_toggle_status_note = Some(format!(
+                    "Saved plugin state for {} scope.",
+                    self.plugin_toggle_scope.title()
+                ));
+                self.plugin_toggle.active = false;
+                self.push_output("Plugin configuration saved.", OutputRole::System);
+            }
+            Err(error) => {
+                self.push_output(
+                    format!("Failed to save plugin configuration: {error}"),
+                    OutputRole::Error,
+                );
+            }
+        }
+        self.needs_redraw = true;
+    }
+
+    fn toggle_named_plugin(&mut self, name: &str, platform: Option<String>) {
+        let config_path = edgecrab_core::edgecrab_home().join("config.yaml");
+        let mut config = self.load_runtime_config();
+        let enabled = config.is_plugin_enabled(name, platform.as_deref());
+
+        match &platform {
+            Some(platform_name) => {
+                let disabled = config
+                    .plugins
+                    .platform_disabled
+                    .entry(platform_name.to_ascii_lowercase())
+                    .or_default();
+                disabled.retain(|candidate| candidate != name);
+                if enabled {
+                    disabled.push(name.to_string());
+                    disabled.sort();
+                    disabled.dedup();
+                }
+            }
+            None => {
+                config
+                    .plugins
+                    .disabled
+                    .retain(|candidate| candidate != name);
+                if enabled {
+                    config.plugins.disabled.push(name.to_string());
+                    config.plugins.disabled.sort();
+                    config.plugins.disabled.dedup();
+                }
+            }
+        }
+
+        match config.save_to(&config_path) {
+            Ok(()) => self.push_output(
+                format!(
+                    "{} plugin `{name}`{}.",
+                    if enabled { "Disabled" } else { "Enabled" },
+                    platform
+                        .as_ref()
+                        .map(|scope| format!(" for `{scope}`"))
+                        .unwrap_or_default()
+                ),
+                OutputRole::System,
+            ),
+            Err(error) => self.push_output(
+                format!("Failed to update plugin `{name}`: {error}"),
+                OutputRole::Error,
+            ),
         }
     }
 
@@ -13335,7 +13619,7 @@ impl App {
         }
     }
 
-    fn handle_show_plugins(&mut self) {
+    fn handle_show_plugins(&mut self, args: String) {
         let mut manager = crate::plugins::PluginManager::new();
         manager.discover_all();
         let plugins = manager.plugins();
@@ -13345,19 +13629,63 @@ impl App {
                  Install with: edgecrab plugins install <repo>",
                 OutputRole::System,
             );
+        } else if let Some(name) = args.trim().strip_prefix("info ").map(str::trim) {
+            if let Some(plugin) = plugins.iter().find(|plugin| plugin.name == name) {
+                let mut text = format!("PLUGIN: {}\n", plugin.name);
+                text.push_str("─────────────────────────────────────────────────────────\n");
+                text.push_str(&format!("Version: {}\n", plugin.version));
+                text.push_str(&format!("Kind: {}\n", plugin.kind.as_tag()));
+                text.push_str(&format!("State: {}\n", plugin.status_label()));
+                text.push_str(&format!("Source: {}\n", plugin.source));
+                text.push_str(&format!("Trust: {:?}\n", plugin.trust_level));
+                text.push_str(&format!("Enabled: {}\n", plugin.enabled));
+                text.push_str(&format!("Description: {}\n", plugin.description));
+                if !plugin.tools.is_empty() {
+                    text.push_str(&format!(
+                        "Tools: {}\n",
+                        plugin
+                            .tools
+                            .iter()
+                            .map(|tool| tool.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+                if !plugin.missing_env.is_empty() {
+                    text.push_str(&format!("Missing Env: {}\n", plugin.missing_env.join(", ")));
+                }
+                self.push_output(text, OutputRole::Assistant);
+            } else {
+                self.push_output(format!("Plugin `{name}` not found."), OutputRole::Error);
+            }
+        } else if matches!(args.trim(), "status") {
+            let mut text = String::from("PLUGIN STATUS\n");
+            text.push_str("─────────────────────────────────────────────────────────\n");
+            for plugin in plugins {
+                text.push_str(&format!(
+                    "{}: {} (kind={}, enabled={}, tools={})\n",
+                    plugin.name,
+                    plugin.status_label(),
+                    plugin.kind.as_tag(),
+                    plugin.enabled,
+                    plugin.tools.len()
+                ));
+            }
+            self.push_output(text, OutputRole::Assistant);
         } else {
             let mut text = format!("Plugins ({}):\n", plugins.len());
             for p in plugins {
                 text.push_str(&format!(
-                    "  {} v{}  ({}, {} tools, {} hooks)\n",
+                    "  {} v{}  ({}, {}, status={}, {} tools)\n",
                     p.name,
                     p.version,
                     p.source,
+                    p.kind.as_tag(),
+                    p.status_label(),
                     p.tools.len(),
-                    p.hooks.len(),
                 ));
             }
-            self.push_output(text, OutputRole::System);
+            self.push_output(text, OutputRole::Assistant);
         }
     }
 
@@ -15929,6 +16257,10 @@ impl App {
 
         if self.tool_manager.active {
             self.render_tool_manager(frame, frame.area());
+        }
+
+        if self.plugin_toggle.active {
+            self.render_plugin_toggle(frame, frame.area());
         }
 
         if self.remote_skill_browser.selector.active {
@@ -18517,6 +18849,224 @@ impl App {
             Span::styled(
                 edgecrab_core::safe_truncate(footer_note, 44),
                 Style::default().fg(Color::Rgb(95, 115, 125)),
+            ),
+        ]));
+        frame.render_widget(help, chunks[2]);
+    }
+
+    fn render_plugin_toggle(&self, frame: &mut Frame, area: Rect) {
+        frame.render_widget(Clear, area);
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ])
+            .split(area);
+        let body = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+            .split(chunks[1]);
+
+        let search_text = if self.plugin_toggle.query.is_empty() {
+            "Search plugins, descriptions, or kinds".to_string()
+        } else {
+            self.plugin_toggle.query.clone()
+        };
+        let search_style = if self.plugin_toggle.query.is_empty() {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let header = Paragraph::new(Line::from(vec![
+            Span::styled("  🔌 ", Style::default().fg(Color::Rgb(210, 190, 110))),
+            Span::styled(search_text, search_style),
+            Span::raw("   "),
+            Span::styled(
+                format!("[{}]", self.plugin_toggle_scope.title()),
+                Style::default()
+                    .fg(Color::Rgb(255, 238, 170))
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Rgb(210, 190, 110)))
+                .title(" Plugin Toggle "),
+        );
+        frame.render_widget(header, chunks[0]);
+
+        let filtered = &self.plugin_toggle.filtered;
+        let selected = self.plugin_toggle.selected;
+        let max_visible = body[0].height as usize;
+        let scroll_start = if selected >= max_visible {
+            selected - max_visible + 1
+        } else {
+            0
+        };
+
+        let items: Vec<ListItem> = if filtered.is_empty() {
+            vec![ListItem::new(Line::from(Span::styled(
+                "  No plugins matched the current filter.",
+                Style::default().fg(Color::Rgb(120, 120, 135)),
+            )))]
+        } else {
+            filtered
+                .iter()
+                .skip(scroll_start)
+                .take(max_visible)
+                .enumerate()
+                .map(|(vis_idx, &entry_idx)| {
+                    let entry = &self.plugin_toggle.items[entry_idx];
+                    let is_selected = vis_idx + scroll_start == selected;
+                    let bg = if is_selected {
+                        Color::Rgb(46, 38, 18)
+                    } else {
+                        Color::Rgb(22, 22, 18)
+                    };
+                    let name_style = if is_selected {
+                        Style::default()
+                            .bg(bg)
+                            .fg(Color::Rgb(255, 236, 175))
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Rgb(220, 220, 210))
+                    };
+                    ListItem::new(Line::from(vec![
+                        selector_marker(is_selected, Color::Rgb(210, 190, 110), Some(bg)),
+                        Span::styled(
+                            format!("  {}", entry.check_state.glyph()),
+                            Style::default().bg(bg).fg(Color::Rgb(180, 220, 150)),
+                        ),
+                        Span::raw("  "),
+                        Span::styled(unicode_pad_right(&entry.kind, 12), Style::default().bg(bg)),
+                        Span::styled(unicode_pad_right(&entry.display_name, 26), name_style),
+                        Span::raw("  "),
+                        Span::styled(
+                            unicode_trunc(
+                                &format!("v{} · ~{} tokens", entry.version, entry.estimated_tokens),
+                                28,
+                            ),
+                            Style::default().bg(bg).fg(Color::Rgb(160, 160, 145)),
+                        ),
+                    ]))
+                })
+                .collect()
+        };
+        frame.render_widget(
+            List::new(items).style(Style::default().bg(Color::Rgb(22, 22, 18))),
+            body[0],
+        );
+
+        let mut detail_lines = Vec::new();
+        if let Some(entry) = self.plugin_toggle.current() {
+            detail_lines.push(Line::from(Span::styled(
+                entry.display_name.clone(),
+                Style::default()
+                    .fg(Color::Rgb(255, 236, 175))
+                    .add_modifier(Modifier::BOLD),
+            )));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(format!("Kind: {}", entry.kind)));
+            detail_lines.push(Line::from(format!("Version: {}", entry.version)));
+            detail_lines.push(Line::from(format!("Source: {}", entry.source)));
+            detail_lines.push(Line::from(format!("Tools: {}", entry.tool_count)));
+            detail_lines.push(Line::from(format!(
+                "Estimated prompt cost: ~{} tokens",
+                entry.estimated_tokens
+            )));
+            if entry.needs_credentials {
+                detail_lines.push(Line::from(format!(
+                    "Credentials: {}",
+                    if entry.credentials_satisfied {
+                        "configured"
+                    } else {
+                        "missing required environment variables"
+                    }
+                )));
+            }
+            detail_lines.push(Line::from(""));
+            for line in entry.description.lines() {
+                detail_lines.push(Line::from(line.to_string()));
+            }
+        }
+
+        let detail = Paragraph::new(Text::from(detail_lines.clone()))
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Rgb(110, 96, 58)))
+                    .title(" Details "),
+            );
+        if self.detail_fullscreen_active(DetailSurface::PluginToggle) {
+            self.render_fullscreen_browser_detail(
+                frame,
+                area,
+                FullscreenBrowserChrome {
+                    query: &self.plugin_toggle.query,
+                    header: BrowserChrome {
+                        title: "Plugin Toggle",
+                        placeholder: "Search plugins, descriptions, or kinds",
+                        icon: "🔌",
+                        icon_color: Color::Rgb(210, 190, 110),
+                        border_color: Color::Rgb(210, 190, 110),
+                    },
+                    detail: ScrollableDetailChrome {
+                        title: "Details",
+                        border_color: Color::Rgb(210, 190, 110),
+                        focused: true,
+                        requested_scroll: self
+                            .detail_fullscreen_scroll(DetailSurface::PluginToggle),
+                    },
+                    help: Line::from(vec![
+                        Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(210, 190, 110))),
+                        Span::styled("change item  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("type ", Style::default().fg(Color::Rgb(210, 190, 110))),
+                        Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(210, 190, 110))),
+                        Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Space ", Style::default().fg(Color::Rgb(210, 190, 110))),
+                        Span::styled("toggle  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Enter ", Style::default().fg(Color::Rgb(210, 190, 110))),
+                        Span::styled("save  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Tab ", Style::default().fg(Color::Rgb(210, 190, 110))),
+                        Span::styled("scope  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Z ", Style::default().fg(Color::Rgb(210, 190, 110))),
+                        Span::styled("split view  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Esc ", Style::default().fg(Color::Rgb(210, 190, 110))),
+                        Span::styled("close", Style::default().fg(Color::DarkGray)),
+                    ]),
+                },
+                detail_lines,
+            );
+            return;
+        }
+        frame.render_widget(detail, body[1]);
+
+        let footer_note = self
+            .plugin_toggle_status_note
+            .clone()
+            .unwrap_or_else(|| plugin_toggle_status_line(&self.plugin_toggle.items));
+        let help = Paragraph::new(Line::from(vec![
+            Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(210, 190, 110))),
+            Span::styled("browse  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Space ", Style::default().fg(Color::Rgb(210, 190, 110))),
+            Span::styled("toggle  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Enter ", Style::default().fg(Color::Rgb(210, 190, 110))),
+            Span::styled("save  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Tab ", Style::default().fg(Color::Rgb(210, 190, 110))),
+            Span::styled("scope  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Z ", Style::default().fg(Color::Rgb(210, 190, 110))),
+            Span::styled("detail  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Esc ", Style::default().fg(Color::Rgb(210, 190, 110))),
+            Span::styled("close  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                edgecrab_core::safe_truncate(&footer_note, 42),
+                Style::default().fg(Color::Rgb(120, 120, 110)),
             ),
         ]));
         frame.render_widget(help, chunks[2]);

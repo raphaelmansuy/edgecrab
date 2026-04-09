@@ -160,8 +160,13 @@ pub enum CommandResult {
     ListModels(String),
     /// Show cron job status (args: "list" or "")
     ShowCronStatus(String),
-    /// Discover and list plugins
-    ShowPlugins,
+    /// Manage plugins and open the plugin toggle overlay.
+    ShowPlugins(String),
+    /// Open the interactive plugin toggle overlay.
+    ShowPluginToggle {
+        name: Option<String>,
+        platform: Option<String>,
+    },
     /// Show gateway platform availability
     ShowPlatforms,
     /// Show active personality/persona
@@ -286,6 +291,33 @@ fn parse_session_archive_command(args: &str) -> CommandResult {
             "Usage: /sessions [browse|search <query>|switch <id>|delete <id>|rename <id> <title>|prune [days]|new]".into(),
         ),
     }
+}
+
+fn parse_plugins_command(args: &str) -> CommandResult {
+    let trimmed = args.trim();
+    if trimmed.is_empty() || matches!(trimmed, "list" | "ls") {
+        return CommandResult::ShowPlugins(trimmed.to_string());
+    }
+    if trimmed == "toggle" {
+        return CommandResult::ShowPluginToggle {
+            name: None,
+            platform: None,
+        };
+    }
+    if let Some(rest) = trimmed.strip_prefix("toggle ") {
+        let mut name = None;
+        let mut platform = None;
+        let mut parts = rest.split_whitespace().peekable();
+        while let Some(part) = parts.next() {
+            if part == "--platform" {
+                platform = parts.next().map(ToString::to_string);
+            } else if name.is_none() {
+                name = Some(part.to_string());
+            }
+        }
+        return CommandResult::ShowPluginToggle { name, platform };
+    }
+    CommandResult::ShowPlugins(trimmed.to_string())
 }
 
 fn parse_current_session_command(args: &str) -> CommandResult {
@@ -936,8 +968,8 @@ impl CommandRegistry {
         self.register(Command {
             name: "plugins",
             aliases: &["plugin"],
-            description: "List installed plugins",
-            handler: |_| CommandResult::ShowPlugins,
+            description: "Manage plugins: list, info, enable, disable, status, toggle",
+            handler: |args| parse_plugins_command(args),
         });
 
         // ── Advanced ──────────────────────────────────────────────────
@@ -1583,6 +1615,18 @@ mod tests {
         match reg.dispatch("/tools reset") {
             Some(CommandResult::ResetToolPolicy) => {}
             other => panic!("expected ResetToolPolicy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_plugins_toggle_opens_overlay() {
+        let reg = CommandRegistry::new();
+        match reg.dispatch("/plugins toggle") {
+            Some(CommandResult::ShowPluginToggle {
+                name: None,
+                platform: None,
+            }) => {}
+            other => panic!("expected ShowPluginToggle, got {other:?}"),
         }
     }
 

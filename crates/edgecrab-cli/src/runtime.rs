@@ -2,12 +2,18 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context;
+use async_trait::async_trait;
 
 use edgecrab_core::{Agent, AgentBuilder, AppConfig, ensure_edgecrab_home};
+use edgecrab_plugins::script::engine::ScriptRuntime;
+use edgecrab_plugins::tool_server::client::ToolServerClient;
+use edgecrab_plugins::{DiscoveredPlugin, PluginKind, discover_plugins};
 use edgecrab_state::SessionDb;
 use edgecrab_tools::ToolRegistry;
-use edgecrab_types::Message;
+use edgecrab_tools::registry::{ToolContext, ToolHandler};
+use edgecrab_types::{Message, ToolError, ToolSchema};
 use edgequake_llm::LLMProvider;
+use serde_json::json;
 
 pub struct RuntimeContext {
     pub config_path: PathBuf,
@@ -85,7 +91,9 @@ pub fn open_state_db(path: &Path) -> anyhow::Result<Arc<SessionDb>> {
 }
 
 pub fn build_tool_registry() -> Arc<ToolRegistry> {
-    Arc::new(ToolRegistry::new())
+    let mut registry = ToolRegistry::new();
+    register_plugin_tools(&mut registry, &AppConfig::default());
+    Arc::new(registry)
 }
 
 /// Build a `ToolRegistry` and populate it with dynamically discovered MCP
@@ -99,10 +107,142 @@ pub fn build_tool_registry() -> Arc<ToolRegistry> {
 pub async fn build_tool_registry_with_mcp_discovery(
     config: &edgecrab_core::AppConfig,
 ) -> Arc<ToolRegistry> {
-    let _ = config; // currently discovery uses its own disk-read; config ref reserved for future use
     let mut registry = ToolRegistry::new();
     edgecrab_tools::tools::mcp_client::discover_and_register_mcp_tools(&mut registry).await;
+    register_plugin_tools(&mut registry, config);
     Arc::new(registry)
+}
+
+enum PluginToolBackend {
+    ToolServer(Arc<ToolServerClient>),
+    Script(Arc<ScriptRuntime>),
+}
+
+struct PluginToolProxy {
+    tool_name: &'static str,
+    plugin_name: String,
+    description: String,
+    backend: PluginToolBackend,
+}
+
+#[async_trait]
+impl ToolHandler for PluginToolProxy {
+    fn name(&self) -> &'static str {
+        self.tool_name
+    }
+
+    fn toolset(&self) -> &'static str {
+        "plugins"
+    }
+
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: self.tool_name.into(),
+            description: self.description.clone(),
+            parameters: json!({
+                "type": "object",
+                "additionalProperties": true
+            }),
+            strict: None,
+        }
+    }
+
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<String, ToolError> {
+        if !ctx.config.is_plugin_enabled(&self.plugin_name) {
+            return Err(ToolError::Unavailable {
+                tool: self.tool_name.into(),
+                reason: format!("plugin '{}' is disabled for this session", self.plugin_name),
+            });
+        }
+
+        match &self.backend {
+            PluginToolBackend::ToolServer(client) => client
+                .tool_call(self.tool_name, args)
+                .await
+                .map(|value| value.to_string())
+                .map_err(|error| ToolError::ExecutionFailed {
+                    tool: self.tool_name.into(),
+                    message: error.to_string(),
+                }),
+            PluginToolBackend::Script(runtime) => {
+                runtime.call_tool(self.tool_name, &args).map_err(|error| {
+                    ToolError::ExecutionFailed {
+                        tool: self.tool_name.into(),
+                        message: error.to_string(),
+                    }
+                })
+            }
+        }
+    }
+
+    fn emoji(&self) -> &'static str {
+        "🔌"
+    }
+}
+
+fn register_plugin_tools(registry: &mut ToolRegistry, config: &AppConfig) {
+    let discovery = match discover_plugins(&config.plugins, edgecrab_types::Platform::Cli) {
+        Ok(discovery) => discovery,
+        Err(error) => {
+            tracing::warn!(?error, "plugin discovery failed");
+            return;
+        }
+    };
+
+    for plugin in discovery.plugins {
+        register_plugin(registry, plugin);
+    }
+}
+
+fn register_plugin(registry: &mut ToolRegistry, plugin: DiscoveredPlugin) {
+    let Some(manifest) = plugin.manifest.as_ref() else {
+        return;
+    };
+    match manifest.plugin.kind {
+        PluginKind::ToolServer => {
+            let Some(exec) = manifest.exec.clone() else {
+                return;
+            };
+            let client = Arc::new(ToolServerClient::new(plugin.path.clone(), exec));
+            for tool in &manifest.tools {
+                registry.register_dynamic(Box::new(PluginToolProxy {
+                    tool_name: Box::leak(tool.name.clone().into_boxed_str()),
+                    plugin_name: plugin.name.clone(),
+                    description: tool.description.clone(),
+                    backend: PluginToolBackend::ToolServer(client.clone()),
+                }));
+            }
+        }
+        PluginKind::Script => {
+            let Some(script) = manifest.script.clone() else {
+                return;
+            };
+            let runtime = match ScriptRuntime::load(
+                &plugin.path.join(&script.file),
+                script.max_operations,
+                script.max_call_depth,
+            ) {
+                Ok(runtime) => Arc::new(runtime),
+                Err(error) => {
+                    tracing::warn!(plugin = %plugin.name, ?error, "script plugin failed to load");
+                    return;
+                }
+            };
+            for tool in &manifest.tools {
+                registry.register_dynamic(Box::new(PluginToolProxy {
+                    tool_name: Box::leak(tool.name.clone().into_boxed_str()),
+                    plugin_name: plugin.name.clone(),
+                    description: tool.description.clone(),
+                    backend: PluginToolBackend::Script(runtime.clone()),
+                }));
+            }
+        }
+        PluginKind::Skill => {}
+    }
 }
 
 pub fn build_agent(

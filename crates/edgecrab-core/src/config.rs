@@ -14,6 +14,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+pub use edgecrab_plugins::config::PluginsConfig;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use edgecrab_tools::tools::backends::{
@@ -42,6 +43,7 @@ pub struct AppConfig {
     pub mcp_servers: HashMap<String, McpServerConfig>,
     pub memory: MemoryConfig,
     pub skills: SkillsConfig,
+    pub plugins: PluginsConfig,
     pub security: SecurityConfig,
     pub terminal: TerminalConfig,
     pub delegation: DelegationConfig,
@@ -139,6 +141,10 @@ impl AppConfig {
         }
     }
 
+    pub fn is_plugin_enabled(&self, name: &str, platform: Option<&str>) -> bool {
+        self.plugins.is_plugin_enabled(name, platform)
+    }
+
     /// Apply `EDGECRAB_*` environment variables.
     ///
     /// WHY env vars: Container / CI deployments often inject secrets
@@ -164,6 +170,23 @@ impl AppConfig {
         }
         if let Ok(val) = std::env::var("EDGECRAB_SKIP_MEMORY") {
             self.skip_memory = parse_bool_env(&val);
+        }
+        if let Ok(val) = std::env::var("EDGECRAB_PLUGINS_ENABLED") {
+            self.plugins.enabled = parse_bool_env(&val);
+        }
+        if let Ok(val) = std::env::var("EDGECRAB_PLUGINS_AUTO_ENABLE") {
+            self.plugins.auto_enable = parse_bool_env(&val);
+        }
+        if let Ok(val) = std::env::var("EDGECRAB_PLUGINS_CALL_TIMEOUT") {
+            if let Ok(seconds) = val.parse() {
+                self.plugins.call_timeout_secs = seconds;
+            }
+        }
+        if let Ok(val) = std::env::var("EDGECRAB_PLUGINS_HUB_ENABLED") {
+            self.plugins.hub.enabled = parse_bool_env(&val);
+        }
+        if let Ok(val) = std::env::var("EDGECRAB_PLUGINS_SCAN_ON_LOAD") {
+            self.plugins.security.scan_on_load = parse_bool_env(&val);
         }
         if let Ok(val) = std::env::var("EDGECRAB_TERMINAL_BACKEND") {
             self.terminal.backend = val.parse().expect("infallible");

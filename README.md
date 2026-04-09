@@ -53,6 +53,7 @@ hermes-agent soul  +  OpenClaw vision  =  EdgeCrab
   - [What EdgeCrab Can Do](#what-edgecrab-can-do)
     - [ReAct Tool Loop](#react-tool-loop)
     - [Built-in Tools](#built-in-tools)
+    - [Semantic Code Intelligence (LSP)](#semantic-code-intelligence-lsp)
       - [File Tools (`file` toolset)](#file-tools-file-toolset)
       - [Terminal Tools (`terminal` toolset)](#terminal-tools-terminal-toolset)
       - [Web Tools (`web` toolset)](#web-tools-web-toolset)
@@ -71,6 +72,7 @@ hermes-agent soul  +  OpenClaw vision  =  EdgeCrab
     - [15 Messaging Gateways](#15-messaging-gateways)
     - [Persistent Memory \& Learning](#persistent-memory--learning)
     - [Skills Library](#skills-library)
+    - [Plugin System](#plugin-system)
     - [Cron Scheduling](#cron-scheduling)
     - [Checkpoints \& Rollback](#checkpoints--rollback)
     - [Profiles \& Worktrees](#profiles--worktrees)
@@ -110,6 +112,8 @@ Most AI agents are either too constrained (coding agents that forget you exist a
 **It's fast and lean.** Unlike Python agents, EdgeCrab is a Rust binary. It starts before you finish blinking. It uses ~15 MB of RAM instead of 150 MB. Security is compiled in — path jails, SSRF guards, command scanners — not runtime patches.
 
 **It's extensible.** MCP servers, custom Rust tools, Python/JS sandboxes, sub-agents, Mixture-of-Agents consensus — the full toolkit for heavy-duty automation.
+
+**It's now plugin-native.** Skill plugins inject prompt expertise, tool-server plugins expose external JSON-RPC tools, and script plugins run safe Rhai logic, all from `~/.edgecrab/plugins/` with persisted enable/disable policy.
 
 ---
 
@@ -480,6 +484,31 @@ Skills are saved to `~/.edgecrab/skills/` and loaded on demand. The agent can al
 
 ---
 
+### Plugin System
+
+Plugins extend EdgeCrab beyond the built-in tool inventory without forking the repo.
+
+```bash
+edgecrab plugins list
+edgecrab plugins info github-tools
+edgecrab plugins status
+edgecrab plugins install owner/repo
+edgecrab plugins enable github-tools
+edgecrab plugins disable github-tools
+edgecrab plugins toggle github-tools
+edgecrab plugins remove github-tools
+```
+
+EdgeCrab now supports three plugin kinds:
+
+- `skill` plugins load `SKILL.md` content from `~/.edgecrab/plugins/<name>/` into the session prompt with Hermes-compatible frontmatter, readiness checks, and platform filtering.
+- `tool-server` plugins spawn a subprocess and proxy JSON-RPC `tools/list` and `tools/call` methods into the normal `ToolRegistry`, so plugin tools look like first-class tools to the model.
+- `script` plugins load Rhai code for lightweight local extension points and tool handlers without shipping a separate daemon.
+
+Plugin state persists in `config.yaml` under `plugins:`. Disabling a plugin removes it from tool exposure or prompt injection without uninstalling it.
+
+---
+
 ### Cron Scheduling
 
 Schedule recurring or one-shot tasks:
@@ -790,7 +819,9 @@ edgecrab mcp remove <name>
 # Plugins
 edgecrab plugins list
 edgecrab plugins install <path>
-edgecrab plugins update
+edgecrab plugins status
+edgecrab plugins toggle <name>
+edgecrab plugins update <name>
 edgecrab plugins remove <name>
 
 # Cron

@@ -12,6 +12,7 @@ bedrock-model-discovery = ["dep:aws-config", "dep:aws-sdk-bedrock"]
 
 [dependencies]
 edgecrab-types = { workspace = true }
+edgecrab-plugins = { workspace = true }
 edgecrab-lsp = { workspace = true }
 edgecrab-tools = { workspace = true }
 edgecrab-state = { workspace = true }
