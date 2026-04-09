@@ -19,8 +19,9 @@ name: Release — PyPI CLI (edgecrab-cli)
 #     Env:      pypi
 
 on:
-  release:
-    types: [published]
+  workflow_run:
+    workflows: ["Release — Native Binaries"]
+    types: [completed]
   workflow_dispatch:
     inputs:
       tag_name:
@@ -34,13 +35,14 @@ permissions:
 
 jobs:
   build:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     name: Build edgecrab-cli wheels
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag_name || github.event.release.tag_name || github.ref }}
+          ref: ${{ inputs.tag_name || github.event.workflow_run.head_branch || github.ref }}
 
       - uses: actions/setup-python@v5
         with:
@@ -49,10 +51,10 @@ jobs:
       - name: Resolve version from tag
         id: version
         env:
-          RELEASE_TAG_NAME: ${{ github.event.release.tag_name }}
           INPUT_TAG_NAME: ${{ inputs.tag_name }}
+          WORKFLOW_RUN_TAG_NAME: ${{ github.event.workflow_run.head_branch }}
         run: |
-          TAG="${INPUT_TAG_NAME:-${RELEASE_TAG_NAME:-$GITHUB_REF_NAME}}"
+          TAG="${INPUT_TAG_NAME:-${WORKFLOW_RUN_TAG_NAME:-$GITHUB_REF_NAME}}"
           VERSION="${TAG#v}"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Publishing edgecrab-cli==$VERSION"

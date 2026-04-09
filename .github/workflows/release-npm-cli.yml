@@ -11,8 +11,9 @@ name: Release — npm CLI (edgecrab-cli)
 #   NPM_TOKEN  (environment secret on the "npm" GitHub environment)
 
 on:
-  release:
-    types: [published]
+  workflow_run:
+    workflows: ["Release — Native Binaries"]
+    types: [completed]
   workflow_dispatch:
     inputs:
       tag_name:
@@ -25,6 +26,7 @@ permissions:
 
 jobs:
   publish-npm-cli:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     name: Publish edgecrab-cli to npm
     runs-on: ubuntu-latest
     environment: npm
@@ -34,7 +36,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag_name || github.event.release.tag_name || github.ref }}
+          ref: ${{ inputs.tag_name || github.event.workflow_run.head_branch || github.ref }}
 
       - uses: actions/setup-node@v4
         with:
@@ -44,10 +46,10 @@ jobs:
       - name: Resolve version from tag
         id: version
         env:
-          RELEASE_TAG_NAME: ${{ github.event.release.tag_name }}
           INPUT_TAG_NAME: ${{ inputs.tag_name }}
+          WORKFLOW_RUN_TAG_NAME: ${{ github.event.workflow_run.head_branch }}
         run: |
-          TAG="${INPUT_TAG_NAME:-${RELEASE_TAG_NAME:-$GITHUB_REF_NAME}}"
+          TAG="${INPUT_TAG_NAME:-${WORKFLOW_RUN_TAG_NAME:-$GITHUB_REF_NAME}}"
           VERSION="${TAG#v}"
           echo "tag=$TAG"       >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"

@@ -58,6 +58,7 @@ jobs:
           || gh release create "$TAG_NAME" \
                --repo "${{ github.repository }}" \
                --title "$TAG_NAME" \
+               --draft \
                --generate-notes
 
       - name: Upload npm tarball to GitHub Release

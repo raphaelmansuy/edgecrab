@@ -15,8 +15,8 @@
 | `release-rust.yml` | Tag push (`v*`) | Publish all 11 crates to crates.io in dependency order |
 | `release-node.yml` | Tag push (`v*`) | Publish npm package (JS/TS SDK) |
 | `release-python.yml` | Tag push (`v*`) | Publish Python SDK to PyPI |
-| `release-npm-cli.yml` | GitHub release `published` | Publish `edgecrab-cli` npm wrapper after binaries are public |
-| `release-pypi-cli.yml` | GitHub release `published` | Publish `edgecrab-cli` PyPI wrapper after binaries are public |
+| `release-npm-cli.yml` | `release-binaries.yml` completed successfully | Publish `edgecrab-cli` npm wrapper after binaries are public |
+| `release-pypi-cli.yml` | `release-binaries.yml` completed successfully | Publish `edgecrab-cli` PyPI wrapper after binaries are public |
 | `release-docker.yml` | Tag push (`v*`) | Build and push Docker image to GHCR |
 | `deploy-site.yml` | Push to `main` touching `site/` | Build Astro docs site → GitHub Pages |
 

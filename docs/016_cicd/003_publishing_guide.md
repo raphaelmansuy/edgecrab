@@ -13,8 +13,8 @@
 | Rust crates (×10) | [crates.io](https://crates.io) | `release-rust.yml` | `make publish-rust` | tag `v*` |
 | Python SDK (`edgecrab-sdk`) | [PyPI](https://pypi.org) | `release-python.yml` | `make publish-python` | tag `v*` |
 | Node.js SDK (`edgecrab-sdk`) | [npm](https://npmjs.com) | `release-node.yml` | `make publish-node` | tag `v*` |
-| npm CLI wrapper (`edgecrab-cli`) | [npm](https://npmjs.com) | `release-npm-cli.yml` | `make publish-npm-cli` | GitHub release `published` |
-| PyPI CLI wrapper (`edgecrab-cli`) | [PyPI](https://pypi.org) | `release-pypi-cli.yml` | `make publish-pypi-cli` | GitHub release `published` |
+| npm CLI wrapper (`edgecrab-cli`) | [npm](https://npmjs.com) | `release-npm-cli.yml` | `make publish-npm-cli` | successful `Release — Native Binaries` workflow |
+| PyPI CLI wrapper (`edgecrab-cli`) | [PyPI](https://pypi.org) | `release-pypi-cli.yml` | `make publish-pypi-cli` | successful `Release — Native Binaries` workflow |
 | Docker image | [GHCR](https://ghcr.io) | `release-docker.yml` | *(CI only)* | tag `v*` |
 | Docs site | GitHub Pages / www.edgecrab.com | `deploy-site.yml` | `make site-deploy` | push to `main` |
 
@@ -66,8 +66,8 @@ make tag-release VERSION=0.2.0
 ```
 
 One annotated tag triggers the binary, Rust, SDK, and Docker publishers. When
-the native binaries finish and the GitHub Release is published, that release
-event then triggers the CLI wrapper publishers:
+the native binaries finish successfully, their workflow completion then
+triggers the CLI wrapper publishers:
 
 ```
 git push origin v0.2.0
