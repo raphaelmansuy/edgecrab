@@ -849,8 +849,14 @@ async fn real_hermes_holographic_plugin_installs_and_runs_end_to_end() {
 async fn real_hermes_honcho_memory_cli_is_invocable_end_to_end() {
     let home = tempdir().expect("temp home");
     let edgecrab_home = home.path().join(".edgecrab");
-    let cache_key =
-        repo_source_cache_key("NousResearch/hermes-agent", &[("hermes", "tree:plugins")]);
+    let cache_key = repo_source_cache_key(
+        "NousResearch/hermes-agent",
+        &[
+            ("skill", "tree:skills"),
+            ("skill", "tree:optional-skills"),
+            ("hermes", "tree:plugins"),
+        ],
+    );
     write_cached_repo_index(
         &edgecrab_home,
         "hermes-plugins",

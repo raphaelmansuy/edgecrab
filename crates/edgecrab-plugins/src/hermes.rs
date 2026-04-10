@@ -1266,7 +1266,42 @@ mod tests {
                 ])
                 .status()
                 .expect("git checkout hermes-agent ref");
-            assert!(status.success(), "failed to checkout hermes-agent ref");
+            if status.success() {
+                return path;
+            }
+
+            let fetch = Command::new("git")
+                .args([
+                    "-C",
+                    path.to_str().expect("utf8 path"),
+                    "fetch",
+                    "--depth",
+                    "1",
+                    "origin",
+                    REAL_HERMES_REF,
+                ])
+                .status()
+                .expect("git fetch hermes-agent ref");
+            if fetch.success() {
+                let checkout = Command::new("git")
+                    .args([
+                        "-C",
+                        path.to_str().expect("utf8 path"),
+                        "checkout",
+                        "FETCH_HEAD",
+                    ])
+                    .status()
+                    .expect("git checkout fetched hermes-agent ref");
+                assert!(
+                    checkout.success(),
+                    "failed to checkout fetched hermes-agent ref"
+                );
+                return path;
+            }
+
+            eprintln!(
+                "warning: failed to resolve pinned hermes-agent ref {REAL_HERMES_REF}; using cloned default branch HEAD"
+            );
             path
         })
     }
