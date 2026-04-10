@@ -6,9 +6,26 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  rust-quality:
+    name: Rust — lint & fmt
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./scripts/release-version.sh check
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
   rust:
-    name: Rust — build & test
+    name: Rust — tests
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -19,12 +36,8 @@ jobs:
       - run: ./scripts/release-version.sh check
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --workspace
-      - run: cargo build -p edgecrab-lsp --examples  # pre-build mock server used by integration tests
-      - run: cargo test -p edgecrab-lsp
-      - run: cargo test --workspace
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo fmt --all --check
+      - run: cargo test -p edgecrab-lsp --all-targets
+      - run: cargo test --workspace --exclude edgecrab-lsp
 
   python-sdk:
     name: Python SDK — build & test

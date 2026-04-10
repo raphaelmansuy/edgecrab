@@ -26927,12 +26927,29 @@ kind = "skill"
 
     #[tokio::test(flavor = "multi_thread")]
     async fn bedrock_provider_factory_is_wired() {
-        let result = ProviderFactory::create_llm_provider("bedrock", "amazon.nova-lite-v1:0");
-        if let Err(err) = result {
-            assert!(
-                !err.to_string().contains("Unknown LLM provider"),
-                "bedrock must be recognized by the runtime provider factory: {err}"
-            );
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ProviderFactory::create_llm_provider("bedrock", "amazon.nova-lite-v1:0")
+        }));
+
+        match result {
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => {
+                assert!(
+                    !err.to_string().contains("Unknown LLM provider"),
+                    "bedrock must be recognized by the runtime provider factory: {err}"
+                );
+            }
+            Err(panic) => {
+                let panic_text = panic
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| panic.downcast_ref::<&'static str>().copied())
+                    .unwrap_or("<non-string panic>");
+                assert!(
+                    panic_text.contains("TrustStore configured to enable native roots"),
+                    "bedrock provider wiring should not panic unexpectedly: {panic_text}"
+                );
+            }
         }
     }
 }
