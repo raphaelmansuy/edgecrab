@@ -3121,7 +3121,7 @@ def register(ctx):
                 webhook_message("bob", "bravo"),
                 webhook_message("alice", "again"),
             ],
-            std::time::Duration::from_millis(100),
+            std::time::Duration::from_millis(10),
         ));
         gateway.add_adapter(adapter.clone());
         gateway.set_agent(Arc::new(
@@ -3134,7 +3134,11 @@ def register(ctx):
         let task = tokio::spawn(async move { gateway.run().await });
         let sent = adapter.wait_for_sent(4).await;
         cancel.cancel();
-        task.await.expect("gateway join").expect("gateway run");
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("gateway shutdown timeout")
+            .expect("gateway join")
+            .expect("gateway run");
 
         assert!(
             sent.iter()
@@ -3186,16 +3190,20 @@ def register(ctx):
                 webhook_message("alice", "hello"),
                 webhook_message("alice", "/new"),
             ],
-            std::time::Duration::from_millis(1000),
+            std::time::Duration::from_millis(10),
         ));
         gateway.add_adapter(adapter.clone());
         gateway.set_agent(agent);
 
         let task = tokio::spawn(async move { gateway.run().await });
         let _ = adapter.wait_for_sent(2).await;
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         cancel.cancel();
-        task.await.expect("gateway join").expect("gateway run");
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("gateway shutdown timeout")
+            .expect("gateway join")
+            .expect("gateway run");
 
         let log =
             std::fs::read_to_string(plugin_dir.join("gateway-session-hooks.jsonl")).expect("log");

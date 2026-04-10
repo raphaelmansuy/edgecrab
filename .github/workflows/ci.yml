@@ -30,14 +30,26 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-14]
+        include:
+          - os: ubuntu-latest
+            workspace_test_cmd: cargo test --workspace --exclude edgecrab-lsp
+          - os: macos-14
+            workspace_test_cmd: cargo test --workspace --exclude edgecrab-lsp --no-run
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
       - uses: actions/checkout@v4
       - run: ./scripts/release-version.sh check
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p edgecrab-lsp --all-targets
-      - run: cargo test --workspace --exclude edgecrab-lsp
+      - run: ${{ matrix.workspace_test_cmd }}
+      - if: matrix.os == 'macos-14'
+        run: cargo test -p edgecrab-cli --test plugins_e2e
+      - if: matrix.os == 'macos-14'
+        run: cargo test -p edgecrab-gateway gateway_keeps_agent_history_isolated_per_chat_session
+      - if: matrix.os == 'macos-14'
+        run: cargo test -p edgecrab-gateway gateway_session_hooks_fire_across_chat_reset_and_shutdown
 
   python-sdk:
     name: Python SDK — build & test
