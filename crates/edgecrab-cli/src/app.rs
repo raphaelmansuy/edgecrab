@@ -29,6 +29,7 @@
 //! - Input line highlighting (cyan for valid commands, red for invalid)
 //! - Fish-style ghost text from input history
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{self, BufRead, Write};
 use std::sync::Arc;
@@ -1944,6 +1945,12 @@ impl SimpleDetailState {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DetailScrollMetrics {
+    surface: Option<DetailSurface>,
+    max_scroll: u16,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct DetailFullscreenState {
     surface: DetailSurface,
@@ -3159,6 +3166,8 @@ pub struct App {
     detail_fullscreen: Option<DetailFullscreenState>,
     /// Scroll position for split-view overlays that do not expose a dedicated pane focus model.
     simple_detail_state: SimpleDetailState,
+    /// Last rendered scroll bounds for the active split-detail surface.
+    split_detail_metrics: Cell<DetailScrollMetrics>,
     /// Drill-down inspector for a single saved session.
     session_inspector: SessionInspector,
     /// Config center overlay (activated by `/config`)
@@ -3813,6 +3822,7 @@ impl App {
             session_browser_pane: DetailPaneState::default(),
             detail_fullscreen: None,
             simple_detail_state: SimpleDetailState::default(),
+            split_detail_metrics: Cell::new(DetailScrollMetrics::default()),
             session_inspector: SessionInspector::new(),
             config_selector: FuzzySelector::new(),
             gateway_browser: FuzzySelector::new(),
@@ -6868,8 +6878,16 @@ impl App {
                 {
                     self.page_down_detail_fullscreen(DetailSurface::ModelSelector);
                 }
-                KeyCode::PageUp => self.page_up_split_detail(DetailSurface::ModelSelector, 8),
-                KeyCode::PageDown => self.page_down_split_detail(DetailSurface::ModelSelector, 8),
+                KeyCode::PageUp => {
+                    self.page_up_simple_overlay(DetailSurface::ModelSelector, |app| {
+                        app.model_selector.page_up();
+                    })
+                }
+                KeyCode::PageDown => {
+                    self.page_down_simple_overlay(DetailSurface::ModelSelector, |app| {
+                        app.model_selector.page_down();
+                    })
+                }
                 KeyCode::Backspace => {
                     self.model_selector.pop_char();
                     self.reset_split_detail_scroll(DetailSurface::ModelSelector);
@@ -7105,9 +7123,15 @@ impl App {
                 {
                     self.page_down_detail_fullscreen(DetailSurface::VisionModelSelector);
                 }
-                KeyCode::PageUp => self.page_up_split_detail(DetailSurface::VisionModelSelector, 8),
+                KeyCode::PageUp => {
+                    self.page_up_simple_overlay(DetailSurface::VisionModelSelector, |app| {
+                        app.vision_model_selector.page_up();
+                    })
+                }
                 KeyCode::PageDown => {
-                    self.page_down_split_detail(DetailSurface::VisionModelSelector, 8)
+                    self.page_down_simple_overlay(DetailSurface::VisionModelSelector, |app| {
+                        app.vision_model_selector.page_down();
+                    })
                 }
                 KeyCode::Backspace => {
                     self.vision_model_selector.pop_char();
@@ -7172,9 +7196,15 @@ impl App {
                 {
                     self.page_down_detail_fullscreen(DetailSurface::ImageModelSelector);
                 }
-                KeyCode::PageUp => self.page_up_split_detail(DetailSurface::ImageModelSelector, 8),
+                KeyCode::PageUp => {
+                    self.page_up_simple_overlay(DetailSurface::ImageModelSelector, |app| {
+                        app.image_model_selector.page_up();
+                    })
+                }
                 KeyCode::PageDown => {
-                    self.page_down_split_detail(DetailSurface::ImageModelSelector, 8)
+                    self.page_down_simple_overlay(DetailSurface::ImageModelSelector, |app| {
+                        app.image_model_selector.page_down();
+                    })
                 }
                 KeyCode::Backspace => {
                     self.image_model_selector.pop_char();
@@ -7246,8 +7276,14 @@ impl App {
                 KeyCode::PageDown if self.detail_fullscreen_active(DetailSurface::McpSelector) => {
                     self.page_down_detail_fullscreen(DetailSurface::McpSelector);
                 }
-                KeyCode::PageUp => self.page_up_split_detail(DetailSurface::McpSelector, 8),
-                KeyCode::PageDown => self.page_down_split_detail(DetailSurface::McpSelector, 8),
+                KeyCode::PageUp => self.page_up_simple_overlay(DetailSurface::McpSelector, |app| {
+                    app.mcp_selector.page_up();
+                }),
+                KeyCode::PageDown => {
+                    self.page_down_simple_overlay(DetailSurface::McpSelector, |app| {
+                        app.mcp_selector.page_down();
+                    })
+                }
                 KeyCode::Backspace => {
                     self.mcp_selector.pop_char();
                     self.reset_split_detail_scroll(DetailSurface::McpSelector);
@@ -7380,9 +7416,15 @@ impl App {
                 {
                     self.page_down_detail_fullscreen(DetailSurface::RemoteMcpBrowser);
                 }
-                KeyCode::PageUp => self.page_up_split_detail(DetailSurface::RemoteMcpBrowser, 8),
+                KeyCode::PageUp => {
+                    self.page_up_simple_overlay(DetailSurface::RemoteMcpBrowser, |app| {
+                        app.remote_mcp_browser.selector.page_up();
+                    })
+                }
                 KeyCode::PageDown => {
-                    self.page_down_split_detail(DetailSurface::RemoteMcpBrowser, 8)
+                    self.page_down_simple_overlay(DetailSurface::RemoteMcpBrowser, |app| {
+                        app.remote_mcp_browser.selector.page_down();
+                    })
                 }
                 KeyCode::Backspace => {
                     self.remote_mcp_browser.selector.pop_char();
@@ -7469,9 +7511,15 @@ impl App {
                 {
                     self.page_down_detail_fullscreen(DetailSurface::RemoteSkillBrowser);
                 }
-                KeyCode::PageUp => self.page_up_split_detail(DetailSurface::RemoteSkillBrowser, 8),
+                KeyCode::PageUp => {
+                    self.page_up_simple_overlay(DetailSurface::RemoteSkillBrowser, |app| {
+                        app.remote_skill_browser.selector.page_up();
+                    })
+                }
                 KeyCode::PageDown => {
-                    self.page_down_split_detail(DetailSurface::RemoteSkillBrowser, 8)
+                    self.page_down_simple_overlay(DetailSurface::RemoteSkillBrowser, |app| {
+                        app.remote_skill_browser.selector.page_down();
+                    })
                 }
                 KeyCode::Backspace => {
                     self.remote_skill_browser.selector.pop_char();
@@ -7559,9 +7607,15 @@ impl App {
                 {
                     self.page_down_detail_fullscreen(DetailSurface::RemotePluginBrowser);
                 }
-                KeyCode::PageUp => self.page_up_split_detail(DetailSurface::RemotePluginBrowser, 8),
+                KeyCode::PageUp => {
+                    self.page_up_simple_overlay(DetailSurface::RemotePluginBrowser, |app| {
+                        app.remote_plugin_browser.selector.page_up();
+                    })
+                }
                 KeyCode::PageDown => {
-                    self.page_down_split_detail(DetailSurface::RemotePluginBrowser, 8)
+                    self.page_down_simple_overlay(DetailSurface::RemotePluginBrowser, |app| {
+                        app.remote_plugin_browser.selector.page_down();
+                    })
                 }
                 KeyCode::Backspace => {
                     self.remote_plugin_browser.selector.pop_char();
@@ -7633,8 +7687,16 @@ impl App {
                 {
                     self.page_down_detail_fullscreen(DetailSurface::SkillSelector);
                 }
-                KeyCode::PageUp => self.page_up_split_detail(DetailSurface::SkillSelector, 8),
-                KeyCode::PageDown => self.page_down_split_detail(DetailSurface::SkillSelector, 8),
+                KeyCode::PageUp => {
+                    self.page_up_simple_overlay(DetailSurface::SkillSelector, |app| {
+                        app.skill_selector.page_up();
+                    })
+                }
+                KeyCode::PageDown => {
+                    self.page_down_simple_overlay(DetailSurface::SkillSelector, |app| {
+                        app.skill_selector.page_down();
+                    })
+                }
                 _ if selector_action_key(&key, 'r') => {
                     self.open_remote_skill_selector(None);
                 }
@@ -7691,8 +7753,14 @@ impl App {
                 KeyCode::PageDown if self.detail_fullscreen_active(DetailSurface::ToolManager) => {
                     self.page_down_detail_fullscreen(DetailSurface::ToolManager);
                 }
-                KeyCode::PageUp => self.page_up_split_detail(DetailSurface::ToolManager, 8),
-                KeyCode::PageDown => self.page_down_split_detail(DetailSurface::ToolManager, 8),
+                KeyCode::PageUp => self.page_up_simple_overlay(DetailSurface::ToolManager, |app| {
+                    app.tool_manager.page_up();
+                }),
+                KeyCode::PageDown => {
+                    self.page_down_simple_overlay(DetailSurface::ToolManager, |app| {
+                        app.tool_manager.page_down();
+                    })
+                }
                 _ if selector_action_key(&key, 'r') => {
                     self.reset_tool_manager_policy();
                 }
@@ -7752,8 +7820,16 @@ impl App {
                 KeyCode::PageDown if self.detail_fullscreen_active(DetailSurface::PluginToggle) => {
                     self.page_down_detail_fullscreen(DetailSurface::PluginToggle);
                 }
-                KeyCode::PageUp => self.page_up_split_detail(DetailSurface::PluginToggle, 8),
-                KeyCode::PageDown => self.page_down_split_detail(DetailSurface::PluginToggle, 8),
+                KeyCode::PageUp => {
+                    self.page_up_simple_overlay(DetailSurface::PluginToggle, |app| {
+                        app.plugin_toggle.page_up();
+                    })
+                }
+                KeyCode::PageDown => {
+                    self.page_down_simple_overlay(DetailSurface::PluginToggle, |app| {
+                        app.plugin_toggle.page_down();
+                    })
+                }
                 _ if selector_action_key(&key, 'r') => {
                     self.open_remote_plugin_selector(None, None);
                 }
@@ -7811,8 +7887,16 @@ impl App {
                 {
                     self.page_down_detail_fullscreen(DetailSurface::ConfigSelector);
                 }
-                KeyCode::PageUp => self.page_up_split_detail(DetailSurface::ConfigSelector, 8),
-                KeyCode::PageDown => self.page_down_split_detail(DetailSurface::ConfigSelector, 8),
+                KeyCode::PageUp => {
+                    self.page_up_simple_overlay(DetailSurface::ConfigSelector, |app| {
+                        app.config_selector.page_up();
+                    })
+                }
+                KeyCode::PageDown => {
+                    self.page_down_simple_overlay(DetailSurface::ConfigSelector, |app| {
+                        app.config_selector.page_down();
+                    })
+                }
                 KeyCode::Backspace => {
                     self.config_selector.pop_char();
                     self.reset_split_detail_scroll(DetailSurface::ConfigSelector);
@@ -17864,7 +17948,7 @@ impl App {
             Span::styled("type ", Style::default().fg(Color::Cyan)),
             Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
             Span::styled("PgUp/Dn ", Style::default().fg(Color::Cyan)),
-            Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("page or scroll  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Enter ", Style::default().fg(Color::Cyan)),
             Span::styled("select  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Z ", Style::default().fg(Color::Cyan)),
@@ -18273,6 +18357,53 @@ impl App {
         }
     }
 
+    fn measure_scrollable_detail_max_scroll(area: Rect, detail_lines: &[Line<'_>]) -> u16 {
+        let inner = Block::default().borders(Borders::ALL).inner(area);
+        if inner.width == 0 || inner.height == 0 {
+            return 0;
+        }
+
+        let visual_rows_for_width = |content_width: usize| -> u16 {
+            detail_lines
+                .iter()
+                .map(|line| {
+                    let width = line.width();
+                    if width == 0 {
+                        1
+                    } else {
+                        width.div_ceil(content_width.max(1)) as u16
+                    }
+                })
+                .sum()
+        };
+
+        let mut content_width = inner.width.max(1) as usize;
+        let mut visual_rows = visual_rows_for_width(content_width);
+        if visual_rows > inner.height && inner.width > 1 {
+            content_width = inner.width.saturating_sub(1).max(1) as usize;
+            visual_rows = visual_rows_for_width(content_width);
+        }
+
+        visual_rows.saturating_sub(inner.height)
+    }
+
+    fn remember_split_detail_metrics(
+        &self,
+        surface: DetailSurface,
+        area: Rect,
+        detail_lines: &[Line<'_>],
+    ) {
+        self.split_detail_metrics.set(DetailScrollMetrics {
+            surface: Some(surface),
+            max_scroll: Self::measure_scrollable_detail_max_scroll(area, detail_lines),
+        });
+    }
+
+    fn split_detail_max_scroll(&self, surface: DetailSurface) -> Option<u16> {
+        let metrics = self.split_detail_metrics.get();
+        (metrics.surface == Some(surface)).then_some(metrics.max_scroll)
+    }
+
     fn detail_fullscreen_active(&self, surface: DetailSurface) -> bool {
         self.detail_fullscreen
             .is_some_and(|state| state.surface == surface)
@@ -18317,6 +18448,38 @@ impl App {
         self.needs_redraw = true;
     }
 
+    fn page_up_simple_overlay<F>(&mut self, surface: DetailSurface, fallback: F)
+    where
+        F: FnOnce(&mut Self),
+    {
+        let should_fallback = self
+            .split_detail_max_scroll(surface)
+            .is_some_and(|_| self.split_detail_scroll(surface) == 0);
+        if should_fallback {
+            fallback(self);
+            self.reset_split_detail_scroll(surface);
+            self.reset_detail_fullscreen_scroll(surface);
+        } else {
+            self.page_up_split_detail(surface, 8);
+        }
+    }
+
+    fn page_down_simple_overlay<F>(&mut self, surface: DetailSurface, fallback: F)
+    where
+        F: FnOnce(&mut Self),
+    {
+        let should_fallback = self
+            .split_detail_max_scroll(surface)
+            .is_some_and(|max_scroll| self.split_detail_scroll(surface) >= max_scroll);
+        if should_fallback {
+            fallback(self);
+            self.reset_split_detail_scroll(surface);
+            self.reset_detail_fullscreen_scroll(surface);
+        } else {
+            self.page_down_split_detail(surface, 8);
+        }
+    }
+
     fn render_standard_split_detail(
         &self,
         frame: &mut Frame,
@@ -18325,6 +18488,7 @@ impl App {
         border_color: Color,
         detail_lines: Vec<Line<'static>>,
     ) {
+        self.remember_split_detail_metrics(surface, area, &detail_lines);
         self.render_scrollable_browser_detail(
             frame,
             area,
@@ -18617,7 +18781,7 @@ impl App {
             Span::styled("type ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
             Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(110, 220, 210))),
-            Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("page or scroll  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Enter ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("default action  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Space ", Style::default().fg(Color::Rgb(110, 220, 210))),
@@ -18915,7 +19079,7 @@ impl App {
             Span::styled("type ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
             Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(110, 220, 210))),
-            Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("page or scroll  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Enter ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("default action  ", Style::default().fg(Color::DarkGray)),
             Span::styled("I ", Style::default().fg(Color::Rgb(110, 220, 210))),
@@ -19121,7 +19285,7 @@ impl App {
             Span::styled("type ", Style::default().fg(Color::Rgb(255, 191, 0))),
             Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
             Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(255, 191, 0))),
-            Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("page or scroll  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Space ", Style::default().fg(Color::Rgb(255, 191, 0))),
             Span::styled("toggle active  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Enter ", Style::default().fg(Color::Rgb(255, 191, 0))),
@@ -19403,7 +19567,7 @@ impl App {
             Span::styled("type ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
             Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(110, 220, 210))),
-            Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("page or scroll  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Enter ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("default action  ", Style::default().fg(Color::DarkGray)),
             Span::styled("I ", Style::default().fg(Color::Rgb(110, 220, 210))),
@@ -19725,7 +19889,7 @@ impl App {
             Span::styled("type ", Style::default().fg(Color::Rgb(255, 210, 110))),
             Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
             Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(255, 210, 110))),
-            Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("page or scroll  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Enter ", Style::default().fg(Color::Rgb(255, 210, 110))),
             Span::styled("default action  ", Style::default().fg(Color::DarkGray)),
             Span::styled("I ", Style::default().fg(Color::Rgb(255, 210, 110))),
@@ -20008,7 +20172,7 @@ impl App {
             Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("browse  ", Style::default().fg(Color::DarkGray)),
             Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(110, 220, 210))),
-            Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("page or scroll  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Space ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("toggle  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Tab ", Style::default().fg(Color::Rgb(110, 220, 210))),
@@ -20370,7 +20534,7 @@ impl App {
             Span::styled("type ", Style::default().fg(Color::Rgb(210, 190, 110))),
             Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
             Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(210, 190, 110))),
-            Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("page or scroll  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Space ", Style::default().fg(Color::Rgb(210, 190, 110))),
             Span::styled("stage change  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Enter ", Style::default().fg(Color::Rgb(210, 190, 110))),
@@ -20623,7 +20787,7 @@ impl App {
             Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(130, 210, 255))),
             Span::styled("browse  ", Style::default().fg(Color::DarkGray)),
             Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(130, 210, 255))),
-            Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("page or scroll  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Enter ", Style::default().fg(Color::Rgb(130, 210, 255))),
             Span::styled("run action  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Z ", Style::default().fg(Color::Rgb(130, 210, 255))),
@@ -20751,6 +20915,7 @@ impl App {
             ));
         }
 
+        self.remember_split_detail_metrics(DetailSurface::GatewayBrowser, body[1], &detail_lines);
         if self.detail_fullscreen_active(DetailSurface::GatewayBrowser) {
             self.render_fullscreen_browser_detail(
                 frame,
@@ -20796,6 +20961,7 @@ impl App {
             return;
         }
 
+        self.remember_split_detail_metrics(DetailSurface::GatewayBrowser, body[1], &detail_lines);
         self.render_scrollable_browser_detail(
             frame,
             body[1],
@@ -21093,6 +21259,7 @@ impl App {
                 "Try a title fragment, model name, source like cli or telegram, or terms from the conversation itself.",
             ));
         }
+        self.remember_split_detail_metrics(DetailSurface::SessionBrowser, body[1], &detail_lines);
         self.render_scrollable_browser_detail(
             frame,
             body[1],
@@ -21131,7 +21298,7 @@ impl App {
                         Span::styled("type ", Style::default().fg(Color::Rgb(110, 190, 255))),
                         Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
                         Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(110, 190, 255))),
-                        Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("page or scroll  ", Style::default().fg(Color::DarkGray)),
                         Span::styled("Enter ", Style::default().fg(Color::Rgb(110, 190, 255))),
                         Span::styled("inspect  ", Style::default().fg(Color::DarkGray)),
                         Span::styled("R ", Style::default().fg(Color::Rgb(110, 190, 255))),
@@ -21297,6 +21464,7 @@ impl App {
         );
 
         let detail_lines = self.build_session_inspector_detail_lines();
+        self.remember_split_detail_metrics(DetailSurface::SessionInspector, body[1], &detail_lines);
         self.render_scrollable_browser_detail(
             frame,
             body[1],
@@ -23005,6 +23173,14 @@ fn png_crc32(data: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn render_for_test(app: &mut App, width: u16, height: u16) {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("draw frame");
+    }
 
     fn line_spans_text(line: &OutputLine) -> String {
         line.prebuilt_spans
@@ -25287,6 +25463,76 @@ kind = "skill"
         assert_eq!(
             app.split_detail_scroll(DetailSurface::RemoteSkillBrowser),
             16
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_selector_page_keys_fall_back_to_selector_when_detail_fits() {
+        let mut app = App::new();
+        let entries = (0..12)
+            .map(|idx| SkillEntry {
+                name: format!("skill-{idx:02}"),
+                display_name: format!("Skill {idx:02}"),
+                is_dir: false,
+                active: false,
+                category: "testing".into(),
+                relative_path: format!("skills/skill-{idx:02}.md"),
+                desc: format!("Short preview {idx:02}"),
+                detail: format!("One-line detail {idx:02}"),
+                detail_view: format!("Short detail {idx:02}"),
+                search_text: format!("skill {idx:02} short"),
+            })
+            .collect::<Vec<_>>();
+        app.skill_selector.set_items(entries);
+        app.skill_selector.active = true;
+
+        render_for_test(&mut app, 100, 28);
+
+        app.handle_key_event(event::KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(app.skill_selector.selected, 8);
+        assert_eq!(app.split_detail_scroll(DetailSurface::SkillSelector), 0);
+
+        app.handle_key_event(event::KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        assert_eq!(app.skill_selector.selected, 0);
+        assert_eq!(app.split_detail_scroll(DetailSurface::SkillSelector), 0);
+    }
+
+    #[tokio::test]
+    async fn remote_skill_browser_page_keys_prefer_detail_scroll_when_it_overflows() {
+        let mut app = App::new();
+        app.remote_skill_browser
+            .selector
+            .set_items(vec![RemoteSkillEntry {
+                source_label: "EdgeCrab".into(),
+                trust_level: "trusted".into(),
+                name: "long-detail".into(),
+                identifier: "edgecrab://skills/long-detail".into(),
+                description: (0..32)
+                    .map(|idx| format!("line {idx:02} wraps through the detail pane"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                origin: "https://example.com/skills/long-detail".into(),
+                tags: vec!["tui".into(), "audit".into()],
+                installed_name: None,
+                action: RemoteSkillAction::Install,
+                search_text: "long detail tui audit".into(),
+            }]);
+        app.remote_skill_browser.selector.active = true;
+
+        render_for_test(&mut app, 100, 28);
+
+        app.handle_key_event(event::KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(app.remote_skill_browser.selector.selected, 0);
+        assert_eq!(
+            app.split_detail_scroll(DetailSurface::RemoteSkillBrowser),
+            8
+        );
+
+        app.handle_key_event(event::KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        assert_eq!(app.remote_skill_browser.selector.selected, 0);
+        assert_eq!(
+            app.split_detail_scroll(DetailSurface::RemoteSkillBrowser),
+            0
         );
     }
 
