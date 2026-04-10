@@ -86,15 +86,7 @@ fn run_edgecrab(home: &Path, args: &[&str]) -> String {
 }
 
 fn run_edgecrab_with_env(home: &Path, args: &[&str], envs: &[(&str, &str)]) -> String {
-    let edgecrab_home = home.join(".edgecrab");
-    let mut command = edgecrab();
-    command
-        .env("HOME", home)
-        .env("EDGECRAB_HOME", &edgecrab_home);
-    for (key, value) in envs {
-        command.env(key, value);
-    }
-    let output = command.args(args).output().expect("run edgecrab");
+    let output = run_edgecrab_output_with_env(home, args, envs);
 
     assert!(
         output.status.success(),
@@ -104,6 +96,22 @@ fn run_edgecrab_with_env(home: &Path, args: &[&str], envs: &[(&str, &str)]) -> S
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+fn run_edgecrab_output_with_env(
+    home: &Path,
+    args: &[&str],
+    envs: &[(&str, &str)],
+) -> std::process::Output {
+    let edgecrab_home = home.join(".edgecrab");
+    let mut command = edgecrab();
+    command
+        .env("HOME", home)
+        .env("EDGECRAB_HOME", &edgecrab_home);
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    command.args(args).output().expect("run edgecrab")
 }
 
 fn create_entrypoint_plugin_package(dir: &Path) {
@@ -873,15 +881,36 @@ async fn real_hermes_honcho_memory_cli_is_invocable_end_to_end() {
         ]),
     );
 
-    let install_out = run_edgecrab(
-        home.path(),
-        &[
-            "plugins",
-            "install",
-            "--force",
-            "hub:hermes-plugins/plugins/memory/honcho",
-        ],
-    );
+    let hub_install_args = [
+        "plugins",
+        "install",
+        "--force",
+        "hub:hermes-plugins/plugins/memory/honcho",
+    ];
+    let hub_install = run_edgecrab_output_with_env(home.path(), &hub_install_args, &[]);
+    let install_out = if hub_install.status.success() {
+        String::from_utf8_lossy(&hub_install.stdout).into_owned()
+    } else {
+        let stderr = String::from_utf8_lossy(&hub_install.stderr);
+        assert!(
+            stderr.contains("403 rate limit exceeded"),
+            "unexpected honcho install failure\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&hub_install.stdout),
+            stderr
+        );
+        run_edgecrab(
+            home.path(),
+            &[
+                "plugins",
+                "install",
+                "--force",
+                real_hermes_repo()
+                    .join("plugins/memory/honcho")
+                    .to_str()
+                    .expect("utf8 honcho path"),
+            ],
+        )
+    };
     assert!(install_out.contains("Plugin 'honcho' installed and enabled."));
 
     let plugin = discover_installed_plugin(&edgecrab_home, "honcho");
