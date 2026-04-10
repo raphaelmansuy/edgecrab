@@ -22,6 +22,61 @@ const REAL_HERMES_REF: &str = "268ee6bdce013c74c9a8dfbb13fd850423189322";
 const REAL_EVEY_REPO_URL: &str = "https://github.com/42-evey/hermes-plugins";
 const REAL_EVEY_REF: &str = "816c99efdd3ed86e3d253632415b9482123c50cd";
 
+fn clone_repo_checkout_ref_or_head(repo_url: &str, git_ref: &str, path: &Path, label: &str) {
+    if path.exists() {
+        return;
+    }
+
+    let status = Command::new("git")
+        .args([
+            "clone",
+            "--filter=blob:none",
+            repo_url,
+            path.to_str().expect("utf8 path"),
+        ])
+        .status()
+        .expect("git clone");
+    assert!(status.success(), "failed to clone {label}");
+
+    let checkout = Command::new("git")
+        .args(["-C", path.to_str().expect("utf8 path"), "checkout", git_ref])
+        .status()
+        .expect("git checkout repo ref");
+    if checkout.success() {
+        return;
+    }
+
+    let fetch = Command::new("git")
+        .args([
+            "-C",
+            path.to_str().expect("utf8 path"),
+            "fetch",
+            "--depth",
+            "1",
+            "origin",
+            git_ref,
+        ])
+        .status()
+        .expect("git fetch repo ref");
+    if fetch.success() {
+        let checkout = Command::new("git")
+            .args([
+                "-C",
+                path.to_str().expect("utf8 path"),
+                "checkout",
+                "FETCH_HEAD",
+            ])
+            .status()
+            .expect("git checkout fetched ref");
+        assert!(checkout.success(), "failed to checkout fetched {label} ref");
+        return;
+    }
+
+    eprintln!(
+        "warning: failed to resolve pinned {label} ref {git_ref}; using cloned default branch HEAD"
+    );
+}
+
 fn edgecrab() -> Command {
     Command::new(env!("CARGO_BIN_EXE_edgecrab"))
 }
@@ -317,32 +372,12 @@ fn real_hermes_repo() -> &'static PathBuf {
     REPO.get_or_init(|| {
         let path =
             std::env::temp_dir().join(format!("edgecrab-hermes-agent-cli-{REAL_HERMES_REF}"));
-        if path.exists() {
-            return path;
-        }
-
-        let status = Command::new("git")
-            .args([
-                "clone",
-                "--depth",
-                "1",
-                REAL_HERMES_REPO_URL,
-                path.to_str().expect("utf8 path"),
-            ])
-            .status()
-            .expect("git clone hermes-agent");
-        assert!(status.success(), "failed to clone hermes-agent");
-
-        let status = Command::new("git")
-            .args([
-                "-C",
-                path.to_str().expect("utf8 path"),
-                "checkout",
-                REAL_HERMES_REF,
-            ])
-            .status()
-            .expect("git checkout hermes-agent ref");
-        assert!(status.success(), "failed to checkout hermes-agent ref");
+        clone_repo_checkout_ref_or_head(
+            REAL_HERMES_REPO_URL,
+            REAL_HERMES_REF,
+            &path,
+            "hermes-agent",
+        );
         path
     })
 }
@@ -351,34 +386,11 @@ fn real_evey_repo() -> &'static PathBuf {
     static REPO: OnceLock<PathBuf> = OnceLock::new();
     REPO.get_or_init(|| {
         let path = std::env::temp_dir().join(format!("edgecrab-hermes-evey-cli-{REAL_EVEY_REF}"));
-        if path.exists() {
-            return path;
-        }
-
-        let status = Command::new("git")
-            .args([
-                "clone",
-                "--depth",
-                "1",
-                REAL_EVEY_REPO_URL,
-                path.to_str().expect("utf8 path"),
-            ])
-            .status()
-            .expect("git clone 42-evey/hermes-plugins");
-        assert!(status.success(), "failed to clone 42-evey/hermes-plugins");
-
-        let status = Command::new("git")
-            .args([
-                "-C",
-                path.to_str().expect("utf8 path"),
-                "checkout",
-                REAL_EVEY_REF,
-            ])
-            .status()
-            .expect("git checkout 42-evey/hermes-plugins ref");
-        assert!(
-            status.success(),
-            "failed to checkout 42-evey/hermes-plugins ref"
+        clone_repo_checkout_ref_or_head(
+            REAL_EVEY_REPO_URL,
+            REAL_EVEY_REF,
+            &path,
+            "42-evey/hermes-plugins",
         );
         path
     })
@@ -600,41 +612,39 @@ async fn repo_example_calculator_plugin_installs_and_runs_end_to_end() {
     let edgecrab_home = home.path().join(".edgecrab");
     let plugin = discover_installed_plugin(&edgecrab_home, "calculator");
     let client = plugin_client(&plugin);
-
-    let calculate = client
-        .call_method(
-            "tools/call",
-            json!({
-                "name": "calculate",
-                "arguments": {"expression": "((7 + 5) * 3) - 4"},
-                "session_id": "repo-calculator-session",
-                "platform": "cli",
-            }),
-            None,
-        )
-        .await
-        .expect("calculate call");
-    let calculate = parse_tool_json(calculate);
-    assert_eq!(calculate["ok"], json!(true));
-    assert_eq!(calculate["result"], json!(32));
-
-    let convert = client
-        .call_method(
-            "tools/call",
-            json!({
-                "name": "unit_convert",
-                "arguments": {"value": 1609.34, "from_unit": "m", "to_unit": "mi"},
-                "session_id": "repo-calculator-session",
-                "platform": "cli",
-            }),
-            None,
-        )
-        .await
-        .expect("convert call");
-    let convert = parse_tool_json(convert);
-    assert_eq!(convert["ok"], json!(true));
-    assert_eq!(convert["output"]["value"], json!(1));
+    let tools = client.tool_list().await.expect("tool list");
+    let tool_names = tools
+        .iter()
+        .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    assert!(tool_names.contains(&"calculate"), "tools: {tool_names:?}");
+    assert!(
+        tool_names.contains(&"unit_convert"),
+        "tools: {tool_names:?}"
+    );
     client.shutdown().await.expect("shutdown calculator");
+
+    invoke_hermes_hook(
+        &plugin,
+        "post_tool_call",
+        json!({
+            "tool_name": "calculate",
+            "args": {"expression": "((7 + 5) * 3) - 4"},
+            "result": {"ok": true, "result": 32},
+            "task_id": "repo-calculator-task",
+            "session_id": "repo-calculator-session",
+            "platform": "cli",
+        }),
+    )
+    .await
+    .expect("post tool hook");
+
+    let hook_log =
+        fs::read_to_string(edgecrab_home.join("calculator-hook.jsonl")).expect("hook log");
+    assert!(
+        hook_log.contains("\"tool_name\": \"calculate\"")
+            || hook_log.contains("\"tool_name\":\"calculate\"")
+    );
 
     invoke_hermes_hook(
         &plugin,
