@@ -1114,7 +1114,6 @@ fn run_plugins(command: PluginsCommand) -> anyhow::Result<()> {
             name,
             force,
             no_enable,
-            replace_existing: false,
         })?,
         PluginsCommand::Enable { name } => {
             plugins_cmd::run(plugins_cmd::PluginAction::Enable { name })?
