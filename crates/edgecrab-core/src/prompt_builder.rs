@@ -19,6 +19,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use edgecrab_tools::edit_contract::{MAX_MUTATION_PAYLOAD_BYTES, MAX_MUTATION_PAYLOAD_KIB};
+use edgecrab_tools::tools::skills::load_skill_prompt_bundle;
 use edgecrab_types::Platform;
 
 // ─── Skills cache ─────────────────────────────────────────────────────
@@ -1070,41 +1071,28 @@ pub fn load_memory_sections(edgecrab_home: &Path) -> Vec<String> {
 /// descriptions (from YAML frontmatter) in the system prompt — not the
 /// full skill content. The agent can use `skill_view` to load full
 /// details on demand. This keeps prompt size manageable.
-/// Load the full content of preloaded skills from `~/.edgecrab/skills/<name>/SKILL.md`.
+/// Load the full content of preloaded skills from the configured skill roots.
 ///
 /// Returns a formatted string containing each skill's full markdown content,
 /// prefixed with a header. Returns an empty string when the list is empty or
 /// no skill files are found.
-pub fn load_preloaded_skills(edgecrab_home: &Path, skill_names: &[String]) -> String {
+pub fn load_preloaded_skills(
+    edgecrab_home: &Path,
+    external_dirs: &[String],
+    skill_names: &[String],
+    session_id: Option<&str>,
+) -> String {
     if skill_names.is_empty() {
         return String::new();
     }
-    let skills_dir = edgecrab_home.join("skills");
     let mut parts: Vec<String> = Vec::new();
 
     for name in skill_names {
-        // Try both flat and optional-skills locations:
-        // ~/.edgecrab/skills/<name>/SKILL.md
-        // ~/.edgecrab/optional-skills/<name>/SKILL.md
-        let candidates = [
-            skills_dir.join(name).join("SKILL.md"),
-            edgecrab_home
-                .join("optional-skills")
-                .join(name)
-                .join("SKILL.md"),
-        ];
-        let mut loaded = false;
-        for path in &candidates {
-            if let Ok(content) = std::fs::read_to_string(path) {
-                let stripped = strip_yaml_frontmatter(content.trim()).trim().to_string();
-                if !stripped.is_empty() {
-                    parts.push(format!("## Skill: {name}\n\n{stripped}"));
-                    loaded = true;
-                    break;
-                }
-            }
-        }
-        if !loaded {
+        if let Some(bundle) =
+            load_skill_prompt_bundle(edgecrab_home, external_dirs, name, session_id)
+        {
+            parts.push(bundle);
+        } else {
             tracing::debug!("preloaded skill '{name}' not found in skills directories");
         }
     }
@@ -1434,6 +1422,16 @@ pub fn extract_skill_description(content: &str) -> Option<String> {
             let desc = rest.trim().trim_matches('"').trim_matches('\'');
             if !desc.is_empty() {
                 // Truncate long descriptions
+                return Some(if desc.len() > 200 {
+                    format!("{}…", crate::safe_truncate(desc, 197))
+                } else {
+                    desc.to_string()
+                });
+            }
+        }
+        if let Some(rest) = line.strip_prefix("when_to_use:") {
+            let desc = rest.trim().trim_matches('"').trim_matches('\'');
+            if !desc.is_empty() {
                 return Some(if desc.len() > 200 {
                     format!("{}…", crate::safe_truncate(desc, 197))
                 } else {
@@ -1891,6 +1889,35 @@ mod tests {
     }
 
     #[test]
+    fn load_preloaded_skills_includes_claude_skill_scripts_context() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let skill_dir = tmp.path().join("skills").join("cli-helper");
+        let scripts_dir = skill_dir.join("scripts");
+        std::fs::create_dir_all(&scripts_dir).expect("mkdir");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nread_files:\n  - notes.md\n---\n\
+Run `${CLAUDE_SKILL_DIR}/scripts/helper.py --session ${CLAUDE_SESSION_ID}`.\n",
+        )
+        .expect("write skill");
+        std::fs::write(skill_dir.join("notes.md"), "Notes for the helper").expect("write notes");
+        std::fs::write(scripts_dir.join("helper.py"), "print('helper')").expect("write script");
+
+        let preloaded = load_preloaded_skills(
+            tmp.path(),
+            &[],
+            &["cli-helper".to_string()],
+            Some("session-42"),
+        );
+
+        assert!(preloaded.contains("Base directory for this skill:"));
+        assert!(preloaded.contains("scripts/helper.py --session session-42"));
+        assert!(preloaded.contains("Notes for the helper"));
+        assert!(preloaded.contains("scripts/helper.py"));
+        assert!(!preloaded.contains("${CLAUDE_SKILL_DIR}"));
+    }
+
+    #[test]
     fn load_skill_summary_description_md_fallback() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let skill_dir = tmp.path().join("skills").join("no-desc-skill");
@@ -1913,6 +1940,35 @@ mod tests {
         assert!(
             summary.contains("Fallback description from DESCRIPTION.md"),
             "DESCRIPTION.md fallback not used:\n{summary}"
+        );
+    }
+
+    #[test]
+    fn extract_skill_description_falls_back_to_when_to_use() {
+        let content =
+            "---\nwhen_to_use: Use this when the repo has multiple release trains.\n---\n# Skill";
+        let description = extract_skill_description(content).expect("description");
+        assert_eq!(
+            description,
+            "Use this when the repo has multiple release trains."
+        );
+    }
+
+    #[test]
+    fn load_skill_summary_uses_when_to_use_when_description_missing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let skill_dir = tmp.path().join("skills").join("claude-style");
+        std::fs::create_dir_all(&skill_dir).expect("mkdir");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nwhen_to_use: Use when the deployment has stalled.\n---\n# Claude Style",
+        )
+        .expect("write");
+
+        let summary = load_skill_summary(tmp.path(), &[], None, None).expect("summary");
+        assert!(
+            summary.contains("Use when the deployment has stalled."),
+            "missing when_to_use fallback in:\n{summary}"
         );
     }
 

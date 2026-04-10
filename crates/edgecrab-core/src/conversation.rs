@@ -90,6 +90,10 @@ struct ApiCallContext<'a> {
     cancel: &'a CancellationToken,
     event_tx: Option<&'a tokio::sync::mpsc::UnboundedSender<crate::StreamEvent>>,
     use_native_streaming: bool,
+    discovered_plugins: Option<&'a edgecrab_plugins::PluginDiscovery>,
+    conversation_session_id: &'a str,
+    platform: edgecrab_types::Platform,
+    api_call_count: u32,
 }
 
 fn provider_manages_transport_retries(provider: &dyn LLMProvider) -> bool {
@@ -264,17 +268,17 @@ const MAX_DELEGATE_TASK_CALLS_PER_TURN: usize = 3;
 /// `clippy::too_many_arguments` lint. Grouping the 6 shared dispatch
 /// params into one struct reduces argument count to 3 for each function
 /// and makes the shared state explicit.
-struct DispatchContext<'a> {
+struct DispatchContext {
     cwd: std::path::PathBuf,
-    registry: Option<&'a Arc<ToolRegistry>>,
-    cancel: &'a CancellationToken,
-    state_db: &'a Option<Arc<edgecrab_state::SessionDb>>,
+    registry: Option<Arc<ToolRegistry>>,
+    cancel: CancellationToken,
+    state_db: Option<Arc<edgecrab_state::SessionDb>>,
     platform: edgecrab_types::Platform,
-    process_table: &'a Arc<edgecrab_tools::ProcessTable>,
+    process_table: Arc<edgecrab_tools::ProcessTable>,
     provider: Option<Arc<dyn edgequake_llm::LLMProvider>>,
     gateway_sender: Option<Arc<dyn edgecrab_tools::registry::GatewaySender>>,
     sub_agent_runner: Option<Arc<dyn edgecrab_tools::SubAgentRunner>>,
-    event_tx: Option<&'a tokio::sync::mpsc::UnboundedSender<crate::StreamEvent>>,
+    event_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::StreamEvent>>,
     delegation_event_tx: Option<tokio::sync::mpsc::UnboundedSender<DelegationEvent>>,
     /// Channel for interactive clarify requests (None in batch/gateway modes).
     clarify_tx:
@@ -293,6 +297,8 @@ struct DispatchContext<'a> {
     todo_store: Option<Arc<edgecrab_tools::TodoStore>>,
     /// Hard capability failures already observed in this conversation.
     capability_suppressions: Arc<Mutex<HashMap<String, ToolErrorResponse>>>,
+    /// Snapshot of discovered runtime plugins for Hermes hook dispatch.
+    discovered_plugins: Option<Arc<edgecrab_plugins::PluginDiscovery>>,
 }
 
 impl Agent {
@@ -330,6 +336,7 @@ impl Agent {
         // conversations are not affected by a /model hot-swap.
         let config = self.config.read().await.clone();
         let provider = self.provider.read().await.clone();
+        let tool_registry = self.tool_registry.read().await.clone();
 
         let mut session = {
             let mut shared = self.session.write().await;
@@ -381,7 +388,7 @@ impl Agent {
         // actually enabled. Without this, the agent gets instructions for tools
         // it cannot use.
         let (mut active_tool_defs, tool_names_for_prompt) =
-            if let Some(ref registry) = self.tool_registry {
+            if let Some(ref registry) = tool_registry {
                 let ctx = build_tool_context(
                     &cwd,
                     app_config_ref.clone(),
@@ -390,7 +397,7 @@ impl Agent {
                     config.platform,
                     &self.process_table,
                     Some(provider.clone()),
-                    self.tool_registry.clone(),
+                    tool_registry.clone(),
                     None,
                     None,
                     None, // clarify_tx not needed for schema resolution
@@ -456,7 +463,7 @@ impl Agent {
                 {
                     disabled_skills.extend(platform_disabled.iter().cloned());
                 }
-                let toolsets_for_prompt = if let Some(registry) = self.tool_registry.as_ref() {
+                let toolsets_for_prompt = if let Some(registry) = tool_registry.as_ref() {
                     available_toolsets_for_prompt(registry, &tool_names_for_prompt)
                 } else {
                     Vec::new()
@@ -469,8 +476,12 @@ impl Agent {
                 );
                 // Load preloaded skills (from -s/--skill flag or config.skills.preloaded)
                 // and prepend their full content before the auto-discovered skill summary.
-                let preloaded_content =
-                    load_preloaded_skills(&home, &config.skills_config.preloaded);
+                let preloaded_content = load_preloaded_skills(
+                    &home,
+                    &config.skills_config.external_dirs,
+                    &config.skills_config.preloaded,
+                    Some(&conversation_session_id),
+                );
                 let plugin_skill_prompt = discover_plugins(&config.plugins_config, config.platform)
                     .ok()
                     .and_then(|discovery| build_plugin_skill_prompt(&discovery));
@@ -538,7 +549,9 @@ impl Agent {
         }
 
         let is_first_turn = session.messages.is_empty();
-        let discovered_plugins = discover_plugins(&config.plugins_config, config.platform).ok();
+        let discovered_plugins = discover_plugins(&config.plugins_config, config.platform)
+            .ok()
+            .map(Arc::new);
         if let Some(discovery) = discovered_plugins.as_ref() {
             if is_first_turn {
                 for plugin in discovery
@@ -655,8 +668,11 @@ impl Agent {
                 }
             }
             if !injected_context.is_empty() {
-                expansion.expanded =
-                    format!("{}\n\n{}", expansion.expanded, injected_context.join("\n\n"));
+                expansion.expanded = format!(
+                    "{}\n\n{}",
+                    expansion.expanded,
+                    injected_context.join("\n\n")
+                );
             }
         }
 
@@ -778,7 +794,7 @@ impl Agent {
         // WHY here: We need the provider and registry to construct child agents.
         // Created once per conversation, shared across all tool dispatches.
         let sub_agent_runner: Option<Arc<dyn edgecrab_tools::SubAgentRunner>> =
-            if let Some(ref registry) = self.tool_registry {
+            if let Some(ref registry) = tool_registry {
                 Some(Arc::new(CoreSubAgentRunner::new(
                     provider.clone(),
                     registry.clone(),
@@ -932,7 +948,7 @@ impl Agent {
 
         loop {
             if tool_defs_dirty {
-                active_tool_defs = if let Some(ref registry) = self.tool_registry {
+                active_tool_defs = if let Some(ref registry) = tool_registry {
                     let schema_ctx = build_tool_context(
                         &cwd,
                         app_config_ref.clone(),
@@ -941,7 +957,7 @@ impl Agent {
                         config.platform,
                         &self.process_table,
                         Some(effective_provider.clone()),
-                        self.tool_registry.clone(),
+                        tool_registry.clone(),
                         None,
                         None,
                         None,
@@ -1101,6 +1117,10 @@ impl Agent {
                     cancel: &cancel,
                     event_tx,
                     use_native_streaming: native_streaming_active,
+                    discovered_plugins: discovered_plugins.as_deref(),
+                    conversation_session_id: &conversation_session_id,
+                    platform: config.platform,
+                    api_call_count: session.api_call_count,
                 },
             )
             .await
@@ -1159,6 +1179,10 @@ impl Agent {
                                         cancel: &cancel,
                                         event_tx,
                                         use_native_streaming: fallback_native_streaming,
+                                        discovered_plugins: discovered_plugins.as_deref(),
+                                        conversation_session_id: &conversation_session_id,
+                                        platform: config.platform,
+                                        api_call_count: session.api_call_count,
                                     },
                                 )
                                 .await
@@ -1233,15 +1257,15 @@ impl Agent {
             // Process response
             let dctx = DispatchContext {
                 cwd: cwd.clone(),
-                registry: self.tool_registry.as_ref(),
-                cancel: &cancel,
-                state_db: &self.state_db,
+                registry: tool_registry.clone(),
+                cancel: cancel.clone(),
+                state_db: self.state_db.clone(),
                 platform: config.platform,
-                process_table: &self.process_table,
+                process_table: self.process_table.clone(),
                 provider: Some(provider.clone()),
                 gateway_sender: self.gateway_sender.read().await.clone(),
                 sub_agent_runner: sub_agent_runner.clone(),
-                event_tx,
+                event_tx: event_tx.cloned(),
                 delegation_event_tx: delegation_tx_for_dispatch.clone(),
                 clarify_tx: clarify_tx_for_dispatch.clone(),
                 approval_tx: approval_tx_for_dispatch.clone(),
@@ -1250,6 +1274,7 @@ impl Agent {
                 conversation_session_id: conversation_session_id.clone(),
                 todo_store: Some(self.todo_store.clone()),
                 capability_suppressions: capability_suppressions.clone(),
+                discovered_plugins: discovered_plugins.clone(),
             };
             let action = match process_response(
                 &response,
@@ -1357,7 +1382,7 @@ impl Agent {
 
         if !interrupted
             && !config.skip_memory
-            && self.tool_registry.is_some()
+            && tool_registry.is_some()
             && turn_tool_calls >= SKILL_REFLECTION_THRESHOLD
         {
             // WHY tokio::spawn (fire-and-forget):
@@ -1380,7 +1405,7 @@ impl Agent {
                 system_prompt: session.cached_system_prompt.clone(),
                 tool_defs: active_tool_defs.clone(),
                 cwd: cwd.clone(),
-                registry: self.tool_registry.as_ref().map(Arc::clone),
+                registry: tool_registry.as_ref().map(Arc::clone),
                 cancel: cancel.clone(),
                 state_db: self.state_db.clone(),
                 platform: config.platform,
@@ -1518,6 +1543,29 @@ impl Agent {
         }
 
         let completed = !interrupted && !final_response.trim().is_empty();
+        if let Some(discovery) = discovered_plugins.as_ref() {
+            for plugin in discovery
+                .plugins
+                .iter()
+                .filter(|plugin| hermes_supports_hook(plugin, "on_session_end"))
+            {
+                if let Err(error) = invoke_hermes_hook(
+                    plugin,
+                    "on_session_end",
+                    serde_json::json!({
+                        "session_id": &session_id,
+                        "completed": completed,
+                        "interrupted": interrupted,
+                        "model": &config.model,
+                        "platform": config.platform.to_string(),
+                    }),
+                )
+                .await
+                {
+                    tracing::warn!(plugin = %plugin.name, ?error, "Hermes on_session_end hook failed");
+                }
+            }
+        }
         if config.save_trajectories {
             let trajectory_dir = edgecrab_home().join("trajectories");
             let trajectory_path = trajectory_dir.join(if completed {
@@ -2102,6 +2150,111 @@ fn estimate_request_prompt_tokens(
     estimate_stream_prompt_tokens(&chat_messages, tool_defs)
 }
 
+async fn invoke_pre_api_request_hooks(
+    ctx: &ApiCallContext<'_>,
+    provider: &Arc<dyn LLMProvider>,
+    messages: &[edgequake_llm::ChatMessage],
+    tool_defs: &[edgequake_llm::ToolDefinition],
+    attempt: u32,
+) {
+    let Some(discovery) = ctx.discovered_plugins else {
+        return;
+    };
+
+    let approx_input_tokens = estimate_stream_prompt_tokens(messages, tool_defs);
+    let request_char_count = serde_json::to_string(messages)
+        .map(|serialized| serialized.chars().count())
+        .unwrap_or_default();
+    let max_tokens = ctx
+        .options
+        .and_then(|options| options.max_tokens)
+        .unwrap_or(0);
+
+    for plugin in discovery
+        .plugins
+        .iter()
+        .filter(|plugin| hermes_supports_hook(plugin, "pre_api_request"))
+    {
+        if let Err(error) = invoke_hermes_hook(
+            plugin,
+            "pre_api_request",
+            serde_json::json!({
+                "task_id": ctx.conversation_session_id,
+                "session_id": ctx.conversation_session_id,
+                "platform": ctx.platform.to_string(),
+                "model": provider.model(),
+                "provider": provider.name(),
+                "base_url": serde_json::Value::Null,
+                "api_mode": if tool_defs.is_empty() { "chat" } else { "chat_with_tools" },
+                "api_call_count": ctx.api_call_count + attempt + 1,
+                "message_count": messages.len(),
+                "tool_count": tool_defs.len(),
+                "approx_input_tokens": approx_input_tokens,
+                "request_char_count": request_char_count,
+                "max_tokens": max_tokens,
+            }),
+        )
+        .await
+        {
+            tracing::warn!(plugin = %plugin.name, ?error, "Hermes pre_api_request hook failed");
+        }
+    }
+}
+
+async fn invoke_post_api_request_hooks(
+    ctx: &ApiCallContext<'_>,
+    provider: &Arc<dyn LLMProvider>,
+    messages: &[edgequake_llm::ChatMessage],
+    tool_defs: &[edgequake_llm::ToolDefinition],
+    response: &edgequake_llm::LLMResponse,
+    attempt: u32,
+    started_at: std::time::Instant,
+) {
+    let Some(discovery) = ctx.discovered_plugins else {
+        return;
+    };
+
+    let usage = serde_json::json!({
+        "prompt_tokens": response.prompt_tokens,
+        "completion_tokens": response.completion_tokens,
+        "total_tokens": response.total_tokens,
+        "cache_hit_tokens": response.cache_hit_tokens,
+        "thinking_tokens": response.thinking_tokens,
+    });
+
+    for plugin in discovery
+        .plugins
+        .iter()
+        .filter(|plugin| hermes_supports_hook(plugin, "post_api_request"))
+    {
+        if let Err(error) = invoke_hermes_hook(
+            plugin,
+            "post_api_request",
+            serde_json::json!({
+                "task_id": ctx.conversation_session_id,
+                "session_id": ctx.conversation_session_id,
+                "platform": ctx.platform.to_string(),
+                "model": provider.model(),
+                "provider": provider.name(),
+                "base_url": serde_json::Value::Null,
+                "api_mode": if tool_defs.is_empty() { "chat" } else { "chat_with_tools" },
+                "api_call_count": ctx.api_call_count + attempt + 1,
+                "api_duration": started_at.elapsed().as_secs_f64(),
+                "finish_reason": response.finish_reason.clone().unwrap_or_else(|| "stop".into()),
+                "message_count": messages.len(),
+                "response_model": response.model.clone(),
+                "usage": usage,
+                "assistant_content_chars": response.content.chars().count(),
+                "assistant_tool_call_count": response.tool_calls.len(),
+            }),
+        )
+        .await
+        {
+            tracing::warn!(plugin = %plugin.name, ?error, "Hermes post_api_request hook failed");
+        }
+    }
+}
+
 fn available_toolsets_for_prompt(
     registry: &edgecrab_tools::registry::ToolRegistry,
     tool_names: &[String],
@@ -2218,6 +2371,8 @@ async fn api_call_with_retry(
 
         loop {
             let tokens_sent = std::sync::atomic::AtomicBool::new(false);
+            invoke_pre_api_request_hooks(&ctx, provider, messages, tool_defs, attempt).await;
+            let request_started_at = std::time::Instant::now();
 
             // ── API call — interruptible ────────────────────────────────
             // We race the provider future against the cancel token.
@@ -2264,6 +2419,16 @@ async fn api_call_with_retry(
 
             match result {
                 Ok(response) => {
+                    invoke_post_api_request_hooks(
+                        &ctx,
+                        provider,
+                        messages,
+                        tool_defs,
+                        &response,
+                        attempt,
+                        request_started_at,
+                    )
+                    .await;
                     if let Some(tx) = ctx.event_tx {
                         let ctx_json = serde_json::json!({
                             "event": "llm:post",
@@ -2533,7 +2698,7 @@ fn remember_tool_suppression(
 async fn process_response(
     response: &edgequake_llm::LLMResponse,
     session: &mut SessionState,
-    dctx: &DispatchContext<'_>,
+    dctx: &DispatchContext,
     tool_errors: &mut Vec<edgecrab_types::ToolErrorRecord>,
 ) -> Result<LoopAction, AgentError> {
     // Check for tool calls
@@ -2579,7 +2744,7 @@ async fn process_response(
                 .unwrap_or(false);
 
             // Notify TUI that a tool execution is starting
-            if let Some(tx) = dctx.event_tx {
+            if let Some(tx) = dctx.event_tx.as_ref() {
                 let _ = tx.send(crate::StreamEvent::ToolExec {
                     tool_call_id: tc.id.clone(),
                     name: tc.function.name.clone(),
@@ -2594,11 +2759,11 @@ async fn process_response(
                 let tc_id = tc.id.clone();
                 let tc_name = tc.function.name.clone();
                 let tc_args = tc.function.arguments.clone();
-                let reg = dctx.registry.cloned();
+                let reg = dctx.registry.clone();
                 let cancel_token = dctx.cancel.clone();
                 let state = dctx.state_db.clone();
                 let plat = dctx.platform;
-                let proc_table = dctx.process_table.clone();
+                let proc_table = Arc::clone(&dctx.process_table);
                 let prov = dctx.provider.clone();
                 let gateway_sender = dctx.gateway_sender.clone();
                 let sar = dctx.sub_agent_runner.clone();
@@ -2611,16 +2776,17 @@ async fn process_response(
                 let todo_store_clone = dctx.todo_store.clone();
                 let capability_suppressions = dctx.capability_suppressions.clone();
                 let dispatch_cwd = dctx.cwd.clone();
+                let discovered_plugins = dctx.discovered_plugins.clone();
 
                 parallel_tasks.spawn(async move {
                     let started = std::time::Instant::now();
                     let inner = DispatchContext {
                         cwd: dispatch_cwd,
-                        registry: reg.as_ref(),
-                        cancel: &cancel_token,
-                        state_db: &state,
+                        registry: reg,
+                        cancel: cancel_token,
+                        state_db: state,
                         platform: plat,
-                        process_table: &proc_table,
+                        process_table: proc_table,
                         provider: prov,
                         gateway_sender,
                         sub_agent_runner: sar,
@@ -2633,6 +2799,7 @@ async fn process_response(
                         conversation_session_id: conv_sess_id,
                         todo_store: todo_store_clone,
                         capability_suppressions,
+                        discovered_plugins,
                     };
                     let result = dispatch_single_tool(&tc_id, &tc_name, &tc_args, &inner).await;
                     let duration_ms = started.elapsed().as_millis() as u64;
@@ -2651,7 +2818,7 @@ async fn process_response(
                 Ok((tc_id, tc_name, args_json, (tool_result, injected_messages), duration_ms)) => {
                     let is_error = is_tool_error(&tool_result);
                     emit_tool_done(
-                        dctx.event_tx,
+                        dctx.event_tx.as_ref(),
                         &tc_id,
                         &tc_name,
                         &args_json,
@@ -2711,13 +2878,12 @@ async fn process_response(
         for tc in sequential_calls {
             let started = std::time::Instant::now();
             let (tool_result, injected_messages) =
-                dispatch_single_tool(&tc.id, &tc.function.name, &tc.function.arguments, dctx)
-                    .await;
+                dispatch_single_tool(&tc.id, &tc.function.name, &tc.function.arguments, dctx).await;
             let duration_ms = started.elapsed().as_millis() as u64;
 
             let is_error = is_tool_error(&tool_result);
             emit_tool_done(
-                dctx.event_tx,
+                dctx.event_tx.as_ref(),
                 &tc.id,
                 &tc.function.name,
                 &tc.function.arguments,
@@ -2759,6 +2925,32 @@ async fn process_response(
         msg.reasoning = Some(thinking.clone());
     }
     session.messages.push(msg);
+    if let Some(discovery) = dctx.discovered_plugins.as_ref() {
+        let history_json =
+            serde_json::to_value(&session.messages).unwrap_or_else(|_| serde_json::json!([]));
+        for plugin in discovery
+            .plugins
+            .iter()
+            .filter(|plugin| hermes_supports_hook(plugin, "post_llm_call"))
+        {
+            if let Err(error) = invoke_hermes_hook(
+                plugin,
+                "post_llm_call",
+                serde_json::json!({
+                    "session_id": &dctx.conversation_session_id,
+                    "user_message": "",
+                    "assistant_response": &text,
+                    "conversation_history": history_json,
+                    "model": "",
+                    "platform": dctx.platform.to_string(),
+                }),
+            )
+            .await
+            {
+                tracing::warn!(plugin = %plugin.name, ?error, "Hermes post_llm_call hook failed");
+            }
+        }
+    }
     Ok(LoopAction::Done(text))
 }
 
@@ -2800,9 +2992,9 @@ async fn dispatch_single_tool(
     tool_call_id: &str,
     name: &str,
     args_json: &str,
-    dctx: &DispatchContext<'_>,
+    dctx: &DispatchContext,
 ) -> (String, Vec<Message>) {
-    let Some(reg) = dctx.registry else {
+    let Some(reg) = dctx.registry.as_ref() else {
         return (
             format!(
                 "Tool '{}' execution is not yet wired (no ToolRegistry provided).",
@@ -2828,7 +3020,7 @@ async fn dispatch_single_tool(
     }
 
     // Emit tool:pre hook event — informational (fire-and-forget, no cancellation)
-    if let Some(tx) = dctx.event_tx {
+    if let Some(tx) = dctx.event_tx.as_ref() {
         let ctx_json = serde_json::json!({
             "event": "tool:pre",
             "tool_name": name,
@@ -2841,22 +3033,43 @@ async fn dispatch_single_tool(
             context_json: ctx_json,
         });
     }
+    if let Some(discovery) = dctx.discovered_plugins.as_ref() {
+        for plugin in discovery
+            .plugins
+            .iter()
+            .filter(|plugin| hermes_supports_hook(plugin, "pre_tool_call"))
+        {
+            if let Err(error) = invoke_hermes_hook(
+                plugin,
+                "pre_tool_call",
+                serde_json::json!({
+                    "tool_name": name,
+                    "args": serde_json::from_str::<serde_json::Value>(args_json).unwrap_or_else(|_| serde_json::json!({})),
+                    "task_id": &dctx.conversation_session_id,
+                }),
+            )
+            .await
+            {
+                tracing::warn!(plugin = %plugin.name, ?error, "Hermes pre_tool_call hook failed");
+            }
+        }
+    }
 
     let injected_messages = Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let ctx = build_tool_context(
         &dctx.cwd,
         dctx.app_config_ref.clone(),
-        dctx.cancel,
-        dctx.state_db,
+        &dctx.cancel,
+        &dctx.state_db,
         dctx.platform,
-        dctx.process_table,
+        &dctx.process_table,
         dctx.provider.clone(),
-        dctx.registry.cloned(), // Pass registry so execute_code can dispatch RPC tool calls
+        dctx.registry.clone(), // Pass registry so execute_code can dispatch RPC tool calls
         dctx.sub_agent_runner.clone(),
         dctx.delegation_event_tx.clone(),
         dctx.clarify_tx.clone(),
         dctx.approval_tx.clone(),
-        make_tool_progress_tx(dctx.event_tx),
+        make_tool_progress_tx(dctx.event_tx.as_ref()),
         dctx.gateway_sender.clone(),
         dctx.origin_chat.clone(),
         Some(tool_call_id.to_string()),
@@ -2890,7 +3103,7 @@ async fn dispatch_single_tool(
     };
 
     // Emit tool:post hook event
-    if let Some(tx) = dctx.event_tx {
+    if let Some(tx) = dctx.event_tx.as_ref() {
         let is_error = is_tool_error(&result);
         let ctx_json = serde_json::json!({
             "event": "tool:post",
@@ -2903,6 +3116,28 @@ async fn dispatch_single_tool(
             event: "tool:post".to_string(),
             context_json: ctx_json,
         });
+    }
+    if let Some(discovery) = dctx.discovered_plugins.as_ref() {
+        for plugin in discovery
+            .plugins
+            .iter()
+            .filter(|plugin| hermes_supports_hook(plugin, "post_tool_call"))
+        {
+            if let Err(error) = invoke_hermes_hook(
+                plugin,
+                "post_tool_call",
+                serde_json::json!({
+                    "tool_name": name,
+                    "args": serde_json::from_str::<serde_json::Value>(args_json).unwrap_or_else(|_| serde_json::json!({})),
+                    "result": &result,
+                    "task_id": &dctx.conversation_session_id,
+                }),
+            )
+            .await
+            {
+                tracing::warn!(plugin = %plugin.name, ?error, "Hermes post_tool_call hook failed");
+            }
+        }
     }
 
     let queued_messages = {
@@ -3017,18 +3252,13 @@ struct BackgroundReflectionCtx {
 /// dispatched on a cloned session snapshot. Changes to the in-memory session are NOT
 /// propagated back — the learning outcome is durable (on-disk skills/memories).
 async fn run_learning_reflection_bg(ctx: BackgroundReflectionCtx) {
-    // Borrow from owned ctx to satisfy DispatchContext<'a> lifetime requirements.
-    let registry_arc = ctx.registry.as_ref();
-    let state_db_ref = &ctx.state_db;
-    let process_table_ref = &ctx.process_table;
-
     let dctx = DispatchContext {
         cwd: ctx.cwd.clone(),
-        registry: registry_arc,
-        cancel: &ctx.cancel,
-        state_db: state_db_ref,
+        registry: ctx.registry.clone(),
+        cancel: ctx.cancel.clone(),
+        state_db: ctx.state_db.clone(),
         platform: ctx.platform,
-        process_table: process_table_ref,
+        process_table: ctx.process_table.clone(),
         provider: Some(Arc::clone(&ctx.provider)),
         gateway_sender: ctx.gateway_sender.clone(),
         sub_agent_runner: ctx.sub_agent_runner.clone(),
@@ -3041,6 +3271,7 @@ async fn run_learning_reflection_bg(ctx: BackgroundReflectionCtx) {
         conversation_session_id: ctx.conversation_session_id.clone(),
         todo_store: ctx.todo_store.clone(),
         capability_suppressions: Arc::new(Mutex::new(HashMap::new())),
+        discovered_plugins: None,
     };
 
     // Work on local session clone — we don't need results propagated back.
@@ -3077,7 +3308,7 @@ async fn run_learning_reflection(
     session: &mut SessionState,
     tool_defs: &[edgequake_llm::ToolDefinition],
     provider: &Arc<dyn LLMProvider>,
-    dctx: &DispatchContext<'_>,
+    dctx: &DispatchContext,
 ) {
     const REFLECTION_PROMPT: &str = "\
 [system: learning checkpoint] This session used multiple tool calls. \
@@ -3195,6 +3426,9 @@ mod tests {
         stream_attempts: Arc<std::sync::atomic::AtomicUsize>,
         nonstream_attempts: Arc<std::sync::atomic::AtomicUsize>,
     }
+
+    #[derive(Clone)]
+    struct StaticResponseProvider;
 
     #[async_trait]
     impl LLMProvider for StreamingUsageProvider {
@@ -3542,6 +3776,100 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl LLMProvider for StaticResponseProvider {
+        fn name(&self) -> &str {
+            "static-response-test"
+        }
+
+        fn model(&self) -> &str {
+            "static-response-model"
+        }
+
+        fn max_context_length(&self) -> usize {
+            8192
+        }
+
+        async fn complete(
+            &self,
+            prompt: &str,
+        ) -> edgequake_llm::Result<edgequake_llm::LLMResponse> {
+            Ok(edgequake_llm::LLMResponse::new(prompt, self.model()))
+        }
+
+        async fn complete_with_options(
+            &self,
+            prompt: &str,
+            _options: &CompletionOptions,
+        ) -> edgequake_llm::Result<edgequake_llm::LLMResponse> {
+            self.complete(prompt).await
+        }
+
+        async fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _options: Option<&CompletionOptions>,
+        ) -> edgequake_llm::Result<edgequake_llm::LLMResponse> {
+            Ok(edgequake_llm::LLMResponse::new("ok", self.model()))
+        }
+    }
+
+    fn write_api_hook_plugin(dir: &std::path::Path) {
+        std::fs::write(
+            dir.join("plugin.yaml"),
+            r#"
+name: api-hooks
+version: "1.0.0"
+description: API hook recorder
+provides_hooks:
+  - pre_api_request
+  - post_api_request
+"#,
+        )
+        .expect("manifest");
+        std::fs::write(
+            dir.join("__init__.py"),
+            r#"
+import json
+from pathlib import Path
+
+def _append(event_name, payload):
+    target = Path(__file__).with_name("api-hooks.jsonl")
+    with target.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"event": event_name, "payload": payload}) + "\n")
+
+def register(ctx):
+    ctx.register_hook("pre_api_request", lambda **kwargs: _append("pre_api_request", kwargs))
+    ctx.register_hook("post_api_request", lambda **kwargs: _append("post_api_request", kwargs))
+"#,
+        )
+        .expect("plugin");
+    }
+
+    fn api_hook_plugin(dir: &std::path::Path) -> edgecrab_plugins::DiscoveredPlugin {
+        let manifest = edgecrab_plugins::parse_hermes_manifest(dir).expect("manifest");
+        edgecrab_plugins::DiscoveredPlugin {
+            name: manifest.name.clone(),
+            version: manifest.version.clone(),
+            description: manifest.description.clone(),
+            compatibility: None,
+            kind: edgecrab_plugins::PluginKind::Hermes,
+            status: edgecrab_plugins::PluginStatus::Available,
+            path: dir.to_path_buf(),
+            manifest: Some(edgecrab_plugins::synthesize_hermes_manifest(dir, &manifest)),
+            skill: None,
+            tools: Vec::new(),
+            hooks: vec!["post_api_request".into(), "pre_api_request".into()],
+            trust_level: edgecrab_plugins::TrustLevel::Unverified,
+            install_source: None,
+            enabled: true,
+            source: edgecrab_plugins::SkillSource::User,
+            missing_env: Vec::new(),
+            related_skills: Vec::new(),
+            cli_commands: Vec::new(),
+        }
+    }
+
     #[tokio::test]
     async fn api_call_streaming_preserves_authoritative_usage() {
         let provider: Arc<dyn LLMProvider> = Arc::new(StreamingUsageProvider {
@@ -3705,6 +4033,10 @@ mod tests {
                 cancel: &cancel,
                 event_tx: None,
                 use_native_streaming: false,
+                discovered_plugins: None,
+                conversation_session_id: "test-session",
+                platform: edgecrab_types::Platform::Cli,
+                api_call_count: 0,
             },
         )
         .await
@@ -3745,6 +4077,10 @@ mod tests {
                 cancel: &cancel,
                 event_tx: None,
                 use_native_streaming: false,
+                discovered_plugins: None,
+                conversation_session_id: "test-session",
+                platform: edgecrab_types::Platform::Cli,
+                api_call_count: 0,
             },
         )
         .await;
@@ -3774,6 +4110,10 @@ mod tests {
                 cancel: &cancel,
                 event_tx: Some(&tx),
                 use_native_streaming: true,
+                discovered_plugins: None,
+                conversation_session_id: "test-session",
+                platform: edgecrab_types::Platform::Cli,
+                api_call_count: 0,
             },
         )
         .await
@@ -3818,6 +4158,10 @@ mod tests {
                 cancel: &cancel,
                 event_tx: Some(&tx),
                 use_native_streaming: true,
+                discovered_plugins: None,
+                conversation_session_id: "test-session",
+                platform: edgecrab_types::Platform::Cli,
+                api_call_count: 0,
             },
         )
         .await
@@ -3830,6 +4174,42 @@ mod tests {
             nonstream_attempts.load(std::sync::atomic::Ordering::SeqCst),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn api_call_with_retry_invokes_hermes_api_hooks() {
+        let temp = TempDir::new().expect("tempdir");
+        write_api_hook_plugin(temp.path());
+        let provider: Arc<dyn LLMProvider> = Arc::new(StaticResponseProvider);
+        let cancel = CancellationToken::new();
+        let discovery = edgecrab_plugins::PluginDiscovery {
+            plugins: vec![api_hook_plugin(temp.path())],
+        };
+
+        let outcome = api_call_with_retry(
+            &provider,
+            &[ChatMessage::user("hello")],
+            &[],
+            0,
+            ApiCallContext {
+                options: None,
+                cancel: &cancel,
+                event_tx: None,
+                use_native_streaming: false,
+                discovered_plugins: Some(&discovery),
+                conversation_session_id: "api-hook-session",
+                platform: edgecrab_types::Platform::Cli,
+                api_call_count: 0,
+            },
+        )
+        .await
+        .expect("api call");
+
+        assert_eq!(outcome.response.content, "ok");
+        let log = std::fs::read_to_string(temp.path().join("api-hooks.jsonl")).expect("hook log");
+        assert!(log.contains("pre_api_request"));
+        assert!(log.contains("post_api_request"));
+        assert!(log.contains("api-hook-session"));
     }
 
     #[test]
@@ -4614,20 +4994,20 @@ mod tests {
         );
     }
 
-    fn make_dispatch_context_for_test<'a>(
-        registry: &'a Arc<ToolRegistry>,
-        cancel: &'a CancellationToken,
-        state_db: &'a Option<Arc<edgecrab_state::SessionDb>>,
-        process_table: &'a Arc<ProcessTable>,
+    fn make_dispatch_context_for_test(
+        registry: &Arc<ToolRegistry>,
+        cancel: &CancellationToken,
+        state_db: &Option<Arc<edgecrab_state::SessionDb>>,
+        process_table: &Arc<ProcessTable>,
         capability_suppressions: Arc<Mutex<HashMap<String, ToolErrorResponse>>>,
-    ) -> DispatchContext<'a> {
+    ) -> DispatchContext {
         DispatchContext {
             cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
-            registry: Some(registry),
-            cancel,
-            state_db,
+            registry: Some(Arc::clone(registry)),
+            cancel: cancel.clone(),
+            state_db: state_db.clone(),
             platform: edgecrab_types::Platform::Cli,
-            process_table,
+            process_table: Arc::clone(process_table),
             provider: None,
             gateway_sender: None,
             sub_agent_runner: None,
@@ -4640,6 +5020,7 @@ mod tests {
             conversation_session_id: "test-conversation".into(),
             todo_store: None,
             capability_suppressions,
+            discovered_plugins: None,
         }
     }
 

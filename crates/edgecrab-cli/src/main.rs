@@ -52,6 +52,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, anyhow};
 use clap::Parser;
+use edgecrab_plugins::{discover_plugins, invoke_hermes_cli_command};
 use shell_words::split as shell_split;
 use tokio_util::sync::CancellationToken;
 
@@ -140,6 +141,10 @@ fn create_explicit_provider(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if try_run_plugin_cli_command_from_argv().await? {
+        return Ok(());
+    }
+
     let args = CliArgs::parse();
     let subcommand = args.command.clone();
 
@@ -236,6 +241,7 @@ async fn main() -> anyhow::Result<()> {
             eprintln!("edgecrab: no prompt provided in quiet mode. Use -q \"your prompt\"");
             std::process::exit(1);
         }
+        agent.finalize_session().await;
         let _ = edgecrab_tools::tools::terminal::cleanup_all_backends().await;
         return Ok(());
     }
@@ -301,9 +307,133 @@ async fn main() -> anyhow::Result<()> {
 
     // Stop the background cron scheduler when the TUI exits
     cron_stop.cancel();
+    agent.finalize_session().await;
     let _ = edgecrab_tools::tools::terminal::cleanup_all_backends().await;
 
     Ok(())
+}
+
+async fn try_run_plugin_cli_command_from_argv() -> anyhow::Result<bool> {
+    let argv: Vec<String> = std::env::args().collect();
+    let Some((command_index, command_name)) = detect_plugin_cli_candidate(&argv) else {
+        return Ok(false);
+    };
+
+    if let Some(profile) = extract_option_value(&argv, &["-p", "--profile"]) {
+        profile::activate_profile(Some(&profile))?;
+    } else if let Some(config_path) = extract_option_value(&argv, &["-c", "--config"]) {
+        activate_runtime_home_from_config(Some(&config_path))?;
+    }
+
+    let config = edgecrab_core::AppConfig::load().unwrap_or_default();
+    let discovery =
+        discover_plugins(&config.plugins, edgecrab_types::Platform::Cli).unwrap_or_default();
+    let plugin = discovery.plugins.iter().find(|plugin| {
+        plugin.enabled
+            && plugin
+                .cli_commands
+                .iter()
+                .any(|entry| entry.name == command_name)
+    });
+    let Some(plugin) = plugin else {
+        return Ok(false);
+    };
+
+    let command = plugin
+        .cli_commands
+        .iter()
+        .find(|entry| entry.name == command_name)
+        .expect("matched cli command");
+    let argv_tail = argv[(command_index + 1)..].to_vec();
+    let (exit_code, stdout, stderr) =
+        invoke_hermes_cli_command(plugin, &command.name, &argv_tail).await?;
+    if !stdout.is_empty() {
+        print!("{stdout}");
+    }
+    if !stderr.is_empty() {
+        eprint!("{stderr}");
+    }
+    if exit_code != 0 {
+        std::process::exit(exit_code);
+    }
+    Ok(true)
+}
+
+fn detect_plugin_cli_candidate(argv: &[String]) -> Option<(usize, String)> {
+    let builtins = [
+        "profile",
+        "completion",
+        "setup",
+        "doctor",
+        "migrate",
+        "acp",
+        "version",
+        "update",
+        "whatsapp",
+        "status",
+        "sessions",
+        "config",
+        "tools",
+        "mcp",
+        "plugins",
+        "cron",
+        "gateway",
+        "skills",
+    ];
+
+    let mut index = 1usize;
+    while index < argv.len() {
+        let token = &argv[index];
+        if token == "--" {
+            return None;
+        }
+        if token.starts_with('-') {
+            index += if option_takes_value(token) { 2 } else { 1 };
+            continue;
+        }
+        if builtins.iter().any(|builtin| builtin == token) {
+            return None;
+        }
+        return Some((index, token.clone()));
+    }
+    None
+}
+
+fn option_takes_value(token: &str) -> bool {
+    matches!(
+        token,
+        "-p" | "--profile"
+            | "-c"
+            | "--config"
+            | "-m"
+            | "--model"
+            | "--toolset"
+            | "-s"
+            | "--session"
+            | "-C"
+            | "--continue"
+            | "-r"
+            | "--resume"
+            | "-S"
+            | "--skill"
+    )
+}
+
+fn extract_option_value(argv: &[String], names: &[&str]) -> Option<String> {
+    let mut index = 1usize;
+    while index < argv.len() {
+        let token = &argv[index];
+        if let Some((name, value)) = token.split_once('=')
+            && names.iter().any(|candidate| candidate == &name)
+        {
+            return Some(value.to_string());
+        }
+        if names.iter().any(|candidate| candidate == &token.as_str()) {
+            return argv.get(index + 1).cloned();
+        }
+        index += 1;
+    }
+    None
 }
 
 /// Dispatch to a named subcommand.

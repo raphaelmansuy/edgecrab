@@ -51,7 +51,7 @@ use ratatui::{
     },
 };
 use tokio::sync::mpsc;
-use tui_textarea::{CursorMove, TextArea};
+use tui_textarea::{CursorMove, Scrolling, TextArea, WrapMode};
 use unicode_width::UnicodeWidthStr;
 
 use crate::cli_args::CliArgs;
@@ -1607,6 +1607,39 @@ enum VimPending {
     Go,
 }
 
+impl VimPending {
+    fn operator_char(self) -> char {
+        match self {
+            Self::Delete => 'd',
+            Self::Change => 'c',
+            Self::Yank => 'y',
+            Self::Go => 'g',
+        }
+    }
+
+    fn input_title_suffix(self) -> &'static str {
+        match self {
+            Self::Delete => " [d]",
+            Self::Change => " [c]",
+            Self::Yank => " [y]",
+            Self::Go => " [g]",
+        }
+    }
+
+    fn status_hint(self) -> String {
+        let op = self.operator_char();
+        match self {
+            Self::Go => " NORMAL [g]  g=top  G=bottom  Esc=cancel  ^S=send ".to_string(),
+            Self::Delete | Self::Change | Self::Yank => {
+                format!(
+                    " NORMAL [{}]  w/b/e/$ or {op}{op}  Esc=cancel  ^S=send ",
+                    op
+                )
+            }
+        }
+    }
+}
+
 /// A single model entry for the model selector overlay.
 #[derive(Clone)]
 struct ModelEntry {
@@ -1882,11 +1915,33 @@ enum DetailSurface {
     RemoteMcpBrowser,
     SkillSelector,
     RemoteSkillBrowser,
+    RemotePluginBrowser,
     ToolManager,
     PluginToggle,
     ConfigSelector,
     SessionBrowser,
     SessionInspector,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SimpleDetailState {
+    surface: Option<DetailSurface>,
+    scroll: u16,
+}
+
+impl SimpleDetailState {
+    fn scroll_for(&self, surface: DetailSurface) -> u16 {
+        if self.surface == Some(surface) {
+            self.scroll
+        } else {
+            0
+        }
+    }
+
+    fn set_scroll(&mut self, surface: DetailSurface, scroll: u16) {
+        self.surface = Some(surface);
+        self.scroll = scroll;
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1940,8 +1995,58 @@ impl FuzzyItem for RemoteSkillEntry {
     }
 }
 
-struct RemoteSkillBrowser {
-    selector: FuzzySelector<RemoteSkillEntry>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemotePluginAction {
+    Install,
+    Update,
+    Replace,
+}
+
+impl RemotePluginAction {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Install => "install",
+            Self::Update => "update",
+            Self::Replace => "replace",
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RemotePluginEntry {
+    name: String,
+    identifier: String,
+    description: String,
+    source_label: String,
+    origin: String,
+    trust_level: String,
+    kind: String,
+    tags: Vec<String>,
+    requires_env: Vec<String>,
+    installed_name: Option<String>,
+    action: RemotePluginAction,
+    search_text: String,
+}
+
+impl FuzzyItem for RemotePluginEntry {
+    fn primary(&self) -> &str {
+        &self.identifier
+    }
+
+    fn secondary(&self) -> &str {
+        &self.search_text
+    }
+
+    fn tag(&self) -> &str {
+        &self.source_label
+    }
+}
+
+struct RemoteBrowserState<T>
+where
+    T: Clone + FuzzyItem,
+{
+    selector: FuzzySelector<T>,
     notices: Vec<String>,
     last_completed_query: Option<String>,
     search_due_at: Option<Instant>,
@@ -1949,9 +2054,13 @@ struct RemoteSkillBrowser {
     next_request_id: u64,
     loading_query: Option<String>,
     action_in_flight: Option<String>,
+    source_filter: Option<String>,
 }
 
-impl RemoteSkillBrowser {
+impl<T> RemoteBrowserState<T>
+where
+    T: Clone + FuzzyItem,
+{
     fn new() -> Self {
         Self {
             selector: FuzzySelector::new(),
@@ -1962,13 +2071,43 @@ impl RemoteSkillBrowser {
             next_request_id: 0,
             loading_query: None,
             action_in_flight: None,
+            source_filter: None,
         }
     }
 
     fn current_query(&self) -> String {
         self.selector.query.trim().to_string()
     }
+
+    fn activate(&mut self, initial_query: Option<&str>, source_filter: Option<&str>) {
+        self.selector.active = true;
+        self.selector.query = initial_query.map(str::trim).unwrap_or_default().to_string();
+        self.selector.selected = 0;
+        self.selector.update_filter();
+        self.notices.clear();
+        self.last_completed_query = None;
+        self.search_due_at = None;
+        self.inflight_request_id = None;
+        self.loading_query = None;
+        self.action_in_flight = None;
+        self.source_filter = source_filter
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+    }
+
+    fn reset_results(&mut self) {
+        self.search_due_at = None;
+        self.inflight_request_id = None;
+        self.loading_query = None;
+        self.last_completed_query = None;
+        self.notices.clear();
+        self.selector.set_items(Vec::new());
+    }
 }
+
+type RemoteSkillBrowser = RemoteBrowserState<RemoteSkillEntry>;
+type RemotePluginBrowser = RemoteBrowserState<RemotePluginEntry>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RemoteMcpAction {
@@ -2022,33 +2161,7 @@ impl FuzzyItem for RemoteMcpEntry {
     }
 }
 
-struct RemoteMcpBrowser {
-    selector: FuzzySelector<RemoteMcpEntry>,
-    notices: Vec<String>,
-    last_completed_query: Option<String>,
-    search_due_at: Option<Instant>,
-    inflight_request_id: Option<u64>,
-    next_request_id: u64,
-    loading_query: Option<String>,
-}
-
-impl RemoteMcpBrowser {
-    fn new() -> Self {
-        Self {
-            selector: FuzzySelector::new(),
-            notices: Vec::new(),
-            last_completed_query: None,
-            search_due_at: None,
-            inflight_request_id: None,
-            next_request_id: 0,
-            loading_query: None,
-        }
-    }
-
-    fn current_query(&self) -> String {
-        self.selector.query.trim().to_string()
-    }
-}
+type RemoteMcpBrowser = RemoteBrowserState<RemoteMcpEntry>;
 
 /// A single MCP preset entry for the MCP browser overlay.
 #[derive(Clone)]
@@ -2474,6 +2587,7 @@ struct SessionMessageEntry {
 impl SessionMessageEntry {
     fn from_message(index: usize, message: &edgecrab_types::Message) -> Self {
         let role_label = message.role.as_str().to_string();
+        let content = message.text_content();
         let preview = message_preview(message);
         let mut meta_bits = Vec::new();
         if let Some(name) = message.name.as_deref().filter(|name| !name.is_empty()) {
@@ -2515,6 +2629,9 @@ impl SessionMessageEntry {
         let headline = format!("#{:<3} {}", index + 1, role_label);
 
         let mut search_parts = vec![headline.clone(), preview.clone(), meta.clone()];
+        if !content.trim().is_empty() {
+            search_parts.push(content);
+        }
         if let Some(reasoning) = message.reasoning.as_deref() {
             search_parts.push(reasoning.to_string());
         }
@@ -2537,6 +2654,45 @@ impl SessionMessageEntry {
             message: message.clone(),
             search_text: search_parts.join(" "),
         }
+    }
+
+    fn browser_match_score(
+        &self,
+        matched_role: Option<&str>,
+        matched_snippet: Option<&str>,
+    ) -> usize {
+        let mut score = 0usize;
+
+        if matched_role.is_some_and(|role| role.eq_ignore_ascii_case(&self.role_label)) {
+            score += 100;
+        }
+
+        let haystack = normalize_search_haystack(&self.search_text);
+        if let Some(snippet) = matched_snippet {
+            let snippet = normalize_search_haystack(snippet);
+            if !snippet.is_empty() {
+                if haystack.contains(&snippet) {
+                    score += 1_000;
+                }
+
+                let terms = snippet
+                    .split_whitespace()
+                    .filter(|term| term.len() > 1)
+                    .collect::<Vec<_>>();
+                if !terms.is_empty() {
+                    let matched_terms = terms
+                        .iter()
+                        .filter(|term| haystack.contains(**term))
+                        .count();
+                    score += matched_terms * 25;
+                    if matched_terms == terms.len() {
+                        score += 250;
+                    }
+                }
+            }
+        }
+
+        score
     }
 }
 
@@ -2587,6 +2743,23 @@ impl SessionInspectorMeta {
             debug_lines: Vec::new(),
         }
     }
+}
+
+fn normalize_search_haystack(text: &str) -> String {
+    let mut normalized = String::with_capacity(text.len());
+    let mut last_was_space = true;
+
+    for ch in text.chars() {
+        if ch.is_alphanumeric() {
+            normalized.extend(ch.to_lowercase());
+            last_was_space = false;
+        } else if !last_was_space {
+            normalized.push(' ');
+            last_was_space = true;
+        }
+    }
+
+    normalized.trim().to_string()
 }
 
 struct SessionInspector {
@@ -2972,6 +3145,8 @@ pub struct App {
     plugin_toggle_scope: PluginScope,
     /// Last non-error status note shown in the plugin toggle footer.
     plugin_toggle_status_note: Option<String>,
+    /// Remote plugin browser overlay (activated by `/plugins search` or `/plugins browse`)
+    remote_plugin_browser: RemotePluginBrowser,
     /// Remote skill browser overlay (activated by `/skills search` or `/skills hub`)
     remote_skill_browser: RemoteSkillBrowser,
     /// Session browser overlay (activated by F5 or `/session` with no args)
@@ -2982,6 +3157,8 @@ pub struct App {
     session_browser_pane: DetailPaneState,
     /// Shared fullscreen detail mode for split-pane selector browsers.
     detail_fullscreen: Option<DetailFullscreenState>,
+    /// Scroll position for split-view overlays that do not expose a dedicated pane focus model.
+    simple_detail_state: SimpleDetailState,
     /// Drill-down inspector for a single saved session.
     session_inspector: SessionInspector,
     /// Config center overlay (activated by `/config`)
@@ -3232,11 +3409,28 @@ enum AgentResponse {
         query: String,
         report: edgecrab_tools::tools::skills_hub::SearchReport,
     },
+    /// A remote plugin search completed for the given request id and query.
+    RemotePluginSearchReady {
+        request_id: u64,
+        query: String,
+        report: edgecrab_plugins::PluginSearchReport,
+    },
     /// A remote MCP search completed for the given request id and query.
     RemoteMcpSearchReady {
         request_id: u64,
         query: String,
         report: crate::mcp_catalog::McpSearchReport,
+    },
+    /// A remote plugin install/update action completed.
+    RemotePluginActionComplete {
+        message: String,
+        plugin_name: String,
+    },
+    /// A remote plugin install/update action failed.
+    RemotePluginActionFailed {
+        action_label: String,
+        identifier: String,
+        error: String,
     },
     /// A remote skill install/update action completed.
     RemoteSkillActionComplete { message: String, skill_name: String },
@@ -3524,6 +3718,7 @@ impl App {
         let mut textarea = TextArea::default();
         textarea.set_max_histories(512);
         textarea.set_tab_length(4);
+        textarea.set_wrap_mode(WrapMode::WordOrGlyph);
         textarea.set_cursor_line_style(Style::default());
         textarea.set_block(
             Block::default()
@@ -3611,11 +3806,13 @@ impl App {
             plugin_toggle: FuzzySelector::new(),
             plugin_toggle_scope: PluginScope::Global,
             plugin_toggle_status_note: None,
+            remote_plugin_browser: RemotePluginBrowser::new(),
             remote_skill_browser: RemoteSkillBrowser::new(),
             session_browser: FuzzySelector::new(),
             session_browser_status_note: None,
             session_browser_pane: DetailPaneState::default(),
             detail_fullscreen: None,
+            simple_detail_state: SimpleDetailState::default(),
             session_inspector: SessionInspector::new(),
             config_selector: FuzzySelector::new(),
             gateway_browser: FuzzySelector::new(),
@@ -4041,6 +4238,7 @@ impl App {
         let mut fresh = TextArea::default();
         fresh.set_max_histories(512);
         fresh.set_tab_length(4);
+        fresh.set_wrap_mode(WrapMode::WordOrGlyph);
         fresh.set_style(self.theme.input_text);
         fresh.set_placeholder_text("Type a message or /help for commands...");
         fresh.set_placeholder_style(
@@ -4052,9 +4250,34 @@ impl App {
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(self.theme.input_border)
-                .title(self.editor_mode.input_title(&self.theme.prompt_symbol)),
+                .title(self.input_panel_title(&self.theme.prompt_symbol)),
         );
         fresh
+    }
+
+    fn input_panel_title(&self, prompt_symbol: &str) -> String {
+        let mut title = self.editor_mode.input_title(prompt_symbol);
+        if matches!(self.editor_mode, InputEditorMode::ComposeNormal) {
+            if let Some(pending) = self.vim_pending {
+                title.pop();
+                title.push_str(pending.input_title_suffix());
+                title.push(' ');
+            }
+        }
+        title
+    }
+
+    fn input_area_height_for_area(&mut self, area: Rect) -> u16 {
+        let max_input_height = if self.editor_mode.is_compose() {
+            area.height.saturating_sub(6).clamp(6, 16)
+        } else {
+            10
+        };
+        let min_input_height = if self.editor_mode.is_compose() { 5 } else { 3 };
+        self.textarea
+            .measure(area.width.max(3))
+            .preferred_rows
+            .clamp(min_input_height, max_input_height)
     }
 
     fn set_editor_mode(&mut self, mode: InputEditorMode) {
@@ -4074,6 +4297,14 @@ impl App {
             "Shift+Enter=compose"
         } else {
             "Ctrl+J=compose"
+        }
+    }
+
+    fn compose_normal_hint(&self) -> String {
+        if let Some(pending) = self.vim_pending {
+            pending.status_hint()
+        } else {
+            " NORMAL  hjkl/←↓↑→  i/a/o/O C/S/s Y D  PgUp/Dn=input  ^S=send  Esc=inline ".to_string()
         }
     }
 
@@ -4443,6 +4674,11 @@ impl App {
         self.skill_selector.replace_items_preserving_state(entries);
     }
 
+    fn open_skill_selector(&mut self) {
+        self.reset_split_detail_scroll(DetailSurface::SkillSelector);
+        self.skill_selector.activate();
+    }
+
     fn normalize_skill_identifier(identifier: &str) -> String {
         identifier.trim().replace('\\', "/")
     }
@@ -4482,7 +4718,7 @@ impl App {
                 let description = if skill.description.trim().is_empty() {
                     "No description available".to_string()
                 } else {
-                    unicode_trunc(skill.description.trim(), 120)
+                    skill.description.trim().to_string()
                 };
                 let search_text = format!(
                     "{} {} {} {} {} {}",
@@ -4512,6 +4748,71 @@ impl App {
         (entries, notices)
     }
 
+    fn build_remote_plugin_entries(
+        report: &edgecrab_plugins::PluginSearchReport,
+    ) -> (Vec<RemotePluginEntry>, Vec<String>) {
+        let mut manager = crate::plugins::PluginManager::new();
+        manager.discover_all();
+        let mut installed_by_source = HashMap::new();
+        let mut installed_by_name = HashMap::new();
+        for plugin in manager.plugins() {
+            installed_by_name.insert(plugin.name.clone(), plugin.name.clone());
+            if let Some(source) = &plugin.install_source {
+                installed_by_source.insert(source.clone(), plugin.name.clone());
+            }
+        }
+
+        let mut entries = Vec::new();
+        let mut notices = Vec::new();
+        for group in &report.groups {
+            if let Some(notice) = &group.notice {
+                notices.push(format!("{}: {}", group.source.label, notice));
+            }
+
+            for plugin in &group.results {
+                let installed_name = installed_by_source.get(&plugin.identifier).cloned();
+                let action = if installed_name.is_some() {
+                    RemotePluginAction::Update
+                } else if installed_by_name.contains_key(&plugin.name) {
+                    RemotePluginAction::Replace
+                } else {
+                    RemotePluginAction::Install
+                };
+                let description = if plugin.description.trim().is_empty() {
+                    "No description available".to_string()
+                } else {
+                    plugin.description.trim().to_string()
+                };
+                let search_text = format!(
+                    "{} {} {} {} {} {} {}",
+                    plugin.name,
+                    plugin.identifier,
+                    description,
+                    plugin.origin,
+                    plugin.kind.as_tag(),
+                    plugin.trust_level,
+                    plugin.tags.join(" ")
+                );
+                entries.push(RemotePluginEntry {
+                    name: plugin.name.clone(),
+                    identifier: plugin.identifier.clone(),
+                    description,
+                    source_label: group.source.label.clone(),
+                    origin: plugin.origin.clone(),
+                    trust_level: plugin.trust_level.clone(),
+                    kind: plugin.kind.as_tag().to_string(),
+                    tags: plugin.tags.clone(),
+                    requires_env: plugin.requires_env.clone(),
+                    installed_name,
+                    action,
+                    search_text,
+                });
+            }
+        }
+
+        (entries, notices)
+    }
+
     fn build_remote_mcp_entries(
         report: &crate::mcp_catalog::McpSearchReport,
     ) -> (Vec<RemoteMcpEntry>, Vec<String>) {
@@ -4527,7 +4828,7 @@ impl App {
                 let description = if entry.description.trim().is_empty() {
                     "No description available".to_string()
                 } else {
-                    unicode_trunc(entry.description.trim(), 120)
+                    entry.description.trim().to_string()
                 };
                 let transport = entry.transport.clone();
                 let search_text = format!(
@@ -4559,15 +4860,8 @@ impl App {
 
     fn open_remote_mcp_selector(&mut self, initial_query: Option<&str>) {
         self.mcp_selector.active = false;
-        self.remote_mcp_browser.selector.active = true;
-        self.remote_mcp_browser.selector.query =
-            initial_query.map(str::trim).unwrap_or_default().to_string();
-        self.remote_mcp_browser.selector.selected = 0;
-        self.remote_mcp_browser.selector.update_filter();
-        self.remote_mcp_browser.notices.clear();
-        self.remote_mcp_browser.last_completed_query = None;
-        self.remote_mcp_browser.loading_query = None;
-        self.remote_mcp_browser.inflight_request_id = None;
+        self.reset_split_detail_scroll(DetailSurface::RemoteMcpBrowser);
+        self.remote_mcp_browser.activate(initial_query, None);
         self.schedule_remote_mcp_search(true);
         self.needs_redraw = true;
     }
@@ -4575,12 +4869,7 @@ impl App {
     fn schedule_remote_mcp_search(&mut self, immediate: bool) {
         let query = self.remote_mcp_browser.current_query();
         if query.is_empty() {
-            self.remote_mcp_browser.search_due_at = None;
-            self.remote_mcp_browser.inflight_request_id = None;
-            self.remote_mcp_browser.loading_query = None;
-            self.remote_mcp_browser.last_completed_query = None;
-            self.remote_mcp_browser.notices.clear();
-            self.remote_mcp_browser.selector.set_items(Vec::new());
+            self.remote_mcp_browser.reset_results();
             self.needs_redraw = true;
             return;
         }
@@ -4651,6 +4940,7 @@ impl App {
         self.remote_mcp_browser.notices = notices;
         self.remote_mcp_browser.selector.set_items(entries);
         self.remote_mcp_browser.selector.selected = 0;
+        self.reset_split_detail_scroll(DetailSurface::RemoteMcpBrowser);
         self.needs_redraw = true;
     }
 
@@ -4732,16 +5022,8 @@ impl App {
 
     fn open_remote_skill_selector(&mut self, initial_query: Option<&str>) {
         self.skill_selector.active = false;
-        self.remote_skill_browser.selector.active = true;
-        self.remote_skill_browser.selector.query =
-            initial_query.map(str::trim).unwrap_or_default().to_string();
-        self.remote_skill_browser.selector.selected = 0;
-        self.remote_skill_browser.selector.update_filter();
-        self.remote_skill_browser.action_in_flight = None;
-        self.remote_skill_browser.notices.clear();
-        self.remote_skill_browser.last_completed_query = None;
-        self.remote_skill_browser.loading_query = None;
-        self.remote_skill_browser.inflight_request_id = None;
+        self.reset_split_detail_scroll(DetailSurface::RemoteSkillBrowser);
+        self.remote_skill_browser.activate(initial_query, None);
         self.schedule_remote_skill_search(true);
         self.needs_redraw = true;
     }
@@ -4749,12 +5031,7 @@ impl App {
     fn schedule_remote_skill_search(&mut self, immediate: bool) {
         let query = self.remote_skill_browser.current_query();
         if query.is_empty() {
-            self.remote_skill_browser.search_due_at = None;
-            self.remote_skill_browser.inflight_request_id = None;
-            self.remote_skill_browser.loading_query = None;
-            self.remote_skill_browser.last_completed_query = None;
-            self.remote_skill_browser.notices.clear();
-            self.remote_skill_browser.selector.set_items(Vec::new());
+            self.remote_skill_browser.reset_results();
             self.needs_redraw = true;
             return;
         }
@@ -4805,6 +5082,170 @@ impl App {
         self.needs_redraw = true;
     }
 
+    fn open_remote_plugin_selector(
+        &mut self,
+        initial_query: Option<&str>,
+        source_filter: Option<&str>,
+    ) {
+        self.plugin_toggle.active = false;
+        self.reset_split_detail_scroll(DetailSurface::RemotePluginBrowser);
+        self.remote_plugin_browser
+            .activate(initial_query, source_filter);
+        self.schedule_remote_plugin_search(true);
+        self.needs_redraw = true;
+    }
+
+    fn schedule_remote_plugin_search(&mut self, immediate: bool) {
+        let query = self.remote_plugin_browser.current_query();
+        if query.is_empty() {
+            self.remote_plugin_browser.reset_results();
+            self.needs_redraw = true;
+            return;
+        }
+
+        self.remote_plugin_browser.search_due_at = Some(if immediate {
+            Instant::now()
+        } else {
+            Instant::now() + Duration::from_millis(250)
+        });
+        self.needs_redraw = true;
+    }
+
+    fn poll_remote_plugin_search(&mut self) {
+        if !self.remote_plugin_browser.selector.active {
+            return;
+        }
+
+        let Some(deadline) = self.remote_plugin_browser.search_due_at else {
+            return;
+        };
+        if Instant::now() < deadline {
+            return;
+        }
+
+        let query = self.remote_plugin_browser.current_query();
+        self.remote_plugin_browser.search_due_at = None;
+        if query.is_empty() {
+            return;
+        }
+        if self.remote_plugin_browser.loading_query.as_deref() == Some(query.as_str()) {
+            return;
+        }
+
+        self.remote_plugin_browser.next_request_id =
+            self.remote_plugin_browser.next_request_id.saturating_add(1);
+        let request_id = self.remote_plugin_browser.next_request_id;
+        let source_filter = self.remote_plugin_browser.source_filter.clone();
+        self.remote_plugin_browser.inflight_request_id = Some(request_id);
+        self.remote_plugin_browser.loading_query = Some(query.clone());
+        let tx = self.response_tx.clone();
+        self.rt_handle.spawn(async move {
+            let config_path = edgecrab_core::edgecrab_home().join("config.yaml");
+            let config = edgecrab_core::AppConfig::load_from(&config_path).unwrap_or_default();
+            let report = edgecrab_plugins::search_hub_report(
+                &config.plugins,
+                &query,
+                source_filter.as_deref(),
+                12,
+            )
+            .await
+            .unwrap_or_default();
+            let _ = tx.send(AgentResponse::RemotePluginSearchReady {
+                request_id,
+                query,
+                report,
+            });
+        });
+        self.needs_redraw = true;
+    }
+
+    fn apply_remote_plugin_search_result(
+        &mut self,
+        request_id: u64,
+        query: String,
+        report: edgecrab_plugins::PluginSearchReport,
+    ) {
+        if self.remote_plugin_browser.inflight_request_id != Some(request_id) {
+            return;
+        }
+        if self.remote_plugin_browser.current_query() != query {
+            return;
+        }
+
+        let (entries, notices) = Self::build_remote_plugin_entries(&report);
+        self.remote_plugin_browser.inflight_request_id = None;
+        self.remote_plugin_browser.loading_query = None;
+        self.remote_plugin_browser.last_completed_query = Some(query);
+        self.remote_plugin_browser.notices = notices;
+        self.remote_plugin_browser.selector.set_items(entries);
+        self.remote_plugin_browser.selector.selected = 0;
+        self.reset_split_detail_scroll(DetailSurface::RemotePluginBrowser);
+        self.needs_redraw = true;
+    }
+
+    fn run_remote_plugin_action(&mut self, entry: RemotePluginEntry) {
+        if self.remote_plugin_browser.action_in_flight.is_some() {
+            self.push_output(
+                "A remote plugin action is already running. Wait for it to finish.",
+                OutputRole::System,
+            );
+            return;
+        }
+
+        let action_label = entry.action.label().to_string();
+        self.remote_plugin_browser.action_in_flight =
+            Some(format!("{} {}", action_label, entry.identifier));
+        self.needs_redraw = true;
+
+        let tx = self.response_tx.clone();
+        let action_identifier = entry.identifier.clone();
+        self.rt_handle.spawn(async move {
+            let result = match entry.action {
+                RemotePluginAction::Install | RemotePluginAction::Replace => {
+                    tokio::task::spawn_blocking(move || {
+                        crate::plugins_cmd::install_plugin_capture(
+                            &entry.identifier,
+                            None,
+                            false,
+                            false,
+                        )
+                    })
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result.map_err(|error| error.to_string()))
+                }
+                RemotePluginAction::Update => {
+                    let plugin_name = entry
+                        .installed_name
+                        .clone()
+                        .unwrap_or_else(|| entry.name.clone());
+                    tokio::task::spawn_blocking(move || {
+                        crate::plugins_cmd::update_plugin_capture(&plugin_name)
+                    })
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result.map_err(|error| error.to_string()))
+                }
+            };
+
+            match result {
+                Ok(outcome) => {
+                    let _ = tx.send(AgentResponse::RemotePluginActionComplete {
+                        message: outcome.message,
+                        plugin_name: outcome.plugin_name,
+                    });
+                }
+                Err(error) => {
+                    let _ = tx.send(AgentResponse::RemotePluginActionFailed {
+                        action_label,
+                        identifier: action_identifier,
+                        error,
+                    });
+                }
+            }
+        });
+    }
+
     fn apply_remote_skill_search_result(
         &mut self,
         request_id: u64,
@@ -4825,6 +5266,7 @@ impl App {
         self.remote_skill_browser.notices = notices;
         self.remote_skill_browser.selector.set_items(entries);
         self.remote_skill_browser.selector.selected = 0;
+        self.reset_split_detail_scroll(DetailSurface::RemoteSkillBrowser);
         self.needs_redraw = true;
     }
 
@@ -5624,10 +6066,16 @@ impl App {
 
         match (key.modifiers, key.code) {
             (_, KeyCode::Enter) => {}
-            (KeyModifiers::NONE, KeyCode::Char('h')) => self.textarea.move_cursor(CursorMove::Back),
-            (KeyModifiers::NONE, KeyCode::Char('j')) => self.textarea.move_cursor(CursorMove::Down),
-            (KeyModifiers::NONE, KeyCode::Char('k')) => self.textarea.move_cursor(CursorMove::Up),
-            (KeyModifiers::NONE, KeyCode::Char('l')) => {
+            (KeyModifiers::NONE, KeyCode::Left | KeyCode::Char('h')) => {
+                self.textarea.move_cursor(CursorMove::Back)
+            }
+            (KeyModifiers::NONE, KeyCode::Down | KeyCode::Char('j')) => {
+                self.textarea.move_cursor(CursorMove::Down)
+            }
+            (KeyModifiers::NONE, KeyCode::Up | KeyCode::Char('k')) => {
+                self.textarea.move_cursor(CursorMove::Up)
+            }
+            (KeyModifiers::NONE, KeyCode::Right | KeyCode::Char('l')) => {
                 self.textarea.move_cursor(CursorMove::Forward)
             }
             (KeyModifiers::NONE, KeyCode::Char('w')) => {
@@ -5639,10 +6087,13 @@ impl App {
             (KeyModifiers::NONE, KeyCode::Char('e')) => {
                 self.textarea.move_cursor(CursorMove::WordEnd)
             }
-            (KeyModifiers::NONE, KeyCode::Char('0')) | (KeyModifiers::NONE, KeyCode::Char('^')) => {
+            (KeyModifiers::NONE, KeyCode::Home | KeyCode::Char('0'))
+            | (KeyModifiers::NONE, KeyCode::Char('^')) => {
                 self.textarea.move_cursor(CursorMove::Head)
             }
-            (KeyModifiers::NONE, KeyCode::Char('$')) => self.textarea.move_cursor(CursorMove::End),
+            (KeyModifiers::NONE, KeyCode::End | KeyCode::Char('$')) => {
+                self.textarea.move_cursor(CursorMove::End)
+            }
             (KeyModifiers::NONE, KeyCode::Char('g')) => self.vim_pending = Some(VimPending::Go),
             (KeyModifiers::SHIFT, KeyCode::Char('g'))
             | (KeyModifiers::NONE, KeyCode::Char('G')) => {
@@ -5678,6 +6129,10 @@ impl App {
             (KeyModifiers::NONE, KeyCode::Char('x')) => {
                 self.textarea.delete_next_char();
             }
+            (KeyModifiers::NONE, KeyCode::Char('s')) => {
+                self.textarea.delete_next_char();
+                self.enter_compose_insert();
+            }
             (KeyModifiers::NONE, KeyCode::Char('p')) => {
                 self.textarea.paste();
             }
@@ -5690,9 +6145,24 @@ impl App {
             (KeyModifiers::NONE, KeyCode::Char('d')) => self.vim_pending = Some(VimPending::Delete),
             (KeyModifiers::NONE, KeyCode::Char('c')) => self.vim_pending = Some(VimPending::Change),
             (KeyModifiers::NONE, KeyCode::Char('y')) => self.vim_pending = Some(VimPending::Yank),
+            (KeyModifiers::SHIFT, KeyCode::Char('c'))
+            | (KeyModifiers::NONE, KeyCode::Char('C')) => {
+                self.textarea.delete_line_by_end();
+                self.enter_compose_insert();
+            }
             (KeyModifiers::SHIFT, KeyCode::Char('d'))
             | (KeyModifiers::NONE, KeyCode::Char('D')) => {
                 self.textarea.delete_line_by_end();
+            }
+            (KeyModifiers::SHIFT, KeyCode::Char('s'))
+            | (KeyModifiers::NONE, KeyCode::Char('S')) => {
+                self.apply_vim_line_operator(VimPending::Change);
+            }
+            (KeyModifiers::SHIFT, KeyCode::Char('y'))
+            | (KeyModifiers::NONE, KeyCode::Char('Y')) => {
+                self.textarea.start_selection();
+                self.textarea.move_cursor(CursorMove::End);
+                self.textarea.copy();
             }
             _ => {}
         }
@@ -6149,7 +6619,7 @@ impl App {
             // F3 — open skill browser (same experience as F2 for models)
             (_, KeyCode::F(3)) => {
                 self.refresh_skills_list();
-                self.skill_selector.activate();
+                self.open_skill_selector();
                 return;
             }
             // F7 — open dedicated vision-model selector
@@ -6362,7 +6832,10 @@ impl App {
                     }
                 }
                 _ if selector_action_key(&key, 'z') => {
-                    self.toggle_detail_fullscreen(DetailSurface::ModelSelector, 0);
+                    self.toggle_detail_fullscreen(
+                        DetailSurface::ModelSelector,
+                        self.split_detail_scroll(DetailSurface::ModelSelector),
+                    );
                 }
                 KeyCode::Enter => {
                     if let Some(model) = self.model_selector.current().map(|e| e.display.clone()) {
@@ -6379,10 +6852,12 @@ impl App {
                 }
                 KeyCode::Up => {
                     self.model_selector.move_up();
+                    self.reset_split_detail_scroll(DetailSurface::ModelSelector);
                     self.reset_detail_fullscreen_scroll(DetailSurface::ModelSelector);
                 }
                 KeyCode::Down => {
                     self.model_selector.move_down();
+                    self.reset_split_detail_scroll(DetailSurface::ModelSelector);
                     self.reset_detail_fullscreen_scroll(DetailSurface::ModelSelector);
                 }
                 KeyCode::PageUp if self.detail_fullscreen_active(DetailSurface::ModelSelector) => {
@@ -6393,10 +6868,11 @@ impl App {
                 {
                     self.page_down_detail_fullscreen(DetailSurface::ModelSelector);
                 }
-                KeyCode::PageUp => self.model_selector.page_up(),
-                KeyCode::PageDown => self.model_selector.page_down(),
+                KeyCode::PageUp => self.page_up_split_detail(DetailSurface::ModelSelector, 8),
+                KeyCode::PageDown => self.page_down_split_detail(DetailSurface::ModelSelector, 8),
                 KeyCode::Backspace => {
                     self.model_selector.pop_char();
+                    self.reset_split_detail_scroll(DetailSurface::ModelSelector);
                     self.reset_detail_fullscreen_scroll(DetailSurface::ModelSelector);
                 }
                 KeyCode::Char(c)
@@ -6405,6 +6881,7 @@ impl App {
                         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                 {
                     self.model_selector.push_char(c);
+                    self.reset_split_detail_scroll(DetailSurface::ModelSelector);
                     self.reset_detail_fullscreen_scroll(DetailSurface::ModelSelector);
                 }
                 _ => {}
@@ -6592,7 +7069,10 @@ impl App {
                     }
                 }
                 _ if selector_action_key(&key, 'z') => {
-                    self.toggle_detail_fullscreen(DetailSurface::VisionModelSelector, 0);
+                    self.toggle_detail_fullscreen(
+                        DetailSurface::VisionModelSelector,
+                        self.split_detail_scroll(DetailSurface::VisionModelSelector),
+                    );
                 }
                 KeyCode::Enter => {
                     if let Some(model) = self
@@ -6607,10 +7087,12 @@ impl App {
                 }
                 KeyCode::Up => {
                     self.vision_model_selector.move_up();
+                    self.reset_split_detail_scroll(DetailSurface::VisionModelSelector);
                     self.reset_detail_fullscreen_scroll(DetailSurface::VisionModelSelector);
                 }
                 KeyCode::Down => {
                     self.vision_model_selector.move_down();
+                    self.reset_split_detail_scroll(DetailSurface::VisionModelSelector);
                     self.reset_detail_fullscreen_scroll(DetailSurface::VisionModelSelector);
                 }
                 KeyCode::PageUp
@@ -6623,10 +7105,13 @@ impl App {
                 {
                     self.page_down_detail_fullscreen(DetailSurface::VisionModelSelector);
                 }
-                KeyCode::PageUp => self.vision_model_selector.page_up(),
-                KeyCode::PageDown => self.vision_model_selector.page_down(),
+                KeyCode::PageUp => self.page_up_split_detail(DetailSurface::VisionModelSelector, 8),
+                KeyCode::PageDown => {
+                    self.page_down_split_detail(DetailSurface::VisionModelSelector, 8)
+                }
                 KeyCode::Backspace => {
                     self.vision_model_selector.pop_char();
+                    self.reset_split_detail_scroll(DetailSurface::VisionModelSelector);
                     self.reset_detail_fullscreen_scroll(DetailSurface::VisionModelSelector);
                 }
                 KeyCode::Char(c)
@@ -6635,6 +7120,7 @@ impl App {
                         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                 {
                     self.vision_model_selector.push_char(c);
+                    self.reset_split_detail_scroll(DetailSurface::VisionModelSelector);
                     self.reset_detail_fullscreen_scroll(DetailSurface::VisionModelSelector);
                 }
                 _ => {}
@@ -6650,7 +7136,10 @@ impl App {
                     }
                 }
                 _ if selector_action_key(&key, 'z') => {
-                    self.toggle_detail_fullscreen(DetailSurface::ImageModelSelector, 0);
+                    self.toggle_detail_fullscreen(
+                        DetailSurface::ImageModelSelector,
+                        self.split_detail_scroll(DetailSurface::ImageModelSelector),
+                    );
                 }
                 KeyCode::Enter => {
                     if let Some(model) = self
@@ -6665,10 +7154,12 @@ impl App {
                 }
                 KeyCode::Up => {
                     self.image_model_selector.move_up();
+                    self.reset_split_detail_scroll(DetailSurface::ImageModelSelector);
                     self.reset_detail_fullscreen_scroll(DetailSurface::ImageModelSelector);
                 }
                 KeyCode::Down => {
                     self.image_model_selector.move_down();
+                    self.reset_split_detail_scroll(DetailSurface::ImageModelSelector);
                     self.reset_detail_fullscreen_scroll(DetailSurface::ImageModelSelector);
                 }
                 KeyCode::PageUp
@@ -6681,10 +7172,13 @@ impl App {
                 {
                     self.page_down_detail_fullscreen(DetailSurface::ImageModelSelector);
                 }
-                KeyCode::PageUp => self.image_model_selector.page_up(),
-                KeyCode::PageDown => self.image_model_selector.page_down(),
+                KeyCode::PageUp => self.page_up_split_detail(DetailSurface::ImageModelSelector, 8),
+                KeyCode::PageDown => {
+                    self.page_down_split_detail(DetailSurface::ImageModelSelector, 8)
+                }
                 KeyCode::Backspace => {
                     self.image_model_selector.pop_char();
+                    self.reset_split_detail_scroll(DetailSurface::ImageModelSelector);
                     self.reset_detail_fullscreen_scroll(DetailSurface::ImageModelSelector);
                 }
                 KeyCode::Char(c)
@@ -6693,6 +7187,7 @@ impl App {
                         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                 {
                     self.image_model_selector.push_char(c);
+                    self.reset_split_detail_scroll(DetailSurface::ImageModelSelector);
                     self.reset_detail_fullscreen_scroll(DetailSurface::ImageModelSelector);
                 }
                 _ => {}
@@ -6710,7 +7205,10 @@ impl App {
                     }
                 }
                 _ if selector_action_key(&key, 'z') => {
-                    self.toggle_detail_fullscreen(DetailSurface::McpSelector, 0);
+                    self.toggle_detail_fullscreen(
+                        DetailSurface::McpSelector,
+                        self.split_detail_scroll(DetailSurface::McpSelector),
+                    );
                 }
                 _ if selector_action_key(&key, 'r') => {
                     let query = self.mcp_selector.query.clone();
@@ -6734,10 +7232,12 @@ impl App {
                 }
                 KeyCode::Up => {
                     self.mcp_selector.move_up();
+                    self.reset_split_detail_scroll(DetailSurface::McpSelector);
                     self.reset_detail_fullscreen_scroll(DetailSurface::McpSelector);
                 }
                 KeyCode::Down => {
                     self.mcp_selector.move_down();
+                    self.reset_split_detail_scroll(DetailSurface::McpSelector);
                     self.reset_detail_fullscreen_scroll(DetailSurface::McpSelector);
                 }
                 KeyCode::PageUp if self.detail_fullscreen_active(DetailSurface::McpSelector) => {
@@ -6746,10 +7246,11 @@ impl App {
                 KeyCode::PageDown if self.detail_fullscreen_active(DetailSurface::McpSelector) => {
                     self.page_down_detail_fullscreen(DetailSurface::McpSelector);
                 }
-                KeyCode::PageUp => self.mcp_selector.page_up(),
-                KeyCode::PageDown => self.mcp_selector.page_down(),
+                KeyCode::PageUp => self.page_up_split_detail(DetailSurface::McpSelector, 8),
+                KeyCode::PageDown => self.page_down_split_detail(DetailSurface::McpSelector, 8),
                 KeyCode::Backspace => {
                     self.mcp_selector.pop_char();
+                    self.reset_split_detail_scroll(DetailSurface::McpSelector);
                     self.reset_detail_fullscreen_scroll(DetailSurface::McpSelector);
                 }
                 KeyCode::Char(' ') => {
@@ -6804,6 +7305,7 @@ impl App {
                 }
                 KeyCode::Char(c) if selector_search_char(&key) == Some(c) => {
                     self.mcp_selector.push_char(c);
+                    self.reset_split_detail_scroll(DetailSurface::McpSelector);
                     self.reset_detail_fullscreen_scroll(DetailSurface::McpSelector);
                 }
                 _ => {}
@@ -6820,7 +7322,10 @@ impl App {
                     }
                 }
                 _ if selector_action_key(&key, 'z') => {
-                    self.toggle_detail_fullscreen(DetailSurface::RemoteMcpBrowser, 0);
+                    self.toggle_detail_fullscreen(
+                        DetailSurface::RemoteMcpBrowser,
+                        self.split_detail_scroll(DetailSurface::RemoteMcpBrowser),
+                    );
                 }
                 KeyCode::Enter => {
                     if let Some(entry) = self.remote_mcp_browser.selector.current().cloned() {
@@ -6857,10 +7362,12 @@ impl App {
                 }
                 KeyCode::Up => {
                     self.remote_mcp_browser.selector.move_up();
+                    self.reset_split_detail_scroll(DetailSurface::RemoteMcpBrowser);
                     self.reset_detail_fullscreen_scroll(DetailSurface::RemoteMcpBrowser);
                 }
                 KeyCode::Down => {
                     self.remote_mcp_browser.selector.move_down();
+                    self.reset_split_detail_scroll(DetailSurface::RemoteMcpBrowser);
                     self.reset_detail_fullscreen_scroll(DetailSurface::RemoteMcpBrowser);
                 }
                 KeyCode::PageUp
@@ -6873,15 +7380,19 @@ impl App {
                 {
                     self.page_down_detail_fullscreen(DetailSurface::RemoteMcpBrowser);
                 }
-                KeyCode::PageUp => self.remote_mcp_browser.selector.page_up(),
-                KeyCode::PageDown => self.remote_mcp_browser.selector.page_down(),
+                KeyCode::PageUp => self.page_up_split_detail(DetailSurface::RemoteMcpBrowser, 8),
+                KeyCode::PageDown => {
+                    self.page_down_split_detail(DetailSurface::RemoteMcpBrowser, 8)
+                }
                 KeyCode::Backspace => {
                     self.remote_mcp_browser.selector.pop_char();
+                    self.reset_split_detail_scroll(DetailSurface::RemoteMcpBrowser);
                     self.reset_detail_fullscreen_scroll(DetailSurface::RemoteMcpBrowser);
                     self.schedule_remote_mcp_search(false);
                 }
                 KeyCode::Char(c) if selector_search_char(&key) == Some(c) => {
                     self.remote_mcp_browser.selector.push_char(c);
+                    self.reset_split_detail_scroll(DetailSurface::RemoteMcpBrowser);
                     self.reset_detail_fullscreen_scroll(DetailSurface::RemoteMcpBrowser);
                     self.schedule_remote_mcp_search(false);
                 }
@@ -6900,7 +7411,10 @@ impl App {
                     }
                 }
                 _ if selector_action_key(&key, 'z') => {
-                    self.toggle_detail_fullscreen(DetailSurface::RemoteSkillBrowser, 0);
+                    self.toggle_detail_fullscreen(
+                        DetailSurface::RemoteSkillBrowser,
+                        self.split_detail_scroll(DetailSurface::RemoteSkillBrowser),
+                    );
                 }
                 KeyCode::Enter => {
                     if let Some(entry) = self.remote_skill_browser.selector.current().cloned() {
@@ -6932,15 +7446,17 @@ impl App {
                     self.remote_skill_browser.selector.active = false;
                     self.close_detail_fullscreen(DetailSurface::RemoteSkillBrowser);
                     self.refresh_skills_list();
-                    self.skill_selector.activate();
+                    self.open_skill_selector();
                     self.needs_redraw = true;
                 }
                 KeyCode::Up => {
                     self.remote_skill_browser.selector.move_up();
+                    self.reset_split_detail_scroll(DetailSurface::RemoteSkillBrowser);
                     self.reset_detail_fullscreen_scroll(DetailSurface::RemoteSkillBrowser);
                 }
                 KeyCode::Down => {
                     self.remote_skill_browser.selector.move_down();
+                    self.reset_split_detail_scroll(DetailSurface::RemoteSkillBrowser);
                     self.reset_detail_fullscreen_scroll(DetailSurface::RemoteSkillBrowser);
                 }
                 KeyCode::PageUp
@@ -6953,17 +7469,111 @@ impl App {
                 {
                     self.page_down_detail_fullscreen(DetailSurface::RemoteSkillBrowser);
                 }
-                KeyCode::PageUp => self.remote_skill_browser.selector.page_up(),
-                KeyCode::PageDown => self.remote_skill_browser.selector.page_down(),
+                KeyCode::PageUp => self.page_up_split_detail(DetailSurface::RemoteSkillBrowser, 8),
+                KeyCode::PageDown => {
+                    self.page_down_split_detail(DetailSurface::RemoteSkillBrowser, 8)
+                }
                 KeyCode::Backspace => {
                     self.remote_skill_browser.selector.pop_char();
+                    self.reset_split_detail_scroll(DetailSurface::RemoteSkillBrowser);
                     self.reset_detail_fullscreen_scroll(DetailSurface::RemoteSkillBrowser);
                     self.schedule_remote_skill_search(false);
                 }
                 KeyCode::Char(c) if selector_search_char(&key) == Some(c) => {
                     self.remote_skill_browser.selector.push_char(c);
+                    self.reset_split_detail_scroll(DetailSurface::RemoteSkillBrowser);
                     self.reset_detail_fullscreen_scroll(DetailSurface::RemoteSkillBrowser);
                     self.schedule_remote_skill_search(false);
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        if self.remote_plugin_browser.selector.active {
+            match key.code {
+                KeyCode::Esc => {
+                    if !self.close_detail_fullscreen(DetailSurface::RemotePluginBrowser) {
+                        self.remote_plugin_browser.selector.active = false;
+                        self.remote_plugin_browser.action_in_flight = None;
+                        self.needs_redraw = true;
+                    }
+                }
+                _ if selector_action_key(&key, 'z') => {
+                    self.toggle_detail_fullscreen(
+                        DetailSurface::RemotePluginBrowser,
+                        self.split_detail_scroll(DetailSurface::RemotePluginBrowser),
+                    );
+                }
+                KeyCode::Enter => {
+                    if let Some(entry) = self.remote_plugin_browser.selector.current().cloned() {
+                        self.run_remote_plugin_action(entry);
+                    }
+                }
+                _ if selector_action_key(&key, 'i') => {
+                    if let Some(entry) = self.remote_plugin_browser.selector.current().cloned() {
+                        self.run_remote_plugin_action(entry);
+                    }
+                }
+                _ if selector_action_key(&key, 'u') => {
+                    if let Some(mut entry) = self.remote_plugin_browser.selector.current().cloned()
+                    {
+                        if entry.installed_name.is_some() {
+                            entry.action = RemotePluginAction::Update;
+                            self.run_remote_plugin_action(entry);
+                        } else {
+                            self.push_output(
+                                "This remote plugin is not hub-installed yet. Use Enter or I to install it.",
+                                OutputRole::System,
+                            );
+                        }
+                    }
+                }
+                _ if selector_action_key(&key, 'r') => {
+                    self.schedule_remote_plugin_search(true);
+                }
+                _ if selector_action_key(&key, 'l') => {
+                    let scope = self.plugin_toggle_scope.clone();
+                    self.remote_plugin_browser.selector.active = false;
+                    self.close_detail_fullscreen(DetailSurface::RemotePluginBrowser);
+                    self.open_plugin_toggle(scope);
+                    self.needs_redraw = true;
+                }
+                KeyCode::Up => {
+                    self.remote_plugin_browser.selector.move_up();
+                    self.reset_split_detail_scroll(DetailSurface::RemotePluginBrowser);
+                    self.reset_detail_fullscreen_scroll(DetailSurface::RemotePluginBrowser);
+                }
+                KeyCode::Down => {
+                    self.remote_plugin_browser.selector.move_down();
+                    self.reset_split_detail_scroll(DetailSurface::RemotePluginBrowser);
+                    self.reset_detail_fullscreen_scroll(DetailSurface::RemotePluginBrowser);
+                }
+                KeyCode::PageUp
+                    if self.detail_fullscreen_active(DetailSurface::RemotePluginBrowser) =>
+                {
+                    self.page_up_detail_fullscreen(DetailSurface::RemotePluginBrowser);
+                }
+                KeyCode::PageDown
+                    if self.detail_fullscreen_active(DetailSurface::RemotePluginBrowser) =>
+                {
+                    self.page_down_detail_fullscreen(DetailSurface::RemotePluginBrowser);
+                }
+                KeyCode::PageUp => self.page_up_split_detail(DetailSurface::RemotePluginBrowser, 8),
+                KeyCode::PageDown => {
+                    self.page_down_split_detail(DetailSurface::RemotePluginBrowser, 8)
+                }
+                KeyCode::Backspace => {
+                    self.remote_plugin_browser.selector.pop_char();
+                    self.reset_split_detail_scroll(DetailSurface::RemotePluginBrowser);
+                    self.reset_detail_fullscreen_scroll(DetailSurface::RemotePluginBrowser);
+                    self.schedule_remote_plugin_search(false);
+                }
+                KeyCode::Char(c) if selector_search_char(&key) == Some(c) => {
+                    self.remote_plugin_browser.selector.push_char(c);
+                    self.reset_split_detail_scroll(DetailSurface::RemotePluginBrowser);
+                    self.reset_detail_fullscreen_scroll(DetailSurface::RemotePluginBrowser);
+                    self.schedule_remote_plugin_search(false);
                 }
                 _ => {}
             }
@@ -6979,7 +7589,10 @@ impl App {
                     }
                 }
                 _ if selector_action_key(&key, 'z') => {
-                    self.toggle_detail_fullscreen(DetailSurface::SkillSelector, 0);
+                    self.toggle_detail_fullscreen(
+                        DetailSurface::SkillSelector,
+                        self.split_detail_scroll(DetailSurface::SkillSelector),
+                    );
                 }
                 KeyCode::Char(' ') => {
                     if let Some(name) = self
@@ -7004,10 +7617,12 @@ impl App {
                 }
                 KeyCode::Up => {
                     self.skill_selector.move_up();
+                    self.reset_split_detail_scroll(DetailSurface::SkillSelector);
                     self.reset_detail_fullscreen_scroll(DetailSurface::SkillSelector);
                 }
                 KeyCode::Down => {
                     self.skill_selector.move_down();
+                    self.reset_split_detail_scroll(DetailSurface::SkillSelector);
                     self.reset_detail_fullscreen_scroll(DetailSurface::SkillSelector);
                 }
                 KeyCode::PageUp if self.detail_fullscreen_active(DetailSurface::SkillSelector) => {
@@ -7018,17 +7633,19 @@ impl App {
                 {
                     self.page_down_detail_fullscreen(DetailSurface::SkillSelector);
                 }
-                KeyCode::PageUp => self.skill_selector.page_up(),
-                KeyCode::PageDown => self.skill_selector.page_down(),
+                KeyCode::PageUp => self.page_up_split_detail(DetailSurface::SkillSelector, 8),
+                KeyCode::PageDown => self.page_down_split_detail(DetailSurface::SkillSelector, 8),
                 _ if selector_action_key(&key, 'r') => {
                     self.open_remote_skill_selector(None);
                 }
                 KeyCode::Backspace => {
                     self.skill_selector.pop_char();
+                    self.reset_split_detail_scroll(DetailSurface::SkillSelector);
                     self.reset_detail_fullscreen_scroll(DetailSurface::SkillSelector);
                 }
                 KeyCode::Char(c) if selector_search_char(&key) == Some(c) => {
                     self.skill_selector.push_char(c);
+                    self.reset_split_detail_scroll(DetailSurface::SkillSelector);
                     self.reset_detail_fullscreen_scroll(DetailSurface::SkillSelector);
                 }
                 _ => {}
@@ -7046,20 +7663,26 @@ impl App {
                 KeyCode::Tab => {
                     self.tool_manager_scope = self.tool_manager_scope.next();
                     let _ = self.refresh_tool_manager_entries();
+                    self.reset_split_detail_scroll(DetailSurface::ToolManager);
                     self.reset_detail_fullscreen_scroll(DetailSurface::ToolManager);
                 }
                 _ if selector_action_key(&key, 'z') => {
-                    self.toggle_detail_fullscreen(DetailSurface::ToolManager, 0);
+                    self.toggle_detail_fullscreen(
+                        DetailSurface::ToolManager,
+                        self.split_detail_scroll(DetailSurface::ToolManager),
+                    );
                 }
                 KeyCode::Enter | KeyCode::Char(' ') => {
                     self.toggle_tool_manager_selected();
                 }
                 KeyCode::Up => {
                     self.tool_manager.move_up();
+                    self.reset_split_detail_scroll(DetailSurface::ToolManager);
                     self.reset_detail_fullscreen_scroll(DetailSurface::ToolManager);
                 }
                 KeyCode::Down => {
                     self.tool_manager.move_down();
+                    self.reset_split_detail_scroll(DetailSurface::ToolManager);
                     self.reset_detail_fullscreen_scroll(DetailSurface::ToolManager);
                 }
                 KeyCode::PageUp if self.detail_fullscreen_active(DetailSurface::ToolManager) => {
@@ -7068,17 +7691,19 @@ impl App {
                 KeyCode::PageDown if self.detail_fullscreen_active(DetailSurface::ToolManager) => {
                     self.page_down_detail_fullscreen(DetailSurface::ToolManager);
                 }
-                KeyCode::PageUp => self.tool_manager.page_up(),
-                KeyCode::PageDown => self.tool_manager.page_down(),
+                KeyCode::PageUp => self.page_up_split_detail(DetailSurface::ToolManager, 8),
+                KeyCode::PageDown => self.page_down_split_detail(DetailSurface::ToolManager, 8),
                 _ if selector_action_key(&key, 'r') => {
                     self.reset_tool_manager_policy();
                 }
                 KeyCode::Backspace => {
                     self.tool_manager.pop_char();
+                    self.reset_split_detail_scroll(DetailSurface::ToolManager);
                     self.reset_detail_fullscreen_scroll(DetailSurface::ToolManager);
                 }
                 KeyCode::Char(c) if selector_search_char(&key) == Some(c) => {
                     self.tool_manager.push_char(c);
+                    self.reset_split_detail_scroll(DetailSurface::ToolManager);
                     self.reset_detail_fullscreen_scroll(DetailSurface::ToolManager);
                 }
                 _ => {}
@@ -7096,10 +7721,14 @@ impl App {
                 KeyCode::Tab => {
                     self.plugin_toggle_scope = self.next_plugin_toggle_scope();
                     let _ = self.refresh_plugin_toggle_entries();
+                    self.reset_split_detail_scroll(DetailSurface::PluginToggle);
                     self.reset_detail_fullscreen_scroll(DetailSurface::PluginToggle);
                 }
                 _ if selector_action_key(&key, 'z') => {
-                    self.toggle_detail_fullscreen(DetailSurface::PluginToggle, 0);
+                    self.toggle_detail_fullscreen(
+                        DetailSurface::PluginToggle,
+                        self.split_detail_scroll(DetailSurface::PluginToggle),
+                    );
                 }
                 KeyCode::Enter => {
                     self.confirm_plugin_toggle();
@@ -7109,10 +7738,12 @@ impl App {
                 }
                 KeyCode::Up => {
                     self.plugin_toggle.move_up();
+                    self.reset_split_detail_scroll(DetailSurface::PluginToggle);
                     self.reset_detail_fullscreen_scroll(DetailSurface::PluginToggle);
                 }
                 KeyCode::Down => {
                     self.plugin_toggle.move_down();
+                    self.reset_split_detail_scroll(DetailSurface::PluginToggle);
                     self.reset_detail_fullscreen_scroll(DetailSurface::PluginToggle);
                 }
                 KeyCode::PageUp if self.detail_fullscreen_active(DetailSurface::PluginToggle) => {
@@ -7121,14 +7752,19 @@ impl App {
                 KeyCode::PageDown if self.detail_fullscreen_active(DetailSurface::PluginToggle) => {
                     self.page_down_detail_fullscreen(DetailSurface::PluginToggle);
                 }
-                KeyCode::PageUp => self.plugin_toggle.page_up(),
-                KeyCode::PageDown => self.plugin_toggle.page_down(),
+                KeyCode::PageUp => self.page_up_split_detail(DetailSurface::PluginToggle, 8),
+                KeyCode::PageDown => self.page_down_split_detail(DetailSurface::PluginToggle, 8),
+                _ if selector_action_key(&key, 'r') => {
+                    self.open_remote_plugin_selector(None, None);
+                }
                 KeyCode::Backspace => {
                     self.plugin_toggle.pop_char();
+                    self.reset_split_detail_scroll(DetailSurface::PluginToggle);
                     self.reset_detail_fullscreen_scroll(DetailSurface::PluginToggle);
                 }
                 KeyCode::Char(c) if selector_search_char(&key) == Some(c) => {
                     self.plugin_toggle.push_char(c);
+                    self.reset_split_detail_scroll(DetailSurface::PluginToggle);
                     self.reset_detail_fullscreen_scroll(DetailSurface::PluginToggle);
                 }
                 _ => {}
@@ -7144,7 +7780,10 @@ impl App {
                     }
                 }
                 _ if selector_action_key(&key, 'z') => {
-                    self.toggle_detail_fullscreen(DetailSurface::ConfigSelector, 0);
+                    self.toggle_detail_fullscreen(
+                        DetailSurface::ConfigSelector,
+                        self.split_detail_scroll(DetailSurface::ConfigSelector),
+                    );
                 }
                 KeyCode::Enter => {
                     if let Some(entry) = self.config_selector.current() {
@@ -7156,10 +7795,12 @@ impl App {
                 }
                 KeyCode::Up => {
                     self.config_selector.move_up();
+                    self.reset_split_detail_scroll(DetailSurface::ConfigSelector);
                     self.reset_detail_fullscreen_scroll(DetailSurface::ConfigSelector);
                 }
                 KeyCode::Down => {
                     self.config_selector.move_down();
+                    self.reset_split_detail_scroll(DetailSurface::ConfigSelector);
                     self.reset_detail_fullscreen_scroll(DetailSurface::ConfigSelector);
                 }
                 KeyCode::PageUp if self.detail_fullscreen_active(DetailSurface::ConfigSelector) => {
@@ -7170,10 +7811,11 @@ impl App {
                 {
                     self.page_down_detail_fullscreen(DetailSurface::ConfigSelector);
                 }
-                KeyCode::PageUp => self.config_selector.page_up(),
-                KeyCode::PageDown => self.config_selector.page_down(),
+                KeyCode::PageUp => self.page_up_split_detail(DetailSurface::ConfigSelector, 8),
+                KeyCode::PageDown => self.page_down_split_detail(DetailSurface::ConfigSelector, 8),
                 KeyCode::Backspace => {
                     self.config_selector.pop_char();
+                    self.reset_split_detail_scroll(DetailSurface::ConfigSelector);
                     self.reset_detail_fullscreen_scroll(DetailSurface::ConfigSelector);
                 }
                 KeyCode::Char(c)
@@ -7182,6 +7824,7 @@ impl App {
                         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                 {
                     self.config_selector.push_char(c);
+                    self.reset_split_detail_scroll(DetailSurface::ConfigSelector);
                     self.reset_detail_fullscreen_scroll(DetailSurface::ConfigSelector);
                 }
                 _ => {}
@@ -7510,6 +8153,16 @@ impl App {
 
         match (key.modifiers, key.code) {
             // Page Up/Down — scroll output by viewport height
+            (_, KeyCode::PageUp) if self.editor_mode.is_compose() => {
+                self.textarea.scroll(Scrolling::PageUp);
+                self.needs_redraw = true;
+                return;
+            }
+            (_, KeyCode::PageDown) if self.editor_mode.is_compose() => {
+                self.textarea.scroll(Scrolling::PageDown);
+                self.needs_redraw = true;
+                return;
+            }
             (_, KeyCode::PageUp) => {
                 let page = self.output_area_height.max(3).saturating_sub(2);
                 self.scroll_output(page as i32);
@@ -8105,7 +8758,7 @@ impl App {
             CommandResult::SkillSelector => {
                 self.remote_skill_browser.selector.active = false;
                 self.refresh_skills_list();
-                self.skill_selector.activate();
+                self.open_skill_selector();
             }
             CommandResult::ToolManager(mode) => {
                 self.open_tool_manager(mode);
@@ -9157,12 +9810,50 @@ impl App {
                 } => {
                     self.apply_remote_skill_search_result(request_id, query, report);
                 }
+                AgentResponse::RemotePluginSearchReady {
+                    request_id,
+                    query,
+                    report,
+                } => {
+                    self.apply_remote_plugin_search_result(request_id, query, report);
+                }
                 AgentResponse::RemoteMcpSearchReady {
                     request_id,
                     query,
                     report,
                 } => {
                     self.apply_remote_mcp_search_result(request_id, query, report);
+                }
+                AgentResponse::RemotePluginActionComplete {
+                    message,
+                    plugin_name,
+                } => {
+                    self.remote_plugin_browser.action_in_flight = None;
+                    if let Err(error) = self.refresh_agent_plugin_runtime() {
+                        self.push_output(
+                            format!("Plugin runtime refresh failed: {error}"),
+                            OutputRole::Error,
+                        );
+                    }
+                    self.push_output(
+                        format!("{message}\nInspect with: /plugins info {plugin_name}"),
+                        OutputRole::System,
+                    );
+                    if self.remote_plugin_browser.selector.active {
+                        self.schedule_remote_plugin_search(true);
+                    }
+                }
+                AgentResponse::RemotePluginActionFailed {
+                    action_label,
+                    identifier,
+                    error,
+                } => {
+                    self.remote_plugin_browser.action_in_flight = None;
+                    self.push_output(
+                        format!("Remote {action_label} failed for '{identifier}': {error}"),
+                        OutputRole::Error,
+                    );
+                    self.needs_redraw = true;
                 }
                 AgentResponse::RemoteSkillActionComplete {
                     message,
@@ -10163,6 +10854,7 @@ impl App {
         if !self.refresh_tool_manager_entries() {
             return;
         }
+        self.reset_split_detail_scroll(DetailSurface::ToolManager);
         self.tool_manager_status_note =
             Some("Space toggles policy. Tab switches scope. R restores defaults.".into());
         self.tool_manager.active = true;
@@ -10206,6 +10898,32 @@ impl App {
             disabled_tools_option.as_deref(),
         )
         .map_err(|err| err.to_string())
+    }
+
+    fn refresh_agent_plugin_runtime(&mut self) -> Result<(), String> {
+        let Some(agent) = self.agent.as_ref().cloned() else {
+            return Ok(());
+        };
+
+        let config = self.load_runtime_config();
+        let registry =
+            self.rt_handle
+                .block_on(crate::runtime::build_tool_registry_with_mcp_discovery(
+                    &config,
+                ));
+        let plugins_config = config.plugins.clone();
+        self.rt_handle.block_on(async move {
+            agent.set_plugins_config(plugins_config).await;
+            agent.set_tool_registry(registry).await;
+        });
+
+        if self.tool_manager.active {
+            let _ = self.refresh_tool_manager_entries();
+        }
+        if self.plugin_toggle.active {
+            let _ = self.refresh_plugin_toggle_entries();
+        }
+        Ok(())
     }
 
     fn toggle_tool_manager_selected(&mut self) {
@@ -10364,7 +11082,12 @@ impl App {
                 )
             })
             .collect::<Vec<_>>();
-        entries.sort_by(|left, right| left.name.cmp(&right.name));
+        entries.sort_by(|left, right| {
+            matches!(right.check_state, PluginCheckState::On)
+                .cmp(&matches!(left.check_state, PluginCheckState::On))
+                .then_with(|| left.runtime_status.cmp(&right.runtime_status))
+                .then_with(|| left.name.cmp(&right.name))
+        });
         entries
     }
 
@@ -10380,11 +11103,15 @@ impl App {
     }
 
     fn open_plugin_toggle(&mut self, scope: PluginScope) {
+        self.remote_plugin_browser.selector.active = false;
+        self.remote_plugin_browser.action_in_flight = None;
         self.plugin_toggle_scope = scope;
         let _ = self.refresh_plugin_toggle_entries();
-        self.plugin_toggle_status_note =
-            Some("Space stages changes. Enter saves. Tab switches platform scope.".into());
-        self.plugin_toggle.active = true;
+        self.reset_split_detail_scroll(DetailSurface::PluginToggle);
+        self.plugin_toggle_status_note = Some(
+            "Space stages changes. Enter saves. Tab switches scope. R opens remote search.".into(),
+        );
+        self.plugin_toggle.activate();
         self.needs_redraw = true;
     }
 
@@ -10405,6 +11132,17 @@ impl App {
     }
 
     fn confirm_plugin_toggle(&mut self) {
+        if !self
+            .plugin_toggle
+            .items
+            .iter()
+            .any(PluginToggleEntry::has_pending_change)
+        {
+            self.plugin_toggle.active = false;
+            self.plugin_toggle_status_note = Some("No plugin changes to save.".into());
+            self.needs_redraw = true;
+            return;
+        }
         let config_path = edgecrab_core::edgecrab_home().join("config.yaml");
         let mut config = self.load_runtime_config();
         let target_names = self
@@ -10451,6 +11189,12 @@ impl App {
                     "Saved plugin state for {} scope.",
                     self.plugin_toggle_scope.title()
                 ));
+                if let Err(error) = self.refresh_agent_plugin_runtime() {
+                    self.push_output(
+                        format!("Plugin runtime refresh failed: {error}"),
+                        OutputRole::Error,
+                    );
+                }
                 self.plugin_toggle.active = false;
                 self.push_output("Plugin configuration saved.", OutputRole::System);
             }
@@ -10497,17 +11241,25 @@ impl App {
         }
 
         match config.save_to(&config_path) {
-            Ok(()) => self.push_output(
-                format!(
-                    "{} plugin `{name}`{}.",
-                    if enabled { "Disabled" } else { "Enabled" },
-                    platform
-                        .as_ref()
-                        .map(|scope| format!(" for `{scope}`"))
-                        .unwrap_or_default()
-                ),
-                OutputRole::System,
-            ),
+            Ok(()) => {
+                if let Err(error) = self.refresh_agent_plugin_runtime() {
+                    self.push_output(
+                        format!("Plugin runtime refresh failed: {error}"),
+                        OutputRole::Error,
+                    );
+                }
+                self.push_output(
+                    format!(
+                        "{} plugin `{name}`{}.",
+                        if enabled { "Disabled" } else { "Enabled" },
+                        platform
+                            .as_ref()
+                            .map(|scope| format!(" for `{scope}`"))
+                            .unwrap_or_default()
+                    ),
+                    OutputRole::System,
+                );
+            }
             Err(error) => self.push_output(
                 format!("Failed to update plugin `{name}`: {error}"),
                 OutputRole::Error,
@@ -11258,6 +12010,7 @@ impl App {
         );
 
         self.image_model_selector.set_items(entries);
+        self.reset_split_detail_scroll(DetailSurface::ImageModelSelector);
         self.image_model_selector
             .activate_with_primary(&current_spec);
     }
@@ -11662,6 +12415,7 @@ impl App {
 
     fn open_config_selector(&mut self) {
         self.config_selector.set_items(self.build_config_entries());
+        self.reset_split_detail_scroll(DetailSurface::ConfigSelector);
         self.config_selector.activate();
         self.needs_redraw = true;
     }
@@ -12031,8 +12785,13 @@ impl App {
                     .enumerate()
                     .map(|(index, message)| SessionMessageEntry::from_message(index, message))
                     .collect::<Vec<_>>();
+                let selected = Self::best_session_message_selection(
+                    &items,
+                    entry.matched_role.as_deref(),
+                    entry.matched_snippet.as_deref(),
+                );
                 self.session_inspector.selector.query.clear();
-                self.session_inspector.selector.selected = 0;
+                self.session_inspector.selector.selected = selected;
                 self.session_inspector.selector.set_items(items);
                 self.session_inspector.session =
                     Some(SessionInspectorMeta::from_browser_entry(&entry));
@@ -12205,6 +12964,7 @@ impl App {
         };
         let entries = build_mcp_selector_entries_from(&configured, &official_entries);
         self.mcp_selector.set_items(entries);
+        self.reset_split_detail_scroll(DetailSurface::McpSelector);
         self.mcp_selector.active = true;
         if let Some(query) = initial_query
             .map(str::trim)
@@ -13141,6 +13901,7 @@ impl App {
         target: ModelSelectorTarget,
     ) {
         self.model_selector_target = target;
+        self.reset_split_detail_scroll(DetailSurface::ModelSelector);
         if preserve_state {
             if self.model_selector.active {
                 self.model_selector.replace_items_preserving_state(models);
@@ -13281,6 +14042,7 @@ impl App {
         };
 
         self.vision_model_selector.set_items(entries);
+        self.reset_split_detail_scroll(DetailSurface::VisionModelSelector);
         self.vision_model_selector
             .activate_with_primary(&current_primary);
     }
@@ -13620,11 +14382,44 @@ impl App {
     }
 
     fn handle_show_plugins(&mut self, args: String) {
+        let trimmed = args.trim();
+        if trimmed.is_empty() || matches!(trimmed, "list" | "ls") {
+            self.open_plugin_toggle(PluginScope::Global);
+            return;
+        }
         let action = crate::plugins_cmd::action_from_slash_args(&args)
             .unwrap_or(crate::plugins_cmd::PluginAction::List);
-        match crate::plugins_cmd::run_capture(action) {
-            Ok(text) => self.push_output(text, OutputRole::Assistant),
-            Err(error) => self.push_output(format!("plugins: {error}"), OutputRole::Error),
+        let refresh_runtime = matches!(
+            &action,
+            crate::plugins_cmd::PluginAction::Install { .. }
+                | crate::plugins_cmd::PluginAction::Enable { .. }
+                | crate::plugins_cmd::PluginAction::Disable { .. }
+                | crate::plugins_cmd::PluginAction::Toggle { .. }
+                | crate::plugins_cmd::PluginAction::Update { .. }
+                | crate::plugins_cmd::PluginAction::Remove { .. }
+        );
+        match action {
+            crate::plugins_cmd::PluginAction::Search { query, source } => {
+                self.open_remote_plugin_selector(
+                    (!query.is_empty()).then_some(query.trim()),
+                    source.as_deref(),
+                );
+            }
+            crate::plugins_cmd::PluginAction::Browse => {
+                self.open_remote_plugin_selector(None, None);
+            }
+            other => match crate::plugins_cmd::run_capture(other) {
+                Ok(text) => {
+                    if refresh_runtime && let Err(error) = self.refresh_agent_plugin_runtime() {
+                        self.push_output(
+                            format!("Plugin runtime refresh failed: {error}"),
+                            OutputRole::Error,
+                        );
+                    }
+                    self.push_output(text, OutputRole::Assistant);
+                }
+                Err(error) => self.push_output(format!("plugins: {error}"), OutputRole::Error),
+            },
         }
     }
 
@@ -16134,14 +16929,7 @@ impl App {
 
     /// Render the full application frame.
     pub fn render(&mut self, frame: &mut Frame) {
-        let max_input_height = if self.editor_mode.is_compose() {
-            frame.area().height.saturating_sub(6).clamp(6, 16)
-        } else {
-            10
-        };
-        let min_input_height = if self.editor_mode.is_compose() { 5 } else { 3 };
-        let textarea_height =
-            (self.textarea.lines().len() as u16 + 2).clamp(min_input_height, max_input_height);
+        let textarea_height = self.input_area_height_for_area(frame.area());
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -16201,6 +16989,10 @@ impl App {
 
         if self.plugin_toggle.active {
             self.render_plugin_toggle(frame, frame.area());
+        }
+
+        if self.remote_plugin_browser.selector.active {
+            self.render_remote_plugin_selector(frame, frame.area());
         }
 
         if self.remote_skill_browser.selector.active {
@@ -16827,7 +17619,7 @@ impl App {
                         .add_modifier(Modifier::BOLD),
                 ));
                 right_spans.push(Span::styled(
-                    " NORMAL  vim hjkl/wbe  i/a/o edit  ^S=send  Esc=inline ",
+                    self.compose_normal_hint(),
                     Style::default().fg(Color::Rgb(255, 210, 80)),
                 ));
             } else if !self.active_skills.is_empty() {
@@ -17058,13 +17850,21 @@ impl App {
             );
             return;
         }
-        self.render_browser_detail(frame, body[1], detail_lines);
+        self.render_standard_split_detail(
+            frame,
+            body[1],
+            detail_surface,
+            Color::Cyan,
+            detail_lines,
+        );
 
         let help = Paragraph::new(Line::from(vec![
             Span::styled(" ↑↓ ", Style::default().fg(Color::Cyan)),
             Span::styled("browse  ", Style::default().fg(Color::DarkGray)),
             Span::styled("type ", Style::default().fg(Color::Cyan)),
             Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("PgUp/Dn ", Style::default().fg(Color::Cyan)),
+            Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Enter ", Style::default().fg(Color::Cyan)),
             Span::styled("select  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Z ", Style::default().fg(Color::Cyan)),
@@ -17322,12 +18122,36 @@ impl App {
             .split(area)
     }
 
+    fn browser_list_visible_rows(area: Rect, bordered: bool) -> usize {
+        let reserved_rows = if bordered { 2 } else { 0 };
+        area.height.saturating_sub(reserved_rows).max(1) as usize
+    }
+
     fn browser_scroll_start(selected: usize, max_visible: usize) -> usize {
         if selected >= max_visible {
             selected - max_visible + 1
         } else {
             0
         }
+    }
+
+    fn best_session_message_selection(
+        items: &[SessionMessageEntry],
+        matched_role: Option<&str>,
+        matched_snippet: Option<&str>,
+    ) -> usize {
+        let mut best_index = 0usize;
+        let mut best_score = 0usize;
+
+        for (index, entry) in items.iter().enumerate() {
+            let score = entry.browser_match_score(matched_role, matched_snippet);
+            if score > best_score {
+                best_score = score;
+                best_index = index;
+            }
+        }
+
+        best_index
     }
 
     fn render_browser_header(
@@ -17363,23 +18187,6 @@ impl App {
         frame.render_widget(search, area);
     }
 
-    fn render_browser_detail(
-        &self,
-        frame: &mut Frame,
-        area: Rect,
-        detail_lines: Vec<Line<'static>>,
-    ) {
-        let detail = Paragraph::new(Text::from(detail_lines))
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Rgb(60, 80, 84)))
-                    .title(" Details "),
-            );
-        frame.render_widget(detail, area);
-    }
-
     fn render_scrollable_browser_detail(
         &self,
         frame: &mut Frame,
@@ -17405,18 +18212,28 @@ impl App {
             return;
         }
 
-        let content_width = inner.width.saturating_sub(1).max(1) as usize;
-        let visual_rows: u16 = detail_lines
-            .iter()
-            .map(|line| {
-                let width = line.width();
-                if width == 0 {
-                    1
-                } else {
-                    width.div_ceil(content_width) as u16
-                }
-            })
-            .sum();
+        let visual_rows_for_width = |content_width: usize| -> u16 {
+            detail_lines
+                .iter()
+                .map(|line| {
+                    let width = line.width();
+                    if width == 0 {
+                        1
+                    } else {
+                        width.div_ceil(content_width.max(1)) as u16
+                    }
+                })
+                .sum()
+        };
+
+        let full_width = inner.width.max(1) as usize;
+        let mut content_width = full_width;
+        let mut visual_rows = visual_rows_for_width(content_width);
+        let needs_scrollbar = visual_rows > inner.height;
+        if needs_scrollbar && inner.width > 1 {
+            content_width = inner.width.saturating_sub(1).max(1) as usize;
+            visual_rows = visual_rows_for_width(content_width);
+        }
         let max_scroll = visual_rows.saturating_sub(inner.height);
         let scroll = chrome.requested_scroll.min(max_scroll);
 
@@ -17426,12 +18243,16 @@ impl App {
         let content_area = Rect {
             x: inner.x,
             y: inner.y,
-            width: inner.width.saturating_sub(1),
+            width: if needs_scrollbar && inner.width > 1 {
+                inner.width.saturating_sub(1)
+            } else {
+                inner.width
+            },
             height: inner.height,
         };
         frame.render_widget(paragraph, content_area);
 
-        if visual_rows > inner.height {
+        if needs_scrollbar {
             let mut scrollbar_state =
                 ScrollbarState::new(max_scroll as usize).position(scroll as usize);
             let scrollbar_area = Rect {
@@ -17457,8 +18278,70 @@ impl App {
             .is_some_and(|state| state.surface == surface)
     }
 
+    fn split_detail_scroll(&self, surface: DetailSurface) -> u16 {
+        match surface {
+            DetailSurface::GatewayBrowser => self.gateway_browser_pane.scroll,
+            DetailSurface::SessionBrowser => self.session_browser_pane.scroll,
+            DetailSurface::SessionInspector => self.session_inspector.pane.scroll,
+            _ => self.simple_detail_state.scroll_for(surface),
+        }
+    }
+
+    fn set_split_detail_scroll(&mut self, surface: DetailSurface, scroll: u16) {
+        match surface {
+            DetailSurface::GatewayBrowser => self.gateway_browser_pane.scroll = scroll,
+            DetailSurface::SessionBrowser => self.session_browser_pane.scroll = scroll,
+            DetailSurface::SessionInspector => self.session_inspector.pane.scroll = scroll,
+            _ => self.simple_detail_state.set_scroll(surface, scroll),
+        }
+    }
+
+    fn reset_split_detail_scroll(&mut self, surface: DetailSurface) {
+        self.set_split_detail_scroll(surface, 0);
+        self.needs_redraw = true;
+    }
+
+    fn page_up_split_detail(&mut self, surface: DetailSurface, step: u16) {
+        let scroll = self
+            .split_detail_scroll(surface)
+            .saturating_sub(step.max(1));
+        self.set_split_detail_scroll(surface, scroll);
+        self.needs_redraw = true;
+    }
+
+    fn page_down_split_detail(&mut self, surface: DetailSurface, step: u16) {
+        let scroll = self
+            .split_detail_scroll(surface)
+            .saturating_add(step.max(1));
+        self.set_split_detail_scroll(surface, scroll);
+        self.needs_redraw = true;
+    }
+
+    fn render_standard_split_detail(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        surface: DetailSurface,
+        border_color: Color,
+        detail_lines: Vec<Line<'static>>,
+    ) {
+        self.render_scrollable_browser_detail(
+            frame,
+            area,
+            ScrollableDetailChrome {
+                title: "Details",
+                border_color,
+                focused: true,
+                requested_scroll: self.split_detail_scroll(surface),
+            },
+            detail_lines,
+        );
+    }
+
     fn toggle_detail_fullscreen(&mut self, surface: DetailSurface, initial_scroll: u16) {
         if self.detail_fullscreen_active(surface) {
+            let scroll = self.detail_fullscreen_scroll(surface);
+            self.set_split_detail_scroll(surface, scroll);
             self.detail_fullscreen = None;
         } else {
             self.detail_fullscreen = Some(DetailFullscreenState {
@@ -17471,6 +18354,8 @@ impl App {
 
     fn close_detail_fullscreen(&mut self, surface: DetailSurface) -> bool {
         if self.detail_fullscreen_active(surface) {
+            let scroll = self.detail_fullscreen_scroll(surface);
+            self.set_split_detail_scroll(surface, scroll);
             self.detail_fullscreen = None;
             self.needs_redraw = true;
             true
@@ -17718,13 +18603,21 @@ impl App {
             return;
         }
 
-        self.render_browser_detail(frame, body[1], detail_lines);
+        self.render_standard_split_detail(
+            frame,
+            body[1],
+            DetailSurface::McpSelector,
+            Color::Rgb(110, 220, 210),
+            detail_lines,
+        );
 
         let help = Paragraph::new(Line::from(vec![
             Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("browse  ", Style::default().fg(Color::DarkGray)),
             Span::styled("type ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Enter ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("default action  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Space ", Style::default().fg(Color::Rgb(110, 220, 210))),
@@ -17947,8 +18840,8 @@ impl App {
                     .fg(Color::Rgb(255, 191, 0))
                     .add_modifier(Modifier::BOLD),
             )));
-            for notice in browser.notices.iter().take(4) {
-                detail_lines.push(Line::from(format!("- {}", unicode_trunc(notice, 120))));
+            for notice in &browser.notices {
+                detail_lines.push(Line::from(format!("- {notice}")));
             }
         }
 
@@ -18001,7 +18894,13 @@ impl App {
             return;
         }
 
-        self.render_browser_detail(frame, body[1], detail_lines);
+        self.render_standard_split_detail(
+            frame,
+            body[1],
+            DetailSurface::RemoteMcpBrowser,
+            Color::Rgb(90, 190, 220),
+            detail_lines,
+        );
 
         let status_text = if browser.inflight_request_id.is_some() {
             "searching"
@@ -18015,6 +18914,8 @@ impl App {
             Span::styled("browse  ", Style::default().fg(Color::DarkGray)),
             Span::styled("type ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Enter ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("default action  ", Style::default().fg(Color::DarkGray)),
             Span::styled("I ", Style::default().fg(Color::Rgb(110, 220, 210))),
@@ -18206,13 +19107,21 @@ impl App {
             );
             return;
         }
-        self.render_browser_detail(frame, body[1], detail_lines);
+        self.render_standard_split_detail(
+            frame,
+            body[1],
+            DetailSurface::SkillSelector,
+            Color::Rgb(255, 191, 0),
+            detail_lines,
+        );
 
         let help = Paragraph::new(Line::from(vec![
             Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(255, 191, 0))),
             Span::styled("browse  ", Style::default().fg(Color::DarkGray)),
             Span::styled("type ", Style::default().fg(Color::Rgb(255, 191, 0))),
             Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(255, 191, 0))),
+            Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Space ", Style::default().fg(Color::Rgb(255, 191, 0))),
             Span::styled("toggle active  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Enter ", Style::default().fg(Color::Rgb(255, 191, 0))),
@@ -18419,14 +19328,8 @@ impl App {
                     .fg(Color::Rgb(255, 191, 0))
                     .add_modifier(Modifier::BOLD),
             )));
-            for notice in browser.notices.iter().take(4) {
-                detail_lines.push(Line::from(format!("- {}", unicode_trunc(notice, 120))));
-            }
-            if browser.notices.len() > 4 {
-                detail_lines.push(Line::from(format!(
-                    "... {} more notice(s)",
-                    browser.notices.len() - 4
-                )));
+            for notice in &browser.notices {
+                detail_lines.push(Line::from(format!("- {notice}")));
             }
         }
 
@@ -18486,13 +19389,21 @@ impl App {
             return;
         }
 
-        self.render_browser_detail(frame, body[1], detail_lines);
+        self.render_standard_split_detail(
+            frame,
+            body[1],
+            DetailSurface::RemoteSkillBrowser,
+            Color::Rgb(255, 191, 0),
+            detail_lines,
+        );
 
         let mut help_spans = vec![
             Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("browse  ", Style::default().fg(Color::DarkGray)),
             Span::styled("type ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Enter ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("default action  ", Style::default().fg(Color::DarkGray)),
             Span::styled("I ", Style::default().fg(Color::Rgb(110, 220, 210))),
@@ -18518,6 +19429,328 @@ impl App {
         help_spans.push(Span::styled(
             format!("{} {}", filtered.len(), status_text),
             Style::default().fg(Color::Rgb(100, 120, 120)),
+        ));
+        let help = Paragraph::new(Line::from(help_spans));
+        frame.render_widget(help, chunks[2]);
+    }
+
+    fn render_remote_plugin_selector(&self, frame: &mut Frame, area: Rect) {
+        frame.render_widget(Clear, area);
+
+        let chunks = Self::browser_overlay_chunks(area);
+        let body = Self::browser_body_chunks(chunks[1]);
+
+        let browser = &self.remote_plugin_browser;
+        let query = browser.current_query();
+        let title = if let Some(source) = browser.source_filter.as_deref() {
+            if browser.inflight_request_id.is_some() {
+                format!("Remote Plugins · {source} · Searching…")
+            } else {
+                format!("Remote Plugins · {source}")
+            }
+        } else if browser.inflight_request_id.is_some() {
+            "Remote Plugins · Searching…".to_string()
+        } else {
+            "Remote Plugins".to_string()
+        };
+        self.render_browser_header(
+            frame,
+            chunks[0],
+            &browser.selector.query,
+            BrowserChrome {
+                title: &title,
+                placeholder:
+                    "Type to search official and configured plugin registries, or use /plugins search --source <name> <query>",
+                icon: "🔌",
+                icon_color: Color::Rgb(210, 190, 110),
+                border_color: if browser.inflight_request_id.is_some() {
+                    Color::Rgb(210, 190, 110)
+                } else {
+                    Color::Rgb(255, 191, 0)
+                },
+            },
+        );
+
+        let filtered = &browser.selector.filtered;
+        let selected = browser.selector.selected;
+        let max_visible = body[0].height as usize;
+        let scroll_start = Self::browser_scroll_start(selected, max_visible);
+
+        let items: Vec<ListItem> = if filtered.is_empty() {
+            let empty_text = if query.is_empty() {
+                "  Start typing to search remote plugins."
+            } else if browser.inflight_request_id.is_some() {
+                "  Searching remote plugin registries…"
+            } else {
+                "  No remote plugins matched this query."
+            };
+            vec![ListItem::new(Line::from(Span::styled(
+                empty_text.to_string(),
+                Style::default().fg(Color::Rgb(120, 120, 135)),
+            )))]
+        } else {
+            filtered
+                .iter()
+                .skip(scroll_start)
+                .take(max_visible)
+                .enumerate()
+                .map(|(vis_idx, &entry_idx)| {
+                    let entry = &browser.selector.items[entry_idx];
+                    let is_selected = vis_idx + scroll_start == selected;
+                    let bg = if is_selected {
+                        Color::Rgb(42, 34, 18)
+                    } else {
+                        Color::Rgb(24, 22, 16)
+                    };
+                    let source_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(205, 190, 140))
+                    } else {
+                        Style::default().fg(Color::Rgb(155, 140, 105))
+                    };
+                    let action_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(210, 240, 175))
+                    } else {
+                        Style::default().fg(Color::Rgb(135, 165, 110))
+                    };
+                    let kind_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(150, 165, 205))
+                    } else {
+                        Style::default().fg(Color::Rgb(110, 125, 160))
+                    };
+                    let main_style = if is_selected {
+                        Style::default()
+                            .bg(bg)
+                            .fg(Color::Rgb(255, 236, 175))
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Rgb(220, 220, 210))
+                    };
+                    let desc_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(185, 180, 165))
+                    } else {
+                        Style::default().fg(Color::Rgb(140, 135, 125))
+                    };
+                    ListItem::new(Line::from(vec![
+                        selector_marker(is_selected, Color::Rgb(255, 210, 110), Some(bg)),
+                        Span::styled(format!("  {:<11}", entry.source_label), source_style),
+                        Span::styled(format!("{:<8}", entry.action.label()), action_style),
+                        Span::styled(unicode_pad_right(&entry.kind, 8), kind_style),
+                        Span::raw("  "),
+                        Span::styled(unicode_trunc(&entry.identifier, 40), main_style),
+                        Span::raw("  "),
+                        Span::styled(unicode_trunc(&entry.description, 28), desc_style),
+                    ]))
+                })
+                .collect()
+        };
+
+        frame.render_widget(
+            List::new(items).style(Style::default().bg(Color::Rgb(24, 22, 16))),
+            body[0],
+        );
+
+        let mut detail_lines = Vec::new();
+        if let Some(entry) = browser.selector.current() {
+            let status_line = match entry.action {
+                RemotePluginAction::Install => "Default action: install".to_string(),
+                RemotePluginAction::Update => format!(
+                    "Default action: update ({})",
+                    entry.installed_name.as_deref().unwrap_or(&entry.name)
+                ),
+                RemotePluginAction::Replace => {
+                    "Default action: replace existing local plugin".to_string()
+                }
+            };
+            detail_lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{} ", entry.source_label),
+                    Style::default()
+                        .fg(Color::Rgb(255, 236, 175))
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("[{}]", entry.trust_level),
+                    Style::default().fg(Color::Rgb(185, 180, 165)),
+                ),
+            ]));
+            detail_lines.push(Line::from(entry.identifier.clone()));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(entry.description.clone()));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(vec![
+                Span::styled("Kind: ", Style::default().fg(Color::Rgb(205, 190, 140))),
+                Span::raw(entry.kind.clone()),
+            ]));
+            detail_lines.push(Line::from(vec![
+                Span::styled("Origin: ", Style::default().fg(Color::Rgb(205, 190, 140))),
+                Span::raw(entry.origin.clone()),
+            ]));
+            detail_lines.push(Line::from(vec![
+                Span::styled("Action: ", Style::default().fg(Color::Rgb(205, 190, 140))),
+                Span::raw(status_line),
+            ]));
+            if !entry.requires_env.is_empty() {
+                detail_lines.push(Line::from(vec![
+                    Span::styled(
+                        "Requires env: ",
+                        Style::default().fg(Color::Rgb(205, 190, 140)),
+                    ),
+                    Span::raw(entry.requires_env.join(", ")),
+                ]));
+            }
+            if !entry.tags.is_empty() {
+                detail_lines.push(Line::from(vec![
+                    Span::styled("Tags: ", Style::default().fg(Color::Rgb(205, 190, 140))),
+                    Span::raw(entry.tags.join(", ")),
+                ]));
+            }
+            if entry.action == RemotePluginAction::Replace {
+                detail_lines.push(Line::from(""));
+                detail_lines.push(Line::from(Span::styled(
+                    "Warning: this source would replace an existing local plugin with the same name.",
+                    Style::default().fg(Color::Rgb(255, 180, 120)),
+                )));
+            }
+        } else if query.is_empty() {
+            detail_lines.push(Line::from(Span::styled(
+                "Registry Sources",
+                Style::default()
+                    .fg(Color::Rgb(255, 236, 175))
+                    .add_modifier(Modifier::BOLD),
+            )));
+            let config = self.load_runtime_config();
+            for source in edgecrab_plugins::hub_source_summaries(&config.plugins) {
+                detail_lines.push(Line::from(format!(
+                    "- {} [{}] — {}",
+                    source.label,
+                    format!("{:?}", source.trust_level).to_ascii_lowercase(),
+                    source.description
+                )));
+            }
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(
+                "Use /plugins search --source hermes <query> to constrain the browser to one registry family.",
+            ));
+        } else if browser.inflight_request_id.is_some() {
+            detail_lines.push(Line::from("Searching remote plugin registries…"));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(
+                "You can keep typing while results refresh. Source failures are surfaced as notes instead of blocking the browser.",
+            ));
+        } else {
+            detail_lines.push(Line::from("No results for the current query."));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(
+                "Try a broader term, a source name like 'edgecrab' or 'hermes', or use /plugins search --source <name> <query>.",
+            ));
+        }
+
+        if !browser.notices.is_empty() {
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(Span::styled(
+                "Source Notes",
+                Style::default()
+                    .fg(Color::Rgb(255, 191, 0))
+                    .add_modifier(Modifier::BOLD),
+            )));
+            for notice in &browser.notices {
+                detail_lines.push(Line::from(format!("- {notice}")));
+            }
+        }
+
+        if let Some(action) = &browser.action_in_flight {
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(Span::styled(
+                format!("Running: {action}"),
+                Style::default().fg(Color::Rgb(210, 240, 175)),
+            )));
+        }
+
+        if self.detail_fullscreen_active(DetailSurface::RemotePluginBrowser) {
+            self.render_fullscreen_browser_detail(
+                frame,
+                area,
+                FullscreenBrowserChrome {
+                    query: &browser.selector.query,
+                    header: BrowserChrome {
+                        title: &title,
+                        placeholder:
+                            "Type to search official and configured plugin registries, or use /plugins search --source <name> <query>",
+                        icon: "🔌",
+                        icon_color: Color::Rgb(255, 210, 110),
+                        border_color: if browser.inflight_request_id.is_some() {
+                            Color::Rgb(255, 210, 110)
+                        } else {
+                            Color::Rgb(255, 191, 0)
+                        },
+                    },
+                    detail: ScrollableDetailChrome {
+                        title: "Details",
+                        border_color: Color::Rgb(255, 191, 0),
+                        focused: true,
+                        requested_scroll: self
+                            .detail_fullscreen_scroll(DetailSurface::RemotePluginBrowser),
+                    },
+                    help: Line::from(vec![
+                        Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(255, 210, 110))),
+                        Span::styled("change item  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("type ", Style::default().fg(Color::Rgb(255, 210, 110))),
+                        Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(255, 210, 110))),
+                        Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Enter ", Style::default().fg(Color::Rgb(255, 210, 110))),
+                        Span::styled("default action  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Z ", Style::default().fg(Color::Rgb(255, 210, 110))),
+                        Span::styled("split view  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Esc ", Style::default().fg(Color::Rgb(255, 210, 110))),
+                        Span::styled("close  ", Style::default().fg(Color::DarkGray)),
+                    ]),
+                },
+                detail_lines,
+            );
+            return;
+        }
+
+        self.render_standard_split_detail(
+            frame,
+            body[1],
+            DetailSurface::RemotePluginBrowser,
+            Color::Rgb(255, 191, 0),
+            detail_lines,
+        );
+
+        let mut help_spans = vec![
+            Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(255, 210, 110))),
+            Span::styled("browse  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("type ", Style::default().fg(Color::Rgb(255, 210, 110))),
+            Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(255, 210, 110))),
+            Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Enter ", Style::default().fg(Color::Rgb(255, 210, 110))),
+            Span::styled("default action  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("I ", Style::default().fg(Color::Rgb(255, 210, 110))),
+            Span::styled("install/update  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("U ", Style::default().fg(Color::Rgb(255, 210, 110))),
+            Span::styled("update  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Z ", Style::default().fg(Color::Rgb(255, 210, 110))),
+            Span::styled("detail  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("R ", Style::default().fg(Color::Rgb(255, 210, 110))),
+            Span::styled("refresh  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("L ", Style::default().fg(Color::Rgb(255, 210, 110))),
+            Span::styled("local browser  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Esc ", Style::default().fg(Color::Rgb(255, 210, 110))),
+            Span::styled("cancel  ", Style::default().fg(Color::DarkGray)),
+        ];
+        let status_text = if browser.inflight_request_id.is_some() {
+            "searching"
+        } else if !query.is_empty() && filtered.is_empty() {
+            "no matches"
+        } else {
+            "matches"
+        };
+        help_spans.push(Span::styled(
+            format!("{} {}", filtered.len(), status_text),
+            Style::default().fg(Color::Rgb(155, 140, 105)),
         ));
         let help = Paragraph::new(Line::from(help_spans));
         frame.render_widget(help, chunks[2]);
@@ -18697,7 +19930,7 @@ impl App {
                     if !entry.description.is_empty() {
                         detail_lines.push(Line::from(""));
                         detail_lines.push(Line::from("Included tools:"));
-                        for tool in entry.description.split(", ").take(8) {
+                        for tool in entry.description.split(", ") {
                             detail_lines.push(Line::from(format!("  • {tool}")));
                         }
                     }
@@ -18719,14 +19952,6 @@ impl App {
             }
         }
 
-        let detail = Paragraph::new(Text::from(detail_lines.clone()))
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Rgb(64, 88, 98)))
-                    .title(" Details "),
-            );
         if self.detail_fullscreen_active(DetailSurface::ToolManager) {
             self.render_fullscreen_browser_detail(
                 frame,
@@ -18767,7 +19992,13 @@ impl App {
             );
             return;
         }
-        frame.render_widget(detail, body[1]);
+        self.render_standard_split_detail(
+            frame,
+            body[1],
+            DetailSurface::ToolManager,
+            Color::Rgb(110, 220, 210),
+            detail_lines,
+        );
 
         let footer_note = self
             .tool_manager_status_note
@@ -18776,6 +20007,8 @@ impl App {
         let help = Paragraph::new(Line::from(vec![
             Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("browse  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Space ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("toggle  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Tab ", Style::default().fg(Color::Rgb(110, 220, 210))),
@@ -18797,60 +20030,38 @@ impl App {
     fn render_plugin_toggle(&self, frame: &mut Frame, area: Rect) {
         frame.render_widget(Clear, area);
 
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3),
-                Constraint::Min(1),
-                Constraint::Length(1),
-            ])
-            .split(area);
-        let body = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-            .split(chunks[1]);
-
-        let search_text = if self.plugin_toggle.query.is_empty() {
-            "Search plugins, descriptions, or kinds".to_string()
-        } else {
-            self.plugin_toggle.query.clone()
-        };
-        let search_style = if self.plugin_toggle.query.is_empty() {
-            Style::default().fg(Color::DarkGray)
-        } else {
-            Style::default().fg(Color::White)
-        };
-        let header = Paragraph::new(Line::from(vec![
-            Span::styled("  🔌 ", Style::default().fg(Color::Rgb(210, 190, 110))),
-            Span::styled(search_text, search_style),
-            Span::raw("   "),
-            Span::styled(
-                format!("[{}]", self.plugin_toggle_scope.title()),
-                Style::default()
-                    .fg(Color::Rgb(255, 238, 170))
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Rgb(210, 190, 110)))
-                .title(" Plugin Toggle "),
+        let chunks = Self::browser_overlay_chunks(area);
+        let body = Self::browser_body_chunks(chunks[1]);
+        let title = format!("Browse Plugins [{}]", self.plugin_toggle_scope.title());
+        self.render_browser_header(
+            frame,
+            chunks[0],
+            &self.plugin_toggle.query,
+            BrowserChrome {
+                title: &title,
+                placeholder:
+                    "Search installed plugins by name, tool, CLI command, status, source, or trust.",
+                icon: "🔌",
+                icon_color: Color::Rgb(210, 190, 110),
+                border_color: Color::Rgb(210, 190, 110),
+            },
         );
-        frame.render_widget(header, chunks[0]);
 
         let filtered = &self.plugin_toggle.filtered;
         let selected = self.plugin_toggle.selected;
         let max_visible = body[0].height as usize;
-        let scroll_start = if selected >= max_visible {
-            selected - max_visible + 1
-        } else {
-            0
-        };
+        let scroll_start = Self::browser_scroll_start(selected, max_visible);
 
         let items: Vec<ListItem> = if filtered.is_empty() {
+            let empty_text = if self.plugin_toggle.items.is_empty() {
+                "  No local plugins installed yet."
+            } else if self.plugin_toggle.query.trim().is_empty() {
+                "  No plugins available in this scope."
+            } else {
+                "  No plugins matched the current filter."
+            };
             vec![ListItem::new(Line::from(Span::styled(
-                "  No plugins matched the current filter.",
+                empty_text.to_string(),
                 Style::default().fg(Color::Rgb(120, 120, 135)),
             )))]
         } else {
@@ -18867,6 +20078,27 @@ impl App {
                     } else {
                         Color::Rgb(22, 22, 18)
                     };
+                    let state_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(210, 240, 175))
+                    } else {
+                        Style::default().fg(Color::Rgb(150, 180, 120))
+                    };
+                    let pending_style = if entry.has_pending_change() {
+                        if is_selected {
+                            Style::default().bg(bg).fg(Color::Rgb(255, 195, 120))
+                        } else {
+                            Style::default().fg(Color::Rgb(210, 150, 90))
+                        }
+                    } else if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(120, 110, 90))
+                    } else {
+                        Style::default().fg(Color::Rgb(90, 85, 70))
+                    };
+                    let kind_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(150, 165, 205))
+                    } else {
+                        Style::default().fg(Color::Rgb(110, 125, 160))
+                    };
                     let name_style = if is_selected {
                         Style::default()
                             .bg(bg)
@@ -18875,22 +20107,48 @@ impl App {
                     } else {
                         Style::default().fg(Color::Rgb(220, 220, 210))
                     };
+                    let trust_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(205, 190, 140))
+                    } else {
+                        Style::default().fg(Color::Rgb(155, 140, 105))
+                    };
+                    let detail_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(160, 160, 145))
+                    } else {
+                        Style::default().fg(Color::Rgb(120, 120, 110))
+                    };
                     ListItem::new(Line::from(vec![
                         selector_marker(is_selected, Color::Rgb(210, 190, 110), Some(bg)),
+                        Span::styled(format!("  {:<8}", entry.runtime_status), state_style),
+                        Span::raw("  "),
                         Span::styled(
-                            format!("  {}", entry.check_state.glyph()),
-                            Style::default().bg(bg).fg(Color::Rgb(180, 220, 150)),
+                            format!(
+                                "{:<7}",
+                                if entry.has_pending_change() {
+                                    "staged"
+                                } else {
+                                    ""
+                                }
+                            ),
+                            pending_style,
                         ),
                         Span::raw("  "),
-                        Span::styled(unicode_pad_right(&entry.kind, 12), Style::default().bg(bg)),
-                        Span::styled(unicode_pad_right(&entry.display_name, 26), name_style),
+                        Span::styled(unicode_pad_right(&entry.kind, 8), kind_style),
+                        Span::styled(unicode_trunc(&entry.display_name, 24), name_style),
+                        Span::raw("  "),
+                        Span::styled(unicode_pad_right(&entry.trust_level, 10), trust_style),
                         Span::raw("  "),
                         Span::styled(
                             unicode_trunc(
-                                &format!("v{} · ~{} tokens", entry.version, entry.estimated_tokens),
-                                28,
+                                &format!(
+                                    "{} {} tool{}",
+                                    entry.check_state.glyph(),
+                                    entry.tool_count,
+                                    if entry.tool_count == 1 { "" } else { "s" }
+                                ),
+                                18,
                             ),
-                            Style::default().bg(bg).fg(Color::Rgb(160, 160, 145)),
+                            detail_style,
                         ),
                     ]))
                 })
@@ -18910,38 +20168,144 @@ impl App {
                     .add_modifier(Modifier::BOLD),
             )));
             detail_lines.push(Line::from(""));
-            detail_lines.push(Line::from(format!("Kind: {}", entry.kind)));
-            detail_lines.push(Line::from(format!("Version: {}", entry.version)));
-            detail_lines.push(Line::from(format!("Source: {}", entry.source)));
-            detail_lines.push(Line::from(format!("Tools: {}", entry.tool_count)));
-            detail_lines.push(Line::from(format!(
-                "Estimated prompt cost: ~{} tokens",
-                entry.estimated_tokens
-            )));
-            if entry.needs_credentials {
-                detail_lines.push(Line::from(format!(
-                    "Credentials: {}",
-                    if entry.credentials_satisfied {
-                        "configured"
-                    } else {
-                        "missing required environment variables"
-                    }
+            detail_lines.push(Line::from(vec![
+                Span::styled(
+                    "Desired state: ",
+                    Style::default().fg(Color::Rgb(205, 190, 140)),
+                ),
+                Span::raw(entry.state_label()),
+            ]));
+            detail_lines.push(Line::from(vec![
+                Span::styled(
+                    "Runtime status: ",
+                    Style::default().fg(Color::Rgb(205, 190, 140)),
+                ),
+                Span::raw(entry.runtime_status.clone()),
+            ]));
+            detail_lines.push(Line::from(vec![
+                Span::styled("Scope: ", Style::default().fg(Color::Rgb(205, 190, 140))),
+                Span::raw(self.plugin_toggle_scope.title()),
+            ]));
+            detail_lines.push(Line::from(vec![
+                Span::styled("Kind: ", Style::default().fg(Color::Rgb(205, 190, 140))),
+                Span::raw(entry.kind.clone()),
+            ]));
+            detail_lines.push(Line::from(vec![
+                Span::styled("Trust: ", Style::default().fg(Color::Rgb(205, 190, 140))),
+                Span::raw(entry.trust_level.clone()),
+            ]));
+            detail_lines.push(Line::from(vec![
+                Span::styled("Version: ", Style::default().fg(Color::Rgb(205, 190, 140))),
+                Span::raw(entry.version.clone()),
+            ]));
+            detail_lines.push(Line::from(vec![
+                Span::styled("Source: ", Style::default().fg(Color::Rgb(205, 190, 140))),
+                Span::raw(entry.source.clone()),
+            ]));
+            if let Some(install_source) = entry.install_source.as_deref() {
+                detail_lines.push(Line::from(vec![
+                    Span::styled(
+                        "Install source: ",
+                        Style::default().fg(Color::Rgb(205, 190, 140)),
+                    ),
+                    Span::raw(install_source.to_string()),
+                ]));
+            }
+            detail_lines.push(Line::from(vec![
+                Span::styled("Tools: ", Style::default().fg(Color::Rgb(205, 190, 140))),
+                Span::raw(if entry.tools.is_empty() {
+                    "none".into()
+                } else {
+                    entry.tools.join(", ")
+                }),
+            ]));
+            if !entry.cli_commands.is_empty() {
+                detail_lines.push(Line::from(vec![
+                    Span::styled("CLI: ", Style::default().fg(Color::Rgb(205, 190, 140))),
+                    Span::raw(entry.cli_commands.join(", ")),
+                ]));
+            }
+            if let Some(compatibility) = entry.compatibility.as_deref() {
+                detail_lines.push(Line::from(vec![
+                    Span::styled(
+                        "Compatibility: ",
+                        Style::default().fg(Color::Rgb(205, 190, 140)),
+                    ),
+                    Span::raw(compatibility.to_string()),
+                ]));
+            }
+            if !entry.related_skills.is_empty() {
+                detail_lines.push(Line::from(vec![
+                    Span::styled(
+                        "Related skills: ",
+                        Style::default().fg(Color::Rgb(205, 190, 140)),
+                    ),
+                    Span::raw(entry.related_skills.join(", ")),
+                ]));
+            }
+            detail_lines.push(Line::from(vec![
+                Span::styled(
+                    "Estimated prompt cost: ",
+                    Style::default().fg(Color::Rgb(205, 190, 140)),
+                ),
+                Span::raw(format!("~{} tokens", entry.estimated_tokens)),
+            ]));
+            if !entry.missing_env.is_empty() {
+                detail_lines.push(Line::from(vec![
+                    Span::styled(
+                        "Missing env: ",
+                        Style::default().fg(Color::Rgb(255, 180, 120)),
+                    ),
+                    Span::raw(entry.missing_env.join(", ")),
+                ]));
+            }
+            if entry.has_pending_change() {
+                detail_lines.push(Line::from(""));
+                detail_lines.push(Line::from(Span::styled(
+                    "This plugin has staged changes that are not saved yet.",
+                    Style::default().fg(Color::Rgb(255, 195, 120)),
                 )));
             }
             detail_lines.push(Line::from(""));
             for line in entry.description.lines() {
                 detail_lines.push(Line::from(line.to_string()));
             }
+        } else if self.plugin_toggle.items.is_empty() {
+            detail_lines.push(Line::from(Span::styled(
+                "No Local Plugins",
+                Style::default()
+                    .fg(Color::Rgb(255, 236, 175))
+                    .add_modifier(Modifier::BOLD),
+            )));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(
+                "Install a local Hermes plugin with `edgecrab plugins install ./path`, or press R to search remote plugin registries.",
+            ));
+        } else if self.plugin_toggle.query.trim().is_empty() {
+            detail_lines.push(Line::from(Span::styled(
+                "Installed Plugins",
+                Style::default()
+                    .fg(Color::Rgb(255, 236, 175))
+                    .add_modifier(Modifier::BOLD),
+            )));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(
+                "Browse installed plugins by status, tool surface, trust, and source.",
+            ));
+            detail_lines.push(Line::from(
+                "Space stages enable or disable changes. Enter saves them for the active scope.",
+            ));
+            detail_lines.push(Line::from(
+                "Tab cycles between global policy and platform-specific policy.",
+            ));
+        } else {
+            detail_lines.push(Line::from("No plugins matched the current query."));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(
+                "Try a broader term, a tool name, a trust level, or press R to search remote sources.",
+            ));
         }
 
-        let detail = Paragraph::new(Text::from(detail_lines.clone()))
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Rgb(110, 96, 58)))
-                    .title(" Details "),
-            );
         if self.detail_fullscreen_active(DetailSurface::PluginToggle) {
             self.render_fullscreen_browser_detail(
                 frame,
@@ -18949,8 +20313,9 @@ impl App {
                 FullscreenBrowserChrome {
                     query: &self.plugin_toggle.query,
                     header: BrowserChrome {
-                        title: "Plugin Toggle",
-                        placeholder: "Search plugins, descriptions, or kinds",
+                        title: &title,
+                        placeholder:
+                            "Search installed plugins by name, tool, CLI command, status, source, or trust.",
                         icon: "🔌",
                         icon_color: Color::Rgb(210, 190, 110),
                         border_color: Color::Rgb(210, 190, 110),
@@ -18970,11 +20335,13 @@ impl App {
                         Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(210, 190, 110))),
                         Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
                         Span::styled("Space ", Style::default().fg(Color::Rgb(210, 190, 110))),
-                        Span::styled("toggle  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("stage change  ", Style::default().fg(Color::DarkGray)),
                         Span::styled("Enter ", Style::default().fg(Color::Rgb(210, 190, 110))),
                         Span::styled("save  ", Style::default().fg(Color::DarkGray)),
                         Span::styled("Tab ", Style::default().fg(Color::Rgb(210, 190, 110))),
                         Span::styled("scope  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("R ", Style::default().fg(Color::Rgb(210, 190, 110))),
+                        Span::styled("remote search  ", Style::default().fg(Color::DarkGray)),
                         Span::styled("Z ", Style::default().fg(Color::Rgb(210, 190, 110))),
                         Span::styled("split view  ", Style::default().fg(Color::DarkGray)),
                         Span::styled("Esc ", Style::default().fg(Color::Rgb(210, 190, 110))),
@@ -18985,7 +20352,13 @@ impl App {
             );
             return;
         }
-        frame.render_widget(detail, body[1]);
+        self.render_standard_split_detail(
+            frame,
+            body[1],
+            DetailSurface::PluginToggle,
+            Color::Rgb(210, 190, 110),
+            detail_lines,
+        );
 
         let footer_note = self
             .plugin_toggle_status_note
@@ -18994,12 +20367,18 @@ impl App {
         let help = Paragraph::new(Line::from(vec![
             Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(210, 190, 110))),
             Span::styled("browse  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("type ", Style::default().fg(Color::Rgb(210, 190, 110))),
+            Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(210, 190, 110))),
+            Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Space ", Style::default().fg(Color::Rgb(210, 190, 110))),
-            Span::styled("toggle  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("stage change  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Enter ", Style::default().fg(Color::Rgb(210, 190, 110))),
             Span::styled("save  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Tab ", Style::default().fg(Color::Rgb(210, 190, 110))),
             Span::styled("scope  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("R ", Style::default().fg(Color::Rgb(210, 190, 110))),
+            Span::styled("remote search  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Z ", Style::default().fg(Color::Rgb(210, 190, 110))),
             Span::styled("detail  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Esc ", Style::default().fg(Color::Rgb(210, 190, 110))),
@@ -19010,6 +20389,87 @@ impl App {
             ),
         ]));
         frame.render_widget(help, chunks[2]);
+    }
+
+    fn build_config_detail_lines(&self, entry: Option<&ConfigEntry>) -> Vec<Line<'static>> {
+        let mut detail_lines = Vec::new();
+        if let Some(entry) = entry {
+            detail_lines.push(Line::from(Span::styled(
+                entry.title.clone(),
+                Style::default()
+                    .fg(Color::Rgb(130, 210, 255))
+                    .add_modifier(Modifier::BOLD),
+            )));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(entry.detail.clone()));
+            detail_lines.push(Line::from(""));
+            let detail_body = match entry.action {
+                ConfigAction::ShowSummary => self.render_config_summary(),
+                ConfigAction::ShowPaths => self.render_config_paths(),
+                ConfigAction::OpenTools => {
+                    "Press Enter to open the live tool manager. Use Space to toggle toolsets or individual tools, Tab to switch scopes, and R to restore defaults.".into()
+                }
+                ConfigAction::OpenGatewayBrowser => {
+                    "Press Enter to open the gateway control browser. From there you can toggle platforms, edit bind settings, change allowlists, update home channels, and restart the gateway runtime without leaving the TUI.".into()
+                }
+                ConfigAction::ShowGatewayHomes => {
+                    let config = self.load_runtime_config();
+                    self.render_gateway_home_channel_summary(&config)
+                }
+                ConfigAction::ShowVoice => format!(
+                    "Voice readback is {}.\nRun `/voice status` for recorder, provider, and push-to-talk details.",
+                    if self.voice_mode_enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                ),
+                ConfigAction::ShowUpdateStatus => {
+                    "Runs the local git-based update check and prints ahead/behind guidance.".into()
+                }
+                ConfigAction::OpenModel => "Press Enter to open the model selector overlay.".into(),
+                ConfigAction::OpenCheapModel => {
+                    "Press Enter to open the cheap-model selector. Selecting a model enables smart routing for obviously simple turns.".into()
+                }
+                ConfigAction::ToggleMoa => {
+                    "Press Enter to enable or disable the moa tool while keeping the saved aggregator and expert roster.".into()
+                }
+                ConfigAction::OpenVisionModel => {
+                    "Press Enter to open the dedicated vision-model selector.".into()
+                }
+                ConfigAction::OpenImageModel => {
+                    "Press Enter to open the image-model selector.".into()
+                }
+                ConfigAction::OpenMoaAggregator => {
+                    "Press Enter to pick the default aggregator model used by the moa tool.".into()
+                }
+                ConfigAction::OpenMoaReferences => {
+                    "Press Enter to edit the full default MoA expert roster. Use Space to toggle experts and Enter to save.".into()
+                }
+                ConfigAction::AddMoaExpert => {
+                    "Press Enter to choose one model to add to the saved MoA expert roster.".into()
+                }
+                ConfigAction::RemoveMoaExpert => {
+                    "Press Enter to choose one configured expert to remove from the saved MoA roster.".into()
+                }
+                ConfigAction::ToggleStreaming => {
+                    "Press Enter to toggle live token streaming.".into()
+                }
+                ConfigAction::ToggleReasoning => {
+                    "Press Enter to toggle visible reasoning output.".into()
+                }
+                ConfigAction::ToggleStatusBar => {
+                    "Press Enter to show or hide the status bar.".into()
+                }
+                ConfigAction::OpenSkins => {
+                    "Press Enter to browse installed skins and apply one live.".into()
+                }
+            };
+            for line in detail_body.lines() {
+                detail_lines.push(Line::from(line.to_string()));
+            }
+        }
+        detail_lines
     }
 
     fn render_config_selector(&self, frame: &mut Frame, area: Rect) {
@@ -19111,92 +20571,7 @@ impl App {
             body[0],
         );
 
-        let mut detail_lines = Vec::new();
-        if let Some(entry) = self.config_selector.current() {
-            detail_lines.push(Line::from(Span::styled(
-                entry.title.clone(),
-                Style::default()
-                    .fg(Color::Rgb(130, 210, 255))
-                    .add_modifier(Modifier::BOLD),
-            )));
-            detail_lines.push(Line::from(""));
-            detail_lines.push(Line::from(entry.detail.clone()));
-            detail_lines.push(Line::from(""));
-            let detail_body = match entry.action {
-                ConfigAction::ShowSummary => self.render_config_summary(),
-                ConfigAction::ShowPaths => self.render_config_paths(),
-                ConfigAction::OpenTools => {
-                    "Press Enter to open the live tool manager. Use Space to toggle toolsets or individual tools, Tab to switch scopes, and R to restore defaults.".into()
-                }
-                ConfigAction::OpenGatewayBrowser => {
-                    "Press Enter to open the gateway control browser. From there you can toggle platforms, edit bind settings, change allowlists, update home channels, and restart the gateway runtime without leaving the TUI.".into()
-                }
-                ConfigAction::ShowGatewayHomes => {
-                    let config = self.load_runtime_config();
-                    self.render_gateway_home_channel_summary(&config)
-                }
-                ConfigAction::ShowVoice => format!(
-                    "Voice readback is {}.\nRun `/voice status` for recorder, provider, and push-to-talk details.",
-                    if self.voice_mode_enabled {
-                        "enabled"
-                    } else {
-                        "disabled"
-                    }
-                ),
-                ConfigAction::ShowUpdateStatus => {
-                    "Runs the local git-based update check and prints ahead/behind guidance.".into()
-                }
-                ConfigAction::OpenModel => "Press Enter to open the model selector overlay.".into(),
-                ConfigAction::OpenCheapModel => {
-                    "Press Enter to open the cheap-model selector. Selecting a model enables smart routing for obviously simple turns.".into()
-                }
-                ConfigAction::ToggleMoa => {
-                    "Press Enter to enable or disable the moa tool while keeping the saved aggregator and expert roster.".into()
-                }
-                ConfigAction::OpenVisionModel => {
-                    "Press Enter to open the dedicated vision-model selector.".into()
-                }
-                ConfigAction::OpenImageModel => {
-                    "Press Enter to open the image-model selector.".into()
-                }
-                ConfigAction::OpenMoaAggregator => {
-                    "Press Enter to pick the default aggregator model used by the moa tool.".into()
-                }
-                ConfigAction::OpenMoaReferences => {
-                    "Press Enter to edit the full default MoA expert roster. Use Space to toggle experts and Enter to save.".into()
-                }
-                ConfigAction::AddMoaExpert => {
-                    "Press Enter to choose one model to add to the saved MoA expert roster.".into()
-                }
-                ConfigAction::RemoveMoaExpert => {
-                    "Press Enter to choose one configured expert to remove from the saved MoA roster.".into()
-                }
-                ConfigAction::ToggleStreaming => {
-                    "Press Enter to toggle live token streaming.".into()
-                }
-                ConfigAction::ToggleReasoning => {
-                    "Press Enter to toggle visible reasoning output.".into()
-                }
-                ConfigAction::ToggleStatusBar => {
-                    "Press Enter to show or hide the status bar.".into()
-                }
-                ConfigAction::OpenSkins => {
-                    "Press Enter to browse installed skins and apply one live.".into()
-                }
-            };
-            for line in detail_body.lines().take(18) {
-                detail_lines.push(Line::from(line.to_string()));
-            }
-        }
-
-        let detail = Paragraph::new(Text::from(detail_lines.clone()))
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Rgb(64, 88, 98)))
-                    .title(" Details "),
-            );
+        let detail_lines = self.build_config_detail_lines(self.config_selector.current());
         if self.detail_fullscreen_active(DetailSurface::ConfigSelector) {
             self.render_fullscreen_browser_detail(
                 frame,
@@ -19236,11 +20611,19 @@ impl App {
             );
             return;
         }
-        frame.render_widget(detail, body[1]);
+        self.render_standard_split_detail(
+            frame,
+            body[1],
+            DetailSurface::ConfigSelector,
+            Color::Rgb(130, 210, 255),
+            detail_lines,
+        );
 
         let help = Paragraph::new(Line::from(vec![
             Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(130, 210, 255))),
             Span::styled("browse  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(130, 210, 255))),
+            Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Enter ", Style::default().fg(Color::Rgb(130, 210, 255))),
             Span::styled("run action  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Z ", Style::default().fg(Color::Rgb(130, 210, 255))),
@@ -19276,7 +20659,7 @@ impl App {
 
         let filtered = &self.gateway_browser.filtered;
         let selected = self.gateway_browser.selected;
-        let max_visible = body[0].height as usize;
+        let max_visible = Self::browser_list_visible_rows(body[0], false);
         let scroll_start = Self::browser_scroll_start(selected, max_visible);
 
         let items: Vec<ListItem> = if filtered.is_empty() {
@@ -19454,6 +20837,123 @@ impl App {
         frame.render_widget(help, chunks[2]);
     }
 
+    fn build_session_inspector_detail_lines(&self) -> Vec<Line<'static>> {
+        let mut detail_lines = Vec::new();
+        let selector = &self.session_inspector.selector;
+
+        if let Some(session) = self.session_inspector.session.as_ref() {
+            detail_lines.push(Line::from(vec![
+                Span::styled(
+                    session.title.clone(),
+                    Style::default()
+                        .fg(Color::Rgb(120, 215, 185))
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!("  ({})", session.source)),
+            ]));
+            detail_lines.push(Line::from(format!(
+                "{} · {} messages · started {} · last active {}",
+                session.model,
+                session.message_count,
+                session.started_label,
+                session.last_active_label
+            )));
+            detail_lines.push(Line::from(format!("Session ID: {}", session.id)));
+            if !session.preview.is_empty() {
+                detail_lines.push(Line::from(format!("Preview: {}", session.preview)));
+            }
+            if let (Some(role), Some(snippet)) = (
+                session.matched_role.as_deref(),
+                session.matched_snippet.as_deref(),
+            ) {
+                detail_lines.push(Line::from(format!(
+                    "Opened from browser match: {role} -> {snippet}"
+                )));
+            }
+            if !selector.query.trim().is_empty() {
+                detail_lines.push(Line::from(format!("Local filter: {}", selector.query)));
+            }
+            if session.is_live {
+                detail_lines.push(Line::from("Mode: live in-memory session debugger"));
+            }
+            for line in &session.debug_lines {
+                detail_lines.push(Line::from(line.clone()));
+            }
+            detail_lines.push(Line::from(""));
+
+            if let Some(entry) = selector.current() {
+                detail_lines.push(Line::from(Span::styled(
+                    "Selected message",
+                    Style::default().add_modifier(Modifier::BOLD),
+                )));
+                detail_lines.push(Line::from(vec![
+                    Span::styled(
+                        entry.headline.clone(),
+                        Style::default()
+                            .fg(Color::Rgb(120, 215, 185))
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(format!("  {}", entry.meta)),
+                ]));
+                detail_lines.push(Line::from(""));
+
+                let content = entry.message.text_content();
+                if !content.trim().is_empty() {
+                    detail_lines.push(Line::from(Span::styled(
+                        "Content",
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )));
+                    for line in content.lines() {
+                        detail_lines.push(Line::from(line.to_string()));
+                    }
+                } else {
+                    detail_lines.push(Line::from("(No text content stored for this message.)"));
+                }
+
+                if let Some(reasoning) = entry
+                    .message
+                    .reasoning
+                    .as_deref()
+                    .filter(|reasoning| !reasoning.trim().is_empty())
+                {
+                    detail_lines.push(Line::from(""));
+                    detail_lines.push(Line::from(Span::styled(
+                        "Reasoning",
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )));
+                    for line in reasoning.lines() {
+                        detail_lines.push(Line::from(line.to_string()));
+                    }
+                }
+
+                if let Some(tool_calls) = entry
+                    .message
+                    .tool_calls
+                    .as_ref()
+                    .filter(|tool_calls| !tool_calls.is_empty())
+                {
+                    detail_lines.push(Line::from(""));
+                    detail_lines.push(Line::from(Span::styled(
+                        "Tool Calls",
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )));
+                    for call in tool_calls {
+                        detail_lines.push(Line::from(format!(
+                            "- {}  ({})",
+                            call.function.name, call.id
+                        )));
+                    }
+                }
+            } else {
+                detail_lines.push(Line::from(
+                    "No message is selected. Clear the filter or move the cursor to inspect the timeline.",
+                ));
+            }
+        }
+
+        detail_lines
+    }
+
     /// Render the session browser overlay (activated by F5 or `/sessions`).
     fn render_session_browser(&self, frame: &mut Frame, area: Rect) {
         frame.render_widget(Clear, area);
@@ -19475,7 +20975,7 @@ impl App {
 
         let filtered = &self.session_browser.filtered;
         let selected = self.session_browser.selected;
-        let max_visible = body[0].height as usize;
+        let max_visible = Self::browser_list_visible_rows(body[0], true);
         let scroll_start = Self::browser_scroll_start(selected, max_visible);
 
         let items: Vec<ListItem> = if filtered.is_empty() {
@@ -19707,7 +21207,7 @@ impl App {
         let selector = &self.session_inspector.selector;
         let filtered = &selector.filtered;
         let selected = selector.selected;
-        let max_visible = body[0].height as usize;
+        let max_visible = Self::browser_list_visible_rows(body[0], true);
         let scroll_start = Self::browser_scroll_start(selected, max_visible);
 
         let items: Vec<ListItem> = if filtered.is_empty() {
@@ -19796,110 +21296,7 @@ impl App {
             body[0],
         );
 
-        let mut detail_lines = Vec::new();
-        if let Some(session) = self.session_inspector.session.as_ref() {
-            detail_lines.push(Line::from(vec![
-                Span::styled(
-                    session.title.clone(),
-                    Style::default()
-                        .fg(Color::Rgb(120, 215, 185))
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(format!("  ({})", session.source)),
-            ]));
-            detail_lines.push(Line::from(format!(
-                "{} · {} messages · started {} · last active {}",
-                session.model,
-                session.message_count,
-                session.started_label,
-                session.last_active_label
-            )));
-            detail_lines.push(Line::from(format!("Session ID: {}", session.id)));
-            if !session.preview.is_empty() {
-                detail_lines.push(Line::from(format!("Preview: {}", session.preview)));
-            }
-            if let (Some(role), Some(snippet)) = (
-                session.matched_role.as_deref(),
-                session.matched_snippet.as_deref(),
-            ) {
-                detail_lines.push(Line::from(format!("Search hit: {role} -> {snippet}")));
-            }
-            if !selector.query.trim().is_empty() {
-                detail_lines.push(Line::from(format!("Local filter: {}", selector.query)));
-            }
-            if session.is_live {
-                detail_lines.push(Line::from("Mode: live in-memory session debugger"));
-            }
-            for line in &session.debug_lines {
-                detail_lines.push(Line::from(line.clone()));
-            }
-            detail_lines.push(Line::from(""));
-
-            if let Some(entry) = selector.current() {
-                detail_lines.push(Line::from(vec![
-                    Span::styled(
-                        entry.headline.clone(),
-                        Style::default()
-                            .fg(Color::Rgb(120, 215, 185))
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(format!("  {}", entry.meta)),
-                ]));
-                detail_lines.push(Line::from(""));
-
-                let content = entry.message.text_content();
-                if !content.trim().is_empty() {
-                    detail_lines.push(Line::from(Span::styled(
-                        "Content",
-                        Style::default().add_modifier(Modifier::BOLD),
-                    )));
-                    for line in content.lines() {
-                        detail_lines.push(Line::from(line.to_string()));
-                    }
-                } else {
-                    detail_lines.push(Line::from("(No text content stored for this message.)"));
-                }
-
-                if let Some(reasoning) = entry
-                    .message
-                    .reasoning
-                    .as_deref()
-                    .filter(|reasoning| !reasoning.trim().is_empty())
-                {
-                    detail_lines.push(Line::from(""));
-                    detail_lines.push(Line::from(Span::styled(
-                        "Reasoning",
-                        Style::default().add_modifier(Modifier::BOLD),
-                    )));
-                    for line in reasoning.lines() {
-                        detail_lines.push(Line::from(line.to_string()));
-                    }
-                }
-
-                if let Some(tool_calls) = entry
-                    .message
-                    .tool_calls
-                    .as_ref()
-                    .filter(|tool_calls| !tool_calls.is_empty())
-                {
-                    detail_lines.push(Line::from(""));
-                    detail_lines.push(Line::from(Span::styled(
-                        "Tool Calls",
-                        Style::default().add_modifier(Modifier::BOLD),
-                    )));
-                    for call in tool_calls {
-                        detail_lines.push(Line::from(format!(
-                            "- {}  ({})",
-                            call.function.name, call.id
-                        )));
-                    }
-                }
-            } else {
-                detail_lines.push(Line::from(
-                    "No message is selected. Clear the filter or move the cursor to inspect the timeline.",
-                ));
-            }
-        }
+        let detail_lines = self.build_session_inspector_detail_lines();
         self.render_scrollable_browser_detail(
             frame,
             body[1],
@@ -21043,7 +22440,44 @@ impl App {
 
     /// Render the input box + completion overlay + ghost text.
     fn render_input(&mut self, frame: &mut Frame, area: Rect) {
-        // Render the textarea widget
+        // Configure the block before rendering so mode and pending-operator
+        // feedback appear immediately on the current frame.
+        let text = self.textarea_text();
+        let block = if self.is_processing {
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(
+                    Style::default()
+                        .fg(Color::Rgb(60, 60, 75))
+                        .add_modifier(Modifier::DIM),
+                )
+                .title(self.input_panel_title("⧗ waiting…"))
+        } else if text.starts_with('/') {
+            let cmd_name = text.split_whitespace().next().unwrap_or("");
+            let is_valid = self.all_command_names.iter().any(|c| c == cmd_name);
+            let border_color = if is_valid {
+                Color::Cyan
+            } else if cmd_name.len() > 1 {
+                Color::Rgb(239, 83, 80)
+            } else {
+                self.theme.input_border.fg.unwrap_or(Color::White)
+            };
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(border_color))
+                .title(self.input_panel_title(&self.theme.prompt_symbol))
+        } else if text.starts_with('@') {
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Green))
+                .title(self.input_panel_title(&self.theme.prompt_symbol))
+        } else {
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(self.theme.input_border)
+                .title(self.input_panel_title(&self.theme.prompt_symbol))
+        };
+        self.textarea.set_block(block);
         frame.render_widget(&self.textarea, area);
 
         // Ghost text overlay (Fish-style hint)
@@ -21114,22 +22548,28 @@ impl App {
                 .map(|(i, (cmd, desc))| {
                     let candidate_idx = scroll_start + i;
                     let is_selected = candidate_idx == self.completion.selected;
+                    let bg = if is_selected {
+                        Color::Rgb(55, 55, 75)
+                    } else {
+                        Color::Reset
+                    };
                     let cmd_style = if is_selected {
                         Style::default()
-                            .bg(Color::Rgb(55, 55, 75))
+                            .bg(bg)
                             .fg(Color::Cyan)
                             .add_modifier(Modifier::BOLD)
                     } else {
                         Style::default().fg(Color::Rgb(200, 200, 210))
                     };
                     let desc_style = if is_selected {
-                        Style::default()
-                            .bg(Color::Rgb(55, 55, 75))
-                            .fg(Color::Rgb(140, 145, 165))
+                        Style::default().bg(bg).fg(Color::Rgb(140, 145, 165))
                     } else {
                         Style::default().fg(Color::Rgb(95, 100, 120))
                     };
-                    let mut spans = vec![Span::styled(format!(" {cmd}"), cmd_style)];
+                    let mut spans = vec![
+                        selector_marker(is_selected, Color::Cyan, Some(bg)),
+                        Span::styled(format!(" {cmd}"), cmd_style),
+                    ];
                     if !desc.is_empty() {
                         spans.push(Span::styled(format!(" — {desc}"), desc_style));
                     }
@@ -21175,52 +22615,6 @@ impl App {
             ))
             .style(Style::default().bg(Color::Rgb(25, 25, 35)));
             frame.render_widget(footer, footer_area);
-        }
-
-        // Input line highlighting: color the border based on input validity + busy state
-        let text = self.textarea_text();
-        if self.is_processing {
-            // Dimmed border while agent is processing — signals "not ready for input"
-            self.textarea.set_block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(
-                        Style::default()
-                            .fg(Color::Rgb(60, 60, 75))
-                            .add_modifier(Modifier::DIM),
-                    )
-                    .title(self.editor_mode.input_title("⧗ waiting…")),
-            );
-        } else if text.starts_with('/') {
-            let cmd_name = text.split_whitespace().next().unwrap_or("");
-            let is_valid = self.all_command_names.iter().any(|c| c == cmd_name);
-            let border_color = if is_valid {
-                Color::Cyan
-            } else if cmd_name.len() > 1 {
-                Color::Rgb(239, 83, 80) // Red for invalid
-            } else {
-                self.theme.input_border.fg.unwrap_or(Color::White)
-            };
-            self.textarea.set_block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(border_color))
-                    .title(self.editor_mode.input_title(&self.theme.prompt_symbol)),
-            );
-        } else if text.starts_with('@') {
-            self.textarea.set_block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Green))
-                    .title(self.editor_mode.input_title(&self.theme.prompt_symbol)),
-            );
-        } else {
-            self.textarea.set_block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(self.theme.input_border)
-                    .title(self.editor_mode.input_title(&self.theme.prompt_symbol)),
-            );
         }
     }
 }
@@ -21411,6 +22805,7 @@ fn event_loop(
         // Check for agent responses first (non-blocking)
         app.check_responses();
         app.poll_remote_skill_search();
+        app.poll_remote_plugin_search();
         app.poll_remote_mcp_search();
 
         // Advance spinner on each tick
@@ -21623,6 +23018,21 @@ mod tests {
             .unwrap_or_else(|| line.text.clone())
     }
 
+    fn plain_line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
+    }
+
+    fn plain_lines_text(lines: &[Line<'_>]) -> String {
+        lines
+            .iter()
+            .map(plain_line_text)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     fn mock_agent() -> Arc<edgecrab_core::Agent> {
         let provider: Arc<dyn edgequake_llm::LLMProvider> =
             Arc::new(edgequake_llm::MockProvider::new());
@@ -21646,6 +23056,43 @@ mod tests {
                 .build()
                 .expect("build agent"),
         )
+    }
+
+    fn write_script_plugin(home: &std::path::Path, plugin_name: &str, tool_name: &str) {
+        let plugin_dir = home.join("plugins").join(plugin_name);
+        std::fs::create_dir_all(&plugin_dir).expect("plugin dir");
+        std::fs::write(
+            plugin_dir.join("plugin.toml"),
+            format!(
+                r#"[plugin]
+name = "{plugin_name}"
+version = "1.0.0"
+description = "Demo script plugin"
+kind = "script"
+
+[script]
+file = "main.rhai"
+
+[[tools]]
+name = "{tool_name}"
+description = "Demo plugin tool"
+"#
+            ),
+        )
+        .expect("plugin manifest");
+        std::fs::write(
+            plugin_dir.join("main.rhai"),
+            format!(
+                r#"fn tool_call(name, args_json) {{
+    if name == "{tool_name}" {{
+        return "{{\"ok\":true}}";
+    }}
+    return "{{}}";
+}}
+"#
+            ),
+        )
+        .expect("script file");
     }
 
     fn sample_browser_session(
@@ -22292,6 +23739,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_inspector_prefers_matching_message_from_browser_search_hit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(
+            edgecrab_state::SessionDb::open(&dir.path().join("sessions.db")).expect("session db"),
+        );
+
+        let session = sample_browser_session(
+            "sess-hit-777777",
+            "Reconnect debugging",
+            1_720_000_230.0,
+            "anthropic/claude-opus-4.6",
+        );
+        db.save_session(&session).expect("save session");
+        db.save_message(
+            "sess-hit-777777",
+            &edgecrab_types::Message::user("Initial notes about the outage"),
+            1_720_000_231.0,
+        )
+        .expect("save user");
+        db.save_message(
+            "sess-hit-777777",
+            &edgecrab_types::Message::assistant(
+                "Tracing websocket reconnect jitter through the retry loop now.",
+            ),
+            1_720_000_232.0,
+        )
+        .expect("save assistant");
+
+        let agent = mock_agent_with_state_db(db);
+        let mut app = App::new();
+        app.set_agent(agent);
+        app.open_session_browser_with_query(Some("websocket jitter"));
+
+        let entry = app
+            .session_browser
+            .current()
+            .cloned()
+            .expect("search hit entry");
+        app.open_session_inspector(entry);
+
+        assert_eq!(
+            app.session_inspector
+                .selector
+                .current()
+                .map(|entry| (entry.index, entry.role_label.as_str())),
+            Some((1, "assistant"))
+        );
+
+        let detail = plain_lines_text(&app.build_session_inspector_detail_lines());
+        assert!(detail.contains("Opened from browser match: assistant ->"));
+        assert!(detail.contains("Selected message\n#2   assistant"));
+        assert!(detail.contains("Tracing websocket reconnect jitter through the retry loop now."));
+    }
+
+    #[tokio::test]
+    async fn session_inspector_detail_tracks_selected_message() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(
+            edgecrab_state::SessionDb::open(&dir.path().join("sessions.db")).expect("session db"),
+        );
+
+        let session = sample_browser_session(
+            "sess-detail-888888",
+            "Inspector sync",
+            1_720_000_240.0,
+            "openai/gpt-4.1",
+        );
+        db.save_session(&session).expect("save session");
+        db.save_message(
+            "sess-detail-888888",
+            &edgecrab_types::Message::user("First unique message"),
+            1_720_000_241.0,
+        )
+        .expect("save first");
+        db.save_message(
+            "sess-detail-888888",
+            &edgecrab_types::Message::assistant("Second unique reply"),
+            1_720_000_242.0,
+        )
+        .expect("save second");
+
+        let agent = mock_agent_with_state_db(db);
+        let mut app = App::new();
+        app.set_agent(agent);
+        app.open_session_browser();
+
+        let entry = app
+            .session_browser
+            .items
+            .iter()
+            .find(|entry| entry.id == "sess-detail-888888")
+            .cloned()
+            .expect("session entry");
+        app.open_session_inspector(entry);
+
+        let initial_detail = plain_lines_text(&app.build_session_inspector_detail_lines());
+        assert!(initial_detail.contains("Selected message\n#1   user"));
+        assert!(initial_detail.contains("First unique message"));
+
+        app.handle_key_event(event::KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+
+        let moved_detail = plain_lines_text(&app.build_session_inspector_detail_lines());
+        assert_eq!(
+            app.session_inspector
+                .selector
+                .current()
+                .map(|entry| entry.index),
+            Some(1)
+        );
+        assert!(moved_detail.contains("Selected message\n#2   assistant"));
+        assert!(moved_detail.contains("Second unique reply"));
+    }
+
+    #[tokio::test]
     async fn session_browser_lowercase_letters_stay_in_filter() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = Arc::new(
@@ -22506,7 +24067,7 @@ mod tests {
 
         assert!(app.session_browser.active);
         assert!(!app.detail_fullscreen_active(DetailSurface::SessionBrowser));
-        assert_eq!(app.session_browser_pane.scroll, 8);
+        assert_eq!(app.session_browser_pane.scroll, 16);
     }
 
     #[tokio::test]
@@ -23035,6 +24596,191 @@ mod tests {
         assert!(app.remote_skill_browser.selector.query.is_empty());
     }
 
+    #[test]
+    #[serial_test::serial(edgecrab_home_env)]
+    fn build_remote_plugin_entries_marks_update_replace_and_install() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+
+        let plugins_dir = dir.path().join("plugins");
+        std::fs::create_dir_all(plugins_dir.join("native-plugin")).expect("native plugin dir");
+        std::fs::create_dir_all(plugins_dir.join("local-only")).expect("local plugin dir");
+        std::fs::write(
+            plugins_dir.join("native-plugin").join("plugin.toml"),
+            r#"
+[plugin]
+name = "native-plugin"
+version = "1.0.0"
+description = "Native plugin"
+kind = "skill"
+
+[trust]
+level = "community"
+source = "hub:edgecrab-official/native-plugin"
+"#,
+        )
+        .expect("write plugin");
+        std::fs::write(
+            plugins_dir.join("local-only").join("plugin.toml"),
+            r#"
+[plugin]
+name = "local-only"
+version = "1.0.0"
+description = "Local plugin"
+kind = "skill"
+"#,
+        )
+        .expect("write local plugin");
+
+        let report = edgecrab_plugins::PluginSearchReport {
+            groups: vec![edgecrab_plugins::PluginSearchGroup {
+                source: edgecrab_plugins::PluginHubSourceInfo {
+                    name: "edgecrab-official".into(),
+                    label: "edgecrab-official".into(),
+                    trust_level: edgecrab_plugins::TrustLevel::Official,
+                    description: "Official EdgeCrab plugin registry".into(),
+                    url: "https://plugins.edgecrab.sh/index.json".into(),
+                },
+                results: vec![
+                    edgecrab_plugins::PluginMeta {
+                        name: "native-plugin".into(),
+                        identifier: "hub:edgecrab-official/native-plugin".into(),
+                        description: "Hub-managed plugin".into(),
+                        version: "1.1.0".into(),
+                        kind: edgecrab_plugins::PluginKind::Skill,
+                        origin: "https://plugins.edgecrab.sh/native-plugin".into(),
+                        trust_level: "official".into(),
+                        tags: vec!["official".into()],
+                        install_url: "https://plugins.edgecrab.sh/native-plugin.zip".into(),
+                        requires_env: vec![],
+                    },
+                    edgecrab_plugins::PluginMeta {
+                        name: "local-only".into(),
+                        identifier: "hub:edgecrab-official/local-only".into(),
+                        description: "Would replace local plugin".into(),
+                        version: "1.1.0".into(),
+                        kind: edgecrab_plugins::PluginKind::Skill,
+                        origin: "https://plugins.edgecrab.sh/local-only".into(),
+                        trust_level: "official".into(),
+                        tags: vec!["official".into()],
+                        install_url: "https://plugins.edgecrab.sh/local-only.zip".into(),
+                        requires_env: vec!["PLUGIN_TOKEN".into()],
+                    },
+                    edgecrab_plugins::PluginMeta {
+                        name: "fresh-remote".into(),
+                        identifier: "hub:edgecrab-official/fresh-remote".into(),
+                        description: "Brand new plugin".into(),
+                        version: "0.1.0".into(),
+                        kind: edgecrab_plugins::PluginKind::ToolServer,
+                        origin: "https://plugins.edgecrab.sh/fresh-remote".into(),
+                        trust_level: "official".into(),
+                        tags: vec!["tool-server".into()],
+                        install_url: "https://plugins.edgecrab.sh/fresh-remote.zip".into(),
+                        requires_env: vec![],
+                    },
+                ],
+                notice: Some("using cached index after source timeout".into()),
+            }],
+        };
+
+        let (entries, notices) = App::build_remote_plugin_entries(&report);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].action, RemotePluginAction::Update);
+        assert_eq!(entries[1].action, RemotePluginAction::Replace);
+        assert_eq!(entries[2].action, RemotePluginAction::Install);
+        assert_eq!(entries[1].requires_env, vec!["PLUGIN_TOKEN"]);
+        assert_eq!(notices.len(), 1);
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[tokio::test]
+    async fn plugins_search_opens_remote_browser_with_query() {
+        let mut app = App::new();
+
+        app.handle_show_plugins("search native plugin".into());
+
+        assert!(app.remote_plugin_browser.selector.active);
+        assert_eq!(app.remote_plugin_browser.selector.query, "native plugin");
+        assert!(!app.plugin_toggle.active);
+    }
+
+    #[tokio::test]
+    async fn plugins_search_with_source_filter_opens_remote_browser() {
+        let mut app = App::new();
+
+        app.handle_show_plugins("search --source hermes weather".into());
+
+        assert!(app.remote_plugin_browser.selector.active);
+        assert_eq!(app.remote_plugin_browser.selector.query, "weather");
+        assert_eq!(
+            app.remote_plugin_browser.source_filter.as_deref(),
+            Some("hermes")
+        );
+    }
+
+    #[tokio::test]
+    async fn plugins_browse_without_query_opens_remote_browser() {
+        let mut app = App::new();
+
+        app.handle_show_plugins("browse".into());
+
+        assert!(app.remote_plugin_browser.selector.active);
+        assert!(app.remote_plugin_browser.selector.query.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn plugins_without_args_open_local_overlay() {
+        let mut app = App::new();
+
+        app.handle_show_plugins(String::new());
+
+        assert!(app.plugin_toggle.active);
+        assert!(!app.remote_plugin_browser.selector.active);
+    }
+
+    #[tokio::test]
+    async fn plugin_selector_lowercase_letters_stay_in_filter() {
+        let mut app = App::new();
+        app.plugin_toggle.set_items(vec![PluginToggleEntry {
+            name: "json-toolbox".into(),
+            display_name: "json-toolbox".into(),
+            description: "JSON validation tools".into(),
+            version: "1.0.0".into(),
+            source: "user".into(),
+            kind: "hermes".into(),
+            tool_count: 2,
+            estimated_tokens: 0,
+            check_state: PluginCheckState::On,
+            original_check_state: PluginCheckState::On,
+            runtime_status: "running".into(),
+            trust_level: "official".into(),
+            tools: vec!["json_validate".into(), "json_pointer_get".into()],
+            cli_commands: vec!["json-toolbox".into()],
+            missing_env: Vec::new(),
+            related_skills: vec!["api-debugging".into()],
+            compatibility: Some("Requires json-toolbox plugin".into()),
+            install_source: Some("./plugins/developer/json-toolbox".into()),
+            credentials_satisfied: true,
+            search_text: "json-toolbox hermes running official json_validate json_pointer_get"
+                .into(),
+        }]);
+        app.plugin_toggle.activate();
+
+        app.handle_key_event(event::KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+
+        assert!(app.plugin_toggle.active);
+        assert_eq!(app.plugin_toggle.query, "j");
+        assert!(!app.remote_plugin_browser.selector.active);
+    }
+
     #[tokio::test]
     #[serial_test::serial(edgecrab_home_env)]
     async fn refresh_skills_list_builds_rich_entries_for_bundle_and_flat_skills() {
@@ -23476,6 +25222,74 @@ mod tests {
         assert!(!app.config_selector.filtered.is_empty());
     }
 
+    #[tokio::test]
+    async fn config_selector_detail_is_not_truncated_and_preserves_scroll() {
+        let mut app = App::new();
+        let entry = app
+            .build_config_entries()
+            .into_iter()
+            .find(|entry| entry.action == ConfigAction::ShowSummary)
+            .expect("summary entry");
+        let detail_lines = app.build_config_detail_lines(Some(&entry));
+        assert!(detail_lines.len() > 18);
+
+        app.handle_config_command(String::new());
+        app.handle_key_event(event::KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(app.split_detail_scroll(DetailSurface::ConfigSelector), 8);
+
+        app.handle_key_event(event::KeyEvent::new(KeyCode::Char('Z'), KeyModifiers::NONE));
+        app.handle_key_event(event::KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(
+            app.detail_fullscreen_scroll(DetailSurface::ConfigSelector),
+            16
+        );
+
+        app.handle_key_event(event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.split_detail_scroll(DetailSurface::ConfigSelector), 16);
+    }
+
+    #[tokio::test]
+    async fn remote_skill_browser_page_keys_scroll_split_detail() {
+        let mut app = App::new();
+        app.remote_skill_browser
+            .selector
+            .set_items(vec![RemoteSkillEntry {
+                source_label: "EdgeCrab".into(),
+                trust_level: "trusted".into(),
+                name: "long-detail".into(),
+                identifier: "edgecrab://skills/long-detail".into(),
+                description: (0..24)
+                    .map(|idx| format!("line {idx:02} wraps through the detail pane"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                origin: "https://example.com/skills/long-detail".into(),
+                tags: vec!["tui".into(), "audit".into()],
+                installed_name: None,
+                action: RemoteSkillAction::Install,
+                search_text: "long detail tui audit".into(),
+            }]);
+        app.remote_skill_browser.selector.active = true;
+
+        app.handle_key_event(event::KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(
+            app.split_detail_scroll(DetailSurface::RemoteSkillBrowser),
+            8
+        );
+
+        app.handle_key_event(event::KeyEvent::new(KeyCode::Char('Z'), KeyModifiers::NONE));
+        app.handle_key_event(event::KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(
+            app.detail_fullscreen_scroll(DetailSurface::RemoteSkillBrowser),
+            16
+        );
+
+        app.handle_key_event(event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(
+            app.split_detail_scroll(DetailSurface::RemoteSkillBrowser),
+            16
+        );
+    }
+
     #[test]
     #[serial_test::serial(edgecrab_home_env)]
     fn cheap_model_command_updates_agent_and_config() {
@@ -23866,6 +25680,66 @@ mod tests {
                 .unwrap_or_default()
                 .iter()
                 .any(|entry| entry == "terminal")
+        );
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(edgecrab_home_env)]
+    fn tool_manager_shows_plugin_tools_and_tracks_enable_disable() {
+        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
+            .lock()
+            .expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+
+        write_script_plugin(dir.path(), "demo-script", "demo_plugin_tool");
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let _enter = rt.enter();
+        let mut app = App::new();
+        let agent = mock_agent();
+        drop(_enter);
+        app.set_agent(agent);
+
+        app.refresh_agent_plugin_runtime()
+            .expect("refresh plugin runtime");
+        app.open_tool_manager(ToolManagerMode::All);
+        app.tool_manager_scope = ToolManagerScope::Tools;
+        let _ = app.refresh_tool_manager_entries();
+
+        let plugin_tool = app
+            .tool_manager
+            .items
+            .iter()
+            .find(|entry| entry.name == "demo_plugin_tool")
+            .expect("plugin tool visible");
+        assert_eq!(plugin_tool.kind, ToolManagerItemKind::Tool);
+        assert_eq!(plugin_tool.toolset, "plugins");
+        assert!(plugin_tool.dynamic, "plugin tool should be dynamic");
+        assert!(plugin_tool.exposed, "enabled plugin tool should be exposed");
+
+        app.toggle_named_plugin("demo-script", None);
+        assert!(
+            app.tool_manager
+                .items
+                .iter()
+                .all(|entry| entry.name != "demo_plugin_tool"),
+            "disabled plugin tool should be removed from the live tool manager inventory"
+        );
+
+        app.toggle_named_plugin("demo-script", None);
+        assert!(
+            app.tool_manager
+                .items
+                .iter()
+                .any(|entry| entry.name == "demo_plugin_tool"),
+            "re-enabled plugin tool should return to the live tool manager inventory"
         );
 
         unsafe {
@@ -24521,6 +26395,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compose_long_wrapped_line_expands_input_height() {
+        let mut app = App::new();
+        app.open_compose_editor(false);
+        app.textarea.insert_str(
+            "this is a deliberately long compose line that should wrap across multiple visual rows \
+             instead of disappearing off-screen",
+        );
+
+        assert_eq!(app.textarea.wrap_mode(), WrapMode::WordOrGlyph);
+        assert!(
+            app.input_area_height_for_area(Rect::new(0, 0, 28, 20)) > 5,
+            "wrapped compose input should grow beyond the compose minimum height"
+        );
+    }
+
+    #[tokio::test]
+    async fn compose_page_down_scrolls_editor_not_output() {
+        let mut app = App::new();
+        app.open_compose_editor(false);
+        app.textarea = TextArea::from((0..24).map(|i| format!("line {i:02}")));
+        app.textarea.set_wrap_mode(WrapMode::WordOrGlyph);
+        app.apply_textarea_editor_style();
+        app.textarea.move_cursor(CursorMove::Top);
+
+        let area = Rect::new(0, 0, 40, 6);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(&app.textarea, area, &mut buffer);
+
+        app.handle_key_event(event::KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+
+        assert_eq!(app.scroll_offset, 0);
+        assert!(
+            app.textarea.cursor().0 > 0,
+            "PageDown in compose mode should move the editor viewport/cursor"
+        );
+    }
+
+    #[tokio::test]
+    async fn compose_normal_pending_operator_is_visible_in_title() {
+        let mut app = App::new();
+        app.open_compose_editor(false);
+        app.handle_key_event(event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.handle_key_event(event::KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+
+        assert_eq!(app.input_panel_title(">"), " Compose NORMAL [d] ");
+        assert!(app.compose_normal_hint().contains("[d]"));
+    }
+
+    #[tokio::test]
     async fn compose_normal_x_deletes_character() {
         let mut app = App::new();
         app.textarea.insert_str("hello");
@@ -24530,6 +26453,32 @@ mod tests {
         app.handle_key_event(event::KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
 
         assert_eq!(app.editor_mode, InputEditorMode::ComposeNormal);
+        assert_eq!(app.textarea_text(), "ello");
+    }
+
+    #[tokio::test]
+    async fn compose_normal_c_alias_changes_to_end_of_line() {
+        let mut app = App::new();
+        app.textarea.insert_str("hello world");
+        app.open_compose_editor(false);
+        app.handle_key_event(event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.handle_key_event(event::KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE));
+        app.handle_key_event(event::KeyEvent::new(KeyCode::Char('C'), KeyModifiers::NONE));
+
+        assert_eq!(app.editor_mode, InputEditorMode::ComposeInsert);
+        assert_eq!(app.textarea_text(), "");
+    }
+
+    #[tokio::test]
+    async fn compose_normal_s_substitutes_character() {
+        let mut app = App::new();
+        app.textarea.insert_str("hello");
+        app.open_compose_editor(false);
+        app.handle_key_event(event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.handle_key_event(event::KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE));
+        app.handle_key_event(event::KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+
+        assert_eq!(app.editor_mode, InputEditorMode::ComposeInsert);
         assert_eq!(app.textarea_text(), "ello");
     }
 
@@ -24978,12 +26927,29 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn bedrock_provider_factory_is_wired() {
-        let result = ProviderFactory::create_llm_provider("bedrock", "amazon.nova-lite-v1:0");
-        if let Err(err) = result {
-            assert!(
-                !err.to_string().contains("Unknown LLM provider"),
-                "bedrock must be recognized by the runtime provider factory: {err}"
-            );
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ProviderFactory::create_llm_provider("bedrock", "amazon.nova-lite-v1:0")
+        }));
+
+        match result {
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => {
+                assert!(
+                    !err.to_string().contains("Unknown LLM provider"),
+                    "bedrock must be recognized by the runtime provider factory: {err}"
+                );
+            }
+            Err(panic) => {
+                let panic_text = panic
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| panic.downcast_ref::<&'static str>().copied())
+                    .unwrap_or("<non-string panic>");
+                assert!(
+                    panic_text.contains("TrustStore configured to enable native roots"),
+                    "bedrock provider wiring should not panic unexpectedly: {panic_text}"
+                );
+            }
         }
     }
 }

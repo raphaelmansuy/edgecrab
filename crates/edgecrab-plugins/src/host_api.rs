@@ -72,11 +72,21 @@ async fn handle_host_request_inner(
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             match level {
-                "trace" => tracing::trace!(target: "edgecrab_plugins::host_api", plugin = plugin_name, "{message}"),
-                "debug" => tracing::debug!(target: "edgecrab_plugins::host_api", plugin = plugin_name, "{message}"),
-                "warn" => tracing::warn!(target: "edgecrab_plugins::host_api", plugin = plugin_name, "{message}"),
-                "error" => tracing::error!(target: "edgecrab_plugins::host_api", plugin = plugin_name, "{message}"),
-                _ => tracing::info!(target: "edgecrab_plugins::host_api", plugin = plugin_name, "{message}"),
+                "trace" => {
+                    tracing::trace!(target: "edgecrab_plugins::host_api", plugin = plugin_name, "{message}")
+                }
+                "debug" => {
+                    tracing::debug!(target: "edgecrab_plugins::host_api", plugin = plugin_name, "{message}")
+                }
+                "warn" => {
+                    tracing::warn!(target: "edgecrab_plugins::host_api", plugin = plugin_name, "{message}")
+                }
+                "error" => {
+                    tracing::error!(target: "edgecrab_plugins::host_api", plugin = plugin_name, "{message}")
+                }
+                _ => {
+                    tracing::info!(target: "edgecrab_plugins::host_api", plugin = plugin_name, "{message}")
+                }
             }
             Ok(json!({ "ok": true }))
         }
@@ -150,20 +160,21 @@ async fn handle_host_request_inner(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .ok_or((-32602, "missing secret name".into()))?;
-            if !capabilities.secrets.iter().any(|candidate| candidate == name) {
+            if !capabilities
+                .secrets
+                .iter()
+                .any(|candidate| candidate == name)
+            {
                 return Err((-32003, format!("Secret not whitelisted: {name}")));
             }
-            let value = std::env::var(name)
-                .map_err(|_| (-32003, format!("Secret unavailable: {name}")))?;
+            let value =
+                std::env::var(name).map_err(|_| (-32003, format!("Secret unavailable: {name}")))?;
             tracing::info!(target: "edgecrab_plugins::host_api", plugin = plugin_name, secret = name, "plugin secret read");
             Ok(json!({ "value": value }))
         }
         "host:inject_message" => {
             require_capability(capabilities, &method)?;
-            let role = params
-                .get("role")
-                .and_then(Value::as_str)
-                .unwrap_or("user");
+            let role = params.get("role").and_then(Value::as_str).unwrap_or("user");
             let content = params
                 .get("content")
                 .and_then(Value::as_str)
@@ -187,7 +198,7 @@ async fn handle_host_request_inner(
                     return Err((
                         -32602,
                         "inject_message role must be 'user' or 'assistant'".into(),
-                    ))
+                    ));
                 }
             };
             queue.lock().await.push(message);
@@ -208,7 +219,10 @@ async fn handle_host_request_inner(
                 .filter(|value| !value.is_empty())
                 .ok_or((-32602, "missing tool name".into()))?;
             if ctx.current_tool_name.as_deref() == Some(tool) {
-                return Err((-32005, format!("Plugin cannot call itself via host:tool_call: {tool}")));
+                return Err((
+                    -32005,
+                    format!("Plugin cannot call itself via host:tool_call: {tool}"),
+                ));
             }
             let Some(registry) = &ctx.tool_registry else {
                 return Err((-32006, "tool registry unavailable".into()));
@@ -239,7 +253,11 @@ fn require_capability(
     if matches!(method, "host:platform_info" | "host:log") {
         return Ok(());
     }
-    if capabilities.host.iter().any(|candidate| candidate == method) {
+    if capabilities
+        .host
+        .iter()
+        .any(|candidate| candidate == method)
+    {
         return Ok(());
     }
     Err((-32001, format!("Capability not granted: {method}")))

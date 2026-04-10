@@ -18,7 +18,7 @@
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use edgecrab_types::{ToolError, ToolSchema};
 
@@ -187,7 +187,7 @@ struct ConditionalActivation {
 }
 
 /// Metadata extracted from YAML frontmatter in SKILL.md files.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct SkillMeta {
     name: Option<String>,
     description: Option<String>,
@@ -198,6 +198,82 @@ struct SkillMeta {
     read_files: Vec<String>, // Progressive disclosure: linked files to load
     required_environment_variables: Vec<EnvVarSpec>, // Secure setup on load
     conditional_activation: ConditionalActivation, // Fallback/requires rules
+    when_to_use: Option<String>,
+    argument_hint: Option<String>,
+    arguments: Vec<String>,
+    allowed_tools: Vec<String>,
+    user_invocable: bool,
+    disable_model_invocation: bool,
+    execution_context: Option<String>,
+    shell: Option<String>,
+}
+
+impl Default for SkillMeta {
+    fn default() -> Self {
+        Self {
+            name: None,
+            description: None,
+            category: None,
+            version: None,
+            license: None,
+            platforms: Vec::new(),
+            read_files: Vec::new(),
+            required_environment_variables: Vec::new(),
+            conditional_activation: ConditionalActivation::default(),
+            when_to_use: None,
+            argument_hint: None,
+            arguments: Vec::new(),
+            allowed_tools: Vec::new(),
+            user_invocable: true,
+            disable_model_invocation: false,
+            execution_context: None,
+            shell: None,
+        }
+    }
+}
+
+fn parse_frontmatter_bool(value: &str) -> Option<bool> {
+    match value.trim().trim_matches('"').trim_matches('\'') {
+        v if v.eq_ignore_ascii_case("true")
+            || v.eq_ignore_ascii_case("yes")
+            || v.eq_ignore_ascii_case("on")
+            || v == "1" =>
+        {
+            Some(true)
+        }
+        v if v.eq_ignore_ascii_case("false")
+            || v.eq_ignore_ascii_case("no")
+            || v.eq_ignore_ascii_case("off")
+            || v == "0" =>
+        {
+            Some(false)
+        }
+        _ => None,
+    }
+}
+
+fn parse_inline_frontmatter_list(value: &str) -> Vec<String> {
+    let trimmed = value.trim();
+    let stripped = trimmed.trim_start_matches('[').trim_end_matches(']');
+    stripped
+        .split(',')
+        .map(|item| item.trim().trim_matches('"').trim_matches('\'').to_string())
+        .filter(|item| !item.is_empty())
+        .collect()
+}
+
+fn apply_list_to_meta(meta: &mut SkillMeta, key: &str, items: Vec<String>) {
+    match key {
+        "platforms" => meta.platforms = items,
+        "read_files" => meta.read_files = items,
+        "fallback_for_toolsets" => meta.conditional_activation.fallback_for_toolsets = items,
+        "requires_toolsets" => meta.conditional_activation.requires_toolsets = items,
+        "fallback_for_tools" => meta.conditional_activation.fallback_for_tools = items,
+        "requires_tools" => meta.conditional_activation.requires_tools = items,
+        "arguments" => meta.arguments = items,
+        "allowed-tools" => meta.allowed_tools = items,
+        _ => {}
+    }
 }
 
 /// Parse YAML frontmatter from a skill file into SkillMeta.
@@ -291,22 +367,8 @@ fn parse_skill_frontmatter(content: &str) -> SkillMeta {
             && !trimmed_line.starts_with('#')
         {
             // Flush accumulated list to metadata
-            match current_list_key {
-                Some("platforms") => meta.platforms = current_list_context.clone(),
-                Some("read_files") => meta.read_files = current_list_context.clone(),
-                Some("fallback_for_toolsets") => {
-                    meta.conditional_activation.fallback_for_toolsets = current_list_context.clone()
-                }
-                Some("requires_toolsets") => {
-                    meta.conditional_activation.requires_toolsets = current_list_context.clone()
-                }
-                Some("fallback_for_tools") => {
-                    meta.conditional_activation.fallback_for_tools = current_list_context.clone()
-                }
-                Some("requires_tools") => {
-                    meta.conditional_activation.requires_tools = current_list_context.clone()
-                }
-                _ => {}
+            if let Some(list_key) = current_list_key {
+                apply_list_to_meta(&mut meta, list_key, current_list_context.clone());
             }
             current_list_key = None;
             current_list_context.clear();
@@ -320,6 +382,11 @@ fn parse_skill_frontmatter(content: &str) -> SkillMeta {
                 "description" => {
                     if !val.is_empty() {
                         meta.description = Some(val.to_string());
+                    }
+                }
+                "when_to_use" => {
+                    if !val.is_empty() {
+                        meta.when_to_use = Some(val.to_string());
                     }
                 }
                 "category" => meta.category = Some(val.to_string()),
@@ -339,13 +406,7 @@ fn parse_skill_frontmatter(content: &str) -> SkillMeta {
                         current_list_key = Some("platforms");
                         current_list_context.clear();
                     } else {
-                        // Inline format: [cli, telegram]
-                        let stripped = val.trim_start_matches('[').trim_end_matches(']');
-                        meta.platforms = stripped
-                            .split(',')
-                            .map(|s| s.trim().to_string())
-                            .filter(|s| !s.is_empty())
-                            .collect();
+                        meta.platforms = parse_inline_frontmatter_list(val);
                     }
                 }
                 "read_files" => {
@@ -353,12 +414,7 @@ fn parse_skill_frontmatter(content: &str) -> SkillMeta {
                         current_list_key = Some("read_files");
                         current_list_context.clear();
                     } else {
-                        let stripped = val.trim_start_matches('[').trim_end_matches(']');
-                        meta.read_files = stripped
-                            .split(',')
-                            .map(|s| s.trim().to_string())
-                            .filter(|s| !s.is_empty())
-                            .collect();
+                        meta.read_files = parse_inline_frontmatter_list(val);
                     }
                 }
                 "fallback_for_toolsets" => {
@@ -366,12 +422,8 @@ fn parse_skill_frontmatter(content: &str) -> SkillMeta {
                         current_list_key = Some("fallback_for_toolsets");
                         current_list_context.clear();
                     } else {
-                        let stripped = val.trim_start_matches('[').trim_end_matches(']');
-                        meta.conditional_activation.fallback_for_toolsets = stripped
-                            .split(',')
-                            .map(|s| s.trim().to_string())
-                            .filter(|s| !s.is_empty())
-                            .collect();
+                        meta.conditional_activation.fallback_for_toolsets =
+                            parse_inline_frontmatter_list(val);
                     }
                 }
                 "requires_toolsets" => {
@@ -379,12 +431,8 @@ fn parse_skill_frontmatter(content: &str) -> SkillMeta {
                         current_list_key = Some("requires_toolsets");
                         current_list_context.clear();
                     } else {
-                        let stripped = val.trim_start_matches('[').trim_end_matches(']');
-                        meta.conditional_activation.requires_toolsets = stripped
-                            .split(',')
-                            .map(|s| s.trim().to_string())
-                            .filter(|s| !s.is_empty())
-                            .collect();
+                        meta.conditional_activation.requires_toolsets =
+                            parse_inline_frontmatter_list(val);
                     }
                 }
                 "fallback_for_tools" => {
@@ -392,12 +440,8 @@ fn parse_skill_frontmatter(content: &str) -> SkillMeta {
                         current_list_key = Some("fallback_for_tools");
                         current_list_context.clear();
                     } else {
-                        let stripped = val.trim_start_matches('[').trim_end_matches(']');
-                        meta.conditional_activation.fallback_for_tools = stripped
-                            .split(',')
-                            .map(|s| s.trim().to_string())
-                            .filter(|s| !s.is_empty())
-                            .collect();
+                        meta.conditional_activation.fallback_for_tools =
+                            parse_inline_frontmatter_list(val);
                     }
                 }
                 "requires_tools" => {
@@ -405,12 +449,49 @@ fn parse_skill_frontmatter(content: &str) -> SkillMeta {
                         current_list_key = Some("requires_tools");
                         current_list_context.clear();
                     } else {
-                        let stripped = val.trim_start_matches('[').trim_end_matches(']');
-                        meta.conditional_activation.requires_tools = stripped
-                            .split(',')
-                            .map(|s| s.trim().to_string())
-                            .filter(|s| !s.is_empty())
-                            .collect();
+                        meta.conditional_activation.requires_tools =
+                            parse_inline_frontmatter_list(val);
+                    }
+                }
+                "arguments" => {
+                    if val.is_empty() {
+                        current_list_key = Some("arguments");
+                        current_list_context.clear();
+                    } else {
+                        meta.arguments = parse_inline_frontmatter_list(val);
+                    }
+                }
+                "allowed-tools" => {
+                    if val.is_empty() {
+                        current_list_key = Some("allowed-tools");
+                        current_list_context.clear();
+                    } else {
+                        meta.allowed_tools = parse_inline_frontmatter_list(val);
+                    }
+                }
+                "argument-hint" => {
+                    if !val.is_empty() {
+                        meta.argument_hint = Some(val.to_string());
+                    }
+                }
+                "user-invocable" => {
+                    if let Some(parsed) = parse_frontmatter_bool(val) {
+                        meta.user_invocable = parsed;
+                    }
+                }
+                "disable-model-invocation" => {
+                    if let Some(parsed) = parse_frontmatter_bool(val) {
+                        meta.disable_model_invocation = parsed;
+                    }
+                }
+                "context" => {
+                    if !val.is_empty() {
+                        meta.execution_context = Some(val.to_string());
+                    }
+                }
+                "shell" => {
+                    if !val.is_empty() {
+                        meta.shell = Some(val.to_string());
                     }
                 }
                 "required_environment_variables" => {
@@ -424,20 +505,8 @@ fn parse_skill_frontmatter(content: &str) -> SkillMeta {
     }
 
     // Flush any accumulated context
-    match current_list_key {
-        Some("platforms") => meta.platforms = current_list_context,
-        Some("read_files") => meta.read_files = current_list_context,
-        Some("fallback_for_toolsets") => {
-            meta.conditional_activation.fallback_for_toolsets = current_list_context
-        }
-        Some("requires_toolsets") => {
-            meta.conditional_activation.requires_toolsets = current_list_context
-        }
-        Some("fallback_for_tools") => {
-            meta.conditional_activation.fallback_for_tools = current_list_context
-        }
-        Some("requires_tools") => meta.conditional_activation.requires_tools = current_list_context,
-        _ => {}
+    if let Some(list_key) = current_list_key {
+        apply_list_to_meta(&mut meta, list_key, current_list_context);
     }
 
     if !current_env_var.name.is_empty() {
@@ -460,6 +529,144 @@ fn strip_frontmatter(content: &str) -> &str {
     } else {
         content
     }
+}
+
+fn normalize_skill_dir_for_prompt(skill_dir: &Path) -> String {
+    let display = skill_dir.to_string_lossy().to_string();
+    if cfg!(windows) {
+        display.replace('\\', "/")
+    } else {
+        display
+    }
+}
+
+fn discover_supporting_files(skill_dir: &Path) -> Vec<String> {
+    let mut supporting_files = Vec::new();
+    for subdir in &["references", "templates", "scripts", "assets"] {
+        let sub_path = skill_dir.join(subdir);
+        let entries = match std::fs::read_dir(&sub_path) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+                supporting_files.push(format!("{subdir}/{name}"));
+            }
+        }
+    }
+    supporting_files.sort();
+    supporting_files
+}
+
+fn render_skill_bundle(
+    skill_dir: &Path,
+    skill_name: &str,
+    session_id: Option<&str>,
+) -> Option<(String, SkillMeta)> {
+    let skill_path = skill_dir.join("SKILL.md");
+    let content = std::fs::read_to_string(&skill_path).ok()?;
+    let meta = parse_skill_frontmatter(&content);
+    let normalized_dir = normalize_skill_dir_for_prompt(skill_dir);
+
+    let mut output = format!(
+        "Base directory for this skill: {normalized_dir}\n\n{}",
+        strip_frontmatter(&content).trim()
+    );
+    output = output.replace("${CLAUDE_SKILL_DIR}", &normalized_dir);
+    if let Some(session_id) = session_id {
+        output = output.replace("${CLAUDE_SESSION_ID}", session_id);
+    }
+
+    for linked_file in &meta.read_files {
+        if linked_file.contains("..") || (linked_file.contains('/') && linked_file.starts_with('/'))
+        {
+            continue;
+        }
+        let linked_path = skill_dir.join(linked_file);
+        if let Ok(linked_content) = std::fs::read_to_string(&linked_path) {
+            output.push_str(&format!(
+                "\n\n--- {} ---\n{}",
+                linked_file,
+                linked_content.trim()
+            ));
+        }
+    }
+
+    let supporting_files = discover_supporting_files(skill_dir);
+    if !supporting_files.is_empty() {
+        output.push_str("\n\n### Supporting Files\n\n");
+        output.push_str(
+            "Files bundled with this skill are available under the skill directory. \
+Use them via normal file or terminal tools when the workflow requires them:\n",
+        );
+        for file in &supporting_files {
+            output.push_str(&format!("- `{file}`\n"));
+        }
+    }
+
+    let mut claude_fields = Vec::new();
+    if let Some(when_to_use) = &meta.when_to_use {
+        claude_fields.push(format!("- When to use: {when_to_use}"));
+    }
+    if !meta.arguments.is_empty() {
+        claude_fields.push(format!("- Arguments: `{}`", meta.arguments.join("`, `")));
+    }
+    if let Some(argument_hint) = &meta.argument_hint {
+        claude_fields.push(format!("- Argument hint: {argument_hint}"));
+    }
+    if !meta.allowed_tools.is_empty() {
+        claude_fields.push(format!(
+            "- Allowed tools: `{}`",
+            meta.allowed_tools.join("`, `")
+        ));
+    }
+    if !meta.user_invocable {
+        claude_fields.push("- User invocable: false".to_string());
+    }
+    if meta.disable_model_invocation {
+        claude_fields.push("- Disable model invocation: true".to_string());
+    }
+    if let Some(context) = &meta.execution_context {
+        claude_fields.push(format!("- Execution context: {context}"));
+    }
+    if let Some(shell) = &meta.shell {
+        claude_fields.push(format!("- Shell: {shell}"));
+    }
+    if !claude_fields.is_empty() {
+        output.push_str("\n\n### Claude-Compatible Metadata\n\n");
+        output.push_str(
+            "EdgeCrab parses these metadata fields for compatibility. Claude-specific runtime \
+semantics such as inline prompt-shell execution and forked skill-agent invocation are not \
+executed automatically by EdgeCrab.\n",
+        );
+        for field in &claude_fields {
+            output.push_str(field);
+            output.push('\n');
+        }
+    }
+
+    let heading = if output.starts_with("## Skill:") {
+        output
+    } else {
+        format!("## Skill: {skill_name}\n\n{output}")
+    };
+    Some((heading, meta))
+}
+
+pub fn load_skill_prompt_bundle(
+    edgecrab_home: &Path,
+    external_dirs: &[String],
+    name: &str,
+    session_id: Option<&str>,
+) -> Option<String> {
+    let skills_base = edgecrab_home.join("skills");
+    let roots = resolve_skill_directories(&skills_base, external_dirs);
+    let skill_dir = find_skill_dir_in_roots(&roots, name)?;
+    render_skill_bundle(&skill_dir, name, session_id).map(|(rendered, _)| rendered)
 }
 
 /// Determine the current platform string for filtering.
@@ -663,6 +870,10 @@ impl ToolHandler for SkillsListTool {
                         continue;
                     }
 
+                    if !meta.user_invocable {
+                        continue;
+                    }
+
                     // Filter by platform compatibility (always check current OS)
                     if !should_show_on_platform(&meta.platforms) {
                         continue;
@@ -709,7 +920,7 @@ impl ToolHandler for SkillsListTool {
                 current_category = Some(cat.to_string());
             }
             let display_name = meta.name.as_deref().unwrap_or(name.as_str());
-            if let Some(ref desc) = meta.description {
+            if let Some(desc) = meta.description.as_ref().or(meta.when_to_use.as_ref()) {
                 output.push_str(&format!("- **{}**: {}\n", display_name, desc));
             } else {
                 output.push_str(&format!("- **{}**\n", display_name));
@@ -792,6 +1003,9 @@ impl ToolHandler for SkillsCategoriesList {
                     // This is a skill — check platform compatibility
                     if let Ok(content) = std::fs::read_to_string(&skill_md) {
                         let m = parse_skill_frontmatter(&content);
+                        if !m.user_invocable {
+                            continue;
+                        }
                         if !m.platforms.is_empty() && !should_show_on_platform(&m.platforms) {
                             continue;
                         }
@@ -948,24 +1162,15 @@ impl ToolHandler for SkillViewTool {
             return Ok(format!("## Skill: {} / {}\n\n{}", args.name, fp, content));
         }
 
-        let skill_path = skill_dir.join("SKILL.md");
-
-        if !skill_path.is_file() {
+        if !skill_dir.join("SKILL.md").is_file() {
             return Err(ToolError::NotFound(format!(
                 "Skill '{}' not found — no SKILL.md at expected path",
                 args.name
             )));
         }
 
-        let content = tokio::fs::read_to_string(&skill_path)
-            .await
-            .map_err(|e| ToolError::Other(format!("Cannot read skill: {}", e)))?;
-
-        // Parse frontmatter for linked files
-        let meta = parse_skill_frontmatter(&content);
-        let body = strip_frontmatter(&content);
-
-        let mut output = format!("## Skill: {}\n\n{}", args.name, body);
+        let (mut output, meta) = render_skill_bundle(&skill_dir, &args.name, Some(&ctx.session_id))
+            .ok_or_else(|| ToolError::Other("Cannot read skill".into()))?;
 
         // Register required_environment_variables declared by this skill as
         // passthrough so they survive the `safe_env()` blocklist filter.
@@ -984,63 +1189,6 @@ impl ToolHandler for SkillViewTool {
         let missing_vars = check_missing_env_vars(&meta);
         if !missing_vars.is_empty() {
             output.push_str(&format_env_var_guidance(&missing_vars));
-        }
-
-        // Progressive disclosure: load linked files from read_files frontmatter
-        for linked_file in &meta.read_files {
-            // Sanitize linked filename
-            if linked_file.contains("..")
-                || linked_file.contains('/') && linked_file.starts_with('/')
-            {
-                continue; // Skip absolute paths or traversal attempts
-            }
-            let linked_path = skill_dir.join(linked_file);
-            if linked_path.is_file() {
-                match tokio::fs::read_to_string(&linked_path).await {
-                    Ok(linked_content) => {
-                        output.push_str(&format!(
-                            "\n\n--- {} ---\n{}",
-                            linked_file,
-                            linked_content.trim()
-                        ));
-                    }
-                    Err(_) => {
-                        output.push_str(&format!(
-                            "\n\n--- {} ---\n(could not read file)",
-                            linked_file
-                        ));
-                    }
-                }
-            }
-        }
-
-        // Discover supporting files in standard subdirectories
-        // (references/, templates/, scripts/, assets/) — like hermes-agent
-        let mut supporting_files: Vec<String> = Vec::new();
-        for subdir in &["references", "templates", "scripts", "assets"] {
-            let sub_path = skill_dir.join(subdir);
-            if sub_path.is_dir() {
-                if let Ok(mut entries) = tokio::fs::read_dir(&sub_path).await {
-                    while let Ok(Some(entry)) = entries.next_entry().await {
-                        let p = entry.path();
-                        if p.is_file() {
-                            if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-                                supporting_files.push(format!("{}/{}", subdir, name));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if !supporting_files.is_empty() {
-            supporting_files.sort();
-            output.push_str("\n\n### Supporting Files\n\n");
-            output
-                .push_str("Load any of these with `skill_view` using the `file_path` parameter:\n");
-            for sf in &supporting_files {
-                output.push_str(&format!("- `{}`\n", sf));
-            }
         }
 
         Ok(output)
@@ -1746,7 +1894,7 @@ mod skill_manage_tests {
 
         SkillManageTool
             .execute(
-                json!({"action": "create", "name": "skill1", "content": "old"}),
+                json!({"action": "create", "name": "skill1", "content": "old sentinel content"}),
                 &ctx,
             )
             .await
@@ -1765,7 +1913,7 @@ mod skill_manage_tests {
             .await
             .expect("view");
         assert!(view.contains("new content"));
-        assert!(!view.contains("old"));
+        assert!(!view.contains("old sentinel content"));
     }
 
     #[tokio::test]
@@ -2146,6 +2294,56 @@ mod skill_manage_tests {
     }
 
     #[tokio::test]
+    async fn skills_list_hides_non_user_invocable_skills() {
+        let dir = TempDir::new().expect("tmpdir");
+        let hidden_dir = dir.path().join("skills").join("hidden_skill");
+        std::fs::create_dir_all(&hidden_dir).expect("mkdir");
+        std::fs::write(
+            hidden_dir.join("SKILL.md"),
+            "---\nuser-invocable: false\ndescription: Hidden\n---\n# Hidden",
+        )
+        .expect("write hidden");
+
+        let visible_dir = dir.path().join("skills").join("visible_skill");
+        std::fs::create_dir_all(&visible_dir).expect("mkdir");
+        std::fs::write(
+            visible_dir.join("SKILL.md"),
+            "---\ndescription: Visible\n---\n# Visible",
+        )
+        .expect("write visible");
+
+        let ctx = ctx_in(dir.path());
+        let result = SkillsListTool.execute(json!({}), &ctx).await.expect("list");
+        assert!(
+            result.contains("visible_skill"),
+            "visible skill missing: {result}"
+        );
+        assert!(
+            !result.contains("hidden_skill"),
+            "non-user-invocable skill should be hidden: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn skills_list_uses_when_to_use_when_description_is_missing() {
+        let dir = TempDir::new().expect("tmpdir");
+        let skill_dir = dir.path().join("skills").join("claude_skill");
+        std::fs::create_dir_all(&skill_dir).expect("mkdir");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nwhen_to_use: Use this when validating release branches.\n---\n# Claude Skill",
+        )
+        .expect("write skill");
+
+        let ctx = ctx_in(dir.path());
+        let result = SkillsListTool.execute(json!({}), &ctx).await.expect("list");
+        assert!(
+            result.contains("Use this when validating release branches."),
+            "when_to_use fallback missing: {result}"
+        );
+    }
+
+    #[tokio::test]
     async fn skill_view_lists_supporting_files() {
         let dir = TempDir::new().expect("tmpdir");
         let skill_dir = dir.path().join("skills").join("rich_skill");
@@ -2167,6 +2365,99 @@ mod skill_manage_tests {
             result.contains("references/api.md"),
             "should list the file: {result}"
         );
+    }
+
+    #[tokio::test]
+    async fn skill_view_renders_claude_metadata_fields() {
+        let dir = TempDir::new().expect("tmpdir");
+        let skill_dir = dir.path().join("skills").join("claude_meta");
+        std::fs::create_dir_all(&skill_dir).expect("mkdir");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\n\
+when_to_use: Use when triaging incidents.\n\
+arguments: [service, severity]\n\
+argument-hint: <service> <severity>\n\
+allowed-tools: [read_file, run_terminal]\n\
+user-invocable: false\n\
+disable-model-invocation: true\n\
+context: fork\n\
+shell: powershell\n\
+---\n\
+# Incident Skill\n",
+        )
+        .expect("write skill");
+
+        let ctx = ctx_in(dir.path());
+        let result = SkillViewTool
+            .execute(json!({"name": "claude_meta"}), &ctx)
+            .await
+            .expect("view");
+        assert!(result.contains("Claude-Compatible Metadata"));
+        assert!(result.contains("When to use: Use when triaging incidents."));
+        assert!(result.contains("Arguments: `service`, `severity`"));
+        assert!(result.contains("Argument hint: <service> <severity>"));
+        assert!(result.contains("Allowed tools: `read_file`, `run_terminal`"));
+        assert!(result.contains("User invocable: false"));
+        assert!(result.contains("Disable model invocation: true"));
+        assert!(result.contains("Execution context: fork"));
+        assert!(result.contains("Shell: powershell"));
+        assert!(result.contains("not executed automatically by EdgeCrab"));
+    }
+
+    #[test]
+    fn load_skill_prompt_bundle_supports_claude_skill_dir_and_scripts() {
+        let dir = TempDir::new().expect("tmpdir");
+        let skill_dir = dir.path().join("skills").join("claude_script_skill");
+        let scripts_dir = skill_dir.join("scripts");
+        std::fs::create_dir_all(&scripts_dir).expect("mkdir");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nread_files:\n  - extra.md\n---\n\
+Run `${CLAUDE_SKILL_DIR}/scripts/check.py --session ${CLAUDE_SESSION_ID}`.\n",
+        )
+        .expect("write skill");
+        std::fs::write(skill_dir.join("extra.md"), "Linked file body").expect("write linked");
+        std::fs::write(scripts_dir.join("check.py"), "print('ok')").expect("write script");
+
+        let rendered =
+            load_skill_prompt_bundle(dir.path(), &[], "claude_script_skill", Some("sess-123"))
+                .expect("bundle");
+
+        assert!(rendered.contains("Base directory for this skill:"));
+        assert!(rendered.contains("scripts/check.py --session sess-123"));
+        assert!(rendered.contains("Linked file body"));
+        assert!(rendered.contains("scripts/check.py"));
+        assert!(!rendered.contains("${CLAUDE_SKILL_DIR}"));
+        assert!(!rendered.contains("${CLAUDE_SESSION_ID}"));
+    }
+
+    #[test]
+    fn parse_skill_frontmatter_supports_claude_fields() {
+        let meta = parse_skill_frontmatter(
+            "---\n\
+when_to_use: Use for release prep\n\
+arguments:\n\
+  - service\n\
+  - version\n\
+argument-hint: <service> <version>\n\
+allowed-tools: [read_file, run_terminal]\n\
+user-invocable: false\n\
+disable-model-invocation: true\n\
+context: fork\n\
+shell: bash\n\
+---\n\
+# Skill\n",
+        );
+
+        assert_eq!(meta.when_to_use.as_deref(), Some("Use for release prep"));
+        assert_eq!(meta.arguments, vec!["service", "version"]);
+        assert_eq!(meta.argument_hint.as_deref(), Some("<service> <version>"));
+        assert_eq!(meta.allowed_tools, vec!["read_file", "run_terminal"]);
+        assert!(!meta.user_invocable);
+        assert!(meta.disable_model_invocation);
+        assert_eq!(meta.execution_context.as_deref(), Some("fork"));
+        assert_eq!(meta.shell.as_deref(), Some("bash"));
     }
 }
 

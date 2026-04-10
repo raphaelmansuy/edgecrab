@@ -6,8 +6,10 @@ use edgecrab_types::Platform;
 use crate::config::PluginsConfig;
 use crate::error::PluginError;
 use crate::hermes::{
-    looks_like_hermes_plugin, missing_required_env as missing_hermes_env,
-    parse_hermes_manifest, synthesize_manifest as synthesize_hermes_manifest,
+    HermesCliCommand, discover_entrypoint_plugins, hermes_declared_hooks, hermes_declared_tools,
+    introspect_runtime_surface, introspect_runtime_surface_for_entrypoint,
+    looks_like_hermes_plugin, missing_required_env as missing_hermes_env, parse_hermes_manifest,
+    synthesize_entrypoint_manifest, synthesize_manifest as synthesize_hermes_manifest,
 };
 use crate::manifest::{PluginManifest, parse_plugin_manifest};
 use crate::skill::inject::build_prompt_fragment;
@@ -19,6 +21,7 @@ pub struct DiscoveredPlugin {
     pub name: String,
     pub version: String,
     pub description: String,
+    pub compatibility: Option<String>,
     pub kind: PluginKind,
     pub status: PluginStatus,
     pub path: PathBuf,
@@ -27,9 +30,12 @@ pub struct DiscoveredPlugin {
     pub tools: Vec<String>,
     pub hooks: Vec<String>,
     pub trust_level: TrustLevel,
+    pub install_source: Option<String>,
     pub enabled: bool,
     pub source: SkillSource,
     pub missing_env: Vec<String>,
+    pub related_skills: Vec<String>,
+    pub cli_commands: Vec<HermesCliCommand>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -63,6 +69,17 @@ pub fn discover_plugins(
             } else {
                 continue;
             };
+            if seen.insert(plugin.name.clone()) {
+                plugins.push(plugin);
+            }
+        }
+    }
+    if let Ok(entrypoints) = discover_entrypoint_plugins() {
+        for entrypoint in entrypoints {
+            if seen.contains(&entrypoint.name) {
+                continue;
+            }
+            let plugin = load_hermes_entrypoint_plugin(config, entrypoint, platform)?;
             if seen.insert(plugin.name.clone()) {
                 plugins.push(plugin);
             }
@@ -108,6 +125,9 @@ fn load_plugin_from_manifest(
     manifest_path: &Path,
 ) -> Result<DiscoveredPlugin, PluginError> {
     let manifest = parse_plugin_manifest(manifest_path)?;
+    if manifest.plugin.kind == PluginKind::Hermes && looks_like_hermes_plugin(path) {
+        return load_hermes_plugin_with_install_metadata(config, path, source, platform, manifest);
+    }
     let enabled = config.is_plugin_enabled(&manifest.plugin.name, Some(&platform.to_string()));
     let skill = if manifest.plugin.kind == PluginKind::Skill && path.join("SKILL.md").is_file() {
         scan_skills_dir(path, source, &[], platform)?
@@ -126,10 +146,19 @@ fn load_plugin_from_manifest(
         },
         |skill| status_for_skill(enabled, skill),
     );
+    let compatibility = skill
+        .as_ref()
+        .and_then(|loaded| loaded.manifest.compatibility.clone());
+    let related_skills = skill
+        .as_ref()
+        .map(|loaded| loaded.manifest.related_skills.clone())
+        .unwrap_or_default();
+    let missing_env = skill.as_ref().map(skill_missing_env).unwrap_or_default();
     Ok(DiscoveredPlugin {
         name: manifest.plugin.name.clone(),
         version: manifest.plugin.version.clone(),
         description: manifest.plugin.description.clone(),
+        compatibility,
         kind: manifest.plugin.kind,
         status,
         path: path.to_path_buf(),
@@ -144,11 +173,17 @@ fn load_plugin_from_manifest(
             .as_ref()
             .map(|trust| trust.level)
             .unwrap_or_default(),
+        install_source: manifest
+            .trust
+            .as_ref()
+            .and_then(|trust| trust.source.clone()),
         manifest: Some(manifest),
         skill,
         enabled,
         source,
-        missing_env: Vec::new(),
+        missing_env,
+        related_skills,
+        cli_commands: Vec::new(),
     })
 }
 
@@ -167,6 +202,8 @@ fn load_skill_only_plugin(
         })?;
     let missing_env = skill_missing_env(&loaded);
     let enabled = config.is_plugin_enabled(&loaded.manifest.name, Some(&platform.to_string()));
+    let compatibility = loaded.manifest.compatibility.clone();
+    let related_skills = loaded.manifest.related_skills.clone();
     Ok(DiscoveredPlugin {
         name: loaded.manifest.name.clone(),
         version: loaded
@@ -175,6 +212,7 @@ fn load_skill_only_plugin(
             .clone()
             .unwrap_or_else(|| "0.1.0".into()),
         description: loaded.manifest.description.clone(),
+        compatibility,
         kind: PluginKind::Skill,
         status: status_for_skill(enabled, &loaded),
         path: path.to_path_buf(),
@@ -183,9 +221,12 @@ fn load_skill_only_plugin(
         tools: Vec::new(),
         hooks: Vec::new(),
         trust_level: TrustLevel::Unverified,
+        install_source: None,
         enabled,
         source,
         missing_env,
+        related_skills,
+        cli_commands: Vec::new(),
     })
 }
 
@@ -234,6 +275,7 @@ fn status_for_skill(enabled: bool, loaded: &LoadedSkill) -> PluginStatus {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
@@ -245,6 +287,7 @@ mod tests {
                 name: "demo".into(),
                 version: "0.1.0".into(),
                 description: "Demo".into(),
+                compatibility: None,
                 kind: PluginKind::Skill,
                 status: PluginStatus::Available,
                 path: PathBuf::from("/tmp/demo"),
@@ -264,9 +307,12 @@ mod tests {
                 tools: Vec::new(),
                 hooks: Vec::new(),
                 trust_level: TrustLevel::Unverified,
+                install_source: None,
                 enabled: true,
                 source: SkillSource::User,
                 missing_env: Vec::new(),
+                related_skills: Vec::new(),
+                cli_commands: Vec::new(),
             }],
         };
 
@@ -301,11 +347,13 @@ requires_env:
 
         let config = PluginsConfig {
             install_dir: temp.path().join("empty-install-root"),
-            external_dirs: vec![plugin_dir
-                .parent()
-                .expect("parent")
-                .to_string_lossy()
-                .to_string()],
+            external_dirs: vec![
+                plugin_dir
+                    .parent()
+                    .expect("parent")
+                    .to_string_lossy()
+                    .to_string(),
+            ],
             ..PluginsConfig::default()
         };
 
@@ -318,6 +366,72 @@ requires_env:
 
         assert_eq!(plugin.status, PluginStatus::SetupNeeded);
         assert_eq!(plugin.missing_env, vec!["EDGECRAB_TEST_HERMES_TOKEN"]);
+    }
+
+    #[test]
+    fn hermes_plugin_loads_bundled_skill_metadata() {
+        let temp = TempDir::new().expect("tempdir");
+        let plugin_dir = temp.path().join("calculator");
+        std::fs::create_dir_all(&plugin_dir).expect("plugin dir");
+        std::fs::write(
+            plugin_dir.join("plugin.yaml"),
+            r#"
+name: calculator
+version: "1.0.0"
+description: Calculator plugin
+provides_tools:
+  - calculate
+"#,
+        )
+        .expect("manifest");
+        std::fs::write(
+            plugin_dir.join("__init__.py"),
+            "def register(ctx):\n    pass\n",
+        )
+        .expect("plugin");
+        std::fs::write(
+            plugin_dir.join("SKILL.md"),
+            r#"---
+name: calculator-skill
+description: Use calculator for exact arithmetic.
+compatibility: Requires calculator plugin
+metadata:
+  hermes:
+    related_skills: [math-notes]
+---
+
+# Calculator
+
+Use `calculate` for exact arithmetic.
+"#,
+        )
+        .expect("skill");
+
+        let config = PluginsConfig {
+            install_dir: temp.path().join("empty-install-root"),
+            external_dirs: vec![
+                plugin_dir
+                    .parent()
+                    .expect("parent")
+                    .to_string_lossy()
+                    .to_string(),
+            ],
+            ..PluginsConfig::default()
+        };
+
+        let discovery = discover_plugins(&config, Platform::Cli).expect("discovery");
+        let plugin = discovery
+            .plugins
+            .iter()
+            .find(|plugin| plugin.name == "calculator")
+            .expect("plugin discovered");
+
+        assert_eq!(
+            plugin.compatibility.as_deref(),
+            Some("Requires calculator plugin")
+        );
+        assert_eq!(plugin.related_skills, vec!["math-notes"]);
+        assert!(plugin.skill.is_some());
     }
 }
 
@@ -340,13 +454,77 @@ fn load_hermes_plugin(
     platform: Platform,
 ) -> Result<DiscoveredPlugin, PluginError> {
     let hermes_manifest = parse_hermes_manifest(path)?;
-    let manifest = synthesize_hermes_manifest(path, &hermes_manifest);
+    load_hermes_plugin_with_install_metadata(
+        config,
+        path,
+        source,
+        platform,
+        synthesize_hermes_manifest(path, &hermes_manifest),
+    )
+}
+
+fn load_hermes_plugin_with_install_metadata(
+    config: &PluginsConfig,
+    path: &Path,
+    source: SkillSource,
+    platform: Platform,
+    install_manifest: PluginManifest,
+) -> Result<DiscoveredPlugin, PluginError> {
+    let hermes_manifest = parse_hermes_manifest(path)?;
+    let mut manifest = synthesize_hermes_manifest(path, &hermes_manifest);
+    if let (Some(exec), Some(installed_exec)) =
+        (manifest.exec.as_mut(), install_manifest.exec.as_ref())
+    {
+        exec.env = installed_exec.env.clone();
+        exec.cwd = installed_exec.cwd.clone();
+    }
+    manifest.trust = install_manifest.trust.clone();
+    manifest.integrity = install_manifest.integrity.clone();
+    let runtime_surface = introspect_runtime_surface(path, &hermes_manifest);
+    let mut tools = hermes_declared_tools(&hermes_manifest);
+    for tool in runtime_surface.tools {
+        if !tools.iter().any(|existing| existing == &tool.name) {
+            tools.push(tool.name);
+        }
+    }
+    tools.sort();
+    let mut hooks = hermes_declared_hooks(&hermes_manifest);
+    for hook in runtime_surface.hooks {
+        if !hooks.iter().any(|existing| existing == &hook) {
+            hooks.push(hook);
+        }
+    }
+    hooks.sort();
     let enabled = config.is_plugin_enabled(&manifest.plugin.name, Some(&platform.to_string()));
     let missing_env = missing_hermes_env(&hermes_manifest);
+    let skill = if path.join("SKILL.md").is_file() {
+        scan_skills_dir(path, source, &[], platform)?
+            .into_iter()
+            .find(|loaded| loaded.path == path.join("SKILL.md"))
+    } else {
+        None
+    };
+    let compatibility = skill
+        .as_ref()
+        .and_then(|loaded| loaded.manifest.compatibility.clone());
+    let related_skills = skill
+        .as_ref()
+        .map(|loaded| loaded.manifest.related_skills.clone())
+        .unwrap_or_default();
+    let trust_level = manifest
+        .trust
+        .as_ref()
+        .map(|trust| trust.level)
+        .unwrap_or(TrustLevel::Unverified);
+    let install_source = manifest
+        .trust
+        .as_ref()
+        .and_then(|trust| trust.source.clone());
     Ok(DiscoveredPlugin {
         name: manifest.plugin.name.clone(),
         version: manifest.plugin.version.clone(),
         description: manifest.plugin.description.clone(),
+        compatibility,
         kind: manifest.plugin.kind,
         status: if !enabled {
             PluginStatus::Disabled
@@ -357,13 +535,64 @@ fn load_hermes_plugin(
         },
         path: path.to_path_buf(),
         manifest: Some(manifest),
-        skill: None,
-        tools: hermes_manifest.provides_tools,
-        hooks: hermes_manifest.provides_hooks,
-        trust_level: TrustLevel::Unverified,
+        skill,
+        tools,
+        hooks,
+        trust_level,
+        install_source,
         enabled,
         source,
         missing_env,
+        related_skills,
+        cli_commands: runtime_surface.cli_commands,
+    })
+}
+
+fn load_hermes_entrypoint_plugin(
+    config: &PluginsConfig,
+    entrypoint: crate::hermes::HermesEntrypointPlugin,
+    platform: Platform,
+) -> Result<DiscoveredPlugin, PluginError> {
+    let manifest = synthesize_entrypoint_manifest(&entrypoint, None);
+    let runtime_surface = introspect_runtime_surface_for_entrypoint(&entrypoint);
+    let mut tools = runtime_surface
+        .tools
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect::<Vec<_>>();
+    tools.sort();
+    tools.dedup();
+    let mut hooks = runtime_surface.hooks.clone();
+    hooks.sort();
+    hooks.dedup();
+    let enabled = config.is_plugin_enabled(&manifest.plugin.name, Some(&platform.to_string()));
+
+    Ok(DiscoveredPlugin {
+        name: manifest.plugin.name.clone(),
+        version: manifest.plugin.version.clone(),
+        description: manifest.plugin.description.clone(),
+        compatibility: None,
+        kind: manifest.plugin.kind,
+        status: if enabled {
+            PluginStatus::Available
+        } else {
+            PluginStatus::Disabled
+        },
+        path: entrypoint
+            .module_path
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(format!("entrypoint:{}", entrypoint.name))),
+        manifest: Some(manifest),
+        skill: None,
+        tools,
+        hooks,
+        trust_level: TrustLevel::Unverified,
+        install_source: Some(format!("entrypoint:{}", entrypoint.value)),
+        enabled,
+        source: SkillSource::System,
+        missing_env: Vec::new(),
+        related_skills: Vec::new(),
+        cli_commands: runtime_surface.cli_commands,
     })
 }
 

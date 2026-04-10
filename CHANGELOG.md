@@ -7,6 +7,40 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Hermes plugin install and runtime E2E coverage** — new CLI integration tests now install and execute a guide-style Hermes plugin bundle, a real upstream `holographic` Hermes plugin, and a real upstream `1password` Hermes skill directly through `edgecrab plugins install`.
+- **Hermes entry-point and plugin CLI E2E coverage** — a new integration test now installs a pip-distributed Hermes entry-point plugin into an isolated virtualenv, verifies discovery through `EDGECRAB_PLUGIN_PYTHON`, and executes a top-level Hermes CLI command registered through `ctx.register_cli_command()`.
+- **Community Hermes repo coverage and authoring guides** — new docs and site guides now show how to build Hermes-style plugins for EdgeCrab, and the CLI E2E suite now covers real `42-evey/hermes-plugins` plugins (`evey-telemetry`, `evey-status`).
+- **Official repo Hermes example plugins** — the repository now ships `plugins/productivity/calculator` and `plugins/developer/json-toolbox` as dependency-free Hermes-format examples, both covered by CLI E2E tests and usable as documentation-grade templates.
+- **Installed plugin browser now has first-class TUI UX** — `/plugins` now opens the local plugin browser overlay by default, with split-pane details, fuzzy filtering across plugin/runtime metadata, staged enable-disable changes, scope switching, and direct handoff to remote plugin search.
+- **Gateway parity proof for Hermes session hooks** — new gateway tests now prove per-chat agent isolation plus `on_session_start`, `on_session_end`, `on_session_finalize`, and `on_session_reset` behavior through real gateway message flow, reset, and shutdown paths.
+- **Claude-style standalone skill bundle support for helper scripts** — preloaded and viewed skills now render a deterministic base-directory header, substitute `${CLAUDE_SKILL_DIR}` and `${CLAUDE_SESSION_ID}`, surface bundled helper files from `references/`, `templates/`, `scripts/`, and `assets/`, and parse Claude frontmatter metadata including `when_to_use`, `arguments`, `argument-hint`, `allowed-tools`, `user-invocable`, `disable-model-invocation`, `context`, and `shell`.
+- **Compatibility claims narrowed to code-proven behavior** — docs now distinguish supported Claude-style skill-bundle features from still-missing Claude runtime semantics such as inline prompt-shell execution and automatic forked skill-agent invocation.
+- **Remote plugin browser now stays plugin-only** — curated repo-backed plugin search no longer mixes standalone skills into the plugin overlay, skill-only sources are hidden from plugin-browser source summaries, and per-source reporting no longer starves Hermes plugin results behind earlier sources.
+
+### Changed
+
+- **Hermes local bundle installs are now source-compatible** — `edgecrab plugins install ./path` now accepts raw Hermes plugin directories and raw `SKILL.md` skill bundles without requiring authors to add a handwritten `plugin.toml`.
+- **Installed Hermes plugins retain their Hermes runtime identity** — rediscovery now preserves hook introspection, bundled `SKILL.md` metadata, and the persisted `HERMES_HOME` mapping instead of degrading installed Hermes bundles into generic manifest-only plugins.
+- **Installed Hermes memory plugins now retain their upstream package identity** — flattened installs are now aliased back into `plugins.memory.<name>` so real upstream plugins such as `honcho` keep working across fresh-process rediscovery, runtime hooks, and CLI loading.
+- **Hermes hook parity now matches upstream `VALID_HOOKS` in the CLI runtime** — EdgeCrab now drives `pre_tool_call`, `post_tool_call`, `pre_llm_call`, `post_llm_call`, `pre_api_request`, `post_api_request`, `on_session_start`, `on_session_end`, `on_session_finalize`, and `on_session_reset`.
+- **Hermes hub search now indexes upstream Python plugin directories** — the curated `hermes-plugins` source now returns installable results from `plugins/...` as well as `skills/...` and `optional-skills/...`.
+- **Hermes hub search now indexes repo-root Hermes plugin directories too** — the curated `hermes-evey` source maps `42-evey/hermes-plugins` directly, including declared shared support files for curated GitHub installs.
+- **`edgecrab-official` now indexes repo-local Hermes plugins too** — the official source now scans the repository `plugins/` tree in addition to official skills, and repo-backed caches are keyed by mapping so skill and plugin indexes do not trample each other.
+- **Rust release automation now publishes `edgecrab-plugins` explicitly** — crates.io publish order and local publish helpers now include the shared plugin crate as a first-class release artifact instead of relying on workspace-only coverage.
+
+### Fixed
+
+- **Hermes memory-provider plugins without static `provides_tools` declarations no longer fail local install** — EdgeCrab now permits Hermes manifest bundles whose runtime tools are discovered dynamically.
+- **Installer-stamped trusted manifests now rediscover cleanly** — plugin manifests stamped with install-time trust/source/checksum metadata no longer fail validation as if the bundle had self-assigned trust.
+- **Manifest-backed skill installs now surface missing credentials correctly** — installed Hermes skills such as `1password` now keep their `setup-needed` state and missing environment variable list in `/plugins info`.
+- **Pip-installed Hermes plugins are now discovered through the selected Python runtime** — EdgeCrab now reads the `hermes_agent.plugins` entry-point group from the configured plugin Python interpreter instead of only scanning directory bundles.
+- **`ctx.register_cli_command()` and `cli.py register_cli(subparser)` now map to executable EdgeCrab CLI trees** — Hermes plugins can expose `edgecrab <plugin-command> ...` trees through either upstream registration path instead of being silently ignored.
+- **The TUI Tool Manager now tracks plugin state live** — installing, enabling, disabling, updating, or removing plugins rebuilds the active agent registry immediately so `/tools` always reflects the real set of exposed plugin tools without requiring a restart.
+- **Hermes and tool-server plugin schemas now preserve real `inputSchema` definitions** — dynamic plugin tools no longer downgrade to a generic object schema before provider submission, and outgoing tool schemas are normalized so strict OpenAI-compatible validators accept object tools that rely on `additionalProperties`.
+- **Plugin search now uses layered hub caches** — source indexes, repo-backed plugin trees, and repo-entry descriptions are cached separately with TTL-based freshness checks, stale-cache fallback on refresh failure, and shared cache primitives instead of duplicated per-source logic.
+
 ---
 
 ## [0.2.4] — 2026-04-09

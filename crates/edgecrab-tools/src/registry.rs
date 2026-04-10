@@ -31,6 +31,7 @@ use tokio_util::sync::CancellationToken;
 
 use edgecrab_state::SessionDb;
 use edgecrab_types::{Message, Platform, ToolError, ToolSchema};
+use serde_json::{Map, Value};
 
 use crate::config_ref::AppConfigRef;
 use crate::process_table::ProcessTable;
@@ -791,9 +792,43 @@ pub fn to_llm_definitions(schemas: &[ToolSchema]) -> Vec<edgequake_llm::ToolDefi
     schemas
         .iter()
         .map(|s| {
-            edgequake_llm::ToolDefinition::function(&s.name, &s.description, s.parameters.clone())
+            edgequake_llm::ToolDefinition::function(
+                &s.name,
+                &s.description,
+                normalize_json_schema(&s.parameters),
+            )
         })
         .collect()
+}
+
+/// Normalize JSON Schema into a provider-safe shape.
+///
+/// Some OpenAI-compatible tool validators reject object schemas that omit a
+/// `properties` map, even when `additionalProperties` is present. Plugin and
+/// MCP schemas coming from external runtimes are the most common source of
+/// that shape. We normalize recursively at the LLM bridge so every tool path
+/// uses the same deterministic schema contract.
+pub fn normalize_json_schema(schema: &Value) -> Value {
+    match schema {
+        Value::Object(object) => {
+            let mut normalized = Map::new();
+            for (key, value) in object {
+                normalized.insert(key.clone(), normalize_json_schema(value));
+            }
+
+            if normalized.get("type").and_then(Value::as_str) == Some("object") {
+                let needs_properties =
+                    !matches!(normalized.get("properties"), Some(Value::Object(_)));
+                if needs_properties {
+                    normalized.insert("properties".into(), Value::Object(Map::new()));
+                }
+            }
+
+            Value::Object(normalized)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(normalize_json_schema).collect()),
+        _ => schema.clone(),
+    }
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────
@@ -1160,6 +1195,31 @@ mod tests {
         let defs = to_llm_definitions(&schemas);
         assert_eq!(defs.len(), 1);
         assert_eq!(defs[0].function.name, "read_file");
+    }
+
+    #[test]
+    fn normalize_json_schema_inserts_missing_object_properties_recursively() {
+        let normalized = normalize_json_schema(&json!({
+            "type": "object",
+            "additionalProperties": true,
+            "properties": {
+                "options": {
+                    "type": "object",
+                    "additionalProperties": true
+                },
+                "entries": {
+                    "type": "array",
+                    "items": {
+                        "type": "object"
+                    }
+                }
+            }
+        }));
+
+        assert_eq!(normalized["type"], "object");
+        assert!(normalized["properties"].is_object());
+        assert!(normalized["properties"]["options"]["properties"].is_object());
+        assert!(normalized["properties"]["entries"]["items"]["properties"].is_object());
     }
 
     #[test]

@@ -76,7 +76,7 @@ git push origin v0.2.0
     │                            └── publishes GitHub Release
     │                                  ├── release-npm-cli.yml  → publish edgecrab-cli to npm
     │                                  └── release-pypi-cli.yml → publish edgecrab-cli to PyPI
-    ├── release-rust.yml       → publish 11 crates to crates.io + update GH release notes
+    ├── release-rust.yml       → publish 12 crates to crates.io + update GH release notes
     ├── release-python.yml     → publish edgecrab-sdk to PyPI (multi-platform wheels)
     ├── release-node.yml       → publish edgecrab-sdk to npm
     └── release-docker.yml     → push multi-arch Docker image to GHCR
@@ -255,7 +255,7 @@ npm list -g --depth=0 | grep edgecrab
 |---|---|---|
 | `ci.yml` | push/PR to `main` | Build, test, clippy, fmt, audit, site build |
 | `release-binaries.yml` | tag `v*` | Cross-compile 4 platform binaries, upload checksums, publish GitHub Release |
-| `release-rust.yml` | tag `v*` | Publish 11 crates in dependency order, then update GitHub release notes |
+| `release-rust.yml` | tag `v*` | Publish 12 crates in dependency order, then update GitHub release notes |
 | `release-node.yml` | tag `v*` | Publish `edgecrab-sdk` to npm |
 | `release-python.yml` | tag `v*` | Build multi-platform wheels + publish `edgecrab-sdk` to PyPI |
 | `release-npm-cli.yml` | release `published` | Publish `edgecrab-cli` to npm after binaries are public |

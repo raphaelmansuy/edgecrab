@@ -1,6 +1,6 @@
 # 🦀 CI/CD Secrets Setup
 
-> **WHY**: A Rust workspace publishing 11 crates to crates.io, two SDK packages (npm + PyPI), one Docker image, and a documentation site needs disciplined secret hygiene — the wrong token in the wrong workflow is a supply-chain incident.
+> **WHY**: A Rust workspace publishing 12 crates to crates.io, two SDK packages (npm + PyPI), one Docker image, and a documentation site needs disciplined secret hygiene — the wrong token in the wrong workflow is a supply-chain incident.
 
 **Source**: `.github/workflows/`
 
@@ -12,7 +12,7 @@
 |---|---|---|
 | `ci.yml` | Push / PR | Build, test, clippy, fmt check |
 | `release-binaries.yml` | Tag push (`v*`) | Build native binaries, upload checksums, publish GitHub Release |
-| `release-rust.yml` | Tag push (`v*`) | Publish all 11 crates to crates.io in dependency order |
+| `release-rust.yml` | Tag push (`v*`) | Publish all 12 crates to crates.io in dependency order |
 | `release-node.yml` | Tag push (`v*`) | Publish npm package (JS/TS SDK) |
 | `release-python.yml` | Tag push (`v*`) | Publish Python SDK to PyPI |
 | `release-npm-cli.yml` | `release-binaries.yml` completed successfully | Publish `edgecrab-cli` npm wrapper after binaries are public |

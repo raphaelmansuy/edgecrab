@@ -10,7 +10,9 @@ use axum::{Router, http::StatusCode};
 use tempfile::tempdir;
 
 fn edgecrab() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_edgecrab"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_edgecrab"));
+    command.env("EDGECRAB_DISABLE_BROWSER_OPEN", "1");
+    command
 }
 
 #[derive(Clone)]

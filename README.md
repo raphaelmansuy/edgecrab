@@ -482,6 +482,41 @@ Inside TUI: `/skills` opens the installed-skill browser, and `/skills search [qu
 
 Skills are saved to `~/.edgecrab/skills/` and loaded on demand. The agent can also create new skills mid-session during learning reflection.
 
+Claude-style skill bundles with helper scripts are supported in the standalone skills runtime:
+
+- bundled helper files under `references/`, `templates/`, `scripts/`, and `assets/`
+- `${CLAUDE_SKILL_DIR}` substitution to the concrete skill directory
+- `${CLAUDE_SESSION_ID}` substitution to the active EdgeCrab session id
+- the same bundle rendering for `skill_view` and preloaded `--skill` / `skills.preloaded` flows
+- parsing and display of `when_to_use`, `arguments`, `argument-hint`, `allowed-tools`,
+  `user-invocable`, `disable-model-invocation`, `context`, and `shell`
+
+Current boundary: EdgeCrab does not auto-execute Claude inline prompt-shell
+blocks and does not auto-fork a dedicated skill sub-agent from those metadata
+fields alone.
+
+### Skills Vs Plugins
+
+First principles:
+
+- A `skill` is reusable guidance for the model.
+- A `plugin` is an installable runtime unit that EdgeCrab discovers, enables, disables, updates, and audits.
+
+That leads to a clean operational split:
+
+- Use `skills` when the extension is instructions-first: procedures, examples, checklists, workflow scaffolding, or bundled helper files/scripts that the agent uses through normal tools.
+- Use `plugins` when the extension needs executable code, tool registration, hooks, readiness checks, trust metadata, or install lifecycle management.
+- A plain skill changes prompt behavior. It can bundle helper files such as `scripts/`, `references/`, `templates/`, and `assets/`, but it still does not register a new runtime service or plugin lifecycle on its own.
+- A plugin may bundle a `SKILL.md`, but that bundled skill is still part of a plugin-managed runtime bundle.
+
+Concrete examples:
+
+- `~/.edgecrab/skills/security-review/SKILL.md` is a standalone skill.
+- `~/.edgecrab/skills/security-review/scripts/check.py` can be bundled with that skill and referenced from `SKILL.md`.
+- `~/.edgecrab/plugins/github-tools/plugin.toml` is a plugin.
+- `~/.edgecrab/plugins/calculator/plugin.yaml` plus `__init__.py` is a Hermes plugin.
+- A plugin of kind `skill` is still managed through `edgecrab plugins ...`, not `edgecrab skills ...`.
+
 ---
 
 ### Plugin System
@@ -502,6 +537,7 @@ edgecrab plugins toggle [github-tools]
 edgecrab plugins audit --lines 20
 edgecrab plugins search github
 edgecrab plugins search --source hermes weather
+edgecrab plugins search --source hermes-evey telemetry
 edgecrab plugins browse
 edgecrab plugins update
 edgecrab plugins remove github-tools
@@ -512,9 +548,115 @@ EdgeCrab now supports four plugin kinds:
 - `skill` plugins load `SKILL.md` content from `~/.edgecrab/plugins/<name>/` into the session prompt with Hermes-compatible frontmatter, readiness checks, and platform filtering.
 - `tool-server` plugins spawn a subprocess and proxy MCP-compatible newline-delimited JSON-RPC over stdio, including reverse `host:*` calls for platform info, memory/session access, secret reads, safe conversation message injection, logging, and delegated tool execution.
 - `script` plugins load Rhai code for lightweight local extension points and tool handlers without shipping a separate daemon.
-- `hermes` plugins load Hermes-style Python directory plugins with `plugin.yaml` + `__init__.py register(ctx)` compatibility, including `requires_env` setup gating plus `on_session_start` and `pre_llm_call` hook support.
+- `hermes` plugins load Hermes-style Python directory plugins with `plugin.yaml` + `__init__.py register(ctx)` compatibility, including `requires_env` setup gating, bundled `SKILL.md` loading, `post_tool_call`, `on_session_start`, `pre_llm_call`, and `on_session_end`.
 
 EdgeCrab also discovers legacy Hermes plugin roots from `~/.hermes/plugins/`, plus `./.hermes/plugins/` when `HERMES_ENABLE_PROJECT_PLUGINS=true`. Plugin installs now stage in quarantine, run a static security scan, resolve trust from their source, and stamp `plugin.toml` with a directory checksum before activation. Plugin state persists in `config.yaml` under `plugins:`. Disabled or setup-needed plugins are excluded from tool exposure or prompt injection without uninstalling them.
+
+Runtime exposure is live:
+
+- enabled plugin tools are registered into the `plugins` toolset and appear in `/tools`
+- disabling a plugin removes its tools from the active registry without restarting EdgeCrab
+- re-enabling a plugin re-exposes those tools immediately in the same TUI session
+
+Inside the TUI you can verify that directly:
+
+```text
+/plugins                 # open the installed-plugin browser overlay
+/tools                   # shows active built-in + plugin tools
+/plugins disable demo
+/tools                   # demo plugin tools are gone
+/plugins enable demo
+/tools                   # demo plugin tools are back under the plugins toolset
+```
+
+Remote plugin search is cached by first principles:
+
+- hub indexes and repo-backed source trees are cached under `~/.edgecrab/plugins/.hub/cache/`
+- repo-backed plugin descriptions are cached separately so repeated searches do not refetch `plugin.yaml` or `SKILL.md`
+- expired cache is refreshed when possible, but stale cache is still used on refresh failure so plugin search degrades gracefully instead of going empty
+
+Example: install a Hermes guide-style local plugin with a bundled skill:
+
+```text
+calculator/
+├── plugin.yaml
+├── __init__.py
+├── schemas.py
+├── tools.py
+├── SKILL.md
+└── data/
+    └── units.json
+```
+
+```bash
+edgecrab plugins install ./calculator
+edgecrab plugins info calculator
+edgecrab plugins status
+```
+
+This repository also ships official Hermes-format examples that are indexed by
+the `edgecrab-official` search source:
+
+```bash
+edgecrab plugins search --source edgecrab calculator
+edgecrab plugins search --source edgecrab json
+
+edgecrab plugins install ./plugins/productivity/calculator
+edgecrab plugins install ./plugins/developer/json-toolbox
+
+edgecrab plugins info calculator
+edgecrab plugins info json-toolbox
+```
+
+Those examples prove two different Hermes runtime surfaces:
+
+- `plugins/productivity/calculator` registers tools plus a `post_tool_call` hook
+- `plugins/developer/json-toolbox` registers tools plus a top-level CLI command
+
+Example: install real Hermes assets directly from a local clone of `NousResearch/hermes-agent`:
+
+```bash
+edgecrab plugins install ~/src/hermes-agent/plugins/memory/holographic
+edgecrab plugins info holographic
+
+# pip entry-point plugins are discovered through the selected Python runtime
+EDGECRAB_PLUGIN_PYTHON=~/.venvs/hermes/bin/python \
+  edgecrab plugins list
+EDGECRAB_PLUGIN_PYTHON=~/.venvs/hermes/bin/python \
+  edgecrab entry-demo status
+```
+
+Standalone Hermes skills are browsed from the skills surface instead of the
+plugin browser:
+
+```bash
+edgecrab skills search 1password
+edgecrab skills install hermes-agent:security/1password
+```
+
+Example: search and install curated community Hermes plugins from `42-evey/hermes-plugins`:
+
+```bash
+edgecrab plugins search --source hermes-evey telemetry
+edgecrab plugins install hub:hermes-evey/evey-telemetry
+edgecrab plugins install hub:hermes-evey/evey-status
+edgecrab plugins info evey-telemetry
+```
+
+For a step-by-step authoring tutorial, see `docs/007_memory_skills/005_building_hermes_style_plugins.md` and the site guide at `site/src/content/docs/guides/build-hermes-plugin.md`.
+
+Compatibility proof currently covers:
+
+- official repo Hermes examples `calculator` and `json-toolbox`, including search visibility and local end-to-end install/runtime proof
+- guide-style Hermes plugin install and end-to-end tool execution from the upstream "Build a Hermes Plugin" contract
+- real upstream Hermes plugin install and runtime execution for `holographic`
+- real upstream Hermes optional-skill compatibility for `1password` via local bundle install
+- real upstream Python import/runtime shims plus `cli.py register_cli(subparser)` CLI bridging for `honcho`
+- real `42-evey/hermes-plugins` runtime execution for `evey-telemetry` and `evey-status`
+- pip entry-point discovery and top-level Hermes CLI command execution through `ctx.register_cli_command()`
+- Hermes hub indexing for upstream `plugins/...` directories and `42-evey` repo-root Hermes directories in the plugin browser
+- full Hermes `VALID_HOOKS` surface in the CLI runtime: `pre_tool_call`, `post_tool_call`, `pre_llm_call`, `post_llm_call`, `pre_api_request`, `post_api_request`, `on_session_start`, `on_session_end`, `on_session_finalize`, `on_session_reset`
+- gateway per-chat session isolation and session-boundary parity proof for `on_session_start`, `on_session_end`, `on_session_finalize`, and `on_session_reset`
 
 ---
 
@@ -919,7 +1061,7 @@ Type these inside the TUI (after `❯`):
 | `/mcp [subcommand]`                      | Browse, install, test, diagnose, or remove MCP servers |
 | `/reload-mcp`                            | Hot-reload MCP servers (no restart needed)      |
 | `/mcp-token <server> <token>`            | Set MCP bearer token at runtime                 |
-| `/plugins [list/info/status/install/enable/disable/toggle/audit/hub]` | Manage plugins |
+| `/plugins [info/status/install/enable/disable/toggle/audit/hub]` | Browse installed plugins and manage plugin actions |
 | `/memory [show/edit]`                    | View or edit agent memory                       |
 | `/cost`                                  | Show token costs for this session               |
 | `/usage`                                 | Detailed usage breakdown                        |
@@ -1368,7 +1510,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for full details.
 | -------------- | -------------------------------------------------- | ------------------------------------------------------------------- |
 | **npm**        | `edgecrab-cli` (binary wrapper — no Rust required) | `npm install -g edgecrab-cli`                                       |
 | **pip**        | `edgecrab-cli` (binary wrapper — no Rust required) | `pip install edgecrab-cli`                                          |
-| **cargo**      | Rust crates (11 crates published)                  | `cargo install edgecrab-cli`                                        |
+| **cargo**      | Rust crates (12 crates published)                  | `cargo install edgecrab-cli`                                        |
 | **Python SDK** | `edgecrab-sdk`                                     | `pip install edgecrab-sdk`                                          |
 | **Node SDK**   | `edgecrab-sdk`                                     | `npm install edgecrab-sdk`                                          |
 | **Docker**     | GHCR multi-arch                                    | `docker pull ghcr.io/raphaelmansuy/edgecrab:latest`                 |
