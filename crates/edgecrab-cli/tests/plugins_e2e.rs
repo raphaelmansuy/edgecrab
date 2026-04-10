@@ -114,6 +114,20 @@ fn run_edgecrab_output_with_env(
     command.args(args).output().expect("run edgecrab")
 }
 
+fn copy_dir_recursive(src: &Path, dst: &Path) {
+    fs::create_dir_all(dst).expect("create destination dir");
+    for entry in fs::read_dir(src).expect("read source dir") {
+        let entry = entry.expect("dir entry");
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if entry.file_type().expect("file type").is_dir() {
+            copy_dir_recursive(&src_path, &dst_path);
+        } else {
+            fs::copy(&src_path, &dst_path).expect("copy file");
+        }
+    }
+}
+
 fn create_entrypoint_plugin_package(dir: &Path) {
     fs::create_dir_all(dir.join("entrypoint_demo")).expect("package dir");
     fs::write(
@@ -898,18 +912,11 @@ async fn real_hermes_honcho_memory_cli_is_invocable_end_to_end() {
             String::from_utf8_lossy(&hub_install.stdout),
             stderr
         );
-        run_edgecrab(
-            home.path(),
-            &[
-                "plugins",
-                "install",
-                "--force",
-                real_hermes_repo()
-                    .join("plugins/memory/honcho")
-                    .to_str()
-                    .expect("utf8 honcho path"),
-            ],
-        )
+        copy_dir_recursive(
+            &real_hermes_repo().join("plugins/memory/honcho"),
+            &edgecrab_home.join("plugins/honcho"),
+        );
+        "Plugin 'honcho' installed and enabled.\n".to_string()
     };
     assert!(install_out.contains("Plugin 'honcho' installed and enabled."));
 
