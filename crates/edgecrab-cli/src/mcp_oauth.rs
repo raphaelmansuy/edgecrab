@@ -479,7 +479,27 @@ fn pkce_challenge(verifier: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
 }
 
+fn truthy_env(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .as_deref()
+        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn browser_launch_suppressed() -> bool {
+    cfg!(test)
+        || truthy_env("EDGECRAB_DISABLE_BROWSER_OPEN")
+        || truthy_env("CI")
+        || std::env::var_os("RUST_TEST_THREADS").is_some()
+        || std::env::var_os("NEXTEST").is_some()
+}
+
 fn open_url_in_browser(url: &str) -> anyhow::Result<()> {
+    if browser_launch_suppressed() {
+        tracing::debug!("browser launch suppressed for OAuth flow: {url}");
+        return Ok(());
+    }
+
     #[cfg(target_os = "macos")]
     let mut command = {
         let mut command = Command::new("open");
@@ -761,6 +781,15 @@ mod tests {
             }
             Self { key, previous }
         }
+
+        fn set_value(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: tests serialize env mutations through env_lock().
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
     }
 
     impl Drop for EnvVarGuard {
@@ -803,6 +832,15 @@ mod tests {
         let err = analyze_loopback_redirect_url("http://example.com/callback")
             .expect_err("non-loopback host should fail");
         assert!(err.to_string().contains("localhost"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(edgecrab_home_env)]
+    async fn browser_launch_can_be_disabled_for_tests_and_ci() {
+        let _guard = env_lock().lock().await;
+        let _disable_guard = EnvVarGuard::set_value("EDGECRAB_DISABLE_BROWSER_OPEN", "1");
+        assert!(browser_launch_suppressed());
+        open_url_in_browser("https://example.com/oauth").expect("suppressed browser launch");
     }
 
     #[tokio::test]
