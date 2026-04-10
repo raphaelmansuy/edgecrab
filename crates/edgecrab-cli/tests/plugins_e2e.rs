@@ -848,6 +848,24 @@ async fn real_hermes_holographic_plugin_installs_and_runs_end_to_end() {
 #[tokio::test(flavor = "multi_thread")]
 async fn real_hermes_honcho_memory_cli_is_invocable_end_to_end() {
     let home = tempdir().expect("temp home");
+    let edgecrab_home = home.path().join(".edgecrab");
+    let cache_key =
+        repo_source_cache_key("NousResearch/hermes-agent", &[("hermes", "tree:plugins")]);
+    write_cached_repo_index(
+        &edgecrab_home,
+        "hermes-plugins",
+        &cache_key,
+        json!([
+            {
+                "name": "honcho",
+                "repo_path": "plugins/memory/honcho",
+                "tags": ["memory"],
+                "kind": "hermes",
+                "tools": [],
+                "requires_env": [],
+            }
+        ]),
+    );
 
     let install_out = run_edgecrab(
         home.path(),
@@ -860,7 +878,6 @@ async fn real_hermes_honcho_memory_cli_is_invocable_end_to_end() {
     );
     assert!(install_out.contains("Plugin 'honcho' installed and enabled."));
 
-    let edgecrab_home = home.path().join(".edgecrab");
     let plugin = discover_installed_plugin(&edgecrab_home, "honcho");
     assert!(
         plugin
