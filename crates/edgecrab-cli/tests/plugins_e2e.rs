@@ -871,54 +871,10 @@ async fn real_hermes_holographic_plugin_installs_and_runs_end_to_end() {
 async fn real_hermes_honcho_memory_cli_is_invocable_end_to_end() {
     let home = tempdir().expect("temp home");
     let edgecrab_home = home.path().join(".edgecrab");
-    let cache_key = repo_source_cache_key(
-        "NousResearch/hermes-agent",
-        &[
-            ("skill", "tree:skills"),
-            ("skill", "tree:optional-skills"),
-            ("hermes", "tree:plugins"),
-        ],
+    copy_dir_recursive(
+        &real_hermes_repo().join("plugins/memory/honcho"),
+        &edgecrab_home.join("plugins/honcho"),
     );
-    write_cached_repo_index(
-        &edgecrab_home,
-        "hermes-plugins",
-        &cache_key,
-        json!([
-            {
-                "name": "honcho",
-                "repo_path": "plugins/memory/honcho",
-                "tags": ["memory"],
-                "kind": "hermes",
-                "tools": [],
-                "requires_env": [],
-            }
-        ]),
-    );
-
-    let hub_install_args = [
-        "plugins",
-        "install",
-        "--force",
-        "hub:hermes-plugins/plugins/memory/honcho",
-    ];
-    let hub_install = run_edgecrab_output_with_env(home.path(), &hub_install_args, &[]);
-    let install_out = if hub_install.status.success() {
-        String::from_utf8_lossy(&hub_install.stdout).into_owned()
-    } else {
-        let stderr = String::from_utf8_lossy(&hub_install.stderr);
-        assert!(
-            stderr.contains("403 rate limit exceeded"),
-            "unexpected honcho install failure\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&hub_install.stdout),
-            stderr
-        );
-        copy_dir_recursive(
-            &real_hermes_repo().join("plugins/memory/honcho"),
-            &edgecrab_home.join("plugins/honcho"),
-        );
-        "Plugin 'honcho' installed and enabled.\n".to_string()
-    };
-    assert!(install_out.contains("Plugin 'honcho' installed and enabled."));
 
     let plugin = discover_installed_plugin(&edgecrab_home, "honcho");
     assert!(
