@@ -65,12 +65,24 @@ jobs:
           MAX_ATTEMPTS="${3:-90}"
           WAIT_SECONDS="${4:-10}"
           STABILIZE_SECONDS="${5:-30}"
+          INITIAL_WAIT_SECONDS="${6:-30}"
           EXACT_VERSION_URL="https://crates.io/api/v1/crates/$CRATE/$VERSION"
+          CRATE_URL="https://crates.io/api/v1/crates/$CRATE"
+
+          echo "Waiting ${INITIAL_WAIT_SECONDS}s before probing crates.io for $CRATE $VERSION propagation..."
+          sleep "$INITIAL_WAIT_SECONDS"
 
           for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
             BODY="$(curl -fsSL "$EXACT_VERSION_URL" 2>/dev/null || true)"
             if [[ -n "$BODY" ]] && echo "$BODY" | jq -e --arg crate "$CRATE" --arg version "$VERSION" '.version | select(.crate == $crate and .num == $version)' >/dev/null; then
               echo "$CRATE $VERSION is visible on crates.io; waiting ${STABILIZE_SECONDS}s for index propagation..."
+              sleep "$STABILIZE_SECONDS"
+              echo "$CRATE $VERSION propagation wait completed"
+              exit 0
+            fi
+            BODY="$(curl -fsSL "$CRATE_URL" 2>/dev/null || true)"
+            if [[ -n "$BODY" ]] && echo "$BODY" | jq -e --arg version "$VERSION" '.crate | select(.max_version == $version)' >/dev/null; then
+              echo "$CRATE reports max_version $VERSION on crates.io; waiting ${STABILIZE_SECONDS}s for index propagation..."
               sleep "$STABILIZE_SECONDS"
               echo "$CRATE $VERSION propagation wait completed"
               exit 0
