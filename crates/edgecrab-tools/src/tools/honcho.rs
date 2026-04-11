@@ -175,6 +175,68 @@ fn save_store(store: &UserModelStore) -> Result<(), ToolError> {
     })
 }
 
+pub fn honcho_store_path() -> Result<PathBuf, ToolError> {
+    store_path()
+}
+
+pub fn honcho_valid_categories() -> &'static [&'static str] {
+    VALID_CATEGORIES
+}
+
+pub fn honcho_append_entry(category: &str, content: &str) -> Result<UserModelEntry, ToolError> {
+    let trimmed = content.trim();
+    if !is_valid_category(category) {
+        return Err(ToolError::InvalidArgs {
+            tool: "honcho".into(),
+            message: format!(
+                "Invalid category '{category}'. Valid: {}",
+                VALID_CATEGORIES.join(", ")
+            ),
+        });
+    }
+    if trimmed.is_empty() {
+        return Err(ToolError::InvalidArgs {
+            tool: "honcho".into(),
+            message: "content cannot be empty".into(),
+        });
+    }
+    if trimmed.chars().count() > ENTRY_MAX_CHARS {
+        return Err(ToolError::InvalidArgs {
+            tool: "honcho".into(),
+            message: format!("content too long (max {ENTRY_MAX_CHARS} chars)"),
+        });
+    }
+    check_memory_content(trimmed).map_err(|e| ToolError::ExecutionFailed {
+        tool: "honcho".into(),
+        message: format!("Refused to save suspicious content: {e}"),
+    })?;
+
+    let mut store = load_store()?;
+    let entry = UserModelEntry::new(category, trimmed);
+    store.entries.push(entry.clone());
+    save_store(&store)?;
+    Ok(entry)
+}
+
+pub fn honcho_remove_entry(id_prefix: &str) -> Result<Option<UserModelEntry>, ToolError> {
+    let mut store = load_store()?;
+    let needle = id_prefix.trim();
+    if needle.is_empty() {
+        return Ok(None);
+    }
+    if let Some(index) = store
+        .entries
+        .iter()
+        .position(|entry| entry.id.starts_with(needle))
+    {
+        let removed = store.entries.remove(index);
+        save_store(&store)?;
+        Ok(Some(removed))
+    } else {
+        Ok(None)
+    }
+}
+
 // ─── Public helper used by prompt_builder.rs ─────────────────────────
 
 /// Load the Honcho user context section for injection into the system prompt.

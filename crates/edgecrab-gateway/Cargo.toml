@@ -7,6 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+edgecrab-command-catalog = { workspace = true }
 edgecrab-core = { workspace = true }
 edgecrab-types = { workspace = true }
 edgecrab-state = { workspace = true }
@@ -42,3 +43,4 @@ tokio = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
 tempfile = { workspace = true }
 edgequake-llm = { workspace = true }
+serial_test = "3"

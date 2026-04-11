@@ -148,6 +148,7 @@ impl DingTalkAdapter {
                                 thread_id: None,
                                 user_display_name: body.sender_nick.clone(),
                                 attachments: Vec::new(),
+                                ..Default::default()
                             },
                         };
 

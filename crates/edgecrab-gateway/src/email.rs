@@ -448,6 +448,7 @@ impl PlatformAdapter for EmailAdapter {
                                 thread_id: email.subject,
                                 user_display_name: email.from,
                                 attachments: Vec::new(),
+                                ..Default::default()
                             },
                         };
 

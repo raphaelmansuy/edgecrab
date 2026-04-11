@@ -7,6 +7,10 @@ sidebar:
 
 EdgeCrab is driven entirely from the terminal. This page covers every entry point: the interactive TUI, one-shot prompts, global flags, subcommands, and in-session slash commands.
 
+Hermes-parity note: when a feature primarily lives as a slash command, use
+`edgecrab slash <command...>` to reach the same handler from argv without
+duplicating a separate clap tree.
+
 All information here is sourced directly from `crates/edgecrab-cli/src/cli_args.rs` and `crates/edgecrab-cli/src/commands.rs`.
 
 ---
@@ -161,7 +165,7 @@ Each invocation gets its own worktree and branch automatically. Clean worktrees 
 
 ### `--skill` (`-S`)
 
-Preload one or more skills into the system prompt before the first turn:
+Preload one or more skills into the session-scoped preloaded-skill set before the first turn:
 
 ```bash
 edgecrab -S code-review "review the PR"
@@ -190,6 +194,7 @@ All subcommands defined in `Command` enum in `cli_args.rs`:
 edgecrab setup [section] [--force]  — interactive setup wizard
 edgecrab doctor                     — diagnostics check
 edgecrab migrate [--dry-run]        — hermes → edgecrab migration
+edgecrab claw migrate [FLAGS...]    — OpenClaw → edgecrab migration
 edgecrab acp                        — ACP stdio server for editors
 edgecrab version                    — detailed version info
 edgecrab whatsapp                   — pair and configure WhatsApp bridge
@@ -243,9 +248,27 @@ Import config, memories, skills, and env from a hermes-agent installation:
 ```bash
 edgecrab migrate --dry-run   # preview what will be migrated
 edgecrab migrate             # execute migration
+edgecrab migrate --source /path/to/.hermes
 ```
 
-See [Migrating from Hermes](/user-guide/migration/).
+See [Migration](/user-guide/migration/).
+
+### `claw migrate`
+
+Import the EdgeCrab-native subset of an OpenClaw home and archive the rest for
+manual review:
+
+```bash
+edgecrab claw migrate
+edgecrab claw migrate --dry-run
+edgecrab claw migrate --preset user-data
+edgecrab claw migrate --migrate-secrets
+edgecrab claw migrate --workspace-target /absolute/workspace
+edgecrab claw migrate --skill-conflict rename
+```
+
+Use `--preset full` to include allowlisted secrets. Unsupported advanced
+OpenClaw-only settings are archived under `~/.edgecrab/migration/openclaw/`.
 
 ### `acp`
 
@@ -431,7 +454,7 @@ Skills installed in `~/.edgecrab/skills/` are automatically registered as slash 
 |---------|-------------|
 | `/help` | List all slash commands |
 | `/quit` | Exit EdgeCrab |
-| `/clear` | Clear visible output area |
+| `/clear` | Clear the screen and start a fresh session |
 | `/new` | Start fresh session (clears history) |
 | `/status` | Show current session status |
 | `/version` | Show version info |
@@ -459,8 +482,8 @@ Skills installed in `~/.edgecrab/skills/` are automatically registered as slash 
 | Command | Description |
 |---------|-------------|
 | `/config [key] [value]` | Show or set config values |
-| `/prompt` | Show the current system prompt |
-| `/verbose` | Cycle tool progress: off → new → all → verbose |
+| `/prompt` | Show, clear, or set the custom system prompt override |
+| `/verbose` | Cycle tool progress: off → new → all → verbose; `/verbose <mode>` sets directly |
 | `/personality <name>` | Switch agent personality |
 | `/statusbar <on\|off>` | Toggle the status bar |
 
@@ -481,7 +504,7 @@ Skills installed in `~/.edgecrab/skills/` are automatically registered as slash 
 | `/cost` | Show token cost for this session |
 | `/usage` | Cumulative API usage stats |
 | `/compress` | Manually compress conversation history |
-| `/insights` | Show session insights summary |
+| `/insights [days]` | Show current-session insights plus N-day history (default: 30) |
 
 ### Advanced
 
@@ -495,7 +518,7 @@ Skills installed in `~/.edgecrab/skills/` are automatically registered as slash 
 
 | Command | Description |
 |---------|-------------|
-| `/theme` | Reload theme from `~/.edgecrab/skin.yaml` |
+| `/skin` | Open the skin browser or reload `~/.edgecrab/skin.yaml` (`/theme` alias) |
 | `/paste` | Enter multi-line paste mode |
 
 ### Gateway & Scheduling

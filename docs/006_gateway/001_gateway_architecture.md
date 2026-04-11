@@ -20,8 +20,8 @@ translates `String` responses back to platform-native formats. The agent sees on
 standard `IncomingMessage` regardless of origin.
 
 🦀 *`hermes-agent` (EdgeCrab's Python predecessor) supported multiple gateway platforms.
-OpenClaw focuses on single-user desktop use. EdgeCrab ships 18 platform adapters —
-the crab fights everywhere at once.*
+OpenClaw focuses on single-user desktop use. EdgeCrab currently ships 15 gateway
+adapters — the crab fights everywhere at once.*
 
 ---
 
@@ -96,7 +96,7 @@ the crab fights everywhere at once.*
 
 ## `PlatformAdapter` trait
 
-All 18 adapters implement this trait:
+All 15 gateway adapters implement this trait:
 
 ```rust
 #[async_trait]

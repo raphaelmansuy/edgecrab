@@ -238,7 +238,7 @@ Session saved to SQLite (WAL commit)
 **1. Single binary.** Everything compiles into one statically-linked
 executable. No Python venv, no Node.js, no shared libraries except
 the OS. Browser tools require Chrome — that is the only soft
-dependency. Cold start: < 50 ms.
+dependency. Current stripped macOS arm64 release builds land around 49 MB, though exact size varies by target.
 
 **2. Security at the type level.** `SanitizedPath` and `SafeUrl` are
 distinct Rust types in `edgecrab-types`. Functions that touch the
@@ -255,8 +255,7 @@ exist. Toolsets own which tools are active per session. Policy changes
 never require touching tool implementations.
 
 **5. No Python.** EdgeCrab is a ground-up Rust rewrite of hermes-agent.
-Result: < 50 ms cold start (vs 1–3 s), ~15 MB resident (vs ~80–150 MB), no GC
-pauses, no venv to manage.
+Result: one native executable, no GC pauses, and no venv to manage.
 
 **6. Config resolution order.** `AppConfig::default()` → `config.yaml`
 → `EDGECRAB_*` env vars → CLI flags. Later layers always win.
@@ -283,7 +282,7 @@ Each crate maps to a distinct responsibility with a clear interface. The benefit
 **Why SQLite instead of a file-based session store?**
 FTS5 full-text search, WAL-mode concurrent access, and atomic transactions. Session search across thousands of messages is instant without an external search service.
 
-**Why is the binary ~15 MB instead of smaller?**
+**Why is the binary ~49 MB instead of smaller?**
 Static linking embeds all dependencies (TLS, SQLite, the Aho-Corasick scanner, etc.) into a single executable. No dynamic library dependencies means the binary runs on any Linux distro without managing shared libraries.
 
 **How do I find which crate owns a given feature?**

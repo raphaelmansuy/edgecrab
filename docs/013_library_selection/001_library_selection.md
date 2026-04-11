@@ -145,7 +145,7 @@ inventory = "0.3"
 inventory::submit! { &ReadFileTool as &dyn ToolHandler }
 ```
 
-At startup, `ToolRegistry::collect()` iterates all submitted items. Adding a new tool requires zero changes outside the tool's own file. This is how EdgeCrab reaches 65 tools without a monolithic dispatch table.
+At startup, `ToolRegistry::collect()` iterates all submitted items. Adding a new tool requires zero changes outside the tool's own file. This is how EdgeCrab reaches 91 core tools without a monolithic dispatch table.
 
 - Reference: [docs.rs/inventory](https://docs.rs/inventory) | [dtolnay/inventory](https://github.com/dtolnay/inventory)
 

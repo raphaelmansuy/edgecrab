@@ -294,6 +294,7 @@ impl HomeAssistantAdapter {
                 thread_id: None,
                 user_display_name: data["user_name"].as_str().map(String::from),
                 attachments: Vec::new(),
+                ..Default::default()
             },
         };
 

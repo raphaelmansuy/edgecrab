@@ -1,0 +1,18 @@
+# Starter profile: research
+# Focus: evidence gathering, synthesis, and comparative analysis.
+
+model:
+  default: "openai/gpt-5"
+  max_iterations: 120
+
+display:
+  personality: "teacher"
+  show_cost: true
+  show_status_bar: true
+  tool_progress: "verbose"
+
+honcho:
+  enabled: true
+  cloud_sync: false
+
+reasoning_effort: "high"

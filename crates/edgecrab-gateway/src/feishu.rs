@@ -1249,6 +1249,7 @@ async fn parse_event(
                 .and_then(Value::as_str)
                 .map(str::to_string),
             attachments: normalized.attachments,
+            ..Default::default()
         },
     }))
 }

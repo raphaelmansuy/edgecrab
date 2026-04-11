@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use rusqlite::{Connection, OpenFlags, params};
 
+use crate::common::{copy_dir_recursive, ensure_dir};
 use crate::report::{MigrationItem, MigrationReport, MigrationStatus};
 
 /// Migrates hermes-agent (~/.hermes/) → EdgeCrab (~/.edgecrab/).
@@ -530,35 +531,6 @@ struct SourceMessageRow {
     reasoning: Option<String>,
     reasoning_details: Option<String>,
     codex_reasoning_items: Option<String>,
-}
-
-/// Recursively copy a directory tree. Returns file count.
-fn copy_dir_recursive(src: &Path, dst: &Path) -> anyhow::Result<usize> {
-    std::fs::create_dir_all(dst)?;
-    let mut count = 0;
-
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let src_path = entry.path();
-        let dst_path = dst.join(entry.file_name());
-
-        if src_path.is_dir() {
-            count += copy_dir_recursive(&src_path, &dst_path)?;
-        } else {
-            std::fs::copy(&src_path, &dst_path)?;
-            count += 1;
-        }
-    }
-
-    Ok(count)
-}
-
-/// Ensure a directory exists.
-fn ensure_dir(dir: &Path) -> std::io::Result<()> {
-    if !dir.exists() {
-        std::fs::create_dir_all(dir)?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]

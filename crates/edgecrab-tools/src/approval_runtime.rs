@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, RwLock};
 
 use edgecrab_security::approval::{ApprovalMode, ApprovalPolicy};
 use edgecrab_types::ToolError;
@@ -22,6 +22,11 @@ fn approval_policy() -> &'static ApprovalPolicy {
 fn allowlist_file_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn yolo_sessions() -> &'static RwLock<HashSet<String>> {
+    static SESSIONS: OnceLock<RwLock<HashSet<String>>> = OnceLock::new();
+    SESSIONS.get_or_init(|| RwLock::new(HashSet::new()))
 }
 
 fn allowlist_path(edgecrab_home: &Path) -> std::path::PathBuf {
@@ -67,14 +72,39 @@ fn command_preview(command: &str) -> String {
     crate::safe_truncate(&single_line, 80).to_string()
 }
 
+fn session_key(ctx: &ToolContext) -> String {
+    ctx.session_key
+        .clone()
+        .unwrap_or_else(|| ctx.session_id.clone())
+}
+
+pub fn yolo_enabled_for_session(session_key: &str) -> bool {
+    yolo_sessions()
+        .read()
+        .map(|sessions| sessions.contains(session_key))
+        .unwrap_or(false)
+}
+
+pub fn set_yolo_for_session(session_key: impl Into<String>, enabled: bool) {
+    let session_key = session_key.into();
+    if let Ok(mut sessions) = yolo_sessions().write() {
+        if enabled {
+            sessions.insert(session_key);
+        } else {
+            sessions.remove(&session_key);
+        }
+    }
+}
+
 pub(crate) fn command_approval_reasons(ctx: &ToolContext, command: &str) -> Option<Vec<String>> {
+    if yolo_enabled_for_session(&session_key(ctx)) {
+        return None;
+    }
+
     let policy = approval_policy();
     policy.load_permanent_allowlist(&load_persistent_allowlist(&ctx.config.edgecrab_home));
 
-    let session_id = ctx
-        .session_key
-        .clone()
-        .unwrap_or_else(|| ctx.session_id.clone());
+    let session_id = session_key(ctx);
     let check = policy.check("terminal", &json!({ "command": command }), &session_id);
     if check.needs_approval {
         Some(check.reasons)
@@ -88,13 +118,14 @@ pub(crate) async fn request_command_approval(
     command: &str,
     reasons: Vec<String>,
 ) -> Result<(), ToolError> {
+    if yolo_enabled_for_session(&session_key(ctx)) {
+        return Ok(());
+    }
+
     let policy = approval_policy();
     policy.load_permanent_allowlist(&load_persistent_allowlist(&ctx.config.edgecrab_home));
 
-    let session_id = ctx
-        .session_key
-        .clone()
-        .unwrap_or_else(|| ctx.session_id.clone());
+    let session_id = session_key(ctx);
     let check = policy.check("terminal", &json!({ "command": command }), &session_id);
     if !check.needs_approval {
         return Ok(());

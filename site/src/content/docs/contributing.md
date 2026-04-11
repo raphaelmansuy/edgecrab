@@ -119,7 +119,7 @@ Then register in `gateway_catalog.rs` and add the `Platform::YourPlatform` varia
 
 ## Dependency Policy
 
-EdgeCrab's binary size (~15 MB stripped) and startup time (< 50 ms) are tracked metrics. New dependencies are evaluated carefully — open an issue before adding one. Prefer the existing ecosystem (`tokio`, `axum`, `reqwest`, `serde_json`, `rusqlite`) over new crates that overlap.
+EdgeCrab's binary size is tracked, and current stripped macOS arm64 release builds land around 49 MB. New dependencies are evaluated carefully — open an issue before adding one. Prefer the existing ecosystem (`tokio`, `axum`, `reqwest`, `serde_json`, `rusqlite`) over new crates that overlap.
 
 ---
 

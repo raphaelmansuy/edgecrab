@@ -18,10 +18,10 @@ EdgeCrab was forged in the heat of a hypothetical three-way battle:
   │                     │   │                       │   │                 │
   │  ■ enhanced reason  │   │  ■ tool use           │   │  ■ deep reason  │
   │  ■ model weights    │   │  ■ TypeScript/Node.js  │   │  ■ fast tools   │
-  │  ■ stateless infer  │   │  ■ no built-in        │   │  ■ 65 tools     │
+  │  ■ stateless infer  │   │  ■ no built-in        │   │  ■ 91 tools     │
   │  ■ Python inference │   │    security layer     │   │  ■ security     │
-  │    stack            │   │  ■ single-user        │   │  ■ Rust, 15 MB  │
-  │  ■ not an agent FW  │   │    desktop focus      │   │  ■ 18 platforms │
+  │    stack            │   │  ■ single-user        │   │  ■ Rust, ~49 MB │
+  │  ■ not an agent FW  │   │    desktop focus      │   │  ■ 15 gateways  │
   └─────────────────────┘   └──────────────────────┘   └─────────────────┘
          Round 1                    Round 2                WINNER 🏆
     (model, not a runtime)     (TypeScript, not Rust)    (all of the above)
@@ -61,7 +61,7 @@ The concrete benefits that flow from this design:
 
 | Concern | Without EdgeCrab | With EdgeCrab |
 |---|---|---|
-| Tool dispatch | Re-implemented per frontend | `ToolRegistry` with 65 registered tools |
+| Tool dispatch | Re-implemented per frontend | `ToolRegistry` with 91 registered core tools |
 | Session history | Siloed per channel | Unified SQLite with FTS5 search |
 | Security | Each integration decides its own | `CommandScanner`, `PathJail`, `InjectionCheck` enforced at the registry level |
 | Prompt assembly | Hand-rolled strings | `PromptBuilder` with memory, skills, and context-file injection |
@@ -178,10 +178,10 @@ edgecrab/
 │   ├── edgecrab-security/     ← path jail, cmd scan, injection, redaction
 │   ├── edgecrab-state/        ← SQLite WAL + FTS5 session persistence
 │   ├── edgecrab-cron/         ← schedule parsing, job store, delivery metadata
-│   ├── edgecrab-tools/        ← registry, 65 tools, toolsets, process table
+│   ├── edgecrab-tools/        ← registry, 91 tools, toolsets, process table
 │   ├── edgecrab-core/         ← Agent, loop, prompt builder, compression, routing
 │   ├── edgecrab-cli/          ← clap, ratatui, setup wizard, doctor, profiles
-│   ├── edgecrab-gateway/      ← 18 adapters, delivery, hooks, pairing, mirroring
+│   ├── edgecrab-gateway/      ← 15 adapters, delivery, hooks, pairing, mirroring
 │   ├── edgecrab-acp/          ← JSON-RPC 2.0 stdio ACP server
 │   └── edgecrab-migrate/      ← hermes→edgecrab migration helper
 ├── docs/                      ← this documentation tree
@@ -197,12 +197,12 @@ edgecrab/
 | Fact | Value | Source |
 |---|---|---|
 | Rust edition | 2024 | `Cargo.toml` |
-| MSRV | 1.85.0 | `workspace.package.rust-version` |
-| Default model | `anthropic/claude-sonnet-4-20250514` | `edgecrab-types/src/config.rs` |
+| MSRV | 1.86.0 | `workspace.package.rust-version` |
+| Default model | `ollama/gemma4:latest` | `edgecrab-core/src/config.rs` |
 | Default max iterations | 90 | `AgentConfig` default impl |
-| Registered tools | 65 | `edgecrab-tools/src/toolsets.rs` `CORE_TOOLS` |
+| Registered core tools | 91 | `edgecrab-tools/src/toolsets.rs` `CORE_TOOLS` |
 | CLI slash commands | 53 | `edgecrab-cli/src/commands.rs` |
-| Platform adapters | 18 | `Platform` enum in `edgecrab-types` |
+| Gateway adapters | 15 | `edgecrab-gateway/src/lib.rs` |
 | SQLite schema version | 6 | `edgecrab-state/src/session_db.rs` |
 | Command scanner patterns | ~40 literal + regex secondary | `edgecrab-security/src/command_scan.rs` |
 | Max compression retries | 3 | `conversation.rs: MAX_RETRIES` |
@@ -214,7 +214,7 @@ edgecrab/
 
 **1. Single binary, zero runtime deps.**
 Release profile uses `lto = true`, `codegen-units = 1`, `strip = true`.
-The resulting binary is ~15 MB and starts in under 50 ms.
+Current stripped macOS arm64 release builds land around 49 MB. Exact size varies by target triple and enabled features.
 
 **2. Trait-object frontends, not generics.**
 `LLMProvider`, `ToolHandler`, `GatewaySender`, `SubAgentRunner`, and

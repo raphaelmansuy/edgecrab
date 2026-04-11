@@ -104,7 +104,8 @@ Provider [1]: 1
 Supported providers: `copilot` · `openai` · `anthropic` · `google` (Gemini) · `vertexai` · `xai` (Grok) · `deepseek` · `mistral` · `groq` · `huggingface` · `zai` · `openrouter` · `ollama` · `lmstudio`. See [Provider Overview](/providers/overview/).
 
 :::note[Already have hermes-agent config?]
-Run `edgecrab migrate` to import your existing config, memories, and skills in one step.
+Run `edgecrab migrate` to import Hermes state, or `edgecrab claw migrate` to
+import the EdgeCrab-native subset of an OpenClaw home.
 :::
 
 ---
@@ -204,7 +205,7 @@ Once inside the TUI, type `/help` to see all commands. Key shortcuts:
 | `/model provider/model` | Hot-swap LLM mid-session |
 | `/new` | Start a fresh session |
 | `/help` | Full command reference |
-| `/theme [name]` | List or switch skin preset |
+| `/skin [name]` | Browse or switch skin preset (`/theme` alias) |
 | `/memory` | View loaded memories |
 | `/tools` | List active tools |
 
@@ -328,4 +329,3 @@ Reduce `model.max_iterations` or break the prompt into smaller steps. For large 
 **Q: Where are my conversation logs stored?**
 
 In `~/.edgecrab/state.db` (SQLite). Browse them with `edgecrab sessions list` and search with `edgecrab sessions browse --query "auth bug"`.
-

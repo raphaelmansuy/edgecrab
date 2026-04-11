@@ -6,6 +6,12 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[[bin]]
+name = "mock_lsp_server"
+path = "src/bin/mock_lsp_server.rs"
+test = false
+bench = false
+
 [dependencies]
 async-lsp = { workspace = true }
 lsp-types = { workspace = true }

@@ -261,7 +261,7 @@ Honcho is completely optional. File-backed memory works without it.
 > **Tip: Keep `MEMORY.md` concise.** It loads on every session and contributes tokens.
 > One-liners per fact are better than paragraphs:
 > ```markdown
-> - Project: edgecrab, Rust 2024, MSRV 1.85.0
+> - Project: edgecrab, Rust 2024, MSRV 1.86.0
 > - Test command: cargo test --workspace
 > - Deploy: cargo publish crates in dependency order
 > ```

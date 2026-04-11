@@ -9,6 +9,13 @@ All flags, subcommands, and arguments are sourced directly from
 `crates/edgecrab-cli/src/cli_args.rs`. Run `edgecrab --help` or
 `edgecrab <subcommand> --help` for live output at any time.
 
+Hermes-parity note: EdgeCrab now exposes Hermes-style entrypoints such as
+`chat`, `model`, `auth`, `login`, `logout`, `webhook`, `insights`, `dump`,
+`logs`, `pairing`, `memory`, `honcho`, `claw`, and `uninstall` directly on
+the CLI, while still preserving EdgeCrab-native families like `plugins`,
+`mcp`, and `profiles`. For slash-first flows, `edgecrab slash <command...>`
+is the generic DRY bridge into the same TUI command registry used by `/help`.
+
 ---
 
 ## Installing the CLI
@@ -46,8 +53,8 @@ cargo install edgecrab-cli
 
 ```bash
 edgecrab version
-# EdgeCrab v0.1.0
-# Rust 1.85.0
+# EdgeCrab v0.2.4
+# Rust 1.86.0
 #
 # Supported providers (via edgequake-llm):
 #   copilot        — GitHub Copilot (GITHUB_TOKEN)
@@ -71,13 +78,41 @@ edgecrab version
 ```
 edgecrab [GLOBAL FLAGS] [PROMPT]   -- interactive TUI (default)
   |
+  +-- chat [PROMPT...]             -- Hermes-compatible chat entrypoint
+  +-- model                        -- open the interactive model picker
+  +-- new                          -- interactive wrapper for /new
+  +-- clear                        -- interactive wrapper for /clear
+  +-- retry                        -- interactive wrapper for /retry
+  +-- undo                         -- interactive wrapper for /undo
+  +-- btw [QUESTION...]            -- interactive wrapper for /btw
+  +-- provider                     -- interactive wrapper for /provider
+  +-- prompt [ARGS...]             -- interactive wrapper for /prompt
+  +-- personality [ARGS...]        -- interactive wrapper for /personality
+  +-- reasoning [ARGS...]          -- interactive wrapper for /reasoning
+  +-- yolo [ARGS...]               -- interactive wrapper for /yolo
+  +-- verbose [ARGS...]            -- interactive wrapper for /verbose
+  +-- statusbar [ARGS...]          -- interactive wrapper for /statusbar
+  +-- voice [ARGS...]              -- interactive wrapper for /voice
+  +-- browser [ARGS...]            -- interactive wrapper for /browser
+  +-- reload-mcp                   -- interactive wrapper for /reload-mcp
+  +-- slash <COMMAND...>           -- run any slash command through the TUI registry
+  +-- insights [--days N]          -- historical usage analytics
   +-- setup [section] [--force]    -- first-run wizard
   +-- doctor                       -- environment diagnostics
   +-- migrate [--dry-run]          -- import from hermes-agent
+  +-- claw migrate [FLAGS...]      -- import from OpenClaw
   +-- acp [init]                   -- ACP stdio server / VS Code onboarding
   +-- version                      -- build info + provider list
   +-- update [--check]             -- channel-aware update workflow
+  +-- auth <sub>                   -- Copilot + MCP auth control plane
+  +-- login <target>               -- interactive login/import shortcut
+  +-- logout [target]              -- clear cached local auth state
   +-- status                       -- runtime status summary
+  +-- dump [--all]                 -- shareable support snapshot
+  +-- logs <sub>                   -- inspect log files
+  +-- pairing <sub>                -- gateway pairing approvals
+  +-- memory <sub>                 -- inspect MEMORY.md / USER.md
+  +-- honcho <sub>                 -- Honcho-compatible user model
   +-- whatsapp                     -- pair WhatsApp bridge
   |
   +-- profile  <sub>               -- named profile management
@@ -89,7 +124,9 @@ edgecrab [GLOBAL FLAGS] [PROMPT]   -- interactive TUI (default)
   +-- skills   <sub>               -- skill management
   +-- cron     <sub>               -- scheduled prompts
   +-- gateway  <sub>               -- messaging gateway daemon
+  +-- webhook  <sub>               -- dynamic webhook subscriptions
   +-- completion <shell>           -- shell tab-completion script
+  +-- uninstall                    -- remove EdgeCrab-managed local artifacts
 ```
 
 ---
@@ -111,6 +148,7 @@ in clap):
 | `--config <path>` | `-c` | Use alternate config file instead of `~/.edgecrab/config.yaml` |
 | `--debug` | | Enable debug logging (`RUST_LOG=debug`) |
 | `--no-banner` | | Skip the startup ASCII art banner |
+| `--yolo` | | Start the session with dangerous-command approvals bypassed |
 
 **Agent-only flags** (only apply when running in interactive / one-shot mode):
 
@@ -125,6 +163,7 @@ in clap):
 
 ```bash
 edgecrab                                    # Interactive TUI
+edgecrab chat                               # Same runtime, Hermes-style entrypoint
 edgecrab "summarise the git log"            # One-shot with initial message
 edgecrab -q "explain this codebase"         # Quiet/pipe mode
 edgecrab -C                                 # Continue the last session
@@ -134,6 +173,30 @@ edgecrab -w "refactor auth module"          # New isolated worktree
 edgecrab -S security-audit "audit payment"  # Preload a skill
 edgecrab --model anthropic/claude-opus-4    # Override model
 edgecrab --toolset coding "write tests"     # Use 'coding' toolset only
+edgecrab --yolo "fix the build fast"        # Disable dangerous-command approval prompts
+```
+
+`edgecrab model` launches the normal TUI and opens the `/model` selector immediately.
+It is intentionally not a separate model-management codepath.
+
+`edgecrab slash ...` uses the same command parsing and handlers as the in-session
+slash surface. Examples:
+
+```bash
+edgecrab slash insights 7
+edgecrab slash btw "summarize this branch before I merge it"
+edgecrab slash profile
+```
+
+High-frequency Hermes flows also have thin top-level wrappers that forward into
+the same slash handlers:
+
+```bash
+edgecrab new
+edgecrab btw "quick side question"
+edgecrab prompt clear
+edgecrab reasoning high
+edgecrab reload-mcp
 ```
 
 ---
@@ -152,7 +215,8 @@ edgecrab setup --force          # Overwrite existing config from scratch
 ```
 
 The wizard detects API keys from the environment, lets you choose a
-provider, and writes `~/.edgecrab/config.yaml`.
+provider, and writes `~/.edgecrab/config.yaml`. On a fresh install it also
+detects OpenClaw homes and offers to import them before proceeding.
 
 ---
 
@@ -205,6 +269,7 @@ One-way import from `~/.hermes/` (hermes-agent) into `~/.edgecrab/`.
 ```bash
 edgecrab migrate            # Live migration
 edgecrab migrate --dry-run  # Preview without writing any files
+edgecrab migrate --source /path/to/.hermes
 ```
 
 What is imported:
@@ -229,8 +294,8 @@ Print build info and supported providers.
 
 ```bash
 edgecrab version
-# EdgeCrab v0.1.0  (rustc 1.85.0, git a1b2c3d)
-# Rust 1.85.0
+# EdgeCrab v0.2.4  (rustc 1.86.0, git a1b2c3d)
+# Rust 1.86.0
 # ...providers listed as above...
 
 edgecrab --version   # identical output
@@ -248,6 +313,137 @@ edgecrab status
 ```
 
 ---
+
+## `edgecrab dump`
+
+Print a support-friendly runtime snapshot: version, active profile, key paths,
+provider model, gateway state, and optional local inventory counts.
+
+```bash
+edgecrab dump
+edgecrab dump --all
+```
+
+---
+
+## `edgecrab logs`
+
+Inspect log files under `~/.edgecrab/logs/`.
+
+```bash
+edgecrab logs list
+edgecrab logs path
+edgecrab logs path gateway
+edgecrab logs show gateway --lines 200
+edgecrab logs tail gateway
+```
+
+---
+
+## `edgecrab pairing`
+
+Manage gateway pairing approvals and the approved-user list.
+
+```bash
+edgecrab pairing list
+edgecrab pairing list --pending
+edgecrab pairing approve <platform> <code>
+edgecrab pairing revoke <platform> <user-id>
+edgecrab pairing clear-pending --platform telegram
+```
+
+---
+
+## `edgecrab memory`
+
+Inspect or edit persistent memory files stored under `~/.edgecrab/memories/`.
+
+```bash
+edgecrab memory show
+edgecrab memory show user
+edgecrab memory edit memory
+edgecrab memory path
+```
+
+---
+
+## `edgecrab honcho`
+
+Hermes-compatible Honcho control plane for EdgeCrab's local user-model store.
+EdgeCrab keeps the local JSON store as the source of truth and can optionally
+enable cloud-sync style behavior through config.
+
+```bash
+edgecrab honcho status
+edgecrab honcho setup
+edgecrab honcho setup --cloud-sync
+edgecrab honcho mode
+edgecrab honcho mode local
+edgecrab honcho tokens --context 12 --write-frequency 4
+edgecrab honcho list
+edgecrab honcho search rust
+edgecrab honcho add preference "prefers terse code review findings"
+edgecrab honcho remove <id-prefix>
+edgecrab honcho identity ./SOUL.md
+edgecrab honcho path
+```
+
+---
+
+## `edgecrab claw`
+
+Hermes-compatible OpenClaw migration entrypoint. This imports the EdgeCrab-native
+subset of an OpenClaw home directory and archives the unsupported remainder for
+manual review under `~/.edgecrab/migration/openclaw/`.
+
+```bash
+edgecrab claw migrate
+edgecrab claw migrate --dry-run
+edgecrab claw migrate --preset user-data
+edgecrab claw migrate --migrate-secrets
+edgecrab claw migrate --overwrite
+edgecrab claw migrate --source /path/to/.openclaw
+edgecrab claw migrate --workspace-target /absolute/workspace
+edgecrab claw migrate --skill-conflict rename
+```
+
+Key flags:
+
+| Flag | Description |
+|------|-------------|
+| `--source <path>` | Override the detected OpenClaw directory (`~/.openclaw`, `~/.clawdbot`, `~/.moldbot`) |
+| `--dry-run` | Preview only |
+| `--preset {user-data,full}` | `user-data` excludes secrets; `full` includes allowlisted secrets |
+| `--overwrite` | Replace conflicting target files instead of skipping |
+| `--migrate-secrets` | Import allowlisted secrets even when not using `--preset full` |
+| `--workspace-target <abs-path>` | Copy OpenClaw `AGENTS.md` into a workspace |
+| `--skill-conflict {skip,overwrite,rename}` | Control how skill name conflicts are handled |
+
+Imported directly:
+
+- `SOUL.md`
+- `MEMORY.md` / `USER.md`
+- workspace and shared skills into `~/.edgecrab/skills/openclaw-imports/`
+- `command_allowlist.json`
+- messaging `.env` keys such as Telegram / Discord / Slack / Signal allowlists
+- allowlisted provider secrets
+- `model.default`, `tts.*`, `mcp_servers`, `terminal.timeout`, `timezone`, `reasoning_effort`
+
+Archived for manual review:
+
+- gateway/session/browser/approval/skills-registry/ui/logging config that does not map 1:1 to EdgeCrab
+- supplemental workspace docs such as `IDENTITY.md`, `TOOLS.md`, `HEARTBEAT.md`, `BOOTSTRAP.md`
+
+---
+
+## `edgecrab insights`
+
+Read historical analytics from the session database.
+
+```bash
+edgecrab insights
+edgecrab insights --days 7
+```
 
 ## `edgecrab whatsapp`
 
@@ -292,8 +488,10 @@ edgecrab completion zsh  >> ~/.zshrc
 ## `edgecrab profile`
 
 Manage named profiles. Each profile gets its own isolated home
-directory under `~/.edgecrab/profiles/<name>/` (config, memories,
-skills, sessions).
+directory under `~/.edgecrab/profiles/<name>/` with its own config,
+SOUL, memory, skills, plugins, hooks, MCP tokens, and SQLite session
+store. EdgeCrab seeds bundled starter profiles (`work`, `research`,
+`homelab`) automatically on normal startup and profile commands.
 
 ```bash
 edgecrab profile list                              # List all profiles
@@ -302,7 +500,7 @@ edgecrab profile create <name> --clone             # Clone current profile (conf
 edgecrab profile create <name> --clone-all         # Clone everything including memories/sessions
 edgecrab profile create <name> --clone-from other  # Clone from a specific profile
 edgecrab profile use <name>                        # Switch sticky default profile
-edgecrab profile show <name>                       # Show profile details (dir, model, disk usage)
+edgecrab profile show [name]                       # Show a named profile, or print the active profile + home if omitted
 edgecrab profile alias <name>                      # Generate a shell wrapper alias
 edgecrab profile alias <name> --name myalias       # Alias with a custom name
 edgecrab profile alias <name> --remove             # Remove the shell alias
@@ -393,6 +591,93 @@ HTTP MCP servers can authenticate with bearer tokens from:
 
 ---
 
+## `edgecrab auth`
+
+Manage the authentication state EdgeCrab actually owns today:
+
+- GitHub Copilot token import and local cache
+- env-backed provider API keys stored in `~/.edgecrab/.env`
+- structured provider state stored in `~/.edgecrab/auth.json`
+- MCP bearer-token and OAuth token cache state
+
+This is not Hermes' general multi-provider credential-pool subsystem. EdgeCrab
+does not yet ship pooled provider rotation, per-provider cooldown reset, or
+provider-wide OAuth/API-key inventory management.
+
+```bash
+edgecrab auth list                            # List Copilot, provider, and MCP auth targets
+edgecrab auth status                          # Same as list, concise overview
+edgecrab auth status copilot                 # Detailed Copilot cache state
+edgecrab auth status provider/openai         # Show provider token state in ~/.edgecrab/.env and ~/.edgecrab/auth.json
+edgecrab auth status mcp/github              # Detailed MCP auth path for one server
+edgecrab auth add copilot --token <gh-token> # Save a GitHub token for Copilot
+edgecrab auth add provider/openai --token <tok> # Save one provider token to ~/.edgecrab/.env and record provider metadata in ~/.edgecrab/auth.json
+edgecrab auth add mcp/github --token <tok>   # Save a bearer token for one MCP server
+edgecrab auth login copilot                  # Import VS Code Copilot token and warm cache
+edgecrab auth login mcp/github               # Run interactive OAuth login for one MCP server
+edgecrab auth remove provider/openai         # Remove one provider token from ~/.edgecrab/.env and clear its auth.json entry
+edgecrab auth remove copilot                 # Clear EdgeCrab's local Copilot token cache
+edgecrab auth remove mcp/github              # Remove one cached MCP token
+edgecrab auth reset                          # Clear all EdgeCrab-managed local auth caches
+```
+
+Target syntax:
+
+- `copilot`
+- `provider/<name>` for env-backed providers such as `openai`, `anthropic`, `gemini`, `openrouter`, `xai`, `deepseek`, `mistral`, `groq`, `cohere`, `perplexity`, `huggingface`, and `zai`
+- `mcp/<server>`
+- `<server>` for a configured MCP server name
+
+---
+
+## `edgecrab login` and `edgecrab logout`
+
+Hermes-style shortcuts over `edgecrab auth`.
+
+```bash
+edgecrab login copilot        # Equivalent to: edgecrab auth login copilot
+edgecrab login provider/openai  # Provider targets are env-backed and instruct you to use auth add
+edgecrab login mcp/github     # Equivalent to: edgecrab auth login mcp/github
+edgecrab logout               # Clear all local Copilot + provider + MCP auth caches
+edgecrab logout copilot       # Clear only Copilot cache
+edgecrab logout provider/openai # Clear one provider token from ~/.edgecrab/.env and its auth.json entry
+edgecrab logout mcp/github    # Clear one cached MCP token
+```
+
+---
+
+## `edgecrab webhook`
+
+Manage dynamic gateway webhook subscriptions stored in
+`~/.edgecrab/webhook_subscriptions.json`.
+
+```bash
+edgecrab webhook list
+edgecrab webhook subscribe github --events push,pull_request --prompt "Summarise the repo event"
+edgecrab webhook subscribe github --skill code-review --deliver github_comment --deliver-extra repo=org/repo --deliver-extra pr_number=42
+edgecrab webhook subscribe alerts --deliver telegram --deliver-extra chat_id=12345 --deliver-extra thread_id=17
+edgecrab webhook subscribe github --secret _INSECURE_NO_AUTH --rate-limit 60 --max-body-bytes 2097152
+edgecrab webhook remove github
+edgecrab webhook test github
+edgecrab webhook path
+```
+
+Behavior:
+
+- The gateway exposes `POST /webhooks/<name>` for saved subscriptions.
+- Requests are authenticated with `X-Hub-Signature-256: sha256=...`, a raw 64-char hex HMAC, or `X-Webhook-Secret`.
+- `--secret _INSECURE_NO_AUTH` disables secret checking for a route. This is compatibility-focused and should only be used on trusted internal networks.
+- Event filters use `X-Event-Type`, `X-GitHub-Event`, or `payload.event_type`.
+- Duplicate deliveries are rejected when a stable delivery ID is present.
+- Per-route rate limits and maximum body sizes are enforced at ingress.
+- Prompt templates support dot-path placeholders and `{__raw__}` for the full JSON payload.
+- `--skill` preloads named skills into the webhook session before the turn runs.
+- `--deliver` supports Hermes-style final-response routing such as `log`, `origin`, `telegram`, `discord`, `slack`, `signal`, and `github_comment`.
+- `--deliver-extra key=value` is template-rendered against the JSON payload before delivery, so values like `repo={repository.full_name}` and `pr_number={pull_request.number}` work the same way Hermes operators expect.
+- Matching requests are converted into agent messages and queued into the running gateway, with delivery metadata attached for the final response path.
+
+---
+
 ## `edgecrab plugins`
 
 Manage installed plugins.
@@ -477,6 +762,29 @@ edgecrab gateway configure telegram          # Configure a specific platform
 Platforms are enabled and configured via environment variables or `config.yaml` gateway section —
 not via `gateway start` flags. See [User Guide → Messaging](/user-guide/messaging/) for per-platform
 setup.
+
+---
+
+## `edgecrab uninstall`
+
+Remove EdgeCrab-managed local artifacts safely.
+
+```bash
+edgecrab uninstall --dry-run
+edgecrab uninstall --purge-data --yes
+edgecrab uninstall --purge-data --purge-auth-cache --remove-binary --yes
+```
+
+Safe defaults:
+
+- stops the local background gateway if it is running
+- removes profile wrapper scripts created in `~/.local/bin/`
+- only removes `~/.edgecrab/` when `--purge-data` is passed
+- only removes the local Copilot cache when `--purge-auth-cache` is passed
+- only removes the current `edgecrab` binary when `--remove-binary` is passed
+
+Unlike Hermes, EdgeCrab does not blindly delete a source checkout or guess at
+shell `PATH` edits during uninstall.
 
 ---
 

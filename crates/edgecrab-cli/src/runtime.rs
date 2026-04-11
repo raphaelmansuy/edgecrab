@@ -4,6 +4,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use async_trait::async_trait;
 
+use crate::profile;
 use edgecrab_core::{Agent, AgentBuilder, AppConfig, ensure_edgecrab_home};
 use edgecrab_plugins::script::engine::ScriptRuntime;
 use edgecrab_plugins::tool_server::client::ToolServerClient;
@@ -34,6 +35,12 @@ pub fn load_runtime(
     } else {
         ensure_edgecrab_home().context("failed to initialize edgecrab home")?
     };
+
+    let profile_report =
+        profile::ensure_bundled_profiles_seeded().context("failed to seed bundled profiles")?;
+    if !profile_report.created.is_empty() {
+        tracing::info!(profiles_sync = %profile_report.summary(), "bundled profiles synced");
+    }
 
     // Load secrets from ~/.edgecrab/.env into the process environment BEFORE
     // config parsing so that tokens saved by `edgecrab gateway configure`

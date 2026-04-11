@@ -49,7 +49,7 @@ You're already using Hermes Agent or another AI agent and want to switch.
 
 **Time: ~5 minutes**
 
-1. **[Migrating from Hermes](/user-guide/migration/)** — One-command import of config, memories, skills
+1. **[Migration](/user-guide/migration/)** — Hermes import plus OpenClaw native-subset import
 2. **[CLI Interface](/user-guide/cli/)** — How EdgeCrab's commands map to Hermes commands
 3. **[Skills System](/features/skills/)** — How EdgeCrab extends and improves on skills
 
@@ -119,7 +119,7 @@ EdgeCrab Docs
 |   +-- Sessions & Memory      <- history, memory, compression
 |   +-- Docker Deployment      <- container operation
 |   +-- Security Model         <- defense-in-depth layers
-|   \-- Migrating from Hermes  <- import your existing data
+|   \-- Migration  <- import your existing Hermes or OpenClaw data
 |
 +-- Features
 |   +-- Overview               <- feature comparison

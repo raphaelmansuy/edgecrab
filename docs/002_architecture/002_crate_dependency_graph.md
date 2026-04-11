@@ -33,7 +33,7 @@ Understanding the graph answers: *"where does this new code go?"*
         │                    │                         │              │
         │                    ▼                         ▼              ▼
         │            edgecrab-tools           edgecrab-state  edgecrab-security
-        │            (ToolRegistry, 65 tools) (SQLite WAL)    (CommandScanner)
+        │            (ToolRegistry, 91 tools) (SQLite WAL)    (CommandScanner)
         │                    │                         │              │
         │                    └─────────────────────────┼──────────────┘
         │                                              │

@@ -15,6 +15,7 @@ default = ["bedrock-model-discovery"]
 bedrock-model-discovery = ["edgecrab-core/bedrock-model-discovery"]
 
 [dependencies]
+edgecrab-command-catalog = { workspace = true }
 edgecrab-core = { workspace = true }
 edgecrab-plugins = { workspace = true }
 edgecrab-types = { workspace = true }
@@ -57,6 +58,8 @@ unicode-width = { workspace = true }
 similar = { workspace = true }
 which = { workspace = true }
 libc = { workspace = true }
+flate2 = { workspace = true }
+tar = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

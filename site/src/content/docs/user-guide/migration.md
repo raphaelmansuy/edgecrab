@@ -1,15 +1,15 @@
 ---
-title: Migrating from Hermes Agent
-description: Import your entire Hermes Agent configuration, memories, skills, and session data into EdgeCrab with a single command. Zero manual work.
+title: Migrating from Hermes Agent And OpenClaw
+description: Import Hermes Agent state directly, or import the EdgeCrab-native subset of an OpenClaw home and archive the unsupported remainder for manual review.
 sidebar:
   order: 6
 ---
 
-If you're moving from [Hermes Agent](https://github.com/NousResearch/hermes-agent), EdgeCrab includes a first-class migration tool that imports everything in one step.
+If you're moving from [Hermes Agent](https://github.com/NousResearch/hermes-agent), EdgeCrab imports the directly compatible state in one step. If you're moving from OpenClaw, EdgeCrab imports the native subset and archives the rest under `~/.edgecrab/migration/openclaw/` instead of guessing.
 
 ---
 
-## What Gets Migrated
+## Hermes Import
 
 | Asset | Source | Destination |
 |-------|--------|-------------|
@@ -18,16 +18,17 @@ If you're moving from [Hermes Agent](https://github.com/NousResearch/hermes-agen
 | Skills | `~/.hermes/skills/` | `~/.edgecrab/skills/` |
 | Environment file | `~/.hermes/.env` | `~/.edgecrab/.env` |
 
-Session history stored in Hermes's PostgreSQL or SQLite backend is **not** migrated (format is incompatible). Only the structured state above is imported.
+Hermes session history in `state.db` is imported when the source DB exists and the target session IDs do not already exist.
 
 ---
 
-## Step 1 — Dry Run
+## Hermes Dry Run
 
 Always run the dry-run first to see exactly what will happen:
 
 ```bash
 edgecrab migrate --dry-run
+edgecrab migrate --source /path/to/.hermes
 ```
 
 ```
@@ -50,7 +51,7 @@ Run `edgecrab migrate` (without --dry-run) to execute.
 
 ---
 
-## Step 2 — Execute Migration
+## Hermes Execute
 
 ```bash
 edgecrab migrate
@@ -69,7 +70,44 @@ Migration complete. Run `edgecrab doctor` to verify.
 
 ---
 
-## Step 3 — Verify
+## OpenClaw Import
+
+OpenClaw uses a different data model. EdgeCrab therefore splits the import into:
+
+- direct import for the parts that map cleanly into EdgeCrab
+- archival for the parts that do not
+
+Run it with:
+
+```bash
+edgecrab claw migrate --dry-run
+edgecrab claw migrate
+edgecrab claw migrate --preset user-data
+edgecrab claw migrate --preset full
+edgecrab claw migrate --migrate-secrets
+edgecrab claw migrate --workspace-target /absolute/workspace
+edgecrab claw migrate --skill-conflict rename
+```
+
+OpenClaw items imported directly:
+
+| Asset | Source | Destination |
+|-------|--------|-------------|
+| Persona | `workspace/SOUL.md` | `~/.edgecrab/SOUL.md` |
+| Memory | `workspace/MEMORY.md`, `workspace/USER.md`, `workspace/memory/*.md` | `~/.edgecrab/memories/` |
+| Skills | `workspace/skills/`, shared skill directories | `~/.edgecrab/skills/openclaw-imports/` |
+| Command allowlist | `exec-approvals.json` | `~/.edgecrab/command_allowlist.json` |
+| Messaging/env | OpenClaw config and credentials files | `~/.edgecrab/.env` |
+| Selected config | model, tts, MCP servers, terminal timeout, timezone, reasoning effort | `~/.edgecrab/config.yaml` |
+
+OpenClaw items archived instead of force-mapped:
+
+- gateway/session/browser/approval/skills-registry/ui/logging config
+- supplemental workspace docs such as `IDENTITY.md`, `TOOLS.md`, `HEARTBEAT.md`, `BOOTSTRAP.md`
+
+Archive output lands under `~/.edgecrab/migration/openclaw/<timestamp>/`.
+
+## Verify
 
 ```bash
 edgecrab doctor
@@ -88,16 +126,27 @@ If `~/.edgecrab/` already exists (e.g., you ran `edgecrab setup` first), the mig
               ⚠ 3 files already exist — skipping (use --overwrite to replace)
 ```
 
-To force overwrite:
+Hermes import is intentionally conservative. It does not overwrite existing
+EdgeCrab files. If you want a clean re-import, move or remove the specific
+target files first, then rerun:
 
 ```bash
-edgecrab migrate --overwrite
+mv ~/.edgecrab/config.yaml ~/.edgecrab/config.yaml.backup
+edgecrab migrate
 ```
 
-Or merge manually:
+For OpenClaw conflicts, use:
+
+```bash
+edgecrab claw migrate --overwrite
+edgecrab claw migrate --skill-conflict rename
+```
+
+Or inspect the dry-run manually:
 
 ```bash
 edgecrab migrate --dry-run > /tmp/migration-plan.txt
+edgecrab claw migrate --dry-run > /tmp/openclaw-plan.txt
 # Review and selectively copy files
 ```
 
@@ -156,9 +205,9 @@ Your Hermes Agent installation is never modified by `edgecrab migrate`.
 
 ## Frequently Asked Questions
 
-**Q: My Hermes session history isn't migrated. Is that expected?**
+**Q: Why does OpenClaw migration archive some files instead of importing them?**
 
-Yes — session history uses different SQLite schemas and cannot be auto-migrated. Only config, memories, skills, and `.env` are imported. If critical conversations exist, export them from Hermes first: `hermes sessions export <id> > important-session.md`.
+Because EdgeCrab does not share OpenClaw's config model. Archiving is safer than pretending a field maps cleanly when it does not.
 
 **Q: Some of my Hermes config keys aren't recognized. What do I do?**
 

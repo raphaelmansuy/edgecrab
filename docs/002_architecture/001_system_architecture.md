@@ -29,9 +29,9 @@ into platform-native output.
   ║  ┌─────────────────┐  ┌──────────────────┐  ┌───────────────┐  ║
   ║  │  edgecrab-cli   │  │ edgecrab-gateway  │  │ edgecrab-acp  │  ║
   ║  │                 │  │                  │  │               │  ║
-  ║  │ clap subcommands│  │ 18 platform       │  │ JSON-RPC 2.0  │  ║
+  ║  │ clap subcommands│  │ 15 gateway        │  │ JSON-RPC 2.0  │  ║
   ║  │ ratatui TUI     │  │ adapters          │  │ stdio server  │  ║
-  ║  │ 53 slash cmds   │  │ delivery router   │  │ VS Code / Zed │  ║
+  ║  │ slash commands  │  │ delivery router   │  │ VS Code / Zed │  ║
   ║  │ setup wizard    │  │ hook registry     │  │ JetBrains     │  ║
   ║  │ doctor          │  │ session fan-out   │  │               │  ║
   ║  └────────┬────────┘  └────────┬─────────┘  └───────┬───────┘  ║
@@ -55,7 +55,7 @@ into platform-native output.
   ║                      │ uses                                      ║
   ║  ┌───────────────────▼──────────┐  ┌────────────────────────┐   ║
   ║  │  edgecrab-tools               │  │  edgecrab-state        │   ║
-  ║  │  ToolRegistry (65 tools)      │  │  SessionDb             │   ║
+  ║  │  ToolRegistry (91 tools)      │  │  SessionDb             │   ║
   ║  │  ToolHandler trait            │  │  SQLite WAL + FTS5     │   ║
   ║  │  ToolContext                  │  │  schema v6             │   ║
   ║  │  ProcessTable                 │  └────────────────────────┘   ║

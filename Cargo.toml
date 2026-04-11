@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/edgecrab-command-catalog",
     "crates/edgecrab-types",
     "crates/edgecrab-security",
     "crates/edgecrab-state",
@@ -24,6 +25,7 @@ authors = ["Raphael Mansuy"]
 
 [workspace.dependencies]
 # Internal crates
+edgecrab-command-catalog = { path = "crates/edgecrab-command-catalog", version = "0.2.4" }
 edgecrab-types = { path = "crates/edgecrab-types", version = "0.2.4" }
 edgecrab-security = { path = "crates/edgecrab-security", version = "0.2.4" }
 edgecrab-state = { path = "crates/edgecrab-state", version = "0.2.4" }
@@ -106,6 +108,8 @@ dotenvy = "0.15"
 mockall = "0.13"
 libc = "0.2"
 portable-pty = "0.9"
+flate2 = "1"
+tar = "0.4"
 
 # Execution backends
 bollard = { version = "0.18", features = ["ssl"] }

@@ -4,8 +4,8 @@
 > `crates/`. If it conflicts with the code, the code wins.
 
 > 🦀 *"`hermes-agent` had the history. OpenClaw had the claws. EdgeCrab had both —
-> plus a security scanner, 65 tools, and a 15 MB binary that starts in 50 ms.
-> The bout was brief."*
+> plus a security scanner, 91 core tools, and a stripped release binary that is
+> currently about 49 MB on macOS arm64. The bout was brief."*
 >
 > *(Note: `hermes-agent` is EdgeCrab's **Python** predecessor — `~/.hermes/`, `prompt_toolkit` TUI, ~80–150 MB. OpenClaw is a TypeScript/Node.js personal assistant — [github.com/openclaw](https://github.com/openclaw).)*
 
@@ -43,7 +43,7 @@ a change with confidence on day one.
           │                      │                        │
   ┌───────▼───────┐   ┌──────────▼──────┐   ┌────────────▼────┐
   │edgecrab-tools │   │ edgecrab-state  │   │edgecrab-security│
-  │ 65 tools,     │   │ SQLite WAL/FTS5 │   │path·cmd·inject  │
+  │ 91 tools,     │   │ SQLite WAL/FTS5 │   │path·cmd·inject  │
   │ registry,     │   │ sessions, FTS   │   │redact·url·policy│
   │ toolsets      │   └─────────────────┘   └─────────────────┘
   └───────────────┘
@@ -55,7 +55,7 @@ a change with confidence on day one.
   └───────────────────────────────┘
 
   edgecrab-cron ─── schedule parsing + job store (shared by cli + tools)
-  edgecrab-migrate ─ legacy hermes→edgecrab import helper
+  edgecrab-migrate ─ hermes/openclaw → edgecrab import helper
 ```
 
 ---
@@ -68,12 +68,12 @@ a change with confidence on day one.
 | `edgecrab-security` | Path jail, command scan, injection check, redaction | `CommandScanner`, `ApprovalPolicy` |
 | `edgecrab-state` | SQLite session store, FTS5 search, analytics | `SessionDb` |
 | `edgecrab-cron` | Cron schedule parsing, job store, delivery | `CronJob`, `CronStore` |
-| `edgecrab-tools` | Tool registry, 65 tools, toolsets, backends | `ToolRegistry`, `ToolHandler` |
+| `edgecrab-tools` | Tool registry, 91 tools, toolsets, backends | `ToolRegistry`, `ToolHandler` |
 | `edgecrab-core` | Agent, conversation loop, prompt builder, routing | `Agent`, `AgentBuilder` |
 | `edgecrab-cli` | TUI, clap commands, setup wizard, doctor | `CliArgs`, all subcommands |
-| `edgecrab-gateway` | 18-platform adapters, delivery, hooks, pairing | `PlatformAdapter`, `HookRegistry` |
+| `edgecrab-gateway` | 15 gateway adapters, delivery, hooks, pairing | `PlatformAdapter`, `HookRegistry` |
 | `edgecrab-acp` | JSON-RPC 2.0 stdio server for VS Code / Zed | `AcpServer` |
-| `edgecrab-migrate` | One-time hermes migration helper | `MigrateReport` |
+| `edgecrab-migrate` | One-time Hermes/OpenClaw migration helper | `MigrationReport` |
 
 ---
 
@@ -135,21 +135,22 @@ Pick the path that matches your goal.
 | 9 | [Context Compression](./003_agent_core/004_context_compression.md) | 5-pass compression pipeline |
 | 10 | [Smart Model Routing](./003_agent_core/005_smart_model_routing.md) | Cheap / Primary / Fallback |
 | 11 | [Tool Registry](./004_tools_system/001_tool_registry.md) | `ToolHandler` trait and dispatch |
-| 12 | [Tool Catalogue](./004_tools_system/002_tool_catalogue.md) | All 65 tools |
+| 12 | [Tool Catalogue](./004_tools_system/002_tool_catalogue.md) | All 91 core tools |
 | 13 | [Toolset Composition](./004_tools_system/003_toolset_composition.md) | Named sets and aliases |
 | 14 | [Tools Runtime](./004_tools_system/004_tools_runtime.md) | `ToolContext`, execution backends |
 | 15 | [CLI Architecture](./005_cli/001_cli_architecture.md) | Clap, ratatui, slash commands |
-| 16 | [Gateway Architecture](./006_gateway/001_gateway_architecture.md) | 18 adapters, hooks, delivery |
-| 17 | [Memory and Skills](./007_memory_skills/001_memory_skills.md) | `~/.edgecrab/memories/`, skill files |
-| 18 | [Creating Skills](./007_memory_skills/002_creating_skills.md) | Writing and testing skill files |
-| 19 | [Execution Backends](./008_environments/001_environments.md) | Local, Docker, SSH, Modal, Daytona |
-| 20 | [Config and State](./009_config_state/001_config_state.md) | `AppConfig`, resolution order |
-| 21 | [Session Storage](./009_config_state/002_session_storage.md) | SQLite schema, WAL, FTS5 |
-| 22 | [Data Models](./010_data_models/001_data_models.md) | All public types |
-| 23 | [Security](./011_security/001_security.md) | All security primitives |
-| 24 | [Library Selection](./013_library_selection/001_library_selection.md) | Why each dependency |
-| 25 | [CI/CD Secrets](./016_cicd/001_secrets_setup.md) | GitHub Actions secrets |
-| 26 | [GitHub Pages DNS](./016_cicd/002_github_pages_dns.md) | DNS setup |
+| 16 | [Hermes Command Parity](./005_cli/002_hermes_command_parity.md) | Hermes command surface vs EdgeCrab |
+| 17 | [Gateway Architecture](./006_gateway/001_gateway_architecture.md) | 15 adapters, hooks, delivery |
+| 18 | [Memory and Skills](./007_memory_skills/001_memory_skills.md) | `~/.edgecrab/memories/`, skill files |
+| 19 | [Creating Skills](./007_memory_skills/002_creating_skills.md) | Writing and testing skill files |
+| 20 | [Execution Backends](./008_environments/001_environments.md) | Local, Docker, SSH, Modal, Daytona |
+| 21 | [Config and State](./009_config_state/001_config_state.md) | `AppConfig`, resolution order |
+| 22 | [Session Storage](./009_config_state/002_session_storage.md) | SQLite schema, WAL, FTS5 |
+| 23 | [Data Models](./010_data_models/001_data_models.md) | All public types |
+| 24 | [Security](./011_security/001_security.md) | All security primitives |
+| 25 | [Library Selection](./013_library_selection/001_library_selection.md) | Why each dependency |
+| 26 | [CI/CD Secrets](./016_cicd/001_secrets_setup.md) | GitHub Actions secrets |
+| 27 | [GitHub Pages DNS](./016_cicd/002_github_pages_dns.md) | DNS setup |
 | 27 | [Hooks](./hooks.md) | Native and script hooks |
 
 ---

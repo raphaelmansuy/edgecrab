@@ -169,6 +169,11 @@ pub fn run() -> anyhow::Result<()> {
 // ─── Fresh Setup ──────────────────────────────────────────────────────
 
 fn run_fresh_setup(home: &Path, config_path: &Path) -> anyhow::Result<()> {
+    if offer_openclaw_migration(home)? {
+        println!("\n✓ OpenClaw migration completed. Loading the imported EdgeCrab config.\n");
+        return run_reconfigure_menu(home, config_path);
+    }
+
     println!("\n╔══════════════════════════════════════════════════════╗");
     println!("║         Welcome to EdgeCrab — AI terminal agent       ║");
     println!("╚══════════════════════════════════════════════════════╝\n");
@@ -280,6 +285,48 @@ fn run_fresh_setup(home: &Path, config_path: &Path) -> anyhow::Result<()> {
     println!("    Visit https://openrouter.ai/nousresearch for all variants.\n");
 
     Ok(())
+}
+
+fn offer_openclaw_migration(home: &Path) -> anyhow::Result<bool> {
+    use edgecrab_migrate::openclaw::{
+        OpenClawMigrationOptions, OpenClawMigrator, OpenClawPreset, SkillConflictMode,
+    };
+
+    let Some(source_root) = OpenClawMigrator::default_source_home() else {
+        return Ok(false);
+    };
+
+    if !prompt_yes_no(
+        &format!(
+            "Found OpenClaw data at {}. Import it into EdgeCrab before setup?",
+            source_root.display()
+        ),
+        true,
+    )? {
+        return Ok(false);
+    }
+
+    let options = OpenClawMigrationOptions {
+        execute: true,
+        overwrite: true,
+        migrate_secrets: true,
+        preset: OpenClawPreset::Full,
+        workspace_target: None,
+        skill_conflict_mode: SkillConflictMode::Overwrite,
+    };
+    let migrator = OpenClawMigrator::new(source_root.clone(), home.to_path_buf(), options);
+    let report = migrator.migrate_all()?;
+
+    let succeeded = report.success_count();
+    let failed = report.failed_count();
+    println!();
+    println!("Imported OpenClaw source: {}", source_root.display());
+    println!("Migrated items: {succeeded}");
+    if failed > 0 {
+        println!("Failures: {failed}");
+    }
+
+    Ok(succeeded > 0)
 }
 
 // ─── Reconfigure Menu ─────────────────────────────────────────────────

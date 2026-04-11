@@ -1110,9 +1110,7 @@ mod tests {
 
     #[test]
     fn runtime_snapshot_reports_env_backed_platforms_and_attention() {
-        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
-            .lock()
-            .expect("env lock");
+        let _guard = crate::gateway_catalog::lock_test_env();
         let config = AppConfig::default();
         unsafe {
             std::env::set_var("MATRIX_HOMESERVER", "https://matrix.example");
@@ -1151,9 +1149,7 @@ mod tests {
 
     #[test]
     fn runtime_snapshot_excludes_explicitly_disabled_typed_platforms() {
-        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
-            .lock()
-            .expect("env lock");
+        let _guard = crate::gateway_catalog::lock_test_env();
         let mut config = AppConfig::default();
         config.gateway.telegram.enabled = true;
         config.gateway.disable_platform("telegram");
@@ -1177,9 +1173,7 @@ mod tests {
     #[test]
     #[serial_test::serial(edgecrab_home_env)]
     fn gateway_paths_follow_edgecrab_home() {
-        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
-            .lock()
-            .expect("env lock");
+        let _guard = crate::gateway_catalog::lock_test_env();
         let dir = tempfile::tempdir().expect("tempdir");
         unsafe {
             std::env::set_var("EDGECRAB_HOME", dir.path());

@@ -3,10 +3,11 @@
 > **Verified against:** `crates/edgecrab-tools/src/toolsets.rs` ·
 > `crates/edgecrab-tools/src/tools/`
 
-65 tools are registered through `inventory::submit!`. This page
-groups them by function and records which toolset each belongs to.
+91 core tools are exposed through `CORE_TOOLS` in `toolsets.rs`, with handlers
+registered through `inventory::submit!`. This page groups them by function and
+records which toolset each belongs to.
 
-🦀 *`hermes-agent` (EdgeCrab's Python predecessor) shipped a broad tool set in the same categories. OpenClaw ([TypeScript/Node.js](https://github.com/openclaw)) focuses on browser automation, camera, and productivity integrations. EdgeCrab deploys 65 registered tools across every execution domain — and every one runs through a security gate.*
+🦀 *`hermes-agent` (EdgeCrab's Python predecessor) shipped a broad tool set in the same categories. OpenClaw ([TypeScript/Node.js](https://github.com/openclaw)) focuses on browser automation, camera, and productivity integrations. EdgeCrab deploys 91 core tools across every execution domain — and every one runs through a security gate.*
 
 ---
 

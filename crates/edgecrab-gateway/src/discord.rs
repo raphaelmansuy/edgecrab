@@ -638,6 +638,7 @@ impl DiscordAdapter {
                                     thread_id,
                                     user_display_name: Some(username),
                                     attachments,
+                                    ..Default::default()
                                 },
                             };
 

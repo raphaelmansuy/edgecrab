@@ -15,6 +15,8 @@
 
 #![deny(clippy::unwrap_used)]
 
+pub mod common;
 pub mod compat;
 pub mod hermes;
+pub mod openclaw;
 pub mod report;

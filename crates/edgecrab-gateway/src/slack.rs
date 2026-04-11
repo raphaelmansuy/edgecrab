@@ -795,6 +795,7 @@ impl PlatformAdapter for SlackAdapter {
                         thread_id: thread_ts,
                         user_display_name: None,
                         attachments,
+                        ..Default::default()
                     },
                 };
 

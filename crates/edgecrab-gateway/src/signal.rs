@@ -855,6 +855,7 @@ impl SignalAdapter {
                         thread_id: None,
                         user_display_name: None,
                         attachments,
+                        ..Default::default()
                     },
                 };
 

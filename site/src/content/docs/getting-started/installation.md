@@ -24,7 +24,7 @@ Verify:
 
 ```bash
 edgecrab version
-# EdgeCrab 0.1.1  (rustc 1.85.0, 2025-02-20)
+# EdgeCrab 0.2.4  (rustc 1.86.0, 2026-04-11)
 #   providers: copilot openai anthropic gemini xai deepseek ...
 ```
 
@@ -43,7 +43,7 @@ Verify:
 
 ```bash
 edgecrab version
-# EdgeCrab 0.1.0  (rustc 1.85.0, 2025-02-20)
+# EdgeCrab 0.2.4  (rustc 1.86.0, 2026-04-11)
 #   providers: copilot openai anthropic gemini xai deepseek huggingface zai openrouter ollama lmstudio
 ```
 
@@ -85,7 +85,7 @@ cargo install edgecrab-cli
 ```
 
 Pulls and compiles the latest stable release from [crates.io](https://crates.io/crates/edgecrab-cli).
-Requires **Rust 1.85+**. The binary is placed in `~/.cargo/bin/edgecrab`.
+Requires **Rust 1.86+**. The binary is placed in `~/.cargo/bin/edgecrab`.
 
 > **No Rust?** Install it in one command:
 > ```bash
@@ -96,7 +96,7 @@ Verify:
 
 ```bash
 edgecrab version
-# EdgeCrab 0.1.0  (rustc 1.85.0, 2025-02-20)
+# EdgeCrab 0.2.4  (rustc 1.86.0, 2026-04-11)
 #   providers: copilot openai anthropic gemini xai deepseek huggingface zai openrouter ollama lmstudio
 ```
 
@@ -313,7 +313,7 @@ No. The binary is fully self-contained. The Rust toolchain is only needed to com
 **Q: How do I install a specific version?**
 
 ```bash
-cargo install edgecrab-cli --version 0.1.0
+cargo install edgecrab-cli --version 0.2.4
 ```
 Or download a tagged release from GitHub Releases.
 
@@ -327,7 +327,7 @@ sudo cp target/release/edgecrab /usr/local/bin/
 
 **Q: How much disk space does EdgeCrab use?**
 
-- Binary: ~15 MB
+- Binary: ~49 MB for current stripped macOS arm64 release builds; other targets vary
 - State database: grows with session history, typically < 100 MB per year of heavy use
 - Skills directory: ~1 KB per skill (just Markdown files)
 - Total: `~/.edgecrab/` is typically < 50 MB

@@ -3,7 +3,8 @@
 > **Verified against:** `crates/edgecrab-cli/src/main.rs` ·
 > `crates/edgecrab-cli/src/cli_args.rs` ·
 > `crates/edgecrab-cli/src/commands.rs` ·
-> `crates/edgecrab-cli/src/app.rs`
+> `crates/edgecrab-cli/src/app.rs` ·
+> `crates/edgecrab-command-catalog/src/lib.rs`
 
 ---
 
@@ -48,9 +49,33 @@ but does not implement the thoughts.*
 ```
   edgecrab
    ├── [none]         Interactive TUI / single-turn (default)
+   ├── chat           Hermes-compatible chat entrypoint
+   ├── model          Open the interactive model selector
+   ├── slash          Generic bridge into the slash-command registry
+   ├── insights       Historical usage analytics
    ├── setup          Onboarding wizard
    ├── doctor         System diagnostics
    ├── version        Print version
+   ├── auth           Copilot + MCP auth control plane
+   │    ├── list
+   │    ├── status
+   │    ├── add
+   │    ├── login
+   │    ├── remove
+   │    └── reset
+   ├── login          Hermes-style auth shortcut
+   ├── logout         Clear cached local auth state
+   ├── dump           Support snapshot
+   ├── logs           Local log inspection
+   ├── pairing        Gateway pairing approval management
+   ├── memory         MEMORY.md / USER.md inspection
+   ├── honcho         Honcho-compatible user-model control plane
+   ├── webhook        Dynamic gateway webhook subscriptions
+   │    ├── subscribe
+   │    ├── list
+   │    ├── remove
+   │    ├── test
+   │    └── path
    ├── profile        Profile management
    │    ├── list
    │    ├── use
@@ -119,10 +144,13 @@ but does not implement the thoughts.*
    │    ├── restart
    │    ├── status
    │    └── configure
+   ├── claw
+   │    └── migrate
    ├── acp            JSON-RPC 2.0 stdio server (editor integration)
    ├── migrate        Hermes → EdgeCrab migration
    ├── whatsapp       WhatsApp bridge pairing
    ├── status         Agent and gateway status
+   ├── uninstall      Remove EdgeCrab-managed local artifacts
    └── completion     Shell completion generation (bash/zsh)
 ```
 
@@ -144,9 +172,14 @@ Options:
       --debug                     Enable debug logging
       --no-banner                 Skip the startup banner
   -w, --worktree                  Create a git worktree for this session
-  -S, --skill <SKILL,...>         Pre-load skills by name
+  -S, --skill <SKILL,...>         Pre-load session skills by name
   -p, --profile <PROFILE>         Use a named profile
+      --yolo                      Start with approval prompts bypassed
 ```
+
+`edgecrab claw migrate` now mirrors Hermes' OpenClaw entrypoint rather than
+aliasing the Hermes importer. It imports EdgeCrab-native OpenClaw data and
+archives unsupported OpenClaw-only config for manual review.
 
 `--config <PATH>` is not just a file override. The parent directory of that
 config file becomes the effective runtime home for sibling `.env`, `state.db`,
@@ -154,10 +187,25 @@ plugins, skills, and other binary-command state.
 
 ---
 
-## The 46 slash commands
+## The slash commands
 
-Slash commands are registered in `commands.rs` and available inside the TUI
-by typing `/` followed by the command name:
+Slash commands are handled in `commands.rs`, but the user-facing metadata now
+lives in the shared `edgecrab-command-catalog` crate so the TUI help and the
+gateway help no longer maintain separate hardcoded tables.
+
+That is the right dependency direction:
+
+- `edgecrab-command-catalog` owns static command metadata
+- `edgecrab-cli` owns TUI dispatch and rendering
+- `edgecrab-gateway` owns messaging dispatch and runtime semantics
+
+This keeps the command definitions DRY without creating an illegal dependency
+from the gateway back into the CLI crate.
+
+For argv parity without an explosion of one-off clap subcommands, EdgeCrab now
+uses `edgecrab slash <command...>` as the generic bridge into the same
+`CommandRegistry` used by the TUI. That preserves one command grammar and one
+handler graph.
 
 | Category | Commands |
 |---|---|
@@ -167,7 +215,7 @@ by typing `/` followed by the command name:
 | Config | `/config`, `/prompt`, `/verbose`, `/personality`, `/statusbar`, `/mouse` |
 | Tools | `/tools`, `/toolsets`, `/mcp`, `/reload-mcp`, `/mcp-token`, `/plugins`, `/skills`, `/browser`, `/memory` |
 | Analysis | `/cost`, `/usage`, `/compress`, `/insights` |
-| Appearance | `/theme`, `/paste` |
+| Appearance | `/skin`, `/paste` |
 | Workflow | `/queue`, `/background`, `/rollback`, `/cron`, `/voice` |
 | Gateway | `/platforms`, `/approve`, `/deny`, `/sethome`, `/update` |
 | Diagnostics | `/doctor` and `/permissions` on macOS |
@@ -175,12 +223,19 @@ by typing `/` followed by the command name:
 Recent UX notes:
 
 - `/config` opens a searchable config center instead of only dumping paths.
+- `/clear` now follows Hermes behavior: it clears the transcript and starts a fresh session.
 - `/cheap_model` and `/moa aggregator` reuse the same fast selector pattern as `/model`.
 - `/moa experts` uses a searchable multi-select overlay for full roster editing, while `/moa add` and `/moa remove` open focused add/remove expert pickers.
 - `/moa on|off` gives Mixture-of-Agents the same explicit enable/disable ergonomics as cheap-model routing, and `/config` exposes a live MoA toggle.
-- `/theme` opens the skin browser by default; `/theme reload` is explicit.
+- `/skin` is the Hermes-compatible primary command; `/theme` remains an alias.
+- `/skin` opens the skin browser by default; `/skin reload` explicitly refreshes `~/.edgecrab/skin.yaml`.
+- `--skill` and in-TUI skill activation now both feed the same session-scoped preloaded-skill set on the agent instead of prepending ad hoc text to the next user message.
+- `/prompt` now manages the persisted `agent.system_prompt` override: `/prompt`, `/prompt clear`, `/prompt <text>`.
+- `/insights [days]` now matches Hermes' optional day-window argument instead of hardcoding 30 days.
 - `/statusbar` is a real persisted toggle.
+- `/verbose` cycles immediately on bare `/verbose`; `/verbose open` keeps the richer EdgeCrab picker available.
 - `/approve`, `/deny`, `/sethome`, and `/update` now operate on live TUI or config state.
+- `/webhook subscribe` now mirrors Hermes route semantics for `skills`, `deliver`, and templated `deliver_extra`, while reusing the shared gateway delivery router instead of duplicating platform send code.
 
 ---
 
@@ -200,6 +255,9 @@ Recent UX notes:
 | `tool_display.rs` | Tool call/result rendering in the TUI |
 | `fuzzy_selector.rs` | Interactive fuzzy session/model selector |
 | `gateway_cmd.rs` | Gateway start/stop/status commands |
+| `auth_cmd.rs` | Copilot + provider-env + MCP auth control plane |
+| `webhook_cmd.rs` | Dynamic webhook subscription management |
+| `uninstall_cmd.rs` | Safe uninstall planning and execution |
 | `cron_cmd.rs` | Cron subcommand implementations |
 | `model_discovery.rs` | Model list fetching from provider APIs |
 | `status_cmd.rs` | `edgecrab status` output |
@@ -211,7 +269,9 @@ Recent UX notes:
 ## Profiles
 
 Profiles are named configurations that isolate everything:
-config, memory, skills, sessions, and the state database:
+config, memory, skills, plugins, hooks, sessions, and the state database.
+The CLI seeds bundled starter profiles (`work`, `research`, `homelab`)
+from compiled templates on startup and before profile-management commands.
 
 ```
   ~/.edgecrab/                     (default profile)
@@ -236,6 +296,11 @@ edgecrab profile create work
 edgecrab --profile work "..."
 edgecrab profile use work  # set as default
 ```
+
+In the TUI, `/profile` shows the active profile summary and `/profiles`
+opens a searchable browser. `/profile use <name>` performs a live runtime
+switch by rebuilding the agent, tool registry, skills view, MCP
+connections, and state DB path immediately.
 
 ---
 

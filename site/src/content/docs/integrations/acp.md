@@ -60,7 +60,7 @@ The generated agent manifest looks like this:
 {
   "name": "edgecrab",
   "description": "EdgeCrab — an ACP-compatible agent with file, terminal, and skill tools. Launched as a child process and communicates via JSON-RPC 2.0 over stdio.",
-  "version": "0.1.0",
+  "version": "0.2.4",
   "launch": {
     "type": "command",
     "command": "edgecrab acp"

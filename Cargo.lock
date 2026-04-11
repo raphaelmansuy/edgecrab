@@ -1730,6 +1730,7 @@ dependencies = [
  "dialoguer",
  "dirs 5.0.1",
  "edgecrab-acp",
+ "edgecrab-command-catalog",
  "edgecrab-core",
  "edgecrab-cron",
  "edgecrab-gateway",
@@ -1739,6 +1740,7 @@ dependencies = [
  "edgecrab-tools",
  "edgecrab-types",
  "edgequake-llm",
+ "flate2",
  "libc",
  "rand 0.9.2",
  "ratatui",
@@ -1752,6 +1754,7 @@ dependencies = [
  "shellexpand",
  "similar",
  "strsim",
+ "tar",
  "tempfile",
  "tokio",
  "tokio-util",
@@ -1763,6 +1766,10 @@ dependencies = [
  "uuid",
  "which",
 ]
+
+[[package]]
+name = "edgecrab-command-catalog"
+version = "0.2.4"
 
 [[package]]
 name = "edgecrab-core"
@@ -1827,6 +1834,7 @@ dependencies = [
  "chrono",
  "dashmap",
  "dirs 5.0.1",
+ "edgecrab-command-catalog",
  "edgecrab-core",
  "edgecrab-state",
  "edgecrab-tools",
@@ -1841,6 +1849,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_norway",
+ "serial_test",
  "sha2",
  "tempfile",
  "tokio",
@@ -1887,16 +1896,14 @@ name = "edgecrab-migrate"
 version = "0.2.4"
 dependencies = [
  "anyhow",
+ "chrono",
  "dirs 5.0.1",
  "edgecrab-state",
- "edgecrab-types",
  "rusqlite",
- "serde",
  "serde_json",
  "serde_norway",
  "tempfile",
  "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -2280,6 +2287,17 @@ dependencies = [
  "libc",
  "thiserror 1.0.69",
  "winapi",
+]
+
+[[package]]
+name = "filetime"
+version = "0.2.27"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f98844151eee8917efc50bd9e8318cb963ae8b297431495d3f758616ea5c57db"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "libredox",
 ]
 
 [[package]]
@@ -3321,7 +3339,10 @@ version = "0.1.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7ddbf48fd451246b1f8c2610bd3b4ac0cc6e149d89832867093ab69a17194f08"
 dependencies = [
+ "bitflags 2.11.0",
  "libc",
+ "plain",
+ "redox_syscall 0.7.4",
 ]
 
 [[package]]
@@ -3947,7 +3968,7 @@ checksum = "2621685985a2ebf1c516881c026032ac7deafcda1a2c9b7850dc81e3dfcb64c1"
 dependencies = [
  "cfg-if",
  "libc",
- "redox_syscall",
+ "redox_syscall 0.5.18",
  "smallvec",
  "windows-link",
 ]
@@ -4132,6 +4153,12 @@ name = "pkg-config"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
+
+[[package]]
+name = "plain"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "png"
@@ -4634,6 +4661,15 @@ name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed2bf2547551a7053d6fdfafda3f938979645c44812fbfcda098faae3f1a362d"
+dependencies = [
+ "bitflags 2.11.0",
+]
+
+[[package]]
+name = "redox_syscall"
+version = "0.7.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f450ad9c3b1da563fb6948a8e0fb0fb9269711c9c73d9ea1de5058c79c8d643a"
 dependencies = [
  "bitflags 2.11.0",
 ]
@@ -5558,6 +5594,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "tar"
+version = "0.4.45"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22692a6476a21fa75fdfc11d452fda482af402c008cdbaf3476414e122040973"
+dependencies = [
+ "filetime",
+ "libc",
+ "xattr",
 ]
 
 [[package]]
@@ -7063,6 +7110,16 @@ name = "x11rb-protocol"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ea6fc2961e4ef194dcbfe56bb845534d0dc8098940c7e5c012a258bfec6701bd"
+
+[[package]]
+name = "xattr"
+version = "1.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32e45ad4206f6d2479085147f02bc2ef834ac85886624a23575ae137c8aa8156"
+dependencies = [
+ "libc",
+ "rustix",
+]
 
 [[package]]
 name = "xmlparser"

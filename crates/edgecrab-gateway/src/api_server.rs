@@ -277,6 +277,7 @@ async fn create_response(
             thread_id: None,
             user_display_name: Some("API Client".to_string()),
             attachments: Vec::new(),
+            ..Default::default()
         },
     };
 
@@ -406,6 +407,7 @@ async fn chat_completions(
                 thread_id: None,
                 user_display_name: Some("API Client".to_string()),
                 attachments: Vec::new(),
+                ..Default::default()
             },
         };
 
@@ -435,6 +437,7 @@ async fn chat_completions(
                 thread_id: None,
                 user_display_name: Some("API Client".to_string()),
                 attachments: Vec::new(),
+                ..Default::default()
             },
         };
 

@@ -5,7 +5,7 @@ sidebar:
   order: 4
 ---
 
-Tools are the atomic actions EdgeCrab can perform. **90+ tools** are registered at compile time via `inventory::submit!`. They are organized into **toolsets** (named groups) and activated via **aliases** in config or CLI.
+Tools are the atomic actions EdgeCrab can perform. **91 core tools** are exposed through `CORE_TOOLS`, with handlers registered at compile time via `inventory::submit!`. They are organized into **toolsets** (named groups) and activated via **aliases** in config or CLI.
 
 ---
 

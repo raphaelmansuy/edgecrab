@@ -166,7 +166,7 @@ Advanced     /queue /background /rollback
 Gateway      /platforms /approve /deny /sethome /update
 Scheduling   /cron
 Media        /voice /browser
-Appearance   /theme /skin /paste /mouse
+Appearance   /skin /theme /paste /mouse
 Diagnostics  /doctor
 Auth         /copilot-auth
 MCP          /mcp-token
@@ -209,7 +209,7 @@ but have no access to the foreground session's history.
 ## Theming
 
 The skin file lives at `~/.edgecrab/skin.yaml`. Reload without
-restarting with `/theme`.
+restarting with `/skin` or `/skin reload`.
 
 ### SkinConfig Fields (from `theme.rs`)
 
@@ -245,7 +245,7 @@ thinking_verbs:
 Reload after editing:
 
 ```
-/theme
+/skin
 ```
 
 Switch to a named preset:

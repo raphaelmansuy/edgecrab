@@ -169,6 +169,9 @@ No restart needed — EdgeCrab picks up new skills automatically.
 
 ### At Launch
 
+CLI `--skill` loads skills into the session-scoped preloaded-skill set before
+the first turn runs.
+
 ```bash
 edgecrab -S security-audit "audit the payment service"
 edgecrab -S "security-audit,code-review" "full review"
@@ -178,10 +181,13 @@ edgecrab --skill rust-test-fixer --skill code-review
 ### Inside the TUI
 
 ```
-/security-audit        # load skill, it prompts for input
+/security-audit        # toggle skill on for this session
 ```
 
-Every installed skill is auto-registered as a slash command. Typing `/security-audit some context` loads the skill and sends `some context` as the first message.
+Every installed skill is auto-registered as a slash command. Typing
+`/security-audit some context` activates the skill for the session and sends
+`some context` as the next message. Typing the same skill command again with
+no context toggles it off.
 
 ### Permanently in Config
 
