@@ -3,7 +3,7 @@
 ## Quick start — one command
 
 ```bash
-./scripts/bump-version.sh 0.2.0
+./scripts/release-version.sh set <version>
 ```
 
 Or via GitHub Actions (no local tools needed):
@@ -55,7 +55,7 @@ Derived package versions are synced by [`scripts/release-version.sh`](/Users/rap
 ./scripts/release-version.sh print
 ./scripts/release-version.sh sync
 ./scripts/release-version.sh check
-./scripts/release-version.sh set 0.2.0
+./scripts/release-version.sh set <version>
 ```
 
 > The npm CLI wrapper derives its binary tag from `package.json`, and the PyPI
@@ -74,7 +74,7 @@ If you can't use the script or the coordinator workflow:
 git checkout main && git pull
 
 # 2. Bump the canonical version and sync all derived package metadata
-VERSION=0.2.0
+VERSION=<version>
 
 ./scripts/release-version.sh set "$VERSION"
 ./scripts/release-version.sh check
@@ -92,6 +92,11 @@ git push origin "v$VERSION"
 ---
 
 ## After the release
+
+The crates.io workflow publishes crates in dependency order and now waits on
+the exact `crates.io/api/v1/crates/<crate>/<version>` endpoint before moving
+to dependents. The wait intentionally keeps a short stabilization buffer after
+visibility so we do not publish faster than the registry has propagated.
 
 ### Update the Homebrew formula
 
@@ -138,18 +143,21 @@ Commit and push the tap repository after verifying the diff.
 ```bash
 # Docker (should pull the arm64 image on Apple Silicon)
 docker pull ghcr.io/raphaelmansuy/edgecrab:latest
-docker run --rm ghcr.io/raphaelmansuy/edgecrab:latest --version
+docker run --rm --entrypoint /bin/sh ghcr.io/raphaelmansuy/edgecrab:latest -lc 'which edgecrab && edgecrab --version'
 
 # npm (fresh install, no cache)
 npm install -g edgecrab-cli
+which edgecrab
 edgecrab --version
 
 # pip
 pip install --force-reinstall edgecrab-cli
+which edgecrab
 edgecrab --version
 
 # Homebrew
 brew upgrade edgecrab
+which edgecrab
 edgecrab --version
 ```
 

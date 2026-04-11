@@ -40,16 +40,17 @@ The PyPI wrapper in this repository now treats the package-managed binary as aut
 
 ---
 
-## Homebrew Still Shows `0.2.3`
+## Homebrew Still Shows An Older Version
 
 That is a release-channel sync problem, not a local install problem.
-During this audit:
 
-- npm was current at `0.3.0`
-- PyPI was current at `0.3.0`
-- crates.io was current at `0.3.0`
-- Docker was current at `0.3.0`
-- Homebrew tap was still at `0.2.3`
+Check the live tap metadata and your resolved binary:
+
+```bash
+brew info raphaelmansuy/tap/edgecrab
+which edgecrab
+edgecrab --version
+```
 
 Use npm, pip, cargo, Docker, or the GitHub Release binaries until the tap sync completes.
 
@@ -117,7 +118,7 @@ Remove the stale install or move the intended one earlier in `PATH`.
 
 ## Best Install Method Right Now
 
-For the current audited release state:
+For the most reliable install path:
 
 - use `npm install -g edgecrab-cli` if you want a quick install with no Rust toolchain
 - use `python -m pip install --upgrade edgecrab-cli` or `pipx install edgecrab-cli` if you prefer Python packaging

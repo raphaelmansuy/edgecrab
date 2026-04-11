@@ -53,22 +53,25 @@ cargo install edgecrab-cli
 
 ```bash
 edgecrab version
-# EdgeCrab v0.3.0
+# EdgeCrab v<current-version>
 # Rust 1.86.0
 #
-# Supported providers (via edgequake-llm):
-#   copilot        — GitHub Copilot (GITHUB_TOKEN)
-#   openai         — OpenAI (OPENAI_API_KEY)
+# Supported providers (from model catalog):
 #   anthropic      — Anthropic (ANTHROPIC_API_KEY)
-#   gemini         — Google Gemini (GOOGLE_API_KEY)
-#   openrouter     — OpenRouter (OPENROUTER_API_KEY)
-#   xai            — xAI Grok (XAI_API_KEY)
-#   mistral        — Mistral AI (MISTRAL_API_KEY)
-#   ollama         — Ollama (local, no key)
-#   lmstudio       — LMStudio (local, no key)
-#   azure          — Azure OpenAI (AZURE_OPENAI_API_KEY)
 #   bedrock        — AWS Bedrock (AWS_ACCESS_KEY_ID)
-#   huggingface    — HuggingFace (HUGGINGFACE_API_KEY)
+#   copilot        — GitHub Copilot (GITHUB_TOKEN)
+#   deepseek       — DeepSeek (Provider configured via model catalog/runtime integration)
+#   google         — Google (Provider configured via model catalog/runtime integration)
+#   groq           — Groq (Provider configured via model catalog/runtime integration)
+#   huggingface    — Hugging Face (HUGGINGFACE_API_KEY)
+#   lmstudio       — LM Studio (local) (local, no key)
+#   mistral        — Mistral AI (MISTRAL_API_KEY)
+#   ollama         — Ollama (local) (local, no key)
+#   openai         — OpenAI (OPENAI_API_KEY)
+#   openrouter     — OpenRouter (OPENROUTER_API_KEY)
+#   vertexai       — Vertex AI (GOOGLE_CLOUD_PROJECT + ADC)
+#   xai            — xAI (XAI_API_KEY)
+#   zai            — Z.AI Platform (Provider configured via model catalog/runtime integration)
 ```
 
 ---
@@ -294,11 +297,12 @@ Print build info and supported providers.
 
 ```bash
 edgecrab version
-# EdgeCrab v0.3.0  (rustc 1.86.0, git a1b2c3d)
+# EdgeCrab v<current-version>
 # Rust 1.86.0
 # ...providers listed as above...
 
-edgecrab --version   # identical output
+edgecrab --version
+# edgecrab <current-version>
 ```
 
 ---

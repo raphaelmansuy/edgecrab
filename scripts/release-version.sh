@@ -53,7 +53,7 @@ set_workspace_version() {
 
 set_workspace_dependency_versions() {
   local version="$1"
-  perl -0pi -e 's/^(edgecrab-(?:types|security|state|plugins|cron|lsp|tools|core|gateway|acp|migrate) = \{ path = "crates\/[^"]+", version = )"[^"]+"/${1}"'"$version"'"/mg' \
+  perl -0pi -e 's/^(edgecrab-(?:command-catalog|types|security|state|plugins|cron|lsp|tools|core|gateway|acp|migrate) = \{ path = "crates\/[^"]+", version = )"[^"]+"/${1}"'"$version"'"/mg' \
     Cargo.toml
 }
 
@@ -62,6 +62,11 @@ sync_versions() {
 
   perl -0pi -e 's/"version": "[^"]+"/"version": "'"$version"'"/' \
     sdks/node/package.json
+
+  if [[ -f sdks/node/package-lock.json ]]; then
+    perl -0pi -e 's/^(\s*"version":\s*)"[^"]+"/${1}"'"$version"'"/m; s/("packages":\s*\{\s*"":\s*\{\s*"name":\s*"edgecrab-sdk",\s*"version":\s*)"[^"]+"/${1}"'"$version"'"/s' \
+      sdks/node/package-lock.json
+  fi
 
   perl -0pi -e 's/"version": "[^"]+"/"version": "'"$version"'"/' \
     sdks/npm-cli/package.json
@@ -77,6 +82,10 @@ read_npm_version() {
 
 read_node_sdk_version() {
   sed -n 's/^[[:space:]]*"version": "\([^"]*\)",$/\1/p' sdks/node/package.json
+}
+
+read_node_sdk_lock_version() {
+  sed -n 's/^[[:space:]]*"version": "\([^"]*\)",$/\1/p' sdks/node/package-lock.json | head -n 1
 }
 
 read_pypi_cli_version() {
@@ -96,7 +105,7 @@ check_synced() {
     awk '
       /^\[workspace\.dependencies\]/ { in_section=1; next }
       /^\[/ { in_section=0 }
-      in_section && /^edgecrab-(types|security|state|plugins|cron|lsp|tools|core|gateway|acp|migrate) = \{ path = "crates\// {
+      in_section && /^edgecrab-(command-catalog|types|security|state|plugins|cron|lsp|tools|core|gateway|acp|migrate) = \{ path = "crates\// {
         line=$0
         sub(/^.*version = "/, "", line)
         sub(/".*$/, "", line)
@@ -115,6 +124,15 @@ check_synced() {
   if [[ "$node_sdk_version" != "$version" ]]; then
     echo "Version drift: sdks/node/package.json is $node_sdk_version, expected $version" >&2
     failed=1
+  fi
+
+  if [[ -f sdks/node/package-lock.json ]]; then
+    local node_sdk_lock_version
+    node_sdk_lock_version="$(read_node_sdk_lock_version)"
+    if [[ "$node_sdk_lock_version" != "$version" ]]; then
+      echo "Version drift: sdks/node/package-lock.json is $node_sdk_lock_version, expected $version" >&2
+      failed=1
+    fi
   fi
 
   local npm_version

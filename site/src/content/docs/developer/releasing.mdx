@@ -16,7 +16,7 @@ Useful commands:
 ./scripts/release-version.sh print
 ./scripts/release-version.sh sync
 ./scripts/release-version.sh check
-./scripts/bump-version.sh 0.3.1 --dry-run
+./scripts/release-version.sh set <version>
 ```
 
 ---
@@ -33,17 +33,17 @@ cargo clippy -- -D warnings
 2. Bump and sync versions.
 
 ```bash
-./scripts/release-version.sh set 0.3.1
+./scripts/release-version.sh set <version>
 ./scripts/release-version.sh check
 ```
 
 3. Commit and tag.
 
 ```bash
-git commit -am "chore: bump version to 0.3.1"
-git tag v0.3.1
+git commit -am "release: <version>"
+git tag v<version>
 git push origin main
-git push origin v0.3.1
+git push origin v<version>
 ```
 
 4. Monitor workflows:
@@ -65,7 +65,7 @@ Dependent crates cannot be published safely until crates.io has indexed the prev
 This repository keeps that protection in place.
 
 The current release workflow no longer relies on blind `sleep 30` delays alone.
-It waits until the specific crate version is actually visible on crates.io before moving to the next dependent crate.
+It waits until the specific crate version is actually visible on crates.io, then keeps a short stabilization buffer before moving to the next dependent crate.
 
 ---
 
@@ -77,16 +77,18 @@ Run these after a release:
 cargo search edgecrab-cli --limit 1
 npm view edgecrab-cli version
 python -m pip index versions edgecrab-cli
-docker run --rm ghcr.io/raphaelmansuy/edgecrab:latest --version
+docker run --rm --entrypoint /bin/sh ghcr.io/raphaelmansuy/edgecrab:latest -lc 'which edgecrab && edgecrab --version'
 ```
 
 Then test fresh installs:
 
 ```bash
 npm install -g edgecrab-cli
+which edgecrab
 edgecrab --version
 
 python -m pip install --upgrade edgecrab-cli
+which edgecrab
 edgecrab --version
 ```
 

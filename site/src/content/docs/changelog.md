@@ -14,6 +14,26 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.3.2] — Fix Release: Crates.io Propagation, Version Sync, and Docs Accuracy
+
+### Fixed
+
+- **crates.io release propagation waits are now robust enough for real registry lag** — the Rust release workflow now checks the exact published crate-version endpoint, allows a longer bounded wait, and keeps a short stabilization buffer before publishing dependents.
+- **release version syncing now includes `edgecrab-command-catalog` and the Node SDK lockfile header** — the version script and its drift check now cover these previously missed files, preventing silent version skew inside the workspace.
+- **CLI reference docs now match the real command output** — `edgecrab version` and `edgecrab --version` are documented separately, with the provider list corrected to the current model catalog output.
+- **Astro docs no longer hard-code stale release numbers across install, update, ACP, self-hosting, and FAQ pages** — examples now use explicit verification commands or placeholders where a fixed patch number would rot quickly.
+
+### Verification
+
+| Check | Result |
+|--------|--------|
+| crates.io wait helper | **validated locally against `edgecrab-types 0.3.1` exact-version endpoint** |
+| `pnpm build` in `site/` | **passed** |
+| `cargo run -- version` | **passed** |
+| `cargo run -- --version` | **passed** |
+
+---
+
 ## [0.3.1] — Fix Release: Distribution, Release, and Docs Sync
 
 ### Fixed

@@ -17,8 +17,6 @@ edgecrab update
 from npm, PyPI/pipx, cargo, Homebrew, source, or a manual binary install, then
 either runs the right upgrade command or prints safe manual guidance.
 
-During this audit, npm, PyPI, crates.io, and Docker were current at `0.3.0`, while the public Homebrew tap still pointed at `0.2.3`.
-
 ### From crates.io
 
 ```bash
@@ -73,8 +71,9 @@ Use npm, pip, cargo, Docker, or the GitHub Release binaries until the tap sync w
 ## Check Your Current Version
 
 ```bash
+which edgecrab
 edgecrab --version
-# edgecrab 0.3.0
+# edgecrab <current-version>
 ```
 
 ---
@@ -160,7 +159,7 @@ No, unless the update adds new required config fields (rare, always documented i
 
 **Q: How do I update to a specific version, not the latest?**
 
-`cargo install edgecrab-cli --version 0.3.0 --force`
+`cargo install edgecrab-cli --version <version> --force`
 
 For pre-built binaries, download the specific tag from GitHub Releases.
 

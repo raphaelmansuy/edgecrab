@@ -6,21 +6,21 @@ sidebar:
 ---
 
 Get EdgeCrab up and running in under two minutes. Choose the method that fits your environment.
-During this audit, the currently verified release across registries was `0.3.0`.
+Always verify the install path and version you actually resolved after installation.
 
 ---
 
-## Verified Channel Status
+## Release-Channel Verification
 
-| Channel | Package / Image | Verified latest | Status |
-|--------|------------------|-----------------|--------|
-| npm | `edgecrab-cli` | `0.3.0` | current |
-| PyPI | `edgecrab-cli` | `0.3.0` | current |
-| crates.io | `edgecrab-cli` | `0.3.0` | current |
-| Docker | `ghcr.io/raphaelmansuy/edgecrab:latest` | `0.3.0` | current |
-| Homebrew tap | `raphaelmansuy/tap/edgecrab` | `0.2.3` | stale until tap sync runs |
+For every install method, check both the resolved executable and its version:
 
-For the fastest path to the current release, use npm, pip, cargo, Docker, or the native GitHub Release binaries.
+```bash
+which edgecrab
+edgecrab --version
+```
+
+If `which edgecrab` points somewhere unexpected, you are testing the wrong install.
+Use `which -a edgecrab` to find all candidates on your `PATH`.
 
 ---
 
@@ -37,8 +37,9 @@ Requires **Node.js 18+**. No Rust, GCC, or build tools needed.
 Verify:
 
 ```bash
+which edgecrab
 edgecrab --version
-# edgecrab 0.3.0
+# edgecrab <current-version>
 ```
 
 You can also run without a global install:
@@ -61,6 +62,7 @@ The wrapper now treats the package-managed binary as authoritative, so an unrela
 Requires **Python 3.10+**. No Rust or build tools needed.
 
 ```bash
+which edgecrab
 edgecrab --version
 edgecrab setup
 edgecrab "explain this codebase"
@@ -90,8 +92,9 @@ Requires **Rust 1.86+**. The binary is placed in `~/.cargo/bin/edgecrab`.
 Verify:
 
 ```bash
+which edgecrab
 edgecrab --version
-# edgecrab 0.3.0
+# edgecrab <current-version>
 ```
 
 ---
@@ -172,11 +175,12 @@ cargo test --workspace
 ```bash
 brew tap raphaelmansuy/tap
 brew install edgecrab
+which edgecrab
 edgecrab --version
 ```
 
-Homebrew support exists, but the public tap was still serving `0.2.3` during this documentation audit while the other release channels were already at `0.3.0`.
-If `edgecrab --version` shows an older release after `brew upgrade`, use npm, pip, cargo, Docker, or the native GitHub Release binaries until the tap sync finishes.
+Homebrew support exists, but the tap can lag the other release channels.
+If `edgecrab --version` shows an older release after `brew upgrade`, compare it with `brew info raphaelmansuy/tap/edgecrab` and use npm, pip, cargo, Docker, or the native GitHub Release binaries until the tap sync finishes.
 
 ---
 
@@ -338,7 +342,7 @@ No. The binary is fully self-contained. The Rust toolchain is only needed to com
 **Q: How do I install a specific version?**
 
 ```bash
-cargo install edgecrab-cli --version 0.3.0
+cargo install edgecrab-cli --version <version>
 ```
 Or download a tagged release from GitHub Releases.
 
