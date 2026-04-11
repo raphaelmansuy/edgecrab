@@ -96,7 +96,7 @@ Verify:
 
 ```bash
 curl http://localhost:8642/health
-# {"status":"ok","version":"0.2.4","provider":"openai","model":"gpt-4o"}
+# {"status":"ok","version":"0.3.0","provider":"openai","model":"gpt-4o"}
 ```
 
 ---

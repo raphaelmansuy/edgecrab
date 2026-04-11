@@ -7,6 +7,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+---
+
+## [0.3.0] — 2026-04-11
 ### Added
 
 - **Profile starter bundles and code-true profile docs** — EdgeCrab now seeds bundled `work`, `research`, and `homelab` profiles with starter `config.yaml`, `SOUL.md`, and memory files, and the README, internal docs, and site docs now document the real profile YAML format and command surface.

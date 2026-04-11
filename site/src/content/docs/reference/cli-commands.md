@@ -53,7 +53,7 @@ cargo install edgecrab-cli
 
 ```bash
 edgecrab version
-# EdgeCrab v0.2.4
+# EdgeCrab v0.3.0
 # Rust 1.86.0
 #
 # Supported providers (via edgequake-llm):
@@ -294,7 +294,7 @@ Print build info and supported providers.
 
 ```bash
 edgecrab version
-# EdgeCrab v0.2.4  (rustc 1.86.0, git a1b2c3d)
+# EdgeCrab v0.3.0  (rustc 1.86.0, git a1b2c3d)
 # Rust 1.86.0
 # ...providers listed as above...
 

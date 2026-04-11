@@ -69,7 +69,7 @@ brew upgrade edgecrab
 
 ```bash
 edgecrab version
-# EdgeCrab 0.2.4  (rustc 1.86.0, 2026-04-11)
+# EdgeCrab 0.3.0  (rustc 1.86.0, 2026-04-11)
 ```
 
 ---
@@ -156,7 +156,7 @@ No, unless the update adds new required config fields (rare, always documented i
 **Q: How do I update to a specific version, not the latest?**
 
 ```bash
-cargo install edgecrab-cli --version 0.2.4 --force
+cargo install edgecrab-cli --version 0.3.0 --force
 ```
 
 For pre-built binaries, download the specific tag from GitHub Releases.

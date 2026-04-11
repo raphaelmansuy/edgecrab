@@ -10,7 +10,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
-## [Unreleased] — Phase 5: Integration & Polish
+## [Unreleased]
+
+---
+
+## [0.3.0] — Phase 5: Integration & Polish
 
 ### Added
 

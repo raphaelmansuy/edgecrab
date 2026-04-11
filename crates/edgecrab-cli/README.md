@@ -3,7 +3,7 @@
 > **Why this crate?** The most capable agent in the world is useless if interacting with it  
 > feels like work. `edgecrab-cli` is the face of EdgeCrab: a full-screen ratatui TUI, guided  
 > setup wizard, 42 slash commands, YAML theming, live streaming output, and instant startup  
-> (< 50 ms). It packages the `Agent` from `edgecrab-core` into a single 15 MB static binary  
+> (< 50 ms). It packages the `Agent` from `edgecrab-core` into a self-contained release binary  
 > with zero runtime dependencies.
 
 Part of [EdgeCrab](https://www.edgecrab.com) — the Rust SuperAgent.

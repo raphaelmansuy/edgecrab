@@ -16,7 +16,7 @@ members = [
     "crates/edgecrab-migrate",
 ]
 [workspace.package]
-version = "0.2.4"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.86.0"
 license = "Apache-2.0"
@@ -25,18 +25,18 @@ authors = ["Raphael Mansuy"]
 
 [workspace.dependencies]
 # Internal crates
-edgecrab-command-catalog = { path = "crates/edgecrab-command-catalog", version = "0.2.4" }
-edgecrab-types = { path = "crates/edgecrab-types", version = "0.2.4" }
-edgecrab-security = { path = "crates/edgecrab-security", version = "0.2.4" }
-edgecrab-state = { path = "crates/edgecrab-state", version = "0.2.4" }
-edgecrab-plugins = { path = "crates/edgecrab-plugins", version = "0.2.4" }
-edgecrab-cron = { path = "crates/edgecrab-cron", version = "0.2.4" }
-edgecrab-lsp = { path = "crates/edgecrab-lsp", version = "0.2.4" }
-edgecrab-tools = { path = "crates/edgecrab-tools", version = "0.2.4" }
-edgecrab-core = { path = "crates/edgecrab-core", version = "0.2.4" }
-edgecrab-gateway = { path = "crates/edgecrab-gateway", version = "0.2.4" }
-edgecrab-acp = { path = "crates/edgecrab-acp", version = "0.2.4" }
-edgecrab-migrate = { path = "crates/edgecrab-migrate", version = "0.2.4" }
+edgecrab-command-catalog = { path = "crates/edgecrab-command-catalog", version = "0.3.0" }
+edgecrab-types = { path = "crates/edgecrab-types", version = "0.3.0" }
+edgecrab-security = { path = "crates/edgecrab-security", version = "0.3.0" }
+edgecrab-state = { path = "crates/edgecrab-state", version = "0.3.0" }
+edgecrab-plugins = { path = "crates/edgecrab-plugins", version = "0.3.0" }
+edgecrab-cron = { path = "crates/edgecrab-cron", version = "0.3.0" }
+edgecrab-lsp = { path = "crates/edgecrab-lsp", version = "0.3.0" }
+edgecrab-tools = { path = "crates/edgecrab-tools", version = "0.3.0" }
+edgecrab-core = { path = "crates/edgecrab-core", version = "0.3.0" }
+edgecrab-gateway = { path = "crates/edgecrab-gateway", version = "0.3.0" }
+edgecrab-acp = { path = "crates/edgecrab-acp", version = "0.3.0" }
+edgecrab-migrate = { path = "crates/edgecrab-migrate", version = "0.3.0" }
 
 # Shared across workspace — single version for consistency
 serde = { version = "1", features = ["derive"] }

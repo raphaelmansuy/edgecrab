@@ -1,7 +1,7 @@
 # edgecrab-cli (PyPI)
 
 > **EdgeCrab** — Super Powerful Personal Assistant inspired by **NousHermes** and **OpenClaw**.  
-> Blazing-fast TUI · ReAct tool loop · Multi-provider LLM · ACP protocol · Single 15 MB static binary.
+> Blazing-fast TUI · ReAct tool loop · Multi-provider LLM · ACP protocol · Rust-native prebuilt binary.
 
 [![PyPI](https://img.shields.io/pypi/v/edgecrab-cli.svg)](https://pypi.org/project/edgecrab-cli/)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/raphaelmansuy/edgecrab/blob/main/LICENSE)
@@ -53,7 +53,7 @@ the reasoning depth of **NousHermes** and the tool-use power of **OpenClaw**.
 
 | Feature | Detail |
 |---------|--------|
-| **Single binary** | 15 MB static binary, < 50 ms startup, ~15 MB resident memory |
+| **Single binary** | Self-contained prebuilt binary, < 50 ms startup, measured macOS release artifact is about 49 MB |
 | **Multi-provider LLM** | Copilot · OpenAI · Anthropic · Gemini · xAI · DeepSeek · Ollama |
 | **ReAct tool loop** | File, terminal, web search, memory, process, skill tools |
 | **ratatui TUI** | 60 fps capable terminal UI with streaming output |

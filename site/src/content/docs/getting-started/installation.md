@@ -24,7 +24,7 @@ Verify:
 
 ```bash
 edgecrab version
-# EdgeCrab 0.2.4  (rustc 1.86.0, 2026-04-11)
+# EdgeCrab 0.3.0  (rustc 1.86.0, 2026-04-11)
 #   providers: copilot openai anthropic gemini xai deepseek ...
 ```
 
@@ -43,7 +43,7 @@ Verify:
 
 ```bash
 edgecrab version
-# EdgeCrab 0.2.4  (rustc 1.86.0, 2026-04-11)
+# EdgeCrab 0.3.0  (rustc 1.86.0, 2026-04-11)
 #   providers: copilot openai anthropic gemini xai deepseek huggingface zai openrouter ollama lmstudio
 ```
 
@@ -96,7 +96,7 @@ Verify:
 
 ```bash
 edgecrab version
-# EdgeCrab 0.2.4  (rustc 1.86.0, 2026-04-11)
+# EdgeCrab 0.3.0  (rustc 1.86.0, 2026-04-11)
 #   providers: copilot openai anthropic gemini xai deepseek huggingface zai openrouter ollama lmstudio
 ```
 
@@ -313,7 +313,7 @@ No. The binary is fully self-contained. The Rust toolchain is only needed to com
 **Q: How do I install a specific version?**
 
 ```bash
-cargo install edgecrab-cli --version 0.2.4
+cargo install edgecrab-cli --version 0.3.0
 ```
 Or download a tagged release from GitHub Releases.
 
