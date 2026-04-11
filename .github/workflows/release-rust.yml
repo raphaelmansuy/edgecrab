@@ -143,6 +143,14 @@ jobs:
       - name: Wait for crates.io index (core)
         run: sleep 30
 
+      - name: Publish edgecrab-command-catalog
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: publish_crate edgecrab-command-catalog --no-verify
+
+      - name: Wait for crates.io index (command-catalog)
+        run: sleep 30
+
       - name: Publish edgecrab-gateway
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
