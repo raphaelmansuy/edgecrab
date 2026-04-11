@@ -1,7 +1,7 @@
 {
   "name": "EdgeCrab — Your SuperAgent, Built in Rust",
   "short_name": "EdgeCrab",
-  "description": "Rust-native autonomous coding agent. 91 core tools. 15 LLM providers. 15 messaging gateways. Stripped release binary is about 49 MB on current macOS arm64 builds.",
+  "description": "Rust-native autonomous coding agent and personal assistant. Native Rust binary, ReAct tool loop, multi-provider LLM support, messaging gateways, and built-in security.",
   "start_url": "/",
   "display": "standalone",
   "background_color": "#0f0f0f",

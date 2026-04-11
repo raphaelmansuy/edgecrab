@@ -1,0 +1,135 @@
+---
+title: Releasing
+description: EdgeCrab release process, version authority, registry verification, Homebrew tap sync, and site publication checks.
+sidebar:
+  order: 3
+---
+
+## Release Authority
+
+The canonical release version lives in the workspace root `Cargo.toml` under `[workspace.package].version`.
+Everything else derives from that source through `./scripts/release-version.sh`.
+
+Useful commands:
+
+```bash
+./scripts/release-version.sh print
+./scripts/release-version.sh sync
+./scripts/release-version.sh check
+./scripts/bump-version.sh 0.3.1 --dry-run
+```
+
+---
+
+## Standard Release Flow
+
+1. Run the quality gate.
+
+```bash
+cargo test
+cargo clippy -- -D warnings
+```
+
+2. Bump and sync versions.
+
+```bash
+./scripts/release-version.sh set 0.3.1
+./scripts/release-version.sh check
+```
+
+3. Commit and tag.
+
+```bash
+git commit -am "chore: bump version to 0.3.1"
+git tag v0.3.1
+git push origin main
+git push origin v0.3.1
+```
+
+4. Monitor workflows:
+
+- `release-binaries.yml`
+- `release-rust.yml`
+- `release-node.yml`
+- `release-python.yml`
+- `release-npm-cli.yml`
+- `release-pypi-cli.yml`
+- `release-docker.yml`
+- `release-homebrew-tap.yml`
+
+---
+
+## Why The Rust Publish Flow Still Waits
+
+Dependent crates cannot be published safely until crates.io has indexed the previously published crate version.
+This repository keeps that protection in place.
+
+The current release workflow no longer relies on blind `sleep 30` delays alone.
+It waits until the specific crate version is actually visible on crates.io before moving to the next dependent crate.
+
+---
+
+## Install-Channel Verification Checklist
+
+Run these after a release:
+
+```bash
+cargo search edgecrab-cli --limit 1
+npm view edgecrab-cli version
+python -m pip index versions edgecrab-cli
+docker run --rm ghcr.io/raphaelmansuy/edgecrab:latest --version
+```
+
+Then test fresh installs:
+
+```bash
+npm install -g edgecrab-cli
+edgecrab --version
+
+python -m pip install --upgrade edgecrab-cli
+edgecrab --version
+```
+
+Also verify the docs site and Homebrew tap:
+
+```bash
+curl -I https://www.edgecrab.com
+brew info raphaelmansuy/tap/edgecrab
+```
+
+---
+
+## Homebrew Tap Sync
+
+The Homebrew formula lives in the external repository `raphaelmansuy/homebrew-tap`.
+This repository now includes:
+
+- `scripts/update-homebrew-formula.sh`
+- `.github/workflows/release-homebrew-tap.yml`
+
+The workflow downloads `edgecrab-checksums.txt` from the GitHub Release, updates `Formula/edgecrab.rb`, and pushes the tap update with `HOMEBREW_TAP_PUSH_TOKEN`.
+
+If the tap is behind, Homebrew users will keep seeing the old version even when npm, PyPI, crates.io, and Docker are already current.
+
+---
+
+## Docs And Site Checks
+
+The site has historically drifted when hard-coded version claims aged out.
+Prefer source-derived facts or generic wording for:
+
+- release version
+- provider count
+- tool count
+- gateway count
+- install-channel claims
+
+Before merging a release-related docs change:
+
+```bash
+cd site
+pnpm install
+pnpm build
+```
+
+Make sure `https://www.edgecrab.com` is updated after the deploy workflow completes.

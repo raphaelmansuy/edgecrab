@@ -4025,10 +4025,6 @@ impl App {
         // Load persisted command history from ~/.edgecrab/history
         app.load_history_file();
 
-        // Pre-load skills list for completion overlay
-        app.refresh_skills_list();
-        app.refresh_profiles_list();
-
         app
     }
 
@@ -4847,6 +4843,7 @@ impl App {
     }
 
     fn open_skill_selector(&mut self) {
+        self.refresh_skills_list();
         self.reset_split_detail_scroll(DetailSurface::SkillSelector);
         self.skill_selector.activate();
     }

@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Once;
 
 use anyhow::Context;
 use async_trait::async_trait;
@@ -15,6 +16,8 @@ use edgecrab_tools::registry::{ToolContext, ToolHandler, normalize_json_schema};
 use edgecrab_types::{Message, ToolError, ToolSchema};
 use edgequake_llm::LLMProvider;
 use serde_json::{Value, json};
+
+static STARTUP_SKILLS_SYNC: Once = Once::new();
 
 pub struct RuntimeContext {
     pub config_path: PathBuf,
@@ -49,15 +52,7 @@ pub fn load_runtime(
     // process and existing env vars are NOT overwritten.
     load_dot_env(&home.join(".env"));
 
-    // ── Bundled skills sync ──────────────────────────────────────────
-    // Seed / update bundled skills from the repo's skills/ directory into
-    // ~/.edgecrab/skills/. Safe and idempotent — respects user modifications.
-    if let Some(report) = edgecrab_tools::tools::skills_sync::sync_on_startup() {
-        let summary = report.summary();
-        if summary != "No changes" {
-            tracing::info!(skills_sync = %summary, "bundled skills synced");
-        }
-    }
+    schedule_startup_skills_sync();
 
     let config_path = config_override
         .map(PathBuf::from)
@@ -81,6 +76,21 @@ pub fn load_runtime(
         config_path,
         config,
     })
+}
+
+fn schedule_startup_skills_sync() {
+    STARTUP_SKILLS_SYNC.call_once(|| {
+        // Skills sync can scan and hash a non-trivial tree. Run it off the
+        // blocking startup path so the CLI can render sooner.
+        std::thread::spawn(|| {
+            if let Some(report) = edgecrab_tools::tools::skills_sync::sync_on_startup() {
+                let summary = report.summary();
+                if summary != "No changes" {
+                    tracing::info!(skills_sync = %summary, "bundled skills synced");
+                }
+            }
+        });
+    });
 }
 
 pub fn open_state_db(path: &Path) -> anyhow::Result<Arc<SessionDb>> {

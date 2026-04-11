@@ -22,10 +22,10 @@ git clone https://github.com/raphaelmansuy/edgecrab
 cd edgecrab
 
 # Debug build (fast compile)
-cargo build
+cargo build --workspace
 
 # Release build (optimized)
-cargo build --release
+cargo build --workspace --release
 
 # The binary is at:
 ./target/release/edgecrab

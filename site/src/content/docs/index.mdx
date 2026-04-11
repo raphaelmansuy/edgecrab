@@ -1,12 +1,12 @@
 ---
 title: EdgeCrab — Your Super Powerful Personal Assistant
-description: EdgeCrab is a SuperAgent — personal assistant and coding agent in one. Carries the soul of Nous Hermes Agent and the presence of OpenClaw, packaged as a stripped Rust release binary of about 49 MB on current macOS arm64 builds. 15 LLM providers. 15 messaging gateways. 91 core tools including LSP semantic coding. Install via npm, pip, or cargo.
+description: EdgeCrab is a SuperAgent for personal assistance and coding, built as a native Rust binary with a ratatui TUI, ReAct tool loop, multi-provider LLM support, and messaging gateways. Install via npm, pip, cargo, Docker, or native binaries.
 template: splash
 hero:
   title: |
     Not a Coding Agent. Your <span class="font-black text-transparent bg-clip-text bg-gradient-to-b from-orange-600 to-red-600">Personal Assistant</span>, Built in Rust.
   tagline: |
-    The user-alignment soul of Nous Hermes. The always-on presence of OpenClaw. 15 LLM providers. 15 messaging gateways. 91 core tools including LSP semantic coding. One stripped release binary that is about 49 MB on current macOS arm64 builds — on your laptop, your server, or the edge.
+    The user-alignment soul of Nous Hermes. The always-on presence of OpenClaw. Native Rust delivery for your laptop, your server, or the edge.
   actions:
     - text: Get Started
       link: /getting-started/quick-start/
@@ -24,10 +24,11 @@ import ComparisonSection from '../../components/landing/ComparisonSection.astro'
 import BenchmarkSection from '../../components/landing/BenchmarkSection.astro';
 import WhyRustSection from '../../components/landing/WhyRustSection.astro';
 import UseCasesSection from '../../components/landing/UseCasesSection.astro';
+import { coreToolCount, gatewayCount, providerCount, workspaceVersion } from '../../data/project-facts';
 
 <FeatureGrid
   title="Two Great Traditions. One Rust Binary."
-  subtitle="EdgeCrab synthesises Hermes Agent's ethos of autonomous learning, persistent memory, and user-first alignment with OpenClaw's vision of an always-on assistant living in your channels. Delivered as a stripped Rust release binary that is about 49 MB on current macOS arm64 builds: no Python venv, no Node.js runtime."
+  subtitle={`EdgeCrab synthesises Hermes Agent's ethos of autonomous learning, persistent memory, and user-first alignment with OpenClaw's vision of an always-on assistant living in your channels. Delivered as a native Rust binary: ${coreToolCount} core tools, ${providerCount} LLM providers, ${gatewayCount} messaging gateways, and no Python or Node runtime requirement for the agent itself.`}
   features={[
     {
       icon: 'terminal',
@@ -37,16 +38,16 @@ import UseCasesSection from '../../components/landing/UseCasesSection.astro';
     {
       icon: 'refresh',
       title: 'ReAct Tool Loop',
-      description: 'Autonomous Reason → Act → Observe loop runs up to 90 iterations. Dispatches 91 registered core tools, including semantic LSP operations, fires learning reflection after ≥5 tool calls, and auto-compresses context at 50% threshold.',
+      description: `Autonomous Reason → Act → Observe loop runs up to 90 iterations. Dispatches ${coreToolCount} registered core tools, including semantic LSP operations, fires learning reflection after ≥5 tool calls, and auto-compresses context at 50% threshold.`,
     },
     {
       icon: 'globe',
-      title: '15 LLM Providers',
-      description: 'GitHub Copilot, OpenAI, Anthropic, Google Gemini, xAI Grok, DeepSeek, Mistral, Groq, HuggingFace, Z.AI, OpenRouter, Ollama, LM Studio, VertexAI — hot-swappable mid-session via /model.',
+      title: `${providerCount} LLM Providers`,
+      description: 'GitHub Copilot, OpenAI, Anthropic, Google Gemini, xAI Grok, DeepSeek, Mistral, Groq, HuggingFace, Z.AI, OpenRouter, Ollama, LM Studio, VertexAI, and AWS Bedrock — hot-swappable mid-session via /model.',
     },
     {
       icon: 'layers',
-      title: '15 Messaging Gateways',
+      title: `${gatewayCount} Messaging Gateways`,
       description: 'Telegram, Discord, Slack, WhatsApp, Signal, Matrix, Mattermost, DingTalk, SMS, Email, Home Assistant, Webhook, API Server, Feishu/Lark, WeCom — streaming delivery with 300ms edit intervals.',
     },
     {
@@ -124,7 +125,7 @@ import UseCasesSection from '../../components/landing/UseCasesSection.astro';
       body: 'hermes-agent is brilliant — autonomous learning, persistent memory, Honcho user model, deep tool chains. It inspired EdgeCrab\'s entire architecture. The difference: hermes-agent ships through a Python runtime and uv-managed environment. EdgeCrab ships as compiled Rust: same memory system, same Honcho integration, same learning reflection — in one native executable.',
       wins: [
         'No Python runtime or uv bootstrap in the deployment path',
-        '~49 MB stripped macOS arm64 release build today',
+        'Single native binary with no Python or Node runtime dependency for the agent itself',
         'One executable to copy, version, and verify',
         '7 compiled-in security layers vs runtime patches',
       ],
@@ -136,12 +137,12 @@ import UseCasesSection from '../../components/landing/UseCasesSection.astro';
       headline: 'Same reach, 100× leaner',
       body: 'OpenClaw nailed the vision: an always-on personal assistant living in your channels. EdgeCrab took that vision and compressed it into a single native executable instead of a Node.js runtime stack.',
       wins: [
-        '15 gateways with streaming delivery vs OpenClaw\'s excellent 24+ adapters',
+        `${gatewayCount} gateways with streaming delivery vs OpenClaw's excellent 24+ adapters`,
         'Native binary deployment instead of a Node.js runtime stack',
         'Built-in cron scheduler — no external crontab wrangling',
         'ReAct autonomous loop vs single-turn responses',
       ],
-      honest: 'OpenClaw has 24+ channel adapters — more breadth than EdgeCrab\'s 15 gateways today. If you need SMS shortcodes or IRC bots out of the box, OpenClaw still leads there.',
+      honest: `OpenClaw has 24+ channel adapters — more breadth than EdgeCrab's ${gatewayCount} gateways today. If you need SMS shortcodes or IRC bots out of the box, OpenClaw still leads there.`,
     },
     {
       tag: 'the synthesis',
@@ -149,7 +150,7 @@ import UseCasesSection from '../../components/landing/UseCasesSection.astro';
       headline: 'One binary, both dream',
       body: 'EdgeCrab is what you get when you take Hermes Agent\'s soul (autonomous learning, memory, user alignment, Honcho) and pair it with OpenClaw\'s vision (always-on channels, instant presence) — then forge the result in Rust. You keep 100% of the power, you shed 95% of the weight. No Python venv, no Node.js runtime, no 500 MB node_modules. Just one binary that runs your agent anywhere.',
       wins: [
-        '91 core tools + 15 gateways + memory + learning — in one download',
+        `${coreToolCount} core tools + ${gatewayCount} gateways + memory + learning — in one download`,
         'Sub-agent delegation up to 3 parallel children, depth 2',
         'Mixture of Agents: 4 frontier models in parallel, synthesized',
         '6 terminal backends: local, Docker, SSH, Modal, Daytona, Singularity',
@@ -162,23 +163,14 @@ import UseCasesSection from '../../components/landing/UseCasesSection.astro';
 <BenchmarkSection
   eyebrow="By the Numbers"
   title="Verified Project Facts"
-  subtitle="Every number below is either source-derived from the current tree or measured from the current local stripped macOS arm64 release build."
+  subtitle="Every number below is source-derived from the current tree, except where explicitly marked as a local measurement."
   metrics={[
-    {
-      label: 'Binary Size',
-      unit: 'megabytes (measured locally)',
-      lowerIsBetter: true,
-      bars: [
-        { name: 'EdgeCrab', value: 49, max: 64, formatted: '~49 MB', win: true },
-      ],
-      note: 'Measured from the current stripped macOS arm64 release build. Other targets vary.',
-    },
     {
       label: 'Core Tools',
       unit: 'count (source-derived)',
       lowerIsBetter: false,
       bars: [
-        { name: 'EdgeCrab', value: 91, max: 100, formatted: '91 core', win: true },
+        { name: 'EdgeCrab', value: coreToolCount, max: 100, formatted: `${coreToolCount} core`, win: true },
       ],
       note: 'Derived from `CORE_TOOLS` in `crates/edgecrab-tools/src/toolsets.rs`.',
     },
@@ -187,7 +179,7 @@ import UseCasesSection from '../../components/landing/UseCasesSection.astro';
       unit: 'count (source-derived)',
       lowerIsBetter: false,
       bars: [
-        { name: 'EdgeCrab', value: 15, max: 15, formatted: '15 built-in', win: true },
+        { name: 'EdgeCrab', value: providerCount, max: providerCount, formatted: `${providerCount} built-in`, win: true },
       ],
       note: 'Derived from `providers:` in `crates/edgecrab-core/src/model_catalog_default.yaml`.',
     },
@@ -196,12 +188,12 @@ import UseCasesSection from '../../components/landing/UseCasesSection.astro';
       unit: 'count (source-derived)',
       lowerIsBetter: false,
       bars: [
-        { name: 'EdgeCrab', value: 15, max: 15, formatted: '15 adapters', win: true },
+        { name: 'EdgeCrab', value: gatewayCount, max: gatewayCount, formatted: `${gatewayCount} adapters`, win: true },
       ],
       note: 'Derived from the gateway modules exported in `crates/edgecrab-gateway/src/lib.rs`.',
     },
   ]}
-  caveatText="<strong>Measurement note:</strong> binary size is from the current local stripped macOS arm64 release build. Source-derived counts come directly from the current repository state."
+  caveatText={`<strong>Release note:</strong> the current workspace version is v${workspaceVersion}. Source-derived counts come directly from the current repository state.`}
 />
 
 <UseCasesSection
@@ -291,26 +283,8 @@ import UseCasesSection from '../../components/landing/UseCasesSection.astro';
 
 <QuickStart
   title="Five Ways to Install — Pick Yours"
-  subtitle="Homebrew · npm · pip · cargo · Docker — all install the same native static binary. No Python venv. No Node.js runtime for the agent itself. Your SuperAgent is live in under 90 seconds."
+  subtitle="npm, pip, cargo, Docker, and native binaries are verified against the current release. Homebrew support exists, but the external tap can lag until it is synced."
   tabs={[
-    {
-      label: 'Homebrew (macOS)',
-      lang: 'bash',
-      code: `# Install via Homebrew — auto-detects Apple Silicon or Intel
-brew tap raphaelmansuy/tap
-brew install edgecrab
-
-# Run setup wizard (detects API keys, writes config)
-edgecrab setup
-
-# Verify health (checks keys, provider ping, binary size)
-edgecrab doctor
-
-# Start chatting
-edgecrab
-edgecrab "summarise the git log for today"
-edgecrab --model anthropic/claude-opus-4-6 "review this codebase"`,
-    },
     {
       label: 'npm',
       lang: 'bash',
@@ -334,7 +308,7 @@ edgecrab --model anthropic/claude-opus-4-6 "review this codebase"`,
       code: `# Install via pip — no Rust required
 # Use pipx for an isolated install (recommended)
 pipx install edgecrab-cli
-# or: pip install edgecrab-cli
+# or: python -m pip install --upgrade edgecrab-cli
 
 # Run setup wizard
 edgecrab setup
@@ -350,7 +324,7 @@ edgecrab --model ollama/llama3.3 "work completely offline"`,
     {
       label: 'Cargo',
       lang: 'bash',
-      code: `# Compile and install from crates.io (requires Rust 1.85+)
+      code: `# Compile and install from crates.io (requires Rust 1.86+)
 cargo install edgecrab-cli
 
 # Run setup wizard
@@ -358,6 +332,28 @@ edgecrab setup
 
 # Verify health
 edgecrab doctor
+
+# Start chatting
+edgecrab
+edgecrab "review the architecture docs"
+edgecrab --model openai/gpt-5 "design a release checklist"`,
+    },
+    {
+      label: 'Homebrew (macOS)',
+      lang: 'bash',
+      code: `# Homebrew support exists, but verify the tap is current
+brew tap raphaelmansuy/tap
+brew install edgecrab
+edgecrab --version
+
+# Run setup wizard
+edgecrab setup
+
+# Verify health
+edgecrab doctor
+
+# If brew still serves an older release, use npm, pip, cargo,
+# Docker, or the native GitHub Release binaries until the tap sync completes.
 
 # Start chatting
 edgecrab
@@ -444,7 +440,7 @@ docker compose logs -f`,
       values: [
         'Autonomous agent (Python) — 40+ tools, learns and grows',
         'Personal assistant platform (TypeScript) — 24+ channels',
-        '✓ SuperAgent — 91 core tools + 15 gateways + learns autonomously (Rust)',
+        `✓ SuperAgent — ${coreToolCount} core tools + ${gatewayCount} gateways + learns autonomously (Rust)`,
       ],
       highlight: true,
     },
@@ -453,7 +449,7 @@ docker compose logs -f`,
       values: [
         '✓ Lives on your server, remembers what it learns, improves over time',
         '✓ Always-on presence in your channels and tools',
-        '✓ Both: Hermes soul (memory + learning) + OpenClaw presence (15 gateways)',
+        `✓ Both: Hermes soul (memory + learning) + OpenClaw presence (${gatewayCount} gateways)`,
       ],
     },
     {
@@ -495,7 +491,7 @@ docker compose logs -f`,
       values: [
         '✓ 7 platforms: Telegram, Discord, Slack, WhatsApp, Signal, Email, CLI',
         '✓ 24+ channels: WhatsApp, Telegram, Slack, Discord, Matrix, IRC…',
-        '✓ 15 gateways: Telegram, Discord, Slack, WhatsApp, Signal, Matrix, Mattermost, DingTalk, Email, SMS, HA, Webhook, API, Feishu, WeCom',
+        `✓ ${gatewayCount} gateways: Telegram, Discord, Slack, WhatsApp, Signal, Matrix, Mattermost, DingTalk, Email, SMS, HA, Webhook, API, Feishu, WeCom`,
       ],
       highlight: true,
     },
@@ -546,7 +542,7 @@ docker compose logs -f`,
       values: [
         '~1–3 s (Python + uv)',
         '> 500 ms on 0.8 GHz edge hardware',
-        '✓ Current stripped macOS arm64 release build is about 49 MB',
+        '✓ Single Rust binary with no Python or Node runtime dependencies for the agent itself',
       ],
       highlight: true,
     },
@@ -563,7 +559,7 @@ docker compose logs -f`,
       values: [
         '11 cloud providers',
         'Via OpenAI-compatible APIs',
-        '✓ 15 built-in: Copilot, OpenAI, Anthropic, Gemini, Vertex AI, Bedrock, xAI, DeepSeek, Mistral, Groq, HuggingFace, Z.AI, OpenRouter, Ollama, LM Studio',
+        `✓ ${providerCount} built-in: Copilot, OpenAI, Anthropic, Gemini, Vertex AI, Bedrock, xAI, DeepSeek, Mistral, Groq, HuggingFace, Z.AI, OpenRouter, Ollama, LM Studio`,
       ],
       highlight: true,
     },
@@ -572,8 +568,8 @@ docker compose logs -f`,
 
 <CtaSection
   title="From the Soul of Hermes to the Speed of Rust"
-  subtitle="EdgeCrab is open source, Apache 2.0. Your SuperAgent — personal + coding, learns and grows with you. Install via Homebrew (macOS), npm, pip, or cargo in 90 seconds. Runs anywhere: macOS, Linux, Windows, edge hardware."
-  installCmd="brew install raphaelmansuy/tap/edgecrab"
+  subtitle="EdgeCrab is open source, Apache 2.0. Your SuperAgent runs on macOS, Linux, Windows, and edge hardware. Use npm, pip, cargo, Docker, or native release binaries today; use Homebrew once the external tap has been synced."
+  installCmd="npm install -g edgecrab-cli"
   primaryHref="/getting-started/quick-start/"
   primaryText="Get Started Free"
   secondaryHref="https://github.com/raphaelmansuy/edgecrab"

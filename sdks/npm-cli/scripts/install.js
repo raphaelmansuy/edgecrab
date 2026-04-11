@@ -17,8 +17,7 @@ const https = require('node:https');
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
-const { execSync } = require('node:child_process');
-const { createGunzip } = require('node:zlib');
+const { execSync, spawnSync } = require('node:child_process');
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 // First principle: the wrapper package version is the binary release version.
@@ -49,12 +48,7 @@ if (!archive) {
 }
 
 const url = `https://github.com/${REPO}/releases/download/v${BINARY_VERSION}/${archive}`;
-
-// Skip download in CI if binary already exists (cache hit)
-if (fs.existsSync(DEST)) {
-  console.log(`[edgecrab-cli] Binary already present: ${DEST}`);
-  process.exit(0);
-}
+const VERSION_RE = /\bedgecrab\s+([0-9]+\.[0-9]+\.[0-9]+)\b/i;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -96,9 +90,49 @@ function extractZip(zipPath) {
   execSync(`powershell -Command "Expand-Archive -Path '${zipPath}' -DestinationPath '${BIN_DIR}' -Force"`, { stdio: 'pipe' });
 }
 
+function readBinaryVersion(binaryPath) {
+  if (!fs.existsSync(binaryPath)) {
+    return null;
+  }
+  try {
+    const result = spawnSync(binaryPath, ['--version'], {
+      encoding: 'utf8',
+      timeout: 5000,
+      env: {
+        ...process.env,
+        EDGECRAB_INSTALL_METHOD: 'npm',
+        EDGECRAB_WRAPPER_VERSION: BINARY_VERSION,
+        EDGECRAB_BINARY_VERSION: BINARY_VERSION,
+      },
+    });
+    const output = `${result.stdout || ''}\n${result.stderr || ''}`;
+    const match = output.match(VERSION_RE);
+    return match ? match[1] : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function hasCurrentBinary(binaryPath) {
+  return readBinaryVersion(binaryPath) === BINARY_VERSION;
+}
+
 // ─── Main ─────────────────────────────────────────────────────────────────────
-async function main() {
+async function ensureInstalledBinary() {
   fs.mkdirSync(BIN_DIR, { recursive: true });
+
+  if (hasCurrentBinary(DEST)) {
+    console.log(`[edgecrab-cli] Binary already present: ${DEST}`);
+    return DEST;
+  }
+
+  if (fs.existsSync(DEST)) {
+    const existingVersion = readBinaryVersion(DEST) || 'unknown';
+    console.log(
+      `[edgecrab-cli] Replacing stale binary at ${DEST} (found ${existingVersion}, need ${BINARY_VERSION})`
+    );
+    fs.rmSync(DEST, { force: true });
+  }
 
   const tmpFile = path.join(os.tmpdir(), `edgecrab-install-${Date.now()}.${archive.endsWith('.zip') ? 'zip' : 'tar.gz'}`);
 
@@ -125,16 +159,37 @@ async function main() {
       extractTarGz(tmpFile);
     }
     fs.chmodSync(DEST, 0o755);
+    const installedVersion = readBinaryVersion(DEST);
+    if (installedVersion !== BINARY_VERSION) {
+      throw new Error(
+        `Installed binary version mismatch: expected ${BINARY_VERSION}, got ${installedVersion || 'unknown'}`
+      );
+    }
     console.log(`[edgecrab-cli] Installed: ${DEST}`);
+    return DEST;
   } catch (err) {
     console.error(`[edgecrab-cli] Extraction failed: ${err.message}`);
     console.error(`[edgecrab-cli] You can install manually: cargo install edgecrab-cli`);
+    return null;
   } finally {
     try { fs.unlinkSync(tmpFile); } catch (_) { /* ignore */ }
   }
 }
 
-main().catch((err) => {
-  console.error(`[edgecrab-cli] Unexpected error: ${err.message}`);
-  process.exit(0); // always non-fatal to avoid blocking npm install
-});
+async function main() {
+  await ensureInstalledBinary();
+}
+
+if (require.main === module) {
+  main().catch((err) => {
+    console.error(`[edgecrab-cli] Unexpected error: ${err.message}`);
+    process.exit(0); // always non-fatal to avoid blocking npm install
+  });
+}
+
+module.exports = {
+  BINARY_VERSION,
+  DEST,
+  ensureInstalledBinary,
+  readBinaryVersion,
+};

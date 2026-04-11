@@ -14,7 +14,7 @@ We welcome contributions of all sizes. This page covers the basics — see [Deve
 ```bash
 git clone https://github.com/raphaelmansuy/edgecrab
 cd edgecrab
-cargo build          # builds all 11 crates
+cargo build --workspace
 cargo test --workspace
 cargo clippy --workspace -- -D warnings
 cargo fmt --all

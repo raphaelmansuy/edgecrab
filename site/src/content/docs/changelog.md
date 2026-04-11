@@ -14,6 +14,37 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.3.1] — Fix Release: Distribution, Release, and Docs Sync
+
+### Fixed
+
+- **`cargo run` at the workspace root now works** — the workspace default member is `edgecrab-cli`, and the CLI package now declares `default-run = "edgecrab"`.
+- **npm CLI wrapper no longer serves stale native binaries** — reinstall and first-run logic now verify the actual native binary version and replace mismatched cached binaries instead of silently reusing them.
+- **PyPI CLI wrapper no longer prefers an unrelated older system binary on `PATH`** — by default it now treats the package-managed native binary as authoritative, preventing stale Homebrew or cargo installs from shadowing the upgraded PyPI install.
+- **CLI startup does less blocking work before the UI is usable** — bundled skills sync is moved off the blocking startup path, and the initial skills/profile scans are now lazy where safe.
+- **Release docs site facts are now source-derived at build time** — homepage version, provider/tool/gateway counts, and related claims are generated from the repository state instead of stale hard-coded values.
+
+### Changed
+
+- **Release automation now updates the external Homebrew tap explicitly** — a dedicated workflow and helper script update `raphaelmansuy/homebrew-tap` from GitHub Release checksums.
+- **crates.io publication waits are now version-aware** — dependent crate publishing still waits for propagation, but the release workflow now polls for the exact published version instead of relying only on fixed sleeps.
+- **Install and troubleshooting documentation was audited end-to-end** — npm, PyPI, crates.io, Docker, Homebrew, `cargo run`, FAQ, release process, and site copy were all updated for accuracy.
+
+### Verification
+
+| Check | Result |
+|--------|--------|
+| `cargo run -- --version` | **passed** |
+| `cargo build --workspace` | **passed** |
+| `cargo check -p edgecrab-cli` | **passed** |
+| `pnpm build` in `site/` | **passed** |
+| fresh npm install | **`which edgecrab` + `edgecrab --version` verified** |
+| fresh PyPI install | **`which edgecrab` + `edgecrab --version` verified** |
+| Docker image | **`which edgecrab` + `edgecrab --version` verified** |
+| Homebrew tap | **verified stale at `0.2.3` before tap-sync fix release** |
+
+---
+
 ## [0.3.0] — Phase 5: Integration & Polish
 
 ### Added

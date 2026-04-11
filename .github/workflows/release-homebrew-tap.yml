@@ -1,0 +1,86 @@
+name: Release — Homebrew Tap
+
+on:
+  workflow_run:
+    workflows: ["Release — Native Binaries"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Tag name to sync into the tap (e.g. v0.3.0)'
+        required: true
+        default: 'v0.3.0'
+
+permissions:
+  contents: read
+
+jobs:
+  sync-tap:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    name: Update raphaelmansuy/homebrew-tap
+    runs-on: ubuntu-latest
+    env:
+      TAP_REPOSITORY: raphaelmansuy/homebrew-tap
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version from tag
+        id: version
+        env:
+          INPUT_TAG_NAME: ${{ inputs.tag_name }}
+          WORKFLOW_RUN_TAG_NAME: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          TAG="${INPUT_TAG_NAME:-${WORKFLOW_RUN_TAG_NAME:-$GITHUB_REF_NAME}}"
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Download checksums asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "${{ steps.version.outputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --pattern edgecrab-checksums.txt \
+            --dir release-assets
+
+      - name: Extract macOS checksums
+        id: checksums
+        run: |
+          ARM_SHA="$(awk '/edgecrab-aarch64-apple-darwin\.tar\.gz/ { print $1 }' release-assets/edgecrab-checksums.txt)"
+          X86_SHA="$(awk '/edgecrab-x86_64-apple-darwin\.tar\.gz/ { print $1 }' release-assets/edgecrab-checksums.txt)"
+          if [[ -z "$ARM_SHA" || -z "$X86_SHA" ]]; then
+            echo "Failed to locate macOS checksums in release-assets/edgecrab-checksums.txt" >&2
+            exit 1
+          fi
+          echo "arm_sha=$ARM_SHA" >> "$GITHUB_OUTPUT"
+          echo "x86_sha=$X86_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout tap repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TAP_REPOSITORY }}
+          token: ${{ secrets.HOMEBREW_TAP_PUSH_TOKEN }}
+          path: homebrew-tap
+
+      - name: Update formula
+        run: |
+          ./scripts/update-homebrew-formula.sh \
+            homebrew-tap/Formula/edgecrab.rb \
+            "${{ steps.version.outputs.version }}" \
+            "${{ steps.checksums.outputs.arm_sha }}" \
+            "${{ steps.checksums.outputs.x86_sha }}"
+
+      - name: Commit and push tap update
+        run: |
+          cd homebrew-tap
+          if git diff --quiet -- Formula/edgecrab.rb; then
+            echo "Homebrew formula already up to date"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/edgecrab.rb
+          git commit -m "edgecrab ${{ steps.version.outputs.version }}"
+          git push origin HEAD:master

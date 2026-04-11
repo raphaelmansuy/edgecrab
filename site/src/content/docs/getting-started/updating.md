@@ -17,6 +17,8 @@ edgecrab update
 from npm, PyPI/pipx, cargo, Homebrew, source, or a manual binary install, then
 either runs the right upgrade command or prints safe manual guidance.
 
+During this audit, npm, PyPI, crates.io, and Docker were current at `0.3.0`, while the public Homebrew tap still pointed at `0.2.3`.
+
 ### From crates.io
 
 ```bash
@@ -32,7 +34,7 @@ Download the latest archive from [GitHub Releases](https://github.com/raphaelman
 ```bash
 # macOS / Linux — replace in place
 sudo cp edgecrab /usr/local/bin/edgecrab
-edgecrab version
+edgecrab --version
 ```
 
 ### Docker
@@ -63,13 +65,16 @@ brew update
 brew upgrade edgecrab
 ```
 
+If `edgecrab --version` still reports an older release after that, the tap itself is stale rather than your local machine.
+Use npm, pip, cargo, Docker, or the GitHub Release binaries until the tap sync workflow updates `raphaelmansuy/homebrew-tap`.
+
 ---
 
 ## Check Your Current Version
 
 ```bash
-edgecrab version
-# EdgeCrab 0.3.0  (rustc 1.86.0, 2026-04-11)
+edgecrab --version
+# edgecrab 0.3.0
 ```
 
 ---
@@ -155,9 +160,7 @@ No, unless the update adds new required config fields (rare, always documented i
 
 **Q: How do I update to a specific version, not the latest?**
 
-```bash
-cargo install edgecrab-cli --version 0.3.0 --force
-```
+`cargo install edgecrab-cli --version 0.3.0 --force`
 
 For pre-built binaries, download the specific tag from GitHub Releases.
 
@@ -171,6 +174,23 @@ It depends on how you installed EdgeCrab:
 - cargo: runs `cargo install edgecrab-cli --locked --force --version <version>`
 - brew: runs `brew update` then `brew upgrade edgecrab`
 - source or manual binary: prints safe manual steps instead of mutating the install blindly
+
+**Q: I upgraded `edgecrab-cli`, but `edgecrab --version` still shows an old release. Why?**
+
+Two common causes were fixed in this repository:
+
+- npm used to keep an old downloaded native binary if the file already existed.
+- PyPI used to prefer any native `edgecrab` already on `PATH`, even if it was older than the package you had just installed.
+
+If you still hit this locally, run:
+
+```bash
+which -a edgecrab
+edgecrab --version
+```
+
+If the wrong binary is coming from Homebrew or an old cargo install, remove or upgrade that install.
+For npm and PyPI wrapper installs, reinstalling now self-heals the cached native binary to the package version.
 
 **Q: The new version has a new config option I want to use. How do I add it?**
 

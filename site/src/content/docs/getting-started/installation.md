@@ -5,46 +5,40 @@ sidebar:
   order: 2
 ---
 
-Get EdgeCrab up and running in under two minutes. Choose the method that fits your environment —
-**no build tools required** when installing via Homebrew, npm, or pip.
+Get EdgeCrab up and running in under two minutes. Choose the method that fits your environment.
+During this audit, the currently verified release across registries was `0.3.0`.
 
 ---
 
-## Option A — Homebrew (macOS, fastest)
+## Verified Channel Status
 
-```bash
-brew tap raphaelmansuy/tap
-brew install edgecrab
-```
+| Channel | Package / Image | Verified latest | Status |
+|--------|------------------|-----------------|--------|
+| npm | `edgecrab-cli` | `0.3.0` | current |
+| PyPI | `edgecrab-cli` | `0.3.0` | current |
+| crates.io | `edgecrab-cli` | `0.3.0` | current |
+| Docker | `ghcr.io/raphaelmansuy/edgecrab:latest` | `0.3.0` | current |
+| Homebrew tap | `raphaelmansuy/tap/edgecrab` | `0.2.3` | stale until tap sync runs |
 
-Auto-detects your CPU architecture (Apple Silicon or Intel) and installs the correct binary.
-**No dependencies needed.** Instant startup (~50ms cold start).
-
-Verify:
-
-```bash
-edgecrab version
-# EdgeCrab 0.3.0  (rustc 1.86.0, 2026-04-11)
-#   providers: copilot openai anthropic gemini xai deepseek ...
-```
+For the fastest path to the current release, use npm, pip, cargo, Docker, or the native GitHub Release binaries.
 
 ---
 
-## Option B — npm (recommended, no Rust required)
+## Option A — npm (recommended, no Rust required)
 
 ```bash
 npm install -g edgecrab-cli
 ```
 
 The postinstall script automatically downloads the correct pre-built native binary for your platform.
+If an older cached binary is already present, the wrapper now replaces it automatically instead of silently keeping the stale binary.
 Requires **Node.js 18+**. No Rust, GCC, or build tools needed.
 
 Verify:
 
 ```bash
-edgecrab version
-# EdgeCrab 0.3.0  (rustc 1.86.0, 2026-04-11)
-#   providers: copilot openai anthropic gemini xai deepseek huggingface zai openrouter ollama lmstudio
+edgecrab --version
+# edgecrab 0.3.0
 ```
 
 You can also run without a global install:
@@ -56,17 +50,18 @@ npx edgecrab-cli "summarise the git log for today"
 
 ---
 
-## Option C — pip (recommended, no Rust required)
+## Option B — pip (recommended, no Rust required)
 
 ```bash
-pip install edgecrab-cli
+python -m pip install --upgrade edgecrab-cli
 ```
 
 On first run the package downloads the correct pre-built binary for your platform.
+The wrapper now treats the package-managed binary as authoritative, so an unrelated older native `edgecrab` already on your `PATH` does not override the version you just installed.
 Requires **Python 3.10+**. No Rust or build tools needed.
 
 ```bash
-edgecrab version
+edgecrab --version
 edgecrab setup
 edgecrab "explain this codebase"
 ```
@@ -78,7 +73,7 @@ edgecrab "explain this codebase"
 
 ---
 
-## Option D — cargo install (from source)
+## Option C — cargo install
 
 ```bash
 cargo install edgecrab-cli
@@ -95,14 +90,13 @@ Requires **Rust 1.86+**. The binary is placed in `~/.cargo/bin/edgecrab`.
 Verify:
 
 ```bash
-edgecrab version
-# EdgeCrab 0.3.0  (rustc 1.86.0, 2026-04-11)
-#   providers: copilot openai anthropic gemini xai deepseek huggingface zai openrouter ollama lmstudio
+edgecrab --version
+# edgecrab 0.3.0
 ```
 
 ---
 
-## Option E — Pre-built Binary
+## Option D — Pre-built Binary
 
 Download the archive for your platform from [GitHub Releases](https://github.com/raphaelmansuy/edgecrab/releases):
 
@@ -123,7 +117,7 @@ chmod +x /usr/local/bin/edgecrab
 
 ---
 
-## Option F — Docker
+## Option E — Docker
 
 ```bash
 docker pull ghcr.io/raphaelmansuy/edgecrab:latest
@@ -137,21 +131,52 @@ See [Docker Deployment](/user-guide/docker/) for full configuration, docker-comp
 
 ---
 
-## Option G — Build from Source
+## Option F — Build from Source
 
 ```bash
 git clone https://github.com/raphaelmansuy/edgecrab
 cd edgecrab
 cargo build --release       # ~30 s on modern hardware
-./target/release/edgecrab version
+./target/release/edgecrab --version
 ```
 
 For development (incremental, unoptimized):
 
 ```bash
 cargo build
-./target/debug/edgecrab version
+./target/debug/edgecrab --version
 ```
+
+---
+
+## Running from the workspace root
+
+`cargo run` now defaults to the main CLI target from the workspace root:
+
+```bash
+cargo run -- --version
+cargo run -- "summarise this repository"
+```
+
+Use the explicit full-workspace commands when you want to build or test everything:
+
+```bash
+cargo build --workspace
+cargo test --workspace
+```
+
+---
+
+## Option G — Homebrew (macOS)
+
+```bash
+brew tap raphaelmansuy/tap
+brew install edgecrab
+edgecrab --version
+```
+
+Homebrew support exists, but the public tap was still serving `0.2.3` during this documentation audit while the other release channels were already at `0.3.0`.
+If `edgecrab --version` shows an older release after `brew upgrade`, use npm, pip, cargo, Docker, or the native GitHub Release binaries until the tap sync finishes.
 
 ---
 
@@ -159,12 +184,12 @@ cargo build
 
 | Method | Command | Requires | Speed |
 |--------|---------|----------|-------|
-| **Homebrew** (macOS) | `brew install raphaelmansuy/tap/edgecrab` | Homebrew | ~50ms startup |
 | **npm** | `npm install -g edgecrab-cli` | Node.js 18+ | ~1-2s startup |
 | **pip** | `pip install edgecrab-cli` | Python 3.10+ | ~1-2s startup |
 | **cargo** | `cargo install edgecrab-cli` | Rust 1.85+ | ~5-10m build |
 | **Docker** | `docker pull ghcr.io/raphaelmansuy/edgecrab:latest` | Docker | ~100ms in container |
-| **Pre-built binary** | Download from GitHub Releases | Nothing | ~50ms startup |
+| **Pre-built binary** | Download from GitHub Releases | Nothing | fast |
+| **Homebrew** (macOS) | `brew install raphaelmansuy/tap/edgecrab` | Homebrew | currently tap-lagged |
 
 ---
 

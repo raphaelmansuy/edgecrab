@@ -8,9 +8,12 @@ provides a resolve() helper to get the absolute path.
 
 from __future__ import annotations
 
+import os
 import platform
+import re
 import shutil
 import stat
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -41,6 +44,7 @@ _BIN_NAME = "edgecrab.exe" if sys.platform == "win32" else "edgecrab"
 
 # Cache binary alongside this package
 _CACHE_DIR = Path(__file__).parent / "_bin"
+_VERSION_RE = re.compile(r"\bedgecrab\s+([0-9]+\.[0-9]+\.[0-9]+)\b", re.IGNORECASE)
 
 
 def _asset_name() -> str:
@@ -101,8 +105,14 @@ def ensure_binary() -> Path:
     _CACHE_DIR.mkdir(parents=True, exist_ok=True)
     dest = _CACHE_DIR / _BIN_NAME
 
-    if dest.exists():
+    if dest.exists() and _binary_version(dest) == BINARY_VERSION:
         return dest
+    if dest.exists():
+        print(
+            f"[edgecrab-cli] Replacing cached binary {dest} with version {BINARY_VERSION}",
+            file=sys.stderr,
+        )
+        dest.unlink(missing_ok=True)
 
     asset = _asset_name()
     url = f"https://github.com/{REPO}/releases/download/v{BINARY_VERSION}/{asset}"
@@ -129,6 +139,29 @@ def ensure_binary() -> Path:
     return dest
 
 
+def _binary_version(path: Path) -> str | None:
+    """Return the native binary's semantic version, or None if unreadable."""
+    try:
+        env = os.environ.copy()
+        env.setdefault("EDGECRAB_INSTALL_METHOD", "pypi")
+        env.setdefault("EDGECRAB_WRAPPER_VERSION", BINARY_VERSION)
+        env.setdefault("EDGECRAB_BINARY_VERSION", BINARY_VERSION)
+        result = subprocess.run(
+            [str(path), "--version"],
+            capture_output=True,
+            check=False,
+            env=env,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+    output = f"{result.stdout}\n{result.stderr}"
+    match = _VERSION_RE.search(output)
+    return match.group(1) if match else None
+
+
 def _is_native_binary(path: str) -> bool:
     """Return True only if *path* is a native executable, not a script wrapper."""
     try:
@@ -150,11 +183,16 @@ def resolve() -> Path:
     """
     Return the path to the edgecrab binary.
 
-    First checks for a system-wide native `edgecrab` on PATH (e.g. installed
-    via cargo or brew).  Skips any Python wrapper scripts (like the one
-    installed by this very package) to avoid infinite-exec loops.
+    By default, the package-managed binary is authoritative so upgrades cannot
+    be shadowed by an older system install lingering on PATH.
+
+    Set `EDGECRAB_USE_SYSTEM_BINARY=1` to opt into a system-wide native
+    `edgecrab`, but only when its version matches the wrapper package version.
     """
-    system_binary = shutil.which("edgecrab")
-    if system_binary and _is_native_binary(system_binary):
-        return Path(system_binary)
+    if os.environ.get("EDGECRAB_USE_SYSTEM_BINARY") in {"1", "true", "TRUE", "yes", "YES"}:
+        system_binary = shutil.which("edgecrab")
+        if system_binary and _is_native_binary(system_binary):
+            system_path = Path(system_binary)
+            if _binary_version(system_path) == BINARY_VERSION:
+                return system_path
     return ensure_binary()

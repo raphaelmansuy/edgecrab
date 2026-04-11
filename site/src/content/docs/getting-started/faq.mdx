@@ -1,0 +1,126 @@
+---
+title: FAQ & Troubleshooting
+description: Common EdgeCrab install, version, startup, and release-channel problems, with verified fixes and diagnostic commands.
+sidebar:
+  order: 4
+---
+
+## Wrong Version After `npm install -g edgecrab-cli`
+
+If `edgecrab --version` still shows an older release after reinstalling, the usual causes are:
+
+- an old downloaded native binary was kept in the npm wrapper cache
+- another `edgecrab` earlier on your `PATH` is shadowing the one you expected
+
+Run:
+
+```bash
+which -a edgecrab
+edgecrab --version
+```
+
+The npm wrapper in this repository now verifies the native binary version and replaces stale cached binaries automatically.
+
+---
+
+## Wrong Version After `pip install --upgrade edgecrab-cli`
+
+The PyPI wrapper used to accidentally prefer any native `edgecrab` already on `PATH`.
+That meant an older Homebrew or cargo install could win over the version you had just upgraded with pip.
+
+Run:
+
+```bash
+which -a edgecrab
+python -m pip show edgecrab-cli
+edgecrab --version
+```
+
+The PyPI wrapper in this repository now treats the package-managed binary as authoritative by default.
+
+---
+
+## Homebrew Still Shows `0.2.3`
+
+That is a release-channel sync problem, not a local install problem.
+During this audit:
+
+- npm was current at `0.3.0`
+- PyPI was current at `0.3.0`
+- crates.io was current at `0.3.0`
+- Docker was current at `0.3.0`
+- Homebrew tap was still at `0.2.3`
+
+Use npm, pip, cargo, Docker, or the GitHub Release binaries until the tap sync completes.
+
+---
+
+## `cargo run` From The Workspace Root
+
+Use:
+
+```bash
+cargo run -- --version
+cargo run -- "summarise this repo"
+```
+
+For full-workspace verification, keep using:
+
+```bash
+cargo build --workspace
+cargo test --workspace
+```
+
+---
+
+## Startup Feels Slow
+
+Expected causes:
+
+- first-run setup work such as config discovery
+- model/provider initialization
+- MCP discovery when configured
+- binary download on first npm or PyPI wrapper use
+
+This repository now removes bundled skills sync from the blocking startup path and lazy-loads some TUI scans, so cold start should feel better than before.
+
+If startup is still slow, capture:
+
+```bash
+time edgecrab --version
+time edgecrab doctor
+EDGECRAB_LOG=debug edgecrab --version
+```
+
+---
+
+## `edgecrab` Resolves To The Wrong Binary
+
+Inspect every candidate on your `PATH`:
+
+```bash
+which -a edgecrab
+ls -l "$(which edgecrab)"
+```
+
+Typical sources:
+
+- Homebrew: `/opt/homebrew/bin/edgecrab`
+- cargo: `~/.cargo/bin/edgecrab`
+- fnm or other shims
+- npm global prefix
+- pipx or venv script shims
+
+Remove the stale install or move the intended one earlier in `PATH`.
+
+---
+
+## Best Install Method Right Now
+
+For the current audited release state:
+
+- use `npm install -g edgecrab-cli` if you want a quick install with no Rust toolchain
+- use `python -m pip install --upgrade edgecrab-cli` or `pipx install edgecrab-cli` if you prefer Python packaging
+- use `cargo install edgecrab-cli` if you want crates.io-native installation
+- use Docker or GitHub Release binaries for the most explicit deployment path
+- avoid relying on Homebrew until the tap has been updated

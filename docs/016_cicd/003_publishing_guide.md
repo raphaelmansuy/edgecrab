@@ -103,8 +103,12 @@ curl -I https://www.edgecrab.com    # HTTP 200
 
 ### Step 6 — Update Homebrew tap
 
-After the GitHub Release is published, update the external tap formula with the
-new version and the macOS checksum from `edgecrab-checksums.txt`.
+After the GitHub Release is published, the preferred path is the automated
+`release-homebrew-tap.yml` workflow. It downloads `edgecrab-checksums.txt`,
+updates `raphaelmansuy/homebrew-tap`, and pushes the formula change with
+`HOMEBREW_TAP_PUSH_TOKEN`.
+
+Manual fallback if needed:
 
 ```bash
 gh release download v0.2.0 --pattern edgecrab-checksums.txt --repo raphaelmansuy/edgecrab
@@ -112,8 +116,17 @@ grep 'edgecrab-aarch64-apple-darwin.tar.gz' edgecrab-checksums.txt
 grep 'edgecrab-x86_64-apple-darwin.tar.gz' edgecrab-checksums.txt
 ```
 
-Then update `raphaelmansuy/homebrew-tap` `Formula/edgecrab.rb`, push that
-change, and verify:
+Then update the formula:
+
+```bash
+./scripts/update-homebrew-formula.sh \
+  /path/to/homebrew-tap/Formula/edgecrab.rb \
+  0.2.0 \
+  <arm64-sha256> \
+  <x86_64-sha256>
+```
+
+Push that change, and verify:
 
 ```bash
 brew update
@@ -161,21 +174,26 @@ make publish-rust
 Equivalent manual steps:
 
 ```bash
-cargo publish -p edgecrab-types && sleep 30
-cargo publish -p edgecrab-security --no-verify && sleep 30
-cargo publish -p edgecrab-state    --no-verify && sleep 30
-cargo publish -p edgecrab-cron     --no-verify && sleep 30
-cargo publish -p edgecrab-tools    --no-verify && sleep 30
-cargo publish -p edgecrab-lsp      --no-verify && sleep 30
-cargo publish -p edgecrab-core     --no-verify && sleep 30
-cargo publish -p edgecrab-gateway  --no-verify && sleep 30
-cargo publish -p edgecrab-acp      --no-verify && sleep 30
-cargo publish -p edgecrab-migrate  --no-verify && sleep 30
+cargo publish -p edgecrab-types
+# Wait until crates.io shows the exact version before continuing.
+
+cargo publish -p edgecrab-security --no-verify
+cargo publish -p edgecrab-state    --no-verify
+cargo publish -p edgecrab-cron     --no-verify
+cargo publish -p edgecrab-tools    --no-verify
+cargo publish -p edgecrab-lsp      --no-verify
+cargo publish -p edgecrab-core     --no-verify
+cargo publish -p edgecrab-gateway  --no-verify
+cargo publish -p edgecrab-acp      --no-verify
+cargo publish -p edgecrab-migrate  --no-verify
 cargo publish -p edgecrab-cli      --no-verify
 ```
 
 > `--no-verify` is required for crates with workspace path dependencies.
 > The repository CI is the correctness gate.
+> Do not publish dependent crates back-to-back without waiting for crates.io
+> propagation; the release workflow keeps that protection in place with
+> version-aware polling.
 
 ### Publish Python SDK
 

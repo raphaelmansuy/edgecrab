@@ -1,6 +1,12 @@
 ---
 // Hero override for Starlight — EdgeCrab landing hero
 import heroImg from '../../assets/hero.jpeg';
+import {
+  coreToolCount,
+  gatewayCount,
+  providerCount,
+  workspaceVersion,
+} from '../../data/project-facts';
 
 const base = import.meta.env.BASE_URL;
 const installCmd = 'npm install -g edgecrab-cli';
@@ -17,7 +23,7 @@ const installCmd = 'npm install -g edgecrab-cli';
     <div class="hero-content">
       <div class="hero-eyebrow">
         <span class="eyebrow-badge">🦀 SuperAgent</span>
-        <span class="eyebrow-text">Hermes Agent soul · OpenClaw vision · 15 LLM providers · 15 gateways · learns &amp; improves</span>
+        <span class="eyebrow-text">{providerCount} LLM providers · {gatewayCount} gateways · {coreToolCount} core tools · learns &amp; improves</span>
         <svg class="eyebrow-arrow" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg>
       </div>
 
@@ -27,7 +33,7 @@ const installCmd = 'npm install -g edgecrab-cli';
       </h1>
 
       <p class="hero-subtitle">
-        Personal + coding SuperAgent that grows with you. Powered by the soul of Hermes Agent and the vision of OpenClaw — delivered as a single 15&nbsp;MB Rust binary that starts in &lt;&nbsp;50&nbsp;ms.
+        Personal + coding SuperAgent that grows with you. Powered by the best ideas from Hermes Agent and OpenClaw, delivered as a single native Rust binary with no Python or Node.js runtime requirement.
       </p>
 
       <div class="hero-actions">
@@ -52,27 +58,22 @@ const installCmd = 'npm install -g edgecrab-cli';
 
       <div class="hero-metrics" aria-label="Key metrics">
         <div class="metric">
-          <span class="metric-value">&lt;&nbsp;50</span>
-          <span class="metric-label">ms startup</span>
+          <span class="metric-value">v{workspaceVersion}</span>
+          <span class="metric-label">current release</span>
         </div>
         <div class="metric-sep" aria-hidden="true"></div>
         <div class="metric">
-          <span class="metric-value">15</span><span class="metric-suffix">&nbsp;MB</span>
-          <span class="metric-label">binary size</span>
+          <span class="metric-value" data-count={String(coreToolCount)}>0</span>
+          <span class="metric-label">core tools</span>
         </div>
         <div class="metric-sep" aria-hidden="true"></div>
         <div class="metric">
-          <span class="metric-value" data-count="1200">0</span><span class="metric-suffix">+</span>
-          <span class="metric-label">tests</span>
-        </div>
-        <div class="metric-sep" aria-hidden="true"></div>
-        <div class="metric">
-          <span class="metric-value" data-count="14">0</span>
+          <span class="metric-value" data-count={String(providerCount)}>0</span>
           <span class="metric-label">LLM providers</span>
         </div>
         <div class="metric-sep" aria-hidden="true"></div>
         <div class="metric">
-          <span class="metric-value" data-count="15">0</span>
+          <span class="metric-value" data-count={String(gatewayCount)}>0</span>
           <span class="metric-label">gateways</span>
         </div>
       </div>

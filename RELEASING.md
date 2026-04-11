@@ -95,8 +95,12 @@ git push origin "v$VERSION"
 
 ### Update the Homebrew formula
 
-Once binaries are live on the GitHub Release, update the tap. Prefer the
-published `edgecrab-checksums.txt` asset attached by `release-binaries.yml`:
+Once binaries are live on the GitHub Release, the preferred path is the
+automated `release-homebrew-tap.yml` workflow. It downloads
+`edgecrab-checksums.txt`, updates `raphaelmansuy/homebrew-tap`, and pushes the
+formula change using `HOMEBREW_TAP_PUSH_TOKEN`.
+
+Manual fallback if needed:
 
 ```bash
 gh release download "v${VERSION}" \
@@ -117,7 +121,17 @@ echo "ARM SHA256:   $ARM_SHA"
 echo "x86_64 SHA256: $X86_SHA"
 ```
 
-Then edit `Formula/edgecrab.rb` in `homebrew-tap` with the new version + SHA256 values, commit, and push.
+Then update the formula with:
+
+```bash
+./scripts/update-homebrew-formula.sh \
+  /path/to/homebrew-tap/Formula/edgecrab.rb \
+  "$VERSION" \
+  "$ARM_SHA" \
+  "$X86_SHA"
+```
+
+Commit and push the tap repository after verifying the diff.
 
 ### Verify all install methods
 
@@ -139,6 +153,9 @@ brew upgrade edgecrab
 edgecrab --version
 ```
 
+If Homebrew is still behind while npm, PyPI, crates.io, and Docker are current,
+the tap sync is the missing step.
+
 ---
 
 ## Required secrets / environments
@@ -148,6 +165,7 @@ edgecrab --version
 | `NPM_TOKEN` | `npm` environment | `release-npm-cli.yml` |
 | `CARGO_REGISTRY_TOKEN` | repository secrets | `release-rust.yml` |
 | PyPI OIDC trusted publisher | `pypi` environment | `release-pypi-cli.yml` |
+| `HOMEBREW_TAP_PUSH_TOKEN` | repository secrets | `release-homebrew-tap.yml` |
 | `GITHUB_TOKEN` | auto-provisioned | all workflows |
 
 ---

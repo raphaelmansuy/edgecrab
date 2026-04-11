@@ -3,9 +3,16 @@ import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
 import sitemap from '@astrojs/sitemap';
 import tailwindcss from '@tailwindcss/vite';
+import {
+	coreToolCount,
+	gatewayCount,
+	providerCount,
+	workspaceVersion,
+} from './src/data/project-facts.ts';
 
 const siteUrl = 'https://www.edgecrab.com';
 const ogImageUrl = `${siteUrl}/og-image.png`;
+const siteDescription = `Rust-native autonomous coding agent and personal assistant. ${coreToolCount} core tools, ${providerCount} LLM providers, ${gatewayCount} messaging gateways, and a single native binary.`;
 
 export default defineConfig({
 	site: siteUrl,
@@ -17,7 +24,7 @@ export default defineConfig({
 		}),
 		starlight({
 			title: 'EdgeCrab',
-			description: 'Rust-native autonomous coding agent. Blazing-fast TUI, ReAct tool loop, multi-provider LLM, ACP protocol, built-in security. Single static binary.',
+			description: siteDescription,
 			logo: {
 				light: './src/assets/logo.svg',
 				dark: './src/assets/logo-dark.svg',
@@ -141,9 +148,8 @@ export default defineConfig({
 						operatingSystem: 'macOS, Linux, Windows',
 						url: siteUrl,
 						downloadUrl: 'https://github.com/raphaelmansuy/edgecrab/releases',
-						softwareVersion: '0.1.2',
-						description:
-							'Rust-native autonomous coding agent and personal assistant. 91 core tools, 15 LLM providers, 15 messaging gateways, and a stripped release binary around 49 MB on current macOS arm64 builds.',
+						softwareVersion: workspaceVersion,
+						description: siteDescription,
 						offers: {
 							'@type': 'Offer',
 							price: '0',
@@ -179,7 +185,7 @@ export default defineConfig({
 					tag: 'meta',
 					attrs: {
 						name: 'twitter:description',
-						content: 'Blazing-fast TUI, ReAct tool loop, multi-provider LLM, ACP protocol. Single static binary. < 50ms startup.',
+						content: siteDescription,
 					},
 				},
 			],
@@ -190,6 +196,7 @@ export default defineConfig({
 						{ label: 'Quick Start', slug: 'getting-started/quick-start' },
 						{ label: 'Installation', slug: 'getting-started/installation' },
 						{ label: 'Updating & Uninstalling', slug: 'getting-started/updating' },
+						{ label: 'FAQ & Troubleshooting', slug: 'getting-started/faq' },
 						{ label: 'Learning Path', slug: 'getting-started/learning-path' },
 					],
 				},
@@ -261,6 +268,7 @@ export default defineConfig({
 					items: [
 						{ label: 'Architecture', slug: 'developer/architecture' },
 						{ label: 'Contributing', slug: 'developer/contributing' },
+						{ label: 'Releasing', slug: 'developer/releasing' },
 					],
 				},
 				{

@@ -151,7 +151,7 @@ edgecrab setup && edgecrab doctor && edgecrab
 ```bash
 git clone https://github.com/raphaelmansuy/edgecrab
 cd edgecrab
-cargo build --release         # ~30 s first build
+cargo build --workspace --release         # ~30 s first build
 ./target/release/edgecrab setup
 ```
 
@@ -1449,8 +1449,11 @@ sections) and archives unsupported OpenClaw-only config under
 ## Testing
 
 ```bash
+# Root convenience target
+cargo run
+
 # Run all unit + integration tests
-cargo test
+cargo test --workspace
 
 # Run only a specific crate
 cargo test -p edgecrab-core
@@ -1458,10 +1461,10 @@ cargo test -p edgecrab-tools
 cargo test -p edgecrab-gateway
 
 # Run E2E tests (requires a configured LLM provider)
-cargo test -- --include-ignored
+cargo test --workspace -- --include-ignored
 
 # Lint (zero warnings policy)
-cargo clippy -- -D warnings
+cargo clippy --workspace -- -D warnings
 
 # Format check
 cargo fmt --check
@@ -1533,10 +1536,10 @@ edgecrab/
 
 ```bash
 # Debug build (fast iteration)
-cargo build
+cargo build --workspace
 
 # Release build (optimized, ~3× faster startup than debug)
-cargo build --release
+cargo build --workspace --release
 
 # Cross-compile for Linux on macOS
 cargo build --release --target x86_64-unknown-linux-musl
@@ -1553,9 +1556,9 @@ EdgeCrab welcomes contributions. The codebase has a zero-clippy-warnings policy 
 ```bash
 git clone https://github.com/raphaelmansuy/edgecrab
 cd edgecrab
-cargo build                    # verify it compiles
-cargo test                     # run test suite
-cargo clippy -- -D warnings    # must be warning-free
+cargo build --workspace                    # verify it compiles
+cargo test --workspace                     # run test suite
+cargo clippy --workspace -- -D warnings    # must be warning-free
 ```
 
 **Adding a new tool:**

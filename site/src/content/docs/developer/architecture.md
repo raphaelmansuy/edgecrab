@@ -126,7 +126,7 @@ SQLite WAL-mode session database:
 - `LlmClient` — unified OpenAI-compatible HTTP client with streaming,
   prompt caching, and retry logic
 - `CompressionEngine` — context window summarisation when threshold hit
-- Provider setup: detect API keys, build `ModelConfig` for 14 providers (12 cloud + 2 local)
+- Provider setup: detect API keys, build `ModelConfig` for 15 providers (13 cloud + 2 local)
 
 ### `edgecrab-cli`
 

@@ -6,9 +6,9 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: 'Tag name to publish (e.g. v0.1.0) — used for version sync'
+        description: 'Tag name to publish (e.g. v0.3.0) — used for version sync'
         required: true
-        default: 'v0.1.0'
+        default: 'v0.3.0'
 
 permissions:
   contents: write

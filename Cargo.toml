@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+default-members = ["crates/edgecrab-cli"]
 members = [
     "crates/edgecrab-command-catalog",
     "crates/edgecrab-types",
@@ -16,7 +17,7 @@ members = [
     "crates/edgecrab-migrate",
 ]
 [workspace.package]
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 rust-version = "1.86.0"
 license = "Apache-2.0"
@@ -26,17 +27,17 @@ authors = ["Raphael Mansuy"]
 [workspace.dependencies]
 # Internal crates
 edgecrab-command-catalog = { path = "crates/edgecrab-command-catalog", version = "0.3.0" }
-edgecrab-types = { path = "crates/edgecrab-types", version = "0.3.0" }
-edgecrab-security = { path = "crates/edgecrab-security", version = "0.3.0" }
-edgecrab-state = { path = "crates/edgecrab-state", version = "0.3.0" }
-edgecrab-plugins = { path = "crates/edgecrab-plugins", version = "0.3.0" }
-edgecrab-cron = { path = "crates/edgecrab-cron", version = "0.3.0" }
-edgecrab-lsp = { path = "crates/edgecrab-lsp", version = "0.3.0" }
-edgecrab-tools = { path = "crates/edgecrab-tools", version = "0.3.0" }
-edgecrab-core = { path = "crates/edgecrab-core", version = "0.3.0" }
-edgecrab-gateway = { path = "crates/edgecrab-gateway", version = "0.3.0" }
-edgecrab-acp = { path = "crates/edgecrab-acp", version = "0.3.0" }
-edgecrab-migrate = { path = "crates/edgecrab-migrate", version = "0.3.0" }
+edgecrab-types = { path = "crates/edgecrab-types", version = "0.3.1" }
+edgecrab-security = { path = "crates/edgecrab-security", version = "0.3.1" }
+edgecrab-state = { path = "crates/edgecrab-state", version = "0.3.1" }
+edgecrab-plugins = { path = "crates/edgecrab-plugins", version = "0.3.1" }
+edgecrab-cron = { path = "crates/edgecrab-cron", version = "0.3.1" }
+edgecrab-lsp = { path = "crates/edgecrab-lsp", version = "0.3.1" }
+edgecrab-tools = { path = "crates/edgecrab-tools", version = "0.3.1" }
+edgecrab-core = { path = "crates/edgecrab-core", version = "0.3.1" }
+edgecrab-gateway = { path = "crates/edgecrab-gateway", version = "0.3.1" }
+edgecrab-acp = { path = "crates/edgecrab-acp", version = "0.3.1" }
+edgecrab-migrate = { path = "crates/edgecrab-migrate", version = "0.3.1" }
 
 # Shared across workspace — single version for consistency
 serde = { version = "1", features = ["derive"] }

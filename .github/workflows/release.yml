@@ -92,6 +92,7 @@ jobs:
           echo "- release-rust.yml" >> "$GITHUB_STEP_SUMMARY"
           echo "- release-node.yml" >> "$GITHUB_STEP_SUMMARY"
           echo "- release-python.yml" >> "$GITHUB_STEP_SUMMARY"
+          echo "- release-homebrew-tap.yml" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Dry-run summary
         if: inputs.dry_run == 'true'

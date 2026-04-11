@@ -6,9 +6,9 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: 'Tag to publish from (e.g. v0.1.3)'
+        description: 'Tag to publish from (e.g. v0.3.0)'
         required: true
-        default: 'v0.1.3'
+        default: 'v0.3.0'
 
 permissions:
   contents: write
@@ -57,6 +57,29 @@ jobs:
           EOF
           chmod +x /usr/local/bin/publish_crate
 
+          cat > /usr/local/bin/wait_for_crate_version << 'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          CRATE="$1"
+          VERSION="$2"
+          MAX_ATTEMPTS="${3:-40}"
+          WAIT_SECONDS="${4:-10}"
+
+          for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
+            BODY="$(curl -fsSL "https://crates.io/api/v1/crates/$CRATE" 2>/dev/null || true)"
+            if [[ -n "$BODY" ]] && echo "$BODY" | jq -e --arg version "$VERSION" '.versions[]? | select(.num == $version)' >/dev/null; then
+              echo "$CRATE $VERSION is visible on crates.io"
+              exit 0
+            fi
+            echo "Waiting for $CRATE $VERSION to appear on crates.io (attempt $attempt/$MAX_ATTEMPTS)..."
+            sleep "$WAIT_SECONDS"
+          done
+
+          echo "Timed out waiting for $CRATE $VERSION on crates.io" >&2
+          exit 1
+          EOF
+          chmod +x /usr/local/bin/wait_for_crate_version
+
       - name: Verify version consistency
         env:
           INPUT_TAG: ${{ inputs.tag_name }}
@@ -69,6 +92,7 @@ jobs:
             echo "ERROR: tag $TAG_VERSION ≠ Cargo.toml $CARGO_VERSION"
             exit 1
           fi
+          echo "CRATE_VERSION=$TAG_VERSION" >> "$GITHUB_ENV"
 
       - name: Generate CHANGELOG
         uses: taiki-e/install-action@git-cliff
@@ -85,7 +109,7 @@ jobs:
         run: publish_crate edgecrab-types
 
       - name: Wait for crates.io index (types)
-        run: sleep 30
+        run: wait_for_crate_version edgecrab-types "$CRATE_VERSION"
 
       - name: Publish edgecrab-security
         env:
@@ -93,7 +117,7 @@ jobs:
         run: publish_crate edgecrab-security
 
       - name: Wait for crates.io index (security)
-        run: sleep 30
+        run: wait_for_crate_version edgecrab-security "$CRATE_VERSION"
 
       - name: Publish edgecrab-state
         env:
@@ -101,7 +125,7 @@ jobs:
         run: publish_crate edgecrab-state
 
       - name: Wait for crates.io index (state)
-        run: sleep 30
+        run: wait_for_crate_version edgecrab-state "$CRATE_VERSION"
 
       - name: Publish edgecrab-cron
         env:
@@ -109,7 +133,7 @@ jobs:
         run: publish_crate edgecrab-cron --no-verify
 
       - name: Wait for crates.io index (cron)
-        run: sleep 30
+        run: wait_for_crate_version edgecrab-cron "$CRATE_VERSION"
 
       - name: Publish edgecrab-tools
         env:
@@ -117,7 +141,7 @@ jobs:
         run: publish_crate edgecrab-tools --no-verify
 
       - name: Wait for crates.io index (tools)
-        run: sleep 30
+        run: wait_for_crate_version edgecrab-tools "$CRATE_VERSION"
 
       - name: Publish edgecrab-plugins
         env:
@@ -125,7 +149,7 @@ jobs:
         run: publish_crate edgecrab-plugins --no-verify
 
       - name: Wait for crates.io index (plugins)
-        run: sleep 30
+        run: wait_for_crate_version edgecrab-plugins "$CRATE_VERSION"
 
       - name: Publish edgecrab-lsp
         env:
@@ -133,7 +157,7 @@ jobs:
         run: publish_crate edgecrab-lsp --no-verify
 
       - name: Wait for crates.io index (lsp)
-        run: sleep 30
+        run: wait_for_crate_version edgecrab-lsp "$CRATE_VERSION"
 
       - name: Publish edgecrab-core
         env:
@@ -141,7 +165,7 @@ jobs:
         run: publish_crate edgecrab-core --no-verify
 
       - name: Wait for crates.io index (core)
-        run: sleep 30
+        run: wait_for_crate_version edgecrab-core "$CRATE_VERSION"
 
       - name: Publish edgecrab-command-catalog
         env:
@@ -149,7 +173,7 @@ jobs:
         run: publish_crate edgecrab-command-catalog --no-verify
 
       - name: Wait for crates.io index (command-catalog)
-        run: sleep 30
+        run: wait_for_crate_version edgecrab-command-catalog "$CRATE_VERSION"
 
       - name: Publish edgecrab-gateway
         env:
@@ -157,7 +181,7 @@ jobs:
         run: publish_crate edgecrab-gateway --no-verify
 
       - name: Wait for crates.io index (gateway)
-        run: sleep 30
+        run: wait_for_crate_version edgecrab-gateway "$CRATE_VERSION"
 
       - name: Publish edgecrab-acp
         env:
@@ -165,7 +189,7 @@ jobs:
         run: publish_crate edgecrab-acp --no-verify
 
       - name: Wait for crates.io index (acp)
-        run: sleep 30
+        run: wait_for_crate_version edgecrab-acp "$CRATE_VERSION"
 
       - name: Publish edgecrab-migrate
         env:
@@ -173,7 +197,7 @@ jobs:
         run: publish_crate edgecrab-migrate --no-verify
 
       - name: Wait for crates.io index (migrate)
-        run: sleep 30
+        run: wait_for_crate_version edgecrab-migrate "$CRATE_VERSION"
 
       - name: Publish edgecrab-cli
         env:

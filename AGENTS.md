@@ -5,10 +5,11 @@ Instructions for AI coding assistants and developers working on the edgecrab cod
 ## Development Environment
 
 ```bash
-cargo build             # debug build
-cargo build --release   # optimised binary
-cargo test              # full test suite (~650+ tests)
-cargo clippy -- -D warnings   # lint (zero warnings required)
+cargo run               # launches the default CLI target from the workspace root
+cargo build --workspace             # debug build for the full workspace
+cargo build --workspace --release   # optimised full-workspace build
+cargo test --workspace              # full test suite (~650+ tests)
+cargo clippy --workspace -- -D warnings   # lint (zero warnings required)
 ```
 
 **Binary location:** `target/release/edgecrab`  
@@ -565,18 +566,18 @@ edgecrab migrate              # live migration
 ## Testing
 
 ```bash
-cargo test                          # full suite (~650+ tests)
+cargo test --workspace              # full suite (~650+ tests)
 cargo test -p edgecrab-core         # core crate only
 cargo test -p edgecrab-tools        # tools crate only
 cargo test -p edgecrab-tools --lib browser   # specific module
-cargo test -- --include-ignored     # include E2E tests (need VS Code Copilot)
-cargo clippy -- -D warnings         # lint (must be clean)
+cargo test --workspace -- --include-ignored     # include E2E tests (need VS Code Copilot)
+cargo clippy --workspace -- -D warnings         # lint (must be clean)
 cargo doc --no-deps --open          # browse generated docs
 ```
 
 **Tests must not write to `~/.edgecrab/`.** Use `tempfile::TempDir` for any test that touches the file system. Set the `EDGECRAB_HOME` env var to the temp dir path in your test fixture.
 
-Always run the full `cargo test` suite before pushing changes.
+Always run the full `cargo test --workspace` suite before pushing changes.
 
 ---
 
@@ -588,4 +589,4 @@ This project uses standard Rust toolchain (`rustup`, `cargo`). Recommended exten
 - **CodeLLDB** — debug adapter
 - **Even Better TOML** — Cargo.toml editing
 
-No extra setup required beyond `cargo build`.
+No extra setup required beyond `cargo build --workspace`.

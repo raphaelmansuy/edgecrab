@@ -129,7 +129,7 @@ EdgeCrab Docs
 |   \-- SQLite State & Search  <- session persistence & FTS5
 |
 +-- LLM Providers
-|   +-- Provider Overview      <- all 14 providers
+|   +-- Provider Overview      <- all 15 providers
 |   \-- Local Models           <- Ollama & LM Studio
 |
 +-- Integrations
