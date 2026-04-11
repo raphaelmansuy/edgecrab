@@ -795,7 +795,7 @@ impl ProfileManager {
                     last_error = None;
                     break;
                 }
-                Err(err) if !home.exists() => {
+                Err(_) if !home.exists() => {
                     last_error = None;
                     break;
                 }
