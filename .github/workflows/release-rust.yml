@@ -34,8 +34,9 @@ jobs:
           set -euo pipefail
           CRATE="$1"; shift
           FLAGS="${*:-}"
-          MAX_RETRIES=15
+          MAX_RETRIES=30
           RETRY_WAIT=660   # 11 minutes — clears the 10-minute new-crate window
+          DEPENDENCY_WAIT=30
 
           for attempt in $(seq 1 $MAX_RETRIES); do
             OUTPUT=$(cargo publish -p "$CRATE" $FLAGS 2>&1) && echo "$OUTPUT" && exit 0 || true
@@ -47,6 +48,11 @@ jobs:
             if echo "$OUTPUT" | grep -q "429\|Too Many Requests\|rate limit"; then
               echo "Rate limited. Waiting ${RETRY_WAIT}s before retry $((attempt+1))/$MAX_RETRIES ..."
               sleep $RETRY_WAIT
+              continue
+            fi
+            if echo "$OUTPUT" | grep -Eqi "failed to select a version|candidate versions found which didn't match|no matching package named|failed to get `edgecrab-|perhaps a crate was updated and forgotten to be re-vendored"; then
+              echo "Dependency propagation is not complete yet. Waiting ${DEPENDENCY_WAIT}s before retry $((attempt+1))/$MAX_RETRIES ..."
+              sleep $DEPENDENCY_WAIT
               continue
             fi
             echo "Unexpected error publishing $CRATE — aborting."
@@ -91,8 +97,8 @@ jobs:
             sleep "$WAIT_SECONDS"
           done
 
-          echo "Timed out waiting for $CRATE $VERSION on crates.io" >&2
-          exit 1
+          echo "Timed out waiting for $CRATE $VERSION on crates.io; continuing and relying on publish retries if dependency resolution still lags."
+          exit 0
           EOF
           chmod +x /usr/local/bin/wait_for_crate_version
 
