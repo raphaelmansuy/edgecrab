@@ -76,6 +76,14 @@ pub struct PlatformDiagnostic {
 #[cfg(test)]
 pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+#[cfg(test)]
+pub(crate) fn lock_test_env() -> std::sync::MutexGuard<'static, ()> {
+    match TEST_ENV_LOCK.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
 const NO_FIELDS: &[EnvField] = &[];
 
 const SMS_FIELDS: &[EnvField] = &[
@@ -1166,7 +1174,7 @@ mod tests {
 
     #[test]
     fn generic_env_platform_detects_partial_configuration() {
-        let _guard = TEST_ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_test_env();
         let config = AppConfig::default();
         unsafe {
             std::env::set_var("TWILIO_ACCOUNT_SID", "sid");
@@ -1190,7 +1198,7 @@ mod tests {
 
     #[test]
     fn whatsapp_platform_detects_unpaired_session() {
-        let _guard = TEST_ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_test_env();
         let temp = tempdir().expect("temp dir");
         let mut config = AppConfig::default();
         config.gateway.whatsapp.enabled = true;
@@ -1203,7 +1211,7 @@ mod tests {
 
     #[test]
     fn generic_platform_not_configured_does_not_emit_missing_detail() {
-        let _guard = TEST_ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_test_env();
         unsafe {
             std::env::remove_var("MATTERMOST_URL");
             std::env::remove_var("MATTERMOST_TOKEN");
@@ -1216,7 +1224,7 @@ mod tests {
 
     #[test]
     fn email_platform_requires_domain_for_mailgun() {
-        let _guard = TEST_ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_test_env();
         unsafe {
             std::env::set_var("EMAIL_PROVIDER", "mailgun");
             std::env::set_var("EMAIL_API_KEY", "key");
@@ -1236,7 +1244,7 @@ mod tests {
 
     #[test]
     fn email_platform_accepts_generic_smtp_password_without_api_key() {
-        let _guard = TEST_ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_test_env();
         unsafe {
             std::env::set_var("EMAIL_PROVIDER", "generic_smtp");
             std::env::set_var("EMAIL_FROM", "bot@example.com");
@@ -1258,7 +1266,7 @@ mod tests {
 
     #[test]
     fn api_server_false_requires_explicit_enable() {
-        let _guard = TEST_ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_test_env();
         unsafe {
             std::env::set_var("API_SERVER_ENABLED", "false");
         }
@@ -1273,7 +1281,7 @@ mod tests {
 
     #[test]
     fn explicit_disable_overrides_legacy_typed_enable_in_diagnostics() {
-        let _guard = TEST_ENV_LOCK.lock().expect("env lock");
+        let _guard = lock_test_env();
         unsafe {
             std::env::set_var("TELEGRAM_BOT_TOKEN", "token");
         }

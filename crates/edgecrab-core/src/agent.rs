@@ -125,6 +125,8 @@ pub struct AgentConfig {
     /// Optional persona/personality instruction appended to the system prompt.
     /// Resolved from `config.display.personality` via `resolve_personality()`.
     pub personality_addon: Option<String>,
+    /// Optional custom prompt persisted in config and appended to the base prompt.
+    pub custom_system_prompt: Option<String>,
     /// Model config for routing (base_url, api_key_env, smart routing).
     pub model_config: crate::config::ModelConfig,
     /// Skills config — disabled skills, platform-specific disabled.
@@ -204,6 +206,7 @@ impl Default for AgentConfig {
             skip_memory: false,
             reasoning_effort: None,
             personality_addon: None,
+            custom_system_prompt: None,
             model_config: crate::config::ModelConfig::default(),
             skills_config: crate::config::SkillsConfig::default(),
             plugins_config: crate::config::PluginsConfig::default(),
@@ -905,6 +908,10 @@ impl Agent {
         self.session.read().await.cached_system_prompt.clone()
     }
 
+    pub async fn custom_system_prompt(&self) -> Option<String> {
+        self.config.read().await.custom_system_prompt.clone()
+    }
+
     /// Publish the latest local turn snapshot back into shared session state.
     ///
     /// WHY whole-state replace: execute_loop now owns a local SessionState copy
@@ -943,6 +950,36 @@ impl Agent {
         {
             let mut config = self.config.write().await;
             config.personality_addon = addon;
+        }
+        self.invalidate_system_prompt().await;
+    }
+
+    pub async fn set_custom_system_prompt(&self, prompt: Option<String>) {
+        {
+            let mut config = self.config.write().await;
+            config.custom_system_prompt = prompt.and_then(|value| {
+                let trimmed = value.trim();
+                (!trimmed.is_empty()).then_some(trimmed.to_string())
+            });
+        }
+        self.invalidate_system_prompt().await;
+    }
+
+    pub async fn preloaded_skills(&self) -> Vec<String> {
+        self.config.read().await.skills_config.preloaded.clone()
+    }
+
+    pub fn preloaded_skills_snapshot(&self) -> Vec<String> {
+        self.config
+            .try_read()
+            .map(|config| config.skills_config.preloaded.clone())
+            .unwrap_or_default()
+    }
+
+    pub async fn set_preloaded_skills(&self, skills: Vec<String>) {
+        {
+            let mut config = self.config.write().await;
+            config.skills_config.preloaded = skills;
         }
         self.invalidate_system_prompt().await;
     }
@@ -1640,6 +1677,8 @@ impl AgentBuilder {
 
         Self {
             config: AgentConfig {
+                custom_system_prompt: (!config.agent.system_prompt.trim().is_empty())
+                    .then_some(config.agent.system_prompt.clone()),
                 model: config.model.default_model.clone(),
                 enabled_toolsets: config.tools.enabled_toolsets.clone().unwrap_or_default(),
                 disabled_toolsets: config.tools.disabled_toolsets.clone().unwrap_or_default(),

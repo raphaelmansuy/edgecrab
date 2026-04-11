@@ -163,7 +163,7 @@ Watch what the agent does:
 If something is missing, edit `~/.edgecrab/skills/git-pr-review.md` and:
 
 ```
-/theme    # Reload (skills are reloaded with the theme)
+/skin     # Reload skin/browser state (skills are re-indexed automatically)
 ```
 
 Or exit and restart EdgeCrab.

@@ -696,7 +696,6 @@ mod tests {
     use super::*;
     use std::fs;
     use std::sync::Arc;
-    use std::sync::OnceLock;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use axum::extract::{Query, State};
@@ -762,11 +761,6 @@ mod tests {
         (format!("http://{}", addr), shutdown_tx, state)
     }
 
-    fn env_lock() -> &'static tokio::sync::Mutex<()> {
-        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
-    }
-
     struct EnvVarGuard {
         key: &'static str,
         previous: Option<std::ffi::OsString>,
@@ -775,7 +769,7 @@ mod tests {
     impl EnvVarGuard {
         fn set(key: &'static str, value: &std::path::Path) -> Self {
             let previous = std::env::var_os(key);
-            // SAFETY: tests serialize env mutations through env_lock().
+            // SAFETY: tests serialize env mutations through lock_test_env().
             unsafe {
                 std::env::set_var(key, value);
             }
@@ -784,7 +778,7 @@ mod tests {
 
         fn set_value(key: &'static str, value: &str) -> Self {
             let previous = std::env::var_os(key);
-            // SAFETY: tests serialize env mutations through env_lock().
+            // SAFETY: tests serialize env mutations through lock_test_env().
             unsafe {
                 std::env::set_var(key, value);
             }
@@ -794,7 +788,7 @@ mod tests {
 
     impl Drop for EnvVarGuard {
         fn drop(&mut self) {
-            // SAFETY: tests serialize env mutations through env_lock().
+            // SAFETY: tests serialize env mutations through lock_test_env().
             unsafe {
                 if let Some(previous) = self.previous.take() {
                     std::env::set_var(self.key, previous);
@@ -834,19 +828,17 @@ mod tests {
         assert!(err.to_string().contains("localhost"));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial(edgecrab_home_env)]
     async fn browser_launch_can_be_disabled_for_tests_and_ci() {
-        let _guard = env_lock().lock().await;
         let _disable_guard = EnvVarGuard::set_value("EDGECRAB_DISABLE_BROWSER_OPEN", "1");
         assert!(browser_launch_suppressed());
         open_url_in_browser("https://example.com/oauth").expect("suppressed browser launch");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial(edgecrab_home_env)]
     async fn authorization_code_login_supports_dynamic_loopback_redirects() {
-        let _guard = env_lock().lock().await;
         let (base_url, shutdown_tx, state) = spawn_browser_oauth_server().await;
         let home = tempdir().expect("temp home");
         let edgecrab_home = home.path().join(".edgecrab");

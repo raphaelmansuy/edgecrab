@@ -384,6 +384,7 @@ impl MattermostAdapter {
                 thread_id: root_id,
                 user_display_name: data["sender_name"].as_str().map(String::from),
                 attachments: Vec::new(),
+                ..Default::default()
             },
         };
 

@@ -10,7 +10,7 @@
 [![CI](https://github.com/raphaelmansuy/edgecrab/actions/workflows/ci.yml/badge.svg)](https://github.com/raphaelmansuy/edgecrab/actions/workflows/ci.yml)
 [![Website](https://img.shields.io/badge/Website-edgecrab.com-orange.svg)](https://www.edgecrab.com)
 
-EdgeCrab is a **SuperAgent** — a personal assistant and coding agent forged in Rust. It carries the soul of **Nous Hermes Agent** (autonomous reasoning, persistent memory, user-first alignment) and the always-on presence of **OpenClaw** (15 messaging gateways, smart-home integration), compressed into a **15 MB static binary** that starts in **< 50 ms** with zero runtime dependencies.
+EdgeCrab is a **SuperAgent** — a personal assistant and coding agent forged in Rust. It carries the soul of **Nous Hermes Agent** (autonomous reasoning, persistent memory, user-first alignment) and the always-on presence of **OpenClaw** (15 messaging gateways, smart-home integration), packaged as a stripped native release binary of about **49 MB** on current macOS arm64 builds, with zero Python or Node.js runtime dependencies.
 
 
 
@@ -25,10 +25,10 @@ hermes-agent soul  +  OpenClaw vision  =  EdgeCrab
 
 | Metric              | EdgeCrab 🦀                     | hermes-agent ☤   |
 | ------------------- | ------------------------------ | ---------------- |
-| Binary              | 15 MB static                   | Python venv + uv |
-| Startup             | < 50 ms                        | ~1–3 s           |
-| Memory              | ~15 MB resident                | ~80–150 MB       |
-| LLM providers       | 14 built-in (+ Azure, Bedrock) | varies           |
+| Binary              | ~49 MB stripped release build  | Python venv + uv |
+| Runtime bootstrap   | None                           | Python + uv      |
+| Memory              | Workload-dependent native process | ~80–150 MB    |
+| LLM providers       | 15 built-in                    | varies           |
 | Messaging platforms | 15 gateways                    | 7 platforms      |
 | Tests               | 1629 passing (Rust)            | —                |
 | Migrate from hermes | `edgecrab migrate`             | N/A              |
@@ -77,7 +77,7 @@ hermes-agent soul  +  OpenClaw vision  =  EdgeCrab
     - [Checkpoints \& Rollback](#checkpoints--rollback)
     - [Profiles \& Worktrees](#profiles--worktrees)
     - [Vision, TTS \& Transcription](#vision-tts--transcription)
-  - [14 LLM Providers](#14-llm-providers)
+  - [15 LLM Providers](#15-llm-providers)
   - [6 Terminal Backends](#6-terminal-backends)
   - [MCP Server Integration](#mcp-server-integration)
   - [ACP / VS Code Copilot Integration](#acp--vs-code-copilot-integration)
@@ -109,7 +109,7 @@ Most AI agents are either too constrained (coding agents that forget you exist a
 
 **It's everywhere.** Like OpenClaw, EdgeCrab lives in your channels — Telegram, Discord, Slack, WhatsApp, Signal, Matrix, Mattermost, DingTalk, SMS, Email, Home Assistant, and more. Send it a voice memo on WhatsApp and get a PR back.
 
-**It's fast and lean.** Unlike Python agents, EdgeCrab is a Rust binary. It starts before you finish blinking. It uses ~15 MB of RAM instead of 150 MB. Security is compiled in — path jails, SSRF guards, command scanners — not runtime patches.
+**It's fast and lean.** Unlike Python agents, EdgeCrab ships as a native Rust binary instead of a Python or Node.js runtime stack. Current stripped macOS arm64 release builds land around 49 MB, and security is compiled in — path jails, SSRF guards, command scanners — not runtime patches.
 
 **It's extensible.** MCP servers, custom Rust tools, Python/JS sandboxes, sub-agents, Mixture-of-Agents consensus — the full toolkit for heavy-duty automation.
 
@@ -717,17 +717,55 @@ The `checkpoint` tool is also available to the agent itself — it can snapshot 
 
 ### Profiles & Worktrees
 
-**Profiles** let you switch between different configurations instantly:
+**Profiles** give EdgeCrab isolated runtime homes with separate `config.yaml`,
+`.env`, `SOUL.md`, memories, skills, plugins, hooks, MCP tokens, and
+`state.db`. EdgeCrab now seeds three starter profiles by default:
+`work`, `research`, and `homelab`.
 
 ```bash
-edgecrab profile create work         # create "work" profile
-edgecrab profile create homelab      # create "homelab" profile
-edgecrab profile use work            # switch to work profile
-edgecrab profile alias w work        # alias shorthand
+edgecrab profile list                # default + bundled starters
+edgecrab profile show work
+edgecrab profile use work            # sticky default profile
+edgecrab -p research "compare SDKs"  # one-shot override
+edgecrab profile alias work --name w
 edgecrab profile list
 ```
 
-Profiles store their config in `~/.edgecrab/profiles/<name>/` — different API keys, default models, memory files, and toolsets per context.
+Starter profile examples:
+
+```yaml
+# ~/.edgecrab/profiles/work/config.yaml
+model:
+  default: "anthropic/claude-opus-4.6"
+  max_iterations: 90
+
+display:
+  personality: "technical"
+  tool_progress: "verbose"
+  show_cost: true
+
+reasoning_effort: "high"
+```
+
+```yaml
+# ~/.edgecrab/profiles/research/config.yaml
+model:
+  default: "openai/gpt-5"
+  max_iterations: 120
+
+display:
+  personality: "teacher"
+
+reasoning_effort: "high"
+```
+
+In the TUI, `/profile` now mirrors Hermes and shows the active profile name
+plus its effective home directory. `/profiles` opens the interactive browser,
+and `/profile show <name>` jumps that browser to a specific profile. Inside it: `Enter` switch,
+`C` config, `S` SOUL, `M` memory, `T` tools, `A` alias, `E` export,
+`D` delete, `N` create, `I` import, `O` rename, `Tab` or `Left`/`Right`
+cycle detail views, and `Home`/`End` jump through results. The runtime
+switch is live, not deferred to the next launch.
 
 **Worktrees** isolate each agent session in a separate git worktree:
 
@@ -759,9 +797,9 @@ Transcription: Whisper (local), Groq Whisper, OpenAI Whisper.
 
 ---
 
-## 14 LLM Providers
+## 15 LLM Providers
 
-EdgeCrab ships with 14 LLM providers out of the box (12 cloud, 2 local). Over 200 models compiled in, with user override via `~/.edgecrab/models.yaml`.
+EdgeCrab ships with 15 LLM providers out of the box (13 cloud, 2 local). Over 200 models are compiled in, with user override via `~/.edgecrab/models.yaml`.
 
 | Provider      | Env Var                          | Notable Models                                    |
 | ------------- | -------------------------------- | ------------------------------------------------- |
@@ -968,6 +1006,14 @@ edgecrab tools enable <toolset>
 edgecrab tools disable <toolset>
 
 # Providers
+edgecrab auth list
+edgecrab auth status [copilot|provider/<name>|mcp/<server>]
+edgecrab auth add copilot --token <github-token>
+edgecrab auth add provider/openai --token <api-token>   # writes ~/.edgecrab/.env and ~/.edgecrab/auth.json
+edgecrab auth add mcp/<server> --token <bearer-token>
+edgecrab auth login [copilot|mcp/<server>]
+edgecrab login <target>
+edgecrab logout [target]                                 # clears local auth cache; provider targets also clear auth.json metadata
 edgecrab mcp list
 edgecrab mcp add <name>
 edgecrab mcp remove <name>
@@ -1001,8 +1047,16 @@ edgecrab gateway stop
 edgecrab gateway restart
 edgecrab gateway status
 edgecrab gateway configure [--platform <name>]
+edgecrab webhook subscribe <name> [--events push,pull_request] [--skill code-review] [--deliver github_comment] [--deliver-extra repo=org/repo] [--deliver-extra pr_number=42] [--rate-limit 30] [--max-body-bytes 1048576]
+edgecrab webhook list
+edgecrab webhook test <name>
+edgecrab webhook path
 edgecrab whatsapp               # WhatsApp QR pairing wizard
 edgecrab status                 # overall gateway status
+
+# Cleanup
+edgecrab uninstall --dry-run
+edgecrab uninstall --purge-data --yes
 
 # Skills
 edgecrab skills list
@@ -1018,10 +1072,10 @@ edgecrab profile use <name>
 edgecrab profile create <name>
 edgecrab profile delete <name>
 edgecrab profile show [name]
-edgecrab profile alias <alias> <name>
+edgecrab profile alias <name> [--name alias]
 edgecrab profile rename <old> <new>
 edgecrab profile export <name> [--output path]
-edgecrab profile import <path>
+edgecrab profile import <path> [--name name]
 
 # ACP
 edgecrab acp                    # start ACP stdio server
@@ -1039,11 +1093,14 @@ edgecrab completion fish
 
 Type these inside the TUI (after `❯`):
 
+Every built-in slash command is also reachable from argv with
+`edgecrab slash <command...>`.
+
 | Command                                  | Action                                          |
 | ---------------------------------------- | ----------------------------------------------- |
 | `/help`                                  | List all slash commands with descriptions       |
 | `/quit` / `/exit`                        | Exit EdgeCrab                                   |
-| `/clear`                                 | Clear the output area                           |
+| `/clear`                                 | Clear the screen and start a fresh session      |
 | `/new`                                   | Start a fresh session                           |
 | `/model [provider/model]`                | Hot-swap LLM without restart                    |
 | `/reasoning [effort]`                    | Set reasoning effort (low/medium/high/auto)     |
@@ -1057,8 +1114,8 @@ Type these inside the TUI (after `❯`):
 | `/resume [id-or-title]`                  | Resume a past session                           |
 | `/session [list/switch/delete]`          | Manage sessions                                 |
 | `/config [show/set]`                     | View or update config                           |
-| `/prompt`                                | Show current system prompt                      |
-| `/verbose`                               | Toggle verbose tool output                      |
+| `/prompt`                                | Show, clear, or set the custom system prompt    |
+| `/verbose`                               | Cycle tool progress or set it explicitly        |
 | `/personality [preset]`                  | Switch agent personality (14 presets)           |
 | `/statusbar`                             | Toggle status bar                               |
 | `/tools`                                 | List active toolsets and tools                  |
@@ -1071,8 +1128,8 @@ Type these inside the TUI (after `❯`):
 | `/cost`                                  | Show token costs for this session               |
 | `/usage`                                 | Detailed usage breakdown                        |
 | `/compress`                              | Force context compression now                   |
-| `/insights`                              | Show session statistics and key moments         |
-| `/theme [preset]`                        | List or switch built-in theme                   |
+| `/insights [days]`                       | Show session statistics and N-day historical analytics |
+| `/skin [preset]`                         | Browse or switch skins (`/theme` alias)         |
 | `/paste`                                 | Toggle paste mode (multi-line clipboard input)  |
 | `/queue <message>`                       | Queue a message while agent is running          |
 | `/background`                            | Fork current task to background, free the TUI   |
@@ -1080,7 +1137,7 @@ Type these inside the TUI (after `❯`):
 | `/platforms`                             | Show connected gateway platforms                |
 | `/approve`                               | Approve a pending agent action                  |
 | `/deny`                                  | Deny a pending agent action                     |
-| `/sethome`                               | Set cwd as home directory                       |
+| `/sethome`                               | Configure gateway home channel                  |
 | `/update`                                | Check for EdgeCrab updates                      |
 | `/cron [list/add/remove]`                | Manage cron jobs inline                         |
 | `/voice <on/off/status>`                 | Toggle voice output                             |
@@ -1367,6 +1424,10 @@ edgecrab migrate --dry-run
 
 # Live migration
 edgecrab migrate
+
+# OpenClaw import
+edgecrab claw migrate --dry-run
+edgecrab claw migrate
 ```
 
 | What        | From                    | To                        |
@@ -1377,6 +1438,11 @@ edgecrab migrate
 | Environment | `~/.hermes/.env`        | `~/.edgecrab/.env`        |
 
 The migrator is in `crates/edgecrab-migrate/`. It returns a `MigrationReport` with per-item `MigrationStatus` (Success/Skipped/Failed). Config format differences are handled automatically.
+
+For OpenClaw, EdgeCrab imports the parts that map cleanly into EdgeCrab-native
+state (`SOUL.md`, memories, skills, selected `.env` keys, selected config
+sections) and archives unsupported OpenClaw-only config under
+`~/.edgecrab/migration/openclaw/` for manual review.
 
 ---
 

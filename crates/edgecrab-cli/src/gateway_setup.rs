@@ -2285,9 +2285,7 @@ mod tests {
     #[test]
     #[serial_test::serial(edgecrab_home_env)]
     fn save_env_key_updates_exact_match_only() {
-        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
-            .lock()
-            .expect("env lock");
+        let _guard = crate::gateway_catalog::lock_test_env();
         let home = tempdir().expect("temp dir");
         unsafe {
             std::env::set_var("EDGECRAB_HOME", home.path());
@@ -2309,9 +2307,7 @@ mod tests {
     #[test]
     #[serial_test::serial(edgecrab_home_env)]
     fn remove_env_key_deletes_only_target_key() {
-        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
-            .lock()
-            .expect("env lock");
+        let _guard = crate::gateway_catalog::lock_test_env();
         let home = tempdir().expect("temp dir");
         unsafe {
             std::env::set_var("EDGECRAB_HOME", home.path());

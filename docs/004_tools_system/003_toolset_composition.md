@@ -6,7 +6,7 @@
 
 ## Why toolsets exist
 
-Giving the model all 65 tools on every turn has two costs: it inflates the
+Giving the model all 91 core tools on every turn has two costs: it inflates the
 token count of every API call (tool schemas take tokens), and it gives the model
 a larger decision surface for choosing the wrong tool. Toolsets are a
 configuration-time policy layer that controls which tools the model can access
@@ -226,7 +226,7 @@ a tool in multiple contexts, use an alias that includes all the relevant canonic
 
 ## Cross-references
 
-- All 65 tools by function → [Tool Catalogue](./002_tool_catalogue.md)
+- All 91 core tools by function → [Tool Catalogue](./002_tool_catalogue.md)
 - How toolsets are filtered at dispatch → [Tool Registry](./001_tool_registry.md)
 - CLI `--toolset` flag → [CLI Architecture](../005_cli/001_cli_architecture.md)
 - Config file toolset settings → [Config and State](../009_config_state/001_config_state.md)

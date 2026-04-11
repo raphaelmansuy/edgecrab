@@ -15,7 +15,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 #![allow(clippy::result_large_err)]
 
-mod approval_runtime;
+pub mod approval_runtime;
 mod command_interaction;
 pub mod config_ref;
 pub mod edit_contract;

@@ -7,8 +7,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+---
+
+## [0.3.0] — 2026-04-11
 ### Added
 
+- **Profile starter bundles and code-true profile docs** — EdgeCrab now seeds bundled `work`, `research`, and `homelab` profiles with starter `config.yaml`, `SOUL.md`, and memory files, and the README, internal docs, and site docs now document the real profile YAML format and command surface.
+- **First-class TUI profile browser and live runtime switching** — `/profiles` now opens a searchable profile browser, `/profile` exposes full inline management, and `/profile use <name>` rebuilds the running runtime immediately instead of deferring the switch to the next launch.
+- **Native in-browser profile admin controls** — the profile browser now performs create, rename, import, export, alias, and delete flows through direct TUI capture overlays instead of command prefills, with `Home`/`End` navigation and inspection for `config.yaml`, `SOUL.md`, memory, and tool policy.
+- **`/profile` now routes through the same overlay surface** — profile read subcommands now open the browser on the relevant profile and detail tab instead of dropping large reports into scrollback, and the browser now supports view cycling with `Tab`, `Shift-Tab`, and `Left`/`Right`, plus an inline help tab.
 - **Hermes plugin install and runtime E2E coverage** — new CLI integration tests now install and execute a guide-style Hermes plugin bundle, a real upstream `holographic` Hermes plugin, and a real upstream `1password` Hermes skill directly through `edgecrab plugins install`.
 - **Hermes entry-point and plugin CLI E2E coverage** — a new integration test now installs a pip-distributed Hermes entry-point plugin into an isolated virtualenv, verifies discovery through `EDGECRAB_PLUGIN_PYTHON`, and executes a top-level Hermes CLI command registered through `ctx.register_cli_command()`.
 - **Community Hermes repo coverage and authoring guides** — new docs and site guides now show how to build Hermes-style plugins for EdgeCrab, and the CLI E2E suite now covers real `42-evey/hermes-plugins` plugins (`evey-telemetry`, `evey-status`).
@@ -21,6 +28,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- **Profile management now exceeds Hermes on backend safety** — profile export/import no longer shells out to `tar`, active-profile persistence is atomic, alias collisions are validated, clone flows preserve the right identity files, and profile deletion now attempts to stop a running gateway before removing the profile directory.
+- **Release documentation now follows measured reality** — README, internal docs, and the Astro site now report the current stripped macOS arm64 binary size at about 49 MB and use source-derived provider, tool, and gateway counts instead of stale marketing numbers.
 - **Hermes local bundle installs are now source-compatible** — `edgecrab plugins install ./path` now accepts raw Hermes plugin directories and raw `SKILL.md` skill bundles without requiring authors to add a handwritten `plugin.toml`.
 - **Installed Hermes plugins retain their Hermes runtime identity** — rediscovery now preserves hook introspection, bundled `SKILL.md` metadata, and the persisted `HERMES_HOME` mapping instead of degrading installed Hermes bundles into generic manifest-only plugins.
 - **Installed Hermes memory plugins now retain their upstream package identity** — flattened installs are now aliased back into `plugins.memory.<name>` so real upstream plugins such as `honcho` keep working across fresh-process rediscovery, runtime hooks, and CLI loading.
@@ -32,6 +41,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- **Full workspace release validation is green again** — the flaky profile-delete TUI test now tolerates macOS cwd races in the parallel suite, the LSP integration test no longer deadlocks by spawning `cargo run` from inside `cargo test`, and release verification now passes under `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo build --release`.
+- **OpenClaw/Hermes migration helpers now preserve heading context and character-budget merges correctly** — markdown memory extraction now drops generic top-level file headings while retaining useful subheading context, and merged memory entry limits now count characters instead of UTF-8 bytes.
 - **Hermes memory-provider plugins without static `provides_tools` declarations no longer fail local install** — EdgeCrab now permits Hermes manifest bundles whose runtime tools are discovered dynamically.
 - **Installer-stamped trusted manifests now rediscover cleanly** — plugin manifests stamped with install-time trust/source/checksum metadata no longer fail validation as if the bundle had self-assigned trust.
 - **Manifest-backed skill installs now surface missing credentials correctly** — installed Hermes skills such as `1password` now keep their `setup-needed` state and missing environment variable list in `/plugins info`.
@@ -304,4 +315,4 @@ _First public release. Phase 5: Integration & Polish._
 - **Total: 1753 tests across all packages**
 - Clippy: **0 warnings** with `-D warnings`
 - Build time: ~5s (debug), clean cache
-- Binary size: **15 MB** static, < 50 ms cold start
+- Binary size: **~49 MB** for current stripped macOS arm64 release builds; startup time depends on provider and environment

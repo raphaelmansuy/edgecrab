@@ -106,6 +106,8 @@ Gateway-specific and terminal-specific variables follow the same `EDGECRAB_` pre
 ```
 ~/.edgecrab/              ← $EDGECRAB_HOME (default)
 ├── config.yaml           ← main config (Tier 2)
+├── auth.json             ← structured provider-auth metadata and active provider
+├── .env                  ← provider API keys and other local secrets
 ├── models.yaml           ← model catalog with cost metadata
 ├── SOUL.md               ← persistent personality / system-prompt addendum
 ├── state.db              ← SQLite session store (schema v6)
@@ -136,14 +138,25 @@ Each profile is an isolated runtime context. Profile switching changes the effec
 ```
 ~/.edgecrab/profiles/<name>/
 ├── config.yaml     ← profile-specific overrides
+├── auth.json       ← profile-scoped provider auth metadata
 ├── .env            ← profile-specific secrets (loaded before env vars)
 ├── SOUL.md         ← profile-specific personality
+├── memories/       ← profile-specific durable memory
+├── skills/         ← profile-specific skills
+├── plugins/        ← profile-specific plugins
+├── hooks/          ← profile-specific hooks
 └── state.db        ← profile-specific session store
 ```
 
-**What profiles share**: the global `models.yaml` and the global `~/.edgecrab/skills/` directory (unless overridden in the profile `config.yaml`).
+EdgeCrab seeds bundled starter profiles on normal startup and profile commands:
+`work`, `research`, and `homelab`. These are created once under
+`~/.edgecrab/profiles/` and never overwrite existing user-edited profiles.
 
-**What profiles isolate**: conversation history, secrets, model selection, memory, and personality.
+**What profiles share**: the `edgecrab` binary, the global sticky-profile marker
+`~/.edgecrab/.active_profile`, and repo-local context files such as `AGENTS.md`.
+
+**What profiles isolate**: conversation history, secrets, model selection,
+memory, skills, plugins, hooks, MCP tokens, and personality.
 
 ```bash
 # switch to the "work" profile for this session
@@ -192,6 +205,7 @@ moa:
 ## Tips
 
 - **Don't store secrets in `config.yaml`** — use a profile `.env` file or real environment variables; secrets are redacted from logs via `edgecrab-security/src/redact.rs` but only if they contain a known pattern.
+- **Provider auth now has two local layers** — `auth.json` tracks the active provider and metadata, while `.env` still carries the actual provider API key material used at runtime.
 - **The `SOUL.md` file is the fastest way to give EdgeCrab a persistent personality** without modifying code. It is appended to the system prompt on every turn.
 - **`models.yaml` controls cost tracking** — if you add a new model, add a cost entry so `/cost` and trajectory files report accurately.
 

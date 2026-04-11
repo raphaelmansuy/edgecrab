@@ -1,0 +1,18 @@
+# Starter profile: work
+# Focus: production engineering, code review, operational discipline.
+
+model:
+  default: "anthropic/claude-opus-4.6"
+  max_iterations: 90
+
+display:
+  personality: "technical"
+  show_cost: true
+  show_status_bar: true
+  tool_progress: "verbose"
+
+honcho:
+  enabled: true
+  cloud_sync: false
+
+reasoning_effort: "high"

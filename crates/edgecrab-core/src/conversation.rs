@@ -540,6 +540,11 @@ impl Agent {
                     )
             };
             // Append personality addon if configured (e.g. kawaii, pirate, philosopher)
+            let prompt = if let Some(ref custom_prompt) = config.custom_system_prompt {
+                format!("{prompt}\n\n{custom_prompt}")
+            } else {
+                prompt
+            };
             let prompt = if let Some(ref addon) = config.personality_addon {
                 format!("{prompt}\n\n## Personality\n\n{addon}")
             } else {

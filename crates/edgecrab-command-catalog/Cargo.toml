@@ -1,0 +1,9 @@
+[package]
+name = "edgecrab-command-catalog"
+description = "Shared slash-command metadata for EdgeCrab CLI and gateway"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]

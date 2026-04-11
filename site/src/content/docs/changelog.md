@@ -10,7 +10,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
-## [Unreleased] — Phase 5: Integration & Polish
+## [Unreleased]
+
+---
+
+## [0.3.0] — Phase 5: Integration & Polish
 
 ### Added
 
@@ -24,17 +28,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 - **CI and release automation updated for `edgecrab-lsp`** — CI now runs the dedicated LSP package tests explicitly and the crates.io publish order includes the new crate before `edgecrab-core`.
 - **Docs and website refreshed** — the features overview, tool reference, coding workflows guide, and configuration reference now document the LSP feature set and configuration.
+- **Release-prep honesty pass** — the README, internal docs, and site now use source-derived provider/tool/gateway counts and the measured stripped macOS arm64 release binary size of about 49 MB instead of stale placeholder numbers.
 
 ### Stats
 
 | Metric | Value |
 |--------|-------|
-| Tests passing | **324** (unit + integration + e2e) |
+| Verification | **`cargo test --workspace` passed** |
 | Clippy warnings | **0** (`-D warnings`) |
-| Binary size | **~15 MB** (static, stripped) |
-| Cold startup | **< 50 ms** |
+| Binary size | **~49 MB** (current stripped macOS arm64 release build) |
+| Startup profile | **Native binary, no Python/Node bootstrap** |
 | Rust edition | **2024** |
-| MSRV | **1.85.0** |
+| MSRV | **1.86.0** |
 
 ---
 

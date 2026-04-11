@@ -143,7 +143,7 @@ export default defineConfig({
 						downloadUrl: 'https://github.com/raphaelmansuy/edgecrab/releases',
 						softwareVersion: '0.1.2',
 						description:
-							'Rust-native autonomous coding agent and personal assistant. 74 tools, 14 LLM providers, 15 messaging gateways, single 15 MB binary with < 50 ms startup.',
+							'Rust-native autonomous coding agent and personal assistant. 91 core tools, 15 LLM providers, 15 messaging gateways, and a stripped release binary around 49 MB on current macOS arm64 builds.',
 						offers: {
 							'@type': 'Offer',
 							price: '0',

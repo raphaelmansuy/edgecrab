@@ -1,6 +1,6 @@
 # 🦀 Security Model
 
-> **WHY**: An AI agent that can run shell commands, read files, and fetch URLs is an attractive target for prompt injection, path traversal, SSRF, and secret leakage. Rather than scattering ad-hoc checks across 65 tools, EdgeCrab centralises all security primitives in `edgecrab-security` — a single crate every tool calls before doing real work.
+> **WHY**: An AI agent that can run shell commands, read files, and fetch URLs is an attractive target for prompt injection, path traversal, SSRF, and secret leakage. Rather than scattering ad-hoc checks across 91 core tools, EdgeCrab centralises all security primitives in `edgecrab-security` — a single crate every tool calls before doing real work.
 
 **Source**: `crates/edgecrab-security/src/`
 

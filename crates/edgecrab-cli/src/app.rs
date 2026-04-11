@@ -55,7 +55,7 @@ use tui_textarea::{CursorMove, Scrolling, TextArea, WrapMode};
 use unicode_width::UnicodeWidthStr;
 
 use crate::cli_args::CliArgs;
-use crate::commands::{CommandRegistry, CommandResult, ToolManagerMode};
+use crate::commands::{CommandRegistry, CommandResult, ToolManagerMode, gateway_commands_page};
 use crate::edit_diff::{LocalEditSnapshot, capture_local_edit_snapshot, render_edit_diff_lines};
 use crate::fuzzy_selector::{FuzzyItem, FuzzySelector};
 use crate::gateway_browser::{
@@ -67,6 +67,10 @@ use crate::markdown_render;
 use crate::mcp_support;
 use crate::plugin_toggle::{
     PluginCheckState, PluginScope, PluginToggleEntry, plugin_toggle_status_line,
+};
+use crate::profile::{ProfileManager, ProfileSummary};
+use crate::runtime::{
+    build_agent, build_tool_registry_with_mcp_discovery, load_runtime, open_state_db,
 };
 use crate::theme::{SkinConfig, Theme};
 use crate::tool_display::{
@@ -1518,6 +1522,12 @@ enum ValueCaptureAction {
     HomeChannel(String),
     AllowedUsers(String),
     PrimaryField(String),
+    ProfileCreate,
+    ProfileRename(String),
+    ProfileDeleteConfirm(String),
+    ProfileAlias(String),
+    ProfileExport(String),
+    ProfileImport,
 }
 
 /// Result payload delivered back to the main loop via `AgentResponse::BgOp`
@@ -1876,6 +1886,106 @@ impl FuzzyItem for SkillEntry {
     }
 }
 
+#[derive(Clone)]
+struct ProfileEntry {
+    name: String,
+    is_default: bool,
+    is_active: bool,
+    gateway_running: bool,
+    model: String,
+    detail: String,
+    detail_view: String,
+    search_text: String,
+}
+
+impl ProfileEntry {
+    fn display_title(&self) -> String {
+        let marker = if self.is_active { "*" } else { " " };
+        format!("[{marker}] {}", self.name)
+    }
+
+    fn kind_label(&self) -> &'static str {
+        if self.is_default { "default" } else { "named" }
+    }
+
+    fn status_label(&self) -> &'static str {
+        if self.is_active {
+            "active"
+        } else if self.gateway_running {
+            "running"
+        } else {
+            "ready"
+        }
+    }
+
+    fn detail_actions_line(&self) -> &'static str {
+        if self.is_active {
+            "Actions: Enter reload, C config, S SOUL, M memory, T tools, V summary, H help, A alias, E export, D delete, N new, I import, O rename, Tab cycle, R refresh"
+        } else {
+            "Actions: Enter switch, C config, S SOUL, M memory, T tools, V summary, H help, A alias, E export, D delete, N new, I import, O rename, Tab cycle, R refresh"
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProfileDetailMode {
+    Summary,
+    Config,
+    Soul,
+    Memory,
+    Tools,
+    Help,
+}
+
+impl ProfileDetailMode {
+    fn title(self) -> &'static str {
+        match self {
+            Self::Summary => "Summary",
+            Self::Config => "Config",
+            Self::Soul => "SOUL",
+            Self::Memory => "Memory",
+            Self::Tools => "Tools",
+            Self::Help => "Help",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Summary => Self::Config,
+            Self::Config => Self::Soul,
+            Self::Soul => Self::Memory,
+            Self::Memory => Self::Tools,
+            Self::Tools => Self::Help,
+            Self::Help => Self::Summary,
+        }
+    }
+
+    fn previous(self) -> Self {
+        match self {
+            Self::Summary => Self::Help,
+            Self::Config => Self::Summary,
+            Self::Soul => Self::Config,
+            Self::Memory => Self::Soul,
+            Self::Tools => Self::Memory,
+            Self::Help => Self::Tools,
+        }
+    }
+}
+
+impl FuzzyItem for ProfileEntry {
+    fn primary(&self) -> &str {
+        &self.name
+    }
+
+    fn secondary(&self) -> &str {
+        &self.search_text
+    }
+
+    fn tag(&self) -> &str {
+        &self.model
+    }
+}
+
 struct SelectorChrome<'a> {
     title: &'a str,
     placeholder: &'a str,
@@ -1913,6 +2023,7 @@ enum DetailSurface {
     GatewayBrowser,
     McpSelector,
     RemoteMcpBrowser,
+    ProfileSelector,
     SkillSelector,
     RemoteSkillBrowser,
     RemotePluginBrowser,
@@ -1947,6 +2058,16 @@ impl SimpleDetailState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct DetailFullscreenState {
     surface: DetailSurface,
+    scroll: u16,
+}
+
+#[derive(Clone, Debug)]
+struct DocumentOverlayState {
+    title: String,
+    subtitle: String,
+    body: String,
+    icon: String,
+    accent: Color,
     scroll: u16,
 }
 
@@ -3093,6 +3214,8 @@ pub struct App {
     tool_progress_mode: ToolProgressMode,
     /// Whether the status bar is visible.
     show_status_bar: bool,
+    /// Whether dangerous command approvals are bypassed for the current session.
+    yolo_enabled: bool,
     /// Queued prompts to run after the current one completes
     prompt_queue: Vec<String>,
     /// Display state machine (spinner animation)
@@ -3131,6 +3254,10 @@ pub struct App {
     mcp_selector: FuzzySelector<McpPresetEntry>,
     /// Remote MCP browser overlay (activated by `/mcp search`).
     remote_mcp_browser: RemoteMcpBrowser,
+    /// Profile browser overlay (activated by `/profiles` with no args)
+    profile_selector: FuzzySelector<ProfileEntry>,
+    /// Active detail tab inside the profile browser overlay.
+    profile_detail_mode: ProfileDetailMode,
     /// Skill browser overlay (activated by `/skills` with no args)
     skill_selector: FuzzySelector<SkillEntry>,
     /// Tool manager overlay (activated by `/tools` or `/toolsets`)
@@ -3159,6 +3286,8 @@ pub struct App {
     detail_fullscreen: Option<DetailFullscreenState>,
     /// Scroll position for split-view overlays that do not expose a dedicated pane focus model.
     simple_detail_state: SimpleDetailState,
+    /// Shared read-only report/document overlay for slash command inspection flows.
+    document_overlay: Option<DocumentOverlayState>,
     /// Drill-down inspector for a single saved session.
     session_inspector: SessionInspector,
     /// Config center overlay (activated by `/config`)
@@ -3433,7 +3562,10 @@ enum AgentResponse {
         error: String,
     },
     /// A remote skill install/update action completed.
-    RemoteSkillActionComplete { message: String, skill_name: String },
+    RemoteSkillActionComplete {
+        message: String,
+        skill_name: String,
+    },
     /// A remote skill install/update action failed.
     RemoteSkillActionFailed {
         action_label: String,
@@ -3461,11 +3593,22 @@ enum AgentResponse {
         response: String,
     },
     /// A background session reported progress.
-    BackgroundPromptProgress { task_id: String, text: String },
+    BackgroundPromptProgress {
+        task_id: String,
+        text: String,
+    },
     /// An isolated `/background` session failed.
     BackgroundPromptFailed {
         task_num: u64,
         task_id: String,
+        error: String,
+    },
+    SideQuestionComplete {
+        question: String,
+        response: String,
+    },
+    SideQuestionFailed {
+        question: String,
         error: String,
     },
 }
@@ -3768,6 +3911,7 @@ impl App {
             streaming_enabled: display_preferences.streaming_enabled,
             tool_progress_mode: display_preferences.tool_progress_mode,
             show_status_bar: display_preferences.show_status_bar,
+            yolo_enabled: false,
             prompt_queue: Vec::new(),
             display_state: DisplayState::Idle,
             completion: CompletionState {
@@ -3799,6 +3943,8 @@ impl App {
             moa_reference_selector_mode: MoaReferenceSelectorMode::EditRoster,
             mcp_selector: FuzzySelector::new(),
             remote_mcp_browser: RemoteMcpBrowser::new(),
+            profile_selector: FuzzySelector::new(),
+            profile_detail_mode: ProfileDetailMode::Summary,
             skill_selector: FuzzySelector::new(),
             tool_manager: FuzzySelector::new(),
             tool_manager_scope: ToolManagerScope::All,
@@ -3813,6 +3959,7 @@ impl App {
             session_browser_pane: DetailPaneState::default(),
             detail_fullscreen: None,
             simple_detail_state: SimpleDetailState::default(),
+            document_overlay: None,
             session_inspector: SessionInspector::new(),
             config_selector: FuzzySelector::new(),
             gateway_browser: FuzzySelector::new(),
@@ -3880,6 +4027,7 @@ impl App {
 
         // Pre-load skills list for completion overlay
         app.refresh_skills_list();
+        app.refresh_profiles_list();
 
         app
     }
@@ -3894,7 +4042,13 @@ impl App {
 
     /// Set the agent for LLM dispatch.
     pub fn set_agent(&mut self, agent: Arc<Agent>) {
+        self.active_skills = agent.preloaded_skills_snapshot();
+        self.refresh_skills_list();
         self.agent = Some(agent);
+    }
+
+    pub fn set_yolo_enabled(&mut self, enabled: bool) {
+        self.yolo_enabled = enabled;
     }
 
     /// Get a reference to the agent, or push an error and return None.
@@ -4015,6 +4169,24 @@ impl App {
         // cells are only erased by a full clear → next draw writes every cell.
         self.needs_full_terminal_clear = true;
         self.needs_redraw = true;
+    }
+
+    fn start_fresh_session(&mut self, status_message: Option<&str>, show_banner: bool) {
+        if let Some(ref agent) = self.agent {
+            let agent = Arc::clone(agent);
+            self.rt_handle.block_on(async move {
+                agent.new_session().await;
+            });
+        }
+        self.yolo_enabled = false;
+        self.clear_output();
+        if show_banner {
+            let model = self.model_name.clone();
+            self.push_colorful_banner(&model);
+        }
+        if let Some(message) = status_message {
+            self.push_output(message, OutputRole::System);
+        }
     }
 
     /// Push a borderless gradient welcome banner into the output area.
@@ -4677,6 +4849,194 @@ impl App {
     fn open_skill_selector(&mut self) {
         self.reset_split_detail_scroll(DetailSurface::SkillSelector);
         self.skill_selector.activate();
+    }
+
+    fn build_profile_entry(summary: ProfileSummary) -> ProfileEntry {
+        let detail = format!(
+            "{} | skills={} | sessions={} | env={} | gw={}",
+            summary.model,
+            summary.skill_count,
+            summary.session_count,
+            if summary.has_env { "yes" } else { "no" },
+            if summary.gateway_running { "on" } else { "off" }
+        );
+        let alias = summary
+            .alias_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "none".into());
+        let detail_view = format!(
+            "Profile:  {}\nKind:     {}\nState:    {}\nHome:     {}\nModel:    {}\nSkills:   {}\nPlugins:  {}\nHooks:    {}\nSessions: {}\nGateway:  {}\nEnv:      {}\nSOUL:     {}\nHoncho:   {}\nMCP:      {} enabled\nAlias:    {}\nDisk:     {} MB",
+            summary.name,
+            summary.kind_label(),
+            summary.state_label(),
+            summary.home.display(),
+            summary.model,
+            summary.skill_count,
+            summary.plugin_count,
+            summary.hook_count,
+            summary.session_count,
+            if summary.gateway_running {
+                "running"
+            } else {
+                "stopped"
+            },
+            if summary.has_env {
+                "present"
+            } else {
+                "missing"
+            },
+            if summary.soul_present {
+                "present"
+            } else {
+                "missing"
+            },
+            summary.honcho_label(),
+            summary.enabled_mcp_servers,
+            alias,
+            summary.disk_mb
+        );
+        let search_text = format!(
+            "{} {} {} {} {} {} {} {} {}",
+            summary.name,
+            summary.kind_label(),
+            summary.state_label(),
+            summary.model,
+            summary.home.display(),
+            detail,
+            if summary.has_env { "env" } else { "" },
+            if summary.gateway_running {
+                "gateway"
+            } else {
+                ""
+            },
+            alias
+        );
+        ProfileEntry {
+            name: summary.name,
+            is_default: summary.is_default,
+            is_active: summary.is_active,
+            gateway_running: summary.gateway_running,
+            model: summary.model,
+            detail,
+            detail_view,
+            search_text,
+        }
+    }
+
+    fn refresh_profiles_list(&mut self) {
+        let manager = ProfileManager::new();
+        let entries = manager
+            .summaries()
+            .map(|summaries| {
+                let mut entries: Vec<ProfileEntry> = summaries
+                    .into_iter()
+                    .map(Self::build_profile_entry)
+                    .collect();
+                entries.sort_by(|left, right| {
+                    right
+                        .is_active
+                        .cmp(&left.is_active)
+                        .then_with(|| left.name.cmp(&right.name))
+                });
+                entries
+            })
+            .unwrap_or_default();
+        self.profile_selector
+            .replace_items_preserving_state(entries);
+    }
+
+    fn focus_profile_selector_item(&mut self, profile_name: Option<&str>) {
+        if let Some(name) = profile_name {
+            self.profile_selector.activate_with_primary(name);
+        } else {
+            self.profile_selector.activate();
+        }
+    }
+
+    fn set_profile_detail_mode(&mut self, mode: ProfileDetailMode) {
+        self.profile_detail_mode = mode;
+        self.reset_split_detail_scroll(DetailSurface::ProfileSelector);
+        self.reset_detail_fullscreen_scroll(DetailSurface::ProfileSelector);
+        self.needs_redraw = true;
+    }
+
+    fn cycle_profile_detail_mode(&mut self, forward: bool) {
+        let mode = if forward {
+            self.profile_detail_mode.next()
+        } else {
+            self.profile_detail_mode.previous()
+        };
+        self.set_profile_detail_mode(mode);
+    }
+
+    fn open_profile_selector_with(
+        &mut self,
+        profile_name: Option<&str>,
+        detail_mode: ProfileDetailMode,
+    ) {
+        self.refresh_profiles_list();
+        self.profile_detail_mode = detail_mode;
+        self.reset_split_detail_scroll(DetailSurface::ProfileSelector);
+        self.reset_detail_fullscreen_scroll(DetailSurface::ProfileSelector);
+        self.focus_profile_selector_item(profile_name);
+        self.needs_redraw = true;
+    }
+
+    fn open_profile_selector(&mut self) {
+        self.open_profile_selector_with(None, ProfileDetailMode::Summary);
+    }
+
+    fn open_document_overlay(
+        &mut self,
+        title: impl Into<String>,
+        subtitle: impl Into<String>,
+        body: impl Into<String>,
+        icon: impl Into<String>,
+        accent: Color,
+    ) {
+        self.document_overlay = Some(DocumentOverlayState {
+            title: title.into(),
+            subtitle: subtitle.into(),
+            body: body.into(),
+            icon: icon.into(),
+            accent,
+            scroll: 0,
+        });
+        self.needs_redraw = true;
+    }
+
+    fn close_document_overlay(&mut self) {
+        self.document_overlay = None;
+        self.needs_redraw = true;
+    }
+
+    fn scroll_document_overlay(&mut self, delta: i16) {
+        let Some(overlay) = self.document_overlay.as_mut() else {
+            return;
+        };
+        overlay.scroll = if delta.is_negative() {
+            overlay.scroll.saturating_sub(delta.unsigned_abs())
+        } else {
+            overlay.scroll.saturating_add(delta as u16)
+        };
+        self.needs_redraw = true;
+    }
+
+    fn set_document_overlay_scroll(&mut self, scroll: u16) {
+        if let Some(overlay) = self.document_overlay.as_mut() {
+            overlay.scroll = scroll;
+            self.needs_redraw = true;
+        }
+    }
+
+    fn open_report_overlay(
+        &mut self,
+        title: impl Into<String>,
+        subtitle: impl Into<String>,
+        body: impl Into<String>,
+    ) {
+        self.open_document_overlay(title, subtitle, body, "≡", Color::Rgb(130, 210, 255));
     }
 
     fn normalize_skill_identifier(identifier: &str) -> String {
@@ -5448,6 +5808,47 @@ impl App {
                 ("remove", "Delete a token: remove <server-id>"),
                 ("list", "List stored server tokens"),
             ],
+            "auth" => &[
+                ("list", "List auth targets and local cache state"),
+                ("status", "Show status for one target: status <target>"),
+                ("add", "Store a token: add <target> --token <secret>"),
+                ("login", "Run login/import for one target"),
+                ("remove", "Delete one cached target"),
+                ("reset", "Clear one target or all targets"),
+            ],
+            "login" => &[
+                ("copilot", "Import the VS Code Copilot token"),
+                ("provider/openai", "Provider env-backed token target"),
+                (
+                    "mcp/<server>",
+                    "Run OAuth login for one configured MCP server",
+                ),
+            ],
+            "logout" => &[
+                ("copilot", "Clear the Copilot token cache"),
+                (
+                    "provider/openai",
+                    "Remove one provider token from ~/.edgecrab/.env",
+                ),
+                ("mcp/<server>", "Remove one cached MCP token"),
+            ],
+            "webhook" => &[
+                ("list", "List dynamic webhook subscriptions"),
+                (
+                    "subscribe",
+                    "Create a route: subscribe <name> [--events push]",
+                ),
+                ("remove", "Delete a route: remove <name>"),
+                ("test", "Send a signed test payload to a route"),
+                ("path", "Show the subscriptions JSON path"),
+            ],
+            "uninstall" => &[
+                ("--dry-run", "Preview the uninstall plan"),
+                ("--purge-data", "Delete ~/.edgecrab as part of uninstall"),
+                ("--purge-auth-cache", "Delete the local Copilot cache"),
+                ("--remove-binary", "Delete the current edgecrab binary"),
+                ("--yes", "Execute without interactive confirmation"),
+            ],
             "mcp" => &[
                 ("list", "List configured MCP servers"),
                 ("refresh", "Refresh the official MCP catalog cache"),
@@ -6195,9 +6596,7 @@ impl App {
             self.active_skills.push(name.to_string());
             let desc = Self::read_skill_desc(&skill_md);
             let msg = if desc.is_empty() {
-                format!(
-                    "📚 Skill '{name}' activated — its context will be prepended to your next message."
-                )
+                format!("📚 Skill '{name}' activated — it is now preloaded for this session.")
             } else {
                 format!("📚 Skill '{name}' activated: {desc}")
             };
@@ -6210,46 +6609,24 @@ impl App {
             );
         }
 
+        if let Some(agent) = self.agent.clone() {
+            let active = self.active_skills.clone();
+            self.rt_handle
+                .block_on(async move { agent.set_preloaded_skills(active).await });
+        }
+
         self.refresh_skills_list();
         self.needs_redraw = true;
     }
 
     /// Activate or deactivate a skill by name.
     ///
-    /// Typing `/skill_name` a second time toggles the skill off.  Active
-    /// skills have their SKILL.md content silently prepended to the next agent
-    /// prompt via `build_prompt_with_skills()`.
+    /// Typing `/skill_name` a second time toggles the skill off. Active skills
+    /// are stored as session-scoped preloaded skills on the agent config,
+    /// mirroring Hermes-style preloaded skill semantics.
     fn activate_skill(&mut self, name: &str) {
         let next_state = !self.active_skills.iter().any(|skill| skill == name);
         self.set_skill_activation(name, next_state);
-    }
-
-    /// Build the prompt actually sent to the agent by prepending active skill
-    /// contexts to the user's raw input.
-    ///
-    /// The enriched prompt is invisible in the output pane — the user's message
-    /// is displayed as-is; only the agent sees the skill content.  This keeps
-    /// the conversation history readable while still injecting the full skill
-    /// context.
-    fn build_prompt_with_skills(&self, user_input: &str) -> String {
-        if self.active_skills.is_empty() {
-            return user_input.to_string();
-        }
-        let mut context = String::new();
-        for name in &self.active_skills {
-            if let Some(skill_md) = Self::find_skill_md(name) {
-                if let Ok(content) = std::fs::read_to_string(&skill_md) {
-                    context.push_str(&format!(
-                        "--- SKILL: {name} ---\n{}\n--- END SKILL ---\n\n",
-                        content.trim()
-                    ));
-                }
-            }
-        }
-        if context.is_empty() {
-            return user_input.to_string();
-        }
-        format!("{context}{user_input}")
     }
 
     // ─── Tab Completion ─────────────────────────────────────────────
@@ -6659,6 +7036,20 @@ impl App {
 
         if matches!(self.display_state, DisplayState::ValueCapture { .. }) {
             self.handle_value_capture_key(key);
+            return;
+        }
+
+        if self.document_overlay.is_some() {
+            match key.code {
+                KeyCode::Esc => self.close_document_overlay(),
+                KeyCode::Up => self.scroll_document_overlay(-1),
+                KeyCode::Down => self.scroll_document_overlay(1),
+                KeyCode::PageUp => self.scroll_document_overlay(-8),
+                KeyCode::PageDown => self.scroll_document_overlay(8),
+                KeyCode::Home => self.set_document_overlay_scroll(0),
+                KeyCode::End => self.set_document_overlay_scroll(u16::MAX),
+                _ => {}
+            }
             return;
         }
 
@@ -7580,6 +7971,145 @@ impl App {
             return;
         }
 
+        if self.profile_selector.active {
+            match key.code {
+                KeyCode::Esc => {
+                    if !self.close_detail_fullscreen(DetailSurface::ProfileSelector) {
+                        self.profile_selector.active = false;
+                    }
+                }
+                _ if selector_action_key(&key, 'z') => {
+                    self.toggle_detail_fullscreen(
+                        DetailSurface::ProfileSelector,
+                        self.split_detail_scroll(DetailSurface::ProfileSelector),
+                    );
+                }
+                KeyCode::Enter => {
+                    if let Some(name) = self
+                        .profile_selector
+                        .current()
+                        .map(|entry| entry.name.clone())
+                    {
+                        self.handle_profile_switch(name);
+                    }
+                }
+                _ if selector_action_key(&key, 'v') => {
+                    self.set_profile_detail_mode(ProfileDetailMode::Summary);
+                }
+                _ if selector_action_key(&key, 'c') => {
+                    self.set_profile_detail_mode(ProfileDetailMode::Config);
+                }
+                _ if selector_action_key(&key, 's') => {
+                    self.set_profile_detail_mode(ProfileDetailMode::Soul);
+                }
+                _ if selector_action_key(&key, 'm') => {
+                    self.set_profile_detail_mode(ProfileDetailMode::Memory);
+                }
+                _ if selector_action_key(&key, 't') => {
+                    self.set_profile_detail_mode(ProfileDetailMode::Tools);
+                }
+                _ if selector_action_key(&key, 'h') || matches!(key.code, KeyCode::Char('?')) => {
+                    self.set_profile_detail_mode(ProfileDetailMode::Help);
+                }
+                _ if selector_action_key(&key, 'a') => {
+                    if let Some(name) = self
+                        .profile_selector
+                        .current()
+                        .map(|entry| entry.name.clone())
+                    {
+                        self.open_profile_alias_editor(name);
+                    }
+                }
+                _ if selector_action_key(&key, 'e') => {
+                    if let Some(name) = self
+                        .profile_selector
+                        .current()
+                        .map(|entry| entry.name.clone())
+                    {
+                        self.open_profile_export_editor(name);
+                    }
+                }
+                _ if selector_action_key(&key, 'd') || selector_action_key(&key, 'x') => {
+                    if let Some(name) = self
+                        .profile_selector
+                        .current()
+                        .map(|entry| entry.name.clone())
+                    {
+                        self.open_profile_delete_editor(name);
+                    }
+                }
+                _ if selector_action_key(&key, 'n') => {
+                    self.open_profile_create_editor();
+                }
+                _ if selector_action_key(&key, 'i') => {
+                    self.open_profile_import_editor();
+                }
+                _ if selector_action_key(&key, 'o') => {
+                    if let Some(name) = self
+                        .profile_selector
+                        .current()
+                        .map(|entry| entry.name.clone())
+                    {
+                        self.open_profile_rename_editor(name);
+                    }
+                }
+                KeyCode::Home => {
+                    self.profile_selector.selected = 0;
+                    self.reset_split_detail_scroll(DetailSurface::ProfileSelector);
+                    self.reset_detail_fullscreen_scroll(DetailSurface::ProfileSelector);
+                }
+                KeyCode::End => {
+                    self.profile_selector.selected =
+                        self.profile_selector.filtered.len().saturating_sub(1);
+                    self.reset_split_detail_scroll(DetailSurface::ProfileSelector);
+                    self.reset_detail_fullscreen_scroll(DetailSurface::ProfileSelector);
+                }
+                KeyCode::Left | KeyCode::BackTab => {
+                    self.cycle_profile_detail_mode(false);
+                }
+                KeyCode::Right | KeyCode::Tab => {
+                    self.cycle_profile_detail_mode(true);
+                }
+                KeyCode::Up => {
+                    self.profile_selector.move_up();
+                    self.reset_split_detail_scroll(DetailSurface::ProfileSelector);
+                    self.reset_detail_fullscreen_scroll(DetailSurface::ProfileSelector);
+                }
+                KeyCode::Down => {
+                    self.profile_selector.move_down();
+                    self.reset_split_detail_scroll(DetailSurface::ProfileSelector);
+                    self.reset_detail_fullscreen_scroll(DetailSurface::ProfileSelector);
+                }
+                KeyCode::PageUp
+                    if self.detail_fullscreen_active(DetailSurface::ProfileSelector) =>
+                {
+                    self.page_up_detail_fullscreen(DetailSurface::ProfileSelector);
+                }
+                KeyCode::PageDown
+                    if self.detail_fullscreen_active(DetailSurface::ProfileSelector) =>
+                {
+                    self.page_down_detail_fullscreen(DetailSurface::ProfileSelector);
+                }
+                KeyCode::PageUp => self.page_up_split_detail(DetailSurface::ProfileSelector, 8),
+                KeyCode::PageDown => self.page_down_split_detail(DetailSurface::ProfileSelector, 8),
+                _ if selector_action_key(&key, 'r') => {
+                    self.refresh_profiles_list();
+                }
+                KeyCode::Backspace => {
+                    self.profile_selector.pop_char();
+                    self.reset_split_detail_scroll(DetailSurface::ProfileSelector);
+                    self.reset_detail_fullscreen_scroll(DetailSurface::ProfileSelector);
+                }
+                KeyCode::Char(c) if selector_search_char(&key) == Some(c) => {
+                    self.profile_selector.push_char(c);
+                    self.reset_split_detail_scroll(DetailSurface::ProfileSelector);
+                    self.reset_detail_fullscreen_scroll(DetailSurface::ProfileSelector);
+                }
+                _ => {}
+            }
+            return;
+        }
+
         // Skill selector overlay active — same key scheme as model selector
         if self.skill_selector.active {
             match key.code {
@@ -8302,7 +8832,7 @@ impl App {
                 block = format_image_attachment_block(&path_refs)
             );
         }
-        let prompt = self.build_prompt_with_skills(&effective_input);
+        let prompt = effective_input;
         let hook_registry_clone = self.hook_registry.clone();
         self.rt_handle.spawn(async move {
             use edgecrab_core::agent::StreamEvent;
@@ -8511,7 +9041,7 @@ impl App {
                 self.push_output(text, OutputRole::System);
             }
             CommandResult::Clear => {
-                self.clear_output();
+                self.start_fresh_session(None, true);
             }
             CommandResult::Exit => {
                 self.should_exit = true;
@@ -8578,14 +9108,7 @@ impl App {
                 self.handle_mcp_command(args);
             }
             CommandResult::SessionNew => {
-                if let Some(ref agent) = self.agent {
-                    let agent = Arc::clone(agent);
-                    self.rt_handle.block_on(async move {
-                        agent.new_session().await;
-                    });
-                }
-                self.clear_output();
-                self.push_output("New session started.", OutputRole::System);
+                self.start_fresh_session(Some("New session started."), false);
             }
             CommandResult::ReloadTheme => {
                 self.theme = Theme::from_skin(&SkinConfig::load());
@@ -8684,8 +9207,8 @@ impl App {
             CommandResult::ShowUsage => {
                 self.handle_show_usage();
             }
-            CommandResult::ShowPrompt => {
-                self.handle_show_prompt();
+            CommandResult::PromptCommand(args) => {
+                self.handle_prompt_command(args);
             }
             CommandResult::ShowConfig(args) => {
                 self.handle_config_command(args);
@@ -8694,17 +9217,8 @@ impl App {
                 self.handle_show_history();
             }
             CommandResult::ToggleVerbose => {
-                // Open the interactive picker overlay instead of blind-cycling.
-                // Position the cursor on the currently active mode so the user
-                // sees the live state immediately and can navigate from there.
-                self.verbose_selector_cursor = match self.tool_progress_mode {
-                    ToolProgressMode::Off => 0,
-                    ToolProgressMode::New => 1,
-                    ToolProgressMode::All => 2,
-                    ToolProgressMode::Verbose => 3,
-                };
-                self.verbose_selector_active = true;
-                self.needs_redraw = true;
+                let msg = self.cycle_tool_progress_mode();
+                self.push_output(msg, OutputRole::System);
             }
             CommandResult::SetToolProgress(mode) => {
                 let msg = self.handle_tool_progress_command(mode);
@@ -8752,13 +9266,25 @@ impl App {
             CommandResult::BackgroundPrompt(prompt) => {
                 self.handle_background_prompt(prompt);
             }
+            CommandResult::SideQuestion(question) => {
+                self.handle_side_question(question);
+            }
+            CommandResult::BranchSession(name) => {
+                self.handle_branch_session(name);
+            }
             CommandResult::ShowSkills(args) => {
                 self.handle_show_skills(args);
+            }
+            CommandResult::ShowProfiles(args) => {
+                self.handle_show_profiles(args);
             }
             CommandResult::SkillSelector => {
                 self.remote_skill_browser.selector.active = false;
                 self.refresh_skills_list();
                 self.open_skill_selector();
+            }
+            CommandResult::ProfileSelector => {
+                self.open_profile_selector();
             }
             CommandResult::ToolManager(mode) => {
                 self.open_tool_manager(mode);
@@ -8837,17 +9363,75 @@ impl App {
             CommandResult::SwitchSkin(name) => {
                 self.handle_switch_skin(name);
             }
-            CommandResult::ShowInsights => {
-                self.handle_show_insights();
+            CommandResult::ShowInsights(days) => {
+                self.handle_show_insights(days);
             }
             CommandResult::PasteClipboard => {
                 self.handle_paste_clipboard();
+            }
+            CommandResult::AttachImagePath(path) => {
+                self.handle_paste(path);
+            }
+            CommandResult::AuthCommand(command) => {
+                match self
+                    .rt_handle
+                    .block_on(crate::auth_cmd::run_capture(command))
+                {
+                    Ok(report) => self.push_output(report, OutputRole::System),
+                    Err(err) => {
+                        self.push_output(format!("Auth command failed: {err}"), OutputRole::Error)
+                    }
+                }
+            }
+            CommandResult::LoginTarget(target) => {
+                match self
+                    .rt_handle
+                    .block_on(crate::auth_cmd::login_target_capture(&target))
+                {
+                    Ok(report) => self.push_output(report, OutputRole::System),
+                    Err(err) => self.push_output(format!("Login failed: {err}"), OutputRole::Error),
+                }
+            }
+            CommandResult::LogoutTarget(target) => {
+                match self
+                    .rt_handle
+                    .block_on(crate::auth_cmd::logout_target_capture(target.as_deref()))
+                {
+                    Ok(report) => self.push_output(report, OutputRole::System),
+                    Err(err) => {
+                        self.push_output(format!("Logout failed: {err}"), OutputRole::Error)
+                    }
+                }
+            }
+            CommandResult::WebhookCommand(command) => {
+                match self
+                    .rt_handle
+                    .block_on(crate::webhook_cmd::run_capture(command))
+                {
+                    Ok(report) => self.push_output(report, OutputRole::System),
+                    Err(err) => self
+                        .push_output(format!("Webhook command failed: {err}"), OutputRole::Error),
+                }
+            }
+            CommandResult::UninstallCommand(options) => {
+                match self
+                    .rt_handle
+                    .block_on(crate::uninstall_cmd::run_capture(options))
+                {
+                    Ok(report) => self.push_output(report, OutputRole::System),
+                    Err(err) => {
+                        self.push_output(format!("Uninstall failed: {err}"), OutputRole::Error)
+                    }
+                }
             }
             CommandResult::CopilotAuth => {
                 self.handle_copilot_auth();
             }
             CommandResult::MouseMode(mode) => {
                 self.handle_mouse_mode(mode);
+            }
+            CommandResult::SetYolo(mode) => {
+                self.handle_set_yolo(mode);
             }
             CommandResult::ApprovalChoice(choice) => {
                 self.handle_approval_choice_command(choice);
@@ -8880,6 +9464,9 @@ impl App {
             }
             CommandResult::CheckUpdates => {
                 self.handle_update_status();
+            }
+            CommandResult::ShowGatewayCommands(args) => {
+                self.handle_show_gateway_commands(args);
             }
         }
     }
@@ -9990,6 +10577,29 @@ impl App {
                         OutputRole::Error,
                     );
                 }
+                AgentResponse::SideQuestionComplete { question, response } => {
+                    let body = if response.trim().is_empty() {
+                        "(No response generated)".to_string()
+                    } else {
+                        response
+                    };
+                    self.push_output(
+                        format!(
+                            "/btw {}\n\n{body}",
+                            edgecrab_core::safe_truncate(question.trim(), 72)
+                        ),
+                        OutputRole::Assistant,
+                    );
+                }
+                AgentResponse::SideQuestionFailed { question, error } => {
+                    self.push_output(
+                        format!(
+                            "/btw {}\nError: {error}",
+                            edgecrab_core::safe_truncate(question.trim(), 72)
+                        ),
+                        OutputRole::Error,
+                    );
+                }
             }
         }
 
@@ -10185,6 +10795,14 @@ impl App {
     }
 
     fn apply_value_capture_action(&mut self, action: ValueCaptureAction, value: String) {
+        let refresh_gateway = matches!(
+            &action,
+            ValueCaptureAction::BindAddress
+                | ValueCaptureAction::HomeChannel(_)
+                | ValueCaptureAction::AllowedUsers(_)
+                | ValueCaptureAction::PrimaryField(_)
+        );
+
         match action {
             ValueCaptureAction::BindAddress => {
                 let trimmed = value.trim();
@@ -10315,8 +10933,80 @@ impl App {
                     return;
                 }
             }
+            ValueCaptureAction::ProfileCreate => {
+                let tokens = match shell_words::split(&value) {
+                    Ok(tokens) => tokens,
+                    Err(err) => {
+                        self.push_output(format!("profile create: {err}"), OutputRole::Error);
+                        return;
+                    }
+                };
+                let Some(name) = tokens.first() else {
+                    self.push_output(
+                        "profile create: enter a name, for example `research --clone-from work`.",
+                        OutputRole::Error,
+                    );
+                    return;
+                };
+                let clone = tokens.iter().any(|token| token == "--clone");
+                let clone_all = tokens.iter().any(|token| token == "--clone-all");
+                let clone_from = tokens
+                    .windows(2)
+                    .find_map(|window| (window[0] == "--clone-from").then_some(window[1].as_str()));
+                self.execute_profile_create(name, clone, clone_all, clone_from);
+            }
+            ValueCaptureAction::ProfileRename(old_name) => {
+                if value.is_empty() {
+                    self.push_output(
+                        "profile rename: enter the new profile name.",
+                        OutputRole::Error,
+                    );
+                    return;
+                }
+                self.execute_profile_rename(&old_name, &value);
+            }
+            ValueCaptureAction::ProfileDeleteConfirm(name) => {
+                if value != name {
+                    self.push_output(
+                        format!("profile delete: type `{name}` exactly to confirm."),
+                        OutputRole::Error,
+                    );
+                    return;
+                }
+                self.execute_profile_delete(&name);
+            }
+            ValueCaptureAction::ProfileAlias(name) => {
+                if value.eq_ignore_ascii_case("clear") || value.is_empty() {
+                    self.execute_profile_alias(&name, true, None);
+                } else {
+                    self.execute_profile_alias(&name, false, Some(value.as_str()));
+                }
+            }
+            ValueCaptureAction::ProfileExport(name) => {
+                let output = (!value.is_empty()).then_some(value.as_str());
+                self.execute_profile_export(&name, output);
+            }
+            ValueCaptureAction::ProfileImport => {
+                let tokens = match shell_words::split(&value) {
+                    Ok(tokens) => tokens,
+                    Err(err) => {
+                        self.push_output(format!("profile import: {err}"), OutputRole::Error);
+                        return;
+                    }
+                };
+                let Some(archive) = tokens.first() else {
+                    self.push_output(
+                        "profile import: enter an archive path and optional target name.",
+                        OutputRole::Error,
+                    );
+                    return;
+                };
+                self.execute_profile_import(archive, tokens.get(1).map(String::as_str));
+            }
         }
-        self.refresh_gateway_browser();
+        if refresh_gateway {
+            self.refresh_gateway_browser();
+        }
     }
 
     fn save_gateway_primary_field(&mut self, field: &str, value: &str) -> bool {
@@ -10548,7 +11238,11 @@ impl App {
                  Usage:            /cheap_model to pick a cheap model, then EdgeCrab will auto-route obviously simple turns."
             )
         };
-        self.push_output(text, OutputRole::System);
+        self.open_report_overlay(
+            "Cheap Model Routing",
+            "Smart routing and cheap-model fallback policy",
+            text,
+        );
     }
 
     fn handle_set_cheap_model(&mut self, spec: String) {
@@ -11563,7 +12257,11 @@ impl App {
             references,
             toolset_note,
         );
-        self.push_output(text, OutputRole::System);
+        self.open_report_overlay(
+            "Mixture-of-Agents",
+            "Default MoA runtime, roster, and toolset exposure",
+            text,
+        );
     }
 
     fn handle_set_moa_aggregator(&mut self, spec: String) {
@@ -11800,7 +12498,11 @@ impl App {
                 }
             ),
         };
-        self.push_output(text, OutputRole::System);
+        self.open_report_overlay(
+            "Vision Routing",
+            "Dedicated vision backend and fallback behavior",
+            text,
+        );
     }
 
     fn handle_set_vision_model(&mut self, spec: String) {
@@ -11890,7 +12592,11 @@ impl App {
             image_generation.model,
             cli_image_models::default_selection_spec(),
         );
-        self.push_output(text, OutputRole::System);
+        self.open_report_overlay(
+            "Image Routing",
+            "Default image-generation backend and persistence",
+            text,
+        );
     }
 
     fn handle_set_image_model(&mut self, spec: String) {
@@ -12054,7 +12760,11 @@ impl App {
             snap.budget_remaining,
             snap.budget_max,
         );
-        self.push_output(text, OutputRole::System);
+        self.open_report_overlay(
+            "Session Status",
+            "Live runtime model, routing, and budget snapshot",
+            text,
+        );
     }
 
     fn handle_show_cost(&mut self) {
@@ -12096,7 +12806,7 @@ impl App {
             snap.api_call_count,
             cost_line,
         );
-        self.push_output(text, OutputRole::System);
+        self.open_report_overlay("Token Usage & Cost", format!("Model {}", snap.model), text);
         self.total_tokens = snap.context_pressure_tokens();
         if let Some(usd) = cost_result.amount_usd {
             self.session_cost = usd;
@@ -12108,26 +12818,78 @@ impl App {
     }
 
     fn handle_show_prompt(&mut self) {
-        let Some(agent) = self.require_agent() else {
-            return;
-        };
         let prompt = self
-            .rt_handle
-            .block_on(async move { agent.system_prompt().await });
+            .agent
+            .clone()
+            .and_then(|agent| {
+                self.rt_handle
+                    .block_on(async move { agent.custom_system_prompt().await })
+            })
+            .or_else(|| {
+                let configured = self.load_runtime_config().agent.system_prompt;
+                (!configured.trim().is_empty()).then_some(configured)
+            });
+
         match prompt {
-            Some(p) => {
-                let preview = edgecrab_core::safe_truncate(&p, 2000);
-                self.push_output(
-                    format!("System prompt ({} chars):\n{}", p.len(), preview),
-                    OutputRole::System,
-                );
-            }
-            None => {
-                self.push_output(
-                    "System prompt: (not yet assembled — send a message first)",
-                    OutputRole::System,
-                );
-            }
+            Some(prompt) => self.open_report_overlay(
+                "System Prompt",
+                format!("Custom override ({} characters)", prompt.len()),
+                prompt,
+            ),
+            None => self.open_report_overlay(
+                "System Prompt",
+                "Using the default assembled prompt",
+                "No custom prompt set.\n\nUsage:\n  /prompt clear\n  /prompt <text>\n\nEdgeCrab will keep using the default assembled system prompt until you set an override.",
+            ),
+        }
+    }
+
+    fn handle_prompt_command(&mut self, raw: String) {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("show") {
+            self.handle_show_prompt();
+            return;
+        }
+
+        let cleared = trimmed.eq_ignore_ascii_case("clear");
+        let mut config = self.load_runtime_config();
+        config.agent.system_prompt = if cleared {
+            String::new()
+        } else {
+            trimmed.to_string()
+        };
+
+        let config_path = edgecrab_core::edgecrab_home().join("config.yaml");
+        let save_result = config.save_to(&config_path);
+        if let Some(agent) = self.agent.clone() {
+            let next_prompt = (!cleared).then_some(trimmed.to_string());
+            self.rt_handle
+                .block_on(async move { agent.set_custom_system_prompt(next_prompt).await });
+        }
+
+        match (cleared, save_result) {
+            (true, Ok(())) => self.push_output(
+                "System prompt cleared (saved to config).",
+                OutputRole::System,
+            ),
+            (true, Err(err)) => self.push_output(
+                format!("System prompt cleared for this session. Saving config failed: {err}"),
+                OutputRole::System,
+            ),
+            (false, Ok(())) => self.push_output(
+                format!(
+                    "System prompt set (saved to config).\n\"{}\"",
+                    edgecrab_core::safe_truncate(trimmed, 80)
+                ),
+                OutputRole::System,
+            ),
+            (false, Err(err)) => self.push_output(
+                format!(
+                    "System prompt set for this session. Saving config failed: {err}\n\"{}\"",
+                    edgecrab_core::safe_truncate(trimmed, 80)
+                ),
+                OutputRole::System,
+            ),
         }
     }
 
@@ -12423,10 +13185,18 @@ impl App {
     fn handle_config_selector_action(&mut self, action: ConfigAction) {
         match action {
             ConfigAction::ShowSummary => {
-                self.push_output(self.render_config_summary(), OutputRole::System);
+                self.open_report_overlay(
+                    "Config Summary",
+                    "Runtime defaults, display state, and saved control-plane settings",
+                    self.render_config_summary(),
+                );
             }
             ConfigAction::ShowPaths => {
-                self.push_output(self.render_config_paths(), OutputRole::System);
+                self.open_report_overlay(
+                    "Config Paths",
+                    "Resolved EdgeCrab config, data, and cache locations",
+                    self.render_config_paths(),
+                );
             }
             ConfigAction::OpenTools => {
                 self.open_tool_manager(ToolManagerMode::All);
@@ -12484,9 +13254,10 @@ impl App {
             }
             ConfigAction::ShowGatewayHomes => {
                 let config = self.load_runtime_config();
-                self.push_output(
+                self.open_report_overlay(
+                    "Gateway Home Channels",
+                    "Per-platform DM and home-channel routing",
                     self.render_gateway_home_channel_summary(&config),
-                    OutputRole::System,
                 );
             }
             ConfigAction::ShowUpdateStatus => {
@@ -12500,7 +13271,11 @@ impl App {
         match normalized.as_str() {
             "" | "open" | "browse" => self.open_config_selector(),
             "show" | "summary" | "status" => {
-                self.push_output(self.render_config_summary(), OutputRole::System);
+                self.open_report_overlay(
+                    "Config Summary",
+                    "Runtime defaults, display state, and saved control-plane settings",
+                    self.render_config_summary(),
+                );
             }
             "model" => self.refresh_model_selector_catalog(),
             "cheap" | "cheap_model" | "cheap-model" | "routing" => {
@@ -12509,7 +13284,11 @@ impl App {
             "moa" => self.handle_show_moa_config(),
             "tools" | "toolsets" => self.open_tool_manager(ToolManagerMode::All),
             "paths" | "path" => {
-                self.push_output(self.render_config_paths(), OutputRole::System);
+                self.open_report_overlay(
+                    "Config Paths",
+                    "Resolved EdgeCrab config, data, and cache locations",
+                    self.render_config_paths(),
+                );
             }
             "voice" => self.handle_voice_mode("status".into()),
             "gateway" | "homes" => {
@@ -12517,12 +13296,13 @@ impl App {
             }
             "update" => self.handle_update_status(),
             "edit" => {
-                self.push_output(
+                self.open_report_overlay(
+                    "Config Edit",
+                    "Editor-based configuration workflow",
                     format!(
                         "Edit the config file with your editor of choice:\n{}\n\nCLI shortcut: edgecrab config edit",
                         edgecrab_core::edgecrab_home().join("config.yaml").display()
                     ),
-                    OutputRole::System,
                 );
             }
             _ => self.push_output(
@@ -12550,7 +13330,11 @@ impl App {
             snap.input_tokens,
             snap.output_tokens,
         );
-        self.push_output(text, OutputRole::System);
+        self.open_report_overlay(
+            "Session History",
+            "Current live conversation counters",
+            text,
+        );
     }
 
     fn handle_save_session(&mut self, path: Option<String>) {
@@ -13153,6 +13937,11 @@ impl App {
                 let prompt_tokens = snap.context_pressure_tokens();
                 self.load_messages(messages);
                 self.model_name = snap.model;
+                self.yolo_enabled = snap
+                    .session_id
+                    .as_deref()
+                    .map(edgecrab_tools::approval_runtime::yolo_enabled_for_session)
+                    .unwrap_or(false);
                 self.update_context_window();
                 self.total_tokens = prompt_tokens;
                 if !recap.is_empty() {
@@ -13352,6 +14141,684 @@ impl App {
         });
     }
 
+    fn current_session_key(&self) -> Option<String> {
+        let agent = self.agent.as_ref()?;
+        agent
+            .try_session_snapshot()
+            .and_then(|snap| snap.session_id)
+    }
+
+    fn handle_set_yolo(&mut self, mode: String) {
+        let Some(session_key) = self.current_session_key() else {
+            self.push_output(
+                "YOLO mode is unavailable until a session is active.",
+                OutputRole::System,
+            );
+            return;
+        };
+
+        let action = mode.trim().to_ascii_lowercase();
+        match action.as_str() {
+            "" | "toggle" => {
+                self.yolo_enabled = !self.yolo_enabled;
+            }
+            "on" | "enable" | "enabled" => {
+                self.yolo_enabled = true;
+            }
+            "off" | "disable" | "disabled" => {
+                self.yolo_enabled = false;
+            }
+            "status" => {
+                self.push_output(
+                    format!(
+                        "YOLO mode is {} for this session.",
+                        if self.yolo_enabled { "ON" } else { "OFF" }
+                    ),
+                    OutputRole::System,
+                );
+                return;
+            }
+            other => {
+                self.push_output(
+                    format!("Unknown yolo mode '{other}'. Use: /yolo [on|off|toggle|status]"),
+                    OutputRole::System,
+                );
+                return;
+            }
+        }
+
+        edgecrab_tools::approval_runtime::set_yolo_for_session(&session_key, self.yolo_enabled);
+        self.push_output(
+            format!(
+                "YOLO mode {} for session {}.",
+                if self.yolo_enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
+                edgecrab_core::safe_truncate(&session_key, 12)
+            ),
+            OutputRole::System,
+        );
+    }
+
+    fn handle_show_gateway_commands(&mut self, args: String) {
+        let page = args
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .filter(|page| *page > 0)
+            .unwrap_or(1);
+        let report = gateway_commands_page(page, &self.skills_completion_names);
+        self.open_report_overlay("Gateway Commands", "Shared slash-command catalog", report);
+    }
+
+    fn handle_side_question(&mut self, question: String) {
+        let Some(agent) = self.require_agent() else {
+            return;
+        };
+        let tx = self.response_tx.clone();
+        let preview = edgecrab_core::safe_truncate(question.trim(), 72).to_string();
+        self.push_output(format!("💬 /btw {preview}"), OutputRole::System);
+
+        self.rt_handle.spawn(async move {
+            let history = agent.messages().await;
+            let system_prompt = agent.system_prompt().await;
+            let provider = agent.provider_handle().await;
+            let child = match edgecrab_core::AgentBuilder::new(&agent.session_snapshot().await.model)
+                .provider(provider)
+                .tools(Arc::new(edgecrab_tools::registry::ToolRegistry::new()))
+                .platform(edgecrab_types::Platform::Cli)
+                .streaming(false)
+                .quiet_mode(true)
+                .max_iterations(8)
+                .build()
+            {
+                Ok(agent) => agent,
+                Err(error) => {
+                    let _ = tx.send(AgentResponse::SideQuestionFailed {
+                        question,
+                        error: error.to_string(),
+                    });
+                    return;
+                }
+            };
+
+            let prompt = format!(
+                "[Ephemeral /btw side question. Answer from the existing conversation context. \
+                 Do not call tools. Do not persist anything. Keep the answer concise.]\n\n{question}"
+            );
+            match child
+                .run_conversation(&prompt, system_prompt.as_deref(), Some(history))
+                .await
+            {
+                Ok(result) => {
+                    let _ = tx.send(AgentResponse::SideQuestionComplete {
+                        question,
+                        response: result.final_response,
+                    });
+                }
+                Err(error) => {
+                    let _ = tx.send(AgentResponse::SideQuestionFailed {
+                        question,
+                        error: error.to_string(),
+                    });
+                }
+            }
+        });
+    }
+
+    fn handle_branch_session(&mut self, name: Option<String>) {
+        let Some(agent) = self.require_agent() else {
+            return;
+        };
+        if !agent.has_state_db() {
+            self.push_output(
+                "Session branching requires the session database.",
+                OutputRole::System,
+            );
+            return;
+        }
+
+        let session_cost = self.session_cost;
+        let branch_result = self.rt_handle.block_on(async {
+            let messages = agent.messages().await;
+            if messages.is_empty() {
+                return Err("No conversation to branch yet.".to_string());
+            }
+
+            let snapshot = agent.session_snapshot().await;
+            let Some(current_session_id) = snapshot.session_id else {
+                return Err("Current session has no ID.".to_string());
+            };
+            let Some(db) = agent.state_db().await else {
+                return Err("No state database configured.".to_string());
+            };
+
+            let current_record = db
+                .get_session(&current_session_id)
+                .map_err(|e| e.to_string())?;
+            let base_title = current_record
+                .as_ref()
+                .and_then(|record| record.title.as_deref())
+                .filter(|title| !title.trim().is_empty())
+                .unwrap_or("branch");
+            let new_title = match name {
+                Some(explicit) if !explicit.trim().is_empty() => explicit,
+                _ => db
+                    .next_title_in_lineage(base_title)
+                    .map_err(|e| e.to_string())?,
+            };
+
+            let system_prompt = agent.system_prompt().await;
+            let new_session_id = uuid::Uuid::new_v4().to_string();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| e.to_string())?
+                .as_secs_f64();
+
+            let record = edgecrab_state::SessionRecord {
+                id: new_session_id.clone(),
+                source: "cli".into(),
+                user_id: None,
+                model: Some(snapshot.model.clone()),
+                system_prompt,
+                parent_session_id: Some(current_session_id.clone()),
+                started_at: now,
+                ended_at: Some(now),
+                end_reason: Some("branched".into()),
+                message_count: messages.len() as i64,
+                tool_call_count: snapshot.api_call_count as i64,
+                input_tokens: snapshot.input_tokens as i64,
+                output_tokens: snapshot.output_tokens as i64,
+                cache_read_tokens: snapshot.cache_read_tokens as i64,
+                cache_write_tokens: snapshot.cache_write_tokens as i64,
+                reasoning_tokens: snapshot.reasoning_tokens as i64,
+                estimated_cost_usd: Some(session_cost),
+                title: Some(new_title.clone()),
+            };
+
+            db.save_session(&record).map_err(|e| e.to_string())?;
+            db.replace_messages(&new_session_id, &messages, now)
+                .map_err(|e| e.to_string())?;
+            agent
+                .restore_session(&new_session_id)
+                .await
+                .map_err(|e| e.to_string())?;
+
+            Ok::<_, String>((new_session_id, new_title, messages, snapshot.model))
+        });
+
+        match branch_result {
+            Ok((session_id, title, messages, model)) => {
+                self.load_messages(messages);
+                self.model_name = model;
+                self.update_context_window();
+                self.yolo_enabled = false;
+                self.push_output(
+                    format!(
+                        "Branched session \"{title}\".\nNew session: {}",
+                        edgecrab_core::safe_truncate(&session_id, 12)
+                    ),
+                    OutputRole::System,
+                );
+            }
+            Err(error) => self.push_output(format!("branch: {error}"), OutputRole::Error),
+        }
+    }
+
+    fn open_value_capture(
+        &mut self,
+        title: impl Into<String>,
+        prompt: impl Into<String>,
+        placeholder: impl Into<String>,
+        masked: bool,
+        buffer: impl Into<String>,
+        action: ValueCaptureAction,
+    ) {
+        self.display_state = DisplayState::ValueCapture {
+            title: title.into(),
+            prompt: prompt.into(),
+            placeholder: placeholder.into(),
+            masked,
+            buffer: buffer.into(),
+            action,
+        };
+        self.needs_redraw = true;
+    }
+
+    fn open_profile_create_editor(&mut self) {
+        self.open_value_capture(
+            "Create Profile",
+            "Create a profile inline. Syntax: <name> [--clone|--clone-all] [--clone-from source].",
+            "research --clone-from work",
+            false,
+            "",
+            ValueCaptureAction::ProfileCreate,
+        );
+    }
+
+    fn open_profile_rename_editor(&mut self, old_name: String) {
+        self.open_value_capture(
+            format!("Rename Profile · {old_name}"),
+            "Enter the new profile name.",
+            "new-profile-name",
+            false,
+            "",
+            ValueCaptureAction::ProfileRename(old_name),
+        );
+    }
+
+    fn open_profile_delete_editor(&mut self, name: String) {
+        let placeholder = name.clone();
+        self.open_value_capture(
+            format!("Delete Profile · {name}"),
+            format!("Type `{name}` to confirm permanent deletion."),
+            placeholder,
+            false,
+            "",
+            ValueCaptureAction::ProfileDeleteConfirm(name),
+        );
+    }
+
+    fn open_profile_alias_editor(&mut self, name: String) {
+        let current_alias = self
+            .profile_selector
+            .current()
+            .and_then(|entry| (entry.name == name).then_some(entry.name.clone()))
+            .unwrap_or_else(|| name.clone());
+        self.open_value_capture(
+            format!("Profile Alias · {name}"),
+            "Enter an alias wrapper name. Use `clear` to remove the canonical alias.",
+            "work",
+            false,
+            current_alias,
+            ValueCaptureAction::ProfileAlias(name),
+        );
+    }
+
+    fn open_profile_export_editor(&mut self, name: String) {
+        self.open_value_capture(
+            format!("Export Profile · {name}"),
+            "Optional archive path. Leave blank to write <profile>.tar.gz in the current directory.",
+            format!("{name}.tar.gz"),
+            false,
+            "",
+            ValueCaptureAction::ProfileExport(name),
+        );
+    }
+
+    fn open_profile_import_editor(&mut self) {
+        self.open_value_capture(
+            "Import Profile",
+            "Import a profile archive inline. Syntax: <archive-path> [target-name].",
+            "/path/to/profile.tar.gz imported-name",
+            false,
+            "",
+            ValueCaptureAction::ProfileImport,
+        );
+    }
+
+    fn execute_profile_create(
+        &mut self,
+        name: &str,
+        clone: bool,
+        clone_all: bool,
+        clone_from: Option<&str>,
+    ) {
+        let manager = ProfileManager::new();
+        match manager.create_report(name, clone, clone_all, clone_from) {
+            Ok(report) => {
+                self.refresh_profiles_list();
+                self.push_output(report.render(), OutputRole::System);
+            }
+            Err(err) => self.push_output(format!("profile create: {err}"), OutputRole::Error),
+        }
+    }
+
+    fn execute_profile_delete(&mut self, name: &str) {
+        let manager = ProfileManager::new();
+        match manager.delete(name, true) {
+            Ok(()) => {
+                self.refresh_profiles_list();
+                self.push_output(format!("Profile '{}' deleted.", name), OutputRole::System);
+            }
+            Err(err) => self.push_output(format!("profile delete: {err:#}"), OutputRole::Error),
+        }
+    }
+
+    fn execute_profile_rename(&mut self, old_name: &str, new_name: &str) {
+        let manager = ProfileManager::new();
+        let current = manager.active();
+        match manager.rename(old_name, new_name) {
+            Ok(()) => {
+                self.refresh_profiles_list();
+                if current == old_name {
+                    self.handle_profile_switch(new_name.to_string());
+                } else {
+                    self.push_output(
+                        format!("Profile '{}' renamed to '{}'.", old_name, new_name),
+                        OutputRole::System,
+                    );
+                }
+            }
+            Err(err) => self.push_output(format!("profile rename: {err}"), OutputRole::Error),
+        }
+    }
+
+    fn execute_profile_alias(&mut self, name: &str, remove: bool, alias_name: Option<&str>) {
+        let manager = ProfileManager::new();
+        match manager.alias(name, remove, alias_name) {
+            Ok(()) => {
+                self.refresh_profiles_list();
+                self.push_output(
+                    format!("Alias operation completed for profile '{}'.", name),
+                    OutputRole::System,
+                );
+            }
+            Err(err) => self.push_output(format!("profile alias: {err}"), OutputRole::Error),
+        }
+    }
+
+    fn execute_profile_export(&mut self, name: &str, output: Option<&str>) {
+        let manager = ProfileManager::new();
+        match manager.export(name, output) {
+            Ok(()) => self.push_output(format!("Profile '{}' exported.", name), OutputRole::System),
+            Err(err) => self.push_output(format!("profile export: {err}"), OutputRole::Error),
+        }
+    }
+
+    fn execute_profile_import(&mut self, archive: &str, name: Option<&str>) {
+        let manager = ProfileManager::new();
+        match manager.import(archive, name) {
+            Ok(()) => {
+                self.refresh_profiles_list();
+                self.push_output("Profile imported.", OutputRole::System);
+            }
+            Err(err) => self.push_output(format!("profile import: {err}"), OutputRole::Error),
+        }
+    }
+
+    fn handle_profile_switch(&mut self, name: String) {
+        if self.is_processing {
+            self.push_output(
+                "Finish or stop the current request before switching profiles.",
+                OutputRole::System,
+            );
+            return;
+        }
+
+        let manager = ProfileManager::new();
+        if let Err(err) = manager.set_active_profile(&name) {
+            self.push_output(format!("profile use: {err}"), OutputRole::Error);
+            return;
+        }
+
+        if let Some(agent) = self.agent.clone() {
+            self.rt_handle.block_on(async {
+                agent.finalize_session().await;
+            });
+        }
+
+        if let Err(err) = crate::profile::activate_profile(Some(&name)) {
+            self.push_output(format!("profile switch: {err}"), OutputRole::Error);
+            return;
+        }
+
+        let runtime = match load_runtime(None, None, None) {
+            Ok(runtime) => runtime,
+            Err(err) => {
+                self.push_output(format!("profile switch: {err}"), OutputRole::Error);
+                return;
+            }
+        };
+
+        let model = runtime.config.model.default_model.clone();
+        let provider = match crate::create_provider(&model) {
+            Ok(provider) => provider,
+            Err(err) => {
+                self.push_output(format!("profile switch: {err}"), OutputRole::Error);
+                return;
+            }
+        };
+        let state_db = match open_state_db(&runtime.state_db_path) {
+            Ok(db) => db,
+            Err(err) => {
+                self.push_output(format!("profile switch: {err}"), OutputRole::Error);
+                return;
+            }
+        };
+        let tool_registry = self
+            .rt_handle
+            .block_on(build_tool_registry_with_mcp_discovery(&runtime.config));
+        let new_agent = match build_agent(
+            &runtime,
+            provider,
+            state_db,
+            tool_registry,
+            edgecrab_types::Platform::Cli,
+            false,
+            None,
+        ) {
+            Ok(agent) => agent,
+            Err(err) => {
+                self.push_output(format!("profile switch: {err}"), OutputRole::Error);
+                return;
+            }
+        };
+        if let Err(err) =
+            self.rt_handle
+                .block_on(crate::gateway_cmd::attach_gateway_sender_if_running(
+                    &new_agent, &runtime,
+                ))
+        {
+            self.push_output(format!("profile switch: {err}"), OutputRole::Error);
+            return;
+        }
+
+        self.agent = Some(new_agent);
+        self.set_model(&model);
+        self.total_tokens = 0;
+        self.session_cost = 0.0;
+        self.turn_count = 0;
+        self.last_response_time = None;
+        self.last_agent_response_text.clear();
+        self.streaming_line = None;
+        self.reasoning_line = None;
+        self.in_flight_tool_count = 0;
+        self.active_tools.clear();
+        self.active_subagents.clear();
+        self.pending_tool_lines.clear();
+        self.prompt_queue.clear();
+        self.active_skills.clear();
+        self.display_state = DisplayState::Idle;
+        self.voice_input_device = runtime.config.voice.input_device;
+        self.voice_push_to_talk_key = runtime.config.voice.push_to_talk_key;
+        self.voice_continuous_default = runtime.config.voice.continuous;
+        self.voice_hallucination_filter = runtime.config.voice.hallucination_filter;
+        edgecrab_tools::tools::mcp_client::reload_mcp_connections();
+        self.refresh_skills_list();
+        self.refresh_profiles_list();
+        self.profile_selector.active = false;
+        self.close_detail_fullscreen(DetailSurface::ProfileSelector);
+        self.clear_output();
+        self.push_output(
+            format!(
+                "Switched to profile '{}'.\nHome: {}\nModel: {}\nUse /profile or /profiles to reopen the profile control overlay.",
+                name,
+                edgecrab_core::edgecrab_home().display(),
+                model
+            ),
+            OutputRole::System,
+        );
+        self.needs_redraw = true;
+    }
+
+    fn handle_show_profiles(&mut self, args: String) {
+        let args = args.trim().to_string();
+
+        if args.is_empty() || args == "status" {
+            let manager = ProfileManager::new();
+            self.push_output(manager.render_active_status(), OutputRole::System);
+            return;
+        }
+
+        let tokens = match shell_words::split(&args) {
+            Ok(tokens) => tokens,
+            Err(err) => {
+                self.push_output(format!("profile: {err}"), OutputRole::Error);
+                return;
+            }
+        };
+        if tokens.is_empty() {
+            self.push_output(
+                "Usage: /profile [show|config|soul|memory|tools|list|use|create|delete|rename|alias|export|import|help]",
+                OutputRole::System,
+            );
+            return;
+        }
+
+        match tokens[0].as_str() {
+            "help" => self.open_profile_selector_with(None, ProfileDetailMode::Help),
+            "list" | "ls" => self.open_profile_selector_with(None, ProfileDetailMode::Summary),
+            "show" => {
+                let active = ProfileManager::new().active();
+                let name = tokens.get(1).map(String::as_str).unwrap_or(active.as_str());
+                self.open_profile_selector_with(Some(name), ProfileDetailMode::Summary);
+            }
+            "config" => {
+                let active = ProfileManager::new().active();
+                let name = tokens.get(1).map(String::as_str).unwrap_or(active.as_str());
+                self.open_profile_selector_with(Some(name), ProfileDetailMode::Config);
+            }
+            "soul" => {
+                let active = ProfileManager::new().active();
+                let name = tokens.get(1).map(String::as_str).unwrap_or(active.as_str());
+                self.open_profile_selector_with(Some(name), ProfileDetailMode::Soul);
+            }
+            "memory" => {
+                let active = ProfileManager::new().active();
+                let name = tokens.get(1).map(String::as_str).unwrap_or(active.as_str());
+                self.open_profile_selector_with(Some(name), ProfileDetailMode::Memory);
+            }
+            "tools" => {
+                let active = ProfileManager::new().active();
+                let name = tokens.get(1).map(String::as_str).unwrap_or(active.as_str());
+                self.open_profile_selector_with(Some(name), ProfileDetailMode::Tools);
+            }
+            "use" => {
+                let active = ProfileManager::new().active();
+                let Some(name) = tokens.get(1).map(String::as_str).or(Some(active.as_str())) else {
+                    self.push_output("Usage: /profile use <name>", OutputRole::System);
+                    return;
+                };
+                self.open_profile_selector_with(Some(name), ProfileDetailMode::Summary);
+            }
+            "create" => {
+                let initial = tokens[1..].join(" ");
+                self.open_profile_selector_with(None, ProfileDetailMode::Help);
+                self.open_value_capture(
+                    "Create Profile",
+                    "Create a profile inline. Syntax: <name> [--clone|--clone-all] [--clone-from source].",
+                    "research --clone-from work",
+                    false,
+                    initial,
+                    ValueCaptureAction::ProfileCreate,
+                );
+            }
+            "delete" => {
+                let Some(name) = tokens.get(1) else {
+                    self.open_profile_selector_with(None, ProfileDetailMode::Help);
+                    return;
+                };
+                self.open_profile_selector_with(Some(name), ProfileDetailMode::Summary);
+                self.open_profile_delete_editor(name.clone());
+            }
+            "rename" => {
+                let Some(old_name) = tokens.get(1) else {
+                    self.open_profile_selector_with(None, ProfileDetailMode::Help);
+                    return;
+                };
+                self.open_profile_selector_with(Some(old_name), ProfileDetailMode::Summary);
+                self.open_value_capture(
+                    format!("Rename Profile · {old_name}"),
+                    "Enter the new profile name.",
+                    "new-profile-name",
+                    false,
+                    tokens.get(2).cloned().unwrap_or_default(),
+                    ValueCaptureAction::ProfileRename(old_name.clone()),
+                );
+            }
+            "alias" => {
+                let Some(name) = tokens.get(1) else {
+                    self.open_profile_selector_with(None, ProfileDetailMode::Help);
+                    return;
+                };
+                let remove = tokens.iter().any(|token| token == "--remove");
+                let alias_name = tokens
+                    .windows(2)
+                    .find_map(|window| (window[0] == "--name").then_some(window[1].as_str()));
+                self.open_profile_selector_with(Some(name), ProfileDetailMode::Summary);
+                self.open_value_capture(
+                    format!("Profile Alias · {name}"),
+                    "Enter an alias wrapper name. Use `clear` to remove the canonical alias.",
+                    name,
+                    false,
+                    if remove {
+                        "clear".into()
+                    } else {
+                        alias_name.unwrap_or(name).to_string()
+                    },
+                    ValueCaptureAction::ProfileAlias(name.clone()),
+                );
+            }
+            "export" => {
+                let Some(name) = tokens.get(1) else {
+                    self.open_profile_selector_with(None, ProfileDetailMode::Help);
+                    return;
+                };
+                let output = tokens.windows(2).find_map(|window| {
+                    (window[0] == "-o" || window[0] == "--output").then_some(window[1].as_str())
+                });
+                self.open_profile_selector_with(Some(name), ProfileDetailMode::Summary);
+                self.open_value_capture(
+                    format!("Export Profile · {name}"),
+                    "Optional archive path. Leave blank to write <profile>.tar.gz in the current directory.",
+                    format!("{name}.tar.gz"),
+                    false,
+                    output.unwrap_or_default(),
+                    ValueCaptureAction::ProfileExport(name.clone()),
+                );
+            }
+            "import" => {
+                let initial_name = tokens
+                    .windows(2)
+                    .find_map(|window| (window[0] == "--name").then_some(window[1].as_str()));
+                let initial = match (tokens.get(1), initial_name) {
+                    (Some(archive), Some(name)) => format!("{archive} {name}"),
+                    (Some(archive), None) => archive.clone(),
+                    (None, _) => String::new(),
+                };
+                self.open_profile_selector_with(None, ProfileDetailMode::Help);
+                self.open_value_capture(
+                    "Import Profile",
+                    "Import a profile archive inline. Syntax: <archive-path> [target-name].",
+                    "/path/to/profile.tar.gz imported-name",
+                    false,
+                    initial,
+                    ValueCaptureAction::ProfileImport,
+                );
+            }
+            other => self.push_output(
+                format!(
+                    "Unknown profile subcommand '{}'. Use /profile help or /profiles.",
+                    other
+                ),
+                OutputRole::System,
+            ),
+        }
+    }
+
     fn handle_show_skills(&mut self, args: String) {
         // Use ~/.edgecrab/skills/ — mirrors skills tool (edgecrab_home-based)
         let skills_dir = edgecrab_core::edgecrab_home().join("skills");
@@ -13397,7 +14864,11 @@ impl App {
                             text.push_str(
                                 "\nUsage: /skills view <name.md>  /skills search  /skills install <path>",
                             );
-                            self.push_output(text, OutputRole::System);
+                            self.open_report_overlay(
+                                "Installed Skills",
+                                format!("{} local skill entries", skills.len()),
+                                text,
+                            );
                         }
                     }
                     Err(e) => self.push_output(format!("Cannot read skills dir: {e}"), OutputRole::Error),
@@ -13421,7 +14892,14 @@ impl App {
                         match std::fs::read_to_string(&path) {
                             Ok(content) => {
                                 let header = format!("=== {} ===\n", path.file_name().unwrap_or_default().to_string_lossy());
-                                self.push_output(format!("{header}{content}"), OutputRole::System);
+                                self.open_report_overlay(
+                                    format!(
+                                        "Skill · {}",
+                                        path.file_name().unwrap_or_default().to_string_lossy()
+                                    ),
+                                    path.display().to_string(),
+                                    format!("{header}{content}"),
+                                );
                             }
                             Err(e) => self.push_output(format!("Cannot read skill: {e}"), OutputRole::Error),
                         }
@@ -13711,6 +15189,18 @@ impl App {
         )
     }
 
+    fn open_tool_progress_selector(&mut self) -> String {
+        self.verbose_selector_cursor = match self.tool_progress_mode {
+            ToolProgressMode::Off => 0,
+            ToolProgressMode::New => 1,
+            ToolProgressMode::All => 2,
+            ToolProgressMode::Verbose => 3,
+        };
+        self.verbose_selector_active = true;
+        self.needs_redraw = true;
+        self.format_tool_progress_status()
+    }
+
     fn cycle_tool_progress_mode(&mut self) -> String {
         let next = self.tool_progress_mode.cycle();
         let save_note = match self.set_tool_progress_mode(next) {
@@ -13725,12 +15215,13 @@ impl App {
         let normalized = raw.trim().to_ascii_lowercase();
         match normalized.as_str() {
             "" | "cycle" | "next" => self.cycle_tool_progress_mode(),
+            "open" => self.open_tool_progress_selector(),
             "status" => self.format_tool_progress_status(),
             "off" => self.set_tool_progress_mode_explicit(ToolProgressMode::Off),
             "new" => self.set_tool_progress_mode_explicit(ToolProgressMode::New),
             "all" => self.set_tool_progress_mode_explicit(ToolProgressMode::All),
             "verbose" => self.set_tool_progress_mode_explicit(ToolProgressMode::Verbose),
-            _ => "Usage: /verbose [off|new|all|verbose|status]".into(),
+            _ => "Usage: /verbose [off|new|all|verbose|status|open]".into(),
         }
     }
 
@@ -14218,7 +15709,11 @@ impl App {
             build_models_inventory_report(&filtered_providers, &current, &filter)
         };
 
-        self.push_output(text, OutputRole::System);
+        self.open_report_overlay(
+            "Usage Insights",
+            "Current session plus 30-day historical usage",
+            text,
+        );
     }
 
     // ─── Wired slash command handlers (Phase 8.1) ───────────────────
@@ -14408,6 +15903,40 @@ impl App {
             crate::plugins_cmd::PluginAction::Browse => {
                 self.open_remote_plugin_selector(None, None);
             }
+            crate::plugins_cmd::PluginAction::Status => {
+                match crate::plugins_cmd::run_capture(crate::plugins_cmd::PluginAction::Status) {
+                    Ok(text) => self.open_report_overlay(
+                        "Plugin Status",
+                        "Installed plugin runtime and health summary",
+                        text,
+                    ),
+                    Err(error) => self.push_output(format!("plugins: {error}"), OutputRole::Error),
+                }
+            }
+            crate::plugins_cmd::PluginAction::Info { name } => {
+                match crate::plugins_cmd::run_capture(crate::plugins_cmd::PluginAction::Info {
+                    name: name.clone(),
+                }) {
+                    Ok(text) => self.open_report_overlay(
+                        format!("Plugin · {name}"),
+                        "Installed plugin detail",
+                        text,
+                    ),
+                    Err(error) => self.push_output(format!("plugins: {error}"), OutputRole::Error),
+                }
+            }
+            crate::plugins_cmd::PluginAction::Audit { lines } => {
+                match crate::plugins_cmd::run_capture(crate::plugins_cmd::PluginAction::Audit {
+                    lines,
+                }) {
+                    Ok(text) => self.open_report_overlay(
+                        "Plugin Audit",
+                        format!("Recent plugin audit trail ({lines} lines requested)"),
+                        text,
+                    ),
+                    Err(error) => self.push_output(format!("plugins: {error}"), OutputRole::Error),
+                }
+            }
             other => match crate::plugins_cmd::run_capture(other) {
                 Ok(text) => {
                     if refresh_runtime && let Err(error) = self.refresh_agent_plugin_runtime() {
@@ -14513,16 +16042,14 @@ impl App {
 
     fn open_gateway_bind_editor(&mut self) {
         let config = self.load_runtime_config();
-        self.display_state = DisplayState::ValueCapture {
-            title: "Gateway Bind".into(),
-            prompt: "Edit the bind address as host:port. Use `clear` to reset to 127.0.0.1:8080."
-                .into(),
-            placeholder: "127.0.0.1:8080".into(),
-            masked: false,
-            buffer: format!("{}:{}", config.gateway.host, config.gateway.port),
-            action: ValueCaptureAction::BindAddress,
-        };
-        self.needs_redraw = true;
+        self.open_value_capture(
+            "Gateway Bind",
+            "Edit the bind address as host:port. Use `clear` to reset to 127.0.0.1:8080.",
+            "127.0.0.1:8080",
+            false,
+            format!("{}:{}", config.gateway.host, config.gateway.port),
+            ValueCaptureAction::BindAddress,
+        );
     }
 
     fn open_gateway_home_channel_editor(&mut self) {
@@ -14547,15 +16074,14 @@ impl App {
             "slack" => config.gateway.slack.home_channel.unwrap_or_default(),
             _ => String::new(),
         };
-        self.display_state = DisplayState::ValueCapture {
-            title: format!("{} Home Channel", entry.diagnostic.name),
-            prompt: "Set the proactive delivery target. Use `clear` to remove it.".into(),
-            placeholder: "chat-id, channel-id, or thread target".into(),
-            masked: false,
-            buffer: current,
-            action: ValueCaptureAction::HomeChannel(entry.diagnostic.id.into()),
-        };
-        self.needs_redraw = true;
+        self.open_value_capture(
+            format!("{} Home Channel", entry.diagnostic.name),
+            "Set the proactive delivery target. Use `clear` to remove it.",
+            "chat-id, channel-id, or thread target",
+            false,
+            current,
+            ValueCaptureAction::HomeChannel(entry.diagnostic.id.into()),
+        );
     }
 
     fn open_gateway_allowlist_editor(&mut self) {
@@ -14587,15 +16113,14 @@ impl App {
             .unwrap_or_default(),
         };
 
-        self.display_state = DisplayState::ValueCapture {
-            title: format!("{} Allowlist", entry.diagnostic.name),
-            prompt: "Comma-separated IDs. Leave blank or use `clear` for open access.".into(),
-            placeholder: "user-1,user-2".into(),
-            masked: false,
-            buffer: current,
-            action: ValueCaptureAction::AllowedUsers(entry.diagnostic.id.into()),
-        };
-        self.needs_redraw = true;
+        self.open_value_capture(
+            format!("{} Allowlist", entry.diagnostic.name),
+            "Comma-separated IDs. Leave blank or use `clear` for open access.",
+            "user-1,user-2",
+            false,
+            current,
+            ValueCaptureAction::AllowedUsers(entry.diagnostic.id.into()),
+        );
     }
 
     fn open_gateway_primary_editor(&mut self) {
@@ -14606,15 +16131,7 @@ impl App {
         if let Some((title, prompt, placeholder, masked, current, action)) =
             self.gateway_primary_capture_for(&entry)
         {
-            self.display_state = DisplayState::ValueCapture {
-                title,
-                prompt,
-                placeholder,
-                masked,
-                buffer: current,
-                action,
-            };
-            self.needs_redraw = true;
+            self.open_value_capture(title, prompt, placeholder, masked, current, action);
         } else {
             self.push_output(
                 format!(
@@ -15409,7 +16926,7 @@ impl App {
         }
     }
 
-    fn handle_show_insights(&mut self) {
+    fn handle_show_insights(&mut self, days: u32) {
         let Some(agent) = self.require_agent() else {
             return;
         };
@@ -15455,13 +16972,13 @@ impl App {
             cost.amount_usd.unwrap_or(0.0)
         ));
 
-        // ── Historical (30-day) ────────────────────────────────────────
+        // ── Historical window ──────────────────────────────────────────
         let db_opt = self.rt_handle.block_on(async { agent.state_db().await });
         if let Some(db) = db_opt {
-            match db.query_insights(30) {
+            match db.query_insights(days) {
                 Ok(report) if report.overview.total_sessions > 0 => {
                     let ov = &report.overview;
-                    text.push_str("\n── Last 30 days (all sessions) ─────────\n");
+                    text.push_str(&format!("\n── Last {days} days (all sessions) ─────────\n"));
                     text.push_str(&format!("  Sessions:       {}\n", ov.total_sessions));
                     text.push_str(&format!("  Messages:       {}\n", ov.total_messages));
                     text.push_str(&format!("  Tool calls:     {}\n", ov.total_tool_calls));
@@ -15513,7 +17030,9 @@ impl App {
                     }
                 }
                 Ok(_) => {
-                    text.push_str("\n  No historical sessions found for the last 30 days.\n");
+                    text.push_str(&format!(
+                        "\n  No historical sessions found for the last {days} days.\n"
+                    ));
                 }
                 Err(e) => {
                     text.push_str(&format!("\n  (Historical insights unavailable: {e})\n"));
@@ -15723,7 +17242,11 @@ impl App {
                             transport
                         ));
                     }
-                    self.push_output(lines.join("\n"), OutputRole::System);
+                    self.open_report_overlay(
+                        "Configured MCP Servers",
+                        "Saved MCP transports and enablement state",
+                        lines.join("\n"),
+                    );
                 }
                 Ok(_) => self.push_output("No MCP servers configured.", OutputRole::System),
                 Err(err) => self.push_output(err, OutputRole::Error),
@@ -15760,25 +17283,28 @@ impl App {
                     return;
                 };
                 if let Some(preset) = crate::mcp_catalog::find_preset(preset_name) {
-                    self.push_output(
+                    self.open_report_overlay(
+                        format!("MCP Preset · {}", preset.display_name),
+                        "Built-in MCP preset details",
                         crate::mcp_catalog::render_preset_detail(preset),
-                        OutputRole::System,
                     );
                     return;
                 }
                 if let Some(entry) = self.rt_handle.block_on(
                     crate::mcp_catalog::find_official_catalog_entry_with_refresh(preset_name),
                 ) {
-                    self.push_output(
+                    self.open_report_overlay(
+                        format!("Official MCP Entry · {}", entry.display_name),
+                        "Official remote MCP catalog entry",
                         crate::mcp_catalog::render_official_catalog_entry(&entry),
-                        OutputRole::System,
                     );
                     return;
                 }
                 match self.configured_mcp_server(preset_name) {
-                    Ok(server) => self.push_output(
+                    Ok(server) => self.open_report_overlay(
+                        format!("MCP Server · {}", server.name),
+                        "Configured local MCP server detail",
                         mcp_support::render_configured_server_detail(&server),
-                        OutputRole::System,
                     ),
                     Err(err) => self.push_output(err, OutputRole::Error),
                 }
@@ -15926,7 +17452,11 @@ impl App {
                     return;
                 };
                 match mcp_support::render_mcp_auth_guide(name) {
-                    Ok(report) => self.push_output(report, OutputRole::System),
+                    Ok(report) => self.open_report_overlay(
+                        format!("MCP Auth · {name}"),
+                        "Authentication and token guidance",
+                        report,
+                    ),
                     Err(err) => {
                         self.push_output(format!("MCP auth failed: {err}"), OutputRole::Error)
                     }
@@ -16978,6 +18508,10 @@ impl App {
             self.render_remote_mcp_selector(frame, frame.area());
         }
 
+        if self.profile_selector.active {
+            self.render_profile_selector(frame, frame.area());
+        }
+
         // Skill selector overlay (full screen, takes precedence over model selector)
         if self.skill_selector.active {
             self.render_skill_selector(frame, frame.area());
@@ -17044,6 +18578,10 @@ impl App {
         // Status bar picker overlay (compact centered popup)
         if self.statusbar_selector_active {
             self.render_statusbar_selector(frame, frame.area());
+        }
+
+        if self.document_overlay.is_some() {
+            self.render_document_overlay(frame, frame.area());
         }
 
         // Approval overlay (full screen, highest precedence)
@@ -17424,6 +18962,19 @@ impl App {
             "│",
             Style::default().fg(Color::Rgb(50, 50, 65)),
         ));
+
+        if let Some(overlay) = self.document_overlay.as_ref() {
+            left_spans.push(Span::styled(
+                format!(" {} {} ", overlay.icon, unicode_trunc(&overlay.title, 28)),
+                Style::default()
+                    .fg(overlay.accent)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            left_spans.push(Span::styled(
+                "│",
+                Style::default().fg(Color::Rgb(50, 50, 65)),
+            ));
+        }
 
         // Model name
         left_spans.push(Span::styled(
@@ -18938,10 +20489,313 @@ impl App {
         frame.render_widget(help, chunks[2]);
     }
 
+    fn profile_browser_title(&self) -> &'static str {
+        match self.profile_detail_mode {
+            ProfileDetailMode::Summary => "Browse Profiles",
+            ProfileDetailMode::Config => "Browse Profiles · Config",
+            ProfileDetailMode::Soul => "Browse Profiles · SOUL",
+            ProfileDetailMode::Memory => "Browse Profiles · Memory",
+            ProfileDetailMode::Tools => "Browse Profiles · Tools",
+            ProfileDetailMode::Help => "Browse Profiles · Help",
+        }
+    }
+
+    fn profile_help_text(&self) -> String {
+        [
+            "Profiles",
+            "",
+            "Enter  switch to the selected profile",
+            "V      summary view",
+            "C      config.yaml view",
+            "S      SOUL.md view",
+            "M      memory files view",
+            "T      tool policy view",
+            "A      alias editor",
+            "E      export editor",
+            "D      delete confirmation",
+            "N      create editor",
+            "I      import editor",
+            "O      rename editor",
+            "Tab / Right  next detail tab",
+            "Shift-Tab / Left  previous detail tab",
+            "Home / End  jump to first or last match",
+            "PgUp / PgDn  scroll the detail pane",
+            "Z      toggle split/full detail",
+            "Esc    close overlay",
+            "",
+            "Slash command entry points:",
+            "/profile",
+            "/profile show <name>",
+            "/profile config <name>",
+            "/profile soul <name>",
+            "/profile memory <name>",
+            "/profile tools <name>",
+            "/profile create ...",
+            "/profile rename ...",
+            "/profile delete ...",
+            "/profile alias ...",
+            "/profile export ...",
+            "/profile import ...",
+        ]
+        .join("\n")
+    }
+
+    fn render_profile_detail_text(&self, entry: Option<&ProfileEntry>) -> String {
+        let Some(entry) = entry else {
+            return match self.profile_detail_mode {
+                ProfileDetailMode::Help => self.profile_help_text(),
+                _ => "No profiles matched this query.".into(),
+            };
+        };
+
+        let manager = ProfileManager::new();
+        match self.profile_detail_mode {
+            ProfileDetailMode::Summary => {
+                format!("{}\n\n{}", entry.detail_view, entry.detail_actions_line())
+            }
+            ProfileDetailMode::Config => manager
+                .render_config(&entry.name)
+                .unwrap_or_else(|err| format!("profile config: {err}")),
+            ProfileDetailMode::Soul => manager
+                .render_soul(&entry.name)
+                .unwrap_or_else(|err| format!("profile soul: {err}")),
+            ProfileDetailMode::Memory => manager
+                .render_memory(&entry.name)
+                .unwrap_or_else(|err| format!("profile memory: {err}")),
+            ProfileDetailMode::Tools => manager
+                .render_tools_report(&entry.name)
+                .unwrap_or_else(|err| format!("profile tools: {err}")),
+            ProfileDetailMode::Help => {
+                format!(
+                    "{}\n\nCurrent selection: {}",
+                    self.profile_help_text(),
+                    entry.name
+                )
+            }
+        }
+    }
+
     /// Render the full-screen skill browser overlay.
     ///
     /// UX mirrors `render_model_selector` — same search-box + list + help-line
     /// layout — so users get a consistent experience between `/model` and `/skills`.
+    fn render_profile_selector(&self, frame: &mut Frame, area: Rect) {
+        frame.render_widget(Clear, area);
+
+        let chunks = Self::browser_overlay_chunks(area);
+        let body = Self::browser_body_chunks(chunks[1]);
+        self.render_browser_header(
+            frame,
+            chunks[0],
+            &self.profile_selector.query,
+            BrowserChrome {
+                title: self.profile_browser_title(),
+                placeholder: "Search profiles by name, model, path, or status.",
+                icon: "👤",
+                icon_color: Color::Rgb(120, 205, 255),
+                border_color: Color::Rgb(120, 205, 255),
+            },
+        );
+
+        let max_visible = body[0].height as usize;
+        let filtered = &self.profile_selector.filtered;
+        let selected = self.profile_selector.selected;
+        let scroll_start = Self::browser_scroll_start(selected, max_visible);
+
+        let items: Vec<ListItem> = filtered
+            .iter()
+            .skip(scroll_start)
+            .take(max_visible)
+            .enumerate()
+            .map(|(vis_idx, &profile_idx)| {
+                let entry = &self.profile_selector.items[profile_idx];
+                let is_selected = vis_idx + scroll_start == selected;
+                let bg = if is_selected {
+                    Color::Rgb(18, 36, 48)
+                } else {
+                    Color::Rgb(20, 20, 28)
+                };
+                ListItem::new(Line::from(vec![
+                    selector_marker(is_selected, Color::Rgb(120, 205, 255), Some(bg)),
+                    Span::styled(
+                        format!("  {:<7}", entry.status_label()),
+                        if is_selected {
+                            Style::default().bg(bg).fg(Color::Rgb(165, 225, 255))
+                        } else {
+                            Style::default().fg(Color::Rgb(90, 130, 155))
+                        },
+                    ),
+                    Span::styled(
+                        format!("{:<8}", entry.kind_label()),
+                        if is_selected {
+                            Style::default().bg(bg).fg(Color::Rgb(110, 170, 210))
+                        } else {
+                            Style::default().fg(Color::Rgb(70, 100, 120))
+                        },
+                    ),
+                    Span::styled(
+                        unicode_trunc(&entry.display_title(), 24),
+                        if is_selected {
+                            Style::default()
+                                .bg(bg)
+                                .fg(Color::Rgb(180, 235, 255))
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(Color::Rgb(135, 200, 225))
+                        },
+                    ),
+                    Span::raw("  "),
+                    Span::styled(
+                        unicode_trunc(&entry.detail, 48),
+                        if is_selected {
+                            Style::default().bg(bg).fg(Color::Rgb(135, 180, 205))
+                        } else {
+                            Style::default().fg(Color::Rgb(85, 110, 130))
+                        },
+                    ),
+                ]))
+            })
+            .collect();
+        frame.render_widget(
+            List::new(items).style(Style::default().bg(Color::Rgb(20, 20, 28))),
+            body[0],
+        );
+
+        let mut detail_lines = Vec::new();
+        if let Some(entry) = self.profile_selector.current() {
+            detail_lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{} ", entry.status_label().to_uppercase()),
+                    Style::default()
+                        .fg(Color::Rgb(120, 205, 255))
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(entry.display_title()),
+                Span::styled(
+                    format!("  [{}]", self.profile_detail_mode.title()),
+                    Style::default().fg(Color::Rgb(90, 150, 180)),
+                ),
+            ]));
+        } else {
+            detail_lines.push(Line::from(Span::styled(
+                format!("Detail Mode: {}", self.profile_detail_mode.title()),
+                Style::default()
+                    .fg(Color::Rgb(120, 205, 255))
+                    .add_modifier(Modifier::BOLD),
+            )));
+        }
+        detail_lines.push(Line::from(""));
+        for line in self
+            .render_profile_detail_text(self.profile_selector.current())
+            .lines()
+        {
+            detail_lines.push(Line::from(line.to_string()));
+        }
+
+        if self.detail_fullscreen_active(DetailSurface::ProfileSelector) {
+            self.render_fullscreen_browser_detail(
+                frame,
+                area,
+                FullscreenBrowserChrome {
+                    query: &self.profile_selector.query,
+                    header: BrowserChrome {
+                        title: self.profile_browser_title(),
+                        placeholder: "Search profiles by name, model, path, or status.",
+                        icon: "👤",
+                        icon_color: Color::Rgb(120, 205, 255),
+                        border_color: Color::Rgb(120, 205, 255),
+                    },
+                    detail: ScrollableDetailChrome {
+                        title: "Details",
+                        border_color: Color::Rgb(120, 205, 255),
+                        focused: true,
+                        requested_scroll: self
+                            .detail_fullscreen_scroll(DetailSurface::ProfileSelector),
+                    },
+                    help: Line::from(vec![
+                        Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(120, 205, 255))),
+                        Span::styled("change item  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("type ", Style::default().fg(Color::Rgb(120, 205, 255))),
+                        Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(120, 205, 255))),
+                        Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Enter ", Style::default().fg(Color::Rgb(120, 205, 255))),
+                        Span::styled("switch profile  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("C ", Style::default().fg(Color::Rgb(120, 205, 255))),
+                        Span::styled("config  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("S ", Style::default().fg(Color::Rgb(120, 205, 255))),
+                        Span::styled("SOUL  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("M ", Style::default().fg(Color::Rgb(120, 205, 255))),
+                        Span::styled("memory  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("T ", Style::default().fg(Color::Rgb(120, 205, 255))),
+                        Span::styled("tools  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("V ", Style::default().fg(Color::Rgb(120, 205, 255))),
+                        Span::styled("view summary  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("A/E ", Style::default().fg(Color::Rgb(120, 205, 255))),
+                        Span::styled("alias/export  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("D/N/I/O ", Style::default().fg(Color::Rgb(120, 205, 255))),
+                        Span::styled(
+                            "delete/new/import/rename  ",
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                        Span::styled("Tab/←→ ", Style::default().fg(Color::Rgb(120, 205, 255))),
+                        Span::styled("cycle views  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Home/End ", Style::default().fg(Color::Rgb(120, 205, 255))),
+                        Span::styled("jump  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Z ", Style::default().fg(Color::Rgb(120, 205, 255))),
+                        Span::styled("split view  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Esc ", Style::default().fg(Color::Rgb(120, 205, 255))),
+                        Span::styled("close  ", Style::default().fg(Color::DarkGray)),
+                    ]),
+                },
+                detail_lines,
+            );
+            return;
+        }
+
+        self.render_standard_split_detail(
+            frame,
+            body[1],
+            DetailSurface::ProfileSelector,
+            Color::Rgb(120, 205, 255),
+            detail_lines,
+        );
+
+        let help = Paragraph::new(Line::from(vec![
+            Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(120, 205, 255))),
+            Span::styled("browse  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("type ", Style::default().fg(Color::Rgb(120, 205, 255))),
+            Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(120, 205, 255))),
+            Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Enter ", Style::default().fg(Color::Rgb(120, 205, 255))),
+            Span::styled("switch  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("C/S/M/T ", Style::default().fg(Color::Rgb(120, 205, 255))),
+            Span::styled("inspect  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("V ", Style::default().fg(Color::Rgb(120, 205, 255))),
+            Span::styled("summary  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("A/E ", Style::default().fg(Color::Rgb(120, 205, 255))),
+            Span::styled("alias/export  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("D/N/I/O ", Style::default().fg(Color::Rgb(120, 205, 255))),
+            Span::styled("manage  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Tab/←→ ", Style::default().fg(Color::Rgb(120, 205, 255))),
+            Span::styled("views  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Home/End ", Style::default().fg(Color::Rgb(120, 205, 255))),
+            Span::styled("jump  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Z ", Style::default().fg(Color::Rgb(120, 205, 255))),
+            Span::styled("detail  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("R ", Style::default().fg(Color::Rgb(120, 205, 255))),
+            Span::styled("refresh  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Esc ", Style::default().fg(Color::Rgb(120, 205, 255))),
+            Span::styled("close  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{} profile(s)", filtered.len()),
+                Style::default().fg(Color::Rgb(80, 100, 120)),
+            ),
+        ]));
+        frame.render_widget(help, chunks[2]);
+    }
+
     fn render_skill_selector(&self, frame: &mut Frame, area: Rect) {
         frame.render_widget(Clear, area);
 
@@ -21556,6 +23410,66 @@ impl App {
         frame.render_widget(help, chunks[2]);
     }
 
+    fn render_document_overlay(&self, frame: &mut Frame, area: Rect) {
+        let Some(overlay) = self.document_overlay.as_ref() else {
+            return;
+        };
+
+        frame.render_widget(Clear, area);
+
+        let chunks = Self::browser_overlay_chunks(area);
+        let header = Paragraph::new(Line::from(vec![
+            Span::styled(
+                format!("  {} ", overlay.icon),
+                Style::default().fg(overlay.accent),
+            ),
+            Span::styled(
+                if overlay.subtitle.trim().is_empty() {
+                    "Read-only report".to_string()
+                } else {
+                    overlay.subtitle.clone()
+                },
+                Style::default().fg(Color::White),
+            ),
+        ]))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(overlay.accent))
+                .title(format!(" {} ", overlay.title)),
+        );
+        frame.render_widget(header, chunks[0]);
+
+        let detail_lines: Vec<Line<'static>> = overlay
+            .body
+            .lines()
+            .map(|line| Line::from(line.to_string()))
+            .collect();
+        self.render_scrollable_browser_detail(
+            frame,
+            chunks[1],
+            ScrollableDetailChrome {
+                title: "Details",
+                border_color: overlay.accent,
+                focused: true,
+                requested_scroll: overlay.scroll,
+            },
+            detail_lines,
+        );
+
+        let help = Paragraph::new(Line::from(vec![
+            Span::styled(" ↑↓ ", Style::default().fg(overlay.accent)),
+            Span::styled("scroll line  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("PgUp/Dn ", Style::default().fg(overlay.accent)),
+            Span::styled("scroll page  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Home/End ", Style::default().fg(overlay.accent)),
+            Span::styled("jump  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Esc ", Style::default().fg(overlay.accent)),
+            Span::styled("close", Style::default().fg(Color::DarkGray)),
+        ]));
+        frame.render_widget(help, chunks[2]);
+    }
+
     fn render_skin_browser(&self, frame: &mut Frame, area: Rect) {
         frame.render_widget(Clear, area);
 
@@ -23058,6 +24972,20 @@ mod tests {
         )
     }
 
+    fn set_test_edgecrab_home(path: &std::path::Path) {
+        crate::profile::set_test_edgecrab_home_override(Some(path));
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", path);
+        }
+    }
+
+    fn clear_test_edgecrab_home() {
+        crate::profile::set_test_edgecrab_home_override(None);
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
     fn write_script_plugin(home: &std::path::Path, plugin_name: &str, tool_name: &str) {
         let plugin_dir = home.join("plugins").join(plugin_name);
         std::fs::create_dir_all(&plugin_dir).expect("plugin dir");
@@ -23150,9 +25078,7 @@ description = "Demo plugin tool"
     #[test]
     #[serial_test::serial(edgecrab_home_env)]
     fn gateway_platform_panel_surfaces_runtime_states_and_actions() {
-        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
-            .lock()
-            .expect("env lock");
+        let _guard = crate::gateway_catalog::lock_test_env();
         let dir = tempfile::tempdir().expect("tempdir");
         unsafe {
             std::env::set_var("EDGECRAB_HOME", dir.path());
@@ -23213,9 +25139,7 @@ description = "Demo plugin tool"
     #[tokio::test]
     #[serial_test::serial(edgecrab_home_env)]
     async fn platforms_command_opens_gateway_browser_overlay() {
-        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
-            .lock()
-            .expect("env lock");
+        let _guard = crate::gateway_catalog::lock_test_env();
         let dir = tempfile::tempdir().expect("tempdir");
         unsafe {
             std::env::set_var("EDGECRAB_HOME", dir.path());
@@ -23246,9 +25170,7 @@ description = "Demo plugin tool"
     #[tokio::test]
     #[serial_test::serial(edgecrab_home_env)]
     async fn gateway_bind_editor_persists_from_tui_flow() {
-        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
-            .lock()
-            .expect("env lock");
+        let _guard = crate::gateway_catalog::lock_test_env();
         let dir = tempfile::tempdir().expect("tempdir");
         unsafe {
             std::env::set_var("EDGECRAB_HOME", dir.path());
@@ -23262,6 +25184,358 @@ description = "Demo plugin tool"
         assert_eq!(config.gateway.host, "0.0.0.0");
         assert_eq!(config.gateway.port, 9091);
 
+        clear_test_edgecrab_home();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(edgecrab_home_env)]
+    async fn profile_create_capture_creates_profile_inline() {
+        let _guard = crate::gateway_catalog::lock_test_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let edgecrab_home = dir.path().join(".edgecrab");
+        set_test_edgecrab_home(&edgecrab_home);
+
+        let manager = ProfileManager::new();
+        manager
+            .create_report("cargo", false, false, None)
+            .expect("create source");
+        let source_home = crate::profile::edgecrab_home()
+            .join("profiles")
+            .join("cargo");
+        std::fs::write(source_home.join("SOUL.md"), "# Source profile\n")
+            .expect("write source soul");
+
+        let mut app = App::new();
+        set_test_edgecrab_home(&edgecrab_home);
+        app.apply_value_capture_action(
+            ValueCaptureAction::ProfileCreate,
+            "git --clone --clone-from cargo".into(),
+        );
+
+        set_test_edgecrab_home(&edgecrab_home);
+        let work_home = crate::profile::edgecrab_home().join("profiles").join("git");
+        assert!(work_home.exists());
+        assert_eq!(
+            std::fs::read_to_string(work_home.join("SOUL.md")).expect("read work soul"),
+            "# Source profile\n"
+        );
+
+        clear_test_edgecrab_home();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(edgecrab_home_env)]
+    async fn profile_delete_capture_requires_exact_confirmation() {
+        let _guard = crate::gateway_catalog::lock_test_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let edgecrab_home = dir.path().join(".edgecrab");
+        set_test_edgecrab_home(&edgecrab_home);
+
+        ProfileManager::new()
+            .create_report("git", false, false, None)
+            .expect("create work");
+        let work_home = crate::profile::edgecrab_home().join("profiles").join("git");
+
+        let mut app = App::new();
+        set_test_edgecrab_home(&edgecrab_home);
+        app.apply_value_capture_action(
+            ValueCaptureAction::ProfileDeleteConfirm("git".into()),
+            "wrong".into(),
+        );
+        assert!(work_home.exists());
+
+        set_test_edgecrab_home(&edgecrab_home);
+        app.apply_value_capture_action(
+            ValueCaptureAction::ProfileDeleteConfirm("git".into()),
+            "git".into(),
+        );
+        set_test_edgecrab_home(&edgecrab_home);
+        assert!(
+            !work_home.exists(),
+            "profile delete output:\n{}\nactive_profile={}\nwork_home={}",
+            app.output
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            edgecrab_home.join(".active_profile").display(),
+            work_home.display(),
+        );
+
+        clear_test_edgecrab_home();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(edgecrab_home_env)]
+    async fn profile_rename_capture_renames_profile_inline() {
+        let _guard = crate::gateway_catalog::lock_test_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let edgecrab_home = dir.path().join(".edgecrab");
+        set_test_edgecrab_home(&edgecrab_home);
+
+        ProfileManager::new()
+            .create_report("tar", false, false, None)
+            .expect("create work");
+
+        let mut app = App::new();
+        set_test_edgecrab_home(&edgecrab_home);
+        app.apply_value_capture_action(
+            ValueCaptureAction::ProfileRename("tar".into()),
+            "sed".into(),
+        );
+
+        set_test_edgecrab_home(&edgecrab_home);
+        assert!(
+            !crate::profile::edgecrab_home()
+                .join("profiles")
+                .join("tar")
+                .exists()
+        );
+        assert!(
+            crate::profile::edgecrab_home()
+                .join("profiles")
+                .join("sed")
+                .exists()
+        );
+
+        clear_test_edgecrab_home();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(edgecrab_home_env)]
+    async fn profile_export_import_capture_round_trips_archive() {
+        let _guard = crate::gateway_catalog::lock_test_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let edgecrab_home = dir.path().join(".edgecrab");
+        set_test_edgecrab_home(&edgecrab_home);
+
+        ProfileManager::new()
+            .create_report("git", false, false, None)
+            .expect("create work");
+        let work_home = crate::profile::edgecrab_home().join("profiles").join("git");
+        std::fs::write(work_home.join("SOUL.md"), "# Exported profile\n").expect("write soul");
+
+        let archive = dir.path().join("git-export.tar.gz");
+        let mut app = App::new();
+        set_test_edgecrab_home(&edgecrab_home);
+        app.apply_value_capture_action(
+            ValueCaptureAction::ProfileExport("git".into()),
+            archive.display().to_string(),
+        );
+        assert!(archive.exists());
+
+        set_test_edgecrab_home(&edgecrab_home);
+        app.apply_value_capture_action(
+            ValueCaptureAction::ProfileImport,
+            format!("{} sed", archive.display()),
+        );
+
+        set_test_edgecrab_home(&edgecrab_home);
+        let imported_home = crate::profile::edgecrab_home().join("profiles").join("sed");
+        assert!(imported_home.exists());
+        assert_eq!(
+            std::fs::read_to_string(imported_home.join("SOUL.md")).expect("read imported soul"),
+            "# Exported profile\n"
+        );
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(edgecrab_home_env)]
+    async fn profile_command_shows_active_profile_status() {
+        let _guard = crate::gateway_catalog::lock_test_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path().join(".edgecrab"));
+        }
+
+        let manager = ProfileManager::new();
+        manager
+            .create_report("git", false, false, None)
+            .expect("create profile");
+        manager.set_active_profile("git").expect("set active");
+
+        let mut app = App::new();
+        app.handle_show_profiles(String::new());
+
+        let rendered = app.output.last().expect("output").text.clone();
+        assert!(rendered.starts_with("Profile: git\nHome:    "));
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(edgecrab_home_env)]
+    async fn profile_config_subcommand_opens_overlay_in_config_mode() {
+        let _guard = crate::gateway_catalog::lock_test_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path().join(".edgecrab"));
+        }
+
+        ProfileManager::new()
+            .create_report("git", false, false, None)
+            .expect("create profile");
+
+        let mut app = App::new();
+        app.handle_show_profiles("config git".into());
+
+        assert!(app.profile_selector.active);
+        assert_eq!(app.profile_detail_mode, ProfileDetailMode::Config);
+        assert_eq!(
+            app.profile_selector
+                .current()
+                .map(|entry| entry.name.as_str()),
+            Some("git")
+        );
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(edgecrab_home_env)]
+    fn status_command_opens_document_overlay() {
+        let _guard = crate::gateway_catalog::lock_test_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path().join(".edgecrab"));
+        }
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let _enter = rt.enter();
+        let agent = mock_agent();
+        let mut app = App::new();
+        app.set_agent(agent);
+
+        app.handle_show_status();
+
+        let overlay = app.document_overlay.as_ref().expect("document overlay");
+        assert_eq!(overlay.title, "Session Status");
+        assert!(overlay.body.contains("Session status:"));
+        assert!(overlay.body.contains("Model:"));
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(edgecrab_home_env)]
+    fn prompt_command_opens_document_overlay_when_custom_prompt_missing() {
+        let _guard = crate::gateway_catalog::lock_test_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path().join(".edgecrab"));
+        }
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let _enter = rt.enter();
+        let agent = mock_agent();
+        let mut app = App::new();
+        app.set_agent(agent);
+
+        app.handle_show_prompt();
+
+        let overlay = app.document_overlay.as_ref().expect("document overlay");
+        assert_eq!(overlay.title, "System Prompt");
+        assert!(overlay.subtitle.contains("default assembled"));
+        assert!(overlay.body.contains("No custom prompt set"));
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(edgecrab_home_env)]
+    fn prompt_command_persists_custom_prompt_override() {
+        let _guard = crate::gateway_catalog::lock_test_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path().join(".edgecrab"));
+        }
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let _enter = rt.enter();
+        let agent = mock_agent();
+        let mut app = App::new();
+        app.set_agent(agent.clone());
+
+        app.handle_prompt_command("Answer like a systems engineer.".into());
+
+        let config = edgecrab_core::AppConfig::load().expect("load config");
+        assert_eq!(
+            config.agent.system_prompt,
+            "Answer like a systems engineer."
+        );
+        assert_eq!(
+            rt.block_on(agent.custom_system_prompt()),
+            Some("Answer like a systems engineer.".into())
+        );
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[tokio::test]
+    async fn document_overlay_keyboard_navigation_is_functional() {
+        let mut app = App::new();
+        app.open_report_overlay(
+            "Diagnostics",
+            "Keyboard navigation test",
+            (0..40)
+                .map(|idx| format!("line {idx:02}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+
+        app.handle_key_event(event::KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(
+            app.document_overlay.as_ref().map(|overlay| overlay.scroll),
+            Some(8)
+        );
+
+        app.handle_key_event(event::KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(
+            app.document_overlay.as_ref().map(|overlay| overlay.scroll),
+            Some(0)
+        );
+
+        app.handle_key_event(event::KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        assert_eq!(
+            app.document_overlay.as_ref().map(|overlay| overlay.scroll),
+            Some(u16::MAX)
+        );
+
+        app.handle_key_event(event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.document_overlay.is_none());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(edgecrab_home_env)]
+    async fn skills_list_opens_document_overlay() {
+        let _guard = crate::gateway_catalog::lock_test_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path().join(".edgecrab");
+        let skills_dir = home.join("skills");
+        std::fs::create_dir_all(&skills_dir).expect("skills dir");
+        std::fs::write(skills_dir.join("demo.md"), "# Demo Skill\n").expect("skill file");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", &home);
+        }
+
+        let mut app = App::new();
+        app.handle_show_skills("list".into());
+
+        let overlay = app.document_overlay.as_ref().expect("document overlay");
+        assert_eq!(overlay.title, "Installed Skills");
+        assert!(overlay.body.contains("demo.md"));
+
         unsafe {
             std::env::remove_var("EDGECRAB_HOME");
         }
@@ -23270,9 +25544,7 @@ description = "Demo plugin tool"
     #[test]
     #[serial_test::serial(edgecrab_home_env)]
     fn stream_command_updates_runtime_behavior_and_config() {
-        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
-            .lock()
-            .expect("env lock");
+        let _guard = crate::gateway_catalog::lock_test_env();
         let dir = tempfile::tempdir().expect("tempdir");
         unsafe {
             std::env::set_var("EDGECRAB_HOME", dir.path());
@@ -23387,6 +25659,44 @@ description = "Demo plugin tool"
                 .any(|line| line.text.contains("EdgeCrab (background #1)"))
         );
         assert!(app.background_tasks_active.is_empty());
+    }
+
+    #[tokio::test]
+    async fn btw_works_without_existing_conversation_history() {
+        let provider = Arc::new(edgequake_llm::MockProvider::new());
+        provider
+            .add_response("Short side-answer from isolated context.")
+            .await;
+        let provider_dyn: Arc<dyn edgequake_llm::LLMProvider> = provider.clone();
+        let agent = Arc::new(
+            edgecrab_core::AgentBuilder::new("mock")
+                .provider(provider_dyn)
+                .tools(Arc::new(edgecrab_tools::registry::ToolRegistry::new()))
+                .build()
+                .expect("build agent"),
+        );
+
+        let mut app = App::new();
+        app.set_agent(agent.clone());
+
+        app.handle_side_question("what owns title sanitization?".into());
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        app.check_responses();
+
+        assert!(
+            app.output
+                .iter()
+                .any(|line| { line.text.contains("💬 /btw what owns title sanitization?") })
+        );
+        assert!(app.output.iter().any(|line| {
+            line.text.contains("/btw what owns title sanitization?")
+                && line
+                    .text
+                    .contains("Short side-answer from isolated context.")
+        }));
+
+        let snapshot = agent.session_snapshot().await;
+        assert_eq!(snapshot.message_count, 0);
     }
 
     #[test]
@@ -24294,9 +26604,7 @@ description = "Demo plugin tool"
     #[tokio::test]
     #[serial_test::serial(edgecrab_home_env)]
     async fn mcp_selector_shows_disabled_servers_from_config() {
-        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
-            .lock()
-            .expect("env lock");
+        let _guard = crate::gateway_catalog::lock_test_env();
         let dir = tempfile::tempdir().expect("tempdir");
         unsafe {
             std::env::set_var("EDGECRAB_HOME", dir.path());
@@ -24326,9 +26634,7 @@ description = "Demo plugin tool"
     #[tokio::test]
     #[serial_test::serial(edgecrab_home_env)]
     async fn mcp_enable_and_disable_commands_persist_server_state() {
-        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
-            .lock()
-            .expect("env lock");
+        let _guard = crate::gateway_catalog::lock_test_env();
         let dir = tempfile::tempdir().expect("tempdir");
         unsafe {
             std::env::set_var("EDGECRAB_HOME", dir.path());
@@ -24368,9 +26674,7 @@ description = "Demo plugin tool"
     #[tokio::test]
     #[serial_test::serial(edgecrab_home_env)]
     async fn mcp_search_filters_official_snapshot_entries() {
-        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
-            .lock()
-            .expect("env lock");
+        let _guard = crate::gateway_catalog::lock_test_env();
         let dir = tempfile::tempdir().expect("tempdir");
         unsafe {
             std::env::set_var("EDGECRAB_HOME", dir.path());
@@ -24487,9 +26791,7 @@ description = "Demo plugin tool"
     #[test]
     #[serial_test::serial(edgecrab_home_env)]
     fn build_remote_skill_entries_marks_update_replace_and_install() {
-        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
-            .lock()
-            .expect("env lock");
+        let _guard = crate::gateway_catalog::lock_test_env();
         let dir = tempfile::tempdir().expect("tempdir");
         unsafe {
             std::env::set_var("EDGECRAB_HOME", dir.path());
@@ -24599,9 +26901,7 @@ description = "Demo plugin tool"
     #[test]
     #[serial_test::serial(edgecrab_home_env)]
     fn build_remote_plugin_entries_marks_update_replace_and_install() {
-        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
-            .lock()
-            .expect("env lock");
+        let _guard = crate::gateway_catalog::lock_test_env();
         let dir = tempfile::tempdir().expect("tempdir");
         unsafe {
             std::env::set_var("EDGECRAB_HOME", dir.path());
@@ -24784,9 +27084,7 @@ kind = "skill"
     #[tokio::test]
     #[serial_test::serial(edgecrab_home_env)]
     async fn refresh_skills_list_builds_rich_entries_for_bundle_and_flat_skills() {
-        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
-            .lock()
-            .expect("env lock");
+        let _guard = crate::gateway_catalog::lock_test_env();
         let dir = tempfile::tempdir().expect("tempdir");
         unsafe {
             std::env::set_var("EDGECRAB_HOME", dir.path());
@@ -24863,9 +27161,7 @@ kind = "skill"
     #[tokio::test]
     #[serial_test::serial(edgecrab_home_env)]
     async fn activate_skill_supports_flat_markdown_files() {
-        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
-            .lock()
-            .expect("env lock");
+        let _guard = crate::gateway_catalog::lock_test_env();
         let dir = tempfile::tempdir().expect("tempdir");
         unsafe {
             std::env::set_var("EDGECRAB_HOME", dir.path());
@@ -24890,6 +27186,41 @@ kind = "skill"
                 .text
                 .contains("activated")
         );
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(edgecrab_home_env)]
+    fn activate_skill_updates_agent_preloaded_skills() {
+        let _guard = crate::gateway_catalog::lock_test_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+
+        let skills_dir = dir.path().join("skills");
+        std::fs::create_dir_all(&skills_dir).expect("skills dir");
+        std::fs::write(
+            skills_dir.join("quickstart.md"),
+            "---\ndescription: Quick command snippets\n---\n# Quickstart\nUse this for shell snippets.\n",
+        )
+        .expect("write flat skill");
+
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let (mut app, agent) = rt.block_on(async { (App::new(), mock_agent()) });
+        app.set_agent(agent.clone());
+        app.activate_skill("quickstart");
+
+        assert_eq!(
+            app.rt_handle.block_on(agent.preloaded_skills()),
+            vec!["quickstart"]
+        );
+
+        app.activate_skill("quickstart");
+        assert!(app.rt_handle.block_on(agent.preloaded_skills()).is_empty());
 
         unsafe {
             std::env::remove_var("EDGECRAB_HOME");
@@ -25050,9 +27381,7 @@ kind = "skill"
     #[test]
     #[serial_test::serial(edgecrab_home_env)]
     fn persist_voice_preferences_round_trip() {
-        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
-            .lock()
-            .expect("env lock");
+        let _guard = crate::gateway_catalog::lock_test_env();
         let dir = tempfile::tempdir().expect("tempdir");
         unsafe {
             std::env::set_var("EDGECRAB_HOME", dir.path());
@@ -25075,9 +27404,7 @@ kind = "skill"
     #[test]
     #[serial_test::serial(edgecrab_home_env)]
     fn persist_display_preferences_round_trip_includes_tool_progress_and_status_bar() {
-        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
-            .lock()
-            .expect("env lock");
+        let _guard = crate::gateway_catalog::lock_test_env();
         let dir = tempfile::tempdir().expect("tempdir");
         unsafe {
             std::env::set_var("EDGECRAB_HOME", dir.path());
@@ -25106,9 +27433,7 @@ kind = "skill"
     #[test]
     #[serial_test::serial(edgecrab_home_env)]
     fn persist_smart_routing_round_trip() {
-        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
-            .lock()
-            .expect("env lock");
+        let _guard = crate::gateway_catalog::lock_test_env();
         let dir = tempfile::tempdir().expect("tempdir");
         unsafe {
             std::env::set_var("EDGECRAB_HOME", dir.path());
@@ -25134,9 +27459,7 @@ kind = "skill"
     #[test]
     #[serial_test::serial(edgecrab_home_env)]
     fn persist_moa_config_round_trip() {
-        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
-            .lock()
-            .expect("env lock");
+        let _guard = crate::gateway_catalog::lock_test_env();
         let dir = tempfile::tempdir().expect("tempdir");
         unsafe {
             std::env::set_var("EDGECRAB_HOME", dir.path());
@@ -25187,9 +27510,7 @@ kind = "skill"
     #[tokio::test]
     #[serial_test::serial(edgecrab_home_env)]
     async fn sethome_updates_single_enabled_platform_without_explicit_platform_arg() {
-        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
-            .lock()
-            .expect("env lock");
+        let _guard = crate::gateway_catalog::lock_test_env();
         let dir = tempfile::tempdir().expect("tempdir");
         unsafe {
             std::env::set_var("EDGECRAB_HOME", dir.path());
@@ -25293,9 +27614,7 @@ kind = "skill"
     #[test]
     #[serial_test::serial(edgecrab_home_env)]
     fn cheap_model_command_updates_agent_and_config() {
-        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
-            .lock()
-            .expect("env lock");
+        let _guard = crate::gateway_catalog::lock_test_env();
         let dir = tempfile::tempdir().expect("tempdir");
         unsafe {
             std::env::set_var("EDGECRAB_HOME", dir.path());
@@ -25329,9 +27648,7 @@ kind = "skill"
     #[test]
     #[serial_test::serial(edgecrab_home_env)]
     fn moa_reference_selector_tracks_saved_selection() {
-        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
-            .lock()
-            .expect("env lock");
+        let _guard = crate::gateway_catalog::lock_test_env();
         let dir = tempfile::tempdir().expect("tempdir");
         unsafe {
             std::env::set_var("EDGECRAB_HOME", dir.path());
@@ -25405,9 +27722,7 @@ kind = "skill"
     #[test]
     #[serial_test::serial(edgecrab_home_env)]
     fn moa_off_command_updates_agent_and_config() {
-        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
-            .lock()
-            .expect("env lock");
+        let _guard = crate::gateway_catalog::lock_test_env();
         let dir = tempfile::tempdir().expect("tempdir");
         unsafe {
             std::env::set_var("EDGECRAB_HOME", dir.path());
@@ -25438,9 +27753,7 @@ kind = "skill"
     #[test]
     #[serial_test::serial(edgecrab_home_env)]
     fn moa_aggregator_command_enables_feature_and_normalizes_model() {
-        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
-            .lock()
-            .expect("env lock");
+        let _guard = crate::gateway_catalog::lock_test_env();
         let dir = tempfile::tempdir().expect("tempdir");
         unsafe {
             std::env::set_var("EDGECRAB_HOME", dir.path());
@@ -25472,9 +27785,7 @@ kind = "skill"
     #[test]
     #[serial_test::serial(edgecrab_home_env)]
     fn moa_on_repairs_whitelist_and_persists_toolset_filters() {
-        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
-            .lock()
-            .expect("env lock");
+        let _guard = crate::gateway_catalog::lock_test_env();
         let dir = tempfile::tempdir().expect("tempdir");
         unsafe {
             std::env::set_var("EDGECRAB_HOME", dir.path());
@@ -25513,9 +27824,7 @@ kind = "skill"
     #[test]
     #[serial_test::serial(edgecrab_home_env)]
     fn moa_on_removes_literal_disabled_toolset_block() {
-        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
-            .lock()
-            .expect("env lock");
+        let _guard = crate::gateway_catalog::lock_test_env();
         let dir = tempfile::tempdir().expect("tempdir");
         unsafe {
             std::env::set_var("EDGECRAB_HOME", dir.path());
@@ -25554,9 +27863,7 @@ kind = "skill"
     #[test]
     #[serial_test::serial(edgecrab_home_env)]
     fn moa_on_reports_alias_blocker_when_toolset_policy_still_hides_tool() {
-        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
-            .lock()
-            .expect("env lock");
+        let _guard = crate::gateway_catalog::lock_test_env();
         let dir = tempfile::tempdir().expect("tempdir");
         unsafe {
             std::env::set_var("EDGECRAB_HOME", dir.path());
@@ -25594,9 +27901,7 @@ kind = "skill"
     #[test]
     #[serial_test::serial(edgecrab_home_env)]
     fn persist_tool_filters_round_trip() {
-        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
-            .lock()
-            .expect("env lock");
+        let _guard = crate::gateway_catalog::lock_test_env();
         let dir = tempfile::tempdir().expect("tempdir");
         unsafe {
             std::env::set_var("EDGECRAB_HOME", dir.path());
@@ -25635,9 +27940,7 @@ kind = "skill"
     #[test]
     #[serial_test::serial(edgecrab_home_env)]
     fn tool_manager_toggle_persists_explicit_tool_disable() {
-        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
-            .lock()
-            .expect("env lock");
+        let _guard = crate::gateway_catalog::lock_test_env();
         let dir = tempfile::tempdir().expect("tempdir");
         unsafe {
             std::env::set_var("EDGECRAB_HOME", dir.path());
@@ -25690,9 +27993,7 @@ kind = "skill"
     #[test]
     #[serial_test::serial(edgecrab_home_env)]
     fn tool_manager_shows_plugin_tools_and_tracks_enable_disable() {
-        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
-            .lock()
-            .expect("env lock");
+        let _guard = crate::gateway_catalog::lock_test_env();
         let dir = tempfile::tempdir().expect("tempdir");
         unsafe {
             std::env::set_var("EDGECRAB_HOME", dir.path());
@@ -25750,9 +28051,7 @@ kind = "skill"
     #[test]
     #[serial_test::serial(edgecrab_home_env)]
     fn moa_reset_uses_current_chat_model_as_safe_baseline() {
-        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
-            .lock()
-            .expect("env lock");
+        let _guard = crate::gateway_catalog::lock_test_env();
         let dir = tempfile::tempdir().expect("tempdir");
         unsafe {
             std::env::set_var("EDGECRAB_HOME", dir.path());
@@ -26095,9 +28394,7 @@ kind = "skill"
     #[tokio::test]
     #[serial_test::serial(edgecrab_home_env)]
     async fn cycle_tool_progress_mode_follows_hermes_order() {
-        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
-            .lock()
-            .expect("env lock");
+        let _guard = crate::gateway_catalog::lock_test_env();
         let dir = tempfile::tempdir().expect("tempdir");
         unsafe {
             std::env::set_var("EDGECRAB_HOME", dir.path());

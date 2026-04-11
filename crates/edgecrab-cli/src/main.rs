@@ -14,11 +14,14 @@
 
 mod acp_setup;
 mod app;
+mod auth_cmd;
 mod banner;
+mod bundled_profiles;
 mod cli_args;
 mod commands;
 mod cron_cmd;
 mod doctor;
+mod dump_cmd;
 mod edit_diff;
 mod fuzzy_selector;
 mod gateway_browser;
@@ -26,11 +29,15 @@ mod gateway_catalog;
 mod gateway_cmd;
 mod gateway_presentation;
 mod gateway_setup;
+mod honcho_cmd;
 mod image_models;
+mod logs_cmd;
 mod markdown_render;
 mod mcp_catalog;
 mod mcp_oauth;
 mod mcp_support;
+mod memory_cmd;
+mod pairing_cmd;
 #[cfg(target_os = "macos")]
 mod permissions;
 mod plugin_toggle;
@@ -43,23 +50,27 @@ mod skin_engine;
 mod status_cmd;
 mod theme;
 mod tool_display;
+mod uninstall_cmd;
 mod update;
 mod vision_models;
+mod webhook_cmd;
 mod whatsapp_cmd;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, anyhow};
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use edgecrab_plugins::{discover_plugins, invoke_hermes_cli_command};
 use shell_words::split as shell_split;
 use tokio_util::sync::CancellationToken;
 
 use app::App;
 use cli_args::{
-    AcpCommand, CliArgs, Command, ConfigCommand, CronCommand, GatewayCommand, McpCommand,
-    PluginsCommand, ProfileCommand, SessionCommand, SkillsCommand, ToolsCommand,
+    AcpCommand, AuthCommand, ClawCommand, CliArgs, Command, ConfigCommand, CronCommand,
+    GatewayCommand, HonchoCommand, LogsCommand, McpCommand, MemoryCommand, OpenClawPresetArg,
+    PairingCommand, PluginsCommand, ProfileCommand, SessionCommand, SkillConflictModeArg,
+    SkillsCommand, ToolsCommand, WebhookCommand,
 };
 use edgecrab_core::config::McpServerConfig;
 use edgecrab_state::SessionDb;
@@ -147,6 +158,7 @@ async fn main() -> anyhow::Result<()> {
 
     let args = CliArgs::parse();
     let subcommand = args.command.clone();
+    let mut initial_prompt = args.prompt_text();
 
     // Initialize tracing
     if args.debug {
@@ -172,9 +184,25 @@ async fn main() -> anyhow::Result<()> {
         activate_runtime_home_from_config(args.config.as_deref())?;
     }
 
-    // Route to subcommand if one was given
-    if let Some(cmd) = subcommand {
-        return run_subcommand(cmd, &args).await;
+    // Route to non-interactive subcommands immediately. `chat` and slash-backed
+    // deliberately reuse the default interactive runtime below.
+    if let Some(cmd) = subcommand.clone() {
+        match cmd {
+            Command::Chat { prompt } => {
+                if !prompt.is_empty() {
+                    initial_prompt = Some(prompt.join(" "));
+                }
+            }
+            other if forwarded_interactive_slash(&other).is_some() => {
+                let slash = forwarded_interactive_slash(&other)
+                    .ok_or_else(|| anyhow!("missing forwarded slash command"))?;
+                require_interactive_terminal(forwarded_command_name(&other))?;
+                initial_prompt = Some(slash);
+            }
+            other => {
+                return run_subcommand(other, &args).await;
+            }
+        }
     }
 
     // ── Git worktree isolation (-w flag) ─────────────────────────────
@@ -232,6 +260,14 @@ async fn main() -> anyhow::Result<()> {
             .with_context(|| format!("failed to restore session '{session_id}'"))?;
     }
 
+    if args.yolo
+        && let Some(session_id) = agent
+            .try_session_snapshot()
+            .and_then(|snap| snap.session_id)
+    {
+        edgecrab_tools::approval_runtime::set_yolo_for_session(&session_id, true);
+    }
+
     // Quiet mode: send prompt, print response, exit
     if args.quiet {
         if let Some(prompt) = args.prompt_text() {
@@ -249,6 +285,7 @@ async fn main() -> anyhow::Result<()> {
     // Interactive TUI mode
     let mut app = App::new();
     app.set_agent(Arc::clone(&agent));
+    app.set_yolo_enabled(args.yolo);
 
     // Show banner
     if !args.no_banner {
@@ -262,7 +299,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Handle initial prompt — dispatch to agent via the streaming channel
-    if let Some(prompt) = args.prompt_text() {
+    if let Some(prompt) = initial_prompt {
         // Simulate user typing the initial prompt into the TUI input.
         // The process_input path handles agent dispatch via the mpsc channel.
         app.dispatch_initial_prompt(prompt);
@@ -360,26 +397,7 @@ async fn try_run_plugin_cli_command_from_argv() -> anyhow::Result<bool> {
 }
 
 fn detect_plugin_cli_candidate(argv: &[String]) -> Option<(usize, String)> {
-    let builtins = [
-        "profile",
-        "completion",
-        "setup",
-        "doctor",
-        "migrate",
-        "acp",
-        "version",
-        "update",
-        "whatsapp",
-        "status",
-        "sessions",
-        "config",
-        "tools",
-        "mcp",
-        "plugins",
-        "cron",
-        "gateway",
-        "skills",
-    ];
+    let builtins = builtin_cli_command_names();
 
     let mut index = 1usize;
     while index < argv.len() {
@@ -391,12 +409,88 @@ fn detect_plugin_cli_candidate(argv: &[String]) -> Option<(usize, String)> {
             index += if option_takes_value(token) { 2 } else { 1 };
             continue;
         }
-        if builtins.iter().any(|builtin| builtin == token) {
+        if builtins.contains(token) {
             return None;
         }
         return Some((index, token.clone()));
     }
     None
+}
+
+fn builtin_cli_command_names() -> std::collections::HashSet<String> {
+    let root = CliArgs::command();
+    let mut names = std::collections::HashSet::new();
+    for subcommand in root.get_subcommands() {
+        names.insert(subcommand.get_name().to_string());
+        for alias in subcommand.get_all_aliases() {
+            names.insert(alias.to_string());
+        }
+    }
+    names
+}
+
+fn forwarded_command_name(command: &Command) -> &'static str {
+    match command {
+        Command::Model => "edgecrab model",
+        Command::New => "edgecrab new",
+        Command::Clear => "edgecrab clear",
+        Command::Retry => "edgecrab retry",
+        Command::Undo => "edgecrab undo",
+        Command::Btw { .. } => "edgecrab btw",
+        Command::Provider => "edgecrab provider",
+        Command::Prompt { .. } => "edgecrab prompt",
+        Command::Personality { .. } => "edgecrab personality",
+        Command::Reasoning { .. } => "edgecrab reasoning",
+        Command::Yolo { .. } => "edgecrab yolo",
+        Command::Verbose { .. } => "edgecrab verbose",
+        Command::Statusbar { .. } => "edgecrab statusbar",
+        Command::Voice { .. } => "edgecrab voice",
+        Command::Browser { .. } => "edgecrab browser",
+        Command::ReloadMcp => "edgecrab reload-mcp",
+        Command::Slash { .. } => "edgecrab slash",
+        _ => "edgecrab",
+    }
+}
+
+fn forwarded_interactive_slash(command: &Command) -> Option<String> {
+    match command {
+        Command::Model => Some("/model".into()),
+        Command::New => Some("/new".into()),
+        Command::Clear => Some("/clear".into()),
+        Command::Retry => Some("/retry".into()),
+        Command::Undo => Some("/undo".into()),
+        Command::Btw { args } => {
+            CliArgs::slash_text(&[vec!["btw".to_string()], args.clone()].concat())
+        }
+        Command::Provider => Some("/provider".into()),
+        Command::Prompt { args } => {
+            CliArgs::slash_text(&[vec!["prompt".to_string()], args.clone()].concat())
+        }
+        Command::Personality { args } => {
+            CliArgs::slash_text(&[vec!["personality".to_string()], args.clone()].concat())
+        }
+        Command::Reasoning { args } => {
+            CliArgs::slash_text(&[vec!["reasoning".to_string()], args.clone()].concat())
+        }
+        Command::Yolo { args } => {
+            CliArgs::slash_text(&[vec!["yolo".to_string()], args.clone()].concat())
+        }
+        Command::Verbose { args } => {
+            CliArgs::slash_text(&[vec!["verbose".to_string()], args.clone()].concat())
+        }
+        Command::Statusbar { args } => {
+            CliArgs::slash_text(&[vec!["statusbar".to_string()], args.clone()].concat())
+        }
+        Command::Voice { args } => {
+            CliArgs::slash_text(&[vec!["voice".to_string()], args.clone()].concat())
+        }
+        Command::Browser { args } => {
+            CliArgs::slash_text(&[vec!["browser".to_string()], args.clone()].concat())
+        }
+        Command::ReloadMcp => Some("/reload-mcp".into()),
+        Command::Slash { command } => CliArgs::slash_text(command),
+        _ => None,
+    }
 }
 
 fn option_takes_value(token: &str) -> bool {
@@ -447,6 +541,10 @@ async fn run_subcommand(cmd: Command, args: &CliArgs) -> anyhow::Result<()> {
     }
 
     match cmd {
+        Command::Insights { days } => {
+            run_insights(args, days)?;
+        }
+
         Command::Setup { section, force } => {
             setup::run_with_options(section.as_deref(), force)?;
         }
@@ -458,8 +556,8 @@ async fn run_subcommand(cmd: Command, args: &CliArgs) -> anyhow::Result<()> {
             }
         }
 
-        Command::Migrate { dry_run } => {
-            run_migrate(dry_run)?;
+        Command::Migrate { dry_run, source } => {
+            run_migrate(dry_run, source.as_deref())?;
         }
 
         Command::Acp { command } => match command {
@@ -483,8 +581,48 @@ async fn run_subcommand(cmd: Command, args: &CliArgs) -> anyhow::Result<()> {
             whatsapp_cmd::run(args)?;
         }
 
+        Command::Auth { command } => {
+            run_auth(command).await?;
+        }
+
+        Command::Login { target } => {
+            auth_cmd::login_target(&target).await?;
+        }
+
+        Command::Logout { target } => {
+            auth_cmd::logout_target(target.as_deref()).await?;
+        }
+
         Command::Status => {
             status_cmd::run(args)?;
+        }
+
+        Command::Dump { all } => {
+            dump_cmd::run(args, all)?;
+        }
+
+        Command::Logs { command } => {
+            run_logs(command)?;
+        }
+
+        Command::Pairing { command } => {
+            run_pairing(command)?;
+        }
+
+        Command::Memory { command } => {
+            run_memory(command)?;
+        }
+
+        Command::Honcho { command } => {
+            run_honcho(command)?;
+        }
+
+        Command::Claw { command } => {
+            run_claw(command)?;
+        }
+
+        Command::Webhook { command } => {
+            run_webhook(command).await?;
         }
 
         Command::Sessions { command } => {
@@ -519,6 +657,23 @@ async fn run_subcommand(cmd: Command, args: &CliArgs) -> anyhow::Result<()> {
             run_skills(command).await?;
         }
 
+        Command::Uninstall {
+            dry_run,
+            purge_data,
+            purge_auth_cache,
+            remove_binary,
+            yes,
+        } => {
+            uninstall_cmd::run(uninstall_cmd::UninstallOptions {
+                dry_run,
+                purge_data,
+                purge_auth_cache,
+                remove_binary,
+                yes,
+            })
+            .await?;
+        }
+
         Command::Profile { command } => {
             run_profile(command)?;
         }
@@ -526,21 +681,169 @@ async fn run_subcommand(cmd: Command, args: &CliArgs) -> anyhow::Result<()> {
         Command::Completion { shell } => {
             profile::print_completion(&shell)?;
         }
+
+        Command::Chat { .. }
+        | Command::Model
+        | Command::New
+        | Command::Clear
+        | Command::Retry
+        | Command::Undo
+        | Command::Btw { .. }
+        | Command::Provider
+        | Command::Prompt { .. }
+        | Command::Personality { .. }
+        | Command::Reasoning { .. }
+        | Command::Yolo { .. }
+        | Command::Verbose { .. }
+        | Command::Statusbar { .. }
+        | Command::Voice { .. }
+        | Command::Browser { .. }
+        | Command::ReloadMcp
+        | Command::Slash { .. } => {
+            anyhow::bail!(
+                "interactive command routing bug: interactive slash-backed commands should bypass run_subcommand"
+            );
+        }
     }
     Ok(())
+}
+
+fn require_interactive_terminal(command_name: &str) -> anyhow::Result<()> {
+    use std::io::IsTerminal;
+
+    if std::io::stdin().is_terminal() {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "{command_name} requires an interactive terminal. Run it directly instead of through a pipe or non-interactive subprocess."
+    );
+}
+
+fn run_insights(args: &CliArgs, days: u32) -> anyhow::Result<()> {
+    let runtime = load_runtime(
+        args.config.as_deref(),
+        args.model.as_deref(),
+        args.toolset.as_deref(),
+    )?;
+    let db = open_state_db(&runtime.state_db_path)?;
+    let report = db.query_insights(days)?;
+    println!("{}", format_insights_report(&report));
+    Ok(())
+}
+
+fn run_logs(command: LogsCommand) -> anyhow::Result<()> {
+    logs_cmd::run(command)
+}
+
+async fn run_auth(command: AuthCommand) -> anyhow::Result<()> {
+    auth_cmd::run(command).await
+}
+
+fn run_pairing(command: PairingCommand) -> anyhow::Result<()> {
+    pairing_cmd::run(command)
+}
+
+fn run_memory(command: MemoryCommand) -> anyhow::Result<()> {
+    memory_cmd::run(command)
+}
+
+fn run_honcho(command: HonchoCommand) -> anyhow::Result<()> {
+    honcho_cmd::run(command)
+}
+
+fn run_claw(command: ClawCommand) -> anyhow::Result<()> {
+    match command {
+        ClawCommand::Migrate {
+            dry_run,
+            source,
+            preset,
+            overwrite,
+            migrate_secrets,
+            workspace_target,
+            skill_conflict,
+        } => run_openclaw_migrate(
+            dry_run,
+            source.as_deref(),
+            preset,
+            overwrite,
+            migrate_secrets,
+            workspace_target.as_deref(),
+            skill_conflict,
+        ),
+    }
+}
+
+async fn run_webhook(command: WebhookCommand) -> anyhow::Result<()> {
+    webhook_cmd::run(command).await
+}
+
+fn format_insights_report(report: &edgecrab_state::InsightsReport) -> String {
+    let ov = &report.overview;
+    let mut text = format!("Insights ({days} days)\n", days = report.days);
+    text.push_str(&format!("Sessions:      {}\n", ov.total_sessions));
+    text.push_str(&format!("Messages:      {}\n", ov.total_messages));
+    text.push_str(&format!("Tool calls:    {}\n", ov.total_tool_calls));
+    text.push_str(&format!(
+        "Tokens:        {}\n",
+        ov.total_input_tokens
+            + ov.total_output_tokens
+            + ov.total_cache_read_tokens
+            + ov.total_cache_write_tokens
+            + ov.total_reasoning_tokens
+    ));
+    if ov.total_reasoning_tokens > 0 {
+        text.push_str(&format!("Reasoning:     {}\n", ov.total_reasoning_tokens));
+    }
+    text.push_str(&format!(
+        "Est. cost:     ${:.2}\n",
+        ov.estimated_total_cost_usd
+    ));
+
+    if !report.models.is_empty() {
+        text.push_str("\nTop models:\n");
+        for model in report.models.iter().take(5) {
+            text.push_str(&format!(
+                "  {:30} {:4} sessions  ${:.2}\n",
+                model.model, model.sessions, model.estimated_cost_usd
+            ));
+        }
+    }
+
+    if !report.platforms.is_empty() {
+        text.push_str("\nPlatforms:\n");
+        for platform in report.platforms.iter().take(8) {
+            text.push_str(&format!(
+                "  {:18} {:4} sessions  {} tool calls\n",
+                platform.source, platform.sessions, platform.tool_calls
+            ));
+        }
+    }
+
+    if !report.top_tools.is_empty() {
+        text.push_str("\nTop tools:\n");
+        for tool in report.top_tools.iter().take(8) {
+            text.push_str(&format!("  {:30} {}\n", tool.name, tool.count));
+        }
+    }
+
+    text
 }
 
 /// Run the Hermes → EdgeCrab migrator.
 ///
 /// WHY separate fn: isolates edgecrab-migrate dependency linkage so
 /// the ACP/doctor paths don't transitively pull in migration code.
-fn run_migrate(dry_run: bool) -> anyhow::Result<()> {
+fn run_migrate(dry_run: bool, source: Option<&std::path::Path>) -> anyhow::Result<()> {
     use dirs::home_dir;
     use edgecrab_migrate::hermes::HermesMigrator;
 
-    let hermes_home = home_dir()
-        .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?
-        .join(".hermes");
+    let hermes_home = match source {
+        Some(path) => path.to_path_buf(),
+        None => home_dir()
+            .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?
+            .join(".hermes"),
+    };
     let edgecrab_home = home_dir()
         .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?
         .join(".edgecrab");
@@ -618,6 +921,115 @@ fn run_migrate(dry_run: bool) -> anyhow::Result<()> {
         }
     } else {
         println!("⚠  Migration completed with {failed} failure(s). Check output above.");
+    }
+
+    Ok(())
+}
+
+fn run_openclaw_migrate(
+    dry_run: bool,
+    source: Option<&std::path::Path>,
+    preset: OpenClawPresetArg,
+    overwrite: bool,
+    migrate_secrets: bool,
+    workspace_target: Option<&std::path::Path>,
+    skill_conflict: SkillConflictModeArg,
+) -> anyhow::Result<()> {
+    use dirs::home_dir;
+    use edgecrab_migrate::openclaw::{
+        OpenClawMigrationOptions, OpenClawMigrator, OpenClawPreset, SkillConflictMode,
+    };
+
+    let source_root = match source {
+        Some(path) => path.to_path_buf(),
+        None => OpenClawMigrator::default_source_home().ok_or_else(|| {
+            anyhow::anyhow!("no OpenClaw home found in ~/.openclaw, ~/.clawdbot, or ~/.moldbot")
+        })?,
+    };
+    let edgecrab_home = home_dir()
+        .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?
+        .join(".edgecrab");
+
+    if !source_root.exists() {
+        anyhow::bail!(
+            "OpenClaw source directory does not exist: {}",
+            source_root.display()
+        );
+    }
+
+    let migrate_secrets = migrate_secrets || matches!(preset, OpenClawPresetArg::Full);
+    let options = OpenClawMigrationOptions {
+        execute: !dry_run,
+        overwrite,
+        migrate_secrets,
+        preset: match preset {
+            OpenClawPresetArg::UserData => OpenClawPreset::UserData,
+            OpenClawPresetArg::Full => OpenClawPreset::Full,
+        },
+        workspace_target: workspace_target.map(std::path::Path::to_path_buf),
+        skill_conflict_mode: match skill_conflict {
+            SkillConflictModeArg::Skip => SkillConflictMode::Skip,
+            SkillConflictModeArg::Overwrite => SkillConflictMode::Overwrite,
+            SkillConflictModeArg::Rename => SkillConflictMode::Rename,
+        },
+    };
+
+    if dry_run {
+        println!("🔍 Dry-run mode — no files will be written.\n");
+    } else {
+        println!("🚀 Migrating OpenClaw → EdgeCrab...\n");
+    }
+
+    println!("  Source:      {}", source_root.display());
+    println!("  Destination: {}", edgecrab_home.display());
+    println!("  Preset:      {}", options.preset.as_str());
+    println!("  Overwrite:   {}", if overwrite { "yes" } else { "no" });
+    println!(
+        "  Secrets:     {}\n",
+        if options.migrate_secrets {
+            "yes (allowlisted only)"
+        } else {
+            "no"
+        }
+    );
+
+    if !dry_run {
+        std::fs::create_dir_all(&edgecrab_home)?;
+    }
+
+    let migrator = OpenClawMigrator::new(source_root, edgecrab_home, options);
+    let report = migrator.migrate_all()?;
+
+    for item in &report.items {
+        use edgecrab_migrate::report::MigrationStatus;
+        let icon = match item.status {
+            MigrationStatus::Success => "✓",
+            MigrationStatus::Skipped => "⟳",
+            MigrationStatus::Failed => "✗",
+        };
+        println!("  {icon} {:18} — {}", item.name, item.detail);
+    }
+
+    println!();
+    if report.has_failures() {
+        println!(
+            "⚠  OpenClaw migration completed with {} failure(s).",
+            report.failed_count()
+        );
+    } else if dry_run {
+        println!(
+            "✅ Dry-run complete. {} item(s) would be migrated.",
+            report.success_count()
+        );
+        println!("   Re-run without --dry-run to apply.");
+    } else {
+        println!(
+            "✅ Migration complete. {} item(s) migrated.",
+            report.success_count()
+        );
+        println!(
+            "   Advanced OpenClaw-only settings that EdgeCrab cannot import directly were archived under ~/.edgecrab/migration/openclaw/."
+        );
     }
 
     Ok(())
@@ -1158,6 +1570,7 @@ async fn run_gateway(command: GatewayCommand, args: &CliArgs) -> anyhow::Result<
         }
         _ => {
             let action = match command {
+                GatewayCommand::Run => gateway_cmd::GatewayAction::Start { foreground: true },
                 GatewayCommand::Start { foreground } => {
                     gateway_cmd::GatewayAction::Start { foreground }
                 }
@@ -1536,6 +1949,7 @@ async fn run_cron(command: CronCommand, args: &CliArgs) -> anyhow::Result<()> {
 ///
 /// WHY separate fn: keeps run_subcommand() slim; ProfileManager owns all I/O.
 fn run_profile(command: ProfileCommand) -> anyhow::Result<()> {
+    profile::ensure_bundled_profiles_seeded()?;
     let mgr = profile::ProfileManager::new();
     match command {
         ProfileCommand::List => mgr.list()?,
@@ -1549,7 +1963,7 @@ fn run_profile(command: ProfileCommand) -> anyhow::Result<()> {
             mgr.create(&name, clone, clone_all, clone_from.as_deref())?;
         }
         ProfileCommand::Delete { name, yes } => mgr.delete(&name, yes)?,
-        ProfileCommand::Show { name } => mgr.show(&name)?,
+        ProfileCommand::Show { name } => mgr.show(name.as_deref())?,
         ProfileCommand::Alias {
             name,
             remove,
@@ -1751,6 +2165,7 @@ fn set_config_value(
             config.model.streaming = enabled;
             config.display.streaming = enabled;
         }
+        "agent.system_prompt" => config.agent.system_prompt = value.to_string(),
         "display.skin" => config.display.skin = value.to_string(),
         "display.personality" => config.display.personality = value.to_string(),
         "display.show_reasoning" => config.display.show_reasoning = parse_bool(value)?,
@@ -1923,9 +2338,11 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        activate_runtime_home_from_config, explicit_provider_request, parse_editor_command,
+        activate_runtime_home_from_config, builtin_cli_command_names, detect_plugin_cli_candidate,
+        explicit_provider_request, forwarded_interactive_slash, parse_editor_command,
         render_version_report, runtime_home_for_config_override, set_config_value,
     };
+    use crate::cli_args::Command;
 
     #[test]
     fn set_config_value_supports_smart_routing_and_moa_keys() {
@@ -1981,7 +2398,9 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(edgecrab_home_env)]
     fn activate_runtime_home_from_config_sets_edgecrab_home() {
+        let _guard = crate::gateway_catalog::lock_test_env();
         let previous = std::env::var_os("EDGECRAB_HOME");
         activate_runtime_home_from_config(Some("/tmp/edgecrab-runtime/config.yaml"))
             .expect("activate runtime home");
@@ -1997,6 +2416,52 @@ mod tests {
                 std::env::remove_var("EDGECRAB_HOME");
             }
         }
+    }
+
+    #[test]
+    fn builtin_cli_command_names_include_forwarded_wrappers_and_aliases() {
+        let names = builtin_cli_command_names();
+        assert!(names.contains("slash"));
+        assert!(names.contains("new"));
+        assert!(names.contains("clear"));
+        assert!(names.contains("btw"));
+        assert!(names.contains("reload-mcp"));
+        assert!(names.contains("statusbar"));
+        assert!(names.contains("sb"));
+    }
+
+    #[test]
+    fn detect_plugin_cli_candidate_ignores_builtin_wrappers() {
+        assert_eq!(
+            detect_plugin_cli_candidate(&["edgecrab".into(), "btw".into(), "hello".into()]),
+            None
+        );
+        assert_eq!(
+            detect_plugin_cli_candidate(&["edgecrab".into(), "reload-mcp".into()]),
+            None
+        );
+        assert_eq!(
+            detect_plugin_cli_candidate(&["edgecrab".into(), "custom-plugin".into()]),
+            Some((1, "custom-plugin".into()))
+        );
+    }
+
+    #[test]
+    fn forwarded_interactive_slash_maps_wrappers_without_duplicate_logic() {
+        assert_eq!(
+            forwarded_interactive_slash(&Command::New),
+            Some("/new".to_string())
+        );
+        assert_eq!(
+            forwarded_interactive_slash(&Command::Btw {
+                args: vec!["quick".into(), "check".into()]
+            }),
+            Some("/btw quick check".to_string())
+        );
+        assert_eq!(
+            forwarded_interactive_slash(&Command::ReloadMcp),
+            Some("/reload-mcp".to_string())
+        );
     }
 
     #[test]

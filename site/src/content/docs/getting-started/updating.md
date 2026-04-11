@@ -69,7 +69,7 @@ brew upgrade edgecrab
 
 ```bash
 edgecrab version
-# EdgeCrab 0.1.0  (rustc 1.85.0, 2025-02-20)
+# EdgeCrab 0.3.0  (rustc 1.86.0, 2026-04-11)
 ```
 
 ---
@@ -128,7 +128,8 @@ Your data includes:
 2. Install EdgeCrab (any method above)
 3. Run `edgecrab doctor` to verify API keys are set
 
-If moving from Hermes Agent, use `edgecrab migrate` instead — see [Migrating from Hermes](/user-guide/migration/).
+If moving from Hermes Agent, use `edgecrab migrate`. If moving from OpenClaw,
+use `edgecrab claw migrate` — see [Migration](/user-guide/migration/).
 
 ---
 
@@ -155,7 +156,7 @@ No, unless the update adds new required config fields (rare, always documented i
 **Q: How do I update to a specific version, not the latest?**
 
 ```bash
-cargo install edgecrab-cli --version 0.1.0 --force
+cargo install edgecrab-cli --version 0.3.0 --force
 ```
 
 For pre-built binaries, download the specific tag from GitHub Releases.

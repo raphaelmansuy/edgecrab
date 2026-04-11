@@ -551,6 +551,7 @@ async fn parse_callback(
             thread_id: None,
             user_display_name: None,
             attachments: Vec::new(),
+            ..Default::default()
         },
     }))
 }

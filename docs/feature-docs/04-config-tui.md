@@ -15,7 +15,7 @@ EdgeCrab provides a **full-featured TUI** (built with `ratatui`), a CLI-driven c
 
 - **Tab completion**: TUI supports fuzzy-matched tab completion for all slash commands.
 - **Setup wizard**: Interactive, sectioned, with env var detection for provider keys.
-- **Skins**: User can switch skins at runtime (`/theme` opens the browser, `/theme reload` explicitly reloads `skin.yaml`), or install custom YAML skins.
+- **Skins**: User can switch skins at runtime (`/skin` opens the browser, `/skin reload` explicitly reloads `skin.yaml`; `/theme` remains an alias), or install custom YAML skins.
 - **Model-routing UX is consistent**: `/model`, `/cheap_model`, and `/moa aggregator` all use the same full-screen selector pattern; `/moa experts` edits the full roster, `/moa add` and `/moa remove` provide focused expert management, and `/moa on|off` now reports effective availability while repairing literal MoA toolset filters when possible.
 - **Config Center**: `/config` opens a searchable TUI control surface for state summary, paths, primary/cheap/vision/image/MoA model routing, a MoA enable toggle, display toggles, voice status, gateway home channels, and update checks.
 - **No `inquire` menus**: Unlike EdgeCode, EdgeCrab does not use `inquire` for config menus; all interaction stays in TUI overlays and CLI prompts.

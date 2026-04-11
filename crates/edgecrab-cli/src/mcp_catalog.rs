@@ -1313,9 +1313,7 @@ mod tests {
 
     impl TempEdgecrabHome {
         fn new() -> Self {
-            let guard = crate::gateway_catalog::TEST_ENV_LOCK
-                .lock()
-                .expect("env lock");
+            let guard = crate::gateway_catalog::lock_test_env();
             let dir = tempfile::tempdir().expect("tempdir");
             unsafe {
                 std::env::set_var("EDGECRAB_HOME", dir.path());

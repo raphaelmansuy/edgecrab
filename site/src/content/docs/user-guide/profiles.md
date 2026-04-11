@@ -1,250 +1,238 @@
 ---
 title: Profiles
-description: Named profiles with isolated home directories — separate config, env, SOUL.md, memory, skills, and state per profile. Grounded in crates/edgecrab-cli/src/profile.rs.
+description: Named EdgeCrab profiles with isolated config, SOUL.md, memories, skills, sessions, and live TUI switching. Grounded in crates/edgecrab-cli/src/profile.rs and app.rs.
 sidebar:
   order: 9
 ---
 
-Profiles let you run EdgeCrab with completely isolated configurations. Each profile has its own `config.yaml`, `.env`, `SOUL.md`, memories, skills, and state database — making it easy to maintain separate agent identities for work, personal use, different clients, or different projects.
+Profiles give EdgeCrab isolated runtime homes under `~/.edgecrab/profiles/<name>/`. Each profile has its own config, personality, memory, skills, session database, plugins, hooks, and state. The default profile is still `~/.edgecrab/`.
 
----
+EdgeCrab now ships starter profiles and seeds them automatically on normal startup and profile commands:
 
-## Profile Directory Structure
+- `work` for production engineering and code review
+- `research` for evidence-heavy synthesis and comparison work
+- `homelab` for infrastructure, automation, and Home Assistant workflows
 
-Each profile lives under `~/.edgecrab/profiles/<name>/`:
+## What A Profile Contains
 
+```text
+~/.edgecrab/profiles/work/
+├── config.yaml
+├── .env
+├── SOUL.md
+├── state.db
+├── memories/
+│   ├── USER.md
+│   └── MEMORY.md
+├── skills/
+├── plugins/
+├── hooks/
+├── mcp-tokens/
+└── ...
 ```
-~/.edgecrab/profiles/
-├── work/
-│   ├── config.yaml       # Work-specific model, toolsets, etc.
-│   ├── .env              # Work API keys
-│   ├── SOUL.md           # Work agent identity
-│   ├── memories/         # Work-specific memory
-│   ├── skills/           # Work-specific skills
-│   └── state.db          # Work sessions database
-├── personal/
-│   ├── config.yaml
-│   ├── .env
-│   ├── SOUL.md
-│   └── ...
-└── client-acme/
-    └── ...
+
+The active sticky profile is stored in `~/.edgecrab/.active_profile`.
+
+## Bundled Starter Profiles
+
+Bundled profiles are seeded from templates compiled into the CLI crate. They are created once, skipped if you already have a profile with the same name, and never overwrite user edits.
+
+### `work`
+
+Focus: production coding, review, and high-discipline execution.
+
+```yaml
+model:
+  default: "anthropic/claude-opus-4.6"
+  max_iterations: 90
+
+display:
+  personality: "technical"
+  show_cost: true
+  show_status_bar: true
+  tool_progress: "verbose"
+
+honcho:
+  enabled: true
+  cloud_sync: false
+
+reasoning_effort: "high"
 ```
 
-The active profile is tracked in `~/.edgecrab/.active_profile`. Shell aliases are created at `~/.local/bin/<profile_name>` as thin wrappers for `edgecrab -p <name>`.
+### `research`
 
----
+Focus: source-backed analysis, synthesis, and comparisons.
 
-## Managing Profiles
+```yaml
+model:
+  default: "openai/gpt-5"
+  max_iterations: 120
 
-### List Profiles
+display:
+  personality: "teacher"
+  show_cost: true
+  show_status_bar: true
+  tool_progress: "verbose"
+
+honcho:
+  enabled: true
+  cloud_sync: false
+
+reasoning_effort: "high"
+```
+
+### `homelab`
+
+Focus: local infra, automations, containers, and Home Assistant.
+
+```yaml
+model:
+  default: "copilot/gpt-4.1"
+  max_iterations: 90
+
+display:
+  personality: "technical"
+  show_cost: true
+  show_status_bar: true
+  tool_progress: "verbose"
+
+honcho:
+  enabled: true
+  cloud_sync: false
+
+reasoning_effort: "medium"
+```
+
+## YAML Format
+
+A profile is not a special schema. It is just a normal EdgeCrab home rooted at `~/.edgecrab/profiles/<name>/`, and its `config.yaml` uses the same `AppConfig` structure as the default profile.
+
+Minimal example:
+
+```yaml
+model:
+  default: "copilot/gpt-4.1"
+  max_iterations: 60
+
+display:
+  personality: "concise"
+
+reasoning_effort: "medium"
+```
+
+Typical profile-local files:
+
+- `config.yaml` for models, toolsets, display, gateway, MCP, plugins, and policy
+- `.env` for profile-specific secrets
+- `SOUL.md` for profile identity and operating rules
+- `memories/USER.md` and `memories/MEMORY.md` for durable memory
+
+## CLI Commands
+
+Use the binary subcommands for lifecycle operations:
 
 ```bash
 edgecrab profile list
-```
-
-Output:
-```
-  default   (built-in)
-* work      ~/.edgecrab/profiles/work/
-  personal  ~/.edgecrab/profiles/personal/
-```
-
-`*` marks the active profile.
-
-### Create a Profile
-
-```bash
-edgecrab profile create work
-edgecrab profile create client-acme --clone work   # clone from an existing profile
-```
-
-This creates the profile directory with default config files. Edit them to customize:
-
-```bash
-edgecrab -p work config edit    # edit work profile config
-```
-
-### Switch Active Profile
-
-```bash
+edgecrab profile show
+edgecrab profile show work
 edgecrab profile use work
+edgecrab profile create client-acme
+edgecrab profile create lab-copy --clone
+edgecrab profile create audit-sandbox --clone-all --clone-from work
+edgecrab profile alias work --name w
+edgecrab profile rename client-acme client-acme-2026
+edgecrab profile export work -o ./work-backup.tar.gz
+edgecrab profile import ./work-backup.tar.gz --name work-restored
+edgecrab profile delete work-restored --yes
 ```
 
-All subsequent `edgecrab` invocations use the work profile until you switch again.
-
-### Delete a Profile
+Use `-p` or `--profile` to run under a profile without changing the sticky default:
 
 ```bash
-edgecrab profile delete client-acme
+edgecrab -p research "compare these two APIs"
+edgecrab -p homelab "check the Home Assistant automations"
 ```
 
-This removes the entire `~/.edgecrab/profiles/client-acme/` directory permanently.
+## TUI Commands
 
-### Show Profile Info
+The TUI now has first-class profile UX while still keeping Hermes-style status output.
 
-```bash
-edgecrab profile show            # show active profile
-edgecrab profile show work       # show a specific profile
-edgecrab profile path            # print active profile home path
-edgecrab profile path work       # print a specific profile's path
+- `/profile` shows the active profile name and effective home directory
+- `/profile list` opens the browser in summary mode
+- `/profile show <name>` opens the browser focused on that profile in summary mode
+- `/profile config <name>` opens the browser in `config.yaml` mode
+- `/profile soul <name>` opens the browser in `SOUL.md` mode
+- `/profile memory <name>` opens the browser in memory mode
+- `/profile tools <name>` opens the browser in tool policy mode
+- `/profile use <name>` focuses that profile for live switching inside the running TUI
+- `/profiles` opens the interactive profile browser directly
+- `/profiles use <name>` works as a shorthand for switching directly
+
+Important: `/profile use <name>` is a real runtime switch. The TUI rebuilds the runtime, agent, tool registry, MCP connections, skills, and session DB path immediately. This is stronger than a "next launch only" toggle.
+
+Inside the profile browser:
+
+- `Enter` switches to the selected profile
+- `C` shows `config.yaml`
+- `S` shows `SOUL.md`
+- `M` shows profile memory files
+- `T` shows tool policy and toolset configuration
+- `A` writes or refreshes the default alias
+- `E` opens inline export
+- `D` opens inline delete confirmation
+- `N` opens inline profile creation
+- `I` opens inline profile import
+- `O` opens inline profile rename
+- `Tab`, `Shift-Tab`, `Left`, and `Right` cycle detail views without leaving the overlay
+- `H` or `?` opens the profile-browser help tab
+- `Home` and `End` jump to the first or last visible result
+
+## Isolation Model
+
+These are isolated per profile:
+
+- `config.yaml`
+- `.env`
+- `SOUL.md`
+- `memories/`
+- `skills/`
+- `plugins/`
+- `hooks/`
+- `state.db`
+- gateway PID/state files
+- MCP token storage
+
+These remain outside profile isolation:
+
+- the `edgecrab` binary itself
+- global sticky-profile marker `~/.edgecrab/.active_profile`
+- shared shell alias directory `~/.local/bin/`
+- repo-local context files such as `AGENTS.md`
+
+## SOUL.md Example
+
+Each profile can have a different operating stance. Example `SOUL.md`:
+
+```md
+# Client Review Profile
+
+You are operating in a client-specific profile.
+
+- Prefer evidence from the repository over assumptions.
+- Treat compatibility and migration risk as first-class concerns.
+- Be concise, but never omit materially relevant risk.
 ```
 
----
+## Practical Patterns
 
-## Running Under a Profile
-
-Use `-p` / `--profile` to run EdgeCrab under a specific profile without switching the active profile:
-
-```bash
-edgecrab -p work "open a PR for the auth refactor"
-edgecrab -p personal "help me plan my vacation"
-edgecrab -p client-acme -S deploy-aws "deploy the staging environment"
-```
-
----
-
-## Shell Aliases
-
-When you create a profile, EdgeCrab registers a shell alias at `~/.local/bin/<name>` (if that directory is in `$PATH`). This lets you invoke profiles directly:
-
-```bash
-# After: edgecrab profile create work
-work "open a PR for the auth refactor"
-
-# After: edgecrab profile create personal
-personal "what should I make for dinner?"
-```
-
-The alias is a thin wrapper:
-
-```bash
-#!/bin/bash
-exec edgecrab -p work "$@"
-```
-
----
-
-## Profile-Specific SOUL.md
-
-Each profile can have a different agent identity. Edit `~/.edgecrab/profiles/<name>/SOUL.md` to define the persona:
-
-```markdown
-# Work Profile Agent
-
-You are a professional software engineering assistant. You work on production Rust
-systems. Be concise, precise, and always reference actual code. Never mock
-implementations — only write or suggest code that actually compiles and works.
-```
-
-```markdown
-# Personal Profile Agent
-
-You are a helpful personal assistant. Help with task planning, research,
-writing, cooking, and life organization. Be warm and conversational.
-```
-
----
-
-## Profile Isolation
-
-Profiles are fully isolated:
-
-| Resource | Isolated per profile? |
-|----------|-----------------------|
-| `config.yaml` | ✅ |
-| `.env` (API keys) | ✅ |
-| `SOUL.md` (identity) | ✅ |
-| `memories/` | ✅ |
-| `skills/` | ✅ |
-| `state.db` (sessions) | ✅ |
-| Binary / version | ❌ (shared) |
-| Cron jobs | ❌ (shared `~/.edgecrab/cron/`) |
-
----
-
-## Example: Work vs Personal
-
-```bash
-# Create work profile with high reasoning model
-edgecrab profile create work
-cat > ~/.edgecrab/profiles/work/config.yaml << 'EOF'
-model:
-  default: "anthropic/claude-opus-4"
-  max_iterations: 90
-tools:
-  enabled_toolsets: ["coding"]
-reasoning_effort: "high"
-EOF
-
-# Create personal profile with fast cheap model
-edgecrab profile create personal
-cat > ~/.edgecrab/profiles/personal/config.yaml << 'EOF'
-model:
-  default: "copilot/gpt-4.1-mini"
-  max_iterations: 30
-display:
-  personality: "helpful"
-EOF
-```
-
-Now just run:
-
-```bash
-work "refactor the auth module"     # uses claude-opus-4, reasoning=high
-personal "plan my weekend"          # uses gpt-4.1-mini, friendly tone
-```
-
----
-
-## Pro Tips
-
-**Create profiles for clients.** Each client gets a dedicated profile with their codebase context in `memories/` and project guidelines in `AGENTS.md`. Switch instantly: `edgecrab -p acme-corp`.
-
-**Use a `--clone` profile for experiments.** Before exploring a risky refactoring, clone your active profile and experiment there — the sessions are isolated and won't pollute your main history:
-```bash
-edgecrab profile create refactor-experiment --clone
-edgecrab -p refactor-experiment "aggressively refactor the auth module"
-# not happy? just delete the profile
-edgecrab profile delete refactor-experiment
-```
-
-**Don't use profiles for toolset switching.** Profile isolation is heavyweight (separate directories). For "I just want fewer tools today", use `--toolset` instead.
-
----
-
-## Frequently Asked Questions
-
-**Q: How much disk space does each profile use?**
-
-Creating a profile creates an empty directory structure: essentially zero. Space grows with sessions (state.db), memories, and skills — just like the default profile.
-
-**Q: Can I share skills between profiles?**
-
-Use `skills.external_dirs` in each profile's `config.yaml` to point at a shared directory:
-```yaml
-skills:
-  external_dirs:
-    - ~/.edgecrab/skills   # the default profile's skills
-```
-
-**Q: I deleted my default profile by accident. How do I recover?**
-
-The default profile is `~/.edgecrab/` itself. If you deleted `~/.edgecrab/profiles/default`, you haven't deleted the default. If you deleted `~/.edgecrab/`, restore from backup. `edgecrab setup` can recreate the directory structure but cannot recover sessions or memories.
-
-**Q: Can I use the same API key in multiple profiles?**
-
-Yes. The simplest approach: put the key in `~/.edgecrab/.env` (the default profile's env). The profile-specific `.env` overrides or extends it. If `OPENAI_API_KEY` is not in the profile's `.env`, EdgeCrab falls back to the default profile's `.env` (this fallback behavior may be project-specific — check `edgecrab doctor -p <name>` to confirm key visibility).
-
-**Q: Can profiles have different gateway configurations?**
-
-Yes — each profile's `config.yaml` has its own `gateway:` section. A `work` profile could have Slack enabled, while a `personal` profile has Telegram enabled.
-
----
+- Keep `work` as the sticky default and use `-p research` for one-off comparison tasks.
+- Use `--clone` for safe forks that copy identity and secrets but not the whole runtime state.
+- Use `--clone-all` only when you explicitly want sessions, skills, and local state copied too.
+- Export profiles for backup or handoff; imports refuse `default` so the base home cannot be silently replaced.
 
 ## See Also
 
-- [Configuration](/user-guide/configuration/) — Full `config.yaml` structure
-- [Context Files](/features/context-files/) — Profile-scoped SOUL.md
-- [Memory](/features/memory/) — Profile-isolated memory directories
-- [CLI Commands](/reference/cli-commands/) — `edgecrab profile` subcommand reference
+- [CLI Commands](/reference/cli-commands/) for `edgecrab profile`
+- [Slash Commands](/reference/slash-commands/) for `/profile` and `/profiles`
+- [Configuration](/user-guide/configuration/) for the full YAML schema
+- [Memory](/features/memory/) for profile-local memory behavior

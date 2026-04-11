@@ -109,9 +109,9 @@ impl GatewaySender for GatewaySenderBridge {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ResolvedTarget {
-    channel_id: String,
-    thread_id: Option<String>,
+pub(crate) struct ResolvedTarget {
+    pub(crate) channel_id: String,
+    pub(crate) thread_id: Option<String>,
 }
 
 // ─── Platform string parsing ─────────────────────────────────────────
@@ -121,7 +121,7 @@ struct ResolvedTarget {
 /// WHY separate function: `Platform` is defined in `edgecrab-types` without
 /// a `FromStr` impl to keep that crate minimal. We localise the mapping here
 /// where it is used.
-fn parse_platform(s: &str) -> Option<Platform> {
+pub(crate) fn parse_platform(s: &str) -> Option<Platform> {
     match s.to_lowercase().as_str() {
         "telegram" => Some(Platform::Telegram),
         "discord" => Some(Platform::Discord),
@@ -142,7 +142,7 @@ fn parse_platform(s: &str) -> Option<Platform> {
     }
 }
 
-fn resolve_target(
+pub(crate) fn resolve_target(
     platform: Platform,
     platform_name: &str,
     recipient: &str,

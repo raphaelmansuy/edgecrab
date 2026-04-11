@@ -12,15 +12,21 @@
 //!     └── run message dispatch loop (mpsc receiver)
 //! ```
 
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use axum::extract::State;
+use axum::body::Bytes;
+use axum::extract::{Path as AxumPath, State};
+use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use edgecrab_command_catalog::{SlashSurface, slash_commands_for_surface};
 use edgecrab_tools::tools::transcribe::TranscribeAudioTool;
 use edgecrab_tools::tools::tts::TextToSpeechTool;
 use edgecrab_tools::tools::vision::VisionAnalyzeTool;
@@ -35,11 +41,17 @@ use crate::delivery::DeliveryRouter;
 use crate::event_processor::GatewayEventProcessor;
 use crate::hooks::{HookContext, HookRegistry};
 use crate::interactions::{InteractionBroker, PendingInteractionKind};
-use crate::platform::{IncomingMessage, PlatformAdapter};
+use crate::platform::{IncomingMessage, PlatformAdapter, WebhookDelivery};
+use crate::sender::{parse_platform, resolve_target};
 use crate::session::{SessionKey, SessionManager};
 use crate::voice_delivery::voice_delivery_doctor;
 use crate::webhook::WebhookPayload;
+use crate::webhook_subscriptions::{
+    default_max_body_bytes, default_rate_limit_per_minute, load_subscriptions, verify_signature,
+};
 use edgecrab_core::{Agent, IsolatedAgentOptions};
+use edgecrab_core::{config::resolve_personality, model_catalog::ModelCatalog};
+use edgecrab_tools::create_provider_for_model;
 use edgecrab_types::Role;
 
 /// Deterministic gateway-side image pre-analysis prompt.
@@ -148,32 +160,150 @@ fn incoming_message_is_voice_origin(msg: &IncomingMessage) -> bool {
     has_audio && msg.text.trim().is_empty()
 }
 
+fn gateway_builtin_commands() -> Vec<(String, String)> {
+    let mut commands = Vec::new();
+    for command in slash_commands_for_surface(SlashSurface::Gateway) {
+        commands.push((
+            format!("/{}", command.name),
+            command.description.to_string(),
+        ));
+        for alias in command.aliases {
+            commands.push((format!("/{alias}"), format!("Alias for /{}", command.name)));
+        }
+    }
+    commands.sort_by(|a, b| a.0.cmp(&b.0));
+    commands
+}
+
+fn installed_skill_commands() -> Vec<String> {
+    let skills_dir = edgecrab_core::edgecrab_home().join("skills");
+    let Ok(entries) = std::fs::read_dir(skills_dir) else {
+        return Vec::new();
+    };
+
+    let mut names = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(raw_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if path.is_dir() {
+            names.push(raw_name.to_string());
+        } else if path.extension().is_some_and(|ext| ext == "md") {
+            names.push(raw_name.trim_end_matches(".md").to_string());
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn gateway_commands_page(page: usize) -> String {
+    const PAGE_SIZE: usize = 12;
+
+    let mut entries = gateway_builtin_commands();
+    entries.extend(
+        installed_skill_commands()
+            .into_iter()
+            .map(|name| (format!("/{name}"), "Installed skill command".to_string())),
+    );
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let total_pages = entries.len().max(1).div_ceil(PAGE_SIZE);
+    let page = page.clamp(1, total_pages);
+    let start = (page - 1) * PAGE_SIZE;
+    let end = (start + PAGE_SIZE).min(entries.len());
+
+    let mut text = format!("Available commands page {page}/{total_pages}\n\n");
+    for (name, description) in &entries[start..end] {
+        text.push_str(&format!("{name:<18} {description}\n"));
+    }
+    if total_pages > 1 {
+        text.push_str("\nUse /commands <page> to browse more.");
+    }
+    text
+}
+
 /// Help text shown when a user sends /help to the gateway.
-const HELP_TEXT: &str = "\
-*Available commands:*
+fn gateway_help_text() -> String {
+    let mut text = String::from("*Available commands:*\n\n");
+    for (name, description) in gateway_builtin_commands() {
+        text.push_str(&format!("{name} - {description}\n"));
+    }
+    text.push_str(
+        "\nAny other message is forwarded to the AI agent.\n\n\
+         Tip: if you send a message while the agent is responding, it will be\n\
+         queued and processed after the current response finishes. Use /stop\n\
+         to cancel the current response and discard the queue.\n\n\
+         When the agent asks for clarification, reply with plain text or a\n\
+         choice number. When it asks for approval, reply `/approve`,\n\
+         `/approve session`, `/approve always`, or `/deny`.",
+    );
+    text
+}
 
-/help    - Show this help message
-/new     - Start a fresh conversation (clears history)
-/reset   - Alias for /new
-/stop    - Stop the current agent response
-/retry   - Retry your last message
-/status  - Show whether an agent is currently running
-/usage   - Show session stats
-/voice   - Control spoken replies: off, on, tts, status, doctor
-/background - Run a prompt in a separate background session
-/hooks   - List loaded event hooks
-/approve - Approve the oldest pending command request
-/deny    - Deny the oldest pending approval or clarify request
+fn format_gateway_insights(
+    snapshot: &edgecrab_core::SessionSnapshot,
+    historical: Option<&edgecrab_state::InsightsReport>,
+) -> String {
+    let cost = edgecrab_core::pricing::estimate_cost(
+        &edgecrab_core::pricing::CanonicalUsage {
+            input_tokens: snapshot.input_tokens,
+            output_tokens: snapshot.output_tokens,
+            cache_read_tokens: snapshot.cache_read_tokens,
+            cache_write_tokens: snapshot.cache_write_tokens,
+            reasoning_tokens: snapshot.reasoning_tokens,
+        },
+        &snapshot.model,
+    );
 
-Any other message is forwarded to the AI agent.
+    let mut text = String::from("Current chat session\n");
+    text.push_str(&format!("• Model: {}\n", snapshot.model));
+    text.push_str(&format!("• User turns: {}\n", snapshot.user_turn_count));
+    text.push_str(&format!("• Messages: {}\n", snapshot.message_count));
+    text.push_str(&format!("• API calls: {}\n", snapshot.api_call_count));
+    text.push_str(&format!(
+        "• Tokens: {}\n",
+        snapshot.input_tokens
+            + snapshot.output_tokens
+            + snapshot.cache_read_tokens
+            + snapshot.cache_write_tokens
+            + snapshot.reasoning_tokens
+    ));
+    text.push_str(&format!(
+        "• Estimated cost: ${:.4}\n",
+        cost.amount_usd.unwrap_or(0.0)
+    ));
 
-Tip: If you send a message while the agent is responding, it will be
-queued and processed after the current response finishes. Use /stop
-to cancel the current response and discard the queue.
+    if let Some(report) = historical {
+        let ov = &report.overview;
+        text.push_str(&format!("\nLast {} days\n", report.days));
+        text.push_str(&format!("• Sessions: {}\n", ov.total_sessions));
+        text.push_str(&format!("• Messages: {}\n", ov.total_messages));
+        text.push_str(&format!("• Tool calls: {}\n", ov.total_tool_calls));
+        text.push_str(&format!(
+            "• Estimated cost: ${:.2}\n",
+            ov.estimated_total_cost_usd
+        ));
+        if !report.models.is_empty() {
+            text.push_str("\nTop models:\n");
+            for model in report.models.iter().take(5) {
+                text.push_str(&format!(
+                    "• {}: {} sessions, ${:.2}\n",
+                    model.model, model.sessions, model.estimated_cost_usd
+                ));
+            }
+        }
+        if !report.top_tools.is_empty() {
+            text.push_str("\nTop tools:\n");
+            for tool in report.top_tools.iter().take(5) {
+                text.push_str(&format!("• {}: {}\n", tool.name, tool.count));
+            }
+        }
+    }
 
-When the agent asks for clarification, reply with plain text or a
-choice number. When it asks for approval, reply `/approve`,
-`/approve session`, `/approve always`, or `/deny`.";
+    text
+}
 
 fn parse_approval_reply(text: &str) -> Option<edgecrab_core::ApprovalChoice> {
     let normalized = text.trim().to_ascii_lowercase();
@@ -551,6 +681,12 @@ async fn deliver_text_and_media(
     platform: edgecrab_types::Platform,
     metadata: &crate::platform::MessageMetadata,
 ) -> anyhow::Result<usize> {
+    if let Some(webhook_delivery) = metadata.webhook_delivery.as_ref() {
+        if should_use_custom_webhook_delivery(platform, webhook_delivery) {
+            return deliver_webhook_response(delivery, response, webhook_delivery).await;
+        }
+    }
+
     let (cleaned, media_refs) = crate::platform::extract_media_from_response(response);
     let text_result = if let Some(text) =
         crate::platform::response_text_after_media_extraction(response, &cleaned, &media_refs)
@@ -585,6 +721,97 @@ async fn deliver_text_and_media(
     }
 
     Ok(text_result)
+}
+
+fn should_use_custom_webhook_delivery(
+    platform: edgecrab_types::Platform,
+    webhook_delivery: &WebhookDelivery,
+) -> bool {
+    if platform != edgecrab_types::Platform::Webhook {
+        return false;
+    }
+    let deliver = webhook_delivery.deliver.trim();
+    !deliver.is_empty()
+        && !deliver.eq_ignore_ascii_case("log")
+        && !deliver.eq_ignore_ascii_case("origin")
+        && !deliver.eq_ignore_ascii_case("webhook")
+}
+
+async fn deliver_webhook_response(
+    delivery: &DeliveryRouter,
+    response: &str,
+    webhook_delivery: &WebhookDelivery,
+) -> anyhow::Result<usize> {
+    let deliver = webhook_delivery.deliver.trim();
+    if deliver.eq_ignore_ascii_case("github_comment") {
+        let text = crate::platform::extract_media_from_response(response).0;
+        return deliver_github_comment(text.trim(), &webhook_delivery.deliver_extra);
+    }
+
+    let platform = parse_platform(deliver)
+        .ok_or_else(|| anyhow::anyhow!("unknown webhook deliver target '{deliver}'"))?;
+    let recipient = webhook_delivery
+        .deliver_extra
+        .get("chat_id")
+        .or_else(|| webhook_delivery.deliver_extra.get("recipient"))
+        .map(String::as_str)
+        .unwrap_or("");
+    let target = resolve_target(platform, deliver, recipient)
+        .map_err(|err| anyhow::anyhow!("webhook delivery target error: {err}"))?;
+    let thread_id = webhook_delivery
+        .deliver_extra
+        .get("thread_id")
+        .or_else(|| webhook_delivery.deliver_extra.get("message_thread_id"))
+        .filter(|value| !value.trim().is_empty())
+        .cloned()
+        .or(target.thread_id.clone());
+    let metadata = crate::platform::MessageMetadata {
+        channel_id: Some(target.channel_id),
+        thread_id,
+        ..Default::default()
+    };
+    delivery.deliver(response, platform, &metadata).await?;
+    Ok(response.len())
+}
+
+fn deliver_github_comment(
+    content: &str,
+    extra: &BTreeMap<String, String>,
+) -> anyhow::Result<usize> {
+    let repo = extra
+        .get("repo")
+        .map(String::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("github_comment delivery requires deliver_extra.repo"))?;
+    let pr_number = extra
+        .get("pr_number")
+        .or_else(|| extra.get("issue_number"))
+        .map(String::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("github_comment delivery requires deliver_extra.pr_number")
+        })?;
+
+    let result = Command::new("gh")
+        .args([
+            "pr", "comment", pr_number, "--repo", repo, "--body", content,
+        ])
+        .output()
+        .map_err(|error| {
+            anyhow::anyhow!("failed to run gh for github_comment delivery: {error}")
+        })?;
+    if !result.status.success() {
+        let stderr = String::from_utf8_lossy(&result.stderr).trim().to_string();
+        anyhow::bail!(
+            "github_comment delivery failed: {}",
+            if stderr.is_empty() {
+                format!("gh exited with {}", result.status)
+            } else {
+                stderr
+            }
+        );
+    }
+    Ok(content.len())
 }
 
 async fn maybe_send_voice_reply(
@@ -747,6 +974,43 @@ pub struct GatewayState {
     pub hook_registry: Arc<HookRegistry>,
     pub message_tx: mpsc::Sender<IncomingMessage>,
     pub cancel: CancellationToken,
+    webhook_ingress: Arc<tokio::sync::Mutex<WebhookIngressState>>,
+}
+
+#[derive(Default)]
+struct WebhookIngressState {
+    seen_deliveries: HashMap<String, Instant>,
+    route_windows: HashMap<String, Vec<Instant>>,
+}
+
+impl WebhookIngressState {
+    fn prune(&mut self, now: Instant, ttl: Duration) {
+        self.seen_deliveries
+            .retain(|_, seen_at| now.duration_since(*seen_at) <= ttl);
+        for timestamps in self.route_windows.values_mut() {
+            timestamps.retain(|seen_at| now.duration_since(*seen_at) <= Duration::from_secs(60));
+        }
+    }
+
+    fn is_duplicate(&mut self, key: &str, now: Instant, ttl: Duration) -> bool {
+        if let Some(previous) = self.seen_deliveries.get(key).copied()
+            && now.duration_since(previous) <= ttl
+        {
+            return true;
+        }
+        self.seen_deliveries.insert(key.to_string(), now);
+        false
+    }
+
+    fn exceeds_rate_limit(&mut self, route: &str, limit_per_minute: u32, now: Instant) -> bool {
+        let bucket = self.route_windows.entry(route.to_string()).or_default();
+        bucket.retain(|seen_at| now.duration_since(*seen_at) <= Duration::from_secs(60));
+        if limit_per_minute > 0 && bucket.len() >= limit_per_minute as usize {
+            return true;
+        }
+        bucket.push(now);
+        false
+    }
 }
 
 /// The main gateway service.
@@ -898,6 +1162,278 @@ impl Gateway {
         }
     }
 
+    async fn session_is_running(&self, session_key: &str) -> bool {
+        self.running_sessions.lock().await.contains_key(session_key)
+    }
+
+    async fn resolve_command_session_agent(
+        &self,
+        msg: &IncomingMessage,
+        origin_chat_id: &str,
+    ) -> Result<Arc<Agent>, String> {
+        let Some(base_agent) = self.agent.as_ref().cloned() else {
+            return Err("No agent configured.".into());
+        };
+        let session_lookup = SessionKey::new(
+            msg.platform,
+            &msg.user_id,
+            msg.channel_id
+                .as_deref()
+                .or(msg.metadata.channel_id.as_deref()),
+        );
+        let session = self
+            .session_manager
+            .resolve(
+                &session_lookup,
+                &base_agent,
+                (msg.platform.to_string(), origin_chat_id.to_string()),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut guard = session.write().await;
+        guard.touch();
+        Ok(guard.agent.clone())
+    }
+
+    async fn handle_model_command(&self, msg: &IncomingMessage, origin_chat_id: &str) -> String {
+        let Ok(agent) = self
+            .resolve_command_session_agent(msg, origin_chat_id)
+            .await
+        else {
+            return "No agent configured.".into();
+        };
+
+        let target = msg.get_command_args().trim();
+        if target.is_empty() || target.eq_ignore_ascii_case("status") {
+            let current = agent.model().await;
+            return format!(
+                "Current model: {current}\nUsage: /model <provider>/<model>\nThis is session-scoped in gateway mode."
+            );
+        }
+
+        let Some((provider, model)) = target.split_once('/') else {
+            return format!("Invalid model target '{target}'. Use /model <provider>/<model>.");
+        };
+
+        match create_provider_for_model(provider, model) {
+            Ok(provider_impl) => {
+                agent.swap_model(target.to_string(), provider_impl).await;
+                format!("Model switched to {target} for this chat session.")
+            }
+            Err(error) => format!("Failed to switch model to {target}: {error}"),
+        }
+    }
+
+    async fn handle_provider_command(&self, msg: &IncomingMessage, origin_chat_id: &str) -> String {
+        let Ok(agent) = self
+            .resolve_command_session_agent(msg, origin_chat_id)
+            .await
+        else {
+            return "No agent configured.".into();
+        };
+        let current_model = agent.model().await;
+        let current_provider = current_model.split('/').next().unwrap_or("unknown");
+        let catalog = ModelCatalog::get();
+        let providers = catalog
+            .providers
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("Current provider: {current_provider}\nAvailable providers: {providers}")
+    }
+
+    async fn handle_reasoning_command(
+        &self,
+        msg: &IncomingMessage,
+        origin_chat_id: &str,
+    ) -> String {
+        let Ok(agent) = self
+            .resolve_command_session_agent(msg, origin_chat_id)
+            .await
+        else {
+            return "No agent configured.".into();
+        };
+        let level = msg.get_command_args().trim().to_ascii_lowercase();
+        match level.as_str() {
+            "" | "status" => {
+                "Usage: /reasoning <low|medium|high|status>\nGateway mode supports effort selection; reasoning-visibility toggles remain TUI-only.".into()
+            }
+            "low" | "medium" | "high" => {
+                agent.set_reasoning_effort(Some(level.clone())).await;
+                format!("Reasoning effort set to {level} for this chat session.")
+            }
+            _ => "Unknown reasoning option. Use: low, medium, high, status".into(),
+        }
+    }
+
+    async fn handle_personality_command(
+        &self,
+        msg: &IncomingMessage,
+        origin_chat_id: &str,
+    ) -> String {
+        let Ok(agent) = self
+            .resolve_command_session_agent(msg, origin_chat_id)
+            .await
+        else {
+            return "No agent configured.".into();
+        };
+        let config = edgecrab_core::AppConfig::load().unwrap_or_default();
+        let name = msg.get_command_args().trim().to_ascii_lowercase();
+
+        if name.is_empty() || name == "status" {
+            let catalog = edgecrab_core::config::personality_catalog(&config)
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect::<Vec<_>>()
+                .join(", ");
+            return format!("Usage: /personality <name|clear>\nAvailable presets: {catalog}");
+        }
+
+        if name == "clear" {
+            let configured = resolve_personality(&config, &config.display.personality);
+            agent.set_personality_addon(configured).await;
+            return "Cleared the temporary personality overlay for this chat session.".into();
+        }
+
+        match resolve_personality(&config, &name) {
+            Some(addon) => {
+                agent.set_personality_addon(Some(addon)).await;
+                format!("Personality switched to '{name}' for this chat session.")
+            }
+            None => {
+                let catalog = edgecrab_core::config::personality_catalog(&config)
+                    .into_iter()
+                    .map(|(name, _)| name)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("Unknown personality '{name}'. Available: {catalog}")
+            }
+        }
+    }
+
+    async fn handle_resume_command(&self, msg: &IncomingMessage, origin_chat_id: &str) -> String {
+        let query = msg.get_command_args().trim();
+        if query.is_empty() {
+            return "Usage: /resume <session-id-or-title>".into();
+        }
+
+        let Ok(agent) = self
+            .resolve_command_session_agent(msg, origin_chat_id)
+            .await
+        else {
+            return "No agent configured.".into();
+        };
+        let Some(db) = agent.state_db().await else {
+            return "Session database is not configured.".into();
+        };
+
+        match db.resolve_session(query) {
+            Ok(Some(id)) => match agent.restore_session(&id).await {
+                Ok(count) => format!("Resumed session {id} ({count} message(s) restored)."),
+                Err(error) => format!("Failed to restore session {id}: {error}"),
+            },
+            Ok(None) => format!("No session found matching '{query}'."),
+            Err(error) => format!("Failed to resolve session '{query}': {error}"),
+        }
+    }
+
+    async fn handle_title_command(&self, msg: &IncomingMessage, origin_chat_id: &str) -> String {
+        let title = msg.get_command_args().trim();
+        if title.is_empty() {
+            return "Usage: /title <name>".into();
+        }
+        let Ok(agent) = self
+            .resolve_command_session_agent(msg, origin_chat_id)
+            .await
+        else {
+            return "No agent configured.".into();
+        };
+        agent.set_session_title(title.to_string()).await;
+        format!("Session title set to '{title}'.")
+    }
+
+    async fn handle_sethome_command(&self, msg: &IncomingMessage) -> String {
+        let trimmed = msg.get_command_args().trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("status") {
+            let config = edgecrab_core::AppConfig::load().unwrap_or_default();
+            let mut lines = Vec::new();
+            if let Some(value) = config.gateway.telegram.home_channel.as_deref() {
+                lines.push(format!("telegram: {value}"));
+            }
+            if let Some(value) = config.gateway.discord.home_channel.as_deref() {
+                lines.push(format!("discord: {value}"));
+            }
+            if let Some(value) = config.gateway.slack.home_channel.as_deref() {
+                lines.push(format!("slack: {value}"));
+            }
+            if lines.is_empty() {
+                return "No home channels configured.\nUsage: /sethome <telegram|discord|slack> <channel|clear>".into();
+            }
+            return format!("Configured home channels:\n{}", lines.join("\n"));
+        }
+
+        let mut parts = trimmed.split_whitespace();
+        let platform = parts.next().unwrap_or_default().to_ascii_lowercase();
+        let value = parts.collect::<Vec<_>>().join(" ");
+        if value.is_empty() {
+            return "Usage: /sethome <telegram|discord|slack> <channel|clear>".into();
+        }
+        let channel = (!value.eq_ignore_ascii_case("clear")).then_some(value);
+
+        let mut config = edgecrab_core::AppConfig::load().unwrap_or_default();
+        match platform.as_str() {
+            "telegram" => {
+                config.gateway.telegram.enabled = true;
+                config.gateway.enable_platform("telegram");
+                config.gateway.telegram.home_channel = channel.clone();
+            }
+            "discord" => {
+                config.gateway.discord.enabled = true;
+                config.gateway.enable_platform("discord");
+                config.gateway.discord.home_channel = channel.clone();
+            }
+            "slack" => {
+                config.gateway.slack.enabled = true;
+                config.gateway.enable_platform("slack");
+                config.gateway.slack.home_channel = channel.clone();
+            }
+            _ => {
+                return "Unsupported platform. Use one of: telegram, discord, slack".into();
+            }
+        }
+
+        match config.save() {
+            Ok(()) => match channel {
+                Some(value) => format!("Home channel for {platform} set to {value}."),
+                None => format!("Home channel for {platform} cleared."),
+            },
+            Err(error) => format!("Failed to save home channel for {platform}: {error}"),
+        }
+    }
+
+    async fn handle_insights_command(&self, msg: &IncomingMessage, origin_chat_id: &str) -> String {
+        let Ok(agent) = self
+            .resolve_command_session_agent(msg, origin_chat_id)
+            .await
+        else {
+            return "No agent configured.".into();
+        };
+        let days = msg
+            .get_command_args()
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|days| *days > 0)
+            .unwrap_or(30);
+        let snapshot = agent.session_snapshot().await;
+        let historical = match agent.state_db().await {
+            Some(db) => db.query_insights(days).ok(),
+            None => None,
+        };
+        format_gateway_insights(&snapshot, historical.as_ref())
+    }
+
     /// Returns `true` if the user is authorized to use the gateway.
     ///
     /// Authorization rules (first match wins):
@@ -1020,6 +1556,7 @@ impl Gateway {
             hook_registry: self.hook_registry.clone(),
             message_tx: tx.clone(),
             cancel: self.cancel.clone(),
+            webhook_ingress: Arc::new(tokio::sync::Mutex::new(WebhookIngressState::default())),
         };
         let app = build_router(state);
 
@@ -1207,7 +1744,7 @@ impl Gateway {
 
                         let reply_text: Option<String> = match cmd.as_str() {
                             "help" => {
-                                Some(HELP_TEXT.to_string())
+                                Some(gateway_help_text())
                             }
                             "approve" => {
                                 match self
@@ -1442,8 +1979,185 @@ impl Gateway {
                                      • Total active sessions: {total_sessions}"
                                 ))
                             }
+                            "undo" => {
+                                if self.session_is_running(&session_key).await {
+                                    Some("Stop the current response before using /undo.".into())
+                                } else {
+                                    match self
+                                        .resolve_command_session_agent(&msg, &origin_chat_id)
+                                        .await
+                                    {
+                                        Ok(agent) => {
+                                            let removed = agent.undo_last_turn().await;
+                                            Some(if removed == 0 {
+                                                "Nothing to undo.".into()
+                                            } else {
+                                                format!("Undid the last turn ({removed} message(s) removed).")
+                                            })
+                                        }
+                                        Err(error) => Some(error),
+                                    }
+                                }
+                            }
+                            "compress" => {
+                                if self.session_is_running(&session_key).await {
+                                    Some("Stop the current response before using /compress.".into())
+                                } else {
+                                    match self
+                                        .resolve_command_session_agent(&msg, &origin_chat_id)
+                                        .await
+                                    {
+                                        Ok(agent) => {
+                                            let before = agent.session_snapshot().await.message_count;
+                                            agent.force_compress().await;
+                                            let after = agent.session_snapshot().await.message_count;
+                                            Some(format!(
+                                                "Compressed the current chat context ({before} -> {after} messages in live history)."
+                                            ))
+                                        }
+                                        Err(error) => Some(error),
+                                    }
+                                }
+                            }
+                            "model" => Some(self.handle_model_command(&msg, &origin_chat_id).await),
+                            "provider" => {
+                                Some(self.handle_provider_command(&msg, &origin_chat_id).await)
+                            }
+                            "reasoning" => {
+                                if self.session_is_running(&session_key).await {
+                                    Some(
+                                        "Stop the current response before changing reasoning effort."
+                                            .into(),
+                                    )
+                                } else {
+                                    Some(
+                                        self.handle_reasoning_command(&msg, &origin_chat_id).await,
+                                    )
+                                }
+                            }
+                            "personality" => {
+                                if self.session_is_running(&session_key).await {
+                                    Some(
+                                        "Stop the current response before changing personality."
+                                            .into(),
+                                    )
+                                } else {
+                                    Some(
+                                        self.handle_personality_command(&msg, &origin_chat_id)
+                                            .await,
+                                    )
+                                }
+                            }
+                            "title" => {
+                                if self.session_is_running(&session_key).await {
+                                    Some("Stop the current response before setting a title.".into())
+                                } else {
+                                    Some(self.handle_title_command(&msg, &origin_chat_id).await)
+                                }
+                            }
+                            "resume" => {
+                                if self.session_is_running(&session_key).await {
+                                    Some("Stop the current response before resuming another session.".into())
+                                } else {
+                                    Some(self.handle_resume_command(&msg, &origin_chat_id).await)
+                                }
+                            }
+                            "reload-mcp" | "reload_mcp" => {
+                                edgecrab_tools::tools::mcp_client::reload_mcp_connections();
+                                Some("MCP server connections cleared. They will reconnect on the next MCP tool call.".into())
+                            }
+                            "sethome" | "set-home" => {
+                                Some(self.handle_sethome_command(&msg).await)
+                            }
+                            "insights" => {
+                                Some(self.handle_insights_command(&msg, &origin_chat_id).await)
+                            }
                             "voice" => {
                                 Some(self.handle_voice_command(&msg, &origin_chat_id).await)
+                            }
+                            "commands" => {
+                                let page = msg
+                                    .get_command_args()
+                                    .trim()
+                                    .parse::<usize>()
+                                    .ok()
+                                    .filter(|page| *page > 0)
+                                    .unwrap_or(1);
+                                Some(gateway_commands_page(page))
+                            }
+                            "yolo" => {
+                                let currently_enabled =
+                                    edgecrab_tools::approval_runtime::yolo_enabled_for_session(
+                                        &session_key,
+                                    );
+                                match msg
+                                    .get_command_args()
+                                    .trim()
+                                    .to_ascii_lowercase()
+                                    .as_str()
+                                {
+                                    "status" => Some(format!(
+                                        "YOLO mode is {} for this chat session.",
+                                        if currently_enabled { "ON" } else { "OFF" }
+                                    )),
+                                    "on" | "enable" | "enabled" => {
+                                        edgecrab_tools::approval_runtime::set_yolo_for_session(
+                                            &session_key,
+                                            true,
+                                        );
+                                        Some("YOLO mode enabled for this chat session.".into())
+                                    }
+                                    "off" | "disable" | "disabled" => {
+                                        edgecrab_tools::approval_runtime::set_yolo_for_session(
+                                            &session_key,
+                                            false,
+                                        );
+                                        Some("YOLO mode disabled for this chat session.".into())
+                                    }
+                                    "" | "toggle" => {
+                                        edgecrab_tools::approval_runtime::set_yolo_for_session(
+                                            &session_key,
+                                            !currently_enabled,
+                                        );
+                                        Some(format!(
+                                            "YOLO mode {} for this chat session.",
+                                            if currently_enabled {
+                                                "disabled"
+                                            } else {
+                                                "enabled"
+                                            }
+                                        ))
+                                    }
+                                    other => Some(format!(
+                                        "Unknown yolo mode '{other}'. Use: /yolo [on|off|toggle|status]"
+                                    )),
+                                }
+                            }
+                            "rollback" => {
+                                let args = msg.get_command_args().trim();
+                                let prompt = match args {
+                                    "" | "list" => {
+                                        "Please list all available checkpoints by calling the checkpoint tool with action='list'.".to_string()
+                                    }
+                                    name => format!(
+                                        "Please restore the checkpoint named '{}' by calling the checkpoint tool with action='restore', name='{}'.",
+                                        name, name
+                                    ),
+                                };
+                                let rollback_msg = IncomingMessage {
+                                    platform: msg.platform,
+                                    user_id: msg.user_id.clone(),
+                                    channel_id: msg.channel_id.clone(),
+                                    text: prompt,
+                                    thread_id: msg.thread_id.clone(),
+                                    metadata: msg.metadata.clone(),
+                                };
+                                let _ = tx.send(rollback_msg).await;
+                                Some(if args.is_empty() || args == "list" {
+                                    "Listing checkpoints...".into()
+                                } else {
+                                    format!("Attempting to restore checkpoint '{args}'...")
+                                })
                             }
                             "background" | "bg" => {
                                 let prompt = msg.get_command_args().trim().to_string();
@@ -2016,6 +2730,12 @@ impl Gateway {
                                 let origin_chat_id = message_origin_recipient(&msg_clone);
                                 let platform_name = msg_clone.platform.to_string();
 
+                                if !msg_clone.metadata.preloaded_skills.is_empty() {
+                                    session_agent
+                                        .set_preloaded_skills(msg_clone.metadata.preloaded_skills.clone())
+                                        .await;
+                                }
+
                                 // Enrich the prompt with image attachment instructions.
                                 // WHY here: This is the single gateway dispatch point covering
                                 // ALL platforms (WhatsApp, Telegram, Slack, Signal, …). Injecting
@@ -2160,8 +2880,8 @@ impl Gateway {
         }
 
         let session_cancels = {
-            let mut running = self.running_sessions.lock().await;
-            running.drain().map(|(_, token)| token).collect::<Vec<_>>()
+            let running = self.running_sessions.lock().await;
+            running.values().cloned().collect::<Vec<_>>()
         };
         for token in session_cancels {
             token.cancel();
@@ -2172,6 +2892,9 @@ impl Gateway {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        if !self.running_sessions.lock().await.is_empty() {
+            tracing::warn!("gateway shutdown timed out waiting for running sessions to drain");
         }
         self.session_manager.finalize_all().await;
         let _ = edgecrab_tools::tools::terminal::cleanup_all_backends().await;
@@ -2251,6 +2974,7 @@ fn build_router(state: GatewayState) -> Router {
     Router::new()
         .route("/health", get(health_handler))
         .route("/webhook/incoming", post(webhook_incoming))
+        .route("/webhooks/:name", post(webhook_subscription_incoming))
         .with_state(state)
 }
 
@@ -2273,6 +2997,293 @@ async fn webhook_incoming(
     match state.message_tx.send(msg).await {
         Ok(()) => Json(serde_json::json!({"status": "queued"})),
         Err(_) => Json(serde_json::json!({"status": "error", "message": "gateway channel full"})),
+    }
+}
+
+/// Dynamic webhook endpoint backed by ~/.edgecrab/webhook_subscriptions.json.
+async fn webhook_subscription_incoming(
+    State(state): State<GatewayState>,
+    AxumPath(name): AxumPath<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let subscriptions = match load_subscriptions() {
+        Ok(subscriptions) => subscriptions,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"status": "error", "message": err.to_string()})),
+            );
+        }
+    };
+    let Some(subscription) = subscriptions.get(&name) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"status": "error", "message": "subscription not found"})),
+        );
+    };
+
+    let body_limit = if subscription.max_body_bytes == 0 {
+        default_max_body_bytes()
+    } else {
+        subscription.max_body_bytes
+    };
+    if body.len() > body_limit {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({
+                "status": "error",
+                "message": "payload exceeds configured body limit",
+                "route": name,
+            })),
+        );
+    }
+
+    let payload = String::from_utf8_lossy(&body).to_string();
+    let provided_signature = headers
+        .get("X-Hub-Signature-256")
+        .or_else(|| headers.get("X-Webhook-Signature"))
+        .or_else(|| headers.get("X-Gitlab-Token"))
+        .or_else(|| headers.get("X-Webhook-Secret"))
+        .and_then(|value| value.to_str().ok());
+    if !verify_signature(&subscription.secret, &payload, provided_signature) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"status": "error", "message": "invalid webhook signature"})),
+        );
+    }
+
+    let event = headers
+        .get("X-Event-Type")
+        .or_else(|| headers.get("X-GitHub-Event"))
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            serde_json::from_str::<serde_json::Value>(&payload)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("event_type")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string)
+                })
+        });
+
+    if !subscription.accepts_event(event.as_deref()) {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "ignored",
+                "route": name,
+                "reason": "event filtered",
+            })),
+        );
+    }
+
+    let delivery_id = headers
+        .get("X-GitHub-Delivery")
+        .or_else(|| headers.get("X-Delivery-Id"))
+        .or_else(|| headers.get("X-Request-Id"))
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+    {
+        let now = Instant::now();
+        let mut ingress = state.webhook_ingress.lock().await;
+        let ttl = Duration::from_secs(3600);
+        ingress.prune(now, ttl);
+        let delivery_key = format!("{name}:{delivery_id}");
+        if ingress.is_duplicate(&delivery_key, now, ttl) {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "duplicate",
+                    "route": name,
+                    "delivery_id": delivery_id,
+                })),
+            );
+        }
+        let rate_limit = if subscription.rate_limit_per_minute == 0 {
+            default_rate_limit_per_minute()
+        } else {
+            subscription.rate_limit_per_minute
+        };
+        if ingress.exceeds_rate_limit(&name, rate_limit, now) {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({
+                    "status": "error",
+                    "message": "rate limit exceeded",
+                    "route": name,
+                })),
+            );
+        }
+    }
+
+    let text = render_dynamic_webhook_prompt(
+        &name,
+        subscription.prompt.as_str(),
+        &payload,
+        event.as_deref(),
+    );
+    let deliver_extra = render_delivery_extra(&subscription.deliver_extra, &payload);
+    let message = IncomingMessage {
+        platform: edgecrab_types::Platform::Webhook,
+        user_id: format!("webhook:{name}:{delivery_id}"),
+        channel_id: Some(name.clone()),
+        text,
+        thread_id: None,
+        metadata: crate::platform::MessageMetadata {
+            webhook_delivery: Some(WebhookDelivery {
+                deliver: subscription.deliver.clone(),
+                deliver_extra,
+            }),
+            preloaded_skills: subscription.skills.clone(),
+            ..Default::default()
+        },
+    };
+
+    match state.message_tx.send(message).await {
+        Ok(()) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({
+                "status": "accepted",
+                "route": name,
+                "event": event,
+                "delivery_id": delivery_id,
+            })),
+        ),
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"status": "error", "message": "gateway channel full"})),
+        ),
+    }
+}
+
+fn render_dynamic_webhook_prompt(
+    name: &str,
+    prompt: &str,
+    payload: &str,
+    event: Option<&str>,
+) -> String {
+    let payload_json = serde_json::from_str::<serde_json::Value>(payload).ok();
+    let rendered_prompt =
+        render_webhook_template(prompt.trim(), payload_json.as_ref(), event, name);
+    if !rendered_prompt.trim().is_empty() {
+        return rendered_prompt;
+    }
+
+    let pretty_payload = payload_json
+        .as_ref()
+        .and_then(|value| serde_json::to_string_pretty(value).ok())
+        .unwrap_or_else(|| payload.to_string());
+
+    let mut text = String::new();
+    text.push_str(&format!("Webhook subscription: {name}\n"));
+    if let Some(event) = event {
+        text.push_str(&format!("Event: {event}\n"));
+    }
+    text.push_str("Payload:\n");
+    text.push_str(&pretty_payload);
+    text
+}
+
+fn render_delivery_extra(
+    extra: &BTreeMap<String, String>,
+    payload: &str,
+) -> BTreeMap<String, String> {
+    let payload_json = serde_json::from_str::<serde_json::Value>(payload).ok();
+    extra
+        .iter()
+        .map(|(key, value)| {
+            (
+                key.clone(),
+                render_webhook_template(value, payload_json.as_ref(), None, "")
+                    .trim()
+                    .to_string(),
+            )
+        })
+        .collect()
+}
+
+fn render_webhook_template(
+    template: &str,
+    payload: Option<&serde_json::Value>,
+    event: Option<&str>,
+    route: &str,
+) -> String {
+    if template.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::new();
+    let mut rest = template;
+    while let Some(start) = rest.find('{') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        let Some(end) = after.find('}') else {
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        let key = after[..end].trim();
+        if let Some(value) = resolve_webhook_template_value(key, payload, event, route) {
+            out.push_str(&value);
+        } else {
+            out.push('{');
+            out.push_str(key);
+            out.push('}');
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn resolve_webhook_template_value(
+    key: &str,
+    payload: Option<&serde_json::Value>,
+    event: Option<&str>,
+    route: &str,
+) -> Option<String> {
+    match key {
+        "__raw__" => payload
+            .and_then(|value| serde_json::to_string_pretty(value).ok())
+            .map(|raw| edgecrab_core::safe_truncate(&raw, 4000).to_string()),
+        "event" => event.map(str::to_string),
+        "route" => Some(route.to_string()),
+        _ => payload
+            .and_then(|value| lookup_webhook_template_path(value, key))
+            .map(webhook_value_to_string),
+    }
+}
+
+fn lookup_webhook_template_path<'a>(
+    value: &'a serde_json::Value,
+    path: &str,
+) -> Option<&'a serde_json::Value> {
+    let mut current = value;
+    for segment in path.split('.') {
+        current = match current {
+            serde_json::Value::Object(map) => map.get(segment)?,
+            serde_json::Value::Array(items) => items.get(segment.parse::<usize>().ok()?)?,
+            _ => return None,
+        };
+    }
+    Some(current)
+}
+
+fn webhook_value_to_string(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => "null".into(),
+        serde_json::Value::Bool(value) => value.to_string(),
+        serde_json::Value::Number(value) => value.to_string(),
+        serde_json::Value::String(value) => value.clone(),
+        other => serde_json::to_string(other).unwrap_or_else(|_| other.to_string()),
     }
 }
 
@@ -2815,6 +3826,7 @@ def register(ctx):
             hook_registry: Arc::new(HookRegistry::new()),
             message_tx: tx,
             cancel: CancellationToken::new(),
+            webhook_ingress: Arc::new(tokio::sync::Mutex::new(WebhookIngressState::default())),
         };
         let app = build_router(state);
 
@@ -2839,6 +3851,7 @@ def register(ctx):
             hook_registry: Arc::new(HookRegistry::new()),
             message_tx: tx,
             cancel: CancellationToken::new(),
+            webhook_ingress: Arc::new(tokio::sync::Mutex::new(WebhookIngressState::default())),
         };
         let app = build_router(state);
 
@@ -2859,6 +3872,286 @@ def register(ctx):
         assert_eq!(msg.user_id, "u1");
     }
 
+    #[tokio::test]
+    #[serial_test::serial(edgecrab_gateway_env)]
+    async fn dynamic_webhook_duplicate_delivery_returns_duplicate() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path().join(".edgecrab");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", &home);
+        }
+        let mut subscriptions = std::collections::BTreeMap::new();
+        let subscription = crate::webhook_subscriptions::create_subscription(
+            crate::webhook_subscriptions::CreateSubscriptionParams {
+                name: "github",
+                description: None,
+                events: &[],
+                prompt: Some("PR {action}"),
+                skills: &[],
+                secret: crate::webhook_subscriptions::insecure_no_auth_secret().to_string(),
+                deliver: None,
+                deliver_extra: std::collections::BTreeMap::new(),
+                rate_limit_per_minute: Some(30),
+                max_body_bytes: Some(1_048_576),
+            },
+        )
+        .expect("subscription");
+        subscriptions.insert(subscription.name.clone(), subscription);
+        crate::webhook_subscriptions::save_subscriptions(&subscriptions)
+            .expect("save subscriptions");
+        assert!(
+            crate::webhook_subscriptions::load_subscriptions()
+                .expect("load subscriptions")
+                .contains_key("github")
+        );
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let state = GatewayState {
+            session_manager: Arc::new(SessionManager::new(std::time::Duration::from_secs(3600))),
+            hook_registry: Arc::new(HookRegistry::new()),
+            message_tx: tx,
+            cancel: CancellationToken::new(),
+            webhook_ingress: Arc::new(tokio::sync::Mutex::new(WebhookIngressState::default())),
+        };
+        let app = build_router(state);
+
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/webhooks/github")
+                .header("content-type", "application/json")
+                .header("X-GitHub-Event", "pull_request")
+                .header("X-GitHub-Delivery", "delivery-123")
+                .body(Body::from(r#"{"action":"opened"}"#))
+                .expect("request")
+        };
+
+        let first = app
+            .clone()
+            .oneshot(request())
+            .await
+            .expect("first response");
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+        let msg = rx.try_recv().expect("queued message");
+        assert_eq!(msg.user_id, "webhook:github:delivery-123");
+
+        let second = app.oneshot(request()).await.expect("second response");
+        assert_eq!(second.status(), StatusCode::OK);
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(edgecrab_gateway_env)]
+    async fn dynamic_webhook_rate_limit_and_body_limit_are_enforced() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path().join(".edgecrab");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", &home);
+        }
+        let mut subscriptions = std::collections::BTreeMap::new();
+        let subscription = crate::webhook_subscriptions::create_subscription(
+            crate::webhook_subscriptions::CreateSubscriptionParams {
+                name: "limited",
+                description: None,
+                events: &[],
+                prompt: Some("Event {event}"),
+                skills: &[],
+                secret: crate::webhook_subscriptions::insecure_no_auth_secret().to_string(),
+                deliver: None,
+                deliver_extra: std::collections::BTreeMap::new(),
+                rate_limit_per_minute: Some(1),
+                max_body_bytes: Some(32),
+            },
+        )
+        .expect("subscription");
+        subscriptions.insert(subscription.name.clone(), subscription);
+        crate::webhook_subscriptions::save_subscriptions(&subscriptions)
+            .expect("save subscriptions");
+        assert!(
+            crate::webhook_subscriptions::load_subscriptions()
+                .expect("load subscriptions")
+                .contains_key("limited")
+        );
+
+        let (tx, _rx) = mpsc::channel(16);
+        let state = GatewayState {
+            session_manager: Arc::new(SessionManager::new(std::time::Duration::from_secs(3600))),
+            hook_registry: Arc::new(HookRegistry::new()),
+            message_tx: tx,
+            cancel: CancellationToken::new(),
+            webhook_ingress: Arc::new(tokio::sync::Mutex::new(WebhookIngressState::default())),
+        };
+        let app = build_router(state);
+
+        let accepted = Request::builder()
+            .method("POST")
+            .uri("/webhooks/limited")
+            .header("content-type", "application/json")
+            .header("X-GitHub-Delivery", "delivery-a")
+            .body(Body::from(r#"{"ok":true}"#))
+            .expect("request");
+        assert_eq!(
+            app.clone()
+                .oneshot(accepted)
+                .await
+                .expect("accepted")
+                .status(),
+            StatusCode::ACCEPTED
+        );
+
+        let rate_limited = Request::builder()
+            .method("POST")
+            .uri("/webhooks/limited")
+            .header("content-type", "application/json")
+            .header("X-GitHub-Delivery", "delivery-b")
+            .body(Body::from(r#"{"ok":true}"#))
+            .expect("request");
+        assert_eq!(
+            app.clone()
+                .oneshot(rate_limited)
+                .await
+                .expect("rate limited")
+                .status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+
+        let oversized = Request::builder()
+            .method("POST")
+            .uri("/webhooks/limited")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"data":"this payload is longer than thirty-two bytes"}"#,
+            ))
+            .expect("request");
+        assert_eq!(
+            app.oneshot(oversized).await.expect("oversized").status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[test]
+    fn render_dynamic_webhook_prompt_supports_dot_paths_and_raw_payload() {
+        let payload = r#"{"action":"opened","pull_request":{"number":42,"title":"Fix auth"}}"#;
+        let rendered = render_dynamic_webhook_prompt(
+            "github",
+            "PR #{pull_request.number}: {pull_request.title}\nEvent={event}\nRaw={__raw__}",
+            payload,
+            Some("pull_request"),
+        );
+        assert!(rendered.contains("PR #42: Fix auth"));
+        assert!(rendered.contains("Event=pull_request"));
+        assert!(rendered.contains("\"title\": \"Fix auth\""));
+    }
+
+    #[test]
+    fn render_delivery_extra_supports_payload_templates() {
+        let payload = r#"{"repository":{"full_name":"org/repo"},"pull_request":{"number":42}}"#;
+        let extra = BTreeMap::from([
+            ("repo".to_string(), "{repository.full_name}".to_string()),
+            ("pr_number".to_string(), "{pull_request.number}".to_string()),
+        ]);
+        let rendered = render_delivery_extra(&extra, payload);
+        assert_eq!(rendered.get("repo").map(String::as_str), Some("org/repo"));
+        assert_eq!(rendered.get("pr_number").map(String::as_str), Some("42"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(edgecrab_gateway_env)]
+    async fn dynamic_webhook_attaches_skills_and_delivery_metadata() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path().join(".edgecrab");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", &home);
+        }
+
+        let mut subscriptions = std::collections::BTreeMap::new();
+        let deliver_extra = BTreeMap::from([
+            ("repo".to_string(), "{repository.full_name}".to_string()),
+            ("pr_number".to_string(), "{pull_request.number}".to_string()),
+        ]);
+        let subscription = crate::webhook_subscriptions::create_subscription(
+            crate::webhook_subscriptions::CreateSubscriptionParams {
+                name: "github-comment",
+                description: None,
+                events: &[],
+                prompt: Some("Review PR #{pull_request.number}"),
+                skills: &["code-review".to_string()],
+                secret: crate::webhook_subscriptions::insecure_no_auth_secret().to_string(),
+                deliver: Some("github_comment"),
+                deliver_extra,
+                rate_limit_per_minute: Some(30),
+                max_body_bytes: Some(1_048_576),
+            },
+        )
+        .expect("subscription");
+        subscriptions.insert(subscription.name.clone(), subscription);
+        crate::webhook_subscriptions::save_subscriptions(&subscriptions)
+            .expect("save subscriptions");
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let state = GatewayState {
+            session_manager: Arc::new(SessionManager::new(std::time::Duration::from_secs(3600))),
+            hook_registry: Arc::new(HookRegistry::new()),
+            message_tx: tx,
+            cancel: CancellationToken::new(),
+            webhook_ingress: Arc::new(tokio::sync::Mutex::new(WebhookIngressState::default())),
+        };
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/webhooks/github-comment")
+            .header("content-type", "application/json")
+            .header("X-GitHub-Delivery", "delivery-456")
+            .body(Body::from(
+                r#"{"repository":{"full_name":"org/repo"},"pull_request":{"number":42}}"#,
+            ))
+            .expect("request");
+
+        let response = app.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let msg = rx.try_recv().expect("queued message");
+        assert_eq!(msg.metadata.preloaded_skills, vec!["code-review"]);
+        let delivery = msg
+            .metadata
+            .webhook_delivery
+            .as_ref()
+            .expect("webhook delivery metadata");
+        assert_eq!(delivery.deliver, "github_comment");
+        assert_eq!(
+            delivery.deliver_extra.get("repo").map(String::as_str),
+            Some("org/repo")
+        );
+        assert_eq!(
+            delivery.deliver_extra.get("pr_number").map(String::as_str),
+            Some("42")
+        );
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
     // ── Authorization tests ───────────────────────────────────────────────
 
     fn make_msg(user_id: &str, platform: edgecrab_types::Platform) -> IncomingMessage {
@@ -2876,15 +4169,10 @@ def register(ctx):
         Gateway::new(GatewayConfig::default(), CancellationToken::new())
     }
 
-    /// Serializes env-var tests so parallel test execution doesn't cause races.
-    /// Env vars are global process state; reading and writing them concurrently
-    /// is both unsafe (in the Rust sense) and logically incorrect for tests.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// Clear all gateway auth env vars to put the environment in a known state.
     ///
     /// # Safety
-    /// Must be called while holding `ENV_LOCK`.
+    /// Must be called from a serialized test because env vars are global state.
     unsafe fn clear_auth_env() {
         unsafe {
             std::env::remove_var("GATEWAY_ALLOW_ALL_USERS");
@@ -2897,9 +4185,8 @@ def register(ctx):
     }
 
     #[test]
+    #[serial_test::serial(edgecrab_gateway_env)]
     fn auth_open_gateway_when_no_env_vars() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        // SAFETY: single-threaded via ENV_LOCK; no other test holds the lock.
         unsafe {
             clear_auth_env();
         }
@@ -2913,8 +4200,8 @@ def register(ctx):
     }
 
     #[test]
+    #[serial_test::serial(edgecrab_gateway_env)]
     fn auth_global_allow_all() {
-        let _lock = ENV_LOCK.lock().unwrap();
         unsafe {
             clear_auth_env();
             std::env::set_var("GATEWAY_ALLOW_ALL_USERS", "true");
@@ -2928,8 +4215,8 @@ def register(ctx):
     }
 
     #[test]
+    #[serial_test::serial(edgecrab_gateway_env)]
     fn auth_global_allowlist_permits_listed_user() {
-        let _lock = ENV_LOCK.lock().unwrap();
         unsafe {
             clear_auth_env();
             std::env::set_var("GATEWAY_ALLOWED_USERS", "alice,bob");
@@ -2945,8 +4232,8 @@ def register(ctx):
     }
 
     #[test]
+    #[serial_test::serial(edgecrab_gateway_env)]
     fn auth_platform_allowlist_telegram() {
-        let _lock = ENV_LOCK.lock().unwrap();
         unsafe {
             clear_auth_env();
             std::env::set_var("TELEGRAM_ALLOWED_USERS", "12345");
@@ -2962,8 +4249,8 @@ def register(ctx):
     }
 
     #[test]
+    #[serial_test::serial(edgecrab_gateway_env)]
     fn auth_platform_allow_all_discord() {
-        let _lock = ENV_LOCK.lock().unwrap();
         unsafe {
             clear_auth_env();
             std::env::set_var("DISCORD_ALLOW_ALL_USERS", "1");
@@ -2980,24 +4267,13 @@ def register(ctx):
         }
     }
 
-    // ── HELP_TEXT tests ────────────────────────────────────────────────────
+    // ── help-text tests ────────────────────────────────────────────────────
 
     #[test]
     fn help_text_contains_all_commands() {
-        for cmd in &[
-            "/help",
-            "/new",
-            "/reset",
-            "/stop",
-            "/retry",
-            "/status",
-            "/usage",
-            "/voice",
-            "/background",
-            "/approve",
-            "/deny",
-        ] {
-            assert!(HELP_TEXT.contains(cmd), "HELP_TEXT missing {cmd}");
+        let help_text = gateway_help_text();
+        for cmd in gateway_builtin_commands().into_iter().map(|(name, _)| name) {
+            assert!(help_text.contains(&cmd), "gateway help missing {cmd}");
         }
     }
 

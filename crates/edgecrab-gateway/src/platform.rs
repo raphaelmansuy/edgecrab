@@ -16,6 +16,7 @@
 use async_trait::async_trait;
 use edgecrab_types::Platform;
 use regex::Regex;
+use std::collections::BTreeMap;
 use std::sync::OnceLock;
 use tokio::sync::mpsc;
 
@@ -162,6 +163,17 @@ pub struct MessageMetadata {
     pub user_display_name: Option<String>,
     /// Structured media and file inputs attached to the message.
     pub attachments: Vec<MessageAttachment>,
+    /// Hermes-style webhook delivery metadata used to route final responses.
+    pub webhook_delivery: Option<WebhookDelivery>,
+    /// Session-scoped skills to preload before the next turn executes.
+    pub preloaded_skills: Vec<String>,
+}
+
+/// Extra routing metadata for webhook-originated sessions.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WebhookDelivery {
+    pub deliver: String,
+    pub deliver_extra: BTreeMap<String, String>,
 }
 
 /// Unified interface for all messaging platform adapters.

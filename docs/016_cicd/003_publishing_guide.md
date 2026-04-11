@@ -350,7 +350,7 @@ the GitHub Release is published before retrying the wrapper package:
 ```bash
 cargo build --release --target aarch64-apple-darwin -p edgecrab-cli
 tar -czf edgecrab-aarch64-apple-darwin.tar.gz -C target/aarch64-apple-darwin/release edgecrab
-gh release upload v0.1.0 edgecrab-aarch64-apple-darwin.tar.gz --clobber
+gh release upload v<version> edgecrab-aarch64-apple-darwin.tar.gz --clobber
 ```
 
 **`release-rust.yml` fails with "tag version ≠ Cargo.toml version"** — delete the tag, run

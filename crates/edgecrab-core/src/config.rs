@@ -66,6 +66,7 @@ pub struct AppConfig {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct AgentConfig {
+    pub system_prompt: String,
     pub personalities: HashMap<String, PersonalityPreset>,
 }
 

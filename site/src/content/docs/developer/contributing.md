@@ -7,7 +7,7 @@ sidebar:
 
 ## Prerequisites
 
-- Rust 1.85.0+ (`rustup update stable`)
+- Rust 1.86.0+ (`rustup update stable`)
 - `cargo` (ships with Rust)
 - Optional: Chrome/Chromium for browser tool tests
 - Optional: `nextest` for parallel test execution: `cargo install cargo-nextest`

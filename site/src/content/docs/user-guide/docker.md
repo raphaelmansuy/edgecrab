@@ -172,7 +172,7 @@ When running the TUI in Docker, ensure your terminal emulator passes through UTF
 
 **Use `--env-file`, never `--env`.** Passing secrets via `--env VAR=value` leaks them to `docker ps` and process listings. `--env-file ~/.edgecrab/.env` is safe.
 
-**Check memory usage.** EdgeCrab is lightweight (~15 MB resident), so you can run multiple instances on a single host without resource pressure. Set a memory limit anyway for hygiene:
+**Check memory usage.** EdgeCrab is still light enough to run multiple instances on one host, but memory depends on active tools, models, and gateway connections. Set a memory limit anyway for hygiene:
 ```yaml
 services:
   edgecrab:

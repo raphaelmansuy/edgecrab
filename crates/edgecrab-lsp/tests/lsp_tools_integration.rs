@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,29 +12,12 @@ use tempfile::TempDir;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
-fn workspace_manifest_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(|path| path.parent())
-        .expect("workspace root")
-        .join("Cargo.toml")
-}
-
 fn mock_server_command() -> String {
-    std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string())
+    env!("CARGO_BIN_EXE_mock_lsp_server").to_string()
 }
 
 fn mock_server_args() -> Vec<String> {
-    vec![
-        "run".to_string(),
-        "--quiet".to_string(),
-        "--manifest-path".to_string(),
-        workspace_manifest_path().display().to_string(),
-        "-p".to_string(),
-        "edgecrab-lsp".to_string(),
-        "--example".to_string(),
-        "mock_lsp_server".to_string(),
-    ]
+    Vec::new()
 }
 
 fn sample_source() -> &'static str {

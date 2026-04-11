@@ -745,9 +745,7 @@ mod tests {
     #[test]
     #[serial_test::serial(edgecrab_home_env)]
     fn check_mcp_servers_warns_when_absent() {
-        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
-            .lock()
-            .expect("env lock");
+        let _guard = crate::gateway_catalog::lock_test_env();
         let tmp = TempDir::new().expect("tmp");
         // SAFETY: protected by TEST_ENV_LOCK.
         unsafe { std::env::set_var("EDGECRAB_HOME", tmp.path()) };
@@ -761,9 +759,7 @@ mod tests {
     #[test]
     #[serial_test::serial(edgecrab_home_env)]
     fn check_mcp_servers_reports_configured_stdio_server() {
-        let _guard = crate::gateway_catalog::TEST_ENV_LOCK
-            .lock()
-            .expect("env lock");
+        let _guard = crate::gateway_catalog::lock_test_env();
         let tmp = TempDir::new().expect("tmp");
         std::fs::write(
             tmp.path().join("config.yaml"),

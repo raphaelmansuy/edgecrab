@@ -1,6 +1,6 @@
 ---
 title: Slash Commands
-description: All EdgeCrab TUI slash commands with aliases, arguments, and keyboard shortcuts. Grounded in crates/edgecrab-cli/src/commands.rs CommandResult enum and the /help output.
+description: All EdgeCrab TUI and gateway slash commands with aliases, arguments, and keyboard shortcuts. Grounded in the shared edgecrab-command-catalog crate and the runtime handlers.
 sidebar:
   order: 3
 ---
@@ -9,6 +9,19 @@ Type any slash command at the `>` prompt. Commands are case-insensitive.
 Type `/` to open the autocomplete dropdown — installed skills are also
 shown there as runnable commands.
 
+EdgeCrab now uses a shared slash-command catalog for both the TUI and the
+messaging gateway. That means `/help`, `/commands`, and gateway help text are
+derived from one source instead of two drifting hand-maintained lists.
+
+Every built-in slash command is also reachable from the shell through the
+generic bridge:
+
+```bash
+edgecrab slash <command...>
+edgecrab slash insights 14
+edgecrab slash btw "sanity-check this migration plan"
+```
+
 ---
 
 ## Quick Reference
@@ -16,18 +29,18 @@ shown there as runnable commands.
 ```
 Navigation   /help /quit /clear /new /status /version
 Model        /model /cheap_model /vision_model /image_model /moa /provider /reasoning /stream
-Session      /session /retry /undo /stop /history /save /export /title /resume
-Config       /config /prompt /verbose /personality /statusbar
+Session      /session /sessions /retry /undo /stop /btw /history /save /export /title /resume /branch
+Config       /config /prompt /verbose /personality /statusbar /yolo
 Tools        /tools /toolsets /mcp /reload-mcp /plugins
-Memory       /memory /skills
+Memory       /memory /skills /profile /profiles
 Analysis     /cost /usage /compress /insights
 Advanced     /queue /background /rollback
-Gateway      /platforms /approve /deny /sethome /update
+Gateway      /platforms /gateway /commands /approve /deny /sethome /webhook /update
 Scheduling   /cron
 Media        /voice /browser
-Appearance   /theme /skin /paste /mouse
-Diagnostics  /doctor
-Auth         /copilot-auth
+Appearance   /skin /theme /paste /image /mouse
+Diagnostics  /doctor /copilot-auth /auth /login /logout /uninstall
+Auth         /auth /login /logout
 MCP          /mcp /mcp-token
 ```
 
@@ -39,7 +52,7 @@ MCP          /mcp /mcp-token
 |---------|---------|-------------|
 | `/help` | `/h`, `/?` | Show the help overlay with all commands |
 | `/quit` | `/exit`, `/q` | Exit EdgeCrab (auto-saves session) |
-| `/clear` | `/cls` | Clear the visible output buffer |
+| `/clear` | `/cls` | Clear the screen and start a fresh session |
 | `/new` | `/reset` | Start a fresh session (clears conversation history) |
 | `/status` | | Show model, token count, iteration count, and cost |
 | `/version` | | Print EdgeCrab version and build info |
@@ -67,14 +80,17 @@ MCP          /mcp /mcp-token
 | Command | Description |
 |---------|-------------|
 | `/session [id]` | List recent sessions or switch to a session by ID |
+| `/sessions [browse\|search\|switch\|delete\|rename\|prune]` | Browse and manage persisted sessions from inside the TUI |
 | `/retry` | Re-send the last user message |
 | `/undo` | Remove the last user + assistant message pair from history |
 | `/stop` | Abort the current in-flight agent request immediately |
+| `/btw <question>` | Ask an ephemeral side question using the current context only; no tools, no persistence |
 | `/history` | Show session turn count and token usage |
 | `/save [path]` | Save conversation to a JSON file |
 | `/export [path]` | Export conversation as Markdown |
 | `/title <text>` | Set or rename the current session title |
 | `/resume [id]` | Resume a previously saved session |
+| `/branch [name]` | Fork the current session into a new persisted branch |
 | `/session rename <id> <title>` | Rename a session |
 | `/session delete <id>` | Delete a session |
 | `/session prune <days>` | Delete sessions older than N days |
@@ -86,11 +102,12 @@ MCP          /mcp /mcp-token
 | Command | Description |
 |---------|-------------|
 | `/config` | Show config file paths and `EDGECRAB_HOME` directory |
-| `/prompt` | Show the full assembled system prompt for this session |
-| `/verbose` | Cycle tool verbosity: `off` → `new` → `all` → `verbose` |
+| `/prompt` | Show, clear, or set the persisted custom system prompt override: `/prompt`, `/prompt clear`, `/prompt <text>` |
+| `/verbose` | Cycle tool verbosity: `off` → `new` → `all` → `verbose`; use `/verbose <mode>` to set directly or `/verbose open` for the picker |
 | `/personality [name]` | Show active personality or switch preset mid-session |
-| `/skin [name]` | Switch skin preset (alias: `/theme`) |
+| `/skin [name]` | Switch skin preset (primary Hermes-compatible name; alias: `/theme`) |
 | `/statusbar` | Toggle the status bar visibility |
+| `/yolo [on\|off\|toggle\|status]` | Toggle session-scoped dangerous-command approval bypass |
 
 ---
 
@@ -112,7 +129,9 @@ MCP          /mcp /mcp-token
 | Command | Description |
 |---------|-------------|
 | `/memory` | Show all persistent memory files with sizes |
-| `/skills [browse\|search\|install\|update\|remove]` | Open the installed-skills browser, launch the remote-skills browser, install, update, or remove skills |
+| `/skills [browse\|search\|install\|update\|remove]` | Open the installed-skills browser, launch the remote-skills browser, install, update, or remove skills; toggled skills become session-scoped preloaded skills |
+| `/profile [subcommand]` | With no args, show the active profile name and effective home path; subcommands route into overlay modes or inline modal actions: `list`, `show`, `config`, `soul`, `memory`, `tools`, `use`, `create`, `delete`, `rename`, `alias`, `export`, `import` |
+| `/profiles [subcommand]` | Open the interactive profile browser when called without args; in the browser use `Enter` to switch, `C` config, `S` SOUL, `M` memory, `T` tools, `A` alias, `E` export, `D` delete, `N` create, `I` import, `O` rename, `Tab` or `Left`/`Right` to cycle views, `H` or `?` for help, and `Home`/`End` to jump |
 
 ---
 
@@ -123,7 +142,7 @@ MCP          /mcp /mcp-token
 | `/cost` | Show token usage and estimated USD cost for the session |
 | `/usage` | Alias for `/cost` with full per-model breakdown |
 | `/compress` | Manually trigger conversation compression (summarisation) |
-| `/insights` | Show AI-generated session insights from the session DB |
+| `/insights [days]` | Show current-session metrics plus historical analytics for the requested day window (default: 30) |
 
 ---
 
@@ -141,9 +160,10 @@ MCP          /mcp /mcp-token
 
 | Command | Description |
 |---------|-------------|
-| `/theme [name]` | Reload skin from `~/.edgecrab/skin.yaml` or switch named preset |
-| `/skin [name]` | Same as `/theme` |
+| `/skin [name]` | Open the skin browser, reload `~/.edgecrab/skin.yaml`, or switch named preset |
+| `/theme [name]` | Alias for `/skin` |
 | `/paste` | Paste clipboard image or text into the input |
+| `/image <path>` | Queue a local image file for the next prompt without using the clipboard |
 | `/mouse [on\|off\|toggle\|status]` | Manage terminal mouse-capture mode |
 
 ---
@@ -153,15 +173,22 @@ MCP          /mcp /mcp-token
 | Command | Description |
 |---------|-------------|
 | `/platforms` | Show status of all configured messaging platforms |
+| `/gateway [action]` | Show gateway status or control the local gateway runtime from the TUI |
+| `/commands [page]` | Browse the gateway command catalog and installed skill commands |
 | `/approve` | Approve a pending gateway action (inline button equivalent) |
 | `/deny` | Deny a pending gateway action |
 | `/sethome [channel]` | Set the current channel as the home notification channel |
+| `/webhook [subcommand]` | List, create, test, or remove dynamic webhook subscriptions with event filters, duplicate suppression, rate limits, prompt templating, session skill preload, and Hermes-style final delivery routing |
 | `/update` | Check for and install EdgeCrab binary updates |
 | `/cron [subcommand]` | Show or manage scheduled cron jobs |
 | `/voice [on\|off\|tts]` | Toggle voice input/output mode |
 | `/browser [sub]` | Chrome CDP: `connect`, `disconnect`, `status`, `tabs`, `recording on\|off` |
+| `/auth [subcommand]` | List auth targets, inspect status, add env-backed provider tokens, or remove cached auth state |
+| `/login <target>` | Shortcut for one auth login/import flow; useful targets are `copilot`, `provider/openai`, and `mcp/<server>` |
+| `/logout [target]` | Clear one target or all EdgeCrab-managed local auth caches |
 | `/doctor` | Run diagnostics inline (providers, tools, platforms) |
 | `/copilot-auth` | Trigger GitHub Copilot device-code authentication flow |
+| `/uninstall [flags]` | Preview or execute a local uninstall plan; in the TUI it refuses destructive execution unless `--yes` is supplied |
 
 ---
 
@@ -237,8 +264,8 @@ current session (does not change the underlying model):
 
 ## FAQ
 
-**What's the difference between `/new` and `/session`?**
-`/new` (alias `/reset`) starts a fresh session immediately, discarding current history. `/session` without arguments lists all saved sessions so you can switch to one.
+**What's the difference between `/new`, `/session`, and `/sessions`?**
+`/new` (alias `/reset`) starts a fresh session immediately. `/session` focuses on the live current session. `/sessions` opens the persisted session archive and management flows.
 
 **Can I run a slash command while the agent is responding?**
 Yes for `/stop` and `/approve`/`/deny` — they interrupt or gate the current turn. Other commands are queued until the turn finishes.

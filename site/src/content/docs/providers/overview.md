@@ -1,11 +1,11 @@
 ---
 title: LLM Provider Overview
-description: All 14 LLM providers supported by EdgeCrab — GitHub Copilot, OpenAI, Anthropic, Google Gemini, Vertex AI, xAI Grok, DeepSeek, Mistral, Groq, Hugging Face, Z.AI, OpenRouter, Ollama, and LM Studio.
+description: All 15 LLM providers supported by EdgeCrab — GitHub Copilot, OpenAI, Anthropic, Google Gemini, Vertex AI, AWS Bedrock, xAI Grok, DeepSeek, Mistral, Groq, Hugging Face, Z.AI, OpenRouter, Ollama, and LM Studio.
 sidebar:
   order: 1
 ---
 
-EdgeCrab supports **14 LLM providers** out of the box (12 cloud, 2 local). Over 200 models compiled in, with user override via `~/.edgecrab/models.yaml`. Auto-detection finds the right provider from your environment variables — or switch at any time with `--model` or `/model` inside the TUI.
+EdgeCrab supports **15 LLM providers** out of the box (13 cloud, 2 local). Over 200 models are compiled in, with user override via `~/.edgecrab/models.yaml`. Auto-detection finds the right provider from your environment variables — or switch at any time with `--model` or `/model` inside the TUI.
 
 ---
 
@@ -18,17 +18,18 @@ EdgeCrab supports **14 LLM providers** out of the box (12 cloud, 2 local). Over 
 | 3 | `anthropic` | `ANTHROPIC_API_KEY` | Claude Opus 4.6, Sonnet 4.6, Haiku 4.5 |
 | 4 | `google` | `GOOGLE_API_KEY` | Gemini 2.5 Pro, Gemini 2.5 Flash |
 | 5 | `vertexai` | `GOOGLE_APPLICATION_CREDENTIALS` | Gemini via Google Cloud |
-| 6 | `xai` | `XAI_API_KEY` | Grok 3, Grok 4 |
-| 7 | `deepseek` | `DEEPSEEK_API_KEY` | DeepSeek V3, DeepSeek R1 |
-| 8 | `mistral` | `MISTRAL_API_KEY` | Mistral Large, Mistral Small |
-| 9 | `groq` | `GROQ_API_KEY` | Llama 3.3 70B, Gemma2 (blazing fast inference) |
-| 10 | `huggingface` | `HUGGING_FACE_HUB_TOKEN` | Any HF Inference API model |
-| 11 | `zai` | `ZAI_API_KEY` | Z.AI / GLM series |
-| 12 | `openrouter` | `OPENROUTER_API_KEY` | 600+ models via one endpoint |
+| 6 | `bedrock` | AWS credentials chain | Claude, Nova, and Bedrock-hosted models |
+| 7 | `xai` | `XAI_API_KEY` | Grok 3, Grok 4 |
+| 8 | `deepseek` | `DEEPSEEK_API_KEY` | DeepSeek V3, DeepSeek R1 |
+| 9 | `mistral` | `MISTRAL_API_KEY` | Mistral Large, Mistral Small |
+| 10 | `groq` | `GROQ_API_KEY` | Llama 3.3 70B, Gemma2 (blazing fast inference) |
+| 11 | `huggingface` | `HUGGING_FACE_HUB_TOKEN` | Any HF Inference API model |
+| 12 | `zai` | `ZAI_API_KEY` | Z.AI / GLM series |
+| 13 | `openrouter` | `OPENROUTER_API_KEY` | 600+ models via one endpoint |
 | — | `ollama` | *(none)* | Any model — `ollama serve` on port 11434 |
 | — | `lmstudio` | *(none)* | Any model — LM Studio on port 1234 |
 
-> **Auto-detection order**: EdgeCrab checks env vars in priority order (1–12). The first matching key sets the default provider. Local providers (ollama, lmstudio) are available regardless.
+> **Auto-detection order**: EdgeCrab checks env vars in priority order (1–13). The first matching key sets the default provider. Local providers (ollama, lmstudio) are available regardless.
 
 ---
 

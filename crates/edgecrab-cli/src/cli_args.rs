@@ -17,7 +17,7 @@
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 /// EdgeCrab — AI-native terminal agent
 ///
@@ -107,11 +107,139 @@ pub struct CliArgs {
     ///   edgecrab --profile dev gateway start
     #[arg(short = 'p', long = "profile", global = true)]
     pub profile: Option<String>,
+
+    /// Bypass dangerous-command approval prompts for this session.
+    ///
+    /// Hermes compatibility flag. Equivalent to enabling `/yolo` at startup.
+    #[arg(long, global = true)]
+    pub yolo: bool,
 }
 
 /// CLI subcommands — each maps to a hermes-agent equivalent.
 #[derive(Subcommand, Debug, Clone)]
 pub enum Command {
+    /// Interactive or one-shot chat with the agent
+    ///
+    /// Equivalent to `hermes chat`. Reuses the default interactive runtime,
+    /// so all global flags still apply (`--model`, `--resume`, `--quiet`,
+    /// `--worktree`, `--yolo`, `-S`, etc.).
+    Chat {
+        /// Optional initial prompt to send immediately
+        #[arg(trailing_var_arg = true)]
+        prompt: Vec<String>,
+    },
+
+    /// Open the interactive model selector
+    ///
+    /// Equivalent to `hermes model`. This launches the normal TUI and opens
+    /// the `/model` picker immediately.
+    Model,
+
+    /// Start a fresh session through the Hermes-compatible slash path
+    New,
+
+    /// Clear the transcript and start fresh through the slash path
+    Clear,
+
+    /// Retry the last user turn through the slash path
+    Retry,
+
+    /// Undo the last exchange through the slash path
+    Undo,
+
+    /// Ask an ephemeral side question using current session context
+    Btw {
+        /// Question text
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
+    },
+
+    /// Show current provider availability through the slash path
+    Provider,
+
+    /// View, clear, or set the persisted custom prompt override
+    Prompt {
+        /// Prompt arguments, for example: `clear` or free-form text
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
+    },
+
+    /// Show or switch the session personality
+    Personality {
+        /// Personality name
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
+    },
+
+    /// Manage reasoning effort and display mode
+    Reasoning {
+        /// Reasoning arguments, for example: `high`, `show`, `hide`
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
+    },
+
+    /// Toggle or inspect YOLO approval bypass
+    Yolo {
+        /// Optional mode: on, off, toggle, status
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
+    },
+
+    /// Cycle or set tool-progress verbosity
+    Verbose {
+        /// Optional mode: off, new, all, verbose, open
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
+    },
+
+    /// Toggle or inspect the status bar
+    #[command(visible_alias = "sb")]
+    Statusbar {
+        /// Optional mode: on, off, toggle, status
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
+    },
+
+    /// Toggle or inspect voice mode
+    Voice {
+        /// Optional voice args, for example: on, off, tts hello
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
+    },
+
+    /// Control the browser/CDP bridge
+    Browser {
+        /// Browser command arguments
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
+    },
+
+    /// Reload MCP connections through the slash path
+    ReloadMcp,
+
+    /// Execute any slash command through the normal TUI command pipeline
+    ///
+    /// This is the universal CLI bridge for Hermes-style slash commands that
+    /// do not warrant dedicated top-level clap trees. Examples:
+    ///   edgecrab slash insights 7
+    ///   edgecrab slash btw "quick side question"
+    ///   edgecrab slash profile
+    Slash {
+        /// Slash command without the leading `/`
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+
+    /// Show historical token, cost, and activity analytics
+    ///
+    /// Hermes-compatible top-level insights entrypoint. Reads persisted
+    /// session history from the state database.
+    Insights {
+        /// Number of days of history to include
+        #[arg(long, default_value_t = 30)]
+        days: u32,
+    },
+
     /// Manage named profiles (isolated config + memory + skills + sessions)
     ///
     /// Equivalent to `hermes profile`. Each profile has its own home directory
@@ -168,6 +296,9 @@ pub enum Command {
         /// Preview what would be migrated without writing any files
         #[arg(long)]
         dry_run: bool,
+        /// Override the default Hermes source directory (~/.hermes)
+        #[arg(long)]
+        source: Option<PathBuf>,
     },
 
     /// Start ACP stdio server or generate editor onboarding files
@@ -196,8 +327,81 @@ pub enum Command {
     /// Equivalent to `hermes whatsapp`.
     Whatsapp,
 
+    /// Manage EdgeCrab-managed authentication state
+    ///
+    /// Honest Hermes-compatibility surface over the auth systems EdgeCrab
+    /// actually ships today: GitHub Copilot token import/cache and MCP
+    /// bearer-token / OAuth state.
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommand,
+    },
+
+    /// Start an interactive login flow for one auth target
+    ///
+    /// Equivalent to `hermes login`, but only for real EdgeCrab targets such
+    /// as `copilot` or `mcp/<server>`.
+    Login {
+        /// Auth target: `copilot`, `mcp/<server>`, or a configured MCP server name
+        target: String,
+    },
+
+    /// Clear cached local authentication state
+    ///
+    /// Equivalent to `hermes logout`, but scoped to EdgeCrab-managed local
+    /// auth artifacts. With no target, clears all cached Copilot + MCP state.
+    Logout {
+        /// Optional auth target: `copilot`, `mcp/<server>`, or a configured MCP server name
+        target: Option<String>,
+    },
+
     /// Show a high-level runtime status summary
     Status,
+
+    /// Print a shareable setup and runtime summary
+    ///
+    /// Hermes-compatible support/debugging snapshot.
+    Dump {
+        /// Include additional counts and local file inventory details
+        #[arg(long)]
+        all: bool,
+    },
+
+    /// View log files under `~/.edgecrab/logs/`
+    Logs {
+        #[command(subcommand)]
+        command: LogsCommand,
+    },
+
+    /// Manage gateway pairing approvals
+    Pairing {
+        #[command(subcommand)]
+        command: PairingCommand,
+    },
+
+    /// Inspect or edit persistent memory files
+    Memory {
+        #[command(subcommand)]
+        command: MemoryCommand,
+    },
+
+    /// Manage EdgeCrab's Honcho-compatible user model
+    Honcho {
+        #[command(subcommand)]
+        command: HonchoCommand,
+    },
+
+    /// Hermes-compatible OpenClaw migration entrypoint
+    Claw {
+        #[command(subcommand)]
+        command: ClawCommand,
+    },
+
+    /// Manage dynamic webhook subscriptions for the gateway
+    Webhook {
+        #[command(subcommand)]
+        command: WebhookCommand,
+    },
 
     /// Persisted session management
     Sessions {
@@ -251,6 +455,28 @@ pub enum Command {
         #[command(subcommand)]
         command: SkillsCommand,
     },
+
+    /// Remove EdgeCrab-managed local artifacts
+    ///
+    /// Safe by default: stops the gateway, removes profile wrapper scripts,
+    /// and only purges data or the current binary when explicitly requested.
+    Uninstall {
+        /// Preview actions without deleting anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Delete ~/.edgecrab/ as part of the uninstall
+        #[arg(long)]
+        purge_data: bool,
+        /// Delete EdgeCrab's local Copilot token cache
+        #[arg(long)]
+        purge_auth_cache: bool,
+        /// Delete the currently running edgecrab binary
+        #[arg(long)]
+        remove_binary: bool,
+        /// Skip the confirmation prompt
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -303,6 +529,249 @@ pub enum SessionCommand {
     },
     /// Show high-level session statistics
     Stats,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum LogsCommand {
+    /// List available log files
+    List,
+    /// Print the logs directory or one resolved log-file path
+    Path {
+        /// Optional log file name (for example: gateway, signal-cli, whatsapp-bridge)
+        name: Option<String>,
+    },
+    /// Print the last N lines from a log file
+    Show {
+        /// Optional log file name (defaults to gateway when present)
+        name: Option<String>,
+        #[arg(long, default_value_t = 120)]
+        lines: usize,
+    },
+    /// Follow a log file continuously
+    Tail {
+        /// Optional log file name (defaults to gateway when present)
+        name: Option<String>,
+        #[arg(long, default_value_t = 120)]
+        lines: usize,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum PairingCommand {
+    /// List pending and/or approved pairing entries
+    List {
+        /// Restrict to pending requests
+        #[arg(long)]
+        pending: bool,
+        /// Restrict to approved users
+        #[arg(long)]
+        approved: bool,
+        /// Optional platform filter
+        #[arg(long)]
+        platform: Option<String>,
+    },
+    /// Approve a pending pairing code
+    Approve { platform: String, code: String },
+    /// Revoke an approved paired user
+    Revoke { platform: String, user_id: String },
+    /// Remove pending pairing requests without approving them
+    ClearPending {
+        /// Optional platform filter
+        #[arg(long)]
+        platform: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum MemoryCommand {
+    /// Show memory file contents
+    Show {
+        /// Target: memory, user, or all (default: all)
+        target: Option<String>,
+    },
+    /// Open a memory file in $EDITOR / $VISUAL
+    Edit {
+        /// Target: memory or user (default: memory)
+        target: Option<String>,
+    },
+    /// Print memory file path(s)
+    Path {
+        /// Target: memory, user, or all (default: all)
+        target: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum AuthCommand {
+    /// List auth targets and their local state
+    List,
+    /// Show detailed auth state for one or all targets
+    Status {
+        /// Optional auth target: `copilot`, `mcp/<server>`, or a configured MCP server name
+        target: Option<String>,
+    },
+    /// Add or cache credentials for one auth target
+    Add {
+        /// Auth target: `copilot`, `mcp/<server>`, or a configured MCP server name
+        target: String,
+        /// Token value to cache (required for MCP bearer-token targets; optional for Copilot)
+        #[arg(long)]
+        token: Option<String>,
+    },
+    /// Start an interactive login/import flow
+    Login {
+        /// Auth target: `copilot`, `mcp/<server>`, or a configured MCP server name
+        target: String,
+    },
+    /// Remove local cached credentials for one target
+    #[command(visible_aliases = ["logout", "rm"])]
+    Remove {
+        /// Auth target: `copilot`, `mcp/<server>`, or a configured MCP server name
+        target: String,
+    },
+    /// Reset cached auth state for one target or all targets
+    Reset {
+        /// Optional auth target: `copilot`, `mcp/<server>`, or a configured MCP server name
+        target: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum HonchoCommand {
+    /// Show Honcho config and local-store status
+    Status,
+    /// Enable or disable Honcho support
+    Setup {
+        /// Enable cloud sync mode as well as the local store
+        #[arg(long)]
+        cloud_sync: bool,
+        /// Disable Honcho entirely
+        #[arg(long)]
+        disable: bool,
+    },
+    /// Show or set the effective Honcho mode
+    Mode {
+        /// disabled | local | hybrid | honcho
+        mode: Option<String>,
+    },
+    /// Show or update Honcho context/write budgets
+    Tokens {
+        /// Max entries injected into the prompt
+        #[arg(long)]
+        context: Option<usize>,
+        /// Auto-write frequency in messages (0 = manual only)
+        #[arg(long = "write-frequency")]
+        write_frequency: Option<u32>,
+    },
+    /// List all stored Honcho entries
+    List,
+    /// Search stored Honcho entries
+    Search { query: String },
+    /// Add a new Honcho entry
+    Add {
+        category: String,
+        #[arg(trailing_var_arg = true)]
+        content: Vec<String>,
+    },
+    /// Remove an entry by ID or ID prefix
+    Remove { id: String },
+    /// Seed identity context from a local file such as SOUL.md
+    Identity { file: Option<String> },
+    /// Print the Honcho store path
+    Path,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum ClawCommand {
+    /// Migrate OpenClaw data into EdgeCrab
+    Migrate {
+        #[arg(long)]
+        dry_run: bool,
+        /// Override the default OpenClaw source directory (~/.openclaw, ~/.clawdbot, ~/.moldbot)
+        #[arg(long)]
+        source: Option<PathBuf>,
+        /// Migration preset: user-data or full
+        #[arg(long, value_enum, default_value_t = OpenClawPresetArg::Full)]
+        preset: OpenClawPresetArg,
+        /// Overwrite conflicting target files instead of skipping them
+        #[arg(long)]
+        overwrite: bool,
+        /// Import allowlisted secrets such as provider API keys
+        #[arg(long)]
+        migrate_secrets: bool,
+        /// Copy OpenClaw workspace AGENTS.md into this absolute workspace path
+        #[arg(long)]
+        workspace_target: Option<PathBuf>,
+        /// How to handle skill name conflicts under ~/.edgecrab/skills/openclaw-imports/
+        #[arg(long, value_enum, default_value_t = SkillConflictModeArg::Skip)]
+        skill_conflict: SkillConflictModeArg,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum OpenClawPresetArg {
+    #[value(alias = "user_data")]
+    UserData,
+    Full,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum SkillConflictModeArg {
+    Skip,
+    Overwrite,
+    Rename,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum WebhookCommand {
+    /// Create or update a dynamic webhook route
+    #[command(visible_alias = "add")]
+    Subscribe {
+        /// Route name, exposed as /webhooks/<name>
+        name: String,
+        /// Human-readable description
+        #[arg(long)]
+        description: Option<String>,
+        /// Comma-separated event filter(s); omit to accept every event
+        #[arg(long, value_delimiter = ',')]
+        events: Vec<String>,
+        /// Prompt prepended to the synthesized agent message
+        #[arg(long)]
+        prompt: Option<String>,
+        /// Skills to preload for the webhook session before the first turn
+        #[arg(long = "skill", value_delimiter = ',')]
+        skills: Vec<String>,
+        /// Shared secret; generated automatically when omitted
+        #[arg(long)]
+        secret: Option<String>,
+        /// Hermes-style final delivery target (`log`, `telegram`, `origin`, `github_comment`, ...)
+        #[arg(long)]
+        deliver: Option<String>,
+        /// Extra delivery metadata as repeated key=value pairs
+        #[arg(long = "deliver-extra")]
+        deliver_extra: Vec<String>,
+        /// Fixed-window request limit per minute
+        #[arg(long)]
+        rate_limit: Option<u32>,
+        /// Maximum accepted body size in bytes
+        #[arg(long)]
+        max_body_bytes: Option<usize>,
+    },
+    /// List configured dynamic webhook routes
+    #[command(visible_alias = "ls")]
+    List,
+    /// Remove a dynamic webhook route
+    #[command(visible_aliases = ["rm", "delete"])]
+    Remove { name: String },
+    /// Send a signed test request to a route
+    Test {
+        name: String,
+        /// Raw JSON payload body to POST
+        #[arg(long)]
+        payload: Option<String>,
+    },
+    /// Print the subscriptions file path
+    Path,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -516,6 +985,11 @@ pub enum CronCommand {
 
 #[derive(Subcommand, Debug, Clone)]
 pub enum GatewayCommand {
+    /// Run the gateway in the foreground
+    ///
+    /// Hermes-compatible alias for `edgecrab gateway start --foreground`.
+    Run,
+
     /// Start the gateway in the foreground or background
     ///
     /// Examples:
@@ -602,8 +1076,8 @@ pub enum ProfileCommand {
 
     /// Show details about a profile (home dir, model, platforms, disk usage)
     Show {
-        /// Profile to inspect
-        name: String,
+        /// Profile to inspect (defaults to the active profile)
+        name: Option<String>,
     },
 
     /// Regenerate or remove the shell alias script for a profile
@@ -704,6 +1178,24 @@ impl CliArgs {
             Some(self.prompt.join(" "))
         }
     }
+
+    pub fn slash_text(command: &[String]) -> Option<String> {
+        let trimmed: Vec<String> = command
+            .iter()
+            .map(|part| part.trim().to_string())
+            .filter(|part| !part.is_empty())
+            .collect();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        let joined = trimmed.join(" ");
+        if joined.starts_with('/') {
+            Some(joined)
+        } else {
+            Some(format!("/{joined}"))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -772,11 +1264,181 @@ mod tests {
     }
 
     #[test]
-    fn parse_migrate_dry_run() {
-        let args = CliArgs::parse_from(["edgecrab", "migrate", "--dry-run"]);
+    fn parse_chat_subcommand_with_prompt() {
+        let args = CliArgs::parse_from(["edgecrab", "chat", "explain", "this", "crate"]);
         assert!(matches!(
             args.command,
-            Some(Command::Migrate { dry_run: true })
+            Some(Command::Chat { prompt }) if prompt == vec!["explain", "this", "crate"]
+        ));
+    }
+
+    #[test]
+    fn parse_model_subcommand() {
+        let args = CliArgs::parse_from(["edgecrab", "model"]);
+        assert!(matches!(args.command, Some(Command::Model)));
+    }
+
+    #[test]
+    fn parse_slash_subcommand() {
+        let args = CliArgs::parse_from(["edgecrab", "slash", "insights", "14"]);
+        assert!(matches!(
+            args.command,
+            Some(Command::Slash { command }) if command == vec!["insights", "14"]
+        ));
+        assert_eq!(
+            CliArgs::slash_text(&["insights".into(), "14".into()]).as_deref(),
+            Some("/insights 14")
+        );
+    }
+
+    #[test]
+    fn parse_btw_subcommand() {
+        let args = CliArgs::parse_from(["edgecrab", "btw", "quick", "question"]);
+        assert!(matches!(
+            args.command,
+            Some(Command::Btw { args }) if args == vec!["quick", "question"]
+        ));
+    }
+
+    #[test]
+    fn parse_prompt_subcommand() {
+        let args = CliArgs::parse_from(["edgecrab", "prompt", "clear"]);
+        assert!(matches!(
+            args.command,
+            Some(Command::Prompt { args }) if args == vec!["clear"]
+        ));
+    }
+
+    #[test]
+    fn parse_reload_mcp_subcommand() {
+        let args = CliArgs::parse_from(["edgecrab", "reload-mcp"]);
+        assert!(matches!(args.command, Some(Command::ReloadMcp)));
+    }
+
+    #[test]
+    fn hermes_reference_commands_are_reachable_via_slash_bridge() {
+        for name in [
+            "new",
+            "clear",
+            "history",
+            "save",
+            "retry",
+            "undo",
+            "title",
+            "branch",
+            "compress",
+            "rollback",
+            "stop",
+            "approve",
+            "deny",
+            "background",
+            "btw",
+            "queue",
+            "status",
+            "profile",
+            "sethome",
+            "resume",
+            "config",
+            "model",
+            "provider",
+            "prompt",
+            "personality",
+            "statusbar",
+            "verbose",
+            "yolo",
+            "reasoning",
+            "skin",
+            "voice",
+            "tools",
+            "toolsets",
+            "skills",
+            "cron",
+            "reload-mcp",
+            "browser",
+            "plugins",
+            "commands",
+            "help",
+            "usage",
+            "insights",
+            "platforms",
+            "paste",
+            "update",
+            "quit",
+        ] {
+            let args = CliArgs::parse_from(["edgecrab", "slash", name]);
+            assert!(
+                matches!(
+                    args.command,
+                    Some(Command::Slash { command }) if command == vec![name]
+                ),
+                "slash bridge failed for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_honcho_status_subcommand() {
+        let args = CliArgs::parse_from(["edgecrab", "honcho", "status"]);
+        assert!(matches!(
+            args.command,
+            Some(Command::Honcho {
+                command: HonchoCommand::Status
+            })
+        ));
+    }
+
+    #[test]
+    fn parse_claw_migrate_subcommand() {
+        let args = CliArgs::parse_from([
+            "edgecrab",
+            "claw",
+            "migrate",
+            "--dry-run",
+            "--preset",
+            "user-data",
+            "--overwrite",
+            "--migrate-secrets",
+            "--skill-conflict",
+            "rename",
+            "--workspace-target",
+            "/tmp/workspace",
+        ]);
+        assert!(matches!(
+            args.command,
+            Some(Command::Claw {
+                command: ClawCommand::Migrate {
+                    dry_run: true,
+                    preset: OpenClawPresetArg::UserData,
+                    overwrite: true,
+                    migrate_secrets: true,
+                    skill_conflict: SkillConflictModeArg::Rename,
+                    ..
+                }
+            })
+        ));
+    }
+
+    #[test]
+    fn parse_insights_subcommand() {
+        let args = CliArgs::parse_from(["edgecrab", "insights", "--days", "14"]);
+        assert!(matches!(args.command, Some(Command::Insights { days: 14 })));
+    }
+
+    #[test]
+    fn parse_migrate_dry_run() {
+        let args = CliArgs::parse_from([
+            "edgecrab",
+            "migrate",
+            "--dry-run",
+            "--source",
+            "/tmp/.hermes",
+        ]);
+        assert!(matches!(
+            args.command,
+            Some(Command::Migrate {
+                dry_run: true,
+                source: Some(_)
+            })
         ));
     }
 
@@ -785,7 +1447,10 @@ mod tests {
         let args = CliArgs::parse_from(["edgecrab", "migrate"]);
         assert!(matches!(
             args.command,
-            Some(Command::Migrate { dry_run: false })
+            Some(Command::Migrate {
+                dry_run: false,
+                source: None
+            })
         ));
     }
 
@@ -979,6 +1644,17 @@ mod tests {
     }
 
     #[test]
+    fn parse_gateway_run_subcommand() {
+        let args = CliArgs::parse_from(["edgecrab", "gateway", "run"]);
+        assert!(matches!(
+            args.command,
+            Some(Command::Gateway {
+                command: GatewayCommand::Run
+            })
+        ));
+    }
+
+    #[test]
     fn parse_whatsapp_subcommand() {
         let args = CliArgs::parse_from(["edgecrab", "whatsapp"]);
         assert!(matches!(args.command, Some(Command::Whatsapp)));
@@ -988,6 +1664,67 @@ mod tests {
     fn parse_status_subcommand() {
         let args = CliArgs::parse_from(["edgecrab", "status"]);
         assert!(matches!(args.command, Some(Command::Status)));
+    }
+
+    #[test]
+    fn parse_dump_subcommand() {
+        let args = CliArgs::parse_from(["edgecrab", "dump", "--all"]);
+        assert!(matches!(args.command, Some(Command::Dump { all: true })));
+    }
+
+    #[test]
+    fn parse_logs_show_subcommand() {
+        let args = CliArgs::parse_from(["edgecrab", "logs", "show", "gateway", "--lines", "50"]);
+        assert!(matches!(
+            args.command,
+            Some(Command::Logs {
+                command: LogsCommand::Show { lines: 50, .. }
+            })
+        ));
+    }
+
+    #[test]
+    fn parse_pairing_approve_subcommand() {
+        let args = CliArgs::parse_from(["edgecrab", "pairing", "approve", "telegram", "ABCD1234"]);
+        assert!(matches!(
+            args.command,
+            Some(Command::Pairing {
+                command: PairingCommand::Approve { .. }
+            })
+        ));
+    }
+
+    #[test]
+    fn parse_memory_edit_subcommand() {
+        let args = CliArgs::parse_from(["edgecrab", "memory", "edit", "user"]);
+        assert!(matches!(
+            args.command,
+            Some(Command::Memory {
+                command: MemoryCommand::Edit { .. }
+            })
+        ));
+    }
+
+    #[test]
+    fn parse_profile_show_without_name_defaults_later() {
+        let args = CliArgs::parse_from(["edgecrab", "profile", "show"]);
+        assert!(matches!(
+            args.command,
+            Some(Command::Profile {
+                command: ProfileCommand::Show { name: None }
+            })
+        ));
+    }
+
+    #[test]
+    fn parse_profile_show_with_name() {
+        let args = CliArgs::parse_from(["edgecrab", "profile", "show", "work"]);
+        assert!(matches!(
+            args.command,
+            Some(Command::Profile {
+                command: ProfileCommand::Show { name: Some(_) }
+            })
+        ));
     }
 
     #[test]
@@ -1076,6 +1813,89 @@ mod tests {
             args.command,
             Some(Command::Skills {
                 command: SkillsCommand::Update { .. }
+            })
+        ));
+    }
+
+    #[test]
+    fn parse_auth_add_subcommand() {
+        let args =
+            CliArgs::parse_from(["edgecrab", "auth", "add", "copilot", "--token", "ghu_test"]);
+        assert!(matches!(
+            args.command,
+            Some(Command::Auth {
+                command: AuthCommand::Add { target, token }
+            }) if target == "copilot" && token.as_deref() == Some("ghu_test")
+        ));
+    }
+
+    #[test]
+    fn parse_webhook_subscribe_subcommand() {
+        let args = CliArgs::parse_from([
+            "edgecrab",
+            "webhook",
+            "subscribe",
+            "github",
+            "--events",
+            "push,pull_request",
+        ]);
+        assert!(matches!(
+            args.command,
+            Some(Command::Webhook {
+                command: WebhookCommand::Subscribe { name, events, .. }
+            }) if name == "github" && events == vec!["push", "pull_request"]
+        ));
+    }
+
+    #[test]
+    fn parse_webhook_subscribe_with_delivery_and_skills() {
+        let args = CliArgs::parse_from([
+            "edgecrab",
+            "webhook",
+            "subscribe",
+            "github",
+            "--skill",
+            "code-review,triage",
+            "--deliver",
+            "github_comment",
+            "--deliver-extra",
+            "repo=org/repo",
+            "--deliver-extra",
+            "pr_number=42",
+        ]);
+        assert!(matches!(
+            args.command,
+            Some(Command::Webhook {
+                command: WebhookCommand::Subscribe {
+                    name,
+                    skills,
+                    deliver,
+                    deliver_extra,
+                    ..
+                }
+            }) if name == "github"
+                && skills == vec!["code-review", "triage"]
+                && deliver.as_deref() == Some("github_comment")
+                && deliver_extra == vec!["repo=org/repo", "pr_number=42"]
+        ));
+    }
+
+    #[test]
+    fn parse_uninstall_subcommand() {
+        let args = CliArgs::parse_from([
+            "edgecrab",
+            "uninstall",
+            "--dry-run",
+            "--purge-data",
+            "--yes",
+        ]);
+        assert!(matches!(
+            args.command,
+            Some(Command::Uninstall {
+                dry_run: true,
+                purge_data: true,
+                yes: true,
+                ..
             })
         ));
     }

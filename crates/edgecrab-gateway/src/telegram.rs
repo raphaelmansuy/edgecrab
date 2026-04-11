@@ -896,6 +896,7 @@ impl PlatformAdapter for TelegramAdapter {
                                 thread_id: msg.message_thread_id.map(|id| id.to_string()),
                                 user_display_name: display_name,
                                 attachments,
+                                ..Default::default()
                             },
                         };
 

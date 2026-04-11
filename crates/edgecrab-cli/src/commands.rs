@@ -14,7 +14,7 @@
 //!   Tools         /tools /toolsets /mcp /reload-mcp /plugins
 //!   Memory        /memory
 //!   Analysis      /cost /usage /compress /insights
-//!   Appearance    /theme /paste
+//!   Appearance    /skin /paste
 //!   Advanced      /queue /background /rollback
 //!   Gateway       /platforms /gateway /approve /deny /sethome /update
 //!   Scheduling    /cron
@@ -28,6 +28,9 @@
 
 use std::collections::HashMap;
 
+use edgecrab_command_catalog::{
+    SlashCommandSpec, SlashSurface, grouped_slash_commands_for_surface, slash_commands_for_surface,
+};
 use edgecrab_core::{DiscoveryAvailability, live_discovery_availability};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,8 +109,8 @@ pub enum CommandResult {
     ShowCost,
     /// Show full token usage breakdown
     ShowUsage,
-    /// Show the assembled system prompt
-    ShowPrompt,
+    /// Show, clear, or update the custom system prompt override
+    PromptCommand(String),
     /// Open or query the configuration surface
     ShowConfig(String),
     /// Show message history summary
@@ -140,12 +143,20 @@ pub enum CommandResult {
     QueuePrompt(String),
     /// Run a prompt in the background
     BackgroundPrompt(String),
+    /// Ask an ephemeral side question using the current session context.
+    SideQuestion(String),
+    /// Fork the current session into a new branch and switch to it.
+    BranchSession(Option<String>),
     /// Show/manage skills
     ShowSkills(String),
+    /// Show/manage profiles
+    ShowProfiles(String),
     /// Show/manage MCP servers and presets
     ShowMcp(String),
     /// Activate the interactive skill selector overlay
     SkillSelector,
+    /// Activate the interactive profile selector overlay.
+    ProfileSelector,
     /// Activate the interactive tool manager overlay.
     ToolManager(ToolManagerMode),
     /// Reset tool and toolset policy back to defaults.
@@ -175,14 +186,28 @@ pub enum CommandResult {
     SwitchPersonality(String),
     /// Switch to a named skin preset (session-level)
     SwitchSkin(String),
-    /// Show conversation insights from session DB
-    ShowInsights,
+    /// Show conversation insights from session DB for the requested day window.
+    ShowInsights(u32),
     /// Paste clipboard text into the input
     PasteClipboard,
+    /// Queue a local image file for the next prompt.
+    AttachImagePath(String),
+    /// Run one auth control-plane command.
+    AuthCommand(crate::cli_args::AuthCommand),
+    /// Start a login/import flow for one auth target.
+    LoginTarget(String),
+    /// Clear cached auth state for one or all targets.
+    LogoutTarget(Option<String>),
+    /// Manage dynamic gateway webhook subscriptions.
+    WebhookCommand(crate::cli_args::WebhookCommand),
+    /// Plan or execute a local uninstall action.
+    UninstallCommand(crate::uninstall_cmd::UninstallOptions),
     /// Trigger Copilot GitHub authentication (device code flow or auto-import from VS Code)
     CopilotAuth,
     /// Manage terminal mouse capture mode (on/off/toggle/status)
     MouseMode(String),
+    /// Toggle or inspect YOLO approval bypass for the current session.
+    SetYolo(String),
     /// Resolve the current approval prompt from a slash command.
     ApprovalChoice(edgecrab_core::ApprovalChoice),
     /// macOS permission diagnostics and bootstrap workflow.
@@ -205,6 +230,8 @@ pub enum CommandResult {
     GatewayControl(String),
     /// Show local upgrade status and actionable update guidance.
     CheckUpdates,
+    /// Show the gateway slash-command catalog, optionally paginated.
+    ShowGatewayCommands(String),
 }
 
 /// A registered slash command.
@@ -403,6 +430,15 @@ impl CommandRegistry {
         map
     }
 
+    pub fn gateway_entries(&self) -> Vec<(&'static str, &'static str)> {
+        let mut entries: Vec<_> = slash_commands_for_surface(SlashSurface::Gateway)
+            .into_iter()
+            .map(|cmd| (cmd.name, cmd.description))
+            .collect();
+        entries.sort_by_key(|(name, _)| *name);
+        entries
+    }
+
     fn register(&mut self, cmd: Command) {
         // Register all aliases in the alias_map BEFORE moving cmd into commands.
         // We read cmd.aliases first (while cmd is still accessible), then insert.
@@ -432,7 +468,7 @@ impl CommandRegistry {
         self.register(Command {
             name: "clear",
             aliases: &["cls"],
-            description: "Clear the output area",
+            description: "Clear the screen and start a fresh session",
             handler: |_| CommandResult::Clear,
         });
 
@@ -465,7 +501,8 @@ impl CommandRegistry {
         self.register(Command {
             name: "model",
             aliases: &[],
-            description: "Show model selector or switch model (e.g. /model openrouter/openai/gpt-5.4)",
+            description:
+                "Show model selector or switch model (e.g. /model openrouter/openai/gpt-5.4)",
             // WHY return ModelSwitch: The handler can't access the agent directly
             // (fn pointer, not closure). The App event loop performs the actual
             // provider creation + agent.swap_model() call.
@@ -718,14 +755,15 @@ impl CommandRegistry {
         self.register(Command {
             name: "prompt",
             aliases: &["sys", "system"],
-            description: "Show the current system prompt",
-            handler: |_| CommandResult::ShowPrompt,
+            description: "Show, clear, or set the custom system prompt (/prompt, /prompt clear, /prompt <text>)",
+            handler: |args| CommandResult::PromptCommand(args.trim().to_string()),
         });
 
         self.register(Command {
             name: "verbose",
             aliases: &["v"],
-            description: "Open tool-progress picker (TUI); or set directly: /verbose [off|new|all|verbose]",
+            description:
+                "Cycle tool-progress mode; or set directly: /verbose [off|new|all|verbose|status]",
             handler: |args| {
                 let args = args.trim();
                 if args.is_empty() {
@@ -817,15 +855,24 @@ impl CommandRegistry {
             name: "insights",
             aliases: &[],
             description: "Show conversation insights",
-            handler: |_| CommandResult::ShowInsights,
+            handler: |args| {
+                let trimmed = args.trim();
+                if trimmed.is_empty() {
+                    return CommandResult::ShowInsights(30);
+                }
+                match trimmed.parse::<u32>() {
+                    Ok(days) if days > 0 => CommandResult::ShowInsights(days),
+                    _ => CommandResult::Output("Usage: /insights [days]".into()),
+                }
+            },
         });
 
         // ── Appearance ────────────────────────────────────────────────
 
         self.register(Command {
-            name: "theme",
-            aliases: &["skin"],
-            description: "Browse, reload, or switch skins: /theme, /theme reload, /theme <name>",
+            name: "skin",
+            aliases: &["theme"],
+            description: "Browse, reload, or switch skins: /skin, /skin reload, /skin <name>",
             handler: |args| {
                 let name = args.trim();
                 if name.eq_ignore_ascii_case("reload") {
@@ -870,7 +917,7 @@ impl CommandRegistry {
                      ✓ Tool registry: loaded\n\
                      {api_key_status}\n\
                      ✓ Config dir: {home}\n\
-                     Skin: {home}/skin.yaml (use /theme to reload)\n\
+                     Skin: {home}/skin.yaml (use /skin reload to refresh)\n\
                      \nFor full diagnostics run: edgecrab doctor"
                 ))
             },
@@ -889,6 +936,46 @@ impl CommandRegistry {
             aliases: &["copilot-login", "gh-auth"],
             description: "Authenticate with GitHub Copilot (auto-imports VS Code token or starts device flow)",
             handler: |_| CommandResult::CopilotAuth,
+        });
+
+        self.register(Command {
+            name: "auth",
+            aliases: &[],
+            description: "Inspect or mutate EdgeCrab-managed auth state",
+            handler: |args| match crate::auth_cmd::command_from_slash_args(args) {
+                Ok(command) => CommandResult::AuthCommand(command),
+                Err(err) => CommandResult::Output(err),
+            },
+        });
+
+        self.register(Command {
+            name: "login",
+            aliases: &[],
+            description: "Run one auth login/import flow",
+            handler: |args| match crate::auth_cmd::login_target_from_slash_args(args) {
+                Ok(target) => CommandResult::LoginTarget(target),
+                Err(err) => CommandResult::Output(err),
+            },
+        });
+
+        self.register(Command {
+            name: "logout",
+            aliases: &[],
+            description: "Clear one or all local auth caches",
+            handler: |args| match crate::auth_cmd::logout_target_from_slash_args(args) {
+                Ok(target) => CommandResult::LogoutTarget(target),
+                Err(err) => CommandResult::Output(err),
+            },
+        });
+
+        self.register(Command {
+            name: "uninstall",
+            aliases: &[],
+            description: "Preview or execute EdgeCrab uninstall actions",
+            handler: |args| match crate::uninstall_cmd::options_from_slash_args(args) {
+                Ok(options) => CommandResult::UninstallCommand(options),
+                Err(err) => CommandResult::Output(err),
+            },
         });
 
         // ── Session (extended) ────────────────────────────────────────
@@ -949,7 +1036,7 @@ impl CommandRegistry {
 
         self.register(Command {
             name: "reload-mcp",
-            aliases: &["mcp-reload"],
+            aliases: &["mcp-reload", "reload_mcp"],
             description: "Reload MCP server connections",
             handler: |_| CommandResult::ReloadMcp,
         });
@@ -964,7 +1051,8 @@ impl CommandRegistry {
         self.register(Command {
             name: "mcp-token",
             aliases: &[],
-            description: "Manage MCP OAuth Bearer tokens: set <server> <token> | remove <server> | list",
+            description:
+                "Manage MCP OAuth Bearer tokens: set <server> <token> | remove <server> | list",
             handler: |args| CommandResult::McpToken(args.trim().to_string()),
         });
 
@@ -995,6 +1083,24 @@ impl CommandRegistry {
         });
 
         self.register(Command {
+            name: "btw",
+            aliases: &[],
+            description: "Ask an ephemeral side question using the current session context",
+            handler: |args| {
+                let prompt = args.trim();
+                if prompt.is_empty() {
+                    CommandResult::Output(
+                        "Usage: /btw <question>\n\
+                         Example: /btw which module owns session title handling?"
+                            .into(),
+                    )
+                } else {
+                    CommandResult::SideQuestion(prompt.to_string())
+                }
+            },
+        });
+
+        self.register(Command {
             name: "background",
             aliases: &["bg"],
             description: "Run a prompt in the background",
@@ -1008,6 +1114,16 @@ impl CommandRegistry {
                 } else {
                     CommandResult::BackgroundPrompt(args.to_string())
                 }
+            },
+        });
+
+        self.register(Command {
+            name: "branch",
+            aliases: &["fork"],
+            description: "Branch the current session and switch to the new copy",
+            handler: |args| {
+                let name = args.trim();
+                CommandResult::BranchSession((!name.is_empty()).then_some(name.to_string()))
             },
         });
 
@@ -1033,9 +1149,11 @@ impl CommandRegistry {
         self.register(Command {
             name: "gateway",
             aliases: &["gatewayctl"],
-            description: "Manage gateway runtime: /gateway [start|stop|restart|status]",
+            description:
+                "Show gateway status or manage the runtime: /gateway [start|stop|restart|status]",
             handler: |args| match args.trim().to_ascii_lowercase().as_str() {
-                "" | "status" => CommandResult::GatewayControl("status".into()),
+                "" => CommandResult::ShowPlatforms,
+                "status" => CommandResult::GatewayControl("status".into()),
                 "start" => CommandResult::GatewayControl("start".into()),
                 "stop" => CommandResult::GatewayControl("stop".into()),
                 "restart" => CommandResult::GatewayControl("restart".into()),
@@ -1043,6 +1161,13 @@ impl CommandRegistry {
                     "Unknown gateway action '{other}'. Use: /gateway [start|stop|restart|status]"
                 )),
             },
+        });
+
+        self.register(Command {
+            name: "commands",
+            aliases: &[],
+            description: "Browse the gateway slash-command catalog",
+            handler: |args| CommandResult::ShowGatewayCommands(args.trim().to_string()),
         });
 
         self.register(Command {
@@ -1073,9 +1198,19 @@ impl CommandRegistry {
 
         self.register(Command {
             name: "sethome",
-            aliases: &[],
+            aliases: &["set-home"],
             description: "Show or set gateway home channels: /sethome [platform] <channel|clear>",
             handler: |args| CommandResult::SetHomeChannel(args.trim().to_string()),
+        });
+
+        self.register(Command {
+            name: "webhook",
+            aliases: &[],
+            description: "Manage dynamic gateway webhook subscriptions",
+            handler: |args| match crate::webhook_cmd::command_from_slash_args(args) {
+                Ok(command) => CommandResult::WebhookCommand(command),
+                Err(err) => CommandResult::Output(err),
+            },
         });
 
         self.register(Command {
@@ -1083,6 +1218,13 @@ impl CommandRegistry {
             aliases: &[],
             description: "Check release status and show channel-aware update guidance",
             handler: |_| CommandResult::CheckUpdates,
+        });
+
+        self.register(Command {
+            name: "yolo",
+            aliases: &[],
+            description: "Toggle YOLO mode (skip dangerous command approvals for this session)",
+            handler: |args| CommandResult::SetYolo(args.trim().to_string()),
         });
 
         // ── Scheduling ────────────────────────────────────────────────
@@ -1128,6 +1270,27 @@ impl CommandRegistry {
             },
         });
 
+        self.register(Command {
+            name: "profile",
+            aliases: &[],
+            description: "Inspect or manage profiles (or /profile <subcommand>)",
+            handler: |args| CommandResult::ShowProfiles(args.trim().to_string()),
+        });
+
+        self.register(Command {
+            name: "profiles",
+            aliases: &[],
+            description: "Browse and switch profiles",
+            handler: |args| {
+                let trimmed = args.trim();
+                if trimmed.is_empty() {
+                    CommandResult::ProfileSelector
+                } else {
+                    CommandResult::ShowProfiles(trimmed.to_string())
+                }
+            },
+        });
+
         // ── Appearance (extended) ─────────────────────────────────────
 
         self.register(Command {
@@ -1135,6 +1298,23 @@ impl CommandRegistry {
             aliases: &[],
             description: "Paste clipboard text and attach to next message",
             handler: |_| CommandResult::PasteClipboard,
+        });
+
+        self.register(Command {
+            name: "image",
+            aliases: &[],
+            description: "Attach a local image file to the next prompt",
+            handler: |args| {
+                let path = args.trim();
+                if path.is_empty() {
+                    CommandResult::Output(
+                        "Usage: /image <path-to-image>\nAttaches the local image to your next prompt."
+                            .into(),
+                    )
+                } else {
+                    CommandResult::AttachImagePath(path.to_string())
+                }
+            },
         });
     }
 }
@@ -1184,98 +1364,38 @@ fn provider_help_text() -> String {
     )
 }
 
-fn help_text() -> String {
-    let permissions_help = if cfg!(target_os = "macos") {
-        "                       /permissions, /perm   — Inspect or bootstrap macOS permissions\n"
-    } else {
-        ""
-    };
+fn format_help_section(commands: &[&SlashCommandSpec]) -> String {
+    let width = commands
+        .iter()
+        .map(|cmd| cmd.label_with_aliases().len())
+        .max()
+        .unwrap_or(0)
+        + 2;
 
-    format!(
-        "EdgeCrab slash commands:\n\
-         \n\
-         Navigation:\n\
-           /help, /h, /?         — Show this help\n\
-           /quit, /exit, /q      — Exit EdgeCrab\n\
-           /clear, /cls          — Clear the output area\n\
-           /version              — Show version and build info\n\
-           /status               — Show session status (model, tokens, turns)\n\
-         \n\
-         Model:\n\
-          /model [name]         — Show or switch model\n\
-          /cheap_model [spec]   — Open, show, or set smart-routing cheap model\n\
-          /vision_model [spec]  — Open, show, or set dedicated vision model\n\
-          /image_model [spec]   — Open, show, or set default image generation model\n\
-          /moa [subcommand]     — Configure Mixture-of-Agents defaults\n\
-          /provider             — List available providers\n\
-          /reasoning [mode]     — Set reasoning effort or think mode\n\
-          /stream [mode]        — Toggle live token streaming\n\
-         \n\
-         Session:\n\
-           /new, /reset          — Start a fresh conversation\n\
-           /session              — Inspect and debug the live current session\n\
-           /sessions [browse]    — Browse and manage saved sessions\n\
-           /retry                — Re-send the last user message\n\
-           /undo                 — Remove last message pair from history\n\
-           /stop                 — Cancel the current agent request\n\
-           /history              — Show session turn count and token usage\n\
-           /save [path]          — Save conversation to file\n\
-           /export [path]        — Export conversation as Markdown\n\
-           /title [name]         — Set session title\n\
-           /resume [id]          — Resume a previous session\n\
-         \n\
-         Config:\n\
-           /config               — Open config center or inspect config\n\
-           /prompt               — Show the current system prompt\n\
-           /verbose              — Cycle tool progress display\n\
-           /personality [name]   — Show or switch personality preset\n\
-           /statusbar [mode]     — Show or set status bar visibility\n\
-         \n\
-         Tools:\n\
-           /tools                — Browse and configure tools\n\
-           /toolsets             — Browse and configure toolsets\n\
-           /mcp [args]           — Search, install, test, or remove MCP servers\n\
-           /reload-mcp           — Reload MCP server connections\n\
-           /plugins              — Browse installed plugins and manage plugin actions\n\
-         \n\
-         Memory & Skills:\n\
-           /memory               — Show memory status\n\
-           /skills               — List and manage skills\n\
-         \n\
-         Analysis:\n\
-           /cost                 — Show token usage and estimated cost\n\
-           /usage                — Alias for /cost with full breakdown\n\
-           /compress             — Manually trigger context compression\n\
-           /insights             — Show conversation insights\n\
-         \n\
-         Advanced:\n\
-           /queue [prompt]       — Queue a prompt for execution\n\
-           /background [prompt]  — Run a prompt in the background\n\
-           /rollback             — Restore a file checkpoint\n\
-         \n\
-         Gateway:\n\
-           /platforms            — Show gateway platform status\n\
-           /gateway [action]     — Start, stop, restart, or inspect the gateway runtime\n\
-           /approve [scope]      — Approve pending action (once/session/always)\n\
-           /deny                 — Deny pending approval or clarify prompt\n\
-           /sethome [args]       — Show or set gateway home channels\n\
-           /update               — Check release status and update guidance\n\
-         \n\
-        Scheduling & Media:\n\
-          /cron [subcommand]    — Manage scheduled tasks\n\
-          /voice [subcommand]   — Voice tools: TTS, record, talk, continuous, doctor\n\
-          /browser [sub]        — Chrome CDP: connect, disconnect, status, tabs, recording on|off\n\
-         \n\
-         Appearance:\n\
-           /theme, /skin [name]  — Browse, reload, or switch skins\n\
-                                 /mouse [mode]         — Mouse capture: on/off/toggle/status\n\
-           /paste                — Paste clipboard text/image into the next prompt\n\
-         \n\
-         Diagnostics:\n\
-           /doctor, /diag        — Run diagnostics\n\
-{permissions_help}\
-         \n\
-         Keyboard shortcuts:\n\
+    let mut text = String::new();
+    for command in commands {
+        let label = command.label_with_aliases();
+        text.push_str(&format!("  {label:<width$} - {}\n", command.description));
+    }
+    text
+}
+
+fn help_text() -> String {
+    let mut text = String::from("EdgeCrab slash commands:\n\n");
+    for (category, commands) in grouped_slash_commands_for_surface(SlashSurface::Cli) {
+        text.push_str(category);
+        text.push_str(":\n");
+        text.push_str(&format_help_section(&commands));
+        if category == "Diagnostics" && cfg!(target_os = "macos") {
+            text.push_str(
+                "  /permissions, /perm [mode] - Inspect or bootstrap macOS permissions\n",
+            );
+        }
+        text.push('\n');
+    }
+
+    text.push_str(
+        "Keyboard shortcuts:\n\
           F2                   — Open model selector\n\
           F3                   — Open skill selector\n\
           F7                   — Open vision-model selector\n\
@@ -1297,8 +1417,48 @@ fn help_text() -> String {
            Shift+Enter*         — Open compose editor + insert newline\n\
            Esc / hjkl / wbe    — Compose normal mode (basic Vim editing)\n\
          \n\
-         * Shift+Enter requires terminal keyboard enhancement support; Ctrl+J always works."
-    )
+         * Shift+Enter requires terminal keyboard enhancement support; Ctrl+J always works.",
+    );
+    text
+}
+
+pub fn gateway_commands_page(page: usize, skill_names: &[String]) -> String {
+    const PAGE_SIZE: usize = 12;
+
+    let registry = CommandRegistry::new();
+    let mut entries: Vec<(String, String)> = registry
+        .gateway_entries()
+        .into_iter()
+        .map(|(name, description)| (format!("/{name}"), description.to_string()))
+        .collect();
+
+    let mut skills: Vec<String> = skill_names
+        .iter()
+        .filter(|name| !name.trim().is_empty())
+        .map(|name| format!("/{}", name.trim()))
+        .collect();
+    skills.sort();
+    skills.dedup();
+    entries.extend(
+        skills
+            .into_iter()
+            .map(|name| (name, "Installed skill command".to_string())),
+    );
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let total_pages = entries.len().max(1).div_ceil(PAGE_SIZE);
+    let page = page.clamp(1, total_pages);
+    let start = (page - 1) * PAGE_SIZE;
+    let end = (start + PAGE_SIZE).min(entries.len());
+
+    let mut text = format!("Gateway commands page {page}/{total_pages}\n");
+    for (name, description) in &entries[start..end] {
+        text.push_str(&format!("{name:<18} {description}\n"));
+    }
+    if total_pages > 1 {
+        text.push_str("\nUse /commands <page> to browse more.");
+    }
+    text
 }
 
 #[cfg(test)]
@@ -1794,14 +1954,14 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_theme_no_args_opens_browser_and_reload_is_explicit() {
+    fn dispatch_skin_no_args_opens_browser_and_reload_is_explicit() {
         let reg = CommandRegistry::new();
         assert!(matches!(
-            reg.dispatch("/theme"),
+            reg.dispatch("/skin"),
             Some(CommandResult::SwitchSkin(name)) if name.is_empty()
         ));
         assert!(matches!(
-            reg.dispatch("/theme reload"),
+            reg.dispatch("/skin reload"),
             Some(CommandResult::ReloadTheme)
         ));
     }
@@ -1818,34 +1978,16 @@ mod tests {
     #[test]
     fn dispatch_all_new_commands_exist() {
         let reg = CommandRegistry::new();
-        // All these should dispatch to *something* (not return None)
-        let new_commands = [
-            "/title",
-            "/resume",
-            "/reasoning",
-            "/stream",
-            "/cheap_model",
-            "/moa",
-            "/statusbar",
-            "/reload-mcp",
-            "/plugins",
-            "/queue",
-            "/background",
-            "/rollback",
-            "/platforms",
-            "/gateway",
-            "/approve",
-            "/deny",
-            "/sethome",
-            "/update",
-            "/cron",
-            "/voice",
-            "/paste",
-            "/skills",
-        ];
-        for cmd in &new_commands {
-            let result = reg.dispatch(cmd);
-            assert!(result.is_some(), "command {} should be registered", cmd);
+        let all_names = reg.all_names();
+        for command in slash_commands_for_surface(SlashSurface::Cli) {
+            assert!(
+                all_names.contains(&command.name),
+                "missing canonical command {}",
+                command.name
+            );
+            for alias in command.aliases {
+                assert!(all_names.contains(alias), "missing alias {alias}");
+            }
         }
     }
 
@@ -1879,20 +2021,41 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_insights_supports_optional_days() {
+        let reg = CommandRegistry::new();
+        assert!(matches!(
+            reg.dispatch("/insights"),
+            Some(CommandResult::ShowInsights(30))
+        ));
+        assert!(matches!(
+            reg.dispatch("/insights 14"),
+            Some(CommandResult::ShowInsights(14))
+        ));
+        assert!(matches!(
+            reg.dispatch("/insights nope"),
+            Some(CommandResult::Output(msg)) if msg == "Usage: /insights [days]"
+        ));
+    }
+
+    #[test]
     fn dispatch_prompt_returns_show_prompt() {
         let reg = CommandRegistry::new();
         assert!(matches!(
             reg.dispatch("/prompt"),
-            Some(CommandResult::ShowPrompt)
+            Some(CommandResult::PromptCommand(args)) if args.is_empty()
         ));
         // aliases
         assert!(matches!(
             reg.dispatch("/sys"),
-            Some(CommandResult::ShowPrompt)
+            Some(CommandResult::PromptCommand(args)) if args.is_empty()
         ));
         assert!(matches!(
             reg.dispatch("/system"),
-            Some(CommandResult::ShowPrompt)
+            Some(CommandResult::PromptCommand(args)) if args.is_empty()
+        ));
+        assert!(matches!(
+            reg.dispatch("/prompt clear"),
+            Some(CommandResult::PromptCommand(args)) if args == "clear"
         ));
     }
 
@@ -2083,6 +2246,33 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_profile_no_args_returns_show_profiles() {
+        let reg = CommandRegistry::new();
+        match reg.dispatch("/profile") {
+            Some(CommandResult::ShowProfiles(args)) => assert!(args.is_empty()),
+            _ => panic!("expected ShowProfiles"),
+        }
+    }
+
+    #[test]
+    fn dispatch_profiles_no_args_returns_profile_selector() {
+        let reg = CommandRegistry::new();
+        assert!(matches!(
+            reg.dispatch("/profiles"),
+            Some(CommandResult::ProfileSelector)
+        ));
+    }
+
+    #[test]
+    fn dispatch_profiles_with_args_returns_show_profiles() {
+        let reg = CommandRegistry::new();
+        match reg.dispatch("/profiles use work") {
+            Some(CommandResult::ShowProfiles(args)) => assert_eq!(args, "use work"),
+            _ => panic!("expected ShowProfiles(use work)"),
+        }
+    }
+
+    #[test]
     fn dispatch_mouse_mode_variants() {
         let reg = CommandRegistry::new();
         match reg.dispatch("/mouse") {
@@ -2096,6 +2286,43 @@ mod tests {
         match reg.dispatch("/mouse status") {
             Some(CommandResult::MouseMode(args)) => assert_eq!(args, "status"),
             _ => panic!("expected MouseMode for /mouse status"),
+        }
+    }
+
+    #[test]
+    fn dispatch_auth_commands() {
+        let reg = CommandRegistry::new();
+        match reg.dispatch("/auth status provider/openai") {
+            Some(CommandResult::AuthCommand(crate::cli_args::AuthCommand::Status { target })) => {
+                assert_eq!(target.as_deref(), Some("provider/openai"))
+            }
+            _ => panic!("expected AuthCommand::Status"),
+        }
+        match reg.dispatch("/login copilot") {
+            Some(CommandResult::LoginTarget(target)) => assert_eq!(target, "copilot"),
+            _ => panic!("expected LoginTarget"),
+        }
+        match reg.dispatch("/logout provider/openai") {
+            Some(CommandResult::LogoutTarget(target)) => {
+                assert_eq!(target.as_deref(), Some("provider/openai"))
+            }
+            _ => panic!("expected LogoutTarget"),
+        }
+    }
+
+    #[test]
+    fn dispatch_webhook_and_uninstall_commands() {
+        let reg = CommandRegistry::new();
+        match reg.dispatch("/webhook list") {
+            Some(CommandResult::WebhookCommand(crate::cli_args::WebhookCommand::List)) => {}
+            _ => panic!("expected WebhookCommand::List"),
+        }
+        match reg.dispatch("/uninstall --dry-run --purge-data") {
+            Some(CommandResult::UninstallCommand(options)) => {
+                assert!(options.dry_run);
+                assert!(options.purge_data);
+            }
+            _ => panic!("expected UninstallCommand"),
         }
     }
 }

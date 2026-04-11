@@ -36,7 +36,7 @@ A full-featured terminal UI with:
 
 See [TUI Interface](/features/tui/)
 
-### 14 LLM Providers
+### 15 LLM Providers
 
 Switch provider and model without restarting:
 
