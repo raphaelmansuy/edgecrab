@@ -65,7 +65,7 @@ Dependent crates cannot be published safely until crates.io has indexed the prev
 This repository keeps that protection in place.
 
 The current release workflow no longer relies on blind `sleep 30` delays alone.
-It waits until the specific crate version is actually visible on crates.io, then keeps a short stabilization buffer before moving to the next dependent crate.
+It keeps an intentional propagation delay, probes the specific crate version with bounded network timeouts, then keeps a short stabilization buffer before moving to the next dependent crate. If crates.io is slow, bounded publish retries take over instead of letting the workflow hang forever.
 
 ---
 
@@ -88,6 +88,10 @@ which edgecrab
 edgecrab --version
 
 python -m pip install --upgrade edgecrab-cli
+which edgecrab
+edgecrab --version
+
+cargo install edgecrab-cli --locked --force
 which edgecrab
 edgecrab --version
 ```

@@ -6,9 +6,9 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: 'Tag name to publish (e.g. v0.3.2)'
+        description: 'Tag name to publish (e.g. v0.3.3)'
         required: true
-        default: 'v0.3.2'
+        default: 'v0.3.3'
 
 permissions:
   id-token: write
@@ -20,6 +20,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag_name || github.ref }}
 
       - uses: actions/setup-python@v5
         with:

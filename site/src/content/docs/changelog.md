@@ -14,6 +14,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.3.3] — Fix Release: Deterministic Tag Reruns and Bounded Rust Publish Waits
+
+### Fixed
+
+- **Rust crates.io release waits now fail soft without hanging a workflow runner** — the helper keeps the intentional propagation delay, but every crates.io probe now uses explicit connection and total-request timeouts before the publish-retry logic takes over.
+- **Manual release reruns now rebuild the requested tag, not the current branch tip** — native binaries, Docker, Node SDK, and Python SDK dispatches now check out the selected tag ref so re-publishing a release is reproducible.
+- **Release coordinator bumps now include the Node SDK lockfile** — versioned release metadata can no longer drift between `sdks/node/package.json` and `sdks/node/package-lock.json`.
+
+### Verification
+
+| Check | Result |
+|--------|--------|
+| `cargo run -- --version` | **passed locally before cut** |
+| `cargo fmt --all --check` | **passed locally before cut** |
+| `./scripts/release-version.sh check` | **passed locally before cut** |
+
 ## [0.3.2] — Fix Release: Crates.io Propagation, Version Sync, and Docs Accuracy
 
 ### Fixed

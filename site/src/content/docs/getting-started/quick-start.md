@@ -21,7 +21,7 @@ npm/pip/cargo  writes config     verifies keys    TUI starts
 - At least one LLM access method: GitHub Copilot subscription, an API key, or a local Ollama instance
 - **For npm install:** Node.js 18+
 - **For pip install:** Python 3.10+
-- **For cargo install:** Rust 1.85+ (optional — only needed for building from source)
+- **For cargo install:** Rust 1.86+ (optional — only needed for building from source)
 
 ---
 

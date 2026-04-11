@@ -77,7 +77,7 @@ docker run -p 8642:8642 -e OPENAI_API_KEY="$OPENAI_API_KEY" edgecrab:local
 ```
 
 The `Dockerfile` uses a multi-stage build:
-1. **Builder stage**: `rust:1.85-slim` — compiles all crates
+1. **Builder stage**: `rust:1-slim-bookworm` — compiles all crates with the current stable Rust toolchain
 2. **Runtime stage**: `debian:bookworm-slim` — adds only the binary and runtime libs (~25 MB final image)
 
 ---

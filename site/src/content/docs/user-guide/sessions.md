@@ -90,7 +90,7 @@ EdgeCrab identifies facts worth persisting during sessions:
 ### Writing a Memory Manually
 
 ```bash
-echo "# Project: edgecrab\n\nAlways use Result<T, Box<dyn Error>> for error handling.\nTarget: Rust 1.85, edition 2024." > ~/.edgecrab/memories/project-edgecrab.md
+echo "# Project: edgecrab\n\nAlways use Result<T, Box<dyn Error>> for error handling.\nTarget: Rust 1.86, edition 2024." > ~/.edgecrab/memories/project-edgecrab.md
 ```
 
 Or ask EdgeCrab directly:

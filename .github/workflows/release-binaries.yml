@@ -22,9 +22,9 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: 'Tag name to attach binaries to (e.g. v0.3.2)'
+        description: 'Tag name to attach binaries to (e.g. v0.3.3)'
         required: true
-        default: 'v0.3.2'
+        default: 'v0.3.3'
 
 permissions:
   contents: write
@@ -60,6 +60,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag_name || github.ref }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

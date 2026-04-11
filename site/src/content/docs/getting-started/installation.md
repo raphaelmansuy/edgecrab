@@ -190,7 +190,7 @@ If `edgecrab --version` shows an older release after `brew upgrade`, compare it 
 |--------|---------|----------|-------|
 | **npm** | `npm install -g edgecrab-cli` | Node.js 18+ | ~1-2s startup |
 | **pip** | `pip install edgecrab-cli` | Python 3.10+ | ~1-2s startup |
-| **cargo** | `cargo install edgecrab-cli` | Rust 1.85+ | ~5-10m build |
+| **cargo** | `cargo install edgecrab-cli` | Rust 1.86+ | ~5-10m build |
 | **Docker** | `docker pull ghcr.io/raphaelmansuy/edgecrab:latest` | Docker | ~100ms in container |
 | **Pre-built binary** | Download from GitHub Releases | Nothing | fast |
 | **Homebrew** (macOS) | `brew install raphaelmansuy/tap/edgecrab` | Homebrew | currently tap-lagged |
@@ -297,11 +297,11 @@ Or run `source $HOME/.cargo/env` which Rustup creates.
 
 ### Cargo build fails with `error[E0554]: #![feature]` or edition error
 
-You need Rust ≥ 1.85. Upgrade:
+You need Rust ≥ 1.86. Upgrade:
 ```bash
 rustup update stable
 rustup default stable
-rustc --version   # confirm 1.85+
+rustc --version   # confirm 1.86+
 ```
 
 ### `edgecrab doctor` shows provider ping failure

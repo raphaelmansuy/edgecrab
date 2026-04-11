@@ -9,6 +9,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.3.3] — 2026-04-11
+
+### Fixed
+
+- **Rust release publication no longer depends on a potentially hanging crates.io probe** — the release workflow keeps intentional propagation waits, but the network probes are now hard-bounded with curl timeouts and a shorter best-effort polling window before falling back to publish retries.
+- **Manual release reruns now publish from the requested tag instead of whatever `main` currently contains** — the binaries, Docker, Node SDK, and Python SDK workflows now check out `inputs.tag_name` for `workflow_dispatch`, which removes a class of mismatched re-release bugs.
+- **Release automation now commits the Node SDK lockfile when the version changes** — the coordinator no longer leaves `sdks/node/package-lock.json` behind during a version bump.
+
+### Changed
+
+- **Release operator defaults now point at the next fix tag** — the manual-dispatch workflows now default to `v0.3.3`, reducing accidental reruns against the broken `v0.3.2` path.
+
 ## [0.3.0] — 2026-04-11
 ### Added
 

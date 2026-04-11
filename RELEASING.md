@@ -33,6 +33,10 @@ Pushing a `v*.*.*` tag triggers all downstream workflows in parallel:
 Binary archives are built first; npm/pip wrappers download them lazily at
 install time so there is no ordering dependency between workflows.
 
+For manual reruns, pass the exact tag with `workflow_dispatch`.
+The release workflows now check out that tag explicitly, so a rerun for `vX.Y.Z`
+rebuilds the tagged source instead of the moving `main` branch.
+
 ---
 
 ## Version authority
@@ -81,8 +85,9 @@ VERSION=<version>
 
 # 3. Commit, tag, push
 git add Cargo.toml sdks/npm-cli/package.json \
-        sdks/node/package.json sdks/pypi-cli/edgecrab_cli/_version.py \
-        sdks/python/pyproject.toml
+        sdks/node/package.json sdks/node/package-lock.json \
+        sdks/pypi-cli/edgecrab_cli/_version.py \
+        sdks/python/edgecrab/_version.py
 git commit -m "chore: bump version to $VERSION"
 git tag "v$VERSION"
 git push origin main
@@ -93,10 +98,12 @@ git push origin "v$VERSION"
 
 ## After the release
 
-The crates.io workflow publishes crates in dependency order and now waits on
-the exact `crates.io/api/v1/crates/<crate>/<version>` endpoint before moving
-to dependents. The wait intentionally keeps a short stabilization buffer after
-visibility so we do not publish faster than the registry has propagated.
+The crates.io workflow publishes crates in dependency order and still keeps an
+intentional propagation delay between dependent publishes. It probes the exact
+`crates.io/api/v1/crates/<crate>/<version>` endpoint with hard timeouts, then
+keeps a short stabilization buffer after visibility so we do not publish faster
+than the registry has propagated. If crates.io stays slow, the workflow falls
+back to bounded publish retries instead of hanging indefinitely.
 
 ### Update the Homebrew formula
 
@@ -111,13 +118,8 @@ Manual fallback if needed:
 gh release download "v${VERSION}" \
   --repo raphaelmansuy/edgecrab \
   --pattern edgecrab-checksums.txt
-
 cat edgecrab-checksums.txt
-```
 
-Manual fallback if needed:
-
-```bash
 # Download both macOS archives and compute SHA256
 ARM_SHA=$(curl -sL https://github.com/raphaelmansuy/edgecrab/releases/download/v${VERSION}/edgecrab-aarch64-apple-darwin.tar.gz | shasum -a 256 | awk '{print $1}')
 X86_SHA=$(curl -sL https://github.com/raphaelmansuy/edgecrab/releases/download/v${VERSION}/edgecrab-x86_64-apple-darwin.tar.gz | shasum -a 256 | awk '{print $1}')
@@ -152,6 +154,11 @@ edgecrab --version
 
 # pip
 pip install --force-reinstall edgecrab-cli
+which edgecrab
+edgecrab --version
+
+# cargo
+cargo install edgecrab-cli --locked --force
 which edgecrab
 edgecrab --version
 
