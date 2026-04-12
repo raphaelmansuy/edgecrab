@@ -2424,7 +2424,7 @@ async fn api_call_with_retry(
     max_retries: u32,
     ctx: ApiCallContext<'_>,
 ) -> Result<ApiCallOutcome, AgentError> {
-    let mut last_err = None;
+    let mut last_err: Option<String> = None;
     let mut native_tool_streaming_enabled = ctx.use_native_streaming;
     let mut disabled_native_tool_streaming = false;
     // WHY max_retries for both streaming and non-streaming:
@@ -2608,7 +2608,7 @@ async fn api_call_with_retry(
                         }
                     }
 
-                    last_err = Some(e);
+                    last_err = Some(e.to_string());
                     if provider_handles_error {
                         break 'attempt_loop;
                     }
@@ -2616,7 +2616,7 @@ async fn api_call_with_retry(
                     // burning through the retry budget on a permanent failure
                     // (geo-block, bad API key, invalid request, etc.).
                     if matches!(
-                        last_err.as_ref().unwrap(),
+                        &e,
                         edgequake_llm::LlmError::AuthError(_)
                             | edgequake_llm::LlmError::InvalidRequest(_)
                             | edgequake_llm::LlmError::ModelNotFound(_)
@@ -2635,7 +2635,7 @@ async fn api_call_with_retry(
         retry_budget,
         last_err.map_or_else(
             || "unknown error".to_string(),
-            |e| augment_provider_error(provider, e.to_string())
+            |e| augment_provider_error(provider, e)
         )
     )))
 }

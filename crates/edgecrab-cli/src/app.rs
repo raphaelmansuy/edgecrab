@@ -661,24 +661,18 @@ async fn forward_agent_stream_to_tui(
 
     loop {
         if let Some(join_result) = agent_result.take() {
-            loop {
-                match chunk_rx.try_recv() {
-                    Ok(event) => {
-                        if forward_stream_event_to_tui(
-                            event,
-                            &tx,
-                            &hook_registry,
-                            &mut saw_token_event,
-                            &mut saw_reasoning_event,
-                            &mut saw_terminal_event,
-                        )
-                        .await
-                        {
-                            return;
-                        }
-                    }
-                    Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-                    | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+            while let Ok(event) = chunk_rx.try_recv() {
+                if forward_stream_event_to_tui(
+                    event,
+                    &tx,
+                    &hook_registry,
+                    &mut saw_token_event,
+                    &mut saw_reasoning_event,
+                    &mut saw_terminal_event,
+                )
+                .await
+                {
+                    return;
                 }
             }
 
@@ -901,8 +895,9 @@ fn selector_marker(is_selected: bool, accent: Color, bg: Option<Color>) -> Span<
 const SESSION_BROWSER_LIMIT: usize = 250;
 const SESSION_BROWSER_SEARCH_LIMIT: usize = 120;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 enum SplitPaneFocus {
+    #[default]
     List,
     Detail,
 }
@@ -913,12 +908,6 @@ impl SplitPaneFocus {
             Self::List => Self::Detail,
             Self::Detail => Self::List,
         }
-    }
-}
-
-impl Default for SplitPaneFocus {
-    fn default() -> Self {
-        Self::List
     }
 }
 
