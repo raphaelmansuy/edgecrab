@@ -164,7 +164,7 @@ EdgeCrab Setup Wizard
 ✓ Detected OpenAI (OPENAI_API_KEY)
 
 Choose LLM provider:
-  [1] copilot      (GitHub Copilot — gpt-4.1-mini)  ← auto-detected
+  [1] copilot      (GitHub Copilot — GPT-5 / Claude / Gemini catalog)  ← auto-detected
   [2] openai       (OpenAI — GPT-4.1, GPT-5, o3/o4)
   [3] anthropic    (Anthropic — Claude Opus 4.6)
   [4] ollama       (local — llama3.3)
@@ -1154,9 +1154,16 @@ Keyboard shortcuts:
 | `Ctrl+C`                 | Interrupt running agent                             |
 | `Ctrl+L`                 | Clear output area                                   |
 | `Ctrl+U`                 | Clear input line                                    |
+| `Ctrl+B` / `Ctrl+F`      | Fallback page up/down when the terminal swallows PgUp/PgDn |
 | `Alt+↑` / `Alt+↓`        | Scroll output                                       |
 | `Ctrl+Home` / `Ctrl+End` | Jump to top/bottom of output                        |
 | `Tab`                    | Accept ghost text / cycle slash command completions |
+
+Terminal troubleshooting:
+
+- If `PgUp` / `PgDn` do not reach EdgeCrab, use `Ctrl+B` / `Ctrl+F`.
+- On macOS Terminal.app, EdgeCrab now starts in a conservative compatibility mode: mouse capture is off by default and the fallback paging keys are enabled automatically.
+- You can force that mode in any terminal with `EDGECRAB_TUI_COMPAT=1 edgecrab`.
 
 ---
 

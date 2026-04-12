@@ -6,9 +6,9 @@
 //!
 //! Public macOS APIs are uneven:
 //! - Accessibility: `AXIsProcessTrusted()` gives a direct yes/no answer.
-//! - Apple Events / Automation: `AEDeterminePermissionToAutomateTarget()`
-//!   reports granted / denied / would-prompt, but only for already-running
-//!   target applications.
+//! - Apple Events / Automation has APIs, but their preflight behavior is not
+//!   reliable enough for a hot-path TUI permission check, so EdgeCrab stays
+//!   heuristic-only there.
 //! - Full Disk Access has no equivalent public preflight API, so protected-path
 //!   access still relies on capability probing and output rewriting.
 
@@ -224,121 +224,57 @@ fn command_needs_accessibility(command: &str) -> bool {
     accessibility_ui_scripting_regex().is_match(command)
 }
 
-#[cfg(target_os = "macos")]
+// macOS permission preflight is split by safety:
+// - Accessibility (`AXIsProcessTrusted`) is safe and cheap, so we query it.
+// - AppleEvents / Automation remains heuristic-only because
+//   AEDeterminePermissionToAutomateTarget can hang indefinitely on some hosts.
 fn macos_preflight(command: &str) -> MacosPermissionPreflight {
-    let automation_target = automation_target_from_command(command);
-    let automation_state = automation_target
-        .as_ref()
-        .map(|target| automation_consent_state(&target.bundle_id));
-    let accessibility_state =
-        command_needs_accessibility(command).then(accessibility_consent_state);
-    MacosPermissionPreflight {
-        automation_target: automation_target.map(|target| target.label),
-        automation_state,
-        accessibility_state,
+    let mut preflight = MacosPermissionPreflight::default();
+    if let Some(target) = automation_target_from_command(command) {
+        preflight.automation_target = Some(target.label);
     }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn macos_preflight(_command: &str) -> MacosPermissionPreflight {
-    MacosPermissionPreflight::default()
+    if command_needs_accessibility(command) {
+        preflight.accessibility_state = Some(accessibility_consent_state());
+    }
+    preflight
 }
 
 pub fn preflight_command_permissions(command: &str) -> MacosPermissionPreflight {
     macos_preflight(command)
 }
 
+pub fn accessibility_consent_status() -> Option<MacosConsentState> {
+    #[cfg(target_os = "macos")]
+    {
+        Some(accessibility_consent_state())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn accessibility_consent_state() -> MacosConsentState {
-    if unsafe { AXIsProcessTrusted() } != 0 {
+    tracing::debug!("checking macOS Accessibility (AXIsProcessTrusted)");
+    let trusted = unsafe { AXIsProcessTrusted() } != 0;
+    let state = if trusted {
         MacosConsentState::Granted
     } else {
         MacosConsentState::Denied
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn automation_consent_state(bundle_id: &str) -> MacosConsentState {
-    let Some(status) = automation_consent_status(bundle_id) else {
-        return MacosConsentState::Unknown;
     };
-
-    match status {
-        0 => MacosConsentState::Granted,
-        -1743 => MacosConsentState::Denied,
-        -1744 => MacosConsentState::WouldPrompt,
-        -600 => MacosConsentState::Unknown,
-        _ => MacosConsentState::Unknown,
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn automation_consent_status(bundle_id: &str) -> Option<i32> {
-    let mut desc = AEDesc {
-        descriptor_type: 0,
-        data_handle: std::ptr::null_mut(),
-    };
-    let status = unsafe {
-        AECreateDesc(
-            four_char_code(*b"bund"),
-            bundle_id.as_ptr().cast(),
-            i32::try_from(bundle_id.len()).ok()?,
-            &mut desc,
-        )
-    };
-    if status != 0 {
-        return None;
-    }
-
-    let permission_status = unsafe {
-        AEDeterminePermissionToAutomateTarget(
-            &desc,
-            four_char_code(*b"****"),
-            four_char_code(*b"****"),
-            0,
-        )
-    };
-    let _ = unsafe { AEDisposeDesc(&mut desc) };
-    Some(permission_status)
-}
-
-#[cfg(target_os = "macos")]
-const fn four_char_code(code: [u8; 4]) -> u32 {
-    u32::from_be_bytes(code)
+    tracing::debug!(trusted, ?state, "AXIsProcessTrusted result");
+    state
 }
 
 #[cfg(target_os = "macos")]
 type Boolean = u8;
 
 #[cfg(target_os = "macos")]
-#[repr(C)]
-struct AEDesc {
-    descriptor_type: u32,
-    data_handle: *mut std::ffi::c_void,
-}
-
-#[cfg(target_os = "macos")]
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {
     fn AXIsProcessTrusted() -> Boolean;
-}
-
-#[cfg(target_os = "macos")]
-#[link(name = "CoreServices", kind = "framework")]
-unsafe extern "C" {
-    fn AECreateDesc(
-        type_code: u32,
-        data_ptr: *const std::ffi::c_void,
-        data_size: i32,
-        result: *mut AEDesc,
-    ) -> i32;
-    fn AEDisposeDesc(desc: *mut AEDesc) -> i32;
-    fn AEDeterminePermissionToAutomateTarget(
-        target: *const AEDesc,
-        event_class: u32,
-        event_id: u32,
-        ask_user_if_needed: Boolean,
-    ) -> i32;
 }
 
 #[cfg(test)]

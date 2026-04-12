@@ -29,6 +29,7 @@
 //! - Input line highlighting (cyan for valid commands, red for invalid)
 //! - Fish-style ghost text from input history
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{self, BufRead, Write};
 use std::sync::Arc;
@@ -104,6 +105,764 @@ fn progressive_keyboard_flags() -> KeyboardEnhancementFlags {
         | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
 }
 
+fn env_flag_truthy(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn terminal_program() -> Option<String> {
+    std::env::var("TERM_PROGRAM").ok()
+}
+
+fn env_var_present(name: &str) -> bool {
+    std::env::var_os(name).is_some()
+}
+
+fn is_remote_terminal_session() -> bool {
+    env_var_present("SSH_CONNECTION")
+        || env_var_present("SSH_CLIENT")
+        || env_var_present("SSH_TTY")
+        || env_var_present("MOSH_IP")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalUiProfile {
+    Standard,
+    ReducedMotion,
+    BasicCompat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalGlyphProfile {
+    Unicode,
+    Ascii,
+}
+
+fn compact_spinner_frame(frame_idx: usize, glyphs: TerminalGlyphProfile) -> &'static str {
+    match glyphs {
+        TerminalGlyphProfile::Unicode => SPINNER_FRAMES[frame_idx % SPINNER_FRAMES.len()],
+        TerminalGlyphProfile::Ascii => ASCII_SPINNER_FRAMES[frame_idx % ASCII_SPINNER_FRAMES.len()],
+    }
+}
+
+fn terminal_glyph_profile_for(
+    ui_profile: TerminalUiProfile,
+    remote_session: bool,
+    term: Option<&str>,
+) -> TerminalGlyphProfile {
+    if env_flag_truthy("EDGECRAB_TUI_ASCII") {
+        return TerminalGlyphProfile::Ascii;
+    }
+
+    let term = term.map(str::trim).unwrap_or_default();
+    if matches!(ui_profile, TerminalUiProfile::BasicCompat) || remote_session {
+        return TerminalGlyphProfile::Ascii;
+    }
+    if matches!(term, "dumb" | "cons25") {
+        return TerminalGlyphProfile::Ascii;
+    }
+    TerminalGlyphProfile::Unicode
+}
+
+fn adjust_ui_profile_for_remote(
+    ui_profile: TerminalUiProfile,
+    remote_session: bool,
+) -> TerminalUiProfile {
+    if remote_session && matches!(ui_profile, TerminalUiProfile::Standard) {
+        TerminalUiProfile::ReducedMotion
+    } else {
+        ui_profile
+    }
+}
+
+fn terminal_supports_direct_paging_keys(
+    term_program: Option<&str>,
+    term: Option<&str>,
+    ui_profile: TerminalUiProfile,
+    remote_session: bool,
+) -> bool {
+    if env_flag_truthy("EDGECRAB_TUI_NO_DIRECT_PAGING") {
+        return false;
+    }
+    if env_flag_truthy("EDGECRAB_TUI_DIRECT_PAGING") {
+        return true;
+    }
+    if remote_session || matches!(ui_profile, TerminalUiProfile::BasicCompat) {
+        return false;
+    }
+    if env_var_present("TMUX") || env_var_present("STY") {
+        return false;
+    }
+
+    let term_program = term_program
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let term = term.map(str::trim).filter(|value| !value.is_empty());
+
+    match term_program {
+        Some("Apple_Terminal") => false,
+        Some(
+            "iTerm.app" | "WezTerm" | "vscode" | "WarpTerminal" | "ghostty" | "rio" | "Tabby"
+            | "Hyper" | "HyperTerm" | "contour" | "JetBrains-JediTerm",
+        ) => true,
+        Some(_) => true,
+        None => term
+            .map(|value| value.to_ascii_lowercase())
+            .map(|value| {
+                !matches!(
+                    value.as_str(),
+                    "dumb" | "linux" | "vt100" | "vt220" | "ansi"
+                ) && !value.starts_with("screen")
+                    && !value.starts_with("tmux")
+                    && !value.starts_with("rxvt")
+                    && !value.starts_with("putty")
+            })
+            .unwrap_or(false),
+    }
+}
+
+fn terminal_ui_profile_for(
+    term_program: Option<&str>,
+    term: Option<&str>,
+    forced_basic: bool,
+    forced_reduced_motion: bool,
+    forced_fast: bool,
+) -> TerminalUiProfile {
+    let term_program = term_program
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let term = term.map(str::trim).filter(|value| !value.is_empty());
+
+    if forced_fast {
+        return TerminalUiProfile::Standard;
+    }
+    if forced_basic {
+        return TerminalUiProfile::BasicCompat;
+    }
+    if forced_reduced_motion {
+        return TerminalUiProfile::ReducedMotion;
+    }
+
+    match term_program {
+        Some("Apple_Terminal") => TerminalUiProfile::BasicCompat,
+        Some(
+            "gnome-terminal"
+            | "gnome-terminal-server"
+            | "xfce4-terminal"
+            | "konsole"
+            | "mate-terminal"
+            | "tilix"
+            | "terminator"
+            | "qterminal"
+            | "guake"
+            | "yakuake"
+            | "lxterminal"
+            | "ptyxis"
+            | "deepin-terminal",
+        ) => TerminalUiProfile::ReducedMotion,
+        Some(
+            "iTerm.app" | "WezTerm" | "vscode" | "WarpTerminal" | "ghostty" | "rio" | "Tabby"
+            | "Hyper" | "HyperTerm" | "contour" | "JetBrains-JediTerm",
+        ) => TerminalUiProfile::Standard,
+        _ => {
+            if let Some(term_name) = term.map(|value| value.to_ascii_lowercase()) {
+                if matches!(term_name.as_str(), "linux" | "vt100" | "vt220" | "ansi")
+                    || term_name.starts_with("rxvt")
+                    || term_name.starts_with("screen")
+                    || term_name.starts_with("tmux")
+                    || term_name.starts_with("eterm")
+                    || term_name.starts_with("putty")
+                {
+                    return TerminalUiProfile::ReducedMotion;
+                }
+            }
+            TerminalUiProfile::Standard
+        }
+    }
+}
+
+fn detect_terminal_ui_profile() -> TerminalUiProfile {
+    let forced_basic = env_flag_truthy("EDGECRAB_TUI_COMPAT");
+    let forced_reduced_motion = env_flag_truthy("EDGECRAB_TUI_REDUCED_MOTION");
+    let forced_fast = env_flag_truthy("EDGECRAB_TUI_FAST");
+    if forced_fast || forced_basic || forced_reduced_motion {
+        return terminal_ui_profile_for(
+            terminal_program().as_deref(),
+            std::env::var("TERM").ok().as_deref(),
+            forced_basic,
+            forced_reduced_motion,
+            forced_fast,
+        );
+    }
+
+    // Fast-path capability markers from terminal envs. These are more reliable
+    // than TERM=xterm-256color when TERM_PROGRAM is absent.
+    if env_var_present("KITTY_WINDOW_ID")
+        || env_var_present("WEZTERM_PANE")
+        || env_var_present("WT_SESSION")
+        || env_var_present("ALACRITTY_SOCKET")
+        || env_var_present("GHOSTTY_RESOURCES_DIR")
+    {
+        return TerminalUiProfile::Standard;
+    }
+
+    // Linux desktop / multiplexer markers that tend to benefit from fewer
+    // redraws even though they still support the richer input path.
+    if env_var_present("VTE_VERSION")
+        || env_var_present("KONSOLE_VERSION")
+        || env_var_present("GNOME_TERMINAL_SCREEN")
+        || env_var_present("TMUX")
+    {
+        return TerminalUiProfile::ReducedMotion;
+    }
+
+    terminal_ui_profile_for(
+        terminal_program().as_deref(),
+        std::env::var("TERM").ok().as_deref(),
+        false,
+        false,
+        false,
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TerminalRuntimeCapabilities {
+    ui_profile: TerminalUiProfile,
+    glyph_profile: TerminalGlyphProfile,
+    remote_session: bool,
+    direct_paging_keys_supported: bool,
+    compact_status_bar: bool,
+    rich_transcript: bool,
+    show_output_scrollbar: bool,
+    show_ghost_hint: bool,
+    min_draw_interval: Duration,
+    animate_status_indicators: bool,
+    mouse_capture_enabled: bool,
+    live_token_display_enabled: bool,
+}
+
+fn terminal_runtime_capabilities() -> TerminalRuntimeCapabilities {
+    let remote_session = is_remote_terminal_session();
+    let term = std::env::var("TERM").ok();
+    let term_program = terminal_program();
+    let ui_profile = adjust_ui_profile_for_remote(detect_terminal_ui_profile(), remote_session);
+
+    let glyph_profile = terminal_glyph_profile_for(ui_profile, remote_session, term.as_deref());
+    let direct_paging_keys_supported = terminal_supports_direct_paging_keys(
+        term_program.as_deref(),
+        term.as_deref(),
+        ui_profile,
+        remote_session,
+    );
+    let compact_status_bar = remote_session
+        || matches!(
+            ui_profile,
+            TerminalUiProfile::ReducedMotion | TerminalUiProfile::BasicCompat
+        );
+    let rich_transcript = matches!(ui_profile, TerminalUiProfile::Standard) && !remote_session;
+    let show_output_scrollbar =
+        !matches!(ui_profile, TerminalUiProfile::BasicCompat) && !remote_session;
+    let show_ghost_hint = !matches!(ui_profile, TerminalUiProfile::BasicCompat);
+    let min_draw_interval = match ui_profile {
+        TerminalUiProfile::Standard => Duration::ZERO,
+        TerminalUiProfile::ReducedMotion => Duration::from_millis(40),
+        TerminalUiProfile::BasicCompat => Duration::from_millis(90),
+    };
+    let animate_status_indicators = matches!(ui_profile, TerminalUiProfile::Standard);
+    let mouse_capture_enabled = !matches!(ui_profile, TerminalUiProfile::BasicCompat);
+    let live_token_display_enabled = !matches!(ui_profile, TerminalUiProfile::BasicCompat);
+
+    TerminalRuntimeCapabilities {
+        ui_profile,
+        glyph_profile,
+        remote_session,
+        direct_paging_keys_supported,
+        compact_status_bar,
+        rich_transcript,
+        show_output_scrollbar,
+        show_ghost_hint,
+        min_draw_interval,
+        animate_status_indicators,
+        mouse_capture_enabled,
+        live_token_display_enabled,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecoveredAssistantTurn {
+    reasoning: Option<String>,
+    text: String,
+}
+
+fn recover_latest_assistant_turn(
+    messages: &[edgecrab_types::Message],
+) -> Option<RecoveredAssistantTurn> {
+    messages.iter().rev().find_map(|message| {
+        if message.role != edgecrab_types::Role::Assistant {
+            return None;
+        }
+
+        let text = message.text_content();
+        let reasoning = message
+            .reasoning
+            .clone()
+            .filter(|text| !text.trim().is_empty());
+        if text.trim().is_empty() && reasoning.is_none() {
+            return None;
+        }
+
+        Some(RecoveredAssistantTurn { reasoning, text })
+    })
+}
+
+async fn forward_stream_event_to_tui(
+    event: edgecrab_core::agent::StreamEvent,
+    tx: &mpsc::UnboundedSender<AgentResponse>,
+    hook_registry: &edgecrab_gateway::hooks::HookRegistry,
+    saw_token_event: &mut bool,
+    saw_reasoning_event: &mut bool,
+    saw_terminal_event: &mut bool,
+) -> bool {
+    use edgecrab_core::agent::StreamEvent;
+
+    match event {
+        StreamEvent::Token(text) => {
+            *saw_token_event = true;
+            tracing::info!(len = text.len(), "TUI→agent: forwarding token");
+            let _ = tx.send(AgentResponse::Token(text));
+        }
+        StreamEvent::Reasoning(text) => {
+            *saw_reasoning_event = true;
+            tracing::info!(len = text.len(), "TUI→agent: forwarding reasoning");
+            let _ = tx.send(AgentResponse::Reasoning(text));
+        }
+        StreamEvent::ToolExec {
+            tool_call_id,
+            name,
+            args_json,
+        } => {
+            tracing::info!(tool = %name, "TUI→agent: forwarding tool exec");
+            let _ = tx.send(AgentResponse::ToolExec {
+                tool_call_id,
+                name,
+                args_json,
+            });
+        }
+        StreamEvent::ToolProgress {
+            tool_call_id,
+            name,
+            message,
+        } => {
+            tracing::info!(tool = %name, "TUI→agent: forwarding tool progress");
+            let _ = tx.send(AgentResponse::ToolProgress {
+                tool_call_id,
+                name,
+                message,
+            });
+        }
+        StreamEvent::ToolDone {
+            tool_call_id,
+            name,
+            args_json,
+            result_preview,
+            duration_ms,
+            is_error,
+        } => {
+            tracing::info!(tool = %name, is_error, "TUI→agent: forwarding tool done");
+            let _ = tx.send(AgentResponse::ToolDone {
+                tool_call_id,
+                name,
+                args_json,
+                result_preview,
+                duration_ms,
+                is_error,
+            });
+        }
+        StreamEvent::SubAgentStart {
+            task_index,
+            task_count,
+            goal,
+        } => {
+            tracing::info!(
+                task_index,
+                task_count,
+                "TUI→agent: forwarding subagent start"
+            );
+            let _ = tx.send(AgentResponse::SubAgentStart {
+                task_index,
+                task_count,
+                goal,
+            });
+        }
+        StreamEvent::SubAgentReasoning {
+            task_index,
+            task_count,
+            text,
+        } => {
+            tracing::info!(
+                task_index,
+                task_count,
+                len = text.len(),
+                "TUI→agent: forwarding subagent reasoning"
+            );
+            let _ = tx.send(AgentResponse::SubAgentReasoning {
+                task_index,
+                task_count,
+                text,
+            });
+        }
+        StreamEvent::SubAgentToolExec {
+            task_index,
+            task_count,
+            name,
+            args_json,
+        } => {
+            tracing::info!(
+                task_index,
+                task_count,
+                tool = %name,
+                "TUI→agent: forwarding subagent tool exec"
+            );
+            let _ = tx.send(AgentResponse::SubAgentToolExec {
+                task_index,
+                task_count,
+                name,
+                args_json,
+            });
+        }
+        StreamEvent::SubAgentFinish {
+            task_index,
+            task_count,
+            status,
+            duration_ms,
+            summary,
+            api_calls,
+            model,
+        } => {
+            tracing::info!(
+                task_index,
+                task_count,
+                status = %status,
+                "TUI→agent: forwarding subagent finish"
+            );
+            let _ = tx.send(AgentResponse::SubAgentFinish {
+                task_index,
+                task_count,
+                status,
+                duration_ms,
+                summary,
+                api_calls,
+                model,
+            });
+        }
+        StreamEvent::Done => {
+            *saw_terminal_event = true;
+            tracing::info!("TUI→agent: forwarding done");
+            let _ = tx.send(AgentResponse::Done);
+            return true;
+        }
+        StreamEvent::Error(error) => {
+            *saw_terminal_event = true;
+            tracing::warn!(%error, "TUI→agent: forwarding error");
+            let _ = tx.send(AgentResponse::Error(error));
+            return true;
+        }
+        StreamEvent::Clarify {
+            question,
+            choices,
+            response_tx,
+        } => {
+            tracing::info!("TUI→agent: forwarding clarify request");
+            let _ = tx.send(AgentResponse::Clarify {
+                question,
+                choices,
+                response_tx,
+            });
+        }
+        StreamEvent::Approval {
+            command,
+            full_command,
+            reasons: _,
+            response_tx,
+        } => {
+            tracing::info!("TUI→agent: forwarding approval request");
+            let _ = tx.send(AgentResponse::Approval {
+                command,
+                full_command,
+                response_tx,
+            });
+        }
+        StreamEvent::SecretRequest {
+            var_name,
+            prompt,
+            is_sudo,
+            response_tx,
+        } => {
+            tracing::info!(var = %var_name, "TUI→agent: forwarding secret request");
+            let _ = tx.send(AgentResponse::SecretRequest {
+                var_name,
+                prompt,
+                is_sudo,
+                response_tx,
+            });
+        }
+        StreamEvent::HookEvent {
+            event,
+            context_json,
+        } => {
+            tracing::info!(hook = %event, "TUI→agent: handling hook event");
+            if let Ok(ctx) =
+                serde_json::from_str::<edgecrab_gateway::hooks::HookContext>(&context_json)
+            {
+                hook_registry.emit(&event, &ctx).await;
+            } else {
+                tracing::warn!(hook = %event, "TUI→agent: hook context parse failed");
+            }
+        }
+        StreamEvent::ContextPressure {
+            estimated_tokens,
+            threshold_tokens,
+        } => {
+            tracing::info!(
+                estimated_tokens,
+                threshold_tokens,
+                "TUI→agent: forwarding context pressure notice"
+            );
+            let _ = tx.send(AgentResponse::Notice(format_context_pressure_notice(
+                estimated_tokens,
+                threshold_tokens,
+            )));
+        }
+    }
+
+    false
+}
+
+async fn forward_agent_stream_to_tui(
+    agent: Arc<Agent>,
+    mut chunk_rx: mpsc::UnboundedReceiver<edgecrab_core::agent::StreamEvent>,
+    mut agent_task: tokio::task::JoinHandle<Result<(), edgecrab_types::AgentError>>,
+    tx: mpsc::UnboundedSender<AgentResponse>,
+    hook_registry: Arc<edgecrab_gateway::hooks::HookRegistry>,
+) {
+    let mut saw_terminal_event = false;
+    let mut saw_token_event = false;
+    let mut saw_reasoning_event = false;
+    let mut agent_result: Option<
+        Result<Result<(), edgecrab_types::AgentError>, tokio::task::JoinError>,
+    > = None;
+
+    loop {
+        if let Some(join_result) = agent_result.take() {
+            while let Ok(event) = chunk_rx.try_recv() {
+                if forward_stream_event_to_tui(
+                    event,
+                    &tx,
+                    &hook_registry,
+                    &mut saw_token_event,
+                    &mut saw_reasoning_event,
+                    &mut saw_terminal_event,
+                )
+                .await
+                {
+                    return;
+                }
+            }
+
+            tracing::info!(
+                saw_terminal_event,
+                saw_token_event,
+                saw_reasoning_event,
+                ?join_result,
+                "TUI→agent: stream pump observed inner task completion"
+            );
+
+            if saw_terminal_event {
+                return;
+            }
+
+            match join_result {
+                Ok(Ok(())) => {
+                    let messages = agent.messages().await;
+                    if let Some(turn) = recover_latest_assistant_turn(&messages) {
+                        tracing::warn!(
+                            recovered_text_len = turn.text.len(),
+                            recovered_reasoning = turn.reasoning.is_some(),
+                            "TUI→agent: recovered assistant reply after missing terminal stream event"
+                        );
+                        if !saw_reasoning_event {
+                            if let Some(reasoning) = turn.reasoning {
+                                let _ = tx.send(AgentResponse::Reasoning(reasoning));
+                            }
+                        }
+                        if !saw_token_event && !turn.text.is_empty() {
+                            let _ = tx.send(AgentResponse::Token(turn.text));
+                        }
+                        let _ = tx.send(AgentResponse::Done);
+                    } else {
+                        let _ = tx.send(AgentResponse::Error(
+                            "Agent completed, but no assistant reply could be recovered for the TUI."
+                                .to_string(),
+                        ));
+                    }
+                }
+                Ok(Err(err)) => {
+                    let _ = tx.send(AgentResponse::Error(err.to_string()));
+                }
+                Err(err) => {
+                    let _ = tx.send(AgentResponse::Error(format!("Agent task failed: {err}")));
+                }
+            }
+            return;
+        }
+
+        tokio::select! {
+            join_result = &mut agent_task => {
+                agent_result = Some(join_result);
+            }
+            event = chunk_rx.recv() => {
+                match event {
+                    Some(event) => {
+                        if forward_stream_event_to_tui(
+                            event,
+                            &tx,
+                            &hook_registry,
+                            &mut saw_token_event,
+                            &mut saw_reasoning_event,
+                            &mut saw_terminal_event,
+                        )
+                        .await
+                        {
+                            return;
+                        }
+                    }
+                    None => {
+                        tracing::warn!(
+                            saw_terminal_event,
+                            saw_token_event,
+                            saw_reasoning_event,
+                            "TUI→agent: stream channel closed before terminal event"
+                        );
+                        if saw_terminal_event {
+                            return;
+                        }
+                        agent_result = Some((&mut agent_task).await);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn normalize_terminal_control_key(mut key: event::KeyEvent) -> event::KeyEvent {
+    if key.modifiers.is_empty() {
+        if let KeyCode::Char(ch) = key.code {
+            match ch {
+                '\u{2}' => {
+                    key.code = KeyCode::Char('b');
+                    key.modifiers = KeyModifiers::CONTROL;
+                }
+                '\u{3}' => {
+                    key.code = KeyCode::Char('c');
+                    key.modifiers = KeyModifiers::CONTROL;
+                }
+                '\u{4}' => {
+                    key.code = KeyCode::Char('d');
+                    key.modifiers = KeyModifiers::CONTROL;
+                }
+                '\u{6}' => {
+                    key.code = KeyCode::Char('f');
+                    key.modifiers = KeyModifiers::CONTROL;
+                }
+                '\u{7}' => {
+                    key.code = KeyCode::Char('g');
+                    key.modifiers = KeyModifiers::CONTROL;
+                }
+                // In basic PTYs a bare LF/CR is usually just Enter. Treating it
+                // as Ctrl+J makes Terminal.app open compose mode instead of
+                // submitting, which can strand the user before the agent runs.
+                '\n' | '\r' => {
+                    key.code = KeyCode::Enter;
+                    key.modifiers = KeyModifiers::NONE;
+                }
+                '\u{c}' => {
+                    key.code = KeyCode::Char('l');
+                    key.modifiers = KeyModifiers::CONTROL;
+                }
+                '\u{f}' => {
+                    key.code = KeyCode::Char('o');
+                    key.modifiers = KeyModifiers::CONTROL;
+                }
+                '\u{13}' => {
+                    key.code = KeyCode::Char('s');
+                    key.modifiers = KeyModifiers::CONTROL;
+                }
+                '\u{15}' => {
+                    key.code = KeyCode::Char('u');
+                    key.modifiers = KeyModifiers::CONTROL;
+                }
+                _ => {}
+            }
+        }
+    }
+    key
+}
+
+fn normalize_fallback_paging_key(mut key: event::KeyEvent) -> event::KeyEvent {
+    if key.modifiers == KeyModifiers::CONTROL {
+        match key.code {
+            KeyCode::Char('b') | KeyCode::Char('B') => {
+                key.code = KeyCode::PageUp;
+                key.modifiers = KeyModifiers::NONE;
+            }
+            KeyCode::Char('f') | KeyCode::Char('F') => {
+                key.code = KeyCode::PageDown;
+                key.modifiers = KeyModifiers::NONE;
+            }
+            _ => {}
+        }
+    }
+    key
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PagingIntent {
+    Up,
+    Down,
+}
+
+fn paging_intent_for_key(key: event::KeyEvent) -> Option<PagingIntent> {
+    let blocked_modifiers = KeyModifiers::ALT | KeyModifiers::SUPER;
+    match (key.modifiers, key.code) {
+        (_, KeyCode::PageUp) => Some(PagingIntent::Up),
+        (_, KeyCode::PageDown) => Some(PagingIntent::Down),
+        (mods, KeyCode::Char('\u{2}')) if !mods.intersects(blocked_modifiers) => {
+            Some(PagingIntent::Up)
+        }
+        (mods, KeyCode::Char('\u{6}')) if !mods.intersects(blocked_modifiers) => {
+            Some(PagingIntent::Down)
+        }
+        (mods, KeyCode::Char('b' | 'B'))
+            if mods.contains(KeyModifiers::CONTROL) && !mods.intersects(blocked_modifiers) =>
+        {
+            Some(PagingIntent::Up)
+        }
+        (mods, KeyCode::Char('f' | 'F'))
+            if mods.contains(KeyModifiers::CONTROL) && !mods.intersects(blocked_modifiers) =>
+        {
+            Some(PagingIntent::Down)
+        }
+        _ => None,
+    }
+}
+
 fn selector_search_char(key: &event::KeyEvent) -> Option<char> {
     if !key.modifiers.is_empty() {
         return None;
@@ -136,8 +895,9 @@ fn selector_marker(is_selected: bool, accent: Color, bg: Option<Color>) -> Span<
 const SESSION_BROWSER_LIMIT: usize = 250;
 const SESSION_BROWSER_SEARCH_LIMIT: usize = 120;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 enum SplitPaneFocus {
+    #[default]
     List,
     Detail,
 }
@@ -1191,6 +1951,7 @@ fn persist_display_preferences(
 
 // ─── Spinner frames (braille rotation) ──────────────────────────────
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const ASCII_SPINNER_FRAMES: &[&str] = &["-", "\\", "|", "/"];
 const VOICE_LISTEN_FRAMES: &[&str] = &[".  ", ".. ", "...", " ..", "  .", "   "];
 const VOICE_RECORD_FRAMES: &[&str] = &["*  ", "** ", "***", " **", "  *", "   "];
 const VOICE_PLAYBACK_FRAMES: &[&str] = &[">  ", ">> ", ">>>", " >>", "  >", "   "];
@@ -1421,6 +2182,8 @@ pub struct OutputLine {
     pub prebuilt_spans: Option<Vec<Span<'static>>>,
     /// Cached rendered lines (invalidated when text changes).
     rendered: Option<Vec<Line<'static>>>,
+    /// Simplified cached lines for slow / remote terminals.
+    plain_rendered: Option<Vec<Line<'static>>>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1432,6 +2195,13 @@ pub enum OutputRole {
     Reasoning,
     Error,
     User,
+}
+
+impl OutputLine {
+    fn invalidate_render_cache(&mut self) {
+        self.rendered = None;
+        self.plain_rendered = None;
+    }
 }
 
 /// Display state machine for the spinner/status area.
@@ -2038,6 +2808,7 @@ enum DetailSurface {
 struct SimpleDetailState {
     surface: Option<DetailSurface>,
     scroll: u16,
+    focus: SplitPaneFocus,
 }
 
 impl SimpleDetailState {
@@ -2050,8 +2821,33 @@ impl SimpleDetailState {
     }
 
     fn set_scroll(&mut self, surface: DetailSurface, scroll: u16) {
+        if self.surface != Some(surface) {
+            self.focus = SplitPaneFocus::List;
+        }
         self.surface = Some(surface);
         self.scroll = scroll;
+    }
+
+    fn focus_for(&self, surface: DetailSurface) -> SplitPaneFocus {
+        if self.surface == Some(surface) {
+            self.focus
+        } else {
+            SplitPaneFocus::List
+        }
+    }
+
+    fn set_focus(&mut self, surface: DetailSurface, focus: SplitPaneFocus) {
+        if self.surface != Some(surface) {
+            self.scroll = 0;
+        }
+        self.surface = Some(surface);
+        self.focus = focus;
+    }
+
+    fn reset(&mut self, surface: DetailSurface) {
+        self.surface = Some(surface);
+        self.scroll = 0;
+        self.focus = SplitPaneFocus::List;
     }
 }
 
@@ -3052,6 +3848,14 @@ impl ToolManagerScope {
         }
     }
 
+    fn previous(self) -> Self {
+        match self {
+            Self::All => Self::Tools,
+            Self::Toolsets => Self::All,
+            Self::Tools => Self::Toolsets,
+        }
+    }
+
     fn title(self) -> &'static str {
         match self {
             Self::All => "all",
@@ -3202,14 +4006,24 @@ pub struct App {
     cron_tx: mpsc::UnboundedSender<String>,
     /// Whether the agent is currently processing a prompt
     is_processing: bool,
+    /// Abort handle for the live foreground request pump.
+    ///
+    /// WHY explicit abort in addition to `agent.interrupt()`: some terminal and
+    /// provider paths can leave the outer stream-forwarding task waiting for the
+    /// next event even after the agent cancel token is set. Aborting the pump
+    /// lets the TUI leave the "waiting for first token" state immediately.
+    active_request_abort: Option<tokio::task::AbortHandle>,
     /// Index of the output line currently being streamed into (-1 = none)
     streaming_line: Option<usize>,
     /// Index of the current reasoning / think-mode block for this turn.
     reasoning_line: Option<usize>,
     /// Whether extended thinking should be shown in the output pane.
     show_reasoning: bool,
-    /// Whether live token streaming is enabled for future turns.
+    /// Whether API-level streaming is enabled for future turns.
     streaming_enabled: bool,
+    /// Whether assistant tokens should be rendered incrementally in the output
+    /// pane, or buffered and flushed only at turn/tool boundaries.
+    live_token_display_enabled: bool,
     /// Persisted tool-progress display policy.
     tool_progress_mode: ToolProgressMode,
     /// Whether the status bar is visible.
@@ -3224,6 +4038,8 @@ pub struct App {
     completion: CompletionState,
     /// Input history ring buffer
     input_history: Vec<String>,
+    /// Lazy-load persisted history on first actual history-dependent action.
+    history_loaded: bool,
     /// Current position in history (history.len() = "new input")
     history_pos: usize,
     /// Saved input before history navigation started
@@ -3236,6 +4052,8 @@ pub struct App {
     command_descriptions: std::collections::HashMap<String, String>,
     /// Model selector overlay (activated by `/model` with no args)
     model_selector: FuzzySelector<ModelEntry>,
+    /// True once the static model catalog has been seeded into the shared selector.
+    model_selector_seeded: bool,
     /// Which model-setting flow is currently using the shared selector.
     model_selector_target: ModelSelectorTarget,
     /// True while background live model discovery is refreshing the selector.
@@ -3346,6 +4164,28 @@ pub struct App {
     /// any out-of-band characters written to the alternate screen (e.g. from
     /// `tracing::warn!` firing on a background task) are erased.
     needs_full_terminal_clear: bool,
+    /// Minimum wall-clock spacing between terminal draws. This lets the TUI
+    /// adapt to slow PTYs without sacrificing API streaming or input latency.
+    min_draw_interval: Duration,
+    /// Active terminal UX profile derived from runtime terminal capabilities.
+    terminal_ui_profile: TerminalUiProfile,
+    /// Glyph set used for status and transcript accents.
+    terminal_glyph_profile: TerminalGlyphProfile,
+    /// Whether the current terminal session is remote (SSH / mosh).
+    remote_terminal_session: bool,
+    /// Whether the terminal reliably delivers dedicated PageUp / PageDown keys.
+    direct_paging_keys_supported: bool,
+    /// Use a shorter status bar on slow or remote terminals.
+    compact_status_bar: bool,
+    /// Render assistant output as markdown only on fast local terminals.
+    rich_transcript: bool,
+    /// Whether to render the visual scrollbar widget in the output pane.
+    show_output_scrollbar: bool,
+    /// Whether to show ghost text in the input widget.
+    show_ghost_hint: bool,
+    /// When false, periodic redraws exist only for real state changes, not
+    /// cosmetic spinner / kaomoji motion. This keeps slow PTYs responsive.
+    animate_status_indicators: bool,
 
     // ── Personality / UX animation state ─────────────────────────────
     /// Index into thinking_verbs — advances each full spinner rotation
@@ -3381,6 +4221,8 @@ pub struct App {
     /// Accumulated text of the most recent agent response (from streaming tokens).
     /// Used by voice mode to feed TTS after each turn completes.
     last_agent_response_text: String,
+    /// Hidden assistant text buffered while live token display is disabled.
+    buffered_assistant_output: String,
     /// Session-level personality overlay name (e.g. "pirate", "concise").
     /// When Some, the named preset was applied this session via `/personality <name>`.
     /// Mirrors hermes-agent's `/personality` session overlay.
@@ -3427,9 +4269,11 @@ pub struct App {
     voice_playback_active: bool,
     /// Animation cursor for microphone / listening / speaking presence badges.
     voice_presence_frame_idx: usize,
-    /// File-based hook registry — loaded from ~/.edgecrab/hooks/ at startup.
-    /// Receives tool:pre/post, llm:pre/post, and cli:start/end events.
+    /// File-based hook registry. Loaded lazily from `~/.edgecrab/hooks/`
+    /// before the first agent turn so startup reaches the first frame sooner.
     hook_registry: std::sync::Arc<edgecrab_gateway::hooks::HookRegistry>,
+    /// Hooks are loaded lazily so the first terminal frame is not blocked by filesystem scans.
+    hook_registry_loaded: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -3835,6 +4679,74 @@ fn picker_help_line(accent: Color) -> Line<'static> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 impl App {
+    fn clear_active_request_state(&mut self) {
+        self.is_processing = false;
+        self.active_request_abort = None;
+        self.streaming_line = None;
+        self.reasoning_line = None;
+        self.buffered_assistant_output.clear();
+        self.in_flight_tool_count = 0;
+        self.active_subagents.clear();
+        self.turn_stream_tokens = 0;
+        self.pending_tool_lines.clear();
+        self.hidden_tool_calls.clear();
+        self.active_tools.clear();
+        self.seen_tool_signatures.clear();
+        self.display_state = DisplayState::Idle;
+    }
+
+    fn cancel_active_request(&mut self) -> bool {
+        let had_active_request = self.is_processing;
+        if let Some(handle) = self.active_request_abort.take() {
+            handle.abort();
+        }
+        if let Some(ref agent) = self.agent {
+            agent.interrupt();
+        }
+        if had_active_request {
+            self.clear_active_request_state();
+            self.needs_redraw = true;
+        }
+        had_active_request
+    }
+
+    fn flush_buffered_assistant_output(&mut self) {
+        if self.buffered_assistant_output.is_empty() {
+            return;
+        }
+
+        let text = std::mem::take(&mut self.buffered_assistant_output);
+        if let Some(idx) = self.streaming_line {
+            if idx < self.output.len() {
+                self.output[idx].text.push_str(&text);
+                self.output[idx].invalidate_render_cache();
+            } else {
+                self.output.push(OutputLine {
+                    text,
+                    role: OutputRole::Assistant,
+                    prebuilt_spans: None,
+                    rendered: None,
+                    plain_rendered: None,
+                });
+                self.streaming_line = Some(self.output.len() - 1);
+            }
+        } else {
+            self.output.push(OutputLine {
+                text,
+                role: OutputRole::Assistant,
+                prebuilt_spans: None,
+                rendered: None,
+                plain_rendered: None,
+            });
+            self.streaming_line = Some(self.output.len() - 1);
+        }
+
+        if self.at_bottom {
+            self.scroll_offset = 0;
+        }
+        self.needs_redraw = true;
+    }
+
     pub fn new() -> Self {
         let (response_tx, response_rx) = mpsc::unbounded_channel();
         let (cron_tx, cron_rx) = mpsc::unbounded_channel();
@@ -3878,6 +4790,7 @@ impl App {
         );
 
         let runtime_config = edgecrab_core::AppConfig::load().unwrap_or_default();
+        let terminal_caps = terminal_runtime_capabilities();
 
         let mut app = Self {
             textarea,
@@ -3905,10 +4818,13 @@ impl App {
             cron_rx,
             cron_tx,
             is_processing: false,
+            active_request_abort: None,
             streaming_line: None,
             reasoning_line: None,
             show_reasoning: display_preferences.show_reasoning,
             streaming_enabled: display_preferences.streaming_enabled,
+            live_token_display_enabled: display_preferences.streaming_enabled
+                && terminal_caps.live_token_display_enabled,
             tool_progress_mode: display_preferences.tool_progress_mode,
             show_status_bar: display_preferences.show_status_bar,
             yolo_enabled: false,
@@ -3921,19 +4837,14 @@ impl App {
                 arg_start: 0,
             },
             input_history: Vec::new(),
+            history_loaded: false,
             history_pos: 0,
             history_stash: String::new(),
             last_response_time: None,
             all_command_names,
             command_descriptions,
-            model_selector: {
-                let mut ms: FuzzySelector<ModelEntry> = FuzzySelector::new();
-                ms.set_items(build_model_selector_entries(
-                    &ModelCatalog::grouped_catalog(),
-                    None,
-                ));
-                ms
-            },
+            model_selector: FuzzySelector::new(),
+            model_selector_seeded: false,
             model_selector_target: ModelSelectorTarget::Primary,
             model_selector_refresh_in_flight: false,
             vision_model_selector: FuzzySelector::new(),
@@ -3984,6 +4895,16 @@ impl App {
             at_bottom: true,
             needs_redraw: true,
             needs_full_terminal_clear: false,
+            min_draw_interval: terminal_caps.min_draw_interval,
+            terminal_ui_profile: terminal_caps.ui_profile,
+            terminal_glyph_profile: terminal_caps.glyph_profile,
+            remote_terminal_session: terminal_caps.remote_session,
+            direct_paging_keys_supported: terminal_caps.direct_paging_keys_supported,
+            compact_status_bar: terminal_caps.compact_status_bar,
+            rich_transcript: terminal_caps.rich_transcript,
+            show_output_scrollbar: terminal_caps.show_output_scrollbar,
+            show_ghost_hint: terminal_caps.show_ghost_hint,
+            animate_status_indicators: terminal_caps.animate_status_indicators,
             thinking_verb_idx: 0,
             kaomoji_frame_idx: 0,
             turn_count: 0,
@@ -3991,11 +4912,12 @@ impl App {
             approval_pending_tx: None,
             secret_pending_tx: None,
             session_approvals: std::collections::HashSet::new(),
-            mouse_capture_enabled: true, // scroll wheel on by default; F6 to switch
+            mouse_capture_enabled: terminal_caps.mouse_capture_enabled,
             pending_mouse_capture: None,
             last_left_click: None,
             voice_mode_enabled: load_voice_mode_enabled() && voice_readback_ready().is_ok(),
             last_agent_response_text: String::new(),
+            buffered_assistant_output: String::new(),
             session_personality: None,
             session_skin: None,
             pending_images: Vec::new(),
@@ -4013,17 +4935,11 @@ impl App {
             voice_no_speech_count: 0,
             voice_playback_active: false,
             voice_presence_frame_idx: 0,
-            hook_registry: {
-                let mut r = edgecrab_gateway::hooks::HookRegistry::new();
-                r.discover_and_load();
-                std::sync::Arc::new(r)
-            },
+            hook_registry: std::sync::Arc::new(edgecrab_gateway::hooks::HookRegistry::new()),
+            hook_registry_loaded: false,
         };
 
         app.apply_textarea_editor_style();
-
-        // Load persisted command history from ~/.edgecrab/history
-        app.load_history_file();
 
         app
     }
@@ -4045,6 +4961,36 @@ impl App {
 
     pub fn set_yolo_enabled(&mut self, enabled: bool) {
         self.yolo_enabled = enabled;
+    }
+
+    fn ensure_history_loaded(&mut self) {
+        if self.history_loaded {
+            return;
+        }
+        self.load_history_file();
+        self.history_loaded = true;
+        self.history_pos = self.input_history.len();
+    }
+
+    fn ensure_model_selector_seeded(&mut self) {
+        if self.model_selector_seeded {
+            return;
+        }
+        self.model_selector.set_items(build_model_selector_entries(
+            &ModelCatalog::grouped_catalog(),
+            None,
+        ));
+        self.model_selector_seeded = true;
+    }
+
+    fn ensure_hook_registry_loaded(&mut self) {
+        if self.hook_registry_loaded {
+            return;
+        }
+        let mut registry = edgecrab_gateway::hooks::HookRegistry::new();
+        registry.discover_and_load();
+        self.hook_registry = std::sync::Arc::new(registry);
+        self.hook_registry_loaded = true;
     }
 
     /// Get a reference to the agent, or push an error and return None.
@@ -4097,7 +5043,7 @@ impl App {
                         if let Some(reasoning) = message.reasoning.clone() {
                             if !reasoning.trim().is_empty() {
                                 self.push_output(
-                                    format!("🧠 Thinking\n{reasoning}"),
+                                    format!("Thinking\n{reasoning}"),
                                     OutputRole::Reasoning,
                                 );
                             }
@@ -4119,6 +5065,7 @@ impl App {
             role,
             prebuilt_spans: None,
             rendered: None,
+            plain_rendered: None,
         });
         // Only auto-scroll to bottom if the user was already at bottom.
         // Preserves scroll position when user has scrolled up to read history.
@@ -4137,6 +5084,7 @@ impl App {
             role,
             prebuilt_spans: Some(spans),
             rendered: None,
+            plain_rendered: None,
         });
         if self.at_bottom {
             self.scroll_offset = 0;
@@ -4155,6 +5103,7 @@ impl App {
         // tokens to be silently dropped or appended at wrong positions.
         self.streaming_line = None;
         self.reasoning_line = None;
+        self.buffered_assistant_output.clear();
         self.pending_tool_lines.clear();
         self.hidden_tool_calls.clear();
         self.active_tools.clear();
@@ -4464,15 +5413,77 @@ impl App {
         if self.keyboard_enhancement_enabled {
             "Shift+Enter=compose"
         } else {
-            "Ctrl+J=compose"
+            "Ctrl+O=compose"
         }
+    }
+
+    fn paging_key_hint_label(&self) -> &'static str {
+        if self.direct_paging_keys_supported {
+            "PgUp/Dn"
+        } else {
+            "^B/^F"
+        }
+    }
+
+    fn paging_key_help_span(&self, accent: Color) -> Span<'static> {
+        Span::styled(
+            format!("{} ", self.paging_key_hint_label()),
+            Style::default().fg(accent),
+        )
+    }
+
+    fn tab_key_help_span(&self, accent: Color) -> Span<'static> {
+        Span::styled("Tab ", Style::default().fg(accent))
+    }
+
+    fn focus_pane_help_spans(&self, accent: Color) -> [Span<'static>; 2] {
+        [
+            self.tab_key_help_span(accent),
+            Span::styled("focus pane  ", Style::default().fg(Color::DarkGray)),
+        ]
+    }
+
+    fn page_or_scroll_help_spans(&self, accent: Color) -> [Span<'static>; 2] {
+        [
+            self.paging_key_help_span(accent),
+            Span::styled("page or scroll  ", Style::default().fg(Color::DarkGray)),
+        ]
+    }
+
+    fn paging_scroll_hint(&self, scroll: u16, ascii: bool) -> String {
+        if ascii {
+            format!(" scroll:{scroll} ^G=end {} ", self.paging_key_hint_label())
+        } else {
+            format!(" ↑{scroll}  ^G=end  {} ", self.paging_key_hint_label())
+        }
+    }
+
+    fn paging_keyboard_note(&self) -> &'static str {
+        if self.direct_paging_keys_supported {
+            "If PageUp / PageDown do not reach EdgeCrab, use Ctrl+B / Ctrl+F."
+        } else {
+            "Use Ctrl+B / Ctrl+F to page through history and detail panes."
+        }
+    }
+
+    fn normalize_paging_help_line(&self, mut line: Line<'static>) -> Line<'static> {
+        let label = self.paging_key_hint_label();
+        for span in &mut line.spans {
+            if span.content == "PgUp/Dn " {
+                span.content = Cow::Owned(format!("{label} "));
+            }
+        }
+        line
     }
 
     fn compose_normal_hint(&self) -> String {
         if let Some(pending) = self.vim_pending {
             pending.status_hint()
         } else {
-            " NORMAL  hjkl/←↓↑→  i/a/o/O C/S/s Y D  PgUp/Dn=input  ^S=send  Esc=inline ".to_string()
+            format!(
+                " NORMAL  hjkl/←↓↑→  i/a/o/O C/S/s Y D  {}=input  ^S=send  Esc=inline ",
+                self.paging_key_hint_label()
+            )
         }
     }
 
@@ -6314,6 +7325,9 @@ impl App {
             (KeyModifiers::CONTROL, KeyCode::Char('j')) => {
                 self.open_compose_editor(true);
             }
+            (KeyModifiers::CONTROL, KeyCode::Char('o')) => {
+                self.open_compose_editor(true);
+            }
             (KeyModifiers::NONE, KeyCode::Tab) => {
                 if self.textarea.lines().len() > 1 {
                     self.textarea.input(key);
@@ -6667,6 +7681,7 @@ impl App {
     }
 
     fn history_up(&mut self) {
+        self.ensure_history_loaded();
         if self.input_history.is_empty() {
             return;
         }
@@ -6682,6 +7697,7 @@ impl App {
     }
 
     fn history_down(&mut self) {
+        self.ensure_history_loaded();
         if self.history_pos >= self.input_history.len() {
             return;
         }
@@ -6695,6 +7711,7 @@ impl App {
     }
 
     fn push_history(&mut self, entry: &str) {
+        self.ensure_history_loaded();
         let trimmed = entry.trim().to_string();
         if trimmed.is_empty() {
             return;
@@ -6741,6 +7758,272 @@ impl App {
         let new_offset = (self.scroll_offset as i32 + delta).clamp(0, max_scroll as i32) as u16;
         self.scroll_offset = new_offset;
         self.at_bottom = self.scroll_offset == 0;
+        self.needs_redraw = true;
+    }
+
+    fn apply_output_paging(&mut self, intent: PagingIntent) {
+        if self.editor_mode.is_compose() {
+            match intent {
+                PagingIntent::Up => self.textarea.scroll(Scrolling::PageUp),
+                PagingIntent::Down => self.textarea.scroll(Scrolling::PageDown),
+            }
+            self.needs_redraw = true;
+            return;
+        }
+
+        let page = self.output_area_height.max(3).saturating_sub(2) as i32;
+        match intent {
+            PagingIntent::Up => self.scroll_output(page),
+            PagingIntent::Down => self.scroll_output(-page),
+        }
+    }
+
+    fn handle_paging_intent(&mut self, intent: PagingIntent) -> bool {
+        if self.document_overlay.is_some() {
+            self.scroll_document_overlay(match intent {
+                PagingIntent::Up => -8,
+                PagingIntent::Down => 8,
+            });
+            return true;
+        }
+
+        if self.model_selector.active {
+            self.apply_simple_selector_paging(DetailSurface::ModelSelector, intent);
+            return true;
+        }
+
+        if self.gateway_browser.active {
+            match intent {
+                PagingIntent::Up
+                    if self.detail_fullscreen_active(DetailSurface::GatewayBrowser) =>
+                {
+                    self.page_up_detail_fullscreen(DetailSurface::GatewayBrowser);
+                }
+                PagingIntent::Down
+                    if self.detail_fullscreen_active(DetailSurface::GatewayBrowser) =>
+                {
+                    self.page_down_detail_fullscreen(DetailSurface::GatewayBrowser);
+                }
+                PagingIntent::Up => {
+                    if self.gateway_browser_pane.focus == SplitPaneFocus::Detail {
+                        self.gateway_browser_pane.page_up(8);
+                    } else {
+                        self.gateway_browser.page_up();
+                        self.gateway_browser_pane.reset_scroll();
+                        self.reset_detail_fullscreen_scroll(DetailSurface::GatewayBrowser);
+                    }
+                }
+                PagingIntent::Down => {
+                    if self.gateway_browser_pane.focus == SplitPaneFocus::Detail {
+                        self.gateway_browser_pane.page_down(8);
+                    } else {
+                        self.gateway_browser.page_down();
+                        self.gateway_browser_pane.reset_scroll();
+                        self.reset_detail_fullscreen_scroll(DetailSurface::GatewayBrowser);
+                    }
+                }
+            }
+            self.needs_redraw = true;
+            return true;
+        }
+
+        if self.moa_reference_selector.active {
+            match intent {
+                PagingIntent::Up => self.moa_reference_selector.page_up(),
+                PagingIntent::Down => self.moa_reference_selector.page_down(),
+            }
+            return true;
+        }
+
+        macro_rules! handle_split_detail_paging {
+            ($active:expr, $surface:expr) => {
+                if $active {
+                    self.apply_simple_selector_paging($surface, intent);
+                    return true;
+                }
+            };
+        }
+
+        handle_split_detail_paging!(
+            self.vision_model_selector.active,
+            DetailSurface::VisionModelSelector
+        );
+        handle_split_detail_paging!(
+            self.image_model_selector.active,
+            DetailSurface::ImageModelSelector
+        );
+        handle_split_detail_paging!(self.mcp_selector.active, DetailSurface::McpSelector);
+        handle_split_detail_paging!(
+            self.remote_mcp_browser.selector.active,
+            DetailSurface::RemoteMcpBrowser
+        );
+        handle_split_detail_paging!(
+            self.remote_skill_browser.selector.active,
+            DetailSurface::RemoteSkillBrowser
+        );
+        handle_split_detail_paging!(
+            self.remote_plugin_browser.selector.active,
+            DetailSurface::RemotePluginBrowser
+        );
+        handle_split_detail_paging!(self.profile_selector.active, DetailSurface::ProfileSelector);
+        handle_split_detail_paging!(self.skill_selector.active, DetailSurface::SkillSelector);
+        handle_split_detail_paging!(self.tool_manager.active, DetailSurface::ToolManager);
+        handle_split_detail_paging!(self.plugin_toggle.active, DetailSurface::PluginToggle);
+        handle_split_detail_paging!(self.config_selector.active, DetailSurface::ConfigSelector);
+
+        if self.skin_browser.active {
+            match intent {
+                PagingIntent::Up => self.skin_browser.page_up(),
+                PagingIntent::Down => self.skin_browser.page_down(),
+            }
+            return true;
+        }
+
+        if self.session_inspector.active() {
+            match intent {
+                PagingIntent::Up
+                    if self.detail_fullscreen_active(DetailSurface::SessionInspector) =>
+                {
+                    self.page_up_detail_fullscreen(DetailSurface::SessionInspector);
+                }
+                PagingIntent::Down
+                    if self.detail_fullscreen_active(DetailSurface::SessionInspector) =>
+                {
+                    self.page_down_detail_fullscreen(DetailSurface::SessionInspector);
+                }
+                PagingIntent::Up => {
+                    if self.session_inspector.pane.focus == SplitPaneFocus::Detail {
+                        self.session_inspector.pane.page_up(8);
+                    } else {
+                        self.session_inspector.selector.page_up();
+                        self.session_inspector.pane.reset_scroll();
+                        self.reset_detail_fullscreen_scroll(DetailSurface::SessionInspector);
+                    }
+                }
+                PagingIntent::Down => {
+                    if self.session_inspector.pane.focus == SplitPaneFocus::Detail {
+                        self.session_inspector.pane.page_down(8);
+                    } else {
+                        self.session_inspector.selector.page_down();
+                        self.session_inspector.pane.reset_scroll();
+                        self.reset_detail_fullscreen_scroll(DetailSurface::SessionInspector);
+                    }
+                }
+            }
+            self.needs_redraw = true;
+            return true;
+        }
+
+        if self.session_browser.active {
+            match intent {
+                PagingIntent::Up
+                    if self.detail_fullscreen_active(DetailSurface::SessionBrowser) =>
+                {
+                    self.page_up_detail_fullscreen(DetailSurface::SessionBrowser);
+                }
+                PagingIntent::Down
+                    if self.detail_fullscreen_active(DetailSurface::SessionBrowser) =>
+                {
+                    self.page_down_detail_fullscreen(DetailSurface::SessionBrowser);
+                }
+                PagingIntent::Up => {
+                    if self.session_browser_pane.focus == SplitPaneFocus::Detail {
+                        self.session_browser_pane.page_up(8);
+                    } else {
+                        self.session_browser.page_up();
+                        self.session_browser_pane.reset_scroll();
+                        self.reset_detail_fullscreen_scroll(DetailSurface::SessionBrowser);
+                    }
+                }
+                PagingIntent::Down => {
+                    if self.session_browser_pane.focus == SplitPaneFocus::Detail {
+                        self.session_browser_pane.page_down(8);
+                    } else {
+                        self.session_browser.page_down();
+                        self.session_browser_pane.reset_scroll();
+                        self.reset_detail_fullscreen_scroll(DetailSurface::SessionBrowser);
+                    }
+                }
+            }
+            self.needs_redraw = true;
+            return true;
+        }
+
+        if self.completion.active {
+            if !self.completion.candidates.is_empty() {
+                match intent {
+                    PagingIntent::Up => {
+                        self.completion.selected = self.completion.selected.saturating_sub(8);
+                    }
+                    PagingIntent::Down => {
+                        let last = self.completion.candidates.len() - 1;
+                        self.completion.selected = (self.completion.selected + 8).min(last);
+                    }
+                }
+            }
+            return true;
+        }
+
+        self.apply_output_paging(intent);
+        true
+    }
+
+    fn simple_split_focus_supported(surface: DetailSurface) -> bool {
+        matches!(
+            surface,
+            DetailSurface::ModelSelector
+                | DetailSurface::VisionModelSelector
+                | DetailSurface::ImageModelSelector
+                | DetailSurface::McpSelector
+                | DetailSurface::RemoteMcpBrowser
+                | DetailSurface::SkillSelector
+                | DetailSurface::RemoteSkillBrowser
+                | DetailSurface::RemotePluginBrowser
+                | DetailSurface::ToolManager
+                | DetailSurface::PluginToggle
+                | DetailSurface::ConfigSelector
+        )
+    }
+
+    fn simple_split_focus(&self, surface: DetailSurface) -> SplitPaneFocus {
+        self.simple_detail_state.focus_for(surface)
+    }
+
+    fn simple_split_detail_focused(&self, surface: DetailSurface) -> bool {
+        Self::simple_split_focus_supported(surface)
+            && self.simple_split_focus(surface) == SplitPaneFocus::Detail
+            && !self.detail_fullscreen_active(surface)
+    }
+
+    fn simple_split_focus_label(&self, surface: DetailSurface) -> &'static str {
+        match self.simple_split_focus(surface) {
+            SplitPaneFocus::List => "list",
+            SplitPaneFocus::Detail => "detail",
+        }
+    }
+
+    fn toggle_simple_split_focus(&mut self, surface: DetailSurface) {
+        if !Self::simple_split_focus_supported(surface) {
+            return;
+        }
+        let next = self.simple_split_focus(surface).toggle();
+        self.simple_detail_state.set_focus(surface, next);
+        self.needs_redraw = true;
+    }
+
+    fn scroll_split_detail_lines(&mut self, surface: DetailSurface, delta: i16) {
+        let scroll = self.split_detail_scroll(surface);
+        let next = if delta.is_negative() {
+            scroll.saturating_sub(delta.unsigned_abs())
+        } else {
+            scroll.saturating_add(delta as u16)
+        };
+        self.set_split_detail_scroll(surface, next);
+        self.needs_redraw = true;
+    }
+
+    fn set_split_detail_scroll_to_edge(&mut self, surface: DetailSurface, end: bool) {
+        self.set_split_detail_scroll(surface, if end { u16::MAX } else { 0 });
         self.needs_redraw = true;
     }
 
@@ -6847,6 +8130,8 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return;
         }
+        let raw_key = key;
+        let key = normalize_fallback_paging_key(normalize_terminal_control_key(key));
 
         self.needs_redraw = true;
 
@@ -6869,10 +8154,7 @@ impl App {
                 } else if self.voice_recording.is_some() {
                     self.abort_voice_recording("^C  (voice recording cancelled)");
                 } else if self.is_processing {
-                    // Agent is running: interrupt it
-                    if let Some(ref agent) = self.agent {
-                        agent.interrupt();
-                    }
+                    self.cancel_active_request();
                     self.push_output("^C  (cancelled)", OutputRole::System);
                 } else {
                     // Nothing to do: exit
@@ -7017,6 +8299,13 @@ impl App {
                 return;
             }
             _ => {}
+        }
+
+        if let Some(intent) = paging_intent_for_key(raw_key).or_else(|| paging_intent_for_key(key))
+        {
+            if self.handle_paging_intent(intent) {
+                return;
+            }
         }
 
         // Approval overlay active — intercept all keys for choice navigation
@@ -7225,6 +8514,11 @@ impl App {
                         self.split_detail_scroll(DetailSurface::ModelSelector),
                     );
                 }
+                KeyCode::Tab | KeyCode::BackTab
+                    if !self.detail_fullscreen_active(DetailSurface::ModelSelector) =>
+                {
+                    self.toggle_simple_split_focus(DetailSurface::ModelSelector);
+                }
                 KeyCode::Enter => {
                     if let Some(model) = self.model_selector.current().map(|e| e.display.clone()) {
                         self.model_selector.active = false;
@@ -7239,14 +8533,22 @@ impl App {
                     }
                 }
                 KeyCode::Up => {
-                    self.model_selector.move_up();
-                    self.reset_split_detail_scroll(DetailSurface::ModelSelector);
-                    self.reset_detail_fullscreen_scroll(DetailSurface::ModelSelector);
+                    if self.simple_split_detail_focused(DetailSurface::ModelSelector) {
+                        self.scroll_split_detail_lines(DetailSurface::ModelSelector, -1);
+                    } else {
+                        self.model_selector.move_up();
+                        self.reset_split_detail_scroll(DetailSurface::ModelSelector);
+                        self.reset_detail_fullscreen_scroll(DetailSurface::ModelSelector);
+                    }
                 }
                 KeyCode::Down => {
-                    self.model_selector.move_down();
-                    self.reset_split_detail_scroll(DetailSurface::ModelSelector);
-                    self.reset_detail_fullscreen_scroll(DetailSurface::ModelSelector);
+                    if self.simple_split_detail_focused(DetailSurface::ModelSelector) {
+                        self.scroll_split_detail_lines(DetailSurface::ModelSelector, 1);
+                    } else {
+                        self.model_selector.move_down();
+                        self.reset_split_detail_scroll(DetailSurface::ModelSelector);
+                        self.reset_detail_fullscreen_scroll(DetailSurface::ModelSelector);
+                    }
                 }
                 KeyCode::PageUp if self.detail_fullscreen_active(DetailSurface::ModelSelector) => {
                     self.page_up_detail_fullscreen(DetailSurface::ModelSelector);
@@ -7256,8 +8558,29 @@ impl App {
                 {
                     self.page_down_detail_fullscreen(DetailSurface::ModelSelector);
                 }
-                KeyCode::PageUp => self.page_up_split_detail(DetailSurface::ModelSelector, 8),
-                KeyCode::PageDown => self.page_down_split_detail(DetailSurface::ModelSelector, 8),
+                KeyCode::PageUp => self
+                    .apply_simple_selector_paging(DetailSurface::ModelSelector, PagingIntent::Up),
+                KeyCode::PageDown => self
+                    .apply_simple_selector_paging(DetailSurface::ModelSelector, PagingIntent::Down),
+                KeyCode::Home => {
+                    if self.simple_split_detail_focused(DetailSurface::ModelSelector) {
+                        self.set_split_detail_scroll_to_edge(DetailSurface::ModelSelector, false);
+                    } else {
+                        self.model_selector.selected = 0;
+                        self.reset_split_detail_scroll(DetailSurface::ModelSelector);
+                        self.reset_detail_fullscreen_scroll(DetailSurface::ModelSelector);
+                    }
+                }
+                KeyCode::End => {
+                    if self.simple_split_detail_focused(DetailSurface::ModelSelector) {
+                        self.set_split_detail_scroll_to_edge(DetailSurface::ModelSelector, true);
+                    } else {
+                        self.model_selector.selected =
+                            self.model_selector.filtered.len().saturating_sub(1);
+                        self.reset_split_detail_scroll(DetailSurface::ModelSelector);
+                        self.reset_detail_fullscreen_scroll(DetailSurface::ModelSelector);
+                    }
+                }
                 KeyCode::Backspace => {
                     self.model_selector.pop_char();
                     self.reset_split_detail_scroll(DetailSurface::ModelSelector);
@@ -7431,6 +8754,8 @@ impl App {
                         }
                     }
                 }
+                KeyCode::Tab => self.moa_reference_selector.move_down(),
+                KeyCode::BackTab => self.moa_reference_selector.move_up(),
                 KeyCode::Up => self.moa_reference_selector.move_up(),
                 KeyCode::Down => self.moa_reference_selector.move_down(),
                 KeyCode::PageUp => self.moa_reference_selector.page_up(),
@@ -7462,6 +8787,11 @@ impl App {
                         self.split_detail_scroll(DetailSurface::VisionModelSelector),
                     );
                 }
+                KeyCode::Tab | KeyCode::BackTab
+                    if !self.detail_fullscreen_active(DetailSurface::VisionModelSelector) =>
+                {
+                    self.toggle_simple_split_focus(DetailSurface::VisionModelSelector);
+                }
                 KeyCode::Enter => {
                     if let Some(model) = self
                         .vision_model_selector
@@ -7474,14 +8804,22 @@ impl App {
                     }
                 }
                 KeyCode::Up => {
-                    self.vision_model_selector.move_up();
-                    self.reset_split_detail_scroll(DetailSurface::VisionModelSelector);
-                    self.reset_detail_fullscreen_scroll(DetailSurface::VisionModelSelector);
+                    if self.simple_split_detail_focused(DetailSurface::VisionModelSelector) {
+                        self.scroll_split_detail_lines(DetailSurface::VisionModelSelector, -1);
+                    } else {
+                        self.vision_model_selector.move_up();
+                        self.reset_split_detail_scroll(DetailSurface::VisionModelSelector);
+                        self.reset_detail_fullscreen_scroll(DetailSurface::VisionModelSelector);
+                    }
                 }
                 KeyCode::Down => {
-                    self.vision_model_selector.move_down();
-                    self.reset_split_detail_scroll(DetailSurface::VisionModelSelector);
-                    self.reset_detail_fullscreen_scroll(DetailSurface::VisionModelSelector);
+                    if self.simple_split_detail_focused(DetailSurface::VisionModelSelector) {
+                        self.scroll_split_detail_lines(DetailSurface::VisionModelSelector, 1);
+                    } else {
+                        self.vision_model_selector.move_down();
+                        self.reset_split_detail_scroll(DetailSurface::VisionModelSelector);
+                        self.reset_detail_fullscreen_scroll(DetailSurface::VisionModelSelector);
+                    }
                 }
                 KeyCode::PageUp
                     if self.detail_fullscreen_active(DetailSurface::VisionModelSelector) =>
@@ -7493,9 +8831,38 @@ impl App {
                 {
                     self.page_down_detail_fullscreen(DetailSurface::VisionModelSelector);
                 }
-                KeyCode::PageUp => self.page_up_split_detail(DetailSurface::VisionModelSelector, 8),
-                KeyCode::PageDown => {
-                    self.page_down_split_detail(DetailSurface::VisionModelSelector, 8)
+                KeyCode::PageUp => self.apply_simple_selector_paging(
+                    DetailSurface::VisionModelSelector,
+                    PagingIntent::Up,
+                ),
+                KeyCode::PageDown => self.apply_simple_selector_paging(
+                    DetailSurface::VisionModelSelector,
+                    PagingIntent::Down,
+                ),
+                KeyCode::Home => {
+                    if self.simple_split_detail_focused(DetailSurface::VisionModelSelector) {
+                        self.set_split_detail_scroll_to_edge(
+                            DetailSurface::VisionModelSelector,
+                            false,
+                        );
+                    } else {
+                        self.vision_model_selector.selected = 0;
+                        self.reset_split_detail_scroll(DetailSurface::VisionModelSelector);
+                        self.reset_detail_fullscreen_scroll(DetailSurface::VisionModelSelector);
+                    }
+                }
+                KeyCode::End => {
+                    if self.simple_split_detail_focused(DetailSurface::VisionModelSelector) {
+                        self.set_split_detail_scroll_to_edge(
+                            DetailSurface::VisionModelSelector,
+                            true,
+                        );
+                    } else {
+                        self.vision_model_selector.selected =
+                            self.vision_model_selector.filtered.len().saturating_sub(1);
+                        self.reset_split_detail_scroll(DetailSurface::VisionModelSelector);
+                        self.reset_detail_fullscreen_scroll(DetailSurface::VisionModelSelector);
+                    }
                 }
                 KeyCode::Backspace => {
                     self.vision_model_selector.pop_char();
@@ -7529,6 +8896,11 @@ impl App {
                         self.split_detail_scroll(DetailSurface::ImageModelSelector),
                     );
                 }
+                KeyCode::Tab | KeyCode::BackTab
+                    if !self.detail_fullscreen_active(DetailSurface::ImageModelSelector) =>
+                {
+                    self.toggle_simple_split_focus(DetailSurface::ImageModelSelector);
+                }
                 KeyCode::Enter => {
                     if let Some(model) = self
                         .image_model_selector
@@ -7541,14 +8913,22 @@ impl App {
                     }
                 }
                 KeyCode::Up => {
-                    self.image_model_selector.move_up();
-                    self.reset_split_detail_scroll(DetailSurface::ImageModelSelector);
-                    self.reset_detail_fullscreen_scroll(DetailSurface::ImageModelSelector);
+                    if self.simple_split_detail_focused(DetailSurface::ImageModelSelector) {
+                        self.scroll_split_detail_lines(DetailSurface::ImageModelSelector, -1);
+                    } else {
+                        self.image_model_selector.move_up();
+                        self.reset_split_detail_scroll(DetailSurface::ImageModelSelector);
+                        self.reset_detail_fullscreen_scroll(DetailSurface::ImageModelSelector);
+                    }
                 }
                 KeyCode::Down => {
-                    self.image_model_selector.move_down();
-                    self.reset_split_detail_scroll(DetailSurface::ImageModelSelector);
-                    self.reset_detail_fullscreen_scroll(DetailSurface::ImageModelSelector);
+                    if self.simple_split_detail_focused(DetailSurface::ImageModelSelector) {
+                        self.scroll_split_detail_lines(DetailSurface::ImageModelSelector, 1);
+                    } else {
+                        self.image_model_selector.move_down();
+                        self.reset_split_detail_scroll(DetailSurface::ImageModelSelector);
+                        self.reset_detail_fullscreen_scroll(DetailSurface::ImageModelSelector);
+                    }
                 }
                 KeyCode::PageUp
                     if self.detail_fullscreen_active(DetailSurface::ImageModelSelector) =>
@@ -7560,9 +8940,38 @@ impl App {
                 {
                     self.page_down_detail_fullscreen(DetailSurface::ImageModelSelector);
                 }
-                KeyCode::PageUp => self.page_up_split_detail(DetailSurface::ImageModelSelector, 8),
-                KeyCode::PageDown => {
-                    self.page_down_split_detail(DetailSurface::ImageModelSelector, 8)
+                KeyCode::PageUp => self.apply_simple_selector_paging(
+                    DetailSurface::ImageModelSelector,
+                    PagingIntent::Up,
+                ),
+                KeyCode::PageDown => self.apply_simple_selector_paging(
+                    DetailSurface::ImageModelSelector,
+                    PagingIntent::Down,
+                ),
+                KeyCode::Home => {
+                    if self.simple_split_detail_focused(DetailSurface::ImageModelSelector) {
+                        self.set_split_detail_scroll_to_edge(
+                            DetailSurface::ImageModelSelector,
+                            false,
+                        );
+                    } else {
+                        self.image_model_selector.selected = 0;
+                        self.reset_split_detail_scroll(DetailSurface::ImageModelSelector);
+                        self.reset_detail_fullscreen_scroll(DetailSurface::ImageModelSelector);
+                    }
+                }
+                KeyCode::End => {
+                    if self.simple_split_detail_focused(DetailSurface::ImageModelSelector) {
+                        self.set_split_detail_scroll_to_edge(
+                            DetailSurface::ImageModelSelector,
+                            true,
+                        );
+                    } else {
+                        self.image_model_selector.selected =
+                            self.image_model_selector.filtered.len().saturating_sub(1);
+                        self.reset_split_detail_scroll(DetailSurface::ImageModelSelector);
+                        self.reset_detail_fullscreen_scroll(DetailSurface::ImageModelSelector);
+                    }
                 }
                 KeyCode::Backspace => {
                     self.image_model_selector.pop_char();
@@ -7598,6 +9007,11 @@ impl App {
                         self.split_detail_scroll(DetailSurface::McpSelector),
                     );
                 }
+                KeyCode::Tab | KeyCode::BackTab
+                    if !self.detail_fullscreen_active(DetailSurface::McpSelector) =>
+                {
+                    self.toggle_simple_split_focus(DetailSurface::McpSelector);
+                }
                 _ if selector_action_key(&key, 'r') => {
                     let query = self.mcp_selector.query.clone();
                     self.open_mcp_selector(Some(&query), true);
@@ -7619,14 +9033,22 @@ impl App {
                     }
                 }
                 KeyCode::Up => {
-                    self.mcp_selector.move_up();
-                    self.reset_split_detail_scroll(DetailSurface::McpSelector);
-                    self.reset_detail_fullscreen_scroll(DetailSurface::McpSelector);
+                    if self.simple_split_detail_focused(DetailSurface::McpSelector) {
+                        self.scroll_split_detail_lines(DetailSurface::McpSelector, -1);
+                    } else {
+                        self.mcp_selector.move_up();
+                        self.reset_split_detail_scroll(DetailSurface::McpSelector);
+                        self.reset_detail_fullscreen_scroll(DetailSurface::McpSelector);
+                    }
                 }
                 KeyCode::Down => {
-                    self.mcp_selector.move_down();
-                    self.reset_split_detail_scroll(DetailSurface::McpSelector);
-                    self.reset_detail_fullscreen_scroll(DetailSurface::McpSelector);
+                    if self.simple_split_detail_focused(DetailSurface::McpSelector) {
+                        self.scroll_split_detail_lines(DetailSurface::McpSelector, 1);
+                    } else {
+                        self.mcp_selector.move_down();
+                        self.reset_split_detail_scroll(DetailSurface::McpSelector);
+                        self.reset_detail_fullscreen_scroll(DetailSurface::McpSelector);
+                    }
                 }
                 KeyCode::PageUp if self.detail_fullscreen_active(DetailSurface::McpSelector) => {
                     self.page_up_detail_fullscreen(DetailSurface::McpSelector);
@@ -7634,8 +9056,30 @@ impl App {
                 KeyCode::PageDown if self.detail_fullscreen_active(DetailSurface::McpSelector) => {
                     self.page_down_detail_fullscreen(DetailSurface::McpSelector);
                 }
-                KeyCode::PageUp => self.page_up_split_detail(DetailSurface::McpSelector, 8),
-                KeyCode::PageDown => self.page_down_split_detail(DetailSurface::McpSelector, 8),
+                KeyCode::PageUp => {
+                    self.apply_simple_selector_paging(DetailSurface::McpSelector, PagingIntent::Up)
+                }
+                KeyCode::PageDown => self
+                    .apply_simple_selector_paging(DetailSurface::McpSelector, PagingIntent::Down),
+                KeyCode::Home => {
+                    if self.simple_split_detail_focused(DetailSurface::McpSelector) {
+                        self.set_split_detail_scroll_to_edge(DetailSurface::McpSelector, false);
+                    } else {
+                        self.mcp_selector.selected = 0;
+                        self.reset_split_detail_scroll(DetailSurface::McpSelector);
+                        self.reset_detail_fullscreen_scroll(DetailSurface::McpSelector);
+                    }
+                }
+                KeyCode::End => {
+                    if self.simple_split_detail_focused(DetailSurface::McpSelector) {
+                        self.set_split_detail_scroll_to_edge(DetailSurface::McpSelector, true);
+                    } else {
+                        self.mcp_selector.selected =
+                            self.mcp_selector.filtered.len().saturating_sub(1);
+                        self.reset_split_detail_scroll(DetailSurface::McpSelector);
+                        self.reset_detail_fullscreen_scroll(DetailSurface::McpSelector);
+                    }
+                }
                 KeyCode::Backspace => {
                     self.mcp_selector.pop_char();
                     self.reset_split_detail_scroll(DetailSurface::McpSelector);
@@ -7715,6 +9159,11 @@ impl App {
                         self.split_detail_scroll(DetailSurface::RemoteMcpBrowser),
                     );
                 }
+                KeyCode::Tab | KeyCode::BackTab
+                    if !self.detail_fullscreen_active(DetailSurface::RemoteMcpBrowser) =>
+                {
+                    self.toggle_simple_split_focus(DetailSurface::RemoteMcpBrowser);
+                }
                 KeyCode::Enter => {
                     if let Some(entry) = self.remote_mcp_browser.selector.current().cloned() {
                         match entry.action() {
@@ -7749,14 +9198,22 @@ impl App {
                     self.open_mcp_selector(None, false);
                 }
                 KeyCode::Up => {
-                    self.remote_mcp_browser.selector.move_up();
-                    self.reset_split_detail_scroll(DetailSurface::RemoteMcpBrowser);
-                    self.reset_detail_fullscreen_scroll(DetailSurface::RemoteMcpBrowser);
+                    if self.simple_split_detail_focused(DetailSurface::RemoteMcpBrowser) {
+                        self.scroll_split_detail_lines(DetailSurface::RemoteMcpBrowser, -1);
+                    } else {
+                        self.remote_mcp_browser.selector.move_up();
+                        self.reset_split_detail_scroll(DetailSurface::RemoteMcpBrowser);
+                        self.reset_detail_fullscreen_scroll(DetailSurface::RemoteMcpBrowser);
+                    }
                 }
                 KeyCode::Down => {
-                    self.remote_mcp_browser.selector.move_down();
-                    self.reset_split_detail_scroll(DetailSurface::RemoteMcpBrowser);
-                    self.reset_detail_fullscreen_scroll(DetailSurface::RemoteMcpBrowser);
+                    if self.simple_split_detail_focused(DetailSurface::RemoteMcpBrowser) {
+                        self.scroll_split_detail_lines(DetailSurface::RemoteMcpBrowser, 1);
+                    } else {
+                        self.remote_mcp_browser.selector.move_down();
+                        self.reset_split_detail_scroll(DetailSurface::RemoteMcpBrowser);
+                        self.reset_detail_fullscreen_scroll(DetailSurface::RemoteMcpBrowser);
+                    }
                 }
                 KeyCode::PageUp
                     if self.detail_fullscreen_active(DetailSurface::RemoteMcpBrowser) =>
@@ -7768,9 +9225,39 @@ impl App {
                 {
                     self.page_down_detail_fullscreen(DetailSurface::RemoteMcpBrowser);
                 }
-                KeyCode::PageUp => self.page_up_split_detail(DetailSurface::RemoteMcpBrowser, 8),
-                KeyCode::PageDown => {
-                    self.page_down_split_detail(DetailSurface::RemoteMcpBrowser, 8)
+                KeyCode::PageUp => self.apply_simple_selector_paging(
+                    DetailSurface::RemoteMcpBrowser,
+                    PagingIntent::Up,
+                ),
+                KeyCode::PageDown => self.apply_simple_selector_paging(
+                    DetailSurface::RemoteMcpBrowser,
+                    PagingIntent::Down,
+                ),
+                KeyCode::Home => {
+                    if self.simple_split_detail_focused(DetailSurface::RemoteMcpBrowser) {
+                        self.set_split_detail_scroll_to_edge(
+                            DetailSurface::RemoteMcpBrowser,
+                            false,
+                        );
+                    } else {
+                        self.remote_mcp_browser.selector.selected = 0;
+                        self.reset_split_detail_scroll(DetailSurface::RemoteMcpBrowser);
+                        self.reset_detail_fullscreen_scroll(DetailSurface::RemoteMcpBrowser);
+                    }
+                }
+                KeyCode::End => {
+                    if self.simple_split_detail_focused(DetailSurface::RemoteMcpBrowser) {
+                        self.set_split_detail_scroll_to_edge(DetailSurface::RemoteMcpBrowser, true);
+                    } else {
+                        self.remote_mcp_browser.selector.selected = self
+                            .remote_mcp_browser
+                            .selector
+                            .filtered
+                            .len()
+                            .saturating_sub(1);
+                        self.reset_split_detail_scroll(DetailSurface::RemoteMcpBrowser);
+                        self.reset_detail_fullscreen_scroll(DetailSurface::RemoteMcpBrowser);
+                    }
                 }
                 KeyCode::Backspace => {
                     self.remote_mcp_browser.selector.pop_char();
@@ -7803,6 +9290,11 @@ impl App {
                         DetailSurface::RemoteSkillBrowser,
                         self.split_detail_scroll(DetailSurface::RemoteSkillBrowser),
                     );
+                }
+                KeyCode::Tab | KeyCode::BackTab
+                    if !self.detail_fullscreen_active(DetailSurface::RemoteSkillBrowser) =>
+                {
+                    self.toggle_simple_split_focus(DetailSurface::RemoteSkillBrowser);
                 }
                 KeyCode::Enter => {
                     if let Some(entry) = self.remote_skill_browser.selector.current().cloned() {
@@ -7838,14 +9330,22 @@ impl App {
                     self.needs_redraw = true;
                 }
                 KeyCode::Up => {
-                    self.remote_skill_browser.selector.move_up();
-                    self.reset_split_detail_scroll(DetailSurface::RemoteSkillBrowser);
-                    self.reset_detail_fullscreen_scroll(DetailSurface::RemoteSkillBrowser);
+                    if self.simple_split_detail_focused(DetailSurface::RemoteSkillBrowser) {
+                        self.scroll_split_detail_lines(DetailSurface::RemoteSkillBrowser, -1);
+                    } else {
+                        self.remote_skill_browser.selector.move_up();
+                        self.reset_split_detail_scroll(DetailSurface::RemoteSkillBrowser);
+                        self.reset_detail_fullscreen_scroll(DetailSurface::RemoteSkillBrowser);
+                    }
                 }
                 KeyCode::Down => {
-                    self.remote_skill_browser.selector.move_down();
-                    self.reset_split_detail_scroll(DetailSurface::RemoteSkillBrowser);
-                    self.reset_detail_fullscreen_scroll(DetailSurface::RemoteSkillBrowser);
+                    if self.simple_split_detail_focused(DetailSurface::RemoteSkillBrowser) {
+                        self.scroll_split_detail_lines(DetailSurface::RemoteSkillBrowser, 1);
+                    } else {
+                        self.remote_skill_browser.selector.move_down();
+                        self.reset_split_detail_scroll(DetailSurface::RemoteSkillBrowser);
+                        self.reset_detail_fullscreen_scroll(DetailSurface::RemoteSkillBrowser);
+                    }
                 }
                 KeyCode::PageUp
                     if self.detail_fullscreen_active(DetailSurface::RemoteSkillBrowser) =>
@@ -7857,9 +9357,42 @@ impl App {
                 {
                     self.page_down_detail_fullscreen(DetailSurface::RemoteSkillBrowser);
                 }
-                KeyCode::PageUp => self.page_up_split_detail(DetailSurface::RemoteSkillBrowser, 8),
-                KeyCode::PageDown => {
-                    self.page_down_split_detail(DetailSurface::RemoteSkillBrowser, 8)
+                KeyCode::PageUp => self.apply_simple_selector_paging(
+                    DetailSurface::RemoteSkillBrowser,
+                    PagingIntent::Up,
+                ),
+                KeyCode::PageDown => self.apply_simple_selector_paging(
+                    DetailSurface::RemoteSkillBrowser,
+                    PagingIntent::Down,
+                ),
+                KeyCode::Home => {
+                    if self.simple_split_detail_focused(DetailSurface::RemoteSkillBrowser) {
+                        self.set_split_detail_scroll_to_edge(
+                            DetailSurface::RemoteSkillBrowser,
+                            false,
+                        );
+                    } else {
+                        self.remote_skill_browser.selector.selected = 0;
+                        self.reset_split_detail_scroll(DetailSurface::RemoteSkillBrowser);
+                        self.reset_detail_fullscreen_scroll(DetailSurface::RemoteSkillBrowser);
+                    }
+                }
+                KeyCode::End => {
+                    if self.simple_split_detail_focused(DetailSurface::RemoteSkillBrowser) {
+                        self.set_split_detail_scroll_to_edge(
+                            DetailSurface::RemoteSkillBrowser,
+                            true,
+                        );
+                    } else {
+                        self.remote_skill_browser.selector.selected = self
+                            .remote_skill_browser
+                            .selector
+                            .filtered
+                            .len()
+                            .saturating_sub(1);
+                        self.reset_split_detail_scroll(DetailSurface::RemoteSkillBrowser);
+                        self.reset_detail_fullscreen_scroll(DetailSurface::RemoteSkillBrowser);
+                    }
                 }
                 KeyCode::Backspace => {
                     self.remote_skill_browser.selector.pop_char();
@@ -7892,6 +9425,11 @@ impl App {
                         DetailSurface::RemotePluginBrowser,
                         self.split_detail_scroll(DetailSurface::RemotePluginBrowser),
                     );
+                }
+                KeyCode::Tab | KeyCode::BackTab
+                    if !self.detail_fullscreen_active(DetailSurface::RemotePluginBrowser) =>
+                {
+                    self.toggle_simple_split_focus(DetailSurface::RemotePluginBrowser);
                 }
                 KeyCode::Enter => {
                     if let Some(entry) = self.remote_plugin_browser.selector.current().cloned() {
@@ -7928,14 +9466,22 @@ impl App {
                     self.needs_redraw = true;
                 }
                 KeyCode::Up => {
-                    self.remote_plugin_browser.selector.move_up();
-                    self.reset_split_detail_scroll(DetailSurface::RemotePluginBrowser);
-                    self.reset_detail_fullscreen_scroll(DetailSurface::RemotePluginBrowser);
+                    if self.simple_split_detail_focused(DetailSurface::RemotePluginBrowser) {
+                        self.scroll_split_detail_lines(DetailSurface::RemotePluginBrowser, -1);
+                    } else {
+                        self.remote_plugin_browser.selector.move_up();
+                        self.reset_split_detail_scroll(DetailSurface::RemotePluginBrowser);
+                        self.reset_detail_fullscreen_scroll(DetailSurface::RemotePluginBrowser);
+                    }
                 }
                 KeyCode::Down => {
-                    self.remote_plugin_browser.selector.move_down();
-                    self.reset_split_detail_scroll(DetailSurface::RemotePluginBrowser);
-                    self.reset_detail_fullscreen_scroll(DetailSurface::RemotePluginBrowser);
+                    if self.simple_split_detail_focused(DetailSurface::RemotePluginBrowser) {
+                        self.scroll_split_detail_lines(DetailSurface::RemotePluginBrowser, 1);
+                    } else {
+                        self.remote_plugin_browser.selector.move_down();
+                        self.reset_split_detail_scroll(DetailSurface::RemotePluginBrowser);
+                        self.reset_detail_fullscreen_scroll(DetailSurface::RemotePluginBrowser);
+                    }
                 }
                 KeyCode::PageUp
                     if self.detail_fullscreen_active(DetailSurface::RemotePluginBrowser) =>
@@ -7947,9 +9493,42 @@ impl App {
                 {
                     self.page_down_detail_fullscreen(DetailSurface::RemotePluginBrowser);
                 }
-                KeyCode::PageUp => self.page_up_split_detail(DetailSurface::RemotePluginBrowser, 8),
-                KeyCode::PageDown => {
-                    self.page_down_split_detail(DetailSurface::RemotePluginBrowser, 8)
+                KeyCode::PageUp => self.apply_simple_selector_paging(
+                    DetailSurface::RemotePluginBrowser,
+                    PagingIntent::Up,
+                ),
+                KeyCode::PageDown => self.apply_simple_selector_paging(
+                    DetailSurface::RemotePluginBrowser,
+                    PagingIntent::Down,
+                ),
+                KeyCode::Home => {
+                    if self.simple_split_detail_focused(DetailSurface::RemotePluginBrowser) {
+                        self.set_split_detail_scroll_to_edge(
+                            DetailSurface::RemotePluginBrowser,
+                            false,
+                        );
+                    } else {
+                        self.remote_plugin_browser.selector.selected = 0;
+                        self.reset_split_detail_scroll(DetailSurface::RemotePluginBrowser);
+                        self.reset_detail_fullscreen_scroll(DetailSurface::RemotePluginBrowser);
+                    }
+                }
+                KeyCode::End => {
+                    if self.simple_split_detail_focused(DetailSurface::RemotePluginBrowser) {
+                        self.set_split_detail_scroll_to_edge(
+                            DetailSurface::RemotePluginBrowser,
+                            true,
+                        );
+                    } else {
+                        self.remote_plugin_browser.selector.selected = self
+                            .remote_plugin_browser
+                            .selector
+                            .filtered
+                            .len()
+                            .saturating_sub(1);
+                        self.reset_split_detail_scroll(DetailSurface::RemotePluginBrowser);
+                        self.reset_detail_fullscreen_scroll(DetailSurface::RemotePluginBrowser);
+                    }
                 }
                 KeyCode::Backspace => {
                     self.remote_plugin_browser.selector.pop_char();
@@ -8087,8 +9666,12 @@ impl App {
                 {
                     self.page_down_detail_fullscreen(DetailSurface::ProfileSelector);
                 }
-                KeyCode::PageUp => self.page_up_split_detail(DetailSurface::ProfileSelector, 8),
-                KeyCode::PageDown => self.page_down_split_detail(DetailSurface::ProfileSelector, 8),
+                KeyCode::PageUp => self
+                    .apply_simple_selector_paging(DetailSurface::ProfileSelector, PagingIntent::Up),
+                KeyCode::PageDown => self.apply_simple_selector_paging(
+                    DetailSurface::ProfileSelector,
+                    PagingIntent::Down,
+                ),
                 _ if selector_action_key(&key, 'r') => {
                     self.refresh_profiles_list();
                 }
@@ -8121,6 +9704,11 @@ impl App {
                         self.split_detail_scroll(DetailSurface::SkillSelector),
                     );
                 }
+                KeyCode::Tab | KeyCode::BackTab
+                    if !self.detail_fullscreen_active(DetailSurface::SkillSelector) =>
+                {
+                    self.toggle_simple_split_focus(DetailSurface::SkillSelector);
+                }
                 KeyCode::Char(' ') => {
                     if let Some(name) = self
                         .skill_selector
@@ -8143,14 +9731,22 @@ impl App {
                     }
                 }
                 KeyCode::Up => {
-                    self.skill_selector.move_up();
-                    self.reset_split_detail_scroll(DetailSurface::SkillSelector);
-                    self.reset_detail_fullscreen_scroll(DetailSurface::SkillSelector);
+                    if self.simple_split_detail_focused(DetailSurface::SkillSelector) {
+                        self.scroll_split_detail_lines(DetailSurface::SkillSelector, -1);
+                    } else {
+                        self.skill_selector.move_up();
+                        self.reset_split_detail_scroll(DetailSurface::SkillSelector);
+                        self.reset_detail_fullscreen_scroll(DetailSurface::SkillSelector);
+                    }
                 }
                 KeyCode::Down => {
-                    self.skill_selector.move_down();
-                    self.reset_split_detail_scroll(DetailSurface::SkillSelector);
-                    self.reset_detail_fullscreen_scroll(DetailSurface::SkillSelector);
+                    if self.simple_split_detail_focused(DetailSurface::SkillSelector) {
+                        self.scroll_split_detail_lines(DetailSurface::SkillSelector, 1);
+                    } else {
+                        self.skill_selector.move_down();
+                        self.reset_split_detail_scroll(DetailSurface::SkillSelector);
+                        self.reset_detail_fullscreen_scroll(DetailSurface::SkillSelector);
+                    }
                 }
                 KeyCode::PageUp if self.detail_fullscreen_active(DetailSurface::SkillSelector) => {
                     self.page_up_detail_fullscreen(DetailSurface::SkillSelector);
@@ -8160,8 +9756,29 @@ impl App {
                 {
                     self.page_down_detail_fullscreen(DetailSurface::SkillSelector);
                 }
-                KeyCode::PageUp => self.page_up_split_detail(DetailSurface::SkillSelector, 8),
-                KeyCode::PageDown => self.page_down_split_detail(DetailSurface::SkillSelector, 8),
+                KeyCode::PageUp => self
+                    .apply_simple_selector_paging(DetailSurface::SkillSelector, PagingIntent::Up),
+                KeyCode::PageDown => self
+                    .apply_simple_selector_paging(DetailSurface::SkillSelector, PagingIntent::Down),
+                KeyCode::Home => {
+                    if self.simple_split_detail_focused(DetailSurface::SkillSelector) {
+                        self.set_split_detail_scroll_to_edge(DetailSurface::SkillSelector, false);
+                    } else {
+                        self.skill_selector.selected = 0;
+                        self.reset_split_detail_scroll(DetailSurface::SkillSelector);
+                        self.reset_detail_fullscreen_scroll(DetailSurface::SkillSelector);
+                    }
+                }
+                KeyCode::End => {
+                    if self.simple_split_detail_focused(DetailSurface::SkillSelector) {
+                        self.set_split_detail_scroll_to_edge(DetailSurface::SkillSelector, true);
+                    } else {
+                        self.skill_selector.selected =
+                            self.skill_selector.filtered.len().saturating_sub(1);
+                        self.reset_split_detail_scroll(DetailSurface::SkillSelector);
+                        self.reset_detail_fullscreen_scroll(DetailSurface::SkillSelector);
+                    }
+                }
                 _ if selector_action_key(&key, 'r') => {
                     self.open_remote_skill_selector(None);
                 }
@@ -8187,11 +9804,22 @@ impl App {
                         self.tool_manager.active = false;
                     }
                 }
-                KeyCode::Tab => {
+                KeyCode::Left => {
+                    self.tool_manager_scope = self.tool_manager_scope.previous();
+                    let _ = self.refresh_tool_manager_entries();
+                    self.reset_split_detail_scroll(DetailSurface::ToolManager);
+                    self.reset_detail_fullscreen_scroll(DetailSurface::ToolManager);
+                }
+                KeyCode::Right => {
                     self.tool_manager_scope = self.tool_manager_scope.next();
                     let _ = self.refresh_tool_manager_entries();
                     self.reset_split_detail_scroll(DetailSurface::ToolManager);
                     self.reset_detail_fullscreen_scroll(DetailSurface::ToolManager);
+                }
+                KeyCode::Tab | KeyCode::BackTab
+                    if !self.detail_fullscreen_active(DetailSurface::ToolManager) =>
+                {
+                    self.toggle_simple_split_focus(DetailSurface::ToolManager);
                 }
                 _ if selector_action_key(&key, 'z') => {
                     self.toggle_detail_fullscreen(
@@ -8203,14 +9831,22 @@ impl App {
                     self.toggle_tool_manager_selected();
                 }
                 KeyCode::Up => {
-                    self.tool_manager.move_up();
-                    self.reset_split_detail_scroll(DetailSurface::ToolManager);
-                    self.reset_detail_fullscreen_scroll(DetailSurface::ToolManager);
+                    if self.simple_split_detail_focused(DetailSurface::ToolManager) {
+                        self.scroll_split_detail_lines(DetailSurface::ToolManager, -1);
+                    } else {
+                        self.tool_manager.move_up();
+                        self.reset_split_detail_scroll(DetailSurface::ToolManager);
+                        self.reset_detail_fullscreen_scroll(DetailSurface::ToolManager);
+                    }
                 }
                 KeyCode::Down => {
-                    self.tool_manager.move_down();
-                    self.reset_split_detail_scroll(DetailSurface::ToolManager);
-                    self.reset_detail_fullscreen_scroll(DetailSurface::ToolManager);
+                    if self.simple_split_detail_focused(DetailSurface::ToolManager) {
+                        self.scroll_split_detail_lines(DetailSurface::ToolManager, 1);
+                    } else {
+                        self.tool_manager.move_down();
+                        self.reset_split_detail_scroll(DetailSurface::ToolManager);
+                        self.reset_detail_fullscreen_scroll(DetailSurface::ToolManager);
+                    }
                 }
                 KeyCode::PageUp if self.detail_fullscreen_active(DetailSurface::ToolManager) => {
                     self.page_up_detail_fullscreen(DetailSurface::ToolManager);
@@ -8218,8 +9854,30 @@ impl App {
                 KeyCode::PageDown if self.detail_fullscreen_active(DetailSurface::ToolManager) => {
                     self.page_down_detail_fullscreen(DetailSurface::ToolManager);
                 }
-                KeyCode::PageUp => self.page_up_split_detail(DetailSurface::ToolManager, 8),
-                KeyCode::PageDown => self.page_down_split_detail(DetailSurface::ToolManager, 8),
+                KeyCode::PageUp => {
+                    self.apply_simple_selector_paging(DetailSurface::ToolManager, PagingIntent::Up)
+                }
+                KeyCode::PageDown => self
+                    .apply_simple_selector_paging(DetailSurface::ToolManager, PagingIntent::Down),
+                KeyCode::Home => {
+                    if self.simple_split_detail_focused(DetailSurface::ToolManager) {
+                        self.set_split_detail_scroll_to_edge(DetailSurface::ToolManager, false);
+                    } else {
+                        self.tool_manager.selected = 0;
+                        self.reset_split_detail_scroll(DetailSurface::ToolManager);
+                        self.reset_detail_fullscreen_scroll(DetailSurface::ToolManager);
+                    }
+                }
+                KeyCode::End => {
+                    if self.simple_split_detail_focused(DetailSurface::ToolManager) {
+                        self.set_split_detail_scroll_to_edge(DetailSurface::ToolManager, true);
+                    } else {
+                        self.tool_manager.selected =
+                            self.tool_manager.filtered.len().saturating_sub(1);
+                        self.reset_split_detail_scroll(DetailSurface::ToolManager);
+                        self.reset_detail_fullscreen_scroll(DetailSurface::ToolManager);
+                    }
+                }
                 _ if selector_action_key(&key, 'r') => {
                     self.reset_tool_manager_policy();
                 }
@@ -8245,11 +9903,22 @@ impl App {
                         self.plugin_toggle.active = false;
                     }
                 }
-                KeyCode::Tab => {
+                KeyCode::Left => {
+                    self.plugin_toggle_scope = self.previous_plugin_toggle_scope();
+                    let _ = self.refresh_plugin_toggle_entries();
+                    self.reset_split_detail_scroll(DetailSurface::PluginToggle);
+                    self.reset_detail_fullscreen_scroll(DetailSurface::PluginToggle);
+                }
+                KeyCode::Right => {
                     self.plugin_toggle_scope = self.next_plugin_toggle_scope();
                     let _ = self.refresh_plugin_toggle_entries();
                     self.reset_split_detail_scroll(DetailSurface::PluginToggle);
                     self.reset_detail_fullscreen_scroll(DetailSurface::PluginToggle);
+                }
+                KeyCode::Tab | KeyCode::BackTab
+                    if !self.detail_fullscreen_active(DetailSurface::PluginToggle) =>
+                {
+                    self.toggle_simple_split_focus(DetailSurface::PluginToggle);
                 }
                 _ if selector_action_key(&key, 'z') => {
                     self.toggle_detail_fullscreen(
@@ -8264,14 +9933,22 @@ impl App {
                     self.toggle_plugin_selected();
                 }
                 KeyCode::Up => {
-                    self.plugin_toggle.move_up();
-                    self.reset_split_detail_scroll(DetailSurface::PluginToggle);
-                    self.reset_detail_fullscreen_scroll(DetailSurface::PluginToggle);
+                    if self.simple_split_detail_focused(DetailSurface::PluginToggle) {
+                        self.scroll_split_detail_lines(DetailSurface::PluginToggle, -1);
+                    } else {
+                        self.plugin_toggle.move_up();
+                        self.reset_split_detail_scroll(DetailSurface::PluginToggle);
+                        self.reset_detail_fullscreen_scroll(DetailSurface::PluginToggle);
+                    }
                 }
                 KeyCode::Down => {
-                    self.plugin_toggle.move_down();
-                    self.reset_split_detail_scroll(DetailSurface::PluginToggle);
-                    self.reset_detail_fullscreen_scroll(DetailSurface::PluginToggle);
+                    if self.simple_split_detail_focused(DetailSurface::PluginToggle) {
+                        self.scroll_split_detail_lines(DetailSurface::PluginToggle, 1);
+                    } else {
+                        self.plugin_toggle.move_down();
+                        self.reset_split_detail_scroll(DetailSurface::PluginToggle);
+                        self.reset_detail_fullscreen_scroll(DetailSurface::PluginToggle);
+                    }
                 }
                 KeyCode::PageUp if self.detail_fullscreen_active(DetailSurface::PluginToggle) => {
                     self.page_up_detail_fullscreen(DetailSurface::PluginToggle);
@@ -8279,8 +9956,30 @@ impl App {
                 KeyCode::PageDown if self.detail_fullscreen_active(DetailSurface::PluginToggle) => {
                     self.page_down_detail_fullscreen(DetailSurface::PluginToggle);
                 }
-                KeyCode::PageUp => self.page_up_split_detail(DetailSurface::PluginToggle, 8),
-                KeyCode::PageDown => self.page_down_split_detail(DetailSurface::PluginToggle, 8),
+                KeyCode::PageUp => {
+                    self.apply_simple_selector_paging(DetailSurface::PluginToggle, PagingIntent::Up)
+                }
+                KeyCode::PageDown => self
+                    .apply_simple_selector_paging(DetailSurface::PluginToggle, PagingIntent::Down),
+                KeyCode::Home => {
+                    if self.simple_split_detail_focused(DetailSurface::PluginToggle) {
+                        self.set_split_detail_scroll_to_edge(DetailSurface::PluginToggle, false);
+                    } else {
+                        self.plugin_toggle.selected = 0;
+                        self.reset_split_detail_scroll(DetailSurface::PluginToggle);
+                        self.reset_detail_fullscreen_scroll(DetailSurface::PluginToggle);
+                    }
+                }
+                KeyCode::End => {
+                    if self.simple_split_detail_focused(DetailSurface::PluginToggle) {
+                        self.set_split_detail_scroll_to_edge(DetailSurface::PluginToggle, true);
+                    } else {
+                        self.plugin_toggle.selected =
+                            self.plugin_toggle.filtered.len().saturating_sub(1);
+                        self.reset_split_detail_scroll(DetailSurface::PluginToggle);
+                        self.reset_detail_fullscreen_scroll(DetailSurface::PluginToggle);
+                    }
+                }
                 _ if selector_action_key(&key, 'r') => {
                     self.open_remote_plugin_selector(None, None);
                 }
@@ -8312,6 +10011,11 @@ impl App {
                         self.split_detail_scroll(DetailSurface::ConfigSelector),
                     );
                 }
+                KeyCode::Tab | KeyCode::BackTab
+                    if !self.detail_fullscreen_active(DetailSurface::ConfigSelector) =>
+                {
+                    self.toggle_simple_split_focus(DetailSurface::ConfigSelector);
+                }
                 KeyCode::Enter => {
                     if let Some(entry) = self.config_selector.current() {
                         let action = entry.action;
@@ -8321,14 +10025,22 @@ impl App {
                     }
                 }
                 KeyCode::Up => {
-                    self.config_selector.move_up();
-                    self.reset_split_detail_scroll(DetailSurface::ConfigSelector);
-                    self.reset_detail_fullscreen_scroll(DetailSurface::ConfigSelector);
+                    if self.simple_split_detail_focused(DetailSurface::ConfigSelector) {
+                        self.scroll_split_detail_lines(DetailSurface::ConfigSelector, -1);
+                    } else {
+                        self.config_selector.move_up();
+                        self.reset_split_detail_scroll(DetailSurface::ConfigSelector);
+                        self.reset_detail_fullscreen_scroll(DetailSurface::ConfigSelector);
+                    }
                 }
                 KeyCode::Down => {
-                    self.config_selector.move_down();
-                    self.reset_split_detail_scroll(DetailSurface::ConfigSelector);
-                    self.reset_detail_fullscreen_scroll(DetailSurface::ConfigSelector);
+                    if self.simple_split_detail_focused(DetailSurface::ConfigSelector) {
+                        self.scroll_split_detail_lines(DetailSurface::ConfigSelector, 1);
+                    } else {
+                        self.config_selector.move_down();
+                        self.reset_split_detail_scroll(DetailSurface::ConfigSelector);
+                        self.reset_detail_fullscreen_scroll(DetailSurface::ConfigSelector);
+                    }
                 }
                 KeyCode::PageUp if self.detail_fullscreen_active(DetailSurface::ConfigSelector) => {
                     self.page_up_detail_fullscreen(DetailSurface::ConfigSelector);
@@ -8338,8 +10050,31 @@ impl App {
                 {
                     self.page_down_detail_fullscreen(DetailSurface::ConfigSelector);
                 }
-                KeyCode::PageUp => self.page_up_split_detail(DetailSurface::ConfigSelector, 8),
-                KeyCode::PageDown => self.page_down_split_detail(DetailSurface::ConfigSelector, 8),
+                KeyCode::PageUp => self
+                    .apply_simple_selector_paging(DetailSurface::ConfigSelector, PagingIntent::Up),
+                KeyCode::PageDown => self.apply_simple_selector_paging(
+                    DetailSurface::ConfigSelector,
+                    PagingIntent::Down,
+                ),
+                KeyCode::Home => {
+                    if self.simple_split_detail_focused(DetailSurface::ConfigSelector) {
+                        self.set_split_detail_scroll_to_edge(DetailSurface::ConfigSelector, false);
+                    } else {
+                        self.config_selector.selected = 0;
+                        self.reset_split_detail_scroll(DetailSurface::ConfigSelector);
+                        self.reset_detail_fullscreen_scroll(DetailSurface::ConfigSelector);
+                    }
+                }
+                KeyCode::End => {
+                    if self.simple_split_detail_focused(DetailSurface::ConfigSelector) {
+                        self.set_split_detail_scroll_to_edge(DetailSurface::ConfigSelector, true);
+                    } else {
+                        self.config_selector.selected =
+                            self.config_selector.filtered.len().saturating_sub(1);
+                        self.reset_split_detail_scroll(DetailSurface::ConfigSelector);
+                        self.reset_detail_fullscreen_scroll(DetailSurface::ConfigSelector);
+                    }
+                }
                 KeyCode::Backspace => {
                     self.config_selector.pop_char();
                     self.reset_split_detail_scroll(DetailSurface::ConfigSelector);
@@ -8374,6 +10109,8 @@ impl App {
                 }
                 KeyCode::Up => self.skin_browser.move_up(),
                 KeyCode::Down => self.skin_browser.move_down(),
+                KeyCode::Tab => self.skin_browser.move_down(),
+                KeyCode::BackTab => self.skin_browser.move_up(),
                 KeyCode::PageUp => self.skin_browser.page_up(),
                 KeyCode::PageDown => self.skin_browser.page_down(),
                 KeyCode::Backspace => self.skin_browser.pop_char(),
@@ -8804,6 +10541,7 @@ impl App {
         self.seen_tool_signatures.clear();
         // Reset the response accumulator for the new turn (voice mode uses it).
         self.last_agent_response_text.clear();
+        self.buffered_assistant_output.clear();
         self.display_state = DisplayState::AwaitingFirstToken {
             frame: 0,
             started: Instant::now(),
@@ -8830,205 +10568,30 @@ impl App {
             );
         }
         let prompt = effective_input;
+        self.ensure_hook_registry_loaded();
         let hook_registry_clone = self.hook_registry.clone();
-        self.rt_handle.spawn(async move {
-            use edgecrab_core::agent::StreamEvent;
-            let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel::<StreamEvent>();
+        tracing::info!(
+            prompt_len = prompt.len(),
+            "TUI: dispatching prompt to agent task"
+        );
+        let request_task = self.rt_handle.spawn(async move {
+            tracing::info!("TUI→agent: outer task started on tokio worker");
+            let (chunk_tx, chunk_rx) =
+                tokio::sync::mpsc::unbounded_channel::<edgecrab_core::agent::StreamEvent>();
 
             let agent_clone = Arc::clone(&agent);
+            let agent_for_task = Arc::clone(&agent);
             let prompt_clone = prompt.clone();
             let hook_registry = hook_registry_clone;
             let agent_task = tokio::spawn(async move {
-                agent_clone.chat_streaming(&prompt_clone, chunk_tx).await
+                tracing::info!("TUI→agent: inner agent_task started, calling chat_streaming");
+                let result = agent_for_task.chat_streaming(&prompt_clone, chunk_tx).await;
+                tracing::info!(?result, "TUI→agent: chat_streaming returned");
+                result
             });
-            let mut saw_terminal_event = false;
-
-            while let Some(event) = chunk_rx.recv().await {
-                match event {
-                    StreamEvent::Token(text) => {
-                        let _ = tx.send(AgentResponse::Token(text));
-                    }
-                    StreamEvent::Reasoning(text) => {
-                        let _ = tx.send(AgentResponse::Reasoning(text));
-                    }
-                    StreamEvent::ToolExec {
-                        tool_call_id,
-                        name,
-                        args_json,
-                    } => {
-                        let _ = tx.send(AgentResponse::ToolExec {
-                            tool_call_id,
-                            name,
-                            args_json,
-                        });
-                    }
-                    StreamEvent::ToolProgress {
-                        tool_call_id,
-                        name,
-                        message,
-                    } => {
-                        let _ = tx.send(AgentResponse::ToolProgress {
-                            tool_call_id,
-                            name,
-                            message,
-                        });
-                    }
-                    StreamEvent::ToolDone {
-                        tool_call_id,
-                        name,
-                        args_json,
-                        result_preview,
-                        duration_ms,
-                        is_error,
-                    } => {
-                        let _ = tx.send(AgentResponse::ToolDone {
-                            tool_call_id,
-                            name,
-                            args_json,
-                            result_preview,
-                            duration_ms,
-                            is_error,
-                        });
-                    }
-                    StreamEvent::SubAgentStart {
-                        task_index,
-                        task_count,
-                        goal,
-                    } => {
-                        let _ = tx.send(AgentResponse::SubAgentStart {
-                            task_index,
-                            task_count,
-                            goal,
-                        });
-                    }
-                    StreamEvent::SubAgentReasoning {
-                        task_index,
-                        task_count,
-                        text,
-                    } => {
-                        let _ = tx.send(AgentResponse::SubAgentReasoning {
-                            task_index,
-                            task_count,
-                            text,
-                        });
-                    }
-                    StreamEvent::SubAgentToolExec {
-                        task_index,
-                        task_count,
-                        name,
-                        args_json,
-                    } => {
-                        let _ = tx.send(AgentResponse::SubAgentToolExec {
-                            task_index,
-                            task_count,
-                            name,
-                            args_json,
-                        });
-                    }
-                    StreamEvent::SubAgentFinish {
-                        task_index,
-                        task_count,
-                        status,
-                        duration_ms,
-                        summary,
-                        api_calls,
-                        model,
-                    } => {
-                        let _ = tx.send(AgentResponse::SubAgentFinish {
-                            task_index,
-                            task_count,
-                            status,
-                            duration_ms,
-                            summary,
-                            api_calls,
-                            model,
-                        });
-                    }
-                    StreamEvent::Done => {
-                        saw_terminal_event = true;
-                        let _ = tx.send(AgentResponse::Done);
-                        break;
-                    }
-                    StreamEvent::Error(e) => {
-                        saw_terminal_event = true;
-                        let _ = tx.send(AgentResponse::Error(e));
-                        break;
-                    }
-                    StreamEvent::Clarify {
-                        question,
-                        choices,
-                        response_tx,
-                    } => {
-                        let _ = tx.send(AgentResponse::Clarify {
-                            question,
-                            choices,
-                            response_tx,
-                        });
-                        // Don't break — the agent is paused waiting for the answer.
-                        // The TUI will send the answer via the oneshot channel, which
-                        // unblocks the clarify tool and lets the agent continue.
-                    }
-
-                    StreamEvent::Approval {
-                        command,
-                        full_command,
-                        reasons: _,
-                        response_tx,
-                    } => {
-                        let _ = tx.send(AgentResponse::Approval {
-                            command,
-                            full_command,
-                            response_tx,
-                        });
-                        // Don't break — the agent is paused waiting for the approval.
-                    }
-
-                    StreamEvent::SecretRequest {
-                        var_name,
-                        prompt,
-                        is_sudo,
-                        response_tx,
-                    } => {
-                        let _ = tx.send(AgentResponse::SecretRequest {
-                            var_name,
-                            prompt,
-                            is_sudo,
-                            response_tx,
-                        });
-                        // Don't break — agent is paused waiting for the secret value.
-                    }
-
-                    StreamEvent::HookEvent { event, context_json } => {
-                        // Forward tool:pre/post, llm:pre/post events from the
-                        // conversation loop to file-based hook scripts.
-                        if let Ok(ctx) = serde_json::from_str::<
-                            edgecrab_gateway::hooks::HookContext
-                        >(&context_json) {
-                            hook_registry.emit(&event, &ctx).await;
-                        }
-                        // HookEvent is internal — not forwarded to the TUI channel.
-                    }
-
-                    StreamEvent::ContextPressure { estimated_tokens, threshold_tokens } => {
-                        let _ = tx.send(AgentResponse::Notice(format_context_pressure_notice(
-                            estimated_tokens,
-                            threshold_tokens,
-                        )));
-                    }
-                }
-            }
-
-            if !saw_terminal_event {
-                let message = match agent_task.await {
-                    Ok(Ok(())) => {
-                        "Agent stream closed unexpectedly before emitting completion.".to_string()
-                    }
-                    Ok(Err(err)) => err.to_string(),
-                    Err(err) => format!("Agent task failed: {err}"),
-                };
-                let _ = tx.send(AgentResponse::Error(message));
-            }
+            forward_agent_stream_to_tui(agent_clone, chunk_rx, agent_task, tx, hook_registry).await;
         });
+        self.active_request_abort = Some(request_task.abort_handle());
     }
 
     /// Handle a CommandResult from the slash command registry.
@@ -9123,10 +10686,11 @@ impl App {
                 );
             }
             CommandResult::Stop => {
-                if let Some(ref agent) = self.agent {
-                    agent.interrupt();
+                if self.cancel_active_request() {
+                    self.push_output("Stopping current request...", OutputRole::System);
+                } else {
+                    self.push_output("No request is currently running.", OutputRole::System);
                 }
-                self.push_output("Stopping current request...", OutputRole::System);
             }
             CommandResult::Retry => {
                 if let Some(agent) = self.agent.clone() {
@@ -9793,27 +11357,32 @@ impl App {
                         *token_count = self.turn_stream_tokens;
                     }
 
-                    if let Some(idx) = self.streaming_line {
-                        if idx < self.output.len() {
-                            self.output[idx].text.push_str(&text);
-                            self.output[idx].rendered = None; // invalidate cache
+                    if self.live_token_display_enabled {
+                        if let Some(idx) = self.streaming_line {
+                            if idx < self.output.len() {
+                                self.output[idx].text.push_str(&text);
+                                self.output[idx].invalidate_render_cache();
+                            }
+                        } else {
+                            self.output.push(OutputLine {
+                                text: text.clone(),
+                                role: OutputRole::Assistant,
+                                prebuilt_spans: None,
+                                rendered: None,
+                                plain_rendered: None,
+                            });
+                            self.streaming_line = Some(self.output.len() - 1);
+                            // Only auto-scroll to bottom if the user is already there
+                            if self.at_bottom {
+                                self.scroll_offset = 0;
+                            }
                         }
+                        self.needs_redraw = true;
                     } else {
-                        self.output.push(OutputLine {
-                            text: text.clone(),
-                            role: OutputRole::Assistant,
-                            prebuilt_spans: None,
-                            rendered: None,
-                        });
-                        self.streaming_line = Some(self.output.len() - 1);
-                        // Only auto-scroll to bottom if the user is already there
-                        if self.at_bottom {
-                            self.scroll_offset = 0;
-                        }
+                        self.buffered_assistant_output.push_str(&text);
                     }
                     // Accumulate response text for voice mode TTS readback.
                     self.last_agent_response_text.push_str(&text);
-                    self.needs_redraw = true;
                 }
                 AgentResponse::Notice(text) => {
                     self.push_output(text, OutputRole::System);
@@ -9834,14 +11403,15 @@ impl App {
                         if let Some(idx) = self.reasoning_line {
                             if idx < self.output.len() {
                                 self.output[idx].text.push_str(&text);
-                                self.output[idx].rendered = None;
+                                self.output[idx].invalidate_render_cache();
                             }
                         } else {
                             let line = OutputLine {
-                                text: format!("🧠 Thinking\n{text}"),
+                                text: format!("Thinking\n{text}"),
                                 role: OutputRole::Reasoning,
                                 prebuilt_spans: None,
                                 rendered: None,
+                                plain_rendered: None,
                             };
                             if let Some(idx) = self.streaming_line {
                                 let insert_idx = idx.min(self.output.len());
@@ -9864,6 +11434,7 @@ impl App {
                     name,
                     args_json,
                 } => {
+                    self.flush_buffered_assistant_output();
                     // CRITICAL: Break the streaming buffer at the tool boundary.
                     // Without this, tokens arriving after the tool call append to
                     // the pre-tool text, visually merging text before and after
@@ -9915,6 +11486,7 @@ impl App {
                             role: OutputRole::Tool,
                             prebuilt_spans: Some(running_spans),
                             rendered: None,
+                            plain_rendered: None,
                         });
                         self.pending_tool_lines.insert(
                             tool_call_id,
@@ -9978,7 +11550,7 @@ impl App {
                                 Some(detail.as_str()),
                                 &self.theme.tool_emojis,
                             ));
-                            self.output[line_idx].rendered = None;
+                            self.output[line_idx].invalidate_render_cache();
                         }
                     } else {
                         self.push_output(
@@ -10021,7 +11593,7 @@ impl App {
                         if let Some(PendingToolLine { line_idx, .. }) = pending.as_ref() {
                             if *line_idx < self.output.len() {
                                 self.output[*line_idx].prebuilt_spans = Some(spans);
-                                self.output[*line_idx].rendered = None; // invalidate cache
+                                self.output[*line_idx].invalidate_render_cache();
                             } else {
                                 // Index out of range — fall back to append (shouldn't happen).
                                 self.push_output_spans(spans, OutputRole::Tool);
@@ -10082,6 +11654,7 @@ impl App {
                     task_count,
                     goal,
                 } => {
+                    self.flush_buffered_assistant_output();
                     self.progress_seq = self.progress_seq.saturating_add(1);
                     self.active_subagents.insert(
                         task_index,
@@ -10101,6 +11674,7 @@ impl App {
                             task_index, task_count, "subagent", &goal, "running",
                         )),
                         rendered: None,
+                        plain_rendered: None,
                     });
                     if self.at_bottom {
                         self.scroll_offset = 0;
@@ -10128,6 +11702,7 @@ impl App {
                     name,
                     args_json,
                 } => {
+                    self.flush_buffered_assistant_output();
                     self.progress_seq = self.progress_seq.saturating_add(1);
                     self.streaming_line = None;
                     let preview = crate::tool_display::extract_tool_preview(&name, &args_json);
@@ -10147,6 +11722,7 @@ impl App {
                             task_index, task_count, "tool", &detail, "running",
                         )),
                         rendered: None,
+                        plain_rendered: None,
                     });
                     if self.at_bottom {
                         self.scroll_offset = 0;
@@ -10197,6 +11773,7 @@ impl App {
                             tone,
                         )),
                         rendered: None,
+                        plain_rendered: None,
                     });
                     if self.at_bottom {
                         self.scroll_offset = 0;
@@ -10204,18 +11781,8 @@ impl App {
                     self.needs_redraw = true;
                 }
                 AgentResponse::Done => {
-                    self.is_processing = false;
-                    self.streaming_line = None;
-                    self.reasoning_line = None;
-                    // Reset per-turn streaming counters for next turn.
-                    self.in_flight_tool_count = 0;
-                    self.active_subagents.clear();
-                    self.turn_stream_tokens = 0;
-                    self.pending_tool_lines.clear();
-                    self.hidden_tool_calls.clear();
-                    self.active_tools.clear();
-                    self.seen_tool_signatures.clear();
-                    self.display_state = DisplayState::Idle;
+                    self.flush_buffered_assistant_output();
+                    self.clear_active_request_state();
                     self.last_response_time = Some(Instant::now());
                     self.turn_count += 1;
                     self.needs_redraw = true;
@@ -10242,17 +11809,8 @@ impl App {
                     }
                 }
                 AgentResponse::Error(err) => {
-                    self.is_processing = false;
-                    self.streaming_line = None;
-                    self.reasoning_line = None;
-                    self.in_flight_tool_count = 0;
-                    self.active_subagents.clear();
-                    self.turn_stream_tokens = 0;
-                    self.pending_tool_lines.clear();
-                    self.hidden_tool_calls.clear();
-                    self.active_tools.clear();
-                    self.seen_tool_signatures.clear();
-                    self.display_state = DisplayState::Idle;
+                    self.flush_buffered_assistant_output();
+                    self.clear_active_request_state();
                     self.push_output(err, OutputRole::Error);
                     if self.voice_continuous_active {
                         self.stop_continuous_voice_session(false);
@@ -11082,8 +12640,14 @@ impl App {
     }
 
     /// Advance spinner frame (called on every tick).
-    fn tick_spinner(&mut self) {
+    ///
+    /// Returns true only when the tick changed visible state and therefore
+    /// needs a redraw.
+    fn tick_spinner(&mut self) -> bool {
         self.poll_voice_recording_completion();
+        if !self.animate_status_indicators {
+            return false;
+        }
         let mut animated = false;
         let advance_verb = match &mut self.display_state {
             DisplayState::AwaitingFirstToken { frame, .. } => {
@@ -11126,7 +12690,7 @@ impl App {
             animated = true;
         }
         if !animated {
-            return;
+            return false;
         }
         if advance_verb {
             self.thinking_verb_idx = self.thinking_verb_idx.wrapping_add(1);
@@ -11135,7 +12699,20 @@ impl App {
                 self.kaomoji_frame_idx = self.kaomoji_frame_idx.wrapping_add(1);
             }
         }
-        self.needs_redraw = true;
+        true
+    }
+
+    fn needs_periodic_status_refresh(&self) -> bool {
+        matches!(
+            self.display_state,
+            DisplayState::AwaitingFirstToken { .. }
+                | DisplayState::Thinking { .. }
+                | DisplayState::Streaming { .. }
+                | DisplayState::ToolExec { .. }
+                | DisplayState::BgOp { .. }
+        ) || self.voice_recording.is_some()
+            || self.voice_playback_active
+            || self.voice_continuous_active
     }
 
     fn voice_presence_state(&self) -> Option<VoicePresenceState> {
@@ -11547,7 +13124,7 @@ impl App {
         }
         self.reset_split_detail_scroll(DetailSurface::ToolManager);
         self.tool_manager_status_note =
-            Some("Space toggles policy. Tab switches scope. R restores defaults.".into());
+            Some("Space toggles policy. Tab focuses panes. Left/Right changes scope. R restores defaults.".into());
         self.tool_manager.active = true;
         self.needs_redraw = true;
     }
@@ -11754,6 +13331,26 @@ impl App {
         }
     }
 
+    fn previous_plugin_toggle_scope(&self) -> PluginScope {
+        let platforms = self.plugin_toggle_platforms();
+        match &self.plugin_toggle_scope {
+            PluginScope::Global => platforms
+                .last()
+                .cloned()
+                .map(PluginScope::Platform)
+                .unwrap_or(PluginScope::Global),
+            PluginScope::Platform(current) => {
+                let prev_idx = platforms
+                    .iter()
+                    .position(|platform| platform == current)
+                    .and_then(|idx| idx.checked_sub(1));
+                prev_idx
+                    .and_then(|idx| platforms.get(idx).cloned().map(PluginScope::Platform))
+                    .unwrap_or(PluginScope::Global)
+            }
+        }
+    }
+
     fn build_plugin_toggle_entries(&self, scope: &PluginScope) -> Vec<PluginToggleEntry> {
         let config = self.load_runtime_config();
         let mut manager = crate::plugins::PluginManager::new();
@@ -11800,7 +13397,7 @@ impl App {
         let _ = self.refresh_plugin_toggle_entries();
         self.reset_split_detail_scroll(DetailSurface::PluginToggle);
         self.plugin_toggle_status_note = Some(
-            "Space stages changes. Enter saves. Tab switches scope. R opens remote search.".into(),
+            "Space stages changes. Enter saves. Tab focuses panes. Left/Right changes scope. R opens remote search.".into(),
         );
         self.plugin_toggle.activate();
         self.needs_redraw = true;
@@ -14335,8 +15932,7 @@ impl App {
                 title: Some(new_title.clone()),
             };
 
-            db.save_session(&record).map_err(|e| e.to_string())?;
-            db.replace_messages(&new_session_id, &messages, now)
+            db.save_session_with_messages(&record, &messages, now)
                 .map_err(|e| e.to_string())?;
             agent
                 .restore_session(&new_session_id)
@@ -14620,6 +16216,7 @@ impl App {
         self.turn_count = 0;
         self.last_response_time = None;
         self.last_agent_response_text.clear();
+        self.buffered_assistant_output.clear();
         self.streaming_line = None;
         self.reasoning_line = None;
         self.in_flight_tool_count = 0;
@@ -15137,6 +16734,7 @@ impl App {
 
     fn set_streaming_preference(&mut self, enabled: bool) -> anyhow::Result<()> {
         self.streaming_enabled = enabled;
+        self.live_token_display_enabled = enabled;
         if let Some(agent) = self.agent.clone() {
             self.rt_handle.block_on(async {
                 agent.set_streaming(enabled).await;
@@ -15295,8 +16893,19 @@ impl App {
 
         let msg = match normalized.as_str() {
             "" | "status" => {
-                let state = if self.streaming_enabled { "on" } else { "off" };
-                format!("Streaming: {state}. Usage: /stream <on|off|toggle|status>")
+                let api_state = if self.streaming_enabled { "on" } else { "off" };
+                let display_state = if self.live_token_display_enabled {
+                    "on"
+                } else {
+                    "off"
+                };
+                if api_state == display_state {
+                    format!("Streaming: {api_state}. Usage: /stream <on|off|toggle|status>")
+                } else {
+                    format!(
+                        "Streaming API: {api_state}. Live token display: {display_state}. Usage: /stream <on|off|toggle|status>"
+                    )
+                }
             }
             "on" | "enable" | "enabled" => match self.set_streaming_preference(true) {
                 Ok(()) => {
@@ -15407,8 +17016,9 @@ impl App {
     }
 
     fn open_model_selector_for(&mut self, current_model: &str, target: ModelSelectorTarget) {
-        let static_entries = build_model_selector_entries(&ModelCatalog::grouped_catalog(), None);
-        self.apply_model_selector_catalog(static_entries, current_model, false, target);
+        self.ensure_model_selector_seeded();
+        let entries = self.model_selector.items.clone();
+        self.apply_model_selector_catalog(entries, current_model, false, target);
     }
 
     fn refresh_shared_model_selector_catalog(
@@ -18597,6 +20207,11 @@ impl App {
 
     /// Render the scrollable output area with markdown formatting and a scrollbar.
     fn render_output(&mut self, frame: &mut Frame, area: Rect) {
+        if !self.rich_transcript {
+            self.render_output_compact(frame, area);
+            return;
+        }
+
         // ── Pass 1: ensure every OutputLine has a cached render ──────
         for ol in &mut self.output {
             if ol.rendered.is_none() {
@@ -18753,7 +20368,11 @@ impl App {
         // "Scrolled ↑" hint — anchored to right edge of the content area
         // (not the scrollbar edge) so it stays readable.
         if scroll > 0 {
-            let hint = format!(" ↑{}  ^G=end  ↕scroll  PgUp/Dn ", scroll);
+            let hint = format!(
+                " ↑{}  ^G=end  ↕scroll  {} ",
+                scroll,
+                self.paging_key_hint_label()
+            );
             let hint_len = hint
                 .len()
                 .min(content_area.width.saturating_sub(1) as usize);
@@ -18772,8 +20391,157 @@ impl App {
         }
     }
 
+    fn render_output_compact(&mut self, frame: &mut Frame, area: Rect) {
+        let glyphs = self.terminal_glyph_profile;
+        let flatten_spans = |spans: &[Span<'static>]| -> String {
+            spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        };
+        let line_style = |role: OutputRole| match role {
+            OutputRole::Assistant => Style::default().fg(Color::Rgb(220, 228, 235)),
+            OutputRole::Tool => Style::default().fg(Color::Rgb(235, 200, 120)),
+            OutputRole::System => Style::default()
+                .fg(Color::Rgb(155, 165, 175))
+                .add_modifier(Modifier::DIM),
+            OutputRole::Reasoning => Style::default()
+                .fg(Color::Rgb(145, 150, 170))
+                .add_modifier(Modifier::DIM),
+            OutputRole::Error => Style::default().fg(Color::Rgb(239, 83, 80)),
+            OutputRole::User => Style::default().fg(Color::Rgb(255, 248, 220)),
+        };
+        let prefix_for = |role: OutputRole, ascii: bool| match (role, ascii) {
+            (OutputRole::Tool, true) => "[tool] ",
+            (OutputRole::Tool, false) => "› ",
+            (OutputRole::System, true) => "[note] ",
+            (OutputRole::System, false) => "· ",
+            (OutputRole::Reasoning, true) => "[think] ",
+            (OutputRole::Reasoning, false) => "~ ",
+            (OutputRole::Error, true) => "[error] ",
+            (OutputRole::Error, false) => "! ",
+            _ => "",
+        };
+
+        for ol in &mut self.output {
+            if ol.plain_rendered.is_none() {
+                let style = line_style(ol.role);
+                let prefix = prefix_for(ol.role, matches!(glyphs, TerminalGlyphProfile::Ascii));
+                let prefix_width = prefix.width();
+                let text = ol
+                    .prebuilt_spans
+                    .as_ref()
+                    .map(|spans| flatten_spans(spans))
+                    .unwrap_or_else(|| ol.text.clone());
+                let source_lines = if text.is_empty() {
+                    vec![String::new()]
+                } else {
+                    text.lines().map(str::to_string).collect::<Vec<_>>()
+                };
+                let mut rendered_lines = Vec::with_capacity(source_lines.len());
+                for (idx, content) in source_lines.into_iter().enumerate() {
+                    let leader = if idx == 0 {
+                        prefix.to_string()
+                    } else if prefix_width == 0 {
+                        String::new()
+                    } else {
+                        " ".repeat(prefix_width)
+                    };
+                    rendered_lines.push(Line::from(vec![
+                        Span::styled(leader, style),
+                        Span::styled(content, style),
+                    ]));
+                }
+                ol.plain_rendered = Some(rendered_lines);
+            }
+        }
+
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        for ol in &self.output {
+            if let Some(rendered) = &ol.plain_rendered {
+                lines.extend(rendered.clone());
+            }
+        }
+
+        let content_width = area.width.max(1) as usize;
+        let visual_rows: u16 = lines
+            .iter()
+            .map(|line| {
+                let width = line.width();
+                if width == 0 {
+                    1
+                } else {
+                    width.div_ceil(content_width) as u16
+                }
+            })
+            .sum();
+        let visible_height = area.height;
+        let max_scroll = visual_rows.saturating_sub(visible_height);
+        if self.scroll_offset > max_scroll {
+            self.scroll_offset = max_scroll;
+        }
+        let scroll = self.scroll_offset;
+        self.output_visual_rows = visual_rows;
+        self.output_area_height = visible_height;
+        self.at_bottom = scroll == 0;
+
+        let top_row = visual_rows.saturating_sub(visible_height + scroll);
+        let paragraph = Paragraph::new(Text::from(lines))
+            .wrap(Wrap { trim: false })
+            .scroll((top_row, 0));
+        frame.render_widget(paragraph, area);
+
+        if self.show_output_scrollbar && visual_rows > visible_height && area.width > 1 {
+            let scrollbar_area = Rect {
+                x: area.right().saturating_sub(1),
+                y: area.y,
+                width: 1,
+                height: area.height,
+            };
+            let scrollbar_pos = max_scroll.saturating_sub(scroll) as usize;
+            let mut scrollbar_state =
+                ScrollbarState::new(max_scroll as usize).position(scrollbar_pos);
+            frame.render_stateful_widget(
+                Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .begin_symbol(None)
+                    .end_symbol(None)
+                    .track_symbol(Some("|"))
+                    .thumb_symbol("#"),
+                scrollbar_area,
+                &mut scrollbar_state,
+            );
+        }
+
+        if scroll > 0 && area.width > 12 {
+            let hint =
+                self.paging_scroll_hint(scroll, matches!(glyphs, TerminalGlyphProfile::Ascii));
+            let hint_width = hint.width().min(area.width as usize) as u16;
+            let hint_area = Rect::new(
+                area.right().saturating_sub(hint_width),
+                area.y,
+                hint_width,
+                1,
+            );
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    hint,
+                    Style::default()
+                        .fg(Color::Rgb(240, 210, 120))
+                        .bg(Color::Rgb(30, 30, 38))
+                        .add_modifier(Modifier::BOLD),
+                )),
+                hint_area,
+            );
+        }
+    }
+
     /// Render the status bar with spinner and color-coded metrics.
     fn render_status_bar(&self, frame: &mut Frame, area: Rect) {
+        if self.compact_status_bar {
+            self.render_compact_status_bar(frame, area);
+            return;
+        }
+
         let mut left_spans = Vec::new();
 
         // ── Brand badge ─────────────────────────────────────────────
@@ -19097,7 +20865,10 @@ impl App {
         }
         if self.scroll_offset > 0 {
             right_spans.push(Span::styled(
-                " ↑SCROLLED  ^G=↓  ↕scroll  PgUp/Dn ",
+                format!(
+                    " ↑SCROLLED  ^G=↓  ↕scroll  {} ",
+                    self.paging_key_hint_label()
+                ),
                 Style::default()
                     .fg(Color::Rgb(255, 210, 50))
                     .add_modifier(Modifier::BOLD),
@@ -19227,6 +20998,126 @@ impl App {
             .style(Style::default().bg(Color::Rgb(30, 30, 38)))
             .alignment(Alignment::Right);
         frame.render_widget(right_status, right_area);
+    }
+
+    fn render_compact_status_bar(&self, frame: &mut Frame, area: Rect) {
+        let glyphs = self.terminal_glyph_profile;
+        let divider = " | ";
+        let state = match &self.display_state {
+            DisplayState::Idle => "idle".to_string(),
+            DisplayState::AwaitingFirstToken { frame, started } => format!(
+                "{} wait {}s",
+                compact_spinner_frame(*frame, glyphs),
+                started.elapsed().as_secs()
+            ),
+            DisplayState::Thinking { frame, started } => format!(
+                "{} think {}s",
+                compact_spinner_frame(*frame, glyphs),
+                started.elapsed().as_secs()
+            ),
+            DisplayState::Streaming {
+                token_count,
+                started,
+            } => {
+                let secs = started.elapsed().as_secs().max(1);
+                format!("reply {}tok {}t/s", token_count, token_count / secs)
+            }
+            DisplayState::ToolExec { frame, started, .. } => format!(
+                "{} tool {}s",
+                compact_spinner_frame(*frame, glyphs),
+                started.elapsed().as_secs()
+            ),
+            DisplayState::BgOp { frame, label, .. } => format!(
+                "{} {}",
+                compact_spinner_frame(*frame, glyphs),
+                edgecrab_core::safe_truncate(label, 18)
+            ),
+            DisplayState::WaitingForClarify => "reply needed".into(),
+            DisplayState::WaitingForApproval { .. } => "approval needed".into(),
+            DisplayState::SecretCapture { .. } => "secret input".into(),
+            DisplayState::ValueCapture { .. } => "editing".into(),
+        };
+        let token_display = if let (Some(cw), Some(pct)) = (
+            self.context_window,
+            context_usage_ratio(self.total_tokens, self.context_window),
+        ) {
+            format!(
+                "{}/{} {:.0}%",
+                format_tokens(self.total_tokens),
+                format_tokens(cw),
+                pct * 100.0
+            )
+        } else {
+            format_tokens(self.total_tokens)
+        };
+        let mode = if self.mouse_capture_enabled {
+            "scroll"
+        } else {
+            "select"
+        };
+        let transport = if self.remote_terminal_session {
+            "ssh"
+        } else {
+            "local"
+        };
+        let profile = match self.terminal_ui_profile {
+            TerminalUiProfile::Standard => "std",
+            TerminalUiProfile::ReducedMotion => "calm",
+            TerminalUiProfile::BasicCompat => "compat",
+        };
+        let right = format!(
+            "t{}{}{}{}",
+            self.turn_count,
+            divider,
+            mode,
+            if self.remote_terminal_session {
+                " ssh"
+            } else {
+                ""
+            }
+        );
+        let left = format!(
+            "{}{}{}{}{}{}${:.4}{}{}{}{}",
+            state,
+            divider,
+            edgecrab_core::safe_truncate(&self.model_name, 18),
+            divider,
+            token_display,
+            divider,
+            self.session_cost,
+            divider,
+            transport,
+            divider,
+            profile,
+        );
+        let right_width = right.width().min(area.width as usize) as u16;
+        let left_area = Rect {
+            width: area.width.saturating_sub(right_width),
+            ..area
+        };
+        let right_area = Rect {
+            x: area.right().saturating_sub(right_width),
+            width: right_width,
+            ..area
+        };
+        let bg = Style::default().bg(Color::Rgb(30, 30, 38));
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                edgecrab_core::safe_truncate(&left, left_area.width as usize),
+                bg.fg(Color::Rgb(200, 205, 215)),
+            ))
+            .style(bg),
+            left_area,
+        );
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                edgecrab_core::safe_truncate(&right, right_area.width as usize),
+                bg.fg(Color::Rgb(120, 130, 150)),
+            ))
+            .style(bg)
+            .alignment(Alignment::Right),
+            right_area,
+        );
     }
 
     fn render_model_like_selector(
@@ -19384,7 +21275,7 @@ impl App {
                         Span::styled("change item  ", Style::default().fg(Color::DarkGray)),
                         Span::styled("type ", Style::default().fg(Color::Cyan)),
                         Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
-                        Span::styled("PgUp/Dn ", Style::default().fg(Color::Cyan)),
+                        self.paging_key_help_span(Color::Cyan),
                         Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
                         Span::styled("Enter ", Style::default().fg(Color::Cyan)),
                         Span::styled("select  ", Style::default().fg(Color::DarkGray)),
@@ -19406,13 +21297,15 @@ impl App {
             detail_lines,
         );
 
-        let help = Paragraph::new(Line::from(vec![
+        let mut help_spans = vec![
             Span::styled(" ↑↓ ", Style::default().fg(Color::Cyan)),
             Span::styled("browse  ", Style::default().fg(Color::DarkGray)),
             Span::styled("type ", Style::default().fg(Color::Cyan)),
             Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("PgUp/Dn ", Style::default().fg(Color::Cyan)),
-            Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
+        ];
+        help_spans.extend(self.focus_pane_help_spans(Color::Cyan));
+        help_spans.extend(self.page_or_scroll_help_spans(Color::Cyan));
+        help_spans.extend([
             Span::styled("Enter ", Style::default().fg(Color::Cyan)),
             Span::styled("select  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Z ", Style::default().fg(Color::Cyan)),
@@ -19420,7 +21313,11 @@ impl App {
             Span::styled("Esc ", Style::default().fg(Color::Cyan)),
             Span::styled("cancel  ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format!("{model_count} {}", chrome.count_label),
+                format!(
+                    "{model_count} {} · {} pane",
+                    chrome.count_label,
+                    self.simple_split_focus_label(detail_surface)
+                ),
                 Style::default().fg(Color::Rgb(80, 80, 100)),
             ),
             Span::styled(
@@ -19430,7 +21327,8 @@ impl App {
                     .unwrap_or_default(),
                 Style::default().fg(Color::Yellow),
             ),
-        ]));
+        ]);
+        let help = Paragraph::new(Line::from(help_spans));
         frame.render_widget(help, chunks[2]);
     }
 
@@ -19845,7 +21743,12 @@ impl App {
     }
 
     fn reset_split_detail_scroll(&mut self, surface: DetailSurface) {
-        self.set_split_detail_scroll(surface, 0);
+        match surface {
+            DetailSurface::GatewayBrowser => self.gateway_browser_pane.reset_scroll(),
+            DetailSurface::SessionBrowser => self.session_browser_pane.reset_scroll(),
+            DetailSurface::SessionInspector => self.session_inspector.pane.reset_scroll(),
+            _ => self.simple_detail_state.reset(surface),
+        }
         self.needs_redraw = true;
     }
 
@@ -19879,7 +21782,11 @@ impl App {
             ScrollableDetailChrome {
                 title: "Details",
                 border_color,
-                focused: true,
+                focused: if Self::simple_split_focus_supported(surface) {
+                    self.simple_split_focus(surface) == SplitPaneFocus::Detail
+                } else {
+                    true
+                },
                 requested_scroll: self.split_detail_scroll(surface),
             },
             detail_lines,
@@ -19939,6 +21846,82 @@ impl App {
         }
     }
 
+    fn page_simple_selector_list(&mut self, surface: DetailSurface, intent: PagingIntent) {
+        match surface {
+            DetailSurface::ModelSelector => match intent {
+                PagingIntent::Up => self.model_selector.page_up(),
+                PagingIntent::Down => self.model_selector.page_down(),
+            },
+            DetailSurface::VisionModelSelector => match intent {
+                PagingIntent::Up => self.vision_model_selector.page_up(),
+                PagingIntent::Down => self.vision_model_selector.page_down(),
+            },
+            DetailSurface::ImageModelSelector => match intent {
+                PagingIntent::Up => self.image_model_selector.page_up(),
+                PagingIntent::Down => self.image_model_selector.page_down(),
+            },
+            DetailSurface::McpSelector => match intent {
+                PagingIntent::Up => self.mcp_selector.page_up(),
+                PagingIntent::Down => self.mcp_selector.page_down(),
+            },
+            DetailSurface::RemoteMcpBrowser => match intent {
+                PagingIntent::Up => self.remote_mcp_browser.selector.page_up(),
+                PagingIntent::Down => self.remote_mcp_browser.selector.page_down(),
+            },
+            DetailSurface::RemoteSkillBrowser => match intent {
+                PagingIntent::Up => self.remote_skill_browser.selector.page_up(),
+                PagingIntent::Down => self.remote_skill_browser.selector.page_down(),
+            },
+            DetailSurface::RemotePluginBrowser => match intent {
+                PagingIntent::Up => self.remote_plugin_browser.selector.page_up(),
+                PagingIntent::Down => self.remote_plugin_browser.selector.page_down(),
+            },
+            DetailSurface::ProfileSelector => match intent {
+                PagingIntent::Up => self.profile_selector.page_up(),
+                PagingIntent::Down => self.profile_selector.page_down(),
+            },
+            DetailSurface::SkillSelector => match intent {
+                PagingIntent::Up => self.skill_selector.page_up(),
+                PagingIntent::Down => self.skill_selector.page_down(),
+            },
+            DetailSurface::ToolManager => match intent {
+                PagingIntent::Up => self.tool_manager.page_up(),
+                PagingIntent::Down => self.tool_manager.page_down(),
+            },
+            DetailSurface::PluginToggle => match intent {
+                PagingIntent::Up => self.plugin_toggle.page_up(),
+                PagingIntent::Down => self.plugin_toggle.page_down(),
+            },
+            DetailSurface::ConfigSelector => match intent {
+                PagingIntent::Up => self.config_selector.page_up(),
+                PagingIntent::Down => self.config_selector.page_down(),
+            },
+            DetailSurface::GatewayBrowser
+            | DetailSurface::SessionBrowser
+            | DetailSurface::SessionInspector => return,
+        }
+
+        self.reset_split_detail_scroll(surface);
+        self.reset_detail_fullscreen_scroll(surface);
+        self.needs_redraw = true;
+    }
+
+    fn apply_simple_selector_paging(&mut self, surface: DetailSurface, intent: PagingIntent) {
+        if self.detail_fullscreen_active(surface) {
+            match intent {
+                PagingIntent::Up => self.page_up_detail_fullscreen(surface),
+                PagingIntent::Down => self.page_down_detail_fullscreen(surface),
+            }
+        } else if self.simple_split_detail_focused(surface) {
+            match intent {
+                PagingIntent::Up => self.page_up_split_detail(surface, 8),
+                PagingIntent::Down => self.page_down_split_detail(surface, 8),
+            }
+        } else {
+            self.page_simple_selector_list(surface, intent);
+        }
+    }
+
     fn detail_fullscreen_scroll(&self, surface: DetailSurface) -> u16 {
         self.detail_fullscreen
             .filter(|state| state.surface == surface)
@@ -19968,7 +21951,10 @@ impl App {
             },
         );
         self.render_scrollable_browser_detail(frame, chunks[1], chrome.detail, detail_lines);
-        frame.render_widget(Paragraph::new(chrome.help), chunks[2]);
+        frame.render_widget(
+            Paragraph::new(self.normalize_paging_help_line(chrome.help)),
+            chunks[2],
+        );
     }
 
     fn render_mcp_selector(&self, frame: &mut Frame, area: Rect) {
@@ -20134,7 +22120,7 @@ impl App {
                         Span::styled("change item  ", Style::default().fg(Color::DarkGray)),
                         Span::styled("type ", Style::default().fg(Color::Rgb(110, 220, 210))),
                         Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
-                        Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                        self.paging_key_help_span(Color::Rgb(110, 220, 210)),
                         Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
                         Span::styled("Space ", Style::default().fg(Color::Rgb(110, 220, 210))),
                         Span::styled("toggle  ", Style::default().fg(Color::DarkGray)),
@@ -20159,13 +22145,15 @@ impl App {
             detail_lines,
         );
 
-        let help = Paragraph::new(Line::from(vec![
+        let mut help_spans = vec![
             Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("browse  ", Style::default().fg(Color::DarkGray)),
             Span::styled("type ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(110, 220, 210))),
-            Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
+        ];
+        help_spans.extend(self.focus_pane_help_spans(Color::Rgb(110, 220, 210)));
+        help_spans.extend(self.page_or_scroll_help_spans(Color::Rgb(110, 220, 210)));
+        help_spans.extend([
             Span::styled("Enter ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("default action  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Space ", Style::default().fg(Color::Rgb(110, 220, 210))),
@@ -20187,10 +22175,15 @@ impl App {
             Span::styled("Esc ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("cancel  ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format!("{} entries", filtered.len()),
+                format!(
+                    "{} entries · {} pane",
+                    filtered.len(),
+                    self.simple_split_focus_label(DetailSurface::McpSelector)
+                ),
                 Style::default().fg(Color::Rgb(100, 120, 120)),
             ),
-        ]));
+        ]);
+        let help = Paragraph::new(Line::from(help_spans));
         frame.render_widget(help, chunks[2]);
     }
 
@@ -20427,7 +22420,7 @@ impl App {
                         Span::styled("change item  ", Style::default().fg(Color::DarkGray)),
                         Span::styled("type ", Style::default().fg(Color::Rgb(110, 220, 210))),
                         Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
-                        Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                        self.paging_key_help_span(Color::Rgb(110, 220, 210)),
                         Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
                         Span::styled("Enter ", Style::default().fg(Color::Rgb(110, 220, 210))),
                         Span::styled("default action  ", Style::default().fg(Color::DarkGray)),
@@ -20457,13 +22450,15 @@ impl App {
         } else {
             "matches"
         };
-        let help = Paragraph::new(Line::from(vec![
+        let mut help_spans = vec![
             Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("browse  ", Style::default().fg(Color::DarkGray)),
             Span::styled("type ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(110, 220, 210))),
-            Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
+        ];
+        help_spans.extend(self.focus_pane_help_spans(Color::Rgb(110, 220, 210)));
+        help_spans.extend(self.page_or_scroll_help_spans(Color::Rgb(110, 220, 210)));
+        help_spans.extend([
             Span::styled("Enter ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("default action  ", Style::default().fg(Color::DarkGray)),
             Span::styled("I ", Style::default().fg(Color::Rgb(110, 220, 210))),
@@ -20479,10 +22474,16 @@ impl App {
             Span::styled("Esc ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("cancel  ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format!("{} {}", filtered.len(), status_text),
+                format!(
+                    "{} {} · {} pane",
+                    filtered.len(),
+                    status_text,
+                    self.simple_split_focus_label(DetailSurface::RemoteMcpBrowser)
+                ),
                 Style::default().fg(Color::Rgb(100, 120, 120)),
             ),
-        ]));
+        ]);
+        let help = Paragraph::new(Line::from(help_spans));
         frame.render_widget(help, chunks[2]);
     }
 
@@ -20516,7 +22517,7 @@ impl App {
             "Tab / Right  next detail tab",
             "Shift-Tab / Left  previous detail tab",
             "Home / End  jump to first or last match",
-            "PgUp / PgDn  scroll the detail pane",
+            "PgUp / PgDn  jump through matches in split view",
             "Z      toggle split/full detail",
             "Esc    close overlay",
             "",
@@ -20714,7 +22715,7 @@ impl App {
                         Span::styled("change item  ", Style::default().fg(Color::DarkGray)),
                         Span::styled("type ", Style::default().fg(Color::Rgb(120, 205, 255))),
                         Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
-                        Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(120, 205, 255))),
+                        self.paging_key_help_span(Color::Rgb(120, 205, 255)),
                         Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
                         Span::styled("Enter ", Style::default().fg(Color::Rgb(120, 205, 255))),
                         Span::styled("switch profile  ", Style::default().fg(Color::DarkGray)),
@@ -20763,8 +22764,8 @@ impl App {
             Span::styled("browse  ", Style::default().fg(Color::DarkGray)),
             Span::styled("type ", Style::default().fg(Color::Rgb(120, 205, 255))),
             Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(120, 205, 255))),
-            Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
+            self.paging_key_help_span(Color::Rgb(120, 205, 255)),
+            Span::styled("jump list  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Enter ", Style::default().fg(Color::Rgb(120, 205, 255))),
             Span::styled("switch  ", Style::default().fg(Color::DarkGray)),
             Span::styled("C/S/M/T ", Style::default().fg(Color::Rgb(120, 205, 255))),
@@ -20942,7 +22943,7 @@ impl App {
                         Span::styled("change item  ", Style::default().fg(Color::DarkGray)),
                         Span::styled("type ", Style::default().fg(Color::Rgb(255, 191, 0))),
                         Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
-                        Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(255, 191, 0))),
+                        self.paging_key_help_span(Color::Rgb(255, 191, 0)),
                         Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
                         Span::styled("Space ", Style::default().fg(Color::Rgb(255, 191, 0))),
                         Span::styled("toggle active  ", Style::default().fg(Color::DarkGray)),
@@ -20966,13 +22967,15 @@ impl App {
             detail_lines,
         );
 
-        let help = Paragraph::new(Line::from(vec![
+        let mut help_spans = vec![
             Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(255, 191, 0))),
             Span::styled("browse  ", Style::default().fg(Color::DarkGray)),
             Span::styled("type ", Style::default().fg(Color::Rgb(255, 191, 0))),
             Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(255, 191, 0))),
-            Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
+        ];
+        help_spans.extend(self.focus_pane_help_spans(Color::Rgb(255, 191, 0)));
+        help_spans.extend(self.page_or_scroll_help_spans(Color::Rgb(255, 191, 0)));
+        help_spans.extend([
             Span::styled("Space ", Style::default().fg(Color::Rgb(255, 191, 0))),
             Span::styled("toggle active  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Enter ", Style::default().fg(Color::Rgb(255, 191, 0))),
@@ -20984,10 +22987,14 @@ impl App {
             Span::styled("Esc ", Style::default().fg(Color::Rgb(255, 191, 0))),
             Span::styled("cancel  ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format!("{skill_count} skill(s)"),
+                format!(
+                    "{skill_count} skill(s) · {} pane",
+                    self.simple_split_focus_label(DetailSurface::SkillSelector)
+                ),
                 Style::default().fg(Color::Rgb(80, 75, 40)),
             ),
-        ]));
+        ]);
+        let help = Paragraph::new(Line::from(help_spans));
         frame.render_widget(help, chunks[2]);
     }
 
@@ -21225,7 +23232,7 @@ impl App {
                         Span::styled("change item  ", Style::default().fg(Color::DarkGray)),
                         Span::styled("type ", Style::default().fg(Color::Rgb(110, 220, 210))),
                         Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
-                        Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                        self.paging_key_help_span(Color::Rgb(110, 220, 210)),
                         Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
                         Span::styled("Enter ", Style::default().fg(Color::Rgb(110, 220, 210))),
                         Span::styled("default action  ", Style::default().fg(Color::DarkGray)),
@@ -21253,8 +23260,10 @@ impl App {
             Span::styled("browse  ", Style::default().fg(Color::DarkGray)),
             Span::styled("type ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(110, 220, 210))),
-            Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
+        ];
+        help_spans.extend(self.focus_pane_help_spans(Color::Rgb(110, 220, 210)));
+        help_spans.extend(self.page_or_scroll_help_spans(Color::Rgb(110, 220, 210)));
+        help_spans.extend([
             Span::styled("Enter ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("default action  ", Style::default().fg(Color::DarkGray)),
             Span::styled("I ", Style::default().fg(Color::Rgb(110, 220, 210))),
@@ -21269,7 +23278,7 @@ impl App {
             Span::styled("local browser  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Esc ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("cancel  ", Style::default().fg(Color::DarkGray)),
-        ];
+        ]);
         let status_text = if browser.inflight_request_id.is_some() {
             "searching"
         } else if !query.is_empty() && filtered.is_empty() {
@@ -21278,7 +23287,12 @@ impl App {
             "matches"
         };
         help_spans.push(Span::styled(
-            format!("{} {}", filtered.len(), status_text),
+            format!(
+                "{} {} · {} pane",
+                filtered.len(),
+                status_text,
+                self.simple_split_focus_label(DetailSurface::RemoteSkillBrowser)
+            ),
             Style::default().fg(Color::Rgb(100, 120, 120)),
         ));
         let help = Paragraph::new(Line::from(help_spans));
@@ -21547,7 +23561,7 @@ impl App {
                         Span::styled("change item  ", Style::default().fg(Color::DarkGray)),
                         Span::styled("type ", Style::default().fg(Color::Rgb(255, 210, 110))),
                         Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
-                        Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(255, 210, 110))),
+                        self.paging_key_help_span(Color::Rgb(255, 210, 110)),
                         Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
                         Span::styled("Enter ", Style::default().fg(Color::Rgb(255, 210, 110))),
                         Span::styled("default action  ", Style::default().fg(Color::DarkGray)),
@@ -21575,8 +23589,10 @@ impl App {
             Span::styled("browse  ", Style::default().fg(Color::DarkGray)),
             Span::styled("type ", Style::default().fg(Color::Rgb(255, 210, 110))),
             Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(255, 210, 110))),
-            Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
+        ];
+        help_spans.extend(self.focus_pane_help_spans(Color::Rgb(255, 210, 110)));
+        help_spans.extend(self.page_or_scroll_help_spans(Color::Rgb(255, 210, 110)));
+        help_spans.extend([
             Span::styled("Enter ", Style::default().fg(Color::Rgb(255, 210, 110))),
             Span::styled("default action  ", Style::default().fg(Color::DarkGray)),
             Span::styled("I ", Style::default().fg(Color::Rgb(255, 210, 110))),
@@ -21591,7 +23607,7 @@ impl App {
             Span::styled("local browser  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Esc ", Style::default().fg(Color::Rgb(255, 210, 110))),
             Span::styled("cancel  ", Style::default().fg(Color::DarkGray)),
-        ];
+        ]);
         let status_text = if browser.inflight_request_id.is_some() {
             "searching"
         } else if !query.is_empty() && filtered.is_empty() {
@@ -21600,7 +23616,12 @@ impl App {
             "matches"
         };
         help_spans.push(Span::styled(
-            format!("{} {}", filtered.len(), status_text),
+            format!(
+                "{} {} · {} pane",
+                filtered.len(),
+                status_text,
+                self.simple_split_focus_label(DetailSurface::RemotePluginBrowser)
+            ),
             Style::default().fg(Color::Rgb(155, 140, 105)),
         ));
         let help = Paragraph::new(Line::from(help_spans));
@@ -21827,11 +23848,11 @@ impl App {
                         Span::styled("change item  ", Style::default().fg(Color::DarkGray)),
                         Span::styled("type ", Style::default().fg(Color::Rgb(110, 220, 210))),
                         Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
-                        Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                        self.paging_key_help_span(Color::Rgb(110, 220, 210)),
                         Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
                         Span::styled("Space ", Style::default().fg(Color::Rgb(110, 220, 210))),
                         Span::styled("toggle  ", Style::default().fg(Color::DarkGray)),
-                        Span::styled("Tab ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                        Span::styled("←→ ", Style::default().fg(Color::Rgb(110, 220, 210))),
                         Span::styled("scope  ", Style::default().fg(Color::DarkGray)),
                         Span::styled("Z ", Style::default().fg(Color::Rgb(110, 220, 210))),
                         Span::styled("split view  ", Style::default().fg(Color::DarkGray)),
@@ -21851,18 +23872,25 @@ impl App {
             detail_lines,
         );
 
-        let footer_note = self
-            .tool_manager_status_note
-            .as_deref()
-            .unwrap_or("Space toggles. Tab switches scope. R restores defaults.");
-        let help = Paragraph::new(Line::from(vec![
+        let footer_note = self.tool_manager_status_note.as_deref().unwrap_or(
+            "Space toggles. Tab focuses panes. Left/Right changes scope. R restores defaults.",
+        );
+        let footer_summary = format!(
+            "{} · {} scope · {} pane",
+            footer_note,
+            self.tool_manager_scope.title(),
+            self.simple_split_focus_label(DetailSurface::ToolManager)
+        );
+        let mut help_spans = vec![
             Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("browse  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(110, 220, 210))),
-            Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
+        ];
+        help_spans.extend(self.focus_pane_help_spans(Color::Rgb(110, 220, 210)));
+        help_spans.extend(self.page_or_scroll_help_spans(Color::Rgb(110, 220, 210)));
+        help_spans.extend([
             Span::styled("Space ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("toggle  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Tab ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("←→ ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("scope  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Z ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("detail  ", Style::default().fg(Color::DarkGray)),
@@ -21871,10 +23899,11 @@ impl App {
             Span::styled("Esc ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("close  ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                edgecrab_core::safe_truncate(footer_note, 44),
+                edgecrab_core::safe_truncate(&footer_summary, 62),
                 Style::default().fg(Color::Rgb(95, 115, 125)),
             ),
-        ]));
+        ]);
+        let help = Paragraph::new(Line::from(help_spans));
         frame.render_widget(help, chunks[2]);
     }
 
@@ -22147,7 +24176,7 @@ impl App {
                 "Space stages enable or disable changes. Enter saves them for the active scope.",
             ));
             detail_lines.push(Line::from(
-                "Tab cycles between global policy and platform-specific policy.",
+                "Tab switches between the list and detail panes. Use Left and Right to change the active policy scope.",
             ));
         } else {
             detail_lines.push(Line::from("No plugins matched the current query."));
@@ -22183,13 +24212,13 @@ impl App {
                         Span::styled("change item  ", Style::default().fg(Color::DarkGray)),
                         Span::styled("type ", Style::default().fg(Color::Rgb(210, 190, 110))),
                         Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
-                        Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(210, 190, 110))),
+                        self.paging_key_help_span(Color::Rgb(210, 190, 110)),
                         Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
                         Span::styled("Space ", Style::default().fg(Color::Rgb(210, 190, 110))),
                         Span::styled("stage change  ", Style::default().fg(Color::DarkGray)),
                         Span::styled("Enter ", Style::default().fg(Color::Rgb(210, 190, 110))),
                         Span::styled("save  ", Style::default().fg(Color::DarkGray)),
-                        Span::styled("Tab ", Style::default().fg(Color::Rgb(210, 190, 110))),
+                        Span::styled("←→ ", Style::default().fg(Color::Rgb(210, 190, 110))),
                         Span::styled("scope  ", Style::default().fg(Color::DarkGray)),
                         Span::styled("R ", Style::default().fg(Color::Rgb(210, 190, 110))),
                         Span::styled("remote search  ", Style::default().fg(Color::DarkGray)),
@@ -22215,18 +24244,26 @@ impl App {
             .plugin_toggle_status_note
             .clone()
             .unwrap_or_else(|| plugin_toggle_status_line(&self.plugin_toggle.items));
-        let help = Paragraph::new(Line::from(vec![
+        let footer_summary = format!(
+            "{} · {} scope · {} pane",
+            footer_note,
+            self.plugin_toggle_scope.title(),
+            self.simple_split_focus_label(DetailSurface::PluginToggle)
+        );
+        let mut help_spans = vec![
             Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(210, 190, 110))),
             Span::styled("browse  ", Style::default().fg(Color::DarkGray)),
             Span::styled("type ", Style::default().fg(Color::Rgb(210, 190, 110))),
             Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(210, 190, 110))),
-            Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
+        ];
+        help_spans.extend(self.focus_pane_help_spans(Color::Rgb(210, 190, 110)));
+        help_spans.extend(self.page_or_scroll_help_spans(Color::Rgb(210, 190, 110)));
+        help_spans.extend([
             Span::styled("Space ", Style::default().fg(Color::Rgb(210, 190, 110))),
             Span::styled("stage change  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Enter ", Style::default().fg(Color::Rgb(210, 190, 110))),
             Span::styled("save  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Tab ", Style::default().fg(Color::Rgb(210, 190, 110))),
+            Span::styled("←→ ", Style::default().fg(Color::Rgb(210, 190, 110))),
             Span::styled("scope  ", Style::default().fg(Color::DarkGray)),
             Span::styled("R ", Style::default().fg(Color::Rgb(210, 190, 110))),
             Span::styled("remote search  ", Style::default().fg(Color::DarkGray)),
@@ -22235,10 +24272,11 @@ impl App {
             Span::styled("Esc ", Style::default().fg(Color::Rgb(210, 190, 110))),
             Span::styled("close  ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                edgecrab_core::safe_truncate(&footer_note, 42),
+                edgecrab_core::safe_truncate(&footer_summary, 62),
                 Style::default().fg(Color::Rgb(120, 120, 110)),
             ),
-        ]));
+        ]);
+        let help = Paragraph::new(Line::from(help_spans));
         frame.render_widget(help, chunks[2]);
     }
 
@@ -22258,7 +24296,7 @@ impl App {
                 ConfigAction::ShowSummary => self.render_config_summary(),
                 ConfigAction::ShowPaths => self.render_config_paths(),
                 ConfigAction::OpenTools => {
-                    "Press Enter to open the live tool manager. Use Space to toggle toolsets or individual tools, Tab to switch scopes, and R to restore defaults.".into()
+                    "Press Enter to open the live tool manager. Use Tab to move between the list and detail panes, Left and Right to change scope, Space to toggle toolsets or individual tools, and R to restore defaults.".into()
                 }
                 ConfigAction::OpenGatewayBrowser => {
                     "Press Enter to open the gateway control browser. From there you can toggle platforms, edit bind settings, change allowlists, update home channels, and restart the gateway runtime without leaving the TUI.".into()
@@ -22448,7 +24486,7 @@ impl App {
                         Span::styled("change item  ", Style::default().fg(Color::DarkGray)),
                         Span::styled("type ", Style::default().fg(Color::Rgb(130, 210, 255))),
                         Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
-                        Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(130, 210, 255))),
+                        self.paging_key_help_span(Color::Rgb(130, 210, 255)),
                         Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
                         Span::styled("Enter ", Style::default().fg(Color::Rgb(130, 210, 255))),
                         Span::styled("run action  ", Style::default().fg(Color::DarkGray)),
@@ -22470,11 +24508,13 @@ impl App {
             detail_lines,
         );
 
-        let help = Paragraph::new(Line::from(vec![
+        let mut help_spans = vec![
             Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(130, 210, 255))),
             Span::styled("browse  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(130, 210, 255))),
-            Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
+        ];
+        help_spans.extend(self.focus_pane_help_spans(Color::Rgb(130, 210, 255)));
+        help_spans.extend(self.page_or_scroll_help_spans(Color::Rgb(130, 210, 255)));
+        help_spans.extend([
             Span::styled("Enter ", Style::default().fg(Color::Rgb(130, 210, 255))),
             Span::styled("run action  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Z ", Style::default().fg(Color::Rgb(130, 210, 255))),
@@ -22482,10 +24522,15 @@ impl App {
             Span::styled("Esc ", Style::default().fg(Color::Rgb(130, 210, 255))),
             Span::styled("cancel  ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format!("{} item(s)", filtered.len()),
+                format!(
+                    "{} item(s) · {} pane",
+                    filtered.len(),
+                    self.simple_split_focus_label(DetailSurface::ConfigSelector)
+                ),
                 Style::default().fg(Color::Rgb(100, 120, 130)),
             ),
-        ]));
+        ]);
+        let help = Paragraph::new(Line::from(help_spans));
         frame.render_widget(help, chunks[2]);
     }
 
@@ -22628,7 +24673,7 @@ impl App {
                         Span::styled("change item  ", Style::default().fg(Color::DarkGray)),
                         Span::styled("type ", Style::default().fg(Color::Rgb(120, 220, 200))),
                         Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
-                        Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(120, 220, 200))),
+                        self.paging_key_help_span(Color::Rgb(120, 220, 200)),
                         Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
                         Span::styled("Enter ", Style::default().fg(Color::Rgb(120, 220, 200))),
                         Span::styled("edit setup  ", Style::default().fg(Color::DarkGray)),
@@ -22981,7 +25026,7 @@ impl App {
                         Span::styled("change item  ", Style::default().fg(Color::DarkGray)),
                         Span::styled("type ", Style::default().fg(Color::Rgb(110, 190, 255))),
                         Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
-                        Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(110, 190, 255))),
+                        self.paging_key_help_span(Color::Rgb(110, 190, 255)),
                         Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
                         Span::styled("Enter ", Style::default().fg(Color::Rgb(110, 190, 255))),
                         Span::styled("inspect  ", Style::default().fg(Color::DarkGray)),
@@ -23008,7 +25053,7 @@ impl App {
             Span::styled("focus pane  ", Style::default().fg(Color::DarkGray)),
             Span::styled("type ", Style::default().fg(Color::Rgb(110, 190, 255))),
             Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(110, 190, 255))),
+            self.paging_key_help_span(Color::Rgb(110, 190, 255)),
             Span::styled("page or scroll  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Enter ", Style::default().fg(Color::Rgb(110, 190, 255))),
             Span::styled("inspect  ", Style::default().fg(Color::DarkGray)),
@@ -23185,7 +25230,7 @@ impl App {
                         Span::styled("change item  ", Style::default().fg(Color::DarkGray)),
                         Span::styled("type ", Style::default().fg(Color::Rgb(120, 215, 185))),
                         Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
-                        Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(120, 215, 185))),
+                        self.paging_key_help_span(Color::Rgb(120, 215, 185)),
                         Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
                         Span::styled("R ", Style::default().fg(Color::Rgb(120, 215, 185))),
                         Span::styled("resume saved  ", Style::default().fg(Color::DarkGray)),
@@ -23207,7 +25252,7 @@ impl App {
             Span::styled("focus pane  ", Style::default().fg(Color::DarkGray)),
             Span::styled("type ", Style::default().fg(Color::Rgb(120, 215, 185))),
             Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("PgUp/Dn ", Style::default().fg(Color::Rgb(120, 215, 185))),
+            self.paging_key_help_span(Color::Rgb(120, 215, 185)),
             Span::styled("page or scroll  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Z ", Style::default().fg(Color::Rgb(120, 215, 185))),
             Span::styled("detail  ", Style::default().fg(Color::DarkGray)),
@@ -23457,7 +25502,7 @@ impl App {
         let help = Paragraph::new(Line::from(vec![
             Span::styled(" ↑↓ ", Style::default().fg(overlay.accent)),
             Span::styled("scroll line  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("PgUp/Dn ", Style::default().fg(overlay.accent)),
+            self.paging_key_help_span(overlay.accent),
             Span::styled("scroll page  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Home/End ", Style::default().fg(overlay.accent)),
             Span::styled("jump  ", Style::default().fg(Color::DarkGray)),
@@ -24392,7 +26437,7 @@ impl App {
         frame.render_widget(&self.textarea, area);
 
         // Ghost text overlay (Fish-style hint)
-        if matches!(self.editor_mode, InputEditorMode::Inline) {
+        if self.show_ghost_hint && matches!(self.editor_mode, InputEditorMode::Inline) {
             if let Some(hint) = self.ghost_hint() {
                 let (row, col) = self.textarea.cursor();
                 let ghost_x = area.x + 1 + col as u16; // +1 for border
@@ -24491,7 +26536,11 @@ impl App {
             let footer_line = if total_candidates > max_items {
                 let hidden =
                     total_candidates.saturating_sub(scroll_end.saturating_sub(scroll_start));
-                format!(" Tab/↑↓ navigate  PgUp/Dn jump  +{} more ", hidden)
+                format!(
+                    " Tab/↑↓ navigate  {} jump  +{} more ",
+                    self.paging_key_hint_label(),
+                    hidden
+                )
             } else {
                 " Tab/↑↓ navigate  Enter select  Esc cancel ".to_string()
             };
@@ -24639,8 +26688,18 @@ pub fn run_tui(app: &mut App) -> io::Result<()> {
     }));
 
     crossterm::terminal::enable_raw_mode()?;
-    let keyboard_enhancement_supported =
-        crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
+    let terminal_caps = terminal_runtime_capabilities();
+    let terminal_profile = terminal_caps.ui_profile;
+    let compatibility_mode = matches!(terminal_profile, TerminalUiProfile::BasicCompat);
+    let reduced_motion_mode = matches!(
+        terminal_profile,
+        TerminalUiProfile::ReducedMotion | TerminalUiProfile::BasicCompat
+    );
+    let keyboard_enhancement_supported = if compatibility_mode {
+        false
+    } else {
+        crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false)
+    };
     let mut stdout = io::stdout();
     crossterm::execute!(
         stdout,
@@ -24670,9 +26729,65 @@ pub fn run_tui(app: &mut App) -> io::Result<()> {
         std::thread::sleep(KEYBOARD_PROTOCOL_WARMUP);
     }
     app.set_keyboard_enhancement_enabled(keyboard_enhancement_enabled);
+    app.terminal_ui_profile = terminal_caps.ui_profile;
+    app.terminal_glyph_profile = terminal_caps.glyph_profile;
+    app.remote_terminal_session = terminal_caps.remote_session;
+    app.direct_paging_keys_supported = terminal_caps.direct_paging_keys_supported;
+    app.compact_status_bar = terminal_caps.compact_status_bar;
+    app.rich_transcript = terminal_caps.rich_transcript;
+    app.show_output_scrollbar = terminal_caps.show_output_scrollbar;
+    app.show_ghost_hint = terminal_caps.show_ghost_hint;
+    app.min_draw_interval = terminal_caps.min_draw_interval;
+    app.animate_status_indicators = terminal_caps.animate_status_indicators;
+    app.mouse_capture_enabled = terminal_caps.mouse_capture_enabled;
+    if compatibility_mode {
+        app.pending_mouse_capture = None;
+
+        // CRITICAL: do NOT propagate streaming=false to the agent.
+        //
+        // The agent's `config.streaming` controls the LLM API call mode.
+        // Many providers (especially Copilot) work reliably ONLY in streaming
+        // mode.  When non-streaming is forced, the reqwest client uses a
+        // 120-second timeout per attempt with stacked retries, causing the TUI
+        // to appear stuck for minutes.
+        //
+        // Instead, disable ONLY the TUI-side live-token rendering. The agent
+        // keeps using streaming APIs, tokens are buffered silently, and the
+        // response is flushed at tool boundaries or when AgentResponse::Done
+        // arrives. This avoids PTY output flooding while keeping the fast,
+        // reliable streaming API path.
+        if app.live_token_display_enabled {
+            // Disable TUI live display only — do NOT push streaming=false to
+            // the agent, which would force the unreliable non-streaming API path.
+            app.live_token_display_enabled = false;
+            app.push_output(
+                "Terminal compatibility mode active. EdgeCrab switched to a low-bandwidth transcript, compact status bar, and buffered live output to avoid PTY stalls. Mouse capture is off, and Ctrl+B / Ctrl+F provide paging. The agent still uses streaming APIs for reliability.",
+                OutputRole::System,
+            );
+        } else {
+            app.push_output(
+                "Terminal compatibility mode active. EdgeCrab is using a low-bandwidth transcript, compact status bar, and mouse-safe scrolling defaults. Use Ctrl+B / Ctrl+F for paging when the terminal does not deliver dedicated page keys.",
+                OutputRole::System,
+            );
+        }
+    } else if reduced_motion_mode {
+        app.push_output(
+            "Terminal reduced-motion mode active. Redraws are rate-limited and the status bar is compact to keep the TUI responsive, while keyboard support, mouse scrolling, and live output stay enabled.",
+            OutputRole::System,
+        );
+    }
+    if app.remote_terminal_session {
+        app.push_output(
+            "Remote terminal session detected. EdgeCrab is using a calmer draw strategy and simpler glyphs to reduce SSH paint latency and width glitches.",
+            OutputRole::System,
+        );
+    }
     if !keyboard_enhancement_enabled {
         app.push_output(
-            "Keyboard note: this terminal does not expose Shift+Enter separately. Use Ctrl+J to open compose mode and insert a newline; use Ctrl+S to send from compose mode.",
+            format!(
+                "Keyboard note: this terminal does not expose Shift+Enter separately. Press Enter to send. Use Ctrl+O to open compose mode and insert a newline, then Ctrl+S to send from compose mode. Ctrl+J still works when the terminal reports it distinctly. {}",
+                app.paging_keyboard_note()
+            ),
             OutputRole::System,
         );
     }
@@ -24709,11 +26824,97 @@ fn event_loop(
     terminal: &mut ratatui::Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
 ) -> io::Result<()> {
+    fn heartbeat_interval_for(profile: TerminalUiProfile) -> Duration {
+        match profile {
+            TerminalUiProfile::Standard => Duration::from_millis(250),
+            TerminalUiProfile::ReducedMotion => Duration::from_millis(800),
+            TerminalUiProfile::BasicCompat => Duration::from_millis(1000),
+        }
+    }
+
+    fn adaptive_draw_interval_after_draw(
+        profile: TerminalUiProfile,
+        floor: Duration,
+        current: Duration,
+        draw_cost: Duration,
+    ) -> Duration {
+        match profile {
+            TerminalUiProfile::Standard => Duration::ZERO,
+            TerminalUiProfile::ReducedMotion | TerminalUiProfile::BasicCompat => {
+                let ceiling = match profile {
+                    TerminalUiProfile::ReducedMotion => Duration::from_millis(120),
+                    TerminalUiProfile::BasicCompat => Duration::from_millis(180),
+                    TerminalUiProfile::Standard => Duration::ZERO,
+                };
+                let floor_ms = floor.as_millis() as u64;
+                let ceiling_ms = ceiling.as_millis() as u64;
+                let current_ms = current.as_millis() as u64;
+                let draw_ms = draw_cost.as_millis() as u64;
+                let scaled_ms = match profile {
+                    TerminalUiProfile::ReducedMotion => draw_ms.saturating_mul(3) / 2,
+                    TerminalUiProfile::BasicCompat => draw_ms.saturating_mul(2),
+                    TerminalUiProfile::Standard => 0,
+                };
+                let target_ms = scaled_ms.clamp(floor_ms, ceiling_ms);
+                if target_ms > current_ms {
+                    Duration::from_millis(target_ms)
+                } else {
+                    Duration::from_millis(current_ms.saturating_sub(10)).max(floor)
+                }
+            }
+        }
+    }
+
+    fn draw_app(
+        terminal: &mut ratatui::Terminal<CrosstermBackend<io::Stdout>>,
+        app: &mut App,
+        effective_draw_interval: &mut Duration,
+        min_draw_interval: Duration,
+        last_draw: &mut Instant,
+        last_status_heartbeat: &mut Instant,
+    ) -> io::Result<()> {
+        if app.needs_full_terminal_clear {
+            terminal.clear()?;
+            app.needs_full_terminal_clear = false;
+        }
+        let draw_started = Instant::now();
+        terminal.draw(|f| app.render(f))?;
+        let draw_cost = draw_started.elapsed();
+        app.needs_redraw = false;
+        *last_draw = Instant::now();
+        *last_status_heartbeat = *last_draw;
+        *effective_draw_interval = adaptive_draw_interval_after_draw(
+            app.terminal_ui_profile,
+            min_draw_interval,
+            *effective_draw_interval,
+            draw_cost,
+        );
+        Ok(())
+    }
+
     let mut last_tick = Instant::now();
-    let tick_rate = std::time::Duration::from_millis(80); // spinner animation rate
+    let tick_rate = if app.animate_status_indicators {
+        std::time::Duration::from_millis(80) // spinner animation rate
+    } else {
+        std::time::Duration::from_millis(250) // housekeeping without redraw churn
+    };
+
+    // In compatibility mode (Apple Terminal etc.), throttle draws so we never
+    // saturate the PTY output buffer.  Apple Terminal processes escape sequences
+    // ~10-50x slower than GPU-accelerated emulators like iTerm2 / kitty / VSCode.
+    // If we draw faster than the terminal can consume, `write()` blocks — which
+    // starves `check_responses()` and makes the TUI appear stuck.
+    let min_draw_interval = app.min_draw_interval;
+    let mut effective_draw_interval = min_draw_interval;
+    let mut last_draw = Instant::now() - min_draw_interval; // allow immediate first draw
+    let mut last_status_heartbeat = Instant::now();
 
     loop {
-        // Check for agent responses first (non-blocking)
+        // Check for agent responses first (non-blocking).  In compat mode the
+        // draw path can block for tens of milliseconds waiting for the terminal
+        // to drain its buffer, so we drain the response channel BEFORE drawing,
+        // and again AFTER polling for terminal events, to minimise the window
+        // during which an AgentResponse::Done can sit unprocessed.
         app.check_responses();
         app.poll_remote_skill_search();
         app.poll_remote_plugin_search();
@@ -24722,55 +26923,98 @@ fn event_loop(
         // Advance spinner on each tick
         let now_elapsed = last_tick.elapsed();
         if now_elapsed >= tick_rate {
-            app.tick_spinner();
+            if app.tick_spinner() {
+                app.needs_redraw = true;
+            }
             last_tick = Instant::now();
-            app.needs_redraw = true;
         }
 
-        // Only redraw when state changed — reduces CPU on idle
-        if app.needs_redraw {
+        if !app.animate_status_indicators
+            && app.needs_periodic_status_refresh()
+            && last_status_heartbeat.elapsed() >= heartbeat_interval_for(app.terminal_ui_profile)
+        {
+            app.needs_redraw = true;
+            last_status_heartbeat = Instant::now();
+        }
+
+        // Only redraw when state changed — reduces CPU on idle.
+        // In compat mode, honour `min_draw_interval` to avoid flooding the
+        // PTY output buffer; `needs_redraw` stays true so we eventually draw
+        // once the interval has elapsed.
+        let draw_interval_ok = last_draw.elapsed() >= effective_draw_interval;
+        if app.needs_redraw && draw_interval_ok {
             // When clear_output() was called, force a full terminal repaint
             // before drawing so that any out-of-band characters that landed on
             // the alternate screen (e.g. tracing output from a background task)
-            // are erased.  terminal.clear() resets ratatui's internal prev-buffer
+            // are erased. terminal.clear() resets ratatui's internal prev-buffer
             // so the next draw() writes every cell from scratch.
-            if app.needs_full_terminal_clear {
-                terminal.clear()?;
-                app.needs_full_terminal_clear = false;
-            }
-            terminal.draw(|f| app.render(f))?;
-            app.needs_redraw = false;
+            draw_app(
+                terminal,
+                app,
+                &mut effective_draw_interval,
+                min_draw_interval,
+                &mut last_draw,
+                &mut last_status_heartbeat,
+            )?;
         }
 
-        // Poll with a short timeout so we loop quickly while streaming/thinking
-        let poll_timeout = if app.is_processing {
+        // Poll with a short timeout so we loop quickly while streaming/thinking.
+        // In compat mode use a longer timeout to let the terminal catch up.
+        let poll_timeout = if effective_draw_interval >= std::time::Duration::from_millis(120) {
+            // Slow terminal: keep the loop responsive while avoiding spin.
+            std::time::Duration::from_millis(40)
+        } else if app.is_processing {
             std::time::Duration::from_millis(16) // ~60fps while streaming
         } else {
-            std::time::Duration::from_millis(50) // 20fps idle
+            std::time::Duration::from_millis(40) // responsive idle without churn
         };
 
+        let mut priority_interaction = false;
         if event::poll(poll_timeout)? {
             match event::read()? {
                 Event::Key(key) => {
                     app.handle_key_event(key);
+                    priority_interaction = true;
                 }
                 Event::Paste(text) => {
                     // Bracketed paste — insert text directly (safe from injection:
                     // bracketed paste prevents escape sequences from being executed)
                     app.handle_paste(text);
+                    priority_interaction = true;
                 }
                 Event::Mouse(mouse) => {
                     app.handle_mouse_event(mouse);
+                    priority_interaction = true;
                 }
                 Event::Resize(_, _) => {
                     // Terminal resized — force redraw and invalidate all render caches
                     app.needs_redraw = true;
+                    app.needs_full_terminal_clear = true;
                     for line in &mut app.output {
-                        line.rendered = None;
+                        line.invalidate_render_cache();
                     }
+                    priority_interaction = true;
                 }
                 _ => {}
             }
+        }
+
+        // Drain responses again after event processing to minimise latency
+        // for AgentResponse::Done arriving while we were in poll()/draw().
+        app.check_responses();
+
+        // User-directed interactions should feel immediate even on slow PTYs.
+        // These redraws are sparse and locally valuable, so bypass the
+        // background draw throttle after key/paste/mouse/resize events.
+        if priority_interaction && app.needs_redraw {
+            draw_app(
+                terminal,
+                app,
+                &mut effective_draw_interval,
+                min_draw_interval,
+                &mut last_draw,
+                &mut last_status_heartbeat,
+            )?;
         }
 
         if let Some(enabled) = app.take_mouse_capture_request() {
@@ -24942,6 +27186,132 @@ mod tests {
             .map(plain_line_text)
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn terminal_ui_profile_detects_basic_compat_for_apple_terminal() {
+        assert_eq!(
+            terminal_ui_profile_for(
+                Some("Apple_Terminal"),
+                Some("xterm-256color"),
+                false,
+                false,
+                false,
+            ),
+            TerminalUiProfile::BasicCompat
+        );
+    }
+
+    #[test]
+    fn terminal_ui_profile_detects_reduced_motion_for_linux_desktop_terminals() {
+        assert_eq!(
+            terminal_ui_profile_for(
+                Some("gnome-terminal-server"),
+                Some("xterm-256color"),
+                false,
+                false,
+                false,
+            ),
+            TerminalUiProfile::ReducedMotion
+        );
+    }
+
+    #[test]
+    fn terminal_ui_profile_keeps_fast_terminals_on_standard_mode() {
+        assert_eq!(
+            terminal_ui_profile_for(
+                Some("iTerm.app"),
+                Some("xterm-256color"),
+                false,
+                false,
+                false,
+            ),
+            TerminalUiProfile::Standard
+        );
+        assert_eq!(
+            terminal_ui_profile_for(Some("WezTerm"), Some("xterm-256color"), false, false, false,),
+            TerminalUiProfile::Standard
+        );
+    }
+
+    #[test]
+    fn terminal_ui_profile_detects_reduced_motion_for_multiplexed_terms() {
+        assert_eq!(
+            terminal_ui_profile_for(None, Some("screen-256color"), false, false, false),
+            TerminalUiProfile::ReducedMotion
+        );
+        assert_eq!(
+            terminal_ui_profile_for(None, Some("tmux-256color"), false, false, false),
+            TerminalUiProfile::ReducedMotion
+        );
+    }
+
+    #[test]
+    fn remote_sessions_step_standard_profile_down_to_reduced_motion() {
+        assert_eq!(
+            adjust_ui_profile_for_remote(TerminalUiProfile::Standard, true),
+            TerminalUiProfile::ReducedMotion
+        );
+        assert_eq!(
+            adjust_ui_profile_for_remote(TerminalUiProfile::BasicCompat, true),
+            TerminalUiProfile::BasicCompat
+        );
+    }
+
+    #[test]
+    fn remote_or_compat_sessions_prefer_ascii_glyphs() {
+        assert_eq!(
+            terminal_glyph_profile_for(
+                TerminalUiProfile::ReducedMotion,
+                true,
+                Some("xterm-256color")
+            ),
+            TerminalGlyphProfile::Ascii
+        );
+        assert_eq!(
+            terminal_glyph_profile_for(
+                TerminalUiProfile::BasicCompat,
+                false,
+                Some("xterm-256color")
+            ),
+            TerminalGlyphProfile::Ascii
+        );
+        assert_eq!(
+            terminal_glyph_profile_for(TerminalUiProfile::Standard, false, Some("xterm-256color")),
+            TerminalGlyphProfile::Unicode
+        );
+    }
+
+    #[test]
+    fn direct_paging_keys_are_disabled_for_apple_terminal_and_remote_sessions() {
+        assert!(!terminal_supports_direct_paging_keys(
+            Some("Apple_Terminal"),
+            Some("xterm-256color"),
+            TerminalUiProfile::BasicCompat,
+            false,
+        ));
+        assert!(!terminal_supports_direct_paging_keys(
+            Some("iTerm.app"),
+            Some("xterm-256color"),
+            TerminalUiProfile::Standard,
+            true,
+        ));
+    }
+
+    #[test]
+    fn direct_paging_keys_remain_enabled_for_fast_local_terminals() {
+        assert!(terminal_supports_direct_paging_keys(
+            Some("WezTerm"),
+            Some("xterm-256color"),
+            TerminalUiProfile::Standard,
+            false,
+        ));
+        assert!(terminal_supports_direct_paging_keys(
+            Some("gnome-terminal-server"),
+            Some("xterm-256color"),
+            TerminalUiProfile::ReducedMotion,
+            false,
+        ));
     }
 
     fn mock_agent() -> Arc<edgecrab_core::Agent> {
@@ -25886,15 +28256,74 @@ description = "Demo plugin tool"
     }
 
     #[tokio::test]
+    async fn model_selector_page_down_pages_list_in_split_view() {
+        let mut app = App::new();
+        app.open_model_selector_for("anthropic/claude-opus-4.6", ModelSelectorTarget::Primary);
+        app.model_selector.selected = 0;
+        app.set_split_detail_scroll(DetailSurface::ModelSelector, 0);
+
+        app.handle_key_event(event::KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+
+        let expected = 8.min(app.model_selector.filtered.len().saturating_sub(1));
+        assert_eq!(app.model_selector.selected, expected);
+        assert_eq!(app.split_detail_scroll(DetailSurface::ModelSelector), 0);
+        assert_eq!(
+            app.detail_fullscreen_scroll(DetailSurface::ModelSelector),
+            0,
+            "split-view paging should move the visible list, not invisible detail scroll"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_selector_tab_focuses_detail_before_paging() {
+        let mut app = App::new();
+        app.open_model_selector_for("anthropic/claude-opus-4.6", ModelSelectorTarget::Primary);
+
+        app.handle_key_event(event::KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.handle_key_event(event::KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+
+        assert_eq!(
+            app.simple_split_focus(DetailSurface::ModelSelector),
+            SplitPaneFocus::Detail
+        );
+        assert_eq!(app.model_selector.selected, 0);
+        assert_eq!(app.split_detail_scroll(DetailSurface::ModelSelector), 8);
+    }
+
+    #[tokio::test]
+    async fn raw_ctrl_f_and_ctrl_b_page_model_selector_list_without_page_keys() {
+        let mut app = App::new();
+        app.open_model_selector_for("anthropic/claude-opus-4.6", ModelSelectorTarget::Primary);
+        app.model_selector.selected = 0;
+
+        app.handle_key_event(event::KeyEvent::new(
+            KeyCode::Char('\u{6}'),
+            KeyModifiers::NONE,
+        ));
+        let expected = 8.min(app.model_selector.filtered.len().saturating_sub(1));
+        assert_eq!(app.model_selector.selected, expected);
+        assert_eq!(app.split_detail_scroll(DetailSurface::ModelSelector), 0);
+
+        app.handle_key_event(event::KeyEvent::new(
+            KeyCode::Char('\u{2}'),
+            KeyModifiers::NONE,
+        ));
+        assert_eq!(app.model_selector.selected, 0);
+        assert_eq!(app.split_detail_scroll(DetailSurface::ModelSelector), 0);
+    }
+
+    #[tokio::test]
     async fn model_selector_fullscreen_esc_returns_to_split_view() {
         let mut app = App::new();
         app.open_model_selector_for("anthropic/claude-opus-4.6", ModelSelectorTarget::Primary);
+        let selected_before = app.model_selector.selected;
 
         app.handle_key_event(event::KeyEvent::new(KeyCode::Char('Z'), KeyModifiers::NONE));
         app.handle_key_event(event::KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
 
         assert!(app.model_selector.active);
         assert!(app.detail_fullscreen_active(DetailSurface::ModelSelector));
+        assert_eq!(app.model_selector.selected, selected_before);
         assert_eq!(
             app.detail_fullscreen_scroll(DetailSurface::ModelSelector),
             8
@@ -25904,6 +28333,117 @@ description = "Demo plugin tool"
 
         assert!(app.model_selector.active);
         assert!(!app.detail_fullscreen_active(DetailSurface::ModelSelector));
+    }
+
+    #[tokio::test]
+    async fn tool_manager_tab_focuses_detail_and_arrow_keys_change_scope() {
+        let mut app = App::new();
+        app.set_agent(mock_agent());
+        app.open_tool_manager(ToolManagerMode::All);
+
+        app.handle_key_event(event::KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.tool_manager_scope, ToolManagerScope::Toolsets);
+        assert_eq!(
+            app.simple_split_focus(DetailSurface::ToolManager),
+            SplitPaneFocus::List
+        );
+
+        app.handle_key_event(event::KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.handle_key_event(event::KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(
+            app.simple_split_focus(DetailSurface::ToolManager),
+            SplitPaneFocus::Detail
+        );
+        assert_eq!(app.split_detail_scroll(DetailSurface::ToolManager), 8);
+
+        app.handle_key_event(event::KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(app.tool_manager_scope, ToolManagerScope::All);
+        assert_eq!(
+            app.simple_split_focus(DetailSurface::ToolManager),
+            SplitPaneFocus::List
+        );
+        assert_eq!(app.split_detail_scroll(DetailSurface::ToolManager), 0);
+    }
+
+    #[tokio::test]
+    async fn plugin_toggle_tab_focuses_detail_and_arrow_keys_change_scope() {
+        let mut app = App::new();
+        app.plugin_toggle.set_items(vec![PluginToggleEntry {
+            name: "demo".into(),
+            display_name: "Demo Plugin".into(),
+            description: (0..24)
+                .map(|idx| format!("line {idx:02} for plugin detail paging"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            version: "1.0.0".into(),
+            source: "local".into(),
+            kind: "skill".into(),
+            tool_count: 1,
+            estimated_tokens: 64,
+            check_state: PluginCheckState::On,
+            original_check_state: PluginCheckState::On,
+            runtime_status: "enabled".into(),
+            trust_level: "trusted".into(),
+            tools: vec!["demo_tool".into()],
+            cli_commands: vec![],
+            missing_env: vec![],
+            related_skills: vec![],
+            compatibility: Some("cli".into()),
+            install_source: None,
+            credentials_satisfied: true,
+            search_text: "demo plugin skill enabled trusted".into(),
+        }]);
+        app.plugin_toggle_scope = PluginScope::Global;
+        app.plugin_toggle.activate();
+
+        app.handle_key_event(event::KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert!(matches!(app.plugin_toggle_scope, PluginScope::Platform(_)));
+        assert_eq!(
+            app.simple_split_focus(DetailSurface::PluginToggle),
+            SplitPaneFocus::List
+        );
+
+        app.plugin_toggle_scope = PluginScope::Global;
+        app.plugin_toggle.set_items(vec![PluginToggleEntry {
+            name: "demo".into(),
+            display_name: "Demo Plugin".into(),
+            description: (0..24)
+                .map(|idx| format!("line {idx:02} for plugin detail paging"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            version: "1.0.0".into(),
+            source: "local".into(),
+            kind: "skill".into(),
+            tool_count: 1,
+            estimated_tokens: 64,
+            check_state: PluginCheckState::On,
+            original_check_state: PluginCheckState::On,
+            runtime_status: "enabled".into(),
+            trust_level: "trusted".into(),
+            tools: vec!["demo_tool".into()],
+            cli_commands: vec![],
+            missing_env: vec![],
+            related_skills: vec![],
+            compatibility: Some("cli".into()),
+            install_source: None,
+            credentials_satisfied: true,
+            search_text: "demo plugin skill enabled trusted".into(),
+        }]);
+        app.handle_key_event(event::KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.handle_key_event(event::KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(
+            app.simple_split_focus(DetailSurface::PluginToggle),
+            SplitPaneFocus::Detail
+        );
+        assert_eq!(app.split_detail_scroll(DetailSurface::PluginToggle), 8);
+
+        app.handle_key_event(event::KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert!(matches!(app.plugin_toggle_scope, PluginScope::Platform(_)));
+        assert_eq!(
+            app.simple_split_focus(DetailSurface::PluginToggle),
+            SplitPaneFocus::List
+        );
+        assert_eq!(app.split_detail_scroll(DetailSurface::PluginToggle), 0);
     }
 
     #[tokio::test]
@@ -27541,7 +30081,7 @@ kind = "skill"
     }
 
     #[tokio::test]
-    async fn config_selector_detail_is_not_truncated_and_preserves_scroll() {
+    async fn config_selector_detail_focus_pages_and_preserves_scroll() {
         let mut app = App::new();
         let entry = app
             .build_config_entries()
@@ -27552,6 +30092,11 @@ kind = "skill"
         assert!(detail_lines.len() > 18);
 
         app.handle_config_command(String::new());
+        app.handle_key_event(event::KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(
+            app.simple_split_focus(DetailSurface::ConfigSelector),
+            SplitPaneFocus::Detail
+        );
         app.handle_key_event(event::KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
         assert_eq!(app.split_detail_scroll(DetailSurface::ConfigSelector), 8);
 
@@ -27567,7 +30112,7 @@ kind = "skill"
     }
 
     #[tokio::test]
-    async fn remote_skill_browser_page_keys_scroll_split_detail() {
+    async fn remote_skill_browser_detail_focus_pages_split_detail() {
         let mut app = App::new();
         app.remote_skill_browser
             .selector
@@ -27588,6 +30133,11 @@ kind = "skill"
             }]);
         app.remote_skill_browser.selector.active = true;
 
+        app.handle_key_event(event::KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(
+            app.simple_split_focus(DetailSurface::RemoteSkillBrowser),
+            SplitPaneFocus::Detail
+        );
         app.handle_key_event(event::KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
         assert_eq!(
             app.split_detail_scroll(DetailSurface::RemoteSkillBrowser),
@@ -28130,6 +30680,158 @@ kind = "skill"
         assert!(matches!(app.display_state, DisplayState::Streaming { .. }));
     }
 
+    #[test]
+    fn recover_latest_assistant_turn_uses_most_recent_non_empty_assistant_message() {
+        let mut recovered_message = edgecrab_types::Message::assistant("Recovered reply");
+        recovered_message.reasoning = Some("Recovered reasoning".into());
+        let messages = vec![
+            edgecrab_types::Message::user("hello"),
+            edgecrab_types::Message::assistant(""),
+            recovered_message,
+        ];
+
+        let recovered =
+            recover_latest_assistant_turn(&messages).expect("recover latest assistant turn");
+        assert_eq!(recovered.text, "Recovered reply");
+        assert_eq!(recovered.reasoning.as_deref(), Some("Recovered reasoning"));
+    }
+
+    #[tokio::test]
+    async fn forward_agent_stream_recovers_reply_when_agent_finishes_without_terminal_event() {
+        let agent = mock_agent();
+        agent.inject_assistant_context("Recovered reply").await;
+        let (chunk_tx, chunk_rx) =
+            tokio::sync::mpsc::unbounded_channel::<edgecrab_core::agent::StreamEvent>();
+        let (response_tx, mut response_rx) = tokio::sync::mpsc::unbounded_channel();
+        let hook_registry = Arc::new(edgecrab_gateway::hooks::HookRegistry::new());
+
+        let bridge = tokio::spawn(forward_agent_stream_to_tui(
+            agent,
+            chunk_rx,
+            tokio::spawn(async { Ok::<(), edgecrab_types::AgentError>(()) }),
+            response_tx,
+            hook_registry,
+        ));
+
+        // Keep the stream sender alive to simulate a pump that would otherwise
+        // wait forever for a terminal event on the stream channel.
+        let first = response_rx.recv().await.expect("recovered token");
+        let second = response_rx.recv().await.expect("recovered done");
+        drop(chunk_tx);
+        bridge.await.expect("bridge task completes");
+
+        match first {
+            AgentResponse::Token(text) => assert_eq!(text, "Recovered reply"),
+            _ => panic!("expected recovered token"),
+        }
+        assert!(matches!(second, AgentResponse::Done));
+    }
+
+    #[tokio::test]
+    async fn forward_agent_stream_does_not_duplicate_tokens_when_done_is_missing() {
+        let agent = mock_agent();
+        agent.inject_assistant_context("hello").await;
+        let (chunk_tx, chunk_rx) =
+            tokio::sync::mpsc::unbounded_channel::<edgecrab_core::agent::StreamEvent>();
+        let (response_tx, mut response_rx) = tokio::sync::mpsc::unbounded_channel();
+        let hook_registry = Arc::new(edgecrab_gateway::hooks::HookRegistry::new());
+
+        chunk_tx
+            .send(edgecrab_core::agent::StreamEvent::Token("hel".into()))
+            .expect("send partial token");
+
+        let bridge = tokio::spawn(forward_agent_stream_to_tui(
+            agent,
+            chunk_rx,
+            tokio::spawn(async { Ok::<(), edgecrab_types::AgentError>(()) }),
+            response_tx,
+            hook_registry,
+        ));
+
+        let first = response_rx.recv().await.expect("forwarded token");
+        let second = response_rx.recv().await.expect("synthetic done");
+        drop(chunk_tx);
+        bridge.await.expect("bridge task completes");
+
+        match first {
+            AgentResponse::Token(text) => assert_eq!(text, "hel"),
+            _ => panic!("expected forwarded token"),
+        }
+        assert!(matches!(second, AgentResponse::Done));
+        assert!(response_rx.try_recv().is_err(), "unexpected extra response");
+    }
+
+    #[tokio::test]
+    async fn hidden_live_token_display_buffers_until_done() {
+        let mut app = App::new();
+        app.streaming_enabled = false;
+        app.live_token_display_enabled = false;
+        app.is_processing = true;
+        app.display_state = DisplayState::AwaitingFirstToken {
+            frame: 0,
+            started: Instant::now(),
+        };
+
+        app.response_tx
+            .send(AgentResponse::Token("hel".into()))
+            .expect("send token");
+        app.response_tx
+            .send(AgentResponse::Token("lo".into()))
+            .expect("send token");
+        app.check_responses();
+
+        assert_eq!(app.buffered_assistant_output, "hello");
+        assert!(
+            app.output
+                .iter()
+                .all(|line| line.role != OutputRole::Assistant || line.text != "hello")
+        );
+
+        app.response_tx
+            .send(AgentResponse::Done)
+            .expect("send done");
+        app.check_responses();
+
+        assert!(app.buffered_assistant_output.is_empty());
+        assert!(
+            app.output
+                .iter()
+                .any(|line| line.role == OutputRole::Assistant && line.text == "hello")
+        );
+    }
+
+    #[tokio::test]
+    async fn hidden_live_token_display_flushes_before_tool_exec() {
+        let mut app = App::new();
+        app.streaming_enabled = false;
+        app.live_token_display_enabled = false;
+        app.is_processing = true;
+        app.display_state = DisplayState::AwaitingFirstToken {
+            frame: 0,
+            started: Instant::now(),
+        };
+
+        app.response_tx
+            .send(AgentResponse::Token("plan".into()))
+            .expect("send token");
+        app.response_tx
+            .send(AgentResponse::ToolExec {
+                tool_call_id: "tool-1".into(),
+                name: "terminal".into(),
+                args_json: "{\"command\":\"echo ok\"}".into(),
+            })
+            .expect("send tool exec");
+        app.check_responses();
+
+        assert!(app.buffered_assistant_output.is_empty());
+        assert!(
+            app.output
+                .iter()
+                .any(|line| line.role == OutputRole::Assistant && line.text == "plan")
+        );
+        assert!(app.pending_tool_lines.contains_key("tool-1"));
+    }
+
     #[tokio::test]
     async fn tool_done_updates_matching_placeholder_even_when_completions_arrive_out_of_order() {
         let mut app = App::new();
@@ -28662,12 +31364,26 @@ kind = "skill"
     }
 
     #[tokio::test]
-    async fn ctrl_j_is_terminal_safe_multiline_fallback() {
+    async fn ctrl_j_is_multiline_fallback_when_terminal_reports_it_distinctly() {
         let mut app = App::new();
         app.textarea.insert_str("alpha");
 
         app.handle_key_event(event::KeyEvent::new(
             KeyCode::Char('j'),
+            KeyModifiers::CONTROL,
+        ));
+
+        assert_eq!(app.editor_mode, InputEditorMode::ComposeInsert);
+        assert_eq!(app.textarea_text(), "alpha\n");
+    }
+
+    #[tokio::test]
+    async fn ctrl_o_is_terminal_safe_multiline_fallback() {
+        let mut app = App::new();
+        app.textarea.insert_str("alpha");
+
+        app.handle_key_event(event::KeyEvent::new(
+            KeyCode::Char('o'),
             KeyModifiers::CONTROL,
         ));
 
@@ -28724,6 +31440,160 @@ kind = "skill"
             app.textarea.cursor().0 > 0,
             "PageDown in compose mode should move the editor viewport/cursor"
         );
+    }
+
+    #[test]
+    fn ctrl_b_and_ctrl_f_normalize_to_page_keys() {
+        let page_up = normalize_fallback_paging_key(event::KeyEvent::new(
+            KeyCode::Char('b'),
+            KeyModifiers::CONTROL,
+        ));
+        assert_eq!(page_up.code, KeyCode::PageUp);
+        assert_eq!(page_up.modifiers, KeyModifiers::NONE);
+
+        let page_down = normalize_fallback_paging_key(event::KeyEvent::new(
+            KeyCode::Char('f'),
+            KeyModifiers::CONTROL,
+        ));
+        assert_eq!(page_down.code, KeyCode::PageDown);
+        assert_eq!(page_down.modifiers, KeyModifiers::NONE);
+    }
+
+    #[test]
+    fn raw_control_chars_normalize_to_shortcuts() {
+        let ctrl_c = normalize_terminal_control_key(event::KeyEvent::new(
+            KeyCode::Char('\u{3}'),
+            KeyModifiers::NONE,
+        ));
+        assert_eq!(ctrl_c.code, KeyCode::Char('c'));
+        assert_eq!(ctrl_c.modifiers, KeyModifiers::CONTROL);
+
+        let ctrl_f = normalize_terminal_control_key(event::KeyEvent::new(
+            KeyCode::Char('\u{6}'),
+            KeyModifiers::NONE,
+        ));
+        assert_eq!(ctrl_f.code, KeyCode::Char('f'));
+        assert_eq!(ctrl_f.modifiers, KeyModifiers::CONTROL);
+
+        let ctrl_o = normalize_terminal_control_key(event::KeyEvent::new(
+            KeyCode::Char('\u{f}'),
+            KeyModifiers::NONE,
+        ));
+        assert_eq!(ctrl_o.code, KeyCode::Char('o'));
+        assert_eq!(ctrl_o.modifiers, KeyModifiers::CONTROL);
+    }
+
+    #[test]
+    fn raw_newline_normalizes_to_enter_not_ctrl_j() {
+        let enter = normalize_terminal_control_key(event::KeyEvent::new(
+            KeyCode::Char('\n'),
+            KeyModifiers::NONE,
+        ));
+        assert_eq!(enter.code, KeyCode::Enter);
+        assert_eq!(enter.modifiers, KeyModifiers::NONE);
+    }
+
+    #[tokio::test]
+    async fn raw_newline_submits_inline_input_instead_of_opening_compose() {
+        let mut app = App::new();
+        app.textarea.insert_str("hello");
+
+        app.handle_key_event(event::KeyEvent::new(
+            KeyCode::Char('\n'),
+            KeyModifiers::NONE,
+        ));
+
+        assert_eq!(app.editor_mode, InputEditorMode::Inline);
+        assert_eq!(app.textarea_text(), "");
+        assert_eq!(
+            app.output.first().map(|line| line.text.as_str()),
+            Some("> hello")
+        );
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_clears_waiting_state_for_active_request() {
+        let mut app = App::new();
+        app.is_processing = true;
+        app.display_state = DisplayState::AwaitingFirstToken {
+            frame: 0,
+            started: Instant::now(),
+        };
+        let request = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        app.active_request_abort = Some(request.abort_handle());
+
+        app.handle_key_event(event::KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        ));
+
+        tokio::task::yield_now().await;
+        assert!(
+            !app.is_processing,
+            "Ctrl+C should end the active request state"
+        );
+        assert!(
+            app.active_request_abort.is_none(),
+            "Ctrl+C should clear the active request abort handle"
+        );
+        assert!(
+            matches!(app.display_state, DisplayState::Idle),
+            "Ctrl+C should leave the TUI idle instead of stuck waiting"
+        );
+    }
+
+    #[tokio::test]
+    async fn ctrl_f_scrolls_document_overlay_when_page_down_is_unavailable() {
+        let mut app = App::new();
+        let body = (0..80)
+            .map(|i| format!("line {i:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.open_document_overlay("Doc", "fallback paging", body, "≡", Color::White);
+
+        app.handle_key_event(event::KeyEvent::new(
+            KeyCode::Char('f'),
+            KeyModifiers::CONTROL,
+        ));
+
+        let scroll = app
+            .document_overlay
+            .as_ref()
+            .map(|overlay| overlay.scroll)
+            .unwrap_or_default();
+        assert!(scroll > 0, "Ctrl+F should page the document overlay down");
+    }
+
+    #[tokio::test]
+    async fn ctrl_b_and_ctrl_f_scroll_output_without_direct_page_keys() {
+        let mut app = App::new();
+        app.output_visual_rows = 120;
+        app.output_area_height = 20;
+        app.scroll_offset = 0;
+        app.at_bottom = true;
+
+        app.handle_key_event(event::KeyEvent::new(
+            KeyCode::Char('b'),
+            KeyModifiers::CONTROL,
+        ));
+        assert!(app.scroll_offset > 0, "Ctrl+B should page output upward");
+
+        app.handle_key_event(event::KeyEvent::new(
+            KeyCode::Char('f'),
+            KeyModifiers::CONTROL,
+        ));
+        assert_eq!(app.scroll_offset, 0, "Ctrl+F should page output back down");
+    }
+
+    #[test]
+    fn app_startup_defers_nonessential_warmup_work() {
+        let app = App::new();
+        assert!(!app.history_loaded);
+        assert!(!app.model_selector_seeded);
+        assert!(!app.hook_registry_loaded);
+        assert!(app.model_selector.items.is_empty());
     }
 
     #[tokio::test]
@@ -28899,16 +31769,18 @@ kind = "skill"
     async fn remove_reasoning_output_block_keeps_stream_alignment() {
         let mut app = App::new();
         app.output.push(OutputLine {
-            text: "🧠 Thinking\nstep 1".into(),
+            text: "Thinking\nstep 1".into(),
             role: OutputRole::Reasoning,
             prebuilt_spans: None,
             rendered: None,
+            plain_rendered: None,
         });
         app.output.push(OutputLine {
             text: "answer".into(),
             role: OutputRole::Assistant,
             prebuilt_spans: None,
             rendered: None,
+            plain_rendered: None,
         });
         app.reasoning_line = Some(0);
         app.streaming_line = Some(1);

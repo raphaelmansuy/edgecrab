@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use edgecrab_tools::macos_permissions::{MacosConsentState, preflight_command_permissions};
+use edgecrab_tools::macos_permissions::MacosConsentState;
 
 const AUTOMATION_SETTINGS_URL: &str =
     "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation";
@@ -33,32 +33,24 @@ pub(crate) struct PermissionSnapshot {
 }
 
 pub(crate) fn collect_permission_snapshot() -> PermissionSnapshot {
-    if !cfg!(target_os = "macos") {
-        return PermissionSnapshot {
-            supported: false,
-            host_app: None,
-            notes_automation: MacosConsentState::Unknown,
-            system_events_automation: MacosConsentState::Unknown,
-            accessibility: MacosConsentState::Unknown,
-        };
-    }
-
-    let notes =
-        preflight_command_permissions("osascript -e 'tell application \"Notes\" to activate'");
-    let system_events = preflight_command_permissions(
-        "osascript -e 'tell application \"System Events\" to keystroke \" \"'",
-    );
-
+    // Accessibility probing is safe enough to query directly. AppleEvents /
+    // Automation remains `Unknown` here because AEDeterminePermission... can
+    // hang indefinitely on some terminal hosts.
     PermissionSnapshot {
-        supported: true,
-        host_app: detect_terminal_host_app(),
-        notes_automation: notes.automation_state.unwrap_or(MacosConsentState::Unknown),
-        system_events_automation: system_events
-            .automation_state
-            .unwrap_or(MacosConsentState::Unknown),
-        accessibility: system_events
-            .accessibility_state
-            .unwrap_or(MacosConsentState::Unknown),
+        supported: cfg!(target_os = "macos"),
+        host_app: if cfg!(target_os = "macos") {
+            detect_terminal_host_app()
+        } else {
+            None
+        },
+        notes_automation: MacosConsentState::Unknown,
+        system_events_automation: MacosConsentState::Unknown,
+        accessibility: if cfg!(target_os = "macos") {
+            edgecrab_tools::macos_permissions::accessibility_consent_status()
+                .unwrap_or(MacosConsentState::Unknown)
+        } else {
+            MacosConsentState::Unknown
+        },
     }
 }
 

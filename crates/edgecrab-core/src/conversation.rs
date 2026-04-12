@@ -80,6 +80,10 @@ const MAX_RETRIES: u32 = 3;
 
 /// Base backoff delay between retries (doubles each attempt).
 const BASE_BACKOFF: Duration = Duration::from_millis(500);
+#[cfg(test)]
+const STREAM_FIRST_CHUNK_TIMEOUT: Duration = Duration::from_millis(50);
+#[cfg(not(test))]
+const STREAM_FIRST_CHUNK_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Minimum tool-call count in a session before the end-of-session
 /// learning reflection fires. Mirrors hermes-agent's "5+ tool calls" rule.
@@ -116,9 +120,6 @@ fn is_retryable_nonvisible_stream_error(error: &edgequake_llm::LlmError) -> bool
         edgequake_llm::LlmError::RateLimited(_)
             | edgequake_llm::LlmError::NetworkError(_)
             | edgequake_llm::LlmError::Timeout
-            | edgequake_llm::LlmError::AuthError(_)
-            | edgequake_llm::LlmError::ApiError(_)
-            | edgequake_llm::LlmError::InvalidRequest(_)
             | edgequake_llm::LlmError::ProviderError(_)
             | edgequake_llm::LlmError::NotSupported(_)
     )
@@ -315,7 +316,13 @@ impl Agent {
         event_tx: Option<&tokio::sync::mpsc::UnboundedSender<crate::StreamEvent>>,
         cwd_override: Option<&std::path::Path>,
     ) -> Result<ConversationResult, AgentError> {
+        tracing::info!(
+            msg_len = user_message.len(),
+            has_event_tx = event_tx.is_some(),
+            "execute_loop: entered"
+        );
         let _conversation_guard = self.conversation_lock.lock().await;
+        tracing::info!("execute_loop: acquired conversation_lock");
         self.budget.reset();
 
         // Extract (and optionally reset) the cancel token for this conversation turn.
@@ -434,6 +441,8 @@ impl Agent {
                 (Vec::new(), Vec::new())
             };
 
+        let discovered_plugins = discover_plugins(&config.plugins_config, config.platform).ok();
+
         // Cache system prompt on first turn — assemble via PromptBuilder
         //
         // WHY PromptBuilder here: The system prompt is the agent's identity,
@@ -482,9 +491,9 @@ impl Agent {
                     &config.skills_config.preloaded,
                     Some(&conversation_session_id),
                 );
-                let plugin_skill_prompt = discover_plugins(&config.plugins_config, config.platform)
-                    .ok()
-                    .and_then(|discovery| build_plugin_skill_prompt(&discovery));
+                let plugin_skill_prompt = discovered_plugins
+                    .as_ref()
+                    .and_then(build_plugin_skill_prompt);
                 let combined_skill_prompt: Option<String> = match (
                     preloaded_content.is_empty(),
                     skill_summary,
@@ -554,9 +563,7 @@ impl Agent {
         }
 
         let is_first_turn = session.messages.is_empty();
-        let discovered_plugins = discover_plugins(&config.plugins_config, config.platform)
-            .ok()
-            .map(Arc::new);
+        let discovered_plugins = discovered_plugins.map(Arc::new);
         if let Some(discovery) = discovered_plugins.as_ref() {
             if is_first_turn {
                 for plugin in discovery
@@ -700,7 +707,7 @@ impl Agent {
 
         // If smart routing selected a cheaper model, create an alternate provider.
         // This overrides the primary provider for this turn only.
-        let effective_provider = if !route.is_primary {
+        let (effective_provider, smart_routed_provider_active) = if !route.is_primary {
             if let Some((prov_name, model_name)) = route.model.split_once('/') {
                 let canonical = edgecrab_tools::vision_models::normalize_provider_name(prov_name);
                 // Special-case copilot: build directly to use direct API mode
@@ -760,15 +767,15 @@ impl Agent {
                 match cheap_opt {
                     Some(cheap) => {
                         tracing::info!(model = %route.model, "using smart-routed cheap model");
-                        cheap
+                        (cheap, true)
                     }
-                    None => provider.clone(),
+                    None => (provider.clone(), false),
                 }
             } else {
-                provider.clone()
+                (provider.clone(), false)
             }
         } else {
-            provider.clone()
+            (provider.clone(), false)
         };
 
         // Scan user input for prompt injection attempts.
@@ -936,6 +943,12 @@ impl Agent {
         // Persist the stable conversation session id resolved before prompt
         // assembly so later turns reuse the same browser/plugin session.
         self.publish_session_state(&session).await;
+        tracing::info!(
+            session_id = %conversation_session_id,
+            messages = session.messages.len(),
+            has_system_prompt = session.cached_system_prompt.is_some(),
+            "execute_loop: entering main conversation_loop"
+        );
 
         // Main loop: each iteration = one API call
         let mut final_response = String::new();
@@ -951,7 +964,7 @@ impl Agent {
         // bring usage below the warning level.
         let mut pressure_warned = false;
 
-        loop {
+        'conversation_loop: loop {
             if tool_defs_dirty {
                 active_tool_defs = if let Some(ref registry) = tool_registry {
                     let schema_ctx = build_tool_context(
@@ -1105,6 +1118,12 @@ impl Agent {
             // WHY cancel passed here: api_call_with_retry now races every sleep
             // and every API future against the CancellationToken so Ctrl+C takes
             // effect within one event-loop tick rather than after all retries finish.
+            tracing::info!(
+                provider = effective_provider.name(),
+                tool_count = active_tool_defs.len(),
+                messages = chat_messages.len(),
+                "execute_loop: about to call api_call_with_retry"
+            );
             let native_streaming_active = should_use_native_streaming(
                 effective_provider.as_ref(),
                 &active_tool_defs,
@@ -1130,14 +1149,20 @@ impl Agent {
             )
             .await
             {
-                Ok(outcome) => outcome,
+                Ok(outcome) => {
+                    tracing::info!(
+                        elapsed_ms = turn_started_at.elapsed().as_millis() as u64,
+                        "execute_loop: api_call_with_retry succeeded"
+                    );
+                    outcome
+                }
                 // Cancellation during the API call — break cleanly without
                 // attempting the fallback provider (user wants to stop NOW).
                 Err(AgentError::Interrupted) => {
                     interrupted = true;
                     break;
                 }
-                Err(primary_err) => {
+                Err(primary_err) => 'recover: {
                     // In native streaming mode, partial output may already have
                     // been shown to the user. Retrying or swapping to a fallback
                     // provider would duplicate / scramble the live transcript, so
@@ -1145,6 +1170,54 @@ impl Agent {
                     if native_streaming_active {
                         self.publish_session_state(&session).await;
                         return Err(primary_err);
+                    }
+                    let mut primary_err = primary_err;
+                    if smart_routed_provider_active {
+                        tracing::warn!(
+                            routed_model = %route.model,
+                            primary_model = %config.model_config.default_model,
+                            routed_error = %primary_err,
+                            "smart-routed model failed before visible output, retrying primary model"
+                        );
+                        let primary_native_streaming = should_use_native_streaming(
+                            provider.as_ref(),
+                            &active_tool_defs,
+                            config.streaming,
+                            event_tx.is_some(),
+                        );
+                        match api_call_with_retry(
+                            &provider,
+                            &chat_messages,
+                            &active_tool_defs,
+                            MAX_RETRIES,
+                            ApiCallContext {
+                                options: Some(&completion_options),
+                                cancel: &cancel,
+                                event_tx,
+                                use_native_streaming: primary_native_streaming,
+                                discovered_plugins: discovered_plugins.as_deref(),
+                                conversation_session_id: &conversation_session_id,
+                                platform: config.platform,
+                                api_call_count: session.api_call_count,
+                            },
+                        )
+                        .await
+                        {
+                            Ok(outcome) => break 'recover outcome,
+                            Err(AgentError::Interrupted) => {
+                                interrupted = true;
+                                break 'conversation_loop;
+                            }
+                            Err(primary_retry_err) => {
+                                tracing::error!(
+                                    routed_model = %route.model,
+                                    routed_error = %primary_err,
+                                    primary_retry_error = %primary_retry_err,
+                                    "smart-routed model and primary retry both failed"
+                                );
+                                primary_err = primary_retry_err;
+                            }
+                        }
                     }
                     // Try fallback provider if configured
                     if let Some(ref fb) = config.model_config.fallback {
@@ -1196,7 +1269,7 @@ impl Agent {
                                     // Also handle cancellation during fallback call.
                                     Err(AgentError::Interrupted) => {
                                         interrupted = true;
-                                        break;
+                                        break 'conversation_loop;
                                     }
                                     Err(fb_err) => {
                                         tracing::error!(fallback_error = %fb_err, "fallback also failed");
@@ -1522,12 +1595,8 @@ impl Agent {
                 title: Some(title),
             };
 
-            if let Err(e) = db.save_session(&record) {
-                tracing::warn!(error = %e, "failed to save session to state DB");
-            }
-
-            if let Err(e) = db.replace_messages(&session_id, &session.messages, now) {
-                tracing::warn!(error = %e, "failed to save messages to state DB");
+            if let Err(e) = db.save_session_with_messages(&record, &session.messages, now) {
+                tracing::warn!(error = %e, "failed to atomically save session to state DB");
             }
 
             // Auto-title: on the first exchange, spawn a background task that
@@ -2039,9 +2108,14 @@ async fn api_call_streaming(
     event_tx: &tokio::sync::mpsc::UnboundedSender<crate::StreamEvent>,
     any_tokens_sent: &std::sync::atomic::AtomicBool,
 ) -> edgequake_llm::Result<edgequake_llm::LLMResponse> {
+    tracing::info!(
+        provider = provider.name(),
+        "api_call_streaming: opening SSE stream"
+    );
     let mut stream = provider
         .chat_with_tools_stream(messages, tool_defs, None, options)
         .await?;
+    tracing::info!("api_call_streaming: SSE stream opened, waiting for first chunk");
 
     let mut content = String::new();
     let mut thinking = String::new();
@@ -2049,11 +2123,28 @@ async fn api_call_streaming(
     let mut final_usage: Option<StreamUsage> = None;
     let mut finish_reason: Option<String> = None;
     let mut tool_calls: BTreeMap<usize, PartialToolCall> = BTreeMap::new();
+    let first_chunk_deadline = tokio::time::Instant::now() + STREAM_FIRST_CHUNK_TIMEOUT;
+    let mut saw_meaningful_chunk = false;
 
-    while let Some(chunk) = stream.next().await {
+    loop {
+        let next_chunk = if saw_meaningful_chunk {
+            stream.next().await
+        } else {
+            let remaining = first_chunk_deadline
+                .checked_duration_since(tokio::time::Instant::now())
+                .unwrap_or(Duration::ZERO);
+            match tokio::time::timeout(remaining, stream.next()).await {
+                Ok(chunk) => chunk,
+                Err(_) => return Err(edgequake_llm::LlmError::Timeout),
+            }
+        };
+        let Some(chunk) = next_chunk else {
+            break;
+        };
         match chunk? {
             StreamChunk::Content(delta) => {
                 if !delta.is_empty() {
+                    saw_meaningful_chunk = true;
                     any_tokens_sent.store(true, std::sync::atomic::Ordering::Relaxed);
                     content.push_str(&delta);
                     let _ = event_tx.send(crate::StreamEvent::Token(delta));
@@ -2063,6 +2154,7 @@ async fn api_call_streaming(
                 text, tokens_used, ..
             } => {
                 if !text.is_empty() {
+                    saw_meaningful_chunk = true;
                     any_tokens_sent.store(true, std::sync::atomic::Ordering::Relaxed);
                     thinking.push_str(&text);
                     let _ = event_tx.send(crate::StreamEvent::Reasoning(text));
@@ -2091,8 +2183,10 @@ async fn api_call_streaming(
                 if thought_signature.is_some() {
                     entry.thought_signature = thought_signature;
                 }
+                saw_meaningful_chunk = true;
             }
             StreamChunk::Finished { reason, usage, .. } => {
+                saw_meaningful_chunk = true;
                 finish_reason = Some(reason);
                 if usage.is_some() {
                     final_usage = usage;
@@ -2330,7 +2424,7 @@ async fn api_call_with_retry(
     max_retries: u32,
     ctx: ApiCallContext<'_>,
 ) -> Result<ApiCallOutcome, AgentError> {
-    let mut last_err = None;
+    let mut last_err: Option<String> = None;
     let mut native_tool_streaming_enabled = ctx.use_native_streaming;
     let mut disabled_native_tool_streaming = false;
     // WHY max_retries for both streaming and non-streaming:
@@ -2378,6 +2472,12 @@ async fn api_call_with_retry(
             let tokens_sent = std::sync::atomic::AtomicBool::new(false);
             invoke_pre_api_request_hooks(&ctx, provider, messages, tool_defs, attempt).await;
             let request_started_at = std::time::Instant::now();
+            tracing::info!(
+                attempt,
+                streaming = use_native_streaming_this_attempt,
+                provider = provider.name(),
+                "api_call_with_retry: sending API request"
+            );
 
             // ── API call — interruptible ────────────────────────────────
             // We race the provider future against the cancel token.
@@ -2463,6 +2563,23 @@ async fn api_call_with_retry(
                     if use_native_streaming_this_attempt {
                         let visible_output_sent =
                             tokens_sent.load(std::sync::atomic::Ordering::Relaxed);
+                        if !visible_output_sent && matches!(e, edgequake_llm::LlmError::Timeout) {
+                            tracing::warn!(
+                                provider = provider.name(),
+                                model = provider.model(),
+                                attempt,
+                                "native streaming stalled before first visible chunk; will retry with streaming"
+                            );
+                            // Do NOT downgrade to non-streaming here.  Switching to
+                            // non-streaming is worse for tool-heavy calls: the full
+                            // tool schema must be re-sent in a single blocking request
+                            // (up to 120 s timeout) which makes the TUI appear more
+                            // stuck, not less.  Timeout is in
+                            // is_retryable_nonvisible_stream_error, so the code below
+                            // records last_err and breaks the inner loop, letting the
+                            // outer 'attempt_loop retry with streaming and interruptible
+                            // backoff instead.
+                        }
                         if !visible_output_sent
                             && !tool_defs.is_empty()
                             && is_streamed_tool_capability_error(&e)
@@ -2491,8 +2608,20 @@ async fn api_call_with_retry(
                         }
                     }
 
-                    last_err = Some(e);
+                    last_err = Some(e.to_string());
                     if provider_handles_error {
+                        break 'attempt_loop;
+                    }
+                    // Non-retryable errors: abort immediately instead of
+                    // burning through the retry budget on a permanent failure
+                    // (geo-block, bad API key, invalid request, etc.).
+                    if matches!(
+                        &e,
+                        edgequake_llm::LlmError::AuthError(_)
+                            | edgequake_llm::LlmError::InvalidRequest(_)
+                            | edgequake_llm::LlmError::ModelNotFound(_)
+                            | edgequake_llm::LlmError::TokenLimitExceeded { .. }
+                    ) {
                         break 'attempt_loop;
                     }
                     break;
@@ -2506,7 +2635,7 @@ async fn api_call_with_retry(
         retry_budget,
         last_err.map_or_else(
             || "unknown error".to_string(),
-            |e| augment_provider_error(provider, e.to_string())
+            |e| augment_provider_error(provider, e)
         )
     )))
 }
@@ -3427,6 +3556,12 @@ mod tests {
     }
 
     #[derive(Clone)]
+    struct FirstChunkTimeoutProvider {
+        stream_attempts: Arc<std::sync::atomic::AtomicUsize>,
+        nonstream_attempts: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[derive(Clone)]
     struct ToolStreamingRejectedProvider {
         stream_attempts: Arc<std::sync::atomic::AtomicUsize>,
         nonstream_attempts: Arc<std::sync::atomic::AtomicUsize>,
@@ -3701,6 +3836,79 @@ mod tests {
             };
 
             Ok(futures::stream::iter(chunks.into_iter().map(Ok)).boxed())
+        }
+
+        fn supports_tool_streaming(&self) -> bool {
+            true
+        }
+    }
+
+    #[async_trait]
+    impl LLMProvider for FirstChunkTimeoutProvider {
+        fn name(&self) -> &str {
+            "first-chunk-timeout"
+        }
+
+        fn model(&self) -> &str {
+            "first-chunk-timeout-model"
+        }
+
+        fn max_context_length(&self) -> usize {
+            8192
+        }
+
+        async fn complete(
+            &self,
+            prompt: &str,
+        ) -> edgequake_llm::Result<edgequake_llm::LLMResponse> {
+            Ok(edgequake_llm::LLMResponse::new(prompt, self.model()))
+        }
+
+        async fn complete_with_options(
+            &self,
+            prompt: &str,
+            _options: &CompletionOptions,
+        ) -> edgequake_llm::Result<edgequake_llm::LLMResponse> {
+            self.complete(prompt).await
+        }
+
+        async fn chat(
+            &self,
+            messages: &[ChatMessage],
+            options: Option<&CompletionOptions>,
+        ) -> edgequake_llm::Result<edgequake_llm::LLMResponse> {
+            self.chat_with_tools(messages, &[], None, options).await
+        }
+
+        async fn chat_with_tools(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[ToolDefinition],
+            _tool_choice: Option<ToolChoice>,
+            _options: Option<&CompletionOptions>,
+        ) -> edgequake_llm::Result<edgequake_llm::LLMResponse> {
+            self.nonstream_attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(edgequake_llm::LLMResponse::new(
+                "fallback after stalled stream",
+                self.model(),
+            ))
+        }
+
+        async fn chat_with_tools_stream(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[ToolDefinition],
+            _tool_choice: Option<ToolChoice>,
+            _options: Option<&CompletionOptions>,
+        ) -> edgequake_llm::Result<
+            futures::stream::BoxStream<'static, edgequake_llm::Result<StreamChunk>>,
+        > {
+            use futures::StreamExt;
+
+            self.stream_attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(futures::stream::pending().boxed())
         }
 
         fn supports_tool_streaming(&self) -> bool {
@@ -4174,6 +4382,44 @@ def register(ctx):
 
         assert_eq!(outcome.response.content, "tool fallback");
         assert!(outcome.disabled_native_tool_streaming);
+        assert_eq!(stream_attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            nonstream_attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn api_call_with_retry_falls_back_after_stream_stalls_before_first_chunk() {
+        let stream_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let nonstream_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider: Arc<dyn LLMProvider> = Arc::new(FirstChunkTimeoutProvider {
+            stream_attempts: stream_attempts.clone(),
+            nonstream_attempts: nonstream_attempts.clone(),
+        });
+        let cancel = CancellationToken::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let outcome = api_call_with_retry(
+            &provider,
+            &[ChatMessage::user("hello")],
+            &[],
+            1,
+            ApiCallContext {
+                options: None,
+                cancel: &cancel,
+                event_tx: Some(&tx),
+                use_native_streaming: true,
+                discovered_plugins: None,
+                conversation_session_id: "test-session",
+                platform: edgecrab_types::Platform::Cli,
+                api_call_count: 0,
+            },
+        )
+        .await
+        .expect("stalled first chunk should fall back to non-streaming");
+
+        assert_eq!(outcome.response.content, "fallback after stalled stream");
         assert_eq!(stream_attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(
             nonstream_attempts.load(std::sync::atomic::Ordering::SeqCst),
