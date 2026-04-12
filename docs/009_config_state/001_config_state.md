@@ -95,6 +95,11 @@ EDGECRAB_SKIP_CONTEXT_FILES=true
 
 # Disable file-backed memory injection
 EDGECRAB_SKIP_MEMORY=true
+
+# Control spill-to-artifact for oversized tool results
+EDGECRAB_TOOL_RESULT_SPILL=true
+EDGECRAB_TOOL_RESULT_SPILL_THRESHOLD=16384
+EDGECRAB_TOOL_RESULT_SPILL_PREVIEW_LINES=80
 ```
 
 Gateway-specific and terminal-specific variables follow the same `EDGECRAB_` prefix convention; see the gateway and security docs for the full list.
@@ -188,6 +193,11 @@ compression:
   trigger_ratio: 0.80        # compress when context is 80% full
   target_ratio: 0.40         # shrink down to 40% of window
 
+tools:
+  result_spill: true
+  result_spill_threshold: 16384
+  result_spill_preview_lines: 80
+
 memory:
   enabled: true
   max_inject_tokens: 4000
@@ -208,6 +218,7 @@ moa:
 - **Provider auth now has two local layers** — `auth.json` tracks the active provider and metadata, while `.env` still carries the actual provider API key material used at runtime.
 - **The `SOUL.md` file is the fastest way to give EdgeCrab a persistent personality** without modifying code. It is appended to the system prompt on every turn.
 - **`models.yaml` controls cost tracking** — if you add a new model, add a cost entry so `/cost` and trajectory files report accurately.
+- **Spilled tool artifacts are workspace-local, not home-local** — large successful tool results are written under `.edgecrab-artifacts/<session_id>/` in the active cwd so the agent can read them back through normal file tools.
 
 ---
 

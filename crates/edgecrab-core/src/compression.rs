@@ -58,6 +58,7 @@
 //!       └── [Message::system_summary(SUMMARY_PREFIX + text), ...recent]
 //! ```
 
+use std::path::Path;
 use std::sync::Arc;
 
 use edgecrab_types::Message;
@@ -65,6 +66,7 @@ use edgequake_llm::LLMProvider;
 
 use crate::config::CompressionConfig;
 use crate::model_catalog::ModelCatalog;
+use crate::tool_result_spill::{SpillConfig, SpillOutcome, SpillSequence};
 
 // ─── Constants ────────────────────────────────────────────────────────
 
@@ -83,6 +85,23 @@ pub const SUMMARY_PREFIX: &str =
 /// thousands of tokens each. Replacing them before the LLM call keeps
 /// the summarisation prompt itself small — no recursion risk.
 pub const PRUNED_TOOL_PLACEHOLDER: &str = "[tool output pruned — reclaimed context window space]";
+
+/// Context for spilling tool results to artifact files during compression.
+///
+/// When provided to `compress_with_llm` / `prune_tool_outputs`, large tool
+/// results are written to disk artifacts instead of being replaced with a
+/// generic placeholder. This preserves agent access to the full data via
+/// `read_file` while still reclaiming context window space.
+pub struct PruneSpillContext<'a> {
+    /// Active session ID — used for artifact directory scoping.
+    pub session_id: &'a str,
+    /// Current working directory — artifact root.
+    pub cwd: &'a Path,
+    /// Spill configuration (enabled, threshold, preview_lines).
+    pub config: &'a SpillConfig,
+    /// Shared per-session sequence counter for unique artifact filenames.
+    pub seq: &'a SpillSequence,
+}
 
 /// Number of head messages (system prompt + first exchange) always preserved.
 /// Matches hermes-agent's `protect_first_n = 3` constant.
@@ -332,7 +351,10 @@ fn build_summary(messages: &[Message]) -> String {
 /// coherent narrative the model can use to reason about earlier state.
 ///
 /// Pipeline (6 phases — mirrors hermes-agent `context_compressor.py`):
-/// 1. **Prune** — replace large tool outputs with placeholders (cheap, no LLM).
+/// 1. **Prune** — replace large tool outputs with placeholders or spill to
+///    artifact files (cheap, no LLM). When `spill_ctx` is provided, results
+///    exceeding the prune threshold are written to disk artifacts so the
+///    agent can still access them via `read_file`.
 /// 2. **Boundary** — determine head/tail by token-budget walk; align both
 ///    boundaries to avoid splitting tool_call/tool_result groups.
 /// 3. **Prior** — extract any existing `SUMMARY_PREFIX` block for iterative update.
@@ -345,6 +367,7 @@ pub async fn compress_with_llm(
     messages: &[Message],
     params: &CompressionParams,
     provider: &Arc<dyn LLMProvider>,
+    spill_ctx: Option<&PruneSpillContext<'_>>,
 ) -> Vec<Message> {
     let n = messages.len();
     // Need at least: protected head + 1 message to summarise + protected tail.
@@ -353,7 +376,9 @@ pub async fn compress_with_llm(
     }
 
     // Phase 1: prune tool outputs (cheap, no LLM).
-    let pruned = prune_tool_outputs(messages);
+    // When spill context is available, large results are written to artifact
+    // files on disk instead of being replaced with a generic placeholder.
+    let pruned = prune_tool_outputs(messages, spill_ctx);
 
     // Phase 2: determine compression boundaries.
     // Head: always keep system prompt + first exchange (PROTECT_FIRST_N messages).
@@ -398,26 +423,57 @@ pub async fn compress_with_llm(
     sanitize_orphan_pairs(result)
 }
 
-/// Replace large tool-result messages with a placeholder.
+/// Replace large tool-result messages with a placeholder, or spill to disk.
 ///
 /// WHY: Tool outputs (file contents, grep results, command output) are
 /// often thousands of tokens. Replacing them with a 10-token placeholder
 /// before summarisation halves the LLM input cost at no semantic loss —
 /// the summary will describe *what* the tool found, not dump raw bytes.
 ///
+/// When `spill_ctx` is `Some` and spilling is enabled, large results are
+/// written to artifact files on disk instead of being replaced with a
+/// generic placeholder. The message body becomes a compact stub with a
+/// preview and a file path — the agent can still `read_file` the full data.
+///
 /// Threshold: tool results over 200 chars are pruned. This preserves
 /// short "ok" / "error" responses that carry semantic meaning.
-pub fn prune_tool_outputs(messages: &[Message]) -> Vec<Message> {
+pub fn prune_tool_outputs(
+    messages: &[Message],
+    spill_ctx: Option<&PruneSpillContext<'_>>,
+) -> Vec<Message> {
     messages
         .iter()
         .map(|m| {
             if m.role == edgecrab_types::Role::Tool && m.text_content().len() > 200 {
-                // Keep the tool_call_id / tool_name metadata, replace body.
-                Message::tool_result(
-                    m.tool_call_id.as_deref().unwrap_or("unknown"),
-                    m.name.as_deref().unwrap_or("tool"),
-                    PRUNED_TOOL_PLACEHOLDER,
-                )
+                let tool_call_id = m.tool_call_id.as_deref().unwrap_or("unknown");
+                let tool_name = m.name.as_deref().unwrap_or("tool");
+
+                // When spill context is available, attempt to spill to artifact
+                if let Some(ctx) = spill_ctx {
+                    if ctx.config.enabled {
+                        let result = m.text_content();
+                        match crate::tool_result_spill::maybe_spill(
+                            tool_name,
+                            tool_call_id,
+                            result,
+                            ctx.session_id,
+                            ctx.cwd,
+                            ctx.config,
+                            ctx.seq,
+                        ) {
+                            SpillOutcome::Spilled { stub, .. } => {
+                                return Message::tool_result(tool_call_id, tool_name, &stub);
+                            }
+                            SpillOutcome::Inline(_) => {
+                                // Below spill threshold but above prune threshold (200 chars)
+                                // — fall through to placeholder
+                            }
+                        }
+                    }
+                }
+
+                // Default: replace with generic placeholder
+                Message::tool_result(tool_call_id, tool_name, PRUNED_TOOL_PLACEHOLDER)
             } else {
                 m.clone()
             }
@@ -1167,7 +1223,7 @@ mod tests {
             Message::user("run a command"),
             Message::tool_result("id1", "shell_exec", &"x".repeat(500)),
         ];
-        let pruned = prune_tool_outputs(&messages);
+        let pruned = prune_tool_outputs(&messages, None);
         assert_eq!(pruned.len(), 2);
         // User message unchanged
         assert_eq!(pruned[0].text_content(), "run a command");
@@ -1178,8 +1234,99 @@ mod tests {
     #[test]
     fn prune_tool_outputs_keeps_short_results() {
         let messages = vec![Message::tool_result("id1", "shell_exec", "ok")];
-        let pruned = prune_tool_outputs(&messages);
+        let pruned = prune_tool_outputs(&messages, None);
         assert_eq!(pruned[0].text_content(), "ok");
+    }
+
+    #[test]
+    fn prune_tool_outputs_spills_when_context_provided() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let seq = crate::tool_result_spill::SpillSequence::new();
+        let spill_config = crate::tool_result_spill::SpillConfig {
+            enabled: true,
+            threshold: 100, // low threshold to trigger spill
+            preview_lines: 3,
+        };
+        let spill_ctx = PruneSpillContext {
+            session_id: "test-session",
+            cwd: tmp.path(),
+            config: &spill_config,
+            seq: &seq,
+        };
+
+        // 500 chars > spill threshold (100) — should spill, not use placeholder
+        let big_result: String = (1..=50)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let messages = vec![
+            Message::user("search files"),
+            Message::tool_result("id1", "file_search", &big_result),
+        ];
+        let pruned = prune_tool_outputs(&messages, Some(&spill_ctx));
+        assert_eq!(pruned.len(), 2);
+        // User message unchanged
+        assert_eq!(pruned[0].text_content(), "search files");
+        // Tool result should be a spill stub, NOT the generic placeholder
+        let result_content = pruned[1].text_content();
+        assert!(
+            result_content.contains("[tool_result_spill]"),
+            "expected spill stub, got: {result_content}"
+        );
+        assert!(result_content.contains("tool: file_search"));
+        assert!(result_content.contains("--- BEGIN PREVIEW"));
+        assert!(!result_content.contains(PRUNED_TOOL_PLACEHOLDER));
+    }
+
+    #[test]
+    fn prune_tool_outputs_falls_back_to_placeholder_when_below_spill_threshold() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let seq = crate::tool_result_spill::SpillSequence::new();
+        let spill_config = crate::tool_result_spill::SpillConfig {
+            enabled: true,
+            threshold: 10_000, // high spill threshold
+            preview_lines: 5,
+        };
+        let spill_ctx = PruneSpillContext {
+            session_id: "test-session",
+            cwd: tmp.path(),
+            config: &spill_config,
+            seq: &seq,
+        };
+
+        // 500 chars > prune threshold (200) but < spill threshold (10_000)
+        let messages = vec![Message::tool_result("id1", "shell_exec", &"x".repeat(500))];
+        let pruned = prune_tool_outputs(&messages, Some(&spill_ctx));
+        // Should fall back to generic placeholder since below spill threshold
+        assert_eq!(pruned[0].text_content(), PRUNED_TOOL_PLACEHOLDER);
+    }
+
+    #[test]
+    fn prune_tool_outputs_skips_spill_when_disabled() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let seq = crate::tool_result_spill::SpillSequence::new();
+        let spill_config = crate::tool_result_spill::SpillConfig {
+            enabled: false, // disabled
+            threshold: 100,
+            preview_lines: 5,
+        };
+        let spill_ctx = PruneSpillContext {
+            session_id: "test-session",
+            cwd: tmp.path(),
+            config: &spill_config,
+            seq: &seq,
+        };
+
+        let messages = vec![Message::tool_result("id1", "shell_exec", &"x".repeat(500))];
+        let pruned = prune_tool_outputs(&messages, Some(&spill_ctx));
+        // Should use generic placeholder since spill is disabled
+        assert_eq!(pruned[0].text_content(), PRUNED_TOOL_PLACEHOLDER);
     }
 
     #[test]

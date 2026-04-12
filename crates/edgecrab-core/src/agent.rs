@@ -29,7 +29,7 @@ use edgecrab_tools::ProcessTable;
 use edgecrab_tools::TodoStore;
 use edgecrab_tools::config_ref::{AppConfigRef, LspServerConfigRef};
 use edgecrab_tools::registry::{GatewaySender, ToolInventoryEntry, ToolRegistry};
-use edgecrab_types::{AgentError, ApiMode, Cost, Message, Platform, Role, Usage};
+use edgecrab_types::{AgentError, ApiMode, Cost, Message, OriginChat, Platform, Role, Usage};
 use edgequake_llm::LLMProvider;
 
 use crate::config::AppConfig;
@@ -100,7 +100,7 @@ pub struct IsolatedAgentOptions {
     /// Optional quiet-mode override.
     pub quiet_mode: Option<bool>,
     /// Optional origin chat override for gateway-created isolated sessions.
-    pub origin_chat: Option<(String, String)>,
+    pub origin_chat: Option<OriginChat>,
 }
 
 /// Immutable per-agent configuration (subset of AppConfig relevant to the loop).
@@ -139,14 +139,14 @@ pub struct AgentConfig {
     pub delegation_provider: Option<String>,
     pub delegation_max_subagents: u32,
     pub delegation_max_iterations: u32,
-    /// Origin of the current session — (platform_name, chat_id).
+    /// Origin of the current session — named platform + chat identifier.
     ///
     /// Set by the gateway when a message arrives from a real chat
     /// (Telegram, WhatsApp, Discord, etc.).  Passed into every `ToolContext`
     /// so that `manage_cron_jobs(action='create', deliver='origin')` can
     /// record the correct delivery target without the LLM needing to know it.
     /// None in CLI / cron / test sessions.
-    pub origin_chat: Option<(String, String)>,
+    pub origin_chat: Option<OriginChat>,
     /// Browser automation config (recording, timeouts).
     pub browser: crate::config::BrowserConfig,
     /// Whether automatic checkpoints are enabled.
@@ -184,6 +184,12 @@ pub struct AgentConfig {
     pub path_restrictions: Vec<std::path::PathBuf>,
     /// LSP runtime configuration projected from AppConfig.
     pub lsp: crate::config::LspConfig,
+    /// Whether tool-result spill-to-artifact is enabled.
+    pub result_spill: bool,
+    /// Byte threshold for spilling tool results.
+    pub result_spill_threshold: usize,
+    /// Preview lines kept in the spill stub.
+    pub result_spill_preview_lines: usize,
 }
 
 impl Default for AgentConfig {
@@ -236,6 +242,9 @@ impl Default for AgentConfig {
             file_allowed_roots: Vec::new(),
             path_restrictions: Vec::new(),
             lsp: crate::config::LspConfig::default(),
+            result_spill: true,
+            result_spill_threshold: 16_384,
+            result_spill_preview_lines: 80,
         }
     }
 }
@@ -371,6 +380,9 @@ impl AgentConfig {
             stt_whisper_model: Some(self.stt.whisper_model.clone()),
             image_provider: Some(self.image_generation.provider.clone()),
             image_model: Some(self.image_generation.model.clone()),
+            result_spill: self.result_spill,
+            result_spill_threshold: self.result_spill_threshold,
+            result_spill_preview_lines: self.result_spill_preview_lines,
             gateway_running,
             ..Default::default()
         }
@@ -547,7 +559,7 @@ impl Agent {
         // Set origin_chat and platform for this conversation turn.
         {
             let mut cfg = self.config.write().await;
-            cfg.origin_chat = Some((platform.to_string(), chat_id.to_string()));
+            cfg.origin_chat = Some(OriginChat::new(platform, chat_id));
             cfg.platform = platform_from_str(platform).unwrap_or(cfg.platform);
         }
         let result = self.run_conversation(message, None, None).await?;
@@ -577,7 +589,7 @@ impl Agent {
         // Set origin and platform — identical to chat_with_origin().
         {
             let mut cfg = self.config.write().await;
-            cfg.origin_chat = Some((platform.to_string(), chat_id.to_string()));
+            cfg.origin_chat = Some(OriginChat::new(platform, chat_id));
             cfg.platform = platform_from_str(platform).unwrap_or(cfg.platform);
         }
 
@@ -1035,8 +1047,12 @@ impl Agent {
             &config.model,
             &config.compression,
         );
+        // Pass None for spill context in force_compress — this is a manual /compress
+        // command and we don't have a cwd/session_id readily available. Tool results
+        // are still pruned with the generic placeholder, which is fine for /compress.
         session.messages =
-            crate::compression::compress_with_llm(&session.messages, &params, &provider).await;
+            crate::compression::compress_with_llm(&session.messages, &params, &provider, None)
+                .await;
     }
 
     /// Set the session title (persisted on next DB write).
@@ -1720,6 +1736,9 @@ impl AgentBuilder {
                 file_allowed_roots: config.tools.file.allowed_roots.clone(),
                 path_restrictions: config.security.path_restrictions.clone(),
                 lsp: config.lsp.clone(),
+                result_spill: config.tools.result_spill,
+                result_spill_threshold: config.tools.result_spill_threshold,
+                result_spill_preview_lines: config.tools.result_spill_preview_lines,
                 ..Default::default()
             },
             provider: None,
@@ -1769,7 +1788,7 @@ impl AgentBuilder {
     /// `manage_cron_jobs(action='create', deliver='origin')` knows where to
     /// deliver job output without the LLM needing to know the raw chat ID.
     pub fn origin_chat(mut self, platform: String, chat_id: String) -> Self {
-        self.config.origin_chat = Some((platform, chat_id));
+        self.config.origin_chat = Some(OriginChat::new(platform, chat_id));
         self
     }
 

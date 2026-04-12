@@ -140,9 +140,13 @@ For each tool call:
        no match    → fuzzy match (Levenshtein ≤ 3) → ToolError::NotFound
 
   4. result handling
-       Ok(string)   → Message::tool_result(id, name, string) → append
+       Ok(string)   → maybe_spill()
+                    → inline original result
+                      OR preview stub + artifact path under
+                         .edgecrab-artifacts/<session_id>/...
+                    → Message::tool_result(id, name, result) → append
        Err(ToolError) → serialise to ToolErrorResponse JSON → append
-                        (model reads it, adapts next iteration)
+                        (errors stay inline so the model can self-correct)
 ```
 
 ---
@@ -176,6 +180,10 @@ The conversation history always uses the OpenAI-compatible message format:
 This shape is what compression, persistence, and recovery all rely on.
 Breaking it — e.g., appending an `assistant` message immediately after
 another `assistant` — produces provider API errors.
+
+Large successful tool results may appear as `[tool_result_spill]` stubs rather
+than raw output. That is still a valid `tool` message; the full payload lives in
+the referenced artifact file and remains accessible through `read_file`.
 
 ---
 

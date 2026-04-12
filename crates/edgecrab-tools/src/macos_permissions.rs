@@ -285,7 +285,7 @@ mod tests {
     fn detects_notes_target_from_memo() {
         let preflight = preflight_command_permissions("memo notes -s 'Title'");
         assert_eq!(preflight.automation_target.as_deref(), Some("Notes"));
-        assert!(preflight.automation_state.is_some() || !cfg!(target_os = "macos"));
+        assert_eq!(preflight.automation_state, None);
     }
 
     #[test]

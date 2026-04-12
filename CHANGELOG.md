@@ -7,6 +7,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Tool-result spill-to-artifact for large tool outputs** — oversized successful tool results can now be written to session-scoped files under `.edgecrab-artifacts/<session_id>/...` while the conversation keeps only a compact preview stub, reducing prompt bloat without losing recoverability through existing file tools.
+- **Config and env controls for spill behavior** — `tools.result_spill`, `tools.result_spill_threshold`, and `tools.result_spill_preview_lines` are now available in config, with matching `EDGECRAB_TOOL_RESULT_SPILL*` environment overrides.
+
+### Changed
+
+- **Gateway origin metadata is now a named shared type instead of an ambiguous tuple** — `OriginChat { platform, chat_id }` now flows through core, tools, and gateway paths, tightening type safety and making session-key / cron-origin call sites self-documenting.
+
 ---
 
 ## [0.3.4] — 2026-04-12

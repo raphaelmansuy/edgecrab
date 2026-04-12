@@ -85,6 +85,30 @@ impl std::fmt::Display for Platform {
     }
 }
 
+/// Origin chat metadata for gateway-backed sessions.
+///
+/// WHY a named struct: `(String, String)` obscures which value is the platform
+/// name and which is the chat identifier. A shared value type makes call sites
+/// self-documenting across edgecrab-core, edgecrab-tools, and edgecrab-gateway.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct OriginChat {
+    pub platform: String,
+    pub chat_id: String,
+}
+
+impl OriginChat {
+    pub fn new(platform: impl Into<String>, chat_id: impl Into<String>) -> Self {
+        Self {
+            platform: platform.into(),
+            chat_id: chat_id.into(),
+        }
+    }
+
+    pub fn session_key(&self) -> String {
+        format!("{}:{}", self.platform, self.chat_id)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,5 +157,19 @@ mod tests {
             let deser: Platform = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(p, deser);
         }
+    }
+
+    #[test]
+    fn origin_chat_session_key() {
+        let origin = OriginChat::new("telegram", "chat-123");
+        assert_eq!(origin.session_key(), "telegram:chat-123");
+    }
+
+    #[test]
+    fn origin_chat_serde_roundtrip() {
+        let origin = OriginChat::new("discord", "chan-456");
+        let json = serde_json::to_string(&origin).expect("serialize");
+        let deser: OriginChat = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(origin, deser);
     }
 }

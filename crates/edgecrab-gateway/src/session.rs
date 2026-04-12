@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use edgecrab_core::{Agent, IsolatedAgentOptions};
-use edgecrab_types::{AgentError, Platform};
+use edgecrab_types::{AgentError, OriginChat, Platform};
 use tokio::sync::RwLock;
 
 /// Composite key identifying a unique gateway session.
@@ -84,7 +84,7 @@ impl SessionManager {
         &self,
         key: &SessionKey,
         base_agent: &Arc<Agent>,
-        origin_chat: (String, String),
+        origin_chat: OriginChat,
     ) -> Result<Arc<RwLock<GatewaySession>>, AgentError> {
         if let Some(existing) = self.sessions.get(key) {
             return Ok(existing.clone());
@@ -202,7 +202,7 @@ mod tests {
             .resolve(
                 &key,
                 &agent,
-                (Platform::Telegram.to_string(), "ch1".to_string()),
+                OriginChat::new(Platform::Telegram.to_string(), "ch1".to_string()),
             )
             .await
             .expect("resolve session");
@@ -219,7 +219,7 @@ mod tests {
             .resolve(
                 &key,
                 &agent,
-                (Platform::Discord.to_string(), "user1".to_string()),
+                OriginChat::new(Platform::Discord.to_string(), "user1".to_string()),
             )
             .await
             .expect("resolve 1");
@@ -227,7 +227,7 @@ mod tests {
             .resolve(
                 &key,
                 &agent,
-                (Platform::Discord.to_string(), "user1".to_string()),
+                OriginChat::new(Platform::Discord.to_string(), "user1".to_string()),
             )
             .await
             .expect("resolve 2");
@@ -248,21 +248,21 @@ mod tests {
         mgr.resolve(
             &k1,
             &agent,
-            (Platform::Telegram.to_string(), "user1".to_string()),
+            OriginChat::new(Platform::Telegram.to_string(), "user1".to_string()),
         )
         .await
         .expect("resolve k1");
         mgr.resolve(
             &k2,
             &agent,
-            (Platform::Telegram.to_string(), "user2".to_string()),
+            OriginChat::new(Platform::Telegram.to_string(), "user2".to_string()),
         )
         .await
         .expect("resolve k2");
         mgr.resolve(
             &k3,
             &agent,
-            (Platform::Discord.to_string(), "user1".to_string()),
+            OriginChat::new(Platform::Discord.to_string(), "user1".to_string()),
         )
         .await
         .expect("resolve k3");
@@ -286,7 +286,7 @@ mod tests {
         mgr.resolve(
             &key,
             &agent,
-            (Platform::Telegram.to_string(), "user1".to_string()),
+            OriginChat::new(Platform::Telegram.to_string(), "user1".to_string()),
         )
         .await
         .expect("resolve session");
@@ -307,7 +307,7 @@ mod tests {
         mgr.resolve(
             &key,
             &agent,
-            (Platform::Telegram.to_string(), "user1".to_string()),
+            OriginChat::new(Platform::Telegram.to_string(), "user1".to_string()),
         )
         .await
         .expect("resolve session");

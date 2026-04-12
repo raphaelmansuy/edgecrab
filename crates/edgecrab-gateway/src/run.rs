@@ -31,6 +31,7 @@ use edgecrab_tools::tools::transcribe::TranscribeAudioTool;
 use edgecrab_tools::tools::tts::TextToSpeechTool;
 use edgecrab_tools::tools::vision::VisionAnalyzeTool;
 use edgecrab_tools::{AppConfigRef, ToolContext, ToolHandler};
+use edgecrab_types::OriginChat;
 use futures::FutureExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -1186,7 +1187,7 @@ impl Gateway {
             .resolve(
                 &session_lookup,
                 &base_agent,
-                (msg.platform.to_string(), origin_chat_id.to_string()),
+                OriginChat::new(msg.platform.to_string(), origin_chat_id.to_string()),
             )
             .await
             .map_err(|error| error.to_string())?;
@@ -2196,7 +2197,7 @@ impl Gateway {
                                                 session_id: Some(task_id_for_spawn.clone()),
                                                 platform: Some(platform),
                                                 quiet_mode: Some(true),
-                                                origin_chat: Some((
+                                                origin_chat: Some(OriginChat::new(
                                                     platform_name.clone(),
                                                     origin_chat_id_clone.clone(),
                                                 )),
@@ -2691,7 +2692,10 @@ impl Gateway {
                             .resolve(
                                 &session_lookup,
                                 &base_agent,
-                                (msg.platform.to_string(), origin_chat_id_for_key.clone()),
+                                OriginChat::new(
+                                    msg.platform.to_string(),
+                                    origin_chat_id_for_key.clone(),
+                                ),
                             )
                             .await;
                         let session: Arc<tokio::sync::RwLock<crate::session::GatewaySession>> =

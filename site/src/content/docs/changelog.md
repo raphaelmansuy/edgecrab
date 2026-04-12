@@ -12,6 +12,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Large tool outputs can now spill to session-scoped artifact files instead of bloating prompt history** — successful tool results over the configured threshold are persisted under `.edgecrab-artifacts/<session_id>/...`, while the model sees a compact preview stub with metadata and a readable path.
+- **Spill behavior is now configurable** — `tools.result_spill`, `tools.result_spill_threshold`, and `tools.result_spill_preview_lines` plus matching `EDGECRAB_TOOL_RESULT_SPILL*` overrides control whether spilling is enabled, when it triggers, and how much preview is kept inline.
+
+### Changed
+
+- **Gateway/chat origin metadata now uses a named value type** — the internal `(String, String)` pair has been replaced with `OriginChat { platform, chat_id }`, which improves type safety across agent, gateway, and tool dispatch paths without changing user-facing behavior.
+
 ---
 
 ## [0.3.3] — Fix Release: Deterministic Tag Reruns and Bounded Rust Publish Waits

@@ -125,6 +125,23 @@ fn is_retryable_nonvisible_stream_error(error: &edgequake_llm::LlmError) -> bool
     )
 }
 
+fn is_retryable_stream_tool_assembly_error(error: &edgequake_llm::LlmError) -> bool {
+    let message = match error {
+        edgequake_llm::LlmError::ApiError(message)
+        | edgequake_llm::LlmError::InvalidRequest(message)
+        | edgequake_llm::LlmError::ProviderError(message)
+        | edgequake_llm::LlmError::NotSupported(message) => message,
+        _ => return false,
+    };
+
+    let normalized = message.to_ascii_lowercase();
+    normalized.contains("streamed tool call")
+        && (normalized.contains("without arguments")
+            || normalized.contains("without a function name")
+            || normalized.contains("invalid json arguments")
+            || normalized.contains("arguments must be a json object"))
+}
+
 fn is_streamed_tool_capability_error(error: &edgequake_llm::LlmError) -> bool {
     let message = match error {
         edgequake_llm::LlmError::ApiError(message)
@@ -201,7 +218,7 @@ fn build_tool_context(
         tokio::sync::mpsc::UnboundedSender<edgecrab_tools::ToolProgressUpdate>,
     >,
     gateway_sender: Option<Arc<dyn edgecrab_tools::registry::GatewaySender>>,
-    origin_chat: Option<(String, String)>,
+    origin_chat: Option<edgecrab_types::OriginChat>,
     current_tool_call_id: Option<String>,
     current_tool_name: Option<String>,
     // Stable per-conversation session identifier — used as the browser session key
@@ -241,10 +258,12 @@ fn build_tool_context(
         // Build the session key from origin_chat (gateway mode) or fall back
         // to conversation_session_id (CLI mode).  Mirrors hermes-agent's
         // ProcessSession.session_key used for gateway reset protection.
-        session_key: Some(match &origin_chat {
-            Some((platform, chat_id)) => format!("{}:{}", platform, chat_id),
-            None => conversation_session_id.to_string(),
-        }),
+        session_key: Some(
+            origin_chat
+                .as_ref()
+                .map(edgecrab_types::OriginChat::session_key)
+                .unwrap_or_else(|| conversation_session_id.to_string()),
+        ),
         todo_store,
         current_tool_call_id,
         current_tool_name,
@@ -286,9 +305,9 @@ struct DispatchContext {
         Option<tokio::sync::mpsc::UnboundedSender<edgecrab_tools::registry::ClarifyRequest>>,
     /// Channel for interactive dangerous-command approval requests.
     approval_tx: Option<tokio::sync::mpsc::UnboundedSender<ApprovalRequest>>,
-    /// Origin chat context — (platform_name, chat_id) from gateway sessions.
+    /// Origin chat context from gateway sessions.
     /// Used by manage_cron_jobs to set the job's origin so deliver='origin' works.
-    origin_chat: Option<(String, String)>,
+    origin_chat: Option<edgecrab_types::OriginChat>,
     /// Per-turn tool configuration snapshot propagated into ToolContext.
     app_config_ref: AppConfigRef,
     /// Stable per-conversation session ID — shared by all tool calls so browser
@@ -300,6 +319,8 @@ struct DispatchContext {
     capability_suppressions: Arc<Mutex<HashMap<String, ToolErrorResponse>>>,
     /// Snapshot of discovered runtime plugins for Hermes hook dispatch.
     discovered_plugins: Option<Arc<edgecrab_plugins::PluginDiscovery>>,
+    /// Per-session sequence counter for artifact file naming.
+    spill_seq: Arc<crate::tool_result_spill::SpillSequence>,
 }
 
 impl Agent {
@@ -958,6 +979,7 @@ impl Agent {
         let mut tool_errors_acc: Vec<edgecrab_types::ToolErrorRecord> = Vec::new();
         let capability_suppressions: Arc<Mutex<HashMap<String, ToolErrorResponse>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let spill_seq = Arc::new(crate::tool_result_spill::SpillSequence::new());
         let mut tool_defs_dirty = false;
         // Track whether we already emitted a ContextPressure warning this turn
         // so we do not spam the UI on every iteration when compression fails to
@@ -1057,8 +1079,23 @@ impl Agent {
                         estimated_prompt_tokens,
                         "compressing context before API call"
                     );
-                    session.messages =
-                        compress_with_llm(&session.messages, &compression_params, &provider).await;
+                    let spill_ctx = crate::compression::PruneSpillContext {
+                        session_id: &conversation_session_id,
+                        cwd: &cwd,
+                        config: &crate::tool_result_spill::SpillConfig {
+                            enabled: app_config_ref.result_spill,
+                            threshold: app_config_ref.result_spill_threshold,
+                            preview_lines: app_config_ref.result_spill_preview_lines,
+                        },
+                        seq: &spill_seq,
+                    };
+                    session.messages = compress_with_llm(
+                        &session.messages,
+                        &compression_params,
+                        &provider,
+                        Some(&spill_ctx),
+                    )
+                    .await;
                     // Re-inject active todo items preserved outside message history.
                     // Compression can summarize away earlier plan-tracking turns.
                     if let Some(snapshot) = self.todo_store.format_for_injection() {
@@ -1353,6 +1390,7 @@ impl Agent {
                 todo_store: Some(self.todo_store.clone()),
                 capability_suppressions: capability_suppressions.clone(),
                 discovered_plugins: discovered_plugins.clone(),
+                spill_seq: spill_seq.clone(),
             };
             let action = match process_response(
                 &response,
@@ -1566,7 +1604,7 @@ impl Agent {
                 .unwrap_or_default()
                 .as_secs_f64();
             let (source, routing_key) = match &config.origin_chat {
-                Some((platform, chat_id)) => (platform.clone(), Some(chat_id.clone())),
+                Some(origin) => (origin.platform.clone(), Some(origin.chat_id.clone())),
                 None => ("cli".to_string(), None),
             };
 
@@ -2568,17 +2606,21 @@ async fn api_call_with_retry(
                                 provider = provider.name(),
                                 model = provider.model(),
                                 attempt,
-                                "native streaming stalled before first visible chunk; will retry with streaming"
+                                "native streaming stalled before first visible chunk; falling back to non-streaming for this request"
                             );
-                            // Do NOT downgrade to non-streaming here.  Switching to
-                            // non-streaming is worse for tool-heavy calls: the full
-                            // tool schema must be re-sent in a single blocking request
-                            // (up to 120 s timeout) which makes the TUI appear more
-                            // stuck, not less.  Timeout is in
-                            // is_retryable_nonvisible_stream_error, so the code below
-                            // records last_err and breaks the inner loop, letting the
-                            // outer 'attempt_loop retry with streaming and interruptible
-                            // backoff instead.
+                            use_native_streaming_this_attempt = false;
+                            continue;
+                        }
+                        if !visible_output_sent && is_retryable_stream_tool_assembly_error(&e) {
+                            tracing::warn!(
+                                provider = provider.name(),
+                                model = provider.model(),
+                                attempt,
+                                error = %e,
+                                "streamed tool-call assembly failed before any visible output; retrying request"
+                            );
+                            last_err = Some(e.to_string());
+                            break;
                         }
                         if !visible_output_sent
                             && !tool_defs.is_empty()
@@ -2911,6 +2953,7 @@ async fn process_response(
                 let capability_suppressions = dctx.capability_suppressions.clone();
                 let dispatch_cwd = dctx.cwd.clone();
                 let discovered_plugins = dctx.discovered_plugins.clone();
+                let spill_seq = dctx.spill_seq.clone();
 
                 parallel_tasks.spawn(async move {
                     let started = std::time::Instant::now();
@@ -2934,6 +2977,7 @@ async fn process_response(
                         todo_store: todo_store_clone,
                         capability_suppressions,
                         discovered_plugins,
+                        spill_seq,
                     };
                     let result = dispatch_single_tool(&tc_id, &tc_name, &tc_args, &inner).await;
                     let duration_ms = started.elapsed().as_millis() as u64;
@@ -3279,6 +3323,31 @@ async fn dispatch_single_tool(
         std::mem::take(&mut *guard)
     };
 
+    // ── Tool result spill-to-artifact post-processing ────────────────
+    // Skip spill for error results — they are always compact and must
+    // remain inline for the LLM's self-correction logic.
+    let result = if !is_tool_error(&result) {
+        let spill_config = crate::tool_result_spill::SpillConfig {
+            enabled: dctx.app_config_ref.result_spill,
+            threshold: dctx.app_config_ref.result_spill_threshold,
+            preview_lines: dctx.app_config_ref.result_spill_preview_lines,
+        };
+        match crate::tool_result_spill::maybe_spill(
+            name,
+            tool_call_id,
+            result,
+            &dctx.conversation_session_id,
+            &dctx.cwd,
+            &spill_config,
+            &dctx.spill_seq,
+        ) {
+            crate::tool_result_spill::SpillOutcome::Inline(s) => s,
+            crate::tool_result_spill::SpillOutcome::Spilled { stub, .. } => stub,
+        }
+    } else {
+        result
+    };
+
     (result, queued_messages)
 }
 
@@ -3370,7 +3439,7 @@ struct BackgroundReflectionCtx {
     sub_agent_runner: Option<Arc<dyn edgecrab_tools::SubAgentRunner>>,
     app_config_ref: AppConfigRef,
     conversation_session_id: String,
-    origin_chat: Option<(String, String)>,
+    origin_chat: Option<edgecrab_types::OriginChat>,
     todo_store: Option<Arc<edgecrab_tools::TodoStore>>,
 }
 
@@ -3406,6 +3475,7 @@ async fn run_learning_reflection_bg(ctx: BackgroundReflectionCtx) {
         todo_store: ctx.todo_store.clone(),
         capability_suppressions: Arc::new(Mutex::new(HashMap::new())),
         discovered_plugins: None,
+        spill_seq: Arc::new(crate::tool_result_spill::SpillSequence::new()),
     };
 
     // Work on local session clone — we don't need results propagated back.
@@ -5272,6 +5342,7 @@ def register(ctx):
             todo_store: None,
             capability_suppressions,
             discovered_plugins: None,
+            spill_seq: Arc::new(crate::tool_result_spill::SpillSequence::new()),
         }
     }
 

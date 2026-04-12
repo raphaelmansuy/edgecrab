@@ -36,7 +36,8 @@ Key constants exported:
 pub const SUMMARY_PREFIX: &str =
     "[CONTEXT COMPACTION] Earlier turns were summarised to reclaim context window space.\n\n";
 
-pub const PRUNED_TOOL_PLACEHOLDER: &str = "[tool output pruned for context efficiency]";
+pub const PRUNED_TOOL_PLACEHOLDER: &str =
+    "[tool output pruned — reclaimed context window space]";
 ```
 
 ---
@@ -69,12 +70,14 @@ enough for triggering decisions.
   Input: full message history
 
   ┌────────────────────────────────────────────────────────────────┐
-  │  PASS 1 — Tool output pruning (no LLM, cheap)                  │
+  │  PASS 1 — Tool output pruning / spill (no LLM, cheap)          │
   │                                                                │
   │  For every tool_result message:                                │
   │    if content.len() > LARGE_OUTPUT_THRESHOLD:                  │
-  │      replace with PRUNED_TOOL_PLACEHOLDER                      │
-  │      "[tool output pruned for context efficiency]"             │
+  │      with spill context: write full result to artifact file    │
+  │                         keep preview stub in history            │
+  │      without spill context: replace with PRUNED_TOOL_PLACEHOLDER│
+  │      "[tool output pruned — reclaimed context window space]"   │
   │                                                                │
   │  Typically removes 60-80% of tokens in long sessions           │
   └────────────────────────────────────────────────────────────────┘
@@ -178,6 +181,17 @@ The LLM is instructed to produce this exact structure in Pass 3:
   Total: ~15,000 tokens
 ```
 
+When the compressor has spill context, pruned tool messages can instead become:
+
+```text
+[tool_result_spill]
+tool: file_search
+lines: 2847
+bytes: 98304
+artifact: .edgecrab-artifacts/ses_abc123/file_search_001.md
+showing: 80/2847 lines (first 3%)
+```
+
 ---
 
 ## Tips
@@ -212,6 +226,10 @@ Pass 4 kicks in: a structural summary is generated from message type metadata
 Pass 5 (orphan sanitisation) ensures the final message list is always valid.
 Orphaned `tool_result` messages (whose `tool_call` was pruned) are removed.
 Orphaned `tool_call` references get stub results inserted.
+
+**Q: If a tool result was spilled to disk, can the agent still use it after compression?**
+Yes. The stub keeps the relative artifact path, and the artifact lives under the
+active workspace so existing file tools can inspect it later.
 
 **Q: Can I disable compression?**
 Set `compression.enabled = false` in `~/.edgecrab/config.yaml`. The agent

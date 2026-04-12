@@ -172,6 +172,19 @@ impl AppConfig {
         if let Ok(val) = std::env::var("EDGECRAB_SKIP_MEMORY") {
             self.skip_memory = parse_bool_env(&val);
         }
+        if let Ok(val) = std::env::var("EDGECRAB_TOOL_RESULT_SPILL") {
+            self.tools.result_spill = parse_bool_env(&val);
+        }
+        if let Ok(val) = std::env::var("EDGECRAB_TOOL_RESULT_SPILL_THRESHOLD") {
+            if let Ok(n) = val.parse() {
+                self.tools.result_spill_threshold = n;
+            }
+        }
+        if let Ok(val) = std::env::var("EDGECRAB_TOOL_RESULT_SPILL_PREVIEW_LINES") {
+            if let Ok(n) = val.parse() {
+                self.tools.result_spill_preview_lines = n;
+            }
+        }
         if let Ok(val) = std::env::var("EDGECRAB_PLUGINS_ENABLED") {
             self.plugins.enabled = parse_bool_env(&val);
         }
@@ -662,6 +675,12 @@ pub struct ToolsConfig {
     pub tool_delay: f32,
     pub parallel_execution: bool,
     pub max_parallel_workers: usize,
+    /// Gate for tool-result spill-to-artifact (default: true).
+    pub result_spill: bool,
+    /// Byte threshold above which tool results are spilled (default: 16384).
+    pub result_spill_threshold: usize,
+    /// Number of preview lines kept in the stub (default: 80).
+    pub result_spill_preview_lines: usize,
 }
 
 impl Default for ToolsConfig {
@@ -676,6 +695,9 @@ impl Default for ToolsConfig {
             tool_delay: 1.0,
             parallel_execution: true,
             max_parallel_workers: 8,
+            result_spill: true,
+            result_spill_threshold: 16_384,
+            result_spill_preview_lines: 80,
         }
     }
 }

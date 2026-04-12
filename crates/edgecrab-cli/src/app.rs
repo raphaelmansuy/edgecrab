@@ -31760,7 +31760,9 @@ kind = "skill"
     #[tokio::test]
     async fn mouse_mode_toggle_sets_pending_request() {
         let mut app = App::new();
-        // Default is ON (SCROLL mode — wheel scrolling active).
+        // Seed the state explicitly so terminal-capability auto-detection does
+        // not make this toggle-behavior test environment-dependent.
+        app.mouse_capture_enabled = true;
         assert!(app.mouse_capture_enabled);
         // Turning on when already on is a no-op — no pending request.
         app.handle_mouse_mode("on".into());

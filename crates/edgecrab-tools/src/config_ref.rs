@@ -200,6 +200,12 @@ pub struct AppConfigRef {
     pub moa_reference_models: Vec<String>,
     /// Default aggregator model for the `moa` tool.
     pub moa_aggregator_model: Option<String>,
+    /// Whether tool-result spill-to-artifact is enabled (default: true).
+    pub result_spill: bool,
+    /// Byte threshold above which tool results are spilled to artifact files.
+    pub result_spill_threshold: usize,
+    /// Number of preview lines kept in the spill stub.
+    pub result_spill_preview_lines: usize,
 }
 
 impl Default for AppConfigRef {
@@ -260,6 +266,9 @@ impl Default for AppConfigRef {
             moa_enabled: true,
             moa_reference_models: Vec::new(),
             moa_aggregator_model: None,
+            result_spill: true,
+            result_spill_threshold: 16_384,
+            result_spill_preview_lines: 80,
         }
     }
 }
