@@ -19,6 +19,7 @@ All `EDGECRAB_*` variables are applied via `apply_env_overrides()` in `config.rs
 | `EDGECRAB_TIMEZONE` | string | (system) | IANA timezone (e.g. `America/New_York`) |
 | `EDGECRAB_REASONING_EFFORT` | string | `""` | Reasoning budget: `low`, `medium`, `high`, `xhigh` |
 | `EDGECRAB_SAVE_TRAJECTORIES` | bool | `false` | Log full trajectory to file |
+| `EDGECRAB_WORKTREE` | bool | `false` | Launch agent sessions in isolated git worktrees by default |
 | `EDGECRAB_SKIP_CONTEXT_FILES` | bool | `false` | Skip SOUL.md and AGENTS.md loading |
 | `EDGECRAB_SKIP_MEMORY` | bool | `false` | Disable memory for this session |
 | `EDGECRAB_MANAGED` | bool | `false` | Block all config writes (`1` to enable) |

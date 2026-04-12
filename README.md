@@ -771,9 +771,22 @@ switch is live, not deferred to the next launch.
 
 ```bash
 edgecrab -w "explore that refactor idea safely"
-# Creates ~/.edgecrab/worktrees/<name>/, runs there
-# Changes stay isolated — merge or discard when done
+# Creates .worktrees/edgecrab-<id>/ inside the current git repo
+# Changes stay isolated on an ephemeral branch until you merge or discard them
 ```
+
+You can also enable always-on worktree mode in config:
+
+```yaml
+# ~/.edgecrab/config.yaml
+worktree: true
+```
+
+Inside the TUI, `/worktree` opens a report overlay for the current checkout and saved launch policy, and `/worktree on|off|toggle` updates that default for future launches.
+
+`/log` opens a split-pane browser for `~/.edgecrab/logs/`, and `Enter` drills into a per-entry inspector for the selected file tail. Use `1-5` inside that overlay or `/log level <error|warn|info|debug|trace>` to persist the default log verbosity in `config.yaml`; the current process reloads its filter immediately when runtime log reloading is available.
+
+Cleanup is conservative by design: EdgeCrab removes clean disposable worktrees on exit, but keeps worktrees that contain unpushed commits so the agent cannot silently destroy branch-local work.
 
 ---
 
@@ -1118,6 +1131,8 @@ Every built-in slash command is also reachable from argv with
 | `/verbose`                               | Cycle tool progress or set it explicitly        |
 | `/personality [preset]`                  | Switch agent personality (14 presets)           |
 | `/statusbar`                             | Toggle status bar                               |
+| `/log [open\|level <level>]`             | Browse local logs and set the saved log level   |
+| `/worktree [status\|on\|off\|toggle]`    | Show current git checkout status and saved worktree launch policy |
 | `/tools`                                 | List active toolsets and tools                  |
 | `/toolsets`                              | Show toolset aliases and expansions             |
 | `/mcp [subcommand]`                      | Browse, install, test, diagnose, or remove MCP servers |
@@ -1246,6 +1261,11 @@ model:
 display:
   skin: "catppuccin"
   show_reasoning: false
+
+logging:
+  level: "info"              # error | warn | info | debug | trace
+
+worktree: false               # true = launch agent sessions in isolated git worktrees by default
 
 tools:
   enabled_toolsets: null       # null = all toolsets active

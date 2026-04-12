@@ -34,8 +34,10 @@ use edgecrab_types::AgentError;
 pub struct AppConfig {
     pub model: ModelConfig,
     pub agent: AgentConfig,
+    pub logging: LoggingConfig,
     pub tools: ToolsConfig,
     pub lsp: LspConfig,
+    pub worktree: bool,
     pub save_trajectories: bool,
     pub skip_context_files: bool,
     pub skip_memory: bool,
@@ -68,6 +70,20 @@ pub struct AppConfig {
 pub struct AgentConfig {
     pub system_prompt: String,
     pub personalities: HashMap<String, PersonalityPreset>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct LoggingConfig {
+    pub level: String,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            level: "info".into(),
+        }
+    }
 }
 
 impl AppConfig {
@@ -160,11 +176,17 @@ impl AppConfig {
                 self.model.max_iterations = n;
             }
         }
+        if let Ok(val) = std::env::var("EDGECRAB_LOG_LEVEL") {
+            self.logging.level = val;
+        }
         if let Ok(val) = std::env::var("EDGECRAB_TIMEZONE") {
             self.timezone = Some(val);
         }
         if let Ok(val) = std::env::var("EDGECRAB_SAVE_TRAJECTORIES") {
             self.save_trajectories = parse_bool_env(&val);
+        }
+        if let Ok(val) = std::env::var("EDGECRAB_WORKTREE") {
+            self.worktree = parse_bool_env(&val);
         }
         if let Ok(val) = std::env::var("EDGECRAB_SKIP_CONTEXT_FILES") {
             self.skip_context_files = parse_bool_env(&val);
@@ -2240,6 +2262,15 @@ tools:
         cfg.apply_env_overrides();
         assert_eq!(cfg.model.default_model, "test/model");
         unsafe { std::env::remove_var("EDGECRAB_MODEL") };
+    }
+
+    #[test]
+    fn env_override_worktree() {
+        unsafe { std::env::set_var("EDGECRAB_WORKTREE", "1") };
+        let mut cfg = AppConfig::default();
+        cfg.apply_env_overrides();
+        assert!(cfg.worktree);
+        unsafe { std::env::remove_var("EDGECRAB_WORKTREE") };
     }
 
     #[test]

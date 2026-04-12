@@ -18,6 +18,8 @@ Run `edgecrab config show` to print your active resolved configuration (after en
 ```yaml
 # ~/.edgecrab/config.yaml
 
+worktree: false                 # true = launch agent sessions in isolated git worktrees by default
+
 # ── Model ──────────────────────────────────────────────────────────────
 model:
   default: "ollama/gemma4:latest"  # Default LLM model
@@ -377,6 +379,9 @@ EdgeCrab reports a YAML parse error and exits. Run `edgecrab doctor` to diagnose
 
 **Can I have multiple config files (e.g. work vs. personal)?**
 Yes — use Profiles (`edgecrab profile create work`) or pass `--config ~/work-config.yaml` per invocation.
+
+**How do I make worktree isolation the default?**
+Set `worktree: true` in `config.yaml`, export `EDGECRAB_WORKTREE=1`, or use `/worktree on` from the TUI. That changes future launches; it does not teleport the current live session into a new checkout.
 
 **How do I set a custom `base_url` for a non-OpenAI provider?**
 In `config.yaml`:

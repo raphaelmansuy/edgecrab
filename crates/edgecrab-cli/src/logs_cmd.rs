@@ -1,138 +1,56 @@
-use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 
-use anyhow::{Context, anyhow};
+use anyhow::Context;
 
 use crate::cli_args::LogsCommand;
+use crate::logging::{
+    format_log_size, list_log_files, logs_dir_for, read_last_lines, resolve_log_path,
+};
 
 pub fn run(command: LogsCommand) -> anyhow::Result<()> {
+    let home = edgecrab_core::edgecrab_home();
     match command {
-        LogsCommand::List => list_logs(),
+        LogsCommand::List => list_logs(&home),
         LogsCommand::Path { name } => {
             if let Some(name) = name {
-                println!("{}", resolve_log_path(Some(&name))?.display());
+                println!("{}", resolve_log_path(&home, Some(&name))?.display());
             } else {
-                println!("{}", logs_dir().display());
+                println!("{}", logs_dir_for(&home).display());
             }
             Ok(())
         }
-        LogsCommand::Show { name, lines } => show_log(name.as_deref(), lines),
-        LogsCommand::Tail { name, lines } => tail_log(name.as_deref(), lines),
+        LogsCommand::Show { name, lines } => show_log(&home, name.as_deref(), lines),
+        LogsCommand::Tail { name, lines } => tail_log(&home, name.as_deref(), lines),
     }
 }
 
-fn logs_dir() -> PathBuf {
-    edgecrab_core::edgecrab_home().join("logs")
-}
-
-fn list_log_paths() -> anyhow::Result<Vec<PathBuf>> {
-    let dir = logs_dir();
-    let mut paths = Vec::new();
-    if !dir.exists() {
-        return Ok(paths);
-    }
-    for entry in
-        std::fs::read_dir(&dir).with_context(|| format!("failed to read {}", dir.display()))?
-    {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_file() {
-            paths.push(path);
-        }
-    }
-    paths.sort();
-    Ok(paths)
-}
-
-fn resolve_log_path(name: Option<&str>) -> anyhow::Result<PathBuf> {
-    let paths = list_log_paths()?;
-    if paths.is_empty() {
-        anyhow::bail!("No log files found in {}", logs_dir().display());
-    }
-
-    if let Some(name) = name {
-        let normalized = name.trim_end_matches(".log");
-        let mut matches = paths
-            .into_iter()
-            .filter(|path| {
-                let stem = path
-                    .file_stem()
-                    .and_then(|value| value.to_str())
-                    .unwrap_or_default();
-                let file = path
-                    .file_name()
-                    .and_then(|value| value.to_str())
-                    .unwrap_or_default();
-                stem == normalized || file == name || stem.starts_with(normalized)
-            })
-            .collect::<Vec<_>>();
-        matches.sort();
-        matches.dedup();
-        return match matches.len() {
-            0 => Err(anyhow!("No log file matching '{name}'.")),
-            1 => Ok(matches.remove(0)),
-            _ => Err(anyhow!(
-                "Ambiguous log name '{name}'. Matches: {}",
-                matches
-                    .iter()
-                    .map(|path| path
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or_default())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )),
-        };
-    }
-
-    for preferred in [
-        logs_dir().join("gateway.log"),
-        logs_dir().join("agent.log"),
-        logs_dir().join("acp.log"),
-        logs_dir().join("errors.log"),
-    ] {
-        if preferred.exists() {
-            return Ok(preferred);
-        }
-    }
-    if paths.len() == 1 {
-        return Ok(paths[0].clone());
-    }
-    Err(anyhow!(
-        "Multiple log files found. Use `edgecrab logs list` or specify one by name."
-    ))
-}
-
-fn list_logs() -> anyhow::Result<()> {
-    let paths = list_log_paths()?;
-    if paths.is_empty() {
-        println!("No log files found in {}", logs_dir().display());
+fn list_logs(home: &std::path::Path) -> anyhow::Result<()> {
+    let logs = list_log_files(home)?;
+    if logs.is_empty() {
+        println!("No log files found in {}", logs_dir_for(home).display());
         return Ok(());
     }
 
     println!("Log files:");
-    for path in paths {
-        let size = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+    for log in logs {
         println!(
-            "  {:20} {:>8} bytes  {}",
-            path.file_name()
-                .and_then(|value| value.to_str())
-                .unwrap_or_default(),
-            size,
-            path.display()
+            "  {:20} {:>8}  {}",
+            log.name,
+            format_log_size(log.size_bytes),
+            log.path.display()
         );
     }
     Ok(())
 }
 
-fn show_log(name: Option<&str>, lines: usize) -> anyhow::Result<()> {
-    let path = resolve_log_path(name)?;
+fn show_log(home: &std::path::Path, name: Option<&str>, lines: usize) -> anyhow::Result<()> {
+    let path = resolve_log_path(home, name)?;
     println!("{}", read_last_lines(&path, lines)?);
     Ok(())
 }
 
-fn tail_log(name: Option<&str>, lines: usize) -> anyhow::Result<()> {
-    let path = resolve_log_path(name)?;
+fn tail_log(home: &std::path::Path, name: Option<&str>, lines: usize) -> anyhow::Result<()> {
+    let path = resolve_log_path(home, name)?;
     #[cfg(unix)]
     {
         let status = ProcessCommand::new("tail")
@@ -154,27 +72,4 @@ fn tail_log(name: Option<&str>, lines: usize) -> anyhow::Result<()> {
             "Live log following is only supported on Unix in this build. Use `edgecrab logs show` instead."
         )
     }
-}
-
-fn read_last_lines(path: &Path, lines: usize) -> anyhow::Result<String> {
-    #[cfg(unix)]
-    {
-        let output = ProcessCommand::new("tail")
-            .arg("-n")
-            .arg(lines.to_string())
-            .arg(path)
-            .output();
-        if let Ok(output) = output
-            && output.status.success()
-        {
-            return String::from_utf8(output.stdout)
-                .map_err(|err| anyhow!("failed to decode {}: {err}", path.display()));
-        }
-    }
-
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
-    let total = content.lines().count();
-    let skip = total.saturating_sub(lines);
-    Ok(content.lines().skip(skip).collect::<Vec<_>>().join("\n"))
 }

@@ -11,10 +11,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 - **Tool-result spill-to-artifact for large tool outputs** — oversized successful tool results can now be written to session-scoped files under `.edgecrab-artifacts/<session_id>/...` while the conversation keeps only a compact preview stub, reducing prompt bloat without losing recoverability through existing file tools.
 - **Config and env controls for spill behavior** — `tools.result_spill`, `tools.result_spill_threshold`, and `tools.result_spill_preview_lines` are now available in config, with matching `EDGECRAB_TOOL_RESULT_SPILL*` environment overrides.
+- **Config-driven git worktree mode and TUI worktree control surface** — `worktree: true` and `EDGECRAB_WORKTREE=1` now enable isolated git worktrees by default, `/worktree` and `/w` open a dedicated TUI report overlay, and worktree cleanup now preserves branches with unpushed commits instead of deleting them aggressively.
+- **First-class `/log` TUI with persisted log-level control** — `/log` and `/logs` now open a split-pane log browser, `Enter` drills into a per-entry inspector for the selected file tail, and `1-5` or `/log level <error|warn|info|debug|trace>` save the default logging level while also reloading the live process filter when possible.
 
 ### Changed
 
 - **Gateway origin metadata is now a named shared type instead of an ambiguous tuple** — `OriginChat { platform, chat_id }` now flows through core, tools, and gateway paths, tightening type safety and making session-key / cron-origin call sites self-documenting.
+- **Worktree documentation is now code-true** — README, internal docs, and the Astro site now describe repo-local `.worktrees/`, `.worktreeinclude` copy-vs-symlink behavior, future-launch toggles, and the real cleanup semantics.
+- **Interactive and non-interactive log inspection now share one backend** — the `edgecrab logs` subcommand, startup logging bootstrap, config persistence, and the new TUI browsers all reuse the same file-discovery and log-level helpers instead of maintaining separate path-resolution logic.
 
 ---
 

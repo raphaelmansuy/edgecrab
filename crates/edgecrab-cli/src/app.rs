@@ -64,6 +64,10 @@ use crate::gateway_browser::{
 };
 use crate::gateway_catalog::collect_platform_diagnostics;
 use crate::image_models as cli_image_models;
+use crate::logging::{
+    LogFileInfo, LogLevelSetting, default_tail_lines, effective_log_level, format_log_size,
+    list_log_files, persist_log_level, read_last_lines, reload_runtime_log_level, tail_preview,
+};
 use crate::markdown_render;
 use crate::mcp_support;
 use crate::plugin_toggle::{
@@ -878,6 +882,20 @@ fn selector_action_key(key: &event::KeyEvent, ch: char) -> bool {
     match key.code {
         KeyCode::Char(c) => c == upper,
         _ => false,
+    }
+}
+
+fn log_level_shortcut(key: &event::KeyEvent) -> Option<LogLevelSetting> {
+    if !key.modifiers.is_empty() {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char('1') => Some(LogLevelSetting::Error),
+        KeyCode::Char('2') => Some(LogLevelSetting::Warn),
+        KeyCode::Char('3') => Some(LogLevelSetting::Info),
+        KeyCode::Char('4') => Some(LogLevelSetting::Debug),
+        KeyCode::Char('5') => Some(LogLevelSetting::Trace),
+        _ => None,
     }
 }
 
@@ -1949,6 +1967,13 @@ fn persist_display_preferences(
     Ok(())
 }
 
+fn persist_worktree_enabled_to_config(enabled: bool) -> anyhow::Result<()> {
+    let mut config = edgecrab_core::AppConfig::load().unwrap_or_default();
+    config.worktree = enabled;
+    config.save()?;
+    Ok(())
+}
+
 // ─── Spinner frames (braille rotation) ──────────────────────────────
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const ASCII_SPINNER_FRAMES: &[&str] = &["-", "\\", "|", "/"];
@@ -2791,6 +2816,7 @@ enum DetailSurface {
     VisionModelSelector,
     ImageModelSelector,
     GatewayBrowser,
+    LogBrowser,
     McpSelector,
     RemoteMcpBrowser,
     ProfileSelector,
@@ -2802,6 +2828,7 @@ enum DetailSurface {
     ConfigSelector,
     SessionBrowser,
     SessionInspector,
+    LogInspector,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -3708,6 +3735,262 @@ impl SessionInspector {
     }
 }
 
+#[derive(Clone)]
+struct LogBrowserEntry {
+    name: String,
+    path: std::path::PathBuf,
+    kind: String,
+    size_label: String,
+    modified_label: String,
+    preview: String,
+    detail: String,
+    detail_view: String,
+    search_text: String,
+}
+
+impl FuzzyItem for LogBrowserEntry {
+    fn primary(&self) -> &str {
+        &self.name
+    }
+
+    fn secondary(&self) -> &str {
+        &self.search_text
+    }
+
+    fn tag(&self) -> &str {
+        &self.kind
+    }
+}
+
+#[derive(Clone)]
+struct LogLineEntry {
+    level_label: String,
+    timestamp: String,
+    headline: String,
+    summary: String,
+    detail: String,
+    search_text: String,
+}
+
+impl FuzzyItem for LogLineEntry {
+    fn primary(&self) -> &str {
+        &self.headline
+    }
+
+    fn secondary(&self) -> &str {
+        &self.search_text
+    }
+
+    fn tag(&self) -> &str {
+        &self.level_label
+    }
+}
+
+#[derive(Clone)]
+struct LogInspectorMeta {
+    name: String,
+    path: std::path::PathBuf,
+    kind: String,
+    size_label: String,
+    modified_label: String,
+    preview: String,
+}
+
+struct LogInspector {
+    selector: FuzzySelector<LogLineEntry>,
+    file: Option<LogInspectorMeta>,
+    pane: DetailPaneState,
+    return_to_browser: bool,
+}
+
+impl LogInspector {
+    fn new() -> Self {
+        Self {
+            selector: FuzzySelector::new(),
+            file: None,
+            pane: DetailPaneState::default(),
+            return_to_browser: false,
+        }
+    }
+
+    fn active(&self) -> bool {
+        self.selector.active
+    }
+
+    fn close(&mut self) {
+        self.selector.active = false;
+        self.file = None;
+        self.pane.reset();
+        self.return_to_browser = false;
+    }
+}
+
+fn log_kind_for_name(name: &str) -> &'static str {
+    if name.ends_with(".jsonl") {
+        "json"
+    } else if name.contains("error") {
+        "errors"
+    } else if name.ends_with(".log.1")
+        || name.ends_with(".log.2")
+        || name.ends_with(".log.3")
+        || name.ends_with(".log.4")
+        || name.ends_with(".log.5")
+    {
+        "backup"
+    } else {
+        "text"
+    }
+}
+
+fn format_log_timestamp_label(modified: Option<std::time::SystemTime>) -> String {
+    modified
+        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|duration| {
+            chrono::Local
+                .timestamp_opt(duration.as_secs() as i64, 0)
+                .single()
+        })
+        .map(|value| value.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_else(|| "unknown".into())
+}
+
+fn default_log_browser_detail_lines() -> Vec<Line<'static>> {
+    vec![
+        Line::from(Span::styled(
+            "Log Browser",
+            Style::default()
+                .fg(Color::Rgb(255, 196, 120))
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(
+            "Browse the local log archive on the left and inspect the latest tail on the right.",
+        ),
+        Line::from(
+            "Press Enter on a file to open the entry inspector, where each log event gets its own detail pane.",
+        ),
+        Line::from(
+            "Use 1-5 to save and apply the runtime level: 1 error, 2 warn, 3 info, 4 debug, 5 trace.",
+        ),
+    ]
+}
+
+fn log_boundary_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with('{')
+        || trimmed.chars().next().is_some_and(|ch| ch.is_ascii_digit())
+            && [" TRACE ", " DEBUG ", " INFO ", " WARN ", " ERROR "]
+                .iter()
+                .any(|needle| trimmed.contains(needle))
+}
+
+fn summarize_json_log_line(value: &serde_json::Value) -> (String, String, String) {
+    let timestamp = value
+        .get("timestamp")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| value.get("time").and_then(serde_json::Value::as_str))
+        .unwrap_or("structured")
+        .to_string();
+    let level = value
+        .get("level")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("json")
+        .to_ascii_uppercase();
+    let summary = value
+        .get("fields")
+        .and_then(|fields| fields.get("message"))
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| value.get("message").and_then(serde_json::Value::as_str))
+        .unwrap_or("structured log entry")
+        .to_string();
+    (timestamp, level, summary)
+}
+
+fn parse_log_entry_chunks(content: &str) -> Vec<String> {
+    let mut entries = Vec::new();
+    let mut current = String::new();
+
+    for line in content.lines() {
+        if current.is_empty() {
+            current.push_str(line);
+            continue;
+        }
+
+        if log_boundary_line(line) {
+            entries.push(current);
+            current = line.to_string();
+        } else {
+            current.push('\n');
+            current.push_str(line);
+        }
+    }
+
+    if !current.is_empty() {
+        entries.push(current);
+    }
+
+    entries
+}
+
+fn extract_text_log_level(line: &str) -> String {
+    for level in ["TRACE", "DEBUG", "INFO", "WARN", "ERROR"] {
+        if line.contains(level) {
+            return level.to_string();
+        }
+    }
+    "LINE".into()
+}
+
+fn extract_text_log_timestamp(line: &str) -> String {
+    line.split_whitespace()
+        .take(2)
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_string()
+}
+
+fn build_log_line_entries(content: &str) -> Vec<LogLineEntry> {
+    parse_log_entry_chunks(content)
+        .into_iter()
+        .enumerate()
+        .map(|(index, detail)| {
+            let first_line = detail.lines().next().unwrap_or_default().trim();
+            let (timestamp, level_label, summary) = if first_line.starts_with('{') {
+                match serde_json::from_str::<serde_json::Value>(first_line) {
+                    Ok(value) => summarize_json_log_line(&value),
+                    Err(_) => (
+                        "structured".into(),
+                        "JSON".into(),
+                        unicode_trunc(first_line, 96),
+                    ),
+                }
+            } else {
+                (
+                    extract_text_log_timestamp(first_line),
+                    extract_text_log_level(first_line),
+                    unicode_trunc(first_line, 96),
+                )
+            };
+            let headline = format!(
+                "#{:04} {} {}",
+                index + 1,
+                level_label,
+                unicode_trunc(&summary, 72)
+            );
+            let search_text = format!("{headline} {timestamp} {summary} {detail}");
+            LogLineEntry {
+                level_label,
+                timestamp,
+                headline,
+                summary,
+                detail,
+                search_text,
+            }
+        })
+        .collect()
+}
+
 fn strip_search_markup(snippet: &str) -> String {
     snippet
         .replace("<b>", "")
@@ -3783,6 +4066,7 @@ impl FuzzyItem for SkinEntry {
 enum ConfigAction {
     ShowSummary,
     ShowPaths,
+    ShowWorktree,
     OpenTools,
     OpenModel,
     OpenCheapModel,
@@ -3796,6 +4080,7 @@ enum ConfigAction {
     ToggleStreaming,
     ToggleReasoning,
     ToggleStatusBar,
+    OpenLogs,
     OpenSkins,
     ShowVoice,
     OpenGatewayBrowser,
@@ -4100,6 +4385,12 @@ pub struct App {
     session_browser_status_note: Option<String>,
     /// Focus and scroll state for the session browser detail pane.
     session_browser_pane: DetailPaneState,
+    /// Log browser overlay (activated by `/log`)
+    log_browser: FuzzySelector<LogBrowserEntry>,
+    /// Last non-error status note shown in the log browser footer.
+    log_browser_status_note: Option<String>,
+    /// Focus and scroll state for the log browser detail pane.
+    log_browser_pane: DetailPaneState,
     /// Shared fullscreen detail mode for split-pane selector browsers.
     detail_fullscreen: Option<DetailFullscreenState>,
     /// Scroll position for split-view overlays that do not expose a dedicated pane focus model.
@@ -4108,6 +4399,8 @@ pub struct App {
     document_overlay: Option<DocumentOverlayState>,
     /// Drill-down inspector for a single saved session.
     session_inspector: SessionInspector,
+    /// Drill-down inspector for a single log file tail.
+    log_inspector: LogInspector,
     /// Config center overlay (activated by `/config`)
     config_selector: FuzzySelector<ConfigEntry>,
     /// Gateway platform browser overlay (activated by `/platforms`)
@@ -4868,10 +5161,14 @@ impl App {
             session_browser: FuzzySelector::new(),
             session_browser_status_note: None,
             session_browser_pane: DetailPaneState::default(),
+            log_browser: FuzzySelector::new(),
+            log_browser_status_note: None,
+            log_browser_pane: DetailPaneState::default(),
             detail_fullscreen: None,
             simple_detail_state: SimpleDetailState::default(),
             document_overlay: None,
             session_inspector: SessionInspector::new(),
+            log_inspector: LogInspector::new(),
             config_selector: FuzzySelector::new(),
             gateway_browser: FuzzySelector::new(),
             gateway_browser_pane: DetailPaneState::default(),
@@ -10232,6 +10529,203 @@ impl App {
             return;
         }
 
+        if self.log_inspector.active() {
+            match key.code {
+                KeyCode::Esc => {
+                    if !self.close_detail_fullscreen(DetailSurface::LogInspector) {
+                        self.close_log_inspector();
+                    }
+                }
+                _ if selector_action_key(&key, 'z') => {
+                    self.toggle_detail_fullscreen(
+                        DetailSurface::LogInspector,
+                        self.log_inspector.pane.scroll,
+                    );
+                }
+                _ if selector_action_key(&key, 'b') => {
+                    self.close_log_inspector();
+                }
+                _ if selector_action_key(&key, 'r') => {
+                    if let Some(file) = self.log_inspector.file.clone() {
+                        self.open_log_inspector(LogBrowserEntry {
+                            name: file.name,
+                            path: file.path,
+                            kind: file.kind,
+                            size_label: file.size_label,
+                            modified_label: file.modified_label,
+                            preview: file.preview,
+                            detail: String::new(),
+                            detail_view: String::new(),
+                            search_text: String::new(),
+                        });
+                    }
+                }
+                KeyCode::Char(_) if log_level_shortcut(&key).is_some() => {
+                    if let Some(level) = log_level_shortcut(&key) {
+                        self.apply_log_level(level);
+                    }
+                }
+                KeyCode::Tab | KeyCode::BackTab
+                    if !self.detail_fullscreen_active(DetailSurface::LogInspector) =>
+                {
+                    self.log_inspector.pane.focus = self.log_inspector.pane.focus.toggle();
+                }
+                KeyCode::Up => {
+                    self.log_inspector.selector.move_up();
+                    self.log_inspector.pane.reset_scroll();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::LogInspector);
+                }
+                KeyCode::Down => {
+                    self.log_inspector.selector.move_down();
+                    self.log_inspector.pane.reset_scroll();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::LogInspector);
+                }
+                KeyCode::PageUp if self.detail_fullscreen_active(DetailSurface::LogInspector) => {
+                    self.page_up_detail_fullscreen(DetailSurface::LogInspector);
+                }
+                KeyCode::PageUp => {
+                    if self.log_inspector.pane.focus == SplitPaneFocus::Detail {
+                        self.log_inspector.pane.page_up(8);
+                    } else {
+                        self.log_inspector.selector.page_up();
+                        self.log_inspector.pane.reset_scroll();
+                        self.reset_detail_fullscreen_scroll(DetailSurface::LogInspector);
+                    }
+                }
+                KeyCode::PageDown if self.detail_fullscreen_active(DetailSurface::LogInspector) => {
+                    self.page_down_detail_fullscreen(DetailSurface::LogInspector);
+                }
+                KeyCode::PageDown => {
+                    if self.log_inspector.pane.focus == SplitPaneFocus::Detail {
+                        self.log_inspector.pane.page_down(8);
+                    } else {
+                        self.log_inspector.selector.page_down();
+                        self.log_inspector.pane.reset_scroll();
+                        self.reset_detail_fullscreen_scroll(DetailSurface::LogInspector);
+                    }
+                }
+                KeyCode::Home => {
+                    self.log_inspector.selector.selected = 0;
+                    self.log_inspector.pane.reset_scroll();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::LogInspector);
+                }
+                KeyCode::End => {
+                    self.log_inspector.selector.selected =
+                        self.log_inspector.selector.filtered.len().saturating_sub(1);
+                    self.log_inspector.pane.reset_scroll();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::LogInspector);
+                }
+                KeyCode::Backspace => {
+                    self.log_inspector.selector.pop_char();
+                    self.log_inspector.pane.reset_scroll();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::LogInspector);
+                }
+                KeyCode::Char(c) if selector_search_char(&key) == Some(c) => {
+                    self.log_inspector.selector.push_char(c);
+                    self.log_inspector.pane.reset_scroll();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::LogInspector);
+                }
+                _ => {}
+            }
+            self.needs_redraw = true;
+            return;
+        }
+
+        if self.log_browser.active {
+            match key.code {
+                KeyCode::Esc => {
+                    if !self.close_detail_fullscreen(DetailSurface::LogBrowser) {
+                        self.log_browser.active = false;
+                    }
+                }
+                _ if selector_action_key(&key, 'z') => {
+                    self.toggle_detail_fullscreen(
+                        DetailSurface::LogBrowser,
+                        self.log_browser_pane.scroll,
+                    );
+                }
+                _ if selector_action_key(&key, 'r') => {
+                    self.refresh_log_browser();
+                    self.log_browser_pane.reset_scroll();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::LogBrowser);
+                }
+                KeyCode::Char(_) if log_level_shortcut(&key).is_some() => {
+                    if let Some(level) = log_level_shortcut(&key) {
+                        self.apply_log_level(level);
+                    }
+                    self.log_browser_pane.reset_scroll();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::LogBrowser);
+                }
+                KeyCode::Enter => {
+                    if let Some(entry) = self.log_browser.current().cloned() {
+                        self.open_log_inspector(entry);
+                    }
+                }
+                KeyCode::Tab | KeyCode::BackTab
+                    if !self.detail_fullscreen_active(DetailSurface::LogBrowser) =>
+                {
+                    self.log_browser_pane.focus = self.log_browser_pane.focus.toggle();
+                }
+                KeyCode::Up => {
+                    self.log_browser.move_up();
+                    self.log_browser_pane.reset_scroll();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::LogBrowser);
+                }
+                KeyCode::Down => {
+                    self.log_browser.move_down();
+                    self.log_browser_pane.reset_scroll();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::LogBrowser);
+                }
+                KeyCode::PageUp if self.detail_fullscreen_active(DetailSurface::LogBrowser) => {
+                    self.page_up_detail_fullscreen(DetailSurface::LogBrowser);
+                }
+                KeyCode::PageUp => {
+                    if self.log_browser_pane.focus == SplitPaneFocus::Detail {
+                        self.log_browser_pane.page_up(8);
+                    } else {
+                        self.log_browser.page_up();
+                        self.log_browser_pane.reset_scroll();
+                        self.reset_detail_fullscreen_scroll(DetailSurface::LogBrowser);
+                    }
+                }
+                KeyCode::PageDown if self.detail_fullscreen_active(DetailSurface::LogBrowser) => {
+                    self.page_down_detail_fullscreen(DetailSurface::LogBrowser);
+                }
+                KeyCode::PageDown => {
+                    if self.log_browser_pane.focus == SplitPaneFocus::Detail {
+                        self.log_browser_pane.page_down(8);
+                    } else {
+                        self.log_browser.page_down();
+                        self.log_browser_pane.reset_scroll();
+                        self.reset_detail_fullscreen_scroll(DetailSurface::LogBrowser);
+                    }
+                }
+                KeyCode::Home => {
+                    self.log_browser.selected = 0;
+                    self.log_browser_pane.reset_scroll();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::LogBrowser);
+                }
+                KeyCode::End => {
+                    self.log_browser.selected = self.log_browser.filtered.len().saturating_sub(1);
+                    self.log_browser_pane.reset_scroll();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::LogBrowser);
+                }
+                KeyCode::Backspace => {
+                    self.log_browser.pop_char();
+                    self.log_browser_pane.reset_scroll();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::LogBrowser);
+                }
+                KeyCode::Char(c) if selector_search_char(&key) == Some(c) => {
+                    self.log_browser.push_char(c);
+                    self.log_browser_pane.reset_scroll();
+                    self.reset_detail_fullscreen_scroll(DetailSurface::LogBrowser);
+                }
+                _ => {}
+            }
+            self.needs_redraw = true;
+            return;
+        }
+
         // Session browser overlay active — search-first, explicit uppercase actions
         if self.session_browser.active {
             match key.code {
@@ -10885,6 +11379,12 @@ impl App {
                 } else {
                     self.handle_status_bar_command(mode);
                 }
+            }
+            CommandResult::LogCommand(args) => {
+                self.handle_log_command(args);
+            }
+            CommandResult::WorktreeCommand(args) => {
+                self.handle_worktree_command(args);
             }
             CommandResult::ListModels(filter) => {
                 self.handle_list_models(filter);
@@ -14489,6 +14989,7 @@ impl App {
 
     fn render_config_summary(&self) -> String {
         let config = self.load_runtime_config();
+        let worktree_status = self.current_worktree_status();
         let voice_mode = if self.voice_mode_enabled { "on" } else { "off" };
         let session_personality = self
             .session_personality
@@ -14512,6 +15013,7 @@ impl App {
              Tool progress:   {}\n\
              Status bar:      {}\n\
              Voice readback:  {}\n\
+             Worktree mode:   {} ({})\n\
              Personality:     {} (session: {})\n\
              Skin:            {} (session: {})\n\
              Toolsets:        {}\n\
@@ -14543,6 +15045,8 @@ impl App {
                 "hidden"
             },
             voice_mode,
+            if config.worktree { "on" } else { "off" },
+            worktree_status.current_checkout_label(),
             config.display.personality,
             session_personality,
             config.display.skin,
@@ -14610,6 +15114,17 @@ impl App {
                     .into(),
                 tag: "files".into(),
                 action: ConfigAction::ShowPaths,
+            },
+            ConfigEntry {
+                title: format!(
+                    "Worktree Mode  [{}]",
+                    if config.worktree { "on" } else { "off" }
+                ),
+                detail:
+                    "Inspect the current checkout and change the saved default for future launches"
+                        .into(),
+                tag: "git".into(),
+                action: ConfigAction::ShowWorktree,
             },
             ConfigEntry {
                 title: "Tools".into(),
@@ -14729,6 +15244,15 @@ impl App {
                 action: ConfigAction::ToggleStatusBar,
             },
             ConfigEntry {
+                title: format!(
+                    "Logs  [{}]",
+                    effective_log_level(&edgecrab_core::edgecrab_home(), false).as_str()
+                ),
+                detail: "Browse log files and save the default log verbosity".into(),
+                tag: "ops".into(),
+                action: ConfigAction::OpenLogs,
+            },
+            ConfigEntry {
                 title: format!("Skin  [{}]", config.display.skin),
                 detail: "Browse installed skins and apply one without leaving the TUI".into(),
                 tag: "display".into(),
@@ -14792,6 +15316,9 @@ impl App {
                     self.render_config_paths(),
                 );
             }
+            ConfigAction::ShowWorktree => {
+                self.handle_worktree_command(String::new());
+            }
             ConfigAction::OpenTools => {
                 self.open_tool_manager(ToolManagerMode::All);
             }
@@ -14837,6 +15364,9 @@ impl App {
             ConfigAction::ToggleStatusBar => {
                 self.handle_status_bar_command("toggle".into());
             }
+            ConfigAction::OpenLogs => {
+                self.handle_log_command(String::new());
+            }
             ConfigAction::OpenSkins => {
                 self.open_skin_browser();
             }
@@ -14877,6 +15407,7 @@ impl App {
             }
             "moa" => self.handle_show_moa_config(),
             "tools" | "toolsets" => self.open_tool_manager(ToolManagerMode::All),
+            "log" | "logs" => self.handle_log_command(String::new()),
             "paths" | "path" => {
                 self.open_report_overlay(
                     "Config Paths",
@@ -14900,10 +15431,243 @@ impl App {
                 );
             }
             _ => self.push_output(
-                "Usage: /config [open|show|model|cheap|moa|paths|voice|gateway|update|edit]",
+                "Usage: /config [open|show|model|cheap|moa|logs|paths|voice|gateway|update|edit]",
                 OutputRole::System,
             ),
         }
+    }
+
+    fn current_worktree_status(&self) -> crate::worktree::WorktreeRuntimeStatus {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        crate::worktree::inspect_runtime(&cwd, self.load_runtime_config().worktree)
+    }
+
+    fn render_worktree_report(&self) -> String {
+        self.current_worktree_status().render_report()
+    }
+
+    fn open_worktree_report(&mut self, body: String) {
+        self.open_report_overlay(
+            "Git Worktree Mode",
+            "Current checkout plus the saved default launch policy",
+            body,
+        );
+    }
+
+    fn handle_set_worktree_mode(&mut self, enabled: bool) {
+        match persist_worktree_enabled_to_config(enabled) {
+            Ok(()) => {
+                self.config_selector.set_items(self.build_config_entries());
+                let mut report = self.render_worktree_report();
+                report.push_str(&format!(
+                    "\nSaved default updated: isolated worktrees are {} for future launches.\n",
+                    if enabled { "enabled" } else { "disabled" }
+                ));
+                self.open_worktree_report(report);
+            }
+            Err(error) => self.push_output(
+                format!("Failed to update worktree default: {error}"),
+                OutputRole::Error,
+            ),
+        }
+    }
+
+    fn handle_worktree_command(&mut self, args: String) {
+        let normalized = args.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "" | "status" | "show" => self.open_worktree_report(self.render_worktree_report()),
+            "on" | "enable" | "enabled" => self.handle_set_worktree_mode(true),
+            "off" | "disable" | "disabled" => self.handle_set_worktree_mode(false),
+            "toggle" => self.handle_set_worktree_mode(!self.load_runtime_config().worktree),
+            _ => self.push_output(
+                "Usage: /worktree [status|on|off|toggle]",
+                OutputRole::System,
+            ),
+        }
+    }
+
+    fn build_log_browser_entry(&self, info: LogFileInfo) -> LogBrowserEntry {
+        let kind = log_kind_for_name(&info.name).to_string();
+        let size_label = format_log_size(info.size_bytes);
+        let modified_label = format_log_timestamp_label(info.modified);
+        let preview =
+            tail_preview(&info.path, 8).unwrap_or_else(|error| format!("tail failed: {error}"));
+        let preview_excerpt = preview
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .map(|line| unicode_trunc(line.trim(), 92))
+            .unwrap_or_else(|| "(empty log)".into());
+        let saved_level = effective_log_level(&edgecrab_core::edgecrab_home(), false);
+        let detail = format!("{kind} | {size_label} | modified {modified_label}");
+        let detail_view = format!(
+            "File:      {}\nPath:      {}\nKind:      {}\nSize:      {}\nModified:  {}\nLevel:     {} (saved default)\n\nRecent tail:\n{}\n\nActions: Enter inspect | R reload | 1-5 level | Esc close",
+            info.name,
+            info.path.display(),
+            kind,
+            size_label,
+            modified_label,
+            saved_level.badge(),
+            preview
+        );
+        let search_text = format!(
+            "{} {} {} {} {}",
+            info.name, kind, size_label, modified_label, preview
+        );
+
+        LogBrowserEntry {
+            name: info.name,
+            path: info.path,
+            kind,
+            size_label,
+            modified_label,
+            preview: preview_excerpt,
+            detail,
+            detail_view,
+            search_text,
+        }
+    }
+
+    fn refresh_log_browser(&mut self) {
+        let home = edgecrab_core::edgecrab_home();
+        match list_log_files(&home) {
+            Ok(files) => {
+                let status_note = if files.is_empty() {
+                    Some(format!(
+                        "No log files yet under {}",
+                        home.join("logs").display()
+                    ))
+                } else {
+                    Some(format!(
+                        "Saved level {}. 1 error  2 warn  3 info  4 debug  5 trace.",
+                        effective_log_level(&home, false).badge()
+                    ))
+                };
+                let entries = files
+                    .into_iter()
+                    .map(|info| self.build_log_browser_entry(info))
+                    .collect::<Vec<_>>();
+                self.log_browser.replace_items_preserving_state(entries);
+                self.log_browser_status_note = status_note;
+                self.needs_redraw = true;
+            }
+            Err(error) => {
+                self.log_browser.set_items(Vec::new());
+                self.log_browser_status_note = Some(format!("Failed to load logs: {error}"));
+                self.push_output(format!("log: {error}"), OutputRole::Error);
+            }
+        }
+    }
+
+    fn open_log_browser(&mut self, initial_query: Option<&str>) {
+        self.refresh_log_browser();
+        self.log_browser.active = true;
+        self.log_browser.query = initial_query.unwrap_or_default().trim().to_string();
+        self.log_browser.selected = 0;
+        self.log_browser.update_filter();
+        self.log_browser_pane.reset();
+        self.reset_detail_fullscreen_scroll(DetailSurface::LogBrowser);
+        self.needs_redraw = true;
+    }
+
+    fn build_log_inspector_meta(&self, entry: &LogBrowserEntry) -> LogInspectorMeta {
+        LogInspectorMeta {
+            name: entry.name.clone(),
+            path: entry.path.clone(),
+            kind: entry.kind.clone(),
+            size_label: entry.size_label.clone(),
+            modified_label: entry.modified_label.clone(),
+            preview: entry.preview.clone(),
+        }
+    }
+
+    fn open_log_inspector(&mut self, entry: LogBrowserEntry) {
+        let content = read_last_lines(&entry.path, default_tail_lines())
+            .unwrap_or_else(|error| format!("failed to read {}: {error}", entry.path.display()));
+        let items = build_log_line_entries(&content);
+        self.log_inspector.selector.set_items(items);
+        self.log_inspector.file = Some(self.build_log_inspector_meta(&entry));
+        self.log_inspector.selector.active = true;
+        self.log_inspector.selector.selected = 0;
+        self.log_inspector.selector.query.clear();
+        self.log_inspector.selector.update_filter();
+        self.log_inspector.pane.reset();
+        self.log_inspector.return_to_browser = true;
+        self.log_browser.active = false;
+        self.close_detail_fullscreen(DetailSurface::LogBrowser);
+        self.reset_detail_fullscreen_scroll(DetailSurface::LogInspector);
+        self.needs_redraw = true;
+    }
+
+    fn close_log_inspector(&mut self) {
+        let return_to_browser = self.log_inspector.return_to_browser;
+        self.log_inspector.close();
+        self.close_detail_fullscreen(DetailSurface::LogInspector);
+        self.log_browser.active = return_to_browser;
+        self.needs_redraw = true;
+    }
+
+    fn apply_log_level(&mut self, level: LogLevelSetting) {
+        let home = edgecrab_core::edgecrab_home();
+        match persist_log_level(&home, level) {
+            Ok(()) => {
+                let applied_live = reload_runtime_log_level(level).unwrap_or(false);
+                self.refresh_log_browser();
+                self.config_selector.set_items(self.build_config_entries());
+                let mut message = format!(
+                    "Saved default log level: {}.",
+                    level.as_str().to_ascii_uppercase()
+                );
+                if applied_live {
+                    message.push_str(" Applied to the current process.");
+                } else {
+                    message.push_str(" Future launches will use it.");
+                }
+                self.push_output(message, OutputRole::System);
+            }
+            Err(error) => self.push_output(
+                format!("Failed to update log level: {error}"),
+                OutputRole::Error,
+            ),
+        }
+    }
+
+    fn parse_log_level_command(&self, args: &str) -> Option<LogLevelSetting> {
+        let trimmed = args.trim();
+        if let Some(rest) = trimmed.strip_prefix("level ") {
+            return LogLevelSetting::parse(rest);
+        }
+        LogLevelSetting::parse(trimmed)
+    }
+
+    fn handle_log_command(&mut self, args: String) {
+        let trimmed = args.trim();
+        let normalized = trimmed.to_ascii_lowercase();
+        if normalized.is_empty() || matches!(normalized.as_str(), "open" | "browse" | "show") {
+            self.open_log_browser(None);
+            return;
+        }
+        if matches!(normalized.as_str(), "reload" | "refresh") {
+            self.refresh_log_browser();
+            self.open_log_browser(None);
+            return;
+        }
+        if matches!(normalized.as_str(), "status" | "files") {
+            self.open_log_browser(None);
+            return;
+        }
+        if let Some(level) = self.parse_log_level_command(&normalized) {
+            self.apply_log_level(level);
+            if self.log_browser.active {
+                self.refresh_log_browser();
+            }
+            return;
+        }
+
+        self.push_output(
+            "Usage: /log [open|reload|level <error|warn|info|debug|trace>]",
+            OutputRole::System,
+        );
     }
 
     fn handle_show_history(&mut self) {
@@ -20148,9 +20912,17 @@ impl App {
             self.render_gateway_browser(frame, frame.area());
         }
 
+        if self.log_browser.active {
+            self.render_log_browser(frame, frame.area());
+        }
+
         // Session browser overlay (full screen, same precedence as skill browser)
         if self.session_browser.active {
             self.render_session_browser(frame, frame.area());
+        }
+
+        if self.log_inspector.active() {
+            self.render_log_inspector(frame, frame.area());
         }
 
         if self.session_inspector.active() {
@@ -21727,8 +22499,10 @@ impl App {
     fn split_detail_scroll(&self, surface: DetailSurface) -> u16 {
         match surface {
             DetailSurface::GatewayBrowser => self.gateway_browser_pane.scroll,
+            DetailSurface::LogBrowser => self.log_browser_pane.scroll,
             DetailSurface::SessionBrowser => self.session_browser_pane.scroll,
             DetailSurface::SessionInspector => self.session_inspector.pane.scroll,
+            DetailSurface::LogInspector => self.log_inspector.pane.scroll,
             _ => self.simple_detail_state.scroll_for(surface),
         }
     }
@@ -21736,8 +22510,10 @@ impl App {
     fn set_split_detail_scroll(&mut self, surface: DetailSurface, scroll: u16) {
         match surface {
             DetailSurface::GatewayBrowser => self.gateway_browser_pane.scroll = scroll,
+            DetailSurface::LogBrowser => self.log_browser_pane.scroll = scroll,
             DetailSurface::SessionBrowser => self.session_browser_pane.scroll = scroll,
             DetailSurface::SessionInspector => self.session_inspector.pane.scroll = scroll,
+            DetailSurface::LogInspector => self.log_inspector.pane.scroll = scroll,
             _ => self.simple_detail_state.set_scroll(surface, scroll),
         }
     }
@@ -21745,8 +22521,10 @@ impl App {
     fn reset_split_detail_scroll(&mut self, surface: DetailSurface) {
         match surface {
             DetailSurface::GatewayBrowser => self.gateway_browser_pane.reset_scroll(),
+            DetailSurface::LogBrowser => self.log_browser_pane.reset_scroll(),
             DetailSurface::SessionBrowser => self.session_browser_pane.reset_scroll(),
             DetailSurface::SessionInspector => self.session_inspector.pane.reset_scroll(),
+            DetailSurface::LogInspector => self.log_inspector.pane.reset_scroll(),
             _ => self.simple_detail_state.reset(surface),
         }
         self.needs_redraw = true;
@@ -21898,7 +22676,9 @@ impl App {
             },
             DetailSurface::GatewayBrowser
             | DetailSurface::SessionBrowser
-            | DetailSurface::SessionInspector => return,
+            | DetailSurface::SessionInspector
+            | DetailSurface::LogBrowser
+            | DetailSurface::LogInspector => return,
         }
 
         self.reset_split_detail_scroll(surface);
@@ -24295,6 +25075,7 @@ impl App {
             let detail_body = match entry.action {
                 ConfigAction::ShowSummary => self.render_config_summary(),
                 ConfigAction::ShowPaths => self.render_config_paths(),
+                ConfigAction::ShowWorktree => self.render_worktree_report(),
                 ConfigAction::OpenTools => {
                     "Press Enter to open the live tool manager. Use Tab to move between the list and detail panes, Left and Right to change scope, Space to toggle toolsets or individual tools, and R to restore defaults.".into()
                 }
@@ -24349,6 +25130,9 @@ impl App {
                 }
                 ConfigAction::ToggleStatusBar => {
                     "Press Enter to show or hide the status bar.".into()
+                }
+                ConfigAction::OpenLogs => {
+                    "Press Enter to open the local log browser. Inside it you can inspect file tails, drill into individual entries, and save the default log level for future launches.".into()
                 }
                 ConfigAction::OpenSkins => {
                     "Press Enter to browse installed skins and apply one live.".into()
@@ -24728,6 +25512,441 @@ impl App {
             Span::styled(
                 format!("{} platform(s)", filtered.len()),
                 Style::default().fg(Color::Rgb(95, 120, 112)),
+            ),
+        ]));
+        frame.render_widget(help, chunks[2]);
+    }
+
+    fn render_log_browser(&self, frame: &mut Frame, area: Rect) {
+        frame.render_widget(Clear, area);
+
+        let accent = Color::Rgb(255, 196, 120);
+        let chunks = Self::browser_overlay_chunks(area);
+        let body = Self::browser_body_chunks(chunks[1]);
+        self.render_browser_header(
+            frame,
+            chunks[0],
+            &self.log_browser.query,
+            BrowserChrome {
+                title: "Log Browser",
+                placeholder: "Search log files by name, type, preview text, or size.",
+                icon: "◷",
+                icon_color: accent,
+                border_color: accent,
+            },
+        );
+
+        let filtered = &self.log_browser.filtered;
+        let selected = self.log_browser.selected;
+        let max_visible = Self::browser_list_visible_rows(body[0], true);
+        let scroll_start = Self::browser_scroll_start(selected, max_visible);
+
+        let items: Vec<ListItem> = if filtered.is_empty() {
+            vec![ListItem::new(Line::from(Span::styled(
+                "  No log files matched the current filter.",
+                Style::default().fg(Color::Rgb(120, 120, 135)),
+            )))]
+        } else {
+            filtered
+                .iter()
+                .skip(scroll_start)
+                .take(max_visible)
+                .enumerate()
+                .map(|(vis_idx, &entry_idx)| {
+                    let entry = &self.log_browser.items[entry_idx];
+                    let is_selected = vis_idx + scroll_start == selected;
+                    let bg = if is_selected {
+                        Color::Rgb(46, 34, 20)
+                    } else {
+                        Color::Rgb(18, 22, 28)
+                    };
+                    let tag_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(230, 188, 140))
+                    } else {
+                        Style::default().fg(Color::Rgb(150, 126, 100))
+                    };
+                    let title_style = if is_selected {
+                        Style::default()
+                            .bg(bg)
+                            .fg(accent)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Rgb(232, 226, 214))
+                    };
+                    let detail_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(208, 182, 150))
+                    } else {
+                        Style::default().fg(Color::Rgb(140, 136, 128))
+                    };
+                    let preview_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(220, 204, 184))
+                    } else {
+                        Style::default().fg(Color::Rgb(150, 150, 150))
+                    };
+
+                    ListItem::new(Line::from(vec![
+                        selector_marker(is_selected, accent, Some(bg)),
+                        Span::styled(format!("  {:<8}", entry.kind), tag_style),
+                        Span::styled(unicode_trunc(&entry.name, 24), title_style),
+                        Span::raw("  "),
+                        Span::styled(unicode_trunc(&entry.detail, 30), detail_style),
+                        Span::raw("  "),
+                        Span::styled(unicode_trunc(&entry.preview, 28), preview_style),
+                    ]))
+                })
+                .collect()
+        };
+        let list_border_style = if self.log_browser_pane.focus == SplitPaneFocus::List {
+            Style::default().fg(accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Rgb(60, 80, 84))
+        };
+        frame.render_widget(
+            List::new(items)
+                .style(Style::default().bg(Color::Rgb(18, 22, 28)))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(list_border_style)
+                        .title(" Files "),
+                ),
+            body[0],
+        );
+
+        let detail_lines = if let Some(entry) = self.log_browser.current() {
+            let mut lines = vec![Line::from(vec![
+                Span::styled(
+                    format!("{} ", entry.kind),
+                    Style::default().fg(accent).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(entry.name.clone()),
+            ])];
+            lines.push(Line::from(""));
+            lines.extend(
+                entry
+                    .detail_view
+                    .lines()
+                    .map(|line| Line::from(line.to_string())),
+            );
+            lines
+        } else {
+            default_log_browser_detail_lines()
+        };
+
+        self.render_scrollable_browser_detail(
+            frame,
+            body[1],
+            ScrollableDetailChrome {
+                title: "Details",
+                border_color: accent,
+                focused: self.log_browser_pane.focus == SplitPaneFocus::Detail,
+                requested_scroll: self.log_browser_pane.scroll,
+            },
+            detail_lines.clone(),
+        );
+        if self.detail_fullscreen_active(DetailSurface::LogBrowser) {
+            self.render_fullscreen_browser_detail(
+                frame,
+                area,
+                FullscreenBrowserChrome {
+                    query: &self.log_browser.query,
+                    header: BrowserChrome {
+                        title: "Log Browser",
+                        placeholder: "Search log files by name, type, preview text, or size.",
+                        icon: "◷",
+                        icon_color: accent,
+                        border_color: accent,
+                    },
+                    detail: ScrollableDetailChrome {
+                        title: "Details",
+                        border_color: accent,
+                        focused: true,
+                        requested_scroll: self.detail_fullscreen_scroll(DetailSurface::LogBrowser),
+                    },
+                    help: Line::from(vec![
+                        Span::styled(" ↑↓ ", Style::default().fg(accent)),
+                        Span::styled("change file  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("type ", Style::default().fg(accent)),
+                        Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
+                        self.paging_key_help_span(accent),
+                        Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Enter ", Style::default().fg(accent)),
+                        Span::styled("inspect  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("1-5 ", Style::default().fg(accent)),
+                        Span::styled("level  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Z ", Style::default().fg(accent)),
+                        Span::styled("split view  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Esc ", Style::default().fg(accent)),
+                        Span::styled("close", Style::default().fg(Color::DarkGray)),
+                    ]),
+                },
+                detail_lines,
+            );
+            return;
+        }
+
+        let note = self.log_browser_status_note.as_deref().unwrap_or(
+            "Lowercase refines the filter. Enter opens an entry inspector for the selected file tail.",
+        );
+        let help = Paragraph::new(Line::from(vec![
+            Span::styled(" ↑↓ ", Style::default().fg(accent)),
+            Span::styled("files  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Tab ", Style::default().fg(accent)),
+            Span::styled("focus pane  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("type ", Style::default().fg(accent)),
+            Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
+            self.paging_key_help_span(accent),
+            Span::styled("page or scroll  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Enter ", Style::default().fg(accent)),
+            Span::styled("inspect  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("R ", Style::default().fg(accent)),
+            Span::styled("reload  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("1-5 ", Style::default().fg(accent)),
+            Span::styled("level  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Z ", Style::default().fg(accent)),
+            Span::styled("detail  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Esc ", Style::default().fg(accent)),
+            Span::styled("close  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!(
+                    "{} file(s) · {} pane · {}",
+                    filtered.len(),
+                    match self.log_browser_pane.focus {
+                        SplitPaneFocus::List => "list",
+                        SplitPaneFocus::Detail => "detail",
+                    },
+                    note
+                ),
+                Style::default().fg(Color::Rgb(130, 120, 105)),
+            ),
+        ]));
+        frame.render_widget(help, chunks[2]);
+    }
+
+    fn build_log_inspector_detail_lines(&self) -> Vec<Line<'static>> {
+        let mut detail_lines = Vec::new();
+        if let Some(file) = self.log_inspector.file.as_ref() {
+            detail_lines.push(Line::from(vec![
+                Span::styled(
+                    file.name.clone(),
+                    Style::default()
+                        .fg(Color::Rgb(255, 196, 120))
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!("  ({})", file.kind)),
+            ]));
+            detail_lines.push(Line::from(format!(
+                "{} · modified {}",
+                file.size_label, file.modified_label
+            )));
+            detail_lines.push(Line::from(format!("Path: {}", file.path.display())));
+            if !file.preview.is_empty() {
+                detail_lines.push(Line::from(format!("Tail preview: {}", file.preview)));
+            }
+            if !self.log_inspector.selector.query.trim().is_empty() {
+                detail_lines.push(Line::from(format!(
+                    "Local filter: {}",
+                    self.log_inspector.selector.query
+                )));
+            }
+            detail_lines.push(Line::from(""));
+
+            if let Some(entry) = self.log_inspector.selector.current() {
+                detail_lines.push(Line::from(Span::styled(
+                    "Selected entry",
+                    Style::default().add_modifier(Modifier::BOLD),
+                )));
+                detail_lines.push(Line::from(format!(
+                    "{} · {}",
+                    entry.level_label, entry.timestamp
+                )));
+                detail_lines.push(Line::from(format!("Summary: {}", entry.summary)));
+                detail_lines.push(Line::from(""));
+                for line in entry.detail.lines() {
+                    detail_lines.push(Line::from(line.to_string()));
+                }
+            } else {
+                detail_lines.push(Line::from(
+                    "No log entry is selected. Clear the filter or move the cursor to inspect the tail.",
+                ));
+            }
+        }
+        detail_lines
+    }
+
+    fn render_log_inspector(&self, frame: &mut Frame, area: Rect) {
+        frame.render_widget(Clear, area);
+
+        let accent = Color::Rgb(255, 196, 120);
+        let chunks = Self::browser_overlay_chunks(area);
+        let body = Self::browser_body_chunks(chunks[1]);
+        self.render_browser_header(
+            frame,
+            chunks[0],
+            &self.log_inspector.selector.query,
+            BrowserChrome {
+                title: "Log Inspector",
+                placeholder: "Filter the selected file tail by level, timestamp, message, or stacktrace text.",
+                icon: "⌘",
+                icon_color: accent,
+                border_color: accent,
+            },
+        );
+
+        let filtered = &self.log_inspector.selector.filtered;
+        let selected = self.log_inspector.selector.selected;
+        let max_visible = Self::browser_list_visible_rows(body[0], true);
+        let scroll_start = Self::browser_scroll_start(selected, max_visible);
+
+        let items: Vec<ListItem> = if filtered.is_empty() {
+            vec![ListItem::new(Line::from(Span::styled(
+                "  No log entries matched the current filter.",
+                Style::default().fg(Color::Rgb(120, 120, 135)),
+            )))]
+        } else {
+            filtered
+                .iter()
+                .skip(scroll_start)
+                .take(max_visible)
+                .enumerate()
+                .map(|(vis_idx, &entry_idx)| {
+                    let entry = &self.log_inspector.selector.items[entry_idx];
+                    let is_selected = vis_idx + scroll_start == selected;
+                    let bg = if is_selected {
+                        Color::Rgb(46, 34, 20)
+                    } else {
+                        Color::Rgb(18, 22, 28)
+                    };
+                    let tag_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(255, 210, 150))
+                    } else {
+                        Style::default().fg(Color::Rgb(170, 140, 112))
+                    };
+                    let title_style = if is_selected {
+                        Style::default()
+                            .bg(bg)
+                            .fg(accent)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Rgb(225, 220, 210))
+                    };
+                    let detail_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(215, 194, 168))
+                    } else {
+                        Style::default().fg(Color::Rgb(145, 145, 145))
+                    };
+
+                    ListItem::new(Line::from(vec![
+                        selector_marker(is_selected, accent, Some(bg)),
+                        Span::styled(format!("  {:<6}", entry.level_label), tag_style),
+                        Span::styled(unicode_trunc(&entry.timestamp, 19), detail_style),
+                        Span::raw("  "),
+                        Span::styled(unicode_trunc(&entry.summary, 72), title_style),
+                    ]))
+                })
+                .collect()
+        };
+        let list_border_style = if self.log_inspector.pane.focus == SplitPaneFocus::List {
+            Style::default().fg(accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Rgb(60, 80, 84))
+        };
+        frame.render_widget(
+            List::new(items)
+                .style(Style::default().bg(Color::Rgb(18, 22, 28)))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(list_border_style)
+                        .title(" Entries "),
+                ),
+            body[0],
+        );
+
+        let detail_lines = self.build_log_inspector_detail_lines();
+        self.render_scrollable_browser_detail(
+            frame,
+            body[1],
+            ScrollableDetailChrome {
+                title: "Details",
+                border_color: accent,
+                focused: self.log_inspector.pane.focus == SplitPaneFocus::Detail,
+                requested_scroll: self.log_inspector.pane.scroll,
+            },
+            detail_lines.clone(),
+        );
+        if self.detail_fullscreen_active(DetailSurface::LogInspector) {
+            self.render_fullscreen_browser_detail(
+                frame,
+                area,
+                FullscreenBrowserChrome {
+                    query: &self.log_inspector.selector.query,
+                    header: BrowserChrome {
+                        title: "Log Inspector",
+                        placeholder: "Filter the selected file tail by level, timestamp, message, or stacktrace text.",
+                        icon: "⌘",
+                        icon_color: accent,
+                        border_color: accent,
+                    },
+                    detail: ScrollableDetailChrome {
+                        title: "Details",
+                        border_color: accent,
+                        focused: true,
+                        requested_scroll: self.detail_fullscreen_scroll(DetailSurface::LogInspector),
+                    },
+                    help: Line::from(vec![
+                        Span::styled(" ↑↓ ", Style::default().fg(accent)),
+                        Span::styled("change entry  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("type ", Style::default().fg(accent)),
+                        Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
+                        self.paging_key_help_span(accent),
+                        Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("B ", Style::default().fg(accent)),
+                        Span::styled("back  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("R ", Style::default().fg(accent)),
+                        Span::styled("reload  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("1-5 ", Style::default().fg(accent)),
+                        Span::styled("level  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Z ", Style::default().fg(accent)),
+                        Span::styled("split view  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Esc ", Style::default().fg(accent)),
+                        Span::styled("close", Style::default().fg(Color::DarkGray)),
+                    ]),
+                },
+                detail_lines,
+            );
+            return;
+        }
+
+        let help = Paragraph::new(Line::from(vec![
+            Span::styled(" ↑↓ ", Style::default().fg(accent)),
+            Span::styled("entries  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Tab ", Style::default().fg(accent)),
+            Span::styled("focus pane  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("type ", Style::default().fg(accent)),
+            Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
+            self.paging_key_help_span(accent),
+            Span::styled("page or scroll  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("B ", Style::default().fg(accent)),
+            Span::styled("back  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("R ", Style::default().fg(accent)),
+            Span::styled("reload  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("1-5 ", Style::default().fg(accent)),
+            Span::styled("level  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Z ", Style::default().fg(accent)),
+            Span::styled("detail  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Esc ", Style::default().fg(accent)),
+            Span::styled("close  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!(
+                    "{} entry(s) · {} pane",
+                    filtered.len(),
+                    match self.log_inspector.pane.focus {
+                        SplitPaneFocus::List => "list",
+                        SplitPaneFocus::Detail => "detail",
+                    }
+                ),
+                Style::default().fg(Color::Rgb(130, 120, 105)),
             ),
         ]));
         frame.render_widget(help, chunks[2]);
@@ -30086,6 +31305,92 @@ kind = "skill"
         app.handle_config_command(String::new());
         assert!(app.config_selector.active);
         assert!(!app.config_selector.filtered.is_empty());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(edgecrab_home_env)]
+    async fn worktree_command_opens_document_overlay() {
+        let _guard = crate::gateway_catalog::lock_test_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+
+        let mut app = App::new();
+        app.handle_worktree_command(String::new());
+
+        let overlay = app.document_overlay.as_ref().expect("document overlay");
+        assert_eq!(overlay.title, "Git Worktree Mode");
+        assert!(overlay.body.contains("Git worktree status:"));
+        assert!(overlay.body.contains("Launch default:"));
+        assert!(overlay.body.contains("/worktree on"));
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(edgecrab_home_env)]
+    async fn log_command_opens_rich_browser_overlay() {
+        let _guard = crate::gateway_catalog::lock_test_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+        std::fs::create_dir_all(dir.path().join("logs")).expect("create logs");
+        std::fs::write(dir.path().join("logs").join("agent.log"), "INFO hello log")
+            .expect("write log");
+
+        let mut app = App::new();
+        app.handle_log_command(String::new());
+
+        assert!(app.log_browser.active);
+        assert_eq!(app.log_browser.items.len(), 1);
+        assert_eq!(app.log_browser.items[0].name, "agent.log");
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(edgecrab_home_env)]
+    async fn log_level_command_persists_config_default() {
+        let _guard = crate::gateway_catalog::lock_test_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+
+        let mut app = App::new();
+        app.handle_log_command("level debug".into());
+
+        let cfg = edgecrab_core::AppConfig::load().expect("load config");
+        assert_eq!(cfg.logging.level, "debug");
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(edgecrab_home_env)]
+    fn persist_worktree_preference_round_trip() {
+        let _guard = crate::gateway_catalog::lock_test_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+
+        persist_worktree_enabled_to_config(true).expect("persist worktree");
+
+        let cfg = edgecrab_core::AppConfig::load().expect("load config");
+        assert!(cfg.worktree);
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
     }
 
     #[tokio::test]

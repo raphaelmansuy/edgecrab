@@ -68,6 +68,8 @@ Top-level runtime flags (not nested in a section):
 | Flag | Default | Meaning |
 |---|---|---|
 | `save_trajectories` | `false` | Write JSONL replay files after each session |
+| `worktree` | `false` | Launch agent sessions in isolated git worktrees by default |
+| `logging.level` | `"info"` | Default centralized log verbosity |
 | `skip_context_files` | `false` | Skip `CLAUDE.md` / `AGENT.md` injection |
 | `skip_memory` | `false` | Skip file-backed memory injection |
 | `timezone` | system TZ | Overrides tz for cron and timestamps |
@@ -89,6 +91,12 @@ EDGECRAB_TIMEZONE="UTC"
 
 # Write JSONL trajectory files for every session
 EDGECRAB_SAVE_TRAJECTORIES=true
+
+# Launch agent sessions in isolated git worktrees by default
+EDGECRAB_WORKTREE=true
+
+# Override the default centralized logging level
+EDGECRAB_LOG_LEVEL=debug
 
 # Skip injecting CLAUDE.md / AGENT.md files entirely
 EDGECRAB_SKIP_CONTEXT_FILES=true
