@@ -12,7 +12,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **Tool-result spill-to-artifact for large tool outputs** — oversized successful tool results can now be written to session-scoped files under `.edgecrab-artifacts/<session_id>/...` while the conversation keeps only a compact preview stub, reducing prompt bloat without losing recoverability through existing file tools.
 - **Config and env controls for spill behavior** — `tools.result_spill`, `tools.result_spill_threshold`, and `tools.result_spill_preview_lines` are now available in config, with matching `EDGECRAB_TOOL_RESULT_SPILL*` environment overrides.
 - **Config-driven git worktree mode and TUI worktree control surface** — `worktree: true` and `EDGECRAB_WORKTREE=1` now enable isolated git worktrees by default, `/worktree` and `/w` open a dedicated TUI report overlay, and worktree cleanup now preserves branches with unpushed commits instead of deleting them aggressively.
-- **First-class `/log` TUI with persisted log-level control** — `/log` and `/logs` now open a split-pane log browser, `Enter` drills into a per-entry inspector for the selected file tail, and `1-5` or `/log level <error|warn|info|debug|trace>` save the default logging level while also reloading the live process filter when possible.
+- **First-class `/log` TUI with persisted log-level control** — `/log` and `/logs` now open a split-pane log browser, `Enter` drills into a per-entry inspector for the selected file tail, live follow is on by default with `F` as a fast toggle, and `1-5` or `/log level <error|warn|info|debug|trace>` save the default logging level while also reloading the live process filter when possible.
+
+### Documentation
+
+- **Docs sync (2026-04-12)** — updated the repository `README.md` and the site changelog page to reflect recent fixes and the Unreleased notes. See [site changelog](site/src/content/docs/changelog.md) for the published copy.
 
 ### Changed
 

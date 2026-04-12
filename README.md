@@ -10,6 +10,8 @@
 [![CI](https://github.com/raphaelmansuy/edgecrab/actions/workflows/ci.yml/badge.svg)](https://github.com/raphaelmansuy/edgecrab/actions/workflows/ci.yml)
 [![Website](https://img.shields.io/badge/Website-edgecrab.com-orange.svg)](https://www.edgecrab.com)
 
+[![Changelog](https://img.shields.io/badge/Changelog-CHANGELOG.md-blue.svg)](CHANGELOG.md)
+
 EdgeCrab is a **SuperAgent** — a personal assistant and coding agent forged in Rust. It carries the soul of **Nous Hermes Agent** (autonomous reasoning, persistent memory, user-first alignment) and the always-on presence of **OpenClaw** (15 messaging gateways, smart-home integration), packaged as a stripped native release binary of about **49 MB** on current macOS arm64 builds, with zero Python or Node.js runtime dependencies.
 
 
@@ -784,7 +786,7 @@ worktree: true
 
 Inside the TUI, `/worktree` opens a report overlay for the current checkout and saved launch policy, and `/worktree on|off|toggle` updates that default for future launches.
 
-`/log` opens a split-pane browser for `~/.edgecrab/logs/`, and `Enter` drills into a per-entry inspector for the selected file tail. Use `1-5` inside that overlay or `/log level <error|warn|info|debug|trace>` to persist the default log verbosity in `config.yaml`; the current process reloads its filter immediately when runtime log reloading is available.
+`/log` opens a split-pane browser for `~/.edgecrab/logs/`, and `Enter` drills into a per-entry inspector for the selected file tail. The overlay now live-follows by default, `F` toggles follow mode, and `1-5` or `/log level <error|warn|info|debug|trace>` persist the default log verbosity in `config.yaml`; the current process reloads its filter immediately when runtime log reloading is available.
 
 Cleanup is conservative by design: EdgeCrab removes clean disposable worktrees on exit, but keeps worktrees that contain unpushed commits so the agent cannot silently destroy branch-local work.
 
@@ -1131,7 +1133,7 @@ Every built-in slash command is also reachable from argv with
 | `/verbose`                               | Cycle tool progress or set it explicitly        |
 | `/personality [preset]`                  | Switch agent personality (14 presets)           |
 | `/statusbar`                             | Toggle status bar                               |
-| `/log [open\|level <level>]`             | Browse local logs and set the saved log level   |
+| `/log [open\|level <level>]`             | Browse local logs, live-follow tails, and set the saved log level |
 | `/worktree [status\|on\|off\|toggle]`    | Show current git checkout status and saved worktree launch policy |
 | `/tools`                                 | List active toolsets and tools                  |
 | `/toolsets`                              | Show toolset aliases and expansions             |

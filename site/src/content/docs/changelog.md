@@ -8,6 +8,8 @@ sidebar:
 All notable changes to EdgeCrab are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+Last updated: 2026-04-12
+
 ---
 
 ## [Unreleased]
