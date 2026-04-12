@@ -31587,8 +31587,8 @@ kind = "skill"
         assert_eq!(app.scroll_offset, 0, "Ctrl+F should page output back down");
     }
 
-    #[test]
-    fn app_startup_defers_nonessential_warmup_work() {
+    #[tokio::test]
+    async fn app_startup_defers_nonessential_warmup_work() {
         let app = App::new();
         assert!(!app.history_loaded);
         assert!(!app.model_selector_seeded);
