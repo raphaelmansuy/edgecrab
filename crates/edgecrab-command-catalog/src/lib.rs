@@ -368,7 +368,7 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "log",
         aliases: &["logs"],
-        description: "Browse local logs or set the saved log level",
+        description: "Browse and live-follow local logs or set the saved log level",
         category: "Config",
         args_hint: "[open|level <level>]",
         cli: true,

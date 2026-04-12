@@ -334,6 +334,8 @@ edgecrab dump --all
 
 Inspect log files under `~/.edgecrab/logs/`.
 
+Inside the TUI, `/log` opens a split-pane browser for the same directory. It live-follows by default, `F` toggles follow mode, `Enter` opens the selected file in the inspector, and `1-5` persist the default log level.
+
 ```bash
 edgecrab logs list
 edgecrab logs path

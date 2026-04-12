@@ -107,6 +107,7 @@ MCP          /mcp /mcp-token
 | `/personality [name]` | Show active personality or switch preset mid-session |
 | `/skin [name]` | Switch skin preset (primary Hermes-compatible name; alias: `/theme`) |
 | `/statusbar` | Toggle the status bar visibility |
+| `/log [open\|level <level>]` | Open the log browser, live-follow local log tails, or persist the default log level (alias: `/logs`) |
 | `/worktree [status\|on\|off\|toggle]` | Open the git-worktree status overlay or change the saved default for future launches (alias: `/w`) |
 | `/yolo [on\|off\|toggle\|status]` | Toggle session-scoped dangerous-command approval bypass |
 

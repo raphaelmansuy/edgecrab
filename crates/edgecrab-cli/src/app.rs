@@ -101,6 +101,7 @@ use edgequake_llm::ProviderFactory;
 use tokio_util::sync::CancellationToken;
 
 const KEYBOARD_PROTOCOL_WARMUP: Duration = Duration::from_millis(25);
+const LOG_FOLLOW_REFRESH_INTERVAL: Duration = Duration::from_millis(900);
 
 fn progressive_keyboard_flags() -> KeyboardEnhancementFlags {
     KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
@@ -3825,6 +3826,36 @@ impl LogInspector {
     }
 }
 
+struct LogFollowState {
+    enabled: bool,
+    last_refresh: Instant,
+}
+
+impl LogFollowState {
+    fn new() -> Self {
+        Self {
+            enabled: true,
+            last_refresh: Instant::now(),
+        }
+    }
+
+    fn badge(&self) -> &'static str {
+        if self.enabled {
+            "follow on"
+        } else {
+            "follow off"
+        }
+    }
+
+    fn touch(&mut self, now: Instant) {
+        self.last_refresh = now;
+    }
+
+    fn due(&self, now: Instant) -> bool {
+        self.enabled && now.duration_since(self.last_refresh) >= LOG_FOLLOW_REFRESH_INTERVAL
+    }
+}
+
 fn log_kind_for_name(name: &str) -> &'static str {
     if name.ends_with(".jsonl") {
         "json"
@@ -4401,6 +4432,8 @@ pub struct App {
     session_inspector: SessionInspector,
     /// Drill-down inspector for a single log file tail.
     log_inspector: LogInspector,
+    /// Shared live-follow state for log browser and inspector overlays.
+    log_follow: LogFollowState,
     /// Config center overlay (activated by `/config`)
     config_selector: FuzzySelector<ConfigEntry>,
     /// Gateway platform browser overlay (activated by `/platforms`)
@@ -5169,6 +5202,7 @@ impl App {
             document_overlay: None,
             session_inspector: SessionInspector::new(),
             log_inspector: LogInspector::new(),
+            log_follow: LogFollowState::new(),
             config_selector: FuzzySelector::new(),
             gateway_browser: FuzzySelector::new(),
             gateway_browser_pane: DetailPaneState::default(),
@@ -10546,19 +10580,10 @@ impl App {
                     self.close_log_inspector();
                 }
                 _ if selector_action_key(&key, 'r') => {
-                    if let Some(file) = self.log_inspector.file.clone() {
-                        self.open_log_inspector(LogBrowserEntry {
-                            name: file.name,
-                            path: file.path,
-                            kind: file.kind,
-                            size_label: file.size_label,
-                            modified_label: file.modified_label,
-                            preview: file.preview,
-                            detail: String::new(),
-                            detail_view: String::new(),
-                            search_text: String::new(),
-                        });
-                    }
+                    self.refresh_log_inspector();
+                }
+                _ if selector_action_key(&key, 'f') => {
+                    self.toggle_log_follow();
                 }
                 KeyCode::Char(_) if log_level_shortcut(&key).is_some() => {
                     if let Some(level) = log_level_shortcut(&key) {
@@ -10648,6 +10673,9 @@ impl App {
                     self.refresh_log_browser();
                     self.log_browser_pane.reset_scroll();
                     self.reset_detail_fullscreen_scroll(DetailSurface::LogBrowser);
+                }
+                _ if selector_action_key(&key, 'f') => {
+                    self.toggle_log_follow();
                 }
                 KeyCode::Char(_) if log_level_shortcut(&key).is_some() => {
                     if let Some(level) = log_level_shortcut(&key) {
@@ -15534,13 +15562,15 @@ impl App {
             Ok(files) => {
                 let status_note = if files.is_empty() {
                     Some(format!(
-                        "No log files yet under {}",
-                        home.join("logs").display()
+                        "No log files yet under {}. {}.",
+                        home.join("logs").display(),
+                        self.log_follow.badge()
                     ))
                 } else {
                     Some(format!(
-                        "Saved level {}. 1 error  2 warn  3 info  4 debug  5 trace.",
-                        effective_log_level(&home, false).badge()
+                        "Saved level {}. {}. F toggle  R reload  1 error  2 warn  3 info  4 debug  5 trace.",
+                        effective_log_level(&home, false).badge(),
+                        self.log_follow.badge()
                     ))
                 };
                 let entries = files
@@ -15549,6 +15579,7 @@ impl App {
                     .collect::<Vec<_>>();
                 self.log_browser.replace_items_preserving_state(entries);
                 self.log_browser_status_note = status_note;
+                self.log_follow.touch(Instant::now());
                 self.needs_redraw = true;
             }
             Err(error) => {
@@ -15570,6 +15601,81 @@ impl App {
         self.needs_redraw = true;
     }
 
+    fn refresh_log_inspector(&mut self) {
+        let Some(mut file) = self.log_inspector.file.clone() else {
+            return;
+        };
+
+        let selected_signature = self.log_inspector.selector.current().map(|entry| {
+            (
+                entry.timestamp.clone(),
+                entry.level_label.clone(),
+                entry.detail.clone(),
+            )
+        });
+        let query = self.log_inspector.selector.query.clone();
+        let preserve_scroll = !self.log_follow.enabled
+            || !query.trim().is_empty()
+            || self.log_inspector.selector.selected.saturating_add(1)
+                < self.log_inspector.selector.filtered.len();
+        let prior_focus = self.log_inspector.pane.focus;
+        let prior_scroll = self.log_inspector.pane.scroll;
+        let prior_fullscreen_scroll = self.detail_fullscreen_scroll(DetailSurface::LogInspector);
+
+        let content = read_last_lines(&file.path, default_tail_lines())
+            .unwrap_or_else(|error| format!("failed to read {}: {error}", file.path.display()));
+        file.preview =
+            tail_preview(&file.path, 1).unwrap_or_else(|error| format!("tail failed: {error}"));
+        if let Ok(metadata) = std::fs::metadata(&file.path) {
+            file.size_label = format_log_size(metadata.len());
+            file.modified_label = format_log_timestamp_label(metadata.modified().ok());
+        }
+        let items = build_log_line_entries(&content);
+        self.log_inspector.selector.set_items(items);
+        self.log_inspector.file = Some(file);
+        self.log_inspector.selector.query = query;
+        self.log_inspector.selector.update_filter();
+        self.log_inspector.pane.focus = prior_focus;
+
+        if preserve_scroll {
+            if let Some((timestamp, level_label, detail)) = selected_signature
+                && let Some(position) =
+                    self.log_inspector
+                        .selector
+                        .filtered
+                        .iter()
+                        .position(|&idx| {
+                            self.log_inspector
+                                .selector
+                                .items
+                                .get(idx)
+                                .is_some_and(|entry| {
+                                    entry.timestamp == timestamp
+                                        && entry.level_label == level_label
+                                        && entry.detail == detail
+                                })
+                        })
+            {
+                self.log_inspector.selector.selected = position;
+            }
+            self.log_inspector.pane.scroll = prior_scroll;
+            if self.detail_fullscreen_active(DetailSurface::LogInspector)
+                && let Some(state) = self.detail_fullscreen.as_mut()
+                && state.surface == DetailSurface::LogInspector
+            {
+                state.scroll = prior_fullscreen_scroll;
+            }
+        } else {
+            self.log_inspector.selector.selected =
+                self.log_inspector.selector.filtered.len().saturating_sub(1);
+            self.log_inspector.pane.reset_scroll();
+            self.reset_detail_fullscreen_scroll(DetailSurface::LogInspector);
+        }
+
+        self.log_follow.touch(Instant::now());
+        self.needs_redraw = true;
+    }
+
     fn build_log_inspector_meta(&self, entry: &LogBrowserEntry) -> LogInspectorMeta {
         LogInspectorMeta {
             name: entry.name.clone(),
@@ -15582,20 +15688,16 @@ impl App {
     }
 
     fn open_log_inspector(&mut self, entry: LogBrowserEntry) {
-        let content = read_last_lines(&entry.path, default_tail_lines())
-            .unwrap_or_else(|error| format!("failed to read {}: {error}", entry.path.display()));
-        let items = build_log_line_entries(&content);
-        self.log_inspector.selector.set_items(items);
         self.log_inspector.file = Some(self.build_log_inspector_meta(&entry));
         self.log_inspector.selector.active = true;
         self.log_inspector.selector.selected = 0;
         self.log_inspector.selector.query.clear();
-        self.log_inspector.selector.update_filter();
         self.log_inspector.pane.reset();
         self.log_inspector.return_to_browser = true;
         self.log_browser.active = false;
         self.close_detail_fullscreen(DetailSurface::LogBrowser);
         self.reset_detail_fullscreen_scroll(DetailSurface::LogInspector);
+        self.refresh_log_inspector();
         self.needs_redraw = true;
     }
 
@@ -15605,6 +15707,32 @@ impl App {
         self.close_detail_fullscreen(DetailSurface::LogInspector);
         self.log_browser.active = return_to_browser;
         self.needs_redraw = true;
+    }
+
+    fn toggle_log_follow(&mut self) {
+        self.log_follow.enabled = !self.log_follow.enabled;
+        self.log_follow.touch(Instant::now());
+        if self.log_follow.enabled {
+            if self.log_inspector.active() {
+                self.refresh_log_inspector();
+            } else if self.log_browser.active {
+                self.refresh_log_browser();
+            }
+        } else {
+            self.needs_redraw = true;
+        }
+    }
+
+    fn refresh_log_follow_if_due_at(&mut self, now: Instant) {
+        if !self.log_follow.due(now) {
+            return;
+        }
+        if self.log_inspector.active() {
+            self.refresh_log_inspector();
+        } else if self.log_browser.active {
+            self.refresh_log_browser();
+        }
+        self.log_follow.touch(now);
     }
 
     fn apply_log_level(&mut self, level: LogLevelSetting) {
@@ -25672,6 +25800,8 @@ impl App {
                         Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
                         Span::styled("Enter ", Style::default().fg(accent)),
                         Span::styled("inspect  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("F ", Style::default().fg(accent)),
+                        Span::styled("follow  ", Style::default().fg(Color::DarkGray)),
                         Span::styled("1-5 ", Style::default().fg(accent)),
                         Span::styled("level  ", Style::default().fg(Color::DarkGray)),
                         Span::styled("Z ", Style::default().fg(accent)),
@@ -25701,6 +25831,8 @@ impl App {
             Span::styled("inspect  ", Style::default().fg(Color::DarkGray)),
             Span::styled("R ", Style::default().fg(accent)),
             Span::styled("reload  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("F ", Style::default().fg(accent)),
+            Span::styled("follow  ", Style::default().fg(Color::DarkGray)),
             Span::styled("1-5 ", Style::default().fg(accent)),
             Span::styled("level  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Z ", Style::default().fg(accent)),
@@ -25740,6 +25872,10 @@ impl App {
                 file.size_label, file.modified_label
             )));
             detail_lines.push(Line::from(format!("Path: {}", file.path.display())));
+            detail_lines.push(Line::from(format!(
+                "Live follow: {}",
+                self.log_follow.badge()
+            )));
             if !file.preview.is_empty() {
                 detail_lines.push(Line::from(format!("Tail preview: {}", file.preview)));
             }
@@ -25905,6 +26041,8 @@ impl App {
                         Span::styled("back  ", Style::default().fg(Color::DarkGray)),
                         Span::styled("R ", Style::default().fg(accent)),
                         Span::styled("reload  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("F ", Style::default().fg(accent)),
+                        Span::styled("follow  ", Style::default().fg(Color::DarkGray)),
                         Span::styled("1-5 ", Style::default().fg(accent)),
                         Span::styled("level  ", Style::default().fg(Color::DarkGray)),
                         Span::styled("Z ", Style::default().fg(accent)),
@@ -25931,6 +26069,8 @@ impl App {
             Span::styled("back  ", Style::default().fg(Color::DarkGray)),
             Span::styled("R ", Style::default().fg(accent)),
             Span::styled("reload  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("F ", Style::default().fg(accent)),
+            Span::styled("follow  ", Style::default().fg(Color::DarkGray)),
             Span::styled("1-5 ", Style::default().fg(accent)),
             Span::styled("level  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Z ", Style::default().fg(accent)),
@@ -25939,12 +26079,13 @@ impl App {
             Span::styled("close  ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 format!(
-                    "{} entry(s) · {} pane",
+                    "{} entry(s) · {} pane · {}",
                     filtered.len(),
                     match self.log_inspector.pane.focus {
                         SplitPaneFocus::List => "list",
                         SplitPaneFocus::Detail => "detail",
-                    }
+                    },
+                    self.log_follow.badge()
                 ),
                 Style::default().fg(Color::Rgb(130, 120, 105)),
             ),
@@ -28138,6 +28279,7 @@ fn event_loop(
         app.poll_remote_skill_search();
         app.poll_remote_plugin_search();
         app.poll_remote_mcp_search();
+        app.refresh_log_follow_if_due_at(Instant::now());
 
         // Advance spinner on each tick
         let now_elapsed = last_tick.elapsed();
@@ -31368,6 +31510,85 @@ kind = "skill"
 
         let cfg = edgecrab_core::AppConfig::load().expect("load config");
         assert_eq!(cfg.logging.level, "debug");
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(edgecrab_home_env)]
+    async fn log_follow_refreshes_browser_when_new_file_arrives() {
+        let _guard = crate::gateway_catalog::lock_test_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+        std::fs::create_dir_all(dir.path().join("logs")).expect("create logs");
+        std::fs::write(dir.path().join("logs").join("agent.log"), "INFO first")
+            .expect("write first log");
+
+        let mut app = App::new();
+        app.handle_log_command(String::new());
+        assert_eq!(app.log_browser.items.len(), 1);
+
+        std::fs::write(dir.path().join("logs").join("gateway.log"), "WARN second")
+            .expect("write second log");
+        app.log_follow.last_refresh = Instant::now() - LOG_FOLLOW_REFRESH_INTERVAL;
+        app.refresh_log_follow_if_due_at(Instant::now());
+
+        assert_eq!(app.log_browser.items.len(), 2);
+        assert!(
+            app.log_browser_status_note
+                .as_deref()
+                .is_some_and(|note| note.contains("follow on"))
+        );
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(edgecrab_home_env)]
+    async fn log_follow_refreshes_inspector_tail_with_new_entries() {
+        let _guard = crate::gateway_catalog::lock_test_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+        std::fs::create_dir_all(dir.path().join("logs")).expect("create logs");
+        let path = dir.path().join("logs").join("agent.log");
+        std::fs::write(&path, "2026-04-12 INFO first line\n").expect("write initial log");
+
+        let mut app = App::new();
+        app.handle_log_command(String::new());
+        let entry = app
+            .log_browser
+            .current()
+            .cloned()
+            .expect("log browser entry");
+        app.open_log_inspector(entry);
+        assert_eq!(app.log_inspector.selector.filtered.len(), 1);
+
+        std::fs::write(
+            &path,
+            "2026-04-12 INFO first line\n2026-04-12 ERROR second line\n",
+        )
+        .expect("append second line");
+        app.log_follow.last_refresh = Instant::now() - LOG_FOLLOW_REFRESH_INTERVAL;
+        app.refresh_log_follow_if_due_at(Instant::now());
+
+        assert_eq!(app.log_inspector.selector.filtered.len(), 2);
+        let current = app
+            .log_inspector
+            .selector
+            .current()
+            .expect("selected log entry");
+        assert!(current.detail.contains("second line"));
+
+        app.handle_key_event(event::KeyEvent::new(KeyCode::Char('F'), KeyModifiers::NONE));
+        assert!(!app.log_follow.enabled);
 
         unsafe {
             std::env::remove_var("EDGECRAB_HOME");

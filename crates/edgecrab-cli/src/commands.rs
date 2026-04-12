@@ -1039,7 +1039,7 @@ impl CommandRegistry {
         self.register(Command {
             name: "log",
             aliases: &["logs"],
-            description: "Browse local logs or set the saved log level: /log [open|level <error|warn|info|debug|trace>]",
+            description: "Browse and live-follow local logs or set the saved log level: /log [open|level <error|warn|info|debug|trace>]",
             handler: |args| CommandResult::LogCommand(args.trim().to_string()),
         });
 

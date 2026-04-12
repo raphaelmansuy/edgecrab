@@ -233,7 +233,7 @@ Recent UX notes:
 - `/prompt` now manages the persisted `agent.system_prompt` override: `/prompt`, `/prompt clear`, `/prompt <text>`.
 - `/insights [days]` now matches Hermes' optional day-window argument instead of hardcoding 30 days.
 - `/statusbar` is a real persisted toggle.
-- `/log` opens a real split-pane log browser plus entry inspector, and `/log level <level>` persists `logging.level` while reloading the live runtime filter when possible.
+- `/log` opens a real split-pane log browser plus entry inspector, both overlays live-follow by default with `F` as the toggle, and `/log level <level>` persists `logging.level` while reloading the live runtime filter when possible.
 - `/worktree` opens a real report overlay instead of writing status into scrollback, and `/worktree on|off|toggle` persists the default for future launches only.
 - `/verbose` cycles immediately on bare `/verbose`; `/verbose open` keeps the richer EdgeCrab picker available.
 - `/approve`, `/deny`, `/sethome`, and `/update` now operate on live TUI or config state.
