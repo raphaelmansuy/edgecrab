@@ -604,8 +604,10 @@ impl Agent {
         message: &str,
         chunk_tx: tokio::sync::mpsc::UnboundedSender<StreamEvent>,
     ) -> Result<(), AgentError> {
+        tracing::info!(message_len = message.len(), "chat_streaming: entered");
         let streaming_enabled = {
             let config = self.config.read().await;
+            tracing::info!(streaming = config.streaming, model = %config.model, "chat_streaming: config read");
             config.streaming
         };
 

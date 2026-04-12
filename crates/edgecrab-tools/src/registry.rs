@@ -485,6 +485,15 @@ impl ToolRegistry {
         disabled: Option<&[String]>,
         ctx: &ToolContext,
     ) -> Vec<ToolSchema> {
+        let trace_schema_resolution = std::env::var("EDGECRAB_TRACE_SCHEMA_RESOLUTION")
+            .ok()
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false);
         // WHY closure: the identical 4-check predicate was previously duplicated
         // for static and dynamic tool iterators. Extracting it keeps the
         // enabled/disabled logic in a single place.
@@ -513,19 +522,55 @@ impl ToolRegistry {
                 available && passes_check && toolset_allowed
             };
 
-        let static_schemas = self
-            .tools
-            .values()
-            .filter(|h| is_eligible(h.name(), h.toolset(), h.is_available(), h.check_fn(ctx)))
-            .map(|h| h.schema());
+        let mut schemas = Vec::new();
+        for handler in self.tools.values() {
+            let check_started = std::time::Instant::now();
+            if trace_schema_resolution {
+                tracing::info!(tool = handler.name(), "schema-resolution: checking tool");
+            }
+            let available = handler.is_available();
+            let passes_check = handler.check_fn(ctx);
+            let elapsed_ms = check_started.elapsed().as_millis() as u64;
+            if trace_schema_resolution || elapsed_ms >= 100 {
+                tracing::info!(
+                    tool = handler.name(),
+                    available,
+                    passes_check,
+                    elapsed_ms,
+                    "schema-resolution: tool check completed"
+                );
+            }
+            if is_eligible(handler.name(), handler.toolset(), available, passes_check) {
+                schemas.push(handler.schema());
+            }
+        }
 
-        let dynamic_schemas = self
-            .dynamic_tools
-            .values()
-            .filter(|h| is_eligible(h.name(), h.toolset(), h.is_available(), h.check_fn(ctx)))
-            .map(|h| h.schema());
+        for handler in self.dynamic_tools.values() {
+            let check_started = std::time::Instant::now();
+            if trace_schema_resolution {
+                tracing::info!(
+                    tool = handler.name(),
+                    "schema-resolution: checking dynamic tool"
+                );
+            }
+            let available = handler.is_available();
+            let passes_check = handler.check_fn(ctx);
+            let elapsed_ms = check_started.elapsed().as_millis() as u64;
+            if trace_schema_resolution || elapsed_ms >= 100 {
+                tracing::info!(
+                    tool = handler.name(),
+                    available,
+                    passes_check,
+                    elapsed_ms,
+                    "schema-resolution: dynamic tool check completed"
+                );
+            }
+            if is_eligible(handler.name(), handler.toolset(), available, passes_check) {
+                schemas.push(handler.schema());
+            }
+        }
 
-        static_schemas.chain(dynamic_schemas).collect()
+        schemas
     }
 
     /// Dispatch a tool call by name.

@@ -20,12 +20,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use edgecrab_core::{AppConfig, edgecrab_home};
-#[cfg(target_os = "macos")]
-use edgecrab_tools::macos_permissions::MacosConsentState;
 use edgequake_llm::{ProviderFactory, ProviderType};
 
-#[cfg(target_os = "macos")]
-use crate::permissions::collect_permission_snapshot;
 use crate::runtime::load_dot_env;
 
 /// Result of a single doctor check.
@@ -84,8 +80,8 @@ pub async fn run(config_override: Option<&str>) -> anyhow::Result<bool> {
     checks.extend(check_mcp_servers());
     checks.extend(check_provider_keys());
     checks.push(check_vertexai_adc());
-    #[cfg(target_os = "macos")]
-    checks.extend(check_macos_permissions());
+    // macOS FFI permission probing disabled — AEDeterminePermissionToAutomateTarget
+    // can hang and create zombie processes on some terminal hosts.
     checks.push(check_provider_ping(&context).await);
 
     // Print results
@@ -628,64 +624,28 @@ fn detect_best_provider() -> String {
     }
 }
 
-#[cfg(target_os = "macos")]
-fn check_macos_permissions() -> Vec<Check> {
-    let snapshot = collect_permission_snapshot();
-    let mut checks = Vec::new();
-
-    checks.push(match snapshot.host_app {
-        Some(host) => {
-            let bundle = host.bundle_id.unwrap_or_else(|| "bundle id unknown".into());
-            Check::pass("Terminal host", format!("{} ({bundle})", host.display_name))
-        }
-        None => Check::warn(
-            "Terminal host",
-            "could not determine the app hosting this terminal session",
-        ),
-    });
-
-    checks.push(permission_check(
-        "Notes Automation",
-        snapshot.notes_automation,
-        "Grant Automation access or run `/permissions bootstrap` to make macOS expose the consent path.",
-    ));
-    checks.push(permission_check(
-        "System Events Automation",
-        snapshot.system_events_automation,
-        "Grant Automation access if you use UI scripting, or run `/permissions bootstrap` after opening System Settings.",
-    ));
-    checks.push(permission_check(
-        "Accessibility",
-        snapshot.accessibility,
-        "Grant Accessibility access if commands send keystrokes or clicks to other apps.",
-    ));
-
-    checks
-}
-
-#[cfg(target_os = "macos")]
-fn permission_check(label: &str, state: MacosConsentState, remediation: &str) -> Check {
-    match state {
-        MacosConsentState::Granted => Check::pass(label, "granted"),
-        MacosConsentState::WouldPrompt => Check::warn(
-            label,
-            format!("not granted yet; macOS would prompt. {remediation}"),
-        ),
-        MacosConsentState::Denied => Check::warn(
-            label,
-            format!("denied or blocked by cached TCC state. {remediation}"),
-        ),
-        MacosConsentState::Unknown => Check::warn(
-            label,
-            format!("unknown; target app may not be running yet. {remediation}"),
-        ),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
+    use edgecrab_tools::macos_permissions::MacosConsentState;
     use tempfile::TempDir;
+
+    #[cfg(target_os = "macos")]
+    fn permission_check(label: &str, state: MacosConsentState, remedy: &str) -> Check {
+        match state {
+            MacosConsentState::Granted => Check::pass(label, "granted"),
+            MacosConsentState::Denied => {
+                Check::warn(label, format!("cached TCC state is denied — {remedy}"))
+            }
+            MacosConsentState::WouldPrompt => {
+                Check::warn(label, format!("macOS would prompt on first use — {remedy}"))
+            }
+            MacosConsentState::Unknown => {
+                Check::warn(label, format!("consent state unknown — {remedy}"))
+            }
+        }
+    }
 
     #[test]
     fn check_state_dir_nonexistent() {

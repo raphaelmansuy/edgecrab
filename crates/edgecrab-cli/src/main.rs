@@ -31,6 +31,7 @@ mod gateway_presentation;
 mod gateway_setup;
 mod honcho_cmd;
 mod image_models;
+mod logging;
 mod logs_cmd;
 mod markdown_render;
 mod mcp_catalog;
@@ -65,6 +66,7 @@ use edgecrab_plugins::{discover_plugins, invoke_hermes_cli_command};
 use shell_words::split as shell_split;
 use tokio_util::sync::CancellationToken;
 
+use crate::logging::{LoggingMode, StderrMode, init_logging};
 use app::App;
 use cli_args::{
     AcpCommand, AuthCommand, ClawCommand, CliArgs, Command, ConfigCommand, CronCommand,
@@ -160,17 +162,6 @@ async fn main() -> anyhow::Result<()> {
     let subcommand = args.command.clone();
     let mut initial_prompt = args.prompt_text();
 
-    // Initialize tracing
-    if args.debug {
-        tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::DEBUG)
-            .init();
-    } else {
-        tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::WARN)
-            .init();
-    }
-
     let manages_profiles = matches!(
         subcommand,
         Some(Command::Profile { .. }) | Some(Command::Completion { .. })
@@ -183,6 +174,27 @@ async fn main() -> anyhow::Result<()> {
     } else if !manages_profiles {
         activate_runtime_home_from_config(args.config.as_deref())?;
     }
+
+    let logging_home = edgecrab_core::edgecrab_home();
+    let logging_mode = match subcommand.as_ref() {
+        Some(Command::Gateway { .. }) => LoggingMode::Gateway,
+        Some(Command::Acp { .. }) => LoggingMode::Acp,
+        _ => LoggingMode::Agent,
+    };
+    let _logging_guards = init_logging(
+        &logging_home,
+        logging_mode,
+        args.debug,
+        stderr_mode_for(&args, subcommand.as_ref()),
+    )?;
+    tracing::info!(
+        mode = ?logging_mode,
+        command = ?subcommand,
+        quiet = args.quiet,
+        debug = args.debug,
+        edgecrab_home = %logging_home.display(),
+        "edgecrab startup"
+    );
 
     // Route to non-interactive subcommands immediately. `chat` and slash-backed
     // deliberately reuse the default interactive runtime below.
@@ -348,6 +360,50 @@ async fn main() -> anyhow::Result<()> {
     let _ = edgecrab_tools::tools::terminal::cleanup_all_backends().await;
 
     Ok(())
+}
+
+fn stderr_mode_for(args: &CliArgs, subcommand: Option<&Command>) -> StderrMode {
+    if env_flag_truthy("EDGECRAB_LOG_STDERR") {
+        return if args.debug {
+            StderrMode::Debug
+        } else {
+            StderrMode::Warn
+        };
+    }
+
+    if is_interactive_tui(args, subcommand) {
+        return StderrMode::Off;
+    }
+
+    if args.debug {
+        StderrMode::Debug
+    } else {
+        StderrMode::Warn
+    }
+}
+
+fn is_interactive_tui(args: &CliArgs, subcommand: Option<&Command>) -> bool {
+    if args.quiet {
+        return false;
+    }
+
+    match subcommand {
+        None => true,
+        Some(Command::Chat { prompt }) => prompt.is_empty(),
+        Some(command) => forwarded_interactive_slash(command).is_some(),
+    }
+}
+
+fn env_flag_truthy(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 async fn try_run_plugin_cli_command_from_argv() -> anyhow::Result<bool> {

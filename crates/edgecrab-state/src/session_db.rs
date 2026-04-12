@@ -294,6 +294,77 @@ impl SessionDb {
         })
     }
 
+    /// Atomically replace the session header and full message list in one
+    /// transaction so callers never observe a half-persisted turn.
+    pub fn save_session_with_messages(
+        &self,
+        session: &SessionRecord,
+        messages: &[Message],
+        timestamp: f64,
+    ) -> Result<(), AgentError> {
+        let message_count = messages.len() as i64;
+        self.execute_write(|conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO sessions
+                 (id, source, user_id, model, system_prompt, parent_session_id,
+                  started_at, ended_at, end_reason, message_count, tool_call_count,
+                  input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                  reasoning_tokens, estimated_cost_usd, title)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+                params![
+                    session.id,
+                    session.source,
+                    session.user_id,
+                    session.model,
+                    session.system_prompt,
+                    session.parent_session_id,
+                    session.started_at,
+                    session.ended_at,
+                    session.end_reason,
+                    message_count,
+                    session.tool_call_count,
+                    session.input_tokens,
+                    session.output_tokens,
+                    session.cache_read_tokens,
+                    session.cache_write_tokens,
+                    session.reasoning_tokens,
+                    session.estimated_cost_usd,
+                    session.title,
+                ],
+            )?;
+            conn.execute(
+                "DELETE FROM messages WHERE session_id = ?1",
+                params![session.id],
+            )?;
+            for msg in messages {
+                let tool_calls_json = msg
+                    .tool_calls
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+                conn.execute(
+                    "INSERT INTO messages
+                     (session_id, role, content, tool_call_id, tool_calls, tool_name, timestamp,
+                      finish_reason, reasoning)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                    params![
+                        session.id,
+                        msg.role.as_str(),
+                        msg.text_content(),
+                        msg.tool_call_id.as_deref(),
+                        tool_calls_json,
+                        msg.name.as_deref(),
+                        timestamp,
+                        msg.finish_reason.as_deref(),
+                        msg.reasoning.as_deref(),
+                    ],
+                )?;
+            }
+            Ok(())
+        })
+    }
+
     pub fn get_session(&self, id: &str) -> Result<Option<SessionRecord>, AgentError> {
         let conn = self
             .conn
@@ -1591,6 +1662,25 @@ mod tests {
         assert!(hits[0].snippet.contains("Rust"));
         assert_eq!(hits[0].session.preview, "Rust ownership model");
         assert_eq!(hits[1].session.id, "s2");
+    }
+
+    #[test]
+    fn save_session_with_messages_is_atomic_and_keeps_message_count_consistent() {
+        let db = test_db();
+        let mut session = sample_session("atomic");
+        session.message_count = 999;
+        let messages = vec![Message::user("hello"), Message::assistant("world")];
+
+        db.save_session_with_messages(&session, &messages, 42.0)
+            .expect("atomic save");
+
+        let loaded = db.get_session("atomic").expect("get").expect("found");
+        assert_eq!(loaded.message_count, 2);
+
+        let loaded_messages = db.get_messages("atomic").expect("get messages");
+        assert_eq!(loaded_messages.len(), 2);
+        assert_eq!(loaded_messages[0].text_content(), "hello");
+        assert_eq!(loaded_messages[1].text_content(), "world");
     }
 
     #[test]

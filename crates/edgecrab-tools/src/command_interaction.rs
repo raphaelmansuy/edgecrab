@@ -339,6 +339,11 @@ pub(crate) fn macos_prompt_stall_timeout(
     }
     let assessment = assess_command(command);
     assessment.macos_prompt_reason?;
+    tracing::debug!(
+        command_preview = &command[..command.len().min(80)],
+        reason = assessment.macos_prompt_reason,
+        "command may trigger macOS permission dialog — running preflight check"
+    );
     let preflight = preflight_command_permissions(command);
     if matches!(
         preflight.accessibility_state,

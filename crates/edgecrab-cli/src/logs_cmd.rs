@@ -85,9 +85,15 @@ fn resolve_log_path(name: Option<&str>) -> anyhow::Result<PathBuf> {
         };
     }
 
-    let gateway = logs_dir().join("gateway.log");
-    if gateway.exists() {
-        return Ok(gateway);
+    for preferred in [
+        logs_dir().join("gateway.log"),
+        logs_dir().join("agent.log"),
+        logs_dir().join("acp.log"),
+        logs_dir().join("errors.log"),
+    ] {
+        if preferred.exists() {
+            return Ok(preferred);
+        }
     }
     if paths.len() == 1 {
         return Ok(paths[0].clone());

@@ -758,10 +758,35 @@ fn discover_context_files(cwd: &Path) -> Vec<(String, String)> {
         return vec![item];
     }
 
-    // Priority 2: AGENTS.md — hierarchical walk (CWD + all subdirectories)
-    let agents_files = collect_agents_md_files(cwd);
-    if !agents_files.is_empty() {
-        return agents_files;
+    // Priority 2: AGENTS.md — recursive only inside a detected project root.
+    // Launching the TUI from `~` must not recurse through the entire home tree.
+    if let Some(scan_root) = agents_scan_root(cwd) {
+        let started = std::time::Instant::now();
+        let agents_files = collect_agents_md_files(&scan_root);
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        if elapsed_ms >= 100 || scan_root != cwd {
+            tracing::info!(
+                cwd = %cwd.display(),
+                scan_root = %scan_root.display(),
+                file_count = agents_files.len(),
+                elapsed_ms,
+                "context-files: completed AGENTS.md scan"
+            );
+        }
+        if !agents_files.is_empty() {
+            return agents_files;
+        }
+    } else if let Some(item) = load_cwd_file(cwd, "AGENTS.md") {
+        tracing::info!(
+            cwd = %cwd.display(),
+            "context-files: using cwd AGENTS.md only outside detected project root"
+        );
+        return vec![item];
+    } else {
+        tracing::info!(
+            cwd = %cwd.display(),
+            "context-files: skipped recursive AGENTS.md scan outside detected project root"
+        );
     }
 
     // Priority 3: CLAUDE.md — CWD only
@@ -780,6 +805,10 @@ fn discover_context_files(cwd: &Path) -> Vec<(String, String)> {
     }
 
     Vec::new()
+}
+
+fn agents_scan_root(cwd: &Path) -> Option<std::path::PathBuf> {
+    find_git_root(cwd).or_else(|| looks_like_project_root(cwd).then(|| cwd.to_path_buf()))
 }
 
 /// Load a single file from exactly `cwd/name` (no upward walk).
@@ -814,6 +843,41 @@ fn walk_to_git_root_for_file(start: &Path, candidates: &[&str]) -> Option<(Strin
         dir = d.parent();
     }
     None
+}
+
+fn find_git_root(start: &Path) -> Option<std::path::PathBuf> {
+    let mut dir = Some(start);
+    while let Some(current) = dir {
+        if current.join(".git").exists() {
+            return Some(current.to_path_buf());
+        }
+        dir = current.parent();
+    }
+    None
+}
+
+fn looks_like_project_root(dir: &Path) -> bool {
+    const PROJECT_MARKERS: &[&str] = &[
+        "Cargo.toml",
+        "package.json",
+        "pyproject.toml",
+        "go.mod",
+        "Gemfile",
+        "pom.xml",
+        "build.gradle",
+        "build.gradle.kts",
+        "settings.gradle",
+        "composer.json",
+        "setup.py",
+        "requirements.txt",
+        "CMakeLists.txt",
+        "Makefile",
+        "meson.build",
+    ];
+
+    PROJECT_MARKERS
+        .iter()
+        .any(|marker| dir.join(marker).exists())
 }
 
 /// Collect all AGENTS.md files by walking CWD and all subdirectories.
@@ -872,7 +936,11 @@ fn collect_agents_md_recursive(
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.is_dir() {
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        let file_type = metadata.file_type();
+        if !file_type.is_dir() || file_type.is_symlink() {
             continue;
         }
         let name = match path.file_name().and_then(|n| n.to_str()) {
@@ -1723,6 +1791,11 @@ mod tests {
     fn agents_md_hierarchical_walk() {
         // AGENTS.md files from subdirectories are collected
         let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("write Cargo.toml");
         std::fs::write(tmp.path().join("AGENTS.md"), "root agents").expect("write");
         let subdir = tmp.path().join("subdir");
         std::fs::create_dir(&subdir).expect("mkdir");
@@ -1743,6 +1816,11 @@ mod tests {
     fn agents_md_skips_hidden_dirs() {
         // Hidden subdirectories should not be walked for AGENTS.md
         let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("write Cargo.toml");
         std::fs::write(tmp.path().join("AGENTS.md"), "root agents").expect("write");
         let hidden = tmp.path().join(".hidden");
         std::fs::create_dir(&hidden).expect("mkdir");
@@ -1757,6 +1835,46 @@ mod tests {
         assert!(
             !combined.contains("hidden agents"),
             "content from hidden dirs should be skipped"
+        );
+    }
+
+    #[test]
+    fn agents_md_does_not_recurse_outside_project_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("AGENTS.md"), "root agents").expect("write");
+        let subdir = tmp.path().join("nested");
+        std::fs::create_dir(&subdir).expect("mkdir");
+        std::fs::write(subdir.join("AGENTS.md"), "nested agents").expect("write");
+
+        let files = discover_context_files(tmp.path());
+        assert_eq!(files.len(), 1, "non-project cwd should not recurse");
+        assert_eq!(files[0].0, "AGENTS.md");
+        assert!(files[0].1.contains("root agents"));
+        assert!(!files[0].1.contains("nested agents"));
+    }
+
+    #[test]
+    fn agents_md_uses_git_root_when_called_from_subdir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(tmp.path().join(".git")).expect("mkdir .git");
+        std::fs::write(tmp.path().join("AGENTS.md"), "repo agents").expect("write");
+        let app = tmp.path().join("app");
+        std::fs::create_dir(&app).expect("mkdir app");
+        std::fs::write(app.join("AGENTS.md"), "app agents").expect("write");
+
+        let files = discover_context_files(&app);
+        let combined = files
+            .iter()
+            .map(|(name, content)| format!("{name}:{content}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            combined.contains("AGENTS.md:repo agents"),
+            "missing repo AGENTS: {combined}"
+        );
+        assert!(
+            combined.contains("app/AGENTS.md:app agents"),
+            "missing nested AGENTS: {combined}"
         );
     }
 

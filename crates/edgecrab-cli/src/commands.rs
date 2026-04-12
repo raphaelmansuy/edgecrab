@@ -1400,6 +1400,7 @@ fn help_text() -> String {
           F3                   — Open skill selector\n\
           F7                   — Open vision-model selector\n\
            PgUp / PgDn          — Scroll output up/down\n\
+          Ctrl+B / Ctrl+F      — Fallback PageUp / PageDown (works when the terminal swallows page keys)\n\
            Shift+↑ / Shift+↓   — Scroll output 3 rows\n\
            Alt+↑ / Alt+↓       — Scroll output 5 rows\n\
                                  Ctrl+M               — Toggle mouse capture / selection mode\n\
@@ -1409,7 +1410,8 @@ fn help_text() -> String {
            Ctrl+D               — Exit (on empty input)\n\
            Ctrl+L               — Clear screen\n\
            Ctrl+U               — Clear input\n\
-           Ctrl+J               — Open compose editor + insert newline\n\
+           Ctrl+O               — Open compose editor + insert newline\n\
+           Ctrl+J               — Open compose editor when the terminal distinguishes it from Enter\n\
            Ctrl+S               — Send from compose editor\n\
            Tab                  — Tab completion\n\
            ↑/↓                 — Command history\n\
@@ -1417,7 +1419,7 @@ fn help_text() -> String {
            Shift+Enter*         — Open compose editor + insert newline\n\
            Esc / hjkl / wbe    — Compose normal mode (basic Vim editing)\n\
          \n\
-         * Shift+Enter requires terminal keyboard enhancement support; Ctrl+J always works.",
+         * Shift+Enter requires terminal keyboard enhancement support; on basic terminals Enter sends and Ctrl+O is the safe compose fallback.",
     );
     text
 }
