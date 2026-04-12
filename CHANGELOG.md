@@ -9,6 +9,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.3.4] — 2026-04-12
+
+### Fixed
+
+- **Clippy warnings resolved for strict linting** — removed unwrap() on Option in error handling by storing error messages directly, converted loop/match pattern to while_let for idiomatic Rust, and derived Default trait instead of manual impl.
+
+---
+
 ## [0.3.3] — 2026-04-11
 
 ### Fixed
