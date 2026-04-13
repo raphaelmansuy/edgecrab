@@ -20,15 +20,15 @@
 //!       ├── BRAVE_API_KEY set?
 //!       │       └──→ api.search.brave.com (good results, free tier)
 //!       │
-//!       └── fallback: DuckDuckGo Instant Answer API (no key, limited coverage)
-//!                 └──→ AbstractText + RelatedTopics → ranked results
+//!       └── fallback: DuckDuckGo HTML endpoint (no key; Chrome TLS emulation via wreq)
+//!                 └──→ POST html.duckduckgo.com/html/ with BoringSSL JA3/JA4 spoofing
 //! ```
 //!
 //! ## web_extract
 //!
 //! ```text
 //!   web_extract("https://doc.rust-lang.org/...")
-//!       └──→ reqwest::get → readable HTML extraction OR EdgeParse PDF extraction
+//!       └──→ wreq Chrome-emulating client → readable HTML or EdgeParse PDF extraction
 //! ```
 //!
 //! SSRF prevention is applied before any outbound request via
@@ -70,6 +70,9 @@ static ARTICLE_RE: OnceLock<Regex> = OnceLock::new();
 static BODY_RE: OnceLock<Regex> = OnceLock::new();
 static NOISE_BLOCK_RE: OnceLock<Regex> = OnceLock::new();
 static BLOCK_BREAK_RE: OnceLock<Regex> = OnceLock::new();
+/// Compiled regexes for DuckDuckGo HTML result parsing.
+static DDG_RESULT_RE: OnceLock<Regex> = OnceLock::new();
+static DDG_SNIPPET_RE: OnceLock<Regex> = OnceLock::new();
 
 fn html_tag_re() -> &'static Regex {
     HTML_TAG_RE.get_or_init(|| Regex::new(r"<[^>]+>").expect("valid regex"))
@@ -679,27 +682,6 @@ struct SearchArgs {
     backend: Option<String>,
 }
 
-/// Top-level DuckDuckGo Instant Answer API response.
-#[derive(Deserialize)]
-#[allow(non_snake_case)]
-struct DdgResponse {
-    AbstractText: Option<String>,
-    AbstractURL: Option<String>,
-    RelatedTopics: Vec<DdgTopic>,
-}
-
-/// A related topic from the DDG response.
-#[derive(Deserialize)]
-struct DdgTopic {
-    #[serde(rename = "Text")]
-    text: Option<String>,
-    #[serde(rename = "FirstURL")]
-    first_url: Option<String>,
-    /// Nested sub-topics group (ignored for now)
-    #[serde(rename = "Topics")]
-    _topics: Option<Vec<serde_json::Value>>,
-}
-
 /// A single normalized search result.
 #[derive(Serialize)]
 struct SearchResult {
@@ -967,68 +949,87 @@ async fn search_brave(query: &str, max: usize) -> Result<Vec<SearchResult>, Tool
     Ok(results)
 }
 
-/// Search via DuckDuckGo Instant Answer API (no key required).
+/// Search via DuckDuckGo HTML endpoint using Chrome TLS/HTTP-2 fingerprint emulation.
 ///
-/// NOTE: This API only returns results for well-known entities and topics.
-/// It does NOT provide full web search results. For general queries, set
-/// TAVILY_API_KEY or BRAVE_API_KEY for proper search results.
+/// Endpoint: https://html.duckduckgo.com/html/ (POST form, not the Instant Answer API)
 async fn search_duckduckgo(query: &str, max: usize) -> Result<Vec<SearchResult>, ToolError> {
-    let url = format!(
-        "https://api.duckduckgo.com/?q={}&format=json&no_html=1&skip_disambig=1",
-        urlencoding_encode(query)
-    );
+    validate_url("https://html.duckduckgo.com/", "web_search")?;
 
-    validate_url(&url, "web_search")?;
+    let client = build_chrome_client("web_search")?;
 
-    let client = build_client()?;
+    let form = [("q", query), ("b", ""), ("kl", "us-en")];
     let resp = client
-        .get(&url)
-        .header(
-            "User-Agent",
-            "EdgeCrab/0.1 (agent; +https://github.com/raphaelmansuy/edgecrab)",
-        )
+        .post("https://html.duckduckgo.com/html/")
+        .form(&form)
         .send()
         .await
         .map_err(|e| ToolError::ExecutionFailed {
             tool: "web_search".into(),
-            message: format!("HTTP error: {e}"),
+            message: format!("DDG HTTP error: {e}"),
         })?;
 
-    let ddg: DdgResponse =
-        resp.json::<DdgResponse>()
-            .await
-            .map_err(|e| ToolError::ExecutionFailed {
-                tool: "web_search".into(),
-                message: format!("JSON parse error: {e}"),
-            })?;
-
-    let mut results: Vec<SearchResult> = Vec::new();
-
-    // Add the abstract if present
-    if let (Some(text), Some(url)) = (&ddg.AbstractText, &ddg.AbstractURL) {
-        if !text.is_empty() {
-            results.push(SearchResult {
-                title: "Summary".into(),
-                url: url.clone(),
-                description: text.clone(),
-            });
-        }
+    if !resp.status().is_success() {
+        let status = resp.status();
+        return Err(ToolError::ExecutionFailed {
+            tool: "web_search".into(),
+            message: format!(
+                "DDG returned HTTP {status}. \
+                 Set TAVILY_API_KEY or BRAVE_API_KEY for reliable search."
+            ),
+        });
     }
 
-    // Add related topics
-    for topic in ddg.RelatedTopics.iter().take(max) {
-        if let (Some(text), Some(url)) = (&topic.text, &topic.first_url) {
-            if !text.is_empty() {
-                results.push(SearchResult {
-                    title: text.split(" - ").next().unwrap_or(text).to_string(),
-                    url: url.clone(),
-                    description: text.clone(),
-                });
-            }
-        }
+    let html = resp.text().await.map_err(|e| ToolError::ExecutionFailed {
+        tool: "web_search".into(),
+        message: format!("DDG read error: {e}"),
+    })?;
+
+    if html.contains("anomaly-modal") || html.len() < 500 {
+        return Err(ToolError::ExecutionFailed {
+            tool: "web_search".into(),
+            message: "DDG returned a bot-challenge page. \
+                      Set TAVILY_API_KEY or BRAVE_API_KEY for reliable search."
+                .into(),
+        });
     }
 
-    Ok(results)
+    parse_ddg_html_results(&html, max)
+}
+
+/// Parse web results from an `html.duckduckgo.com` HTML response.
+///
+/// Captures `<a class="result__a">` for title+URL and
+/// `<a class="result__snippet">` for description snippets.
+fn parse_ddg_html_results(html: &str, max: usize) -> Result<Vec<SearchResult>, ToolError> {
+    let result_re = DDG_RESULT_RE.get_or_init(|| {
+        Regex::new(r#"class="result__a"[^>]*href="([^"]+)"[^>]*>([^<]+)"#)
+            .expect("valid DDG result regex")
+    });
+    let snippet_re = DDG_SNIPPET_RE.get_or_init(|| {
+        Regex::new(r#"class="result__snippet"[^>]*>([\s\S]*?)</a>"#)
+            .expect("valid DDG snippet regex")
+    });
+
+    let pairs: Vec<(String, String)> = result_re
+        .captures_iter(html)
+        .map(|c| (c[1].to_string(), c[2].trim().to_string()))
+        .collect();
+
+    let snippets: Vec<String> = snippet_re
+        .captures_iter(html)
+        .map(|c| strip_html(&c[1]).trim().to_string())
+        .collect();
+
+    Ok(pairs
+        .into_iter()
+        .take(max)
+        .enumerate()
+        .map(|(i, (url, title))| SearchResult {
+            title,
+            url,
+            description: snippets.get(i).cloned().unwrap_or_default(),
+        })
+        .collect())
 }
 
 fn normalize_firecrawl_document(
@@ -1397,8 +1398,8 @@ impl ToolHandler for WebSearchTool {
                           For best results: set FIRECRAWL_API_KEY (https://firecrawl.dev), \
                           TAVILY_API_KEY (https://app.tavily.com, free tier) \
                           or BRAVE_API_KEY (https://api.search.brave.com/app/keys, free tier). \
-                          Without an API key, falls back to DuckDuckGo Instant Answers which only \
-                          covers well-known topics."
+                          Without an API key, falls back to DuckDuckGo HTML search \
+                          (Chrome TLS fingerprint via wreq; results may vary)."
                 .into(),
             parameters: json!({
                 "type": "object",
@@ -1450,7 +1451,7 @@ impl ToolHandler for WebSearchTool {
                 (
                     "DuckDuckGo",
                     Some(
-                        "DuckDuckGo Instant Answers is the no-key fallback and only covers well-known topics. Set TAVILY_API_KEY or BRAVE_API_KEY in ~/.edgecrab/.env for broader search."
+                        "DuckDuckGo HTML is the no-key fallback (Chrome TLS emulation). For reliable broad search set TAVILY_API_KEY or BRAVE_API_KEY in ~/.edgecrab/.env."
                             .to_string(),
                     ),
                     results,
@@ -1552,13 +1553,9 @@ async fn extract_document_for_url(
                 .map(|page| page.document)
         }
         ContentBackend::Native => {
-            let client = build_client()?;
+            let client = build_chrome_client("web_extract")?;
             let resp = client
                 .get(requested_url.as_str())
-                .header(
-                    "User-Agent",
-                    "EdgeCrab/0.1 (agent; +https://github.com/raphaelmansuy/edgecrab)",
-                )
                 .send()
                 .await
                 .map_err(|e| ToolError::ExecutionFailed {
@@ -1900,7 +1897,7 @@ impl ToolHandler for WebCrawlTool {
         }
 
         let client = match backend {
-            ContentBackend::Native => Some(build_client()?),
+            ContentBackend::Native => Some(build_chrome_client("web_crawl")?),
             ContentBackend::Browser | ContentBackend::Firecrawl | ContentBackend::Tavily => None,
         };
         let mut queue = VecDeque::from([(start_url.clone(), 0usize)]);
@@ -1930,11 +1927,7 @@ impl ToolHandler for WebCrawlTool {
                     let response = client
                         .as_ref()
                         .expect("native client")
-                        .get(current_url.clone())
-                        .header(
-                            "User-Agent",
-                            "EdgeCrab/0.1 (agent; +https://github.com/raphaelmansuy/edgecrab)",
-                        )
+                        .get(current_url.as_str())
                         .send()
                         .await
                         .map_err(|e| ToolError::ExecutionFailed {
@@ -1952,7 +1945,7 @@ impl ToolHandler for WebCrawlTool {
 
                     let content_type = response
                         .headers()
-                        .get(reqwest::header::CONTENT_TYPE)
+                        .get(wreq::header::CONTENT_TYPE)
                         .and_then(|value| value.to_str().ok())
                         .unwrap_or("")
                         .to_string();
@@ -2073,10 +2066,92 @@ fn validate_url(url: &str, tool: &str) -> Result<(), ToolError> {
     }
 }
 
-/// Build a shared reqwest client with a sensible timeout.
+/// Build a browser-emulating HTTP client with Chrome TLS/HTTP-2 fingerprints (wreq).
+///
+/// WHY Chrome fingerprint for arbitrary HTML:
+///   CDN bot-detection (Cloudflare, Akamai, DuckDuckGo) matches the JA3/JA4 TLS
+///   fingerprint of the connecting client. A plain `reqwest` client is trivially
+///   identified as non-browser and blocked. wreq with BoringSSL + GREASE passes
+///   these checks. Use this for any fetch from an untrusted/arbitrary URL.
+///
+/// WHY inline TLS config (not wreq-util):
+///   wreq-util is GPL-3.0 — incompatible with this project's Apache-2.0 licence.
+///   Chrome TLS settings (cipher list, sigalgs, curves) are hardcoded inline.
+fn build_chrome_client(tool: &str) -> Result<wreq::Client, ToolError> {
+    use wreq::{
+        EmulationProvider, SslCurve,
+        header::{ACCEPT, ACCEPT_LANGUAGE, HeaderMap, HeaderValue, USER_AGENT},
+        tls::{AlpnProtos, TlsConfig, TlsVersion},
+    };
+
+    let tls = TlsConfig::builder()
+        .min_tls_version(TlsVersion::TLS_1_2)
+        .max_tls_version(TlsVersion::TLS_1_3)
+        .cipher_list(concat!(
+            "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:",
+            "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256:TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256:",
+            "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384:TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384:",
+            "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256:",
+            "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256:",
+            "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA:TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA:",
+            "TLS_RSA_WITH_AES_128_GCM_SHA256:TLS_RSA_WITH_AES_256_GCM_SHA384:",
+            "TLS_RSA_WITH_AES_128_CBC_SHA:TLS_RSA_WITH_AES_256_CBC_SHA"
+        ))
+        .sigalgs_list(concat!(
+            "ecdsa_secp256r1_sha256:rsa_pss_rsae_sha256:rsa_pkcs1_sha256:",
+            "ecdsa_secp384r1_sha384:rsa_pss_rsae_sha384:rsa_pkcs1_sha384:",
+            "rsa_pss_rsae_sha512:rsa_pkcs1_sha512"
+        ))
+        .curves(vec![
+            SslCurve::X25519,
+            SslCurve::SECP256R1,
+            SslCurve::SECP384R1,
+        ])
+        .alpn_protos(AlpnProtos::ALL)
+        .grease_enabled(true)
+        .permute_extensions(true)
+        .enable_ech_grease(true)
+        .pre_shared_key(true)
+        .enable_ocsp_stapling(true)
+        .build();
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        USER_AGENT,
+        HeaderValue::from_static(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
+             AppleWebKit/537.36 (KHTML, like Gecko) \
+             Chrome/136.0.0.0 Safari/537.36",
+        ),
+    );
+    headers.insert(
+        ACCEPT,
+        HeaderValue::from_static("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
+    );
+    headers.insert(ACCEPT_LANGUAGE, HeaderValue::from_static("en-US,en;q=0.9"));
+
+    let provider = EmulationProvider::builder()
+        .tls_config(tls)
+        .default_headers(headers)
+        .build();
+
+    wreq::Client::builder()
+        .emulation(provider)
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| ToolError::ExecutionFailed {
+            tool: tool.into(),
+            message: format!("Failed to build Chrome-emulating client: {e}"),
+        })
+}
+
+/// Build a plain reqwest client for trusted JSON API backends (Firecrawl, Tavily, Brave).
+///
+/// WHY reqwest (not wreq) here:
+///   These are first-party JSON APIs with Bearer token auth — no bot-detection.
+///   reqwest is lighter and avoids spawning a BoringSSL TLS stack unnecessarily.
 ///
 /// WHY 15-second timeout: Balances responsiveness vs. slow websites.
-/// This timeout balances responsiveness against slow websites.
 fn build_client() -> Result<reqwest::Client, ToolError> {
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
