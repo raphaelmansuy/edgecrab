@@ -451,32 +451,82 @@ fn content_backend_name(backend: ContentBackend) -> &'static str {
     }
 }
 
-/// Returns `true` when the error is transient — quota exhausted, rate-limited,
-/// temporarily unavailable, or a network-level failure — so the caller should
-/// try the next backend in the fallback chain.
+/// Structured error from a remote API backend.  The HTTP status code is
+/// captured at the call boundary so fallback decisions are made on facts,
+/// not fragile string-matching.
 ///
-/// Returns `false` for *content* errors (404 not found, invalid URL, parse
-/// failure, access denied) because switching backends won't fix them.
-fn is_backend_fallback_eligible(err: &ToolError) -> bool {
-    let msg = err.to_string().to_ascii_lowercase();
-    // HTTP status codes that indicate a backend quota / availability problem
-    msg.contains("http 402")
-        || msg.contains("http 429")
-        || msg.contains("http 503")
-        || msg.contains("http 502")
-        || msg.contains("http 500")
-        // Semantic phrases used by Firecrawl / Tavily error bodies
-        || msg.contains("payment required")
-        || msg.contains("quota")
-        || msg.contains("rate limit")
-        || msg.contains("too many requests")
-        || msg.contains("service unavailable")
-        // Network failures — server unreachable / DNS / timeout
-        || msg.contains("timed out")
-        || msg.contains("connection refused")
-        || msg.contains("failed to connect")
-        || msg.contains("dns error")
-        || msg.contains("name resolution")
+/// Construction helpers encode three distinct failure modes:
+/// - [`BackendError::api`]     — server responded with a non-2xx status
+/// - [`BackendError::network`] — request never completed (DNS/TCP/TLS)
+/// - [`BackendError::hard`]    — config, parse, or logic error that a
+///   backend switch cannot fix (missing API key, malformed response, …)
+#[derive(Debug)]
+struct BackendError {
+    /// HTTP status from the *backend API*.
+    /// `None`  = network-level failure (no response received at all).
+    /// `Some(0)` = hard non-HTTP error (parse failure, config error, …).
+    /// Any other value is the literal HTTP status code.
+    status: Option<u16>,
+    tool: String,
+    message: String,
+}
+
+impl BackendError {
+    /// The backend API responded with a non-2xx HTTP status `code`.
+    fn api(code: u16, tool: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            status: Some(code),
+            tool: tool.into(),
+            message: message.into(),
+        }
+    }
+
+    /// The HTTP request never completed (DNS, TCP, TLS, connection refused).
+    /// Always treated as transient — try the next backend.
+    fn network(tool: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            status: None,
+            tool: tool.into(),
+            message: message.into(),
+        }
+    }
+
+    /// A non-HTTP hard failure: missing API key, JSON parse error, unexpected
+    /// response shape.  A backend switch cannot fix these.
+    fn hard(tool: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            status: Some(0),
+            tool: tool.into(),
+            message: message.into(),
+        }
+    }
+
+    /// `true`  → the backend itself is temporarily unavailable (quota,
+    ///           rate-limit, 5xx server error, network failure).
+    ///           The fallback chain should try the next backend.
+    ///
+    /// `false` → the error is content-level or a hard config problem.
+    ///           Retrying with a different backend won't help.
+    fn is_transient(&self) -> bool {
+        match self.status {
+            None => true,                                    // network failure
+            Some(402 | 429 | 500 | 502 | 503 | 504) => true, // quota / server error
+            _ => false,                                      // 404, 403, parse error, hard(0), …
+        }
+    }
+
+    fn into_tool_error(self) -> ToolError {
+        ToolError::ExecutionFailed {
+            tool: self.tool,
+            message: self.message,
+        }
+    }
+}
+
+impl std::fmt::Display for BackendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
 }
 
 /// Returns an ordered list of backends to attempt for `web_extract` /
@@ -776,7 +826,8 @@ async fn search_tavily(query: &str, max: usize) -> Result<Vec<SearchResult>, Too
         }),
         "web_search",
     )
-    .await?;
+    .await
+    .map_err(BackendError::into_tool_error)?;
 
     let results = data["results"]
         .as_array()
@@ -812,17 +863,19 @@ fn firecrawl_metadata_text(metadata: &serde_json::Value, key: &str) -> Option<St
     }
 }
 
+/// Low-level Firecrawl HTTP helper.  Returns [`BackendError`] so that callers
+/// with a fallback chain can inspect `.is_transient()` without string-matching.
+/// Callers that do not need fallback semantics simply call
+/// `.map_err(BackendError::into_tool_error)?`.
 async fn firecrawl_request(
     method: reqwest::Method,
     path_or_url: &str,
     payload: Option<serde_json::Value>,
     tool: &str,
-) -> Result<serde_json::Value, ToolError> {
-    let api_key = std::env::var("FIRECRAWL_API_KEY").map_err(|_| ToolError::ExecutionFailed {
-        tool: tool.into(),
-        message: "Firecrawl backend requires FIRECRAWL_API_KEY.".into(),
-    })?;
-    let client = build_client()?;
+) -> Result<serde_json::Value, BackendError> {
+    let api_key = std::env::var("FIRECRAWL_API_KEY")
+        .map_err(|_| BackendError::hard(tool, "Firecrawl backend requires FIRECRAWL_API_KEY."))?;
+    let client = build_client().map_err(|e| BackendError::hard(tool, e.to_string()))?;
     let url = if path_or_url.starts_with("http://") || path_or_url.starts_with("https://") {
         path_or_url.to_string()
     } else {
@@ -839,24 +892,24 @@ async fn firecrawl_request(
         req = req.header("Content-Type", "application/json").json(&body);
     }
 
-    let resp = req.send().await.map_err(|e| ToolError::ExecutionFailed {
-        tool: tool.into(),
-        message: format!("Firecrawl API error: {e}"),
-    })?;
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| BackendError::network(tool, format!("Firecrawl API error: {e}")))?;
 
     if !resp.status().is_success() {
-        let status = resp.status();
+        let code = resp.status().as_u16();
         let text = resp.text().await.unwrap_or_default();
-        return Err(ToolError::ExecutionFailed {
-            tool: tool.into(),
-            message: format!("Firecrawl API HTTP {status}: {text}"),
-        });
+        return Err(BackendError::api(
+            code,
+            tool,
+            format!("Firecrawl API HTTP {code}: {text}"),
+        ));
     }
 
-    resp.json().await.map_err(|e| ToolError::ExecutionFailed {
-        tool: tool.into(),
-        message: format!("Firecrawl JSON parse error: {e}"),
-    })
+    resp.json()
+        .await
+        .map_err(|e| BackendError::hard(tool, format!("Firecrawl JSON parse error: {e}")))
 }
 
 fn normalize_firecrawl_search_results(data: &serde_json::Value, max: usize) -> Vec<SearchResult> {
@@ -905,20 +958,23 @@ async fn search_firecrawl(query: &str, max: usize) -> Result<Vec<SearchResult>, 
         })),
         "web_search",
     )
-    .await?;
+    .await
+    .map_err(BackendError::into_tool_error)?;
     Ok(normalize_firecrawl_search_results(&data, max))
 }
 
+/// Low-level Tavily HTTP helper.  Returns [`BackendError`] for the same
+/// reason as [`firecrawl_request`]: callers in the fallback chain can inspect
+/// `.is_transient()` without string-matching; other callers convert with
+/// `.map_err(BackendError::into_tool_error)?`.
 async fn tavily_request(
     endpoint: &str,
     payload: serde_json::Value,
     tool: &str,
-) -> Result<serde_json::Value, ToolError> {
-    let api_key = std::env::var("TAVILY_API_KEY").map_err(|_| ToolError::ExecutionFailed {
-        tool: tool.into(),
-        message: "Tavily backend requires TAVILY_API_KEY.".into(),
-    })?;
-    let client = build_client()?;
+) -> Result<serde_json::Value, BackendError> {
+    let api_key = std::env::var("TAVILY_API_KEY")
+        .map_err(|_| BackendError::hard(tool, "Tavily backend requires TAVILY_API_KEY."))?;
+    let client = build_client().map_err(|e| BackendError::hard(tool, e.to_string()))?;
     let url = format!(
         "https://api.tavily.com/{}",
         endpoint.trim_start_matches('/')
@@ -928,12 +984,7 @@ async fn tavily_request(
             map.insert("api_key".into(), serde_json::Value::String(api_key));
             serde_json::Value::Object(map)
         }
-        _ => {
-            return Err(ToolError::ExecutionFailed {
-                tool: tool.into(),
-                message: "Invalid Tavily payload shape.".into(),
-            });
-        }
+        _ => return Err(BackendError::hard(tool, "Invalid Tavily payload shape.")),
     };
 
     let resp = client
@@ -942,24 +993,21 @@ async fn tavily_request(
         .json(&body)
         .send()
         .await
-        .map_err(|e| ToolError::ExecutionFailed {
-            tool: tool.into(),
-            message: format!("Tavily API error: {e}"),
-        })?;
+        .map_err(|e| BackendError::network(tool, format!("Tavily API error: {e}")))?;
 
     if !resp.status().is_success() {
-        let status = resp.status();
+        let code = resp.status().as_u16();
         let text = resp.text().await.unwrap_or_default();
-        return Err(ToolError::ExecutionFailed {
-            tool: tool.into(),
-            message: format!("Tavily API HTTP {status}: {text}"),
-        });
+        return Err(BackendError::api(
+            code,
+            tool,
+            format!("Tavily API HTTP {code}: {text}"),
+        ));
     }
 
-    resp.json().await.map_err(|e| ToolError::ExecutionFailed {
-        tool: tool.into(),
-        message: format!("Tavily JSON parse error: {e}"),
-    })
+    resp.json()
+        .await
+        .map_err(|e| BackendError::hard(tool, format!("Tavily JSON parse error: {e}")))
 }
 
 /// Search via Brave Search API (api_key from BRAVE_API_KEY env).
@@ -1211,10 +1259,12 @@ fn normalize_tavily_document(
     })
 }
 
+/// Extract a single URL via Firecrawl.  Returns [`BackendError`] so the
+/// fallback chain can call `.is_transient()` without string-matching.
 async fn extract_via_firecrawl(
     url: &str,
     max_chars: usize,
-) -> Result<ExtractedDocument, ToolError> {
+) -> Result<ExtractedDocument, BackendError> {
     let data = firecrawl_request(
         reqwest::Method::POST,
         "scrape",
@@ -1228,14 +1278,16 @@ async fn extract_via_firecrawl(
     .await?;
 
     normalize_firecrawl_document(&data["data"], max_chars, Some(url)).ok_or_else(|| {
-        ToolError::ExecutionFailed {
-            tool: "web_extract".into(),
-            message: "Firecrawl extraction returned no document.".into(),
-        }
+        BackendError::hard("web_extract", "Firecrawl extraction returned no document.")
     })
 }
 
-async fn extract_via_tavily(url: &str, max_chars: usize) -> Result<ExtractedDocument, ToolError> {
+/// Extract a single URL via Tavily.  Returns [`BackendError`] for the same
+/// reason as [`extract_via_firecrawl`].
+async fn extract_via_tavily(
+    url: &str,
+    max_chars: usize,
+) -> Result<ExtractedDocument, BackendError> {
     let data = tavily_request(
         "extract",
         json!({
@@ -1260,17 +1312,14 @@ async fn extract_via_tavily(url: &str, max_chars: usize) -> Result<ExtractedDocu
         .and_then(|value| value["error"].as_str())
         .unwrap_or("Tavily extraction returned no document.");
 
-    Err(ToolError::ExecutionFailed {
-        tool: "web_extract".into(),
-        message: failure.to_string(),
-    })
+    Err(BackendError::hard("web_extract", failure))
 }
 
 async fn collect_firecrawl_crawl_pages(
     mut response: serde_json::Value,
     max_chars: usize,
     instructions: Option<&str>,
-) -> Result<Vec<CrawledPage>, ToolError> {
+) -> Result<Vec<CrawledPage>, BackendError> {
     let mut pages = Vec::new();
     let mut seen = HashSet::new();
 
@@ -1328,7 +1377,7 @@ async fn crawl_via_firecrawl(
     max_depth: usize,
     max_chars: usize,
     same_path_only: bool,
-) -> Result<Vec<CrawledPage>, ToolError> {
+) -> Result<Vec<CrawledPage>, BackendError> {
     let mut payload = json!({
         "url": start_url.as_str(),
         "limit": max_pages,
@@ -1357,12 +1406,9 @@ async fn crawl_via_firecrawl(
 
     let started =
         firecrawl_request(reqwest::Method::POST, "crawl", Some(payload), "web_crawl").await?;
-    let job_id = started["id"]
-        .as_str()
-        .ok_or_else(|| ToolError::ExecutionFailed {
-            tool: "web_crawl".into(),
-            message: "Firecrawl crawl did not return a job id.".into(),
-        })?;
+    let job_id = started["id"].as_str().ok_or_else(|| {
+        BackendError::hard("web_crawl", "Firecrawl crawl did not return a job id.")
+    })?;
 
     let mut attempts = 0usize;
     loop {
@@ -1387,18 +1433,15 @@ async fn crawl_via_firecrawl(
                         })
                     })
                     .unwrap_or("Firecrawl crawl failed.");
-                return Err(ToolError::ExecutionFailed {
-                    tool: "web_crawl".into(),
-                    message: failure.to_string(),
-                });
+                return Err(BackendError::hard("web_crawl", failure.to_string()));
             }
             _ => {
                 attempts += 1;
                 if attempts >= 45 {
-                    return Err(ToolError::ExecutionFailed {
-                        tool: "web_crawl".into(),
-                        message: "Firecrawl crawl timed out waiting for completion.".into(),
-                    });
+                    return Err(BackendError::hard(
+                        "web_crawl",
+                        "Firecrawl crawl timed out waiting for completion.",
+                    ));
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
@@ -1411,7 +1454,7 @@ async fn crawl_via_tavily(
     instructions: Option<&str>,
     max_pages: usize,
     max_chars: usize,
-) -> Result<Vec<CrawledPage>, ToolError> {
+) -> Result<Vec<CrawledPage>, BackendError> {
     let mut payload = json!({
         "url": url,
         "limit": max_pages,
@@ -1569,8 +1612,16 @@ struct ExtractArgs {
 struct ExtractBatchEntry {
     url: String,
     success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     result: Option<ExtractedDocument>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    /// Backend that was used (or attempted first) for this URL.
+    backend: &'static str,
+    /// Set when fallback occurred: name of the originally requested backend
+    /// that failed before this entry’s actual backend was tried.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fallback_from: Option<&'static str>,
 }
 
 fn requested_extract_urls(args: &ExtractArgs) -> Result<Vec<String>, ToolError> {
@@ -1609,13 +1660,13 @@ fn parse_extract_url(requested: &str) -> Result<Url, ToolError> {
     })
 }
 
-/// Tries each backend in `chain` in order.  A transient / quota error
-/// (402 / 429 / 503 / network failure) causes the next backend to be
-/// attempted.  A content-level error (404, parse failure, bad URL) is
-/// returned immediately — retrying with a different backend won't help.
+/// Tries each backend in `chain` in order.  A transient failure
+/// (quota / rate-limit / server down / network — see [`BackendError::is_transient`])
+/// causes the next backend to be attempted.  A hard failure (404, parse error,
+/// invalid URL, missing API key) is returned immediately.
 ///
-/// Returns the extracted document **and** the backend that actually
-/// succeeded, so callers can report which path was taken.
+/// Returns the extracted document **and** the backend that actually succeeded
+/// so callers can surface which path was taken in the JSON response.
 async fn extract_with_fallback(
     url: &Url,
     chain: &[ContentBackend],
@@ -1624,15 +1675,12 @@ async fn extract_with_fallback(
     ctx: &ToolContext,
     tool: &str,
 ) -> Result<(ExtractedDocument, ContentBackend), ToolError> {
-    let mut last_err = ToolError::ExecutionFailed {
-        tool: tool.into(),
-        message: "No extraction backend is available.".into(),
-    };
+    let mut last_err = BackendError::hard(tool, "No extraction backend is available.");
 
     for &backend in chain {
         match extract_document_for_url(url, backend, max_chars, render_js_fallback, ctx).await {
             Ok(doc) => return Ok((doc, backend)),
-            Err(e) if is_backend_fallback_eligible(&e) => {
+            Err(e) if e.is_transient() => {
                 tracing::warn!(
                     backend = content_backend_name(backend),
                     url = url.as_str(),
@@ -1641,45 +1689,53 @@ async fn extract_with_fallback(
                 );
                 last_err = e;
             }
-            // Hard error (404, invalid URL, parse failure, …) — no retry.
-            Err(e) => return Err(e),
+            // Hard error (404, parse failure, missing API key, …): propagate immediately.
+            Err(e) => return Err(e.into_tool_error()),
         }
     }
 
-    Err(last_err)
+    Err(last_err.into_tool_error())
 }
 
+/// Dispatch a single URL to the specified backend.  Returns [`BackendError`]
+/// so [`extract_with_fallback`] can inspect `.is_transient()` without any
+/// string-matching.  Callers outside the fallback chain convert with
+/// `.map_err(BackendError::into_tool_error)`.
 async fn extract_document_for_url(
     requested_url: &Url,
     backend: ContentBackend,
     max_chars: usize,
     render_js_fallback: bool,
     ctx: &ToolContext,
-) -> Result<ExtractedDocument, ToolError> {
+) -> Result<ExtractedDocument, BackendError> {
     match backend {
+        // Paid API backends — propagate BackendError directly; is_transient()
+        // reflects the actual HTTP status code from the API.
         ContentBackend::Firecrawl => extract_via_firecrawl(requested_url.as_str(), max_chars).await,
         ContentBackend::Tavily => extract_via_tavily(requested_url.as_str(), max_chars).await,
+
+        // Browser / Native: infrastructure errors are classified Hard because
+        // they reflect target-URL content failures, not backend availability.
         ContentBackend::Browser => {
             fetch_browser_document(requested_url, "text/html", max_chars, ctx, "web_extract")
                 .await
                 .map(|page| page.document)
+                .map_err(|e| BackendError::hard("web_extract", e.to_string()))
         }
         ContentBackend::Native => {
-            let client = build_chrome_client("web_extract")?;
+            let client = build_chrome_client("web_extract")
+                .map_err(|e| BackendError::hard("web_extract", e.to_string()))?;
             let resp = client
                 .get(requested_url.as_str())
                 .send()
                 .await
-                .map_err(|e| ToolError::ExecutionFailed {
-                    tool: "web_extract".into(),
-                    message: format!("HTTP error: {e}"),
-                })?;
+                .map_err(|e| BackendError::hard("web_extract", format!("HTTP error: {e}")))?;
 
             if !resp.status().is_success() {
-                return Err(ToolError::ExecutionFailed {
-                    tool: "web_extract".into(),
-                    message: format!("HTTP {}: {}", resp.status(), requested_url),
-                });
+                return Err(BackendError::hard(
+                    "web_extract",
+                    format!("HTTP {}: {}", resp.status(), requested_url),
+                ));
             }
 
             let final_url = resp.url().clone();
@@ -1689,10 +1745,10 @@ async fn extract_document_for_url(
                 .and_then(|value| value.to_str().ok())
                 .unwrap_or("")
                 .to_string();
-            let body = resp.bytes().await.map_err(|e| ToolError::ExecutionFailed {
-                tool: "web_extract".into(),
-                message: format!("Body read error: {e}"),
-            })?;
+            let body = resp
+                .bytes()
+                .await
+                .map_err(|e| BackendError::hard("web_extract", format!("Body read error: {e}")))?;
 
             fetch_native_document(
                 &final_url,
@@ -1705,6 +1761,7 @@ async fn extract_document_for_url(
             )
             .await
             .map(|page| page.document)
+            .map_err(|e| BackendError::hard("web_extract", e.to_string()))
         }
     }
 }
@@ -1847,6 +1904,10 @@ impl ToolHandler for WebExtractTool {
         }
 
         let mut results = Vec::with_capacity(requested_urls.len());
+        // The "primary" backend is the first in the chain (what the user asked
+        // for, or the highest-priority auto choice).  Each URL reports which
+        // backend was actually used so the agent always knows the fallback path.
+        let primary_backend_name = content_backend_name(chain[0]);
         for requested in requested_urls {
             let entry = match parse_extract_url(&requested) {
                 Ok(parsed) => match extract_with_fallback(
@@ -1859,17 +1920,28 @@ impl ToolHandler for WebExtractTool {
                 )
                 .await
                 {
-                    Ok((document, _used)) => ExtractBatchEntry {
-                        url: requested,
-                        success: true,
-                        result: Some(document),
-                        error: None,
-                    },
+                    Ok((document, used_backend)) => {
+                        let used_name = content_backend_name(used_backend);
+                        ExtractBatchEntry {
+                            url: requested,
+                            success: true,
+                            result: Some(document),
+                            error: None,
+                            backend: used_name,
+                            fallback_from: if used_name != primary_backend_name {
+                                Some(primary_backend_name)
+                            } else {
+                                None
+                            },
+                        }
+                    }
                     Err(error) => ExtractBatchEntry {
                         url: requested,
                         success: false,
                         result: None,
                         error: Some(error.to_string()),
+                        backend: primary_backend_name,
+                        fallback_from: None,
                     },
                 },
                 Err(error) => ExtractBatchEntry {
@@ -1877,6 +1949,8 @@ impl ToolHandler for WebExtractTool {
                     success: false,
                     result: None,
                     error: Some(error.to_string()),
+                    backend: primary_backend_name,
+                    fallback_from: None,
                 },
             };
             results.push(entry);
@@ -2045,7 +2119,7 @@ impl ToolHandler for WebCrawlTool {
                     })
                     .to_string());
                 }
-                Err(e) if is_backend_fallback_eligible(&e) => {
+                Err(e) if e.is_transient() => {
                     tracing::warn!(
                         backend = content_backend_name(backend),
                         url = args.url,
@@ -2054,7 +2128,7 @@ impl ToolHandler for WebCrawlTool {
                     );
                     // Continue to the next backend in the chain.
                 }
-                Err(e) => return Err(e), // hard error (bad URL, etc.)
+                Err(e) => return Err(e.into_tool_error()), // hard error (bad URL, etc.)
             }
         }
 
