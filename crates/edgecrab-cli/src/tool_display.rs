@@ -1743,9 +1743,7 @@ fn parse_header_attr<'a>(header: &'a str, key: &str) -> Option<&'a str> {
     let needle = format!("{key}=");
     let start = header.find(needle.as_str())? + needle.len();
     let rest = &header[start..];
-    let end = rest
-        .find(|c: char| c == ' ' || c == ']')
-        .unwrap_or(rest.len());
+    let end = rest.find([' ', ']']).unwrap_or(rest.len());
     Some(&rest[..end]).filter(|v| !v.is_empty())
 }
 
@@ -2350,7 +2348,10 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
         // The result column now shows the rich format (✓ N bytes) rather than raw text.
-        assert!(joined.contains("src/main.rs"), "should contain path in args preview");
+        assert!(
+            joined.contains("src/main.rs"),
+            "should contain path in args preview"
+        );
         assert!(
             joined.contains("✓ 42 bytes"),
             "result should use rich write_file format, got: {joined}"
