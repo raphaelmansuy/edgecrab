@@ -35,7 +35,7 @@ jobs:
           TAG="${INPUT_TAG_NAME:-$GITHUB_REF_NAME}"
           VERSION="${TAG#v}"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Publishing edgecrab-sdk==$VERSION"
+          echo "Publishing edgecrab==$VERSION"
 
       - name: Sync release version
         run: |
@@ -69,8 +69,13 @@ jobs:
       - name: List dist contents
         run: ls -lh dist/
 
-      - name: Publish to PyPI (OIDC)
+      - name: Publish to PyPI (OIDC preferred, token fallback)
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/
           skip-existing: true
+          # PYPI_API_TOKEN is used when the project is new (OIDC trusted publisher
+          # must be registered for existing projects, but works without for token).
+          # Once edgecrab is registered as a trusted publisher on pypi.org, this
+          # password: line can be removed.
+          password: ${{ secrets.PYPI_API_TOKEN }}

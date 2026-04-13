@@ -90,7 +90,7 @@ hermes-agent soul  +  OpenClaw vision  =  EdgeCrab
   - [Architecture](#architecture-1)
   - [Configuration](#configuration)
   - [SDK: Python \& Node.js](#sdk-python--nodejs)
-    - [Python SDK (`edgecrab-sdk`)](#python-sdk-edgecrab-sdk)
+    - [Python SDK (`edgecrab`)](#python-sdk-edgecrab)
     - [Node.js SDK (`edgecrab-sdk`)](#nodejs-sdk-edgecrab-sdk)
   - [Docker](#docker)
   - [Migrating from hermes-agent](#migrating-from-hermes-agent)
@@ -1351,7 +1351,7 @@ EDGECRAB_SAVE_TRAJECTORIES=true
 
 Both SDKs wrap the OpenAI-compatible HTTP API exposed by EdgeCrab's API server gateway adapter.
 
-### Python SDK (`edgecrab-sdk`)
+### Python SDK (`edgecrab`)
 
 **Python 3.10+ — async-first, streaming, CLI.**
 
@@ -1542,7 +1542,7 @@ edgecrab/
 │   ├── edgecrab-acp/           ACP JSON-RPC 2.0 stdio adapter
 │   └── edgecrab-migrate/       hermes-agent import + schema migrations
 ├── sdks/
-│   ├── python/                 Python SDK (edgecrab-sdk on PyPI)
+│   ├── python/                 Python SDK (edgecrab on PyPI)
 │   └── node/                   Node.js SDK (edgecrab-sdk on npm)
 ├── site/                       Astro documentation website
 ├── docs/                       Specification documents
@@ -1614,7 +1614,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for full details.
 | **npm**        | `edgecrab-cli` (binary wrapper — no Rust required) | `npm install -g edgecrab-cli`                                       |
 | **pip**        | `edgecrab-cli` (binary wrapper — no Rust required) | `pip install edgecrab-cli`                                          |
 | **cargo**      | Rust crates (12 crates published)                  | `cargo install edgecrab-cli`                                        |
-| **Python SDK** | `edgecrab-sdk`                                     | `pip install edgecrab-sdk`                                          |
+| **Python SDK** | `edgecrab`                                         | `pip install edgecrab`                                              |
 | **Node SDK**   | `edgecrab-sdk`                                     | `npm install edgecrab-sdk`                                          |
 | **Docker**     | GHCR multi-arch                                    | `docker pull ghcr.io/raphaelmansuy/edgecrab:latest`                 |
 | **Binary**     | GitHub Release archives                            | [Releases page](https://github.com/raphaelmansuy/edgecrab/releases) |

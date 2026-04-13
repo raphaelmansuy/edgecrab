@@ -1,18 +1,18 @@
 ---
 title: Python SDK
-description: Integrate EdgeCrab into Python applications with the async-first edgecrab-sdk. Agent abstraction, streaming, tool customization, and CLI.
+description: Integrate EdgeCrab into Python applications with the async-first edgecrab package. Agent abstraction, streaming, tool customization, and CLI.
 sidebar:
   order: 2
 ---
 
-The EdgeCrab Python SDK (`edgecrab-sdk`) provides an async-first `Agent` class, streaming support, and a built-in CLI. Compatible with Python 3.10+.
+The EdgeCrab Python SDK (`edgecrab`) provides an async-first `Agent` class, streaming support, and a built-in CLI. Compatible with Python 3.10+.
 
 ---
 
 ## Installation
 
 ```bash
-pip install edgecrab-sdk
+pip install edgecrab
 ```
 
 ---
@@ -234,7 +234,7 @@ See [sdks/python/README.md](https://github.com/raphaelmansuy/edgecrab/blob/main/
 ## FAQ
 
 **Does the SDK require a running EdgeCrab server?**
-No. `edgecrab-sdk` calls the LLM provider directly using the same logic as the CLI. No local server is needed.
+No. `edgecrab` calls the LLM provider directly using the same logic as the CLI. No local server is needed.
 
 **Can I use the SDK with a self-hosted gateway?**
 Yes. Pass `base_url="https://your-gateway.example.com/v1"` to `Agent()` and it will send all requests there.

@@ -83,11 +83,12 @@ VERSION=<version>
 ./scripts/release-version.sh set "$VERSION"
 ./scripts/release-version.sh check
 
-# 3. Commit, tag, push
-git add Cargo.toml sdks/npm-cli/package.json \
+# 3. Commit, tag, push — let release-version.sh sync handle all derived files
+git add Cargo.toml \
+        sdks/npm-cli/package.json \
         sdks/node/package.json sdks/node/package-lock.json \
         sdks/pypi-cli/edgecrab_cli/_version.py \
-        sdks/python/edgecrab/_version.py
+        sdks/python/pyproject.toml sdks/python/edgecrab/_version.py
 git commit -m "chore: bump version to $VERSION"
 git tag "v$VERSION"
 git push origin main
@@ -172,7 +173,11 @@ npm install -g edgecrab-cli
 which edgecrab
 edgecrab --version
 
-# pip
+# pip (Python SDK)
+pip install --force-reinstall edgecrab
+python -c "import edgecrab; print('edgecrab SDK ok')"
+
+# pip (CLI wrapper)
 pip install --force-reinstall edgecrab-cli
 which edgecrab
 edgecrab --version
@@ -200,162 +205,105 @@ the tap sync is the missing step.
 | `NPM_TOKEN` | `npm` environment | `release-npm-cli.yml` | npm Bearer token |
 | `CARGO_REGISTRY_TOKEN` | repository secrets | `release-rust.yml` | Cargo API token |
 | PyPI OIDC trusted publisher | `pypi` environment | `release-pypi-cli.yml` | OIDC federated credential |
-| `HOMEBREW_TAP_PUSH_TOKEN` | repository secrets | `release-homebrew-tap.yml` | **Deprecated: Use GitHub App instead** |
+| `PYPI_API_TOKEN` | `pypi` environment + repository secrets | `release-python.yml` | PyPI API token — required when OIDC trusted publisher is not yet registered for a new project name (e.g. first publish of `edgecrab`); once the project exists on PyPI, OIDC takes over for `release-pypi-cli.yml` |
+| `HOMEBREW_TAP_DEPLOY_KEY` | repository secrets | `release-homebrew-tap.yml` | ed25519 SSH deploy key with write access to `raphaelmansuy/homebrew-tap` (key id 148386829); **primary auth method since v0.4.1** |
+| `HOMEBREW_TAP_PUSH_TOKEN` | repository secrets | `release-homebrew-tap.yml` | **Deprecated** — legacy GitHub PAT; superseded by `HOMEBREW_TAP_DEPLOY_KEY` |
 | `GITHUB_TOKEN` | auto-provisioned | all workflows | GitHub Actions auto-token |
 
-### ⚠️ Homebrew Tap Authentication (Security Best Practice)
+### Homebrew Tap Authentication — current setup (v0.4.1+)
 
-**Current approach (GitHub PAT):** Uses `HOMEBREW_TAP_PUSH_TOKEN` secret
-- ❌ Persistent token stored in repository secrets
-- ❌ Requires manual rotation
-- ❌ High-privilege token (all user permissions)
-- ❌ No automatic expiration
+The tap is updated automatically via an **SSH deploy key** stored as `HOMEBREW_TAP_DEPLOY_KEY`.
 
-**Recommended approach (GitHub App):** Use a private GitHub App
-- ✅ Scoped permissions (only `contents: write`)
-- ✅ Installation-specific tokens
-- ✅ Automatic short-lived token generation
-- ✅ Better audit trail
-- ✅ Revokable per installation
-- ✅ No user account dependency
+**How it works:**
+1. `release-homebrew-tap.yml` decodes the key at runtime (`base64 -d`) and adds it to `ssh-agent`
+2. Clones `raphaelmansuy/homebrew-tap` over SSH, updates the formula, and pushes
+3. Three-tier fallback in the workflow: deploy key → GitHub App tokens (if configured) → PAT → skip (non-fatal)
 
-#### Setting up a GitHub App for Homebrew Tap Updates
+**Key details:**
+- Key id: `148386829`, type: `ed25519`
+- Grant scope: write access to `raphaelmansuy/homebrew-tap` only
+- Stored as: base64-encoded PEM in repository secret `HOMEBREW_TAP_DEPLOY_KEY`
 
-**Step 1: Create a GitHub App**
-
-1. Go to https://github.com/settings/apps/new
-2. Fill in the form:
-   - **App name:** `edgecrab-homebrew-updater` (or similar)
-   - **Homepage URL:** `https://github.com/raphaelmansuy/edgecrab`
-   - **Callback URL:** Leave blank (not needed for server-to-server)
-   - **Setup URL:** Leave blank
-   - **Request user authorization:** Uncheck
-   - **Expire user authorization tokens:** N/A (skip)
-   - **Webhook:** Uncheck (not needed)
-
-3. Under **Permissions**, set:
-   - **Repository permissions:**
-     - `Contents: Read & write` (for updating Formula/)
-   - **Account permissions:** None
-
-4. Under **Where can the app be installed?:**
-   - ✅ Only on this account
-
-5. Click "Create GitHub App"
-
-**Step 2: Generate and store the private key**
-
-1. In the app settings, scroll to "Private keys"
-2. Click "Generate a private key"
-3. Store it securely as a repository secret named `HOMEBREW_TAP_APP_PRIVATE_KEY`
-
-**Step 3: Note the App ID**
-
-Find it in the "About" section. Store it as a repository secret named `HOMEBREW_TAP_APP_ID`.
-
-**Step 4: Install the app to the Homebrew tap repository**
-
-1. Go to the GitHub App settings → "Install App"
-2. Click "Install" next to your account
-3. Select the `raphaelmansuy/homebrew-tap` repository
-4. Click "Install"
-
-**Step 5: Update the workflow**
-
-Replace the `release-homebrew-tap.yml` workflow to use the GitHub App:
-
-```yaml
-name: 'Release — Homebrew Tap'
-on:
-  workflow_run:
-    workflows: ['Release — Native Binaries']
-    types: [completed]
-
-jobs:
-  update-homebrew:
-    runs-on: ubuntu-latest
-    if: github.event.workflow_run.conclusion == 'success'
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          repository: raphaelmansuy/homebrew-tap
-          token: ${{ steps.app-token.outputs.token }}
-
-      - name: Generate GitHub App Token
-        id: app-token
-        uses: actions/create-github-app-token@v1
-        with:
-          app-id: ${{ secrets.HOMEBREW_TAP_APP_ID }}
-          private-key: ${{ secrets.HOMEBREW_TAP_APP_PRIVATE_KEY }}
-          owner: raphaelmansuy
-
-      - name: Download checksums from main edgecrab release
-        run: |
-          VERSION=$(jq -r '.tag_name' <<< '${{ github.event.workflow_run.name }}' | sed 's/v//')
-          gh release download "v${VERSION}" \
-            --repo raphaelmansuy/edgecrab \
-            --pattern edgecrab-checksums.txt
-          cat edgecrab-checksums.txt
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-
-      - name: Update Homebrew formula
-        run: |
-          # Extract checksums and update Formula/edgecrab.rb
-          VERSION=$(cat edgecrab-checksums.txt | head -1 | awk '{print $NF}')
-          ARM_SHA=$(grep 'aarch64-apple-darwin' edgecrab-checksums.txt | awk '{print $1}')
-          X86_SHA=$(grep 'x86_64-apple-darwin' edgecrab-checksums.txt | awk '{print $1}')
-          
-          # Update formula (simplified example)
-          sed -i "s/version \".*\"/version \"${VERSION}\"/" Formula/edgecrab.rb
-          sed -i "s/sha256 \".*\" => :arm64/sha256 \"${ARM_SHA}\" => :arm64/" Formula/edgecrab.rb
-          sed -i "s/sha256 \".*\"/sha256 \"${X86_SHA}\"/" Formula/edgecrab.rb
-          
-          git config user.name "edgecrab-bot[bot]"
-          git config user.email "edgecrab-bot[bot]@users.noreply.github.com"
-          git add Formula/edgecrab.rb
-          git commit -m "chore: update edgecrab to ${VERSION}"
-          git push
-```
-
-**Step 6: Delete the old secret**
-
-Once the App-based workflow is working, remove `HOMEBREW_TAP_PUSH_TOKEN` from repository secrets.
-
-#### Why GitHub App is better
-
-| Aspect | GitHub PAT | GitHub App |
-|--------|----------|-----------|
-| **Scope** | User's full permissions | Explicitly defined permissions |
-| **Lifetime** | Indefinite (until manual revocation) | Automatic (generated per workflow) |
-| **Revocation** | Manual, per-token | Per-installation, immediate |
-| **Audit** | Tied to user account | Tied to app, cleaner audit trail |
-| **Rate limit** | Shared with user | Separate, isolated quota |
-| **Key rotation** | Manual | Automatic per-workflow |
-| **Compromise impact** | User account exposed | Only that app's permissions exposed |
-
-#### Fallback: If using GitHub PAT
-
-If you must use PAT temporarily, follow these security practices:
-
+**To rotate the deploy key:**
 ```bash
-# Create a minimal-scope PAT (via GitHub UI):
-# 1. Go to Settings → Developer settings → Personal access tokens → Fine-grained tokens
-# 2. Create new token with:
-#    - Expiration: 90 days (automatic rotation policy)
-#    - Permissions:
-#      - Repository: Select only raphaelmansuy/homebrew-tap
-#      - Contents: Read & write
-#    - No Organization permissions
-# 3. Document the token's purpose and rotation date
-# 4. Set calendar reminder for rotation
+# 1. Generate a new ed25519 key pair
+ssh-keygen -t ed25519 -C "edgecrab-homebrew-deploy" -f homebrew_deploy_key -N ""
 
-# Store in repository secrets as HOMEBREW_TAP_PUSH_TOKEN
+# 2. Add the public key to raphaelmansuy/homebrew-tap → Settings → Deploy keys
+#    Title: edgecrab-homebrew-deploy, Allow write access: ✅
+
+# 3. Store the base64-encoded private key as the repository secret
+gh secret set HOMEBREW_TAP_DEPLOY_KEY -R raphaelmansuy/edgecrab < <(base64 < homebrew_deploy_key)
+
+# 4. Delete the local key files
+rm homebrew_deploy_key homebrew_deploy_key.pub
+
+# 5. Remove the old deploy key from raphaelmansuy/homebrew-tap → Settings → Deploy keys
 ```
+
+#### Fallback: GitHub App (optional upgrade)
+
+If you want short-lived app tokens instead of a static deploy key, a GitHub App with `contents: write` on the tap repo can be configured. Store `HOMEBREW_TAP_APP_ID` and `HOMEBREW_TAP_APP_PRIVATE_KEY` as repository secrets, then update the workflow to use `actions/create-github-app-token@v1`. The deploy key approach is simpler and currently sufficient.
+
+#### Fallback: GitHub PAT (deprecated)
+
+`HOMEBREW_TAP_PUSH_TOKEN` (fine-grained PAT, `contents: write` on `raphaelmansuy/homebrew-tap`, 90-day expiry) is still checked as a last resort but its use is discouraged. Remove it once the deploy key is confirmed working.
 
 ---
 
-## Versioning policy
+## Lessons learned
+
+### PyPI package naming: first-time publish requires a token
+
+**Background (v0.4.1):** The Python SDK was originally published to PyPI as `edgecrab-sdk`. This meant
+`pip install edgecrab` always failed — the project `edgecrab` did not exist on PyPI.
+
+**Fix:** Rename the package in `sdks/python/pyproject.toml` from `edgecrab-sdk` to `edgecrab`.
+
+**Gotcha — OIDC cannot create a brand-new project:** PyPI OIDC trusted publishers are registered
+per project name. When `edgecrab` didn't exist on PyPI yet, the workflow's OIDC credential (which
+was registered for `edgecrab-sdk`) could not create it. Solution:
+
+1. Build locally: `cd sdks/python && python3 -m build --outdir dist/`
+2. Upload with a PyPI API token (stored in `~/.pypirc`): `python3 -m twine upload dist/*`
+3. Once the project exists, future CI publishes via `PYPI_API_TOKEN` secret work fine.
+4. Eventually register an OIDC trusted publisher on pypi.org for `edgecrab` to allow passwordless CI.
+
+**Note:** `edgecrab-sdk` still exists on PyPI (0.4.1) and cannot be deleted, but all future versions
+will be published under `edgecrab` only. The Node.js SDK remains `edgecrab-sdk` on npm (intentional).
+
+---
+
+### Version sync: always use `release-version.sh sync`
+
+**Background (v0.4.1):** A hotfix commit manually bumped most version files but missed
+`sdks/pypi-cli/edgecrab_cli/_version.py`, causing a CI failure on the PyPI CLI workflow.
+
+**Rule:** Never manually edit version strings in individual files. Always run:
+
+```bash
+./scripts/release-version.sh sync
+```
+
+This is the **only** authoritative way to update all derived versions from `Cargo.toml`. If you have
+already committed without syncing, run sync and add it as an amend or fixup commit before the tag.
+
+---
+
+### Homebrew tap: deploy key is the current primary auth
+
+**Background:** The tap was initially configured with a GitHub PAT (`HOMEBREW_TAP_PUSH_TOKEN`), which
+expired and caused v0.3.4 tap updates to silently skip. The `RELEASING.md` at the time documented
+a GitHub App as the "recommended" path but neither was actually configured.
+
+**Current setup (v0.4.1+):** An ed25519 SSH deploy key (`HOMEBREW_TAP_DEPLOY_KEY`) with write access
+to `raphaelmansuy/homebrew-tap` is stored as a repository secret. This is what actually runs.
+
+The `release-homebrew-tap.yml` workflow tries in order: deploy key → GitHub App tokens → PAT → skip.
+
+---
+
+
 
 EdgeCrab follows [Semantic Versioning](https://semver.org):
 
