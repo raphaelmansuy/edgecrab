@@ -5,10 +5,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
-## [Unreleased]
+## [0.5.0] — 2026-04-13
 
 ### Added
 
+- **Web search fallback chain — Firecrawl → Brave → Tavily → DuckDuckGo** — `web_search` now automatically cascades through available backends when a provider returns a 402, 429, 503, or structured `BackendError`. DuckDuckGo is the final no-key fallback and uses `wreq` (BoringSSL/Chrome TLS fingerprint) to bypass JA3/JA4 bot-detection. The fallback decision is based on typed `BackendError` variants rather than string matching, eliminating false-positive escalations.
+- **`wreq` dependency** — BoringSSL-backed HTTP client (`wreq = "5"`, Apache-2.0) replaces the plain `reqwest` path for DuckDuckGo scraping. Licensed Apache-2.0 and safe alongside `reqwest`'s `rustls-tls` because both use separate TLS backends.
 - **Per-tool rich result display in TUI done-lines** — `tool_display.rs` now ships `format_tool_result(tool_name, result, max_cols)`, a pure formatting layer that converts raw tool output strings into compact, informative summaries before they appear in the agent activity feed.  Each tool category gets a tailored treatment:
   - **terminal** — parses the `[terminal_result … exit_code=N]` structured header and renders `✓ 0  first-stdout-line` / `✗ N  first-error-line` with colour-graded outcome signal.
   - **execute_code** — parses the JSON result envelope `{status, output, error}` and renders `✓ first-output-line` / `✗ error-line`.
