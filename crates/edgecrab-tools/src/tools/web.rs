@@ -451,6 +451,78 @@ fn content_backend_name(backend: ContentBackend) -> &'static str {
     }
 }
 
+/// Returns `true` when the error is transient — quota exhausted, rate-limited,
+/// temporarily unavailable, or a network-level failure — so the caller should
+/// try the next backend in the fallback chain.
+///
+/// Returns `false` for *content* errors (404 not found, invalid URL, parse
+/// failure, access denied) because switching backends won't fix them.
+fn is_backend_fallback_eligible(err: &ToolError) -> bool {
+    let msg = err.to_string().to_ascii_lowercase();
+    // HTTP status codes that indicate a backend quota / availability problem
+    msg.contains("http 402")
+        || msg.contains("http 429")
+        || msg.contains("http 503")
+        || msg.contains("http 502")
+        || msg.contains("http 500")
+        // Semantic phrases used by Firecrawl / Tavily error bodies
+        || msg.contains("payment required")
+        || msg.contains("quota")
+        || msg.contains("rate limit")
+        || msg.contains("too many requests")
+        || msg.contains("service unavailable")
+        // Network failures — server unreachable / DNS / timeout
+        || msg.contains("timed out")
+        || msg.contains("connection refused")
+        || msg.contains("failed to connect")
+        || msg.contains("dns error")
+        || msg.contains("name resolution")
+}
+
+/// Returns an ordered list of backends to attempt for `web_extract` /
+/// `web_crawl`.  "auto" mode builds the full chain so that if a paid API
+/// fails transiently (402 / 429 / 503) the tool automatically retries with
+/// the next available backend.  Explicit overrides return a single-element
+/// slice; the user asked for a specific backend and we honour that intent
+/// rather than silently falling through to a different one.
+fn resolve_extract_backend_chain(
+    preferred: Option<&str>,
+    tool: &str,
+) -> Result<Vec<ContentBackend>, ToolError> {
+    let choice = preferred
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            backend_override(&[
+                if tool == "web_crawl" {
+                    "EDGECRAB_WEB_CRAWL_BACKEND"
+                } else {
+                    "EDGECRAB_WEB_EXTRACT_BACKEND"
+                },
+                "EDGECRAB_WEB_BACKEND",
+            ])
+        });
+
+    match choice.as_deref().unwrap_or("auto") {
+        "auto" => {
+            // Build a priority chain: paid APIs first (better quality), then
+            // the always-available native Chrome-emulating client as the
+            // guaranteed last resort.
+            let mut chain = Vec::with_capacity(3);
+            if has_firecrawl_api_key() {
+                chain.push(ContentBackend::Firecrawl);
+            }
+            if has_tavily_api_key() {
+                chain.push(ContentBackend::Tavily);
+            }
+            chain.push(ContentBackend::Native); // always available
+            Ok(chain)
+        }
+        // Explicit overrides: single-element chain — fallback not applied.
+        other => resolve_content_backend(Some(other), tool).map(|b| vec![b]),
+    }
+}
+
 fn infer_title_from_url(url: &Url, fallback: &str) -> String {
     url.path_segments()
         .and_then(|mut segments| segments.next_back())
@@ -1537,6 +1609,46 @@ fn parse_extract_url(requested: &str) -> Result<Url, ToolError> {
     })
 }
 
+/// Tries each backend in `chain` in order.  A transient / quota error
+/// (402 / 429 / 503 / network failure) causes the next backend to be
+/// attempted.  A content-level error (404, parse failure, bad URL) is
+/// returned immediately — retrying with a different backend won't help.
+///
+/// Returns the extracted document **and** the backend that actually
+/// succeeded, so callers can report which path was taken.
+async fn extract_with_fallback(
+    url: &Url,
+    chain: &[ContentBackend],
+    max_chars: usize,
+    render_js_fallback: bool,
+    ctx: &ToolContext,
+    tool: &str,
+) -> Result<(ExtractedDocument, ContentBackend), ToolError> {
+    let mut last_err = ToolError::ExecutionFailed {
+        tool: tool.into(),
+        message: "No extraction backend is available.".into(),
+    };
+
+    for &backend in chain {
+        match extract_document_for_url(url, backend, max_chars, render_js_fallback, ctx).await {
+            Ok(doc) => return Ok((doc, backend)),
+            Err(e) if is_backend_fallback_eligible(&e) => {
+                tracing::warn!(
+                    backend = content_backend_name(backend),
+                    url = url.as_str(),
+                    error = %e,
+                    "Backend unavailable — trying next in chain"
+                );
+                last_err = e;
+            }
+            // Hard error (404, invalid URL, parse failure, …) — no retry.
+            Err(e) => return Err(e),
+        }
+    }
+
+    Err(last_err)
+}
+
 async fn extract_document_for_url(
     requested_url: &Url,
     backend: ContentBackend,
@@ -1696,21 +1808,38 @@ impl ToolHandler for WebExtractTool {
 
         let requested_urls = requested_extract_urls(&args)?;
         let max_chars = args.max_chars.unwrap_or(8_000).min(50_000);
-        let backend = resolve_content_backend(args.backend.as_deref(), "web_extract")?;
+        // Use a fallback chain: in "auto" mode the tool tries Firecrawl first,
+        // then Tavily, then Native.  If a paid API returns 402 / 429 / 503 the
+        // next backend is attempted automatically.  Explicit backend overrides
+        // still resolve to a single-element chain (no silent fallback).
+        let chain = resolve_extract_backend_chain(args.backend.as_deref(), "web_extract")?;
         let render_js_fallback = args.render_js_fallback.unwrap_or(true);
-        let backend_name = content_backend_name(backend);
         let batch_mode = requested_urls.len() > 1 || args.urls.is_some();
 
         if !batch_mode {
             let only_url = &requested_urls[0];
             let parsed = parse_extract_url(only_url)?;
-            let document =
-                extract_document_for_url(&parsed, backend, max_chars, render_js_fallback, ctx)
-                    .await?;
+            let (document, used_backend) = extract_with_fallback(
+                &parsed,
+                &chain,
+                max_chars,
+                render_js_fallback,
+                ctx,
+                "web_extract",
+            )
+            .await?;
+            let used_name = content_backend_name(used_backend);
+            let requested_name = content_backend_name(chain[0]);
+            let fallback_from: Option<&str> = if used_name != requested_name {
+                Some(requested_name)
+            } else {
+                None
+            };
 
             return Ok(json!({
                 "success": true,
-                "backend": backend_name,
+                "backend": used_name,
+                "fallback_from": fallback_from,
                 "result": document.clone(),
                 "results": [document],
             })
@@ -1720,16 +1849,17 @@ impl ToolHandler for WebExtractTool {
         let mut results = Vec::with_capacity(requested_urls.len());
         for requested in requested_urls {
             let entry = match parse_extract_url(&requested) {
-                Ok(parsed) => match extract_document_for_url(
+                Ok(parsed) => match extract_with_fallback(
                     &parsed,
-                    backend,
+                    &chain,
                     max_chars,
                     render_js_fallback,
                     ctx,
+                    "web_extract",
                 )
                 .await
                 {
-                    Ok(document) => ExtractBatchEntry {
+                    Ok((document, _used)) => ExtractBatchEntry {
                         url: requested,
                         success: true,
                         result: Some(document),
@@ -1753,9 +1883,10 @@ impl ToolHandler for WebExtractTool {
         }
 
         let success_count = results.iter().filter(|entry| entry.success).count();
+        let batch_backend_name = content_backend_name(chain[0]);
         Ok(json!({
             "success": success_count > 0,
-            "backend": backend_name,
+            "backend": batch_backend_name,
             "results": results,
         })
         .to_string())
@@ -1842,9 +1973,11 @@ impl ToolHandler for WebCrawlTool {
         let max_depth = args.max_depth.unwrap_or(2).min(4);
         let max_chars_per_page = args.max_chars_per_page.unwrap_or(4_000).clamp(500, 12_000);
         let same_path_only = args.same_path_only.unwrap_or(false);
-        let backend = resolve_content_backend(args.backend.as_deref(), "web_crawl")?;
+        // Fallback chain: in "auto" mode try Firecrawl first, then Tavily, then
+        // Native BFS.  Transient failures (402 / 429 / 503) fall through to the
+        // next backend automatically.
+        let chain = resolve_extract_backend_chain(args.backend.as_deref(), "web_crawl")?;
         let render_js_fallback = args.render_js_fallback.unwrap_or(true);
-        let backend_name = content_backend_name(backend);
 
         validate_url(&args.url, "web_crawl")?;
         let start_url = Url::parse(&args.url).map_err(|e| ToolError::InvalidArgs {
@@ -1852,8 +1985,14 @@ impl ToolHandler for WebCrawlTool {
             message: format!("Invalid URL: {e}"),
         })?;
 
-        if matches!(backend, ContentBackend::Firecrawl | ContentBackend::Tavily) {
-            let mut pages = match backend {
+        // ── Phase 1: try the paid-API crawl backends (Firecrawl / Tavily) ──
+        for &backend in &chain {
+            if !matches!(backend, ContentBackend::Firecrawl | ContentBackend::Tavily) {
+                // Reached Native / Browser — handled by BFS below.
+                break;
+            }
+
+            let result = match backend {
                 ContentBackend::Firecrawl => {
                     crawl_via_firecrawl(
                         &start_url,
@@ -1863,7 +2002,7 @@ impl ToolHandler for WebCrawlTool {
                         max_chars_per_page,
                         same_path_only,
                     )
-                    .await?
+                    .await
                 }
                 ContentBackend::Tavily => {
                     crawl_via_tavily(
@@ -1872,31 +2011,68 @@ impl ToolHandler for WebCrawlTool {
                         max_pages,
                         max_chars_per_page,
                     )
-                    .await?
+                    .await
                 }
-                ContentBackend::Native | ContentBackend::Browser => unreachable!("handled below"),
+                ContentBackend::Native | ContentBackend::Browser => unreachable!(),
             };
-            pages.sort_by(|left, right| {
-                right
-                    .score
-                    .cmp(&left.score)
-                    .then(left.depth.cmp(&right.depth))
-                    .then(left.url.cmp(&right.url))
-            });
-            pages.truncate(max_pages);
 
-            return Ok(json!({
-                "success": true,
-                "backend": backend_name,
-                "start_url": args.url,
-                "instructions": args.instructions,
-                "pages_visited": pages.len(),
-                "results": pages,
-            })
-            .to_string());
+            match result {
+                Ok(mut pages) => {
+                    pages.sort_by(|left, right| {
+                        right
+                            .score
+                            .cmp(&left.score)
+                            .then(left.depth.cmp(&right.depth))
+                            .then(left.url.cmp(&right.url))
+                    });
+                    pages.truncate(max_pages);
+                    let used_name = content_backend_name(backend);
+                    let requested_name = content_backend_name(chain[0]);
+                    let fallback_from: Option<&str> = if used_name != requested_name {
+                        Some(requested_name)
+                    } else {
+                        None
+                    };
+
+                    return Ok(json!({
+                        "success": true,
+                        "backend": used_name,
+                        "fallback_from": fallback_from,
+                        "start_url": args.url,
+                        "instructions": args.instructions,
+                        "pages_visited": pages.len(),
+                        "results": pages,
+                    })
+                    .to_string());
+                }
+                Err(e) if is_backend_fallback_eligible(&e) => {
+                    tracing::warn!(
+                        backend = content_backend_name(backend),
+                        url = args.url,
+                        error = %e,
+                        "Crawl backend unavailable — trying next in chain"
+                    );
+                    // Continue to the next backend in the chain.
+                }
+                Err(e) => return Err(e), // hard error (bad URL, etc.)
+            }
         }
 
-        let client = match backend {
+        // ── Phase 2: Native / Browser BFS crawl (guaranteed fallback) ──
+        let bfs_backend = chain
+            .iter()
+            .copied()
+            .find(|&b| matches!(b, ContentBackend::Native | ContentBackend::Browser))
+            .unwrap_or(ContentBackend::Native);
+        let bfs_backend_name = content_backend_name(bfs_backend);
+        let requested_name = content_backend_name(chain[0]);
+        let fallback_from: Option<&str> = if bfs_backend_name != requested_name {
+            Some(requested_name)
+        } else {
+            None
+        };
+
+        let client = match bfs_backend {
             ContentBackend::Native => Some(build_chrome_client("web_crawl")?),
             ContentBackend::Browser | ContentBackend::Firecrawl | ContentBackend::Tavily => None,
         };
@@ -1912,7 +2088,7 @@ impl ToolHandler for WebCrawlTool {
 
             validate_url(&current_key, "web_crawl")?;
 
-            let fetched = match backend {
+            let fetched = match bfs_backend {
                 ContentBackend::Browser => {
                     fetch_browser_document(
                         &current_url,
@@ -1969,7 +2145,7 @@ impl ToolHandler for WebCrawlTool {
                     .await?
                 }
                 ContentBackend::Firecrawl | ContentBackend::Tavily => {
-                    unreachable!("handled earlier")
+                    unreachable!("handled in phase 1")
                 }
             };
 
@@ -2025,7 +2201,8 @@ impl ToolHandler for WebCrawlTool {
 
         Ok(json!({
             "success": true,
-            "backend": backend_name,
+            "backend": bfs_backend_name,
+            "fallback_from": fallback_from,
             "start_url": args.url,
             "instructions": args.instructions,
             "pages_visited": visited.len(),
