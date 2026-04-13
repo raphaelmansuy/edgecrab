@@ -7,6 +7,27 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Per-tool rich result display in TUI done-lines** — `tool_display.rs` now ships `format_tool_result(tool_name, result, max_cols)`, a pure formatting layer that converts raw tool output strings into compact, informative summaries before they appear in the agent activity feed.  Each tool category gets a tailored treatment:
+  - **terminal** — parses the `[terminal_result … exit_code=N]` structured header and renders `✓ 0  first-stdout-line` / `✗ N  first-error-line` with colour-graded outcome signal.
+  - **execute_code** — parses the JSON result envelope `{status, output, error}` and renders `✓ first-output-line` / `✗ error-line`.
+  - **web_search** — parses `{results:[…]}` and renders `N results · first-title`.
+  - **web_extract** — parses `{result:{title,content}}` and renders `N.Nk chars · page title`.
+  - **web_crawl** — parses `{pages:[…]}` and renders `N pages crawled`.
+  - **read_file** — counts lines in the returned content and renders `N lines  first-meaningful-line`.
+  - **search_files** — counts match lines in the grep output and renders `N matches`.
+  - **write_file** — extracts byte count from `"Wrote N bytes"` banner and renders `✓ N bytes`.
+  - **apply_patch** — counts Modified/Created/Deleted entries and renders `✓ N file(s)`.
+  - **session_search** — parses results JSON and renders `N results`.
+  - **ha_call_service** — parses JSON success/error flag and renders `✓ ok` / `✗ error`.
+  - All other tools fall back to first meaningful line, single-spaced and truncated to the available column budget.
+- `format_tool_result` is automatically applied in both the compact done-line (`build_tool_done_line_width`) and the verbose detail line (`build_tool_verbose_lines_width`) — zero call-site changes required.
+
+### Changed
+
+- **Verbose result lines now use `format_tool_result` budget** — the verbose result line in `build_tool_verbose_lines_width` passes `verbose_width` to `format_tool_result`, so wide terminals surface significantly more result detail without truncation.
+
 ---
 
 ## [0.4.1] — 2026-04-13
