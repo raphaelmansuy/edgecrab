@@ -6,6 +6,7 @@
 
 use std::time::Duration;
 
+use edgecrab_core::config::{GroupPolicy, UnauthorizedDmBehavior};
 use serde::Deserialize;
 
 /// Progressive streaming and progress-notification settings for the gateway.
@@ -82,6 +83,10 @@ pub struct GatewayConfig {
     pub default_model: String,
     /// Whether to enable the webhook adapter (always-on)
     pub webhook_enabled: bool,
+    /// Default group chat policy for platforms without an explicit override.
+    pub group_policy: GroupPolicy,
+    /// Behavior when an unauthorized user sends a direct message.
+    pub unauthorized_dm_behavior: UnauthorizedDmBehavior,
     /// Streaming and tool-progress settings.
     pub streaming: GatewayStreamingConfig,
 }
@@ -95,6 +100,8 @@ impl Default for GatewayConfig {
             cleanup_interval_secs: 300,
             default_model: "anthropic/claude-sonnet-4-20250514".into(),
             webhook_enabled: true,
+            group_policy: GroupPolicy::default(),
+            unauthorized_dm_behavior: UnauthorizedDmBehavior::default(),
             streaming: GatewayStreamingConfig::default(),
         }
     }

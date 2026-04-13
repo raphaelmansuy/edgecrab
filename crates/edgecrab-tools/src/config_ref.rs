@@ -358,6 +358,16 @@ impl AppConfigRef {
         self.edgecrab_home.join("gateway_media")
     }
 
+    /// Where gateway platform adapters cache inbound document attachments.
+    ///
+    /// The WhatsApp Baileys bridge writes PDF and document files here
+    /// (e.g. `doc_<hex>_filename.pdf`) when a document message arrives.
+    /// `pdf_to_markdown` and other file tools must trust this directory so the
+    /// path-jail check passes when the agent processes a gateway-received document.
+    pub fn document_cache_dir(&self) -> std::path::PathBuf {
+        self.edgecrab_home.join("document_cache")
+    }
+
     /// Dedicated temp root for file tools.
     ///
     /// WHY not host `/tmp`: global temp directories are shared, nondeterministic,

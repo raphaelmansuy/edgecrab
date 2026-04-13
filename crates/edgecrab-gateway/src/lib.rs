@@ -25,6 +25,7 @@
 
 pub mod api_server;
 pub mod attachment_cache;
+pub mod auth;
 pub mod channel_directory;
 pub mod config;
 pub mod delivery;

@@ -1232,10 +1232,21 @@ async fn parse_event(
         return Ok(None);
     }
 
+    let feishu_chat_type = message
+        .get("chat_type")
+        .and_then(Value::as_str)
+        .unwrap_or("p2p");
+    let chat_type = if feishu_chat_type.eq_ignore_ascii_case("p2p") {
+        crate::platform::ChatType::Dm
+    } else {
+        crate::platform::ChatType::Group
+    };
+
     Ok(Some(IncomingMessage {
         platform: Platform::Feishu,
         user_id,
         channel_id: Some(chat_id.clone()),
+        chat_type,
         text,
         thread_id: thread_id.clone(),
         metadata: MessageMetadata {
@@ -1325,6 +1336,7 @@ async fn parse_reaction_event(
         platform: Platform::Feishu,
         user_id,
         channel_id: Some(chat_id.clone()),
+        chat_type: crate::platform::ChatType::Dm, // reactions don't carry chat_type
         text: format!("reaction:{action}:{emoji}"),
         thread_id: thread_id.clone(),
         metadata: MessageMetadata {
@@ -1388,6 +1400,7 @@ async fn parse_card_action_event(
         platform: Platform::Feishu,
         user_id,
         channel_id: Some(chat_id.clone()),
+        chat_type: crate::platform::ChatType::Dm, // card actions don't carry chat_type
         text,
         thread_id: None,
         metadata: MessageMetadata {

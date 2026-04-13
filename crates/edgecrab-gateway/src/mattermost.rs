@@ -376,6 +376,7 @@ impl MattermostAdapter {
             platform: Platform::Mattermost,
             user_id: user_id.to_string(),
             channel_id: Some(channel_id.clone()),
+            chat_type: crate::platform::ChatType::Group,
             text: message.to_string(),
             thread_id: root_id.clone(),
             metadata: MessageMetadata {

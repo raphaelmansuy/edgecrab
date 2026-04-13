@@ -485,6 +485,7 @@ impl SlackAdapter {
             platform: Platform::Slack,
             user_id: payload.user_id,
             channel_id: Some(payload.channel_id.clone()),
+            chat_type: crate::platform::ChatType::Dm, // slash commands are user-scoped
             text,
             thread_id: None,
             metadata: MessageMetadata {
@@ -787,6 +788,11 @@ impl PlatformAdapter for SlackAdapter {
                     platform: Platform::Slack,
                     user_id: user_id.clone(),
                     channel_id: Some(channel.clone()),
+                    chat_type: if is_dm {
+                        crate::platform::ChatType::Dm
+                    } else {
+                        crate::platform::ChatType::Group
+                    },
                     text: rendered_text,
                     thread_id: thread_ts.clone(),
                     metadata: MessageMetadata {

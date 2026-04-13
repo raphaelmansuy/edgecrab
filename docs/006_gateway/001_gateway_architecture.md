@@ -329,6 +329,96 @@ New Telegram/WhatsApp/Signal users are required to pair before the agent respond
 
 ---
 
+## Authorization (auth.rs)
+
+Every inbound message passes through `check_authorization()` before reaching the agent.
+The authorization chain evaluates rules in strict priority order — the first match wins:
+
+| Step | Rule | Result |
+|------|------|--------|
+| 1a | System platform bypass (Webhook, HomeAssistant, Cron, Api) | `Allowed(PlatformBypass)` |
+| 1b | WhatsApp self-chat: `WHATSAPP_MODE=self-chat` | `Allowed(PlatformBypass)` |
+| 1c | Generic self-chat: `{PREFIX}_SELF_CHAT=true` (any platform) | `Allowed(PlatformBypass)` |
+| 2 | Group policy: `GroupPolicy::Disabled` for group/channel messages | `Denied(GroupPolicyDeny)` |
+| 3 | Global allow-all: `GATEWAY_ALLOW_ALL_USERS=true` | `Allowed(GlobalAllowAll)` |
+| 4 | Per-platform allow-all: `{PREFIX}_ALLOW_ALL_USERS=true` | `Allowed(PlatformAllowAll)` |
+| 5 | Pairing store match | `Allowed(PairingApproved)` |
+| 6 | Allowlist match: `GATEWAY_ALLOWED_USERS` or `{PREFIX}_ALLOWED_USERS` | `Allowed(Allowlist)` |
+| 7 | No match — secure by default | `Denied(NoAllowlistDeny)` |
+
+---
+
+## WhatsApp Self-Chat Mode
+
+Self-chat mode lets the user talk to the EdgeCrab agent through their own WhatsApp
+number — messaging themselves. The agent receives only the user's own messages
+and never replies to groups or other contacts.
+
+### Three-Layer Defence
+
+```
+  ┌─────────────────────────────────────────────────────┐
+  │  Layer 1: bridge.js (JavaScript)                    │
+  │  ─────────────────────────────────────              │
+  │  • fromMe=true  → skip groups, skip bot echoes,     │
+  │                    allow only isSelfChat messages    │
+  │  • fromMe=false → drop in self-chat mode            │
+  │  • Echo guard:  recentlySentIds + REPLY_PREFIX      │
+  └──────────────────────┬──────────────────────────────┘
+                         │ HTTP POST /events
+                         ▼
+  ┌─────────────────────────────────────────────────────┐
+  │  Layer 2: WhatsApp Rust Adapter (whatsapp.rs)       │
+  │  ─────────────────────────────────────              │
+  │  • mode != "bot" && !event.from_me → drop           │
+  │  • Defence-in-depth: catches stale/old bridge       │
+  └──────────────────────┬──────────────────────────────┘
+                         │ mpsc::send(IncomingMessage)
+                         ▼
+  ┌─────────────────────────────────────────────────────┐
+  │  Layer 3: Gateway Auth (auth.rs)                    │
+  │  ─────────────────────────────────────              │
+  │  • WHATSAPP_MODE=self-chat → PlatformBypass         │
+  │  • No allowlist required in self-chat mode          │
+  └─────────────────────────────────────────────────────┘
+```
+
+### Configuration
+
+In `~/.edgecrab/config.yaml`:
+
+```yaml
+gateway:
+  enabled_platforms:
+    - whatsapp
+  whatsapp:
+    enabled: true
+    mode: self-chat       # "self-chat" or "bot"
+    bridge_port: 3000
+    allowed_users: []     # not needed in self-chat mode
+    reply_prefix: "⚕ *EdgeCrab Agent*"
+```
+
+### Echo Prevention
+
+When EdgeCrab sends a reply in self-chat mode, the reply appears as a message
+from the same WhatsApp account. Without echo prevention, this would create an
+infinite loop. The bridge prevents this with two mechanisms:
+
+1. **`recentlySentIds`** — a Set of message IDs recently sent by the agent.
+   When a new `fromMe` message matches, it is silently dropped.
+2. **`REPLY_PREFIX`** — messages starting with the configured prefix (e.g.
+   `⚕ *EdgeCrab Agent*`) are identified as agent echoes and dropped.
+
+### `from_me` Field
+
+The `WhatsAppInboundEvent` struct includes a `from_me: bool` field
+(`#[serde(rename = "fromMe", default)]`). It defaults to `false` (conservative)
+so that an unknown-origin message is treated as a contact message and dropped
+in self-chat mode.
+
+---
+
 ## Tips
 
 > **Tip: Check `ADAPTER_RETRY_DELAY = 5s` and `ADAPTER_MAX_RETRY_DELAY = 60s`.**
@@ -372,3 +462,5 @@ corruption.
 - Session DB shared with CLI → [Session Storage](../009_config_state/002_session_storage.md)
 - Hook configuration → [Hooks](../hooks.md)
 - Concurrency model for session fan-out → [Concurrency Model](../002_architecture/003_concurrency_model.md)
+- Path security and `jail_read_path` → `edgecrab-security/path_policy.rs`
+- WhatsApp bridge source → `scripts/whatsapp-bridge/bridge.js`

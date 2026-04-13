@@ -884,10 +884,17 @@ impl PlatformAdapter for TelegramAdapter {
                             continue;
                         }
 
+                        let chat_type = match msg.chat.chat_type.as_str() {
+                            "private" => crate::platform::ChatType::Dm,
+                            "channel" => crate::platform::ChatType::Channel,
+                            _ => crate::platform::ChatType::Group, // group, supergroup
+                        };
+
                         let incoming = IncomingMessage {
                             platform: Platform::Telegram,
                             user_id,
                             channel_id: Some(msg.chat.id.to_string()),
+                            chat_type,
                             text: rendered_text,
                             thread_id: msg.message_thread_id.map(|id| id.to_string()),
                             metadata: MessageMetadata {

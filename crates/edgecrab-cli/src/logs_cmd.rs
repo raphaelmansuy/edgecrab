@@ -4,7 +4,8 @@ use anyhow::Context;
 
 use crate::cli_args::LogsCommand;
 use crate::logging::{
-    format_log_size, list_log_files, logs_dir_for, read_last_lines, resolve_log_path,
+    format_log_size, format_relative_time, list_log_files, logs_dir_for, read_last_lines,
+    resolve_log_path,
 };
 
 pub fn run(command: LogsCommand) -> anyhow::Result<()> {
@@ -31,12 +32,18 @@ fn list_logs(home: &std::path::Path) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    println!("Log files:");
+    println!("  {:<24} {:>8}  {:<14}  Path", "Name", "Size", "Modified");
+    println!("  {}", "-".repeat(80));
     for log in logs {
+        let age = log
+            .modified
+            .map(format_relative_time)
+            .unwrap_or_else(|| "unknown".into());
         println!(
-            "  {:20} {:>8}  {}",
+            "  {:<24} {:>8}  {:<14}  {}",
             log.name,
             format_log_size(log.size_bytes),
+            age,
             log.path.display()
         );
     }

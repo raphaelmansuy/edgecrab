@@ -938,6 +938,45 @@ pub struct FileToolsConfig {
     pub allowed_roots: Vec<PathBuf>,
 }
 
+/// Policy for handling messages originating from group chats.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupPolicy {
+    /// Never process group messages (default — secure by design).
+    #[default]
+    Disabled,
+    /// Only respond when the bot is @mentioned in the group.
+    MentionOnly,
+    /// Only respond to users present in the platform allowlist.
+    AllowedOnly,
+    /// Respond to all group messages from authorized users.
+    Open,
+}
+
+impl std::fmt::Display for GroupPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Disabled => write!(f, "disabled"),
+            Self::MentionOnly => write!(f, "mention_only"),
+            Self::AllowedOnly => write!(f, "allowed_only"),
+            Self::Open => write!(f, "open"),
+        }
+    }
+}
+
+/// Behavior when an unauthorized user sends a DM.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnauthorizedDmBehavior {
+    /// Generate a pairing code and send instructions.
+    #[default]
+    Pair,
+    /// Silently ignore — no response at all (prevents information leakage).
+    Ignore,
+    /// Send a short rejection message (current behavior).
+    Reject,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct GatewayConfig {
@@ -947,6 +986,10 @@ pub struct GatewayConfig {
     pub enabled_platforms: Vec<String>,
     pub disabled_platforms: Vec<String>,
     pub session_timeout_minutes: u32,
+    /// Default group chat policy for platforms without an explicit override.
+    pub group_policy: GroupPolicy,
+    /// Behavior when an unauthorized user sends a direct message.
+    pub unauthorized_dm_behavior: UnauthorizedDmBehavior,
     pub telegram: TelegramGatewayConfig,
     pub discord: DiscordGatewayConfig,
     pub slack: SlackGatewayConfig,
@@ -963,6 +1006,8 @@ impl Default for GatewayConfig {
             enabled_platforms: Vec::new(),
             disabled_platforms: Vec::new(),
             session_timeout_minutes: 30,
+            group_policy: GroupPolicy::default(),
+            unauthorized_dm_behavior: UnauthorizedDmBehavior::default(),
             telegram: TelegramGatewayConfig::default(),
             discord: DiscordGatewayConfig::default(),
             slack: SlackGatewayConfig::default(),

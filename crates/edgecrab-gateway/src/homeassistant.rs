@@ -286,6 +286,7 @@ impl HomeAssistantAdapter {
             platform: Platform::HomeAssistant,
             user_id: user_id.to_string(),
             channel_id: conversation_id.clone(),
+            chat_type: crate::platform::ChatType::Dm,
             text: text.to_string(),
             thread_id: None,
             metadata: MessageMetadata {

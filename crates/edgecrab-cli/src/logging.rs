@@ -269,8 +269,63 @@ pub fn list_log_files(home: &Path) -> anyhow::Result<Vec<LogFileInfo>> {
         });
     }
 
-    entries.sort_by(|left, right| left.name.cmp(&right.name));
+    // Sort DESC by last-modified time so the most recently touched log appears first.
+    entries.sort_by(|left, right| right.modified.cmp(&left.modified));
     Ok(entries)
+}
+
+/// Format a `SystemTime` as a human-readable relative duration ("just now",
+/// "3 min ago", "1h ago", "2 days ago"), with an absolute fallback for
+/// timestamps older than two weeks.
+pub fn format_relative_time(t: SystemTime) -> String {
+    let now = SystemTime::now();
+    let elapsed = match now.duration_since(t) {
+        Ok(d) => d,
+        // Clock skew: file is slightly in the future
+        Err(_) => return "just now".into(),
+    };
+    let secs = elapsed.as_secs();
+    match secs {
+        0..=59 => "just now".into(),
+        60..=3599 => {
+            let m = secs / 60;
+            format!("{m} min ago")
+        }
+        3600..=86399 => {
+            let h = secs / 3600;
+            format!("{h}h ago")
+        }
+        86400..=1_209_599 => {
+            let d = secs / 86400;
+            format!("{d} day{} ago", if d == 1 { "" } else { "s" })
+        }
+        _ => {
+            // Older than 2 weeks — show absolute date in local time.
+            t.duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|d| format_abs_date(d.as_secs()))
+                .unwrap_or_else(|| "unknown".into())
+        }
+    }
+}
+
+/// Minimal YYYY-MM-DD formatter from a Unix timestamp (seconds since epoch).
+/// Avoids pulling in chrono just for this helper.
+fn format_abs_date(unix_secs: u64) -> String {
+    // Days since Unix epoch
+    let days = unix_secs / 86400;
+    // Adjusted for Julian Day Number algorithm
+    let z = days as i64 + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{:04}-{:02}-{:02}", y, m, d)
 }
 
 pub fn resolve_log_path(home: &Path, name: Option<&str>) -> anyhow::Result<PathBuf> {

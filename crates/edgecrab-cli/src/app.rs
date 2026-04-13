@@ -66,7 +66,8 @@ use crate::gateway_catalog::collect_platform_diagnostics;
 use crate::image_models as cli_image_models;
 use crate::logging::{
     LogFileInfo, LogLevelSetting, default_tail_lines, effective_log_level, format_log_size,
-    list_log_files, persist_log_level, read_last_lines, reload_runtime_log_level, tail_preview,
+    format_relative_time, list_log_files, persist_log_level, read_last_lines,
+    reload_runtime_log_level, tail_preview,
 };
 use crate::markdown_render;
 use crate::mcp_support;
@@ -2338,6 +2339,8 @@ enum BackgroundOpResult {
     SystemMsg(String),
     /// Gateway runtime command completed and the browser should refresh.
     GatewayCommandDone { report: String },
+    /// Gateway diagnostics ready — open the full-screen overlay.
+    DiagnoseReady { report: String },
     /// Provider swap succeeded — update model name and persist config.
     ModelSwitchDone { model: String },
     /// Context compression finished — show summary message.
@@ -2359,6 +2362,24 @@ struct CompletionState {
     ///   this offset; `accept_completion` keeps `text[..arg_start]`
     ///   verbatim and replaces only the fragment that follows it.
     arg_start: usize,
+}
+
+/// Full-screen Gateway Diagnostics overlay panel.
+///
+/// SOLID: single responsibility — holds only rendering/scrolling state for the
+/// diagnose overlay. All data production lives in `gateway_cmd::diagnose_report`.
+#[derive(Debug, Default)]
+struct DiagnosePanelState {
+    /// Whether the overlay is currently visible.
+    active: bool,
+    /// Raw report string returned by `diagnose_report()`.
+    report: String,
+    /// Current vertical scroll offset (in display lines).
+    scroll: usize,
+    /// Total number of lines in the report (for scroll clamping).
+    total_lines: usize,
+    /// True while a background refresh is in-flight.
+    refresh_in_flight: bool,
 }
 
 impl CompletionState {
@@ -3874,15 +3895,32 @@ fn log_kind_for_name(name: &str) -> &'static str {
 }
 
 fn format_log_timestamp_label(modified: Option<std::time::SystemTime>) -> String {
-    modified
-        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
-        .and_then(|duration| {
-            chrono::Local
-                .timestamp_opt(duration.as_secs() as i64, 0)
-                .single()
-        })
-        .map(|value| value.format("%Y-%m-%d %H:%M").to_string())
-        .unwrap_or_else(|| "unknown".into())
+    let Some(t) = modified else {
+        return "unknown".into();
+    };
+    // Primary: human-relative ("3 min ago"); secondary: absolute date appended for
+    // timestamps older than 24 h so the user can still orient by calendar date.
+    let relative = format_relative_time(t);
+    let elapsed_secs = std::time::SystemTime::now()
+        .duration_since(t)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if elapsed_secs >= 86400 {
+        // Append the calendar date for older entries.
+        let abs = t
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|d| chrono::Local.timestamp_opt(d.as_secs() as i64, 0).single())
+            .map(|dt| dt.format("%Y-%m-%d").to_string())
+            .unwrap_or_default();
+        if abs.is_empty() {
+            relative
+        } else {
+            format!("{relative} ({abs})")
+        }
+    } else {
+        relative
+    }
 }
 
 fn default_log_browser_detail_lines() -> Vec<Line<'static>> {
@@ -4440,6 +4478,8 @@ pub struct App {
     gateway_browser: FuzzySelector<GatewayPlatformEntry>,
     /// Focus and scroll state for the gateway browser detail pane.
     gateway_browser_pane: DetailPaneState,
+    /// Gateway diagnostics overlay (activated by `/gateway diagnose`)
+    diagnose_panel: DiagnosePanelState,
     /// Skin browser overlay (activated by `/skin list`)
     skin_browser: FuzzySelector<SkinEntry>,
     /// Verbose / tool-progress picker overlay (activated by `/verbose` with no args)
@@ -5206,6 +5246,7 @@ impl App {
             config_selector: FuzzySelector::new(),
             gateway_browser: FuzzySelector::new(),
             gateway_browser_pane: DetailPaneState::default(),
+            diagnose_panel: DiagnosePanelState::default(),
             skin_browser: FuzzySelector::new(),
             verbose_selector_active: false,
             verbose_selector_cursor: 3, // default to Verbose (the new default mode)
@@ -8110,6 +8151,12 @@ impl App {
     }
 
     fn handle_paging_intent(&mut self, intent: PagingIntent) -> bool {
+        // Log browser and log inspector manage their own paging. Let their
+        // key handlers run instead of consuming the key here.
+        if self.log_inspector.active() || self.log_browser.active {
+            return false;
+        }
+
         if self.document_overlay.is_some() {
             self.scroll_document_overlay(match intent {
                 PagingIntent::Up => -8,
@@ -8667,6 +8714,12 @@ impl App {
                 KeyCode::End => self.set_document_overlay_scroll(u16::MAX),
                 _ => {}
             }
+            return;
+        }
+
+        // Gateway Diagnostics overlay — full-screen scrollable report
+        if self.diagnose_panel.active {
+            self.handle_diagnose_panel_key(key);
             return;
         }
 
@@ -11812,10 +11865,11 @@ impl App {
             "start" => crate::gateway_cmd::GatewayAction::Start { foreground: false },
             "stop" => crate::gateway_cmd::GatewayAction::Stop,
             "restart" => crate::gateway_cmd::GatewayAction::Restart,
+            "diagnose" | "diag" => crate::gateway_cmd::GatewayAction::Diagnose,
             other => {
                 self.push_output(
                     format!(
-                        "Unknown gateway action '{other}'. Use: /gateway [start|stop|restart|status]"
+                        "Unknown gateway action '{other}'. Use: /gateway [start|stop|restart|status|diagnose]"
                     ),
                     OutputRole::System,
                 );
@@ -11823,11 +11877,14 @@ impl App {
             }
         };
 
+        let is_diagnose = matches!(action, crate::gateway_cmd::GatewayAction::Diagnose);
+
         let label = match action {
             crate::gateway_cmd::GatewayAction::Start { .. } => "Starting gateway…",
             crate::gateway_cmd::GatewayAction::Stop => "Stopping gateway…",
             crate::gateway_cmd::GatewayAction::Restart => "Restarting gateway…",
             crate::gateway_cmd::GatewayAction::Status => "Inspecting gateway…",
+            crate::gateway_cmd::GatewayAction::Diagnose => "Running gateway diagnostics…",
         };
 
         let tx = self.response_tx.clone();
@@ -11837,12 +11894,27 @@ impl App {
             frame: 0,
             started: Instant::now(),
         };
+        // Mark refresh in-flight so the overlay can show a spinner if open.
+        if is_diagnose {
+            self.diagnose_panel.refresh_in_flight = true;
+        }
         self.needs_redraw = true;
         self.rt_handle.spawn(async move {
             let result = crate::gateway_cmd::run_capture(action, &cli_args).await;
-            let payload = match result {
-                Ok(report) => BackgroundOpResult::GatewayCommandDone { report },
-                Err(err) => BackgroundOpResult::SystemMsg(format!("Gateway command failed: {err}")),
+            let payload = if is_diagnose {
+                match result {
+                    Ok(report) => BackgroundOpResult::DiagnoseReady { report },
+                    Err(err) => {
+                        BackgroundOpResult::SystemMsg(format!("Gateway diagnostics failed: {err}"))
+                    }
+                }
+            } else {
+                match result {
+                    Ok(report) => BackgroundOpResult::GatewayCommandDone { report },
+                    Err(err) => {
+                        BackgroundOpResult::SystemMsg(format!("Gateway command failed: {err}"))
+                    }
+                }
             };
             let _ = tx.send(AgentResponse::BgOp(payload));
         });
@@ -12453,6 +12525,16 @@ impl App {
                         BackgroundOpResult::GatewayCommandDone { report } => {
                             self.push_output(report, OutputRole::System);
                             self.refresh_gateway_browser();
+                        }
+                        BackgroundOpResult::DiagnoseReady { report } => {
+                            // Count lines before storing for scroll-clamping.
+                            let total = report.lines().count();
+                            self.diagnose_panel.report = report;
+                            self.diagnose_panel.total_lines = total;
+                            self.diagnose_panel.scroll = 0;
+                            self.diagnose_panel.active = true;
+                            self.diagnose_panel.refresh_in_flight = false;
+                            self.needs_redraw = true;
                         }
                         BackgroundOpResult::ModelSwitchDone { model } => {
                             self.model_name = model.clone();
@@ -21040,6 +21122,10 @@ impl App {
             self.render_gateway_browser(frame, frame.area());
         }
 
+        if self.diagnose_panel.active {
+            self.render_diagnose_panel(frame, frame.area());
+        }
+
         if self.log_browser.active {
             self.render_log_browser(frame, frame.area());
         }
@@ -26091,6 +26177,229 @@ impl App {
             ),
         ]));
         frame.render_widget(help, chunks[2]);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // ── Gateway Diagnostics Overlay ──────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Render the full-screen Gateway Diagnostics overlay.
+    ///
+    /// DRY: re-uses `browser_overlay_chunks` and the established accent palette
+    /// so it inherits the same visual language as other overlays with zero
+    /// extra styling primitives.
+    fn render_diagnose_panel(&self, frame: &mut Frame, area: Rect) {
+        frame.render_widget(Clear, area);
+
+        // Accent: teal — distinct from the warm-amber log/model overlays.
+        let accent = Color::Rgb(80, 220, 200);
+        let heading_color = Color::Rgb(255, 220, 100);
+        let ok_color = Color::Rgb(100, 220, 100);
+        let err_color = Color::Rgb(255, 100, 80);
+        let warn_color = Color::Rgb(255, 180, 50);
+        let dim_color = Color::Rgb(130, 130, 140);
+        let bg = Color::Rgb(14, 20, 26);
+
+        // ── Layout ───────────────────────────────────────────────────────────
+        // 3 rows: header bar (3) / body / footer (1)
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ])
+            .split(area);
+
+        // ── Header ───────────────────────────────────────────────────────────
+        let title_text = if self.diagnose_panel.refresh_in_flight {
+            "  Gateway Diagnostics  ·  refreshing…"
+        } else {
+            "  Gateway Diagnostics  ·  /gateway diagnose"
+        };
+        let header = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(accent))
+            .title(Span::styled(
+                title_text,
+                Style::default().fg(accent).add_modifier(Modifier::BOLD),
+            ))
+            .style(Style::default().bg(bg));
+        frame.render_widget(header, chunks[0]);
+
+        // ── Body: colorized report lines ─────────────────────────────────────
+        let report_lines: Vec<Line> = self
+            .diagnose_panel
+            .report
+            .lines()
+            .map(|raw| {
+                Self::colorize_diagnose_line(
+                    raw,
+                    ok_color,
+                    err_color,
+                    warn_color,
+                    heading_color,
+                    dim_color,
+                    accent,
+                )
+            })
+            .collect();
+
+        let visible_height = chunks[1].height.saturating_sub(2) as usize;
+        let scroll = self
+            .diagnose_panel
+            .scroll
+            .min(self.diagnose_panel.total_lines.saturating_sub(1));
+
+        let paragraph = Paragraph::new(report_lines)
+            .scroll((scroll as u16, 0))
+            .style(Style::default().bg(bg).fg(Color::Rgb(225, 220, 210)))
+            .block(
+                Block::default()
+                    .borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM)
+                    .border_style(Style::default().fg(Color::Rgb(50, 70, 80)))
+                    .style(Style::default().bg(bg)),
+            )
+            .wrap(ratatui::widgets::Wrap { trim: false });
+        frame.render_widget(paragraph, chunks[1]);
+
+        // Scroll position indicator (top-right of body border)
+        let total = self.diagnose_panel.total_lines;
+        let bottom = (scroll + visible_height).min(total);
+        let pos_text = format!(" {scroll}–{bottom}/{total} ");
+        let pos_x = chunks[1]
+            .x
+            .saturating_add(chunks[1].width.saturating_sub(pos_text.len() as u16 + 1));
+        let pos_area = Rect {
+            x: pos_x,
+            y: chunks[1].y + chunks[1].height.saturating_sub(1),
+            width: pos_text.len() as u16,
+            height: 1,
+        };
+        frame.render_widget(
+            Paragraph::new(Span::styled(pos_text, Style::default().fg(dim_color))),
+            pos_area,
+        );
+
+        // ── Footer: key hints ────────────────────────────────────────────────
+        let help = Paragraph::new(Line::from(vec![
+            Span::styled(" ↑↓ ", Style::default().fg(accent)),
+            Span::styled("scroll  ", Style::default().fg(dim_color)),
+            Span::styled("PgUp/PgDn ", Style::default().fg(accent)),
+            Span::styled("page  ", Style::default().fg(dim_color)),
+            Span::styled("R ", Style::default().fg(accent)),
+            Span::styled("refresh  ", Style::default().fg(dim_color)),
+            Span::styled("Esc/Q ", Style::default().fg(accent)),
+            Span::styled("close", Style::default().fg(dim_color)),
+        ]));
+        frame.render_widget(help, chunks[2]);
+    }
+
+    /// Handle keyboard input while the Gateway Diagnostics overlay is open.
+    fn handle_diagnose_panel_key(&mut self, key: event::KeyEvent) {
+        let page = self.output_area_height.max(4).saturating_sub(2) as usize;
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
+                self.diagnose_panel.active = false;
+            }
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => {
+                self.diagnose_panel.scroll = self.diagnose_panel.scroll.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') => {
+                let max = self.diagnose_panel.total_lines.saturating_sub(1);
+                self.diagnose_panel.scroll = (self.diagnose_panel.scroll + 1).min(max);
+            }
+            KeyCode::PageUp => {
+                self.diagnose_panel.scroll = self.diagnose_panel.scroll.saturating_sub(page);
+            }
+            KeyCode::PageDown => {
+                let max = self.diagnose_panel.total_lines.saturating_sub(1);
+                self.diagnose_panel.scroll = (self.diagnose_panel.scroll + page).min(max);
+            }
+            KeyCode::Home => {
+                self.diagnose_panel.scroll = 0;
+            }
+            KeyCode::End => {
+                self.diagnose_panel.scroll = self.diagnose_panel.total_lines.saturating_sub(1);
+            }
+            KeyCode::Char('r') | KeyCode::Char('R') | KeyCode::F(5) => {
+                // Refresh: re-run diagnostics and stay in overlay.
+                self.handle_gateway_control("diagnose".into());
+            }
+            _ => {}
+        }
+        self.needs_redraw = true;
+    }
+
+    /// Apply semantic TUI colors to a single line from the gateway diagnose report.
+    ///
+    /// WHY free associated function (no `self`): `render_diagnose_panel` maps over
+    /// report lines and only needs the raw text + color palette — no app state.
+    /// Keeping it here keeps all diagnose-overlay logic co-located.
+    fn colorize_diagnose_line<'a>(
+        raw: &'a str,
+        ok_color: Color,
+        err_color: Color,
+        warn_color: Color,
+        heading_color: Color,
+        dim_color: Color,
+        accent: Color,
+    ) -> Line<'a> {
+        // Box-drawing borders (╔ ╚ ║ ═ etc.)
+        if raw.contains('╔') || raw.contains('╚') || raw.contains('║') || raw.contains('╠')
+        {
+            return Line::from(Span::styled(
+                raw,
+                Style::default().fg(accent).add_modifier(Modifier::BOLD),
+            ));
+        }
+        // Section dividers e.g. "── Title ──"
+        let trimmed = raw.trim_start();
+        if trimmed.starts_with("──") || trimmed.starts_with("─────") {
+            return Line::from(Span::styled(raw, Style::default().fg(heading_color)));
+        }
+        // Status marker lines
+        if raw.contains(" \u{2713} ") || raw.contains(" \u{2714} ") {
+            // ✓ ✔
+            return Line::from(Span::styled(raw, Style::default().fg(ok_color)));
+        }
+        if raw.contains(" \u{2717} ") || raw.contains(" \u{2718} ") {
+            // ✗ ✘
+            return Line::from(Span::styled(raw, Style::default().fg(err_color)));
+        }
+        if raw.contains(" \u{25cb} ") || raw.contains(" \u{25e6} ") {
+            // ○ ◦  (offline / not configured)
+            return Line::from(Span::styled(raw, Style::default().fg(dim_color)));
+        }
+        // Issues section entries  e.g. "[ERROR] ..."
+        if trimmed.starts_with('[') && (trimmed.contains("] ") || trimmed.ends_with(']')) {
+            let color = if trimmed.contains("[WARN") {
+                warn_color
+            } else {
+                err_color
+            };
+            return Line::from(Span::styled(raw, Style::default().fg(color)));
+        }
+        // Fix suggestions
+        if trimmed.starts_with("Fix:") || trimmed.starts_with("fix:") {
+            return Line::from(Span::styled(
+                raw,
+                Style::default().fg(ok_color).add_modifier(Modifier::BOLD),
+            ));
+        }
+        // Log severity keywords
+        if raw.contains("ERROR") {
+            return Line::from(Span::styled(raw, Style::default().fg(err_color)));
+        }
+        if raw.contains("WARN") {
+            return Line::from(Span::styled(raw, Style::default().fg(warn_color)));
+        }
+        // Quick-action command lines e.g. "  edgecrab gateway start"
+        if trimmed.starts_with("edgecrab ") {
+            return Line::from(Span::styled(raw, Style::default().fg(accent)));
+        }
+        // Default: plain text, let the paragraph style apply
+        Line::from(raw)
     }
 
     fn build_session_inspector_detail_lines(&self) -> Vec<Line<'static>> {

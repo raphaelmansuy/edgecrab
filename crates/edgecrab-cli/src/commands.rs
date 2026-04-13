@@ -1168,15 +1168,16 @@ impl CommandRegistry {
             name: "gateway",
             aliases: &["gatewayctl"],
             description:
-                "Show gateway status or manage the runtime: /gateway [start|stop|restart|status]",
+                "Show gateway status or manage the runtime: /gateway [start|stop|restart|status|diagnose]",
             handler: |args| match args.trim().to_ascii_lowercase().as_str() {
                 "" => CommandResult::ShowPlatforms,
                 "status" => CommandResult::GatewayControl("status".into()),
                 "start" => CommandResult::GatewayControl("start".into()),
                 "stop" => CommandResult::GatewayControl("stop".into()),
                 "restart" => CommandResult::GatewayControl("restart".into()),
+                "diagnose" | "diag" => CommandResult::GatewayControl("diagnose".into()),
                 other => CommandResult::Output(format!(
-                    "Unknown gateway action '{other}'. Use: /gateway [start|stop|restart|status]"
+                    "Unknown gateway action '{other}'. Use: /gateway [start|stop|restart|status|diagnose]"
                 )),
             },
         });

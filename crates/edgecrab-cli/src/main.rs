@@ -1640,6 +1640,7 @@ async fn run_gateway(command: GatewayCommand, args: &CliArgs) -> anyhow::Result<
                 GatewayCommand::Stop => gateway_cmd::GatewayAction::Stop,
                 GatewayCommand::Restart => gateway_cmd::GatewayAction::Restart,
                 GatewayCommand::Status => gateway_cmd::GatewayAction::Status,
+                GatewayCommand::Diagnose => gateway_cmd::GatewayAction::Diagnose,
                 GatewayCommand::Configure { .. } => unreachable!(),
             };
             gateway_cmd::run(action, args).await

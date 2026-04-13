@@ -843,6 +843,11 @@ impl SignalAdapter {
                     platform: Platform::Signal,
                     user_id: source.clone(),
                     channel_id: channel_id.clone(),
+                    chat_type: if group_id.is_some() {
+                        crate::platform::ChatType::Group
+                    } else {
+                        crate::platform::ChatType::Dm
+                    },
                     text: rendered_text,
                     thread_id: None, // Signal doesn't have threads
                     metadata: MessageMetadata {

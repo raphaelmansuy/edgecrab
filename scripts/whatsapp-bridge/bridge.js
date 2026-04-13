@@ -270,10 +270,21 @@ async function startSocket() {
         if (!isSelfChat) continue;
       }
 
-      // Check allowlist for messages from others (resolve LID → phone if needed)
-      if (!msg.key.fromMe && ALLOWED_USERS.length > 0) {
-        const resolvedNumber = lidToPhone[senderNumber] || senderNumber;
-        if (!ALLOWED_USERS.includes(resolvedNumber)) continue;
+      // Filter messages from contacts (not sent by the user themselves).
+      //
+      // Self-chat mode: EdgeCrab reacts only to the user's own messages typed in
+      // their "Saved Messages" / self-chat window (handled by the fromMe block above).
+      // Any reply that arrives FROM a contact must be silently dropped — forwarding
+      // it would cause EdgeCrab to reply into a third-party conversation by mistake.
+      //
+      // Bot mode: enforce the allowlist when one is configured; allow all contacts
+      // when the list is empty (open-access bot).
+      if (!msg.key.fromMe) {
+        if (WHATSAPP_MODE !== 'bot') continue;          // self-chat: block all contact messages
+        if (ALLOWED_USERS.length > 0) {                 // bot mode: enforce allowlist if set
+          const resolvedNumber = lidToPhone[senderNumber] || senderNumber;
+          if (!ALLOWED_USERS.includes(resolvedNumber)) continue;
+        }
       }
 
       // Extract message body
@@ -381,6 +392,9 @@ async function startSocket() {
         senderName: msg.pushName || senderNumber,
         chatName: isGroup ? (chatId.split('@')[0]) : (msg.pushName || senderNumber),
         isGroup,
+        // fromMe is included so the Rust adapter can enforce self-chat mode
+        // as a second layer of defense independently of the JS filter.
+        fromMe: !!msg.key.fromMe,
         body,
         hasMedia,
         mediaType,

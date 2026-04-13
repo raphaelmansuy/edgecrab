@@ -18,7 +18,7 @@ use serde_json::json;
 
 use edgecrab_types::{ToolError, ToolSchema};
 
-use crate::path_utils::{jail_read_path, jail_write_path_create_dirs};
+use crate::path_utils::{jail_read_path_multi, jail_write_path_create_dirs};
 use crate::registry::{ToolContext, ToolHandler};
 
 const DEFAULT_MAX_CHARS: usize = 20_000;
@@ -168,7 +168,11 @@ impl ToolHandler for PdfToMarkdownTool {
         })?;
 
         let path_policy = ctx.config.file_path_policy(&ctx.cwd);
-        let resolved = jail_read_path(&args.path, &path_policy)?;
+        // Gateway adapters cache inbound PDF attachments to document_cache_dir().
+        // Trust this directory so agents can process files received via messaging
+        // platforms (WhatsApp, Telegram, etc.) without requiring it in allowed_roots.
+        let document_cache = ctx.config.document_cache_dir();
+        let resolved = jail_read_path_multi(&args.path, &path_policy, &[document_cache.as_path()])?;
         let markdown = extract_pdf_markdown_from_path(&resolved, "pdf_to_markdown")?;
 
         let output_path = if let Some(path) = args.output_path.as_deref() {

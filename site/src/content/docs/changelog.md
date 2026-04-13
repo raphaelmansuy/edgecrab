@@ -8,20 +8,40 @@ sidebar:
 All notable changes to EdgeCrab are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-Last updated: 2026-04-12
+Last updated: 2026-04-13
 
 ---
 
 ## [Unreleased]
 
+---
+
+## [0.4.0] — 2026-04-13
+
 ### Added
 
 - **Large tool outputs can now spill to session-scoped artifact files instead of bloating prompt history** — successful tool results over the configured threshold are persisted under `.edgecrab-artifacts/<session_id>/...`, while the model sees a compact preview stub with metadata and a readable path.
 - **Spill behavior is now configurable** — `tools.result_spill`, `tools.result_spill_threshold`, and `tools.result_spill_preview_lines` plus matching `EDGECRAB_TOOL_RESULT_SPILL*` overrides control whether spilling is enabled, when it triggers, and how much preview is kept inline.
+- **Config-driven git worktree mode and TUI worktree control surface** — `worktree: true` and `EDGECRAB_WORKTREE=1` now enable isolated git worktrees by default, `/worktree` and `/w` open a dedicated TUI report overlay, and worktree cleanup now preserves branches with unpushed commits.
+- **First-class `/log` TUI with persisted log-level control** — `/log` and `/logs` now open a split-pane log browser with entry inspector and live follow; `1-5` or `/log level <level>` persist the default log level.
 
 ### Changed
 
-- **Gateway/chat origin metadata now uses a named value type** — the internal `(String, String)` pair has been replaced with `OriginChat { platform, chat_id }`, which improves type safety across agent, gateway, and tool dispatch paths without changing user-facing behavior.
+- **Gateway/chat origin metadata now uses a named value type** — the internal `(String, String)` pair has been replaced with `OriginChat { platform, chat_id }`, improving type safety without changing user-facing behavior.
+- **Interactive and non-interactive log inspection now share one backend** — `edgecrab logs`, startup logging, config persistence, and TUI browsers all reuse the same file-discovery and log-level helpers.
+
+### Fixed
+
+- **Clippy: useless `format!` call replaced with `.to_string()`** — gateway_cmd.rs WhatsApp state message now uses idiomatic Rust.
+
+### Verification
+
+| Check | Result |
+|--------|--------|
+| `cargo run -- --version` | **passed locally before cut** |
+| `cargo fmt --all --check` | **passed locally before cut** |
+| `cargo clippy --workspace -- -D warnings` | **passed locally before cut** |
+| `cargo test --workspace` | **passed locally before cut** |
 
 ---
 
