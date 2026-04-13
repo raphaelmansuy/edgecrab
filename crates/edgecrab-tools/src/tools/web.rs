@@ -374,6 +374,48 @@ fn resolve_search_backend(preferred: Option<&str>) -> Result<SearchBackend, Tool
     }
 }
 
+fn search_backend_name(backend: &SearchBackend) -> &'static str {
+    match backend {
+        SearchBackend::Firecrawl => "firecrawl",
+        SearchBackend::Tavily => "tavily",
+        SearchBackend::Brave => "brave",
+        SearchBackend::DuckDuckGo => "duckduckgo",
+    }
+}
+
+/// Returns an ordered chain of search backends to try in "auto" mode.
+///
+/// Priority: Firecrawl (highest quality) → Brave → Tavily → DuckDuckGo
+/// (guaranteed no-key fallback).
+/// Explicit overrides produce a single-element chain: the caller asked for a
+/// specific backend and we honour that intent without silent fallback.
+fn resolve_search_backend_chain(preferred: Option<&str>) -> Result<Vec<SearchBackend>, ToolError> {
+    let choice = preferred
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .or_else(|| backend_override(&["EDGECRAB_WEB_SEARCH_BACKEND", "EDGECRAB_WEB_BACKEND"]));
+
+    match choice.as_deref().unwrap_or("auto") {
+        "auto" => {
+            let mut chain: Vec<SearchBackend> = Vec::with_capacity(4);
+            if has_firecrawl_api_key() {
+                chain.push(SearchBackend::Firecrawl);
+            }
+            if has_brave_api_key() {
+                chain.push(SearchBackend::Brave);
+            }
+            if has_tavily_api_key() {
+                chain.push(SearchBackend::Tavily);
+            }
+            // DuckDuckGo always available — guaranteed terminal fallback.
+            chain.push(SearchBackend::DuckDuckGo);
+            Ok(chain)
+        }
+        // Explicit override — single element, no silent fallback.
+        other => resolve_search_backend(Some(other)).map(|b| vec![b]),
+    }
+}
+
 fn resolve_content_backend(
     preferred: Option<&str>,
     tool: &str,
@@ -815,7 +857,7 @@ struct SearchResult {
 /// Search via Tavily API (api_key from TAVILY_API_KEY env).
 ///
 /// Tavily free tier: ~1000 searches/month. Get key at https://app.tavily.com
-async fn search_tavily(query: &str, max: usize) -> Result<Vec<SearchResult>, ToolError> {
+async fn search_tavily(query: &str, max: usize) -> Result<Vec<SearchResult>, BackendError> {
     let data = tavily_request(
         "search",
         json!({
@@ -826,8 +868,7 @@ async fn search_tavily(query: &str, max: usize) -> Result<Vec<SearchResult>, Too
         }),
         "web_search",
     )
-    .await
-    .map_err(BackendError::into_tool_error)?;
+    .await?;
 
     let results = data["results"]
         .as_array()
@@ -947,7 +988,7 @@ fn normalize_firecrawl_search_results(data: &serde_json::Value, max: usize) -> V
         .collect()
 }
 
-async fn search_firecrawl(query: &str, max: usize) -> Result<Vec<SearchResult>, ToolError> {
+async fn search_firecrawl(query: &str, max: usize) -> Result<Vec<SearchResult>, BackendError> {
     let data = firecrawl_request(
         reqwest::Method::POST,
         "search",
@@ -958,8 +999,7 @@ async fn search_firecrawl(query: &str, max: usize) -> Result<Vec<SearchResult>, 
         })),
         "web_search",
     )
-    .await
-    .map_err(BackendError::into_tool_error)?;
+    .await?;
     Ok(normalize_firecrawl_search_results(&data, max))
 }
 
@@ -1013,9 +1053,9 @@ async fn tavily_request(
 /// Search via Brave Search API (api_key from BRAVE_API_KEY env).
 ///
 /// Brave free tier: 2000 searches/month. Get key at https://api.search.brave.com/app/keys
-async fn search_brave(query: &str, max: usize) -> Result<Vec<SearchResult>, ToolError> {
+async fn search_brave(query: &str, max: usize) -> Result<Vec<SearchResult>, BackendError> {
     let api_key = std::env::var("BRAVE_API_KEY").unwrap_or_default();
-    let client = build_client()?;
+    let client = build_client().map_err(|e| BackendError::hard("web_search", e.to_string()))?;
 
     let url = format!(
         "https://api.search.brave.com/res/v1/web/search?q={}&count={}",
@@ -1029,23 +1069,20 @@ async fn search_brave(query: &str, max: usize) -> Result<Vec<SearchResult>, Tool
         .header("Accept", "application/json")
         .send()
         .await
-        .map_err(|e| ToolError::ExecutionFailed {
-            tool: "web_search".into(),
-            message: format!("Brave Search API error: {e}"),
-        })?;
+        .map_err(|e| BackendError::network("web_search", format!("Brave Search API error: {e}")))?;
 
     if !resp.status().is_success() {
-        let status = resp.status();
+        let code = resp.status().as_u16();
         let text = resp.text().await.unwrap_or_default();
-        return Err(ToolError::ExecutionFailed {
-            tool: "web_search".into(),
-            message: format!("Brave Search HTTP {status}: {text}"),
-        });
+        return Err(BackendError::api(
+            code,
+            "web_search",
+            format!("Brave Search HTTP {code}: {text}"),
+        ));
     }
 
-    let data: serde_json::Value = resp.json().await.map_err(|e| ToolError::ExecutionFailed {
-        tool: "web_search".into(),
-        message: format!("Brave Search JSON parse error: {e}"),
+    let data: serde_json::Value = resp.json().await.map_err(|e| {
+        BackendError::hard("web_search", format!("Brave Search JSON parse error: {e}"))
     })?;
 
     let results = data["web"]["results"]
@@ -1072,10 +1109,12 @@ async fn search_brave(query: &str, max: usize) -> Result<Vec<SearchResult>, Tool
 /// Search via DuckDuckGo HTML endpoint using Chrome TLS/HTTP-2 fingerprint emulation.
 ///
 /// Endpoint: https://html.duckduckgo.com/html/ (POST form, not the Instant Answer API)
-async fn search_duckduckgo(query: &str, max: usize) -> Result<Vec<SearchResult>, ToolError> {
-    validate_url("https://html.duckduckgo.com/", "web_search")?;
+async fn search_duckduckgo(query: &str, max: usize) -> Result<Vec<SearchResult>, BackendError> {
+    validate_url("https://html.duckduckgo.com/", "web_search")
+        .map_err(|e| BackendError::hard("web_search", e.to_string()))?;
 
-    let client = build_chrome_client("web_search")?;
+    let client = build_chrome_client("web_search")
+        .map_err(|e| BackendError::hard("web_search", e.to_string()))?;
 
     let form = [("q", query), ("b", ""), ("kl", "us-en")];
     let resp = client
@@ -1083,37 +1122,33 @@ async fn search_duckduckgo(query: &str, max: usize) -> Result<Vec<SearchResult>,
         .form(&form)
         .send()
         .await
-        .map_err(|e| ToolError::ExecutionFailed {
-            tool: "web_search".into(),
-            message: format!("DDG HTTP error: {e}"),
-        })?;
+        .map_err(|e| BackendError::network("web_search", format!("DDG HTTP error: {e}")))?;
 
     if !resp.status().is_success() {
-        let status = resp.status();
-        return Err(ToolError::ExecutionFailed {
-            tool: "web_search".into(),
-            message: format!(
-                "DDG returned HTTP {status}. \
-                 Set TAVILY_API_KEY or BRAVE_API_KEY for reliable search."
-            ),
-        });
+        let code = resp.status().as_u16();
+        return Err(BackendError::api(
+            code,
+            "web_search",
+            format!("DDG returned HTTP {code}."),
+        ));
     }
 
-    let html = resp.text().await.map_err(|e| ToolError::ExecutionFailed {
-        tool: "web_search".into(),
-        message: format!("DDG read error: {e}"),
-    })?;
+    let html = resp
+        .text()
+        .await
+        .map_err(|e| BackendError::network("web_search", format!("DDG read error: {e}")))?;
 
+    // DDG bot-challenge: treat as transient so callers can log a warning
+    // rather than hard-failing the whole search.
     if html.contains("anomaly-modal") || html.len() < 500 {
-        return Err(ToolError::ExecutionFailed {
-            tool: "web_search".into(),
-            message: "DDG returned a bot-challenge page. \
-                      Set TAVILY_API_KEY or BRAVE_API_KEY for reliable search."
-                .into(),
-        });
+        return Err(BackendError::api(
+            503,
+            "web_search",
+            "DDG returned a bot-challenge page.",
+        ));
     }
 
-    parse_ddg_html_results(&html, max)
+    parse_ddg_html_results(&html, max).map_err(|e| BackendError::hard("web_search", e.to_string()))
 }
 
 /// Parse web results from an `html.duckduckgo.com` HTML response.
@@ -1491,6 +1526,48 @@ async fn crawl_via_tavily(
     Ok(pages)
 }
 
+/// Try each backend in `chain` in order; advance on transient errors, hard-fail on permanent ones.
+///
+/// Returns the results AND a reference to the backend that produced them so the caller
+/// can report `fallback_from` accurately.
+async fn search_with_fallback<'a>(
+    query: &str,
+    max: usize,
+    chain: &'a [SearchBackend],
+) -> Result<(Vec<SearchResult>, &'a SearchBackend), ToolError> {
+    let mut last_err: Option<BackendError> = None;
+    for backend in chain {
+        let res = match backend {
+            SearchBackend::Firecrawl => search_firecrawl(query, max).await,
+            SearchBackend::Tavily => search_tavily(query, max).await,
+            SearchBackend::Brave => search_brave(query, max).await,
+            SearchBackend::DuckDuckGo => search_duckduckgo(query, max).await,
+        };
+        match res {
+            Ok(results) if !results.is_empty() => return Ok((results, backend)),
+            Ok(_) => {
+                // Backend succeeded but returned nothing — try next.
+                last_err = Some(BackendError::hard("web_search", "No results returned."));
+            }
+            Err(e) if e.is_transient() => {
+                tracing::warn!(
+                    backend = search_backend_name(backend),
+                    error = %e,
+                    "web_search: backend unavailable, trying next in chain",
+                );
+                last_err = Some(e);
+            }
+            Err(e) => return Err(e.into_tool_error()),
+        }
+    }
+    Err(last_err
+        .map(BackendError::into_tool_error)
+        .unwrap_or_else(|| ToolError::ExecutionFailed {
+            tool: "web_search".into(),
+            message: "No search backends are available.".into(),
+        }))
+}
+
 #[async_trait]
 impl ToolHandler for WebSearchTool {
     fn name(&self) -> &'static str {
@@ -1554,30 +1631,32 @@ impl ToolHandler for WebSearchTool {
             })?;
 
         let max = args.max_results.unwrap_or(5).min(20);
+        let chain = resolve_search_backend_chain(args.backend.as_deref())?;
+        let (results, used_backend) = search_with_fallback(&args.query, max, &chain).await?;
 
-        let (backend_name, note, results) = match resolve_search_backend(args.backend.as_deref())? {
-            SearchBackend::Firecrawl => {
-                ("Firecrawl", None, search_firecrawl(&args.query, max).await?)
-            }
-            SearchBackend::Tavily => ("Tavily", None, search_tavily(&args.query, max).await?),
-            SearchBackend::Brave => ("Brave Search", None, search_brave(&args.query, max).await?),
-            SearchBackend::DuckDuckGo => {
-                let results = search_duckduckgo(&args.query, max).await?;
-                (
-                    "DuckDuckGo",
-                    Some(
-                        "DuckDuckGo HTML is the no-key fallback (Chrome TLS emulation). For reliable broad search set TAVILY_API_KEY or BRAVE_API_KEY in ~/.edgecrab/.env."
-                            .to_string(),
-                    ),
-                    results,
-                )
-            }
+        let used_name = search_backend_name(used_backend);
+        let primary_name = search_backend_name(&chain[0]);
+        let fallback_from: Option<&str> = if used_name != primary_name {
+            Some(primary_name)
+        } else {
+            None
+        };
+        let note: Option<String> = if matches!(used_backend, SearchBackend::DuckDuckGo) {
+            Some(
+                "DuckDuckGo HTML is the no-key fallback (Chrome TLS emulation). \
+                 For reliable broad search set TAVILY_API_KEY or BRAVE_API_KEY \
+                 in ~/.edgecrab/.env."
+                    .to_string(),
+            )
+        } else {
+            None
         };
 
         Ok(json!({
             "success": true,
             "query": args.query,
-            "backend": backend_name,
+            "backend": used_name,
+            "fallback_from": fallback_from,
             "note": note,
             "results": results,
         })
