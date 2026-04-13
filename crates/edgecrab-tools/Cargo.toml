@@ -26,6 +26,7 @@ shellexpand = { workspace = true }
 dashmap = { workspace = true }
 regex = { workspace = true }
 reqwest = { workspace = true }
+wreq = { workspace = true }
 tokio-tungstenite = { workspace = true }
 futures = { workspace = true }
 strip-ansi-escapes = { workspace = true }
