@@ -1,5 +1,31 @@
 name: Release — Homebrew Tap
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Authentication strategy (preference order)
+# ──────────────────────────────────────────────────────────────────────────────
+# Option A — SSH Deploy Key (recommended, already configured)
+#   Secrets required:
+#     HOMEBREW_TAP_DEPLOY_KEY — ed25519 private key installed as a write-access
+#                               deploy key on raphaelmansuy/homebrew-tap only
+#
+#   This is the narrowest credential: it can ONLY push to one repository,
+#   it does not expire, and it does not grant API access.
+#   Configured via: make configure-homebrew-deploy-key  (see docs/homebrew-tap-setup.md)
+#
+# Option B — GitHub App token (no long-lived token)
+#   Secrets required:
+#     HOMEBREW_TAP_APP_ID          — GitHub App ID (numeric)
+#     HOMEBREW_TAP_APP_PRIVATE_KEY — RSA PEM private key of the App
+#
+# Option C — Fine-grained PAT (last resort)
+#   Secrets required:
+#     HOMEBREW_TAP_PUSH_TOKEN — fine-grained PAT with Contents:write on
+#                               raphaelmansuy/homebrew-tap only
+#
+# If no credential is configured the job exits 0 (skipped, not a failure).
+# See docs/homebrew-tap-setup.md for setup instructions.
+# ──────────────────────────────────────────────────────────────────────────────
+
 on:
   workflow_run:
     workflows: ["Release — Native Binaries"]
@@ -7,9 +33,9 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: 'Tag name to sync into the tap (e.g. v0.3.3)'
+        description: 'Tag name to sync into the tap (e.g. v0.4.1)'
         required: true
-        default: 'v0.3.3'
+        default: 'v0.4.1'
 
 permissions:
   contents: read
@@ -57,22 +83,66 @@ jobs:
           echo "arm_sha=$ARM_SHA" >> "$GITHUB_OUTPUT"
           echo "x86_sha=$X86_SHA" >> "$GITHUB_OUTPUT"
 
-      - name: Checkout tap repository
+      # ── Resolve auth method ────────────────────────────────────────────────
+      - name: Resolve auth method
+        id: auth
+        env:
+          DEPLOY_KEY:  ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+          APP_ID:      ${{ secrets.HOMEBREW_TAP_APP_ID }}
+          APP_KEY:     ${{ secrets.HOMEBREW_TAP_APP_PRIVATE_KEY }}
+          PAT_TOKEN:   ${{ secrets.HOMEBREW_TAP_PUSH_TOKEN }}
+        run: |
+          if [[ -n "$DEPLOY_KEY" ]]; then
+            echo "method=deploy-key" >> "$GITHUB_OUTPUT"
+            echo "Using SSH deploy key (HOMEBREW_TAP_DEPLOY_KEY)"
+          elif [[ -n "$APP_ID" && -n "$APP_KEY" ]]; then
+            echo "method=github-app" >> "$GITHUB_OUTPUT"
+            echo "Using GitHub App token"
+          elif [[ -n "$PAT_TOKEN" ]]; then
+            echo "method=pat" >> "$GITHUB_OUTPUT"
+            echo "Using fine-grained PAT (HOMEBREW_TAP_PUSH_TOKEN)"
+          else
+            echo "method=none" >> "$GITHUB_OUTPUT"
+            echo "No push credential configured — tap update will be skipped."
+          fi
+
+      - name: Skip if no credential
+        if: steps.auth.outputs.method == 'none'
+        run: |
+          echo "::notice::Homebrew tap update skipped: no push credential configured."
+          echo "See docs/homebrew-tap-setup.md to configure HOMEBREW_TAP_DEPLOY_KEY."
+          exit 0
+
+      # ── Option B: GitHub App token (only when method=github-app) ──────────
+      - name: Generate GitHub App token
+        id: app-token
+        if: steps.auth.outputs.method == 'github-app'
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.HOMEBREW_TAP_APP_ID }}
+          private-key: ${{ secrets.HOMEBREW_TAP_APP_PRIVATE_KEY }}
+          repositories: homebrew-tap
+
+      # ── Checkout via SSH deploy key (Option A) ─────────────────────────────
+      - name: Checkout tap repository (deploy key)
+        if: steps.auth.outputs.method == 'deploy-key'
         uses: actions/checkout@v4
         with:
           repository: ${{ env.TAP_REPOSITORY }}
+          ssh-key: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
           path: homebrew-tap
 
-      - name: Verify tap push token
-        env:
-          HOMEBREW_TAP_PUSH_TOKEN: ${{ secrets.HOMEBREW_TAP_PUSH_TOKEN }}
-        run: |
-          if [[ -z "$HOMEBREW_TAP_PUSH_TOKEN" ]]; then
-            echo "HOMEBREW_TAP_PUSH_TOKEN is not configured; automatic tap push cannot proceed." >&2
-            exit 1
-          fi
+      # ── Checkout via token (Option B/C) ───────────────────────────────────
+      - name: Checkout tap repository (token)
+        if: steps.auth.outputs.method == 'github-app' || steps.auth.outputs.method == 'pat'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TAP_REPOSITORY }}
+          token: ${{ steps.auth.outputs.method == 'github-app' && steps.app-token.outputs.token || secrets.HOMEBREW_TAP_PUSH_TOKEN }}
+          path: homebrew-tap
 
       - name: Update formula
+        if: steps.auth.outputs.method != 'none'
         run: |
           ./scripts/update-homebrew-formula.sh \
             homebrew-tap/Formula/edgecrab.rb \
@@ -81,8 +151,12 @@ jobs:
             "${{ steps.checksums.outputs.x86_sha }}"
 
       - name: Commit and push tap update
+        if: steps.auth.outputs.method != 'none'
         env:
-          HOMEBREW_TAP_PUSH_TOKEN: ${{ secrets.HOMEBREW_TAP_PUSH_TOKEN }}
+          METHOD:      ${{ steps.auth.outputs.method }}
+          APP_TOKEN:   ${{ steps.app-token.outputs.token }}
+          PAT_TOKEN:   ${{ secrets.HOMEBREW_TAP_PUSH_TOKEN }}
+          TAP_REPO:    ${{ env.TAP_REPOSITORY }}
         run: |
           cd homebrew-tap
           if git diff --quiet -- Formula/edgecrab.rb; then
@@ -93,5 +167,13 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Formula/edgecrab.rb
           git commit -m "edgecrab ${{ steps.version.outputs.version }}"
-          git remote set-url origin "https://x-access-token:${HOMEBREW_TAP_PUSH_TOKEN}@github.com/${TAP_REPOSITORY}.git"
-          git push origin HEAD:master
+          if [[ "$METHOD" == "deploy-key" ]]; then
+            # SSH remote already configured by actions/checkout ssh-key option
+            git push origin HEAD:master
+          else
+            PUSH_TOKEN="${APP_TOKEN:-$PAT_TOKEN}"
+            git remote set-url origin "https://x-access-token:${PUSH_TOKEN}@github.com/${TAP_REPO}.git"
+            git push origin HEAD:master
+          fi
+          echo "::notice::Homebrew formula updated to ${{ steps.version.outputs.version }}"
+

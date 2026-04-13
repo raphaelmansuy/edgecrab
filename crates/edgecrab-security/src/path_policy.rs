@@ -184,14 +184,11 @@ impl PathPolicy {
         let mut roots = Vec::new();
         let mut seen = BTreeSet::new();
 
+        // workspace_root is already canonicalized by `canonical_workspace_root()`
+        // before being passed here — add it directly (canonicalize always succeeds
+        // on a path that was just canonicalized successfully).
         for root in std::iter::once(workspace_root.to_path_buf())
             .chain(virtual_tmp_root.into_iter().map(Path::to_path_buf))
-            .chain(
-                self.allowed_roots
-                    .iter()
-                    .map(|root| resolve_root(root, workspace_root)),
-            )
-            .chain(extra_roots.iter().map(|root| (*root).to_path_buf()))
         {
             let canonical = root.canonicalize().map_err(|e| {
                 PathPolicyError::InvalidRoot(format!(
@@ -201,6 +198,51 @@ impl PathPolicy {
             })?;
             if seen.insert(canonical.clone()) {
                 roots.push(canonical);
+            }
+        }
+
+        // Configured allowed_roots: non-existent entries indicate user
+        // misconfiguration (e.g. a path that was removed after being added).
+        // Log a warning and skip rather than failing — the operator sees the message
+        // and the rest of the policy remains effective.
+        for root in &self.allowed_roots {
+            let resolved = resolve_root(root, workspace_root);
+            match resolved.canonicalize() {
+                Ok(canonical) => {
+                    if seen.insert(canonical.clone()) {
+                        roots.push(canonical);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %resolved.display(),
+                        error = %e,
+                        "path-policy: configured allowed root does not exist — skipping"
+                    );
+                }
+            }
+        }
+
+        // Caller-provided extra_roots are optional trusted directories for
+        // lazily-created features (gateway_media/, image_cache/, etc.).
+        // They may legitimately not exist yet on a fresh install or before the
+        // first gateway image arrives.  A non-existent root contains no files,
+        // so skipping it is both safe and semantically correct: "trust nothing
+        // under this root until it exists."
+        for root in extra_roots {
+            match root.canonicalize() {
+                Ok(canonical) => {
+                    if seen.insert(canonical.clone()) {
+                        roots.push(canonical);
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        path = %root.display(),
+                        error = %e,
+                        "path-policy: extra trusted root does not exist yet — skipping"
+                    );
+                }
             }
         }
 

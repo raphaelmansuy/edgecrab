@@ -171,16 +171,10 @@ impl ToolHandler for PdfToMarkdownTool {
         // Gateway adapters cache inbound PDF attachments to document_cache_dir().
         // Trust this directory so agents can process files received via messaging
         // platforms (WhatsApp, Telegram, etc.) without requiring it in allowed_roots.
-        // Only include the cache dir as a trusted root when it actually exists —
-        // `canonicalize()` fails on non-existent paths and would break tests and
-        // fresh installations where the directory has not been created yet.
+        // Non-existent extra_roots are gracefully skipped by path_policy, so this
+        // is safe on fresh installs where the directory has not been created yet.
         let document_cache = ctx.config.document_cache_dir();
-        let trusted_extra: &[&std::path::Path] = if document_cache.exists() {
-            &[document_cache.as_path()]
-        } else {
-            &[]
-        };
-        let resolved = jail_read_path_multi(&args.path, &path_policy, trusted_extra)?;
+        let resolved = jail_read_path_multi(&args.path, &path_policy, &[document_cache.as_path()])?;
         let markdown = extract_pdf_markdown_from_path(&resolved, "pdf_to_markdown")?;
 
         let output_path = if let Some(path) = args.output_path.as_deref() {

@@ -9,6 +9,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.4.1] — 2026-04-13
+
+### Fixed
+
+- **Gateway `vision_analyze` fails when image cache directories do not yet exist** — `path_policy::canonical_allowed_roots` now gracefully skips non-existent extra_roots (lazily-created directories like `gateway_media/`, `image_cache/`, `images/`) instead of raising `InvalidRoot`. This fixes `vision_analyze` in all gateway contexts on a fresh install or before any media has been cached. See [ADR-001](docs/ADR-001-gateway-path-policy.md) for the full analysis.
+- **`pdf_to_markdown` extra-root guard simplified** — the manual `.exists()` workaround added in v0.4.0 is now removed; the security layer handles non-existent optional roots uniformly.
+
+### Added
+
+- **ADR-001: Gateway Path Policy — Tolerate Non-Existent Trusted Roots** — architectural decision record documenting the first-principles analysis, alternatives considered, and the Hermes gateway isolation comparison.
+- **Homebrew tap auto-update supports GitHub App tokens** — `release-homebrew-tap.yml` now accepts `HOMEBREW_TAP_APP_ID` + `HOMEBREW_TAP_APP_PRIVATE_KEY` (GitHub App, preferred) in addition to the legacy `HOMEBREW_TAP_PUSH_TOKEN` (fine-grained PAT). See [docs/homebrew-tap-setup.md](docs/homebrew-tap-setup.md) for setup instructions.
+
+---
+
 ## [0.4.0] — 2026-04-13
 
 ### Added

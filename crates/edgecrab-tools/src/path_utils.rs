@@ -299,4 +299,47 @@ mod tests {
 
         assert_eq!(resolved, mapped.canonicalize().expect("canon mapped"));
     }
+
+    /// Non-existent extra_roots must be silently skipped — do NOT cause an
+    /// `InvalidRoot` error.  This is the regression test for the Gateway
+    /// `vision_analyze` failure: image_cache, gateway_media, and images dirs
+    /// are created lazily and may not exist on a first run.
+    #[test]
+    fn non_existent_extra_root_is_skipped_not_fatal() {
+        let cwd = TempDir::new().expect("cwd");
+        let ghost_dir = cwd.path().join("does_not_exist");
+        // ghost_dir is intentionally NOT created
+        let real_file = cwd.path().join("hello.txt");
+        std::fs::write(&real_file, "hi").expect("write");
+
+        // Passing a non-existent extra root must not cause an error
+        let result = jail_read_path_multi(
+            &real_file.to_string_lossy(),
+            &policy_for(cwd.path()),
+            &[ghost_dir.as_path()],
+        );
+        assert!(result.is_ok(), "non-existent extra root must not be fatal");
+    }
+
+    /// A file that is ONLY under a non-existent extra_root should still be
+    /// blocked — once skipped, the root grants no access.
+    #[test]
+    fn file_under_non_existent_extra_root_is_blocked() {
+        let cwd = TempDir::new().expect("cwd");
+        let other = TempDir::new().expect("other");
+        let ghost_dir = PathBuf::from("/tmp/__edgecrab_ghost_test_dir_that_does_not_exist__");
+        let outside_file = other.path().join("outside.txt");
+        std::fs::write(&outside_file, "secret").expect("write");
+
+        // ghost_dir doesn't exist → it's skipped → outside_file is NOT trusted
+        let result = jail_read_path_multi(
+            &outside_file.to_string_lossy(),
+            &policy_for(cwd.path()),
+            &[ghost_dir.as_path()],
+        );
+        assert!(
+            matches!(result, Err(ToolError::PermissionDenied(_))),
+            "file outside all real roots must be blocked"
+        );
+    }
 }

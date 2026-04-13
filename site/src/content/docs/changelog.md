@@ -16,6 +16,20 @@ Last updated: 2026-04-13
 
 ---
 
+## [0.4.1] — 2026-04-13
+
+### Fixed
+
+- **Gateway `vision_analyze` crashes on fresh installs** — sending an image via WhatsApp, Telegram, or any gateway platform could fail with `Cannot resolve allowed root '~/.edgecrab/images': No such file or directory`. The path security layer now gracefully skips optional trusted roots (like `gateway_media/`, `image_cache/`, `images/`) that haven't been created yet, instead of raising a hard error. The fix is general: any tool that passes lazily-created directories as extra trusted roots now works correctly on first run.
+- **`pdf_to_markdown` extra-root guard simplified** — the manual `.exists()` workaround added in v0.4.0 is replaced by the corrected behavior in the security layer.
+
+### Added
+
+- **ADR-001: Gateway Path Policy** — full architectural decision record explaining the first-principles analysis, the Hermes comparison, alternatives rejected, and security invariants preserved.
+- **Homebrew tap supports GitHub App tokens** — no-secret short-lived authentication for automated formula updates. See the [Homebrew tap setup guide](https://edgecrab.com/setup/homebrew) for configuration steps.
+
+---
+
 ## [0.4.0] — 2026-04-13
 
 ### Added
