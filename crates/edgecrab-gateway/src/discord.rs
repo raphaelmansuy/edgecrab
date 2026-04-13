@@ -626,10 +626,17 @@ impl DiscordAdapter {
                                 continue;
                             }
 
+                            let chat_type = if d["guild_id"].as_str().is_some() {
+                                crate::platform::ChatType::Group
+                            } else {
+                                crate::platform::ChatType::Dm
+                            };
+
                             let incoming = IncomingMessage {
                                 platform: Platform::Discord,
                                 user_id: user_id.clone(),
                                 channel_id: Some(channel_id.clone()),
+                                chat_type,
                                 text: rendered_text,
                                 thread_id: thread_id.clone(),
                                 metadata: MessageMetadata {

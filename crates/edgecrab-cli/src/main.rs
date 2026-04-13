@@ -56,6 +56,7 @@ mod update;
 mod vision_models;
 mod webhook_cmd;
 mod whatsapp_cmd;
+mod worktree;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -220,18 +221,15 @@ async fn main() -> anyhow::Result<()> {
     // ── Git worktree isolation (-w flag) ─────────────────────────────
     // When -w is set, create a disposable worktree under .worktrees/ in the
     // current repo root and cd into it. This mirrors `hermes -w`.
-    if args.worktree {
-        match setup_worktree() {
-            Ok(wt_path) => {
-                std::env::set_current_dir(&wt_path)
-                    .with_context(|| format!("failed to cd into worktree {}", wt_path.display()))?;
-                eprintln!("🌿 Running in isolated worktree: {}", wt_path.display());
-            }
-            Err(e) => {
-                eprintln!("⚠  Failed to create worktree ({e}), continuing in current directory.");
-            }
-        }
-    }
+    let use_worktree = args.worktree
+        || edgecrab_core::AppConfig::load()
+            .map(|config| config.worktree)
+            .unwrap_or(false);
+    let _active_worktree = if use_worktree {
+        Some(worktree::ActiveWorktree::activate()?)
+    } else {
+        None
+    };
 
     // ── Interactive / quiet mode ──────────────────────────────────────
 
@@ -240,6 +238,15 @@ async fn main() -> anyhow::Result<()> {
         args.model.as_deref(),
         args.toolset.as_deref(),
     )?;
+    if let Some(active_worktree) = _active_worktree.as_ref() {
+        let note = active_worktree.system_prompt_note();
+        if runtime.config.agent.system_prompt.trim().is_empty() {
+            runtime.config.agent.system_prompt = note;
+        } else {
+            runtime.config.agent.system_prompt =
+                format!("{}\n\n{}", runtime.config.agent.system_prompt.trim(), note);
+        }
+    }
 
     // Wire preloaded skills from -s flags into the runtime config
     if !args.skills.is_empty() {
@@ -1633,6 +1640,7 @@ async fn run_gateway(command: GatewayCommand, args: &CliArgs) -> anyhow::Result<
                 GatewayCommand::Stop => gateway_cmd::GatewayAction::Stop,
                 GatewayCommand::Restart => gateway_cmd::GatewayAction::Restart,
                 GatewayCommand::Status => gateway_cmd::GatewayAction::Status,
+                GatewayCommand::Diagnose => gateway_cmd::GatewayAction::Diagnose,
                 GatewayCommand::Configure { .. } => unreachable!(),
             };
             gateway_cmd::run(action, args).await
@@ -2315,77 +2323,6 @@ fn set_toolset_state(
         }
     }
     Ok(targets)
-}
-
-// ── Git worktree helpers ───────────────────────────────────────────────
-
-/// Create a disposable git worktree under `.worktrees/<branch>` in the
-/// current repo root and return its path.
-///
-/// The branch name is derived from a short random hash so parallel
-/// invocations each get their own isolated workspace:
-///
-/// ```text
-///   .worktrees/
-///   ├── edgecrab-a1b2c3d4/   ← worktree for session 1
-///   └── edgecrab-e5f6g7h8/   ← worktree for session 2
-/// ```
-///
-/// Mirrors `hermes -w` which creates worktrees under `.worktrees/`.
-fn setup_worktree() -> anyhow::Result<PathBuf> {
-    // Verify git is available
-    let git_check = std::process::Command::new("git")
-        .arg("rev-parse")
-        .arg("--is-inside-work-tree")
-        .output();
-
-    match git_check {
-        Ok(out) if out.status.success() => {}
-        Ok(_) => anyhow::bail!("current directory is not inside a git repository"),
-        Err(e) => anyhow::bail!("git not found: {e}"),
-    }
-
-    // Find the repo root
-    let root_out = std::process::Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .output()?;
-    let repo_root = PathBuf::from(String::from_utf8_lossy(&root_out.stdout).trim());
-
-    // Generate a short unique hash for the branch/worktree name
-    let hash = {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        format!("{:08x}", ts as u32 ^ (ts >> 32) as u32)
-    };
-
-    let branch_name = format!("edgecrab/edgecrab-{hash}");
-    let worktrees_dir = repo_root.join(".worktrees");
-    std::fs::create_dir_all(&worktrees_dir).with_context(|| {
-        format!(
-            "failed to create .worktrees/ dir in {}",
-            repo_root.display()
-        )
-    })?;
-
-    let wt_path = worktrees_dir.join(format!("edgecrab-{hash}"));
-
-    // Create the worktree with a new branch
-    let result = std::process::Command::new("git")
-        .args(["worktree", "add", "-b", &branch_name])
-        .arg(&wt_path)
-        .arg("HEAD")
-        .current_dir(&repo_root)
-        .output()?;
-
-    if !result.status.success() {
-        let stderr = String::from_utf8_lossy(&result.stderr);
-        anyhow::bail!("git worktree add failed: {stderr}");
-    }
-
-    Ok(wt_path)
 }
 
 #[cfg(test)]

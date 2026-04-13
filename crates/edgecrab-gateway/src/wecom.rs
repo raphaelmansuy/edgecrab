@@ -543,6 +543,7 @@ async fn parse_callback(
         platform: Platform::Wecom,
         user_id,
         channel_id: Some(channel_id.clone()),
+        chat_type: crate::platform::ChatType::Dm,
         text,
         thread_id: None,
         metadata: MessageMetadata {

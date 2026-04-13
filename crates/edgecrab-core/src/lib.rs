@@ -18,6 +18,7 @@ pub mod model_router;
 pub mod pricing;
 pub mod prompt_builder;
 pub mod sub_agent_runner;
+pub mod tool_result_spill;
 
 pub use agent::{
     Agent, AgentBuilder, AgentConfig, ApprovalChoice, ConversationResult, IsolatedAgentOptions,

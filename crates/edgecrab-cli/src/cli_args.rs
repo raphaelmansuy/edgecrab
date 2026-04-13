@@ -1023,6 +1023,14 @@ pub enum GatewayCommand {
         /// Configure a specific platform only (telegram, discord, slack, signal, whatsapp, webhook, email, sms, matrix, mattermost, dingtalk, homeassistant)
         platform: Option<String>,
     },
+    /// Deep-inspect gateway config and runtime state — identify issues and show fixes
+    ///
+    /// Checks all enabled platforms, probes live connectivity, reads recent log
+    /// errors and presents a colour-coded summary with exact remediation commands.
+    ///
+    /// Example:
+    ///   edgecrab gateway diagnose
+    Diagnose,
 }
 
 /// Profile management subcommands — mirrors `hermes profile <sub>`.

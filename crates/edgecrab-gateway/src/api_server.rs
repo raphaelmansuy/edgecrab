@@ -269,6 +269,7 @@ async fn create_response(
         platform: Platform::Api,
         user_id: "api".to_string(),
         channel_id: Some(id.clone()),
+        chat_type: crate::platform::ChatType::Dm,
         text: req.input,
         thread_id: None,
         metadata: MessageMetadata {
@@ -399,6 +400,7 @@ async fn chat_completions(
             platform: Platform::Api,
             user_id: "api".to_string(),
             channel_id: Some(request_id.clone()),
+            chat_type: crate::platform::ChatType::Dm,
             text: user_msg,
             thread_id: None,
             metadata: MessageMetadata {
@@ -429,6 +431,7 @@ async fn chat_completions(
             platform: Platform::Api,
             user_id: "api".to_string(),
             channel_id: Some(request_id.clone()),
+            chat_type: crate::platform::ChatType::Dm,
             text: user_msg,
             thread_id: None,
             metadata: MessageMetadata {

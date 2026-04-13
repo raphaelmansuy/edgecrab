@@ -64,6 +64,9 @@ This document tracks command-surface parity from first principles:
 
 - Parity is strongest on the slash surface itself. Hermes and EdgeCrab now
   expose the same operator vocabulary in the TUI.
+- EdgeCrab intentionally extends Hermes with `/worktree` and `/w`. That is not
+  a Hermes command, so it should be treated as an EdgeCrab-native control
+  surface rather than counted as Hermes parity.
 - CLI argv parity is intentionally implemented with one generic bridge instead
   of dozens of thin clap wrappers. That is better engineering, but it is not
   identical to Hermes' exact top-level command layout.

@@ -435,6 +435,7 @@ impl MatrixAdapter {
             platform: Platform::Matrix,
             user_id: sender.to_string(),
             channel_id: Some(room_id.to_string()),
+            chat_type: crate::platform::ChatType::Group,
             text: body.to_string(),
             thread_id: None,
             metadata: MessageMetadata {

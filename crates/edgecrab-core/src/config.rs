@@ -34,8 +34,10 @@ use edgecrab_types::AgentError;
 pub struct AppConfig {
     pub model: ModelConfig,
     pub agent: AgentConfig,
+    pub logging: LoggingConfig,
     pub tools: ToolsConfig,
     pub lsp: LspConfig,
+    pub worktree: bool,
     pub save_trajectories: bool,
     pub skip_context_files: bool,
     pub skip_memory: bool,
@@ -68,6 +70,20 @@ pub struct AppConfig {
 pub struct AgentConfig {
     pub system_prompt: String,
     pub personalities: HashMap<String, PersonalityPreset>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct LoggingConfig {
+    pub level: String,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            level: "info".into(),
+        }
+    }
 }
 
 impl AppConfig {
@@ -160,17 +176,36 @@ impl AppConfig {
                 self.model.max_iterations = n;
             }
         }
+        if let Ok(val) = std::env::var("EDGECRAB_LOG_LEVEL") {
+            self.logging.level = val;
+        }
         if let Ok(val) = std::env::var("EDGECRAB_TIMEZONE") {
             self.timezone = Some(val);
         }
         if let Ok(val) = std::env::var("EDGECRAB_SAVE_TRAJECTORIES") {
             self.save_trajectories = parse_bool_env(&val);
         }
+        if let Ok(val) = std::env::var("EDGECRAB_WORKTREE") {
+            self.worktree = parse_bool_env(&val);
+        }
         if let Ok(val) = std::env::var("EDGECRAB_SKIP_CONTEXT_FILES") {
             self.skip_context_files = parse_bool_env(&val);
         }
         if let Ok(val) = std::env::var("EDGECRAB_SKIP_MEMORY") {
             self.skip_memory = parse_bool_env(&val);
+        }
+        if let Ok(val) = std::env::var("EDGECRAB_TOOL_RESULT_SPILL") {
+            self.tools.result_spill = parse_bool_env(&val);
+        }
+        if let Ok(val) = std::env::var("EDGECRAB_TOOL_RESULT_SPILL_THRESHOLD") {
+            if let Ok(n) = val.parse() {
+                self.tools.result_spill_threshold = n;
+            }
+        }
+        if let Ok(val) = std::env::var("EDGECRAB_TOOL_RESULT_SPILL_PREVIEW_LINES") {
+            if let Ok(n) = val.parse() {
+                self.tools.result_spill_preview_lines = n;
+            }
         }
         if let Ok(val) = std::env::var("EDGECRAB_PLUGINS_ENABLED") {
             self.plugins.enabled = parse_bool_env(&val);
@@ -662,6 +697,12 @@ pub struct ToolsConfig {
     pub tool_delay: f32,
     pub parallel_execution: bool,
     pub max_parallel_workers: usize,
+    /// Gate for tool-result spill-to-artifact (default: true).
+    pub result_spill: bool,
+    /// Byte threshold above which tool results are spilled (default: 16384).
+    pub result_spill_threshold: usize,
+    /// Number of preview lines kept in the stub (default: 80).
+    pub result_spill_preview_lines: usize,
 }
 
 impl Default for ToolsConfig {
@@ -676,6 +717,9 @@ impl Default for ToolsConfig {
             tool_delay: 1.0,
             parallel_execution: true,
             max_parallel_workers: 8,
+            result_spill: true,
+            result_spill_threshold: 16_384,
+            result_spill_preview_lines: 80,
         }
     }
 }
@@ -894,6 +938,45 @@ pub struct FileToolsConfig {
     pub allowed_roots: Vec<PathBuf>,
 }
 
+/// Policy for handling messages originating from group chats.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupPolicy {
+    /// Never process group messages (default — secure by design).
+    #[default]
+    Disabled,
+    /// Only respond when the bot is @mentioned in the group.
+    MentionOnly,
+    /// Only respond to users present in the platform allowlist.
+    AllowedOnly,
+    /// Respond to all group messages from authorized users.
+    Open,
+}
+
+impl std::fmt::Display for GroupPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Disabled => write!(f, "disabled"),
+            Self::MentionOnly => write!(f, "mention_only"),
+            Self::AllowedOnly => write!(f, "allowed_only"),
+            Self::Open => write!(f, "open"),
+        }
+    }
+}
+
+/// Behavior when an unauthorized user sends a DM.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnauthorizedDmBehavior {
+    /// Generate a pairing code and send instructions.
+    #[default]
+    Pair,
+    /// Silently ignore — no response at all (prevents information leakage).
+    Ignore,
+    /// Send a short rejection message (current behavior).
+    Reject,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct GatewayConfig {
@@ -903,6 +986,10 @@ pub struct GatewayConfig {
     pub enabled_platforms: Vec<String>,
     pub disabled_platforms: Vec<String>,
     pub session_timeout_minutes: u32,
+    /// Default group chat policy for platforms without an explicit override.
+    pub group_policy: GroupPolicy,
+    /// Behavior when an unauthorized user sends a direct message.
+    pub unauthorized_dm_behavior: UnauthorizedDmBehavior,
     pub telegram: TelegramGatewayConfig,
     pub discord: DiscordGatewayConfig,
     pub slack: SlackGatewayConfig,
@@ -919,6 +1006,8 @@ impl Default for GatewayConfig {
             enabled_platforms: Vec::new(),
             disabled_platforms: Vec::new(),
             session_timeout_minutes: 30,
+            group_policy: GroupPolicy::default(),
+            unauthorized_dm_behavior: UnauthorizedDmBehavior::default(),
             telegram: TelegramGatewayConfig::default(),
             discord: DiscordGatewayConfig::default(),
             slack: SlackGatewayConfig::default(),
@@ -2218,6 +2307,15 @@ tools:
         cfg.apply_env_overrides();
         assert_eq!(cfg.model.default_model, "test/model");
         unsafe { std::env::remove_var("EDGECRAB_MODEL") };
+    }
+
+    #[test]
+    fn env_override_worktree() {
+        unsafe { std::env::set_var("EDGECRAB_WORKTREE", "1") };
+        let mut cfg = AppConfig::default();
+        cfg.apply_env_overrides();
+        assert!(cfg.worktree);
+        unsafe { std::env::remove_var("EDGECRAB_WORKTREE") };
     }
 
     #[test]

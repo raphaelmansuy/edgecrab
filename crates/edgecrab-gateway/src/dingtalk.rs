@@ -140,6 +140,7 @@ impl DingTalkAdapter {
                             platform: Platform::DingTalk,
                             user_id: body.sender_staff_id.clone().unwrap_or_default(),
                             channel_id: body.conversation_id.clone(),
+                            chat_type: crate::platform::ChatType::Dm,
                             text: body.text.content.clone().unwrap_or_default(),
                             thread_id: None,
                             metadata: MessageMetadata {

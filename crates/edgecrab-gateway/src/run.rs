@@ -31,16 +31,19 @@ use edgecrab_tools::tools::transcribe::TranscribeAudioTool;
 use edgecrab_tools::tools::tts::TextToSpeechTool;
 use edgecrab_tools::tools::vision::VisionAnalyzeTool;
 use edgecrab_tools::{AppConfigRef, ToolContext, ToolHandler};
+use edgecrab_types::OriginChat;
 use futures::FutureExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::auth;
 use crate::config::GatewayConfig;
 use crate::delivery::DeliveryRouter;
 use crate::event_processor::GatewayEventProcessor;
 use crate::hooks::{HookContext, HookRegistry};
 use crate::interactions::{InteractionBroker, PendingInteractionKind};
+use crate::pairing::PairingStore;
 use crate::platform::{IncomingMessage, PlatformAdapter, WebhookDelivery};
 use crate::sender::{parse_platform, resolve_target};
 use crate::session::{SessionKey, SessionManager};
@@ -1045,6 +1048,8 @@ pub struct Gateway {
     /// Per-chat persisted voice reply mode, mirroring Hermes gateway semantics.
     voice_modes: Arc<tokio::sync::Mutex<HashMap<String, GatewayVoiceMode>>>,
     voice_mode_path: PathBuf,
+    /// Pairing store for DM code-based approval.
+    pairing_store: Arc<PairingStore>,
 }
 
 impl Gateway {
@@ -1072,6 +1077,7 @@ impl Gateway {
                 &gateway_voice_mode_path(),
             ))),
             voice_mode_path: gateway_voice_mode_path(),
+            pairing_store: Arc::new(PairingStore::new()),
         }
     }
 
@@ -1186,7 +1192,7 @@ impl Gateway {
             .resolve(
                 &session_lookup,
                 &base_agent,
-                (msg.platform.to_string(), origin_chat_id.to_string()),
+                OriginChat::new(msg.platform.to_string(), origin_chat_id.to_string()),
             )
             .await
             .map_err(|error| error.to_string())?;
@@ -1436,62 +1442,20 @@ impl Gateway {
 
     /// Returns `true` if the user is authorized to use the gateway.
     ///
-    /// Authorization rules (first match wins):
-    /// 1. `GATEWAY_ALLOW_ALL_USERS=true|1|yes`  → allow everyone
-    /// 2. `{PLATFORM}_ALLOW_ALL_USERS=true|1|yes` → allow everyone on that platform
-    /// 3. `GATEWAY_ALLOWED_USERS=id1,id2` / `{PLATFORM}_ALLOWED_USERS=id1,id2`
-    ///    → allow listed IDs only
-    /// 4. If **no** allowlist env-var is configured at all → open gateway
-    ///    (suitable for single-user / local deployments)
+    /// Delegates to `auth::check_authorization()` which is the single source
+    /// of truth for authorization decisions. See that module for the full rule set.
     ///
-    /// Mirrors hermes-agent's `_is_user_authorized()` so operators can reuse
-    /// the same env-var configuration across both gateways.
-    fn is_user_authorized(&self, msg: &IncomingMessage) -> bool {
-        // 1. Global allow-all override
-        let allow_all = std::env::var("GATEWAY_ALLOW_ALL_USERS").unwrap_or_default();
-        if matches!(allow_all.to_ascii_lowercase().trim(), "true" | "1" | "yes") {
-            return true;
-        }
-
-        // 2. Per-platform allow-all override
-        let platform_allow_all_var = match msg.platform {
-            edgecrab_types::Platform::Telegram => "TELEGRAM_ALLOW_ALL_USERS",
-            edgecrab_types::Platform::Discord => "DISCORD_ALLOW_ALL_USERS",
-            _ => "",
-        };
-        if !platform_allow_all_var.is_empty() {
-            let v = std::env::var(platform_allow_all_var).unwrap_or_default();
-            if matches!(v.to_ascii_lowercase().trim(), "true" | "1" | "yes") {
-                return true;
-            }
-        }
-
-        // 3. Collect allowlists from env vars
-        let global_list = std::env::var("GATEWAY_ALLOWED_USERS").unwrap_or_default();
-        let platform_list_var = match msg.platform {
-            edgecrab_types::Platform::Telegram => "TELEGRAM_ALLOWED_USERS",
-            edgecrab_types::Platform::Discord => "DISCORD_ALLOWED_USERS",
-            _ => "",
-        };
-        let platform_list = if platform_list_var.is_empty() {
-            String::new()
-        } else {
-            std::env::var(platform_list_var).unwrap_or_default()
-        };
-
-        // 4. If no allowlist is configured → open gateway
-        if global_list.trim().is_empty() && platform_list.trim().is_empty() {
-            return true;
-        }
-
-        // 5. Check whether user_id is in either allowlist
-        let user_id = msg.user_id.as_str();
-        global_list
-            .split(',')
-            .chain(platform_list.split(','))
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .any(|allowed| allowed == user_id)
+    /// Key difference from the old implementation: when no allowlists are configured,
+    /// access is **denied** by default. Operators must explicitly set
+    /// `GATEWAY_ALLOW_ALL_USERS=true` for open access.
+    fn is_user_authorized(&self, msg: &IncomingMessage) -> auth::AuthResult {
+        auth::check_authorization(
+            msg.platform,
+            &msg.user_id,
+            msg.chat_type,
+            self.config.group_policy,
+            Some(&self.pairing_store),
+        )
     }
 
     ///
@@ -1541,8 +1505,44 @@ impl Gateway {
         tracing::info!(
             adapters = self.adapters.len(),
             bind = %self.config.bind_addr(),
+            group_policy = %self.config.group_policy,
+            unauthorized_dm = ?self.config.unauthorized_dm_behavior,
             "starting gateway"
         );
+
+        // ── Startup security posture audit log ───────────────────────────
+        // Log per-platform security posture so operators can verify config
+        // at startup.  This satisfies ADR-004 Finding 5 (visibility).
+        for adapter in &self.adapters {
+            let platform_id = format!("{:?}", adapter.platform()).to_lowercase();
+            let posture = auth::analyze_platform_security(
+                &platform_id,
+                self.config.group_policy,
+                Some(&self.pairing_store),
+            );
+            if posture.access_mode.is_secure() {
+                tracing::info!(
+                    platform = %posture.platform,
+                    access = %posture.access_mode.label(),
+                    groups = %posture.group_policy,
+                    allowlisted = posture.allowlisted_count,
+                    paired = posture.paired_count,
+                    "platform security posture"
+                );
+            } else {
+                tracing::warn!(
+                    platform = %posture.platform,
+                    access = %posture.access_mode.label(),
+                    groups = %posture.group_policy,
+                    allowlisted = posture.allowlisted_count,
+                    paired = posture.paired_count,
+                    "platform security posture — OPEN ACCESS"
+                );
+            }
+            for w in &posture.warnings {
+                tracing::warn!(platform = %posture.platform, "{w}");
+            }
+        }
 
         if let Some(agent) = self.agent.as_ref() {
             if let Some(db) = agent.state_db().await {
@@ -1687,27 +1687,49 @@ impl Gateway {
 
                     // ── Authorization guard ───────────────────────────────────
                     // Reject messages from unauthorized users before any command
-                    // handling or agent dispatch.  Configuration is via env vars;
-                    // see `is_user_authorized()` for the full rule set.
-                    if !self.is_user_authorized(&msg) {
+                    // handling or agent dispatch.  Uses `auth::check_authorization()`
+                    // for the full rule set — secure-by-default (denies when no
+                    // allowlist configured).
+                    let auth_result = self.is_user_authorized(&msg);
+                    if auth_result.is_allowed() {
+                        tracing::debug!(
+                            platform = ?msg.platform,
+                            user = %msg.user_id,
+                            chat_type = ?msg.chat_type,
+                            reason = ?auth_result,
+                            "auth: access granted"
+                        );
+                    } else {
                         tracing::warn!(
                             platform = ?msg.platform,
                             user = %msg.user_id,
-                            "unauthorized message rejected"
+                            chat_type = ?msg.chat_type,
+                            reason = ?auth_result,
+                            "auth: access denied"
                         );
-                        if let Some(adapter) = self
-                            .adapters
-                            .iter()
-                            .find(|a| a.platform() == msg.platform)
-                            .cloned()
-                        {
-                            let _ = adapter
-                                .send(crate::platform::OutgoingMessage {
-                                    text: "⛔ Unauthorized. Contact the bot administrator."
-                                        .into(),
-                                    metadata: msg.metadata.clone(),
-                                })
-                                .await;
+                        // Determine response based on unauthorized_dm_behavior config
+                        let reply = auth::unauthorized_dm_response(
+                            self.config.unauthorized_dm_behavior,
+                            msg.chat_type,
+                            msg.platform,
+                            &msg.user_id,
+                            &msg.user_id,
+                            &self.pairing_store,
+                        );
+                        if let Some(text) = reply {
+                            if let Some(adapter) = self
+                                .adapters
+                                .iter()
+                                .find(|a| a.platform() == msg.platform)
+                                .cloned()
+                            {
+                                let _ = adapter
+                                    .send(crate::platform::OutgoingMessage {
+                                        text,
+                                        metadata: msg.metadata.clone(),
+                                    })
+                                    .await;
+                            }
                         }
                         continue;
                     }
@@ -1943,6 +1965,7 @@ impl Gateway {
                                             platform: msg.platform,
                                             user_id: msg.user_id.clone(),
                                             channel_id: msg.channel_id.clone(),
+                                            chat_type: msg.chat_type,
                                             text,
                                             thread_id: msg.thread_id.clone(),
                                             metadata: msg.metadata.clone(),
@@ -2148,6 +2171,7 @@ impl Gateway {
                                     platform: msg.platform,
                                     user_id: msg.user_id.clone(),
                                     channel_id: msg.channel_id.clone(),
+                                    chat_type: msg.chat_type,
                                     text: prompt,
                                     thread_id: msg.thread_id.clone(),
                                     metadata: msg.metadata.clone(),
@@ -2196,7 +2220,7 @@ impl Gateway {
                                                 session_id: Some(task_id_for_spawn.clone()),
                                                 platform: Some(platform),
                                                 quiet_mode: Some(true),
-                                                origin_chat: Some((
+                                                origin_chat: Some(OriginChat::new(
                                                     platform_name.clone(),
                                                     origin_chat_id_clone.clone(),
                                                 )),
@@ -2691,7 +2715,10 @@ impl Gateway {
                             .resolve(
                                 &session_lookup,
                                 &base_agent,
-                                (msg.platform.to_string(), origin_chat_id_for_key.clone()),
+                                OriginChat::new(
+                                    msg.platform.to_string(),
+                                    origin_chat_id_for_key.clone(),
+                                ),
                             )
                             .await;
                         let session: Arc<tokio::sync::RwLock<crate::session::GatewaySession>> =
@@ -3136,6 +3163,7 @@ async fn webhook_subscription_incoming(
         platform: edgecrab_types::Platform::Webhook,
         user_id: format!("webhook:{name}:{delivery_id}"),
         channel_id: Some(name.clone()),
+        chat_type: crate::platform::ChatType::Channel,
         text,
         thread_id: None,
         metadata: crate::platform::MessageMetadata {
@@ -3582,6 +3610,7 @@ def register(ctx):
             platform: edgecrab_types::Platform::Webhook,
             user_id: user_id.to_string(),
             channel_id: None,
+            chat_type: crate::platform::ChatType::Dm,
             text: text.to_string(),
             thread_id: None,
             metadata: crate::platform::MessageMetadata::default(),
@@ -3603,6 +3632,7 @@ def register(ctx):
             platform: edgecrab_types::Platform::Signal,
             user_id: "u1".into(),
             channel_id: None,
+            chat_type: crate::platform::ChatType::Dm,
             text: "describe".into(),
             thread_id: None,
             metadata: crate::platform::MessageMetadata {
@@ -3632,6 +3662,7 @@ def register(ctx):
             platform: edgecrab_types::Platform::Signal,
             user_id: "u1".into(),
             channel_id: None,
+            chat_type: crate::platform::ChatType::Dm,
             text: "transcribe".into(),
             thread_id: None,
             metadata: crate::platform::MessageMetadata {
@@ -3666,6 +3697,7 @@ def register(ctx):
             platform: edgecrab_types::Platform::Telegram,
             user_id: "u1".into(),
             channel_id: Some("chat".into()),
+            chat_type: crate::platform::ChatType::Dm,
             text: String::new(),
             thread_id: None,
             metadata: crate::platform::MessageMetadata {
@@ -3687,6 +3719,7 @@ def register(ctx):
             platform: edgecrab_types::Platform::Whatsapp,
             user_id: "u1".into(),
             channel_id: Some("chat".into()),
+            chat_type: crate::platform::ChatType::Dm,
             text: String::new(),
             thread_id: None,
             metadata: crate::platform::MessageMetadata {
@@ -4159,6 +4192,7 @@ def register(ctx):
             platform,
             user_id: user_id.to_string(),
             channel_id: None,
+            chat_type: crate::platform::ChatType::Dm,
             text: "hello".to_string(),
             thread_id: None,
             metadata: crate::platform::MessageMetadata::default(),
@@ -4186,7 +4220,7 @@ def register(ctx):
 
     #[test]
     #[serial_test::serial(edgecrab_gateway_env)]
-    fn auth_open_gateway_when_no_env_vars() {
+    fn auth_deny_by_default_when_no_env_vars() {
         unsafe {
             clear_auth_env();
         }
@@ -4194,8 +4228,8 @@ def register(ctx):
         let gw = make_gateway();
         let msg = make_msg("alice", edgecrab_types::Platform::Telegram);
         assert!(
-            gw.is_user_authorized(&msg),
-            "open gateway should allow everyone"
+            !gw.is_user_authorized(&msg).is_allowed(),
+            "secure-by-default: should deny when no allowlist configured"
         );
     }
 
@@ -4208,7 +4242,7 @@ def register(ctx):
         }
         let gw = make_gateway();
         let msg = make_msg("anyone", edgecrab_types::Platform::Telegram);
-        assert!(gw.is_user_authorized(&msg));
+        assert!(gw.is_user_authorized(&msg).is_allowed());
         unsafe {
             clear_auth_env();
         }
@@ -4224,8 +4258,8 @@ def register(ctx):
         let gw = make_gateway();
         let allow = make_msg("alice", edgecrab_types::Platform::Telegram);
         let deny = make_msg("charlie", edgecrab_types::Platform::Telegram);
-        assert!(gw.is_user_authorized(&allow));
-        assert!(!gw.is_user_authorized(&deny));
+        assert!(gw.is_user_authorized(&allow).is_allowed());
+        assert!(!gw.is_user_authorized(&deny).is_allowed());
         unsafe {
             clear_auth_env();
         }
@@ -4241,8 +4275,8 @@ def register(ctx):
         let gw = make_gateway();
         let allow = make_msg("12345", edgecrab_types::Platform::Telegram);
         let deny = make_msg("99999", edgecrab_types::Platform::Telegram);
-        assert!(gw.is_user_authorized(&allow));
-        assert!(!gw.is_user_authorized(&deny));
+        assert!(gw.is_user_authorized(&allow).is_allowed());
+        assert!(!gw.is_user_authorized(&deny).is_allowed());
         unsafe {
             clear_auth_env();
         }
@@ -4260,8 +4294,8 @@ def register(ctx):
         let gw = make_gateway();
         let discord_msg = make_msg("anyone", edgecrab_types::Platform::Discord);
         let telegram_other = make_msg("stranger", edgecrab_types::Platform::Telegram);
-        assert!(gw.is_user_authorized(&discord_msg));
-        assert!(!gw.is_user_authorized(&telegram_other));
+        assert!(gw.is_user_authorized(&discord_msg).is_allowed());
+        assert!(!gw.is_user_authorized(&telegram_other).is_allowed());
         unsafe {
             clear_auth_env();
         }

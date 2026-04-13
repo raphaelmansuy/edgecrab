@@ -334,6 +334,8 @@ edgecrab dump --all
 
 Inspect log files under `~/.edgecrab/logs/`.
 
+Inside the TUI, `/log` opens a split-pane browser for the same directory. It live-follows by default, `F` toggles follow mode, `Enter` opens the selected file in the inspector, and `1-5` persist the default log level.
+
 ```bash
 edgecrab logs list
 edgecrab logs path
@@ -810,7 +812,7 @@ shell `PATH` edits during uninstall.
 - **`edgecrab sessions browse --query "my query"`**: FTS5 full-text search across all conversation history — faster than scrolling session lists.
 - **`edgecrab config set key value`** avoids opening the YAML editor for single-value changes.
 - **`edgecrab completion zsh >> ~/.zshrc`** adds tab-completion for all subcommands and flags.
-- **Worktrees for risky refactors**: `edgecrab -w "refactor auth module"` creates a git worktree so changes don't land on the current branch until you're ready.
+- **Worktrees for risky refactors**: `edgecrab -w "refactor auth module"` creates a repo-local `.worktrees/...` checkout so changes don't land on the current branch until you're ready. Set `worktree: true` or `EDGECRAB_WORKTREE=1` to make that the default for future launches.
 
 ---
 

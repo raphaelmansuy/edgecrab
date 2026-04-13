@@ -134,6 +134,13 @@ struct WhatsAppInboundEvent {
     sender_id: String,
     #[serde(rename = "senderName")]
     sender_name: Option<String>,
+    /// Whether the message was sent by the account owner.
+    /// Defence-in-depth: bridge.js already filters contact messages in
+    /// self-chat mode, but the Rust adapter enforces the same rule so that
+    /// a stale/old bridge binary can never leak contacts to the agent.
+    /// Defaults to `false` (conservative — treat unknown origin as contact).
+    #[serde(rename = "fromMe", default)]
+    from_me: bool,
     body: String,
     #[serde(rename = "mediaUrls", default)]
     media_urls: Vec<String>,
@@ -192,6 +199,20 @@ impl WhatsAppAdapter {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()?;
+
+        // Propagate WHATSAPP_MODE to the parent process so that the auth module
+        // can read it via std::env::var("WHATSAPP_MODE") when checking
+        // authorization. Without this, only the bridge subprocess would see the
+        // value (it is also passed via cmd.env later) and check_authorization()
+        // would always fall through to NoAllowlistDeny in self-chat mode.
+        //
+        // Safety: this runs at gateway boot before any concurrent access to
+        // WHATSAPP_MODE, and the value is stable for the lifetime of the adapter.
+        #[allow(unused_unsafe)]
+        unsafe {
+            std::env::set_var("WHATSAPP_MODE", &config.mode);
+        }
+
         Ok(Self {
             config,
             client,
@@ -380,6 +401,7 @@ impl WhatsAppAdapter {
             platform: Platform::Whatsapp,
             user_id: event.sender_id,
             channel_id: Some(event.chat_id.clone()),
+            chat_type: crate::platform::ChatType::Dm,
             text,
             thread_id: None,
             metadata: MessageMetadata {
@@ -655,10 +677,47 @@ impl PlatformAdapter for WhatsAppAdapter {
         self.ensure_bridge_ready().await?;
         info!("WhatsApp adapter polling bridge");
 
+        let mode = self.config.mode.clone();
+        let allowed_users = self.config.allowed_users.clone();
+
         loop {
             match self.poll_messages().await {
                 Ok(events) => {
                     for event in events {
+                        // ── Rust-side safety filter ──────────────────────────
+                        // Defence-in-depth: enforce the same rules as bridge.js
+                        // so a stale bridge binary can never leak contact messages
+                        // to the agent.
+                        //
+                        // self-chat mode  → only fromMe=true events; drop contacts
+                        // bot mode        → pass through (allowlist enforced by bridge)
+                        if mode != "bot" && !event.from_me {
+                            debug!(
+                                chat_id = %event.chat_id,
+                                sender_id = %event.sender_id,
+                                "dropping contact message in self-chat mode (Rust guard)"
+                            );
+                            continue;
+                        }
+                        // In bot mode, enforce the allowlist as a second guard if configured.
+                        if mode == "bot" && !allowed_users.is_empty() {
+                            let sender_num = event
+                                .sender_id
+                                .split('@')
+                                .next()
+                                .unwrap_or(&event.sender_id);
+                            if !allowed_users
+                                .iter()
+                                .any(|u| u == sender_num || u == &event.sender_id)
+                            {
+                                debug!(
+                                    sender_id = %event.sender_id,
+                                    "dropping non-allowlisted contact (Rust guard)"
+                                );
+                                continue;
+                            }
+                        }
+
                         let message = Self::event_to_message(event);
                         tx.send(message)
                             .await
@@ -977,6 +1036,7 @@ mod tests {
             chat_id: "123@s.whatsapp.net".into(),
             sender_id: "123@s.whatsapp.net".into(),
             sender_name: Some("Raphael".into()),
+            from_me: true,
             body: "look".into(),
             media_urls: vec!["/tmp/test.png".into(), "/tmp/test.pdf".into()],
         };
@@ -1069,6 +1129,7 @@ mod tests {
             chat_id: "42@s.whatsapp.net".into(),
             sender_id: "42@s.whatsapp.net".into(),
             sender_name: None,
+            from_me: true,
             body: "".into(), // no caption
             media_urls: vec!["/home/.edgecrab/image_cache/img_aabbcc.jpg".into()],
         };
@@ -1090,6 +1151,7 @@ mod tests {
             chat_id: "99@s.whatsapp.net".into(),
             sender_id: "99@s.whatsapp.net".into(),
             sender_name: None,
+            from_me: true,
             body: "Hello, world!".into(),
             media_urls: vec![],
         };
@@ -1207,5 +1269,98 @@ mod tests {
         assert_eq!(requests[0]["filePath"], path.to_string_lossy().as_ref());
 
         server.abort();
+    }
+
+    // ─── self-chat mode: from_me field & filtering ────────────────────────
+
+    #[test]
+    fn from_me_defaults_to_false_when_absent() {
+        let json = serde_json::json!({
+            "chatId": "123@s.whatsapp.net",
+            "senderId": "123@s.whatsapp.net",
+            "body": "hello"
+        });
+        let event: WhatsAppInboundEvent = serde_json::from_value(json).expect("deser");
+        assert!(
+            !event.from_me,
+            "from_me must default to false (conservative)"
+        );
+    }
+
+    #[test]
+    fn from_me_true_when_present() {
+        let json = serde_json::json!({
+            "chatId": "123@s.whatsapp.net",
+            "senderId": "123@s.whatsapp.net",
+            "body": "hello",
+            "fromMe": true
+        });
+        let event: WhatsAppInboundEvent = serde_json::from_value(json).expect("deser");
+        assert!(event.from_me);
+    }
+
+    /// Simulates the Rust-side filter predicate used in the polling loop.
+    /// `mode != "bot" && !event.from_me` → true means "drop this event".
+    fn should_drop(mode: &str, from_me: bool) -> bool {
+        mode != "bot" && !from_me
+    }
+
+    #[test]
+    fn self_chat_mode_drops_contact_messages() {
+        // Contact message in self-chat → MUST be dropped
+        assert!(should_drop("self-chat", false));
+    }
+
+    #[test]
+    fn self_chat_mode_passes_own_messages() {
+        // Own message in self-chat → MUST pass through
+        assert!(!should_drop("self-chat", true));
+    }
+
+    #[test]
+    fn bot_mode_passes_all_messages() {
+        // Bot mode does not use from_me filter (allowlist is enforced separately)
+        assert!(!should_drop("bot", false));
+        assert!(!should_drop("bot", true));
+    }
+
+    /// Simulates the bot-mode allowlist predicate.
+    fn bot_allowlist_allows(sender_id: &str, allowed_users: &[&str]) -> bool {
+        if allowed_users.is_empty() {
+            return true;
+        }
+        let sender_num = sender_id.split('@').next().unwrap_or(sender_id);
+        allowed_users
+            .iter()
+            .any(|u| *u == sender_num || *u == sender_id)
+    }
+
+    #[test]
+    fn bot_mode_empty_allowlist_allows_everyone() {
+        assert!(bot_allowlist_allows("33612345678@s.whatsapp.net", &[]));
+    }
+
+    #[test]
+    fn bot_mode_allowlist_accepts_listed_user() {
+        assert!(bot_allowlist_allows(
+            "33612345678@s.whatsapp.net",
+            &["33612345678"]
+        ));
+    }
+
+    #[test]
+    fn bot_mode_allowlist_rejects_unlisted_user() {
+        assert!(!bot_allowlist_allows(
+            "44700000000@s.whatsapp.net",
+            &["33612345678"]
+        ));
+    }
+
+    #[test]
+    fn bot_mode_allowlist_accepts_full_jid() {
+        assert!(bot_allowlist_allows(
+            "33612345678@s.whatsapp.net",
+            &["33612345678@s.whatsapp.net"]
+        ));
     }
 }

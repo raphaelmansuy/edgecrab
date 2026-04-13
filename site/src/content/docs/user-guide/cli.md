@@ -161,7 +161,8 @@ edgecrab -w "refactor authentication to use JWT"
 edgecrab -w "add rate limiting to the API"
 ```
 
-Each invocation gets its own worktree and branch automatically. Clean worktrees are removed on exit; dirty ones are kept for manual recovery.
+Each invocation gets its own worktree and branch automatically. Worktrees without unpushed commits are removed on exit; worktrees with branch-local unpushed commits are kept for manual recovery.
+Set `worktree: true` in `config.yaml`, export `EDGECRAB_WORKTREE=1`, or use `/worktree on` in the TUI to make this the default for future launches. Cleanup is conservative: EdgeCrab preserves worktrees with unpushed commits.
 
 ### `--skill` (`-S`)
 

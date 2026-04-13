@@ -1,14 +1,21 @@
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use std::time::SystemTime;
 
 use anyhow::Context;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt::writer::MakeWriterExt;
 use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::reload;
 use tracing_subscriber::{EnvFilter, fmt, util::SubscriberInitExt};
 
 const DEFAULT_MAX_LOG_MB: u64 = 10;
 const DEFAULT_BACKUP_COUNT: usize = 5;
+const DEFAULT_LOG_TAIL_LINES: usize = 120;
+
+static LOG_FILTER_RELOAD: OnceLock<reload::Handle<EnvFilter, tracing_subscriber::Registry>> =
+    OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoggingMode {
@@ -44,6 +51,67 @@ pub enum StderrMode {
 
 pub struct LoggingGuards;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LogLevelSetting {
+    Error,
+    Warn,
+    #[default]
+    Info,
+    Debug,
+    Trace,
+}
+
+impl LogLevelSetting {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "error" | "err" => Some(Self::Error),
+            "warn" | "warning" => Some(Self::Warn),
+            "info" => Some(Self::Info),
+            "debug" => Some(Self::Debug),
+            "trace" => Some(Self::Trace),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Warn => "warn",
+            Self::Info => "info",
+            Self::Debug => "debug",
+            Self::Trace => "trace",
+        }
+    }
+
+    pub fn badge(self) -> &'static str {
+        match self {
+            Self::Error => "ERROR",
+            Self::Warn => "WARN ",
+            Self::Info => "INFO ",
+            Self::Debug => "DEBUG",
+            Self::Trace => "TRACE",
+        }
+    }
+
+    fn to_filter(self) -> LevelFilter {
+        match self {
+            Self::Error => LevelFilter::ERROR,
+            Self::Warn => LevelFilter::WARN,
+            Self::Info => LevelFilter::INFO,
+            Self::Debug => LevelFilter::DEBUG,
+            Self::Trace => LevelFilter::TRACE,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LogFileInfo {
+    pub path: PathBuf,
+    pub name: String,
+    pub size_bytes: u64,
+    pub modified: Option<SystemTime>,
+}
+
 pub fn init_logging(
     home: &Path,
     mode: LoggingMode,
@@ -66,7 +134,9 @@ pub fn init_logging(
     let error_writer = make_file_writer(error_path);
     let json_writer = make_file_writer(json_path);
 
-    let base_filter = base_env_filter(debug);
+    let base_filter = base_env_filter(home, debug);
+    let (filter_layer, reload_handle) = reload::Layer::new(base_filter);
+    let _ = LOG_FILTER_RELOAD.set(reload_handle);
     let text_layer = fmt::layer()
         .with_ansi(false)
         .with_target(true)
@@ -92,7 +162,7 @@ pub fn init_logging(
         .with_writer(json_writer);
 
     let subscriber = tracing_subscriber::registry()
-        .with(base_filter)
+        .with(filter_layer)
         .with(text_layer)
         .with(error_layer)
         .with(json_layer);
@@ -122,24 +192,281 @@ pub fn init_logging(
     Ok(LoggingGuards)
 }
 
-fn base_env_filter(debug: bool) -> EnvFilter {
-    let default_level = if debug {
-        LevelFilter::DEBUG
+pub fn logs_dir_for(home: &Path) -> PathBuf {
+    home.join("logs")
+}
+
+pub fn default_log_level(home: &Path) -> LogLevelSetting {
+    let config_path = home.join("config.yaml");
+    if config_path.exists() {
+        edgecrab_core::AppConfig::load_from(&config_path)
+            .ok()
+            .and_then(|config| LogLevelSetting::parse(&config.logging.level))
+            .unwrap_or_default()
     } else {
-        LevelFilter::INFO
+        LogLevelSetting::default()
+    }
+}
+
+pub fn effective_log_level(home: &Path, debug: bool) -> LogLevelSetting {
+    let saved = std::env::var("EDGECRAB_LOG_LEVEL")
+        .ok()
+        .and_then(|value| LogLevelSetting::parse(&value))
+        .unwrap_or_else(|| default_log_level(home));
+    if debug {
+        saved.max(LogLevelSetting::Debug)
+    } else {
+        saved
+    }
+}
+
+pub fn persist_log_level(home: &Path, level: LogLevelSetting) -> anyhow::Result<()> {
+    let config_path = home.join("config.yaml");
+    let mut config = if config_path.exists() {
+        edgecrab_core::AppConfig::load_from(&config_path).unwrap_or_default()
+    } else {
+        edgecrab_core::AppConfig::default()
     };
+    config.logging.level = level.as_str().to_string();
+    config
+        .save_to(&config_path)
+        .context("failed to persist logging level")
+}
+
+pub fn reload_runtime_log_level(level: LogLevelSetting) -> anyhow::Result<bool> {
+    let Some(handle) = LOG_FILTER_RELOAD.get() else {
+        return Ok(false);
+    };
+    handle
+        .reload(base_filter_for_level(level))
+        .context("failed to reload runtime logging filter")?;
+    Ok(true)
+}
+
+pub fn list_log_files(home: &Path) -> anyhow::Result<Vec<LogFileInfo>> {
+    let dir = logs_dir_for(home);
+    let mut entries = Vec::new();
+    if !dir.exists() {
+        return Ok(entries);
+    }
+
+    for entry in fs::read_dir(&dir).with_context(|| format!("failed to read {}", dir.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let metadata = entry.metadata().ok();
+        entries.push(LogFileInfo {
+            name: path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_string(),
+            path,
+            size_bytes: metadata.as_ref().map_or(0, std::fs::Metadata::len),
+            modified: metadata.and_then(|meta| meta.modified().ok()),
+        });
+    }
+
+    // Sort DESC by last-modified time so the most recently touched log appears first.
+    entries.sort_by(|left, right| right.modified.cmp(&left.modified));
+    Ok(entries)
+}
+
+/// Format a `SystemTime` as a human-readable relative duration ("just now",
+/// "3 min ago", "1h ago", "2 days ago"), with an absolute fallback for
+/// timestamps older than two weeks.
+pub fn format_relative_time(t: SystemTime) -> String {
+    let now = SystemTime::now();
+    let elapsed = match now.duration_since(t) {
+        Ok(d) => d,
+        // Clock skew: file is slightly in the future
+        Err(_) => return "just now".into(),
+    };
+    let secs = elapsed.as_secs();
+    match secs {
+        0..=59 => "just now".into(),
+        60..=3599 => {
+            let m = secs / 60;
+            format!("{m} min ago")
+        }
+        3600..=86399 => {
+            let h = secs / 3600;
+            format!("{h}h ago")
+        }
+        86400..=1_209_599 => {
+            let d = secs / 86400;
+            format!("{d} day{} ago", if d == 1 { "" } else { "s" })
+        }
+        _ => {
+            // Older than 2 weeks — show absolute date in local time.
+            t.duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|d| format_abs_date(d.as_secs()))
+                .unwrap_or_else(|| "unknown".into())
+        }
+    }
+}
+
+/// Minimal YYYY-MM-DD formatter from a Unix timestamp (seconds since epoch).
+/// Avoids pulling in chrono just for this helper.
+fn format_abs_date(unix_secs: u64) -> String {
+    // Days since Unix epoch
+    let days = unix_secs / 86400;
+    // Adjusted for Julian Day Number algorithm
+    let z = days as i64 + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{:04}-{:02}-{:02}", y, m, d)
+}
+
+pub fn resolve_log_path(home: &Path, name: Option<&str>) -> anyhow::Result<PathBuf> {
+    let paths = list_log_files(home)?
+        .into_iter()
+        .map(|entry| entry.path)
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        anyhow::bail!("No log files found in {}", logs_dir_for(home).display());
+    }
+
+    if let Some(name) = name {
+        let normalized = name.trim_end_matches(".log");
+        let mut matches = paths
+            .into_iter()
+            .filter(|path| {
+                let stem = path
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or_default();
+                let file = path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or_default();
+                stem == normalized || file == name || stem.starts_with(normalized)
+            })
+            .collect::<Vec<_>>();
+        matches.sort();
+        matches.dedup();
+        return match matches.len() {
+            0 => Err(anyhow::anyhow!("No log file matching '{name}'.")),
+            1 => Ok(matches.remove(0)),
+            _ => Err(anyhow::anyhow!(
+                "Ambiguous log name '{name}'. Matches: {}",
+                matches
+                    .iter()
+                    .map(|path| path
+                        .file_name()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or_default())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        };
+    }
+
+    for preferred in [
+        logs_dir_for(home).join("gateway.log"),
+        logs_dir_for(home).join("agent.log"),
+        logs_dir_for(home).join("acp.log"),
+        logs_dir_for(home).join("errors.log"),
+    ] {
+        if preferred.exists() {
+            return Ok(preferred);
+        }
+    }
+
+    if paths.len() == 1 {
+        return Ok(paths[0].clone());
+    }
+
+    Err(anyhow::anyhow!(
+        "Multiple log files found. Use `edgecrab logs list` or specify one by name."
+    ))
+}
+
+pub fn read_file_text(path: &Path) -> anyhow::Result<String> {
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+pub fn read_last_lines(path: &Path, lines: usize) -> anyhow::Result<String> {
+    #[cfg(unix)]
+    {
+        let output = std::process::Command::new("tail")
+            .arg("-n")
+            .arg(lines.to_string())
+            .arg(path)
+            .output();
+        if let Ok(output) = output
+            && output.status.success()
+        {
+            return String::from_utf8(output.stdout)
+                .map_err(|err| anyhow::anyhow!("failed to decode {}: {err}", path.display()));
+        }
+    }
+
+    let content = read_file_text(path)?;
+    let total = content.lines().count();
+    let skip = total.saturating_sub(lines);
+    Ok(content.lines().skip(skip).collect::<Vec<_>>().join("\n"))
+}
+
+pub fn tail_preview(path: &Path, lines: usize) -> anyhow::Result<String> {
+    let requested = lines.max(1);
+    let content = read_last_lines(path, requested)?;
+    if content.trim().is_empty() {
+        return Ok("(log file is currently empty)".into());
+    }
+    Ok(content)
+}
+
+pub fn format_log_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+pub fn default_tail_lines() -> usize {
+    DEFAULT_LOG_TAIL_LINES
+}
+
+fn base_env_filter(home: &Path, debug: bool) -> EnvFilter {
+    let default_level = effective_log_level(home, debug).to_filter();
     // WHY ignore ambient RUST_LOG here: persistent EdgeCrab file logs should
     // stay debuggable even when the parent shell exports restrictive filters
     // like `RUST_LOG=warn`. EdgeCrab uses its own override knob instead.
-    let mut filter = if let Ok(spec) = std::env::var("EDGECRAB_LOG_FILTER") {
+    let filter = if let Ok(spec) = std::env::var("EDGECRAB_LOG_FILTER") {
         EnvFilter::builder()
             .with_default_directive(default_level.into())
             .parse_lossy(spec)
     } else {
-        EnvFilter::builder()
-            .with_default_directive(default_level.into())
-            .parse_lossy("")
+        base_filter_for_level(effective_log_level(home, debug))
     };
+    add_noisy_module_directives(filter)
+}
+
+fn base_filter_for_level(level: LogLevelSetting) -> EnvFilter {
+    let filter = EnvFilter::builder()
+        .with_default_directive(level.to_filter().into())
+        .parse_lossy("");
+    add_noisy_module_directives(filter)
+}
+
+fn add_noisy_module_directives(mut filter: EnvFilter) -> EnvFilter {
     for noisy in [
         "hyper=warn",
         "h2=warn",
@@ -191,6 +518,11 @@ fn prepare_log_file_path(path: &Path, max_bytes: u64, backups: usize) -> anyhow:
 
 fn make_file_writer(path: PathBuf) -> impl Fn() -> std::fs::File + Clone {
     move || {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap_or_else(|err| {
+                panic!("failed to create log directory {}: {err}", parent.display())
+            });
+        }
         OpenOptions::new()
             .create(true)
             .append(true)
@@ -230,6 +562,19 @@ fn backup_path(path: &Path, idx: usize) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_level_setting_parses_aliases() {
+        assert_eq!(
+            LogLevelSetting::parse("warning"),
+            Some(LogLevelSetting::Warn)
+        );
+        assert_eq!(
+            LogLevelSetting::parse("DEBUG"),
+            Some(LogLevelSetting::Debug)
+        );
+        assert_eq!(LogLevelSetting::parse("nope"), None);
+    }
 
     #[test]
     fn logging_mode_uses_expected_file_names() {
@@ -278,5 +623,39 @@ mod tests {
             content.contains("hello log"),
             "agent.log should contain the emitted event, got: {content:?}"
         );
+    }
+
+    #[test]
+    fn persist_log_level_round_trips_through_config() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        persist_log_level(temp.path(), LogLevelSetting::Trace).expect("persist");
+        assert_eq!(default_log_level(temp.path()), LogLevelSetting::Trace);
+    }
+
+    #[test]
+    fn list_log_files_sorts_entries_by_name() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let log_dir = logs_dir_for(temp.path());
+        fs::create_dir_all(&log_dir).expect("create logs");
+        fs::write(log_dir.join("zeta.log"), "z").expect("write zeta");
+        fs::write(log_dir.join("alpha.log"), "a").expect("write alpha");
+
+        let files = list_log_files(temp.path()).expect("list files");
+        assert_eq!(
+            files.into_iter().map(|file| file.name).collect::<Vec<_>>(),
+            vec!["alpha.log", "zeta.log"]
+        );
+    }
+
+    #[test]
+    fn resolve_log_path_prefers_agent_when_present() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let log_dir = logs_dir_for(temp.path());
+        fs::create_dir_all(&log_dir).expect("create logs");
+        fs::write(log_dir.join("agent.log"), "agent").expect("write agent");
+        fs::write(log_dir.join("errors.log"), "errors").expect("write errors");
+
+        let resolved = resolve_log_path(temp.path(), None).expect("resolve default");
+        assert_eq!(resolved, log_dir.join("agent.log"));
     }
 }

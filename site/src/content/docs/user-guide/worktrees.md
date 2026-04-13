@@ -35,8 +35,10 @@ Each `-w` invocation creates a new branch and worktree under `.worktrees/` in yo
 
 ```yaml
 # ~/.edgecrab/config.yaml
-# Not directly supported in config — use -w flag per session
+worktree: true
 ```
+
+You can also set `EDGECRAB_WORKTREE=1` or use `/worktree on` inside the TUI to persist the same default for future launches.
 
 ### One-shot (quiet mode)
 
@@ -50,17 +52,17 @@ edgecrab -w -q "write tests for the parser module" | tee output.txt
 
 When you run `edgecrab -w`:
 
-1. EdgeCrab creates a new branch: `edgecrab/<timestamp>-<short-hash>`
-2. Creates a worktree at `.worktrees/<branch-name>/`
+1. EdgeCrab creates a new branch: `edgecrab/edgecrab-<short-id>`
+2. Creates a worktree at `.worktrees/edgecrab-<short-id>/`
 3. Starts the agent session from that worktree directory
-4. **On exit:** If the worktree has no uncommitted changes, it is removed automatically. If changes exist, the worktree is preserved for manual recovery.
+4. **On exit:** If the worktree has no unpushed commits, it is removed automatically. If it contains branch-local commits that have not been pushed, EdgeCrab preserves it for manual recovery.
 
 ```
 my-project/
 ├── src/              # main branch
 ├── .worktrees/
-│   ├── edgecrab-1714832400-a1b2c3/   # agent session 1
-│   └── edgecrab-1714832450-d4e5f6/   # agent session 2
+│   ├── edgecrab-a1b2c3d4/   # agent session 1
+│   └── edgecrab-e5f6a7b8/   # agent session 2
 ```
 
 ---
@@ -101,25 +103,34 @@ node_modules/
 .cargo/
 ```
 
-Files matching these patterns are copied (not symlinked) into new worktrees before the agent starts.
+Files matching these patterns are materialized into new worktrees before the agent starts.
+Files are handled conservatively:
+
+- Regular files are copied
+- Directories are symlinked on Unix when safe, otherwise copied
+- Path traversal and symlink escapes outside the repo are rejected
 
 ---
 
 ## Worktrees in Config (Global Toggle)
 
-To always use worktrees without the `-w` flag, there's no direct config key — but you can create a shell alias:
+Worktree mode is now first-class configuration:
 
-```bash
-alias ec='edgecrab -w'
+```yaml
+# ~/.edgecrab/config.yaml
+worktree: true
 ```
 
-Or set your default workflow in a profile:
+The TUI exposes the same state through `/worktree`:
 
-```bash
-edgecrab profile create isolated
-# edit ~/.edgecrab/profiles/isolated/config.yaml
-edgecrab -p isolated "task requiring isolation"
+```text
+/worktree            show current checkout + saved default
+/worktree on         enable isolated worktrees for future launches
+/worktree off        disable the saved default
+/worktree toggle     flip the saved default
 ```
+
+Important: the toggle affects future launches only. It does not move the live TUI session into a newly created worktree.
 
 ---
 
@@ -132,8 +143,8 @@ Stale worktrees that weren't cleaned automatically (e.g. the agent crashed):
 git worktree list
 
 # Remove a stale worktree
-git worktree remove .worktrees/edgecrab-1714832400-a1b2c3
-git branch -D edgecrab/1714832400-a1b2c3
+git worktree remove .worktrees/edgecrab-a1b2c3d4
+git branch -D edgecrab/edgecrab-a1b2c3d4
 ```
 
 Or prune all worktrees whose directories no longer exist:
@@ -146,19 +157,15 @@ git worktree prune
 
 ## Pro Tips
 
-**Use worktrees for every risky task.** Make `-w` your default via an alias:
-```bash
-alias ec='edgecrab -w'   # always isolated
-alias ece='edgecrab'     # explicit non-isolated
-```
+**Use worktrees for every risky task.** If that is your normal operating mode, set `worktree: true` once and use `/worktree off` when you intentionally want the primary checkout.
 
 **Review the branch diff before merging.** The agent may have made changes you want to cherry-pick rather than merge wholesale:
 ```bash
-git diff main edgecrab/1714832400-a1b2c3 -- src/auth.rs
-git show edgecrab/1714832400-a1b2c3:src/auth.rs
+git diff main edgecrab/edgecrab-a1b2c3d4 -- src/auth.rs
+git show edgecrab/edgecrab-a1b2c3d4:src/auth.rs
 ```
 
-**Name sessions when using worktrees.** `edgecrab -w --session auth-refactor` makes it easy to correlate the branch (`edgecrab/auth-refactor`) with the session.
+**Name sessions when using worktrees.** `edgecrab -w --session auth-refactor` still helps correlate transcripts and saved sessions, even though the git branch name itself remains an auto-generated disposable `edgecrab/edgecrab-<short-id>`.
 
 ---
 
@@ -171,7 +178,7 @@ Submodules are not automatically initialized in new worktrees. Run `git submodul
 **Q: The agent created changes in the worktree but I want them in main. How do I merge?**
 
 ```bash
-git merge edgecrab/1714832400-a1b2c3        # merge all changes
+git merge edgecrab/edgecrab-a1b2c3d4        # merge all changes
 git cherry-pick <sha>                        # take specific commits
 git diff main edgecrab/... | git apply       # apply as uncommitted changes
 ```
@@ -185,7 +192,7 @@ Add `.env` to `.worktreeinclude` in your repo root:
 .venv/
 node_modules/
 ```
-EdgeCrab copies (not symlinks) these files into new worktrees so secrets are available.
+EdgeCrab copies regular files into new worktrees so secrets are available. Safe directory includes may be symlinked on Unix to avoid expensive duplication.
 
 **Q: Can I run multiple agents in parallel worktrees at the same time?**
 

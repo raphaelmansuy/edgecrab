@@ -10,7 +10,7 @@
 //!   Navigation    /help /quit /clear /new /status /version
 //!   Model         /model /cheap_model /vision_model /image_model /moa /provider /reasoning /stream
 //!   Session       /session /retry /undo /stop /history /save /export /title /resume
-//!   Config        /config /prompt /verbose /personality /statusbar
+//!   Config        /config /prompt /verbose /personality /statusbar /log
 //!   Tools         /tools /toolsets /mcp /reload-mcp /plugins
 //!   Memory        /memory
 //!   Analysis      /cost /usage /compress /insights
@@ -167,6 +167,10 @@ pub enum CommandResult {
     SetStreaming(String),
     /// Toggle the TUI status bar visibility (on/off/toggle/status)
     SetStatusBar(String),
+    /// Inspect logs or configure the saved logging level.
+    LogCommand(String),
+    /// Inspect or configure persistent git worktree mode.
+    WorktreeCommand(String),
     /// List available models for the current or specified provider
     ListModels(String),
     /// Show cron job status (args: "list" or "")
@@ -1032,6 +1036,20 @@ impl CommandRegistry {
             handler: |args| CommandResult::SetStatusBar(args.trim().to_string()),
         });
 
+        self.register(Command {
+            name: "log",
+            aliases: &["logs"],
+            description: "Browse and live-follow local logs or set the saved log level: /log [open|level <error|warn|info|debug|trace>]",
+            handler: |args| CommandResult::LogCommand(args.trim().to_string()),
+        });
+
+        self.register(Command {
+            name: "worktree",
+            aliases: &["w"],
+            description: "Worktree status and default launch policy: /worktree [status|on|off|toggle]",
+            handler: |args| CommandResult::WorktreeCommand(args.trim().to_string()),
+        });
+
         // ── Tools (extended) ──────────────────────────────────────────
 
         self.register(Command {
@@ -1150,15 +1168,16 @@ impl CommandRegistry {
             name: "gateway",
             aliases: &["gatewayctl"],
             description:
-                "Show gateway status or manage the runtime: /gateway [start|stop|restart|status]",
+                "Show gateway status or manage the runtime: /gateway [start|stop|restart|status|diagnose]",
             handler: |args| match args.trim().to_ascii_lowercase().as_str() {
                 "" => CommandResult::ShowPlatforms,
                 "status" => CommandResult::GatewayControl("status".into()),
                 "start" => CommandResult::GatewayControl("start".into()),
                 "stop" => CommandResult::GatewayControl("stop".into()),
                 "restart" => CommandResult::GatewayControl("restart".into()),
+                "diagnose" | "diag" => CommandResult::GatewayControl("diagnose".into()),
                 other => CommandResult::Output(format!(
-                    "Unknown gateway action '{other}'. Use: /gateway [start|stop|restart|status]"
+                    "Unknown gateway action '{other}'. Use: /gateway [start|stop|restart|status|diagnose]"
                 )),
             },
         });
@@ -1952,6 +1971,40 @@ mod tests {
         assert!(matches!(
             reg.dispatch("/statusbar off"),
             Some(CommandResult::SetStatusBar(args)) if args == "off"
+        ));
+    }
+
+    #[test]
+    fn dispatch_worktree_commands() {
+        let reg = CommandRegistry::new();
+        assert!(matches!(
+            reg.dispatch("/worktree"),
+            Some(CommandResult::WorktreeCommand(args)) if args.is_empty()
+        ));
+        assert!(matches!(
+            reg.dispatch("/worktree on"),
+            Some(CommandResult::WorktreeCommand(args)) if args == "on"
+        ));
+        assert!(matches!(
+            reg.dispatch("/w toggle"),
+            Some(CommandResult::WorktreeCommand(args)) if args == "toggle"
+        ));
+    }
+
+    #[test]
+    fn dispatch_log_commands() {
+        let reg = CommandRegistry::new();
+        assert!(matches!(
+            reg.dispatch("/log"),
+            Some(CommandResult::LogCommand(args)) if args.is_empty()
+        ));
+        assert!(matches!(
+            reg.dispatch("/log level debug"),
+            Some(CommandResult::LogCommand(args)) if args == "level debug"
+        ));
+        assert!(matches!(
+            reg.dispatch("/logs trace"),
+            Some(CommandResult::LogCommand(args)) if args == "trace"
         ));
     }
 

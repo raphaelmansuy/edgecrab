@@ -70,3 +70,4 @@ coverage/
 video_script.py
 *.profdata
 demo/
+.edgecrab-artifacts/

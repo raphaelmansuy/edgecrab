@@ -41,6 +41,7 @@ impl WebhookAdapter {
             platform: Platform::Webhook,
             user_id: payload.user_id.clone().unwrap_or_else(|| "webhook".into()),
             channel_id: payload.channel_id.clone(),
+            chat_type: crate::platform::ChatType::Channel,
             text: payload.text.clone(),
             thread_id: None,
             metadata: MessageMetadata {

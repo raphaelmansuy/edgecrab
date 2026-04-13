@@ -280,13 +280,13 @@ pub struct ToolContext {
     /// Optional gateway message sender — allows tools to send messages to
     /// external platforms via the gateway. Set when running in gateway mode.
     pub gateway_sender: Option<Arc<dyn GatewaySender>>,
-    /// Origin of the current session: (platform_name, chat_id).
+    /// Origin of the current session.
     ///
     /// Set by the gateway dispatcher when a message arrives from a real chat
     /// (e.g. WhatsApp, Telegram). Used by `manage_cron_jobs` to populate the
     /// `origin` field on newly created jobs so `deliver='origin'` can route
     /// results back to the correct chat. None in CLI and cron sessions.
-    pub origin_chat: Option<(String, String)>,
+    pub origin_chat: Option<edgecrab_types::OriginChat>,
     /// Stable session key for this conversation turn.
     ///
     /// WHY: Mirrors hermes-agent's `ProcessSession.session_key`. Passed to

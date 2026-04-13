@@ -19,10 +19,14 @@ use crate::runtime::{
 
 #[derive(Debug, Clone, Copy)]
 pub enum GatewayAction {
-    Start { foreground: bool },
+    Start {
+        foreground: bool,
+    },
     Stop,
     Restart,
     Status,
+    /// Deep config + runtime health check with actionable fix guidance.
+    Diagnose,
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +83,7 @@ pub async fn run_capture(action: GatewayAction, args: &CliArgs) -> anyhow::Resul
         GatewayAction::Stop => stop_background_report(),
         GatewayAction::Restart => restart_background_report(args),
         GatewayAction::Status => status_report(args),
+        GatewayAction::Diagnose => diagnose_report(args),
     }
 }
 
@@ -320,6 +325,8 @@ async fn run_foreground(args: &CliArgs) -> anyhow::Result<()> {
         default_model: runtime.config.model.default_model.clone(),
         session_idle_timeout_secs: runtime.config.gateway.session_timeout_minutes as u64 * 60,
         webhook_enabled: runtime.config.gateway.webhook_enabled,
+        group_policy: runtime.config.gateway.group_policy,
+        unauthorized_dm_behavior: runtime.config.gateway.unauthorized_dm_behavior,
         ..Default::default()
     };
     let cancel = CancellationToken::new();
@@ -670,6 +677,355 @@ fn load_gateway_runtime_snapshot(args: &CliArgs) -> Option<GatewayRuntimeSnapsho
     Some(build_gateway_runtime_snapshot(&runtime.config))
 }
 
+// ─── Gateway Diagnose ──────────────────────────────────────────────────────
+
+/// Deep-inspect gateway configuration and runtime state.
+///
+/// Design principles (First Principles):
+///   • Every check maps directly to a user-observable failure mode.
+///   • Every issue entry carries an exact `Fix:` command — no guessing.
+///   • DRY: reuses `collect_platform_diagnostics`, `check_http_health`,
+///           `recent_log_alerts` and `snapshot` — no duplicated logic.
+///   • SOLID/OCP: new platforms add their runtime probe inside their own
+///                `platform_runtime_probe()` branch; the outer loop is stable.
+fn diagnose_report(args: &CliArgs) -> anyhow::Result<String> {
+    let status = snapshot()?;
+    let config_path = args
+        .config
+        .as_deref()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| edgecrab_core::edgecrab_home().join("config.yaml"));
+
+    let mut out = String::new();
+    let mut issues: Vec<(String, String)> = Vec::new(); // (title, fix_command)
+
+    // ── Header ──────────────────────────────────────────────────────────────
+    writeln!(&mut out).ok();
+    writeln!(
+        &mut out,
+        "╔══════════════════════════════════════════════════╗"
+    )
+    .ok();
+    writeln!(
+        &mut out,
+        "║      EdgeCrab Gateway  ·  Diagnostics Report     ║"
+    )
+    .ok();
+    writeln!(
+        &mut out,
+        "╚══════════════════════════════════════════════════╝"
+    )
+    .ok();
+    writeln!(&mut out).ok();
+    writeln!(&mut out, "  Config  {}", config_path.display()).ok();
+    writeln!(&mut out, "  Log     {}", status.log_path.display()).ok();
+
+    // ── Process ─────────────────────────────────────────────────────────────
+    writeln!(&mut out).ok();
+    writeln!(
+        &mut out,
+        "  ── Process ────────────────────────────────────────"
+    )
+    .ok();
+
+    let (proc_icon, proc_label) = if status.running {
+        ("✓", format!("running  pid {}", status.pid.unwrap_or(0)))
+    } else if status.stale_pid {
+        ("⚠", "stopped (stale pid file cleaned)".to_string())
+    } else {
+        ("○", "stopped".to_string())
+    };
+    writeln!(&mut out, "  {proc_icon}  Gateway     {proc_label}").ok();
+
+    // Load runtime config once for the whole report.
+    let runtime = load_runtime(
+        args.config.as_deref(),
+        args.model.as_deref(),
+        args.toolset.as_deref(),
+    )
+    .ok();
+
+    if let Some(ref rt) = runtime {
+        let gw = &rt.config.gateway;
+        let base_url = format!("http://{}:{}", gw.host, gw.port);
+
+        let http_ok = if status.running {
+            check_http_health(&format!("{base_url}/health"))
+        } else {
+            None
+        };
+        let http_icon = match http_ok {
+            Some(true) => "✓",
+            Some(false) => "✗",
+            None => "○",
+        };
+        writeln!(&mut out, "  {http_icon}  HTTP        {base_url}/health").ok();
+        if http_ok == Some(false) {
+            issues.push((
+                format!("Gateway HTTP not responding at {base_url}/health"),
+                "edgecrab gateway restart".to_string(),
+            ));
+        }
+    }
+
+    // ── Platforms ────────────────────────────────────────────────────────────
+    writeln!(&mut out).ok();
+    writeln!(
+        &mut out,
+        "  ── Platforms ──────────────────────────────────────"
+    )
+    .ok();
+
+    if let Some(ref rt) = runtime {
+        let diagnostics = collect_platform_diagnostics(&rt.config);
+        let visible: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.active || d.state != PlatformState::NotConfigured)
+            .collect();
+
+        if visible.is_empty() {
+            writeln!(&mut out, "  ○  (no platforms configured yet)").ok();
+            writeln!(&mut out, "     Run: edgecrab gateway configure").ok();
+            issues.push((
+                "No messaging platforms enabled".to_string(),
+                "edgecrab gateway configure".to_string(),
+            ));
+        }
+
+        for diag in &visible {
+            let icon = match diag.state {
+                PlatformState::Ready => "✓",
+                PlatformState::Available => "○",
+                PlatformState::Incomplete => "✗",
+                PlatformState::NotConfigured => "·",
+            };
+            let name_col = format!("{:<12}", diag.name);
+            let state_col = format!("[{:<12}]", diag.state.label());
+
+            // Build detail string, appending live runtime probes.
+            let mut detail = diag.detail.clone();
+            platform_runtime_probe(diag, &rt.config, &mut detail, &mut issues);
+
+            writeln!(&mut out, "  {icon}  {name_col}  {state_col}  {detail}").ok();
+
+            // Surface Incomplete platforms as issues automatically.
+            if diag.state == PlatformState::Incomplete && !diag.missing_required.is_empty() {
+                issues.push((
+                    format!(
+                        "{}: missing {}",
+                        diag.name,
+                        diag.missing_required.join(", ")
+                    ),
+                    format!("edgecrab gateway configure {}", diag.id),
+                ));
+            } else if diag.state == PlatformState::Incomplete {
+                issues.push((
+                    format!("{}: {}", diag.name, diag.detail),
+                    format!("edgecrab gateway configure {}", diag.id),
+                ));
+            }
+        }
+    } else {
+        writeln!(
+            &mut out,
+            "  ✗  Could not load config — run `edgecrab gateway configure`"
+        )
+        .ok();
+        issues.push((
+            "Config file could not be loaded".to_string(),
+            "edgecrab gateway configure".to_string(),
+        ));
+    }
+
+    // ── Issues ───────────────────────────────────────────────────────────────
+    // De-duplicate (platform_runtime_probe may emit the same issue twice if
+    // a platform is both Incomplete *and* has a failing live probe).
+    issues.dedup_by(|a, b| a.0 == b.0);
+
+    writeln!(&mut out).ok();
+    if issues.is_empty() {
+        writeln!(&mut out, "  ✓  No configuration issues found").ok();
+    } else {
+        writeln!(
+            &mut out,
+            "  ── Issues Found ({}) ─────────────────────────────",
+            issues.len()
+        )
+        .ok();
+        for (i, (title, fix)) in issues.iter().enumerate() {
+            writeln!(&mut out, "  [{}] {}", i + 1, title).ok();
+            writeln!(&mut out, "      Fix: {fix}").ok();
+        }
+    }
+
+    // ── Recent log errors ────────────────────────────────────────────────────
+    let alerts = recent_log_alerts(&status.log_path, 5);
+    if !alerts.is_empty() {
+        writeln!(&mut out).ok();
+        writeln!(
+            &mut out,
+            "  ── Recent Log Errors ──────────────────────────────"
+        )
+        .ok();
+        for alert in &alerts {
+            // Strip timestamps; keep to ≤110 chars to stay on one terminal line.
+            let stripped = strip_log_timestamp(alert);
+            // Safe Unicode truncation — char boundary aware.
+            let truncated: String = stripped.chars().take(110).collect();
+            writeln!(&mut out, "  · {truncated}").ok();
+        }
+    }
+
+    // ── Quick actions ────────────────────────────────────────────────────────
+    writeln!(&mut out).ok();
+    writeln!(
+        &mut out,
+        "  ── Quick Actions ──────────────────────────────────"
+    )
+    .ok();
+    writeln!(
+        &mut out,
+        "  edgecrab gateway configure    ← manage platform credentials"
+    )
+    .ok();
+    if status.running {
+        writeln!(
+            &mut out,
+            "  edgecrab gateway restart      ← apply config changes"
+        )
+        .ok();
+    } else {
+        writeln!(&mut out, "  edgecrab gateway start        ← launch gateway").ok();
+    }
+    writeln!(
+        &mut out,
+        "  tail -f {}  ← live logs",
+        status.log_path.display()
+    )
+    .ok();
+    writeln!(&mut out).ok();
+
+    Ok(out)
+}
+
+/// Perform live runtime probes for a single platform and append findings to
+/// `detail`. Issues that block normal operation are pushed into `issues`.
+///
+/// WHY separate function: keeps `diagnose_report` stable (Open/Closed) while
+/// allowing platform-specific probe logic to grow independently.
+fn platform_runtime_probe(
+    diag: &crate::gateway_catalog::PlatformDiagnostic,
+    config: &edgecrab_core::AppConfig,
+    detail: &mut String,
+    issues: &mut Vec<(String, String)>,
+) {
+    match diag.id {
+        "whatsapp" if diag.active => {
+            let wa = &config.gateway.whatsapp;
+            let wa_cfg = edgecrab_gateway::whatsapp::WhatsappAdapterConfig::from(wa);
+            let bridge_ok = check_http_health(&wa_cfg.health_url());
+            match bridge_ok {
+                Some(true) => detail.push_str(" · bridge connected"),
+                Some(false) => {
+                    detail.push_str(" · bridge not responding");
+                    issues.push((
+                        format!("WhatsApp bridge not responding at {}", wa_cfg.health_url()),
+                        "edgecrab gateway restart".to_string(),
+                    ));
+                }
+                None => detail.push_str(" · bridge unreachable"),
+            }
+            // Warn if self-chat is missing a phone number — common config mistake.
+            if wa.mode == "self-chat" && wa.allowed_users.is_empty() {
+                detail.push_str(" · mode: self-chat (any own message accepted)");
+            } else if wa.mode == "self-chat" {
+                detail.push_str(&format!(" · mode: self-chat (+{})", wa.allowed_users[0]));
+            } else {
+                detail.push_str(&format!(
+                    " · mode: bot ({} allowed)",
+                    wa.allowed_users.len()
+                ));
+            }
+        }
+        "whatsapp" if !diag.active && diag.state == PlatformState::NotConfigured => {
+            detail.push_str(" · run: edgecrab gateway configure whatsapp");
+        }
+        "whatsapp" => {
+            // Available but not enabled — help user enable it.
+            if diag.state == PlatformState::Available {
+                issues.push((
+                    "WhatsApp is paired but not enabled in config".to_string(),
+                    "edgecrab config set gateway.whatsapp.enabled true && edgecrab gateway restart"
+                        .to_string(),
+                ));
+            }
+        }
+        "slack" if diag.active => {
+            // Slack emits "invalid_auth" in the gateway log — surface it here.
+            let log_ok = gateway_log_path()
+                .map(|p| recent_log_alerts(&p, 20))
+                .unwrap_or_default();
+            let slack_auth_err = log_ok
+                .iter()
+                .any(|a| a.contains("Slack") && a.contains("invalid_auth"));
+            if slack_auth_err {
+                detail.push_str(" · token rejected by Slack API");
+                issues.push((
+                    "Slack bot token is invalid (invalid_auth)".to_string(),
+                    "edgecrab gateway configure slack".to_string(),
+                ));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Strip the RFC 3339 timestamp prefix and verbose crate path from a tracing log line.
+///
+/// Input:  "2026-04-13T00:59:31.000145Z  WARN edgecrab_gateway::run: crates/…/run.rs:123: message"
+/// Output: "WARN  message"
+fn strip_log_timestamp(line: &str) -> String {
+    // 1. Remove leading timestamp (up to the first space after 'Z'), e.g. "2026-04-13T00:59:31Z "
+    //    Guard: both length AND char-boundary are checked so we never slice mid-codepoint.
+    let after_ts =
+        if line.len() > 27 && line.is_char_boundary(27) && line.as_bytes().get(10) == Some(&b'T') {
+            line[27..].trim_start()
+        } else {
+            line.trim()
+        };
+
+    // 2. Keep the severity label (WARN / ERROR / INFO) as a prefix
+    let (severity, rest) = if let Some(s) = after_ts.strip_prefix("ERROR ") {
+        ("ERROR", s)
+    } else if let Some(s) = after_ts.strip_prefix("WARN ") {
+        ("WARN ", s)
+    } else if let Some(s) = after_ts.strip_prefix("INFO ") {
+        ("INFO ", s)
+    } else {
+        ("", after_ts)
+    };
+
+    // 3. Eat "module::path: crates/path/file.rs:NNN: " noise before the message.
+    //    Pattern: everything up to (and including) the last ": " before real text.
+    let message = if let Some(pos) = rest.rfind(": ") {
+        // Only strip if what precedes the last ': ' looks like a file path (contains '/')
+        let candidate = &rest[..pos];
+        if candidate.contains('/') || candidate.contains("::") {
+            &rest[pos + 2..]
+        } else {
+            rest
+        }
+    } else {
+        rest
+    };
+
+    if severity.is_empty() {
+        message.to_string()
+    } else {
+        format!("{severity} {message}")
+    }
+}
+
 fn build_gateway_runtime_snapshot(config: &edgecrab_core::AppConfig) -> GatewayRuntimeSnapshot {
     let gw = &config.gateway;
     let base_url = format!("http://{}:{}", gw.host, gw.port);
@@ -783,6 +1139,7 @@ fn print_gateway_failure_guidance(action: GatewayAction, args: &CliArgs, err: &a
             );
         }
         GatewayAction::Stop => {}
+        GatewayAction::Diagnose => {}
     }
 }
 

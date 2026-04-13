@@ -32,6 +32,7 @@ use crossterm::{
 };
 use dialoguer::{Confirm, Input, Password, Select, theme::ColorfulTheme};
 use edgecrab_core::config::ensure_edgecrab_home;
+use edgecrab_gateway::auth::validate_user_id_format;
 
 use crate::cli_args::CliArgs;
 use crate::gateway_catalog::{
@@ -479,33 +480,51 @@ fn configure_telegram(config: &mut edgecrab_core::AppConfig) -> anyhow::Result<(
         }
     }
 
-    // Allowed users
+    // Allowed users / personal-bot mode
     println!();
-    println!("  🔒 Security: Restrict who can use your bot");
-    println!("    To find your Telegram user ID:");
-    println!("    1. Message @userinfobot on Telegram");
-    println!("    2. It will reply with your numeric ID (e.g., 123456789)");
-    println!();
+    println!("  🔒 Security: How will you use this Telegram bot?");
+    let current_self_chat = std::env::var("TELEGRAM_SELF_CHAT")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+    let default_idx = if current_self_chat { 0 } else { 1 };
+    let access_choice = prompt_select(
+        "  Select access mode:",
+        &[
+            "Personal bot — only you use it (no allowlist required)",
+            "Shared bot   — restrict to specific Telegram user IDs",
+        ],
+        default_idx,
+    )?;
 
-    let current_users = if config.gateway.telegram.allowed_users.is_empty() {
-        "(none — open access)".to_string()
-    } else {
-        config.gateway.telegram.allowed_users.join(", ")
-    };
-    println!("  Current allowed users: {current_users}");
-
-    let input =
-        prompt_line("  Allowed user IDs (comma-separated, blank keeps current, '-' clears): ")?;
-    if input.trim() == "-" {
+    if access_choice == 0 {
+        // Personal-bot / self-chat mode
+        save_env_key("TELEGRAM_SELF_CHAT", "true")?;
         config.gateway.telegram.allowed_users.clear();
-        remove_env_key("TELEGRAM_ALLOWED_USERS")?;
-    } else if !input.trim().is_empty() {
-        config.gateway.telegram.allowed_users = parse_csv_values(&input);
-        // Also save to env for backward compatibility
-        save_env_key(
-            "TELEGRAM_ALLOWED_USERS",
-            &config.gateway.telegram.allowed_users.join(","),
-        )?;
+        let _ = remove_env_key("TELEGRAM_ALLOWED_USERS");
+        println!("  ✓ Personal bot mode enabled (TELEGRAM_SELF_CHAT=true)");
+        println!("  ℹ All messages to this bot will be processed");
+        println!("  💡 Tip: keep the bot token private so only you can reach it");
+    } else {
+        // Shared-bot mode: remove self-chat flag, configure allowlist
+        let _ = remove_env_key("TELEGRAM_SELF_CHAT");
+        println!();
+        println!("    To find your Telegram user ID:");
+        println!("    1. Message @userinfobot on Telegram");
+        println!("    2. It will reply with your numeric ID (e.g., 123456789)");
+        println!();
+        println!("  🔒 Allowed users (only these IDs can send DMs to the bot):");
+        let updated_users = edit_allowed_users("telegram", &config.gateway.telegram.allowed_users)?;
+        if updated_users != config.gateway.telegram.allowed_users {
+            config.gateway.telegram.allowed_users = updated_users;
+            if config.gateway.telegram.allowed_users.is_empty() {
+                remove_env_key("TELEGRAM_ALLOWED_USERS")?;
+            } else {
+                save_env_key(
+                    "TELEGRAM_ALLOWED_USERS",
+                    &config.gateway.telegram.allowed_users.join(","),
+                )?;
+            }
+        }
     }
 
     // Home channel
@@ -607,30 +626,27 @@ fn configure_discord(config: &mut edgecrab_core::AppConfig) -> anyhow::Result<()
     println!("    2. Right-click your name → Copy User ID");
     println!();
 
-    let current_users = if config.gateway.discord.allowed_users.is_empty() {
-        "(none — open access)".to_string()
-    } else {
-        config.gateway.discord.allowed_users.join(", ")
-    };
-    println!("  Current allowed users: {current_users}");
-
-    let input =
-        prompt_line("  Allowed user IDs (comma-separated, blank keeps current, '-' clears): ")?;
-    if input.trim() == "-" {
-        config.gateway.discord.allowed_users.clear();
-        remove_env_key("DISCORD_ALLOWED_USERS")?;
-    } else if !input.trim().is_empty() {
-        let cleaned: Vec<String> = input.split(',').filter_map(normalize_discord_user_id).fold(
-            Vec::new(),
-            |mut acc, user| {
-                if !acc.contains(&user) {
-                    acc.push(user);
-                }
-                acc
-            },
-        );
-        config.gateway.discord.allowed_users = cleaned.clone();
-        save_env_key("DISCORD_ALLOWED_USERS", &cleaned.join(","))?;
+    println!("  🔒 Allowed users (only these IDs can send DMs to the bot):");
+    let updated_users = edit_allowed_users("discord", &config.gateway.discord.allowed_users)?;
+    if updated_users != config.gateway.discord.allowed_users {
+        config.gateway.discord.allowed_users = updated_users;
+        if config.gateway.discord.allowed_users.is_empty() {
+            remove_env_key("DISCORD_ALLOWED_USERS")?;
+        } else {
+            // Normalise existing IDs through the Discord-specific cleaner
+            let cleaned: Vec<String> = config
+                .gateway
+                .discord
+                .allowed_users
+                .iter()
+                .filter_map(|u| normalize_discord_user_id(u))
+                .collect();
+            config.gateway.discord.allowed_users = cleaned;
+            save_env_key(
+                "DISCORD_ALLOWED_USERS",
+                &config.gateway.discord.allowed_users.join(","),
+            )?;
+        }
     }
 
     // Home channel
@@ -738,24 +754,18 @@ fn configure_slack(config: &mut edgecrab_core::AppConfig) -> anyhow::Result<()> 
     println!("    To find a Member ID: click a user → View full profile → ⋮ → Copy member ID");
     println!();
 
-    let current_users = if config.gateway.slack.allowed_users.is_empty() {
-        "(none — unpaired users denied by default)".to_string()
-    } else {
-        config.gateway.slack.allowed_users.join(", ")
-    };
-    println!("  Current allowed users: {current_users}");
-
-    let input =
-        prompt_line("  Allowed user IDs (comma-separated, blank keeps current, '-' clears): ")?;
-    if input.trim() == "-" {
-        config.gateway.slack.allowed_users.clear();
-        remove_env_key("SLACK_ALLOWED_USERS")?;
-    } else if !input.trim().is_empty() {
-        config.gateway.slack.allowed_users = parse_csv_values(&input);
-        save_env_key(
-            "SLACK_ALLOWED_USERS",
-            &config.gateway.slack.allowed_users.join(","),
-        )?;
+    println!("  🔒 Allowed users (only these IDs can send DMs to the bot):");
+    let updated_users = edit_allowed_users("slack", &config.gateway.slack.allowed_users)?;
+    if updated_users != config.gateway.slack.allowed_users {
+        config.gateway.slack.allowed_users = updated_users;
+        if config.gateway.slack.allowed_users.is_empty() {
+            remove_env_key("SLACK_ALLOWED_USERS")?;
+        } else {
+            save_env_key(
+                "SLACK_ALLOWED_USERS",
+                &config.gateway.slack.allowed_users.join(","),
+            )?;
+        }
     }
 
     // Home channel
@@ -984,26 +994,38 @@ fn configure_signal(config: &mut edgecrab_core::AppConfig) -> anyhow::Result<()>
         }
     }
 
-    // Allowed users
+    // Allowed users / self-chat mode
     println!();
-    println!("  🔒 Security: Restrict who can message your agent");
-    println!("    Use phone numbers in international format (e.g., +1234567890)");
-    println!();
-
-    let current_users = if config.gateway.signal.allowed_users.is_empty() {
-        "(none — open access)".to_string()
-    } else {
-        config.gateway.signal.allowed_users.join(", ")
-    };
-    println!("  Current allowed users: {current_users}");
-
-    let input = prompt_line(
-        "  Allowed phone numbers (comma-separated, blank keeps current, '-' clears): ",
+    println!("  🔒 Security: How do you plan to use Signal with EdgeCrab?");
+    let current_self_chat = std::env::var("SIGNAL_SELF_CHAT")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+    let default_idx = if current_self_chat { 0 } else { 1 };
+    let access_choice = prompt_select(
+        "  Select access mode:",
+        &[
+            "Personal use — self-chat (\"Note to Self\", linked-device)",
+            "Shared bot   — restrict access to specific phone numbers",
+        ],
+        default_idx,
     )?;
-    if input.trim() == "-" {
+
+    if access_choice == 0 {
+        // Self-chat mode: bypass auth entirely, no allowlist needed
+        save_env_key("SIGNAL_SELF_CHAT", "true")?;
         config.gateway.signal.allowed_users.clear();
-    } else if !input.trim().is_empty() {
-        config.gateway.signal.allowed_users = parse_csv_values(&input);
+        let _ = remove_env_key("SIGNAL_ALLOWED_USERS");
+        println!("  ✓ Signal self-chat mode enabled (SIGNAL_SELF_CHAT=true)");
+        println!("  ℹ Only linked-device \"Note to Self\" messages will be processed");
+    } else {
+        // Bot mode: remove self-chat flag, configure allowlist
+        let _ = remove_env_key("SIGNAL_SELF_CHAT");
+        println!();
+        println!("  🔒 Allowed users (only these phone numbers can send DMs to the bot):");
+        let updated_users = edit_allowed_users("signal", &config.gateway.signal.allowed_users)?;
+        if updated_users != config.gateway.signal.allowed_users {
+            config.gateway.signal.allowed_users = updated_users;
+        }
     }
 
     if prompt_yes_no(
@@ -1671,29 +1693,29 @@ fn configure_whatsapp(config: &mut edgecrab_core::AppConfig) -> anyhow::Result<(
     config.gateway.whatsapp.mode = prompt_whatsapp_mode(current_choice)?.to_string();
 
     // ── Allowed users ────────────────────────────────────────────────
-    let current_users = if config.gateway.whatsapp.allowed_users.is_empty() {
-        "(none)".to_string()
-    } else {
-        config.gateway.whatsapp.allowed_users.join(", ")
-    };
     println!();
-    println!("  Allowed users: {current_users}");
     if config.gateway.whatsapp.mode == "bot" {
-        println!("  ℹ Phone numbers with country code, no + prefix (e.g. 33614251689)");
-    }
-    let prompt_text = if config.gateway.whatsapp.mode == "bot" {
-        "  Allowed phone numbers (comma-separated, blank keeps current, '-' clears): "
+        println!("  🔒 Allowed users (phone numbers with country code, e.g. +33614251689):");
+        let updated_users = edit_allowed_users("whatsapp", &config.gateway.whatsapp.allowed_users)?;
+        if updated_users != config.gateway.whatsapp.allowed_users {
+            // WhatsApp bridge expects no leading '+' in stored numbers
+            config.gateway.whatsapp.allowed_users = updated_users
+                .into_iter()
+                .map(|value| value.trim_start_matches('+').to_string())
+                .collect();
+        }
     } else {
-        "  Your phone number (blank keeps current, '-' clears): "
-    };
-    let input = prompt_line(prompt_text)?;
-    if input.trim() == "-" {
-        config.gateway.whatsapp.allowed_users.clear();
-    } else if !input.trim().is_empty() {
-        config.gateway.whatsapp.allowed_users = parse_csv_values(&input)
-            .into_iter()
-            .map(|value| value.trim_start_matches('+').to_string())
-            .collect();
+        let current_self = config.gateway.whatsapp.allowed_users.first().cloned();
+        let input = prompt_line(&format!(
+            "  Your phone number (E.164, e.g. +33614251689) [{}]: ",
+            current_self.as_deref().unwrap_or("none")
+        ))?;
+        if input.trim() == "-" {
+            config.gateway.whatsapp.allowed_users.clear();
+        } else if !input.trim().is_empty() {
+            let num = input.trim().trim_start_matches('+').to_string();
+            config.gateway.whatsapp.allowed_users = vec![num];
+        }
     }
 
     // ── Bridge port ──────────────────────────────────────────────────
@@ -1964,6 +1986,92 @@ fn prompt_line(prompt_str: &str) -> io::Result<String> {
         .interact_text()
         .map_err(dialoguer_to_io)
         .map(sanitize_terminal_input)
+}
+
+/// Interactive allowlist editor: display current entries numbered, then offer
+/// Add / Remove-by-number / Clear-all / Done actions in a loop.
+///
+/// Returns the updated list.  Any entry that fails `validate_user_id_format`
+/// is accepted with a warning so users can still configure non-standard IDs.
+///
+/// `platform_id` must be the canonical lowercase platform name (e.g. "telegram").
+fn edit_allowed_users(platform_id: &str, current: &[String]) -> io::Result<Vec<String>> {
+    const MENU_ADD: usize = 0;
+    const MENU_REMOVE: usize = 1;
+    const MENU_CLEAR: usize = 2;
+    const MENU_DONE: usize = 3;
+
+    let mut users: Vec<String> = current.to_vec();
+
+    loop {
+        println!();
+        if users.is_empty() {
+            println!("    (no allowed users configured — new DMs will be denied by default)");
+        } else {
+            println!("    Allowed users:");
+            for (idx, u) in users.iter().enumerate() {
+                println!("      {}. {}", idx + 1, u);
+            }
+        }
+        println!();
+
+        let items = [
+            "Add a user ID",
+            "Remove a user by number",
+            "Clear the entire list",
+            "Done — keep current list",
+        ];
+        match prompt_select("Allowlist action", &items, MENU_DONE)? {
+            MENU_ADD => {
+                let raw = prompt_line("    User ID to add: ")?;
+                let id = raw.trim().to_string();
+                if id.is_empty() {
+                    println!("    ↺ No change (empty input)");
+                    continue;
+                }
+                if let Some(warn) = validate_user_id_format(platform_id, &id) {
+                    println!("    ⚠ {warn}");
+                    if !prompt_yes_no("    Add anyway?", false)? {
+                        continue;
+                    }
+                }
+                if users.contains(&id) {
+                    println!("    ↺ Already in the list: {id}");
+                } else {
+                    users.push(id.clone());
+                    println!("    ✓ Added: {id}");
+                }
+            }
+            MENU_REMOVE => {
+                if users.is_empty() {
+                    println!("    ↺ Nothing to remove");
+                    continue;
+                }
+                let raw = prompt_line("    Enter number to remove (e.g. 1): ")?;
+                match raw.trim().parse::<usize>() {
+                    Ok(n) if n >= 1 && n <= users.len() => {
+                        let removed = users.remove(n - 1);
+                        println!("    ✓ Removed: {removed}");
+                    }
+                    _ => println!(
+                        "    ✗ Invalid number; enter a value between 1 and {}",
+                        users.len()
+                    ),
+                }
+            }
+            MENU_CLEAR => {
+                if users.is_empty() {
+                    println!("    ↺ List is already empty");
+                } else if prompt_yes_no("    Clear all allowed users?", false)? {
+                    users.clear();
+                    println!("    ✓ List cleared");
+                }
+            }
+            _ => break, // MENU_DONE or any unrecognised index
+        }
+    }
+
+    Ok(users)
 }
 
 fn prompt_secret(prompt_str: &str) -> io::Result<String> {
@@ -2242,6 +2350,9 @@ fn strip_wrapping_quotes(value: &str) -> &str {
     value
 }
 
+/// Parse comma- or newline-separated user IDs, trimming whitespace and
+/// stripping surrounding quotes. Deduplicates the result.
+#[allow(dead_code)]
 fn parse_csv_values(input: &str) -> Vec<String> {
     let mut values = Vec::new();
     for raw in input.split(',') {

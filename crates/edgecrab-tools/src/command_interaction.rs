@@ -587,8 +587,8 @@ mod tests {
         let ToolError::CapabilityDenied { message, code, .. } = err else {
             panic!("expected capability denied");
         };
-        assert_eq!(code, "macos_automation_unknown");
-        assert!(message.contains("could not determine Automation consent"));
+        assert_eq!(code, "macos_applescript_target_unresolved");
+        assert!(message.contains("could not statically determine the AppleScript target"));
         assert!(message.contains("/permissions bootstrap"));
     }
 

@@ -22,7 +22,7 @@ pub mod tool;
 pub mod trajectory;
 pub mod usage;
 
-pub use config::{ApiMode, DEFAULT_MODEL, OPENROUTER_BASE_URL, Platform};
+pub use config::{ApiMode, DEFAULT_MODEL, OPENROUTER_BASE_URL, OriginChat, Platform};
 pub use error::{AgentError, ToolError, ToolErrorRecord, ToolErrorResponse};
 pub use message::{Content, ContentPart, ImageUrl, Message, Role};
 pub use tool::{FunctionCall, ToolCall, ToolSchema};

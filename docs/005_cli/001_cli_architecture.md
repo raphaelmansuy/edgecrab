@@ -212,7 +212,7 @@ handler graph.
 | Navigation | `/help`, `/quit`, `/clear`, `/version`, `/status`, `/new` |
 | Session | `/session`, `/retry`, `/undo`, `/stop`, `/history`, `/save`, `/export`, `/title`, `/resume` |
 | Model | `/model`, `/cheap_model`, `/vision_model`, `/image_model`, `/moa`, `/models`, `/provider`, `/reasoning`, `/stream` |
-| Config | `/config`, `/prompt`, `/verbose`, `/personality`, `/statusbar`, `/mouse` |
+| Config | `/config`, `/prompt`, `/verbose`, `/personality`, `/statusbar`, `/log`, `/worktree`, `/mouse` |
 | Tools | `/tools`, `/toolsets`, `/mcp`, `/reload-mcp`, `/mcp-token`, `/plugins`, `/skills`, `/browser`, `/memory` |
 | Analysis | `/cost`, `/usage`, `/compress`, `/insights` |
 | Appearance | `/skin`, `/paste` |
@@ -233,6 +233,8 @@ Recent UX notes:
 - `/prompt` now manages the persisted `agent.system_prompt` override: `/prompt`, `/prompt clear`, `/prompt <text>`.
 - `/insights [days]` now matches Hermes' optional day-window argument instead of hardcoding 30 days.
 - `/statusbar` is a real persisted toggle.
+- `/log` opens a real split-pane log browser plus entry inspector, both overlays live-follow by default with `F` as the toggle, and `/log level <level>` persists `logging.level` while reloading the live runtime filter when possible.
+- `/worktree` opens a real report overlay instead of writing status into scrollback, and `/worktree on|off|toggle` persists the default for future launches only.
 - `/verbose` cycles immediately on bare `/verbose`; `/verbose open` keeps the richer EdgeCrab picker available.
 - `/approve`, `/deny`, `/sethome`, and `/update` now operate on live TUI or config state.
 - `/webhook subscribe` now mirrors Hermes route semantics for `skills`, `deliver`, and templated `deliver_extra`, while reusing the shared gateway delivery router instead of duplicating platform send code.
@@ -346,7 +348,7 @@ spinner for each active tool call with elapsed time.
 > ```
 
 > **Tip: `--worktree` creates an isolated git worktree for the session.**
-> Changes are sandboxed in the worktree. Review with `git diff` before merging.
+> EdgeCrab now also supports a config-level default (`worktree: true`) and a TUI `/worktree` overlay. Disposable worktrees are cleaned automatically, but worktrees with unpushed commits are preserved.
 
 ---
 

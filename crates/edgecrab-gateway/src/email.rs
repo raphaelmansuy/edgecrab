@@ -440,6 +440,7 @@ impl PlatformAdapter for EmailAdapter {
                             platform: Platform::Email,
                             user_id: sender.clone(),
                             channel_id: Some(sender.clone()),
+                            chat_type: crate::platform::ChatType::Dm,
                             text: body,
                             thread_id: email.subject.clone(),
                             metadata: MessageMetadata {

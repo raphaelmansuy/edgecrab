@@ -154,6 +154,7 @@ async fn handle_twilio_webhook(
         platform: Platform::Sms,
         user_id: from.clone(),
         channel_id: Some(from.clone()),
+        chat_type: crate::platform::ChatType::Dm,
         text: body,
         thread_id: None,
         metadata: MessageMetadata {

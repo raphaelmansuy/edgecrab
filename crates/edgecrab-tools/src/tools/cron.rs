@@ -243,7 +243,10 @@ Safety: this tool is disabled inside cron sessions to prevent recursive scheduli
 
 // ─── Action handlers ──────────────────────────────────────────────────
 
-fn do_create(a: CronArgs, origin_chat: Option<(String, String)>) -> Result<String, ToolError> {
+fn do_create(
+    a: CronArgs,
+    origin_chat: Option<edgecrab_types::OriginChat>,
+) -> Result<String, ToolError> {
     let schedule = require_field(&a.schedule, "schedule", "create")?;
     let prompt = a.prompt.as_deref().unwrap_or("");
 
@@ -274,10 +277,10 @@ fn do_create(a: CronArgs, origin_chat: Option<(String, String)>) -> Result<Strin
             builder = builder.repeat(r);
         }
     }
-    if let Some((platform, chat_id)) = origin_chat {
+    if let Some(origin_chat) = origin_chat {
         builder = builder.origin(Origin {
-            platform,
-            chat_id,
+            platform: origin_chat.platform,
+            chat_id: origin_chat.chat_id,
             chat_name: None,
             thread_id: None,
         });

@@ -31,19 +31,27 @@ fn list_pairings(
     if show_pending {
         let pending = store.list_pending(platform);
         if pending.is_empty() {
-            println!("Pending pairing requests: none");
+            println!("  Pending pairing requests: none");
         } else {
-            println!("Pending pairing requests:");
-            for (platform, code, user_id, user_name, age_min) in pending {
+            println!("  Pending pairing requests ({}):", pending.len());
+            println!(
+                "  {:<12} {:<8}  {:<20}  {:<20}  Age",
+                "Platform", "Code", "User ID", "Name"
+            );
+            println!("  {}", "-".repeat(72));
+            for (pf, code, user_id, user_name, age_min) in &pending {
                 println!(
-                    "  {:10} code={} user={} ({}) age={}m",
-                    platform,
+                    "  {:<12} {:<8}  {:<20}  {:<20}  {}m ago",
+                    pf,
                     code,
                     user_id,
-                    display_name(&user_name),
+                    display_name(user_name),
                     age_min
                 );
             }
+            println!();
+            println!("  To approve: edgecrab pairing approve <platform> <code>");
+            println!("  To deny all: edgecrab pairing clear-pending [--platform <p>]");
         }
     }
 
@@ -53,17 +61,19 @@ fn list_pairings(
         }
         let approved = store.list_approved(platform);
         if approved.is_empty() {
-            println!("Approved pairings: none");
+            println!("  Approved pairings: none");
+            println!();
+            println!("  Tip: Users can request pairing by messaging the bot.");
+            println!("       The bot will send them a pairing code to present here.");
         } else {
-            println!("Approved pairings:");
-            for (platform, user_id, user_name) in approved {
-                println!(
-                    "  {:10} user={} ({})",
-                    platform,
-                    user_id,
-                    display_name(&user_name)
-                );
+            println!("  Approved pairings ({}):", approved.len());
+            println!("  {:<12} {:<24}  Name", "Platform", "User ID");
+            println!("  {}", "-".repeat(52));
+            for (pf, user_id, user_name) in &approved {
+                println!("  {:<12} {:<24}  {}", pf, user_id, display_name(user_name));
             }
+            println!();
+            println!("  To revoke: edgecrab pairing revoke <platform> <user_id>");
         }
     }
 
@@ -74,24 +84,40 @@ fn approve_pairing(store: &PairingStore, platform: &str, code: &str) -> anyhow::
     match store.approve_code(platform, code) {
         Some((user_id, user_name)) => {
             println!(
-                "Approved pairing for {} user {} ({}).",
+                "  ✓ Approved pairing for {} user {} ({}).",
                 platform,
                 user_id,
                 display_name(&user_name)
             );
+            println!();
+            println!(
+                "  The user can now send messages to the bot on {}.",
+                platform
+            );
+            println!(
+                "  To revoke later: edgecrab pairing revoke {} {}",
+                platform, user_id
+            );
             Ok(())
         }
-        None => anyhow::bail!("No pending pairing code '{code}' for platform '{platform}'."),
+        None => anyhow::bail!(
+            "No pending pairing code '{}' for platform '{}'.  \
+             Use `edgecrab pairing list --pending` to see active requests.",
+            code,
+            platform
+        ),
     }
 }
 
 fn revoke_pairing(store: &PairingStore, platform: &str, user_id: &str) -> anyhow::Result<()> {
     if store.revoke(platform, user_id) {
-        println!("Revoked pairing for {} user {}.", platform, user_id);
+        println!("  ✓ Revoked pairing for {} user {}.", platform, user_id);
+        println!("    The user will need to pair again to regain access.");
         Ok(())
     } else {
         anyhow::bail!(
-            "User '{}' is not currently paired on '{}'.",
+            "User '{}' is not currently paired on '{}'.  \
+             Use `edgecrab pairing list --approved` to see paired users.",
             user_id,
             platform
         );
@@ -101,7 +127,7 @@ fn revoke_pairing(store: &PairingStore, platform: &str, user_id: &str) -> anyhow
 fn clear_pending(platform: Option<&str>) -> anyhow::Result<()> {
     let files = pending_files(platform)?;
     if files.is_empty() {
-        println!("No pending pairing files found.");
+        println!("  No pending pairing files found.");
         return Ok(());
     }
 
@@ -112,7 +138,12 @@ fn clear_pending(platform: Option<&str>) -> anyhow::Result<()> {
         }
     }
 
-    println!("Cleared {} pending pairing file(s).", files.len());
+    let scope = platform.map_or("(all platforms)".to_string(), |p| p.to_string());
+    println!(
+        "  ✓ Cleared {} pending pairing file(s) for {}.",
+        files.len(),
+        scope
+    );
     Ok(())
 }
 

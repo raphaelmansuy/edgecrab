@@ -20,6 +20,21 @@ use std::collections::BTreeMap;
 use std::sync::OnceLock;
 use tokio::sync::mpsc;
 
+/// Chat type: direct message vs. group/channel.
+///
+/// Used by the authorization layer to enforce group policies and by the
+/// unauthorized-DM handler to decide whether to send pairing codes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum ChatType {
+    /// Direct / private message (1-on-1).
+    #[default]
+    Dm,
+    /// Multi-user group or supergroup.
+    Group,
+    /// Broadcast channel (Telegram channels, Slack channels, etc.).
+    Channel,
+}
+
 /// A normalized attachment kind across messaging platforms.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum MessageAttachmentKind {
@@ -96,6 +111,8 @@ pub struct IncomingMessage {
     pub user_id: String,
     /// Optional channel/group identifier (DMs have None)
     pub channel_id: Option<String>,
+    /// Whether this is a DM, group, or channel message.
+    pub chat_type: ChatType,
     /// The message text
     pub text: String,
     /// Optional thread/topic ID for threaded conversations
@@ -728,6 +745,7 @@ mod tests {
             platform: Platform::Cli,
             user_id: "user1".into(),
             channel_id: None,
+            chat_type: ChatType::Dm,
             text: "hello".into(),
             thread_id: None,
             metadata: MessageMetadata::default(),
