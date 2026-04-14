@@ -80,8 +80,10 @@ use crate::runtime::{
 };
 use crate::theme::{SkinConfig, Theme};
 use crate::tool_display::{
-    build_subagent_event_line, build_tool_done_line, build_tool_running_line,
-    build_tool_verbose_lines, tool_action_verb, tool_icon, tool_signature, tool_status_preview,
+    DisplayWidths, build_context_gauge, build_subagent_done_line_width,
+    build_subagent_running_line_width, build_tool_done_line_width, build_tool_running_line_width,
+    build_tool_verbose_lines_width, tool_action_verb, tool_icon, tool_signature,
+    tool_status_preview, tool_status_preview_width,
 };
 use crate::vision_models::{
     available_vision_model_options_with_dynamic, canonical_provider, current_model_supports_vision,
@@ -2277,14 +2279,16 @@ enum DisplayState {
     /// input area.  When active, the main input is locked and keybindings are
     /// redirected here.
     WaitingForApproval {
-        /// Short display label (content after truncation to ~50 chars).
+        /// Display label (full command — no longer truncated).
         command: String,
-        /// Full command string shown only when user presses 'v' (view).
+        /// Full command string (kept for backward compatibility; identical to `command`).
         full_command: String,
         /// Currently highlighted choice index (0–3 in [Once, Session, Always, Deny]).
         selected: usize,
-        /// Whether the "view" mode is active (shows full_command in overlay).
+        /// Whether the "view" mode is active (legacy — kept for key-handler symmetry).
         show_full: bool,
+        /// Vertical scroll offset for long commands that exceed the visible area.
+        scroll_offset: u16,
     },
     /// The agent is requesting a secret value from the user (e.g. an API key
     /// or sudo password).
@@ -4515,6 +4519,9 @@ pub struct App {
     active_skills: Vec<String>,
 
     // ── Scroll tracking (best-practice UX) ──────────────────────────
+    /// Last known terminal width (updated each render frame). Used by event
+    /// handlers to build width-adaptive tool display spans outside the render loop.
+    last_terminal_width: u16,
     /// Estimated total visual rows in the output area (updated each render)
     output_visual_rows: u16,
     /// Height of the last rendered output viewport (updated each render)
@@ -4613,6 +4620,13 @@ pub struct App {
     /// out of order. Matching by `tool_call_id` avoids upgrading the wrong line
     /// when completion events race.
     pending_tool_lines: std::collections::HashMap<String, PendingToolLine>,
+    /// In-flight sub-agent placeholder lines keyed by `task_index`.
+    ///
+    /// Mirrors `pending_tool_lines` for the delegated-child sub-agent lifecycle:
+    /// - `SubAgentStart`      → insert placeholder line + record index
+    /// - `SubAgentReasoning` / `SubAgentToolExec` → update line in-place
+    /// - `SubAgentFinish`     → replace with done line + remove entry
+    pending_subagent_lines: std::collections::HashMap<usize, PendingSubagentLine>,
     /// Tool call ids deliberately suppressed from the transcript by display policy.
     hidden_tool_calls: HashSet<String>,
     /// Signatures already rendered in the current turn for `tool_progress: new`.
@@ -4648,6 +4662,22 @@ struct PendingToolLine {
     args_json: String,
     line_idx: usize,
     edit_snapshot: Option<LocalEditSnapshot>,
+}
+
+/// Tracks a sub-agent placeholder output line so it can be updated in-place.
+///
+/// When `SubAgentStart` fires, we push a running placeholder and record its
+/// index here.  `SubAgentReasoning` / `SubAgentToolExec` update it in-place.
+/// `SubAgentFinish` replaces it with a structured done line.
+struct PendingSubagentLine {
+    /// Index into `self.output` for the placeholder line.
+    line_idx: usize,
+    /// Wall-clock start time — used to compute elapsed in the running line.
+    started_at: Instant,
+    /// Original task goal (first line of subagent prompt).
+    goal: String,
+    /// Total sub-agent count in this delegate batch.
+    task_count: usize,
 }
 
 struct VoiceRecordingSession {
@@ -5055,6 +5085,7 @@ impl App {
         self.active_subagents.clear();
         self.turn_stream_tokens = 0;
         self.pending_tool_lines.clear();
+        self.pending_subagent_lines.clear();
         self.hidden_tool_calls.clear();
         self.active_tools.clear();
         self.seen_tool_signatures.clear();
@@ -5262,6 +5293,7 @@ impl App {
             statusbar_selector_cursor: 0, // default to Visible
             skills_completion_names: Vec::new(),
             active_skills: Vec::new(),
+            last_terminal_width: 80,
             output_visual_rows: 0,
             output_area_height: 24,
             at_bottom: true,
@@ -5296,6 +5328,7 @@ impl App {
             in_flight_tool_count: 0,
             turn_stream_tokens: 0,
             pending_tool_lines: std::collections::HashMap::new(),
+            pending_subagent_lines: std::collections::HashMap::new(),
             hidden_tool_calls: HashSet::new(),
             seen_tool_signatures: HashSet::new(),
             voice_recording: None,
@@ -12074,11 +12107,12 @@ impl App {
                         // ToolDone later upgrades it in-place with timing/result
                         // info (no layout shift).
                         let edit_snapshot = capture_local_edit_snapshot(&name, &args_json);
-                        let running_spans = build_tool_running_line(
+                        let running_spans = build_tool_running_line_width(
                             &name,
                             &args_json,
                             None,
                             &self.theme.tool_emojis,
+                            &DisplayWidths::from_terminal_width(self.last_terminal_width as usize),
                         );
                         let line_idx = self.output.len();
                         self.output.push(OutputLine {
@@ -12144,12 +12178,16 @@ impl App {
                     }) = self.pending_tool_lines.get(&tool_call_id).cloned()
                     {
                         if line_idx < self.output.len() {
-                            self.output[line_idx].prebuilt_spans = Some(build_tool_running_line(
-                                &tool_name,
-                                &args_json,
-                                Some(detail.as_str()),
-                                &self.theme.tool_emojis,
-                            ));
+                            self.output[line_idx].prebuilt_spans =
+                                Some(build_tool_running_line_width(
+                                    &tool_name,
+                                    &args_json,
+                                    Some(detail.as_str()),
+                                    &self.theme.tool_emojis,
+                                    &DisplayWidths::from_terminal_width(
+                                        self.last_terminal_width as usize,
+                                    ),
+                                ));
                             self.output[line_idx].invalidate_render_cache();
                         }
                     } else {
@@ -12176,13 +12214,16 @@ impl App {
                     let pending = self.pending_tool_lines.remove(&tool_call_id);
                     self.active_tools.remove(&tool_call_id);
                     if !hidden {
-                        let spans = build_tool_done_line(
+                        let widths =
+                            DisplayWidths::from_terminal_width(self.last_terminal_width as usize);
+                        let spans = build_tool_done_line_width(
                             &name,
                             &args_json,
                             result_preview.as_deref(),
                             duration_ms,
                             is_error,
                             &self.theme.tool_emojis,
+                            &widths,
                         );
                         // Upgrade the in-flight placeholder in-place (if present).
                         //
@@ -12204,11 +12245,12 @@ impl App {
                             self.push_output_spans(spans, OutputRole::Tool);
                         }
                         if self.tool_progress_mode == ToolProgressMode::Verbose {
-                            for line in build_tool_verbose_lines(
+                            for line in build_tool_verbose_lines_width(
                                 &name,
                                 &args_json,
                                 result_preview.as_deref(),
                                 is_error,
+                                widths.verbose_content,
                             ) {
                                 self.push_output_spans(line, OutputRole::Tool);
                             }
@@ -12267,15 +12309,31 @@ impl App {
                         },
                     );
                     self.streaming_line = None;
+                    // Push a running placeholder and record its index so that
+                    // SubAgentReasoning / SubAgentToolExec can update it in-place,
+                    // and SubAgentFinish can replace it — exactly like ToolExec/ToolDone.
+                    let widths =
+                        DisplayWidths::from_terminal_width(self.last_terminal_width as usize);
+                    let running_spans = build_subagent_running_line_width(
+                        task_index, task_count, &goal, None, 0, &widths,
+                    );
+                    let line_idx = self.output.len();
                     self.output.push(OutputLine {
                         text: String::new(),
                         role: OutputRole::Tool,
-                        prebuilt_spans: Some(build_subagent_event_line(
-                            task_index, task_count, "subagent", &goal, "running",
-                        )),
+                        prebuilt_spans: Some(running_spans),
                         rendered: None,
                         plain_rendered: None,
                     });
+                    self.pending_subagent_lines.insert(
+                        task_index,
+                        PendingSubagentLine {
+                            line_idx,
+                            started_at: Instant::now(),
+                            goal: goal.clone(),
+                            task_count,
+                        },
+                    );
                     if self.at_bottom {
                         self.scroll_offset = 0;
                     }
@@ -12287,24 +12345,45 @@ impl App {
                     text,
                 } => {
                     self.progress_seq = self.progress_seq.saturating_add(1);
+                    let detail = format!(
+                        "thinking: {}",
+                        edgecrab_core::safe_truncate(text.trim(), 72)
+                    );
                     if let Some(status) = self.active_subagents.get_mut(&task_index) {
-                        status.last_detail = Some(format!(
-                            "thinking: {}",
-                            edgecrab_core::safe_truncate(text.trim(), 72)
-                        ));
+                        status.last_detail = Some(detail.clone());
                         status.last_seq = self.progress_seq;
+                    }
+                    // Update running placeholder in-place — no new lines pushed.
+                    if let Some(pending) = self.pending_subagent_lines.get(&task_index) {
+                        let line_idx = pending.line_idx;
+                        let goal = pending.goal.clone();
+                        let task_count = pending.task_count;
+                        let elapsed = pending.started_at.elapsed().as_secs();
+                        if line_idx < self.output.len() {
+                            let widths = DisplayWidths::from_terminal_width(
+                                self.last_terminal_width as usize,
+                            );
+                            self.output[line_idx].prebuilt_spans =
+                                Some(build_subagent_running_line_width(
+                                    task_index,
+                                    task_count,
+                                    &goal,
+                                    Some(&detail),
+                                    elapsed,
+                                    &widths,
+                                ));
+                            self.output[line_idx].invalidate_render_cache();
+                        }
                     }
                     self.needs_redraw = true;
                 }
                 AgentResponse::SubAgentToolExec {
                     task_index,
-                    task_count,
+                    task_count: _task_count,
                     name,
                     args_json,
                 } => {
-                    self.flush_buffered_assistant_output();
                     self.progress_seq = self.progress_seq.saturating_add(1);
-                    self.streaming_line = None;
                     let preview = crate::tool_display::extract_tool_preview(&name, &args_json);
                     let detail = if preview.is_empty() {
                         name.clone()
@@ -12315,15 +12394,30 @@ impl App {
                         status.last_detail = Some(detail.clone());
                         status.last_seq = self.progress_seq;
                     }
-                    self.output.push(OutputLine {
-                        text: String::new(),
-                        role: OutputRole::Tool,
-                        prebuilt_spans: Some(build_subagent_event_line(
-                            task_index, task_count, "tool", &detail, "running",
-                        )),
-                        rendered: None,
-                        plain_rendered: None,
-                    });
+                    // Update the running placeholder in-place — do NOT push a new line.
+                    // Showing every sub-agent tool call as a permanent line creates
+                    // O(tool_calls × subagents) output noise.
+                    if let Some(pending) = self.pending_subagent_lines.get(&task_index) {
+                        let line_idx = pending.line_idx;
+                        let goal = pending.goal.clone();
+                        let task_count = pending.task_count;
+                        let elapsed = pending.started_at.elapsed().as_secs();
+                        if line_idx < self.output.len() {
+                            let widths = DisplayWidths::from_terminal_width(
+                                self.last_terminal_width as usize,
+                            );
+                            self.output[line_idx].prebuilt_spans =
+                                Some(build_subagent_running_line_width(
+                                    task_index,
+                                    task_count,
+                                    &goal,
+                                    Some(&detail),
+                                    elapsed,
+                                    &widths,
+                                ));
+                            self.output[line_idx].invalidate_render_cache();
+                        }
+                    }
                     if self.at_bottom {
                         self.scroll_offset = 0;
                     }
@@ -12340,41 +12434,31 @@ impl App {
                 } => {
                     self.active_subagents.remove(&task_index);
                     self.streaming_line = None;
-                    let mut parts = vec![
-                        format!("{} in {:.1}s", status, duration_ms as f64 / 1000.0),
-                        format!("api {api_calls}"),
-                    ];
-                    if let Some(model) = model.filter(|m| !m.is_empty()) {
-                        parts.push(model);
-                    }
-                    if !summary.trim().is_empty() {
-                        parts.push(
-                            summary
-                                .lines()
-                                .next()
-                                .unwrap_or_default()
-                                .trim()
-                                .to_string(),
-                        );
-                    }
-                    let tone = if status == "completed" {
-                        "success"
+                    let is_error = status != "completed";
+                    let widths =
+                        DisplayWidths::from_terminal_width(self.last_terminal_width as usize);
+                    let done_spans = build_subagent_done_line_width(
+                        task_index,
+                        task_count,
+                        is_error,
+                        duration_ms,
+                        api_calls,
+                        model.as_deref().filter(|m| !m.is_empty()),
+                        summary.trim(),
+                        &widths,
+                    );
+                    // Replace the running placeholder in-place; fall back to append when
+                    // the placeholder is missing (e.g. session restore, race condition).
+                    if let Some(pending) = self.pending_subagent_lines.remove(&task_index) {
+                        if pending.line_idx < self.output.len() {
+                            self.output[pending.line_idx].prebuilt_spans = Some(done_spans);
+                            self.output[pending.line_idx].invalidate_render_cache();
+                        } else {
+                            self.push_output_spans(done_spans, OutputRole::Tool);
+                        }
                     } else {
-                        "error"
-                    };
-                    self.output.push(OutputLine {
-                        text: String::new(),
-                        role: OutputRole::Tool,
-                        prebuilt_spans: Some(build_subagent_event_line(
-                            task_index,
-                            task_count,
-                            "subagent",
-                            &parts.join("  "),
-                            tone,
-                        )),
-                        rendered: None,
-                        plain_rendered: None,
-                    });
+                        self.push_output_spans(done_spans, OutputRole::Tool);
+                    }
                     if self.at_bottom {
                         self.scroll_offset = 0;
                     }
@@ -12472,14 +12556,11 @@ impl App {
                     } else {
                         // Surface the approval overlay.
                         self.display_state = DisplayState::WaitingForApproval {
-                            command: if command.len() > 50 {
-                                format!("{}…", edgecrab_core::safe_truncate(&command, 47))
-                            } else {
-                                command
-                            },
+                            command: command.clone(),
                             full_command,
                             selected: 0,
                             show_full: false,
+                            scroll_offset: 0,
                         };
                         self.approval_pending_tx = Some(response_tx);
                         self.needs_redraw = true;
@@ -12847,6 +12928,24 @@ impl App {
                 } = self.display_state
                 {
                     *show_full = !*show_full;
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let DisplayState::WaitingForApproval {
+                    ref mut scroll_offset,
+                    ..
+                } = self.display_state
+                {
+                    *scroll_offset = scroll_offset.saturating_add(1);
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let DisplayState::WaitingForApproval {
+                    ref mut scroll_offset,
+                    ..
+                } = self.display_state
+                {
+                    *scroll_offset = scroll_offset.saturating_sub(1);
                 }
             }
             KeyCode::Enter => {
@@ -21040,6 +21139,9 @@ impl App {
 
     /// Render the full application frame.
     pub fn render(&mut self, frame: &mut Frame) {
+        // Cache terminal width for event handlers that build tool display spans
+        self.last_terminal_width = frame.area().width;
+
         let textarea_height = self.input_area_height_for_area(frame.area());
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -21631,7 +21733,13 @@ impl App {
                         .as_deref()
                         .filter(|detail| !detail.trim().is_empty())
                         .map(|detail| edgecrab_core::safe_truncate(detail.trim(), 60).to_string())
-                        .unwrap_or_else(|| tool_status_preview(name, args_json));
+                        .unwrap_or_else(|| {
+                            // Use width-adaptive preview — status bar has more room on wide terminals.
+                            let widths = DisplayWidths::from_terminal_width(
+                                self.last_terminal_width as usize,
+                            );
+                            tool_status_preview_width(name, args_json, widths.status_preview)
+                        });
                     format!(" {spinner} {verb} {icon} {preview}{time_part}{stop_hint} ")
                 };
                 left_spans.push(Span::styled(
@@ -21770,6 +21878,18 @@ impl App {
             format!(" ${:.4}", self.session_cost),
             cost_style,
         ));
+
+        // ── Context pressure gauge ───────────────────────────────────
+        if self.context_window.is_some() {
+            left_spans.push(Span::styled(
+                " │ ",
+                Style::default().fg(Color::Rgb(50, 50, 65)),
+            ));
+            let gauge_spans =
+                build_context_gauge(self.total_tokens, self.context_window.unwrap_or(0));
+            left_spans.extend(gauge_spans);
+        }
+
         if let Some(presence) = self.voice_presence_state() {
             left_spans.push(Span::styled(
                 " │ ",
@@ -27963,15 +28083,21 @@ impl App {
 
     fn render_approval_overlay(&self, frame: &mut Frame, area: Rect) {
         // Only render when in WaitingForApproval state
-        let (command, show_full, full_command, selected) =
+        let (command, full_command, selected, scroll_offset) =
             if let DisplayState::WaitingForApproval {
                 ref command,
                 ref full_command,
-                show_full,
                 selected,
+                scroll_offset,
+                ..
             } = self.display_state
             {
-                (command.as_str(), show_full, full_command.as_str(), selected)
+                (
+                    command.as_str(),
+                    full_command.as_str(),
+                    selected,
+                    scroll_offset,
+                )
             } else {
                 return;
             };
@@ -27981,14 +28107,19 @@ impl App {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Min(1),    // command display + optional full view
+                Constraint::Min(1),    // command display (wrapped + scrollable)
                 Constraint::Length(3), // choice buttons
                 Constraint::Length(1), // help line
             ])
             .split(area);
 
-        // ── Command display ──────────────────────────────────────────
-        let cmd_text = if show_full { full_command } else { command };
+        // ── Command display — always show full command, wrapped and scrollable ──
+        // Use full_command if it differs from command; otherwise command is already full.
+        let cmd_text = if full_command.is_empty() {
+            command
+        } else {
+            full_command
+        };
         let cmd_lines: Vec<Line> = cmd_text
             .lines()
             .map(|l| {
@@ -28013,7 +28144,8 @@ impl App {
                     .border_style(Style::default().fg(Color::Rgb(255, 140, 0)))
                     .title(" ⚠  Approval required "),
             )
-            .wrap(Wrap { trim: false });
+            .wrap(Wrap { trim: false })
+            .scroll((scroll_offset, 0));
         frame.render_widget(cmd_para, chunks[0]);
 
         // ── Choice buttons ───────────────────────────────────────────
@@ -28032,15 +28164,6 @@ impl App {
             btn_spans.push(Span::styled(format!(" [{label}] "), style));
             btn_spans.push(Span::raw(" "));
         }
-        // View toggle indicator
-        let view_style = if show_full {
-            Style::default()
-                .fg(Color::Rgb(255, 140, 0))
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::Rgb(100, 100, 130))
-        };
-        btn_spans.push(Span::styled(" [v]iew ", view_style));
 
         let buttons = Paragraph::new(Line::from(btn_spans)).block(
             Block::default()
@@ -28053,10 +28176,10 @@ impl App {
         let help = Paragraph::new(Line::from(vec![
             Span::styled(" ← → ", Style::default().fg(Color::Rgb(255, 140, 0))),
             Span::styled("select  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("↑ ↓ ", Style::default().fg(Color::Rgb(255, 140, 0))),
+            Span::styled("scroll  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Enter ", Style::default().fg(Color::Rgb(255, 140, 0))),
             Span::styled("confirm  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("v ", Style::default().fg(Color::Rgb(255, 140, 0))),
-            Span::styled("view full  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Esc ", Style::default().fg(Color::Rgb(255, 140, 0))),
             Span::styled("deny", Style::default().fg(Color::DarkGray)),
         ]));
@@ -31707,6 +31830,7 @@ kind = "skill"
             full_command: "rm -rf /tmp/demo".into(),
             selected: 0,
             show_full: false,
+            scroll_offset: 0,
         };
 
         app.handle_approval_choice_command(edgecrab_core::ApprovalChoice::Session);
@@ -32898,7 +33022,8 @@ kind = "skill"
         app.check_responses();
 
         assert_eq!(app.output.len(), 3);
-        assert!(line_spans_text(&app.output[1]).contains("args"));
+        // Verbose line now shows the command value directly (no "args:" prefix).
+        assert!(line_spans_text(&app.output[1]).contains("cargo"));
         assert!(line_spans_text(&app.output[2]).contains("test result: ok"));
     }
 
