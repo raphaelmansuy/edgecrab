@@ -10,6 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     clang \
     libclang-dev \
     git \
+    make \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
