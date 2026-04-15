@@ -17,7 +17,7 @@ members = [
     "crates/edgecrab-migrate",
 ]
 [workspace.package]
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.86.0"
 license = "Apache-2.0"
@@ -26,18 +26,18 @@ authors = ["Raphael Mansuy"]
 
 [workspace.dependencies]
 # Internal crates
-edgecrab-command-catalog = { path = "crates/edgecrab-command-catalog", version = "0.5.0" }
-edgecrab-types = { path = "crates/edgecrab-types", version = "0.5.0" }
-edgecrab-security = { path = "crates/edgecrab-security", version = "0.5.0" }
-edgecrab-state = { path = "crates/edgecrab-state", version = "0.5.0" }
-edgecrab-plugins = { path = "crates/edgecrab-plugins", version = "0.5.0" }
-edgecrab-cron = { path = "crates/edgecrab-cron", version = "0.5.0" }
-edgecrab-lsp = { path = "crates/edgecrab-lsp", version = "0.5.0" }
-edgecrab-tools = { path = "crates/edgecrab-tools", version = "0.5.0" }
-edgecrab-core = { path = "crates/edgecrab-core", version = "0.5.0" }
-edgecrab-gateway = { path = "crates/edgecrab-gateway", version = "0.5.0" }
-edgecrab-acp = { path = "crates/edgecrab-acp", version = "0.5.0" }
-edgecrab-migrate = { path = "crates/edgecrab-migrate", version = "0.5.0" }
+edgecrab-command-catalog = { path = "crates/edgecrab-command-catalog", version = "0.6.0" }
+edgecrab-types = { path = "crates/edgecrab-types", version = "0.6.0" }
+edgecrab-security = { path = "crates/edgecrab-security", version = "0.6.0" }
+edgecrab-state = { path = "crates/edgecrab-state", version = "0.6.0" }
+edgecrab-plugins = { path = "crates/edgecrab-plugins", version = "0.6.0" }
+edgecrab-cron = { path = "crates/edgecrab-cron", version = "0.6.0" }
+edgecrab-lsp = { path = "crates/edgecrab-lsp", version = "0.6.0" }
+edgecrab-tools = { path = "crates/edgecrab-tools", version = "0.6.0" }
+edgecrab-core = { path = "crates/edgecrab-core", version = "0.6.0" }
+edgecrab-gateway = { path = "crates/edgecrab-gateway", version = "0.6.0" }
+edgecrab-acp = { path = "crates/edgecrab-acp", version = "0.6.0" }
+edgecrab-migrate = { path = "crates/edgecrab-migrate", version = "0.6.0" }
 
 # Shared across workspace — single version for consistency
 serde = { version = "1", features = ["derive"] }
@@ -77,12 +77,12 @@ dialoguer = "0.12"
 unicode-width = "0.2"
 
 # HTTP
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "multipart"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "multipart", "socks"] }
 # Browser-emulating HTTP client (BoringSSL TLS + HTTP/2 fingerprint spoofing).
 # Used by DuckDuckGo search backend to bypass JA3/JA4 bot-detection.
 # Apache-2.0 only — Chrome TLS config set manually inline (no wreq-util GPL-3.0 dep).
 # NOTE: incompatible with openssl-sys; safe here because reqwest uses rustls-tls.
-wreq = { version = "5", default-features = false, features = ["json", "gzip", "brotli", "deflate"] }
+wreq = { version = "5", default-features = false, features = ["json", "gzip", "brotli", "deflate", "socks"] }
 axum = "0.7"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 
@@ -95,6 +95,9 @@ secrecy = { version = "0.10", features = ["serde"] }
 # Crypto
 sha2 = "0.10"
 base64 = "0.22"
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+ecb = { version = "0.1", features = ["alloc"] }
 cron = "0.12"
 urlencoding = "2"
 

@@ -67,7 +67,11 @@ edgecrab/
 │   │       ├── skills_guard.rs Security scanner for external skills
 │   │       └── skills_sync.rs  Manifest-based skill sync/seeding
 │   ├── edgecrab-state/      SQLite WAL + FTS5 session store
-│   ├── edgecrab-security/   Path safety, SSRF guard, command scanner
+│   ├── edgecrab-security/   Path safety, SSRF guard, command scanner, proxy
+│   ├── edgecrab-plugins/    Plugin system (WASM + Lua)
+│   ├── edgecrab-command-catalog/  Slash command definitions catalog
+│   ├── edgecrab-lsp/        Language Server Protocol integration
+│   ├── edgecrab-cron/       Cron job scheduling engine
 │   ├── edgecrab-cli/        ratatui TUI, subcommands, skin engine
 │   │   ├── main.rs          Entry point — CLI subcommand dispatch
 │   │   ├── app.rs           TUI App event loop (ratatui)
@@ -85,7 +89,8 @@ edgecrab/
 │   │   ├── pairing.rs       Code-based DM approval for new gateway users
 │   │   ├── mirror.rs        Cross-platform session mirroring
 │   │   └── platforms/       Adapters: telegram, discord, slack, whatsapp, signal, webhook,
-│   │                        sms, matrix, mattermost, dingtalk, homeassistant, api_server, email
+│   │                        sms, matrix, mattermost, dingtalk, homeassistant, api_server,
+│   │                        email, feishu, wecom, bluebubbles, weixin
 │   ├── edgecrab-acp/        ACP JSON-RPC 2.0 stdio adapter (VS Code integration)
 │   └── edgecrab-migrate/    Import hermes-agent config/memories/skills
 └── docs/                    Architecture docs, guides, feature specs
@@ -103,7 +108,7 @@ edgecrab-state   (types)
      ↑
 edgecrab-core    (tools + state + security + types)
      ↑
-edgecrab-cli, edgecrab-gateway, edgecrab-acp, edgecrab-migrate
+edgecrab-cli, edgecrab-gateway, edgecrab-acp, edgecrab-migrate, edgecrab-plugins
 ```
 
 ---
@@ -118,6 +123,7 @@ AgentBuilder::new("anthropic/claude-opus-4.6")
     .tools(registry)             // Arc<ToolRegistry>
     .state_db(db)                // Arc<SessionDb>
     .config(cfg)                 // AgentConfig
+    .context_engine(engine)      // Optional Arc<dyn ContextEngine>
     .build()?  →  Agent
 
 // Simple interface
@@ -370,7 +376,7 @@ The `send_message` tool (in `advanced.rs`) uses the `GatewaySender` trait to sen
 | Memory | `/memory` |
 | Analysis | `/cost` `/usage` `/compress` `/insights` |
 | Appearance | `/theme` `/paste` |
-| Advanced | `/queue` `/background` `/rollback [checkpoint]` |
+| Advanced | `/queue` `/background` `/rollback [checkpoint]` `/debug` `/dump` |
 | Gateway | `/platforms` `/approve` `/deny` `/sethome` `/update` |
 | Scheduling | `/cron` |
 | Media | `/voice <on\|off\|status>` |
@@ -438,6 +444,10 @@ Platform adapters implement `PlatformAdapter` trait. Available platforms:
 | Home Assistant | `homeassistant.rs` | `HASS_URL`, `HASS_TOKEN` |
 | API Server | `api_server.rs` | `API_SERVER_PORT` *(optional)* |
 | Email | `email.rs` | `EMAIL_PROVIDER`, `EMAIL_FROM`, provider-specific SMTP/API credentials |
+| Feishu/Lark | `feishu.rs` | `FEISHU_APP_ID`, `FEISHU_APP_SECRET` |
+| WeCom | `wecom.rs` | `WECOM_BOT_ID`, `WECOM_SECRET` |
+| BlueBubbles (iMessage) | `bluebubbles.rs` | `BLUEBUBBLES_SERVER_URL`, `BLUEBUBBLES_PASSWORD` |
+| WeChat (Weixin) | `weixin.rs` | `WEIXIN_TOKEN`, `WEIXIN_ACCOUNT_ID` |
 
 ### Gateway Features
 
@@ -525,12 +535,43 @@ db.get_messages(session_id)?;
 | Layer | Protection | Crate |
 |-------|-----------|-------|
 | File I/O | Path traversal — canonicalize + check against allowed root | `edgecrab-security` |
-| Web tools | SSRF — block private IPs (10.x, 192.168.x, 172.16.x, 127.x, ::1) | `edgecrab-security` |
+| Web tools | SSRF — block private IPs (10.x, 192.168.x, 172.16.x, 127.x, ::1) + hardened HTTP client | `edgecrab-security` |
 | Terminal | Command injection scan — reject shell metacharacters in args | `edgecrab-security` |
 | Context files | Prompt injection scan — regex + invisible unicode + homoglyphs | `edgecrab-core` |
 | Memory writes | Injection patterns blocked before persisting | `edgecrab-tools` |
 | LLM output | Redaction pipeline — strip secrets/tokens before display | `edgecrab-core` |
 | State DB | WAL mode + integrity checks | `edgecrab-state` |
+| Gateway webhooks | Twilio signature validation, Weixin XML encryption | `edgecrab-gateway` |
+| HTTP proxy | Optional `HTTPS_PROXY`/`HTTP_PROXY` support for outbound requests | `edgecrab-security` |
+
+---
+
+## Context Engine (edgecrab-core)
+
+The Context Engine is a pluggable system for injecting external tool schemas into the agent's ReAct loop. When an `Arc<dyn ContextEngine>` is provided to `AgentBuilder::context_engine()`, the engine's tool schemas are appended to the active tool definitions before each LLM call.
+
+```rust
+AgentBuilder::new("anthropic/claude-opus-4.6")
+    .context_engine(my_engine)   // injects engine tool schemas into the loop
+    .build()?
+```
+
+**Config key:** `context.engine` in `config.yaml` (optional string naming the engine implementation).
+
+---
+
+## Termux / Android Support
+
+EdgeCrab can be built for Android via Termux with the `termux` feature flag:
+
+```bash
+make build-termux   # cross-compile: cargo build --release --target aarch64-linux-android --features termux
+```
+
+When running on Termux:
+- **TUI compact mode** — `IS_TERMUX` or terminal width < 60 cols automatically selects `BasicCompat` UI profile
+- **Path jail** — Termux data directory (`$PREFIX` or `/data/data/com.termux/files`) is added as an allowed root for file tools
+- **Feature flag** — `#[cfg(feature = "termux")]` gates Termux-specific behavior in `edgecrab-cli`
 
 ---
 

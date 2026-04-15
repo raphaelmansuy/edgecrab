@@ -84,6 +84,15 @@ pub async fn run(config_override: Option<&str>) -> anyhow::Result<bool> {
     // can hang and create zombie processes on some terminal hosts.
     checks.push(check_provider_ping(&context).await);
 
+    // Termux-specific checks
+    if *edgecrab_types::IS_TERMUX {
+        checks.push(Check::warn(
+            "Termux",
+            "Running inside Termux — some features may be unavailable (browser, TTS, STT)",
+        ));
+        checks.push(check_termux_storage());
+    }
+
     // Print results
     let label_width = checks.iter().map(|c| c.label.len()).max().unwrap_or(20) + 2;
 
@@ -624,6 +633,22 @@ fn detect_best_provider() -> String {
     }
 }
 
+/// Termux: check if shared storage has been set up.
+fn check_termux_storage() -> Check {
+    let storage = std::path::PathBuf::from(
+        std::env::var("HOME").unwrap_or_else(|_| "/data/data/com.termux/files/home".into()),
+    )
+    .join("storage");
+    if storage.exists() {
+        Check::pass("Termux storage", "~/storage linked (termux-setup-storage was run)")
+    } else {
+        Check::warn(
+            "Termux storage",
+            "~/storage not found — run `termux-setup-storage` to access device files",
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -749,5 +774,23 @@ mod tests {
         let check = permission_check("Accessibility", MacosConsentState::Denied, "fix it");
         assert_eq!(check.status, CheckStatus::Warn);
         assert!(check.detail.contains("cached TCC state"));
+    }
+
+    #[test]
+    fn is_termux_false_on_desktop() {
+        // In normal CI/dev, TERMUX_VERSION is not set
+        if std::env::var("TERMUX_VERSION").is_err() {
+            assert!(!edgecrab_types::is_termux());
+        }
+    }
+
+    #[test]
+    fn check_termux_storage_returns_check() {
+        let check = check_termux_storage();
+        // On desktop: ~/storage almost certainly doesn't exist → warn
+        // On Termux with setup-storage: exists → pass
+        assert!(
+            check.status == CheckStatus::Pass || check.status == CheckStatus::Warn
+        );
     }
 }

@@ -303,6 +303,8 @@ fn resolve_home_channel(platform: Platform) -> Option<String> {
         Platform::Sms => "SMS_HOME_CHANNEL",
         Platform::Webhook => "WEBHOOK_HOME_CHANNEL",
         Platform::HomeAssistant => "HOMEASSISTANT_HOME_CHANNEL",
+        Platform::BlueBubbles => "BLUEBUBBLES_HOME_CHANNEL",
+        Platform::Weixin => "WEIXIN_HOME_CHANNEL",
         Platform::Api => "API_HOME_CHANNEL",
         Platform::Cli | Platform::Cron | Platform::Acp => return None,
     };

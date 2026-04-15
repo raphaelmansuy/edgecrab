@@ -31,3 +31,22 @@ pub use usage::{Cost, Usage};
 
 /// Crate-level Result alias
 pub type Result<T> = std::result::Result<T, AgentError>;
+
+// ─── Termux / Android detection ──────────────────────────────────────
+
+/// Returns `true` if running inside Termux on Android.
+///
+/// Detection checks:
+/// 1. `TERMUX_VERSION` env var is set
+/// 2. `PREFIX` env var contains `com.termux/files/usr`
+pub fn is_termux() -> bool {
+    std::env::var("TERMUX_VERSION").is_ok()
+        || std::env::var("PREFIX")
+            .map(|p| p.contains("com.termux/files/usr"))
+            .unwrap_or(false)
+}
+
+/// Cached result of [`is_termux()`]. Env vars don't change mid-process,
+/// so we evaluate once at first access.
+pub static IS_TERMUX: std::sync::LazyLock<bool> = std::sync::LazyLock::new(is_termux);
+

@@ -869,6 +869,7 @@ mod tests {
             current_tool_name: None,
             injected_messages: None,
             tool_progress_tx: None,
+            watch_notification_tx: None,
         };
 
         let target = resolve_explicit_target(&ctx, "openai", "gpt-4o", Some(&models))

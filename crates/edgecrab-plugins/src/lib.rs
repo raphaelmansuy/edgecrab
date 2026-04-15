@@ -1,4 +1,5 @@
 pub mod config;
+pub mod context;
 pub mod discovery;
 pub mod error;
 pub mod guard;
@@ -10,6 +11,8 @@ pub mod script;
 pub mod skill;
 pub mod tool_server;
 pub mod types;
+
+pub use context::{ContextEngineManifest, discover_context_engines, find_context_engine_manifest};
 
 pub use config::{
     HostApiLimitsConfig, HubSource, PluginOverrideConfig, PluginSecurityConfig, PluginsConfig,

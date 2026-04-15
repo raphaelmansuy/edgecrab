@@ -450,7 +450,7 @@ mod tests {
     }
 }
 
-pub fn build_agent(
+pub async fn build_agent(
     runtime: &RuntimeContext,
     provider: Arc<dyn LLMProvider>,
     state_db: Arc<SessionDb>,
@@ -465,6 +465,16 @@ pub fn build_agent(
         .tools(tool_registry)
         .platform(platform)
         .quiet_mode(quiet);
+
+    // Config-driven context engine loading (ADR-0605)
+    if let Some(ref engine_name) = runtime.config.context.engine {
+        let ctx_length = 128_000_usize; // informational; conversation.rs uses model catalog
+        let threshold = runtime.config.compression.threshold as f64;
+        let engine =
+            edgecrab_core::context_engine::load_context_engine(Some(engine_name), ctx_length, threshold)
+                .await;
+        builder = builder.context_engine(engine);
+    }
 
     if let Some(session_id) = session_id {
         builder = builder.session_id(session_id);

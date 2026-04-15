@@ -39,19 +39,60 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const DEDUP_TTL: Duration = Duration::from_secs(60 * 5);
 const MAX_MESSAGE_LENGTH: usize = 4000;
-const BACKOFF_STEPS: &[u64] = &[2, 5, 10, 30];
+const BACKOFF_STEPS: &[u64] = &[2, 5, 10, 30, 60];
 const UPLOAD_CHUNK_SIZE: usize = 512 * 1024;
 const MAX_UPLOAD_CHUNKS: usize = 100;
+
+// Media size limits — auto-downgrade to file if exceeded
+const MAX_IMAGE_SIZE: u64 = 10 * 1024 * 1024; // 10 MB
+#[allow(dead_code)]
+const MAX_VOICE_SIZE: u64 = 2 * 1024 * 1024; // 2 MB
+#[allow(dead_code)]
+const MAX_VIDEO_SIZE: u64 = 10 * 1024 * 1024; // 10 MB
+const MAX_FILE_SIZE: u64 = 20 * 1024 * 1024; // 20 MB
+
+// Text batching quiet windows
+const BATCH_QUIET_NORMAL: Duration = Duration::from_millis(600);
+const BATCH_QUIET_LONG: Duration = Duration::from_millis(2000);
+const BATCH_LONG_THRESHOLD: usize = 3900;
+
+/// DM/group access policy — mirrors Weixin AccessPolicy
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum WeComAccessPolicy {
+    Open,
+    AllowList,
+    Disabled,
+}
+
+impl WeComAccessPolicy {
+    fn from_env(key: &str, default: Self) -> Self {
+        match env::var(key).unwrap_or_default().to_ascii_lowercase().as_str() {
+            "open" => Self::Open,
+            "allow_list" | "allowlist" => Self::AllowList,
+            "disabled" | "off" => Self::Disabled,
+            _ => default,
+        }
+    }
+}
 
 pub struct WeComAdapter {
     bot_id: String,
     secret: String,
     ws_url: String,
     allowed_users: Arc<HashSet<String>>,
+    dm_policy: WeComAccessPolicy,
+    group_policy: WeComAccessPolicy,
     outbound_tx: Arc<Mutex<Option<mpsc::UnboundedSender<String>>>>,
     pending: Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>>,
     seen_messages: Arc<Mutex<HashMap<String, Instant>>>,
     reply_req_ids: Arc<Mutex<HashMap<String, String>>>,
+    text_batch: Arc<Mutex<HashMap<String, TextBatch>>>,
+}
+
+/// Accumulator for rapid successive text messages from the same user.
+struct TextBatch {
+    parts: Vec<String>,
+    started: Instant,
 }
 
 impl WeComAdapter {
@@ -70,10 +111,13 @@ impl WeComAdapter {
                 .trim()
                 .to_string(),
             allowed_users: Arc::new(parse_csv_set("WECOM_ALLOWED_USERS")),
+            dm_policy: WeComAccessPolicy::from_env("WECOM_DM_POLICY", WeComAccessPolicy::Open),
+            group_policy: WeComAccessPolicy::from_env("WECOM_GROUP_POLICY", WeComAccessPolicy::Disabled),
             outbound_tx: Arc::new(Mutex::new(None)),
             pending: Arc::new(Mutex::new(HashMap::new())),
             seen_messages: Arc::new(Mutex::new(HashMap::new())),
             reply_req_ids: Arc::new(Mutex::new(HashMap::new())),
+            text_batch: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -322,6 +366,9 @@ impl PlatformAdapter for WeComAdapter {
                 self.pending.clone(),
                 self.seen_messages.clone(),
                 self.reply_req_ids.clone(),
+                self.text_batch.clone(),
+                self.dm_policy,
+                self.group_policy,
             ));
             let writer = tokio::spawn(connection_writer(write, out_rx));
 
@@ -342,9 +389,29 @@ impl PlatformAdapter for WeComAdapter {
                 return Err(err);
             }
 
+            // Spawn heartbeat loop — ping every 30s to keep the WS alive
+            let heartbeat_tx = self.outbound_tx.clone();
+            let heartbeat = tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(30));
+                interval.tick().await; // skip first immediate tick
+                loop {
+                    interval.tick().await;
+                    let guard = heartbeat_tx.lock().await;
+                    if let Some(tx) = guard.as_ref() {
+                        let ping_msg = json!({"cmd": APP_CMD_PING}).to_string();
+                        if tx.send(ping_msg).is_err() {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            });
+
             match reader.await {
                 Ok(Ok(())) => {
                     clear_connection(&self.outbound_tx, &pending).await;
+                    heartbeat.abort();
                     writer.abort();
                     anyhow::bail!("WeCom reader exited unexpectedly");
                 }
@@ -357,6 +424,7 @@ impl PlatformAdapter for WeComAdapter {
             }
 
             clear_connection(&self.outbound_tx, &pending).await;
+            heartbeat.abort();
             writer.abort();
             tokio::time::sleep(Duration::from_secs(BACKOFF_STEPS[backoff_index])).await;
             backoff_index = (backoff_index + 1).min(BACKOFF_STEPS.len() - 1);
@@ -402,7 +470,9 @@ impl PlatformAdapter for WeComAdapter {
         caption: Option<&str>,
         metadata: &MessageMetadata,
     ) -> anyhow::Result<()> {
-        self.send_media_path(path, "image", caption, metadata).await
+        let file_size = tokio::fs::metadata(path).await?.len();
+        let media_type = if file_size > MAX_IMAGE_SIZE { "file" } else { "image" };
+        self.send_media_path(path, media_type, caption, metadata).await
     }
 
     async fn send_document(
@@ -411,6 +481,14 @@ impl PlatformAdapter for WeComAdapter {
         caption: Option<&str>,
         metadata: &MessageMetadata,
     ) -> anyhow::Result<()> {
+        let file_size = tokio::fs::metadata(path).await?.len();
+        if file_size > MAX_FILE_SIZE {
+            anyhow::bail!(
+                "WeCom file exceeds maximum size ({} > {} bytes)",
+                file_size,
+                MAX_FILE_SIZE
+            );
+        }
         self.send_media_path(path, "file", caption, metadata).await
     }
 }
@@ -437,6 +515,7 @@ where
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn connection_reader<S>(
     mut read: S,
     tx: mpsc::Sender<IncomingMessage>,
@@ -444,6 +523,9 @@ async fn connection_reader<S>(
     pending: Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>>,
     seen_messages: Arc<Mutex<HashMap<String, Instant>>>,
     reply_req_ids: Arc<Mutex<HashMap<String, String>>>,
+    text_batch: Arc<Mutex<HashMap<String, TextBatch>>>,
+    dm_policy: WeComAccessPolicy,
+    group_policy: WeComAccessPolicy,
 ) -> anyhow::Result<()>
 where
     S: Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
@@ -469,12 +551,81 @@ where
 
                 if is_callback_command(&cmd) {
                     if let Some(message) =
-                        parse_callback(&payload, &allowed_users, &seen_messages).await?
+                        parse_callback(&payload, &allowed_users, &seen_messages, dm_policy, group_policy).await?
                     {
+                        // Text batching: accumulate rapid successive messages from same user
+                        let user_key = message.user_id.clone();
+                        let text_len = message.text.len();
+                        let should_flush;
+                        {
+                            let mut batch = text_batch.lock().await;
+                            let entry = batch.entry(user_key.clone()).or_insert_with(|| TextBatch {
+                                parts: Vec::new(),
+                                started: Instant::now(),
+                            });
+                            entry.parts.push(message.text.clone());
+
+                            // Determine quiet window based on text length
+                            let quiet_window = if text_len >= BATCH_LONG_THRESHOLD {
+                                BATCH_QUIET_LONG
+                            } else {
+                                BATCH_QUIET_NORMAL
+                            };
+
+                            // If this is the first part, start the timer
+                            if entry.parts.len() == 1 {
+                                should_flush = false;
+                            } else {
+                                // Check if the batch has been quiet for long enough
+                                should_flush = entry.started.elapsed() >= quiet_window;
+                            }
+                        }
+
                         if let Some(message_id) = message.metadata.message_id.clone() {
                             reply_req_ids.lock().await.insert(message_id, req_id);
                         }
-                        let _ = tx.send(message).await;
+
+                        // Spawn a delayed flush task for this user's batch
+                        let tx_clone = tx.clone();
+                        let batch_clone = text_batch.clone();
+                        let msg_template = message.clone();
+                        let quiet_window = if text_len >= BATCH_LONG_THRESHOLD {
+                            BATCH_QUIET_LONG
+                        } else {
+                            BATCH_QUIET_NORMAL
+                        };
+
+                        let user_key_spawn = user_key.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(quiet_window).await;
+                            let mut batch = batch_clone.lock().await;
+                            if let Some(entry) = batch.remove(&user_key_spawn) {
+                                if !entry.parts.is_empty() {
+                                    let merged_text = entry.parts.join("\n");
+                                    let merged_msg = IncomingMessage {
+                                        text: merged_text,
+                                        ..msg_template
+                                    };
+                                    let _ = tx_clone.send(merged_msg).await;
+                                }
+                            }
+                        });
+
+                        // If should_flush (batch already waited long enough), cancel the delayed flush
+                        // by removing the entry now — the spawned task will find nothing
+                        if should_flush {
+                            let mut batch = text_batch.lock().await;
+                            if let Some(entry) = batch.remove(&user_key) {
+                                if !entry.parts.is_empty() {
+                                    let merged_text = entry.parts.join("\n");
+                                    let merged_msg = IncomingMessage {
+                                        text: merged_text,
+                                        ..message
+                                    };
+                                    let _ = tx.send(merged_msg).await;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -490,6 +641,8 @@ async fn parse_callback(
     payload: &Value,
     allowed_users: &HashSet<String>,
     seen_messages: &Arc<Mutex<HashMap<String, Instant>>>,
+    dm_policy: WeComAccessPolicy,
+    group_policy: WeComAccessPolicy,
 ) -> anyhow::Result<Option<IncomingMessage>> {
     let body = match payload.get("body") {
         Some(value) => value,
@@ -519,9 +672,6 @@ async fn parse_callback(
     if user_id.is_empty() {
         return Ok(None);
     }
-    if !user_is_allowed(allowed_users, &user_id) {
-        return Ok(None);
-    }
 
     let channel_id = body
         .get("chatid")
@@ -534,6 +684,26 @@ async fn parse_callback(
         return Ok(None);
     }
 
+    // Determine chat type: if chatid != userid, it's a group chat
+    let is_group = channel_id != user_id;
+    let chat_type = if is_group {
+        crate::platform::ChatType::Group
+    } else {
+        crate::platform::ChatType::Dm
+    };
+
+    // Enforce DM/group access policy
+    let policy = if is_group { group_policy } else { dm_policy };
+    match policy {
+        WeComAccessPolicy::Disabled => return Ok(None),
+        WeComAccessPolicy::AllowList => {
+            if !user_is_allowed(allowed_users, &user_id) {
+                return Ok(None);
+            }
+        }
+        WeComAccessPolicy::Open => {}
+    }
+
     let text = extract_text(body);
     if text.trim().is_empty() {
         return Ok(None);
@@ -543,7 +713,7 @@ async fn parse_callback(
         platform: Platform::Wecom,
         user_id,
         channel_id: Some(channel_id.clone()),
-        chat_type: crate::platform::ChatType::Dm,
+        chat_type,
         text,
         thread_id: None,
         metadata: MessageMetadata {
@@ -629,7 +799,7 @@ fn payload_req_id(payload: &Value) -> String {
 }
 
 fn is_callback_command(cmd: &str) -> bool {
-    matches!(cmd, APP_CMD_CALLBACK | APP_CMD_LEGACY_CALLBACK)
+    matches!(cmd, APP_CMD_CALLBACK | APP_CMD_LEGACY_CALLBACK | "aibot_event_callback")
 }
 
 fn raise_if_wecom_error(payload: &Value) -> anyhow::Result<()> {
@@ -733,16 +903,18 @@ mod tests {
         let allowed = HashSet::from([String::from("WECOM:USER:ALICE")]);
         let seen = Arc::new(Mutex::new(HashMap::new()));
 
-        let first = parse_callback(&payload, &allowed, &seen)
+        let first = parse_callback(&payload, &allowed, &seen, WeComAccessPolicy::Open, WeComAccessPolicy::Open)
             .await
             .expect("first parse");
-        let second = parse_callback(&payload, &allowed, &seen)
+        let second = parse_callback(&payload, &allowed, &seen, WeComAccessPolicy::Open, WeComAccessPolicy::Open)
             .await
             .expect("second parse");
         let blocked = parse_callback(
             &payload,
             &HashSet::from([String::from("bob")]),
             &Arc::new(Mutex::new(HashMap::new())),
+            WeComAccessPolicy::AllowList,
+            WeComAccessPolicy::AllowList,
         )
         .await
         .expect("blocked parse");
@@ -826,10 +998,13 @@ mod tests {
             secret: "secret".into(),
             ws_url: format!("ws://{addr}"),
             allowed_users: Arc::new(HashSet::new()),
+            dm_policy: WeComAccessPolicy::Open,
+            group_policy: WeComAccessPolicy::Open,
             outbound_tx: Arc::new(Mutex::new(None)),
             pending: Arc::new(Mutex::new(HashMap::new())),
             seen_messages: Arc::new(Mutex::new(HashMap::new())),
             reply_req_ids: Arc::new(Mutex::new(HashMap::new())),
+            text_batch: Arc::new(Mutex::new(HashMap::new())),
         });
 
         let (tx, mut rx) = mpsc::channel(4);
@@ -992,10 +1167,13 @@ mod tests {
             secret: "secret".into(),
             ws_url: format!("ws://{addr}"),
             allowed_users: Arc::new(HashSet::new()),
+            dm_policy: WeComAccessPolicy::Open,
+            group_policy: WeComAccessPolicy::Open,
             outbound_tx: Arc::new(Mutex::new(None)),
             pending: Arc::new(Mutex::new(HashMap::new())),
             seen_messages: Arc::new(Mutex::new(HashMap::new())),
             reply_req_ids: Arc::new(Mutex::new(HashMap::new())),
+            text_batch: Arc::new(Mutex::new(HashMap::new())),
         });
 
         let temp = tempfile::NamedTempFile::new().expect("temp");
@@ -1032,5 +1210,82 @@ mod tests {
 
         run_task.abort();
         let _ = server.await;
+    }
+
+    #[test]
+    fn wecom_access_policy_from_env() {
+        assert_eq!(
+            WeComAccessPolicy::from_env("__NONEXISTENT_POLICY__", WeComAccessPolicy::Open),
+            WeComAccessPolicy::Open
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_callback_group_policy_disabled_blocks() {
+        let payload = json!({
+            "cmd": APP_CMD_CALLBACK,
+            "headers": { "req_id": "incoming-g1" },
+            "body": {
+                "msgid": "msg-g1",
+                "chatid": "group-room-1",
+                "msgtype": "text",
+                "from": { "userid": "alice" },
+                "text": { "content": "hello group" }
+            }
+        });
+        let allowed = HashSet::new();
+        let seen = Arc::new(Mutex::new(HashMap::new()));
+
+        // Group policy disabled should block
+        let result = parse_callback(
+            &payload,
+            &allowed,
+            &seen,
+            WeComAccessPolicy::Open,
+            WeComAccessPolicy::Disabled,
+        )
+        .await
+        .expect("parse");
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn parse_callback_detects_dm_vs_group() {
+        let dm_payload = json!({
+            "cmd": APP_CMD_CALLBACK,
+            "headers": { "req_id": "req-dm" },
+            "body": {
+                "msgid": "msg-dm-1",
+                "chatid": "alice",
+                "msgtype": "text",
+                "from": { "userid": "alice" },
+                "text": { "content": "direct message" }
+            }
+        });
+        let group_payload = json!({
+            "cmd": APP_CMD_CALLBACK,
+            "headers": { "req_id": "req-grp" },
+            "body": {
+                "msgid": "msg-grp-1",
+                "chatid": "group-chat-123",
+                "msgtype": "text",
+                "from": { "userid": "alice" },
+                "text": { "content": "group message" }
+            }
+        });
+        let allowed = HashSet::new();
+        let seen = Arc::new(Mutex::new(HashMap::new()));
+
+        let dm = parse_callback(&dm_payload, &allowed, &seen, WeComAccessPolicy::Open, WeComAccessPolicy::Open)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(dm.chat_type, crate::platform::ChatType::Dm);
+
+        let grp = parse_callback(&group_payload, &allowed, &seen, WeComAccessPolicy::Open, WeComAccessPolicy::Open)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(grp.chat_type, crate::platform::ChatType::Group);
     }
 }

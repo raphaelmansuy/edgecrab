@@ -220,9 +220,9 @@ impl SlackAdapter {
         let app_token = env::var("SLACK_APP_TOKEN")
             .map_err(|_| anyhow::anyhow!("SLACK_APP_TOKEN environment variable not set"))?;
 
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()?;
+        let client = edgecrab_security::url_safety::build_ssrf_safe_client(
+            Duration::from_secs(30),
+        );
 
         Ok(Self {
             bot_token,
@@ -240,9 +240,9 @@ impl SlackAdapter {
         app_token: String,
         allowed_users: Vec<String>,
     ) -> anyhow::Result<Self> {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()?;
+        let client = edgecrab_security::url_safety::build_ssrf_safe_client(
+            Duration::from_secs(30),
+        );
         Ok(Self {
             bot_token,
             app_token,

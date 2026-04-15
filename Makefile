@@ -16,7 +16,7 @@
 
 .DEFAULT_GOAL := help
 .PHONY: help \
-        build build-debug run run-release check fmt fmt-check lint test test-lsp ci \
+        build build-debug build-termux run run-release check fmt fmt-check lint test test-lsp ci \
         install uninstall \
         test-python test-node test-sdks \
         publish-rust publish-rust-dry \
@@ -87,6 +87,11 @@ build: ## Build optimised release binary
 build-debug: ## Build debug binary
 	$(call log,cargo build)
 	@cargo build
+
+build-termux: ## Cross-compile for Termux/Android (aarch64-linux-android)
+	$(call log,cargo build --release --target aarch64-linux-android --features termux)
+	@cargo build --release --target aarch64-linux-android --features termux
+	$(call ok,Termux binary ready: target/aarch64-linux-android/release/edgecrab)
 
 run: ## Run the edgecrab CLI from the workspace root (debug build). Pass ARGS='...'
 	$(call log,cargo run -p edgecrab-cli --bin edgecrab -- $(ARGS))

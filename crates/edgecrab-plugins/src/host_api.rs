@@ -365,6 +365,7 @@ mod tests {
             current_tool_name: Some("plugin_tool".into()),
             injected_messages: None,
             tool_progress_tx: None,
+            watch_notification_tx: None,
         }
     }
 

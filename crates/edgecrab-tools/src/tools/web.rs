@@ -2407,6 +2407,9 @@ fn validate_url(url: &str, tool: &str) -> Result<(), ToolError> {
 /// WHY inline TLS config (not wreq-util):
 ///   wreq-util is GPL-3.0 — incompatible with this project's Apache-2.0 licence.
 ///   Chrome TLS settings (cipher list, sigalgs, curves) are hardcoded inline.
+///
+/// Automatically wires proxy from environment variables via
+/// [`edgecrab_security::proxy::resolve_proxy_url()`] (6-level cascade).
 fn build_chrome_client(tool: &str) -> Result<wreq::Client, ToolError> {
     use wreq::{
         EmulationProvider, SslCurve,
@@ -2465,9 +2468,28 @@ fn build_chrome_client(tool: &str) -> Result<wreq::Client, ToolError> {
         .default_headers(headers)
         .build();
 
-    wreq::Client::builder()
+    let mut builder = wreq::Client::builder()
         .emulation(provider)
-        .timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(15));
+
+    // Wire proxy from environment variables (6-level cascade)
+    if let Some(proxy_url) = edgecrab_security::proxy::resolve_proxy_url(None) {
+        match wreq::Proxy::all(&proxy_url) {
+            Ok(proxy) => {
+                tracing::debug!(url = %proxy_url, "Chrome-emulating client: using proxy");
+                builder = builder.proxy(proxy);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    url = %proxy_url,
+                    error = %e,
+                    "Chrome-emulating client: invalid proxy URL, proceeding without proxy"
+                );
+            }
+        }
+    }
+
+    builder
         .build()
         .map_err(|e| ToolError::ExecutionFailed {
             tool: tool.into(),
@@ -2481,15 +2503,14 @@ fn build_chrome_client(tool: &str) -> Result<wreq::Client, ToolError> {
 ///   These are first-party JSON APIs with Bearer token auth — no bot-detection.
 ///   reqwest is lighter and avoids spawning a BoringSSL TLS stack unnecessarily.
 ///
+/// WHY SSRF-safe: Even for API-backed calls, the redirect policy guards against
+///   open-redirect chains that could reach private/internal addresses.
+///
 /// WHY 15-second timeout: Balances responsiveness vs. slow websites.
 fn build_client() -> Result<reqwest::Client, ToolError> {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| ToolError::ExecutionFailed {
-            tool: "web".into(),
-            message: format!("Failed to build HTTP client: {e}"),
-        })
+    Ok(edgecrab_security::url_safety::build_ssrf_safe_client(
+        std::time::Duration::from_secs(15),
+    ))
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────

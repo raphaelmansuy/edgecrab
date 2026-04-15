@@ -502,6 +502,7 @@ async fn build_effective_text(agent: &Agent, msg: &IncomingMessage) -> String {
             current_tool_name: None,
             injected_messages: None,
             tool_progress_tx: None,
+            watch_notification_tx: None,
         };
 
         match VisionAnalyzeTool
@@ -565,6 +566,7 @@ async fn build_effective_text(agent: &Agent, msg: &IncomingMessage) -> String {
             current_tool_name: None,
             injected_messages: None,
             tool_progress_tx: None,
+            watch_notification_tx: None,
         };
 
         match TranscribeAudioTool
@@ -887,6 +889,7 @@ async fn maybe_send_voice_reply(
         current_tool_name: None,
         injected_messages: None,
         tool_progress_tx: None,
+            watch_notification_tx: None,
     };
 
     let result = match TextToSpeechTool

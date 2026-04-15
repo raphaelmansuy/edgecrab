@@ -9,6 +9,7 @@ license.workspace = true
 [dependencies]
 edgecrab-command-catalog = { workspace = true }
 edgecrab-core = { workspace = true }
+edgecrab-security = { workspace = true }
 edgecrab-types = { workspace = true }
 edgecrab-state = { workspace = true }
 edgecrab-tools = { workspace = true }
@@ -33,7 +34,13 @@ rand = { workspace = true }
 base64 = { workspace = true }
 sha2 = { workspace = true }
 urlencoding = { workspace = true }
+aes = { workspace = true }
+cbc = { workspace = true }
+ecb = { workspace = true }
 which = { workspace = true }
+subtle = "2"
+hmac = "0.12"
+sha1 = "0.10"
 async-stream = "0.3"
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "pool", "rustls-tls", "hostname", "builder"] }
 md5 = "0.7"

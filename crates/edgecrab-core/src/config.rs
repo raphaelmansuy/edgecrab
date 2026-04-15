@@ -63,6 +63,16 @@ pub struct AppConfig {
     pub auxiliary: AuxiliaryConfig,
     pub moa: MoaConfig,
     pub reasoning_effort: Option<String>,
+    pub context: ContextConfig,
+}
+
+/// Configuration for the pluggable context engine.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ContextConfig {
+    /// Context engine name. "builtin" (default) uses the built-in compressor.
+    /// Set to a plugin name to use a custom context engine.
+    pub engine: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

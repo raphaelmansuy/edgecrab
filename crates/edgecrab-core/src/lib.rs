@@ -10,6 +10,7 @@ use edgecrab_lsp as _;
 pub mod agent;
 pub mod compression;
 pub mod config;
+pub mod context_engine;
 pub mod context_references;
 pub mod conversation;
 pub mod model_catalog;
@@ -25,6 +26,10 @@ pub use agent::{
     IterationBudget, SessionSnapshot, SessionState, StreamEvent,
 };
 pub use compression::{PRUNED_TOOL_PLACEHOLDER, SUMMARY_PREFIX};
+pub use context_engine::{
+    BuiltinCompressorEngine, ContextEngine, ContextEngineSessionCtx, MAX_ENGINE_TOOLS,
+    load_context_engine,
+};
 pub use config::{
     AppConfig, CliOverrides, SmartRoutingYaml, ToolProgressMode, edgecrab_home,
     ensure_edgecrab_home, gateway_image_cache_dir, gateway_media_dir,

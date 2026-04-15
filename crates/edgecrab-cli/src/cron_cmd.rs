@@ -986,7 +986,8 @@ async fn execute_job(job: &CronJob, args: &CliArgs) -> anyhow::Result<String> {
         Platform::Cron,
         true, // quiet mode
         Some(format!("{CRON_SESSION_PREFIX}-{}", job.id)),
-    )?;
+    )
+    .await?;
 
     agent
         .chat(&effective_prompt)

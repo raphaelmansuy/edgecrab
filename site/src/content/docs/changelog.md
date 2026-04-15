@@ -8,7 +8,39 @@ sidebar:
 All notable changes to EdgeCrab are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-Last updated: 2026-04-13
+Last updated: 2026-05-15
+
+---
+
+## [0.6.0] — 2026-05-15
+
+### Added
+
+- **iMessage via BlueBubbles** — webhook-based inbound messages, REST outbound, GUID dedup, tapback filtering, Private API auto-detection, inbound attachment download, improved markdown stripping.
+- **WeChat (Weixin) via iLink Bot API** — POST-based long-poll with sync buffer, AES-128-ECB CDN media pipeline (upload + download), session-expired auto-recovery, context token echo, markdown reformatting.
+- **WeCom enhancements** — WebSocket messaging, AES-256-CBC decryption, chunked media upload, text batching, 30s heartbeat keep-alive, `aibot_event_callback` support.
+- **Pluggable Context Engine** — `ContextEngine` trait for custom context management, `BuiltinCompressorEngine` default, plugin discovery via `edgecrab-plugins`.
+- **Background Process Watch Patterns** — `watch_patterns` parameter for pattern-matched output notifications with rate limiting.
+- **Unified Proxy Support** — 6-level cascade proxy resolution including macOS `scutil` and SOCKS5.
+- **Backup & Import** — Timestamped tar.gz archives with path traversal protection and dry-run mode.
+- **Debug/Dump command** — 15 monitored config paths, API key scanning, `/debug` slash command.
+- **Termux/Android support** — TUI compact mode, Termux path jail, `termux` feature flag.
+- **Security hardening** — SSRF redirect guard, CRLF header injection guard, timing-safe auth, Twilio webhook signature validation.
+
+### Changed
+
+- WeCom `BATCH_LONG_THRESHOLD` raised from 3500 to 3900; `BACKOFF_STEPS` extended with 60s final step.
+- BlueBubbles `strip_markdown()` now handles code fences, links, italic, and nested formatting.
+- Dump `INTERESTING_OVERRIDES` expanded from 8 to 15 monitored config paths.
+
+---
+
+## [0.5.0] — 2026-04-13
+
+### Added
+
+- **Web search fallback chain — Firecrawl → Brave → Tavily → DuckDuckGo** with `wreq` BoringSSL TLS fingerprint.
+- **Per-tool rich result display in TUI done-lines** via `format_tool_result()`.
 
 ---
 

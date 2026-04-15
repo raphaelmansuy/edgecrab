@@ -210,6 +210,7 @@ impl ToolHandler for TerminalTool {
                 &args.command,
                 args.workdir.as_deref(),
                 args.pty,
+                Vec::new(), // terminal tool doesn't support watch_patterns
                 ctx,
             )
             .await?;

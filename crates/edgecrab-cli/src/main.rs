@@ -15,6 +15,7 @@
 mod acp_setup;
 mod app;
 mod auth_cmd;
+mod backup;
 mod banner;
 mod bundled_profiles;
 mod cli_args;
@@ -269,7 +270,8 @@ async fn main() -> anyhow::Result<()> {
         edgecrab_types::Platform::Cli,
         args.quiet,
         resolved_session.clone(),
-    )?;
+    )
+    .await?;
     gateway_cmd::attach_gateway_sender_if_running(&agent, &runtime).await?;
 
     if let Some(ref session_id) = resolved_session {
@@ -662,6 +664,14 @@ async fn run_subcommand(cmd: Command, args: &CliArgs) -> anyhow::Result<()> {
 
         Command::Dump { all } => {
             dump_cmd::run(args, all)?;
+        }
+
+        Command::Backup { output, include_sessions } => {
+            backup::run_backup(output.as_deref(), include_sessions)?;
+        }
+
+        Command::Import { archive, target, dry_run, force } => {
+            backup::run_import(&archive, target.as_deref(), dry_run, force)?;
         }
 
         Command::Logs { command } => {
@@ -1119,7 +1129,8 @@ async fn run_acp(args: &CliArgs) -> anyhow::Result<()> {
         edgecrab_types::Platform::Acp,
         false,
         None,
-    )?;
+    )
+    .await?;
     gateway_cmd::attach_gateway_sender_if_running(&agent, &runtime).await?;
 
     let mut server = AcpServer::new();

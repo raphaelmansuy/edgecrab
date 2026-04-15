@@ -269,6 +269,7 @@ fn build_tool_context(
         current_tool_name,
         injected_messages,
         tool_progress_tx,
+        watch_notification_tx: None,
     }
 }
 
@@ -321,6 +322,11 @@ struct DispatchContext {
     discovered_plugins: Option<Arc<edgecrab_plugins::PluginDiscovery>>,
     /// Per-session sequence counter for artifact file naming.
     spill_seq: Arc<crate::tool_result_spill::SpillSequence>,
+    /// Active context engine for routing engine-provided tool calls.
+    /// `None` when no engine is configured or the engine injects no tools.
+    context_engine: Option<Arc<dyn crate::context_engine::ContextEngine>>,
+    /// Names of tools owned by the context engine (pre-computed set for O(1) lookup).
+    engine_tool_names: Arc<std::collections::HashSet<String>>,
 }
 
 impl Agent {
@@ -461,6 +467,25 @@ impl Agent {
             } else {
                 (Vec::new(), Vec::new())
             };
+
+        // Inject context engine tool schemas (if any) — added once at session start.
+        // Also build engine_tool_names (O(1) lookup set) used in dispatch routing.
+        let engine_for_dispatch = self.context_engine.clone();
+        let engine_tool_names: std::collections::HashSet<String> =
+            if let Some(ref engine) = self.context_engine {
+                let engine_schemas = engine.get_tool_schemas();
+                if !engine_schemas.is_empty() {
+                    let capped = &engine_schemas
+                        [..engine_schemas.len().min(crate::context_engine::MAX_ENGINE_TOOLS)];
+                    active_tool_defs.extend(to_llm_definitions(capped));
+                    capped.iter().map(|s| s.name.clone()).collect()
+                } else {
+                    std::collections::HashSet::new()
+                }
+            } else {
+                std::collections::HashSet::new()
+            };
+        let engine_tool_names = Arc::new(engine_tool_names);
 
         let discovered_plugins = discover_plugins(&config.plugins_config, config.platform).ok();
 
@@ -1391,6 +1416,8 @@ impl Agent {
                 capability_suppressions: capability_suppressions.clone(),
                 discovered_plugins: discovered_plugins.clone(),
                 spill_seq: spill_seq.clone(),
+                context_engine: engine_for_dispatch.clone(),
+                engine_tool_names: engine_tool_names.clone(),
             };
             let action = match process_response(
                 &response,
@@ -2954,6 +2981,8 @@ async fn process_response(
                 let dispatch_cwd = dctx.cwd.clone();
                 let discovered_plugins = dctx.discovered_plugins.clone();
                 let spill_seq = dctx.spill_seq.clone();
+                let context_engine = dctx.context_engine.clone();
+                let engine_tool_names = dctx.engine_tool_names.clone();
 
                 parallel_tasks.spawn(async move {
                     let started = std::time::Instant::now();
@@ -2978,6 +3007,8 @@ async fn process_response(
                         capability_suppressions,
                         discovered_plugins,
                         spill_seq,
+                        context_engine,
+                        engine_tool_names,
                     };
                     let result = dispatch_single_tool(&tc_id, &tc_name, &tc_args, &inner).await;
                     let duration_ms = started.elapsed().as_millis() as u64;
@@ -3233,6 +3264,31 @@ async fn dispatch_single_tool(
         }
     }
 
+    // ── Context engine tool dispatch ─────────────────────────────────
+    // If the tool name belongs to the context engine (O(1) set lookup),
+    // route directly to the engine's handler — bypassing the ToolRegistry.
+    // This separates engine-domain tools from core tools (SRP / DIP).
+    if dctx.engine_tool_names.contains(name) {
+        if let Some(ref engine) = dctx.context_engine {
+            let args: serde_json::Value =
+                serde_json::from_str(args_json).unwrap_or(serde_json::Value::Object(Default::default()));
+            match engine.handle_tool_call(name, args).await {
+                Some(Ok(output)) => return (output, Vec::new()),
+                Some(Err(e)) => {
+                    return (
+                        edgecrab_types::ToolError::ExecutionFailed {
+                            tool: name.to_string(),
+                            message: e.to_string(),
+                        }
+                        .to_llm_response(),
+                        Vec::new(),
+                    )
+                }
+                None => {} // engine declined — fall through to ToolRegistry
+            }
+        }
+    }
+
     let injected_messages = Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let ctx = build_tool_context(
         &dctx.cwd,
@@ -3476,6 +3532,8 @@ async fn run_learning_reflection_bg(ctx: BackgroundReflectionCtx) {
         capability_suppressions: Arc::new(Mutex::new(HashMap::new())),
         discovered_plugins: None,
         spill_seq: Arc::new(crate::tool_result_spill::SpillSequence::new()),
+        context_engine: None,
+        engine_tool_names: Arc::new(std::collections::HashSet::new()),
     };
 
     // Work on local session clone — we don't need results propagated back.
@@ -5343,6 +5401,8 @@ def register(ctx):
             capability_suppressions,
             discovered_plugins: None,
             spill_seq: Arc::new(crate::tool_result_spill::SpillSequence::new()),
+            context_engine: None,
+            engine_tool_names: Arc::new(std::collections::HashSet::new()),
         }
     }
 

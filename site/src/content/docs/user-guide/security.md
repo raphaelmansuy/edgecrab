@@ -318,6 +318,31 @@ Only to the configured LLM API. No telemetry, no crash reporting, no analytics. 
 
 ---
 
+## v0.6 Security Enhancements
+
+### Hardened SSRF HTTP Client
+
+Web tools now use a shared SSRF-guarded HTTP client (`edgecrab_security::ssrf::build_ssrf_client()`) that enforces:
+- DNS resolution checks before every request
+- Redirect following disabled (prevents open-redirect SSRF)
+- Connection timeout enforcement
+- Consistent configuration across all web tool endpoints
+
+### HTTP Proxy Support
+
+Outbound requests respect `HTTPS_PROXY` and `HTTP_PROXY` environment variables. The proxy configuration is applied at the `edgecrab-security` crate level, ensuring all HTTP clients (web tools, gateway adapters) route through the configured proxy.
+
+### Gateway Webhook Validation
+
+- **Twilio SMS**: Incoming webhooks are validated using Twilio's `X-Twilio-Signature` HMAC-SHA1 verification
+- **WeChat/Weixin**: Messages use AES-256-CBC XML encryption for secure transport
+
+### Skills Guard
+
+External skills installed via `/skills install` pass through a 23-pattern security scanner before installation. Patterns cover exfiltration, prompt injection, destructive operations, persistence mechanisms, and obfuscation techniques.
+
+---
+
 ## See Also
 
 - [Configuration](/user-guide/configuration/) — Full `security.*` config reference

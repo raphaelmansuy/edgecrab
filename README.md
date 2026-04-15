@@ -12,7 +12,7 @@
 
 [![Changelog](https://img.shields.io/badge/Changelog-CHANGELOG.md-blue.svg)](CHANGELOG.md)
 
-EdgeCrab is a **SuperAgent** — a personal assistant and coding agent forged in Rust. It carries the soul of **Nous Hermes Agent** (autonomous reasoning, persistent memory, user-first alignment) and the always-on presence of **OpenClaw** (15 messaging gateways, smart-home integration), packaged as a stripped native release binary of about **49 MB** on current macOS arm64 builds, with zero Python or Node.js runtime dependencies.
+EdgeCrab is a **SuperAgent** — a personal assistant and coding agent forged in Rust. It carries the soul of **Nous Hermes Agent** (autonomous reasoning, persistent memory, user-first alignment) and the always-on presence of **OpenClaw** (17 messaging gateways, smart-home integration), packaged as a stripped native release binary of about **49 MB** on current macOS arm64 builds, with zero Python or Node.js runtime dependencies. Runs on Linux, macOS, and Android (Termux).
 
 
 
@@ -31,7 +31,7 @@ hermes-agent soul  +  OpenClaw vision  =  EdgeCrab
 | Runtime bootstrap   | None                           | Python + uv      |
 | Memory              | Workload-dependent native process | ~80–150 MB    |
 | LLM providers       | 15 built-in                    | varies           |
-| Messaging platforms | 15 gateways                    | 7 platforms      |
+| Messaging platforms | 17 gateways                    | 7 platforms      |
 | Tests               | 1629 passing (Rust)            | —                |
 | Migrate from hermes | `edgecrab migrate`             | N/A              |
 
@@ -71,7 +71,7 @@ hermes-agent soul  +  OpenClaw vision  =  EdgeCrab
     - [Sub-agent Delegation](#sub-agent-delegation)
     - [Sandboxed Code Execution](#sandboxed-code-execution)
     - [Browser Automation](#browser-automation)
-    - [15 Messaging Gateways](#15-messaging-gateways)
+    - [17 Messaging Gateways](#17-messaging-gateways)
     - [Persistent Memory \& Learning](#persistent-memory--learning)
     - [Skills Library](#skills-library)
     - [Plugin System](#plugin-system)
@@ -385,9 +385,9 @@ The `browser_snapshot` tool returns an accessibility tree — not pixels — so 
 
 ---
 
-### 15 Messaging Gateways
+### 17 Messaging Gateways
 
-Start the gateway server and EdgeCrab becomes an always-on assistant in 15 messaging platforms simultaneously:
+Start the gateway server and EdgeCrab becomes an always-on assistant in 17 messaging platforms simultaneously:
 
 ```bash
 edgecrab gateway start           # runs in background
@@ -412,7 +412,9 @@ edgecrab gateway stop
 | **Webhook**        | axum HTTP POST                          | any HTTP caller                                   |
 | **API Server**     | axum OpenAI-compatible HTTP             | `API_SERVER_PORT` (optional)                      |
 | **Feishu/Lark**    | REST                                    | `FEISHU_APP_ID` + `FEISHU_APP_SECRET`             |
-| **WeCom**          | REST                                    | `WECOM_CORP_ID` + `WECOM_SECRET`                  |
+| **WeCom**          | WebSocket + REST + heartbeat            | `WECOM_BOT_ID` + `WECOM_SECRET`                   |
+| **iMessage**       | BlueBubbles REST + webhook + attachments| `BLUEBUBBLES_SERVER_URL` + `BLUEBUBBLES_PASSWORD` |
+| **WeChat**         | iLink Bot API POST-poll + AES CDN media | `WEIXIN_TOKEN` + `WEIXIN_ACCOUNT_ID`              |
 
 **Streaming delivery**: Edit-mode platforms (Telegram, Discord, Slack) receive live token streaming with 300ms edit intervals. Batch-mode platforms (WhatsApp, Signal, SMS, Email) accumulate the full response and send once.
 
