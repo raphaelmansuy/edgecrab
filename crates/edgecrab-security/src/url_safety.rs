@@ -121,10 +121,7 @@ pub fn build_ssrf_safe_client_with_proxy(
         }))
         .timeout(timeout);
 
-    let builder = crate::proxy::apply_proxy_to_builder(
-        builder,
-        resolved_proxy.as_deref(),
-    );
+    let builder = crate::proxy::apply_proxy_to_builder(builder, resolved_proxy.as_deref());
 
     builder
         .build()

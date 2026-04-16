@@ -29,9 +29,7 @@ pub fn aes128_ecb_decrypt(key: &[u8; 16], ciphertext: &[u8]) -> Result<Vec<u8>, 
 ///
 /// IV is derived from key[0..16] per the WeCom protocol.
 pub fn aes256_cbc_decrypt(key: &[u8; 32], ciphertext: &[u8]) -> Result<Vec<u8>, &'static str> {
-    let iv: &[u8; 16] = key[..16]
-        .try_into()
-        .map_err(|_| "IV extraction failed")?;
+    let iv: &[u8; 16] = key[..16].try_into().map_err(|_| "IV extraction failed")?;
     Aes256CbcDec::new(key.into(), iv.into())
         .decrypt_padded_vec_mut::<Pkcs7>(ciphertext)
         .map_err(|_| "AES-256-CBC decryption failed")
@@ -111,8 +109,8 @@ mod tests {
         let plaintext = b"WeCom media data";
 
         // Encrypt with CBC
-        let ct_vec = Aes256CbcEnc::new(&key.into(), &iv.into())
-            .encrypt_padded_vec_mut::<Pkcs7>(plaintext);
+        let ct_vec =
+            Aes256CbcEnc::new(&key.into(), &iv.into()).encrypt_padded_vec_mut::<Pkcs7>(plaintext);
 
         // Decrypt
         let pt = aes256_cbc_decrypt(&key, &ct_vec).unwrap();

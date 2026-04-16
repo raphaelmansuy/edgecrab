@@ -176,7 +176,10 @@ pub fn check_watch_patterns(
             } else if let Some(since) = state.overload_since {
                 if now.duration_since(since).as_secs() >= WATCH_OVERLOAD_KILL_SECONDS {
                     state.disabled = true;
-                    debug!(process_id, "Watch patterns permanently disabled (sustained overload)");
+                    debug!(
+                        process_id,
+                        "Watch patterns permanently disabled (sustained overload)"
+                    );
                     let _ = sink.send(WatchEvent {
                         process_id: process_id.to_string(),
                         pattern: pattern.clone(),
@@ -1111,12 +1114,7 @@ mod tests {
 
         // Fire WATCH_MAX_PER_WINDOW + 2 hits in rapid succession
         for i in 0..(WATCH_MAX_PER_WINDOW + 2) {
-            check_watch_patterns(
-                &format!("error line {i}"),
-                "proc-1",
-                &mut state,
-                &tx,
-            );
+            check_watch_patterns(&format!("error line {i}"), "proc-1", &mut state, &tx);
         }
 
         // Drain events — should have at most WATCH_MAX_PER_WINDOW
@@ -1135,12 +1133,7 @@ mod tests {
 
         // Fill the rate window
         for i in 0..(WATCH_MAX_PER_WINDOW + 3) {
-            check_watch_patterns(
-                &format!("error line {i}"),
-                "proc-1",
-                &mut state,
-                &tx,
-            );
+            check_watch_patterns(&format!("error line {i}"), "proc-1", &mut state, &tx);
         }
         // Drain all events from first window
         while rx.try_recv().is_ok() {}
@@ -1162,7 +1155,8 @@ mod tests {
 
         // Simulate sustained overload: exceed rate limit then set overload_since in the past
         state.window_hits = WATCH_MAX_PER_WINDOW + 1;
-        state.overload_since = Some(Instant::now() - Duration::from_secs(WATCH_OVERLOAD_KILL_SECONDS + 1));
+        state.overload_since =
+            Some(Instant::now() - Duration::from_secs(WATCH_OVERLOAD_KILL_SECONDS + 1));
 
         check_watch_patterns("error overload", "proc-1", &mut state, &tx);
         assert!(state.disabled, "should be permanently disabled");
@@ -1196,12 +1190,7 @@ mod tests {
 
         // Fill the first window
         for i in 0..WATCH_MAX_PER_WINDOW {
-            check_watch_patterns(
-                &format!("error line {i}"),
-                "proc-1",
-                &mut state,
-                &tx,
-            );
+            check_watch_patterns(&format!("error line {i}"), "proc-1", &mut state, &tx);
         }
         while rx.try_recv().is_ok() {}
 

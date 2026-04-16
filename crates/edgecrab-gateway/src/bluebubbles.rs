@@ -38,7 +38,10 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use crate::platform::{IncomingMessage, MessageAttachment, MessageAttachmentKind, MessageMetadata, OutgoingMessage, PlatformAdapter};
+use crate::platform::{
+    IncomingMessage, MessageAttachment, MessageAttachmentKind, MessageMetadata, OutgoingMessage,
+    PlatformAdapter,
+};
 
 const MAX_MESSAGE_LENGTH: usize = 4000;
 
@@ -63,14 +66,14 @@ impl BlueBubblesAdapter {
         let server_url = env::var("BLUEBUBBLES_SERVER_URL").ok()?;
         let password = env::var("BLUEBUBBLES_PASSWORD").ok()?;
 
-        let webhook_host = env::var("BLUEBUBBLES_WEBHOOK_HOST")
-            .unwrap_or_else(|_| "127.0.0.1".into());
+        let webhook_host =
+            env::var("BLUEBUBBLES_WEBHOOK_HOST").unwrap_or_else(|_| "127.0.0.1".into());
         let webhook_port: u16 = env::var("BLUEBUBBLES_WEBHOOK_PORT")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(8645);
-        let webhook_path = env::var("BLUEBUBBLES_WEBHOOK_PATH")
-            .unwrap_or_else(|_| "/bb-webhook".into());
+        let webhook_path =
+            env::var("BLUEBUBBLES_WEBHOOK_PATH").unwrap_or_else(|_| "/bb-webhook".into());
         let send_read_receipts = env::var("BLUEBUBBLES_SEND_READ_RECEIPTS")
             .map(|v| v != "false" && v != "0")
             .unwrap_or(true);
@@ -95,8 +98,7 @@ impl BlueBubblesAdapter {
     }
 
     pub fn is_available() -> bool {
-        env::var("BLUEBUBBLES_SERVER_URL").is_ok()
-            && env::var("BLUEBUBBLES_PASSWORD").is_ok()
+        env::var("BLUEBUBBLES_SERVER_URL").is_ok() && env::var("BLUEBUBBLES_PASSWORD").is_ok()
     }
 
     /// Build API URL with password in query params.
@@ -111,17 +113,10 @@ impl BlueBubblesAdapter {
 
     /// Ping the BlueBubbles server to verify connectivity.
     async fn ping(&self) -> anyhow::Result<()> {
-        let resp = self
-            .client
-            .get(self.api_url("/ping"))
-            .send()
-            .await?;
+        let resp = self.client.get(self.api_url("/ping")).send().await?;
 
         if !resp.status().is_success() {
-            anyhow::bail!(
-                "BlueBubbles ping failed: HTTP {}",
-                resp.status()
-            );
+            anyhow::bail!("BlueBubbles ping failed: HTTP {}", resp.status());
         }
         debug!("BlueBubbles server ping OK");
         Ok(())
@@ -129,26 +124,18 @@ impl BlueBubblesAdapter {
 
     /// Detect Private API availability from server info.
     async fn detect_private_api(&self) -> anyhow::Result<bool> {
-        let resp = self
-            .client
-            .get(self.api_url("/server/info"))
-            .send()
-            .await?;
+        let resp = self.client.get(self.api_url("/server/info")).send().await?;
 
         let info: serde_json::Value = resp.json().await?;
         let private_api = info["data"]["private_api_enabled"]
             .as_bool()
             .unwrap_or(false);
-        let helper = info["data"]["helper_connected"]
-            .as_bool()
-            .unwrap_or(false);
+        let helper = info["data"]["helper_connected"].as_bool().unwrap_or(false);
 
         let enabled = private_api && helper;
-        self.private_api_enabled.store(enabled, std::sync::atomic::Ordering::Relaxed);
-        info!(
-            private_api = enabled,
-            "BlueBubbles Private API status"
-        );
+        self.private_api_enabled
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+        info!(private_api = enabled, "BlueBubbles Private API status");
         Ok(enabled)
     }
 
@@ -160,11 +147,7 @@ impl BlueBubblesAdapter {
         );
 
         // Clean up existing webhooks first (crash recovery).
-        let list_resp = self
-            .client
-            .get(self.api_url("/webhook"))
-            .send()
-            .await?;
+        let list_resp = self.client.get(self.api_url("/webhook")).send().await?;
 
         if list_resp.status().is_success() {
             let list: serde_json::Value = list_resp.json().await?;
@@ -261,8 +244,7 @@ impl BlueBubblesAdapter {
             if let Some(chats) = data["data"].as_array() {
                 for chat in chats {
                     if let Some(guid) = chat["guid"].as_str() {
-                        self.guid_cache
-                            .insert(target.to_string(), guid.to_string());
+                        self.guid_cache.insert(target.to_string(), guid.to_string());
                         return Ok(guid.to_string());
                     }
                 }
@@ -270,7 +252,10 @@ impl BlueBubblesAdapter {
         }
 
         // Fallback: create new chat if Private API is available.
-        if self.private_api_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+        if self
+            .private_api_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             let body = serde_json::json!({
                 "participants": [target],
             });
@@ -284,8 +269,7 @@ impl BlueBubblesAdapter {
             if resp.status().is_success() {
                 let data: serde_json::Value = resp.json().await?;
                 if let Some(guid) = data["data"]["guid"].as_str() {
-                    self.guid_cache
-                        .insert(target.to_string(), guid.to_string());
+                    self.guid_cache.insert(target.to_string(), guid.to_string());
                     return Ok(guid.to_string());
                 }
             }
@@ -330,8 +314,7 @@ impl BlueBubblesAdapter {
             .and_then(|n| n.to_str())
             .unwrap_or("file");
 
-        let part = reqwest::multipart::Part::bytes(file_bytes)
-            .file_name(file_name.to_string());
+        let part = reqwest::multipart::Part::bytes(file_bytes).file_name(file_name.to_string());
 
         let form = reqwest::multipart::Form::new()
             .text("chatGuid", chat_guid.to_string())
@@ -363,7 +346,11 @@ impl BlueBubblesAdapter {
 
     /// Mark a message as read (send read receipt).
     async fn mark_read(&self, chat_guid: &str) {
-        if !self.send_read_receipts || !self.private_api_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+        if !self.send_read_receipts
+            || !self
+                .private_api_enabled
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
             return;
         }
         let body = serde_json::json!({
@@ -494,9 +481,7 @@ async fn health_handler() -> &'static str {
 
 async fn webhook_handler(
     State(state): State<Arc<WebhookState>>,
-    axum::extract::Query(params): axum::extract::Query<
-        std::collections::HashMap<String, String>,
-    >,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
     headers: axum::http::HeaderMap,
     body: axum::extract::Json<WebhookPayload>,
 ) -> StatusCode {
@@ -512,11 +497,7 @@ async fn webhook_handler(
         })
         .unwrap_or_default();
 
-    if !bool::from(
-        provided_pw
-            .as_bytes()
-            .ct_eq(state.password.as_bytes()),
-    ) {
+    if !bool::from(provided_pw.as_bytes().ct_eq(state.password.as_bytes())) {
         return StatusCode::UNAUTHORIZED;
     }
 
@@ -587,9 +568,15 @@ async fn webhook_handler(
                         if let Ok(bytes) = resp.bytes().await {
                             if tokio::fs::write(&dest, &bytes).await.is_ok() {
                                 let kind = match att.mime_type.as_deref() {
-                                    Some(m) if m.starts_with("image/") => MessageAttachmentKind::Image,
-                                    Some(m) if m.starts_with("audio/") => MessageAttachmentKind::Audio,
-                                    Some(m) if m.starts_with("video/") => MessageAttachmentKind::Video,
+                                    Some(m) if m.starts_with("image/") => {
+                                        MessageAttachmentKind::Image
+                                    }
+                                    Some(m) if m.starts_with("audio/") => {
+                                        MessageAttachmentKind::Audio
+                                    }
+                                    Some(m) if m.starts_with("video/") => {
+                                        MessageAttachmentKind::Video
+                                    }
                                     _ => MessageAttachmentKind::Document,
                                 };
                                 attachments.push(MessageAttachment {
@@ -602,7 +589,10 @@ async fn webhook_handler(
                         }
                     }
                     Ok(resp) => {
-                        debug!("BlueBubbles attachment download failed: HTTP {}", resp.status());
+                        debug!(
+                            "BlueBubbles attachment download failed: HTTP {}",
+                            resp.status()
+                        );
                     }
                     Err(e) => {
                         debug!("BlueBubbles attachment download error: {e}");
@@ -637,10 +627,12 @@ async fn webhook_handler(
 fn redact_pii(s: &str) -> String {
     // Phone: +1234567890 or similar
     let phone_re = regex::Regex::new(r"\+?\d{7,15}").expect("valid regex");
-    let email_re = regex::Regex::new(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
-        .expect("valid regex");
+    let email_re =
+        regex::Regex::new(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}").expect("valid regex");
     let redacted = phone_re.replace_all(s, "[REDACTED_PHONE]");
-    email_re.replace_all(&redacted, "[REDACTED_EMAIL]").to_string()
+    email_re
+        .replace_all(&redacted, "[REDACTED_EMAIL]")
+        .to_string()
 }
 
 #[async_trait]
@@ -667,7 +659,9 @@ impl PlatformAdapter for BlueBubblesAdapter {
             server_url: self.server_url.clone(),
             client: self.client.clone(),
             tx,
-            private_api: self.private_api_enabled.load(std::sync::atomic::Ordering::Relaxed),
+            private_api: self
+                .private_api_enabled
+                .load(std::sync::atomic::Ordering::Relaxed),
         });
 
         let app = Router::new()
@@ -693,7 +687,9 @@ impl PlatformAdapter for BlueBubblesAdapter {
     }
 
     async fn send(&self, msg: OutgoingMessage) -> anyhow::Result<()> {
-        let chat_guid = self.resolve_chat_guid(msg.metadata.channel_id.as_deref().unwrap_or("")).await?;
+        let chat_guid = self
+            .resolve_chat_guid(msg.metadata.channel_id.as_deref().unwrap_or(""))
+            .await?;
         let text = Self::strip_markdown(&msg.text);
 
         // Split long messages.
@@ -733,10 +729,15 @@ impl PlatformAdapter for BlueBubblesAdapter {
     }
 
     async fn send_typing(&self, metadata: &MessageMetadata) -> anyhow::Result<()> {
-        if !self.private_api_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+        if !self
+            .private_api_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             return Ok(());
         }
-        let chat_guid = self.resolve_chat_guid(metadata.channel_id.as_deref().unwrap_or("")).await?;
+        let chat_guid = self
+            .resolve_chat_guid(metadata.channel_id.as_deref().unwrap_or(""))
+            .await?;
         let body = serde_json::json!({
             "chatGuid": chat_guid,
         });
@@ -755,7 +756,9 @@ impl PlatformAdapter for BlueBubblesAdapter {
         caption: Option<&str>,
         metadata: &MessageMetadata,
     ) -> anyhow::Result<()> {
-        let chat_guid = self.resolve_chat_guid(metadata.channel_id.as_deref().unwrap_or("")).await?;
+        let chat_guid = self
+            .resolve_chat_guid(metadata.channel_id.as_deref().unwrap_or(""))
+            .await?;
         self.send_attachment(&chat_guid, path, caption).await
     }
 
@@ -765,7 +768,9 @@ impl PlatformAdapter for BlueBubblesAdapter {
         caption: Option<&str>,
         metadata: &MessageMetadata,
     ) -> anyhow::Result<()> {
-        let chat_guid = self.resolve_chat_guid(metadata.channel_id.as_deref().unwrap_or("")).await?;
+        let chat_guid = self
+            .resolve_chat_guid(metadata.channel_id.as_deref().unwrap_or(""))
+            .await?;
         self.send_attachment(&chat_guid, path, caption).await
     }
 
@@ -775,7 +780,9 @@ impl PlatformAdapter for BlueBubblesAdapter {
         caption: Option<&str>,
         metadata: &MessageMetadata,
     ) -> anyhow::Result<()> {
-        let chat_guid = self.resolve_chat_guid(metadata.channel_id.as_deref().unwrap_or("")).await?;
+        let chat_guid = self
+            .resolve_chat_guid(metadata.channel_id.as_deref().unwrap_or(""))
+            .await?;
         self.send_attachment(&chat_guid, path, caption).await
     }
 }
@@ -796,9 +803,7 @@ fn split_text(text: &str, max_len: usize) -> Vec<String> {
         }
 
         // Find last space before max_len.
-        let split_at = remaining[..max_len]
-            .rfind(' ')
-            .unwrap_or(max_len);
+        let split_at = remaining[..max_len].rfind(' ').unwrap_or(max_len);
 
         chunks.push(remaining[..split_at].to_string());
         remaining = remaining[split_at..].trim_start();
@@ -825,10 +830,7 @@ mod tests {
             BlueBubblesAdapter::strip_markdown("**bold** and `code`"),
             "bold and code"
         );
-        assert_eq!(
-            BlueBubblesAdapter::strip_markdown("# Header"),
-            "Header"
-        );
+        assert_eq!(BlueBubblesAdapter::strip_markdown("# Header"), "Header");
     }
 
     #[test]
@@ -858,18 +860,12 @@ mod tests {
 
     #[test]
     fn test_redact_pii_phone() {
-        assert_eq!(
-            redact_pii("+14155551234"),
-            "[REDACTED_PHONE]"
-        );
+        assert_eq!(redact_pii("+14155551234"), "[REDACTED_PHONE]");
     }
 
     #[test]
     fn test_redact_pii_email() {
-        assert_eq!(
-            redact_pii("user@example.com"),
-            "[REDACTED_EMAIL]"
-        );
+        assert_eq!(redact_pii("user@example.com"), "[REDACTED_EMAIL]");
     }
 
     #[test]

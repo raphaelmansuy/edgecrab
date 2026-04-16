@@ -4,7 +4,7 @@
 //! Credentials (`.env`, `mcp-tokens/`) are always excluded for security.
 //! Path traversal and symlink attacks are blocked during import.
 
-use std::path::{Path, Component};
+use std::path::{Component, Path};
 
 use anyhow::{Context, Result, bail};
 use tracing::{info, warn};
@@ -45,7 +45,13 @@ pub fn create_backup(
     let mut archive = tar::Builder::new(encoder);
 
     let mut file_count = 0u64;
-    walk_and_add(&home, &home, &mut archive, include_sessions, &mut file_count)?;
+    walk_and_add(
+        &home,
+        &home,
+        &mut archive,
+        include_sessions,
+        &mut file_count,
+    )?;
 
     archive.finish()?;
     info!(path = %out.display(), files = file_count, "Backup archive created");
@@ -65,9 +71,7 @@ fn walk_and_add(
     for entry in entries {
         let entry = entry?;
         let path = entry.path();
-        let rel = path
-            .strip_prefix(root)
-            .unwrap_or(&path);
+        let rel = path.strip_prefix(root).unwrap_or(&path);
 
         let name = rel
             .components()
@@ -141,11 +145,7 @@ pub fn import_backup(
     // Atomic: extract to temp dir first, then copy to target
     let temp_dir = tempfile::Builder::new()
         .prefix(".edgecrab-import-")
-        .tempdir_in(
-            target_dir
-                .parent()
-                .unwrap_or(Path::new("/tmp")),
-        )
+        .tempdir_in(target_dir.parent().unwrap_or(Path::new("/tmp")))
         .with_context(|| "Cannot create temp directory for import")?;
     let temp_path = temp_dir.path().to_path_buf();
 
@@ -195,9 +195,7 @@ pub fn import_backup(
         }
 
         // Strip the "edgecrab/" prefix for extraction
-        let stripped = raw_path
-            .strip_prefix("edgecrab")
-            .unwrap_or(&raw_path);
+        let stripped = raw_path.strip_prefix("edgecrab").unwrap_or(&raw_path);
 
         let dest = temp_path.join(stripped);
 

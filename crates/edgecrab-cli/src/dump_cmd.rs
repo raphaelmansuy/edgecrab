@@ -74,9 +74,9 @@ pub fn run_dump(show_keys: bool) -> String {
 
     let config_path = home.join("config.yaml");
     let config_text = std::fs::read_to_string(&config_path).ok();
-    let config: Option<serde_json::Value> = config_text.as_ref().and_then(|text| {
-        serde_yml::from_str::<serde_json::Value>(text).ok()
-    });
+    let config: Option<serde_json::Value> = config_text
+        .as_ref()
+        .and_then(|text| serde_yml::from_str::<serde_json::Value>(text).ok());
 
     let model = config
         .as_ref()
@@ -111,7 +111,11 @@ pub fn run_dump(show_keys: bool) -> String {
             }
             _ => "not set".to_string(),
         };
-        out.push_str(&format!("  {:<width$} {status}\n", format!("{var}:"), width = max_name_len + 1));
+        out.push_str(&format!(
+            "  {:<width$} {status}\n",
+            format!("{var}:"),
+            width = max_name_len + 1
+        ));
     }
 
     // Section 4: Features
@@ -143,7 +147,11 @@ pub fn run_dump(show_keys: bool) -> String {
     let gateway_running = gateway_cmd::snapshot().map(|g| g.running).unwrap_or(false);
     out.push_str(&format!(
         "  gateway:      {}\n",
-        if gateway_running { "active" } else { "inactive" }
+        if gateway_running {
+            "active"
+        } else {
+            "inactive"
+        }
     ));
 
     // Platforms
@@ -175,11 +183,7 @@ pub fn run_dump(show_keys: bool) -> String {
         .map(|entries| {
             entries
                 .flatten()
-                .filter(|e| {
-                    e.path()
-                        .extension()
-                        .is_some_and(|ext| ext == "md")
-                })
+                .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
                 .count()
         })
         .unwrap_or(0);
@@ -188,7 +192,10 @@ pub fn run_dump(show_keys: bool) -> String {
     // Plugins
     let mut plugins = PluginManager::new();
     plugins.discover_all();
-    out.push_str(&format!("  plugins:      {} loaded\n", plugins.plugins().len()));
+    out.push_str(&format!(
+        "  plugins:      {} loaded\n",
+        plugins.plugins().len()
+    ));
 
     // Memory provider
     out.push_str("  memory:       built-in\n");
@@ -216,19 +223,39 @@ const INTERESTING_OVERRIDES: &[(&str, &[&str], &str)] = &[
     ("save_trajectories", &["save_trajectories"], "false"),
     ("skip_context_files", &["skip_context_files"], "false"),
     ("skip_memory", &["skip_memory"], "false"),
-    ("compression.threshold", &["compression", "threshold"], "0.5"),
+    (
+        "compression.threshold",
+        &["compression", "threshold"],
+        "0.5",
+    ),
     (
         "compression.protect_last_n",
         &["compression", "protect_last_n"],
         "20",
     ),
     ("display.skin", &["display", "skin"], "default"),
-    ("agent.gateway_timeout", &["agent", "gateway_timeout"], "120"),
+    (
+        "agent.gateway_timeout",
+        &["agent", "gateway_timeout"],
+        "120",
+    ),
     ("terminal.backend", &["terminal", "backend"], "native"),
     ("terminal.docker_image", &["terminal", "docker_image"], ""),
-    ("terminal.persistent_shell", &["terminal", "persistent_shell"], "true"),
-    ("browser.allow_private_urls", &["browser", "allow_private_urls"], "false"),
-    ("smart_model_routing.enabled", &["smart_model_routing", "enabled"], "false"),
+    (
+        "terminal.persistent_shell",
+        &["terminal", "persistent_shell"],
+        "true",
+    ),
+    (
+        "browser.allow_private_urls",
+        &["browser", "allow_private_urls"],
+        "false",
+    ),
+    (
+        "smart_model_routing.enabled",
+        &["smart_model_routing", "enabled"],
+        "false",
+    ),
     ("privacy.redact_pii", &["privacy", "redact_pii"], "false"),
 ];
 
@@ -333,10 +360,7 @@ mod tests {
         let output = run_dump(true);
         assert!(output.contains("sk-t"), "Should show first 4 chars");
         assert!(output.contains("cdef"), "Should show last 4 chars");
-        assert!(
-            !output.contains(test_key),
-            "Full key must never appear"
-        );
+        assert!(!output.contains(test_key), "Full key must never appear");
         unsafe { std::env::remove_var("ANTHROPIC_API_KEY") };
     }
 

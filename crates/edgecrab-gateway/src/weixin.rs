@@ -109,7 +109,8 @@ impl DeduplicationMap {
 
     fn evict_expired(&mut self) {
         let now = Instant::now();
-        self.entries.retain(|_, ts| now.duration_since(*ts) < DEDUP_TTL);
+        self.entries
+            .retain(|_, ts| now.duration_since(*ts) < DEDUP_TTL);
     }
 }
 
@@ -194,7 +195,11 @@ fn load_sync_buf(path: &std::path::Path) -> String {
     std::fs::read_to_string(path)
         .ok()
         .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-        .and_then(|v| v.get("get_updates_buf").and_then(|b| b.as_str()).map(|s| s.to_string()))
+        .and_then(|v| {
+            v.get("get_updates_buf")
+                .and_then(|b| b.as_str())
+                .map(|s| s.to_string())
+        })
         .unwrap_or_default()
 }
 
@@ -219,10 +224,9 @@ impl WeixinAdapter {
     pub fn from_env() -> Option<Self> {
         let token = env::var("WEIXIN_TOKEN").ok()?;
         let account_id = env::var("WEIXIN_ACCOUNT_ID").ok()?;
-        let base_url = env::var("WEIXIN_BASE_URL")
-            .unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
-        let cdn_base_url = env::var("WEIXIN_CDN_BASE_URL")
-            .unwrap_or_else(|_| DEFAULT_CDN_BASE_URL.to_string());
+        let base_url = env::var("WEIXIN_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
+        let cdn_base_url =
+            env::var("WEIXIN_CDN_BASE_URL").unwrap_or_else(|_| DEFAULT_CDN_BASE_URL.to_string());
 
         let dm_policy = env::var("WEIXIN_DM_POLICY")
             .map(|v| AccessPolicy::from_env(&v))
@@ -282,10 +286,7 @@ impl WeixinAdapter {
         let uin = base64::engine::general_purpose::STANDARD.encode(rand_bytes);
 
         if let Ok(v) = HeaderValue::from_str("ilink_bot_token") {
-            headers.insert(
-                HeaderName::from_static("authorizationtype"),
-                v,
-            );
+            headers.insert(HeaderName::from_static("authorizationtype"), v);
         }
         if let Ok(v) = HeaderValue::from_str(&format!("Bearer {}", self.token)) {
             headers.insert(reqwest::header::AUTHORIZATION, v);
@@ -297,10 +298,7 @@ impl WeixinAdapter {
             headers.insert(HeaderName::from_static("ilink-app-id"), v);
         }
         if let Ok(v) = HeaderValue::from_str(ILINK_APP_CLIENT_VERSION) {
-            headers.insert(
-                HeaderName::from_static("ilink-app-clientversion"),
-                v,
-            );
+            headers.insert(HeaderName::from_static("ilink-app-clientversion"), v);
         }
         headers
     }
@@ -346,12 +344,15 @@ impl WeixinAdapter {
                     match resp.json::<serde_json::Value>().await {
                         Ok(body) => {
                             // Check for session-expired error
-                            let errcode = body.get("ret")
+                            let errcode = body
+                                .get("ret")
                                 .or_else(|| body.get("errcode"))
                                 .and_then(|v| v.as_i64())
                                 .unwrap_or(0);
                             if errcode == ERRCODE_SESSION_EXPIRED {
-                                warn!("Weixin: session expired (errcode {ERRCODE_SESSION_EXPIRED}), resetting sync buffer");
+                                warn!(
+                                    "Weixin: session expired (errcode {ERRCODE_SESSION_EXPIRED}), resetting sync buffer"
+                                );
                                 let mut buf = self.sync_buf.lock().await;
                                 *buf = String::new();
                                 self.persist_sync_buf(&buf);
@@ -360,7 +361,9 @@ impl WeixinAdapter {
                             }
 
                             // Update sync buffer from response
-                            if let Some(new_buf) = body.get("get_updates_buf").and_then(|v| v.as_str()) {
+                            if let Some(new_buf) =
+                                body.get("get_updates_buf").and_then(|v| v.as_str())
+                            {
                                 let mut buf = self.sync_buf.lock().await;
                                 *buf = new_buf.to_string();
                                 self.persist_sync_buf(&buf);
@@ -542,7 +545,7 @@ impl WeixinAdapter {
                             parts.push(content.to_string());
                         }
                     }
-                    3 => parts.push("[图片]".to_string()),  // Image
+                    3 => parts.push("[图片]".to_string()), // Image
                     34 => parts.push("[语音]".to_string()), // Voice
                     43 => parts.push("[视频]".to_string()), // Video
                     49 => parts.push("[文件]".to_string()), // File
@@ -657,13 +660,8 @@ impl WeixinAdapter {
             _ => "bin",
         };
         let default_name = format!("weixin_media.{ext}");
-        let filename = item
-            .file_name
-            .as_deref()
-            .unwrap_or(&default_name);
-        let cache_dir = edgecrab_core::edgecrab_home()
-            .join("weixin")
-            .join("cache");
+        let filename = item.file_name.as_deref().unwrap_or(&default_name);
+        let cache_dir = edgecrab_core::edgecrab_home().join("weixin").join("cache");
         let _ = std::fs::create_dir_all(&cache_dir);
         let path = cache_dir.join(format!("{}_{filename}", uuid::Uuid::new_v4()));
         if std::fs::write(&path, &data).is_err() {
@@ -715,7 +713,10 @@ impl WeixinAdapter {
                 }
 
                 // Skip separator row (---)
-                if cells.iter().all(|c| c.chars().all(|ch| ch == '-' || ch == ':' || ch == ' ')) {
+                if cells
+                    .iter()
+                    .all(|c| c.chars().all(|ch| ch == '-' || ch == ':' || ch == ' '))
+                {
                     continue;
                 }
 
@@ -771,7 +772,10 @@ impl WeixinAdapter {
 
         if let Some(token) = ctx_token {
             payload.as_object_mut().map(|obj| {
-                obj.insert("context_token".to_string(), serde_json::Value::String(token))
+                obj.insert(
+                    "context_token".to_string(),
+                    serde_json::Value::String(token),
+                )
             });
         }
 
@@ -866,7 +870,9 @@ impl WeixinAdapter {
         let upload_url = body
             .get("upload_url")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Weixin: missing upload_url in getuploadurl response"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("Weixin: missing upload_url in getuploadurl response")
+            })?;
         let upload_param = body
             .get("upload_param")
             .and_then(|v| v.as_str())
@@ -929,7 +935,10 @@ impl WeixinAdapter {
 
         if let Some(token) = ctx_token {
             payload.as_object_mut().map(|obj| {
-                obj.insert("context_token".to_string(), serde_json::Value::String(token))
+                obj.insert(
+                    "context_token".to_string(),
+                    serde_json::Value::String(token),
+                )
             });
         }
 
@@ -965,10 +974,7 @@ impl PlatformAdapter for WeixinAdapter {
     }
 
     async fn start(&self, tx: mpsc::Sender<IncomingMessage>) -> anyhow::Result<()> {
-        info!(
-            "Starting Weixin adapter for account {}",
-            self.account_id
-        );
+        info!("Starting Weixin adapter for account {}", self.account_id);
         self.poll_loop(tx).await;
         Ok(())
     }

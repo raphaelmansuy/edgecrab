@@ -470,9 +470,12 @@ pub async fn build_agent(
     if let Some(ref engine_name) = runtime.config.context.engine {
         let ctx_length = 128_000_usize; // informational; conversation.rs uses model catalog
         let threshold = runtime.config.compression.threshold as f64;
-        let engine =
-            edgecrab_core::context_engine::load_context_engine(Some(engine_name), ctx_length, threshold)
-                .await;
+        let engine = edgecrab_core::context_engine::load_context_engine(
+            Some(engine_name),
+            ctx_length,
+            threshold,
+        )
+        .await;
         builder = builder.context_engine(engine);
     }
 

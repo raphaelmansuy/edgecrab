@@ -889,7 +889,7 @@ async fn maybe_send_voice_reply(
         current_tool_name: None,
         injected_messages: None,
         tool_progress_tx: None,
-            watch_notification_tx: None,
+        watch_notification_tx: None,
     };
 
     let result = match TextToSpeechTool

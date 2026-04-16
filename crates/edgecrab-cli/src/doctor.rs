@@ -640,7 +640,10 @@ fn check_termux_storage() -> Check {
     )
     .join("storage");
     if storage.exists() {
-        Check::pass("Termux storage", "~/storage linked (termux-setup-storage was run)")
+        Check::pass(
+            "Termux storage",
+            "~/storage linked (termux-setup-storage was run)",
+        )
     } else {
         Check::warn(
             "Termux storage",
@@ -789,8 +792,6 @@ mod tests {
         let check = check_termux_storage();
         // On desktop: ~/storage almost certainly doesn't exist → warn
         // On Termux with setup-storage: exists → pass
-        assert!(
-            check.status == CheckStatus::Pass || check.status == CheckStatus::Warn
-        );
+        assert!(check.status == CheckStatus::Pass || check.status == CheckStatus::Warn);
     }
 }

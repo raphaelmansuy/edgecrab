@@ -49,4 +49,3 @@ pub fn is_termux() -> bool {
 /// Cached result of [`is_termux()`]. Env vars don't change mid-process,
 /// so we evaluate once at first access.
 pub static IS_TERMUX: std::sync::LazyLock<bool> = std::sync::LazyLock::new(is_termux);
-

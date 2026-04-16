@@ -179,7 +179,16 @@ pub(crate) async fn start_background_process(
     }
 
     if ctx.config.terminal_backend == BackendKind::Local {
-        spawn_local_process(tool_name, command, &cwd, pty, table, process_id, ctx.watch_notification_tx.clone()).await
+        spawn_local_process(
+            tool_name,
+            command,
+            &cwd,
+            pty,
+            table,
+            process_id,
+            ctx.watch_notification_tx.clone(),
+        )
+        .await
     } else {
         let backend = get_or_create_backend(ctx).await?;
         spawn_remote_process(
@@ -615,10 +624,7 @@ async fn drain_reader(
                         let mut rec = entry.lock().await;
                         if let Some(ref mut watch) = rec.watch_state {
                             crate::process_table::check_watch_patterns(
-                                trimmed,
-                                process_id,
-                                watch,
-                                sink,
+                                trimmed, process_id, watch, sink,
                             );
                         }
                     }

@@ -316,7 +316,8 @@ pub struct ToolContext {
     pub tool_progress_tx: Option<tokio::sync::mpsc::UnboundedSender<ToolProgressUpdate>>,
     /// Optional channel for watch pattern notifications from background processes.
     /// WHY Option: Only needed when watch_patterns is used on run_process.
-    pub watch_notification_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::process_table::WatchEvent>>,
+    pub watch_notification_tx:
+        Option<tokio::sync::mpsc::UnboundedSender<crate::process_table::WatchEvent>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

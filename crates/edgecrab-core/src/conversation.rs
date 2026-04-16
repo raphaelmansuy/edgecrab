@@ -475,8 +475,9 @@ impl Agent {
             if let Some(ref engine) = self.context_engine {
                 let engine_schemas = engine.get_tool_schemas();
                 if !engine_schemas.is_empty() {
-                    let capped = &engine_schemas
-                        [..engine_schemas.len().min(crate::context_engine::MAX_ENGINE_TOOLS)];
+                    let capped = &engine_schemas[..engine_schemas
+                        .len()
+                        .min(crate::context_engine::MAX_ENGINE_TOOLS)];
                     active_tool_defs.extend(to_llm_definitions(capped));
                     capped.iter().map(|s| s.name.clone()).collect()
                 } else {
@@ -3270,8 +3271,8 @@ async fn dispatch_single_tool(
     // This separates engine-domain tools from core tools (SRP / DIP).
     if dctx.engine_tool_names.contains(name) {
         if let Some(ref engine) = dctx.context_engine {
-            let args: serde_json::Value =
-                serde_json::from_str(args_json).unwrap_or(serde_json::Value::Object(Default::default()));
+            let args: serde_json::Value = serde_json::from_str(args_json)
+                .unwrap_or(serde_json::Value::Object(Default::default()));
             match engine.handle_tool_call(name, args).await {
                 Some(Ok(output)) => return (output, Vec::new()),
                 Some(Err(e)) => {
@@ -3282,7 +3283,7 @@ async fn dispatch_single_tool(
                         }
                         .to_llm_response(),
                         Vec::new(),
-                    )
+                    );
                 }
                 None => {} // engine declined — fall through to ToolRegistry
             }

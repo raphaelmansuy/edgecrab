@@ -104,10 +104,7 @@ pub fn apply_proxy_to_builder(
 fn detect_macos_system_proxy() -> Option<String> {
     use std::process::Command;
 
-    let output = Command::new("scutil")
-        .arg("--proxy")
-        .output()
-        .ok()?;
+    let output = Command::new("scutil").arg("--proxy").output().ok()?;
 
     if !output.status.success() {
         return None;
@@ -287,6 +284,8 @@ mod tests {
         let builder = reqwest::Client::builder();
         let builder = apply_proxy_to_builder(builder, Some("not-a-url"));
         // Should still build — invalid proxy is skipped
-        let _client = builder.build().expect("should build with invalid proxy URL");
+        let _client = builder
+            .build()
+            .expect("should build with invalid proxy URL");
     }
 }

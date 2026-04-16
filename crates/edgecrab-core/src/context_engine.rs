@@ -211,7 +211,10 @@ impl PluginProcess {
                 if let Some(err) = resp.get("error") {
                     anyhow::bail!("plugin JSON-RPC error: {err}");
                 }
-                return Ok(resp.get("result").cloned().unwrap_or(serde_json::Value::Null));
+                return Ok(resp
+                    .get("result")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null));
             }
         }
     }
@@ -455,6 +458,7 @@ pub async fn load_context_engine(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -524,11 +528,9 @@ mod tests {
 
     #[tokio::test]
     async fn load_context_engine_unknown_falls_back() {
-        let engine =
-            load_context_engine(Some("__no_such_engine__"), 64_000, 0.6).await;
+        let engine = load_context_engine(Some("__no_such_engine__"), 64_000, 0.6).await;
         // Must fall back gracefully — name is still "compressor"
         assert_eq!(engine.name(), "compressor");
         assert_eq!(engine.context_length(), 64_000);
     }
 }
-

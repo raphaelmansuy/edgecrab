@@ -66,7 +66,11 @@ enum WeComAccessPolicy {
 
 impl WeComAccessPolicy {
     fn from_env(key: &str, default: Self) -> Self {
-        match env::var(key).unwrap_or_default().to_ascii_lowercase().as_str() {
+        match env::var(key)
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str()
+        {
             "open" => Self::Open,
             "allow_list" | "allowlist" => Self::AllowList,
             "disabled" | "off" => Self::Disabled,
@@ -112,7 +116,10 @@ impl WeComAdapter {
                 .to_string(),
             allowed_users: Arc::new(parse_csv_set("WECOM_ALLOWED_USERS")),
             dm_policy: WeComAccessPolicy::from_env("WECOM_DM_POLICY", WeComAccessPolicy::Open),
-            group_policy: WeComAccessPolicy::from_env("WECOM_GROUP_POLICY", WeComAccessPolicy::Disabled),
+            group_policy: WeComAccessPolicy::from_env(
+                "WECOM_GROUP_POLICY",
+                WeComAccessPolicy::Disabled,
+            ),
             outbound_tx: Arc::new(Mutex::new(None)),
             pending: Arc::new(Mutex::new(HashMap::new())),
             seen_messages: Arc::new(Mutex::new(HashMap::new())),
@@ -471,8 +478,13 @@ impl PlatformAdapter for WeComAdapter {
         metadata: &MessageMetadata,
     ) -> anyhow::Result<()> {
         let file_size = tokio::fs::metadata(path).await?.len();
-        let media_type = if file_size > MAX_IMAGE_SIZE { "file" } else { "image" };
-        self.send_media_path(path, media_type, caption, metadata).await
+        let media_type = if file_size > MAX_IMAGE_SIZE {
+            "file"
+        } else {
+            "image"
+        };
+        self.send_media_path(path, media_type, caption, metadata)
+            .await
     }
 
     async fn send_document(
@@ -550,8 +562,14 @@ where
                 }
 
                 if is_callback_command(&cmd) {
-                    if let Some(message) =
-                        parse_callback(&payload, &allowed_users, &seen_messages, dm_policy, group_policy).await?
+                    if let Some(message) = parse_callback(
+                        &payload,
+                        &allowed_users,
+                        &seen_messages,
+                        dm_policy,
+                        group_policy,
+                    )
+                    .await?
                     {
                         // Text batching: accumulate rapid successive messages from same user
                         let user_key = message.user_id.clone();
@@ -559,10 +577,11 @@ where
                         let should_flush;
                         {
                             let mut batch = text_batch.lock().await;
-                            let entry = batch.entry(user_key.clone()).or_insert_with(|| TextBatch {
-                                parts: Vec::new(),
-                                started: Instant::now(),
-                            });
+                            let entry =
+                                batch.entry(user_key.clone()).or_insert_with(|| TextBatch {
+                                    parts: Vec::new(),
+                                    started: Instant::now(),
+                                });
                             entry.parts.push(message.text.clone());
 
                             // Determine quiet window based on text length
@@ -799,7 +818,10 @@ fn payload_req_id(payload: &Value) -> String {
 }
 
 fn is_callback_command(cmd: &str) -> bool {
-    matches!(cmd, APP_CMD_CALLBACK | APP_CMD_LEGACY_CALLBACK | "aibot_event_callback")
+    matches!(
+        cmd,
+        APP_CMD_CALLBACK | APP_CMD_LEGACY_CALLBACK | "aibot_event_callback"
+    )
 }
 
 fn raise_if_wecom_error(payload: &Value) -> anyhow::Result<()> {
@@ -903,12 +925,24 @@ mod tests {
         let allowed = HashSet::from([String::from("WECOM:USER:ALICE")]);
         let seen = Arc::new(Mutex::new(HashMap::new()));
 
-        let first = parse_callback(&payload, &allowed, &seen, WeComAccessPolicy::Open, WeComAccessPolicy::Open)
-            .await
-            .expect("first parse");
-        let second = parse_callback(&payload, &allowed, &seen, WeComAccessPolicy::Open, WeComAccessPolicy::Open)
-            .await
-            .expect("second parse");
+        let first = parse_callback(
+            &payload,
+            &allowed,
+            &seen,
+            WeComAccessPolicy::Open,
+            WeComAccessPolicy::Open,
+        )
+        .await
+        .expect("first parse");
+        let second = parse_callback(
+            &payload,
+            &allowed,
+            &seen,
+            WeComAccessPolicy::Open,
+            WeComAccessPolicy::Open,
+        )
+        .await
+        .expect("second parse");
         let blocked = parse_callback(
             &payload,
             &HashSet::from([String::from("bob")]),
@@ -1276,16 +1310,28 @@ mod tests {
         let allowed = HashSet::new();
         let seen = Arc::new(Mutex::new(HashMap::new()));
 
-        let dm = parse_callback(&dm_payload, &allowed, &seen, WeComAccessPolicy::Open, WeComAccessPolicy::Open)
-            .await
-            .unwrap()
-            .unwrap();
+        let dm = parse_callback(
+            &dm_payload,
+            &allowed,
+            &seen,
+            WeComAccessPolicy::Open,
+            WeComAccessPolicy::Open,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(dm.chat_type, crate::platform::ChatType::Dm);
 
-        let grp = parse_callback(&group_payload, &allowed, &seen, WeComAccessPolicy::Open, WeComAccessPolicy::Open)
-            .await
-            .unwrap()
-            .unwrap();
+        let grp = parse_callback(
+            &group_payload,
+            &allowed,
+            &seen,
+            WeComAccessPolicy::Open,
+            WeComAccessPolicy::Open,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(grp.chat_type, crate::platform::ChatType::Group);
     }
 }

@@ -666,11 +666,19 @@ async fn run_subcommand(cmd: Command, args: &CliArgs) -> anyhow::Result<()> {
             dump_cmd::run(args, all)?;
         }
 
-        Command::Backup { output, include_sessions } => {
+        Command::Backup {
+            output,
+            include_sessions,
+        } => {
             backup::run_backup(output.as_deref(), include_sessions)?;
         }
 
-        Command::Import { archive, target, dry_run, force } => {
+        Command::Import {
+            archive,
+            target,
+            dry_run,
+            force,
+        } => {
             backup::run_import(&archive, target.as_deref(), dry_run, force)?;
         }
 

@@ -2489,12 +2489,10 @@ fn build_chrome_client(tool: &str) -> Result<wreq::Client, ToolError> {
         }
     }
 
-    builder
-        .build()
-        .map_err(|e| ToolError::ExecutionFailed {
-            tool: tool.into(),
-            message: format!("Failed to build Chrome-emulating client: {e}"),
-        })
+    builder.build().map_err(|e| ToolError::ExecutionFailed {
+        tool: tool.into(),
+        message: format!("Failed to build Chrome-emulating client: {e}"),
+    })
 }
 
 /// Build a plain reqwest client for trusted JSON API backends (Firecrawl, Tavily, Brave).

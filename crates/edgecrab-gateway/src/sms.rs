@@ -155,8 +155,7 @@ fn validate_twilio_signature(
         return false;
     };
     mac.update(data.as_bytes());
-    let expected =
-        base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+    let expected = base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
 
     bool::from(expected.as_bytes().ct_eq(signature_header.as_bytes()))
 }
