@@ -377,6 +377,7 @@ mod tests {
 
     /// Roundtrip: backup → import → files match.
     #[test]
+    #[serial_test::serial(edgecrab_home_env)]
     fn backup_restore_roundtrip() {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let fake_home = setup_fake_home();
@@ -405,6 +406,7 @@ mod tests {
 
     /// Dry-run import must not write any files.
     #[test]
+    #[serial_test::serial(edgecrab_home_env)]
     fn import_dry_run_no_writes() {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let fake_home = setup_fake_home();
@@ -430,6 +432,7 @@ mod tests {
 
     /// Import without --force skips existing files.
     #[test]
+    #[serial_test::serial(edgecrab_home_env)]
     fn import_conflict_skip_default() {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let fake_home = setup_fake_home();
@@ -455,6 +458,7 @@ mod tests {
 
     /// Import with --force overwrites existing files.
     #[test]
+    #[serial_test::serial(edgecrab_home_env)]
     fn import_conflict_force_overwrites() {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let fake_home = setup_fake_home();
