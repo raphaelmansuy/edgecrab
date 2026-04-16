@@ -211,9 +211,27 @@ fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), StatusCode> {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         let provided = auth.strip_prefix("Bearer ").unwrap_or(auth);
-        if provided != expected {
+        // Timing-safe comparison to prevent side-channel attacks
+        use subtle::ConstantTimeEq;
+        if !bool::from(provided.as_bytes().ct_eq(expected.as_bytes())) {
             return Err(StatusCode::UNAUTHORIZED);
         }
+    }
+    Ok(())
+}
+
+/// Refuse to bind API server to a non-localhost address without authentication.
+///
+/// Binding to 0.0.0.0 or a public IP without `API_SERVER_KEY` would allow
+/// anyone on the network to inject messages into the agent.
+fn validate_bind_address(host: &str, api_key: &Option<String>) -> anyhow::Result<()> {
+    let is_localhost = host == "127.0.0.1" || host == "::1" || host == "localhost";
+    if !is_localhost && api_key.is_none() {
+        anyhow::bail!(
+            "API_SERVER_KEY required when binding to non-localhost address '{}'. \
+             Set API_SERVER_KEY env var or bind to 127.0.0.1.",
+            host
+        );
     }
     Ok(())
 }
@@ -574,6 +592,9 @@ impl PlatformAdapter for ApiServerAdapter {
     }
 
     async fn start(&self, tx: mpsc::Sender<IncomingMessage>) -> anyhow::Result<()> {
+        // Security: refuse non-localhost bind without API key
+        validate_bind_address(&self.host, &self.api_key)?;
+
         info!("API Server adapter starting on {}:{}", self.host, self.port);
 
         let response_map: ResponseMap = Arc::new(dashmap::DashMap::new());
@@ -743,5 +764,75 @@ mod tests {
     #[test]
     fn api_max_length() {
         assert_eq!(MAX_MESSAGE_LENGTH, 100_000);
+    }
+
+    #[test]
+    fn auth_timing_safe_correct_token() {
+        let state = AppState {
+            tx: mpsc::channel(1).0,
+            response_map: Arc::new(dashmap::DashMap::new()),
+            responses: Arc::new(dashmap::DashMap::new()),
+            api_key: Some("test-key-123".to_string()),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer test-key-123".parse().unwrap());
+        assert!(check_auth(&state, &headers).is_ok());
+    }
+
+    #[test]
+    fn auth_wrong_token_rejected() {
+        let state = AppState {
+            tx: mpsc::channel(1).0,
+            response_map: Arc::new(dashmap::DashMap::new()),
+            responses: Arc::new(dashmap::DashMap::new()),
+            api_key: Some("correct-key".to_string()),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer wrong-key".parse().unwrap());
+        assert_eq!(check_auth(&state, &headers), Err(StatusCode::UNAUTHORIZED));
+    }
+
+    #[test]
+    fn auth_missing_header_rejected() {
+        let state = AppState {
+            tx: mpsc::channel(1).0,
+            response_map: Arc::new(dashmap::DashMap::new()),
+            responses: Arc::new(dashmap::DashMap::new()),
+            api_key: Some("some-key".to_string()),
+        };
+        let headers = HeaderMap::new();
+        assert_eq!(check_auth(&state, &headers), Err(StatusCode::UNAUTHORIZED));
+    }
+
+    #[test]
+    fn auth_no_key_configured_allows_all() {
+        let state = AppState {
+            tx: mpsc::channel(1).0,
+            response_map: Arc::new(dashmap::DashMap::new()),
+            responses: Arc::new(dashmap::DashMap::new()),
+            api_key: None,
+        };
+        let headers = HeaderMap::new();
+        assert!(check_auth(&state, &headers).is_ok());
+    }
+
+    #[test]
+    fn bind_guard_localhost_no_key() {
+        assert!(validate_bind_address("127.0.0.1", &None).is_ok());
+        assert!(validate_bind_address("::1", &None).is_ok());
+        assert!(validate_bind_address("localhost", &None).is_ok());
+    }
+
+    #[test]
+    fn bind_guard_public_no_key_rejected() {
+        assert!(validate_bind_address("0.0.0.0", &None).is_err());
+        assert!(validate_bind_address("192.168.1.100", &None).is_err());
+    }
+
+    #[test]
+    fn bind_guard_public_with_key_ok() {
+        let key = Some("my-api-key".to_string());
+        assert!(validate_bind_address("0.0.0.0", &key).is_ok());
+        assert!(validate_bind_address("192.168.1.100", &key).is_ok());
     }
 }

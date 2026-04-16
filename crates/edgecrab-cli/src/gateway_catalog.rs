@@ -497,6 +497,76 @@ const API_SERVER_FIELDS: &[EnvField] = &[
     },
 ];
 
+const BLUEBUBBLES_FIELDS: &[EnvField] = &[
+    EnvField {
+        key: "BLUEBUBBLES_SERVER_URL",
+        prompt: "BlueBubbles server URL",
+        help: "HTTP URL of your BlueBubbles server (e.g. http://192.168.1.10:1234).",
+        required: true,
+        kind: FieldKind::Text,
+        default_value: None,
+    },
+    EnvField {
+        key: "BLUEBUBBLES_PASSWORD",
+        prompt: "BlueBubbles password",
+        help: "The server password from your BlueBubbles preferences.",
+        required: true,
+        kind: FieldKind::Secret,
+        default_value: None,
+    },
+    EnvField {
+        key: "BLUEBUBBLES_WEBHOOK_HOST",
+        prompt: "Webhook listen host",
+        help: "IP the inbound webhook server binds to.",
+        required: false,
+        kind: FieldKind::Text,
+        default_value: Some("127.0.0.1"),
+    },
+    EnvField {
+        key: "BLUEBUBBLES_WEBHOOK_PORT",
+        prompt: "Webhook listen port",
+        help: "Port for the inbound webhook endpoint.",
+        required: false,
+        kind: FieldKind::Port,
+        default_value: Some("8645"),
+    },
+];
+
+const WEIXIN_FIELDS: &[EnvField] = &[
+    EnvField {
+        key: "WEIXIN_TOKEN",
+        prompt: "Weixin (iLink) API token",
+        help: "Bearer token for the iLink Bot API.",
+        required: true,
+        kind: FieldKind::Secret,
+        default_value: None,
+    },
+    EnvField {
+        key: "WEIXIN_ACCOUNT_ID",
+        prompt: "Weixin account ID",
+        help: "Your bot account identifier on the iLink platform.",
+        required: true,
+        kind: FieldKind::Text,
+        default_value: None,
+    },
+    EnvField {
+        key: "WEIXIN_BASE_URL",
+        prompt: "iLink Bot API base URL",
+        help: "Override the default iLink API endpoint.",
+        required: false,
+        kind: FieldKind::Text,
+        default_value: Some("https://bot.ilink.im"),
+    },
+    EnvField {
+        key: "WEIXIN_ALLOWED_USERS",
+        prompt: "Allowed Weixin user IDs",
+        help: "Comma-separated user IDs. Leave blank for open access.",
+        required: false,
+        kind: FieldKind::Text,
+        default_value: None,
+    },
+];
+
 const PLATFORMS: &[GatewayPlatformDef] = &[
     GatewayPlatformDef {
         id: "telegram",
@@ -670,6 +740,28 @@ const PLATFORMS: &[GatewayPlatformDef] = &[
             "Set host, port, and optional bearer auth.",
         ],
         env_fields: API_SERVER_FIELDS,
+    },
+    GatewayPlatformDef {
+        id: "bluebubbles",
+        name: "BlueBubbles (iMessage)",
+        description: "iMessage bridge via BlueBubbles server",
+        setup_kind: SetupKind::GenericEnv,
+        instructions: &[
+            "Install BlueBubbles on a Mac with an active iMessage account.",
+            "Set the server URL and password from BlueBubbles preferences.",
+        ],
+        env_fields: BLUEBUBBLES_FIELDS,
+    },
+    GatewayPlatformDef {
+        id: "weixin",
+        name: "WeChat (Weixin)",
+        description: "WeChat messaging via iLink Bot API",
+        setup_kind: SetupKind::GenericEnv,
+        instructions: &[
+            "Register a bot on the iLink platform (bot.ilink.im).",
+            "Collect the API token and account ID.",
+        ],
+        env_fields: WEIXIN_FIELDS,
     },
 ];
 
@@ -1168,6 +1260,8 @@ mod tests {
                 "dingtalk",
                 "homeassistant",
                 "api_server",
+                "bluebubbles",
+                "weixin",
             ]
         );
     }

@@ -310,6 +310,19 @@ fn detect_terminal_ui_profile() -> TerminalUiProfile {
         );
     }
 
+    // Termux on Android: compact mode (BasicCompat) for narrow screens.
+    if *edgecrab_types::IS_TERMUX {
+        return TerminalUiProfile::BasicCompat;
+    }
+
+    // Narrow terminals (< 60 cols): fall back to compact mode to avoid
+    // layout overflow on small screens.
+    if let Ok((cols, _)) = crossterm::terminal::size() {
+        if cols < 60 {
+            return TerminalUiProfile::BasicCompat;
+        }
+    }
+
     // Fast-path capability markers from terminal envs. These are more reliable
     // than TERM=xterm-256color when TERM_PROGRAM is absent.
     if env_var_present("KITTY_WINDOW_ID")
@@ -17257,7 +17270,7 @@ impl App {
         let tool_registry = self
             .rt_handle
             .block_on(build_tool_registry_with_mcp_discovery(&runtime.config));
-        let new_agent = match build_agent(
+        let new_agent = match self.rt_handle.block_on(build_agent(
             &runtime,
             provider,
             state_db,
@@ -17265,7 +17278,7 @@ impl App {
             edgecrab_types::Platform::Cli,
             false,
             None,
-        ) {
+        )) {
             Ok(agent) => agent,
             Err(err) => {
                 self.push_output(format!("profile switch: {err}"), OutputRole::Error);
@@ -19078,6 +19091,7 @@ impl App {
             current_tool_name: None,
             injected_messages: None,
             tool_progress_tx: None,
+            watch_notification_tx: None,
         }
     }
 

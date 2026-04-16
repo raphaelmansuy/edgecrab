@@ -127,16 +127,77 @@ struct TwilioWebhookForm {
     message_sid: Option<String>,
 }
 
+/// Validate Twilio `X-Twilio-Signature` header using HMAC-SHA1.
+///
+/// Algorithm (Twilio spec):
+///   1. Concatenate webhook URL + sorted POST params as `key=value`
+///   2. HMAC-SHA1 with the auth token as key
+///   3. base64-encode and compare with the header value
+///
+/// Uses constant-time comparison to prevent timing side-channel attacks.
+fn validate_twilio_signature(
+    auth_token: &str,
+    url: &str,
+    params: &std::collections::BTreeMap<String, String>,
+    signature_header: &str,
+) -> bool {
+    use hmac::{Hmac, Mac};
+    use sha1::Sha1;
+    use subtle::ConstantTimeEq;
+
+    let mut data = url.to_string();
+    for (key, value) in params {
+        data.push_str(key);
+        data.push_str(value);
+    }
+
+    let Ok(mut mac) = Hmac::<Sha1>::new_from_slice(auth_token.as_bytes()) else {
+        return false;
+    };
+    mac.update(data.as_bytes());
+    let expected = base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+
+    bool::from(expected.as_bytes().ct_eq(signature_header.as_bytes()))
+}
+
 /// Shared state for the webhook handler.
 struct WebhookState {
     tx: mpsc::Sender<IncomingMessage>,
     allowed_users: Vec<String>,
+    auth_token: String,
+    webhook_url: String,
 }
 
 async fn handle_twilio_webhook(
     State(state): State<Arc<WebhookState>>,
+    headers: axum::http::HeaderMap,
     Form(form): Form<TwilioWebhookForm>,
 ) -> &'static str {
+    // ── Twilio signature validation ──────────────────────────────────
+    if !state.auth_token.is_empty() {
+        let sig = headers
+            .get("X-Twilio-Signature")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let mut params = std::collections::BTreeMap::new();
+        if let Some(ref v) = form.from {
+            params.insert("From".to_string(), v.clone());
+        }
+        if let Some(ref v) = form.to {
+            params.insert("To".to_string(), v.clone());
+        }
+        if let Some(ref v) = form.body {
+            params.insert("Body".to_string(), v.clone());
+        }
+        if let Some(ref v) = form.message_sid {
+            params.insert("MessageSid".to_string(), v.clone());
+        }
+        if !validate_twilio_signature(&state.auth_token, &state.webhook_url, &params, sig) {
+            warn!("Twilio signature validation failed — rejecting webhook");
+            return "<Response></Response>";
+        }
+    }
+
     let from = normalize_phone_number(&form.from.unwrap_or_default()).unwrap_or_default();
     let body = form.body.unwrap_or_default();
     let message_sid = form.message_sid.unwrap_or_default();
@@ -184,9 +245,14 @@ impl PlatformAdapter for SmsAdapter {
             self.webhook_port
         );
 
+        let webhook_url = env::var("SMS_WEBHOOK_URL")
+            .unwrap_or_else(|_| format!("http://localhost:{}/webhooks/twilio", self.webhook_port));
+
         let state = Arc::new(WebhookState {
             tx,
             allowed_users: self.allowed_users.clone(),
+            auth_token: self.auth_token.clone(),
+            webhook_url,
         });
 
         let app = Router::new()
@@ -290,5 +356,50 @@ mod tests {
     fn invalid_phone_number_is_rejected() {
         assert_eq!(normalize_phone_number("abc123"), None);
         assert_eq!(normalize_phone_number(""), None);
+    }
+
+    #[test]
+    fn twilio_signature_valid() {
+        use std::collections::BTreeMap;
+        let auth_token = "12345";
+        let url = "https://mycompany.com/myapp.php?foo=1&bar=2";
+        let mut params = BTreeMap::new();
+        params.insert("CallSid".to_string(), "CA1234567890ABCDE".to_string());
+        params.insert("Caller".to_string(), "+14158675310".to_string());
+        params.insert("Digits".to_string(), "1234".to_string());
+        params.insert("From".to_string(), "+14158675310".to_string());
+        params.insert("To".to_string(), "+18005551212".to_string());
+
+        // Compute expected signature for this test data
+        use hmac::{Hmac, Mac};
+        use sha1::Sha1;
+        let mut data = url.to_string();
+        for (key, value) in &params {
+            data.push_str(key);
+            data.push_str(value);
+        }
+        let mut mac = Hmac::<Sha1>::new_from_slice(auth_token.as_bytes()).expect("hmac");
+        mac.update(data.as_bytes());
+        let expected_sig =
+            base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+
+        assert!(validate_twilio_signature(
+            auth_token,
+            url,
+            &params,
+            &expected_sig
+        ));
+    }
+
+    #[test]
+    fn twilio_signature_tampered() {
+        use std::collections::BTreeMap;
+        let params = BTreeMap::new();
+        assert!(!validate_twilio_signature(
+            "secret",
+            "https://example.com/webhook",
+            &params,
+            "invalid-signature"
+        ));
     }
 }

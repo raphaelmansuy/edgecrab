@@ -44,6 +44,7 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use tokio::sync::{Mutex, mpsc};
+use tracing::debug;
 
 /// Maximum number of tracked processes (LRU pruning beyond this).
 /// Mirrors hermes-agent's `MAX_PROCESSES = 64`.
@@ -52,6 +53,179 @@ pub const MAX_PROCESSES: usize = 64;
 /// Keep finished processes for 30 minutes before GC.
 /// Mirrors hermes-agent's `FINISHED_TTL_SECONDS = 1800`.
 pub const FINISHED_TTL: Duration = Duration::from_secs(1800);
+
+// ─── Watch Patterns ───────────────────────────────────────────────────
+
+/// Max notifications per rate-limit window.
+/// Source: hermes-agent `process_registry.py:65`.
+const WATCH_MAX_PER_WINDOW: u32 = 8;
+
+/// Rate-limit window length in seconds.
+/// Source: hermes-agent `process_registry.py:66`.
+const WATCH_WINDOW_SECONDS: u64 = 10;
+
+/// Sustained overload → permanent disable after this many seconds.
+/// Source: hermes-agent `process_registry.py:67-68`.
+const WATCH_OVERLOAD_KILL_SECONDS: u64 = 45;
+
+/// Maximum lines to include in a watch event's `matched_output`.
+const WATCH_MAX_OUTPUT_LINES: usize = 20;
+
+/// Maximum chars to include in a watch event's `matched_output`.
+const WATCH_MAX_OUTPUT_CHARS: usize = 2000;
+
+/// Per-process watch pattern state with rate limiting.
+///
+/// Prevents notification floods from chatty processes.
+#[derive(Debug, Clone)]
+pub struct WatchState {
+    /// Substring patterns to match against each output line.
+    pub patterns: Vec<String>,
+    /// Total matches delivered.
+    pub hits: u64,
+    /// Matches dropped by rate limit.
+    pub suppressed: u64,
+    /// Permanently disabled by sustained overload.
+    pub disabled: bool,
+    /// Hits in the current rate window.
+    window_hits: u32,
+    /// When the current rate window began.
+    window_start: Instant,
+    /// When sustained overload started (cleared when rate drops below limit).
+    overload_since: Option<Instant>,
+}
+
+impl WatchState {
+    /// Create a new watch state with the given patterns.
+    pub fn new(patterns: Vec<String>) -> Self {
+        Self {
+            patterns,
+            hits: 0,
+            suppressed: 0,
+            disabled: false,
+            window_hits: 0,
+            window_start: Instant::now(),
+            overload_since: None,
+        }
+    }
+}
+
+/// Notification payload from watch pattern matching.
+#[derive(Debug, Clone)]
+pub struct WatchEvent {
+    /// Which process fired the event.
+    pub process_id: String,
+    /// Which pattern matched.
+    pub pattern: String,
+    /// Trimmed matched output (max 20 lines, 2000 chars).
+    pub matched_output: String,
+    /// How many matches were suppressed since last delivery.
+    pub suppressed_count: u64,
+    /// Event type (match or disabled).
+    pub event_type: WatchEventType,
+}
+
+/// Type of watch event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatchEventType {
+    /// A pattern matched output.
+    Match,
+    /// Overload protection permanently disabled watching.
+    Disabled,
+}
+
+/// Check a single output line against watch patterns, emitting events via the sink.
+///
+/// Rate limiting: max `WATCH_MAX_PER_WINDOW` per 10s window.
+/// Sustained overload (>45s) permanently disables watching for the process.
+///
+/// Only the first matching pattern fires a notification per line.
+pub fn check_watch_patterns(
+    line: &str,
+    process_id: &str,
+    state: &mut WatchState,
+    sink: &mpsc::UnboundedSender<WatchEvent>,
+) {
+    if state.disabled {
+        return;
+    }
+
+    let now = Instant::now();
+
+    for pattern in &state.patterns {
+        if !line.contains(pattern.as_str()) {
+            continue;
+        }
+
+        state.hits += 1;
+
+        // Reset window if expired
+        if now.duration_since(state.window_start).as_secs() >= WATCH_WINDOW_SECONDS {
+            state.window_hits = 0;
+            state.window_start = now;
+        }
+        state.window_hits += 1;
+
+        // Rate limit check
+        if state.window_hits > WATCH_MAX_PER_WINDOW {
+            state.suppressed += 1;
+
+            // Track overload duration
+            if state.overload_since.is_none() {
+                state.overload_since = Some(now);
+            } else if let Some(since) = state.overload_since {
+                if now.duration_since(since).as_secs() >= WATCH_OVERLOAD_KILL_SECONDS {
+                    state.disabled = true;
+                    debug!(
+                        process_id,
+                        "Watch patterns permanently disabled (sustained overload)"
+                    );
+                    let _ = sink.send(WatchEvent {
+                        process_id: process_id.to_string(),
+                        pattern: pattern.clone(),
+                        matched_output: trim_watch_output(line),
+                        suppressed_count: state.suppressed,
+                        event_type: WatchEventType::Disabled,
+                    });
+                    state.suppressed = 0;
+                }
+            }
+            return; // suppress this notification
+        }
+
+        // Within rate limit — clear overload tracker
+        state.overload_since = None;
+
+        let suppressed_count = state.suppressed;
+        state.suppressed = 0;
+
+        let _ = sink.send(WatchEvent {
+            process_id: process_id.to_string(),
+            pattern: pattern.clone(),
+            matched_output: trim_watch_output(line),
+            suppressed_count,
+            event_type: WatchEventType::Match,
+        });
+
+        break; // one notification per line
+    }
+}
+
+/// Trim matched output to fit `WATCH_MAX_OUTPUT_LINES` / `WATCH_MAX_OUTPUT_CHARS`.
+fn trim_watch_output(output: &str) -> String {
+    let lines: Vec<&str> = output.lines().take(WATCH_MAX_OUTPUT_LINES).collect();
+    let joined = lines.join("\n");
+    if joined.len() <= WATCH_MAX_OUTPUT_CHARS {
+        joined
+    } else {
+        // Safe char-boundary truncation
+        let mut end = WATCH_MAX_OUTPUT_CHARS;
+        while !joined.is_char_boundary(end) && end > 0 {
+            end -= 1;
+        }
+        format!("{}…", &joined[..end])
+    }
+}
 
 // ─── ProcessRecord ────────────────────────────────────────────────────
 
@@ -108,6 +282,9 @@ pub struct ProcessRecord {
     /// decouples the tool call from the actual write, which happens in a
     /// background task holding the ChildStdin handle.
     pub stdin_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    /// Watch pattern state for background process monitoring.
+    /// When set, each output line is checked against the patterns.
+    pub watch_state: Option<WatchState>,
 }
 
 /// Process lifecycle states.
@@ -251,6 +428,7 @@ impl ProcessTable {
             pid: None,
             session_key: session_key.into(),
             stdin_tx: None,
+            watch_state: None,
         };
         self.records
             .insert(id.clone(), Arc::new(Mutex::new(record)));
@@ -270,6 +448,27 @@ impl ProcessTable {
             let mut rec = entry.value().lock().await;
             rec.stdin_tx = Some(tx);
         }
+    }
+
+    /// Set watch patterns on an already-registered process.
+    ///
+    /// Call after `register()` to enable output pattern monitoring.
+    pub async fn set_watch_patterns(&self, process_id: &str, patterns: Vec<String>) {
+        if patterns.is_empty() {
+            return;
+        }
+        if let Some(entry) = self.records.get(process_id) {
+            let mut rec = entry.value().lock().await;
+            rec.watch_state = Some(WatchState::new(patterns));
+        }
+    }
+
+    /// Get a direct reference to a process record's mutex.
+    ///
+    /// Used by the drain loop to check watch patterns inline without
+    /// going through the full get_output path.
+    pub fn get_record(&self, process_id: &str) -> Option<Arc<Mutex<ProcessRecord>>> {
+        self.records.get(process_id).map(|e| Arc::clone(e.value()))
     }
 
     /// Register remote-process kill control for a non-local backend task.
@@ -873,5 +1072,148 @@ mod tests {
     async fn get_output_page_not_found_returns_none() {
         let table = ProcessTable::new();
         assert!(table.get_output_page("proc-999", 0, 10).await.is_none());
+    }
+
+    // ─── Watch Pattern Tests ──────────────────────────────────────────
+
+    #[test]
+    fn watch_single_match() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = WatchState::new(vec!["error".to_string()]);
+        check_watch_patterns("compilation error: failed", "proc-1", &mut state, &tx);
+        let event = rx.try_recv().expect("should receive event");
+        assert_eq!(event.process_id, "proc-1");
+        assert_eq!(event.pattern, "error");
+        assert!(event.matched_output.contains("compilation error"));
+        assert_eq!(event.event_type, WatchEventType::Match);
+        assert_eq!(event.suppressed_count, 0);
+    }
+
+    #[test]
+    fn watch_no_match() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = WatchState::new(vec!["error".to_string()]);
+        check_watch_patterns("all good here", "proc-1", &mut state, &tx);
+        assert!(rx.try_recv().is_err(), "should not fire on non-match");
+    }
+
+    #[test]
+    fn watch_multiple_patterns_first_wins() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = WatchState::new(vec!["err".to_string(), "error".to_string()]);
+        check_watch_patterns("error: something", "proc-1", &mut state, &tx);
+        let event = rx.try_recv().expect("should receive event");
+        assert_eq!(event.pattern, "err"); // first pattern matches
+        assert!(rx.try_recv().is_err(), "only one notification per line");
+    }
+
+    #[test]
+    fn watch_rate_limit_suppresses() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = WatchState::new(vec!["error".to_string()]);
+
+        // Fire WATCH_MAX_PER_WINDOW + 2 hits in rapid succession
+        for i in 0..(WATCH_MAX_PER_WINDOW + 2) {
+            check_watch_patterns(&format!("error line {i}"), "proc-1", &mut state, &tx);
+        }
+
+        // Drain events — should have at most WATCH_MAX_PER_WINDOW
+        let mut received = 0;
+        while rx.try_recv().is_ok() {
+            received += 1;
+        }
+        assert_eq!(received, WATCH_MAX_PER_WINDOW as usize);
+        assert!(state.suppressed > 0, "should have suppressed matches");
+    }
+
+    #[test]
+    fn watch_suppressed_count_bundled() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = WatchState::new(vec!["error".to_string()]);
+
+        // Fill the rate window
+        for i in 0..(WATCH_MAX_PER_WINDOW + 3) {
+            check_watch_patterns(&format!("error line {i}"), "proc-1", &mut state, &tx);
+        }
+        // Drain all events from first window
+        while rx.try_recv().is_ok() {}
+
+        // Advance window by resetting start time
+        state.window_start = Instant::now() - Duration::from_secs(WATCH_WINDOW_SECONDS + 1);
+        state.window_hits = 0;
+
+        // Next match should carry the suppressed count
+        check_watch_patterns("error again", "proc-1", &mut state, &tx);
+        let event = rx.try_recv().expect("should receive after window reset");
+        assert!(event.suppressed_count > 0, "should report suppressed count");
+    }
+
+    #[test]
+    fn watch_disabled_after_sustained_overload() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut state = WatchState::new(vec!["error".to_string()]);
+
+        // Simulate sustained overload: exceed rate limit then set overload_since in the past
+        state.window_hits = WATCH_MAX_PER_WINDOW + 1;
+        state.overload_since =
+            Some(Instant::now() - Duration::from_secs(WATCH_OVERLOAD_KILL_SECONDS + 1));
+
+        check_watch_patterns("error overload", "proc-1", &mut state, &tx);
+        assert!(state.disabled, "should be permanently disabled");
+    }
+
+    #[test]
+    fn watch_disabled_no_further_events() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = WatchState::new(vec!["error".to_string()]);
+        state.disabled = true;
+
+        check_watch_patterns("error line", "proc-1", &mut state, &tx);
+        assert!(rx.try_recv().is_err(), "disabled state should fire nothing");
+    }
+
+    #[test]
+    fn watch_output_trimmed() {
+        let long_line = "e".repeat(3000);
+        let trimmed = trim_watch_output(&format!("error: {long_line}"));
+        assert!(
+            trimmed.len() <= WATCH_MAX_OUTPUT_CHARS + 4, // +4 for "…"
+            "should be trimmed: got {} chars",
+            trimmed.len()
+        );
+    }
+
+    #[test]
+    fn watch_window_resets() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = WatchState::new(vec!["error".to_string()]);
+
+        // Fill the first window
+        for i in 0..WATCH_MAX_PER_WINDOW {
+            check_watch_patterns(&format!("error line {i}"), "proc-1", &mut state, &tx);
+        }
+        while rx.try_recv().is_ok() {}
+
+        // Simulate window expiry
+        state.window_start = Instant::now() - Duration::from_secs(WATCH_WINDOW_SECONDS + 1);
+
+        // Should succeed — new window
+        check_watch_patterns("error new window", "proc-1", &mut state, &tx);
+        assert!(rx.try_recv().is_ok(), "should fire in new window");
+    }
+
+    #[tokio::test]
+    async fn watch_patterns_set_on_process() {
+        let table = ProcessTable::new();
+        let id = table.register("cargo test", "/tmp", "");
+        table
+            .set_watch_patterns(&id, vec!["FAIL".to_string()])
+            .await;
+
+        let rec_arc = table.get_record(&id).expect("should exist");
+        let rec = rec_arc.lock().await;
+        let ws = rec.watch_state.as_ref().expect("should have watch state");
+        assert_eq!(ws.patterns, vec!["FAIL"]);
+        assert!(!ws.disabled);
     }
 }

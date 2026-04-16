@@ -1,6 +1,6 @@
 ---
 title: Messaging Gateway
-description: Run EdgeCrab as a persistent AI agent accessible from Telegram, Discord, Slack, Signal, WhatsApp, Matrix, Mattermost, DingTalk, SMS, Email, and Home Assistant. Grounded in crates/edgecrab-gateway/src/.
+description: Run EdgeCrab as a persistent AI agent accessible from Telegram, Discord, Slack, Signal, WhatsApp, Matrix, Mattermost, DingTalk, SMS, Email, Home Assistant, Feishu, WeCom, iMessage, and WeChat. Grounded in crates/edgecrab-gateway/src/.
 sidebar:
   order: 11
 ---
@@ -34,7 +34,7 @@ Each platform maintains independent sessions. A Telegram conversation and a Disc
 
 ---
 
-## Supported Platforms (11 total)
+## Supported Platforms (17 total)
 
 | Platform | Required Env Vars | Guide |
 |----------|-------------------|-------|
@@ -49,6 +49,12 @@ Each platform maintains independent sessions. A Telegram conversation and a Disc
 | SMS (Twilio) | `TWILIO_ACCOUNT_SID` + `TWILIO_AUTH_TOKEN` + `TWILIO_PHONE_NUMBER` | [SMS Setup](/user-guide/messaging/sms/) |
 | Email | `EMAIL_PROVIDER` + `EMAIL_FROM` + provider-specific credentials | [Email Setup](/user-guide/messaging/email/) |
 | Home Assistant | `HA_URL` + `HA_TOKEN` | [Home Assistant](/user-guide/messaging/homeassistant/) |
+| Feishu/Lark | `FEISHU_APP_ID` + `FEISHU_APP_SECRET` | — |
+| WeCom | `WECOM_BOT_ID` + `WECOM_SECRET` | — |
+| Webhook | *(any HTTP caller)* | — |
+| API Server | `API_SERVER_PORT` *(optional)* | — |
+| iMessage | `BLUEBUBBLES_SERVER_URL` + `BLUEBUBBLES_PASSWORD` | [iMessage Setup](/user-guide/messaging/imessage/) |
+| WeChat | `WEIXIN_TOKEN` + `WEIXIN_ACCOUNT_ID` | [WeChat Setup](/user-guide/messaging/wechat/) |
 
 ---
 

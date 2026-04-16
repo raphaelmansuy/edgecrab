@@ -1,7 +1,7 @@
 # edgecrab-cron
 
 > **Why this crate?** EdgeCrab needs to run tasks while you sleep — daily digests, automated  
-> checks, scheduled reminders delivered to any of its 15 messaging gateways. `edgecrab-cron`  
+> checks, scheduled reminders delivered to any of its 17 messaging gateways. `edgecrab-cron`  
 > provides the shared scheduling primitive: cron-expression parsing, job persistence, and  
 > prompt-injection scanning for schedules sourced from user input.
 

@@ -300,14 +300,22 @@ pub fn launch_chrome_for_debugging(port: u16) -> bool {
     let profile_dir = std::env::temp_dir().join(format!("edgecrab-chrome-debug-{port}"));
     let _ = std::fs::create_dir_all(&profile_dir);
 
-    std::process::Command::new(&chrome)
-        .arg(format!("--remote-debugging-port={port}"))
+    let mut cmd = std::process::Command::new(&chrome);
+    cmd.arg(format!("--remote-debugging-port={port}"))
         .arg(format!("--user-data-dir={}", profile_dir.display()))
         .arg("--no-first-run")
         .arg("--no-default-browser-check")
         .arg("--disable-extensions")
         .arg("--disable-sync")
-        .stdout(std::process::Stdio::null())
+        .arg("--disable-blink-features=AutomationControlled")
+        .arg("--window-size=1920,1080");
+
+    // Wire proxy from environment variables (6-level cascade)
+    if let Some(proxy_url) = edgecrab_security::proxy::resolve_proxy_url(None) {
+        cmd.arg(format!("--proxy-server={proxy_url}"));
+    }
+
+    cmd.stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
         .is_ok()
@@ -342,6 +350,9 @@ pub fn chrome_launch_command(port: u16) -> String {
         .join(format!("edgecrab-chrome-debug-{port}"))
         .display()
         .to_string();
+    let proxy_arg = edgecrab_security::proxy::resolve_proxy_url(None)
+        .map(|url| format!(" --proxy-server={url}"))
+        .unwrap_or_default();
 
     #[cfg(target_os = "macos")]
     {
@@ -354,16 +365,17 @@ pub fn chrome_launch_command(port: u16) -> String {
   --user-data-dir="{profile_dir}" \
   --no-first-run \
   --no-default-browser-check \
+  {proxy_arg} \
   about:blank &"#
         )
     }
     #[cfg(target_os = "windows")]
     return format!(
-        r#"start "" "chrome.exe" --remote-debugging-port={port} --user-data-dir="{profile_dir}" --no-first-run about:blank"#
+        r#"start "" "chrome.exe" --remote-debugging-port={port} --user-data-dir="{profile_dir}" --no-first-run{proxy_arg} about:blank"#
     );
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     return format!(
-        r#"google-chrome --remote-debugging-port={port} --user-data-dir="{profile_dir}" --no-first-run about:blank &"#
+        r#"google-chrome --remote-debugging-port={port} --user-data-dir="{profile_dir}" --no-first-run{proxy_arg} about:blank &"#
     );
 }
 
@@ -880,6 +892,12 @@ impl SessionManager {
             tracing::warn!("browser: could not install console listener: {e}");
         }
 
+        // Inject stealth patches to evade bot detection.
+        // Uses Page.addScriptToEvaluateOnNewDocument so patches survive navigation.
+        if let Err(e) = inject_stealth_patches(&session).await {
+            tracing::warn!("browser: could not inject stealth patches: {e}");
+        }
+
         self.sessions
             .insert(task_id.to_string(), Arc::clone(&session));
         Ok(session)
@@ -1051,7 +1069,10 @@ async fn cdp_http_get(path: &str) -> Result<serde_json::Value, ToolError> {
 /// Execute a CDP command at a specific endpoint.
 async fn cdp_http_get_at(ep: &CdpEndpoint, path: &str) -> Result<serde_json::Value, ToolError> {
     let url = format!("{}{path}", ep.base_url());
+    // CDP endpoint is local (127.0.0.1 by default). Never route this through
+    // env-configured proxies, or browser control can break when proxy is set.
     let client = reqwest::Client::builder()
+        .no_proxy()
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|e| ToolError::ExecutionFailed {
@@ -1447,15 +1468,25 @@ async fn ensure_chrome_running() -> Result<(), ToolError> {
     let _ = std::fs::create_dir_all(&profile_dir);
 
     let mut cmd = tokio::process::Command::new(chrome);
-    cmd.args([
-        "--headless",
-        "--disable-gpu",
-        "--no-sandbox",
-        "--disable-dev-shm-usage",
-        &format!("--remote-debugging-port={}", ep.port),
-        &format!("--user-data-dir={}", profile_dir.display()),
-        "about:blank",
-    ]);
+    let mut args = vec![
+        "--headless=new".to_string(),
+        "--disable-gpu".to_string(),
+        "--no-sandbox".to_string(),
+        "--disable-dev-shm-usage".to_string(),
+        "--disable-blink-features=AutomationControlled".to_string(),
+        "--window-size=1920,1080".to_string(),
+        format!("--remote-debugging-port={}", ep.port),
+        format!("--user-data-dir={}", profile_dir.display()),
+    ];
+
+    // Wire proxy from environment variables (6-level cascade)
+    if let Some(proxy_url) = edgecrab_security::proxy::resolve_proxy_url(None) {
+        tracing::debug!(url = %proxy_url, "Chrome: launching with proxy");
+        args.push(format!("--proxy-server={proxy_url}"));
+    }
+
+    args.push("about:blank".to_string());
+    cmd.args(&args);
     cmd.stdout(std::process::Stdio::null());
     cmd.stderr(std::process::Stdio::null());
 
@@ -1511,6 +1542,103 @@ async fn install_console_listener(session: &BrowserSession) -> Result<(), ToolEr
         })()
     "#;
     let _ = cdp_evaluate(&session.ws_url, js).await;
+    Ok(())
+}
+
+/// Inject stealth patches to evade common bot-detection checks.
+///
+/// Uses `Page.addScriptToEvaluateOnNewDocument` so patches are applied on
+/// every subsequent navigation (before any page JS runs). Patches:
+///
+/// 1. `navigator.webdriver` → `false` (Chrome sets `true` in automation mode)
+/// 2. `window.chrome` — creates minimal stub if missing (headless lacks it)
+/// 3. `navigator.plugins` — injects realistic plugin array (headless has empty)
+/// 4. `navigator.languages` — ensures non-empty array
+/// 5. `Permissions.query` — patches notification permission (headless = `denied`)
+/// 6. `WebGL` — patches renderer/vendor to avoid SwiftShader fingerprint
+async fn inject_stealth_patches(session: &BrowserSession) -> Result<(), ToolError> {
+    let stealth_js = r#"
+        // 1. navigator.webdriver = false
+        Object.defineProperty(navigator, 'webdriver', {
+            get: () => false,
+            configurable: true,
+        });
+
+        // 2. window.chrome stub
+        if (!window.chrome) {
+            window.chrome = {
+                runtime: {},
+                loadTimes: function() { return {}; },
+                csi: function() { return {}; },
+                app: { isInstalled: false, InstallState: { INSTALLED: 'installed' }, RunningState: { RUNNING: 'running' } },
+            };
+        }
+
+        // 3. navigator.plugins — inject realistic array
+        Object.defineProperty(navigator, 'plugins', {
+            get: () => {
+                var arr = [
+                    { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format', length: 1 },
+                    { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '', length: 1 },
+                    { name: 'Native Client', filename: 'internal-nacl-plugin', description: '', length: 2 },
+                ];
+                arr.refresh = function() {};
+                arr.item = function(i) { return this[i] || null; };
+                arr.namedItem = function(name) { return this.find(function(p) { return p.name === name; }) || null; };
+                return arr;
+            },
+            configurable: true,
+        });
+
+        // 4. navigator.languages fallback
+        if (!navigator.languages || navigator.languages.length === 0) {
+            Object.defineProperty(navigator, 'languages', {
+                get: () => ['en-US', 'en'],
+                configurable: true,
+            });
+        }
+
+        // 5. Permissions.query patch for notifications
+        var origQuery = window.Permissions && Permissions.prototype.query;
+        if (origQuery) {
+            Permissions.prototype.query = function(parameters) {
+                if (parameters.name === 'notifications') {
+                    return Promise.resolve({ state: Notification.permission });
+                }
+                return origQuery.call(this, parameters);
+            };
+        }
+
+        // 6. WebGL renderer/vendor — avoid SwiftShader detection
+        var getParameterOrig = WebGLRenderingContext.prototype.getParameter;
+        WebGLRenderingContext.prototype.getParameter = function(param) {
+            if (param === 37445) return 'Google Inc. (Intel)';
+            if (param === 37446) return 'ANGLE (Intel, Intel(R) UHD Graphics 630, OpenGL 4.1)';
+            return getParameterOrig.call(this, param);
+        };
+        if (typeof WebGL2RenderingContext !== 'undefined') {
+            var getParam2Orig = WebGL2RenderingContext.prototype.getParameter;
+            WebGL2RenderingContext.prototype.getParameter = function(param) {
+                if (param === 37445) return 'Google Inc. (Intel)';
+                if (param === 37446) return 'ANGLE (Intel, Intel(R) UHD Graphics 630, OpenGL 4.1)';
+                return getParam2Orig.call(this, param);
+            };
+        }
+    "#;
+
+    // addScriptToEvaluateOnNewDocument ensures this runs before ANY page JS
+    // on every future navigation in this session.
+    let _ = cdp_call(
+        &session.ws_url,
+        "Page.addScriptToEvaluateOnNewDocument",
+        json!({ "source": stealth_js }),
+        5,
+    )
+    .await?;
+
+    // Also evaluate immediately on the current about:blank page
+    let _ = cdp_evaluate(&session.ws_url, stealth_js).await;
+
     Ok(())
 }
 

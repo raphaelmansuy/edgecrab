@@ -111,6 +111,10 @@ struct RunArgs {
     cwd: Option<String>,
     #[serde(default)]
     pty: bool,
+    /// Optional substring patterns to watch for in process output.
+    /// Notifications are delivered in real-time when matched.
+    #[serde(default)]
+    watch_patterns: Vec<String>,
 }
 
 pub(crate) async fn start_background_process(
@@ -118,6 +122,7 @@ pub(crate) async fn start_background_process(
     command: &str,
     cwd_override: Option<&str>,
     pty: bool,
+    watch_patterns: Vec<String>,
     ctx: &ToolContext,
 ) -> Result<String, ToolError> {
     // Security: scan for dangerous patterns before spawning.
@@ -168,8 +173,22 @@ pub(crate) async fn start_background_process(
 
     let process_id = table.register(command.to_string(), cwd.clone(), session_key);
 
+    // Set watch patterns if provided
+    if !watch_patterns.is_empty() {
+        table.set_watch_patterns(&process_id, watch_patterns).await;
+    }
+
     if ctx.config.terminal_backend == BackendKind::Local {
-        spawn_local_process(tool_name, command, &cwd, pty, table, process_id).await
+        spawn_local_process(
+            tool_name,
+            command,
+            &cwd,
+            pty,
+            table,
+            process_id,
+            ctx.watch_notification_tx.clone(),
+        )
+        .await
     } else {
         let backend = get_or_create_backend(ctx).await?;
         spawn_remote_process(
@@ -219,6 +238,11 @@ impl ToolHandler for RunProcessTool {
                     "pty": {
                         "type": "boolean",
                         "description": "Allocate a PTY for local interactive CLI sessions. Local backend only. Full-screen terminal UIs remain unsupported."
+                    },
+                    "watch_patterns": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Substring patterns to watch for in process output. Notifications are delivered in real-time when matched. Rate-limited to prevent floods."
                     }
                 },
                 "required": ["command"]
@@ -242,6 +266,7 @@ impl ToolHandler for RunProcessTool {
             &args.command,
             args.cwd.as_deref(),
             args.pty,
+            args.watch_patterns,
             ctx,
         )
         .await
@@ -269,6 +294,7 @@ async fn spawn_local_process(
     pty: bool,
     table: &Arc<ProcessTable>,
     process_id: String,
+    watch_sink: Option<tokio::sync::mpsc::UnboundedSender<crate::process_table::WatchEvent>>,
 ) -> Result<String, ToolError> {
     if pty {
         return crate::local_pty::spawn_background(tool_name, command, cwd, table, process_id)
@@ -334,16 +360,18 @@ async fn spawn_local_process(
     if let Some(stdout_reader) = stdout {
         let t = Arc::clone(&table_clone);
         let p = pid_clone.clone();
+        let ws = watch_sink.clone();
         tokio::spawn(async move {
-            drain_reader(stdout_reader, &t, &p).await;
+            drain_reader(stdout_reader, &t, &p, ws).await;
         });
     }
 
     if let Some(stderr_reader) = stderr {
         let t = Arc::clone(&table_clone);
         let p = pid_clone.clone();
+        let ws = watch_sink;
         tokio::spawn(async move {
-            drain_reader(stderr_reader, &t, &p).await;
+            drain_reader(stderr_reader, &t, &p, ws).await;
         });
     }
 
@@ -562,10 +590,14 @@ fn normalize_output_lines(output: &str) -> Vec<String> {
 /// Shell noise filtering: The first non-empty lines are checked against
 /// `SHELL_NOISE` and silently dropped. This matches the prior
 /// `ProcessRegistry._clean_shell_noise()`.
+///
+/// Watch patterns: If the process has `watch_state` set, each line is
+/// checked against the patterns and notifications are sent via the sink.
 async fn drain_reader(
     mut reader: BufReader<impl tokio::io::AsyncRead + Unpin>,
     table: &ProcessTable,
     process_id: &str,
+    watch_sink: Option<tokio::sync::mpsc::UnboundedSender<crate::process_table::WatchEvent>>,
 ) {
     let mut first_lines = true; // still scanning the startup noise prefix
     let mut line = String::new();
@@ -585,6 +617,18 @@ async fn drain_reader(
                 table
                     .append_output(process_id, vec![trimmed.to_string()])
                     .await;
+
+                // Check watch patterns if configured
+                if let Some(ref sink) = watch_sink {
+                    if let Some(entry) = table.get_record(process_id) {
+                        let mut rec = entry.lock().await;
+                        if let Some(ref mut watch) = rec.watch_state {
+                            crate::process_table::check_watch_patterns(
+                                trimmed, process_id, watch, sink,
+                            );
+                        }
+                    }
+                }
             }
             Err(_) => break,
         }

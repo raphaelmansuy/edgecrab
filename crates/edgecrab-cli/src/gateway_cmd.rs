@@ -297,6 +297,20 @@ fn build_outbound_platform_adapters(
         }
     }
 
+    if config.gateway.platform_enabled("bluebubbles") {
+        match edgecrab_gateway::bluebubbles::BlueBubblesAdapter::from_env() {
+            Some(adapter) => adapters.push(Arc::new(adapter)),
+            None => tracing::warn!("BlueBubbles requested but configuration is incomplete"),
+        }
+    }
+
+    if config.gateway.platform_enabled("weixin") {
+        match edgecrab_gateway::weixin::WeixinAdapter::from_env() {
+            Some(adapter) => adapters.push(Arc::new(adapter)),
+            None => tracing::warn!("Weixin requested but configuration is incomplete"),
+        }
+    }
+
     Ok(adapters)
 }
 
@@ -317,7 +331,8 @@ async fn run_foreground(args: &CliArgs) -> anyhow::Result<()> {
         edgecrab_types::Platform::Webhook,
         false,
         None,
-    )?;
+    )
+    .await?;
 
     let gateway_cfg = edgecrab_gateway::config::GatewayConfig {
         host: runtime.config.gateway.host.clone(),

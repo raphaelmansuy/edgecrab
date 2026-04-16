@@ -456,6 +456,37 @@ pub enum Command {
         command: SkillsCommand,
     },
 
+    /// Create a tar.gz backup of ~/.edgecrab/ state
+    ///
+    /// Credentials (.env, mcp-tokens/) are always excluded.
+    /// Sessions are excluded unless --include-sessions is passed.
+    Backup {
+        /// Output file path (default: edgecrab-backup-YYYY-MM-DD.tar.gz)
+        #[arg(short, long)]
+        output: Option<String>,
+        /// Include sessions.db in the archive
+        #[arg(long)]
+        include_sessions: bool,
+    },
+
+    /// Restore from a backup archive
+    ///
+    /// Atomic extraction: files are unpacked to a temp dir first,
+    /// then copied to the target. Path traversal and symlinks are blocked.
+    Import {
+        /// Path to the tar.gz archive
+        archive: String,
+        /// Target directory (default: ~/.edgecrab/)
+        #[arg(short, long)]
+        target: Option<String>,
+        /// Preview without extracting
+        #[arg(long)]
+        dry_run: bool,
+        /// Overwrite existing files
+        #[arg(long)]
+        force: bool,
+    },
+
     /// Remove EdgeCrab-managed local artifacts
     ///
     /// Safe by default: stops the gateway, removes profile wrapper scripts,

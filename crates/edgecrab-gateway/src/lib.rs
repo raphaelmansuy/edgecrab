@@ -26,6 +26,7 @@
 pub mod api_server;
 pub mod attachment_cache;
 pub mod auth;
+pub mod bluebubbles;
 pub mod channel_directory;
 pub mod config;
 pub mod delivery;
@@ -42,6 +43,7 @@ pub mod mattermost;
 pub mod mirror;
 pub mod pairing;
 pub mod platform;
+pub mod proxy;
 pub mod run;
 pub mod sender;
 pub mod session;
@@ -54,6 +56,8 @@ pub mod voice_delivery;
 pub mod webhook;
 pub mod webhook_subscriptions;
 pub mod wecom;
+pub mod weixin;
+pub mod weixin_crypto;
 pub mod whatsapp;
 
 // ─── Shared adapter constants ─────────────────────────────────────────

@@ -927,6 +927,16 @@ impl CommandRegistry {
             },
         });
 
+        self.register(Command {
+            name: "dump",
+            aliases: &["debug-dump", "debug"],
+            description: "Show compact setup summary for support (copy-paste friendly)",
+            handler: |_| {
+                let output = crate::dump_cmd::run_dump(false);
+                CommandResult::Output(output)
+            },
+        });
+
         #[cfg(target_os = "macos")]
         self.register(Command {
             name: "permissions",

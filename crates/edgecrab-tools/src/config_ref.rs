@@ -308,9 +308,20 @@ impl AppConfigRef {
         let file_tools_tmp_dir = self.file_tools_tmp_dir();
         let _ = std::fs::create_dir_all(&file_tools_tmp_dir);
 
+        let mut allowed = self.file_allowed_roots.clone();
+        // On Termux, add the Termux data directory so file tools can access
+        // Termux-installed packages, shared storage, and user scripts.
+        if *edgecrab_types::IS_TERMUX {
+            if let Ok(prefix) = std::env::var("PREFIX") {
+                allowed.push(std::path::PathBuf::from(prefix));
+            } else {
+                allowed.push(std::path::PathBuf::from("/data/data/com.termux/files"));
+            }
+        }
+
         PathPolicy::new(cwd.to_path_buf())
             .with_virtual_tmp_root(file_tools_tmp_dir)
-            .with_allowed_roots(self.file_allowed_roots.clone())
+            .with_allowed_roots(allowed)
             .with_denied_roots(self.path_restrictions.clone())
     }
 

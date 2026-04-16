@@ -5,6 +5,52 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.6.0] — 2026-05-15
+
+### Added
+
+- **iMessage via BlueBubbles** — New `BlueBubblesAdapter` gateway platform enables iMessage integration through a BlueBubbles server. Features webhook-based inbound messages, REST-based outbound delivery, GUID-based dedup cache, tapback filtering, and markdown stripping. Set `BLUEBUBBLES_SERVER_URL` and `BLUEBUBBLES_PASSWORD` to enable.
+- **WeChat (Weixin) via iLink Bot API** — New `WeixinAdapter` gateway platform for WeChat messaging. POST-based long-poll with sync buffer persistence, AES-128-ECB encrypted CDN media pipeline (upload + download), context token echo, markdown reformatting, session-expired auto-recovery, and message deduplication. Set `WEIXIN_TOKEN` and `WEIXIN_ACCOUNT_ID` to enable.
+- **WeCom enhancements** — New `WeComAdapter` with websocket-based real-time messaging, AES-256-CBC message decryption, chunked media upload, text batching for long responses, and 30-second heartbeat keep-alive.
+- **Pluggable Context Engine** — New `ContextEngine` trait in `edgecrab-core` allows custom context management strategies. Default `BuiltinCompressorEngine` wraps existing compression logic. Engines can inject additional tool schemas at session start. Plugin discovery via `edgecrab-plugins`. New `context.engine` config key.
+- **Background Process Watch Patterns** — `run_process` tool now supports `watch_patterns` parameter for pattern-matched output notifications with rate limiting, overload protection, and configurable notification sinks. Watch patterns are blocked in `execute_code` sandbox.
+- **Unified Proxy Support** — New `proxy.rs` in `edgecrab-gateway` with `resolve_proxy_url()` implementing a 6-level cascade: explicit config → `HTTPS_PROXY` / `HTTP_PROXY` → `ALL_PROXY` → macOS system proxy (`scutil --proxy`) → SOCKS5 → no proxy. SOCKS5 support via `reqwest` socks feature.
+- **Backup & Import** — `edgecrab backup` creates timestamped tar.gz archives of `~/.edgecrab/` excluding secrets (`.env`, `mcp-tokens/`, `sessions.db`). `edgecrab import` restores with path traversal protection, symlink blocking, dry-run mode, and atomic extraction.
+- **Debug/Dump command** — Enhanced `edgecrab dump` with API key status scanning, config override detection (15 monitored paths), first4+last4 key redaction, and `--show-keys` flag. New `/debug` slash command alias.
+- **Termux/Android support** — `is_termux()` + `IS_TERMUX` detection, TUI compact mode for narrow terminals (< 60 cols), Termux data directory in path jail, `termux` feature flag, `make build-termux` target.
+- **SSRF Redirect Guard** — `build_ssrf_safe_client()` validates redirect targets against private IP ranges. Web tools and Slack adapter now use the safe client.
+- **CRLF Header Injection Guard** — `validate_header_value()` blocks carriage return and newline characters in HTTP headers.
+- **API Server Auth Hardening** — Timing-safe Bearer token comparison using `subtle::ConstantTimeEq` and bind-address guard.
+- **Twilio Webhook Signature Validation** — HMAC-SHA1 signature verification for inbound SMS webhooks with constant-time comparison.
+- **Platform::Weixin and Platform::BlueBubbles** enum variants in `edgecrab-types`.
+
+### Changed
+
+- **Weixin adapter: POST-based polling** — Replaced GET-based `getupdates` with POST-based polling using a sync buffer for reliable message ordering and persistence across restarts.
+- **Weixin adapter: full CDN media pipeline** — Added `upload_media()` (AES-128-ECB encrypt → CDN upload), `download_media()` (CDN download → AES-128-ECB decrypt), `send_photo()`, `send_document()`, `send_voice()` for bidirectional media transfer.
+- **Weixin adapter: session-expired auto-recovery** — Detects `errcode -14` and automatically re-authenticates without losing message state.
+- **BlueBubbles: inbound attachment download** — Webhook handler now downloads attachment content via `GET /api/v1/attachment/{guid}/download` and populates `MessageAttachment` on incoming messages.
+- **BlueBubbles: Private API auto-detection** — `detect_private_api()` is called at startup to probe server capabilities and enable Private API features automatically.
+- **BlueBubbles: improved markdown stripping** — `strip_markdown()` now handles code fences, links `[text](url)`, italic markers, and nested formatting.
+- **WeCom: heartbeat keep-alive** — Spawns a 30-second interval ping task to prevent WebSocket connection drops.
+- **WeCom: `aibot_event_callback` handling** — Now recognized as a callback command alongside existing callback types.
+- **WeCom: tuned constants** — `BATCH_LONG_THRESHOLD` raised from 3500 to 3900; `BACKOFF_STEPS` extended with 60-second final step.
+- **Dump: expanded config overrides** — `INTERESTING_OVERRIDES` now monitors 15 config paths including `agent.gateway_timeout`, `terminal.backend`, `terminal.docker_image`, `terminal.persistent_shell`, `browser.allow_private_urls`, `smart_model_routing.enabled`, `privacy.redact_pii`.
+- Web tools `build_client()` now uses `build_ssrf_safe_client()` instead of plain `reqwest::Client::builder()`.
+- Slack adapter constructors (`new()`, `from_tokens()`) now use `build_ssrf_safe_client()`.
+- `execute_code` sandbox blocks `watch_patterns` parameter in terminal tool RPC calls.
+- `edgecrab-gateway` now depends on `edgecrab-security` for SSRF-safe client construction.
+
+### Security
+
+- All outbound HTTP clients in web tools and gateway adapters now enforce SSRF redirect guards.
+- Twilio webhook endpoints validate request signatures before processing.
+- API server uses constant-time token comparison to prevent timing attacks.
+- HTTP headers are validated against CRLF injection.
+- External skills undergo 23-pattern security scan before installation.
+
+---
+
 ## [0.5.0] — 2026-04-13
 
 ### Added

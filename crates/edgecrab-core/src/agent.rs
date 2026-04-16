@@ -88,6 +88,10 @@ pub struct Agent {
     /// After each compression `format_for_injection()` re-injects active items
     /// so the model never loses its plan across context-window boundaries.
     pub(crate) todo_store: Arc<edgecrab_tools::TodoStore>,
+    /// Pluggable context engine for custom context management strategies.
+    /// WHY Option: The default `BuiltinCompressorEngine` is used when None.
+    /// External engines inject additional tool schemas at session start.
+    pub(crate) context_engine: Option<Arc<dyn crate::context_engine::ContextEngine>>,
 }
 
 /// Options for cloning an agent into a fresh isolated session.
@@ -502,6 +506,7 @@ impl Agent {
         provider: Arc<dyn LLMProvider>,
         state_db: Option<Arc<SessionDb>>,
         tool_registry: Option<Arc<ToolRegistry>>,
+        context_engine: Option<Arc<dyn crate::context_engine::ContextEngine>>,
     ) -> Self {
         let budget = Arc::new(IterationBudget::new(config.max_iterations));
 
@@ -522,6 +527,7 @@ impl Agent {
             cancel: std::sync::Mutex::new(CancellationToken::new()),
             gc_cancel,
             todo_store: Arc::new(TodoStore::new()),
+            context_engine,
         }
     }
 
@@ -747,6 +753,7 @@ impl Agent {
             provider,
             self.state_db.clone(),
             self.tool_registry.read().await.clone(),
+            self.context_engine.clone(),
         );
         if let Some(sender) = gateway_sender {
             child.set_gateway_sender(sender).await;
@@ -1254,6 +1261,7 @@ impl Agent {
             current_tool_name: None,
             injected_messages: None,
             tool_progress_tx: None,
+            watch_notification_tx: None,
         };
         registry.tool_inventory(&ctx)
     }
@@ -1672,6 +1680,7 @@ pub struct AgentBuilder {
     provider: Option<Arc<dyn LLMProvider>>,
     state_db: Option<Arc<SessionDb>>,
     tool_registry: Option<Arc<ToolRegistry>>,
+    context_engine: Option<Arc<dyn crate::context_engine::ContextEngine>>,
 }
 
 impl AgentBuilder {
@@ -1684,6 +1693,7 @@ impl AgentBuilder {
             provider: None,
             state_db: None,
             tool_registry: None,
+            context_engine: None,
         }
     }
 
@@ -1744,6 +1754,7 @@ impl AgentBuilder {
             provider: None,
             state_db: None,
             tool_registry: None,
+            context_engine: None,
         }
     }
 
@@ -1759,6 +1770,11 @@ impl AgentBuilder {
 
     pub fn tools(mut self, registry: Arc<ToolRegistry>) -> Self {
         self.tool_registry = Some(registry);
+        self
+    }
+
+    pub fn context_engine(mut self, engine: Arc<dyn crate::context_engine::ContextEngine>) -> Self {
+        self.context_engine = Some(engine);
         self
     }
 
@@ -1811,6 +1827,7 @@ impl AgentBuilder {
             provider,
             self.state_db,
             self.tool_registry,
+            self.context_engine,
         ))
     }
 }

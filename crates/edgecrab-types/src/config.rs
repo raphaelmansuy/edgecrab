@@ -55,6 +55,8 @@ pub enum Platform {
     Api,
     HomeAssistant,
     Acp,
+    BlueBubbles,
+    Weixin,
     /// Scheduled cron job — no interactive user present.
     Cron,
 }
@@ -79,6 +81,8 @@ impl std::fmt::Display for Platform {
             Platform::Api => "api",
             Platform::HomeAssistant => "homeassistant",
             Platform::Acp => "acp",
+            Platform::BlueBubbles => "bluebubbles",
+            Platform::Weixin => "weixin",
             Platform::Cron => "cron",
         };
         write!(f, "{s}")

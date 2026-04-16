@@ -36,6 +36,8 @@ pub fn platform_env_prefix(platform: Platform) -> Option<&'static str> {
         Platform::Feishu => Some("FEISHU"),
         Platform::Wecom => Some("WECOM"),
         Platform::HomeAssistant => Some("HA"),
+        Platform::BlueBubbles => Some("BLUEBUBBLES"),
+        Platform::Weixin => Some("WEIXIN"),
         // These platforms have no user allowlist concept:
         Platform::Webhook | Platform::Api | Platform::Cli | Platform::Acp | Platform::Cron => None,
     }

@@ -14,6 +14,7 @@ path = "src/main.rs"
 [features]
 default = ["bedrock-model-discovery"]
 bedrock-model-discovery = ["edgecrab-core/bedrock-model-discovery"]
+termux = []
 
 [dependencies]
 edgecrab-command-catalog = { workspace = true }
@@ -61,8 +62,8 @@ which = { workspace = true }
 libc = { workspace = true }
 flate2 = { workspace = true }
 tar = { workspace = true }
+tempfile = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
-tempfile = { workspace = true }
 serial_test = "3"

@@ -314,6 +314,10 @@ pub struct ToolContext {
     pub injected_messages: Option<Arc<tokio::sync::Mutex<Vec<Message>>>>,
     /// Optional channel used by tools to emit structured progress updates.
     pub tool_progress_tx: Option<tokio::sync::mpsc::UnboundedSender<ToolProgressUpdate>>,
+    /// Optional channel for watch pattern notifications from background processes.
+    /// WHY Option: Only needed when watch_patterns is used on run_process.
+    pub watch_notification_tx:
+        Option<tokio::sync::mpsc::UnboundedSender<crate::process_table::WatchEvent>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -388,6 +392,7 @@ impl ToolContext {
             current_tool_name: None,
             injected_messages: None,
             tool_progress_tx: None,
+            watch_notification_tx: None,
         }
     }
 

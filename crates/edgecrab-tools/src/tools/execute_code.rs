@@ -123,7 +123,7 @@ const SANDBOX_ALLOWED_TOOLS: &[&str] = &[
 
 /// Terminal parameters that must not be used from sandbox scripts.
 #[cfg(unix)]
-const TERMINAL_BLOCKED_PARAMS: &[&str] = &["background", "check_interval", "pty"];
+const TERMINAL_BLOCKED_PARAMS: &[&str] = &["background", "check_interval", "pty", "watch_patterns"];
 
 pub struct ExecuteCodeToolReal;
 
@@ -1521,6 +1521,7 @@ async fn execute_remote(
                 current_tool_name: None,
                 injected_messages: ctx.injected_messages.clone(),
                 tool_progress_tx: None,
+                watch_notification_tx: None,
             };
             let rpc_dir = format!("{sandbox_dir}/rpc");
             let allowed = Arc::new(sandbox_tools.iter().map(|tool| tool.to_string()).collect());
@@ -1773,6 +1774,7 @@ impl ToolHandler for ExecuteCodeToolReal {
                     current_tool_name: None,
                     injected_messages: ctx.injected_messages.clone(),
                     tool_progress_tx: None,
+                    watch_notification_tx: None,
                 };
                 let counter = tool_call_counter.clone();
                 let allowed: Arc<Vec<String>> =
