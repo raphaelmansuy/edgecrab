@@ -311,6 +311,37 @@ fn format_timestamp(ts: Option<i64>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{LazyLock, Mutex, MutexGuard};
+
+    static ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    struct EnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let lock = ENV_MUTEX.lock().expect("env mutex poisoned");
+            let original = std::env::var(key).ok();
+            unsafe { std::env::set_var(key, value) };
+            Self {
+                _lock: lock,
+                key,
+                original,
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
 
     #[test]
     fn redact_normal_key() {
@@ -344,24 +375,22 @@ mod tests {
     fn dump_no_full_keys_in_output() {
         // Set a test key and ensure it never appears in full
         let test_key = "sk-test-this-is-a-fake-key-12345";
-        unsafe { std::env::set_var("ANTHROPIC_API_KEY", test_key) };
+        let _guard = EnvGuard::set("ANTHROPIC_API_KEY", test_key);
         let output = run_dump(false);
         assert!(
             !output.contains(test_key),
             "Full API key should never appear in dump output"
         );
-        unsafe { std::env::remove_var("ANTHROPIC_API_KEY") };
     }
 
     #[test]
     fn dump_show_keys_includes_redacted() {
         let test_key = "sk-test-redacted-key-abcdef";
-        unsafe { std::env::set_var("ANTHROPIC_API_KEY", test_key) };
+        let _guard = EnvGuard::set("ANTHROPIC_API_KEY", test_key);
         let output = run_dump(true);
         assert!(output.contains("sk-t"), "Should show first 4 chars");
         assert!(output.contains("cdef"), "Should show last 4 chars");
         assert!(!output.contains(test_key), "Full key must never appear");
-        unsafe { std::env::remove_var("ANTHROPIC_API_KEY") };
     }
 
     #[test]
