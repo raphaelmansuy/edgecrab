@@ -642,7 +642,7 @@ impl ProcessTable {
             let rec: tokio::sync::MutexGuard<'_, ProcessRecord> = entry.value().lock().await;
             records.push(rec.clone());
         }
-        records.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        records.sort_by_key(|record| std::cmp::Reverse(record.started_at));
         records
     }
 

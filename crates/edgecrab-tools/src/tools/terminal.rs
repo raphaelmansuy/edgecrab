@@ -47,22 +47,22 @@ fn validate_backend_workdir_visibility(
 
     match backend {
         crate::tools::backends::BackendKind::Modal
-        | crate::tools::backends::BackendKind::Daytona => {
-            if cwd_path.exists() {
-                let cfg = crate::config_ref::AppConfigRef {
-                    terminal_backend: backend.clone(),
-                    ..Default::default()
-                };
-                let fs = describe_execution_filesystem(&cfg, cwd_path);
-                let allowed_roots = fs.file_roots_display();
-                return Err(ToolError::ExecutionFailed {
-                    tool: "terminal".into(),
-                    message: format!(
-                        "The {} backend cannot access host workspace path '{}'. File tools in this session are rooted at {}. Use the local or docker backend for local files, or sync the workspace into the remote sandbox first.",
-                        backend, cwd, allowed_roots
-                    ),
-                });
-            }
+        | crate::tools::backends::BackendKind::Daytona
+            if cwd_path.exists() =>
+        {
+            let cfg = crate::config_ref::AppConfigRef {
+                terminal_backend: backend.clone(),
+                ..Default::default()
+            };
+            let fs = describe_execution_filesystem(&cfg, cwd_path);
+            let allowed_roots = fs.file_roots_display();
+            return Err(ToolError::ExecutionFailed {
+                tool: "terminal".into(),
+                message: format!(
+                    "The {} backend cannot access host workspace path '{}'. File tools in this session are rooted at {}. Use the local or docker backend for local files, or sync the workspace into the remote sandbox first.",
+                    backend, cwd, allowed_roots
+                ),
+            });
         }
         _ => {}
     }
