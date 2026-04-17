@@ -22,7 +22,7 @@ pip install edgecrab
 ```python
 from edgecrab import Agent
 
-agent = Agent(model="anthropic/claude-sonnet-4-20250514")
+agent = Agent(model="openai/gpt-4o")
 reply = agent.chat("Explain Rust ownership in 3 sentences")
 print(reply)
 ```
@@ -86,7 +86,7 @@ asyncio.run(main())
 ```python
 from edgecrab import Agent
 
-agent = Agent(model="anthropic/claude-opus-4-5")
+agent = Agent(model="copilot/gpt-5-mini")
 
 for chunk in agent.stream("Write a Rust async HTTP client"):
     print(chunk, end="", flush=True)
@@ -100,7 +100,7 @@ import asyncio
 from edgecrab import AsyncAgent
 
 async def main():
-    agent = AsyncAgent(model="anthropic/claude-opus-4-5")
+    agent = AsyncAgent(model="copilot/gpt-5-mini")
     async for chunk in agent.astream("Write a Rust async HTTP client"):
         print(chunk, end="", flush=True)
     print()
@@ -185,7 +185,7 @@ edgecrab chat
 edgecrab chat "Summarize the last 10 git commits"
 
 # Use a specific model
-edgecrab chat --model anthropic/claude-opus-4-5 "Explain this codebase"
+edgecrab chat --model openai/gpt-5 "Explain this codebase"
 
 # List available models
 edgecrab models
@@ -217,7 +217,7 @@ except EdgeCrabError as e:
 
 ## Full SDK Docs
 
-See [sdks/python/README.md](https://github.com/raphaelmansuy/edgecrab/blob/main/sdks/python/README.md) in the repository for the complete API reference.
+See the [Python SDK README](https://github.com/raphaelmansuy/edgecrab/blob/main/sdks/python/README.md) in the repository for the complete API reference.
 
 ---
 

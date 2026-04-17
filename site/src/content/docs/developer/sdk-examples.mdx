@@ -1,0 +1,214 @@
+---
+title: SDK Examples
+description: Runnable code examples for the EdgeCrab SDKs across Rust, Python, Node.js, and WASM.
+sidebar:
+  order: 5
+---
+
+Examples now live in the per-SDK example folders in this repository:
+
+- Rust: [crates/edgecrab-sdk/examples](https://github.com/raphaelmansuy/edgecrab/tree/main/crates/edgecrab-sdk/examples)
+- Python: [sdks/python/examples](https://github.com/raphaelmansuy/edgecrab/tree/main/sdks/python/examples)
+- Node.js: [sdks/nodejs-native/examples](https://github.com/raphaelmansuy/edgecrab/tree/main/sdks/nodejs-native/examples)
+- WASM: [sdks/wasm/examples](https://github.com/raphaelmansuy/edgecrab/tree/main/sdks/wasm/examples)
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+## Hello World
+
+The simplest possible agent — send one message, print the reply.
+
+<Tabs>
+<TabItem label="Rust">
+
+```rust
+use edgecrab_sdk::prelude::*;
+
+#[tokio::main]
+async fn main() -> Result<(), SdkError> {
+    let agent = SdkAgent::new("openai/gpt-4o")?;
+    let reply = agent.chat("What is EdgeCrab? Answer in one sentence.").await?;
+    println!("Agent: {reply}");
+    Ok(())
+}
+```
+
+```bash
+cargo run --example hello
+```
+
+</TabItem>
+<TabItem label="Python">
+
+```python
+from edgecrab import Agent
+
+agent = Agent("openai/gpt-4o", quiet_mode=True)
+reply = agent.chat_sync("What is EdgeCrab? Answer in one sentence.")
+print(f"Agent: {reply}")
+```
+
+```bash
+python sdks/python/examples/basic_usage.py
+```
+
+</TabItem>
+</Tabs>
+
+## Streaming
+
+Watch tokens arrive in real-time as the agent generates its response.
+
+<Tabs>
+<TabItem label="Rust">
+
+```rust
+use edgecrab_sdk::prelude::*;
+
+#[tokio::main]
+async fn main() -> Result<(), SdkError> {
+    let agent = SdkAgent::builder("copilot/gpt-5-mini")?
+        .streaming(true)
+        .build()?;
+
+    let mut rx = agent.stream("Write a haiku about Rust.").await?;
+
+    while let Some(event) = rx.recv().await {
+        match &event {
+            StreamEvent::Token(t) => print!("{t}"),
+            StreamEvent::Done => println!("\n--- Done ---"),
+            other => println!("[{other:?}]"),
+        }
+    }
+    Ok(())
+}
+```
+
+</TabItem>
+<TabItem label="Python">
+
+```python
+from edgecrab import Agent
+
+agent = Agent("copilot/gpt-5-mini", streaming=True, quiet_mode=True)
+events = agent.stream_sync("Write a haiku about Python.")
+
+for event in events:
+    if event.kind == "token":
+        print(event.data, end="", flush=True)
+    elif event.kind == "done":
+        print("\n--- Done ---")
+```
+
+</TabItem>
+</Tabs>
+
+## Custom Tool
+
+Register a custom tool that the agent can invoke.
+
+<Tabs>
+<TabItem label="Rust">
+
+```rust
+use edgecrab_sdk::prelude::*;
+
+/// Get the current weather for a city.
+#[edgecrab_tool(name = "get_weather", toolset = "demo", emoji = "🌤️")]
+async fn get_weather(city: String) -> Result<String, edgecrab_types::ToolError> {
+    Ok(format!("The weather in {city} is sunny and 22°C."))
+}
+
+#[tokio::main]
+async fn main() -> Result<(), SdkError> {
+    let agent = SdkAgent::builder("openai/gpt-4o")?
+        .max_iterations(5)
+        .build()?;
+
+    let result = agent.run("What's the weather in Paris?").await?;
+    println!("Reply: {}", result.final_response);
+    println!("API calls: {}", result.api_calls);
+    Ok(())
+}
+```
+
+</TabItem>
+</Tabs>
+
+## Builder Configuration
+
+Demonstrate all builder options.
+
+<Tabs>
+<TabItem label="Rust">
+
+```rust
+use edgecrab_sdk::prelude::*;
+
+#[tokio::main]
+async fn main() -> Result<(), SdkError> {
+    let agent = SdkAgent::builder("openai/gpt-4o")?
+        .max_iterations(10)
+        .temperature(0.5)
+        .streaming(false)
+        .quiet_mode(true)
+        .build()?;
+
+    let result = agent.run("Explain monads in one sentence.").await?;
+    println!("Model: {}", result.model);
+    println!("API calls: {}", result.api_calls);
+    println!("Response: {}", result.final_response);
+    Ok(())
+}
+```
+
+</TabItem>
+<TabItem label="Python">
+
+```python
+from edgecrab import Agent
+
+agent = Agent(
+    "openai/gpt-4o",
+    max_iterations=10,
+    temperature=0.5,
+    quiet_mode=True,
+)
+
+result = agent.run_sync("Explain monads in one sentence.")
+print(f"Model: {result.model}")
+print(f"API calls: {result.api_calls}")
+print(f"Reply: {result.reply}")
+```
+
+</TabItem>
+</Tabs>
+
+## Session Management
+
+List and search conversation sessions.
+
+<Tabs>
+<TabItem label="Python">
+
+```python
+from edgecrab import Agent, Config, edgecrab_home
+
+print(f"EdgeCrab home: {edgecrab_home()}")
+
+config = Config.load()
+print(f"Default model: {config.default_model}")
+
+agent = Agent("copilot/gpt-5-mini", quiet_mode=True)
+
+# List recent sessions
+for s in agent.list_sessions(limit=5):
+    print(f"  {s.id[:8]}... | {s.model} | {s.message_count} msgs")
+
+# Search sessions
+for h in agent.search_sessions("hello", limit=3):
+    print(f"  score={h.score:.2f} | {h.snippet[:60]}...")
+```
+
+</TabItem>
+</Tabs>

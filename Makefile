@@ -151,11 +151,11 @@ uninstall: ## Remove edgecrab from ~/.cargo/bin
 
 test-python: ## Run Python SDK tests
 	$(call log,Python SDK tests)
-	@cd sdks/python && pip install -e ".[dev]" -q && pytest tests/ -v
+	@cd sdks/python && python3 -m pip install -e . -q && pytest tests/test_sdk_e2e.py -v
 
 test-node: ## Run Node.js SDK tests
 	$(call log,Node.js SDK tests)
-	@cd sdks/node && npm ci --silent && npm run build && npm test
+	@cd sdks/nodejs-native && npm ci --silent && npm run build && npm test
 
 test-sdks: test-python test-node ## Run all SDK test suites
 	$(call ok,All SDK tests passed)
@@ -219,29 +219,29 @@ publish-python-local: ## Build Python SDK wheel and install it locally with pip
 	$(call log,Building Python SDK wheel ...)
 	@cd sdks/python && python -m build
 	$(call log,Installing Python SDK locally ...)
-	@pip install --force-reinstall sdks/python/dist/edgecrab_sdk-*.whl
+	@pip install --force-reinstall sdks/python/dist/edgecrab-*.whl
 	$(call ok,Python SDK installed locally)
 
 # ── Node.js / npm ────────────────────────────────────────────────────────────
 publish-node-dry: ## Dry-run: build and pack Node.js SDK
 	$(call log,Building Node.js SDK [dry-run])
-	@cd sdks/node && npm ci && npm run build
-	@cd sdks/node && npm pack --dry-run
+	@cd sdks/nodejs-native && npm ci && npm run build
+	@cd sdks/nodejs-native && npm pack --dry-run
 	$(call ok,Node.js dry-run passed)
 
 publish-node: ## Build and publish Node.js SDK to npm
 	$(call log,Building Node.js SDK ...)
-	@cd sdks/node && npm ci && npm run build
+	@cd sdks/nodejs-native && npm ci && npm run build
 	$(call log,Publishing to npm ...)
-	@cd sdks/node && npm publish --access public
+	@cd sdks/nodejs-native && npm publish --access public
 	$(call ok,Node.js SDK published to npm)
 
 publish-node-local: ## Build Node.js SDK, pack it, and install it locally via npm link
 	$(call log,Building Node.js SDK ...)
-	@cd sdks/node && npm ci && npm run build
+	@cd sdks/nodejs-native && npm ci && npm run build
 	$(call log,Linking Node.js SDK locally ...)
-	@cd sdks/node && npm link --force
-	$(call ok,Node.js SDK linked locally — use 'npm link edgecrab-sdk' in your project)
+	@cd sdks/nodejs-native && npm link --force
+	$(call ok,Node.js SDK linked locally — use 'npm link edgecrab' in your project)
 
 # ── npm CLI (edgecrab-cli wrapper) ───────────────────────────────────────────
 publish-npm-cli-dry: ## Dry-run: pack npm CLI wrapper package

@@ -1,0 +1,25 @@
+[package]
+name = "edgecrab-sdk-core"
+description = "Stable facade for EdgeCrab agent runtime — used by Rust, Python, and Node.js SDKs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+edgecrab-types = { workspace = true }
+edgecrab-core = { workspace = true }
+edgecrab-tools = { workspace = true }
+edgecrab-state = { workspace = true }
+edgecrab-security = { workspace = true }
+edgequake-llm = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile = { workspace = true }

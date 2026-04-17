@@ -70,7 +70,7 @@ Secrets (API keys, bot tokens) go in `.env`. Everything else goes in `config.yam
 ```yaml
 # ~/.edgecrab/config.yaml
 model:
-  default: "anthropic/claude-sonnet-4-20250514"  # Default model
+  default: "openai/gpt-4o"  # Default model
   max_iterations: 90           # Max tool call iterations per conversation
   streaming: true              # Stream tokens to terminal
   prompt_caching: true         # Enable OpenAI/Anthropic prompt caching
@@ -106,7 +106,7 @@ last-chance expert and aggregator fallback if a saved MoA roster is stale.
 
 | Key | Default |
 |-----|---------|
-| `default` | `"anthropic/claude-sonnet-4-20250514"` |
+| `default` | `"openai/gpt-4o"` |
 | `max_iterations` | `90` |
 | `streaming` | `true` |
 | `prompt_caching` | `true` |

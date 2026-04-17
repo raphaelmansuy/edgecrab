@@ -111,7 +111,7 @@ edgecrab [OPTIONS] [PROMPT]
 
 ```bash
 edgecrab --model openai/gpt-4.1-mini "explain this PR"
-edgecrab --model anthropic/claude-opus-4-5 "refactor this function"
+edgecrab --model openai/gpt-5 "refactor this function"
 edgecrab --model ollama/llama3.3 "offline mode"
 edgecrab -m deepseek/deepseek-chat "fast, cost-effective"
 

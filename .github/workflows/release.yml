@@ -71,11 +71,13 @@ jobs:
 
           git add \
             Cargo.toml \
-            sdks/node/package-lock.json \
-            sdks/node/package.json \
+            sdks/nodejs-native/index.js \
+            sdks/nodejs-native/package-lock.json \
+            sdks/nodejs-native/package.json \
             sdks/npm-cli/package.json \
             sdks/pypi-cli/edgecrab_cli/_version.py \
-            sdks/python/edgecrab/_version.py
+            sdks/python/pyproject.toml \
+            sdks/wasm/package.json
 
           git commit -m "chore: bump version to $VERSION"
           git tag "v$VERSION"

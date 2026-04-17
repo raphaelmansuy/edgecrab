@@ -1,0 +1,32 @@
+# ── Maturin / PyO3 build outputs ─────────────────────────────────────────────
+dist/
+*.egg-info/
+.pytest_cache/
+
+# ── Compiled native module ────────────────────────────────────────────────────
+# The .so/.dylib/.pyd file is built by `maturin develop` and should NOT be committed.
+# It is platform-specific and generated during development/CI.
+python/edgecrab/_native*.so
+python/edgecrab/_native*.dylib
+python/edgecrab/_native*.pyd
+python/edgecrab/*.abi3.so
+
+# ── Python cache ──────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+.mypy_cache/
+.ruff_cache/
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+
+# ── Test outputs ──────────────────────────────────────────────────────────────
+.coverage
+htmlcov/
+coverage.xml
+
+# ── macOS noise ───────────────────────────────────────────────────────────────
+.DS_Store

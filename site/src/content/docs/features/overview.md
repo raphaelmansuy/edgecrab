@@ -41,7 +41,7 @@ See [TUI Interface](/features/tui/)
 Switch provider and model without restarting:
 
 ```
-/model anthropic/claude-opus-4
+/model openai/gpt-5
 /model openai/gpt-4o
 /model ollama/llama3.3
 /model copilot/gpt-4.1-mini

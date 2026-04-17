@@ -36,17 +36,17 @@ cargo fmt --all
 
 ```bash
 cd sdks/python
-pip install -e ".[dev]"
-pytest tests/ -v     # 54 tests
+python -m pip install -e .
+pytest tests/test_sdk_e2e.py -v
 ```
 
 ### Node.js SDK
 
 ```bash
-cd sdks/node
+cd sdks/nodejs-native
 npm ci
 npm run build
-npm test             # 24 tests
+npm test
 ```
 
 ---

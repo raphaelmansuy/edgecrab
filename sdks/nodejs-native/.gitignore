@@ -1,0 +1,29 @@
+# ── napi-rs / Node.js native build outputs ───────────────────────────────────
+node_modules/
+dist/
+*.node
+.node_modules/
+
+# ── Built napi artefacts ──────────────────────────────────────────────────────
+# The .node binary is platform-specific and built by `npm run build` / `napi build`.
+# It is restored per-platform via @napi-rs/cli on install.
+edgecrab.darwin-arm64.node
+edgecrab.darwin-x64.node
+edgecrab.linux-x64-gnu.node
+edgecrab.linux-arm64-gnu.node
+edgecrab.linux-x64-musl.node
+edgecrab.linux-arm64-musl.node
+edgecrab.win32-x64-msvc.node
+
+# ── npm / yarn / pnpm logs ────────────────────────────────────────────────────
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnpm-store/
+
+# ── macOS noise ───────────────────────────────────────────────────────────────
+.DS_Store
+
+# ── TypeScript build outputs ──────────────────────────────────────────────────
+*.tsbuildinfo

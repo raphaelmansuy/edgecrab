@@ -5,6 +5,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [Unreleased]
+
+## [0.7.0] — 2026-04-17
+
+### Added
+
+- **Cross-SDK example tracks** — Each SDK now ships friendlier `getting-started`, `business`, and `e2e` example entry points with dedicated READMEs for faster onboarding.
+- **Business-oriented agent showcases** — Added more realistic SDK demos for review pipelines, documentation generation, support flows, and safe automation scenarios.
+- **Grounded E2E smoke coverage** — Refreshed runnable end-to-end verification across Rust, Python, Node.js, and WASM SDK targets.
+
+### Changed
+
+- **One SDK naming story** — Public docs and release surfaces now present a unified EdgeCrab SDK experience across languages, while historical repo folder names remain internal implementation details.
+- **Provider-safe example defaults** — Public examples now prefer Copilot, OpenAI, and Ollama-compatible model strings throughout the SDK docs and tutorial pages.
+- **SDK documentation refresh** — README and Astro docs now point to the new per-SDK example layout and highlight the most practical, user-facing example paths.
+
 ## [0.6.0] — 2026-05-15
 
 ### Added

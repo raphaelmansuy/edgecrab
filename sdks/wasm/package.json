@@ -1,0 +1,30 @@
+{
+  "name": "@edgecrab/wasm",
+  "version": "0.7.0",
+  "description": "WASM bindings for the EdgeCrab AI agent SDK — browser & edge runtime",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/raphaelmansuy/edgecrab"
+  },
+  "files": [
+    "edgecrab_wasm_bg.wasm",
+    "edgecrab_wasm.js",
+    "edgecrab_wasm.d.ts",
+    "edgecrab_wasm_bg.wasm.d.ts"
+  ],
+  "module": "edgecrab_wasm.js",
+  "types": "edgecrab_wasm.d.ts",
+  "sideEffects": [
+    "./edgecrab_wasm.js",
+    "./snippets/*"
+  ],
+  "keywords": [
+    "wasm",
+    "ai",
+    "agent",
+    "llm",
+    "edgecrab",
+    "webassembly"
+  ]
+}

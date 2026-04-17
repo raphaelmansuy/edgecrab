@@ -53,7 +53,7 @@ set_workspace_version() {
 
 set_workspace_dependency_versions() {
   local version="$1"
-  perl -0pi -e 's/^(edgecrab-(?:command-catalog|types|security|state|plugins|cron|lsp|tools|core|gateway|acp|migrate) = \{ path = "crates\/[^"]+", version = )"[^"]+"/${1}"'"$version"'"/mg' \
+  perl -0pi -e 's/^(edgecrab-(?:command-catalog|types|security|state|plugins|cron|lsp|tools|core|gateway|acp|migrate|sdk-core|sdk-macros|sdk) = \{ path = "(?:crates|sdks)\/[^"]+", version = )"[^"]+"/${1}"'"$version"'"/mg' \
     Cargo.toml
 }
 
@@ -61,19 +61,29 @@ sync_versions() {
   local version="$1"
 
   perl -0pi -e 's/"version": "[^"]+"/"version": "'"$version"'"/' \
-    sdks/node/package.json
+    sdks/nodejs-native/package.json
 
-  if [[ -f sdks/node/package-lock.json ]]; then
-    perl -0pi -e 's/^(\s*"version":\s*)"[^"]+"/${1}"'"$version"'"/m; s/("packages":\s*\{\s*"":\s*\{\s*"name":\s*"edgecrab-sdk",\s*"version":\s*)"[^"]+"/${1}"'"$version"'"/s' \
-      sdks/node/package-lock.json
+  if [[ -f sdks/nodejs-native/package-lock.json ]]; then
+    perl -0pi -e 's/^(\s*"version":\s*)"[^"]+"/${1}"'"$version"'"/m; s/("packages":\s*\{\s*"":\s*\{\s*"name":\s*"edgecrab",\s*"version":\s*)"[^"]+"/${1}"'"$version"'"/s' \
+      sdks/nodejs-native/package-lock.json
+  fi
+
+  if [[ -f sdks/nodejs-native/index.js ]]; then
+    perl -0pi -e "s/(bindingPackageVersion !== )'[^']+'/\${1}'$version'/g; s/(expected )[0-9]+\.[0-9]+\.[0-9]+( but got \\$\{bindingPackageVersion\})/\${1}$version\${2}/g" \
+      sdks/nodejs-native/index.js
   fi
 
   perl -0pi -e 's/"version": "[^"]+"/"version": "'"$version"'"/' \
     sdks/npm-cli/package.json
 
+  if [[ -f sdks/wasm/package.json ]]; then
+    perl -0pi -e 's/"version": "[^"]+"/"version": "'"$version"'"/' \
+      sdks/wasm/package.json
+  fi
+
   printf '__version__ = "%s"\n' "$version" > sdks/pypi-cli/edgecrab_cli/_version.py
 
-  printf '__version__ = "%s"\n' "$version" > sdks/python/edgecrab/_version.py
+  perl -0pi -e 's/^(version = )"[^"]+"/${1}"'"$version"'"/m' sdks/python/pyproject.toml
 }
 
 read_npm_version() {
@@ -81,11 +91,11 @@ read_npm_version() {
 }
 
 read_node_sdk_version() {
-  sed -n 's/^[[:space:]]*"version": "\([^"]*\)",$/\1/p' sdks/node/package.json
+  sed -n 's/^[[:space:]]*"version": "\([^"]*\)",$/\1/p' sdks/nodejs-native/package.json
 }
 
 read_node_sdk_lock_version() {
-  sed -n 's/^[[:space:]]*"version": "\([^"]*\)",$/\1/p' sdks/node/package-lock.json | head -n 1
+  sed -n 's/^[[:space:]]*"version": "\([^"]*\)",$/\1/p' sdks/nodejs-native/package-lock.json | head -n 1
 }
 
 read_pypi_cli_version() {
@@ -93,7 +103,19 @@ read_pypi_cli_version() {
 }
 
 read_python_sdk_version() {
-  sed -n 's/^__version__ = "\([^"]*\)"$/\1/p' sdks/python/edgecrab/_version.py
+  sed -n 's/^version = "\([^"]*\)"$/\1/p' sdks/python/pyproject.toml | head -n 1
+}
+
+read_wasm_sdk_version() {
+  if [[ -f sdks/wasm/package.json ]]; then
+    sed -n 's/^[[:space:]]*"version": "\([^"]*\)",$/\1/p' sdks/wasm/package.json
+  fi
+}
+
+read_node_sdk_runtime_version() {
+  if [[ -f sdks/nodejs-native/index.js ]]; then
+    sed -n 's/.*expected \([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\) but got.*/\1/p' sdks/nodejs-native/index.js | head -n 1
+  fi
 }
 
 check_synced() {
@@ -105,7 +127,7 @@ check_synced() {
     awk '
       /^\[workspace\.dependencies\]/ { in_section=1; next }
       /^\[/ { in_section=0 }
-      in_section && /^edgecrab-(command-catalog|types|security|state|plugins|cron|lsp|tools|core|gateway|acp|migrate) = \{ path = "crates\// {
+      in_section && /^edgecrab-(command-catalog|types|security|state|plugins|cron|lsp|tools|core|gateway|acp|migrate|sdk-core|sdk-macros|sdk) = \{ path = "(crates|sdks)\// {
         line=$0
         sub(/^.*version = "/, "", line)
         sub(/".*$/, "", line)
@@ -122,15 +144,24 @@ check_synced() {
   local node_sdk_version
   node_sdk_version="$(read_node_sdk_version)"
   if [[ "$node_sdk_version" != "$version" ]]; then
-    echo "Version drift: sdks/node/package.json is $node_sdk_version, expected $version" >&2
+    echo "Version drift: sdks/nodejs-native/package.json is $node_sdk_version, expected $version" >&2
     failed=1
   fi
 
-  if [[ -f sdks/node/package-lock.json ]]; then
+  if [[ -f sdks/nodejs-native/package-lock.json ]]; then
     local node_sdk_lock_version
     node_sdk_lock_version="$(read_node_sdk_lock_version)"
     if [[ "$node_sdk_lock_version" != "$version" ]]; then
-      echo "Version drift: sdks/node/package-lock.json is $node_sdk_lock_version, expected $version" >&2
+      echo "Version drift: sdks/nodejs-native/package-lock.json is $node_sdk_lock_version, expected $version" >&2
+      failed=1
+    fi
+  fi
+
+  if [[ -f sdks/nodejs-native/index.js ]]; then
+    local node_sdk_runtime_version
+    node_sdk_runtime_version="$(read_node_sdk_runtime_version)"
+    if [[ "$node_sdk_runtime_version" != "$version" ]]; then
+      echo "Version drift: sdks/nodejs-native/index.js expects $node_sdk_runtime_version, expected $version" >&2
       failed=1
     fi
   fi
@@ -152,8 +183,17 @@ check_synced() {
   local python_sdk_version
   python_sdk_version="$(read_python_sdk_version)"
   if [[ "$python_sdk_version" != "$version" ]]; then
-    echo "Version drift: sdks/python/edgecrab/_version.py is $python_sdk_version, expected $version" >&2
+    echo "Version drift: sdks/python/pyproject.toml is $python_sdk_version, expected $version" >&2
     failed=1
+  fi
+
+  if [[ -f sdks/wasm/package.json ]]; then
+    local wasm_sdk_version
+    wasm_sdk_version="$(read_wasm_sdk_version)"
+    if [[ "$wasm_sdk_version" != "$version" ]]; then
+      echo "Version drift: sdks/wasm/package.json is $wasm_sdk_version, expected $version" >&2
+      failed=1
+    fi
   fi
 
   if [[ "$failed" -ne 0 ]]; then

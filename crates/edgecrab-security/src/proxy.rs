@@ -155,25 +155,29 @@ fn parse_scutil_value(text: &str, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{LazyLock, Mutex, MutexGuard};
 
-    /// RAII guard that clears proxy env vars for the duration of a test.
+    static ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    /// RAII guard that serializes and restores proxy env vars for the duration of a test.
     struct EnvGuard {
+        _lock: MutexGuard<'static, ()>,
         vars: Vec<(String, Option<String>)>,
     }
 
     impl EnvGuard {
         fn new(var_names: &[&str]) -> Self {
+            let lock = ENV_MUTEX.lock().expect("env mutex poisoned");
             let vars = var_names
                 .iter()
                 .map(|&name| {
                     let prev = std::env::var(name).ok();
-                    // SAFETY: test-only; tests are serialised with --test-threads=1
-                    // when they mutate env vars.
+                    // SAFETY: test-only mutation protected by ENV_MUTEX.
                     unsafe { std::env::remove_var(name) };
                     (name.to_string(), prev)
                 })
                 .collect();
-            Self { vars }
+            Self { _lock: lock, vars }
         }
     }
 

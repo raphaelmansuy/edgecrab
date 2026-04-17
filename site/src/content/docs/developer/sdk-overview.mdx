@@ -1,0 +1,103 @@
+---
+title: SDK Overview
+description: EdgeCrab SDKs — Rust, Python, Node.js, and WASM libraries for building autonomous AI agents programmatically.
+sidebar:
+  order: 1
+---
+
+EdgeCrab provides first-class SDKs for embedding autonomous AI agents into your
+applications. The SDK family shares the same battle-tested agent runtime that powers
+the CLI.
+
+---
+
+## Available SDKs
+
+| SDK | Language | Crate / Package | Status |
+|-----|----------|-----------------|--------|
+| **Rust SDK** | Rust | `edgecrab-sdk` | ✅ Stable |
+| **Python SDK** | Python 3.10+ | `edgecrab` (PyPI) | ✅ Stable |
+| **Node.js SDK** | Node.js 18+ | `edgecrab` (npm) | ✅ Stable |
+| **WASM SDK** | Browser / bundlers | `@edgecrab/wasm` | ✅ Stable |
+
+All SDKs share the same core engine and provide aligned capabilities:
+
+- **Simple chat** — send a message, get a reply
+- **Streaming** — receive tokens and tool events in real-time
+- **Full conversations** — get detailed results with usage/cost metrics
+- **Custom tools** — register your own tools via macros (Rust) or decorators (Python)
+- **Session management** — list, search, and restore conversation sessions
+- **Configuration** — load from `~/.edgecrab/config.yaml` or configure programmatically
+- **Model catalog** — discover available models and providers
+
+## Architecture
+
+```
+┌─────────────────────┐     ┌──────────────────────┐
+│   edgecrab-sdk      │     │   edgecrab (Python)  │
+│   (Rust prelude)    │     │   (PyO3 bindings)    │
+└────────┬────────────┘     └────────┬─────────────┘
+         │                           │
+         ▼                           ▼
+┌──────────────────────────────────────────────────┐
+│              edgecrab-sdk-core                   │
+│  SdkAgent · SdkConfig · SdkToolRegistry · types │
+└────────────────────┬─────────────────────────────┘
+                     │
+                     ▼
+┌──────────────────────────────────────────────────┐
+│              edgecrab-core                       │
+│  Agent loop · LLM providers · Context engine     │
+└──────────────────────────────────────────────────┘
+```
+
+## Quick Start
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+<Tabs>
+<TabItem label="Rust">
+
+```toml
+# Cargo.toml
+[dependencies]
+edgecrab-sdk = "0.6"
+tokio = { version = "1", features = ["full"] }
+```
+
+```rust
+use edgecrab_sdk::prelude::*;
+
+#[tokio::main]
+async fn main() -> Result<(), SdkError> {
+    let agent = SdkAgent::new("openai/gpt-4o")?;
+    let reply = agent.chat("Hello!").await?;
+    println!("{reply}");
+    Ok(())
+}
+```
+
+</TabItem>
+<TabItem label="Python">
+
+```bash
+pip install edgecrab
+```
+
+```python
+from edgecrab import Agent
+
+agent = Agent("copilot/gpt-5-mini")
+reply = agent.chat_sync("Hello!")
+print(reply)
+```
+
+</TabItem>
+</Tabs>
+
+## Next Steps
+
+- [Rust SDK Guide](/developer/sdk-rust/) — full Rust SDK reference
+- [Python SDK Guide](/developer/sdk-python/) — full Python SDK reference
+- [Custom Tools](/developer/sdk-tools/) — build and register custom tools
+- [Examples](/developer/sdk-examples/) — runnable code samples

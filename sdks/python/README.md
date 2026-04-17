@@ -1,140 +1,82 @@
-# edgecrab-sdk
+# EdgeCrab Python SDK
 
-[![PyPI](https://img.shields.io/pypi/v/edgecrab-sdk.svg)](https://pypi.org/project/edgecrab-sdk/)
-[![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://python.org)
+## WHY
 
-Python SDK for **EdgeCrab** — a Rust-native autonomous coding agent.
+Use this SDK when you want Python productivity with the Rust runtime doing the heavy lifting.
 
-## Install
+This is the canonical EdgeCrab Python SDK publication path.
+
+It is designed for:
+
+- async or sync agent workflows
+- local Ollama validation before paid-provider rollout
+- session-aware applications
+- memory-backed assistants and research tools
+
+## WHAT
+
+Core capabilities:
+
+- native Rust-backed runtime via PyO3
+- sync and async agents
+- streaming callbacks
+- persistent sessions and memory
+- profile-aware configuration via `Config.load_profile()`
+
+### Architecture
+
+```text
+Python app
+   |
+   v
+PyO3 bindings
+   |
+   v
+EdgeCrab Rust runtime
+   |
+   +--> sessions
+   +--> memory
+   +--> tools
+   |
+   v
+LLM provider or local Ollama
+```
+
+## HOW
+
+### Quick start
 
 ```bash
-pip install edgecrab-sdk
+python3 -m pip install -U edgecrab
 ```
-
-## Quick Start
-
-```python
-from edgecrab import EdgeCrabClient
-
-# Connect to a running EdgeCrab API server
-client = EdgeCrabClient(
-    base_url="http://127.0.0.1:8642",
-    api_key="your-api-key",  # optional
-)
-
-# Simple chat
-reply = client.chat("Explain Rust ownership in 3 sentences")
-print(reply)
-
-# With system prompt
-reply = client.chat(
-    "Refactor this function",
-    system="You are a senior Rust developer",
-    model="anthropic/claude-sonnet-4-20250514",
-)
-```
-
-## Async
-
-```python
-import asyncio
-from edgecrab import AsyncEdgeCrabClient
-
-async def main():
-    async with AsyncEdgeCrabClient() as client:
-        reply = await client.chat("Hello!")
-        print(reply)
-
-asyncio.run(main())
-```
-
-## Agent API (recommended)
 
 ```python
 from edgecrab import Agent
 
-agent = Agent(
-    model="anthropic/claude-sonnet-4-20250514",
-    system_prompt="You are a helpful coding assistant",
-)
-
-# Chat with automatic conversation history
-reply = agent.chat("Explain Rust ownership")
+agent = Agent(model="copilot/gpt-5-mini")
+reply = agent.chat_sync("Hello")
 print(reply)
-
-# Continue the conversation
-follow_up = agent.chat("Give me an example")
-print(follow_up)
-
-# Full run with result metadata
-result = agent.run("Refactor this function")
-print(result.response)
-print(f"Turns: {result.turns_used}, Tokens: {result.usage.total_tokens}")
 ```
 
-## Streaming
+### Development and examples
 
-```python
-from edgecrab import EdgeCrabClient, ChatMessage
-
-with EdgeCrabClient() as client:
-    messages = [ChatMessage(role="user", content="Write a haiku about Rust")]
-    for chunk in client.stream_completion(messages=messages):
-        for choice in chunk.choices:
-            if choice.delta.content:
-                print(choice.delta.content, end="", flush=True)
-    print()
-```
-
-## CLI
+See the full examples guide in `examples/README.md`.
 
 ```bash
-edgecrab chat "What is the meaning of life?"
-edgecrab chat --model gpt-4 --system "Be concise" "Explain monads"
-edgecrab chat --stream "Tell me a story"
-edgecrab models
-edgecrab health
+cd sdks/python
+python3 -m pip install -U maturin
+maturin develop
+make e2e
 ```
 
-### Environment Variables
+## SDK Tutorials
 
-| Variable | Description |
-|---|---|
-| `EDGECRAB_BASE_URL` | API server URL (default: `http://127.0.0.1:8642`) |
-| `EDGECRAB_API_KEY` | Bearer token for authentication |
+All tutorials ship with working Python examples in `examples/`.
 
-## API Reference
-
-### `EdgeCrabClient`
-
-| Method | Description |
-|---|---|
-| `chat(message, *, model, system, temperature, max_tokens)` | Simple chat — returns string |
-| `create_completion(messages, *, model, temperature, max_tokens, tools)` | Full completion — returns `ChatCompletionResponse` |
-| `stream_completion(messages, *, model, temperature, max_tokens, tools)` | Streaming — yields `StreamChunk` |
-| `list_models()` | List available models |
-| `health()` | Health check |
-
-### `AsyncEdgeCrabClient`
-
-Same API as `EdgeCrabClient`, but all methods are `async`.
-
-### `Agent` / `AsyncAgent`
-
-| Method | Description |
-|---|---|
-| `chat(message)` | Send message, return reply. Maintains history. |
-| `run(message, *, max_turns)` | Full conversation run — returns `AgentResult` |
-| `add_message(role, content)` | Inject a message into history |
-| `reset()` | Clear history, start new session |
-| `get_messages()` | Get conversation history |
-| `get_turn_count()` | Number of completed turns |
-| `get_usage()` | Accumulated token usage |
-| `list_models()` | List available models |
-| `health()` | Check server health |
-
-## Links
-
-- [GitHub](https://github.com/raphaelmansuy/edgecrab)
-- [Node.js SDK](https://github.com/raphaelmansuy/edgecrab/tree/main/sdks/node)
-- [EdgeCrab Documentation](https://github.com/raphaelmansuy/edgecrab/tree/main/docs)
+| Tutorial | Example | Model |
+| --- | --- | --- |
+| [1. Cost-Aware Code Review](../../site/src/content/docs/tutorials/01-cost-aware-review.md) | `examples/cost_aware_review.py` | openai/gpt-5 + copilot/gpt-5-mini |
+| [2. Parallel Research Pipeline](../../site/src/content/docs/tutorials/02-parallel-research.md) | `examples/parallel_research.py` | copilot/gpt-5-mini |
+| [3. Multi-Agent Pipeline](../../site/src/content/docs/tutorials/03-multi-agent-pipeline.md) | `examples/multi_agent_pipeline.py` | openai/gpt-4o + copilot/gpt-5-mini |
+| [4. Session-Aware Support Bot](../../site/src/content/docs/tutorials/04-session-aware-support.md) | `examples/session_aware_support.py` | copilot/gpt-5-mini |
+| [5. Safe SQL Agent](../../site/src/content/docs/tutorials/05-custom-tool-safe-sql.md) | `examples/safe_sql_agent.py` | copilot/gpt-5-mini |

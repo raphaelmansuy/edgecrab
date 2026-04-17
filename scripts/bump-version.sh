@@ -64,11 +64,11 @@ echo "==> Creating commit and tag v$VERSION"
 
 git add \
   Cargo.toml \
-  sdks/node/package.json \
+  sdks/nodejs-native/package.json \
+  sdks/nodejs-native/package-lock.json \
   sdks/npm-cli/package.json \
   sdks/pypi-cli/edgecrab_cli/_version.py \
-  sdks/python/pyproject.toml \
-  sdks/python/edgecrab/_version.py
+  sdks/python/pyproject.toml
 
 git commit -m "chore: bump version to $VERSION"
 git tag "v$VERSION"

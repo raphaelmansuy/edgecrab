@@ -1,0 +1,30 @@
+[package]
+name = "edgecrab-napi"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Node.js native bindings for the EdgeCrab AI agent SDK (napi-rs)"
+# napi-rs v3 requires MSRV 1.88.0+; do NOT inherit workspace rust-version
+rust-version = "1.88.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+edgecrab-sdk-core = { workspace = true }
+edgecrab-types = { workspace = true }
+edgecrab-tools = { workspace = true }
+edgecrab-state = { workspace = true }
+edgecrab-core = { workspace = true }
+
+napi = { version = "3", features = ["async", "serde-json"] }
+napi-derive = "3"
+serde_json = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[build-dependencies]
+napi-build = "2"

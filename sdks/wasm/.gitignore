@@ -1,0 +1,15 @@
+# ── Rust / wasm-pack build outputs ───────────────────────────────────────────
+target/
+pkg/
+pkg-*/
+dist/
+
+# ── npm / Node.js ─────────────────────────────────────────────────────────────
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ── macOS noise ───────────────────────────────────────────────────────────────
+.DS_Store
