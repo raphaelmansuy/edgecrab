@@ -270,7 +270,7 @@ pub fn list_log_files(home: &Path) -> anyhow::Result<Vec<LogFileInfo>> {
     }
 
     // Sort DESC by last-modified time so the most recently touched log appears first.
-    entries.sort_by(|left, right| right.modified.cmp(&left.modified));
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.modified));
     Ok(entries)
 }
 
@@ -508,26 +508,59 @@ fn prepare_log_file_path(path: &Path, max_bytes: u64, backups: usize) -> anyhow:
             .with_context(|| format!("failed rotating {}", path.display()))?;
     }
 
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .with_context(|| format!("failed to open {}", path.display()))?;
+    open_append_file(path, true).with_context(|| format!("failed to open {}", path.display()))?;
     Ok(path.to_path_buf())
+}
+
+fn open_append_file(path: &Path, create: bool) -> std::io::Result<std::fs::File> {
+    let mut options = OpenOptions::new();
+    options.write(true).append(true);
+    if create {
+        options.create(true);
+    }
+    options.open(path)
+}
+
+fn fallback_log_file() -> std::fs::File {
+    #[cfg(unix)]
+    {
+        if let Ok(file) = OpenOptions::new().write(true).open("/dev/null") {
+            return file;
+        }
+    }
+
+    let fallback_dir = std::env::temp_dir().join("edgecrab-logs");
+    let _ = fs::create_dir_all(&fallback_dir);
+    let fallback_path = fallback_dir.join("fallback.log");
+    open_append_file(&fallback_path, true).unwrap_or_else(|err| {
+        panic!(
+            "failed to open fallback log file {}: {err}",
+            fallback_path.display()
+        )
+    })
 }
 
 fn make_file_writer(path: PathBuf) -> impl Fn() -> std::fs::File + Clone {
     move || {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).unwrap_or_else(|err| {
-                panic!("failed to create log directory {}: {err}", parent.display())
-            });
+        if let Some(parent) = path.parent()
+            && let Err(err) = fs::create_dir_all(parent)
+        {
+            eprintln!(
+                "warning: failed to create log directory {}: {err}",
+                parent.display()
+            );
         }
-        OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .unwrap_or_else(|err| panic!("failed to open log file {}: {err}", path.display()))
+
+        match open_append_file(&path, true) {
+            Ok(file) => file,
+            Err(err) => {
+                eprintln!(
+                    "warning: failed to open log file {}: {err}; falling back to a safe sink",
+                    path.display()
+                );
+                fallback_log_file()
+            }
+        }
     }
 }
 
@@ -623,6 +656,17 @@ mod tests {
             content.contains("hello log"),
             "agent.log should contain the emitted event, got: {content:?}"
         );
+    }
+
+    #[test]
+    fn make_file_writer_survives_removed_parent_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let log_path = temp.path().join("logs").join("agent.log");
+        let writer = make_file_writer(log_path.clone());
+
+        drop(temp);
+
+        let _file = writer();
     }
 
     #[test]

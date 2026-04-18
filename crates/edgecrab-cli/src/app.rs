@@ -8933,10 +8933,8 @@ impl App {
         // Model selector overlay active — intercept all keys
         if self.model_selector.active {
             match key.code {
-                KeyCode::Esc => {
-                    if !self.close_detail_fullscreen(DetailSurface::ModelSelector) {
-                        self.model_selector.active = false;
-                    }
+                KeyCode::Esc if !self.close_detail_fullscreen(DetailSurface::ModelSelector) => {
+                    self.model_selector.active = false;
                 }
                 _ if selector_action_key(&key, 'z') => {
                     self.toggle_detail_fullscreen(
@@ -9032,10 +9030,8 @@ impl App {
 
         if self.gateway_browser.active {
             match key.code {
-                KeyCode::Esc => {
-                    if !self.close_detail_fullscreen(DetailSurface::GatewayBrowser) {
-                        self.gateway_browser.active = false;
-                    }
+                KeyCode::Esc if !self.close_detail_fullscreen(DetailSurface::GatewayBrowser) => {
+                    self.gateway_browser.active = false;
                 }
                 _ if selector_action_key(&key, 'z') => {
                     self.toggle_detail_fullscreen(
@@ -9169,19 +9165,19 @@ impl App {
                 KeyCode::Char(' ')
                     if !key
                         .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                        && self.moa_reference_selector_mode
+                            == MoaReferenceSelectorMode::EditRoster =>
                 {
-                    if self.moa_reference_selector_mode == MoaReferenceSelectorMode::EditRoster {
-                        if let Some(model) = self
-                            .moa_reference_selector
-                            .current()
-                            .map(|entry| entry.display.clone())
-                        {
-                            if !self.moa_reference_selected.insert(model.clone()) {
-                                self.moa_reference_selected.remove(&model);
-                            }
-                            self.needs_redraw = true;
+                    if let Some(model) = self
+                        .moa_reference_selector
+                        .current()
+                        .map(|entry| entry.display.clone())
+                    {
+                        if !self.moa_reference_selected.insert(model.clone()) {
+                            self.moa_reference_selected.remove(&model);
                         }
+                        self.needs_redraw = true;
                     }
                 }
                 KeyCode::Tab => self.moa_reference_selector.move_down(),
@@ -9206,10 +9202,10 @@ impl App {
         // Vision-model selector overlay active — same navigation as /model.
         if self.vision_model_selector.active {
             match key.code {
-                KeyCode::Esc => {
-                    if !self.close_detail_fullscreen(DetailSurface::VisionModelSelector) {
-                        self.vision_model_selector.active = false;
-                    }
+                KeyCode::Esc
+                    if !self.close_detail_fullscreen(DetailSurface::VisionModelSelector) =>
+                {
+                    self.vision_model_selector.active = false;
                 }
                 _ if selector_action_key(&key, 'z') => {
                     self.toggle_detail_fullscreen(
@@ -9315,10 +9311,10 @@ impl App {
 
         if self.image_model_selector.active {
             match key.code {
-                KeyCode::Esc => {
-                    if !self.close_detail_fullscreen(DetailSurface::ImageModelSelector) {
-                        self.image_model_selector.active = false;
-                    }
+                KeyCode::Esc
+                    if !self.close_detail_fullscreen(DetailSurface::ImageModelSelector) =>
+                {
+                    self.image_model_selector.active = false;
                 }
                 _ if selector_action_key(&key, 'z') => {
                     self.toggle_detail_fullscreen(
@@ -9426,10 +9422,8 @@ impl App {
         // installs controlled. Catalog-only entries open detail view instead.
         if self.mcp_selector.active {
             match key.code {
-                KeyCode::Esc => {
-                    if !self.close_detail_fullscreen(DetailSurface::McpSelector) {
-                        self.mcp_selector.active = false;
-                    }
+                KeyCode::Esc if !self.close_detail_fullscreen(DetailSurface::McpSelector) => {
+                    self.mcp_selector.active = false;
                 }
                 _ if selector_action_key(&key, 'z') => {
                     self.toggle_detail_fullscreen(
@@ -9577,11 +9571,9 @@ impl App {
 
         if self.remote_mcp_browser.selector.active {
             match key.code {
-                KeyCode::Esc => {
-                    if !self.close_detail_fullscreen(DetailSurface::RemoteMcpBrowser) {
-                        self.remote_mcp_browser.selector.active = false;
-                        self.needs_redraw = true;
-                    }
+                KeyCode::Esc if !self.close_detail_fullscreen(DetailSurface::RemoteMcpBrowser) => {
+                    self.remote_mcp_browser.selector.active = false;
+                    self.needs_redraw = true;
                 }
                 _ if selector_action_key(&key, 'z') => {
                     self.toggle_detail_fullscreen(
@@ -9708,12 +9700,12 @@ impl App {
 
         if self.remote_skill_browser.selector.active {
             match key.code {
-                KeyCode::Esc => {
-                    if !self.close_detail_fullscreen(DetailSurface::RemoteSkillBrowser) {
-                        self.remote_skill_browser.selector.active = false;
-                        self.remote_skill_browser.action_in_flight = None;
-                        self.needs_redraw = true;
-                    }
+                KeyCode::Esc
+                    if !self.close_detail_fullscreen(DetailSurface::RemoteSkillBrowser) =>
+                {
+                    self.remote_skill_browser.selector.active = false;
+                    self.remote_skill_browser.action_in_flight = None;
+                    self.needs_redraw = true;
                 }
                 _ if selector_action_key(&key, 'z') => {
                     self.toggle_detail_fullscreen(
@@ -9843,12 +9835,12 @@ impl App {
 
         if self.remote_plugin_browser.selector.active {
             match key.code {
-                KeyCode::Esc => {
-                    if !self.close_detail_fullscreen(DetailSurface::RemotePluginBrowser) {
-                        self.remote_plugin_browser.selector.active = false;
-                        self.remote_plugin_browser.action_in_flight = None;
-                        self.needs_redraw = true;
-                    }
+                KeyCode::Esc
+                    if !self.close_detail_fullscreen(DetailSurface::RemotePluginBrowser) =>
+                {
+                    self.remote_plugin_browser.selector.active = false;
+                    self.remote_plugin_browser.action_in_flight = None;
+                    self.needs_redraw = true;
                 }
                 _ if selector_action_key(&key, 'z') => {
                     self.toggle_detail_fullscreen(
@@ -9979,10 +9971,8 @@ impl App {
 
         if self.profile_selector.active {
             match key.code {
-                KeyCode::Esc => {
-                    if !self.close_detail_fullscreen(DetailSurface::ProfileSelector) {
-                        self.profile_selector.active = false;
-                    }
+                KeyCode::Esc if !self.close_detail_fullscreen(DetailSurface::ProfileSelector) => {
+                    self.profile_selector.active = false;
                 }
                 _ if selector_action_key(&key, 'z') => {
                     self.toggle_detail_fullscreen(
@@ -10123,10 +10113,8 @@ impl App {
         // Skill selector overlay active — same key scheme as model selector
         if self.skill_selector.active {
             match key.code {
-                KeyCode::Esc => {
-                    if !self.close_detail_fullscreen(DetailSurface::SkillSelector) {
-                        self.skill_selector.active = false;
-                    }
+                KeyCode::Esc if !self.close_detail_fullscreen(DetailSurface::SkillSelector) => {
+                    self.skill_selector.active = false;
                 }
                 _ if selector_action_key(&key, 'z') => {
                     self.toggle_detail_fullscreen(
@@ -10229,10 +10217,8 @@ impl App {
 
         if self.tool_manager.active {
             match key.code {
-                KeyCode::Esc => {
-                    if !self.close_detail_fullscreen(DetailSurface::ToolManager) {
-                        self.tool_manager.active = false;
-                    }
+                KeyCode::Esc if !self.close_detail_fullscreen(DetailSurface::ToolManager) => {
+                    self.tool_manager.active = false;
                 }
                 KeyCode::Left => {
                     self.tool_manager_scope = self.tool_manager_scope.previous();
@@ -10328,10 +10314,8 @@ impl App {
 
         if self.plugin_toggle.active {
             match key.code {
-                KeyCode::Esc => {
-                    if !self.close_detail_fullscreen(DetailSurface::PluginToggle) {
-                        self.plugin_toggle.active = false;
-                    }
+                KeyCode::Esc if !self.close_detail_fullscreen(DetailSurface::PluginToggle) => {
+                    self.plugin_toggle.active = false;
                 }
                 KeyCode::Left => {
                     self.plugin_toggle_scope = self.previous_plugin_toggle_scope();
@@ -10430,10 +10414,8 @@ impl App {
 
         if self.config_selector.active {
             match key.code {
-                KeyCode::Esc => {
-                    if !self.close_detail_fullscreen(DetailSurface::ConfigSelector) {
-                        self.config_selector.active = false;
-                    }
+                KeyCode::Esc if !self.close_detail_fullscreen(DetailSurface::ConfigSelector) => {
+                    self.config_selector.active = false;
                 }
                 _ if selector_action_key(&key, 'z') => {
                     self.toggle_detail_fullscreen(
@@ -10558,10 +10540,8 @@ impl App {
 
         if self.session_inspector.active() {
             match key.code {
-                KeyCode::Esc => {
-                    if !self.close_detail_fullscreen(DetailSurface::SessionInspector) {
-                        self.close_session_inspector();
-                    }
+                KeyCode::Esc if !self.close_detail_fullscreen(DetailSurface::SessionInspector) => {
+                    self.close_session_inspector();
                 }
                 _ if selector_action_key(&key, 'z') => {
                     self.toggle_detail_fullscreen(
@@ -10664,10 +10644,8 @@ impl App {
 
         if self.log_inspector.active() {
             match key.code {
-                KeyCode::Esc => {
-                    if !self.close_detail_fullscreen(DetailSurface::LogInspector) {
-                        self.close_log_inspector();
-                    }
+                KeyCode::Esc if !self.close_detail_fullscreen(DetailSurface::LogInspector) => {
+                    self.close_log_inspector();
                 }
                 _ if selector_action_key(&key, 'z') => {
                     self.toggle_detail_fullscreen(
@@ -10757,10 +10735,8 @@ impl App {
 
         if self.log_browser.active {
             match key.code {
-                KeyCode::Esc => {
-                    if !self.close_detail_fullscreen(DetailSurface::LogBrowser) {
-                        self.log_browser.active = false;
-                    }
+                KeyCode::Esc if !self.close_detail_fullscreen(DetailSurface::LogBrowser) => {
+                    self.log_browser.active = false;
                 }
                 _ if selector_action_key(&key, 'z') => {
                     self.toggle_detail_fullscreen(
@@ -10856,10 +10832,8 @@ impl App {
         // Session browser overlay active — search-first, explicit uppercase actions
         if self.session_browser.active {
             match key.code {
-                KeyCode::Esc => {
-                    if !self.close_detail_fullscreen(DetailSurface::SessionBrowser) {
-                        self.session_browser.active = false;
-                    }
+                KeyCode::Esc if !self.close_detail_fullscreen(DetailSurface::SessionBrowser) => {
+                    self.session_browser.active = false;
                 }
                 _ if selector_action_key(&key, 'z') => {
                     self.toggle_detail_fullscreen(

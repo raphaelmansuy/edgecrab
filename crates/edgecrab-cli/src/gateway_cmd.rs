@@ -965,15 +965,13 @@ fn platform_runtime_probe(
         "whatsapp" if !diag.active && diag.state == PlatformState::NotConfigured => {
             detail.push_str(" · run: edgecrab gateway configure whatsapp");
         }
-        "whatsapp" => {
+        "whatsapp" if diag.state == PlatformState::Available => {
             // Available but not enabled — help user enable it.
-            if diag.state == PlatformState::Available {
-                issues.push((
-                    "WhatsApp is paired but not enabled in config".to_string(),
-                    "edgecrab config set gateway.whatsapp.enabled true && edgecrab gateway restart"
-                        .to_string(),
-                ));
-            }
+            issues.push((
+                "WhatsApp is paired but not enabled in config".to_string(),
+                "edgecrab config set gateway.whatsapp.enabled true && edgecrab gateway restart"
+                    .to_string(),
+            ));
         }
         "slack" if diag.active => {
             // Slack emits "invalid_auth" in the gateway log — surface it here.
