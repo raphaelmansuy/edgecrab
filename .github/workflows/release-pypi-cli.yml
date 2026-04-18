@@ -25,24 +25,33 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: 'Tag name to publish (e.g. v0.3.3)'
-        required: true
-        default: 'v0.3.3'
+        description: 'Optional tag name to publish; defaults to the selected ref name when left blank'
+        required: false
+        default: ''
 
 permissions:
   id-token: write   # required for OIDC trusted publishing
   contents: read
+
+concurrency:
+  group: release-pypi-cli-${{ github.repository }}-${{ inputs.tag_name || github.event.workflow_run.head_branch || github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
   build:
     if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     name: Build edgecrab-cli wheels
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      version: ${{ steps.version.outputs.version }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.tag_name || github.event.workflow_run.head_branch || github.ref }}
+          ref: ${{ inputs.tag_name || github.event.workflow_run.head_branch || github.ref_name || github.ref }}
+          fetch-depth: 0
+          fetch-tags: true
 
       - uses: actions/setup-python@v5
         with:
@@ -83,9 +92,15 @@ jobs:
     name: Publish edgecrab-cli to PyPI
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     environment: pypi
 
     steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag_name || github.event.workflow_run.head_branch || github.ref_name || github.ref }}
+          fetch-depth: 0
+          fetch-tags: true
       - name: Download dist artifact
         uses: actions/download-artifact@v4
         with:
@@ -100,3 +115,11 @@ jobs:
         with:
           packages-dir: dist/
           skip-existing: true
+          print-hash: true
+
+      - name: Verify PyPI registry propagation
+        env:
+          VERIFY_ATTEMPTS: 24
+          VERIFY_SLEEP_SECS: 15
+        run: |
+          ./scripts/release-verify.sh pypi edgecrab-cli "${{ needs.build.outputs.version || github.ref_name }}"

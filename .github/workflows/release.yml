@@ -28,11 +28,12 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           # Push requires a token with write permissions
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
+          fetch-tags: true
 
       - name: Validate version format
         run: |

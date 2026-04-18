@@ -33,12 +33,16 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: 'Tag name to sync into the tap (e.g. v0.4.1)'
-        required: true
-        default: 'v0.4.1'
+        description: 'Optional tag name to sync into the tap; defaults to the selected ref name when left blank'
+        required: false
+        default: ''
 
 permissions:
   contents: read
+
+concurrency:
+  group: release-homebrew-${{ github.repository }}-${{ inputs.tag_name || github.event.workflow_run.head_branch || github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
   sync-tap:
@@ -49,7 +53,10 @@ jobs:
       TAP_REPOSITORY: raphaelmansuy/homebrew-tap
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
 
       - name: Resolve version from tag
         id: version
@@ -126,7 +133,7 @@ jobs:
       # ── Checkout via SSH deploy key (Option A) ─────────────────────────────
       - name: Checkout tap repository (deploy key)
         if: steps.auth.outputs.method == 'deploy-key'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: ${{ env.TAP_REPOSITORY }}
           ssh-key: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
@@ -135,7 +142,7 @@ jobs:
       # ── Checkout via token (Option B/C) ───────────────────────────────────
       - name: Checkout tap repository (token)
         if: steps.auth.outputs.method == 'github-app' || steps.auth.outputs.method == 'pat'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: ${{ env.TAP_REPOSITORY }}
           token: ${{ steps.auth.outputs.method == 'github-app' && steps.app-token.outputs.token || secrets.HOMEBREW_TAP_PUSH_TOKEN }}
