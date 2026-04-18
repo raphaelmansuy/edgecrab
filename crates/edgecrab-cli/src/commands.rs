@@ -2363,6 +2363,10 @@ mod tests {
             }
             _ => panic!("expected AuthCommand::Status"),
         }
+        match reg.dispatch("/login") {
+            Some(CommandResult::LoginTarget(target)) => assert_eq!(target, "copilot"),
+            _ => panic!("expected LoginTarget for bare /login"),
+        }
         match reg.dispatch("/login copilot") {
             Some(CommandResult::LoginTarget(target)) => assert_eq!(target, "copilot"),
             _ => panic!("expected LoginTarget"),

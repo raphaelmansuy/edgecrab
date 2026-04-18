@@ -1,13 +1,14 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs::OpenOptions;
+use std::io::{self, Write as _};
 use std::path::PathBuf;
 
 use anyhow::{Context, anyhow, bail};
 use chrono::Utc;
 use edgecrab_core::AppConfig;
 use edgecrab_tools::tools::mcp_client::{read_mcp_token_status, remove_mcp_token, write_mcp_token};
-use edgequake_llm::providers::vscode::token::TokenManager;
+use edgequake_llm::providers::vscode::{auth::GitHubAuth, token::TokenManager};
 use serde::{Deserialize, Serialize};
 
 use crate::cli_args::AuthCommand;
@@ -134,6 +135,39 @@ struct ProviderAuthState {
     updated_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CopilotDevicePrompt {
+    pub(crate) open_url: String,
+    pub(crate) display_url: String,
+    pub(crate) user_code: String,
+}
+
+pub(crate) fn render_copilot_device_prompt(prompt: &CopilotDevicePrompt) -> String {
+    format!(
+        "1. Your browser should open automatically.\n2. If it does not, visit:\n   {}\n\n3. Enter this one-time code:\n\n   {}\n\nTip: drag to select the code with your mouse.\nWaiting for GitHub approval...",
+        prompt.display_url, prompt.user_code
+    )
+}
+
+fn friendly_copilot_login_error(message: &str) -> String {
+    if message.contains("expired_token") {
+        return "The login code expired before GitHub approval. Run /login again to generate a fresh code.".into();
+    }
+    if message.contains("access_denied") {
+        return "GitHub approval was cancelled. Run /login again when you want to retry.".into();
+    }
+    message.trim().to_string()
+}
+
+fn print_copilot_device_prompt(prompt: &CopilotDevicePrompt) {
+    let mut stderr = io::stderr();
+    let _ = write!(stderr, "\x1b[2J\x1b[H");
+    let _ = writeln!(stderr, "GitHub Copilot sign-in");
+    let _ = writeln!(stderr, "=======================\n");
+    let _ = writeln!(stderr, "{}\n", render_copilot_device_prompt(prompt));
+    let _ = stderr.flush();
+}
+
 pub async fn run(command: AuthCommand) -> anyhow::Result<()> {
     let report = run_capture(command).await?;
     if !report.trim().is_empty() {
@@ -147,7 +181,9 @@ pub async fn run_capture(command: AuthCommand) -> anyhow::Result<String> {
         AuthCommand::List => list_targets().await,
         AuthCommand::Status { target } => status_target(target.as_deref()).await,
         AuthCommand::Add { target, token } => add_target(&target, token.as_deref()).await,
-        AuthCommand::Login { target } => login_target_capture(&target).await,
+        AuthCommand::Login { target } => {
+            login_target_capture(target.as_deref().unwrap_or("copilot")).await
+        }
         AuthCommand::Remove { target } => remove_target(&target).await,
         AuthCommand::Reset { target } => reset_target(target.as_deref()).await,
     }
@@ -165,17 +201,36 @@ pub async fn login_target_capture(raw_target: &str) -> anyhow::Result<String> {
     match resolve_target(raw_target)? {
         AuthTarget::Copilot => {
             let manager = TokenManager::new()?;
-            if manager.import_vscode_token().await? {
-                let mut out = String::from("Imported the GitHub token from VS Code Copilot.");
-                if manager.get_valid_copilot_token().await.is_ok() {
-                    out.push_str("\nFetched and cached a fresh Copilot access token.");
+            let mut out = String::new();
+
+            let auth = GitHubAuth::new()?;
+            let access_token = match auth
+                .device_code_flow(|code| {
+                    let prompt = CopilotDevicePrompt {
+                        open_url: code
+                            .verification_uri_complete
+                            .clone()
+                            .unwrap_or_else(|| code.verification_uri.clone()),
+                        display_url: code.verification_uri.clone(),
+                        user_code: code.user_code.clone(),
+                    };
+                    print_copilot_device_prompt(&prompt);
+                    open_auth_url(&prompt.open_url);
+                })
+                .await
+            {
+                Ok(token) => token,
+                Err(err) => {
+                    return Err(anyhow!(friendly_copilot_login_error(&err.to_string())));
                 }
-                Ok(out)
-            } else {
-                bail!(
-                    "VS Code Copilot token not found. Run `edgecrab setup` for device-code auth or use `edgecrab auth add copilot --token <github-token>`"
-                )
-            }
+            };
+
+            manager.save_github_token(access_token).await?;
+            manager.get_valid_copilot_token().await?;
+
+            out.push_str("Device login completed and a fresh Copilot token was cached.");
+            out.push_str(" If the next prompt fails with user_weekly_rate_limited or user_global_rate_limited, the login succeeded and GitHub is throttling chat usage for the account. If you are not already on Auto, try /model copilot/auto; otherwise wait for the reset window or switch providers.");
+            Ok(out)
         }
         AuthTarget::Mcp(name) => {
             let summary = mcp_oauth::login_mcp_server(&name, |_| {}).await?;
@@ -221,12 +276,9 @@ pub fn command_from_slash_args(args: &str) -> Result<AuthCommand, String> {
         Some("status") => Ok(AuthCommand::Status {
             target: parts.get(1).cloned(),
         }),
-        Some("login") => {
-            let Some(target) = parts.get(1).cloned() else {
-                return Err(auth_usage().into());
-            };
-            Ok(AuthCommand::Login { target })
-        }
+        Some("login") => Ok(AuthCommand::Login {
+            target: parts.get(1).cloned(),
+        }),
         Some("remove") | Some("logout") | Some("rm") => {
             let Some(target) = parts.get(1).cloned() else {
                 return Err(auth_usage().into());
@@ -250,8 +302,9 @@ pub fn command_from_slash_args(args: &str) -> Result<AuthCommand, String> {
 pub fn login_target_from_slash_args(args: &str) -> Result<String, String> {
     let parts = crate::mcp_support::parse_inline_command_tokens(args.trim())?;
     match parts.as_slice() {
+        [] => Ok("copilot".into()),
         [target] if !target.trim().is_empty() => Ok(target.clone()),
-        _ => Err("Usage: /login <target>\nTargets: copilot, provider/<name>, mcp/<server>, or a configured MCP server name".into()),
+        _ => Err("Usage: /login [target]\nTargets: copilot, provider/<name>, mcp/<server>, or a configured MCP server name\nDefault target: copilot".into()),
     }
 }
 
@@ -594,6 +647,19 @@ fn yes_no(value: bool) -> &'static str {
     if value { "yes" } else { "no" }
 }
 
+fn open_auth_url(url: &str) {
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(url).status();
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let _ = std::process::Command::new("xdg-open").arg(url).status();
+
+    #[cfg(windows)]
+    let _ = std::process::Command::new("cmd")
+        .args(["/C", "start", "", url])
+        .status();
+}
+
 fn copilot_cache_dir() -> anyhow::Result<std::path::PathBuf> {
     dirs::config_dir()
         .map(|base| base.join("edgequake").join("copilot"))
@@ -601,7 +667,7 @@ fn copilot_cache_dir() -> anyhow::Result<std::path::PathBuf> {
 }
 
 fn auth_usage() -> &'static str {
-    "Usage: /auth [list|status [target]|add <target> --token <secret>|login <target>|remove <target>|reset [target]]\nTargets: copilot, provider/<name>, mcp/<server>, or a configured MCP server name"
+    "Usage: /auth [list|status [target]|add <target> --token <secret>|login [target]|remove <target>|reset [target]]\nTargets: copilot, provider/<name>, mcp/<server>, or a configured MCP server name"
 }
 
 fn auth_store_path() -> PathBuf {
@@ -745,6 +811,12 @@ mod tests {
     }
 
     #[test]
+    fn login_without_target_defaults_to_copilot() {
+        let target = login_target_from_slash_args("").unwrap();
+        assert_eq!(target, "copilot");
+    }
+
+    #[test]
     fn resolves_provider_alias() {
         let target = resolve_provider("google").expect("provider alias");
         assert_eq!(target.canonical, "gemini");
@@ -783,5 +855,38 @@ mod tests {
         unsafe {
             std::env::remove_var("EDGECRAB_HOME");
         }
+    }
+
+    #[test]
+    fn copilot_device_prompt_is_compact_and_copyable() {
+        let prompt = CopilotDevicePrompt {
+            open_url: "https://github.com/login/device?user_code=ABCD-EFGH".into(),
+            display_url: "https://github.com/login/device".into(),
+            user_code: "ABCD-EFGH".into(),
+        };
+
+        let rendered = render_copilot_device_prompt(&prompt);
+        assert!(rendered.contains("https://github.com/login/device"));
+        assert!(rendered.contains("ABCD-EFGH"));
+        assert!(rendered.contains("drag to select the code with your mouse"));
+        for line in rendered.lines() {
+            assert!(line.chars().count() <= 72, "line too wide: {line}");
+        }
+    }
+
+    #[test]
+    fn friendly_copilot_login_errors_cover_common_device_flow_cases() {
+        assert_eq!(
+            friendly_copilot_login_error("expired_token"),
+            "The login code expired before GitHub approval. Run /login again to generate a fresh code."
+        );
+        assert_eq!(
+            friendly_copilot_login_error("access_denied"),
+            "GitHub approval was cancelled. Run /login again when you want to retry."
+        );
+        assert_eq!(
+            friendly_copilot_login_error("network hiccup"),
+            "network hiccup"
+        );
     }
 }

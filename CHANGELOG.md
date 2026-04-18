@@ -7,7 +7,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
-## [0.7.0] — 2026-04-17
+## [0.7.0] — 2026-04-18
 
 ### Added
 
@@ -19,7 +19,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 - **One SDK naming story** — Public docs and release surfaces now present a unified EdgeCrab SDK experience across languages, while historical repo folder names remain internal implementation details.
 - **Provider-safe example defaults** — Public examples now prefer Copilot, OpenAI, and Ollama-compatible model strings throughout the SDK docs and tutorial pages.
+- **GitHub Copilot now defaults to Auto-first routing backed by the latest `edgequake-llm` provider behavior** — WHY: GitHub's live router knows which chat-capable model and billing path are actually allowed for the account, so hard-coding a premium model caused avoidable false failures.
 - **SDK documentation refresh** — README and Astro docs now point to the new per-SDK example layout and highlight the most practical, user-facing example paths.
+
+### Fixed
+
+- **Copy-friendly GitHub device login in the TUI** — `/login` now temporarily leaves the alternate screen, shows the device code on a clean plain-terminal panel, and restores the TUI afterward. WHY: raw-mode terminal UIs are bad surfaces for selecting short login codes, so the auth step must optimize for clarity and mouse selection instead of decoration.
 
 ## [0.6.0] — 2026-05-15
 

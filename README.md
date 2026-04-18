@@ -821,7 +821,7 @@ EdgeCrab ships with 15 LLM providers out of the box (13 cloud, 2 local). Over 20
 
 | Provider      | Env Var                          | Notable Models                                    |
 | ------------- | -------------------------------- | ------------------------------------------------- |
-| `copilot`     | `GITHUB_TOKEN`                   | GPT-4.1-mini, GPT-4.1 — free with GitHub Copilot  |
+| `copilot`     | `GITHUB_TOKEN` or VS Code auth cache | `copilot/auto`, GPT-5 mini, GPT-4.1 — routed by GitHub Copilot |
 | `openai`      | `OPENAI_API_KEY`                 | GPT-4.1, GPT-5, o3, o4-mini                       |
 | `anthropic`   | `ANTHROPIC_API_KEY`              | Claude Opus 4.6, Sonnet 4.6, Haiku 4.5            |
 | `google`      | `GOOGLE_API_KEY`                 | Gemini 2.5 Pro, Gemini 2.5 Flash                  |
@@ -848,6 +848,8 @@ edgecrab --model groq/llama-3.3-70b-versatile "quick task"
 /model groq/llama-3.3-70b-versatile
 /reasoning high                      # enable extended thinking (Anthropic/OpenAI)
 ```
+
+**Why `copilot/auto` is now the best default:** GitHub Copilot decides which chat-capable model and billing path are valid for your live session. Following that server choice avoids avoidable model-specific throttles and keeps EdgeCrab aligned with the real VS Code experience.
 
 **Smart routing** (experimental): automatically selects cheap vs full model by turn complexity:
 ```yaml
@@ -1030,8 +1032,11 @@ edgecrab auth add copilot --token <github-token>
 edgecrab auth add provider/openai --token <api-token>   # writes ~/.edgecrab/.env and ~/.edgecrab/auth.json
 edgecrab auth add mcp/<server> --token <bearer-token>
 edgecrab auth login [copilot|mcp/<server>]
-edgecrab login <target>
+edgecrab login [target]                                  # defaults to copilot
 edgecrab logout [target]                                 # clears local auth cache; provider targets also clear auth.json metadata
+
+# If GitHub Copilot needs a fresh login, EdgeCrab opens a dedicated plain-terminal
+# auth screen so the one-time code stays easy to read and easy to select by mouse.
 edgecrab mcp list
 edgecrab mcp add <name>
 edgecrab mcp remove <name>

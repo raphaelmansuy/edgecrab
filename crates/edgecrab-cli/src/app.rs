@@ -11561,24 +11561,23 @@ impl App {
                 self.handle_paste(path);
             }
             CommandResult::AuthCommand(command) => {
-                match self
-                    .rt_handle
-                    .block_on(crate::auth_cmd::run_capture(command))
-                {
-                    Ok(report) => self.push_output(report, OutputRole::System),
-                    Err(err) => {
-                        self.push_output(format!("Auth command failed: {err}"), OutputRole::Error)
+                if let crate::cli_args::AuthCommand::Login { target } = &command {
+                    self.run_login_target_with_terminal_handoff(
+                        target.as_deref().unwrap_or("copilot"),
+                    );
+                } else {
+                    match self
+                        .rt_handle
+                        .block_on(crate::auth_cmd::run_capture(command))
+                    {
+                        Ok(report) => self.push_output(report, OutputRole::System),
+                        Err(err) => self
+                            .push_output(format!("Auth command failed: {err}"), OutputRole::Error),
                     }
                 }
             }
             CommandResult::LoginTarget(target) => {
-                match self
-                    .rt_handle
-                    .block_on(crate::auth_cmd::login_target_capture(&target))
-                {
-                    Ok(report) => self.push_output(report, OutputRole::System),
-                    Err(err) => self.push_output(format!("Login failed: {err}"), OutputRole::Error),
-                }
+                self.run_login_target_with_terminal_handoff(&target);
             }
             CommandResult::LogoutTarget(target) => {
                 match self
@@ -19737,6 +19736,44 @@ impl App {
         self.push_output(text, OutputRole::System);
     }
 
+    fn with_tui_suspended<T, F>(&mut self, action: F) -> anyhow::Result<T>
+    where
+        F: FnOnce(&mut io::Stdout) -> anyhow::Result<T>,
+    {
+        let mut stdout = io::stdout();
+        suspend_tui_surface(&mut stdout, self.keyboard_enhancement_enabled)?;
+        let action_result = action(&mut stdout);
+        let _ = clear_terminal_surface(&mut stdout);
+        let restore_result = restore_tui_surface(
+            &mut stdout,
+            self.keyboard_enhancement_enabled,
+            self.mouse_capture_enabled,
+        );
+        self.pending_mouse_capture = None;
+        self.needs_full_terminal_clear = true;
+        self.needs_redraw = true;
+        restore_result?;
+        action_result
+    }
+
+    fn run_login_target_with_terminal_handoff(&mut self, raw_target: &str) {
+        let target = raw_target.trim().to_string();
+        let handle = self.rt_handle.clone();
+        let result = self.with_tui_suspended(|stdout| {
+            render_terminal_notice_panel(
+                stdout,
+                "EdgeCrab login",
+                "Requesting a fresh login code...",
+            )?;
+            handle.block_on(async { crate::auth_cmd::login_target_capture(&target).await })
+        });
+
+        match result {
+            Ok(report) => self.push_output(report, OutputRole::System),
+            Err(err) => self.push_output(format!("Login failed: {err}"), OutputRole::Error),
+        }
+    }
+
     fn handle_copilot_auth(&mut self) {
         use edgequake_llm::providers::vscode::token::TokenManager;
         self.push_output("Checking for GitHub Copilot token...", OutputRole::System);
@@ -19753,13 +19790,13 @@ impl App {
             }
             Ok(false) => {
                 self.push_output(
-                    "VS Code Copilot token not found (~/.config/github-copilot/hosts.json missing or no token).\nRun: edgecrab setup  — to authenticate via GitHub device code flow.",
+                    "VS Code Copilot token not found (~/.config/github-copilot/hosts.json missing or no token).\nRun /login to start the GitHub device flow on a dedicated copy-friendly screen.",
                     OutputRole::System,
                 );
             }
             Err(e) => {
                 self.push_output(
-                    format!("Copilot auth error: {e}\nRun: edgecrab setup  — to authenticate via GitHub device code flow."),
+                    format!("Copilot auth error: {e}\nRun /login to start the GitHub device flow on a dedicated copy-friendly screen."),
                     OutputRole::Error,
                 );
             }
@@ -28472,6 +28509,66 @@ fn truncate_preview(text: &str, max_chars: usize) -> String {
     }
     let shortened: String = trimmed.chars().take(max_chars.saturating_sub(1)).collect();
     format!("{shortened}...")
+}
+
+fn clear_terminal_surface(stdout: &mut io::Stdout) -> io::Result<()> {
+    crossterm::execute!(
+        stdout,
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+        crossterm::cursor::MoveTo(0, 0),
+    )
+}
+
+fn suspend_tui_surface(
+    stdout: &mut io::Stdout,
+    keyboard_enhancement_enabled: bool,
+) -> io::Result<()> {
+    let _ = crossterm::terminal::disable_raw_mode();
+    if keyboard_enhancement_enabled {
+        let _ = crossterm::execute!(stdout, PopKeyboardEnhancementFlags);
+    }
+    crossterm::execute!(
+        stdout,
+        crossterm::terminal::LeaveAlternateScreen,
+        crossterm::event::DisableMouseCapture,
+        crossterm::event::DisableBracketedPaste,
+        crossterm::cursor::Show,
+    )?;
+    clear_terminal_surface(stdout)
+}
+
+fn restore_tui_surface(
+    stdout: &mut io::Stdout,
+    keyboard_enhancement_enabled: bool,
+    mouse_capture_enabled: bool,
+) -> io::Result<()> {
+    crossterm::terminal::enable_raw_mode()?;
+    crossterm::execute!(
+        stdout,
+        crossterm::terminal::EnterAlternateScreen,
+        crossterm::event::EnableBracketedPaste,
+    )?;
+    if keyboard_enhancement_enabled {
+        let _ = crossterm::execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(progressive_keyboard_flags())
+        );
+    }
+    if mouse_capture_enabled {
+        let _ = crossterm::execute!(stdout, crossterm::event::EnableMouseCapture);
+    }
+    Ok(())
+}
+
+fn render_terminal_notice_panel(stdout: &mut io::Stdout, title: &str, body: &str) -> io::Result<()> {
+    clear_terminal_surface(stdout)?;
+    writeln!(stdout, "{title}")?;
+    writeln!(stdout, "{}", "=".repeat(title.chars().count().max(24)))?;
+    writeln!(stdout)?;
+    for line in body.lines() {
+        writeln!(stdout, "{line}")?;
+    }
+    stdout.flush()
 }
 
 /// Run the interactive TUI event loop.

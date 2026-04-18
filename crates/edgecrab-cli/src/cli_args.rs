@@ -340,10 +340,10 @@ pub enum Command {
     /// Start an interactive login flow for one auth target
     ///
     /// Equivalent to `hermes login`, but only for real EdgeCrab targets such
-    /// as `copilot` or `mcp/<server>`.
+    /// as `copilot` or `mcp/<server>`. Defaults to `copilot`.
     Login {
         /// Auth target: `copilot`, `mcp/<server>`, or a configured MCP server name
-        target: String,
+        target: Option<String>,
     },
 
     /// Clear cached local authentication state
@@ -651,8 +651,8 @@ pub enum AuthCommand {
     },
     /// Start an interactive login/import flow
     Login {
-        /// Auth target: `copilot`, `mcp/<server>`, or a configured MCP server name
-        target: String,
+        /// Auth target: `copilot`, `mcp/<server>`, or a configured MCP server name (defaults to `copilot`)
+        target: Option<String>,
     },
     /// Remove local cached credentials for one target
     #[command(visible_aliases = ["logout", "rm"])]

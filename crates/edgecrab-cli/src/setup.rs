@@ -79,6 +79,30 @@ fn default_model(provider: &str) -> String {
         .unwrap_or_else(|| "ollama/gemma4:latest".to_string())
 }
 
+fn copilot_auth_available() -> bool {
+    if std::env::var("GITHUB_TOKEN")
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+        || std::env::var("VSCODE_COPILOT_TOKEN")
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false)
+    {
+        return true;
+    }
+
+    if let Some(home) = home_dir() {
+        let candidates = [
+            home.join(".config/github-copilot/hosts.json"),
+            home.join("Library/Application Support/github-copilot/hosts.json"),
+            home.join(".config/edgequake/copilot/github_token.json"),
+            home.join("Library/Application Support/edgequake/copilot/github_token.json"),
+        ];
+        return candidates.iter().any(|path| path.exists());
+    }
+
+    false
+}
+
 /// Returns the default edgecrab home directory (~/.edgecrab/).
 pub fn edgecrab_home() -> PathBuf {
     home_dir()
@@ -184,7 +208,15 @@ fn run_fresh_setup(home: &Path, config_path: &Path) -> anyhow::Result<()> {
     // Detect already-configured providers from environment
     let detected: Vec<(&str, &str, &str)> = PROVIDER_ENV_MAP
         .iter()
-        .filter(|(env, _, _)| std::env::var(env).is_ok())
+        .filter(|(env, provider, _)| {
+            if *provider == "copilot" {
+                copilot_auth_available()
+            } else {
+                std::env::var(env)
+                    .map(|value| !value.trim().is_empty())
+                    .unwrap_or(false)
+            }
+        })
         .copied()
         .collect();
 
@@ -1310,7 +1342,7 @@ mod tests {
     #[test]
     fn default_model_coverage() {
         // Values come from the embedded ModelCatalog YAML
-        assert_eq!(default_model("copilot"), "copilot/gpt-5.4");
+        assert_eq!(default_model("copilot"), "copilot/auto");
         assert_eq!(default_model("openai"), "openai/gpt-5.4");
         assert_eq!(default_model("anthropic"), "anthropic/claude-opus-4.6");
         assert_eq!(default_model("google"), "google/gemini-2.5-flash");

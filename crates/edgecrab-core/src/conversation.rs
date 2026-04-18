@@ -1840,10 +1840,29 @@ fn prompt_cache_config_for(
 }
 
 fn augment_provider_error(provider: &Arc<dyn LLMProvider>, error: String) -> String {
-    if provider.name() == "vscode-copilot" && error.contains("api.githubcopilot.com") {
-        return format!(
-            "{error} GitHub Copilot direct mode could not reach the remote API. If you rely on a local Copilot proxy, set `VSCODE_COPILOT_DIRECT=false` or configure `VSCODE_COPILOT_PROXY_URL`."
-        );
+    if provider.name() == "vscode-copilot" {
+        let lower = error.to_ascii_lowercase();
+        if lower.contains("bad credentials")
+            || lower.contains("copilot token request failed: 401")
+            || lower.contains("no github copilot credential")
+        {
+            return format!(
+                "{error} GitHub Copilot needs a fresh login. Exit to a shell and run edgecrab auth login copilot, or rerun edgecrab setup, to perform the official GitHub device flow."
+            );
+        }
+        if lower.contains("user_weekly_rate_limited")
+            || lower.contains("user_global_rate_limited")
+            || lower.contains("global-chat:global-cogs-7-day-key")
+        {
+            return format!(
+                "GitHub Copilot authentication succeeded, but GitHub is currently rate limiting chat requests for this account. {error} If you are not already using Auto, try /model copilot/auto. If Auto is already selected, this is an account-wide GitHub limit, so wait for the reset window shown above or use another provider."
+            );
+        }
+        if error.contains("api.githubcopilot.com") {
+            return format!(
+                "{error} GitHub Copilot direct mode could not reach the remote API. If you rely on a local Copilot proxy, set `VSCODE_COPILOT_DIRECT=false` or configure `VSCODE_COPILOT_PROXY_URL`."
+            );
+        }
     }
     error
 }

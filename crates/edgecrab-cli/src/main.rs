@@ -651,7 +651,7 @@ async fn run_subcommand(cmd: Command, args: &CliArgs) -> anyhow::Result<()> {
         }
 
         Command::Login { target } => {
-            auth_cmd::login_target(&target).await?;
+            auth_cmd::login_target(target.as_deref().unwrap_or("copilot")).await?;
         }
 
         Command::Logout { target } => {

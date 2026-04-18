@@ -76,8 +76,11 @@ providers:
   # ─── GitHub Copilot ──────────────────────────────────────────────
   copilot:
     label: "GitHub Copilot"
-    default_model: "gpt-5.4"
+    default_model: "auto"
     models:
+      - model: "auto"
+        context: 400000
+        tier: standard
       - model: "claude-haiku-4.5"
         context: 200000
         tier: fast
