@@ -42,12 +42,25 @@ jobs:
           ./scripts/release-version.sh set "${{ steps.version.outputs.version }}"
           ./scripts/release-version.sh check
 
-      - run: pip install --upgrade build
+      - run: pip install --upgrade build maturin
 
-      - name: Build sdist and wheel
+      - name: Build distributables
         run: |
           cd sdks/python
-          python -m build --outdir dist/
+          python -m build --sdist --outdir dist/
+          maturin build --release --out dist/ -i python3.10 || true
+
+      - name: Drop non-PyPI-compatible Linux wheels
+        run: |
+          python3 - <<'PY'
+          import pathlib
+          dist = pathlib.Path('sdks/python/dist')
+          for wheel in dist.glob('*.whl'):
+              name = wheel.name
+              if 'linux_' in name and 'manylinux' not in name and 'musllinux' not in name:
+                  print(f'Removing unsupported wheel: {name}')
+                  wheel.unlink()
+          PY
 
       - uses: actions/upload-artifact@v4
         with:

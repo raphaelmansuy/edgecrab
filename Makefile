@@ -225,23 +225,23 @@ publish-python-local: ## Build Python SDK wheel and install it locally with pip
 # ── Node.js / npm ────────────────────────────────────────────────────────────
 publish-node-dry: ## Dry-run: build and pack Node.js SDK
 	$(call log,Building Node.js SDK [dry-run])
-	@cd sdks/nodejs-native && npm ci && npm run build
-	@cd sdks/nodejs-native && npm pack --dry-run
+	@cd sdks/node && npm ci && npm run build
+	@cd sdks/node && npm pack --dry-run
 	$(call ok,Node.js dry-run passed)
 
 publish-node: ## Build and publish Node.js SDK to npm
 	$(call log,Building Node.js SDK ...)
-	@cd sdks/nodejs-native && npm ci && npm run build
+	@cd sdks/node && npm ci && npm run build
 	$(call log,Publishing to npm ...)
-	@cd sdks/nodejs-native && npm publish --access public
+	@cd sdks/node && npm publish --access public
 	$(call ok,Node.js SDK published to npm)
 
 publish-node-local: ## Build Node.js SDK, pack it, and install it locally via npm link
 	$(call log,Building Node.js SDK ...)
-	@cd sdks/nodejs-native && npm ci && npm run build
+	@cd sdks/node && npm ci && npm run build
 	$(call log,Linking Node.js SDK locally ...)
-	@cd sdks/nodejs-native && npm link --force
-	$(call ok,Node.js SDK linked locally — use 'npm link edgecrab' in your project)
+	@cd sdks/node && npm link --force
+	$(call ok,Node.js SDK linked locally — use 'npm link edgecrab-sdk' in your project)
 
 # ── npm CLI (edgecrab-cli wrapper) ───────────────────────────────────────────
 publish-npm-cli-dry: ## Dry-run: pack npm CLI wrapper package

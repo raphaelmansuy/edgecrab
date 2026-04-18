@@ -37,17 +37,17 @@ jobs:
           VERSION="${TAG_NAME#v}"
           ./scripts/release-version.sh set "$VERSION"
           ./scripts/release-version.sh check
-          echo "Publishing edgecrab@$VERSION"
+          echo "Publishing edgecrab-sdk@$VERSION"
 
       - run: |
-          cd sdks/nodejs-native
+          cd sdks/node
           npm ci
           npm run build
 
       - name: Pack npm tarball
         run: |
           mkdir -p release-assets/node
-          cd sdks/nodejs-native
+          cd sdks/node
           npm pack --pack-destination "$GITHUB_WORKSPACE/release-assets/node"
 
       - name: Ensure GitHub Release exists
@@ -76,7 +76,7 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          cd sdks/nodejs-native
+          cd sdks/node
           OUTPUT=$(npm publish --access public 2>&1) && echo "$OUTPUT" || {
             echo "$OUTPUT"
             if echo "$OUTPUT" | grep -Eq "cannot publish over the previously published versions|You cannot publish over the previously published version"; then

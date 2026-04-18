@@ -61,7 +61,13 @@ sync_versions() {
   local version="$1"
 
   perl -0pi -e 's/"version": "[^"]+"/"version": "'"$version"'"/' \
+    sdks/node/package.json \
     sdks/nodejs-native/package.json
+
+  if [[ -f sdks/node/package-lock.json ]]; then
+    perl -0pi -e 's/^(\s*"version":\s*)"[^"]+"/${1}"'"$version"'"/m; s/("packages":\s*\{\s*"":\s*\{\s*"name":\s*"edgecrab-sdk",\s*"version":\s*)"[^"]+"/${1}"'"$version"'"/s' \
+      sdks/node/package-lock.json
+  fi
 
   if [[ -f sdks/nodejs-native/package-lock.json ]]; then
     perl -0pi -e 's/^(\s*"version":\s*)"[^"]+"/${1}"'"$version"'"/m; s/("packages":\s*\{\s*"":\s*\{\s*"name":\s*"edgecrab",\s*"version":\s*)"[^"]+"/${1}"'"$version"'"/s' \
@@ -88,6 +94,10 @@ sync_versions() {
 
 read_npm_version() {
   sed -n 's/^[[:space:]]*"version": "\([^"]*\)",$/\1/p' sdks/npm-cli/package.json
+}
+
+read_node_sdk_public_version() {
+  sed -n 's/^[[:space:]]*"version": "\([^"]*\)",$/\1/p' sdks/node/package.json
 }
 
 read_node_sdk_version() {
@@ -138,6 +148,13 @@ check_synced() {
   if [[ "$dependency_versions" != "$version" ]]; then
     echo "Version drift: workspace internal dependency versions do not all match $version" >&2
     printf '%s\n' "$dependency_versions" >&2
+    failed=1
+  fi
+
+  local node_sdk_public_version
+  node_sdk_public_version="$(read_node_sdk_public_version)"
+  if [[ "$node_sdk_public_version" != "$version" ]]; then
+    echo "Version drift: sdks/node/package.json is $node_sdk_public_version, expected $version" >&2
     failed=1
   fi
 
