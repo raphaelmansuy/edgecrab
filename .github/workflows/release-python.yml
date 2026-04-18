@@ -6,22 +6,31 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: 'Tag name to publish (e.g. v0.3.3)'
-        required: true
-        default: 'v0.3.3'
+        description: 'Optional tag name to publish; defaults to the selected ref name when left blank'
+        required: false
+        default: ''
 
 permissions:
   id-token: write
   contents: read
 
+concurrency:
+  group: release-python-${{ github.repository }}-${{ inputs.tag_name || github.ref_name }}
+  cancel-in-progress: false
+
 jobs:
   build:
-    name: Build sdist + wheel
+    name: Build Python release
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && github.ref || (inputs.tag_name || github.ref) }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.ref_name || github.ref }}
+          fetch-depth: 0
+          fetch-tags: true
 
       - uses: actions/setup-python@v5
         with:
@@ -42,25 +51,13 @@ jobs:
           ./scripts/release-version.sh set "${{ steps.version.outputs.version }}"
           ./scripts/release-version.sh check
 
-      - run: pip install --upgrade build maturin
+      - run: pip install --upgrade build twine
 
-      - name: Build distributables
+      - name: Build source distribution
         run: |
           cd sdks/python
           python -m build --sdist --outdir dist/
-          maturin build --release --out dist/ -i python3.10 || true
-
-      - name: Drop non-PyPI-compatible Linux wheels
-        run: |
-          python3 - <<'PY'
-          import pathlib
-          dist = pathlib.Path('sdks/python/dist')
-          for wheel in dist.glob('*.whl'):
-              name = wheel.name
-              if 'linux_' in name and 'manylinux' not in name and 'musllinux' not in name:
-                  print(f'Removing unsupported wheel: {name}')
-                  wheel.unlink()
-          PY
+          python -m twine check dist/*
 
       - uses: actions/upload-artifact@v4
         with:
@@ -72,8 +69,14 @@ jobs:
     name: Publish to PyPI
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     environment: pypi
     steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.ref_name || github.ref }}
+          fetch-depth: 0
+          fetch-tags: true
       - uses: actions/download-artifact@v4
         with:
           name: python-sdk-dist
@@ -87,8 +90,16 @@ jobs:
         with:
           packages-dir: dist/
           skip-existing: true
+          print-hash: true
           # PYPI_API_TOKEN is used when the project is new (OIDC trusted publisher
           # must be registered for existing projects, but works without for token).
           # Once edgecrab is registered as a trusted publisher on pypi.org, this
           # password: line can be removed.
           password: ${{ secrets.PYPI_API_TOKEN }}
+
+      - name: Verify PyPI registry propagation
+        env:
+          VERIFY_ATTEMPTS: 24
+          VERIFY_SLEEP_SECS: 15
+        run: |
+          ./scripts/release-verify.sh pypi edgecrab "${{ needs.build.outputs.version }}"

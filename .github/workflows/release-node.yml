@@ -6,27 +6,35 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: 'Tag name to publish (e.g. v0.3.3) — used for version sync'
-        required: true
-        default: 'v0.3.3'
+        description: 'Optional tag name to publish; defaults to the selected ref name when left blank'
+        required: false
+        default: ''
 
 permissions:
   contents: write
+
+concurrency:
+  group: release-node-${{ github.repository }}-${{ inputs.tag_name || github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
   publish-npm:
     name: Publish to npm
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     environment: npm
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && github.ref || (inputs.tag_name || github.ref) }}
-      - uses: actions/setup-node@v4
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.ref_name || github.ref }}
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: actions/setup-node@v6
         with:
           node-version: '24'
+          package-manager-cache: false
           registry-url: 'https://registry.npmjs.org'
 
       - name: Sync release version
@@ -85,3 +93,13 @@ jobs:
               exit 1
             fi
           }
+
+      - name: Verify npm registry propagation
+        env:
+          INPUT_TAG_NAME: ${{ inputs.tag_name }}
+          VERIFY_ATTEMPTS: 20
+          VERIFY_SLEEP_SECS: 15
+        run: |
+          TAG_NAME="${INPUT_TAG_NAME:-$GITHUB_REF_NAME}"
+          VERSION="${TAG_NAME#v}"
+          ./scripts/release-verify.sh npm edgecrab-sdk "$VERSION"

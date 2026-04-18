@@ -31,3 +31,9 @@ Documentation = "https://github.com/raphaelmansuy/edgecrab/tree/main/sdks/python
 [tool.maturin]
 python-source = "python"
 module-name = "edgecrab._native"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+markers = [
+    "asyncio: mark tests that require an asyncio event loop",
+]
