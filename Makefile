@@ -26,7 +26,7 @@
         publish-pypi-cli publish-pypi-cli-dry \
         publish-all publish-all-dry \
         publish-python-local publish-node-local publish-npm-cli-local publish-pypi-cli-local \
-        publish-local \
+        publish-local verify-release \
         version-bump tag-release \
         site-dev site-build site-preview site-install site-deploy site-deploy-status \
         clean clean-all
@@ -149,12 +149,13 @@ uninstall: ## Remove edgecrab from ~/.cargo/bin
 ## SDK Tests
 # ══════════════════════════════════════════════════════════════════════════════
 
-test-python: ## Run Python SDK tests
+test-python: ## Run Python SDK tests and packaging checks
 	$(call log,Python SDK tests)
-	@cd sdks/python && python3 -m pip install -e . -q && pytest tests/test_sdk_e2e.py -v
+	@cd sdks/python && python3 -m pip install -q --upgrade build twine pytest pytest-asyncio && python3 -m pip install -e . -q && PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest -p pytest_asyncio.plugin tests/test_sdk_e2e.py -v && python3 -m build --sdist && python3 -m twine check dist/*
 
-test-node: ## Run Node.js SDK tests
+test-node: ## Run public and native Node.js SDK tests
 	$(call log,Node.js SDK tests)
+	@cd sdks/node && npm ci --silent && npm run build && npm test && npm pack --dry-run
 	@cd sdks/nodejs-native && npm ci --silent && npm run build && npm test
 
 test-sdks: test-python test-node ## Run all SDK test suites
@@ -291,6 +292,16 @@ publish-all: publish-rust publish-python publish-node publish-npm-cli publish-py
 
 publish-local: publish-python-local publish-node-local publish-npm-cli-local publish-pypi-cli-local ## Build and install/link all Python + npm packages locally (no registry)
 	$(call ok,All packages published locally)
+
+verify-release: ## Verify public release publication. Usage: make verify-release VERSION=0.7.0
+	@[ -n "$(VERSION)" ] || (printf "$(RED)ERROR: VERSION is required. Example: make verify-release VERSION=0.7.0$(RESET)\n"; exit 1)
+	$(call log,Verifying npm publication for $(VERSION) ...)
+	@./scripts/release-verify.sh npm edgecrab-sdk "$(VERSION)"
+	$(call log,Verifying PyPI publication for $(VERSION) ...)
+	@./scripts/release-verify.sh pypi edgecrab "$(VERSION)"
+	$(call log,Verifying GHCR publication for $(VERSION) ...)
+	@./scripts/release-verify.sh ghcr ghcr.io/raphaelmansuy/edgecrab "$(VERSION)" linux/amd64 linux/arm64
+	$(call ok,All public release assets verified)
 
 # ── Version bump ──────────────────────────────────────────────────────────────
 

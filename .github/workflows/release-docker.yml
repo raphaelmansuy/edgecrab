@@ -6,13 +6,17 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: 'Tag name to publish (e.g. v0.3.3)'
-        required: true
-        default: 'v0.3.3'
+        description: 'Optional tag name to publish; defaults to the selected ref name when left blank'
+        required: false
+        default: ''
 
 permissions:
   contents: read
   packages: write
+
+concurrency:
+  group: release-docker-${{ github.repository }}-${{ inputs.tag_name || github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
   # ── Extract version once ──────────────────────────────────────────────────────
@@ -36,12 +40,15 @@ jobs:
   build-amd64:
     needs: meta
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
-          ref: ${{ github.ref }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.ref_name || github.ref }}
+          fetch-depth: 0
+          fetch-tags: true
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
       - uses: docker/login-action@v3
         with:
@@ -50,7 +57,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push (amd64)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: true
@@ -63,12 +70,15 @@ jobs:
   build-arm64:
     needs: meta
     runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
-          ref: ${{ github.ref }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.ref_name || github.ref }}
+          fetch-depth: 0
+          fetch-tags: true
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
       - uses: docker/login-action@v3
         with:
@@ -77,7 +87,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push (arm64)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: true
@@ -90,7 +100,14 @@ jobs:
   merge:
     needs: [meta, build-amd64, build-arm64]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.ref_name || github.ref }}
+          fetch-depth: 0
+          fetch-tags: true
+
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -112,3 +129,12 @@ jobs:
         run: |
           docker buildx imagetools inspect \
             "ghcr.io/${{ github.repository }}:${{ needs.meta.outputs.version }}"
+
+      - name: Verify GHCR registry propagation
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+          VERSION: ${{ needs.meta.outputs.version }}
+          VERIFY_ATTEMPTS: 24
+          VERIFY_SLEEP_SECS: 15
+        run: |
+          ./scripts/release-verify.sh ghcr "$IMAGE" "$VERSION" linux/amd64 linux/arm64
