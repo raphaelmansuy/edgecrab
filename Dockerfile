@@ -19,19 +19,27 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 
 # Copy all crate manifests for dependency resolution
-COPY crates/edgecrab-types/Cargo.toml     crates/edgecrab-types/
-COPY crates/edgecrab-security/Cargo.toml  crates/edgecrab-security/
-COPY crates/edgecrab-state/Cargo.toml     crates/edgecrab-state/
-COPY crates/edgecrab-cron/Cargo.toml      crates/edgecrab-cron/
-COPY crates/edgecrab-tools/Cargo.toml     crates/edgecrab-tools/
-COPY crates/edgecrab-core/Cargo.toml      crates/edgecrab-core/
-COPY crates/edgecrab-cli/Cargo.toml       crates/edgecrab-cli/
-COPY crates/edgecrab-gateway/Cargo.toml   crates/edgecrab-gateway/
-COPY crates/edgecrab-acp/Cargo.toml       crates/edgecrab-acp/
-COPY crates/edgecrab-migrate/Cargo.toml   crates/edgecrab-migrate/
+COPY crates/edgecrab-command-catalog/Cargo.toml crates/edgecrab-command-catalog/
+COPY crates/edgecrab-types/Cargo.toml           crates/edgecrab-types/
+COPY crates/edgecrab-security/Cargo.toml        crates/edgecrab-security/
+COPY crates/edgecrab-state/Cargo.toml           crates/edgecrab-state/
+COPY crates/edgecrab-plugins/Cargo.toml         crates/edgecrab-plugins/
+COPY crates/edgecrab-cron/Cargo.toml            crates/edgecrab-cron/
+COPY crates/edgecrab-lsp/Cargo.toml             crates/edgecrab-lsp/
+COPY crates/edgecrab-tools/Cargo.toml           crates/edgecrab-tools/
+COPY crates/edgecrab-core/Cargo.toml            crates/edgecrab-core/
+COPY crates/edgecrab-cli/Cargo.toml             crates/edgecrab-cli/
+COPY crates/edgecrab-gateway/Cargo.toml         crates/edgecrab-gateway/
+COPY crates/edgecrab-acp/Cargo.toml             crates/edgecrab-acp/
+COPY crates/edgecrab-migrate/Cargo.toml         crates/edgecrab-migrate/
+COPY crates/edgecrab-sdk-core/Cargo.toml        crates/edgecrab-sdk-core/
+COPY crates/edgecrab-sdk-macros/Cargo.toml      crates/edgecrab-sdk-macros/
+COPY crates/edgecrab-sdk/Cargo.toml             crates/edgecrab-sdk/
+COPY sdks/python/Cargo.toml                     sdks/python/
+COPY sdks/nodejs-native/Cargo.toml              sdks/nodejs-native/
 
 # Dummy build to cache dependencies
-RUN for dir in crates/*/; do \
+RUN for dir in crates/*/ sdks/python/ sdks/nodejs-native/; do \
       mkdir -p "$dir/src"; \
       name=$(basename "$dir"); \
       if [ "$name" = "edgecrab-cli" ]; then \
@@ -41,11 +49,13 @@ RUN for dir in crates/*/; do \
       fi; \
     done \
     && cargo build --release -p edgecrab-cli 2>/dev/null || true \
-    && rm -rf crates/*/src
+    && rm -rf crates/*/src sdks/python/src sdks/nodejs-native/src
 
 # Copy real source and rebuild
 COPY crates/ crates/
-RUN find crates/ -name '*.rs' -exec touch {} + \
+COPY sdks/python/ sdks/python/
+COPY sdks/nodejs-native/ sdks/nodejs-native/
+RUN find crates/ sdks/python/ sdks/nodejs-native/ -name '*.rs' -exec touch {} + \
     && cargo build --release -p edgecrab-cli
 
 # ─── Stage 2: Runtime ─────────────────────────────────────────────────────────
