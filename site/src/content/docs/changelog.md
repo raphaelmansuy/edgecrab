@@ -8,7 +8,41 @@ sidebar:
 All notable changes to EdgeCrab are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-Last updated: 2026-05-15
+Last updated: 2026-04-18
+
+---
+
+## [Unreleased]
+
+## [0.7.0] — 2026-04-18
+
+### Added
+
+- **Cross-SDK example tracks** — Each SDK now ships friendlier `getting-started`, `business`, and `e2e` example entry points with dedicated READMEs for faster onboarding.
+- **Business-oriented agent showcases** — Added more realistic SDK demos for review pipelines, documentation generation, support flows, and safe automation scenarios.
+- **Grounded E2E smoke coverage** — Refreshed runnable end-to-end verification across Rust, Python, Node.js, and WASM SDK targets.
+
+### Changed
+
+- **One SDK naming story** — Public docs and release surfaces now present a unified EdgeCrab SDK experience across languages, while historical repo folder names remain internal implementation details.
+- **Provider-safe example defaults** — Public examples now prefer Copilot, OpenAI, and Ollama-compatible model strings throughout the SDK docs and tutorial pages.
+- **GitHub Copilot now defaults to Auto-first routing backed by the latest `edgequake-llm` provider behavior** — GitHub's live router chooses the chat-capable model and billing path allowed for the current account, so following that route avoids avoidable model-specific failures.
+- **SDK documentation refresh** — README and Astro docs now point to the new per-SDK example layout and highlight the most practical, user-facing example paths.
+
+### Fixed
+
+- **Copy-friendly GitHub device login in the TUI** — `/login` now temporarily leaves the alternate screen, shows the device code on a clean plain-terminal panel, and restores the TUI afterward.
+
+### Verification
+
+| Check | Result |
+|--------|--------|
+| `./scripts/release-version.sh check` | **passed locally before cut** |
+| `cargo fmt --all --check` | **passed locally before cut** |
+| `cargo clippy --workspace --all-targets -- -D warnings` | **passed locally before cut** |
+| `cargo test --workspace --exclude edgecrab-lsp` | **passed locally before cut** |
+| `cargo test -p edgecrab-lsp --all-targets` | **passed locally before cut** |
+| `pnpm build` in `site/` | **passed locally before cut** |
 
 ---
 
@@ -41,10 +75,6 @@ Last updated: 2026-05-15
 
 - **Web search fallback chain — Firecrawl → Brave → Tavily → DuckDuckGo** with `wreq` BoringSSL TLS fingerprint.
 - **Per-tool rich result display in TUI done-lines** via `format_tool_result()`.
-
----
-
-## [Unreleased]
 
 ---
 

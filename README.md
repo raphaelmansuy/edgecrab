@@ -14,6 +14,7 @@
 
 EdgeCrab is a **SuperAgent** — a personal assistant and coding agent forged in Rust. It carries the soul of **Nous Hermes Agent** (autonomous reasoning, persistent memory, user-first alignment) and the always-on presence of **OpenClaw** (17 messaging gateways, smart-home integration), packaged as a stripped native release binary of about **49 MB** on current macOS arm64 builds, with zero Python or Node.js runtime dependencies. Runs on Linux, macOS, and Android (Termux).
 
+> **Latest release: v0.7.0** — first-class SDK coverage across Rust, Python, Node.js, and WASM, with refreshed examples, release-safe docs, and a cleaner onboarding path.
 
 
 ## Architecture

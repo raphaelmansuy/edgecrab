@@ -26,6 +26,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 - **Copy-friendly GitHub device login in the TUI** — `/login` now temporarily leaves the alternate screen, shows the device code on a clean plain-terminal panel, and restores the TUI afterward. WHY: raw-mode terminal UIs are bad surfaces for selecting short login codes, so the auth step must optimize for clarity and mouse selection instead of decoration.
 
+### Verification
+
+| Check | Result |
+|-------|--------|
+| `./scripts/release-version.sh check` | **passed locally before cut** |
+| `cargo fmt --all --check` | **passed locally before cut** |
+| `cargo clippy --workspace --all-targets -- -D warnings` | **passed locally before cut** |
+| `cargo test --workspace --exclude edgecrab-lsp` | **passed locally before cut** |
+| `cargo test -p edgecrab-lsp --all-targets` | **passed locally before cut** |
+| `pnpm build` in `site/` | **passed locally before cut** |
+
 ## [0.6.0] — 2026-05-15
 
 ### Added
