@@ -217,9 +217,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let run_session_id = result.session_id.clone();
     covered.insert("SdkAgent.run");
     ok(&format!(
-        "run → {:?} | session_id_len={} | cost=${:.6}",
+        "run → {:?} | cost=${:.6}",
         result.final_response.chars().take(40).collect::<String>(),
-        result.session_id.len(),
         result.cost.total_cost,
     ));
 
@@ -260,11 +259,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sid = agent.session_id().await;
     assert!(sid.is_some(), "session_id getter returned None");
     covered.insert("SdkAgent.session_id");
-    ok(&format!(
-        "session_id → present={} len={}",
-        sid.is_some(),
-        sid.as_deref().map_or(0, str::len)
-    ));
+    ok("session_id getter → available");
 
     let cwd = std::env::current_dir()?;
     let cwd_reply = agent

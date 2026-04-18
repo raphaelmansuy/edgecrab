@@ -55,7 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     println!("Resolution:\n{}", result.final_response);
-    println!("\nSession:  [redacted] (len={})", result.session_id.len());
+    println!("\nSession:  persisted for follow-up");
     println!("Cost:     ${:.6}", result.cost.total_cost);
 
     Ok(())
