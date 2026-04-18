@@ -28560,7 +28560,11 @@ fn restore_tui_surface(
     Ok(())
 }
 
-fn render_terminal_notice_panel(stdout: &mut io::Stdout, title: &str, body: &str) -> io::Result<()> {
+fn render_terminal_notice_panel(
+    stdout: &mut io::Stdout,
+    title: &str,
+    body: &str,
+) -> io::Result<()> {
     clear_terminal_surface(stdout)?;
     writeln!(stdout, "{title}")?;
     writeln!(stdout, "{}", "=".repeat(title.chars().count().max(24)))?;

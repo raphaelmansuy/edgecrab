@@ -288,7 +288,9 @@ async fn e2e_agent_streaming_with_copilot() {
             Err(err) => {
                 let msg = err.to_string();
                 if is_verified_global_rate_limit(&msg) {
-                    eprintln!("Skipping streaming due to upstream Copilot weekly/global rate limit: {msg}");
+                    eprintln!(
+                        "Skipping streaming due to upstream Copilot weekly/global rate limit: {msg}"
+                    );
                     return;
                 }
                 panic!("streaming should succeed: {msg}");
@@ -316,7 +318,9 @@ async fn e2e_agent_streaming_with_copilot() {
             StreamEvent::Clarify { .. } => {} // not expected in this test
             StreamEvent::Error(e) => {
                 if is_verified_global_rate_limit(&e) {
-                    eprintln!("Skipping streaming due to upstream Copilot weekly/global rate limit: {e}");
+                    eprintln!(
+                        "Skipping streaming due to upstream Copilot weekly/global rate limit: {e}"
+                    );
                     return;
                 }
                 panic!("Unexpected streaming error: {e}")
@@ -371,7 +375,9 @@ async fn e2e_model_swap_with_copilot() {
         Err(err) => {
             let msg = err.to_string();
             if is_verified_global_rate_limit(&msg) {
-                eprintln!("Skipping model swap due to upstream Copilot weekly/global rate limit: {msg}");
+                eprintln!(
+                    "Skipping model swap due to upstream Copilot weekly/global rate limit: {msg}"
+                );
                 return;
             }
             panic!("first chat: {msg}");
@@ -382,9 +388,7 @@ async fn e2e_model_swap_with_copilot() {
     // Hot-swap to the same model (no-op but validates the plumbing)
     let provider2 = edgecrab_tools::create_provider_for_model("vscode-copilot", COPILOT_TEST_MODEL)
         .expect("second provider");
-    agent
-        .swap_model(COPILOT_TEST_SPEC.into(), provider2)
-        .await;
+    agent.swap_model(COPILOT_TEST_SPEC.into(), provider2).await;
 
     // Second turn after swap
     let r2 = match agent.chat("Say BETA").await {
@@ -392,7 +396,9 @@ async fn e2e_model_swap_with_copilot() {
         Err(err) => {
             let msg = err.to_string();
             if is_verified_global_rate_limit(&msg) {
-                eprintln!("Skipping model swap due to upstream Copilot weekly/global rate limit: {msg}");
+                eprintln!(
+                    "Skipping model swap due to upstream Copilot weekly/global rate limit: {msg}"
+                );
                 return;
             }
             panic!("second chat: {msg}");

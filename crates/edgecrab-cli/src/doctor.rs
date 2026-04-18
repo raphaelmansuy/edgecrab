@@ -439,7 +439,10 @@ fn dirs_home() -> Option<std::path::PathBuf> {
 /// We report each separately for clarity.
 fn check_provider_keys() -> Vec<Check> {
     let providers = [
-        ("GITHUB_TOKEN", "GitHub Copilot (env token or VS Code auth cache)"),
+        (
+            "GITHUB_TOKEN",
+            "GitHub Copilot (env token or VS Code auth cache)",
+        ),
         ("OPENAI_API_KEY", "OpenAI"),
         ("ANTHROPIC_API_KEY", "Anthropic"),
         ("GOOGLE_API_KEY", "Google Gemini"),

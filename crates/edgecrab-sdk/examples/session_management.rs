@@ -22,7 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Agent: {reply}");
 
     let session_id = agent.session_id().await.unwrap();
-    println!("\nSession ID: {session_id}");
+    println!("\nSession ID: [redacted] (len={})", session_id.len());
 
     // ── 2. List recent sessions ─────────────────────────────────────
     let sessions = agent.list_sessions(5)?;

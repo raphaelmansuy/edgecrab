@@ -29,7 +29,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!("--- Metadata ---");
     println!("Model:            {}", result.model);
-    println!("Session ID:       {}", &result.session_id[..12]);
+    println!("Session ID:       [redacted]");
     println!("API calls:        {}", result.api_calls);
     println!("Interrupted:      {}", result.interrupted);
     println!("Budget exhausted: {}", result.budget_exhausted);
@@ -52,7 +52,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !result.tool_errors.is_empty() {
         println!("\n--- Tool Errors ---");
         for err in &result.tool_errors {
-            println!("  Turn {}: {} — {}", err.turn, err.tool_name, err.error);
+            println!(
+                "  Turn {}: {} — [error details redacted]",
+                err.turn, err.tool_name
+            );
         }
     }
 
