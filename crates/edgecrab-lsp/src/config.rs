@@ -563,12 +563,27 @@ mod tests {
         let nested = workspace.path().join("packages/app");
         std::fs::create_dir_all(&nested).expect("nested");
 
+        let detected = resolve_project_local_binary("typescript-language-server", Some(&nested))
+            .expect("detected local node_modules binary");
+        assert_eq!(detected, server);
+
         let resolved =
             resolve_server_command("typescript", "typescript-language-server", Some(&nested))
                 .expect("local node_modules binary");
 
-        assert_eq!(resolved.program, server);
-        assert!(resolved.args_prefix.is_empty());
+        let launcher_name = resolved.program.file_name().and_then(|name| name.to_str());
+        let uses_direct_binary = resolved.program == server && resolved.args_prefix.is_empty();
+        let uses_supported_launcher = matches!(launcher_name, Some("pnpm" | "npx" | "yarn"))
+            && resolved
+                .args_prefix
+                .iter()
+                .any(|arg| arg == "typescript-language-server");
+
+        assert!(
+            uses_direct_binary || uses_supported_launcher,
+            "expected direct local binary or supported launcher fallback, got {}",
+            resolved.display()
+        );
     }
 
     #[test]

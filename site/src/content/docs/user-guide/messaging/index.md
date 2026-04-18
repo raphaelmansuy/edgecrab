@@ -183,9 +183,9 @@ Check the platform-specific setup (the bot token is set, the bot is added to the
 
 **Q: I want to run multiple gateways with different models.**
 
-Use profiles. Create a `work` profile with `model: anthropic/claude-opus-4` and run:
+Use profiles. Create a `work` profile with `model: openai/gpt-5` and run:
 ```bash
-edgecrab -p work gateway start &  # uses claude-opus on Slack
+edgecrab -p work gateway start &  # uses your work profile model on Slack
 edgecrab -p fast gateway start &  # uses copilot/gpt-4.1-mini on Telegram
 ```
 Note: multiple gateway processes on the same port will conflict — use different ports via `gateway.port`.

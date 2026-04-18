@@ -264,6 +264,18 @@ export default defineConfig({
 					],
 				},
 				{
+					label: 'SDK Tutorials',
+					badge: { text: 'NEW', variant: 'tip' },
+					items: [
+						{ label: 'Overview', slug: 'tutorials' },
+						{ label: '1. Cost-Aware Code Review', slug: 'tutorials/01-cost-aware-review' },
+						{ label: '2. Parallel Research Pipeline', slug: 'tutorials/02-parallel-research' },
+						{ label: '3. Multi-Agent Documentation', slug: 'tutorials/03-multi-agent-pipeline' },
+						{ label: '4. Session-Aware Support Bot', slug: 'tutorials/04-session-aware-support' },
+						{ label: '5. Safe SQL Agent (Custom Tool)', slug: 'tutorials/05-custom-tool-safe-sql' },
+					],
+				},
+				{
 					label: 'Developer Guide',
 					items: [
 						{ label: 'Architecture', slug: 'developer/architecture' },

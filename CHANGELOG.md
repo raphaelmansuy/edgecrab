@@ -5,6 +5,38 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [Unreleased]
+
+## [0.7.0] — 2026-04-18
+
+### Added
+
+- **Cross-SDK example tracks** — Each SDK now ships friendlier `getting-started`, `business`, and `e2e` example entry points with dedicated READMEs for faster onboarding.
+- **Business-oriented agent showcases** — Added more realistic SDK demos for review pipelines, documentation generation, support flows, and safe automation scenarios.
+- **Grounded E2E smoke coverage** — Refreshed runnable end-to-end verification across Rust, Python, Node.js, and WASM SDK targets.
+
+### Changed
+
+- **One SDK naming story** — Public docs and release surfaces now present a unified EdgeCrab SDK experience across languages, while historical repo folder names remain internal implementation details.
+- **Provider-safe example defaults** — Public examples now prefer Copilot, OpenAI, and Ollama-compatible model strings throughout the SDK docs and tutorial pages.
+- **GitHub Copilot now defaults to Auto-first routing backed by the latest `edgequake-llm` provider behavior** — WHY: GitHub's live router knows which chat-capable model and billing path are actually allowed for the account, so hard-coding a premium model caused avoidable false failures.
+- **SDK documentation refresh** — README and Astro docs now point to the new per-SDK example layout and highlight the most practical, user-facing example paths.
+
+### Fixed
+
+- **Copy-friendly GitHub device login in the TUI** — `/login` now temporarily leaves the alternate screen, shows the device code on a clean plain-terminal panel, and restores the TUI afterward. WHY: raw-mode terminal UIs are bad surfaces for selecting short login codes, so the auth step must optimize for clarity and mouse selection instead of decoration.
+
+### Verification
+
+| Check | Result |
+|-------|--------|
+| `./scripts/release-version.sh check` | **passed locally before cut** |
+| `cargo fmt --all --check` | **passed locally before cut** |
+| `cargo clippy --workspace --all-targets -- -D warnings` | **passed locally before cut** |
+| `cargo test --workspace --exclude edgecrab-lsp` | **passed locally before cut** |
+| `cargo test -p edgecrab-lsp --all-targets` | **passed locally before cut** |
+| `pnpm build` in `site/` | **passed locally before cut** |
+
 ## [0.6.0] — 2026-05-15
 
 ### Added

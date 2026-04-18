@@ -41,20 +41,47 @@ site/dist/
 site/.astro/
 
 # ── SDK build artefacts ───────────────────────────────────────────────────────
-# Python
+# Python SDK (embedded, maturin/PyO3)
 sdks/python/dist/
 sdks/python/*.egg-info/
 sdks/python/.pytest_cache/
+sdks/python/python/edgecrab/_native*.so
+sdks/python/python/edgecrab/_native*.dylib
+sdks/python/python/edgecrab/_native*.pyd
+sdks/python/python/edgecrab/*.abi3.so
+# Python common
 __pycache__/
 *.pyc
 *.pyo
 .mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+*.egg-info/
 
-# Node.js / npm-cli
+# Node.js / npm-cli (legacy)
 sdks/node/node_modules/
 sdks/node/dist/
 sdks/npm-cli/node_modules/
 sdks/npm-cli/dist/
+# Node.js native (napi-rs)
+sdks/nodejs-native/node_modules/
+sdks/nodejs-native/*.node
+sdks/nodejs-native/dist/
+sdks/nodejs-native/.node_modules/
+# WASM SDK
+sdks/wasm/target/
+sdks/wasm/pkg/
+sdks/wasm/pkg-*/
+sdks/wasm/dist/
+sdks/wasm/node_modules/
+
+# SDK Core examples compiled artefacts (in crates/edgecrab-sdk/examples)
+# (these are compiled by Cargo into /target/ — already excluded above)
+
+# SDK examples working files (data, outputs)
+sdk-examples/**/__pycache__/
+sdk-examples/**/*.pyc
 
 # ── Bridge / script dependencies ─────────────────────────────────────────────
 scripts/whatsapp-bridge/node_modules/

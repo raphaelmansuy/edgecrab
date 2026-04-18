@@ -37,5 +37,7 @@ export type {
   StreamChunk,
   StreamChoice,
   StreamDelta,
+  ToolDefinition,
   UsageInfo,
 } from './types.js';
+export { Message, Role, Tool } from './types.js';

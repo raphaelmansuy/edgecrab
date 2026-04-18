@@ -1486,7 +1486,7 @@ impl SessionDb {
             .into_iter()
             .map(|(name, count)| ToolUsage { name, count })
             .collect();
-        top_tools.sort_by(|a, b| b.count.cmp(&a.count));
+        top_tools.sort_by_key(|tool| std::cmp::Reverse(tool.count));
         top_tools.truncate(10);
 
         // ── Daily activity (last 14 days) ──────────────────────────────

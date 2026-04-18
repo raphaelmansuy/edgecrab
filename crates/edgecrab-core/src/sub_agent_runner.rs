@@ -113,14 +113,12 @@ impl SubAgentRunner for CoreSubAgentRunner {
             Some(tokio::spawn(async move {
                 while let Some(event) = child_event_rx.recv().await {
                     match event {
-                        crate::StreamEvent::Reasoning(text) => {
-                            if !text.trim().is_empty() {
-                                let _ = progress_tx.send(DelegationEvent::Thinking {
-                                    task_index,
-                                    task_count,
-                                    text,
-                                });
-                            }
+                        crate::StreamEvent::Reasoning(text) if !text.trim().is_empty() => {
+                            let _ = progress_tx.send(DelegationEvent::Thinking {
+                                task_index,
+                                task_count,
+                                text,
+                            });
                         }
                         crate::StreamEvent::ToolExec {
                             name, args_json, ..

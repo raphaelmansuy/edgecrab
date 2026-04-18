@@ -43,7 +43,7 @@ Focus: production coding, review, and high-discipline execution.
 
 ```yaml
 model:
-  default: "anthropic/claude-opus-4.6"
+  default: "openai/gpt-5"
   max_iterations: 90
 
 display:

@@ -2280,7 +2280,7 @@ fn persist_seen_event_ids(path: Option<&Path>, cache: &HashMap<String, Instant>)
             Some((event_id.clone(), now_unix.saturating_sub(age.as_secs())))
         })
         .collect();
-    recent.sort_by(|a, b| b.1.cmp(&a.1));
+    recent.sort_by_key(|entry| std::cmp::Reverse(entry.1));
     recent.truncate(FEISHU_DEDUP_CACHE_SIZE);
 
     let payload: HashMap<String, u64> = recent.into_iter().collect();

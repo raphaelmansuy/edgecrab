@@ -174,7 +174,7 @@ edgecrab -C "my project"                    # Continue session by title
 edgecrab -r abc123 "add more tests"         # Resume session abc123
 edgecrab -w "refactor auth module"          # New isolated worktree
 edgecrab -S security-audit "audit payment"  # Preload a skill
-edgecrab --model anthropic/claude-opus-4    # Override model
+edgecrab --model openai/gpt-5               # Override model
 edgecrab --toolset coding "write tests"     # Use 'coding' toolset only
 edgecrab --yolo "fix the build fast"        # Disable dangerous-command approval prompts
 ```

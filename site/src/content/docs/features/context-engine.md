@@ -63,7 +63,7 @@ Then pass it to `AgentBuilder`:
 ```rust
 let engine = Arc::new(MyContextEngine::new());
 
-let agent = AgentBuilder::new("anthropic/claude-opus-4.6")
+let agent = AgentBuilder::new("openai/gpt-4o")
     .provider(provider)
     .tools(registry)
     .context_engine(engine)

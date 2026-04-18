@@ -14,6 +14,7 @@
 
 EdgeCrab is a **SuperAgent** — a personal assistant and coding agent forged in Rust. It carries the soul of **Nous Hermes Agent** (autonomous reasoning, persistent memory, user-first alignment) and the always-on presence of **OpenClaw** (17 messaging gateways, smart-home integration), packaged as a stripped native release binary of about **49 MB** on current macOS arm64 builds, with zero Python or Node.js runtime dependencies. Runs on Linux, macOS, and Android (Termux).
 
+> **Latest release: v0.7.0** — first-class SDK coverage across Rust, Python, Node.js, and WASM, with refreshed examples, release-safe docs, and a cleaner onboarding path.
 
 
 ## Architecture
@@ -74,6 +75,7 @@ hermes-agent soul  +  OpenClaw vision  =  EdgeCrab
     - [17 Messaging Gateways](#17-messaging-gateways)
     - [Persistent Memory \& Learning](#persistent-memory--learning)
     - [Skills Library](#skills-library)
+    - [Skills Vs Plugins](#skills-vs-plugins)
     - [Plugin System](#plugin-system)
     - [Cron Scheduling](#cron-scheduling)
     - [Checkpoints \& Rollback](#checkpoints--rollback)
@@ -89,9 +91,9 @@ hermes-agent soul  +  OpenClaw vision  =  EdgeCrab
   - [Security Model](#security-model)
   - [Architecture](#architecture-1)
   - [Configuration](#configuration)
-  - [SDK: Python \& Node.js](#sdk-python--nodejs)
+  - [SDKs](#sdks-one-edgecrab-experience)
     - [Python SDK (`edgecrab`)](#python-sdk-edgecrab)
-    - [Node.js SDK (`edgecrab-sdk`)](#nodejs-sdk-edgecrab-sdk)
+    - [Node.js SDK (`edgecrab`)](#nodejs-sdk-edgecrab)
   - [Docker](#docker)
   - [Migrating from hermes-agent](#migrating-from-hermes-agent)
   - [Testing](#testing)
@@ -184,7 +186,7 @@ Run `edgecrab` to start chatting!
 
 ```bash
 edgecrab "summarise the git log for today and open PRs"
-edgecrab --model anthropic/claude-opus-4-6 "review this codebase for security issues"
+edgecrab --model openai/gpt-5 "review this codebase for security issues"
 edgecrab --model ollama/llama3.3 "explain this code offline"
 edgecrab --quiet "count lines in src/**/*.rs"   # pipe-safe, no banner
 edgecrab -C "continue-my-refactor"              # resume named session
@@ -347,7 +349,7 @@ Configure delegation:
 ```yaml
 delegation:
   enabled: true
-  model: "anthropic/claude-sonnet-4"   # use cheaper model for sub-agents
+  model: "openai/gpt-4o"   # use a capable shared model for sub-agents
   max_subagents: 3
   max_iterations: 50
 ```
@@ -740,7 +742,7 @@ Starter profile examples:
 ```yaml
 # ~/.edgecrab/profiles/work/config.yaml
 model:
-  default: "anthropic/claude-opus-4.6"
+  default: "openai/gpt-5"
   max_iterations: 90
 
 display:
@@ -820,7 +822,7 @@ EdgeCrab ships with 15 LLM providers out of the box (13 cloud, 2 local). Over 20
 
 | Provider      | Env Var                          | Notable Models                                    |
 | ------------- | -------------------------------- | ------------------------------------------------- |
-| `copilot`     | `GITHUB_TOKEN`                   | GPT-4.1-mini, GPT-4.1 — free with GitHub Copilot  |
+| `copilot`     | `GITHUB_TOKEN` or VS Code auth cache | `copilot/auto`, GPT-5 mini, GPT-4.1 — routed by GitHub Copilot |
 | `openai`      | `OPENAI_API_KEY`                 | GPT-4.1, GPT-5, o3, o4-mini                       |
 | `anthropic`   | `ANTHROPIC_API_KEY`              | Claude Opus 4.6, Sonnet 4.6, Haiku 4.5            |
 | `google`      | `GOOGLE_API_KEY`                 | Gemini 2.5 Pro, Gemini 2.5 Flash                  |
@@ -837,7 +839,7 @@ EdgeCrab ships with 15 LLM providers out of the box (13 cloud, 2 local). Over 20
 
 **Switch provider at any time:**
 ```bash
-edgecrab --model anthropic/claude-opus-4-6 "deep code review"
+edgecrab --model openai/gpt-5 "deep code review"
 edgecrab --model ollama/llama3.3 "work offline"
 edgecrab --model groq/llama-3.3-70b-versatile "quick task"
 ```
@@ -847,6 +849,8 @@ edgecrab --model groq/llama-3.3-70b-versatile "quick task"
 /model groq/llama-3.3-70b-versatile
 /reasoning high                      # enable extended thinking (Anthropic/OpenAI)
 ```
+
+**Why `copilot/auto` is now the best default:** GitHub Copilot decides which chat-capable model and billing path are valid for your live session. Following that server choice avoids avoidable model-specific throttles and keeps EdgeCrab aligned with the real VS Code experience.
 
 **Smart routing** (experimental): automatically selects cheap vs full model by turn complexity:
 ```yaml
@@ -948,7 +952,7 @@ The `acp_registry/agent.json` manifest declares capabilities for extension disco
 │                                                             │
 │  The `main` function initializes the agent loop and...      │
 ├────────────────────────────────────────────────────────────┤
-│ ● anthropic/claude-opus-4-6  1,234t  $0.023  [/commands]  │
+│ ● openai/gpt-5              1,234t  $0.023  [/commands]  │
 ├────────────────────────────────────────────────────────────┤
 │ ❯ Type your message…                                        │
 └────────────────────────────────────────────────────────────┘
@@ -1029,8 +1033,11 @@ edgecrab auth add copilot --token <github-token>
 edgecrab auth add provider/openai --token <api-token>   # writes ~/.edgecrab/.env and ~/.edgecrab/auth.json
 edgecrab auth add mcp/<server> --token <bearer-token>
 edgecrab auth login [copilot|mcp/<server>]
-edgecrab login <target>
+edgecrab login [target]                                  # defaults to copilot
 edgecrab logout [target]                                 # clears local auth cache; provider targets also clear auth.json metadata
+
+# If GitHub Copilot needs a fresh login, EdgeCrab opens a dedicated plain-terminal
+# auth screen so the one-time code stays easy to read and easy to select by mouse.
 edgecrab mcp list
 edgecrab mcp add <name>
 edgecrab mcp remove <name>
@@ -1340,7 +1347,7 @@ mcp_servers:
 
 Key environment variables:
 ```bash
-EDGECRAB_MODEL=anthropic/claude-opus-4-6
+EDGECRAB_MODEL=openai/gpt-5
 EDGECRAB_MAX_ITERATIONS=120
 EDGECRAB_TERMINAL_BACKEND=docker
 EDGECRAB_SKIP_MEMORY=false
@@ -1349,23 +1356,25 @@ EDGECRAB_SAVE_TRAJECTORIES=true
 
 ---
 
-## SDK: Python & Node.js
+## SDKs: one EdgeCrab experience
 
-Both SDKs wrap the OpenAI-compatible HTTP API exposed by EdgeCrab's API server gateway adapter.
+EdgeCrab ships first-class SDK surfaces for Rust, Python, Node.js, and WASM.
+The published package names stay simple — `edgecrab`, `edgecrab-sdk`, and `@edgecrab/wasm`.
+The canonical Python SDK now lives directly under `sdks/python` for release and publication.
 
 ### Python SDK (`edgecrab`)
 
-**Python 3.10+ — async-first, streaming, CLI.**
+**Python 3.10+ — async-first, streaming, sessions, and E2E-backed examples.**
 
 ```bash
-pip install edgecrab-sdk
+pip install edgecrab
 ```
 
 ```python
 from edgecrab import Agent
 
 # Simple chat
-agent = Agent(model="anthropic/claude-opus-4-6")
+agent = Agent(model="openai/gpt-4o")
 reply = agent.chat("Explain Rust ownership in 3 sentences")
 print(reply)
 
@@ -1374,7 +1383,7 @@ import asyncio
 from edgecrab import AsyncAgent
 
 async def main():
-    agent = AsyncAgent(model="openai/gpt-4o")
+    agent = AsyncAgent(model="copilot/gpt-5-mini")
     async for token in agent.stream("Write a Rust hello-world"):
         print(token, end="", flush=True)
 
@@ -1388,21 +1397,21 @@ edgecrab models
 edgecrab health
 ```
 
-Full docs: [sdks/python/README.md](sdks/python/README.md)
+Full docs: [Python SDK README](sdks/python/README.md)
 
-### Node.js SDK (`edgecrab-sdk`)
+### Node.js SDK (`edgecrab`)
 
-**Node 18+ — TypeScript-first, streaming, CLI.**
+**Node 18+ — TypeScript-first, streaming, and native runtime access.**
 
 ```bash
-npm install edgecrab-sdk
+npm install edgecrab
 ```
 
 ```typescript
-import { Agent } from 'edgecrab-sdk';
+import { Agent } from 'edgecrab';
 
 // Simple chat
-const agent = new Agent({ model: 'anthropic/claude-opus-4-6' });
+const agent = new Agent({ model: 'openai/gpt-4o' });
 const reply = await agent.chat('Explain Rust ownership');
 console.log(reply);
 
@@ -1414,11 +1423,11 @@ for await (const token of agent.stream('Write a README')) {
 
 CLI via npx:
 ```bash
-npx edgecrab-sdk chat "Hello!"
-npx edgecrab-sdk models
+npx edgecrab chat "Hello!"
+npx edgecrab models
 ```
 
-Full docs: [sdks/node/README.md](sdks/node/README.md)
+Full docs: [Node.js SDK README](sdks/nodejs-native/README.md)
 
 ---
 

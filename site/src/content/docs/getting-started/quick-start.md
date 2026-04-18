@@ -154,7 +154,7 @@ edgecrab --quiet "count lines in src/**/*.rs"   # no banner, pipe-safe
 ### Specify model
 
 ```bash
-edgecrab --model anthropic/claude-sonnet-4-20250514 "review this PR"
+edgecrab --model openai/gpt-4o "review this PR"
 edgecrab --model ollama/llama3.3 "run completely offline"
 ```
 
@@ -224,7 +224,7 @@ pip install edgecrab-sdk
 ```python
 from edgecrab import Agent
 
-agent = Agent(model="anthropic/claude-sonnet-4-20250514")
+agent = Agent(model="openai/gpt-4o")
 reply = agent.chat("Explain Rust ownership in 3 sentences")
 print(reply)
 ```
@@ -285,7 +285,7 @@ alias ecc='edgecrab -C'   # continue last session
 
 **Let the agent see your codebase.** Start `edgecrab` from your project root — it auto-loads `AGENTS.md` from the current directory and all parent directories. The more context it has, the fewer clarifying questions it asks.
 
-**Control costs.** Add `display: { show_cost: true }` to `config.yaml` to see token usage after every response. Use `copilot` or `ollama` for exploration, `claude-opus` for final review.
+**Control costs.** Add `display: { show_cost: true }` to `config.yaml` to see token usage after every response. Use `copilot` or `ollama` for exploration, and `openai/gpt-5` or `openai/gpt-4o` for deeper review.
 
 ---
 

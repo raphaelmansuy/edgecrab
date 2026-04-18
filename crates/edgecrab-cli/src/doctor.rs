@@ -24,6 +24,30 @@ use edgequake_llm::{ProviderFactory, ProviderType};
 
 use crate::runtime::load_dot_env;
 
+fn copilot_auth_available() -> bool {
+    if std::env::var("GITHUB_TOKEN")
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+        || std::env::var("VSCODE_COPILOT_TOKEN")
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false)
+    {
+        return true;
+    }
+
+    if let Some(home) = dirs::home_dir() {
+        let candidates = [
+            home.join(".config/github-copilot/hosts.json"),
+            home.join("Library/Application Support/github-copilot/hosts.json"),
+            home.join(".config/edgequake/copilot/github_token.json"),
+            home.join("Library/Application Support/edgequake/copilot/github_token.json"),
+        ];
+        return candidates.iter().any(|path| path.exists());
+    }
+
+    false
+}
+
 /// Result of a single doctor check.
 #[derive(Debug)]
 pub struct Check {
@@ -415,7 +439,10 @@ fn dirs_home() -> Option<std::path::PathBuf> {
 /// We report each separately for clarity.
 fn check_provider_keys() -> Vec<Check> {
     let providers = [
-        ("GITHUB_TOKEN", "GitHub Copilot (copilot/gpt-4.1-mini)"),
+        (
+            "GITHUB_TOKEN",
+            "GitHub Copilot (env token or VS Code auth cache)",
+        ),
         ("OPENAI_API_KEY", "OpenAI"),
         ("ANTHROPIC_API_KEY", "Anthropic"),
         ("GOOGLE_API_KEY", "Google Gemini"),
@@ -426,7 +453,15 @@ fn check_provider_keys() -> Vec<Check> {
 
     let found: Vec<_> = providers
         .iter()
-        .filter(|(env, _)| std::env::var(env).map(|v| !v.is_empty()).unwrap_or(false))
+        .filter(|(env, _)| {
+            if *env == "GITHUB_TOKEN" {
+                copilot_auth_available()
+            } else {
+                std::env::var(env)
+                    .map(|v| !v.trim().is_empty())
+                    .unwrap_or(false)
+            }
+        })
         .collect();
 
     if found.is_empty() {

@@ -14,7 +14,7 @@ output, slash-command autocomplete, and a live status bar.
 ## Interface Layout
 
 ```
- EdgeCrab  -  anthropic/claude-sonnet-4  -  ~/my-project
+ EdgeCrab  -  openai/gpt-4o  -  ~/my-project
 --------------------------------------------------------------
                                                               
   You: explain the ReAct loop                                 
@@ -27,7 +27,7 @@ output, slash-command autocomplete, and a live status bar.
   | terminal  cargo test  (2.4s)                              
                                                               
 --------------------------------------------------------------
-  claude-sonnet-4 | 8.4K/200K | [####......] 4% | $0.02 | 5m 
+  openai/gpt-4o | 8.4K/200K | [####......] 4% | $0.02 | 5m 
 --------------------------------------------------------------
   > _                                                         
 ```
@@ -43,7 +43,7 @@ Three fixed areas:
 ## Status Bar
 
 ```
-claude-sonnet-4 | 8.4K/200K | [####......] 4% | $0.02 | 5m
+openai/gpt-4o | 8.4K/200K | [####......] 4% | $0.02 | 5m
 ```
 
 | Column | Description |

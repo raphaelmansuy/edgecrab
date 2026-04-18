@@ -162,7 +162,7 @@ fn format_gateway_pairing_summary(
 
     if !pending_pairings.is_empty() {
         let mut pending = pending_pairings.to_vec();
-        pending.sort_by(|left, right| right.4.cmp(&left.4));
+        pending.sort_by_key(|entry| std::cmp::Reverse(entry.4));
         for (platform, code, user_id, user_name, age_minutes) in pending.into_iter().take(3) {
             let label = if user_name.trim().is_empty() {
                 user_id

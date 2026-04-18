@@ -379,26 +379,18 @@ fn parse_skill_frontmatter(content: &str) -> SkillMeta {
             let val = val.trim().trim_matches('"').trim_matches('\'');
             match key {
                 "name" => meta.name = Some(val.to_string()),
-                "description" => {
-                    if !val.is_empty() {
-                        meta.description = Some(val.to_string());
-                    }
+                "description" if !val.is_empty() => {
+                    meta.description = Some(val.to_string());
                 }
-                "when_to_use" => {
-                    if !val.is_empty() {
-                        meta.when_to_use = Some(val.to_string());
-                    }
+                "when_to_use" if !val.is_empty() => {
+                    meta.when_to_use = Some(val.to_string());
                 }
                 "category" => meta.category = Some(val.to_string()),
-                "version" => {
-                    if !val.is_empty() {
-                        meta.version = Some(val.to_string());
-                    }
+                "version" if !val.is_empty() => {
+                    meta.version = Some(val.to_string());
                 }
-                "license" => {
-                    if !val.is_empty() {
-                        meta.license = Some(val.to_string());
-                    }
+                "license" if !val.is_empty() => {
+                    meta.license = Some(val.to_string());
                 }
                 "platforms" => {
                     if val.is_empty() {
@@ -469,10 +461,8 @@ fn parse_skill_frontmatter(content: &str) -> SkillMeta {
                         meta.allowed_tools = parse_inline_frontmatter_list(val);
                     }
                 }
-                "argument-hint" => {
-                    if !val.is_empty() {
-                        meta.argument_hint = Some(val.to_string());
-                    }
+                "argument-hint" if !val.is_empty() => {
+                    meta.argument_hint = Some(val.to_string());
                 }
                 "user-invocable" => {
                     if let Some(parsed) = parse_frontmatter_bool(val) {
@@ -484,20 +474,14 @@ fn parse_skill_frontmatter(content: &str) -> SkillMeta {
                         meta.disable_model_invocation = parsed;
                     }
                 }
-                "context" => {
-                    if !val.is_empty() {
-                        meta.execution_context = Some(val.to_string());
-                    }
+                "context" if !val.is_empty() => {
+                    meta.execution_context = Some(val.to_string());
                 }
-                "shell" => {
-                    if !val.is_empty() {
-                        meta.shell = Some(val.to_string());
-                    }
+                "shell" if !val.is_empty() => {
+                    meta.shell = Some(val.to_string());
                 }
-                "required_environment_variables" => {
-                    if val.is_empty() {
-                        in_env_var_list = true;
-                    }
+                "required_environment_variables" if val.is_empty() => {
+                    in_env_var_list = true;
                 }
                 _ => {}
             }

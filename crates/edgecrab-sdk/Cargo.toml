@@ -1,0 +1,23 @@
+[package]
+name = "edgecrab-sdk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "EdgeCrab SDK — build autonomous AI agents in Rust"
+readme = "README.md"
+keywords = ["ai", "agent", "llm", "sdk", "edgecrab"]
+categories = ["api-bindings", "asynchronous"]
+
+[dependencies]
+edgecrab-sdk-core = { workspace = true }
+edgecrab-sdk-macros = { workspace = true }
+
+# Re-export these so users don't need to depend on them directly
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+inventory = { workspace = true }
+tokio = { workspace = true }

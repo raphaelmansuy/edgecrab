@@ -41,26 +41,38 @@ pub fn build_proxy_client(proxy_url: Option<&str>, timeout: Duration) -> reqwest
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{LazyLock, Mutex, MutexGuard};
 
-    /// RAII guard that removes env vars on drop to avoid test pollution.
+    static ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    /// RAII guard that serializes and restores proxy env vars for the duration of a test.
     struct EnvGuard {
-        vars: Vec<String>,
+        _lock: MutexGuard<'static, ()>,
+        vars: Vec<(String, Option<String>)>,
     }
 
     impl EnvGuard {
-        fn new(vars: &[&str]) -> Self {
-            let vars: Vec<String> = vars.iter().map(|s| s.to_string()).collect();
-            for v in &vars {
-                unsafe { std::env::remove_var(v) };
-            }
-            Self { vars }
+        fn new(var_names: &[&str]) -> Self {
+            let lock = ENV_MUTEX.lock().expect("env mutex poisoned");
+            let vars = var_names
+                .iter()
+                .map(|&name| {
+                    let prev = std::env::var(name).ok();
+                    unsafe { std::env::remove_var(name) };
+                    (name.to_string(), prev)
+                })
+                .collect();
+            Self { _lock: lock, vars }
         }
     }
 
     impl Drop for EnvGuard {
         fn drop(&mut self) {
-            for v in &self.vars {
-                unsafe { std::env::remove_var(v) };
+            for (name, prev) in &self.vars {
+                match prev {
+                    Some(val) => unsafe { std::env::set_var(name, val) },
+                    None => unsafe { std::env::remove_var(name) },
+                }
             }
         }
     }

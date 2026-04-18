@@ -113,3 +113,95 @@ export interface ExportedConversation {
   turnCount: number;
   usage: UsageInfo;
 }
+
+// ─── Convenience types (parity with native SDK) ─────────────────────
+
+/** Message roles. */
+export const Role = Object.freeze({
+  System: 'system' as const,
+  User: 'user' as const,
+  Assistant: 'assistant' as const,
+  Tool: 'tool' as const,
+});
+
+/** A chat message with factory helpers. */
+export class Message {
+  role: ChatMessage['role'];
+  content: string;
+
+  constructor(role: ChatMessage['role'], content: string) {
+    this.role = role;
+    this.content = content;
+  }
+
+  static system(content: string): Message {
+    return new Message('system', content);
+  }
+
+  static user(content: string): Message {
+    return new Message('user', content);
+  }
+
+  static assistant(content: string): Message {
+    return new Message('assistant', content);
+  }
+
+  static tool(content: string): Message {
+    return new Message('tool', content);
+  }
+
+  toJSON(): ChatMessage {
+    return { role: this.role, content: this.content };
+  }
+}
+
+/** Tool definition input. */
+export interface ToolDefinition {
+  name: string;
+  description: string;
+  parameters?: Record<string, unknown>;
+  handler: (args: Record<string, unknown>) => Promise<unknown> | unknown;
+}
+
+/** A tool that the agent can call. */
+export class Tool {
+  name: string;
+  description: string;
+  parameters?: Record<string, unknown>;
+  handler: (args: Record<string, unknown>) => Promise<unknown> | unknown;
+
+  constructor(definition: ToolDefinition) {
+    this.name = definition.name;
+    this.description = definition.description;
+    this.parameters = definition.parameters;
+    this.handler = definition.handler;
+  }
+
+  /** Factory method. */
+  static create(definition: ToolDefinition): Tool {
+    if (!definition.name) throw new Error('Tool name is required');
+    if (!definition.description) throw new Error('Tool description is required');
+    if (!definition.handler) throw new Error('Tool handler is required');
+    return new Tool(definition);
+  }
+
+  /** OpenAI-compatible function schema. */
+  toSchema(): {
+    type: 'function';
+    function: { name: string; description: string; parameters: Record<string, unknown> };
+  } {
+    return {
+      type: 'function',
+      function: {
+        name: this.name,
+        description: this.description,
+        parameters: this.parameters ?? { type: 'object', properties: {} },
+      },
+    };
+  }
+
+  /** Execute the tool handler. */
+  async execute(args: Record<string, unknown>): Promise<unknown> {
+    return this.handler(args);
+  }
+}

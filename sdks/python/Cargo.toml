@@ -1,0 +1,27 @@
+[package]
+name = "edgecrab-python"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Python bindings for the EdgeCrab AI agent SDK"
+
+[lib]
+name = "edgecrab"
+crate-type = ["cdylib"]
+
+[dependencies]
+edgecrab-sdk-core = { workspace = true }
+edgecrab-types = { workspace = true }
+edgecrab-tools = { workspace = true }
+edgecrab-state = { workspace = true }
+edgecrab-core = { workspace = true }
+
+pyo3 = { version = "0.24.1", features = ["abi3-py310"] }
+serde_json = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }

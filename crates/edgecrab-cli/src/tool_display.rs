@@ -2037,34 +2037,32 @@ pub fn format_tool_result(tool_name: &str, result: &str, max_cols: usize) -> Str
             }
             return unicode_trunc(&oneline(result_trimmed), max_cols);
         }
-        "apply_patch" => {
+        "apply_patch" if result_trimmed.contains("succeeded") => {
             // "apply_patch succeeded. Modified: src/a.rs; Created: src/b.rs"
-            if result_trimmed.contains("succeeded") {
-                let detail = result_trimmed
-                    .find(". ")
-                    .map(|i| &result_trimmed[i + 2..])
-                    .unwrap_or(result_trimmed)
-                    .trim();
-                // Count comma-separated items in each section.
-                let count_section = |label: &str, text: &str| -> usize {
-                    text.split(label)
-                        .nth(1)
-                        .map(|s| s.split(';').next().unwrap_or(""))
-                        .map(|s| s.split(',').filter(|t| !t.trim().is_empty()).count())
-                        .unwrap_or(0)
-                };
-                let total = count_section("Modified: ", detail)
-                    + count_section("Created: ", detail)
-                    + count_section("Deleted: ", detail);
-                let summary = if total == 0 {
-                    "✓ ok".to_string()
-                } else if total == 1 {
-                    "✓ 1 file".to_string()
-                } else {
-                    format!("✓ {total} files")
-                };
-                return unicode_trunc(&summary, max_cols);
-            }
+            let detail = result_trimmed
+                .find(". ")
+                .map(|i| &result_trimmed[i + 2..])
+                .unwrap_or(result_trimmed)
+                .trim();
+            // Count comma-separated items in each section.
+            let count_section = |label: &str, text: &str| -> usize {
+                text.split(label)
+                    .nth(1)
+                    .map(|s| s.split(';').next().unwrap_or(""))
+                    .map(|s| s.split(',').filter(|t| !t.trim().is_empty()).count())
+                    .unwrap_or(0)
+            };
+            let total = count_section("Modified: ", detail)
+                + count_section("Created: ", detail)
+                + count_section("Deleted: ", detail);
+            let summary = if total == 0 {
+                "✓ ok".to_string()
+            } else if total == 1 {
+                "✓ 1 file".to_string()
+            } else {
+                format!("✓ {total} files")
+            };
+            return unicode_trunc(&summary, max_cols);
         }
         "read_file" => {
             // Result is the raw file content.  Show line count + first meaningful line.
@@ -2106,15 +2104,14 @@ pub fn format_tool_result(tool_name: &str, result: &str, max_cols: usize) -> Str
                 unicode_trunc(&format!("{match_count} matches"), max_cols)
             };
         }
-        "memory" => {
-            // "Added to user memory file." etc.
+        "memory"
             if result_trimmed.starts_with("Added")
                 || result_trimmed.starts_with("Updated")
                 || result_trimmed.starts_with("Removed")
-                || result_trimmed.contains("success")
-            {
-                return unicode_trunc("✓ saved", max_cols);
-            }
+                || result_trimmed.contains("success") =>
+        {
+            // "Added to user memory file." etc.
+            return unicode_trunc("✓ saved", max_cols);
         }
         "todo" | "manage_todo_list" => {
             return unicode_trunc("✓ plan updated", max_cols);

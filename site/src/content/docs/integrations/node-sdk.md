@@ -5,7 +5,10 @@ sidebar:
   order: 3
 ---
 
-The EdgeCrab Node.js SDK (`edgecrab-sdk`) is a TypeScript-first package with streaming support, tool customization, and a built-in CLI. Compatible with Node.js 18+.
+The EdgeCrab Node.js SDK (`edgecrab-sdk`) is a TypeScript-first HTTP client package with streaming support, tool customization, and a built-in CLI. Compatible with Node.js 18+.
+
+> **Looking for the native embedded SDK?** See the [Node.js Native SDK](/developer/sdk-nodejs/) page
+> for `edgecrab` — the napi-rs package that runs the full agent runtime in-process (no server required).
 
 ---
 
@@ -27,7 +30,7 @@ yarn add edgecrab-sdk
 import { Agent } from 'edgecrab-sdk';
 
 const agent = new Agent({
-  model: 'anthropic/claude-sonnet-4-20250514',
+  model: 'openai/gpt-4o',
 });
 
 const reply = await agent.chat('Explain Rust ownership in 3 sentences');
@@ -73,7 +76,7 @@ await agent.chat('Now add robust error handling to it');
 ```typescript
 import { Agent } from 'edgecrab-sdk';
 
-const agent = new Agent({ model: 'anthropic/claude-opus-4-5' });
+const agent = new Agent({ model: 'copilot/gpt-5-mini' });
 
 for await (const chunk of agent.stream('Write a Rust async HTTP client')) {
   process.stdout.write(chunk);
@@ -171,7 +174,7 @@ npx edgecrab-sdk chat
 npx edgecrab-sdk chat "Summarize the last 10 git commits"
 
 # Specific model
-npx edgecrab-sdk chat --model anthropic/claude-opus-4-5 "Explain this codebase"
+npx edgecrab-sdk chat --model openai/gpt-5 "Explain this codebase"
 
 # List available models
 npx edgecrab-sdk models
@@ -244,7 +247,7 @@ agent.chat('Hello').then(console.log);
 
 ## Full SDK Docs
 
-See [sdks/node/README.md](https://github.com/raphaelmansuy/edgecrab/blob/main/sdks/node/README.md) for the complete TypeScript API reference.
+See [sdks/nodejs-native/README.md](https://github.com/raphaelmansuy/edgecrab/blob/main/sdks/nodejs-native/README.md) for the complete TypeScript API reference.
 
 ---
 

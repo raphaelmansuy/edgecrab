@@ -1818,6 +1818,48 @@ impl AgentBuilder {
         self
     }
 
+    /// Set enabled toolsets (only tools in these toolsets will be available).
+    pub fn enabled_toolsets(mut self, toolsets: Vec<String>) -> Self {
+        self.config.enabled_toolsets = toolsets;
+        self
+    }
+
+    /// Set disabled toolsets (tools in these toolsets will be excluded).
+    pub fn disabled_toolsets(mut self, toolsets: Vec<String>) -> Self {
+        self.config.disabled_toolsets = toolsets;
+        self
+    }
+
+    /// Set enabled tools by name.
+    pub fn enabled_tools(mut self, tools: Vec<String>) -> Self {
+        self.config.enabled_tools = tools;
+        self
+    }
+
+    /// Set disabled tools by name.
+    pub fn disabled_tools(mut self, tools: Vec<String>) -> Self {
+        self.config.disabled_tools = tools;
+        self
+    }
+
+    /// Set a custom system prompt (instructions) appended to the base prompt.
+    pub fn custom_system_prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.config.custom_system_prompt = Some(prompt.into());
+        self
+    }
+
+    /// Skip loading workspace context files such as AGENTS.md.
+    pub fn skip_context_files(mut self, skip: bool) -> Self {
+        self.config.skip_context_files = skip;
+        self
+    }
+
+    /// Skip loading persistent memory and user profile sections.
+    pub fn skip_memory(mut self, skip: bool) -> Self {
+        self.config.skip_memory = skip;
+        self
+    }
+
     pub fn build(self) -> Result<Agent, AgentError> {
         let provider = self
             .provider

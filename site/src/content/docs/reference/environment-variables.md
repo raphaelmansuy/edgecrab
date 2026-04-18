@@ -237,7 +237,7 @@ Variables marked as `csv` accept comma-separated values with optional whitespace
 
 **Set a different model for one session without editing config.yaml:**
 ```bash
-EDGECRAB_MODEL=anthropic/claude-opus-4-5 edgecrab run "big refactor task"
+EDGECRAB_MODEL=openai/gpt-5 edgecrab run "big refactor task"
 ```
 
 **Debug all environment overrides at startup:**
