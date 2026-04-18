@@ -23,7 +23,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag_name || github.ref }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.ref || (inputs.tag_name || github.ref) }}
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
