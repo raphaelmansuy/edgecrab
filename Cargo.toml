@@ -24,7 +24,7 @@ members = [
 [workspace.package]
 version = "0.7.0"
 edition = "2024"
-rust-version = "1.86.0"
+rust-version = "1.95.0"
 license = "Apache-2.0"
 repository = "https://github.com/raphaelmansuy/edgecrab"
 authors = ["Raphael Mansuy"]
@@ -68,7 +68,7 @@ regex = "1"
 url = "2"
 
 # LLM backend
-edgequake-llm = { version = "0.6.6", features = ["bedrock"] }
+edgequake-llm = { version = "0.6.9", features = ["bedrock"] }
 
 # Image processing (vision tool: resize/compress before base64 encoding)
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
@@ -142,7 +142,3 @@ tokio-test = "0.4"
 lto = true
 codegen-units = 1
 strip = true
-
-# [patch.crates-io]
-# Uncomment the line below for local development against a sibling edgequake-llm checkout:
-# edgequake-llm = { path = "../edgequake-llm" }
