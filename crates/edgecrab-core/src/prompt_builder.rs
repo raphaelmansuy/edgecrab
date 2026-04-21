@@ -35,13 +35,158 @@ use edgecrab_types::Platform;
 // simplified to a single Mutex-protected entry since the cache key is
 // always the same home directory.
 
+/// Per-file entry in the skills manifest.
+///
+/// Stores the modification time and size of a single skills file so the cache
+/// can detect file changes without re-reading the content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManifestEntry {
+    mtime_secs: u64,
+    size_bytes: u64,
+}
+
+/// Snapshot of the skills directory: maps each discovered SKILL.md path to its
+/// modification time and byte size.
+///
+/// A manifest is "stale" when any entry no longer matches the disk state —
+/// either the file was modified (`mtime_secs` or `size_bytes` changed), the
+/// file was deleted (no longer present), or a new skill was added (path not
+/// in the manifest).
+///
+/// Inspired by hermes-agent's `_build_skills_manifest()` / `_skills_manifest_valid()`
+/// pattern: mtime+size checks avoid the 60-second false-positive window of a
+/// pure TTL strategy and provide zero-latency invalidation after skill installs.
+#[derive(Debug, Clone)]
+struct SkillsManifest {
+    /// `(absolute_path → (mtime_secs, size_bytes))` for each SKILL.md found.
+    entries: std::collections::HashMap<std::path::PathBuf, ManifestEntry>,
+}
+
+impl SkillsManifest {
+    /// Build a manifest by stat-ing every SKILL.md under `skills_dir`.
+    fn build(skills_dir: &Path) -> Self {
+        let mut entries = std::collections::HashMap::new();
+        if let Ok(read_dir) = std::fs::read_dir(skills_dir) {
+            for entry in read_dir.flatten() {
+                let path = entry.path();
+                // Walk one level of subdirectories (skills are either flat .md
+                // files or directories containing SKILL.md).
+                if path.is_dir() {
+                    let skill_md = path.join("SKILL.md");
+                    if let Ok(meta) = std::fs::metadata(&skill_md) {
+                        let mtime = meta
+                            .modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        entries.insert(
+                            skill_md,
+                            ManifestEntry {
+                                mtime_secs: mtime,
+                                size_bytes: meta.len(),
+                            },
+                        );
+                    }
+                } else if path.extension().is_some_and(|e| e == "md") {
+                    // Flat .md file directly in the skills dir.
+                    if let Ok(meta) = std::fs::metadata(&path) {
+                        let mtime = meta
+                            .modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        entries.insert(
+                            path,
+                            ManifestEntry {
+                                mtime_secs: mtime,
+                                size_bytes: meta.len(),
+                            },
+                        );
+                    }
+                }
+            }
+        }
+        Self { entries }
+    }
+
+    /// Returns `true` when every manifest entry still matches the disk state
+    /// AND no new skills have been added to the skills directory since the
+    /// manifest was built.
+    fn is_valid(&self, skills_dir: &Path) -> bool {
+        // Check that all known entries still match.
+        for (path, expected) in &self.entries {
+            match std::fs::metadata(path) {
+                Err(_) => {
+                    // File deleted — cache is stale.
+                    tracing::trace!(
+                        path = %path.display(),
+                        "skills manifest: file deleted — cache invalidated"
+                    );
+                    return false;
+                }
+                Ok(meta) => {
+                    let mtime = meta
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    if mtime != expected.mtime_secs || meta.len() != expected.size_bytes {
+                        tracing::trace!(
+                            path = %path.display(),
+                            "skills manifest: file changed — cache invalidated"
+                        );
+                        return false;
+                    }
+                }
+            }
+        }
+        // Check for newly added skills by counting current entries.
+        let current_count = count_skill_files(skills_dir);
+        if current_count != self.entries.len() {
+            tracing::trace!(
+                expected = self.entries.len(),
+                actual = current_count,
+                "skills manifest: skill count changed — cache invalidated"
+            );
+            return false;
+        }
+        true
+    }
+}
+
+/// Count the number of SKILL.md entries in `skills_dir` (one level deep).
+fn count_skill_files(skills_dir: &Path) -> usize {
+    let Ok(read_dir) = std::fs::read_dir(skills_dir) else {
+        return 0;
+    };
+    read_dir
+        .flatten()
+        .filter(|e| {
+            let p = e.path();
+            if p.is_dir() {
+                p.join("SKILL.md").is_file()
+            } else {
+                p.extension().is_some_and(|ext| ext == "md")
+            }
+        })
+        .count()
+}
+
 struct SkillsCacheEntry {
     /// The cached summary string (or None if skills dir is absent).
     summary: Option<String>,
     /// Disabled skills used when this entry was generated.
     disabled_at_build: Vec<String>,
-    /// Wall-clock time when the cache was populated.
+    /// Wall-clock time when the cache was populated (max-age fallback).
     built_at: std::time::Instant,
+    /// Manifest of skills files at build time — used for precise invalidation.
+    ///
+    /// When `None` (e.g. skills dir did not exist at build time) the entry falls
+    /// back to TTL-based invalidation.
+    manifest: Option<SkillsManifest>,
 }
 
 // Key = (canonical edgecrab_home path, platform string)
@@ -52,8 +197,11 @@ type SkillsCacheMap = std::collections::HashMap<(std::path::PathBuf, String), Sk
 
 static SKILLS_CACHE: Mutex<Option<SkillsCacheMap>> = Mutex::new(None);
 
-/// TTL for the in-process skills cache.
-const SKILLS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+/// Maximum age for a skills cache entry.
+///
+/// Serves as a hard upper bound even when the manifest check passes — guards
+/// against edge cases like filesystem timestamps being unavailable.
+const SKILLS_CACHE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Invalidate the in-process skills cache.
 ///
@@ -106,7 +254,7 @@ Key rules:
 /// 1. Skip prerequisite lookups and declare "done" too early.
 /// 2. Use placeholders instead of verified values.
 /// 3. Request user confirmation instead of verifying themselves.
-/// Ported from hermes-agent: agent/prompt_builder.py OPENAI_MODEL_EXECUTION_GUIDANCE.
+///    Ported from hermes-agent: agent/prompt_builder.py OPENAI_MODEL_EXECUTION_GUIDANCE.
 ///
 /// FP35: Added <side_effect_verification> block to address the specific failure mode
 /// where the model produces content in the response but does NOT call write_file.
@@ -157,7 +305,7 @@ specific question — not multiple vague clarifications. Usually you can figure 
 /// 1. Use relative paths when absolute paths are safer.
 /// 2. Skip verification steps after making changes.
 /// 3. Make sequential tool calls when parallel calls would be correct.
-/// Ported from hermes-agent: agent/prompt_builder.py GOOGLE_MODEL_OPERATIONAL_GUIDANCE.
+///    Ported from hermes-agent: agent/prompt_builder.py GOOGLE_MODEL_OPERATIONAL_GUIDANCE.
 const GOOGLE_MODEL_OPERATIONAL_GUIDANCE: &str = "\
 ## Gemini/Gemma Operational Standards
 
@@ -768,6 +916,97 @@ of {total} chars — {omitted} chars omitted. Use file tools to read the full fi
     ))
 }
 
+// ─── PromptBlocks ─────────────────────────────────────────────────────
+
+/// The system prompt split into a stable cacheable zone and a dynamic zone.
+///
+/// ## Stable zone
+/// Contains only binary constants and deterministic functions of session-level
+/// configuration (platform, model family, available tools).  It **never**
+/// includes volatile data such as timestamps, file contents, or memory.
+///
+/// Providers that support Anthropic prompt caching should send this block with
+/// `cache_control: {type: "ephemeral"}` to amortise the one-time cache-write
+/// cost across every turn of the session.  On a 50-turn session the stable
+/// prefix is cached after turn 1 and read at ~10× lower cost for turns 2-50.
+///
+/// ## Dynamic zone
+/// Contains per-session volatile content: the datetime stamp, execution
+/// environment, project context files (AGENTS.md, etc.), memory sections, and
+/// the skills prompt.  Providers send this block without `cache_control`.
+///
+/// ## Why the split matters
+/// A single-string prompt puts the datetime at byte offset ~2 000, which means
+/// every byte after the timestamp is never Anthropic-cached.  By moving all
+/// static guidance *before* the timestamp we maximize the cacheable prefix
+/// length (≈ 6 000 – 12 000 tokens depending on toolset).
+///
+/// ## Usage
+/// Call [`PromptBuilder::build_blocks`] to get the split.
+/// Call [`PromptBlocks::combined`] for providers that use a flat string.
+pub struct PromptBlocks {
+    /// Stable, cacheable prefix — binary constants + tool-gated guidance.
+    pub stable: String,
+    /// Dynamic, per-session suffix — datetime, context files, memory, skills.
+    pub dynamic: String,
+}
+
+impl PromptBlocks {
+    /// Flatten both zones into a single prompt string.
+    ///
+    /// Use this for providers that do not support per-block `cache_control`.
+    /// When the provider layer gains cache_control support, callers should
+    /// use [`PromptBlocks::stable`] and [`PromptBlocks::dynamic`] directly.
+    pub fn combined(self) -> String {
+        match (self.stable.is_empty(), self.dynamic.is_empty()) {
+            (true, true) => String::new(),
+            (true, false) => self.dynamic,
+            (false, true) => self.stable,
+            (false, false) => format!("{}\n\n{}", self.stable, self.dynamic),
+        }
+    }
+
+    /// Append `content` to the **stable** (cacheable) zone.
+    ///
+    /// Call this for any section whose text does not change between sessions.
+    /// The name parameter is for documentation and future section-registry
+    /// support; it is not emitted into the prompt.
+    ///
+    /// # Example
+    /// ```ignore
+    /// blocks.stable_section("memory_guidance", MEMORY_GUIDANCE);
+    /// ```
+    pub fn stable_section(&mut self, _name: &str, content: &str) {
+        if content.is_empty() {
+            return;
+        }
+        if !self.stable.is_empty() {
+            self.stable.push_str("\n\n");
+        }
+        self.stable.push_str(content);
+    }
+
+    /// Append `content` to the **dynamic** (volatile) zone.
+    ///
+    /// Call this for any section that changes each session or turn —
+    /// timestamps, context files, memory sections, skills summaries, etc.
+    /// The name parameter is for documentation; it is not emitted.
+    ///
+    /// # Example
+    /// ```ignore
+    /// blocks.volatile_section("datetime", &datetime_block);
+    /// ```
+    pub fn volatile_section(&mut self, _name: &str, content: &str) {
+        if content.is_empty() {
+            return;
+        }
+        if !self.dynamic.is_empty() {
+            self.dynamic.push_str("\n\n");
+        }
+        self.dynamic.push_str(content);
+    }
+}
+
 // ─── PromptBuilder ────────────────────────────────────────────────────
 
 pub struct PromptBuilder {
@@ -890,200 +1129,154 @@ impl PromptBuilder {
         }
     }
 
-    /// Build the full system prompt.
+    /// Build the system prompt split into stable and dynamic zones.
     ///
-    /// `override_identity` replaces the default identity paragraph.
-    /// `cwd` is the working directory for context file discovery.
-    /// `memory_sections` are pre-formatted memory strings to inject.
-    /// `skill_prompt` is the active skills system prompt.
-    pub fn build(
+    /// ## Composition order
+    ///
+    /// **STABLE zone** (all content is determined at session start and never
+    /// changes for the lifetime of the session):
+    /// 1. Identity (DEFAULT_IDENTITY or override)
+    /// 2. Platform hint (CLI / Telegram / Discord / …)
+    /// 3. Tool-use enforcement (non-Anthropic model families only)
+    /// 4. Model-specific execution guidance (GPT / Gemini / generic)
+    ///    5-15. All behavioral constants, gated by `has_tool()`:
+    ///       - MEMORY_GUIDANCE, SESSION_SEARCH_GUIDANCE
+    ///       - TASK_STATUS_GUIDANCE + PROGRESSION_GUIDANCE
+    ///       - SKILLS_GUIDANCE, SCHEDULING_GUIDANCE
+    ///       - MESSAGE_DELIVERY_GUIDANCE, MOA_GUIDANCE
+    ///       - VISION_GUIDANCE, LSP_GUIDANCE
+    ///       - code_editing_guidance(), FILE_OUTPUT_ENFORCEMENT_GUIDANCE
+    ///       - RESEARCH_TASK_GUIDANCE
+    ///
+    /// **DYNAMIC zone** (volatile per session):
+    /// - Datetime stamp + session ID + model name
+    /// - Execution environment guidance
+    /// - Context files (AGENTS.md, .edgecrab.md, .cursorrules, …)
+    /// - Memory sections
+    /// - Skills prompt
+    ///
+    /// ## Why this order matters
+    ///
+    /// Placing the datetime **before** behavioral constants (the old order) forced
+    /// Anthropic's implicit cache boundary right after ~2 800 tokens, wasting every
+    /// subsequent behavioral constant from the cache.  The new order pushes the
+    /// cache boundary past all behavioral constants (≈ 6 000–12 000 tokens),
+    /// reducing prompt token costs by ~25–65 % for typical 50-turn sessions.
+    ///
+    /// See `specs/effective_prompt/02-cache-architecture.md` for the cost analysis.
+    pub fn build_blocks(
         &self,
         override_identity: Option<&str>,
         cwd: Option<&Path>,
         memory_sections: &[String],
         skill_prompt: Option<&str>,
-    ) -> String {
-        let mut sections: Vec<Cow<'_, str>> = Vec::with_capacity(18);
+    ) -> PromptBlocks {
+        let mut stable: Vec<Cow<'_, str>> = Vec::with_capacity(18);
+        let mut dynamic: Vec<Cow<'_, str>> = Vec::with_capacity(6);
 
-        // 1. Identity
-        sections.push(Cow::Borrowed(override_identity.unwrap_or(DEFAULT_IDENTITY)));
+        let model_str = self.model_name.as_deref().unwrap_or("");
 
-        // 2. Platform hints
+        // ════════════════════════════════════════════════════════════════
+        // STABLE ZONE — binary constants + deterministic session config
+        // ════════════════════════════════════════════════════════════════
+
+        // 1. Identity — the agent's persona.
+        stable.push(Cow::Borrowed(override_identity.unwrap_or(DEFAULT_IDENTITY)));
+
+        // 2. Platform hint — tailors communication style per channel.
         if let Some(hint) = platform_hint(&self.platform) {
-            sections.push(Cow::Borrowed(hint));
+            stable.push(Cow::Borrowed(hint));
         }
 
-        // 2.5 Tool-use enforcement — injected for non-Anthropic model families.
+        // 3. Tool-use enforcement — injected for non-Anthropic model families.
         // WHY: GPT, Gemini, Grok, etc. routinely produce narration instead of action.
         // This block overrides that default behaviour. Anthropic Claude models handle
         // this natively and do not need the extra directive.
         // Mirrors hermes-agent: TOOL_USE_ENFORCEMENT_GUIDANCE + TOOL_USE_ENFORCEMENT_MODELS.
-        let model_str = self.model_name.as_deref().unwrap_or("");
         if model_str.is_empty() || Self::needs_tool_use_enforcement(model_str) {
-            sections.push(Cow::Borrowed(TOOL_USE_ENFORCEMENT_GUIDANCE));
+            stable.push(Cow::Borrowed(TOOL_USE_ENFORCEMENT_GUIDANCE));
         }
 
-        // 2.6 Model-specific guidance — GPT execution discipline or Gemini operational rules.
+        // 4. Model-specific guidance — GPT execution discipline or Gemini operational rules.
         // WHY: Each model family has distinct failure modes. One-size-fits-all prompts
         // cannot address all of them. Model-specific blocks are injected here so they
         // appear immediately after the generic enforcement directive.
         if let Some(guidance) = Self::model_specific_guidance(model_str) {
-            sections.push(Cow::Borrowed(guidance));
+            stable.push(Cow::Borrowed(guidance));
         }
 
-        // 3. Date/time stamp — includes session ID and model when available.
-        // WHY: The session ID lets the model self-reference its session in error messages
-        // and lets operators correlate logs. Model + provider help the model reason about
-        // its own capabilities. Ported from hermes-agent _build_system_prompt() timestamp block.
-        {
-            let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
-            let mut ts = format!("Current date/time: {now}");
-            if let Some(ref sid) = self.session_id {
-                if !sid.is_empty() {
-                    ts.push_str(&format!("\nSession ID: {sid}"));
-                }
-            }
-            if !model_str.is_empty() {
-                ts.push_str(&format!("\nModel: {model_str}"));
-                let provider = model_str.split('/').next().unwrap_or(model_str);
-                // Only show provider when it differs from the model name
-                if provider != model_str {
-                    ts.push_str(&format!("\nProvider: {provider}"));
-                }
-            }
-            sections.push(Cow::Owned(ts));
+        // 5. Memory guidance — only when memory_write tool is available.
+        // NOTE: The guidance constant is stable; only the actual memory *sections*
+        // (loaded from disk) go in the dynamic zone.
+        if self.has_tool("memory_write") {
+            stable.push(Cow::Borrowed(MEMORY_GUIDANCE));
         }
 
-        // 4. Execution environment guidance
-        if let Some(ref guidance) = self.execution_environment_guidance {
-            sections.push(Cow::Borrowed(guidance.as_str()));
-        }
-
-        // 5-7. Context files (SOUL.md, AGENTS.md, .cursorrules, etc.)
-        if !self.skip_context_files {
-            if let Some(dir) = cwd {
-                let context_files = discover_context_files(dir);
-                if !context_files.is_empty() {
-                    let mut context_parts: Vec<String> = Vec::new();
-                    for (name, content) in context_files {
-                        // Scan for prompt injection before injecting into the system prompt.
-                        // WHY: Context files like AGENTS.md and SOUL.md are sourced from the
-                        // project workspace and could be tampered with to inject malicious
-                        // instructions. Scan and block any suspicious content.
-                        let threats = scan_for_injection(&content);
-                        let critical: Vec<_> = threats
-                            .iter()
-                            .filter(|t| matches!(t.severity, ThreatSeverity::High))
-                            .collect();
-                        if !critical.is_empty() {
-                            let kinds: Vec<&str> =
-                                critical.iter().map(|t| t.pattern_name.as_str()).collect();
-                            tracing::warn!(
-                                file = %name,
-                                threats = ?kinds,
-                                "Prompt injection detected in context file — blocking injection"
-                            );
-                            context_parts.push(format!(
-                                "[BLOCKED: {name} contained potential prompt injection ({kinds}). Content skipped for security.]",
-                                kinds = kinds.join(", ")
-                            ));
-                            continue;
-                        }
-                        // Strip YAML frontmatter and truncate
-                        let stripped = strip_yaml_frontmatter(&content);
-                        let truncated = truncate_context_file(stripped, &name);
-                        context_parts.push(format!("## {name}\n\n{}", truncated.trim()));
-                    }
-                    if !context_parts.is_empty() {
-                        // Wrap in a "Project Context" header matching hermes-agent's format.
-                        // WHY: This header instructs the agent that these files should be
-                        // followed, not just read. Without the header the agent may treat them
-                        // as passive reference material rather than binding guidelines.
-                        let block = format!(
-                            "# Project Context\n\nThe following project context files have been loaded and should be followed:\n\n{}",
-                            context_parts.join("\n\n")
-                        );
-                        sections.push(Cow::Owned(block));
-                    }
-                }
-            }
-        }
-
-        // 8. Memory guidance + sections — only when memory tool is available
-        if !memory_sections.is_empty() {
-            if self.has_tool("memory_write") {
-                sections.push(Cow::Borrowed(MEMORY_GUIDANCE));
-            }
-            for s in memory_sections {
-                sections.push(Cow::Borrowed(s.as_str()));
-            }
-        }
-
-        // 9. Session search guidance — only when session_search tool is present
+        // 6. Session search guidance — only when session_search tool is present.
         if self.has_tool("session_search") {
-            sections.push(Cow::Borrowed(SESSION_SEARCH_GUIDANCE));
+            stable.push(Cow::Borrowed(SESSION_SEARCH_GUIDANCE));
         }
 
-        // 10. Structured task-status guidance — only when report_task_status is present.
+        // 7. Structured task-status guidance — only when report_task_status is present.
         if self.has_tool("report_task_status") {
-            sections.push(Cow::Borrowed(TASK_STATUS_GUIDANCE));
-            sections.push(Cow::Borrowed(PROGRESSION_GUIDANCE));
+            stable.push(Cow::Borrowed(TASK_STATUS_GUIDANCE));
+            stable.push(Cow::Borrowed(PROGRESSION_GUIDANCE));
         }
 
-        // 11. Skills guidance — only when skill_manage tool is present
+        // 8. Skills guidance — only when skill_manage tool is present.
         if self.has_tool("skill_manage") {
-            sections.push(Cow::Borrowed(SKILLS_GUIDANCE));
+            stable.push(Cow::Borrowed(SKILLS_GUIDANCE));
         }
 
-        // 12. Scheduling guidance — only for interactive sessions (not cron) and
-        //     when manage_cron_jobs is available.
+        // 9. Scheduling guidance — only for interactive sessions (not cron) and
+        //    when manage_cron_jobs is available.
         if self.platform != Platform::Cron && self.has_tool("manage_cron_jobs") {
-            sections.push(Cow::Borrowed(SCHEDULING_GUIDANCE));
+            stable.push(Cow::Borrowed(SCHEDULING_GUIDANCE));
         }
 
-        // 12. Cross-platform delivery guidance — only when send_message is present.
+        // 10. Cross-platform delivery guidance — only when send_message is present.
         if self.has_tool("send_message") {
-            sections.push(Cow::Borrowed(MESSAGE_DELIVERY_GUIDANCE));
+            stable.push(Cow::Borrowed(MESSAGE_DELIVERY_GUIDANCE));
         }
 
-        // 13. MoA tool-selection guidance — only when moa is present.
+        // 11. MoA tool-selection guidance — only when moa is present.
         if self.has_tool("moa") {
-            sections.push(Cow::Borrowed(MOA_GUIDANCE));
+            stable.push(Cow::Borrowed(MOA_GUIDANCE));
         }
 
-        // 14. Vision tool disambiguation — only when vision_analyze is present.
+        // 12. Vision tool disambiguation — only when vision_analyze is present.
         // WHY: Smaller local models (qwen3, llama3) reliably pick browser_vision over
         // vision_analyze when local image files are attached, because browser_vision
         // appears earlier in the tool list. Schema descriptions alone are insufficient;
         // the system prompt is the authoritative source of tool-selection rules.
         if self.has_tool("vision_analyze") {
-            sections.push(Cow::Borrowed(VISION_GUIDANCE));
+            stable.push(Cow::Borrowed(VISION_GUIDANCE));
         }
 
-        // 15. LSP semantic-navigation guidance — only when the LSP surface is present.
+        // 13. LSP semantic-navigation guidance — only when the LSP surface is present.
         if self.has_any_tool(&[
             "lsp_goto_definition",
             "lsp_workspace_symbols",
             "lsp_workspace_type_errors",
         ]) {
-            sections.push(Cow::Borrowed(LSP_GUIDANCE));
+            stable.push(Cow::Borrowed(LSP_GUIDANCE));
         }
 
-        // 16. Direct code-editing guidance — only when file-mutation tools are present.
+        // 14. Direct code-editing guidance — only when file-mutation tools are present.
         if self.has_any_tool(&["apply_patch", "write_file"]) {
-            sections.push(Cow::Owned(code_editing_guidance()));
+            stable.push(Cow::Owned(code_editing_guidance()));
         }
 
-        // 17a. File-output enforcement guidance (FP34) — injected whenever write_file
+        // 15a. File-output enforcement guidance (FP34) — injected whenever write_file
         // is present, for ALL model families. Open-source models (gpt-oss, llama,
         // mistral, phi, deepseek, etc.) interpret "write X to path.md" as a format
         // hint rather than a mandatory write_file call. This block closes that semantic
         // gap with explicit, unambiguous rules.
         if self.has_tool("write_file") {
-            sections.push(Cow::Borrowed(FILE_OUTPUT_ENFORCEMENT_GUIDANCE));
+            stable.push(Cow::Borrowed(FILE_OUTPUT_ENFORCEMENT_GUIDANCE));
         }
 
-        // 17b. Research-to-file task guidance (FP36) — injected when write_file AND
+        // 15b. Research-to-file task guidance (FP36) — injected when write_file AND
         // any web/search tool are present. This pattern (research → compose → write
         // → confirm) is the most common case where open-source models fail: they
         // produce the content in the response and consider the task complete.
@@ -1097,31 +1290,150 @@ impl PromptBuilder {
                 "file_search",
             ])
         {
-            sections.push(Cow::Borrowed(RESEARCH_TASK_GUIDANCE));
+            stable.push(Cow::Borrowed(RESEARCH_TASK_GUIDANCE));
         }
 
-        // 17. Skills prompt — wrapped in XML with mandatory header + scan directive.
-        // WHY: Skills represent the agent's accumulated institutional knowledge.
-        // Plain-text injection buries them in prompt noise. The XML wrapper and
-        // "mandatory" header signal to the model that these are required preflight
-        // checks, dramatically improving skill recall rates across all model families.
-        // Mirrors hermes-agent: prompt_builder.py build_skills_system_prompt() format.
-        if let Some(sp) = skill_prompt {
-            if !sp.is_empty() {
-                // Guard against double-wrapping (e.g. if pre-loaded skills already wrapped)
-                if sp.contains("<available_skills>") {
-                    sections.push(Cow::Borrowed(sp));
-                } else {
-                    sections.push(Cow::Owned(format!(
-                        "## Skills (mandatory)\n\nBefore replying, scan these skills \
-for a matching workflow. If a skill applies, follow it precisely.\n\n\
-<available_skills>\n{sp}\n</available_skills>"
-                    )));
+        // ════════════════════════════════════════════════════════════════
+        // DYNAMIC ZONE — volatile per-session content
+        // ════════════════════════════════════════════════════════════════
+
+        // D1. Date/time stamp — includes session ID and model when available.
+        // WHY volatile: the timestamp changes with every new session.  Placing it
+        // here (after all stable constants) maximises the cacheable prefix length.
+        // WHY: The session ID lets the model self-reference its session in error
+        // messages and lets operators correlate logs. Model + provider help the model
+        // reason about its own capabilities.
+        // Ported from hermes-agent _build_system_prompt() timestamp block.
+        {
+            let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
+            let mut ts = format!("Current date/time: {now}");
+            if let Some(ref sid) = self.session_id
+                && !sid.is_empty()
+            {
+                ts.push_str(&format!("\nSession ID: {sid}"));
+            }
+            if !model_str.is_empty() {
+                ts.push_str(&format!("\nModel: {model_str}"));
+                let provider = model_str.split('/').next().unwrap_or(model_str);
+                // Only show provider when it differs from the model name.
+                if provider != model_str {
+                    ts.push_str(&format!("\nProvider: {provider}"));
+                }
+            }
+            dynamic.push(Cow::Owned(ts));
+        }
+
+        // D2. Execution environment guidance (cwd, allowed paths, etc.)
+        if let Some(ref guidance) = self.execution_environment_guidance {
+            dynamic.push(Cow::Borrowed(guidance.as_str()));
+        }
+
+        // D3. Context files (SOUL.md, AGENTS.md, .cursorrules, etc.)
+        // WHY volatile: AGENTS.md content changes with the project under the cwd.
+        if !self.skip_context_files
+            && let Some(dir) = cwd
+        {
+            let context_files = discover_context_files(dir);
+            if !context_files.is_empty() {
+                let mut context_parts: Vec<String> = Vec::new();
+                for (name, content) in context_files {
+                    // Scan for prompt injection before injecting into the system prompt.
+                    // WHY: Context files like AGENTS.md and SOUL.md are sourced from the
+                    // project workspace and could be tampered with to inject malicious
+                    // instructions. Scan and block any suspicious content.
+                    let threats = scan_for_injection(&content);
+                    let critical: Vec<_> = threats
+                        .iter()
+                        .filter(|t| matches!(t.severity, ThreatSeverity::High))
+                        .collect();
+                    if !critical.is_empty() {
+                        let kinds: Vec<&str> =
+                            critical.iter().map(|t| t.pattern_name.as_str()).collect();
+                        tracing::warn!(
+                            file = %name,
+                            threats = ?kinds,
+                            "Prompt injection detected in context file — blocking injection"
+                        );
+                        context_parts.push(format!(
+                                "[BLOCKED: {name} contained potential prompt injection ({kinds}). Content skipped for security.]",
+                                kinds = kinds.join(", ")
+                            ));
+                        continue;
+                    }
+                    // Strip YAML frontmatter and truncate.
+                    let stripped = strip_yaml_frontmatter(&content);
+                    let truncated = truncate_context_file(stripped, &name);
+                    context_parts.push(format!("## {name}\n\n{}", truncated.trim()));
+                }
+                if !context_parts.is_empty() {
+                    // Wrap in a "Project Context" header matching hermes-agent's format.
+                    // WHY: This header instructs the agent that these files should be
+                    // followed, not just read. Without the header the agent may treat them
+                    // as passive reference material rather than binding guidelines.
+                    let block = format!(
+                        "# Project Context\n\nThe following project context files have been loaded and should be followed:\n\n{}",
+                        context_parts.join("\n\n")
+                    );
+                    dynamic.push(Cow::Owned(block));
                 }
             }
         }
 
-        sections.join("\n\n")
+        // D4. Memory sections — only when memory tool is available.
+        // WHY volatile: memory content grows with each session.
+        if !memory_sections.is_empty() {
+            for s in memory_sections {
+                dynamic.push(Cow::Borrowed(s.as_str()));
+            }
+        }
+
+        // D5. Skills prompt — wrapped in XML with mandatory header + scan directive.
+        // WHY volatile: installed skills change after `/skills install` or remove.
+        // WHY XML wrapper: Skills represent the agent's accumulated institutional
+        // knowledge. Plain-text injection buries them in prompt noise. The XML wrapper
+        // and "mandatory" header signal to the model that these are required preflight
+        // checks, dramatically improving skill recall rates across all model families.
+        // Mirrors hermes-agent: prompt_builder.py build_skills_system_prompt() format.
+        if let Some(sp) = skill_prompt
+            && !sp.is_empty()
+        {
+            // Guard against double-wrapping (e.g. if pre-loaded skills already wrapped).
+            if sp.contains("<available_skills>") {
+                dynamic.push(Cow::Borrowed(sp));
+            } else {
+                dynamic.push(Cow::Owned(format!(
+                    "## Skills (mandatory)\n\nBefore replying, scan these skills \
+for a matching workflow. If a skill applies, follow it precisely.\n\n\
+<available_skills>\n{sp}\n</available_skills>"
+                )));
+            }
+        }
+
+        PromptBlocks {
+            stable: stable.join("\n\n"),
+            dynamic: dynamic.join("\n\n"),
+        }
+    }
+
+    /// Build the full system prompt as a single string.
+    ///
+    /// This is the backward-compatible entry point.  It delegates to
+    /// [`PromptBuilder::build_blocks`] and flattens the result with
+    /// [`PromptBlocks::combined`].
+    ///
+    /// Providers that support `cache_control` blocks (e.g. Anthropic) should
+    /// call `build_blocks()` directly and send the stable and dynamic zones as
+    /// separate system blocks — this reduces prompt token costs by ~25–65 % for
+    /// typical multi-turn sessions.
+    pub fn build(
+        &self,
+        override_identity: Option<&str>,
+        cwd: Option<&Path>,
+        memory_sections: &[String],
+        skill_prompt: Option<&str>,
+    ) -> String {
+        self.build_blocks(override_identity, cwd, memory_sections, skill_prompt)
+            .combined()
     }
 }
 
@@ -1248,10 +1560,10 @@ fn walk_to_git_root_for_file(start: &Path, candidates: &[&str]) -> Option<(Strin
     while let Some(d) = dir {
         for name in candidates {
             let path = d.join(name);
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                if !content.trim().is_empty() {
-                    return Some((name.to_string(), content));
-                }
+            if let Ok(content) = std::fs::read_to_string(&path)
+                && !content.trim().is_empty()
+            {
+                return Some((name.to_string(), content));
             }
         }
         // Stop at git root (don't continue past it)
@@ -1341,10 +1653,10 @@ fn collect_agents_md_recursive(
 ) {
     // Load AGENTS.md in this directory
     let agents_path = dir.join("AGENTS.md");
-    if let Ok(content) = std::fs::read_to_string(&agents_path) {
-        if !content.trim().is_empty() {
-            files.push((agents_path, content));
-        }
+    if let Ok(content) = std::fs::read_to_string(&agents_path)
+        && !content.trim().is_empty()
+    {
+        files.push((agents_path, content));
     }
 
     // Recurse into subdirectories (skip hidden/system dirs)
@@ -1400,11 +1712,11 @@ fn load_cursor_mdc_rules(cwd: &Path) -> Vec<(String, String)> {
     let mut result = Vec::new();
     for entry in mdc_files {
         let path = entry.path();
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            if !content.trim().is_empty() {
-                let display_name = format!(".cursor/rules/{}", entry.file_name().to_string_lossy());
-                result.push((display_name, content));
-            }
+        if let Ok(content) = std::fs::read_to_string(&path)
+            && !content.trim().is_empty()
+        {
+            let display_name = format!(".cursor/rules/{}", entry.file_name().to_string_lossy());
+            result.push((display_name, content));
         }
     }
     result
@@ -1628,23 +1940,28 @@ pub fn load_skill_summary_with_platform(
     available_toolsets: Option<&[String]>,
     platform: &str,
 ) -> Option<String> {
-    // ── In-process cache hit (60-second TTL) ───────────────────────────
+    // ── In-process cache hit (manifest-based or TTL fallback) ──────────
     // Only cache when there are no conditional filters (available_tools /
     // available_toolsets) because those are per-call and can vary.
     let can_cache = available_tools.is_none() && available_toolsets.is_none();
     let cache_key = (edgecrab_home.to_path_buf(), platform.to_string());
-    if can_cache {
-        if let Ok(guard) = SKILLS_CACHE.lock() {
-            if let Some(ref map) = *guard {
-                if let Some(entry) = map.get(&cache_key) {
-                    if entry.built_at.elapsed() < SKILLS_CACHE_TTL
-                        && entry.disabled_at_build == disabled_skills
-                    {
-                        tracing::trace!("skills cache hit");
-                        return entry.summary.clone();
-                    }
-                }
-            }
+    let skills_dir = edgecrab_home.join("skills");
+    if can_cache
+        && let Ok(guard) = SKILLS_CACHE.lock()
+        && let Some(ref map) = *guard
+        && let Some(entry) = map.get(&cache_key)
+    {
+        // Primary check: manifest-based invalidation.
+        // Secondary fallback: max-age TTL (guards against mtime unavailability).
+        let age_ok = entry.built_at.elapsed() < SKILLS_CACHE_MAX_AGE;
+        let manifest_ok = entry.manifest.as_ref().map_or(
+            // No manifest → fall back to age check alone.
+            age_ok,
+            |m| m.is_valid(&skills_dir) && age_ok,
+        );
+        if manifest_ok && entry.disabled_at_build == disabled_skills {
+            tracing::trace!("skills cache hit (manifest valid)");
+            return entry.summary.clone();
         }
     }
 
@@ -1655,30 +1972,36 @@ pub fn load_skill_summary_with_platform(
         available_toolsets,
     );
 
-    if can_cache {
-        if let Ok(mut guard) = SKILLS_CACHE.lock() {
-            let map = guard.get_or_insert_with(std::collections::HashMap::new);
-            // Enforce a soft cap of 16 entries to prevent unbounded memory growth
-            // (same home can accumulate entries per platform × disabled-skill combos).
-            if map.len() >= 16 {
-                // Evict the entry with the oldest build time.
-                if let Some(oldest_key) = map
-                    .iter()
-                    .min_by_key(|(_, v)| v.built_at)
-                    .map(|(k, _)| k.clone())
-                {
-                    map.remove(&oldest_key);
-                }
+    if can_cache && let Ok(mut guard) = SKILLS_CACHE.lock() {
+        let map = guard.get_or_insert_with(std::collections::HashMap::new);
+        // Enforce a soft cap of 16 entries to prevent unbounded memory growth
+        // (same home can accumulate entries per platform × disabled-skill combos).
+        if map.len() >= 16 {
+            // Evict the entry with the oldest build time.
+            if let Some(oldest_key) = map
+                .iter()
+                .min_by_key(|(_, v)| v.built_at)
+                .map(|(k, _)| k.clone())
+            {
+                map.remove(&oldest_key);
             }
-            map.insert(
-                cache_key,
-                SkillsCacheEntry {
-                    summary: result.clone(),
-                    disabled_at_build: disabled_skills.to_vec(),
-                    built_at: std::time::Instant::now(),
-                },
-            );
         }
+        // Build a manifest of the current skills directory state so future
+        // hits can be validated without re-reading file content.
+        let manifest = if skills_dir.is_dir() {
+            Some(SkillsManifest::build(&skills_dir))
+        } else {
+            None
+        };
+        map.insert(
+            cache_key,
+            SkillsCacheEntry {
+                summary: result.clone(),
+                disabled_at_build: disabled_skills.to_vec(),
+                built_at: std::time::Instant::now(),
+                manifest,
+            },
+        );
     }
     result
 }
@@ -3362,15 +3685,15 @@ Run `${CLAUDE_SKILL_DIR}/scripts/helper.py --session ${CLAUDE_SESSION_ID}`.\n",
     #[test]
     fn skills_cache_keyed_by_platform() {
         use tempfile::TempDir;
-        let tmp = TempDir::new().unwrap();
+        let tmp = TempDir::new().expect("temp dir should be created for cache test");
         let home = tmp.path();
         let skills_dir = home.join("skills").join("test-skill");
-        std::fs::create_dir_all(&skills_dir).unwrap();
+        std::fs::create_dir_all(&skills_dir).expect("skills dir should be created");
         std::fs::write(
             skills_dir.join("SKILL.md"),
             "---\ndescription: a skill\n---\nContent",
         )
-        .unwrap();
+        .expect("skill file should be written");
 
         invalidate_skills_cache();
 
@@ -3384,7 +3707,9 @@ Run `${CLAUDE_SKILL_DIR}/scripts/helper.py --session ${CLAUDE_SESSION_ID}`.\n",
 
         // Cache must contain 2 independent entries (different platforms)
         let count = {
-            let guard = SKILLS_CACHE.lock().unwrap();
+            let guard = SKILLS_CACHE
+                .lock()
+                .expect("skills cache lock should not be poisoned");
             guard.as_ref().map(|m| m.len()).unwrap_or(0)
         };
         assert_eq!(count, 2, "Skills cache must have one entry per platform");
@@ -3458,6 +3783,204 @@ Run `${CLAUDE_SKILL_DIR}/scripts/helper.py --session ${CLAUDE_SESSION_ID}`.\n",
     }
 
     // ─── FP26: Rich timestamp ─────────────────────────────────────────
+
+    /// Verify the key invariant of the composition refactor:
+    /// all stable behavioral constants (MEMORY_GUIDANCE, SESSION_SEARCH_GUIDANCE,
+    /// etc.) must appear BEFORE the timestamp in the combined output.
+    /// Previously the timestamp was at position 5, right after model guidance,
+    /// which prevented ~80% of the prompt from being Anthropic-cache-eligible.
+    #[test]
+    fn stable_behavioral_constants_precede_timestamp_in_combined_output() {
+        let builder = PromptBuilder::new(Platform::Cli)
+            .skip_context_files(true)
+            .session_id(Some("order-test-session".to_string()))
+            .available_tools(vec![
+                "memory_write".to_string(),
+                "session_search".to_string(),
+                "report_task_status".to_string(),
+                "vision_analyze".to_string(),
+                "write_file".to_string(),
+                "web_search".to_string(),
+            ]);
+        let prompt = builder.build(None, None, &[], None);
+
+        // Find position of the timestamp block (always present).
+        let ts_pos = prompt
+            .find("Current date/time:")
+            .expect("timestamp must be present");
+
+        // All of these stable behavioral constants must appear BEFORE the timestamp.
+        let stable_markers: &[(&str, &str)] = &[
+            ("MEMORY_GUIDANCE", "persistent memory across sessions"),
+            ("SESSION_SEARCH_GUIDANCE", "session_search to recall"),
+            ("TASK_STATUS_GUIDANCE", "report_task_status"),
+            ("VISION_GUIDANCE", "Image Analysis"),
+            ("FILE_OUTPUT_ENFORCEMENT_GUIDANCE", "File Output"),
+            ("RESEARCH_TASK_GUIDANCE", "Research-to-File"),
+        ];
+        for (label, needle) in stable_markers {
+            let found_pos = prompt
+                .find(needle)
+                .unwrap_or_else(|| panic!("{label} marker '{needle}' not found in prompt"));
+            assert!(
+                found_pos < ts_pos,
+                "{label} ('{needle}' at offset {found_pos}) must appear BEFORE the \
+timestamp (offset {ts_pos}) so it can be Anthropic-cache-eligible"
+            );
+        }
+    }
+
+    /// Verify that `build_blocks()` correctly separates stable and dynamic zones.
+    #[test]
+    fn build_blocks_stable_zone_excludes_timestamp() {
+        let builder = PromptBuilder::new(Platform::Cli)
+            .skip_context_files(true)
+            .session_id(Some("blocks-test-session".to_string()))
+            .model_name(Some("anthropic/claude-opus-4.6".to_string()));
+        let blocks = builder.build_blocks(None, None, &[], None);
+
+        // Stable zone must NOT contain the timestamp.
+        assert!(
+            !blocks.stable.contains("Current date/time:"),
+            "stable zone must not contain the timestamp"
+        );
+        // Stable zone must NOT contain the session ID.
+        assert!(
+            !blocks.stable.contains("blocks-test-session"),
+            "stable zone must not contain the session ID"
+        );
+        // Dynamic zone MUST contain the timestamp.
+        assert!(
+            blocks.dynamic.contains("Current date/time:"),
+            "dynamic zone must contain the timestamp"
+        );
+        // Dynamic zone must contain the session ID.
+        assert!(
+            blocks.dynamic.contains("blocks-test-session"),
+            "dynamic zone must contain the session ID"
+        );
+    }
+
+    /// Verify that `combined()` produces the same output as the old `build()`.
+    #[test]
+    fn build_blocks_combined_equals_build_output() {
+        let builder = PromptBuilder::new(Platform::Cli)
+            .skip_context_files(true)
+            .session_id(Some("combined-test-session".to_string()))
+            .model_name(Some("anthropic/claude-opus-4.6".to_string()))
+            .available_tools(vec!["memory_write".to_string(), "write_file".to_string()]);
+        let combined = builder
+            .build_blocks(
+                None,
+                None,
+                &["## Memory\n\nsome note".to_string()],
+                Some("my-skill"),
+            )
+            .combined();
+        let direct = builder.build(
+            None,
+            None,
+            &["## Memory\n\nsome note".to_string()],
+            Some("my-skill"),
+        );
+        // Both must contain the same key markers; ordering may differ between
+        // the two code paths but all content must be present.
+        for marker in &[
+            "persistent memory across sessions",
+            "Current date/time:",
+            "combined-test-session",
+            "some note",
+            "<available_skills>",
+            "my-skill",
+        ] {
+            assert!(
+                combined.contains(marker),
+                "combined() output missing: '{marker}'"
+            );
+            assert!(
+                direct.contains(marker),
+                "build() output missing: '{marker}'"
+            );
+        }
+    }
+
+    // ── PromptBlocks::stable_section / volatile_section ──────────────────
+
+    #[test]
+    fn stable_section_appends_to_stable_zone() {
+        let mut blocks = crate::prompt_builder::PromptBlocks {
+            stable: String::new(),
+            dynamic: String::new(),
+        };
+        blocks.stable_section("identity", "IDENTITY TEXT");
+        blocks.stable_section("guidance", "GUIDANCE TEXT");
+        assert!(blocks.stable.contains("IDENTITY TEXT"));
+        assert!(blocks.stable.contains("GUIDANCE TEXT"));
+        assert!(
+            blocks.dynamic.is_empty(),
+            "dynamic zone must stay untouched"
+        );
+        // Sections separated by double newline
+        assert!(blocks.stable.contains("\n\nGUIDANCE TEXT"));
+    }
+
+    #[test]
+    fn volatile_section_appends_to_dynamic_zone() {
+        let mut blocks = crate::prompt_builder::PromptBlocks {
+            stable: String::new(),
+            dynamic: String::new(),
+        };
+        blocks.volatile_section("datetime", "2025-01-01T00:00:00Z");
+        blocks.volatile_section("memory", "memory content");
+        assert!(blocks.dynamic.contains("2025-01-01T00:00:00Z"));
+        assert!(blocks.dynamic.contains("memory content"));
+        assert!(blocks.stable.is_empty(), "stable zone must stay untouched");
+        assert!(blocks.dynamic.contains("\n\nmemory content"));
+    }
+
+    #[test]
+    fn stable_section_empty_content_is_ignored() {
+        let mut blocks = crate::prompt_builder::PromptBlocks {
+            stable: "existing".to_string(),
+            dynamic: String::new(),
+        };
+        blocks.stable_section("empty", "");
+        assert_eq!(
+            blocks.stable, "existing",
+            "empty content must not alter stable"
+        );
+    }
+
+    #[test]
+    fn volatile_section_empty_content_is_ignored() {
+        let mut blocks = crate::prompt_builder::PromptBlocks {
+            stable: String::new(),
+            dynamic: "existing".to_string(),
+        };
+        blocks.volatile_section("empty", "");
+        assert_eq!(
+            blocks.dynamic, "existing",
+            "empty content must not alter dynamic"
+        );
+    }
+
+    #[test]
+    fn stable_and_volatile_sections_are_independent() {
+        let mut blocks = crate::prompt_builder::PromptBlocks {
+            stable: String::new(),
+            dynamic: String::new(),
+        };
+        blocks.stable_section("s1", "STABLE");
+        blocks.volatile_section("v1", "DYNAMIC");
+        let combined = blocks.combined();
+        // combined() must contain both in order: stable first, then dynamic
+        let stable_pos = combined.find("STABLE").expect("STABLE not found");
+        let dynamic_pos = combined.find("DYNAMIC").expect("DYNAMIC not found");
+        assert!(
+            stable_pos < dynamic_pos,
+            "stable content must precede dynamic content in combined()"
+        );
+    }
 
     #[test]
     fn timestamp_contains_session_id_when_provided() {

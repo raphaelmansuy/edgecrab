@@ -89,6 +89,26 @@ pub struct GatewayConfig {
     pub unauthorized_dm_behavior: UnauthorizedDmBehavior,
     /// Streaming and tool-progress settings.
     pub streaming: GatewayStreamingConfig,
+    /// How to handle a second user message that arrives while the agent is
+    /// already processing a prior message for the same session.
+    pub second_message_mode: SecondMessageMode,
+}
+
+/// Governs how a second incoming message is handled when the agent is already
+/// running for that session.
+#[derive(Debug, Clone, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum SecondMessageMode {
+    /// Queue the message and deliver it after the current response finishes.
+    /// This is the default and preserves the original FIFO behaviour.
+    #[default]
+    Queue,
+    /// Inject the message as a `Redirect` `SteeringEvent` into the running
+    /// agent loop so it can course-correct mid-turn.
+    Steer,
+    /// Cancel the running agent immediately and start a fresh turn with the
+    /// new message.
+    Interrupt,
 }
 
 impl Default for GatewayConfig {
@@ -103,6 +123,7 @@ impl Default for GatewayConfig {
             group_policy: GroupPolicy::default(),
             unauthorized_dm_behavior: UnauthorizedDmBehavior::default(),
             streaming: GatewayStreamingConfig::default(),
+            second_message_mode: SecondMessageMode::default(),
         }
     }
 }

@@ -547,11 +547,11 @@ async fn rpc_server_loop(
         }
 
         // Strip forbidden terminal parameters
-        if tool_name == "terminal" {
-            if let Some(obj) = tool_args.as_object_mut() {
-                for param in TERMINAL_BLOCKED_PARAMS {
-                    obj.remove(*param);
-                }
+        if tool_name == "terminal"
+            && let Some(obj) = tool_args.as_object_mut()
+        {
+            for param in TERMINAL_BLOCKED_PARAMS {
+                obj.remove(*param);
             }
         }
 
@@ -599,17 +599,15 @@ fn maybe_rewrite_terminal_args(
             .get("workdir")
             .and_then(|value| value.as_str())
             .is_some_and(|value| !value.is_empty());
-        if !has_workdir {
-            if let Some(command) = obj.get("command").and_then(|value| value.as_str()) {
-                obj.insert(
-                    "command".into(),
-                    json!(format!(
-                        "cd {} && {}",
-                        backends::shell_quote(workdir),
-                        command
-                    )),
-                );
-            }
+        if !has_workdir && let Some(command) = obj.get("command").and_then(|value| value.as_str()) {
+            obj.insert(
+                "command".into(),
+                json!(format!(
+                    "cd {} && {}",
+                    backends::shell_quote(workdir),
+                    command
+                )),
+            );
         }
     }
 }
@@ -836,10 +834,10 @@ fn build_child_env(sock_path: &str, cwd: &std::path::Path) -> HashMap<String, St
     }
 
     // Inject timezone if configured
-    if let Ok(tz) = std::env::var("EDGECRAB_TIMEZONE") {
-        if !tz.is_empty() {
-            env.insert("TZ".into(), tz);
-        }
+    if let Ok(tz) = std::env::var("EDGECRAB_TIMEZONE")
+        && !tz.is_empty()
+    {
+        env.insert("TZ".into(), tz);
     }
 
     // Ensure cwd is importable
@@ -976,12 +974,12 @@ fn remote_command_for_runtime(
             "EDGECRAB_RPC_DIR={} PYTHONDONTWRITEBYTECODE=1",
             backends::shell_quote(rpc_dir)
         );
-        if let Ok(tz) = std::env::var("EDGECRAB_TIMEZONE") {
-            if !tz.trim().is_empty() {
-                out.push(' ');
-                out.push_str("TZ=");
-                out.push_str(&backends::shell_quote(tz.trim()));
-            }
+        if let Ok(tz) = std::env::var("EDGECRAB_TIMEZONE")
+            && !tz.trim().is_empty()
+        {
+            out.push(' ');
+            out.push_str("TZ=");
+            out.push_str(&backends::shell_quote(tz.trim()));
         }
         out
     } else {

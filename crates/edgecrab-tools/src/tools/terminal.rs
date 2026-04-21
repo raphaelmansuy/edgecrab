@@ -220,9 +220,7 @@ impl ToolHandler for TerminalTool {
             return Ok(
                 if args.timeout.is_some() || args.timeout_seconds != default_timeout() {
                     // Embed the timeout-ignored note inside the JSON so the result stays parseable
-                    if let Ok(mut v) =
-                        serde_json::from_str::<serde_json::Value>(&started)
-                    {
+                    if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&started) {
                         if let Some(obj) = v.as_object_mut() {
                             obj.insert(
                                 "note".to_string(),
@@ -324,20 +322,21 @@ impl ToolHandler for TerminalTool {
                     .await;
 
                 // Check for retryable errors before consuming the value.
-                if let Err(ref e) = result {
-                    if attempt < MAX_RETRIES && is_backend_retryable(e) {
-                        let wait = Duration::from_secs(1u64 << (attempt + 1)); // 2, 4, 8 s
-                        tracing::warn!(
-                            task_id = %ctx.task_id,
-                            attempt = attempt + 1,
-                            wait_secs = wait.as_secs(),
-                            error = %e,
-                            "terminal backend error; retrying",
-                        );
-                        attempt += 1;
-                        tokio::time::sleep(wait).await;
-                        continue;
-                    }
+                if let Err(ref e) = result
+                    && attempt < MAX_RETRIES
+                    && is_backend_retryable(e)
+                {
+                    let wait = Duration::from_secs(1u64 << (attempt + 1)); // 2, 4, 8 s
+                    tracing::warn!(
+                        task_id = %ctx.task_id,
+                        attempt = attempt + 1,
+                        wait_secs = wait.as_secs(),
+                        error = %e,
+                        "terminal backend error; retrying",
+                    );
+                    attempt += 1;
+                    tokio::time::sleep(wait).await;
+                    continue;
                 }
 
                 match result {
@@ -439,37 +438,37 @@ fn is_backend_retryable(err: &ToolError) -> bool {
 // file I/O that has a dedicated, faster, path-safe tool.
 // Returns a soft warning prepended to output — does NOT block execution.
 
-use std::sync::LazyLock;
 use regex::Regex;
+use std::sync::LazyLock;
 
 static FILE_IO_PATTERNS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
     vec![
         (
-            Regex::new(r"^cat\s+").unwrap(),
+            Regex::new(r"^cat\s+").expect("valid cat anti-pattern regex"),
             "Use `read_file` instead of `cat` — it handles encoding and large files safely.",
         ),
         (
-            Regex::new(r"^head\s+").unwrap(),
+            Regex::new(r"^head\s+").expect("valid head anti-pattern regex"),
             "Use `read_file` with line range instead of `head`.",
         ),
         (
-            Regex::new(r"^tail\s+").unwrap(),
+            Regex::new(r"^tail\s+").expect("valid tail anti-pattern regex"),
             "Use `read_file` with line range instead of `tail`.",
         ),
         (
-            Regex::new(r"python3?\s+-c\s+.*open\(").unwrap(),
+            Regex::new(r"python3?\s+-c\s+.*open\(").expect("valid python open anti-pattern regex"),
             "Use `read_file` instead of python file I/O — it's faster and path-safe.",
         ),
         (
-            Regex::new(r"^less\s+|^more\s+").unwrap(),
+            Regex::new(r"^less\s+|^more\s+").expect("valid pager anti-pattern regex"),
             "Use `read_file` instead of `less`/`more`.",
         ),
         (
-            Regex::new(r#"^echo\s+.*>\s*\S+"#).unwrap(),
+            Regex::new(r#"^echo\s+.*>\s*\S+"#).expect("valid echo redirect anti-pattern regex"),
             "Use `write_file` instead of `echo >` — it creates parent dirs and validates paths.",
         ),
         (
-            Regex::new(r"^sed\s+-i").unwrap(),
+            Regex::new(r"^sed\s+-i").expect("valid sed anti-pattern regex"),
             "Use `patch` instead of `sed -i` — it has fuzzy matching and creates backups.",
         ),
     ]

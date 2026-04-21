@@ -134,6 +134,34 @@ agent.chat_streaming("explain this code", tx).await? // tokens via UnboundedSend
 
 // Full interface — returns ConversationResult with usage/cost
 agent.run_conversation(msg, system, history).await?
+
+// Cancellation — hard interrupt (one-way latch; resets automatically for next turn)
+agent.interrupt();
+
+// Mission Steering — inject guidance into a running loop without stopping it
+let steer_tx = agent.steer_sender(); // Clone and store in TUI / gateway
+steer_tx.send(SteeringEvent::new(SteeringKind::Hint, "focus on auth module")).ok();
+steer_tx.send(SteeringEvent::new(SteeringKind::Redirect, "use async approach instead")).ok();
+steer_tx.send(SteeringEvent::new(SteeringKind::Stop, "stop after this tool")).ok();
+// Steers are injected at the next LoopAction::Continue boundary (after tool results)
+
+// TUI: press Ctrl+S while agent is running to open the Mission Steering overlay.
+// Tab cycles HINT → REDIRECT → STOP, Enter sends, Esc cancels.
+// Status bar shows "⛵ N pending" (amber) / "⛵ applied" (green flash).
+//
+// Gateway second_message_mode (config.yaml):
+//   gateway.second_message_mode: queue     # default — queue second message
+//   gateway.second_message_mode: steer     # inject as Redirect steer
+//   gateway.second_message_mode: interrupt # cancel & restart
+
+// TUI: press Ctrl+S while agent is running to open the Mission Steering overlay.
+// Tab cycles HINT → REDIRECT → STOP, Enter sends, Esc cancels.
+// Status bar shows "⛵ N pending" (amber) / "⛵ applied" (green flash).
+//
+// Gateway second_message_mode (config.yaml):
+//   gateway.second_message_mode: queue     # default — queue second message
+//   gateway.second_message_mode: steer     # inject as Redirect steer
+//   gateway.second_message_mode: interrupt # cancel & restart
 ```
 
 ### ReAct Loop (conversation.rs `execute_loop`)
@@ -149,6 +177,9 @@ while api_call_count < max_iterations && budget.try_consume() {
             result = registry.dispatch(call.name, call.args).await;
             messages.push(tool_result(call.id, result));
         }
+        // ← Steering injection point: drain steer channel here ←
+        // drain_pending_steers() returns [⛵ STEER] text → push as user message
+        // STOP steers also signal cancel token for long-running tool interruption
     } else {
         return ConversationResult { final_response, ... };
     }

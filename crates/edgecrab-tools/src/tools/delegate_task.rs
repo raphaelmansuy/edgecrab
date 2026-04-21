@@ -84,10 +84,10 @@ fn build_child_system_prompt(goal: &str, context: Option<&str>) -> String {
         String::new(),
         format!("YOUR TASK:\n{}", goal),
     ];
-    if let Some(ctx) = context {
-        if !ctx.trim().is_empty() {
-            parts.push(format!("\nCONTEXT:\n{}", ctx));
-        }
+    if let Some(ctx) = context
+        && !ctx.trim().is_empty()
+    {
+        parts.push(format!("\nCONTEXT:\n{}", ctx));
     }
     parts.push(
         "\nComplete this task using the tools available to you. \
@@ -175,21 +175,21 @@ fn build_tool_trace(messages: &[Message]) -> Vec<serde_json::Value> {
                     "status": status,
                 });
 
-                if let Some(tool_call_id) = &msg.tool_call_id {
-                    if let Some(idx) = trace_by_id.get(tool_call_id).copied() {
-                        if let Some(entry) = tool_trace.get_mut(idx) {
-                            if let Some(obj) = entry.as_object_mut() {
-                                obj.extend(result_meta.as_object().cloned().unwrap_or_default());
-                            }
-                        }
-                        continue;
-                    }
-                }
-
-                if let Some(entry) = tool_trace.last_mut() {
-                    if let Some(obj) = entry.as_object_mut() {
+                if let Some(tool_call_id) = &msg.tool_call_id
+                    && let Some(idx) = trace_by_id.get(tool_call_id).copied()
+                {
+                    if let Some(entry) = tool_trace.get_mut(idx)
+                        && let Some(obj) = entry.as_object_mut()
+                    {
                         obj.extend(result_meta.as_object().cloned().unwrap_or_default());
                     }
+                    continue;
+                }
+
+                if let Some(entry) = tool_trace.last_mut()
+                    && let Some(obj) = entry.as_object_mut()
+                {
+                    obj.extend(result_meta.as_object().cloned().unwrap_or_default());
                 }
             }
             _ => {}

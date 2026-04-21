@@ -74,7 +74,7 @@ use crate::context_references::expand_context_refs_with_policy;
 use crate::model_router::{RoutingThresholds, SmartRoutingConfig, resolve_turn_route};
 use crate::pricing::{CanonicalUsage, estimate_cost};
 use crate::prompt_builder::{
-    PromptBuilder, load_global_soul, load_memory_sections, load_preloaded_skills,
+    PromptBlocks, PromptBuilder, load_global_soul, load_memory_sections, load_preloaded_skills,
     load_skill_summary,
 };
 use crate::sub_agent_runner::CoreSubAgentRunner;
@@ -227,13 +227,14 @@ fn parse_retry_after(error_msg: &str) -> Option<Duration> {
                 .chars()
                 .take_while(|c| c.is_ascii_digit() || *c == '.')
                 .collect();
-            if let Ok(seconds) = num_str.parse::<f64>() {
-                if seconds > 0.0 && seconds < 300.0 {
-                    // Add 200ms safety margin so we don't arrive just as the
-                    // quota window resets and immediately hit the limit again.
-                    let millis = (seconds * 1000.0) as u64 + 200;
-                    return Some(Duration::from_millis(millis));
-                }
+            if let Ok(seconds) = num_str.parse::<f64>()
+                && seconds > 0.0
+                && seconds < 300.0
+            {
+                // Add 200ms safety margin so we don't arrive just as the
+                // quota window resets and immediately hit the limit again.
+                let millis = (seconds * 1000.0) as u64 + 200;
+                return Some(Duration::from_millis(millis));
             }
         }
     }
@@ -599,6 +600,18 @@ impl Agent {
             guard.clone()
         };
 
+        // Take ownership of the steering receiver for this conversation turn.
+        //
+        // WHY take + restore: SteeringReceiver is not Clone; we need exclusive
+        // access inside the loop.  We take the Option<Receiver> out of the Mutex
+        // and put a fresh channel pair back when this turn completes so the next
+        // conversation has a clean receiver.  Any steers sent during the old turn
+        // are automatically dropped when the old receiver is dropped.
+        let mut steer_rx = {
+            let mut guard = self.steer_rx.lock().expect("steer_rx mutex not poisoned");
+            guard.take()
+        };
+
         // Snapshot config and provider at loop start so in-flight
         // conversations are not affected by a /model hot-swap.
         let config = self.config.read().await.clone();
@@ -726,17 +739,14 @@ impl Agent {
 
         // Cache system prompt on first turn — assemble via PromptBuilder
         //
-        // WHY PromptBuilder here: The system prompt is the agent's identity,
-        // platform awareness, memory, skills, and context files. Without it,
-        // the agent is a generic "helpful assistant" with no capabilities.
-        // The prompt is cached (frozen snapshot) — mid-session memory writes
-        // update disk but NOT this cached prompt (preserves cache efficiency).
         if session.cached_system_prompt.is_none() {
-            let prompt = if let Some(explicit) = system_message {
-                // Caller provided an explicit system prompt (e.g. gateway, tests)
-                explicit.to_string()
+            if let Some(explicit) = system_message {
+                // Caller provided an explicit system prompt (e.g. gateway, tests).
+                // No stable/dynamic split — use single-block mode.
+                // cached_stable_prompt stays None → build_chat_messages fallback path.
+                session.cached_system_prompt = Some(explicit.to_string());
             } else {
-                // Assemble the full system prompt from all sources
+                // Assemble the full system prompt from all sources.
                 let home = edgecrab_home();
                 let memory_sections = if config.skip_memory {
                     Vec::new()
@@ -818,55 +828,66 @@ impl Agent {
                     edgecrab_tools::describe_execution_filesystem(&app_config_ref, &cwd)
                         .render_prompt_block()
                 });
-                PromptBuilder::new(config.platform)
+                let blocks = PromptBuilder::new(config.platform)
                     .skip_context_files(config.skip_context_files)
                     .execution_environment_guidance(execution_guidance)
                     .available_tools(tool_names_for_prompt)
                     .model_name(Some(config.model.clone()))
                     .session_id(Some(conversation_session_id.clone()))
-                    .build(
+                    .build_blocks(
                         global_soul.as_deref(), // global SOUL.md is identity override
                         Some(&cwd),
                         &memory_sections,
                         combined_skill_prompt.as_deref(),
-                    )
-            };
-            // Append personality addon if configured (e.g. kawaii, pirate, philosopher)
-            let prompt = if let Some(ref custom_prompt) = config.custom_system_prompt {
-                format!("{prompt}\n\n{custom_prompt}")
-            } else {
-                prompt
-            };
-            let prompt = if let Some(ref addon) = config.personality_addon {
-                format!("{prompt}\n\n## Personality\n\n{addon}")
-            } else {
-                prompt
-            };
-            session.cached_system_prompt = Some(prompt);
+                    );
+                // Personality addons are session-specific → append to the dynamic zone
+                // so the stable (cacheable) prefix is never invalidated by addon changes.
+                let mut dynamic = blocks.dynamic;
+                if let Some(ref custom_prompt) = config.custom_system_prompt {
+                    if !dynamic.is_empty() {
+                        dynamic.push_str("\n\n");
+                    }
+                    dynamic.push_str(custom_prompt);
+                }
+                if let Some(ref addon) = config.personality_addon {
+                    if !dynamic.is_empty() {
+                        dynamic.push_str("\n\n");
+                    }
+                    dynamic.push_str(&format!("## Personality\n\n{addon}"));
+                }
+                let stable = blocks.stable;
+                let combined = PromptBlocks {
+                    stable: stable.clone(),
+                    dynamic,
+                }
+                .combined();
+                session.cached_stable_prompt = Some(stable);
+                session.cached_system_prompt = Some(combined);
+            }
         }
 
         let is_first_turn = session.messages.is_empty();
         let discovered_plugins = discovered_plugins.map(Arc::new);
-        if let Some(discovery) = discovered_plugins.as_ref() {
-            if is_first_turn {
-                for plugin in discovery
-                    .plugins
-                    .iter()
-                    .filter(|plugin| hermes_supports_hook(plugin, "on_session_start"))
+        if let Some(discovery) = discovered_plugins.as_ref()
+            && is_first_turn
+        {
+            for plugin in discovery
+                .plugins
+                .iter()
+                .filter(|plugin| hermes_supports_hook(plugin, "on_session_start"))
+            {
+                if let Err(error) = invoke_hermes_hook(
+                    plugin,
+                    "on_session_start",
+                    serde_json::json!({
+                        "session_id": &conversation_session_id,
+                        "model": &config.model,
+                        "platform": config.platform.to_string(),
+                    }),
+                )
+                .await
                 {
-                    if let Err(error) = invoke_hermes_hook(
-                        plugin,
-                        "on_session_start",
-                        serde_json::json!({
-                            "session_id": &conversation_session_id,
-                            "model": &config.model,
-                            "platform": config.platform.to_string(),
-                        }),
-                    )
-                    .await
-                    {
-                        tracing::warn!(plugin = %plugin.name, ?error, "Hermes on_session_start hook failed");
-                    }
+                    tracing::warn!(plugin = %plugin.name, ?error, "Hermes on_session_start hook failed");
                 }
             }
         }
@@ -1529,11 +1550,24 @@ impl Agent {
             // We derive the config from the user's prompt_caching setting.
             let cache_cfg =
                 prompt_cache_config_for(&effective_provider, config.model_config.prompt_caching);
-            let chat_messages = build_chat_messages(
-                session.cached_system_prompt.as_deref(),
-                &session.messages,
-                cache_cfg.as_ref(),
-            );
+            // When cached_stable_prompt is set (built via build_blocks()) AND
+            // Anthropic prompt caching is active, use the two-block path so the
+            // stable zone (8K-12K tokens of binary constants) is cached across
+            // sessions.  The combined prompt keeps the stable zone as a prefix so
+            // split_dynamic_from_stable() can safely extract the dynamic suffix.
+            let chat_messages = match (session.cached_stable_prompt.as_deref(), cache_cfg.as_ref())
+            {
+                (Some(stable), Some(cfg)) => {
+                    let combined = session.cached_system_prompt.as_deref().unwrap_or("");
+                    let dynamic = split_dynamic_from_stable(combined, stable);
+                    build_chat_messages_blocks(stable, dynamic, &session.messages, Some(cfg))
+                }
+                _ => build_chat_messages(
+                    session.cached_system_prompt.as_deref(),
+                    &session.messages,
+                    cache_cfg.as_ref(),
+                ),
+            };
             let completion_options = completion_options_for(&config);
 
             // API call with retry — sends tool definitions so LLM can request tool calls.
@@ -1745,6 +1779,28 @@ impl Agent {
             session.last_prompt_tokens =
                 response.prompt_tokens as u64 + response.cache_hit_tokens.unwrap_or(0) as u64;
 
+            // Estimation fallback: some providers (e.g. VSCode Copilot in
+            // non-streaming mode) return prompt_tokens = 0.  In the streaming
+            // path, api_call_streaming already estimates and sets the value
+            // before returning, so this only fires for the rare non-streaming
+            // case that slipped through.  Without this guard,
+            // context_pressure_tokens() would return 0 on every turn, which
+            // is confusing in the status bar.
+            if session.last_prompt_tokens == 0 {
+                let estimated = estimate_request_prompt_tokens(
+                    session.cached_system_prompt.as_deref(),
+                    &session.messages,
+                    &active_tool_defs,
+                ) as u64;
+                if estimated > 0 {
+                    session.last_prompt_tokens = estimated;
+                    // Charge the estimate to session_input_tokens so the
+                    // cumulative counter stays meaningful (it was incremented
+                    // by 0 above because prompt_tokens was 0).
+                    session.session_input_tokens += estimated;
+                }
+            }
+
             // Empty response nudge: if the LLM returned no content and no
             // tool calls, inject a "please continue" prompt and retry.
             if response.content.trim().is_empty()
@@ -1865,6 +1921,38 @@ impl Agent {
                     break;
                 }
                 LoopAction::Continue => {
+                    // ── Steering injection point ─────────────────────────────
+                    // Check for pending steers AFTER all tool results are appended.
+                    // This is the only safe injection point — it maintains strict
+                    // user/assistant alternation and never corrupts tool call context.
+                    //
+                    // WHY here (not earlier): injecting before tool dispatch would
+                    // interleave user messages with in-flight tool calls, breaking
+                    // the provider's expected message ordering.
+                    if let Some(ref mut rx) = steer_rx
+                        && let Some((steer_msg, steer_kind)) =
+                            crate::steering::drain_pending_steers(rx)
+                    {
+                        tracing::info!(
+                            kind = %steer_kind,
+                            len = steer_msg.len(),
+                            "steering message injected at tool boundary"
+                        );
+                        session.messages.push(Message::user(&steer_msg));
+                        if let Some(tx) = event_tx {
+                            let _ =
+                                tx.send(crate::StreamEvent::SteerApplied { message: steer_msg });
+                        }
+                        // EC-02: For STOP steers, signal the cancel token so long-running
+                        // tools in the NEXT iteration abort at their cancel checkpoint.
+                        // The current turn's tools have already completed — this affects only
+                        // future tool calls after the LLM sees the steer.
+                        if matches!(steer_kind, crate::steering::SteeringKind::Stop) {
+                            tracing::info!("steering STOP: signalling cancel token");
+                            cancel.cancel();
+                        }
+                    }
+
                     // Tool results have been appended to session.messages.
                     // Inject budget pressure warning if approaching iteration limit.
                     if let Some(warning) =
@@ -2160,6 +2248,19 @@ impl Agent {
         let api_calls = session.api_call_count;
         let model = config.model.clone();
 
+        // Return the steering receiver to the mutex so the next conversation
+        // turn can take ownership of it again.  Any events queued during
+        // this turn but not yet consumed are harmlessly dropped when the loop
+        // exits (the receiver is moved into this turn's scope and drained).
+        //
+        // NOTE: We CANNOT replace steer_rx with a new channel here because
+        // the TUI/gateway holds a clone of self.steer_tx.  All senders and
+        // receivers must stay paired; only the receiver moves in/out of the mutex.
+        if let Some(rx) = steer_rx {
+            let mut guard = self.steer_rx.lock().expect("steer_rx mutex not poisoned");
+            *guard = Some(rx);
+        }
+
         Ok(ConversationResult {
             final_response,
             messages,
@@ -2174,6 +2275,111 @@ impl Agent {
             tool_errors: tool_errors_acc,
         })
     }
+}
+
+/// Shared helper: append `messages` as edgequake-llm `ChatMessage`s into `out`.
+///
+/// Extracted to avoid duplicating the role-mapping logic between
+/// `build_chat_messages` (single system block) and
+/// `build_chat_messages_blocks` (stable + dynamic blocks).
+fn append_conversation_messages(out: &mut Vec<edgequake_llm::ChatMessage>, messages: &[Message]) {
+    for m in messages {
+        let text = m.text_content();
+        match m.role {
+            Role::System => out.push(edgequake_llm::ChatMessage::system(&text)),
+            Role::User => out.push(edgequake_llm::ChatMessage::user(&text)),
+            Role::Assistant => {
+                if let Some(ref tool_calls) = m.tool_calls
+                    && !tool_calls.is_empty()
+                {
+                    // Convert our ToolCall → edgequake-llm ToolCall
+                    let llm_calls: Vec<edgequake_llm::ToolCall> =
+                        tool_calls.iter().map(|tc| tc.to_llm()).collect();
+                    out.push(edgequake_llm::ChatMessage::assistant_with_tools(
+                        &text, llm_calls,
+                    ));
+                    continue;
+                }
+                out.push(edgequake_llm::ChatMessage::assistant(&text));
+            }
+            Role::Tool => {
+                // Map tool result messages with their tool_call_id for correlation.
+                let tool_call_id = m.tool_call_id.as_deref().unwrap_or("unknown");
+                let mut chat_msg = edgequake_llm::ChatMessage::tool_result(tool_call_id, &text);
+                // Propagate the tool function name so Gemini/VertexAI providers can
+                // build the correct FunctionResponse.name in convert_messages().
+                // The name is stored in Message::name by Message::tool_result().
+                chat_msg.name = m.name.clone();
+                out.push(chat_msg);
+            }
+        }
+    }
+}
+
+/// Extract the dynamic portion of a combined system prompt given the stable prefix.
+///
+/// Returns the combined string unchanged when the stable prefix is not found,
+/// guarding against any accidental mismatch after an `append_to_system_prompt` call.
+fn split_dynamic_from_stable<'a>(combined: &'a str, stable: &'a str) -> &'a str {
+    if stable.is_empty() || !combined.starts_with(stable) {
+        return combined;
+    }
+    combined[stable.len()..].trim_start_matches('\n')
+}
+
+/// Build edgequake-llm `ChatMessage`s using the stable/dynamic system prompt split.
+///
+/// ## Cache strategy
+/// - `stable` block → emitted as `ChatMessage::system(stable)` with
+///   `cache_control: ephemeral`.  Because the stable zone contains only
+///   binary constants (no datetime, no file content), Anthropic keeps it
+///   cached across sessions and turns, reducing input-token cost by up to 90%.
+/// - `dynamic` block → emitted as `ChatMessage::system(dynamic)` with no
+///   cache_control.  Changes every session so caching would never hit.
+/// - User messages → `apply_cache_control` marks the last N with
+///   `cache_control: ephemeral` (same as the single-block path), with
+///   `cache_system_prompt: false` to avoid double-marking.
+///
+/// When `stable` is empty, falls back to single-block behaviour (only the
+/// dynamic message is emitted, without cache_control).
+pub fn build_chat_messages_blocks(
+    stable: &str,
+    dynamic: &str,
+    messages: &[Message],
+    cache_config: Option<&CachePromptConfig>,
+) -> Vec<edgequake_llm::ChatMessage> {
+    use edgequake_llm::traits::CacheControl;
+
+    let mut out = Vec::with_capacity(messages.len() + 2);
+
+    // Stable system block — mark as cacheable so Anthropic can amortise the
+    // one-time cache-write cost across every turn of the session and across
+    // all sessions that share the same model/toolset configuration.
+    if !stable.is_empty() {
+        let mut sys = edgequake_llm::ChatMessage::system(stable);
+        sys.cache_control = Some(CacheControl::ephemeral());
+        out.push(sys);
+    }
+
+    // Dynamic system block — emitted without cache_control because its content
+    // (datetime, context files, memory) differs between sessions.
+    if !dynamic.is_empty() {
+        out.push(edgequake_llm::ChatMessage::system(dynamic));
+    }
+
+    append_conversation_messages(&mut out, messages);
+
+    // Cache breakpoints on last N user messages.
+    // cache_system_prompt: false → system messages already handled above.
+    if let Some(cfg) = cache_config {
+        let user_cfg = CachePromptConfig {
+            cache_system_prompt: false,
+            ..cfg.clone()
+        };
+        apply_cache_control(&mut out, &user_cfg);
+    }
+
+    out
 }
 
 /// Build edgequake-llm ChatMessages from our internal message list.
@@ -2211,37 +2417,7 @@ pub fn build_chat_messages(
         out.push(edgequake_llm::ChatMessage::system(sys));
     }
 
-    for m in messages {
-        let text = m.text_content();
-        match m.role {
-            Role::System => out.push(edgequake_llm::ChatMessage::system(&text)),
-            Role::User => out.push(edgequake_llm::ChatMessage::user(&text)),
-            Role::Assistant => {
-                if let Some(ref tool_calls) = m.tool_calls {
-                    if !tool_calls.is_empty() {
-                        // Convert our ToolCall → edgequake-llm ToolCall
-                        let llm_calls: Vec<edgequake_llm::ToolCall> =
-                            tool_calls.iter().map(|tc| tc.to_llm()).collect();
-                        out.push(edgequake_llm::ChatMessage::assistant_with_tools(
-                            &text, llm_calls,
-                        ));
-                        continue;
-                    }
-                }
-                out.push(edgequake_llm::ChatMessage::assistant(&text));
-            }
-            Role::Tool => {
-                // Map tool result messages with their tool_call_id for correlation.
-                let tool_call_id = m.tool_call_id.as_deref().unwrap_or("unknown");
-                let mut chat_msg = edgequake_llm::ChatMessage::tool_result(tool_call_id, &text);
-                // Propagate the tool function name so Gemini/VertexAI providers can
-                // build the correct FunctionResponse.name in convert_messages().
-                // The name is stored in Message::name by Message::tool_result().
-                chat_msg.name = m.name.clone();
-                out.push(chat_msg);
-            }
-        }
-    }
+    append_conversation_messages(&mut out, messages);
 
     // Inject Anthropic cache_control breakpoints when prompt caching is enabled.
     // System message → always cacheable; last N user messages → breakpoints.
@@ -2619,17 +2795,17 @@ fn summarize_tool_result_preview(name: &str, tool_result: &str, is_error: bool) 
         return Some(truncate(&line, 88));
     }
 
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(tool_result) {
-        if let Some(obj) = value.as_object() {
-            if let Some(summary) = summarize_structured_result(name, obj) {
-                return Some(truncate(&summary, 88));
-            }
-            for key in ["summary", "message", "status", "result", "path"] {
-                if let Some(text) = obj.get(key).and_then(|v| v.as_str()) {
-                    let text = text.trim();
-                    if !text.is_empty() {
-                        return Some(truncate(text, 88));
-                    }
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(tool_result)
+        && let Some(obj) = value.as_object()
+    {
+        if let Some(summary) = summarize_structured_result(name, obj) {
+            return Some(truncate(&summary, 88));
+        }
+        for key in ["summary", "message", "status", "result", "path"] {
+            if let Some(text) = obj.get(key).and_then(|v| v.as_str()) {
+                let text = text.trim();
+                if !text.is_empty() {
+                    return Some(truncate(text, 88));
                 }
             }
         }
@@ -3465,12 +3641,11 @@ fn strip_budget_warnings_from_history(messages: &mut Vec<Message>) {
 
         // Case 1: JSON object — remove the `_budget_warning` key if present.
         if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&current) {
-            if let Some(obj) = v.as_object_mut() {
-                if obj.remove("_budget_warning").is_some() {
-                    if let Ok(cleaned) = serde_json::to_string(obj) {
-                        msg.content = Some(Content::Text(cleaned));
-                    }
-                }
+            if let Some(obj) = v.as_object_mut()
+                && obj.remove("_budget_warning").is_some()
+                && let Ok(cleaned) = serde_json::to_string(obj)
+            {
+                msg.content = Some(Content::Text(cleaned));
             }
             // If it was valid JSON but had no key, nothing to do.
             continue;
@@ -3576,10 +3751,10 @@ fn normalize_messages_for_trajectory(messages: &[Message]) -> Vec<Message> {
 fn collect_used_tools(messages: &[Message]) -> Vec<String> {
     let mut tools = Vec::new();
     for message in messages.iter().filter(|message| message.role == Role::Tool) {
-        if let Some(name) = &message.name {
-            if !tools.iter().any(|existing| existing == name) {
-                tools.push(name.clone());
-            }
+        if let Some(name) = &message.name
+            && !tools.iter().any(|existing| existing == name)
+        {
+            tools.push(name.clone());
         }
     }
     tools
@@ -4104,9 +4279,7 @@ fn sanitize_tool_name(name: &str) -> std::borrow::Cow<'_, str> {
 
     // Fast path: the name is already well-formed.
     // Valid tool names contain only ASCII alphanumeric chars and underscores.
-    let needs_clean = trimmed.contains("<|")
-        || trimmed.contains(' ')
-        || trimmed.contains('-');
+    let needs_clean = trimmed.contains("<|") || trimmed.contains(' ') || trimmed.contains('-');
     if !needs_clean {
         return std::borrow::Cow::Borrowed(trimmed);
     }
@@ -4214,24 +4387,24 @@ async fn dispatch_single_tool(
     // If the tool name belongs to the context engine (O(1) set lookup),
     // route directly to the engine's handler — bypassing the ToolRegistry.
     // This separates engine-domain tools from core tools (SRP / DIP).
-    if dctx.engine_tool_names.contains(name) {
-        if let Some(ref engine) = dctx.context_engine {
-            let args: serde_json::Value = serde_json::from_str(args_json)
-                .unwrap_or(serde_json::Value::Object(Default::default()));
-            match engine.handle_tool_call(name, args).await {
-                Some(Ok(output)) => return (output, Vec::new()),
-                Some(Err(e)) => {
-                    return (
-                        edgecrab_types::ToolError::ExecutionFailed {
-                            tool: name.to_string(),
-                            message: e.to_string(),
-                        }
-                        .to_llm_response(),
-                        Vec::new(),
-                    );
-                }
-                None => {} // engine declined — fall through to ToolRegistry
+    if dctx.engine_tool_names.contains(name)
+        && let Some(ref engine) = dctx.context_engine
+    {
+        let args: serde_json::Value = serde_json::from_str(args_json)
+            .unwrap_or(serde_json::Value::Object(Default::default()));
+        match engine.handle_tool_call(name, args).await {
+            Some(Ok(output)) => return (output, Vec::new()),
+            Some(Err(e)) => {
+                return (
+                    edgecrab_types::ToolError::ExecutionFailed {
+                        tool: name.to_string(),
+                        message: e.to_string(),
+                    }
+                    .to_llm_response(),
+                    Vec::new(),
+                );
             }
+            None => {} // engine declined — fall through to ToolRegistry
         }
     }
 
@@ -4601,11 +4774,11 @@ fn sanitize_orphaned_tool_results(messages: &mut Vec<Message>) {
     // Collect all tool_call IDs from assistant messages
     let mut valid_ids: HashSet<String> = HashSet::new();
     for msg in messages.iter() {
-        if msg.role == Role::Assistant {
-            if let Some(ref calls) = msg.tool_calls {
-                for tc in calls {
-                    valid_ids.insert(tc.id.clone());
-                }
+        if msg.role == Role::Assistant
+            && let Some(ref calls) = msg.tool_calls
+        {
+            for tc in calls {
+                valid_ids.insert(tc.id.clone());
             }
         }
     }
@@ -4788,11 +4961,11 @@ mod tests {
         ) -> edgequake_llm::Result<()> {
             let mut valid_tool_ids = std::collections::HashSet::new();
             for message in messages {
-                if matches!(message.role, edgequake_llm::ChatRole::Assistant) {
-                    if let Some(tool_calls) = &message.tool_calls {
-                        for tool_call in tool_calls {
-                            valid_tool_ids.insert(tool_call.id.clone());
-                        }
+                if matches!(message.role, edgequake_llm::ChatRole::Assistant)
+                    && let Some(tool_calls) = &message.tool_calls
+                {
+                    for tool_call in tool_calls {
+                        valid_tool_ids.insert(tool_call.id.clone());
                     }
                 }
                 let tool_call_id = message.tool_call_id.as_deref();
@@ -5941,6 +6114,77 @@ def register(ctx):
         assert!(chat_msgs[0].cache_control.is_some());
     }
 
+    // ── build_chat_messages_blocks ────────────────────────────────────────
+
+    #[test]
+    fn build_chat_messages_blocks_emits_two_system_messages() {
+        let msgs = vec![Message::user("hello")];
+        let out = build_chat_messages_blocks("STABLE", "DYNAMIC", &msgs, None);
+        // stable + dynamic + user = 3 messages
+        assert_eq!(out.len(), 3);
+    }
+
+    #[test]
+    fn build_chat_messages_blocks_stable_has_cache_control() {
+        let msgs: Vec<Message> = vec![];
+        let out = build_chat_messages_blocks("STABLE CONTENT", "DYNAMIC CONTENT", &msgs, None);
+        assert_eq!(out.len(), 2);
+        assert!(
+            out[0].cache_control.is_some(),
+            "stable system message must carry cache_control"
+        );
+        assert!(
+            out[1].cache_control.is_none(),
+            "dynamic system message must NOT carry cache_control"
+        );
+    }
+
+    #[test]
+    fn build_chat_messages_blocks_dynamic_has_no_cache_control() {
+        let msgs: Vec<Message> = vec![];
+        let out = build_chat_messages_blocks("", "DYNAMIC ONLY", &msgs, None);
+        // Only dynamic message — no stable block
+        assert_eq!(out.len(), 1);
+        assert!(
+            out[0].cache_control.is_none(),
+            "dynamic-only system message must not be cached"
+        );
+    }
+
+    #[test]
+    fn build_chat_messages_blocks_with_cache_config_does_not_double_mark_system() {
+        let msgs = vec![Message::user("hi")];
+        let cfg = CachePromptConfig::default();
+        let out = build_chat_messages_blocks("STABLE", "DYNAMIC", &msgs, Some(&cfg));
+        // stable[0] already has cache_control set by us, not apply_cache_control
+        assert!(out[0].cache_control.is_some());
+        // dynamic[1] must NOT get cache_control even with cache config active
+        assert!(out[1].cache_control.is_none());
+    }
+
+    #[test]
+    fn split_dynamic_from_stable_extracts_suffix() {
+        let stable = "STABLE CONTENT";
+        let combined = "STABLE CONTENT\n\nDYNAMIC CONTENT";
+        let dynamic = split_dynamic_from_stable(combined, stable);
+        assert_eq!(dynamic, "DYNAMIC CONTENT");
+    }
+
+    #[test]
+    fn split_dynamic_from_stable_fallback_when_prefix_mismatch() {
+        let combined = "SOMETHING ELSE\n\nDYNAMIC";
+        let dynamic = split_dynamic_from_stable(combined, "STABLE");
+        // When stable prefix not found, return combined unchanged
+        assert_eq!(dynamic, combined);
+    }
+
+    #[test]
+    fn split_dynamic_from_stable_empty_stable_returns_combined() {
+        let combined = "ALL CONTENT";
+        let dynamic = split_dynamic_from_stable(combined, "");
+        assert_eq!(dynamic, combined);
+    }
+
     #[test]
     fn prompt_cache_config_is_provider_aware() {
         let provider: Arc<dyn LLMProvider> = Arc::new(edgequake_llm::MockProvider::new());
@@ -6805,7 +7049,10 @@ def register(ctx):
         // Turn 2: same call should be detected as duplicate
         let cached = tracker.check_duplicate("read_file", r#"{"path":"src/main.rs"}"#);
         assert!(cached.is_some(), "should detect duplicate tool call");
-        assert_eq!(cached.unwrap(), "file contents here");
+        assert_eq!(
+            cached.expect("cached duplicate result should be present"),
+            "file contents here"
+        );
     }
 
     #[test]
@@ -6913,7 +7160,8 @@ def register(ctx):
     fn repair_python_booleans() {
         let input = r#"{"flag": True, "other": False, "val": None}"#;
         let repaired = repair_tool_call_arguments(input);
-        let v: serde_json::Value = serde_json::from_str(&repaired).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&repaired).expect("repaired python booleans should parse");
         assert_eq!(v["flag"], serde_json::Value::Bool(true));
         assert_eq!(v["other"], serde_json::Value::Bool(false));
         assert!(v["val"].is_null());
@@ -6923,7 +7171,8 @@ def register(ctx):
     fn repair_trailing_comma() {
         let input = r#"{"a": 1, "b": 2, }"#;
         let repaired = repair_tool_call_arguments(input);
-        let v: serde_json::Value = serde_json::from_str(&repaired).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&repaired).expect("repaired object should parse");
         assert_eq!(v["a"], 1);
         assert_eq!(v["b"], 2);
     }
@@ -6932,15 +7181,23 @@ def register(ctx):
     fn repair_trailing_comma_in_array() {
         let input = r#"{"items": [1, 2, 3, ]}"#;
         let repaired = repair_tool_call_arguments(input);
-        let v: serde_json::Value = serde_json::from_str(&repaired).unwrap();
-        assert_eq!(v["items"].as_array().unwrap().len(), 3);
+        let v: serde_json::Value =
+            serde_json::from_str(&repaired).expect("repaired array should parse");
+        assert_eq!(
+            v["items"]
+                .as_array()
+                .expect("items should be repaired into an array")
+                .len(),
+            3
+        );
     }
 
     #[test]
     fn repair_unclosed_braces() {
         let input = r#"{"a": {"b": 1}"#;
         let repaired = repair_tool_call_arguments(input);
-        let v: serde_json::Value = serde_json::from_str(&repaired).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&repaired).expect("repaired nested object should parse");
         assert_eq!(v["a"]["b"], 1);
     }
 
@@ -6949,7 +7206,8 @@ def register(ctx):
         let input = r#"{"path": "foo.rs", "line": 42}"#;
         let repaired = repair_tool_call_arguments(input);
         assert_eq!(repaired, input); // no changes
-        let v: serde_json::Value = serde_json::from_str(&repaired).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&repaired).expect("valid json should still parse");
         assert_eq!(v["path"], "foo.rs");
     }
 

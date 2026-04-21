@@ -19,6 +19,7 @@ pub mod model_discovery;
 pub mod model_router;
 pub mod pricing;
 pub mod prompt_builder;
+pub mod steering;
 pub mod sub_agent_runner;
 pub mod tool_result_spill;
 
@@ -50,6 +51,10 @@ pub use model_router::{
 };
 pub use pricing::{
     CanonicalUsage, CostResult, CostSource, CostStatus, PricingEntry, estimate_cost, get_pricing,
+};
+pub use steering::{
+    SteeringEvent, SteeringKind, SteeringReceiver, SteeringSender, drain_pending_steers,
+    steering_channel,
 };
 
 /// Truncate `s` to at most `max_bytes` bytes, always stopping at a valid UTF-8

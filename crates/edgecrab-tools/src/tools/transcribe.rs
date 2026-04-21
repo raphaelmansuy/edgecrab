@@ -109,17 +109,17 @@ fn detect_backend() -> SttBackend {
     }
 
     // Groq (free tier, very fast)
-    if let Ok(key) = std::env::var("GROQ_API_KEY") {
-        if !key.is_empty() {
-            return SttBackend::Groq { api_key: key };
-        }
+    if let Ok(key) = std::env::var("GROQ_API_KEY")
+        && !key.is_empty()
+    {
+        return SttBackend::Groq { api_key: key };
     }
 
     // OpenAI (paid)
-    if let Ok(key) = std::env::var("OPENAI_API_KEY") {
-        if !key.is_empty() {
-            return SttBackend::OpenAi { api_key: key };
-        }
+    if let Ok(key) = std::env::var("OPENAI_API_KEY")
+        && !key.is_empty()
+    {
+        return SttBackend::OpenAi { api_key: key };
     }
 
     SttBackend::None

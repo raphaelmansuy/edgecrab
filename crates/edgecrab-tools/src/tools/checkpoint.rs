@@ -105,15 +105,14 @@ fn collect_files(cwd: &Path) -> Vec<PathBuf> {
         .arg("ls-files")
         .current_dir(cwd)
         .output()
+        && out.status.success()
     {
-        if out.status.success() {
-            return String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .map(PathBuf::from)
-                .filter(|p| cwd.join(p).is_file())
-                .take(2000)
-                .collect();
-        }
+        return String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(PathBuf::from)
+            .filter(|p| cwd.join(p).is_file())
+            .take(2000)
+            .collect();
     }
     let mut v = Vec::new();
     collect_recursive(cwd, cwd, 0, 4, &mut v);

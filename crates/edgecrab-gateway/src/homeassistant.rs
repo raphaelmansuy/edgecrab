@@ -108,10 +108,10 @@ impl PlatformAdapter for HomeAssistantAdapter {
 
                     // Wait for auth_required
                     while let Some(Ok(msg)) = read.next().await {
-                        if let WsMessage::Text(text) = msg {
-                            if text.contains("auth_required") {
-                                break;
-                            }
+                        if let WsMessage::Text(text) = msg
+                            && text.contains("auth_required")
+                        {
+                            break;
                         }
                     }
 
@@ -163,12 +163,11 @@ impl PlatformAdapter for HomeAssistantAdapter {
                     while let Some(msg) = read.next().await {
                         match msg {
                             Ok(WsMessage::Text(text)) => {
-                                if let Ok(resp) = serde_json::from_str::<HaWsResponse>(&text) {
-                                    if resp.msg_type.as_deref() == Some("event") {
-                                        if let Some(event) = resp.event {
-                                            self.handle_event(&tx, &event).await;
-                                        }
-                                    }
+                                if let Ok(resp) = serde_json::from_str::<HaWsResponse>(&text)
+                                    && resp.msg_type.as_deref() == Some("event")
+                                    && let Some(event) = resp.event
+                                {
+                                    self.handle_event(&tx, &event).await;
                                 }
                             }
                             Ok(WsMessage::Close(_)) => {

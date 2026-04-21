@@ -325,10 +325,10 @@ fn parse_approval_reply(text: &str) -> Option<edgecrab_core::ApprovalChoice> {
 
 fn parse_clarify_answer(text: &str, choices: &[String]) -> String {
     let trimmed = text.trim();
-    if let Ok(index) = trimmed.parse::<usize>() {
-        if (1..=choices.len()).contains(&index) {
-            return choices[index - 1].clone();
-        }
+    if let Ok(index) = trimmed.parse::<usize>()
+        && (1..=choices.len()).contains(&index)
+    {
+        return choices[index - 1].clone();
     }
     trimmed.to_string()
 }
@@ -686,10 +686,10 @@ async fn deliver_text_and_media(
     platform: edgecrab_types::Platform,
     metadata: &crate::platform::MessageMetadata,
 ) -> anyhow::Result<usize> {
-    if let Some(webhook_delivery) = metadata.webhook_delivery.as_ref() {
-        if should_use_custom_webhook_delivery(platform, webhook_delivery) {
-            return deliver_webhook_response(delivery, response, webhook_delivery).await;
-        }
+    if let Some(webhook_delivery) = metadata.webhook_delivery.as_ref()
+        && should_use_custom_webhook_delivery(platform, webhook_delivery)
+    {
+        return deliver_webhook_response(delivery, response, webhook_delivery).await;
     }
 
     let (cleaned, media_refs) = crate::platform::extract_media_from_response(response);
@@ -704,23 +704,23 @@ async fn deliver_text_and_media(
         0
     };
 
-    if !media_refs.is_empty() {
-        if let Some(adapter) = adapter {
-            for mref in &media_refs {
-                let result = if mref.is_image {
-                    adapter.send_photo(&mref.path, None, metadata).await
-                } else if crate::platform::MediaRef::detect_audio(&mref.path) {
-                    adapter.send_voice(&mref.path, None, metadata).await
-                } else {
-                    adapter.send_document(&mref.path, None, metadata).await
-                };
-                if let Err(e) = result {
-                    tracing::warn!(
-                        path = %mref.path,
-                        error = %e,
-                        "media delivery failed"
-                    );
-                }
+    if !media_refs.is_empty()
+        && let Some(adapter) = adapter
+    {
+        for mref in &media_refs {
+            let result = if mref.is_image {
+                adapter.send_photo(&mref.path, None, metadata).await
+            } else if crate::platform::MediaRef::detect_audio(&mref.path) {
+                adapter.send_voice(&mref.path, None, metadata).await
+            } else {
+                adapter.send_document(&mref.path, None, metadata).await
+            };
+            if let Err(e) = result {
+                tracing::warn!(
+                    path = %mref.path,
+                    error = %e,
+                    "media delivery failed"
+                );
             }
         }
     }
@@ -1053,6 +1053,10 @@ pub struct Gateway {
     voice_mode_path: PathBuf,
     /// Pairing store for DM code-based approval.
     pairing_store: Arc<PairingStore>,
+    /// Steering senders per session — populated when a session task starts,
+    /// removed when it exits.  Used by `SecondMessageMode::Steer` to inject
+    /// live guidance into a running agent loop.
+    steer_senders: Arc<tokio::sync::Mutex<HashMap<String, edgecrab_core::SteeringSender>>>,
 }
 
 impl Gateway {
@@ -1081,6 +1085,7 @@ impl Gateway {
             ))),
             voice_mode_path: gateway_voice_mode_path(),
             pairing_store: Arc::new(PairingStore::new()),
+            steer_senders: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -1547,10 +1552,10 @@ impl Gateway {
             }
         }
 
-        if let Some(agent) = self.agent.as_ref() {
-            if let Some(db) = agent.state_db().await {
-                let _ = crate::channel_directory::build_from_sessions(&db);
-            }
+        if let Some(agent) = self.agent.as_ref()
+            && let Some(db) = agent.state_db().await
+        {
+            let _ = crate::channel_directory::build_from_sessions(&db);
         }
 
         // Build axum router
@@ -1719,8 +1724,8 @@ impl Gateway {
                             &msg.user_id,
                             &self.pairing_store,
                         );
-                        if let Some(text) = reply {
-                            if let Some(adapter) = self
+                        if let Some(text) = reply
+                            && let Some(adapter) = self
                                 .adapters
                                 .iter()
                                 .find(|a| a.platform() == msg.platform)
@@ -1733,7 +1738,6 @@ impl Gateway {
                                     })
                                     .await;
                             }
-                        }
                         continue;
                     }
 
@@ -2351,8 +2355,8 @@ impl Gateway {
                                                         crate::event_processor::should_surface_tool_completion(
                                                             &name, preview,
                                                         )
-                                                    }) {
-                                                        if let Some(adapter) = adapter.as_ref() {
+                                                    })
+                                                        && let Some(adapter) = adapter.as_ref() {
                                                             let _ = adapter
                                                                 .send_status(
                                                                     &format!(
@@ -2366,7 +2370,6 @@ impl Gateway {
                                                                 )
                                                                 .await;
                                                         }
-                                                    }
                                                 }
                                                 edgecrab_core::StreamEvent::SubAgentStart {
                                                     task_index,
@@ -2442,8 +2445,8 @@ impl Gateway {
                                                     duration_ms,
                                                     ..
                                                 } => {
-                                                    if let Some(batch) = subagent_batches.get_mut(&task_index) {
-                                                        if !batch.is_empty() {
+                                                    if let Some(batch) = subagent_batches.get_mut(&task_index)
+                                                        && !batch.is_empty() {
                                                             let summary = batch.join(", ");
                                                             batch.clear();
                                                             if let Some(adapter) = adapter.as_ref() {
@@ -2461,7 +2464,6 @@ impl Gateway {
                                                                     .await;
                                                             }
                                                         }
-                                                    }
                                                     if let Some(adapter) = adapter.as_ref() {
                                                         let _ = adapter
                                                             .send_status(
@@ -2739,21 +2741,91 @@ impl Gateway {
                         {
                             let running = self.running_sessions.lock().await;
                             if running.contains_key(&session_key) {
-                                // Queue the message — don't cancel the running task.
-                                let mut pending = self.pending_messages.lock().await;
-                                pending.insert(session_key.clone(), msg.clone());
-                                drop(pending);
-                                drop(running);
-                                // Notify the user so they know the message was received.
-                                if let Some(ref adapter) = origin_adapter {
-                                    let _ = adapter
-                                        .send(crate::platform::OutgoingMessage {
-                                            text: "⏳ Message queued. I'll respond after the current request finishes.".into(),
-                                            metadata: msg.metadata.clone(),
-                                        })
-                                        .await;
+                                use crate::config::SecondMessageMode;
+                                match self.config.second_message_mode {
+                                    SecondMessageMode::Steer => {
+                                        // Inject as a Redirect steer into the running agent
+                                        // rather than queuing.  If the steer channel is gone
+                                        // (e.g. agent just finished), fall back to queue.
+                                        let steer_senders = self.steer_senders.lock().await;
+                                        let sent = if let Some(steer_tx) = steer_senders.get(&session_key) {
+                                            steer_tx.send(edgecrab_core::SteeringEvent::new(
+                                                edgecrab_core::SteeringKind::Redirect,
+                                                msg.text.clone(),
+                                            )).is_ok()
+                                        } else {
+                                            false
+                                        };
+                                        drop(steer_senders);
+                                        if sent {
+                                            if let Some(ref adapter) = origin_adapter {
+                                                let _ = adapter
+                                                    .send(crate::platform::OutgoingMessage {
+                                                        text: "⛵ Steering the agent with your new message...".into(),
+                                                        metadata: msg.metadata.clone(),
+                                                    })
+                                                    .await;
+                                            }
+                                            drop(running);
+                                            continue;
+                                        }
+                                        // Steer channel closed — fall through to queue.
+                                        drop(running);
+                                        let mut pending = self.pending_messages.lock().await;
+                                        pending.insert(session_key.clone(), msg.clone());
+                                        drop(pending);
+                                        if let Some(ref adapter) = origin_adapter {
+                                            let _ = adapter
+                                                .send(crate::platform::OutgoingMessage {
+                                                    text: "⏳ Message queued. I'll respond after the current request finishes.".into(),
+                                                    metadata: msg.metadata.clone(),
+                                                })
+                                                .await;
+                                        }
+                                        continue;
+                                    }
+                                    SecondMessageMode::Interrupt => {
+                                        // Cancel the running task and let the new message
+                                        // start a fresh turn.  We remove the running token
+                                        // which cancels it, then fall through to spawn.
+                                        let cancel_token = running.get(&session_key).cloned();
+                                        drop(running);
+                                        if let Some(token) = cancel_token {
+                                            token.cancel();
+                                            // Clear any previously queued pending message.
+                                            let mut pending = self.pending_messages.lock().await;
+                                            pending.remove(&session_key);
+                                            drop(pending);
+                                        }
+                                        // Remove the session registration so the new task
+                                        // can register itself below.
+                                        let mut guard = self.running_sessions.lock().await;
+                                        guard.remove(&session_key);
+                                        drop(guard);
+                                        // Remove the stale steer sender.
+                                        let mut steer_senders = self.steer_senders.lock().await;
+                                        steer_senders.remove(&session_key);
+                                        drop(steer_senders);
+                                        // Fall through to the spawn logic below.
+                                    }
+                                    SecondMessageMode::Queue => {
+                                        // Queue the message — don't cancel the running task.
+                                        let mut pending = self.pending_messages.lock().await;
+                                        pending.insert(session_key.clone(), msg.clone());
+                                        drop(pending);
+                                        drop(running);
+                                        // Notify the user so they know the message was received.
+                                        if let Some(ref adapter) = origin_adapter {
+                                            let _ = adapter
+                                                .send(crate::platform::OutgoingMessage {
+                                                    text: "⏳ Message queued. I'll respond after the current request finishes.".into(),
+                                                    metadata: msg.metadata.clone(),
+                                                })
+                                                .await;
+                                        }
+                                        continue; // Don't spawn a second task
+                                    }
                                 }
-                                continue; // Don't spawn a second task
                             }
                         }
 
@@ -2810,6 +2882,15 @@ impl Gateway {
                         let msg_tx = tx.clone();
                         let hook_registry_for_spawn = self.hook_registry.clone();
                         let interaction_broker = self.interaction_broker.clone();
+
+                        // Register the steering sender so SecondMessageMode::Steer can
+                        // inject guidance into this session's running agent loop.
+                        {
+                            let mut steer_guard = self.steer_senders.lock().await;
+                            steer_guard.insert(session_key.clone(), session_agent.steer_sender());
+                        }
+                        let steer_senders_for_task = self.steer_senders.clone();
+
                         // The token is registered in running_sessions; drop the local copy.
                         // /stop cancels the map-held token via running_sessions.remove().cancel().
                         drop(task_cancel);
@@ -3034,6 +3115,12 @@ impl Gateway {
                             {
                                 let mut guard = running_sessions.lock().await;
                                 guard.remove(&task_session_key);
+                            }
+
+                            // Remove the steering sender for this session.
+                            {
+                                let mut steer_guard = steer_senders_for_task.lock().await;
+                                steer_guard.remove(&task_session_key);
                             }
 
                             // Re-dispatch any message that arrived while we were running.

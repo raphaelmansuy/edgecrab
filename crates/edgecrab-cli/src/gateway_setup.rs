@@ -542,17 +542,16 @@ fn configure_telegram(config: &mut edgecrab_core::AppConfig) -> anyhow::Result<(
     println!("  Current home channel: {current_home}");
 
     // Auto-suggest first allowed user as home channel
-    if config.gateway.telegram.home_channel.is_none() {
-        if let Some(first_user) = config.gateway.telegram.allowed_users.first() {
-            if prompt_yes_no(
-                &format!("  Use your user ID ({first_user}) as home channel?"),
-                true,
-            )? {
-                config.gateway.telegram.home_channel = Some(first_user.clone());
-                save_env_key("TELEGRAM_HOME_CHANNEL", first_user)?;
-                println!("  ✓ Home channel set");
-            }
-        }
+    if config.gateway.telegram.home_channel.is_none()
+        && let Some(first_user) = config.gateway.telegram.allowed_users.first()
+        && prompt_yes_no(
+            &format!("  Use your user ID ({first_user}) as home channel?"),
+            true,
+        )?
+    {
+        config.gateway.telegram.home_channel = Some(first_user.clone());
+        save_env_key("TELEGRAM_HOME_CHANNEL", first_user)?;
+        println!("  ✓ Home channel set");
     }
 
     let input = prompt_line("  Home channel ID (blank keeps current, '-' clears): ")?;
@@ -1313,10 +1312,10 @@ fn detect_signal_java_home() -> Option<String> {
             {
                 let output = String::from_utf8_lossy(&out.stderr).to_string()
                     + String::from_utf8_lossy(&out.stdout).as_ref();
-                if let Some(maj) = parse_java_major_version(&output) {
-                    if maj >= min_major {
-                        return Some(home.to_string());
-                    }
+                if let Some(maj) = parse_java_major_version(&output)
+                    && maj >= min_major
+                {
+                    return Some(home.to_string());
                 }
             }
             None
@@ -1362,10 +1361,10 @@ fn detect_signal_java_home() -> Option<String> {
                         {
                             let vout_str = String::from_utf8_lossy(&vout.stderr).to_string()
                                 + String::from_utf8_lossy(&vout.stdout).as_ref();
-                            if let Some(maj) = parse_java_major_version(&vout_str) {
-                                if best.as_ref().is_none_or(|(bv, _)| maj > *bv) {
-                                    best = Some((maj, home));
-                                }
+                            if let Some(maj) = parse_java_major_version(&vout_str)
+                                && best.as_ref().is_none_or(|(bv, _)| maj > *bv)
+                            {
+                                best = Some((maj, home));
                             }
                         }
                     }
@@ -1379,10 +1378,10 @@ fn detect_signal_java_home() -> Option<String> {
         // 3) Existing JAVA_HOME — only accept if it is actually Java 21+.
         if let Ok(existing) = std::env::var("JAVA_HOME") {
             let existing = existing.trim().to_string();
-            if !existing.is_empty() {
-                if let Some(home) = check_java_home(&existing, 21) {
-                    return Some(home);
-                }
+            if !existing.is_empty()
+                && let Some(home) = check_java_home(&existing, 21)
+            {
+                return Some(home);
             }
         }
 
@@ -1400,23 +1399,22 @@ fn detect_signal_java_home() -> Option<String> {
 #[cfg(target_os = "macos")]
 fn parse_java_major_version(version_output: &str) -> Option<u32> {
     for line in version_output.lines() {
-        if line.contains("version") {
-            if let Some(start) = line.find('"') {
-                if let Some(end) = line[start + 1..].find('"') {
-                    let ver = &line[start + 1..start + 1 + end];
-                    let parts: Vec<&str> = ver.split('.').collect();
-                    if let Some(first) = parts.first() {
-                        if let Ok(n) = first.parse::<u32>() {
-                            if n == 1 {
-                                // Legacy style: "1.8.0_392" → Java 8
-                                if let Some(second) = parts.get(1) {
-                                    return second.parse().ok();
-                                }
-                            }
-                            return Some(n);
-                        }
+        if line.contains("version")
+            && let Some(start) = line.find('"')
+            && let Some(end) = line[start + 1..].find('"')
+        {
+            let ver = &line[start + 1..start + 1 + end];
+            let parts: Vec<&str> = ver.split('.').collect();
+            if let Some(first) = parts.first()
+                && let Ok(n) = first.parse::<u32>()
+            {
+                if n == 1 {
+                    // Legacy style: "1.8.0_392" → Java 8
+                    if let Some(second) = parts.get(1) {
+                        return second.parse().ok();
                     }
                 }
+                return Some(n);
             }
         }
     }
@@ -1484,10 +1482,10 @@ fn run_signal_link_flow(_account: &str) -> anyhow::Result<()> {
             }
         }
 
-        if let Some(status) = child.try_wait()? {
-            if !status.success() {
-                break;
-            }
+        if let Some(status) = child.try_wait()?
+            && !status.success()
+        {
+            break;
         }
     }
 

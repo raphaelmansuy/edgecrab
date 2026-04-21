@@ -409,18 +409,18 @@ Categories: preference, style, project, quirk, context, goal, constraint, workfl
         let mut store = load_store()?;
 
         // Update existing entry if update_id provided
-        if let Some(ref uid) = args.update_id {
-            if let Some(entry) = store.entries.iter_mut().find(|e| e.id == *uid) {
-                entry.content = content.to_string();
-                entry.category = category.clone();
-                entry.updated_at = Utc::now().timestamp();
-                let entry_id = entry.id.clone();
-                save_store(&store)?;
-                return Ok(format!(
-                    "Updated user model entry {}",
-                    crate::safe_truncate(&entry_id, 8)
-                ));
-            }
+        if let Some(ref uid) = args.update_id
+            && let Some(entry) = store.entries.iter_mut().find(|e| e.id == *uid)
+        {
+            entry.content = content.to_string();
+            entry.category = category.clone();
+            entry.updated_at = Utc::now().timestamp();
+            let entry_id = entry.id.clone();
+            save_store(&store)?;
+            return Ok(format!(
+                "Updated user model entry {}",
+                crate::safe_truncate(&entry_id, 8)
+            ));
         }
 
         let entry = UserModelEntry::new(category, content);

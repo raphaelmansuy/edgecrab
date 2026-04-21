@@ -314,10 +314,10 @@ impl PairingStore {
         if let Ok(entries) = std::fs::read_dir(&dir) {
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().to_string();
-                if let Some(stripped) = name.strip_suffix(&format!("-{suffix}.json")) {
-                    if !stripped.starts_with('_') {
-                        platforms.push(stripped.to_string());
-                    }
+                if let Some(stripped) = name.strip_suffix(&format!("-{suffix}.json"))
+                    && !stripped.starts_with('_')
+                {
+                    platforms.push(stripped.to_string());
                 }
             }
         }

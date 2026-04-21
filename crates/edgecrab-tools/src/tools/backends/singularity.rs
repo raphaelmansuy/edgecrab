@@ -28,10 +28,10 @@ use super::{
 };
 
 fn resolve_executable() -> Result<String, ToolError> {
-    if let Ok(explicit) = std::env::var("EDGECRAB_SINGULARITY_BIN") {
-        if !explicit.trim().is_empty() {
-            return Ok(explicit);
-        }
+    if let Ok(explicit) = std::env::var("EDGECRAB_SINGULARITY_BIN")
+        && !explicit.trim().is_empty()
+    {
+        return Ok(explicit);
     }
 
     if let Ok(path) = which::which("apptainer") {

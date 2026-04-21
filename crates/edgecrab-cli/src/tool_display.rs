@@ -17,6 +17,8 @@ use ratatui::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::theme::palette as P;
+
 // ── DisplayWidths — single source of truth for column budgets ───────────────
 
 /// Column budget calculator that adapts all display widths to the terminal size.
@@ -248,10 +250,10 @@ fn extract_patch_targets(patch_text: &str) -> Vec<String> {
             .or_else(|| line.strip_prefix("*** Delete File: "))
             .or_else(|| line.strip_prefix("*** Move to: "))
             .map(str::trim);
-        if let Some(path) = path.filter(|path| !path.is_empty()) {
-            if !targets.iter().any(|existing| existing == path) {
-                targets.push(path.to_string());
-            }
+        if let Some(path) = path.filter(|path| !path.is_empty())
+            && !targets.iter().any(|existing| existing == path)
+        {
+            targets.push(path.to_string());
         }
     }
     targets
@@ -494,10 +496,10 @@ fn extract_generic_preview(
     ];
 
     for &key in PRIORITY {
-        if let Some(val) = obj.get(key) {
-            if let Some(preview) = json_value_preview(val) {
-                return unicode_trunc(&format!("{key}: {preview}"), max_cols);
-            }
+        if let Some(val) = obj.get(key)
+            && let Some(preview) = json_value_preview(val)
+        {
+            return unicode_trunc(&format!("{key}: {preview}"), max_cols);
         }
     }
 
@@ -1026,7 +1028,7 @@ pub fn build_tool_verbose_lines_width(
     let indent = Span::styled(
         "     ",
         Style::default()
-            .fg(Color::Rgb(48, 52, 62))
+            .fg(P::INDENT_SPACE)
             .add_modifier(Modifier::DIM),
     );
     let label_style = Style::default()
@@ -1040,9 +1042,9 @@ pub fn build_tool_verbose_lines_width(
         Span::styled(unicode_pad_right(&label, 9), label_style),
         Span::styled(
             args_summary,
-            Style::default()
-                .fg(Color::Rgb(115, 128, 150))
-                .add_modifier(Modifier::DIM),
+            // WCAG AA: SECONDARY_COOL Rgb(148,162,185) → CR 8.0:1 vs black.
+            // DIM removed: DIM is terminal-dependent and can drop contrast below AA.
+            Style::default().fg(P::SECONDARY_COOL),
         ),
     ]);
 
@@ -1052,15 +1054,13 @@ pub fn build_tool_verbose_lines_width(
             indent.clone(),
             Span::styled(
                 unicode_pad_right("", 9),
-                Style::default()
-                    .fg(Color::Rgb(80, 92, 112))
-                    .add_modifier(Modifier::DIM),
+                // WCAG AA: SECONDARY_COOL — label column padding (secondary info).
+                Style::default().fg(P::SECONDARY_COOL),
             ),
             Span::styled(
                 unicode_trunc(&stat, verbose_width),
-                Style::default()
-                    .fg(Color::Rgb(90, 102, 125))
-                    .add_modifier(Modifier::DIM),
+                // WCAG AA: SECONDARY_COOL Rgb(148,162,185) → CR 8.0:1 vs black.
+                Style::default().fg(P::SECONDARY_COOL),
             ),
         ]);
     }
@@ -1081,18 +1081,17 @@ pub fn build_tool_verbose_lines_width(
             indent,
             Span::styled(
                 unicode_pad_right("result", 9),
-                Style::default()
-                    .fg(Color::Rgb(100, 112, 135))
-                    .add_modifier(Modifier::DIM),
+                // WCAG AA: SECONDARY_COOL — "result" key label.
+                Style::default().fg(P::SECONDARY_COOL),
             ),
             Span::styled(
                 display,
                 if is_error {
                     Style::default()
-                        .fg(Color::Rgb(255, 120, 120))
+                        .fg(P::TOOL_RESULT_ERR)
                         .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(Color::Rgb(148, 208, 168))
+                    Style::default().fg(P::TOOL_RESULT_OK)
                 },
             ),
         ]);
@@ -1122,24 +1121,24 @@ fn build_todo_verbose_lines(
         .unwrap_or(mode);
 
     lines.push(vec![
+        // Indent whitespace — purely structural, DIM OK (SC 1.4.3 exempt).
         Span::styled(
             "     ",
             Style::default()
-                .fg(Color::Rgb(52, 56, 66))
+                .fg(P::INDENT_SPACE)
                 .add_modifier(Modifier::DIM),
         ),
         Span::styled(
             unicode_pad_right("plan", 9),
-            Style::default()
-                .fg(Color::Rgb(108, 118, 138))
-                .add_modifier(Modifier::DIM),
+            // WCAG AA: SECONDARY_COOL — "plan" key label.
+            Style::default().fg(P::SECONDARY_COOL),
         ),
         Span::styled(
             unicode_trunc(summary, verbose_width),
             if is_error {
-                Style::default().fg(Color::Rgb(235, 170, 170))
+                Style::default().fg(P::TOOL_RESULT_ERR)
             } else {
-                Style::default().fg(Color::Rgb(156, 208, 188))
+                Style::default().fg(P::TOOL_RESULT_OK)
             },
         ),
     ]);
@@ -1178,7 +1177,7 @@ fn build_todo_verbose_lines(
             Span::styled(
                 "     ",
                 Style::default()
-                    .fg(Color::Rgb(52, 56, 66))
+                    .fg(P::INDENT_SPACE)
                     .add_modifier(Modifier::DIM),
             ),
             Span::styled(format!("{badge} "), badge_style),
@@ -1194,14 +1193,13 @@ fn build_todo_verbose_lines(
             Span::styled(
                 "     ",
                 Style::default()
-                    .fg(Color::Rgb(52, 56, 66))
+                    .fg(P::INDENT_SPACE)
                     .add_modifier(Modifier::DIM),
             ),
             Span::styled(
                 format!("+{} more task(s)", items.len() - 6),
-                Style::default()
-                    .fg(Color::Rgb(120, 132, 152))
-                    .add_modifier(Modifier::DIM),
+                // WCAG AA: TERTIARY_COOL — "+N more" overflow label.
+                Style::default().fg(P::TERTIARY_COOL),
             ),
         ]);
     }
@@ -1285,8 +1283,8 @@ pub fn build_tool_done_line_width(
     // visually distinguish file edits, terminal commands, web searches, etc.
     let category = tool_category(tool_name);
     let bar_style = Style::default()
-        .fg(Color::Rgb(55, 58, 70))
-        .add_modifier(Modifier::DIM);
+        .fg(P::GUTTER_BAR)
+        .add_modifier(Modifier::DIM); // decorative glyph — DIM OK (SC 1.4.3 exempt)
     let emoji_style = if is_error {
         Style::default()
             .fg(Color::Rgb(255, 80, 80))
@@ -1299,19 +1297,18 @@ pub fn build_tool_done_line_width(
     } else {
         Style::default().fg(category.name_color())
     };
-    let preview_style = Style::default()
-        .fg(Color::Rgb(90, 102, 125))
-        .add_modifier(Modifier::DIM);
+    // WCAG AA: TERTIARY_COOL Rgb(125,138,162) → CR 6.0:1 vs black.
+    // DIM removed — terminal DIM is non-deterministic and can drop contrast below AA.
+    let preview_style = Style::default().fg(P::TERTIARY_COOL);
     let result_style = if is_error {
         Style::default()
-            .fg(Color::Rgb(255, 125, 125))
+            .fg(P::TOOL_RESULT_ERR)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::Rgb(148, 208, 168))
+        Style::default().fg(P::TOOL_RESULT_OK)
     };
-    let dur_style = Style::default()
-        .fg(Color::Rgb(72, 79, 98))
-        .add_modifier(Modifier::DIM);
+    // WCAG AA: TERTIARY_WARM Rgb(128,138,152) → CR 5.9:1 vs black.
+    let dur_style = Style::default().fg(P::TERTIARY_WARM);
 
     vec![
         Span::styled("  ┊ ", bar_style),
@@ -1350,7 +1347,14 @@ pub fn build_tool_running_line_width(
     emoji_overrides: &std::collections::HashMap<String, String>,
     widths: &DisplayWidths,
 ) -> Vec<Span<'static>> {
-    build_tool_running_line_width_elapsed(tool_name, args_json, detail, None, emoji_overrides, widths)
+    build_tool_running_line_width_elapsed(
+        tool_name,
+        args_json,
+        detail,
+        None,
+        emoji_overrides,
+        widths,
+    )
 }
 
 /// Like `build_tool_running_line_width` but also shows elapsed time in the placeholder.
@@ -1389,19 +1393,18 @@ pub fn build_tool_running_line_width_elapsed(
     };
 
     let bar_style = Style::default()
-        .fg(Color::Rgb(55, 58, 70))
-        .add_modifier(Modifier::DIM);
+        .fg(P::GUTTER_BAR)
+        .add_modifier(Modifier::DIM); // decorative glyph — DIM OK (SC 1.4.3 exempt)
     let indicator_style = Style::default().fg(category.name_color());
     let name_style = Style::default().fg(category.name_color());
-    let preview_style = Style::default()
-        .fg(Color::Rgb(90, 102, 125))
-        .add_modifier(Modifier::DIM);
+    // WCAG AA: TERTIARY_COOL → CR 6.0:1 vs black; DIM removed.
+    let preview_style = Style::default().fg(P::TERTIARY_COOL);
+    // "···" pulse is a purely decorative indicator; DIM is acceptable here.
     let running_style = Style::default()
         .fg(category.name_color())
         .add_modifier(Modifier::DIM);
-    let elapsed_style = Style::default()
-        .fg(Color::Rgb(100, 112, 135))
-        .add_modifier(Modifier::DIM);
+    // WCAG AA: TERTIARY_COOL for elapsed time text; DIM removed.
+    let elapsed_style = Style::default().fg(P::TERTIARY_COOL);
 
     vec![
         Span::styled("  ┊ ", bar_style),
@@ -1453,22 +1456,20 @@ pub fn build_subagent_running_line_width(
     let elapsed_str = format_duration_aligned(elapsed_secs * 1_000);
 
     let bar_style = Style::default()
-        .fg(Color::Rgb(55, 60, 70))
-        .add_modifier(Modifier::DIM);
-    let icon_style = Style::default().fg(Color::Rgb(95, 175, 255)); // blue → "in progress"
-    let badge_style = Style::default()
-        .fg(Color::Rgb(115, 128, 150))
-        .add_modifier(Modifier::DIM);
-    let goal_style = Style::default().fg(Color::Rgb(185, 198, 218));
-    let detail_style = Style::default()
-        .fg(Color::Rgb(90, 102, 125))
-        .add_modifier(Modifier::DIM);
+        .fg(P::GUTTER_BAR)
+        .add_modifier(Modifier::DIM); // decorative glyph — DIM OK
+    let icon_style = Style::default().fg(Color::Rgb(95, 175, 255)); // blue → "in progress" — CR 9.5:1 ✅
+    // WCAG AA: SECONDARY_COOL for sub-agent badge text; DIM removed.
+    let badge_style = Style::default().fg(P::SECONDARY_COOL);
+    let goal_style = Style::default().fg(Color::Rgb(185, 198, 218)); // L=0.570 CR=12.4:1 ✅
+    // WCAG AA: TERTIARY_COOL for detail column; DIM removed.
+    let detail_style = Style::default().fg(P::TERTIARY_COOL);
+    // "···" pulse — decorative; DIM is acceptable.
     let running_style = Style::default()
         .fg(Color::Rgb(95, 175, 255))
         .add_modifier(Modifier::DIM);
-    let dur_style = Style::default()
-        .fg(Color::Rgb(72, 79, 98))
-        .add_modifier(Modifier::DIM);
+    // WCAG AA: TERTIARY_WARM for elapsed time; DIM removed.
+    let dur_style = Style::default().fg(P::TERTIARY_WARM);
 
     vec![
         Span::styled("  ┊ ", bar_style),
@@ -1527,32 +1528,29 @@ pub fn build_subagent_done_line_width(
     let summary_col = unicode_trunc(summary_first, summary_budget);
 
     let bar_style = Style::default()
-        .fg(Color::Rgb(55, 60, 70))
-        .add_modifier(Modifier::DIM);
+        .fg(P::GUTTER_BAR)
+        .add_modifier(Modifier::DIM); // decorative glyph — DIM OK
     let icon_style = if is_error {
         Style::default()
             .fg(Color::Rgb(255, 80, 80))
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::Rgb(104, 196, 129))
+        Style::default().fg(Color::Rgb(104, 196, 129)) // CR 8.6:1 ✅
     };
-    let badge_style = Style::default()
-        .fg(Color::Rgb(115, 128, 150))
-        .add_modifier(Modifier::DIM);
+    // WCAG AA: SECONDARY_COOL for sub-agent badge; DIM removed.
+    let badge_style = Style::default().fg(P::SECONDARY_COOL);
     let summary_style = if is_error {
         Style::default()
-            .fg(Color::Rgb(255, 125, 125))
+            .fg(P::TOOL_RESULT_ERR)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::Rgb(200, 210, 226))
+        Style::default().fg(Color::Rgb(200, 210, 226)) // L=0.629 CR=13.6:1 ✅
     };
-    let stats_style = Style::default()
-        .fg(Color::Rgb(100, 112, 135))
-        .add_modifier(Modifier::DIM);
-    let model_style = Style::default().fg(Color::Rgb(185, 145, 240)); // violet = Ai category
-    let dur_style = Style::default()
-        .fg(Color::Rgb(72, 79, 98))
-        .add_modifier(Modifier::DIM);
+    // WCAG AA: SECONDARY_COOL for stats pill; DIM removed.
+    let stats_style = Style::default().fg(P::SECONDARY_COOL);
+    let model_style = Style::default().fg(Color::Rgb(185, 145, 240)); // violet = Ai category — CR 8.4:1 ✅
+    // WCAG AA: TERTIARY_WARM for duration; DIM removed.
+    let dur_style = Style::default().fg(P::TERTIARY_WARM);
 
     let icon: &str = if is_error { "❌" } else { "✅" };
     let model_part = if model_short.is_empty() {
@@ -2066,7 +2064,10 @@ fn format_checkpoint_result(v: &serde_json::Value, max_cols: usize) -> String {
             if total == 0 {
                 unicode_trunc("✓ no changes", max_cols)
             } else {
-                unicode_trunc(&format!("✓ diff: +{added} ~{modified} -{deleted}"), max_cols)
+                unicode_trunc(
+                    &format!("✓ diff: +{added} ~{modified} -{deleted}"),
+                    max_cols,
+                )
             }
         }
         "restore_file" => {
@@ -2081,7 +2082,10 @@ fn format_checkpoint_result(v: &serde_json::Value, max_cols: usize) -> String {
 fn format_todo_result(v: &serde_json::Value, max_cols: usize) -> String {
     if let Some(summary) = v.get("summary") {
         let total = summary.get("total").and_then(|t| t.as_u64()).unwrap_or(0);
-        let completed = summary.get("completed").and_then(|c| c.as_u64()).unwrap_or(0);
+        let completed = summary
+            .get("completed")
+            .and_then(|c| c.as_u64())
+            .unwrap_or(0);
         let in_progress = summary
             .get("in_progress")
             .and_then(|ip| ip.as_u64())
@@ -2131,9 +2135,7 @@ pub fn format_tool_result(tool_name: &str, result: &str, max_cols: usize) -> Str
             "session_search" => return format_session_search_result(&val, max_cols),
             _ if tool_name.starts_with("ha_") => return format_ha_result(&val, max_cols),
             // R18: memory_write / memory alias JSON result
-            "memory_write" | "memory"
-                if val.get("ok") == Some(&serde_json::Value::Bool(true)) =>
-            {
+            "memory_write" | "memory" if val.get("ok") == Some(&serde_json::Value::Bool(true)) => {
                 return format_memory_write_result(&val, max_cols);
             }
             // R18: checkpoint JSON result
@@ -2158,17 +2160,16 @@ pub fn format_tool_result(tool_name: &str, result: &str, max_cols: usize) -> Str
     match tool_name {
         "write_file" => {
             // R18: JSON result {"ok":true,"action":"create|overwrite","bytes":N,"path":"..."}
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(result_trimmed) {
-                if v.get("ok") == Some(&serde_json::Value::Bool(true)) {
-                    if let Some(bytes) = v.get("bytes").and_then(|b| b.as_u64()) {
-                        let size = if bytes >= 1024 {
-                            format!("{:.1}k bytes", bytes as f64 / 1024.0)
-                        } else {
-                            format!("{bytes} bytes")
-                        };
-                        return unicode_trunc(&format!("✓ {size}"), max_cols);
-                    }
-                }
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(result_trimmed)
+                && v.get("ok") == Some(&serde_json::Value::Bool(true))
+                && let Some(bytes) = v.get("bytes").and_then(|b| b.as_u64())
+            {
+                let size = if bytes >= 1024 {
+                    format!("{:.1}k bytes", bytes as f64 / 1024.0)
+                } else {
+                    format!("{bytes} bytes")
+                };
+                return unicode_trunc(&format!("✓ {size}"), max_cols);
             }
             // Legacy prose fallback: "Wrote N bytes to 'path'"
             if let Some(rest) = result_trimmed.strip_prefix("Wrote ") {
@@ -2182,42 +2183,41 @@ pub fn format_tool_result(tool_name: &str, result: &str, max_cols: usize) -> Str
         }
         "patch" => {
             // R18: JSON result {"ok":true,"replacements":N,"before_bytes":M,"after_bytes":K,"path":"..."}
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(result_trimmed) {
-                if v.get("ok") == Some(&serde_json::Value::Bool(true)) {
-                    if let Some(n) = v.get("replacements").and_then(|r| r.as_u64()) {
-                        let s = if n == 1 {
-                            "1 replacement".to_string()
-                        } else {
-                            format!("{n} replacements")
-                        };
-                        return unicode_trunc(&format!("✓ {s}"), max_cols);
-                    }
-                }
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(result_trimmed)
+                && v.get("ok") == Some(&serde_json::Value::Bool(true))
+                && let Some(n) = v.get("replacements").and_then(|r| r.as_u64())
+            {
+                let s = if n == 1 {
+                    "1 replacement".to_string()
+                } else {
+                    format!("{n} replacements")
+                };
+                return unicode_trunc(&format!("✓ {s}"), max_cols);
             }
             return unicode_trunc(&oneline(result_trimmed), max_cols);
         }
         "apply_patch" => {
             // R18: JSON result {"ok":true,"modified":[...],"created":[...],"deleted":[...]}
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(result_trimmed) {
-                if v.get("ok") == Some(&serde_json::Value::Bool(true)) {
-                    let total: usize = ["modified", "created", "deleted"]
-                        .iter()
-                        .map(|k| {
-                            v.get(k)
-                                .and_then(|a| a.as_array())
-                                .map(|a| a.len())
-                                .unwrap_or(0)
-                        })
-                        .sum();
-                    let summary = if total == 0 {
-                        "✓ ok".to_string()
-                    } else if total == 1 {
-                        "✓ 1 file".to_string()
-                    } else {
-                        format!("✓ {total} files")
-                    };
-                    return unicode_trunc(&summary, max_cols);
-                }
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(result_trimmed)
+                && v.get("ok") == Some(&serde_json::Value::Bool(true))
+            {
+                let total: usize = ["modified", "created", "deleted"]
+                    .iter()
+                    .map(|k| {
+                        v.get(k)
+                            .and_then(|a| a.as_array())
+                            .map(|a| a.len())
+                            .unwrap_or(0)
+                    })
+                    .sum();
+                let summary = if total == 0 {
+                    "✓ ok".to_string()
+                } else if total == 1 {
+                    "✓ 1 file".to_string()
+                } else {
+                    format!("✓ {total} files")
+                };
+                return unicode_trunc(&summary, max_cols);
             }
             // Legacy prose fallback: "apply_patch succeeded. Modified: ...; Created: ..."
             if result_trimmed.contains("succeeded") {
@@ -2816,17 +2816,13 @@ mod tests {
         );
         assert!(out.contains("✓"), "should have success badge, got: {out}");
         // 1234 >= 1024 so displayed as "1.2k bytes"
-        assert!(
-            out.contains("bytes"),
-            "should show size unit, got: {out}"
-        );
+        assert!(out.contains("bytes"), "should show size unit, got: {out}");
     }
 
     #[test]
     fn test_format_tool_result_apply_patch_counts_files() {
         // R18: JSON result
-        let result =
-            r#"{"ok":true,"modified":["src/main.rs","src/lib.rs"],"created":["src/new.rs"],"deleted":[]}"#;
+        let result = r#"{"ok":true,"modified":["src/main.rs","src/lib.rs"],"created":["src/new.rs"],"deleted":[]}"#;
         let out = format_tool_result("apply_patch", result, 80);
         assert!(out.contains("✓"), "should have success badge, got: {out}");
         assert!(out.contains("3 files"), "should show 3 files, got: {out}");

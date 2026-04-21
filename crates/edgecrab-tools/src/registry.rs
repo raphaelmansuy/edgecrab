@@ -454,7 +454,10 @@ pub struct ToolRegistry {
 //
 // FP2: Make The Right Thing Easy — "42" for an integer field IS the right value.
 fn coerce_tool_args(args: &mut serde_json::Value, schema: &serde_json::Value) {
-    let Some(properties) = schema.get("properties").and_then(serde_json::Value::as_object) else {
+    let Some(properties) = schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+    else {
         return;
     };
     let serde_json::Value::Object(map) = args else {
@@ -470,19 +473,18 @@ fn coerce_tool_args(args: &mut serde_json::Value, schema: &serde_json::Value) {
         };
         match expected_type {
             "integer" if value.is_string() => {
-                if let Some(s) = value.as_str() {
-                    if let Ok(n) = s.parse::<i64>() {
-                        *value = serde_json::Value::Number(n.into());
-                    }
+                if let Some(s) = value.as_str()
+                    && let Ok(n) = s.parse::<i64>()
+                {
+                    *value = serde_json::Value::Number(n.into());
                 }
             }
             "number" if value.is_string() => {
-                if let Some(s) = value.as_str() {
-                    if let Ok(n) = s.parse::<f64>() {
-                        if let Some(n) = serde_json::Number::from_f64(n) {
-                            *value = serde_json::Value::Number(n);
-                        }
-                    }
+                if let Some(s) = value.as_str()
+                    && let Ok(n) = s.parse::<f64>()
+                    && let Some(n) = serde_json::Number::from_f64(n)
+                {
+                    *value = serde_json::Value::Number(n);
                 }
             }
             "boolean" if value.is_string() => match value.as_str() {
@@ -546,9 +548,7 @@ pub fn strip_unavailable_cross_refs(definitions: &mut [ToolSchema]) {
         for &(tool_name, required_tools, text_to_strip) in TOOL_CROSS_REFS {
             // Strip only when NONE of the required_tools are available.
             // If at least one is present the reference remains accurate.
-            let none_available = required_tools
-                .iter()
-                .all(|&t| !available.contains(t));
+            let none_available = required_tools.iter().all(|&t| !available.contains(t));
             if schema.name == tool_name && none_available {
                 schema.description = schema.description.replace(text_to_strip, "");
             }
@@ -1055,7 +1055,11 @@ impl ToolRegistry {
         };
         path_args
             .iter()
-            .filter_map(|pa| args.get(*pa).and_then(serde_json::Value::as_str).map(String::from))
+            .filter_map(|pa| {
+                args.get(*pa)
+                    .and_then(serde_json::Value::as_str)
+                    .map(String::from)
+            })
             .collect()
     }
 
@@ -1695,11 +1699,20 @@ mod tests {
         };
 
         let enriched = registry.enrich_invalid_args_error("read_file", &err);
-        assert!(enriched.is_some(), "should return enriched error for InvalidArgs");
+        assert!(
+            enriched.is_some(),
+            "should return enriched error for InvalidArgs"
+        );
         let resp = enriched.unwrap();
-        assert!(resp.required_fields.is_some(), "should have required_fields");
+        assert!(
+            resp.required_fields.is_some(),
+            "should have required_fields"
+        );
         let rf = resp.required_fields.unwrap();
-        assert!(rf.contains(&"path".to_string()), "read_file requires 'path'");
+        assert!(
+            rf.contains(&"path".to_string()),
+            "read_file requires 'path'"
+        );
         assert!(resp.usage_hint.is_some(), "should have a usage hint");
         assert!(resp.usage_hint.unwrap().contains("path"));
     }
@@ -1708,7 +1721,11 @@ mod tests {
     fn enrich_returns_none_for_non_invalid_args() {
         let registry = ToolRegistry::new();
         let err = ToolError::NotFound("read_file".into());
-        assert!(registry.enrich_invalid_args_error("read_file", &err).is_none());
+        assert!(
+            registry
+                .enrich_invalid_args_error("read_file", &err)
+                .is_none()
+        );
     }
 
     // ── coerce_tool_args tests ───────────────────────────────────────
@@ -1743,7 +1760,8 @@ mod tests {
         });
         let mut args = serde_json::json!({"val": "3.14"});
         coerce_tool_args(&mut args, &schema);
-        assert!((args["val"].as_f64().unwrap() - 3.14).abs() < f64::EPSILON);
+        let expected = 314_f64 / 100.0;
+        assert!((args["val"].as_f64().unwrap() - expected).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -1828,8 +1846,7 @@ mod tests {
 
     #[test]
     fn paths_overlap_parent_child() {
-        let claimed: std::collections::HashSet<String> =
-            ["src".to_string()].into_iter().collect();
+        let claimed: std::collections::HashSet<String> = ["src".to_string()].into_iter().collect();
         assert!(
             super::paths_overlap("src/main.rs", &claimed),
             "child of claimed parent should overlap"
@@ -1848,8 +1865,7 @@ mod tests {
 
     #[test]
     fn paths_overlap_trailing_slash() {
-        let claimed: std::collections::HashSet<String> =
-            ["src/".to_string()].into_iter().collect();
+        let claimed: std::collections::HashSet<String> = ["src/".to_string()].into_iter().collect();
         assert!(
             super::paths_overlap("src/main.rs", &claimed),
             "trailing slash parent should overlap with child"
@@ -1868,8 +1884,7 @@ mod tests {
 
     #[test]
     fn paths_overlap_no_false_prefix() {
-        let claimed: std::collections::HashSet<String> =
-            ["src".to_string()].into_iter().collect();
+        let claimed: std::collections::HashSet<String> = ["src".to_string()].into_iter().collect();
         assert!(
             !super::paths_overlap("src2/foo.rs", &claimed),
             "src2 is NOT a child of src — no path separator"
@@ -1930,10 +1945,7 @@ mod tests {
         let desc = "Navigate to a URL. \
             For simple info retrieval, prefer web_search or web_extract (faster, cheaper). \
             Use browser tools when interactive.";
-        let mut defs = vec![
-            make_browser_schema(desc),
-            make_tool_schema("web_search"),
-        ];
+        let mut defs = vec![make_browser_schema(desc), make_tool_schema("web_search")];
         super::strip_unavailable_cross_refs(&mut defs);
         assert!(
             defs[0].description.contains("web_search"),
@@ -1953,6 +1965,9 @@ mod tests {
         let mut defs = vec![make_tool_schema("unrelated_tool")];
         let original_desc = defs[0].description.clone();
         super::strip_unavailable_cross_refs(&mut defs);
-        assert_eq!(defs[0].description, original_desc, "unrelated tool unchanged");
+        assert_eq!(
+            defs[0].description, original_desc,
+            "unrelated tool unchanged"
+        );
     }
 }

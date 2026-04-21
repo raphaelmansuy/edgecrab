@@ -149,13 +149,13 @@ pub fn resolve_channel_name(platform_name: &str, name: &str) -> Option<String> {
     }
 
     // 2. Guild-qualified match for Discord ("GuildName/channel")
-    if query.contains('/') {
-        if let Some((guild_part, ch_part)) = query.rsplit_once('/') {
-            for ch in channels {
-                let guild = ch.guild.as_deref().unwrap_or("").to_lowercase();
-                if guild == guild_part && ch.name.to_lowercase() == ch_part {
-                    return Some(ch.id.clone());
-                }
+    if query.contains('/')
+        && let Some((guild_part, ch_part)) = query.rsplit_once('/')
+    {
+        for ch in channels {
+            let guild = ch.guild.as_deref().unwrap_or("").to_lowercase();
+            if guild == guild_part && ch.name.to_lowercase() == ch_part {
+                return Some(ch.id.clone());
             }
         }
     }

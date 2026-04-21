@@ -171,24 +171,24 @@ fn find_split_point(text: &str, max_len: usize) -> usize {
     let search_window = &text[..safe_max];
 
     // Try paragraph break (double newline)
-    if let Some(pos) = search_window.rfind("\n\n") {
-        if pos > 0 {
-            return pos + 1; // Include one newline
-        }
+    if let Some(pos) = search_window.rfind("\n\n")
+        && pos > 0
+    {
+        return pos + 1; // Include one newline
     }
 
     // Try single newline
-    if let Some(pos) = search_window.rfind('\n') {
-        if pos > 0 {
-            return pos + 1;
-        }
+    if let Some(pos) = search_window.rfind('\n')
+        && pos > 0
+    {
+        return pos + 1;
     }
 
     // Try space
-    if let Some(pos) = search_window.rfind(' ') {
-        if pos > 0 {
-            return pos + 1;
-        }
+    if let Some(pos) = search_window.rfind(' ')
+        && pos > 0
+    {
+        return pos + 1;
     }
 
     // Hard cut at max_len (ensure valid UTF-8 boundary)

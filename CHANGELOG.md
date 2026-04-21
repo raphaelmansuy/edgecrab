@@ -7,6 +7,62 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-04-21
+
+### Added
+
+- **Mission Steering — inject guidance into a running agent loop** — New `steering` module in `edgecrab-core` adds a non-blocking `tokio::sync::mpsc` channel for sending `SteeringEvent` (Hint / Redirect / Stop) to the running `execute_loop` without interrupting it.
+  - `SteeringKind` enum: `Hint` (add context), `Redirect` (change approach), `Stop` (graceful stop after current tool).
+  - `SteeringEvent` struct with `kind`, `message`, and `timestamp`.
+  - `drain_pending_steers()` — non-blocking batch drain; merges concurrent events, applies `[⛵ STEER]` prefix, enforces 2000-byte truncation (EC-11), and scans for prompt injection via `ThreatSeverity::High`.
+  - `Agent::steer_sender()` — returns a cloneable `SteeringSender` for TUI / gateway consumers.
+  - `execute_loop` injects pending steers at every `LoopAction::Continue` boundary (after tool results, before next API call) to preserve strict user/assistant alternation and Anthropic prompt-cache breakpoints.
+  - `Stop` steers additionally signal the cancellation token (EC-02) to interrupt long-running tools at their next checkpoint.
+  - Two new `StreamEvent` variants: `SteerApplied { message }` (emitted when steer is injected) and `SteerPending { count }` (for future optimistic TUI sync).
+  - All exhaustive `StreamEvent` match sites updated: `edgecrab-gateway`, `edgecrab-cli`, `e2e_copilot` test suite.
+  - 6 unit tests in `steering.rs` — all pass. Full workspace (`cargo build --workspace`) and all 43 library tests pass.
+  - Specs: `specs/steering/` — 6 cross-reference documents covering problem analysis, first principles, architecture, edge cases (EC-01 through EC-12), TUI UX wireframes, and phased implementation plan.
+
+- **TUI Mission Steering Overlay (Phase 3)** — Interactive `Ctrl+S` overlay in the ratatui TUI.
+  - Press `Ctrl+S` while the agent is running to open a compact floating panel.
+  - **Tab** cycles the steer kind: `HINT` → `REDIRECT` → `STOP`.
+  - **Enter** sends the steer and closes the overlay; **Esc** or **Ctrl+S** cancels.
+  - Status bar shows `⛵ N pending` (amber) while steers are in flight; `⛵ applied` (green flash, 4 s) on confirmation.
+  - Right-side status bar hint changes to `^C=cancel  ^S=steer  ↕scroll` while the agent is processing.
+  - When the agent is idle, `Ctrl+S` promotes the steer as a new message prefixed with `[⛵ STEER/<kind>]`.
+  - Six new fields on `App` struct; fully integrated with `set_agent()`, `check_responses()`, and `render_status_bar()`.
+
+- **Gateway `second_message_mode` (Phase 4)** — Configures how a second user message that arrives while the agent is already running for that session is handled.
+  - New `SecondMessageMode` enum in `edgecrab-gateway::config`: `Queue` (default — existing behaviour), `Steer` (inject as a Redirect steer), `Interrupt` (cancel running agent and start fresh).
+  - `Gateway` struct gains `steer_senders: Arc<Mutex<HashMap<…>>>` — populated on task spawn, cleaned up on task exit.
+  - `Steer` mode injects the second message as a `SteeringEvent::Redirect` into the running loop and acks with `⛵ Steering...`; falls back to `Queue` if the steer channel is closed.
+  - `Interrupt` mode cancels the running token, purges the pending-message queue, and deregisters the stale steer sender before spawning a new task.
+  - Configure in `config.yaml`: `gateway.second_message_mode: steer`.
+
+### Documentation
+
+- New Astro site doc: `site/src/content/docs/features/steering.md` — full guide covering TUI usage, API reference, gateway config, edge cases, and architecture diagram.
+- Updated `site/src/content/docs/features/overview.md` to mention Mission Steering.
+- Updated `AGENTS.md` (steering overlay section).
+
+### Changed
+
+- **Prompt cache architecture split into stable and dynamic system-prompt blocks** — `PromptBlocks` now keeps long-lived guidance cacheable while session-specific content stays outside the stable prefix, reducing Anthropic prompt-cache churn and making future `cache_control` integration straightforward.
+- **Skills prompt invalidation now uses a manifest instead of a short TTL** — skill installs, removals, and edits are reflected immediately without waiting for a cache timeout.
+- **EdgeCrab now resolves `edgequake-llm` from the published registry release again** — workspace consumers now target `edgequake-llm 0.6.12` directly and no longer depend on a sibling path override.
+- **TUI contrast palette hardened for dark terminals** — semantic text colors were normalized into a central palette and failing low-contrast spans were lifted to WCAG-compliant ranges.
+
+### Verification
+
+| Check | Result |
+|-------|--------|
+| `./scripts/release-version.sh check` | **passed locally before cut** |
+| `cargo fmt --all --check` | **passed locally before cut** |
+| `cargo clippy --workspace --all-targets -- -D warnings` | **passed locally before cut** |
+| `cargo test --workspace --exclude edgecrab-lsp` | **passed locally before cut** |
+| `cargo test -p edgecrab-lsp --all-targets` | **passed locally before cut** |
+| `fnm exec --using v22.12.0 pnpm build` in `site/` | **passed locally before cut** |
+
 ## [0.7.0] — 2026-04-18
 
 ### Added

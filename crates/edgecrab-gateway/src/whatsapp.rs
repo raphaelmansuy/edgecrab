@@ -278,10 +278,10 @@ impl WhatsAppAdapter {
     }
 
     async fn ensure_bridge_ready(&self) -> anyhow::Result<()> {
-        if let Ok(status) = Self::health(&self.config).await {
-            if status == "connected" {
-                return Ok(());
-            }
+        if let Ok(status) = Self::health(&self.config).await
+            && status == "connected"
+        {
+            return Ok(());
         }
 
         self.start_managed_bridge()?;

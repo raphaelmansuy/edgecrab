@@ -77,17 +77,18 @@ fn command_preview(command: &str) -> String {
 fn describe_macos_preflight(command: &str) -> Option<CapabilityBlock> {
     let preflight = preflight_command_permissions(command);
 
-    if let Some(state) = preflight.accessibility_state {
-        if matches!(
+    if let Some(state) = preflight.accessibility_state
+        && matches!(
             state,
             MacosConsentState::Denied | MacosConsentState::WouldPrompt
-        ) {
-            let (code, action) = if state == MacosConsentState::WouldPrompt {
-                ("macos_accessibility_required", "would trigger")
-            } else {
-                ("macos_accessibility_denied", "was denied")
-            };
-            return Some(CapabilityBlock {
+        )
+    {
+        let (code, action) = if state == MacosConsentState::WouldPrompt {
+            ("macos_accessibility_required", "would trigger")
+        } else {
+            ("macos_accessibility_denied", "was denied")
+        };
+        return Some(CapabilityBlock {
                 code,
                 message: format!(
                     "macOS Accessibility access for the terminal host {action}. Grant Accessibility access in System Settings -> Privacy & Security -> Accessibility."
@@ -97,7 +98,6 @@ fn describe_macos_preflight(command: &str) -> Option<CapabilityBlock> {
                         .into(),
                 ),
             });
-        }
     }
 
     if let Some(state) = preflight.automation_state {
@@ -305,27 +305,27 @@ pub(crate) fn guard_run_process_command(
         return Err(ToolError::capability_denied("run_process", code, message)
             .with_suggested_action(action));
     }
-    if host_is_local_macos(backend_kind) {
-        if let Some(reason) = assessment.macos_prompt_reason {
-            let preflight = describe_macos_preflight(command);
-            let extra = preflight
-                .as_ref()
-                .map(|block| format!("\nPreflight: {}", block.message))
-                .unwrap_or_default();
-            let mut error = ToolError::capability_denied(
-                "run_process",
-                "background_macos_consent_unsupported",
-                format!(
-                    "Command may block on a macOS permission dialog ({reason}). Background execution would hide that prompt and create flaky behavior. Run it in the foreground with `terminal` after granting the required macOS permission.{extra}\nCommand: `{}`",
-                    command_preview(command),
-                ),
-            );
-            error = error.with_suggested_action(
+    if host_is_local_macos(backend_kind)
+        && let Some(reason) = assessment.macos_prompt_reason
+    {
+        let preflight = describe_macos_preflight(command);
+        let extra = preflight
+            .as_ref()
+            .map(|block| format!("\nPreflight: {}", block.message))
+            .unwrap_or_default();
+        let mut error = ToolError::capability_denied(
+            "run_process",
+            "background_macos_consent_unsupported",
+            format!(
+                "Command may block on a macOS permission dialog ({reason}). Background execution would hide that prompt and create flaky behavior. Run it in the foreground with `terminal` after granting the required macOS permission.{extra}\nCommand: `{}`",
+                command_preview(command),
+            ),
+        );
+        error = error.with_suggested_action(
                 "Grant the required macOS permission, then rerun the command in the foreground with `terminal`."
                     .to_string(),
             );
-            return Err(error);
-        }
+        return Err(error);
     }
     Ok(())
 }
@@ -473,25 +473,24 @@ pub(crate) fn rewrite_terminal_exec_result(
             ));
         }
 
-        if let Some(stall_timeout) = macos_prompt_stall_timeout(command, backend_kind) {
-            if requested_timeout > stall_timeout
-                && exec_output.exit_code == 124
-                && exec_output.stdout.trim().is_empty()
-                && exec_output.stderr.trim().is_empty()
-            {
-                return Err(format_macos_prompt_timeout(command, reason, stall_timeout));
-            }
+        if let Some(stall_timeout) = macos_prompt_stall_timeout(command, backend_kind)
+            && requested_timeout > stall_timeout
+            && exec_output.exit_code == 124
+            && exec_output.stdout.trim().is_empty()
+            && exec_output.stderr.trim().is_empty()
+        {
+            return Err(format_macos_prompt_timeout(command, reason, stall_timeout));
         }
     }
 
-    if let Some(reason) = assessment.macos_privacy_reason {
-        if output_mentions_permission_denial(&combined_output) {
-            return Err(format_macos_privacy_denied(
-                command,
-                reason,
-                &combined_output,
-            ));
-        }
+    if let Some(reason) = assessment.macos_privacy_reason
+        && output_mentions_permission_denial(&combined_output)
+    {
+        return Err(format_macos_privacy_denied(
+            command,
+            reason,
+            &combined_output,
+        ));
     }
 
     Ok(())

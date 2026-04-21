@@ -1055,10 +1055,10 @@ impl ManagedModalState {
                 message: format!("Managed Modal exec start JSON parse fail: {e}"),
             })?;
 
-        if let Some(status) = start.status.as_deref() {
-            if terminal_managed_status(status) {
-                return Ok(managed_exec_output(start));
-            }
+        if let Some(status) = start.status.as_deref()
+            && terminal_managed_status(status)
+        {
+            return Ok(managed_exec_output(start));
         }
 
         if start.exec_id.as_deref() != Some(exec_id.as_str()) {
@@ -1127,10 +1127,10 @@ impl ManagedModalState {
                     tool: "terminal".into(),
                     message: format!("Managed Modal exec poll JSON parse fail: {e}"),
                 })?;
-            if let Some(status) = body.status.as_deref() {
-                if terminal_managed_status(status) {
-                    return Ok(managed_exec_output(body));
-                }
+            if let Some(status) = body.status.as_deref()
+                && terminal_managed_status(status)
+            {
+                return Ok(managed_exec_output(body));
             }
         }
     }

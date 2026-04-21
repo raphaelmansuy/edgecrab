@@ -656,13 +656,13 @@ fn normalize_job_value(job: &mut Value) {
         obj.insert("skills".into(), normalized);
     }
 
-    if !obj.contains_key("schedule_display") {
-        if let Some(schedule) = &schedule {
-            obj.insert(
-                "schedule_display".into(),
-                Value::String(schedule_display(schedule)),
-            );
-        }
+    if !obj.contains_key("schedule_display")
+        && let Some(schedule) = &schedule
+    {
+        obj.insert(
+            "schedule_display".into(),
+            Value::String(schedule_display(schedule)),
+        );
     }
 
     if !obj.contains_key("repeat") {
@@ -706,10 +706,10 @@ fn normalize_job_value(job: &mut Value) {
         obj.insert("run_count".into(), json!(completed));
     }
 
-    if !obj.contains_key("updated_at") {
-        if let Some(created_at) = obj.get("created_at").cloned() {
-            obj.insert("updated_at".into(), created_at);
-        }
+    if !obj.contains_key("updated_at")
+        && let Some(created_at) = obj.get("created_at").cloned()
+    {
+        obj.insert("updated_at".into(), created_at);
     }
 }
 

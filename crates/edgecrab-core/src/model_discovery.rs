@@ -437,10 +437,10 @@ async fn fetch_openai_compatible_models(
         .timeout(Duration::from_secs(4))
         .build()?;
     let mut request = client.get(format!("{base}/models"));
-    if let Some(api_key) = api_key {
-        if !api_key.trim().is_empty() {
-            request = request.bearer_auth(api_key);
-        }
+    if let Some(api_key) = api_key
+        && !api_key.trim().is_empty()
+    {
+        request = request.bearer_auth(api_key);
     }
 
     let payload = request.send().await?.error_for_status()?.text().await?;

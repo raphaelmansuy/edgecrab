@@ -347,30 +347,30 @@ fn check_mcp_servers() -> Vec<Check> {
 /// misconfiguration early so the user isn't left with a silent MockProvider fallback.
 fn check_vertexai_adc() -> Check {
     // 1. Is GOOGLE_CLOUD_PROJECT already set in environment?
-    if let Ok(project) = std::env::var("GOOGLE_CLOUD_PROJECT") {
-        if !project.is_empty() {
-            // 2. Verify ADC credentials file exists
-            let adc_file = dirs_home().map(|h| {
-                h.join(".config")
-                    .join("gcloud")
-                    .join("application_default_credentials.json")
-            });
-            let adc_ok = adc_file.as_ref().map(|p| p.exists()).unwrap_or(false);
-            return if adc_ok {
-                Check::pass(
-                    "VertexAI ADC",
-                    format!("project={project}, ADC credentials found — ready"),
-                )
-            } else {
-                Check::warn(
-                    "VertexAI ADC",
-                    format!(
-                        "project={project} set but no ADC credentials found; \
+    if let Ok(project) = std::env::var("GOOGLE_CLOUD_PROJECT")
+        && !project.is_empty()
+    {
+        // 2. Verify ADC credentials file exists
+        let adc_file = dirs_home().map(|h| {
+            h.join(".config")
+                .join("gcloud")
+                .join("application_default_credentials.json")
+        });
+        let adc_ok = adc_file.as_ref().map(|p| p.exists()).unwrap_or(false);
+        return if adc_ok {
+            Check::pass(
+                "VertexAI ADC",
+                format!("project={project}, ADC credentials found — ready"),
+            )
+        } else {
+            Check::warn(
+                "VertexAI ADC",
+                format!(
+                    "project={project} set but no ADC credentials found; \
                          run `gcloud auth application-default login`"
-                    ),
-                )
-            };
-        }
+                ),
+            )
+        };
     }
 
     // 3. Try gcloud config to detect the project

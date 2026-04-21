@@ -339,6 +339,8 @@ async fn e2e_agent_streaming_with_copilot() {
                 // Abort any unexpected secret request so the agent doesn't hang.
                 let _ = response_tx.send(String::new());
             }
+            StreamEvent::SteerPending { .. } => {} // steering notification — not relevant in this test
+            StreamEvent::SteerApplied { .. } => {} // steering applied — not relevant in this test
         }
     }
 

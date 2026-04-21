@@ -172,21 +172,20 @@ async fn execute_replace_patch(args: ReplaceArgs, ctx: &ToolContext) -> Result<S
 
     // R17: Atomic TOCTOU re-check — confirm the file has not been modified by
     // another process in the window between our read and the upcoming write.
-    if let Some((size_at_read, mtime_at_read)) = pre_write_snap {
-        if let Ok(current) = tokio::fs::metadata(&resolved).await {
-            let changed = current.len() != size_at_read
-                || current.modified().ok() != mtime_at_read;
-            if changed {
-                return Err(ToolError::ContentMismatch {
-                    tool: "patch".into(),
-                    path: args.path.clone(),
-                    message: format!(
-                        "'{}' was modified by another process between read and write (TOCTOU). \
+    if let Some((size_at_read, mtime_at_read)) = pre_write_snap
+        && let Ok(current) = tokio::fs::metadata(&resolved).await
+    {
+        let changed = current.len() != size_at_read || current.modified().ok() != mtime_at_read;
+        if changed {
+            return Err(ToolError::ContentMismatch {
+                tool: "patch".into(),
+                path: args.path.clone(),
+                message: format!(
+                    "'{}' was modified by another process between read and write (TOCTOU). \
                          Re-read the file with read_file and retry the patch.",
-                        args.path
-                    ),
-                });
-            }
+                    args.path
+                ),
+            });
         }
     }
 
@@ -431,10 +430,10 @@ fn parse_v4a(patch: &str) -> (Vec<V4AOp>, Option<String>) {
         // ── Hunk header (@@ ... @@) ──────────────────────────────────
         if line.starts_with("@@") {
             if let Some(ref mut op) = current_op {
-                if let Some(h) = current_hunk.take() {
-                    if !h.lines.is_empty() {
-                        op.hunks.push(h);
-                    }
+                if let Some(h) = current_hunk.take()
+                    && !h.lines.is_empty()
+                {
+                    op.hunks.push(h);
                 }
                 let hint = line
                     .trim_start_matches('@')
@@ -479,10 +478,10 @@ fn parse_v4a(patch: &str) -> (Vec<V4AOp>, Option<String>) {
 /// Flush the current in-progress operation into the ops list.
 fn flush_op(current_op: &mut Option<V4AOp>, current_hunk: &mut Option<Hunk>, ops: &mut Vec<V4AOp>) {
     if let Some(mut op) = current_op.take() {
-        if let Some(h) = current_hunk.take() {
-            if !h.lines.is_empty() {
-                op.hunks.push(h);
-            }
+        if let Some(h) = current_hunk.take()
+            && !h.lines.is_empty()
+        {
+            op.hunks.push(h);
         }
         ops.push(op);
     }
@@ -523,19 +522,19 @@ fn apply_update_hunk(content: &str, hunk: &Hunk) -> Result<String, String> {
         // Pure-addition hunk with no context.  Use context hint to locate
         // insertion point (after the line containing the hint), or append.
         let insert_text = replace_lines.join("\n");
-        if let Some(ref hint) = hunk.context_hint {
-            if let Some(pos) = content.find(hint.as_str()) {
-                let eol = content[pos..]
-                    .find('\n')
-                    .map(|o| pos + o + 1)
-                    .unwrap_or(content.len());
-                return Ok(format!(
-                    "{}{}\n{}",
-                    &content[..eol],
-                    insert_text,
-                    &content[eol..]
-                ));
-            }
+        if let Some(ref hint) = hunk.context_hint
+            && let Some(pos) = content.find(hint.as_str())
+        {
+            let eol = content[pos..]
+                .find('\n')
+                .map(|o| pos + o + 1)
+                .unwrap_or(content.len());
+            return Ok(format!(
+                "{}{}\n{}",
+                &content[..eol],
+                insert_text,
+                &content[eol..]
+            ));
         }
         return Ok(format!("{content}\n{insert_text}"));
     }
@@ -550,23 +549,23 @@ fn apply_update_hunk(content: &str, hunk: &Hunk) -> Result<String, String> {
     }
     if count > 1 {
         // Multiple matches: use context hint to choose the closest occurrence.
-        if let Some(hint) = hunk.context_hint.as_deref() {
-            if let Some(hint_pos) = content.find(hint) {
-                let occurrences: Vec<usize> = content
-                    .match_indices(search.as_str())
-                    .map(|(idx, _)| idx)
-                    .collect();
-                if !occurrences.is_empty() {
-                    let chosen = occurrences
-                        .iter()
-                        .copied()
-                        .find(|idx| *idx >= hint_pos)
-                        .or_else(|| occurrences.last().copied())
-                        .expect("occurrence exists");
-                    let before = &content[..chosen];
-                    let after = &content[chosen + search.len()..];
-                    return Ok(format!("{before}{replacement}{after}"));
-                }
+        if let Some(hint) = hunk.context_hint.as_deref()
+            && let Some(hint_pos) = content.find(hint)
+        {
+            let occurrences: Vec<usize> = content
+                .match_indices(search.as_str())
+                .map(|(idx, _)| idx)
+                .collect();
+            if !occurrences.is_empty() {
+                let chosen = occurrences
+                    .iter()
+                    .copied()
+                    .find(|idx| *idx >= hint_pos)
+                    .or_else(|| occurrences.last().copied())
+                    .expect("occurrence exists");
+                let before = &content[..chosen];
+                let after = &content[chosen + search.len()..];
+                return Ok(format!("{before}{replacement}{after}"));
             }
         }
         return Err(format!(
@@ -778,11 +777,11 @@ async fn execute_v4a_patch(patch_text: &str, ctx: &ToolContext) -> Result<String
                     .collect();
                 let content = content_lines.join("\n");
 
-                if let Some(parent) = resolved.parent() {
-                    if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                        errors.push(format!("Cannot create dirs for '{}': {}", op.file_path, e));
-                        break;
-                    }
+                if let Some(parent) = resolved.parent()
+                    && let Err(e) = tokio::fs::create_dir_all(parent).await
+                {
+                    errors.push(format!("Cannot create dirs for '{}': {}", op.file_path, e));
+                    break;
                 }
                 if let Err(e) = tokio::fs::write(resolved, &content).await {
                     errors.push(format!("Cannot write '{}': {}", op.file_path, e));
@@ -979,7 +978,10 @@ mod tests {
             .await
             .expect("patch");
 
-        assert!(result.contains("\"ok\":true") || result.contains("\"ok\": true"), "expected JSON ok result, got: {result}");
+        assert!(
+            result.contains("\"ok\":true") || result.contains("\"ok\": true"),
+            "expected JSON ok result, got: {result}"
+        );
         let content = std::fs::read_to_string(dir.path().join("code.rs")).expect("read");
         assert!(content.contains("println!(\"new\")"));
         assert!(!content.contains("println!(\"old\")"));
@@ -1051,7 +1053,14 @@ mod tests {
         assert_eq!(schema.parameters["additionalProperties"], false);
         assert_eq!(
             schema.parameters["required"],
-            json!(["mode", "path", "old_string", "new_string", "replace_all", "patch"])
+            json!([
+                "mode",
+                "path",
+                "old_string",
+                "new_string",
+                "replace_all",
+                "patch"
+            ])
         );
         assert_eq!(
             schema.parameters["properties"]["path"]["type"],
@@ -1327,7 +1336,10 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&result).expect("JSON result");
         assert_eq!(v["ok"], true, "Got: {result}");
         assert!(
-            v["created"].as_array().map(|a| !a.is_empty()).unwrap_or(false),
+            v["created"]
+                .as_array()
+                .map(|a| !a.is_empty())
+                .unwrap_or(false),
             "Expected non-empty 'created' array, got: {result}"
         );
         let content = std::fs::read_to_string(dir.path().join("hello.txt")).expect("read");
@@ -1349,7 +1361,10 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&result).expect("JSON result");
         assert_eq!(v["ok"], true, "Got: {result}");
         assert!(
-            v["deleted"].as_array().map(|a| !a.is_empty()).unwrap_or(false),
+            v["deleted"]
+                .as_array()
+                .map(|a| !a.is_empty())
+                .unwrap_or(false),
             "Expected non-empty 'deleted' array, got: {result}"
         );
         assert!(!dir.path().join("remove_me.txt").exists());
@@ -1434,7 +1449,10 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&result).expect("JSON result");
         assert_eq!(v["ok"], true, "Got: {result}");
         assert!(
-            v["modified"].as_array().map(|a| !a.is_empty()).unwrap_or(false),
+            v["modified"]
+                .as_array()
+                .map(|a| !a.is_empty())
+                .unwrap_or(false),
             "Expected non-empty 'modified' array, got: {result}"
         );
         let content = std::fs::read_to_string(dir.path().join("greet.py")).expect("read");

@@ -300,15 +300,15 @@ fn parse_file_ref(s: &str) -> (&str, Option<usize>, Option<usize>) {
                 let start_str = &suffix[..dash];
                 let end_str = &suffix[dash + 1..];
                 if let (Ok(start), Ok(end)) = (start_str.parse::<usize>(), end_str.parse::<usize>())
+                    && start > 0
+                    && end >= start
                 {
-                    if start > 0 && end >= start {
-                        return (path_part, Some(start), Some(end));
-                    }
+                    return (path_part, Some(start), Some(end));
                 }
-            } else if let Ok(line) = suffix.parse::<usize>() {
-                if line > 0 {
-                    return (path_part, Some(line), Some(line));
-                }
+            } else if let Ok(line) = suffix.parse::<usize>()
+                && line > 0
+            {
+                return (path_part, Some(line), Some(line));
             }
         }
     }

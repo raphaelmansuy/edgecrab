@@ -77,14 +77,14 @@ impl<T: Clone + FuzzyItem> FuzzySelector<T> {
         self.update_filter();
         self.active = was_active;
 
-        if let Some(primary) = selected_primary {
-            if let Some(pos) = self.filtered.iter().position(|&idx| {
+        if let Some(primary) = selected_primary
+            && let Some(pos) = self.filtered.iter().position(|&idx| {
                 self.items
                     .get(idx)
                     .is_some_and(|item| item.primary() == primary)
-            }) {
-                self.selected = pos;
-            }
+            })
+        {
+            self.selected = pos;
         }
     }
 
@@ -95,14 +95,13 @@ impl<T: Clone + FuzzyItem> FuzzySelector<T> {
         self.selected = 0;
         self.active = true;
         self.update_filter();
-        if !primary.is_empty() {
-            if let Some(pos) = self
+        if !primary.is_empty()
+            && let Some(pos) = self
                 .filtered
                 .iter()
                 .position(|&idx| self.items.get(idx).is_some_and(|i| i.primary() == primary))
-            {
-                self.selected = pos;
-            }
+        {
+            self.selected = pos;
         }
     }
 

@@ -386,10 +386,10 @@ async fn send_oauth_form(
         if let Some(client_id) = oauth.client_id() {
             params.push(("client_id".into(), client_id.to_string()));
         }
-        if oauth.uses_post_auth() {
-            if let Some(client_secret) = oauth.client_secret() {
-                params.push(("client_secret".into(), client_secret.to_string()));
-            }
+        if oauth.uses_post_auth()
+            && let Some(client_secret) = oauth.client_secret()
+        {
+            params.push(("client_secret".into(), client_secret.to_string()));
         }
     }
 

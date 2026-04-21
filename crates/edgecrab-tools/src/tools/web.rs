@@ -162,10 +162,10 @@ fn extract_meta_description(html: &str) -> Option<String> {
 
 fn focus_html_fragment(html: &str) -> String {
     for re in [main_re(), article_re(), body_re()] {
-        if let Some(captures) = re.captures(html) {
-            if let Some(fragment) = captures.get(1) {
-                return fragment.as_str().to_string();
-            }
+        if let Some(captures) = re.captures(html)
+            && let Some(fragment) = captures.get(1)
+        {
+            return fragment.as_str().to_string();
         }
     }
     html.to_string()
@@ -1428,15 +1428,13 @@ async fn crawl_via_firecrawl(
     if let Some(instructions) = instructions {
         payload["prompt"] = serde_json::Value::String(instructions.to_string());
     }
-    if same_path_only {
-        if let Some(patterns) = firecrawl_same_path_patterns(start_url) {
-            payload["includePaths"] = serde_json::Value::Array(
-                patterns
-                    .into_iter()
-                    .map(serde_json::Value::String)
-                    .collect(),
-            );
-        }
+    if same_path_only && let Some(patterns) = firecrawl_same_path_patterns(start_url) {
+        payload["includePaths"] = serde_json::Value::Array(
+            patterns
+                .into_iter()
+                .map(serde_json::Value::String)
+                .collect(),
+        );
     }
 
     let started =

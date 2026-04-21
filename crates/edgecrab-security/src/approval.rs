@@ -115,20 +115,20 @@ impl ApprovalPolicy {
         }
 
         // Check 2: Terminal command scanning
-        if tool_name == "terminal" || tool_name == "shell" {
-            if let Some(cmd) = args.get("command").and_then(|v| v.as_str()) {
-                let result = self.scanner.scan(cmd);
-                if result.is_dangerous {
-                    for m in &result.matched_patterns {
-                        reasons.push(format!("{}: {}", m.category_label(), m.description));
-                    }
-                    // Check if already approved — clear reasons if so
-                    if self.is_approved(cmd, session_id) {
-                        reasons.clear();
-                    }
+        if (tool_name == "terminal" || tool_name == "shell")
+            && let Some(cmd) = args.get("command").and_then(|v| v.as_str())
+        {
+            let result = self.scanner.scan(cmd);
+            if result.is_dangerous {
+                for m in &result.matched_patterns {
+                    reasons.push(format!("{}: {}", m.category_label(), m.description));
                 }
-                scan_result = Some(result);
+                // Check if already approved — clear reasons if so
+                if self.is_approved(cmd, session_id) {
+                    reasons.clear();
+                }
             }
+            scan_result = Some(result);
         }
 
         ApprovalCheck {
@@ -167,15 +167,15 @@ impl ApprovalPolicy {
     /// Check if a command is already approved (session or permanent).
     fn is_approved(&self, command: &str, session_id: &str) -> bool {
         let keys = self.approval_keys_for_command(command);
-        if let Ok(set) = self.permanent_allowlist.read() {
-            if keys.iter().any(|k| set.contains(k)) {
-                return true;
-            }
+        if let Ok(set) = self.permanent_allowlist.read()
+            && keys.iter().any(|k| set.contains(k))
+        {
+            return true;
         }
-        if let Ok(map) = self.session_approved.read() {
-            if let Some(cmds) = map.get(session_id) {
-                return keys.iter().any(|k| cmds.contains(k));
-            }
+        if let Ok(map) = self.session_approved.read()
+            && let Some(cmds) = map.get(session_id)
+        {
+            return keys.iter().any(|k| cmds.contains(k));
         }
         false
     }

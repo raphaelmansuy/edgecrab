@@ -1321,13 +1321,10 @@ impl OpenClawMigrator {
             let destination = self
                 .archive_dir()
                 .join(relative_label(&source, &self.source_root));
-            if self.options.execute {
-                if let Err(error) = copy_path(&source, &destination) {
-                    return MigrationItem::failed(
-                        "archive",
-                        &format!("archive copy failed: {error}"),
-                    );
-                }
+            if self.options.execute
+                && let Err(error) = copy_path(&source, &destination)
+            {
+                return MigrationItem::failed("archive", &format!("archive copy failed: {error}"));
             }
             archived += 1;
         }

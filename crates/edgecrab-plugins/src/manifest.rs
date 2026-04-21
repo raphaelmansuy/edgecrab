@@ -207,28 +207,28 @@ fn validate_plugin_manifest(path: &Path, manifest: &PluginManifest) -> Result<()
     if manifest.plugin.description.trim().is_empty() || manifest.plugin.description.len() > 256 {
         return invalid_manifest(path, "plugin.description must be 1..=256 characters");
     }
-    if let Some(homepage) = manifest.plugin.homepage.as_deref() {
-        if !homepage.starts_with("https://") {
-            return invalid_manifest(path, "plugin.homepage must use https");
-        }
+    if let Some(homepage) = manifest.plugin.homepage.as_deref()
+        && !homepage.starts_with("https://")
+    {
+        return invalid_manifest(path, "plugin.homepage must use https");
     }
 
-    if let Some(trust) = manifest.trust.as_ref() {
-        if matches!(trust.level, TrustLevel::Official | TrustLevel::Trusted) {
-            let installer_stamped = trust
-                .source
-                .as_deref()
-                .is_some_and(|source| !source.trim().is_empty())
-                && manifest
-                    .integrity
-                    .as_ref()
-                    .is_some_and(|integrity| !integrity.checksum.trim().is_empty());
-            if !installer_stamped {
-                return invalid_manifest(
-                    path,
-                    "plugin.toml cannot self-assign official or trusted trust level",
-                );
-            }
+    if let Some(trust) = manifest.trust.as_ref()
+        && matches!(trust.level, TrustLevel::Official | TrustLevel::Trusted)
+    {
+        let installer_stamped = trust
+            .source
+            .as_deref()
+            .is_some_and(|source| !source.trim().is_empty())
+            && manifest
+                .integrity
+                .as_ref()
+                .is_some_and(|integrity| !integrity.checksum.trim().is_empty());
+        if !installer_stamped {
+            return invalid_manifest(
+                path,
+                "plugin.toml cannot self-assign official or trusted trust level",
+            );
         }
     }
 
