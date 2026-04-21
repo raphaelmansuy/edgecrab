@@ -982,11 +982,11 @@ mod tests {
     fn surfaces_file_edit_completions_but_not_generic_searches() {
         assert!(should_surface_tool_completion(
             "write_file",
-            "Wrote 42 bytes to 'src/main.rs'"
+            r#"{"ok":true,"action":"create","bytes":42,"path":"src/main.rs"}"#
         ));
         assert!(should_surface_tool_completion(
             "apply_patch",
-            "Patched 'src/lib.rs': 2 replacement(s)"
+            r#"{"ok":true,"replacements":2,"before_bytes":10,"after_bytes":15,"path":"src/lib.rs"}"#
         ));
         assert!(!should_surface_tool_completion(
             "web_search",
