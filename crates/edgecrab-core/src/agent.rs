@@ -29,7 +29,9 @@ use edgecrab_tools::ProcessTable;
 use edgecrab_tools::TodoStore;
 use edgecrab_tools::config_ref::{AppConfigRef, LspServerConfigRef};
 use edgecrab_tools::registry::{GatewaySender, ToolInventoryEntry, ToolRegistry};
-use edgecrab_types::{AgentError, ApiMode, Cost, Message, OriginChat, Platform, Role, Usage};
+use edgecrab_types::{
+    AgentError, ApiMode, Cost, Message, OriginChat, Platform, Role, RunOutcome, Usage,
+};
 use edgequake_llm::LLMProvider;
 
 use crate::config::AppConfig;
@@ -194,6 +196,8 @@ pub struct AgentConfig {
     pub result_spill_threshold: usize,
     /// Preview lines kept in the spill stub.
     pub result_spill_preview_lines: usize,
+    /// Maximum write payload KiB (None = use default 32 KiB).
+    pub max_write_payload_kib: Option<u32>,
 }
 
 impl Default for AgentConfig {
@@ -249,6 +253,7 @@ impl Default for AgentConfig {
             result_spill: true,
             result_spill_threshold: 16_384,
             result_spill_preview_lines: 80,
+            max_write_payload_kib: None,
         }
     }
 }
@@ -387,6 +392,10 @@ impl AgentConfig {
             result_spill: self.result_spill,
             result_spill_threshold: self.result_spill_threshold,
             result_spill_preview_lines: self.result_spill_preview_lines,
+            max_write_payload_kib: self.max_write_payload_kib.map_or(
+                edgecrab_tools::edit_contract::DEFAULT_MAX_MUTATION_PAYLOAD_KIB,
+                |kib| kib as usize,
+            ),
             gateway_running,
             ..Default::default()
         }
@@ -420,7 +429,16 @@ pub struct SessionState {
     /// runtime. Once observed, repeating the same request wastes latency and
     /// spams users with avoidable 400s. Plain text streaming still remains on.
     pub native_tool_streaming_disabled: bool,
+    /// Terminal harness outcome for the most recent completed run.
+    pub last_run_outcome: Option<RunOutcome>,
     pub session_tool_call_count: u32,
+    /// True after the first successful context compression in this session.
+    ///
+    /// FP33: After the first compression fires, we append a one-shot note to
+    /// `cached_system_prompt` informing the model that earlier turns have been
+    /// compacted.  Subsequent compressions do NOT modify the system prompt so
+    /// that Anthropic's prompt cache breakpoints remain stable.
+    pub first_compression_done: bool,
 }
 
 /// Lock-free iteration budget — prevents runaway tool loops.
@@ -486,6 +504,8 @@ pub struct ConversationResult {
     /// True when the iteration budget was exhausted before the LLM produced
     /// a final text response. Distinct from `interrupted` (user Ctrl+C).
     pub budget_exhausted: bool,
+    /// Authoritative terminal state for the run.
+    pub run_outcome: RunOutcome,
     pub model: String,
     pub usage: Usage,
     pub cost: Cost,
@@ -929,6 +949,11 @@ impl Agent {
         self.session.read().await.cached_system_prompt.clone()
     }
 
+    /// Terminal outcome for the most recent completed run, if any.
+    pub async fn last_run_outcome(&self) -> Option<RunOutcome> {
+        self.session.read().await.last_run_outcome.clone()
+    }
+
     pub async fn custom_system_prompt(&self) -> Option<String> {
         self.config.read().await.custom_system_prompt.clone()
     }
@@ -1057,9 +1082,10 @@ impl Agent {
         // Pass None for spill context in force_compress — this is a manual /compress
         // command and we don't have a cwd/session_id readily available. Tool results
         // are still pruned with the generic placeholder, which is fine for /compress.
-        session.messages =
+        let (compressed, _llm_succeeded) =
             crate::compression::compress_with_llm(&session.messages, &params, &provider, None)
                 .await;
+        session.messages = compressed;
     }
 
     /// Set the session title (persisted on next DB write).
@@ -1483,7 +1509,9 @@ pub enum StreamEvent {
         api_calls: u32,
         model: Option<String>,
     },
-    /// The response is complete.
+    /// The run has finished and the harness has assessed the terminal state.
+    RunFinished { outcome: RunOutcome },
+    /// The response transport is complete.
     Done,
     /// An error occurred — the response is incomplete.
     Error(String),
@@ -1615,6 +1643,11 @@ impl std::fmt::Debug for StreamEvent {
                 task_count,
                 status,
                 duration_ms
+            ),
+            Self::RunFinished { outcome } => write!(
+                f,
+                "RunFinished(state={:?}, exit_reason={:?})",
+                outcome.state, outcome.exit_reason
             ),
             Self::Done => write!(f, "Done"),
             Self::Error(e) => write!(f, "Error({e:?})"),
@@ -1749,6 +1782,7 @@ impl AgentBuilder {
                 result_spill: config.tools.result_spill,
                 result_spill_threshold: config.tools.result_spill_threshold,
                 result_spill_preview_lines: config.tools.result_spill_preview_lines,
+                max_write_payload_kib: config.tools.file.max_write_payload_kib,
                 ..Default::default()
             },
             provider: None,
@@ -2650,5 +2684,47 @@ def register(ctx):
             agent.system_prompt().await.as_deref(),
             Some("Persisted system prompt")
         );
+    }
+
+    // ── FP31: cache_write_tokens on LLMResponse ───────────────────────
+
+    #[test]
+    fn llm_response_cache_write_tokens_defaults_to_none() {
+        let r = edgequake_llm::LLMResponse::new("hello", "test-model");
+        assert!(
+            r.cache_write_tokens.is_none(),
+            "cache_write_tokens must default to None"
+        );
+    }
+
+    #[test]
+    fn llm_response_cache_write_tokens_builder() {
+        let r = edgequake_llm::LLMResponse::new("hello", "test-model").with_cache_write_tokens(42);
+        assert_eq!(r.cache_write_tokens, Some(42));
+    }
+
+    #[test]
+    fn stream_usage_cache_write_tokens_builder() {
+        use edgequake_llm::traits::StreamUsage;
+        let u = StreamUsage::new(10, 5).with_cache_write_tokens(99);
+        assert_eq!(u.cache_write_tokens, Some(99));
+    }
+
+    // ── FP33: first_compression_done on SessionState ──────────────────
+
+    #[test]
+    fn session_state_first_compression_done_defaults_false() {
+        let s = SessionState::default();
+        assert!(
+            !s.first_compression_done,
+            "first_compression_done must start as false"
+        );
+    }
+
+    #[test]
+    fn session_state_first_compression_done_can_be_set() {
+        let mut s = SessionState::default();
+        s.first_compression_done = true;
+        assert!(s.first_compression_done);
     }
 }

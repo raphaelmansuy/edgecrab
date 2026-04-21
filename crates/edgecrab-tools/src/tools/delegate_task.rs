@@ -269,19 +269,13 @@ async fn run_child_task(parent_ctx: &ToolContext, request: ChildTaskRequest) -> 
         Ok(result) => {
             let duration = start.elapsed().as_secs_f64();
             let summary = result.summary.trim().to_string();
-            let status = if result.interrupted {
-                "interrupted"
-            } else if !summary.is_empty() {
-                "completed"
-            } else {
-                "failed"
-            };
+            let status = result.run_outcome.state.as_str().to_string();
             let duration_ms = start.elapsed().as_millis() as u64;
             if let Some(tx) = &parent_ctx.delegation_event_tx {
                 let _ = tx.send(DelegationEvent::TaskFinished {
                     task_index,
                     task_count,
-                    status: status.to_string(),
+                    status: status.clone(),
                     duration_ms,
                     summary: summary.clone(),
                     api_calls: result.api_calls,
@@ -289,15 +283,7 @@ async fn run_child_task(parent_ctx: &ToolContext, request: ChildTaskRequest) -> 
                 });
             }
 
-            let exit_reason = if result.interrupted {
-                "interrupted"
-            } else if result.budget_exhausted {
-                "max_iterations"
-            } else if !summary.is_empty() {
-                "completed"
-            } else {
-                "failed"
-            };
+            let exit_reason = result.run_outcome.exit_reason.as_str();
             let tool_trace = build_tool_trace(&result.messages);
             json!({
                 "task_index": task_index,
@@ -638,8 +624,17 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
+    use edgecrab_types::{CompletionDecision, ExitReason, RunOutcome};
 
     use crate::registry::{SubAgentResult, SubAgentRunRequest, SubAgentRunner};
+
+    fn completed_outcome(summary: &str) -> RunOutcome {
+        RunOutcome::new(
+            CompletionDecision::Completed,
+            ExitReason::ModelReturnedFinalText,
+            summary,
+        )
+    }
 
     #[derive(Default, Clone)]
     struct RecordedCall {
@@ -674,6 +669,7 @@ mod tests {
                 model: Some("mock/model".into()),
                 interrupted: false,
                 budget_exhausted: false,
+                run_outcome: completed_outcome("ok"),
                 messages: Vec::new(),
             })
         }
@@ -889,6 +885,7 @@ mod tests {
                     model: Some("test/model".into()),
                     interrupted: false,
                     budget_exhausted: false,
+                    run_outcome: completed_outcome("done"),
                     messages: vec![
                         Message::assistant_with_tool_calls(
                             "",
@@ -920,7 +917,7 @@ mod tests {
         let entry = &parsed["results"][0];
 
         assert_eq!(entry["model"], "test/model");
-        assert_eq!(entry["exit_reason"], "completed");
+        assert_eq!(entry["exit_reason"], "model_returned_final_text");
         assert_eq!(entry["tokens"]["input"], 42);
         assert_eq!(entry["tokens"]["output"], 7);
         assert_eq!(entry["tokens"]["cache_read"], 11);
@@ -982,6 +979,7 @@ mod tests {
                     model: Some("mock/model".into()),
                     interrupted: false,
                     budget_exhausted: false,
+                    run_outcome: completed_outcome("done"),
                     messages: Vec::new(),
                 })
             }

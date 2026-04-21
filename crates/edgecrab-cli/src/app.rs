@@ -82,7 +82,8 @@ use crate::theme::{SkinConfig, Theme};
 use crate::tool_display::{
     DisplayWidths, build_context_gauge, build_subagent_done_line_width,
     build_subagent_running_line_width, build_tool_done_line_width, build_tool_running_line_width,
-    build_tool_verbose_lines_width, tool_action_verb, tool_icon, tool_signature,
+    build_tool_running_line_width_elapsed,
+    build_tool_verbose_lines_width, tool_action_verb, tool_category, tool_icon, tool_signature,
     tool_status_preview, tool_status_preview_width,
 };
 use crate::vision_models::{
@@ -157,6 +158,71 @@ fn compact_spinner_frame(frame_idx: usize, glyphs: TerminalGlyphProfile) -> &'st
     match glyphs {
         TerminalGlyphProfile::Unicode => SPINNER_FRAMES[frame_idx % SPINNER_FRAMES.len()],
         TerminalGlyphProfile::Ascii => ASCII_SPINNER_FRAMES[frame_idx % ASCII_SPINNER_FRAMES.len()],
+    }
+}
+
+/// Estimate word count from a character count.
+///
+/// Uses a ~4.5-char-per-word average and buckets to the nearest 10 words to
+/// prevent the status bar from flickering on every token. Returns 0 when fewer
+/// than 20 chars have been written (avoids a misleading "~5 words" flash at
+/// session start).
+fn words_estimate(chars: u64) -> u64 {
+    if chars < 20 {
+        return 0;
+    }
+    let raw = (chars as f64 / 4.5) as u64;
+    // Bucket to nearest 10 words for display stability.
+    (raw / 10) * 10
+}
+
+/// Format a duration as an elapsed-time hint for the status bar.
+///
+/// Only returns a non-empty string once `threshold_secs` have elapsed, so the
+/// hint doesn't appear on short interactions. Used by both the `Streaming` and
+/// `ToolExec` status-bar arms, keeping their behaviour consistent (DRY).
+fn format_elapsed_hint(elapsed: std::time::Duration, threshold_secs: u64) -> String {
+    let secs = elapsed.as_secs();
+    if secs >= threshold_secs {
+        format!("  {}s", secs)
+    } else {
+        String::new()
+    }
+}
+
+/// Extract the most recent markdown heading from a streaming token.
+///
+/// Looks for `\n# ` or `\n## ` patterns in the token text (and detects
+/// headings that start at the beginning of the first token with `# `).
+/// Updates `current_section` in-place when a heading is found. Heading text is
+/// truncated to 30 chars for status bar width safety.
+fn extract_streaming_section(token: &str, current_section: &mut Option<String>) {
+    // We scan the token for newline-prefixed heading markers.
+    // Handles both mid-stream cases ("\n## Title") and first-token start ("# Title").
+    let candidates: &[&str] = &["\n### ", "\n## ", "\n# ", "### ", "## ", "# "];
+    for marker in candidates {
+        if let Some(pos) = token.find(marker) {
+            let heading_start = pos + marker.len();
+            // Only treat as heading if at start of token or preceded by newline.
+            let valid_start =
+                pos == 0 || token.as_bytes().get(pos.saturating_sub(1)).copied() == Some(b'\n');
+            if !valid_start {
+                continue;
+            }
+            let rest = &token[heading_start..];
+            let heading: String = rest
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .chars()
+                .take(30)
+                .collect();
+            if !heading.is_empty() {
+                *current_section = Some(heading);
+                return;
+            }
+        }
     }
 }
 
@@ -583,6 +649,14 @@ async fn forward_stream_event_to_tui(
                 model,
             });
         }
+        StreamEvent::RunFinished { outcome } => {
+            tracing::info!(
+                state = outcome.state.as_str(),
+                exit_reason = outcome.exit_reason.as_str(),
+                "TUI→agent: forwarding run outcome"
+            );
+            let _ = tx.send(AgentResponse::RunFinished { outcome });
+        }
         StreamEvent::Done => {
             *saw_terminal_event = true;
             tracing::info!("TUI→agent: forwarding done");
@@ -929,6 +1003,7 @@ fn selector_marker(is_selected: bool, accent: Color, bg: Option<Color>) -> Span<
 
 const SESSION_BROWSER_LIMIT: usize = 250;
 const SESSION_BROWSER_SEARCH_LIMIT: usize = 120;
+const STOP_HOOK_AUTO_PREFIX: &str = "[edgecrab:stop-hook] ";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 enum SplitPaneFocus {
@@ -992,6 +1067,198 @@ fn format_context_pressure_notice(estimated_tokens: usize, threshold_tokens: usi
     format!(
         "⚠ Context {bar} {percent}% to compression ({estimated_tokens}/{threshold_tokens} tokens)"
     )
+}
+
+fn format_run_outcome_notice(outcome: &edgecrab_types::RunOutcome) -> String {
+    let headline = format!("{} {}", outcome.state.emoji(), outcome.state.headline());
+
+    let mut lines = vec![headline.clone()];
+    let summary = outcome.user_summary.trim();
+    if !summary.is_empty() && summary != headline && summary != outcome.state.headline() {
+        lines.push(summary.to_string());
+    }
+    if let Some(hint) = outcome.state.operator_hint() {
+        lines.push(hint.to_string());
+    }
+    if outcome.active_tasks > 0 || outcome.blocked_tasks > 0 {
+        lines.push(format!(
+            "Tasks remaining: {} active, {} blocked.",
+            outcome.active_tasks, outcome.blocked_tasks
+        ));
+    }
+    if let Some(evidence) = outcome.evidence.iter().find(|item| !item.trim().is_empty()) {
+        lines.push(format!(
+            "Evidence: {}",
+            edgecrab_core::safe_truncate(evidence, 120)
+        ));
+    }
+    lines.join("\n")
+}
+
+fn run_outcome_badge_style(outcome: &edgecrab_types::RunOutcome) -> Style {
+    match outcome.state {
+        edgecrab_types::CompletionDecision::Completed => Style::default()
+            .fg(Color::Rgb(12, 28, 20))
+            .bg(Color::Rgb(108, 220, 155))
+            .add_modifier(Modifier::BOLD),
+        edgecrab_types::CompletionDecision::NeedsUserInput
+        | edgecrab_types::CompletionDecision::Blocked
+        | edgecrab_types::CompletionDecision::NeedsVerification => Style::default()
+            .fg(Color::Rgb(36, 24, 10))
+            .bg(Color::Rgb(255, 204, 92))
+            .add_modifier(Modifier::BOLD),
+        edgecrab_types::CompletionDecision::BudgetExhausted
+        | edgecrab_types::CompletionDecision::Incomplete => Style::default()
+            .fg(Color::Rgb(40, 22, 8))
+            .bg(Color::Rgb(255, 170, 90))
+            .add_modifier(Modifier::BOLD),
+        edgecrab_types::CompletionDecision::Interrupted
+        | edgecrab_types::CompletionDecision::Failed => Style::default()
+            .fg(Color::Rgb(38, 12, 12))
+            .bg(Color::Rgb(255, 120, 120))
+            .add_modifier(Modifier::BOLD),
+    }
+}
+
+fn format_task_status_progress_notice(preview: &str) -> String {
+    let trimmed = preview.trim();
+    let lower = trimmed.to_ascii_lowercase();
+
+    if let Some(rest) = trimmed.split_once(':').map(|(_, rest)| rest.trim()) {
+        if lower.starts_with("completed:") {
+            return format!("✅ Milestone reached — {rest}");
+        }
+        if lower.starts_with("blocked:") {
+            return format!("⏸ Progress blocked — {rest}");
+        }
+        if lower.starts_with("progress:") {
+            return format!("📍 Progress update — {rest}");
+        }
+    }
+
+    format!("📍 Progress update — {trimmed}")
+}
+
+fn run_outcome_role(outcome: &edgecrab_types::RunOutcome) -> OutputRole {
+    match outcome.state {
+        edgecrab_types::CompletionDecision::Completed => OutputRole::System,
+        edgecrab_types::CompletionDecision::NeedsUserInput
+        | edgecrab_types::CompletionDecision::Blocked
+        | edgecrab_types::CompletionDecision::Incomplete
+        | edgecrab_types::CompletionDecision::NeedsVerification => OutputRole::System,
+        edgecrab_types::CompletionDecision::BudgetExhausted
+        | edgecrab_types::CompletionDecision::Interrupted
+        | edgecrab_types::CompletionDecision::Failed => OutputRole::Error,
+    }
+}
+
+fn stop_hook_event_name(outcome: &edgecrab_types::RunOutcome) -> &'static str {
+    match outcome.state {
+        edgecrab_types::CompletionDecision::Completed => "agent:task_completed",
+        edgecrab_types::CompletionDecision::NeedsUserInput => "agent:needs_input",
+        edgecrab_types::CompletionDecision::Blocked => "agent:task_blocked",
+        edgecrab_types::CompletionDecision::NeedsVerification => "agent:needs_verification",
+        edgecrab_types::CompletionDecision::BudgetExhausted => "agent:budget_exhausted",
+        edgecrab_types::CompletionDecision::Interrupted => "agent:interrupted",
+        edgecrab_types::CompletionDecision::Failed => "agent:failed",
+        edgecrab_types::CompletionDecision::Incomplete => "agent:task_incomplete",
+    }
+}
+
+fn build_run_outcome_hook_context(
+    event: &str,
+    outcome: &edgecrab_types::RunOutcome,
+) -> edgecrab_gateway::hooks::HookContext {
+    edgecrab_gateway::hooks::HookContext::new(event)
+        .with_platform("cli")
+        .with_str("completion_state", outcome.state.as_str())
+        .with_str("exit_reason", outcome.exit_reason.as_str())
+        .with_str("summary", outcome.user_summary.clone())
+        .with_value("active_tasks", outcome.active_tasks as u64)
+        .with_value("blocked_tasks", outcome.blocked_tasks as u64)
+        .with_value("evidence_count", outcome.evidence.len() as u64)
+}
+
+fn build_stop_hook_followup_prompt(reason: &str) -> String {
+    let reason = reason.trim();
+    let detail = if reason.is_empty() {
+        "a local stop hook requires one more pass before completion can be accepted"
+    } else {
+        reason
+    };
+    format!(
+        "{STOP_HOOK_AUTO_PREFIX}Continue working. A local stop hook blocked completion because {detail}. Do not claim the task is finished yet. Either complete the remaining work with evidence or report the blocker clearly using the task-status tools."
+    )
+}
+
+fn hook_home_display_path() -> String {
+    let home = std::env::var("EDGECRAB_HOME").unwrap_or_else(|_| "~/.edgecrab".to_string());
+    format!("{home}/hooks")
+}
+
+fn format_hook_status_line(hooks: &[edgecrab_gateway::hooks::LoadedHookInfo]) -> String {
+    match hooks.len() {
+        0 => format!("Hooks: none loaded from {}", hook_home_display_path()),
+        1 => format!(
+            "Hooks: 1 file-based hook loaded from {}",
+            hook_home_display_path()
+        ),
+        n => format!(
+            "Hooks: {n} file-based hooks loaded from {}",
+            hook_home_display_path()
+        ),
+    }
+}
+
+fn format_hook_help_body() -> String {
+    format!(
+        "Inspect and manage the local lifecycle hook registry.\n\nCommands:\n• /hooks           open the hook inspector\n• /hooks list      open the hook inspector\n• /hooks status    print a compact status summary\n• /hooks reload    reload HOOK.yaml and handler scripts\n• /hooks help      show this guide\n\nDirectory:\n{}\n\nUseful lifecycle events:\n• agent:start\n• agent:stop\n• agent:task_completed\n• agent:task_blocked\n• agent:needs_input\n• agent:needs_verification\n• command:*\n• tool:pre\n• tool:post",
+        hook_home_display_path()
+    )
+}
+
+fn format_loaded_hooks_report(hooks: &[edgecrab_gateway::hooks::LoadedHookInfo]) -> String {
+    let hooks_dir = hook_home_display_path();
+
+    if hooks.is_empty() {
+        return format!(
+            "No file-based hooks are currently loaded.\n\nHooks directory: {hooks_dir}\n\nTo add one, create a folder with HOOK.yaml and handler.py / handler.ts / handler.js, then run /hooks reload.\n\nUseful events:\n• agent:stop\n• agent:task_completed\n• agent:task_blocked\n• agent:needs_input\n• command:*\n• tool:pre / tool:post"
+        );
+    }
+
+    let mut lines = vec![
+        format!("Loaded hooks: {}", hooks.len()),
+        format!("Hooks directory: {hooks_dir}"),
+        String::new(),
+    ];
+
+    for hook in hooks {
+        let description = hook.description.trim();
+        let desc = if description.is_empty() {
+            "No description provided."
+        } else {
+            description
+        };
+        let events = if hook.events.is_empty() {
+            "(none)".to_string()
+        } else {
+            hook.events.join(", ")
+        };
+        lines.push(format!(
+            "• {} [{} | prio {} | {}s]\n  {}\n  events: {}\n  path: {}",
+            hook.name,
+            hook.language,
+            hook.priority,
+            hook.timeout_secs,
+            desc,
+            events,
+            hook.path.display()
+        ));
+    }
+
+    lines.push(String::new());
+    lines.push("Tip: use /hooks reload after editing a HOOK.yaml or handler script.".into());
+    lines.join("\n")
 }
 
 fn context_usage_ratio(tokens: u64, context_window: Option<u64>) -> Option<f64> {
@@ -2078,7 +2345,10 @@ fn format_phase_status(
         format!("{spinner} {face} {verb_padded}")
     };
     let (left_wing, right_wing) = wings;
-    if elapsed_secs > 10 {
+    if elapsed_secs > 20 {
+        // Stall tier: add ⚠ prefix — likely network issue or rate-limit queue.
+        format!("{left_wing}{core} \u{26a0} {long_label} {elapsed_secs}s  ^C=stop{right_wing}")
+    } else if elapsed_secs > 10 {
         format!("{left_wing}{core} {long_label} {elapsed_secs}s  ^C=stop{right_wing}")
     } else if elapsed_secs > 3 {
         format!("{left_wing}{core} {long_label} {elapsed_secs}s{right_wing}")
@@ -2086,6 +2356,20 @@ fn format_phase_status(
         format!("{left_wing}{core} {early_label}{right_wing}")
     } else {
         format!("{left_wing}{core}{right_wing}")
+    }
+}
+
+/// Map wait elapsed seconds to an urgency color (FP46).
+/// - <15s: amber (normal wait)
+/// - 15-29s: orange (slow, pay attention)
+/// - ≥30s: red (stall — likely network issue or rate-limit queue)
+fn wait_urgency_color(elapsed_secs: u64) -> Color {
+    if elapsed_secs >= 30 {
+        Color::Rgb(239, 83, 80) // red — stall
+    } else if elapsed_secs >= 15 {
+        Color::Rgb(255, 140, 50) // orange — slow
+    } else {
+        Color::Rgb(255, 210, 120) // amber — normal
     }
 }
 
@@ -2260,6 +2544,12 @@ enum DisplayState {
     },
     Streaming {
         token_count: u64,
+        /// Accumulated character count for word-count estimation in the status bar.
+        chars_written: u64,
+        /// Most-recently detected markdown heading (level 1 or 2) in the stream.
+        /// Updated whenever a `\n# ` or `\n## ` sequence completes. Gives users a
+        /// semantic progress landmark during long document generation.
+        current_section: Option<String>,
         started: Instant,
     },
     #[allow(dead_code)]
@@ -4417,6 +4707,12 @@ pub struct App {
     history_stash: String,
     /// Last response completion time (for latency display)
     last_response_time: Option<Instant>,
+    /// Time To First Token for the most recent turn (seconds). Set when the
+    /// first streaming token arrives after an AwaitingFirstToken phase. Shown
+    /// as a calibration hint after each turn completes.
+    last_ttfb_secs: Option<f32>,
+    /// Most recent authoritative harness outcome for the active session.
+    last_run_outcome: Option<edgecrab_types::RunOutcome>,
     /// All command names for completion (cached at startup)
     all_command_names: Vec<String>,
     /// Command name → description (for completion overlay)
@@ -4667,6 +4963,9 @@ pub struct App {
     hook_registry: std::sync::Arc<edgecrab_gateway::hooks::HookRegistry>,
     /// Hooks are loaded lazily so the first terminal frame is not blocked by filesystem scans.
     hook_registry_loaded: bool,
+    /// Consecutive automatic resume attempts triggered by local stop hooks.
+    /// Prevents an unconditional `agent:stop` hook from causing an infinite loop.
+    stop_hook_retry_count: u8,
 }
 
 #[derive(Debug, Clone)]
@@ -4758,6 +5057,10 @@ enum AgentResponse {
         summary: String,
         api_calls: u32,
         model: Option<String>,
+    },
+    /// Final authoritative harness outcome for the run.
+    RunFinished {
+        outcome: edgecrab_types::RunOutcome,
     },
     /// Streaming complete — mark processing done.
     Done,
@@ -4955,6 +5258,10 @@ fn background_progress_text(task_num: u64, event: &edgecrab_core::StreamEvent) -
             task_count,
             status,
             *duration_ms as f64 / 1000.0
+        )),
+        edgecrab_core::StreamEvent::RunFinished { outcome } => Some(format!(
+            "↳ bg#{task_num} {}",
+            edgecrab_core::safe_truncate(&format_run_outcome_notice(outcome), 96)
         )),
         _ => None,
     }
@@ -5251,6 +5558,8 @@ impl App {
             history_pos: 0,
             history_stash: String::new(),
             last_response_time: None,
+            last_ttfb_secs: None,
+            last_run_outcome: None,
             all_command_names,
             command_descriptions,
             model_selector: FuzzySelector::new(),
@@ -5355,6 +5664,7 @@ impl App {
             voice_presence_frame_idx: 0,
             hook_registry: std::sync::Arc::new(edgecrab_gateway::hooks::HookRegistry::new()),
             hook_registry_loaded: false,
+            stop_hook_retry_count: 0,
         };
 
         app.apply_textarea_editor_style();
@@ -5405,10 +5715,139 @@ impl App {
         if self.hook_registry_loaded {
             return;
         }
+        self.reload_hook_registry();
+    }
+
+    fn reload_hook_registry(&mut self) {
         let mut registry = edgecrab_gateway::hooks::HookRegistry::new();
         registry.discover_and_load();
         self.hook_registry = std::sync::Arc::new(registry);
         self.hook_registry_loaded = true;
+    }
+
+    fn maybe_apply_stop_hooks(
+        &mut self,
+        mut outcome: edgecrab_types::RunOutcome,
+    ) -> edgecrab_types::RunOutcome {
+        use edgecrab_gateway::hooks::HookResult;
+        use edgecrab_types::{CompletionDecision, ExitReason};
+
+        self.ensure_hook_registry_loaded();
+
+        let state_event = stop_hook_event_name(&outcome).to_string();
+        let registry = self.hook_registry.clone();
+        let run_finished_ctx = build_run_outcome_hook_context("agent:run_finished", &outcome);
+        let done_ctx = build_run_outcome_hook_context("agent:done", &outcome);
+        let specific_ctx = build_run_outcome_hook_context(&state_event, &outcome);
+        let stop_ctx = build_run_outcome_hook_context("agent:stop", &outcome);
+
+        let hook_result = self.rt_handle.block_on(async move {
+            registry.emit("agent:run_finished", &run_finished_ctx).await;
+            registry.emit("agent:done", &done_ctx).await;
+            match registry.emit_cancellable(&state_event, &specific_ctx).await {
+                cancel @ HookResult::Cancel { .. } => cancel,
+                HookResult::Continue => registry.emit_cancellable("agent:stop", &stop_ctx).await,
+            }
+        });
+
+        match hook_result {
+            HookResult::Continue => {
+                self.stop_hook_retry_count = 0;
+                outcome
+            }
+            HookResult::Cancel { reason } => {
+                let reason = reason.trim();
+                let reason_text = if reason.is_empty() {
+                    "a local stop hook requested another pass before completion can be accepted"
+                } else {
+                    reason
+                };
+
+                self.push_output(
+                    format!("🪝 Stop hook review\n{}", reason_text),
+                    OutputRole::System,
+                );
+
+                let can_resume = matches!(
+                    outcome.state,
+                    CompletionDecision::Completed
+                        | CompletionDecision::Incomplete
+                        | CompletionDecision::NeedsVerification
+                );
+
+                if can_resume && self.stop_hook_retry_count < 3 {
+                    self.stop_hook_retry_count = self.stop_hook_retry_count.saturating_add(1);
+                    self.prompt_queue
+                        .insert(0, build_stop_hook_followup_prompt(reason_text));
+                    outcome.state = CompletionDecision::Incomplete;
+                    outcome.exit_reason = ExitReason::PendingTasks;
+                    outcome.user_summary = format!(
+                        "A local stop hook requested another pass before completion: {}",
+                        reason_text
+                    );
+                } else {
+                    outcome.state = CompletionDecision::Blocked;
+                    outcome.exit_reason = ExitReason::PendingTasks;
+                    outcome.user_summary =
+                        format!("Completion paused by a local stop hook: {}", reason_text);
+                }
+
+                outcome
+            }
+        }
+    }
+
+    fn handle_show_hooks(&mut self, args: String) {
+        let normalized = args.trim().to_ascii_lowercase();
+        if matches!(normalized.as_str(), "reload" | "refresh") {
+            self.reload_hook_registry();
+            self.push_output(
+                format!("Reloaded local hooks from {}.", hook_home_display_path()),
+                OutputRole::System,
+            );
+        } else {
+            self.ensure_hook_registry_loaded();
+        }
+
+        let hooks = self.hook_registry.loaded_hooks();
+        match normalized.as_str() {
+            "status" => {
+                self.push_output(format_hook_status_line(hooks), OutputRole::System);
+            }
+            "help" => {
+                self.open_document_overlay(
+                    "Hooks",
+                    "User-configurable lifecycle automation",
+                    format!(
+                        "{}\n\n{}",
+                        format_hook_help_body(),
+                        format_loaded_hooks_report(hooks)
+                    ),
+                    "🪝",
+                    Color::Rgb(128, 188, 255),
+                );
+            }
+            "" | "list" | "reload" | "refresh" => {
+                let body = format!(
+                    "{}\n\n{}",
+                    format_hook_help_body(),
+                    format_loaded_hooks_report(hooks)
+                );
+                self.open_document_overlay(
+                    "Hooks",
+                    "Local lifecycle hook registry",
+                    body,
+                    "🪝",
+                    Color::Rgb(128, 188, 255),
+                );
+            }
+            other => {
+                self.push_output(
+                    format!("Unknown /hooks option: {other}. Try /hooks help."),
+                    OutputRole::System,
+                );
+            }
+        }
     }
 
     /// Get a reference to the agent, or push an error and return None.
@@ -5788,6 +6227,23 @@ impl App {
                 .title(self.input_panel_title(&self.theme.prompt_symbol)),
         );
         fresh
+    }
+
+    /// Extract the current animation frame index from the active `DisplayState`.
+    ///
+    /// Used by `render_input` to synchronise the input-box waiting title with
+    /// the status bar spinner — both consumers read the same frame counter so
+    /// the braille animation is perfectly in step.
+    ///
+    /// Returns 0 (⠋) when the state has no frame (e.g. `Idle`).
+    fn current_spinner_frame(&self) -> usize {
+        match &self.display_state {
+            DisplayState::AwaitingFirstToken { frame, .. }
+            | DisplayState::Thinking { frame, .. }
+            | DisplayState::ToolExec { frame, .. }
+            | DisplayState::BgOp { frame, .. } => *frame,
+            _ => 0,
+        }
     }
 
     fn input_panel_title(&self, prompt_symbol: &str) -> String {
@@ -11107,8 +11563,19 @@ impl App {
             return;
         }
 
-        // Regular prompt — show it in output and dispatch to agent
-        self.push_output(format!("> {}", input), OutputRole::User);
+        // Regular prompt — show it in output and dispatch to agent.
+        // Internally generated stop-hook follow-ups are hidden from the visible
+        // transcript so the TUI stays focused on real user input.
+        let auto_stop_prompt = input.strip_prefix(STOP_HOOK_AUTO_PREFIX).map(str::trim);
+        if auto_stop_prompt.is_none() {
+            self.stop_hook_retry_count = 0;
+            self.push_output(format!("> {}", input), OutputRole::User);
+        } else {
+            self.push_output(
+                "🪝 Resuming automatically after a local stop-hook review...",
+                OutputRole::System,
+            );
+        }
 
         let agent = match self.agent.clone() {
             Some(a) => a,
@@ -11134,9 +11601,12 @@ impl App {
         self.hidden_tool_calls.clear();
         self.active_tools.clear();
         self.seen_tool_signatures.clear();
+        // Reset per-turn TTFB accumulator — a fresh submit starts fresh measurement.
+        self.last_ttfb_secs = None;
         // Reset the response accumulator for the new turn (voice mode uses it).
         self.last_agent_response_text.clear();
         self.buffered_assistant_output.clear();
+        self.last_run_outcome = None;
         self.display_state = DisplayState::AwaitingFirstToken {
             frame: 0,
             started: Instant::now(),
@@ -11148,7 +11618,7 @@ impl App {
         //
         // If clipboard images are pending, append vision_analyze instructions
         // so the agent automatically processes the attached image(s).
-        let mut effective_input = input.to_string();
+        let mut effective_input = auto_stop_prompt.unwrap_or(input).to_string();
         if !self.pending_images.is_empty() {
             let image_paths: Vec<String> = self
                 .pending_images
@@ -11495,6 +11965,9 @@ impl App {
             }
             CommandResult::ShowPlugins(args) => {
                 self.handle_show_plugins(args);
+            }
+            CommandResult::ShowHooks(args) => {
+                self.handle_show_hooks(args);
             }
             CommandResult::ShowPluginToggle { name, platform } => {
                 if let Some(name) = name {
@@ -11950,6 +12423,19 @@ impl App {
                 AgentResponse::Token(text) => {
                     // Accumulate per-turn token count regardless of streaming mode.
                     self.turn_stream_tokens += 1;
+                    // Record TTFB (Time To First Token) on the very first token that
+                    // arrives out of the AwaitingFirstToken phase. This is the wall-clock
+                    // latency from "submit sent" to "first model token received" — a
+                    // useful calibration metric for model-selection decisions.
+                    if matches!(self.display_state, DisplayState::AwaitingFirstToken { .. })
+                        && self.last_ttfb_secs.is_none()
+                    {
+                        if let DisplayState::AwaitingFirstToken { ref started, .. } =
+                            self.display_state
+                        {
+                            self.last_ttfb_secs = Some(started.elapsed().as_secs_f32());
+                        }
+                    }
                     // Transition to streaming state on first token of a new phase.
                     if self.streaming_enabled
                         && matches!(
@@ -11964,16 +12450,27 @@ impl App {
                         // interruptions, rather than resetting to 0 each streaming phase.
                         self.display_state = DisplayState::Streaming {
                             token_count: self.turn_stream_tokens,
+                            chars_written: 0,
+                            current_section: None,
                             started: Instant::now(),
                         };
                     }
-                    // Keep the Streaming state's token_count in sync with the turn total.
+                    // Keep the Streaming state's token_count, chars_written, and current_section
+                    // in sync as new tokens arrive.
+                    let new_chars = text.len() as u64;
                     if let DisplayState::Streaming {
                         ref mut token_count,
+                        ref mut chars_written,
+                        ref mut current_section,
                         ..
                     } = self.display_state
                     {
                         *token_count = self.turn_stream_tokens;
+                        *chars_written += new_chars;
+                        // Detect new markdown headings in the accumulated streaming text.
+                        // We check for `\n# ` and `\n## ` patterns in the current token
+                        // plus a small look-behind (the text ends with `\n#...`).
+                        extract_streaming_section(&text, current_section);
                     }
 
                     if self.live_token_display_enabled {
@@ -12164,11 +12661,14 @@ impl App {
                     }) = self.pending_tool_lines.get(&tool_call_id).cloned()
                     {
                         if line_idx < self.output.len() {
+                            let elapsed = self.active_tools.get(&tool_call_id)
+                                .map(|s| s.started_at.elapsed().as_secs());
                             self.output[line_idx].prebuilt_spans =
-                                Some(build_tool_running_line_width(
+                                Some(build_tool_running_line_width_elapsed(
                                     &tool_name,
                                     &args_json,
                                     Some(detail.as_str()),
+                                    elapsed,
                                     &self.theme.tool_emojis,
                                     &DisplayWidths::from_terminal_width(
                                         self.last_terminal_width as usize,
@@ -12252,6 +12752,17 @@ impl App {
                             for line in diff_lines {
                                 self.push_output_spans(line, OutputRole::Tool);
                             }
+                        }
+                        if name == "report_task_status"
+                            && !is_error
+                            && let Some(preview) = result_preview
+                                .as_deref()
+                                .filter(|text| !text.trim().is_empty())
+                        {
+                            self.push_output(
+                                format_task_status_progress_notice(preview),
+                                OutputRole::System,
+                            );
                         }
                     }
                     // Decrement the in-flight counter. Only transition back to
@@ -12450,12 +12961,34 @@ impl App {
                     }
                     self.needs_redraw = true;
                 }
+                AgentResponse::RunFinished { outcome } => {
+                    self.flush_buffered_assistant_output();
+                    let outcome = self.maybe_apply_stop_hooks(outcome);
+                    self.last_run_outcome = Some(outcome.clone());
+                    self.push_output(
+                        format_run_outcome_notice(&outcome),
+                        run_outcome_role(&outcome),
+                    );
+                    self.needs_redraw = true;
+                }
                 AgentResponse::Done => {
                     self.flush_buffered_assistant_output();
                     self.clear_active_request_state();
                     self.last_response_time = Some(Instant::now());
                     self.turn_count += 1;
                     self.needs_redraw = true;
+
+                    // Show TTFB calibration hint when the wait was noticeable (>1s).
+                    // This surfaces the model's latency characteristics to the user
+                    // without requiring any external tooling.
+                    if let Some(ttfb) = self.last_ttfb_secs.take() {
+                        if ttfb >= 1.0 {
+                            self.push_output(
+                                format!("  \u{21b3} ttfb: {ttfb:.1}s"),
+                                OutputRole::System,
+                            );
+                        }
+                    }
 
                     // Auto-update status bar tokens/cost from agent
                     self.auto_update_status();
@@ -12481,7 +13014,7 @@ impl App {
                 AgentResponse::Error(err) => {
                     self.flush_buffered_assistant_output();
                     self.clear_active_request_state();
-                    self.push_output(err, OutputRole::Error);
+                    self.push_output(format!("⚠ Run failed\n{}", err.trim()), OutputRole::Error);
                     if self.voice_continuous_active {
                         self.stop_continuous_voice_session(false);
                     }
@@ -13394,6 +13927,58 @@ impl App {
                 self.kaomoji_frame_idx = self.kaomoji_frame_idx.wrapping_add(1);
             }
         }
+
+        // FP49: Refresh in-flight tool placeholder lines with elapsed time.
+        //
+        // After 3s, the "···" tail becomes "···  Xs" directly in the output-area
+        // placeholder, so users see temporal feedback at their focal point (bottom
+        // of output area) without having to look at the peripheral status bar.
+        //
+        // Performance: pending_tool_lines is usually 0–3 entries; the span rebuild
+        // is a pure string transform (no I/O), so this is negligible at ~10fps.
+        if !self.pending_tool_lines.is_empty() {
+            // Collect updates first to avoid borrow conflicts.
+            let updates: Vec<(String, usize, String, String, Option<String>, u64)> = self
+                .pending_tool_lines
+                .iter()
+                .filter_map(|(id, entry)| {
+                    let elapsed = self.active_tools.get(id)?.started_at.elapsed().as_secs();
+                    if elapsed < 3 {
+                        return None; // Nothing new to show yet.
+                    }
+                    let detail = self
+                        .active_tools
+                        .get(id)
+                        .and_then(|s| s.last_detail.clone());
+                    Some((
+                        id.clone(),
+                        entry.line_idx,
+                        entry.tool_name.clone(),
+                        entry.args_json.clone(),
+                        detail,
+                        elapsed,
+                    ))
+                })
+                .collect();
+            for (_id, line_idx, tool_name, args_json, detail, elapsed) in updates {
+                if line_idx < self.output.len() {
+                    let widths = DisplayWidths::from_terminal_width(
+                        self.last_terminal_width as usize,
+                    );
+                    self.output[line_idx].prebuilt_spans =
+                        Some(build_tool_running_line_width_elapsed(
+                            &tool_name,
+                            &args_json,
+                            detail.as_deref(),
+                            Some(elapsed),
+                            &self.theme.tool_emojis,
+                            &widths,
+                        ));
+                    self.output[line_idx].invalidate_render_cache();
+                }
+            }
+        }
+
         true
     }
 
@@ -21401,6 +21986,70 @@ impl App {
             }
         }
 
+        // ── Ghost waiting line (FP45) ─────────────────────────────────
+        // During AwaitingFirstToken and Thinking (when no reasoning output is
+        // yet visible), inject a dim pulsing line at the bottom of the content
+        // area. This puts the waiting indicator AT THE USER'S FOCAL POINT
+        // (bottom of the conversation) rather than only in the peripheral
+        // status bar. The ghost line disappears naturally once real tokens arrive.
+        match &self.display_state {
+            DisplayState::AwaitingFirstToken { frame, started } => {
+                let spinner = SPINNER_FRAMES[*frame % SPINNER_FRAMES.len()];
+                let elapsed = started.elapsed().as_secs();
+                let ghost_text: String = if elapsed > 10 {
+                    format!("  {spinner}  awaiting response\u{2026}  {elapsed}s  (^C to stop)")
+                } else if elapsed > 3 {
+                    format!("  {spinner}  awaiting response\u{2026}  {elapsed}s")
+                } else {
+                    format!("  {spinner}  awaiting response\u{2026}")
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        "\u{258e} ",
+                        Style::default()
+                            .fg(Color::Rgb(50, 90, 110))
+                            .add_modifier(Modifier::DIM),
+                    ),
+                    Span::styled(
+                        ghost_text,
+                        Style::default()
+                            .fg(Color::Rgb(80, 110, 130))
+                            .add_modifier(Modifier::ITALIC | Modifier::DIM),
+                    ),
+                ]));
+            }
+            DisplayState::Thinking { frame, started } => {
+                // Only show when reasoning is not already streaming in the output
+                // area (show_reasoning=true with tokens arriving). When
+                // reasoning_line is Some, the user already sees live reasoning
+                // text — adding a ghost line would duplicate the signal.
+                if self.reasoning_line.is_none() {
+                    let spinner = SPINNER_FRAMES[*frame % SPINNER_FRAMES.len()];
+                    let elapsed = started.elapsed().as_secs();
+                    let ghost_text: String = if elapsed > 3 {
+                        format!("  {spinner}  thinking\u{2026}  {elapsed}s")
+                    } else {
+                        format!("  {spinner}  thinking\u{2026}")
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            "\u{258e} ",
+                            Style::default()
+                                .fg(Color::Rgb(70, 60, 100))
+                                .add_modifier(Modifier::DIM),
+                        ),
+                        Span::styled(
+                            ghost_text,
+                            Style::default()
+                                .fg(Color::Rgb(100, 85, 130))
+                                .add_modifier(Modifier::ITALIC | Modifier::DIM),
+                        ),
+                    ]));
+                }
+            }
+            _ => {}
+        }
+
         // ── Scroll math ───────────────────────────────────────────────
         //
         // Scrollbar is on the LEFT (1 col).  Content starts at x+1.
@@ -21576,6 +22225,41 @@ impl App {
             }
         }
 
+        // ── Ghost waiting line (FP45) compact variant ─────────────────
+        match &self.display_state {
+            DisplayState::AwaitingFirstToken { frame, started } => {
+                let spinner = SPINNER_FRAMES[*frame % SPINNER_FRAMES.len()];
+                let elapsed = started.elapsed().as_secs();
+                let ghost: String = if elapsed > 3 {
+                    format!("  {spinner}  awaiting\u{2026}  {elapsed}s")
+                } else {
+                    format!("  {spinner}  awaiting\u{2026}")
+                };
+                lines.push(Line::from(Span::styled(
+                    ghost,
+                    Style::default()
+                        .fg(Color::Rgb(80, 100, 120))
+                        .add_modifier(Modifier::ITALIC | Modifier::DIM),
+                )));
+            }
+            DisplayState::Thinking { frame, started } if self.reasoning_line.is_none() => {
+                let spinner = SPINNER_FRAMES[*frame % SPINNER_FRAMES.len()];
+                let elapsed = started.elapsed().as_secs();
+                let ghost: String = if elapsed > 3 {
+                    format!("  {spinner}  thinking\u{2026}  {elapsed}s")
+                } else {
+                    format!("  {spinner}  thinking\u{2026}")
+                };
+                lines.push(Line::from(Span::styled(
+                    ghost,
+                    Style::default()
+                        .fg(Color::Rgb(100, 85, 130))
+                        .add_modifier(Modifier::ITALIC | Modifier::DIM),
+                )));
+            }
+            _ => {}
+        }
+
         let content_width = area.width.max(1) as usize;
         let visual_rows: u16 = lines
             .iter()
@@ -21681,33 +22365,35 @@ impl App {
         // ── Spinner / state indicator ────────────────────────────────
         match &self.display_state {
             DisplayState::AwaitingFirstToken { frame: f, started } => {
+                let elapsed_secs = started.elapsed().as_secs();
                 let msg = format_waiting_first_token_status(
                     &self.theme,
                     *f,
                     self.thinking_verb_idx,
                     self.kaomoji_frame_idx,
-                    started.elapsed().as_secs(),
+                    elapsed_secs,
                 );
-                left_spans.push(Span::styled(
-                    format!(" {msg} "),
-                    Style::default().fg(Color::Rgb(255, 210, 120)),
-                ));
+                // FP46: urgency color ramp — amber (normal) → orange (slow) → red (stall)
+                let color = wait_urgency_color(elapsed_secs);
+                left_spans.push(Span::styled(format!(" {msg} "), Style::default().fg(color)));
             }
             DisplayState::Thinking { frame: f, started } => {
+                let elapsed_secs = started.elapsed().as_secs();
                 let msg = format_thinking_status(
                     &self.theme,
                     *f,
                     self.thinking_verb_idx,
                     self.kaomoji_frame_idx,
-                    started.elapsed().as_secs(),
+                    elapsed_secs,
                 );
-                left_spans.push(Span::styled(
-                    format!(" {msg} "),
-                    Style::default().fg(Color::Rgb(255, 220, 80)),
-                ));
+                // FP46: same urgency ramp for extended reasoning waits
+                let color = wait_urgency_color(elapsed_secs);
+                left_spans.push(Span::styled(format!(" {msg} "), Style::default().fg(color)));
             }
             DisplayState::Streaming {
                 token_count,
+                chars_written,
+                current_section,
                 started,
             } => {
                 let elapsed = started.elapsed().as_secs_f64();
@@ -21719,8 +22405,22 @@ impl App {
                 } else {
                     String::new()
                 };
+                // Word estimate: ~4.5 chars per word, bucketed to nearest 10 for stability.
+                let words = words_estimate(*chars_written);
+                let word_str = if words > 0 {
+                    format!(" ~{words}w ")
+                } else {
+                    String::new()
+                };
+                // Show elapsed time after 5s of streaming so user knows how long they've waited.
+                let elapsed_str = format_elapsed_hint(started.elapsed(), 5);
+                // Show current section heading if we detected one.
+                let section_str = current_section
+                    .as_deref()
+                    .map(|s| format!(" │ {s}"))
+                    .unwrap_or_default();
                 left_spans.push(Span::styled(
-                    format!(" ▶ {token_count}tok{rate_str} "),
+                    format!(" ▶{word_str}{section_str}{rate_str}{elapsed_str} "),
                     Style::default().fg(Color::Rgb(100, 230, 100)),
                 ));
             }
@@ -21767,9 +22467,22 @@ impl App {
                         });
                     format!(" {spinner} {verb} {icon} {preview}{time_part}{stop_hint} ")
                 };
+                // FP48: Use semantic category color so the status bar matches the output area.
+                // FP50: Escalate color for slow (>=5s) and stalled (>=15s) tool calls.
+                let category_name = latest_active_tool_entry(&self.active_tools)
+                    .map(|(_, s)| s.name.as_str())
+                    .unwrap_or(name.as_str());
+                let base_color = tool_category(category_name).name_color();
+                let bar_color = if elapsed_secs >= 15 {
+                    Color::Rgb(255, 140, 50)  // orange: stalled / very slow
+                } else if elapsed_secs >= 5 {
+                    Color::Rgb(255, 200, 80)  // amber: slow
+                } else {
+                    base_color
+                };
                 left_spans.push(Span::styled(
                     content,
-                    Style::default().fg(Color::Rgb(77, 208, 225)),
+                    Style::default().fg(bar_color),
                 ));
             }
             DisplayState::BgOp {
@@ -21790,7 +22503,18 @@ impl App {
                 ));
             }
             DisplayState::Idle => {
-                left_spans.push(Span::raw(" "));
+                if let Some(outcome) = self.last_run_outcome.as_ref() {
+                    left_spans.push(Span::styled(
+                        format!(
+                            " {} {} ",
+                            outcome.state.emoji(),
+                            outcome.state.compact_label()
+                        ),
+                        run_outcome_badge_style(outcome),
+                    ));
+                } else {
+                    left_spans.push(Span::raw(" "));
+                }
             }
             DisplayState::WaitingForClarify => {
                 // Agent is paused waiting for a user reply to a clarifying question.
@@ -22135,7 +22859,17 @@ impl App {
         let glyphs = self.terminal_glyph_profile;
         let divider = " | ";
         let state = match &self.display_state {
-            DisplayState::Idle => "idle".to_string(),
+            DisplayState::Idle => self
+                .last_run_outcome
+                .as_ref()
+                .map(|outcome| {
+                    format!(
+                        "{} {}",
+                        outcome.state.emoji(),
+                        outcome.state.compact_label()
+                    )
+                })
+                .unwrap_or_else(|| "idle".to_string()),
             DisplayState::AwaitingFirstToken { frame, started } => format!(
                 "{} wait {}s",
                 compact_spinner_frame(*frame, glyphs),
@@ -22148,10 +22882,17 @@ impl App {
             ),
             DisplayState::Streaming {
                 token_count,
+                chars_written,
                 started,
+                ..
             } => {
                 let secs = started.elapsed().as_secs().max(1);
-                format!("reply {}tok {}t/s", token_count, token_count / secs)
+                let words = words_estimate(*chars_written);
+                if words > 0 {
+                    format!("reply ~{}w {}t/s", words, token_count / secs)
+                } else {
+                    format!("reply {}tok {}t/s", token_count, token_count / secs)
+                }
             }
             DisplayState::ToolExec { frame, started, .. } => format!(
                 "{} tool {}s",
@@ -28217,6 +28958,10 @@ impl App {
         // feedback appear immediately on the current frame.
         let text = self.textarea_text();
         let block = if self.is_processing {
+            // FP53: Animate the waiting title using the same braille spinner frame
+            // as the status bar — zero extra state, perfect sync.
+            let spinner = SPINNER_FRAMES[self.current_spinner_frame() % SPINNER_FRAMES.len()];
+            let waiting_label = format!("{spinner} waiting…");
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(
@@ -28224,7 +28969,7 @@ impl App {
                         .fg(Color::Rgb(60, 60, 75))
                         .add_modifier(Modifier::DIM),
                 )
-                .title(self.input_panel_title("⧗ waiting…"))
+                .title(self.input_panel_title(&waiting_label))
         } else if text.starts_with('/') {
             let cmd_name = text.split_whitespace().next().unwrap_or("");
             let is_valid = self.all_command_names.iter().any(|c| c == cmd_name);
@@ -33282,6 +34027,72 @@ kind = "skill"
         assert_eq!(format_tokens(1_500_000), "1.5M");
     }
 
+    // ── FP39: words_estimate ────────────────────────────────────────────────
+
+    #[test]
+    fn words_estimate_basics() {
+        // Under 20 chars → 0
+        assert_eq!(words_estimate(0), 0);
+        assert_eq!(words_estimate(15), 0);
+        // 45 chars ≈ 10 words (bucketed to 10)
+        assert_eq!(words_estimate(45), 10);
+        // 450 chars ≈ 100 words
+        assert_eq!(words_estimate(450), 100);
+        // 4500 chars ≈ 1000 words
+        assert_eq!(words_estimate(4500), 1000);
+        // Bucketing: 55 chars = 12.2 → buckets to 10
+        assert_eq!(words_estimate(55), 10);
+        // 90 chars = 20 words
+        assert_eq!(words_estimate(90), 20);
+    }
+
+    // ── FP43: format_elapsed_hint ───────────────────────────────────────────
+
+    #[test]
+    fn format_elapsed_hint_threshold() {
+        use std::time::Duration;
+        // Below threshold → empty
+        assert_eq!(format_elapsed_hint(Duration::from_secs(3), 5), "");
+        assert_eq!(format_elapsed_hint(Duration::from_secs(4), 5), "");
+        // At threshold → shows
+        assert_eq!(format_elapsed_hint(Duration::from_secs(5), 5), "  5s");
+        assert_eq!(format_elapsed_hint(Duration::from_secs(60), 5), "  60s");
+        // Different threshold
+        assert_eq!(format_elapsed_hint(Duration::from_secs(2), 3), "");
+        assert_eq!(format_elapsed_hint(Duration::from_secs(3), 3), "  3s");
+    }
+
+    // ── FP40: extract_streaming_section ────────────────────────────────────
+
+    #[test]
+    fn extract_streaming_section_detects_headings() {
+        let mut section: Option<String> = None;
+        // Level 2 heading at start of token after newline
+        extract_streaming_section("\n## Competitive Landscape\nsome text", &mut section);
+        assert_eq!(section.as_deref(), Some("Competitive Landscape"));
+
+        // Level 1 heading
+        let mut s2: Option<String> = None;
+        extract_streaming_section("\n# Introduction\n", &mut s2);
+        assert_eq!(s2.as_deref(), Some("Introduction"));
+
+        // No heading → no change
+        let mut s3: Option<String> = Some("Previous".to_string());
+        extract_streaming_section("just prose text", &mut s3);
+        assert_eq!(s3.as_deref(), Some("Previous"));
+
+        // Heading at very start of first token (no leading newline)
+        let mut s4: Option<String> = None;
+        extract_streaming_section("## Market Analysis\n", &mut s4);
+        assert_eq!(s4.as_deref(), Some("Market Analysis"));
+
+        // Truncation at 30 chars
+        let mut s5: Option<String> = None;
+        let long_title = format!("\n## {}\n", "A".repeat(40));
+        extract_streaming_section(&long_title, &mut s5);
+        assert_eq!(s5.as_ref().map(|s| s.len()), Some(30));
+    }
+
     #[tokio::test]
     async fn ghost_hint_works() {
         let mut app = App::new();
@@ -33653,6 +34464,21 @@ kind = "skill"
         assert!(!app.model_selector_seeded);
         assert!(!app.hook_registry_loaded);
         assert!(app.model_selector.items.is_empty());
+    }
+
+    #[test]
+    fn loaded_hooks_report_includes_useful_empty_state_guidance() {
+        let report = format_loaded_hooks_report(&[]);
+        assert!(report.contains("No file-based hooks are currently loaded."));
+        assert!(report.contains("agent:stop"));
+        assert!(report.contains("/hooks reload"));
+    }
+
+    #[test]
+    fn stop_hook_followup_prompt_uses_hidden_prefix() {
+        let prompt = build_stop_hook_followup_prompt("tests still need to run");
+        assert!(prompt.starts_with(STOP_HOOK_AUTO_PREFIX));
+        assert!(prompt.contains("tests still need to run"));
     }
 
     #[tokio::test]

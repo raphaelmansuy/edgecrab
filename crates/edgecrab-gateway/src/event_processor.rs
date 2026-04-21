@@ -100,6 +100,30 @@ fn format_pending_interaction(view: &PendingInteractionView) -> String {
     }
 }
 
+pub(crate) fn format_run_outcome_status(outcome: &edgecrab_types::RunOutcome) -> String {
+    let headline = format!("{} {}", outcome.state.emoji(), outcome.state.headline());
+
+    let summary = outcome.user_summary.trim();
+    let mut text = if summary.is_empty() || summary == outcome.state.headline() {
+        headline
+    } else {
+        format!("{headline} — {summary}")
+    };
+
+    if let Some(hint) = outcome.state.operator_hint() {
+        text.push_str(&format!(" {hint}"));
+    }
+
+    if outcome.active_tasks > 0 || outcome.blocked_tasks > 0 {
+        text.push_str(&format!(
+            " ({} active, {} blocked)",
+            outcome.active_tasks, outcome.blocked_tasks
+        ));
+    }
+
+    text
+}
+
 // ─── Processor ────────────────────────────────────────────────────────────
 
 /// Translates `StreamEvent`s from the agent into platform-appropriate messages.
@@ -404,6 +428,12 @@ impl GatewayEventProcessor {
                     let _ = self.delta_tx.send(StreamItem::Delta(text)).await;
                 }
 
+                StreamEvent::RunFinished { outcome } => {
+                    if !outcome.is_success() || (self.cfg.enabled && self.cfg.tool_progress) {
+                        self.send_status(&format_run_outcome_status(&outcome)).await;
+                    }
+                }
+
                 StreamEvent::Done => {
                     cancel_typing!();
                     subagent_batches.clear();
@@ -417,7 +447,7 @@ impl GatewayEventProcessor {
                     subagent_batches.clear();
                     tracing::error!(error = %msg, "agent streaming error");
                     // Send an error message to the user.
-                    let err_text = format!("⚠️ An error occurred: {}", msg);
+                    let err_text = format!("⚠️ Run failed — {msg}");
                     self.send_status(&err_text).await;
                     // Terminate the consumer — do not send a partial response.
                     let _ = self.delta_tx.send(StreamItem::Done).await;

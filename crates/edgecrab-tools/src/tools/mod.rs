@@ -43,6 +43,7 @@ pub mod memory;
 pub mod mixture_of_agents;
 pub mod pdf_to_markdown;
 pub mod process;
+pub mod report_task_status;
 pub mod session_search;
 pub mod skills;
 pub mod skills_guard;

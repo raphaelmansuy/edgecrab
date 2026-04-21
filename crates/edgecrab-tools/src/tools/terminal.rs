@@ -204,6 +204,9 @@ impl ToolHandler for TerminalTool {
             message: e.to_string(),
         })?;
 
+        // Soft guardrail: detect file I/O anti-patterns (cat, head, echo >, etc.)
+        let antipattern_warning = detect_file_io_antipattern(&args.command);
+
         if args.background {
             let started = crate::tools::process::start_background_process(
                 "terminal",
@@ -358,6 +361,11 @@ impl ToolHandler for TerminalTool {
             format!("{header}\n{result}")
         };
 
+        // Prepend soft-guardrail warning when a file I/O anti-pattern was detected.
+        if let Some(warning) = antipattern_warning {
+            result = format!("[NOTE: {warning}]\n\n{result}");
+        }
+
         Ok(result)
     }
 }
@@ -411,6 +419,68 @@ fn destructive_checkpoint_label(command: &str) -> String {
 /// non-zero exit — retrying won't change the result).
 fn is_backend_retryable(err: &ToolError) -> bool {
     matches!(err, ToolError::Unavailable { .. } | ToolError::Other(_))
+}
+
+// ── Terminal anti-pattern guard ──────────────────────────────────────
+// Detects when the LLM uses `terminal` as an escape hatch for simple
+// file I/O that has a dedicated, faster, path-safe tool.
+// Returns a soft warning prepended to output — does NOT block execution.
+
+use std::sync::LazyLock;
+use regex::Regex;
+
+static FILE_IO_PATTERNS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
+    vec![
+        (
+            Regex::new(r"^cat\s+").unwrap(),
+            "Use `read_file` instead of `cat` — it handles encoding and large files safely.",
+        ),
+        (
+            Regex::new(r"^head\s+").unwrap(),
+            "Use `read_file` with line range instead of `head`.",
+        ),
+        (
+            Regex::new(r"^tail\s+").unwrap(),
+            "Use `read_file` with line range instead of `tail`.",
+        ),
+        (
+            Regex::new(r"python3?\s+-c\s+.*open\(").unwrap(),
+            "Use `read_file` instead of python file I/O — it's faster and path-safe.",
+        ),
+        (
+            Regex::new(r"^less\s+|^more\s+").unwrap(),
+            "Use `read_file` instead of `less`/`more`.",
+        ),
+        (
+            Regex::new(r#"^echo\s+.*>\s*\S+"#).unwrap(),
+            "Use `write_file` instead of `echo >` — it creates parent dirs and validates paths.",
+        ),
+        (
+            Regex::new(r"^sed\s+-i").unwrap(),
+            "Use `patch` instead of `sed -i` — it has fuzzy matching and creates backups.",
+        ),
+    ]
+});
+
+fn detect_file_io_antipattern(command: &str) -> Option<&'static str> {
+    let trimmed = command.trim();
+    for (pattern, suggestion) in FILE_IO_PATTERNS.iter() {
+        if pattern.is_match(trimmed) {
+            return Some(suggestion);
+        }
+    }
+    // Also check first segment of piped commands
+    if let Some(first_cmd) = trimmed.split('|').next() {
+        let first_trimmed = first_cmd.trim();
+        if first_trimmed != trimmed {
+            for (pattern, suggestion) in FILE_IO_PATTERNS.iter() {
+                if pattern.is_match(first_trimmed) {
+                    return Some(suggestion);
+                }
+            }
+        }
+    }
+    None
 }
 
 inventory::submit!(&TerminalTool as &dyn ToolHandler);
@@ -730,5 +800,45 @@ mod tests {
 
         drop(held_clone);
         let _ = cleanup_all_backends().await;
+    }
+
+    #[test]
+    fn detect_cat_antipattern() {
+        assert!(detect_file_io_antipattern("cat main.rs").is_some());
+        assert!(detect_file_io_antipattern("  cat  README.md").is_some());
+    }
+
+    #[test]
+    fn detect_head_tail_antipattern() {
+        assert!(detect_file_io_antipattern("head -n 20 file.txt").is_some());
+        assert!(detect_file_io_antipattern("tail -f /var/log/syslog").is_some());
+    }
+
+    #[test]
+    fn detect_echo_redirect_antipattern() {
+        assert!(detect_file_io_antipattern("echo hello > output.txt").is_some());
+    }
+
+    #[test]
+    fn detect_sed_inplace_antipattern() {
+        assert!(detect_file_io_antipattern("sed -i 's/foo/bar/' file.rs").is_some());
+    }
+
+    #[test]
+    fn detect_python_file_read_antipattern() {
+        assert!(detect_file_io_antipattern("python3 -c 'print(open(\"f\").read())'").is_some());
+    }
+
+    #[test]
+    fn detect_piped_antipattern() {
+        assert!(detect_file_io_antipattern("cat file.txt | grep foo").is_some());
+    }
+
+    #[test]
+    fn no_false_positive_for_legitimate_commands() {
+        assert!(detect_file_io_antipattern("cargo test --workspace").is_none());
+        assert!(detect_file_io_antipattern("ls -la").is_none());
+        assert!(detect_file_io_antipattern("grep -rn pattern src/").is_none());
+        assert!(detect_file_io_antipattern("git status").is_none());
     }
 }

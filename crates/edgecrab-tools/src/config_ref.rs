@@ -206,6 +206,13 @@ pub struct AppConfigRef {
     pub result_spill_threshold: usize,
     /// Number of preview lines kept in the spill stub.
     pub result_spill_preview_lines: usize,
+    /// Maximum write payload size in KiB for file mutation tools.
+    ///
+    /// WHY FP16 "Defaults protect, overrides empower": the default (32 KiB)
+    /// is safe for most LLM providers. Power users with models that handle
+    /// larger JSON tool arguments can increase this. The value is clamped to
+    /// [8, 256] KiB to prevent mis-configuration.
+    pub max_write_payload_kib: usize,
 }
 
 impl Default for AppConfigRef {
@@ -269,11 +276,17 @@ impl Default for AppConfigRef {
             result_spill: true,
             result_spill_threshold: 16_384,
             result_spill_preview_lines: 80,
+            max_write_payload_kib: crate::edit_contract::DEFAULT_MAX_MUTATION_PAYLOAD_KIB,
         }
     }
 }
 
 impl AppConfigRef {
+    /// Effective maximum write payload in bytes, clamped to [8 KiB, 256 KiB].
+    pub fn max_write_payload_bytes(&self) -> usize {
+        crate::edit_contract::clamp_write_limit_bytes(self.max_write_payload_kib)
+    }
+
     /// Whether a toolset is allowed in the current session.
     ///
     /// Empty `parent_active_toolsets` means "no explicit whitelist" rather than
