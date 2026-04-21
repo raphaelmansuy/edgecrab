@@ -75,6 +75,9 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      - name: Ensure Rust target is installed
+        run: rustup target add ${{ matrix.target }}
+
       # ── Compile ──────────────────────────────────────────────────────────────
       - name: Build binary
         run: cargo build --release --target ${{ matrix.target }} -p edgecrab-cli
