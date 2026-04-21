@@ -38,7 +38,10 @@
 //! provides a reliable second trigger with zero user effort.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::Duration;
 
 use edgecrab_plugins::{
@@ -62,6 +65,7 @@ use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::{Agent, ConversationResult, SessionState, resolve_tool_policy};
+use crate::completion_assessor::{CompletionContext, assess_completion};
 use crate::compression::{
     CompressionParams, CompressionStatus, check_compression_status_for_estimate, compress_with_llm,
 };
@@ -78,6 +82,15 @@ use crate::sub_agent_runner::CoreSubAgentRunner;
 /// Maximum API retries before giving up.
 const MAX_RETRIES: u32 = 3;
 
+/// Internal finish-reason marker used when a native streamed response emitted
+/// visible text successfully, but the subsequent tool-call JSON was truncated.
+///
+/// WHY: Anthropic's streaming docs explicitly allow recovery from interrupted
+/// streams by continuing from the last visible text block. We preserve the text,
+/// disable native tool streaming for the session, and let the main loop issue a
+/// non-streaming continuation turn rather than crashing the whole run.
+const FINISH_REASON_STREAM_INTERRUPTED: &str = "stream_interrupted";
+
 /// Base backoff delay between retries (doubles each attempt).
 const BASE_BACKOFF: Duration = Duration::from_millis(500);
 #[cfg(test)]
@@ -85,9 +98,70 @@ const STREAM_FIRST_CHUNK_TIMEOUT: Duration = Duration::from_millis(50);
 #[cfg(not(test))]
 const STREAM_FIRST_CHUNK_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Maximum time between consecutive stream chunks before declaring the stream
+/// stale. Providers can silently hang mid-stream (FP10: Stale-Stream Detect).
+/// In tests this is set very short; in production 60s covers provider variance.
+#[cfg(test)]
+const STREAM_INTER_CHUNK_TIMEOUT: Duration = Duration::from_millis(50);
+#[cfg(not(test))]
+const STREAM_INTER_CHUNK_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Minimum tool-call count in a session before the end-of-session
 /// learning reflection fires. Mirrors hermes-agent's "5+ tool calls" rule.
 const SKILL_REFLECTION_THRESHOLD: u32 = 5;
+
+#[derive(Debug, Clone, Copy, Default)]
+struct TodoStateSnapshot {
+    active: usize,
+    blocked: usize,
+}
+
+#[derive(Debug, Default, Clone)]
+struct RunProgressState {
+    pending_approvals: Arc<AtomicUsize>,
+    pending_clarifications: Arc<AtomicUsize>,
+    child_runs_in_flight: Arc<AtomicUsize>,
+}
+
+impl RunProgressState {
+    fn completion_context<'a>(
+        &self,
+        final_response: &'a str,
+        messages: &'a [Message],
+        interrupted: bool,
+        budget_exhausted: bool,
+        todo: TodoStateSnapshot,
+    ) -> CompletionContext<'a> {
+        CompletionContext {
+            final_response,
+            messages,
+            interrupted,
+            budget_exhausted,
+            pending_approval: self.pending_approvals.load(Ordering::Relaxed) > 0,
+            pending_clarification: self.pending_clarifications.load(Ordering::Relaxed) > 0,
+            active_todos: todo.active,
+            blocked_todos: todo.blocked,
+            child_runs_in_flight: self.child_runs_in_flight.load(Ordering::Relaxed),
+        }
+    }
+}
+
+fn snapshot_todo_state(todo_store: &edgecrab_tools::TodoStore) -> TodoStateSnapshot {
+    let items = todo_store.read();
+    TodoStateSnapshot {
+        active: items
+            .iter()
+            .filter(|item| item.status == "not-started" || item.status == "in-progress")
+            .count(),
+        blocked: items.iter().filter(|item| item.status == "blocked").count(),
+    }
+}
+
+fn saturating_dec(counter: &AtomicUsize) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        Some(value.saturating_sub(1))
+    });
+}
 
 struct ApiCallContext<'a> {
     options: Option<&'a edgequake_llm::CompletionOptions>,
@@ -123,6 +197,47 @@ fn is_retryable_nonvisible_stream_error(error: &edgequake_llm::LlmError) -> bool
             | edgequake_llm::LlmError::ProviderError(_)
             | edgequake_llm::LlmError::NotSupported(_)
     )
+}
+
+/// FP19: Parse a provider-suggested retry-after duration from a rate limit error message.
+///
+/// WHY: Providers embed a "try again in X.Ys" hint in their error body. Using the
+/// provider-stated wait instead of our fixed BASE_BACKOFF avoids under-sleeping
+/// (which immediately re-hits the limit) and over-sleeping (which wastes wall time).
+///
+/// Cross-ref: Hermes `_parse_retry_after(error_str)` in `run_agent.py`.
+///
+/// Recognised patterns (case-insensitive):
+///   "try again in 1.197s"   → 1.197s + 200ms safety margin
+///   "retry after 2s"        → 2.0s  + 200ms safety margin
+///   "please wait 3 seconds" → 3.0s  + 200ms safety margin
+///
+/// Returns `None` if no numeric wait hint is found.
+fn parse_retry_after(error_msg: &str) -> Option<Duration> {
+    let lower = error_msg.to_ascii_lowercase();
+
+    // Walk the string looking for candidate float values that follow a retry keyword.
+    let keywords = ["try again in ", "retry after ", "please wait ", "wait "];
+
+    for keyword in &keywords {
+        if let Some(pos) = lower.find(keyword) {
+            let after = &lower[pos + keyword.len()..];
+            // Collect leading digit/dot chars to form the number string.
+            let num_str: String = after
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '.')
+                .collect();
+            if let Ok(seconds) = num_str.parse::<f64>() {
+                if seconds > 0.0 && seconds < 300.0 {
+                    // Add 200ms safety margin so we don't arrive just as the
+                    // quota window resets and immediately hit the limit again.
+                    let millis = (seconds * 1000.0) as u64 + 200;
+                    return Some(Duration::from_millis(millis));
+                }
+            }
+        }
+    }
+    None
 }
 
 fn is_retryable_stream_tool_assembly_error(error: &edgequake_llm::LlmError) -> bool {
@@ -283,6 +398,124 @@ enum LoopAction {
 
 const MAX_DELEGATE_TASK_CALLS_PER_TURN: usize = 3;
 
+/// Detects when the LLM emits the exact same tool call across consecutive turns.
+///
+/// WHY: A stuck model repeatedly calls the same tool with identical arguments,
+/// burning budget for zero progress (e.g. re-reading a file it just read, or
+/// retrying a failed command with the same flags). By caching `(name, args_hash)`
+/// from the previous turn, we can detect this loop and short-circuit: inject
+/// the cached result and a "try a different approach" nudge instead of
+/// re-executing.
+///
+/// First Principle FP11: *"Detect loops, don't ride them."*
+///
+/// See [specs/improve_plan/16-assessment-round3.md](../../../specs/improve_plan/16-assessment-round3.md).
+struct DuplicateToolCallDetector {
+    /// Previous turn's tool calls: (name, args_hash) → result text.
+    prev_turn: HashMap<(String, u64), String>,
+    /// Current turn accumulator (swapped into prev_turn at end of turn).
+    current_turn: HashMap<(String, u64), String>,
+}
+
+impl DuplicateToolCallDetector {
+    fn new() -> Self {
+        Self {
+            prev_turn: HashMap::new(),
+            current_turn: HashMap::new(),
+        }
+    }
+
+    /// Hash the tool arguments for dedup lookup.
+    fn hash_args(args: &str) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        args.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Check if this exact call was made in the previous turn.
+    /// Returns `Some(cached_result)` if duplicate detected.
+    fn check_duplicate(&self, name: &str, args: &str) -> Option<&str> {
+        let key = (name.to_string(), Self::hash_args(args));
+        self.prev_turn.get(&key).map(|s| s.as_str())
+    }
+
+    /// Record a tool call and its result in the current turn.
+    fn record(&mut self, name: &str, args: &str, result: &str) {
+        let key = (name.to_string(), Self::hash_args(args));
+        self.current_turn.insert(key, result.to_string());
+    }
+
+    /// End-of-turn: move current → prev and clear current.
+    fn end_turn(&mut self) {
+        std::mem::swap(&mut self.prev_turn, &mut self.current_turn);
+        self.current_turn.clear();
+    }
+}
+
+/// Tracks consecutive tool failures to detect stuck error loops.
+///
+/// Reset on any successful tool call. When `max_before_escalation` consecutive
+/// failures are hit, the conversation loop injects a guidance message telling
+/// the LLM to pause and reconsider its approach (or ask the user for help).
+///
+/// WHY: Without this, the agent can burn 10–30 iterations retrying doomed
+/// tool calls with trivially different arguments, consuming $5–15 of API
+/// budget for zero productive output. With the tracker, a 3-failure streak
+/// triggers an explicit "stop and rethink" message at a cost of ~$0.50.
+///
+/// See [specs/improve_plan/05-failure-escalation.md](../../../specs/improve_plan/05-failure-escalation.md).
+struct ConsecutiveFailureTracker {
+    count: u32,
+    max_before_escalation: u32,
+    last_errors: Vec<String>,
+}
+
+impl ConsecutiveFailureTracker {
+    fn new(max: u32) -> Self {
+        Self {
+            count: 0,
+            max_before_escalation: max,
+            last_errors: Vec::new(),
+        }
+    }
+
+    /// Record a tool error. Returns `true` when escalation threshold is reached.
+    fn record_failure(&mut self, error_summary: &str) -> bool {
+        self.count += 1;
+        self.last_errors.push(error_summary.to_string());
+        // Keep a bounded window of recent errors
+        if self.last_errors.len() > 5 {
+            self.last_errors.remove(0);
+        }
+        self.count >= self.max_before_escalation
+    }
+
+    /// Reset on any successful tool call.
+    fn record_success(&mut self) {
+        self.count = 0;
+        self.last_errors.clear();
+    }
+
+    /// Build a guidance message when escalation fires.
+    fn escalation_message(&self) -> String {
+        let recent = self
+            .last_errors
+            .iter()
+            .map(|e| format!("  - {e}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(
+            "⚠ {count} consecutive tool calls have failed. Recent errors:\n{recent}\n\n\
+             Please stop retrying with similar arguments. Instead:\n\
+             1. Re-read the error messages carefully.\n\
+             2. Consider a completely different approach or tool.\n\
+             3. If you are stuck, ask the user for guidance.",
+            count = self.count
+        )
+    }
+}
+
 /// Shared context passed to `process_response` and `dispatch_single_tool`.
 ///
 /// WHY: Both functions previously took 8 parameters, tripping the
@@ -380,6 +613,7 @@ impl Agent {
             }
             shared.clone()
         };
+        session.last_run_outcome = None;
 
         let conversation_session_id = session
             .session_id
@@ -588,6 +822,8 @@ impl Agent {
                     .skip_context_files(config.skip_context_files)
                     .execution_environment_guidance(execution_guidance)
                     .available_tools(tool_names_for_prompt)
+                    .model_name(Some(config.model.clone()))
+                    .session_id(Some(conversation_session_id.clone()))
                     .build(
                         global_soul.as_deref(), // global SOUL.md is identity override
                         Some(&cwd),
@@ -878,43 +1114,65 @@ impl Agent {
             tokio::sync::mpsc::unbounded_channel::<ApprovalRequest>();
         let (delegation_req_tx, mut delegation_req_rx) =
             tokio::sync::mpsc::unbounded_channel::<DelegationEvent>();
+        let run_progress = RunProgressState::default();
 
         // Only wire the forwarder when we have a streaming event channel.
         if let Some(ev_tx) = event_tx {
             let clarify_ev_tx = ev_tx.clone();
+            let pending_clarifications = run_progress.pending_clarifications.clone();
             tokio::spawn(async move {
                 while let Some(req) = clarify_req_rx.recv().await {
-                    let _ = clarify_ev_tx.send(crate::StreamEvent::Clarify {
-                        question: req.question,
-                        choices: req.choices,
-                        response_tx: req.response_tx,
-                    });
+                    pending_clarifications.fetch_add(1, Ordering::Relaxed);
+                    let (answer_tx, answer_rx) = tokio::sync::oneshot::channel::<String>();
+                    if clarify_ev_tx
+                        .send(crate::StreamEvent::Clarify {
+                            question: req.question,
+                            choices: req.choices,
+                            response_tx: answer_tx,
+                        })
+                        .is_ok()
+                    {
+                        let answer = answer_rx.await.unwrap_or_default();
+                        let _ = req.response_tx.send(answer);
+                    } else {
+                        let _ = req.response_tx.send(String::new());
+                    }
+                    saturating_dec(&pending_clarifications);
                 }
             });
 
             let approval_ev_tx = ev_tx.clone();
+            let pending_approvals = run_progress.pending_approvals.clone();
             tokio::spawn(async move {
                 while let Some(req) = approval_req_rx.recv().await {
+                    pending_approvals.fetch_add(1, Ordering::Relaxed);
                     let (decision_tx, decision_rx) =
                         tokio::sync::oneshot::channel::<crate::ApprovalChoice>();
-                    let _ = approval_ev_tx.send(crate::StreamEvent::Approval {
-                        command: req.command,
-                        full_command: req.full_command,
-                        reasons: req.reasons,
-                        response_tx: decision_tx,
-                    });
-
-                    let mapped = match decision_rx.await {
-                        Ok(crate::ApprovalChoice::Once) => ApprovalResponse::Once,
-                        Ok(crate::ApprovalChoice::Session) => ApprovalResponse::Session,
-                        Ok(crate::ApprovalChoice::Always) => ApprovalResponse::Always,
-                        Ok(crate::ApprovalChoice::Deny) | Err(_) => ApprovalResponse::Deny,
-                    };
-                    let _ = req.response_tx.send(mapped);
+                    if approval_ev_tx
+                        .send(crate::StreamEvent::Approval {
+                            command: req.command,
+                            full_command: req.full_command,
+                            reasons: req.reasons,
+                            response_tx: decision_tx,
+                        })
+                        .is_ok()
+                    {
+                        let mapped = match decision_rx.await {
+                            Ok(crate::ApprovalChoice::Once) => ApprovalResponse::Once,
+                            Ok(crate::ApprovalChoice::Session) => ApprovalResponse::Session,
+                            Ok(crate::ApprovalChoice::Always) => ApprovalResponse::Always,
+                            Ok(crate::ApprovalChoice::Deny) | Err(_) => ApprovalResponse::Deny,
+                        };
+                        let _ = req.response_tx.send(mapped);
+                    } else {
+                        let _ = req.response_tx.send(ApprovalResponse::Deny);
+                    }
+                    saturating_dec(&pending_approvals);
                 }
             });
 
             let delegation_ev_tx = ev_tx.clone();
+            let child_runs_in_flight = run_progress.child_runs_in_flight.clone();
             tokio::spawn(async move {
                 while let Some(req) = delegation_req_rx.recv().await {
                     match req {
@@ -923,6 +1181,7 @@ impl Agent {
                             task_count,
                             goal,
                         } => {
+                            child_runs_in_flight.fetch_add(1, Ordering::Relaxed);
                             let _ = delegation_ev_tx.send(crate::StreamEvent::SubAgentStart {
                                 task_index,
                                 task_count,
@@ -962,6 +1221,7 @@ impl Agent {
                             api_calls,
                             model,
                         } => {
+                            saturating_dec(&child_runs_in_flight);
                             let _ = delegation_ev_tx.send(crate::StreamEvent::SubAgentFinish {
                                 task_index,
                                 task_count,
@@ -976,10 +1236,19 @@ impl Agent {
                 }
             });
         }
-        // In non-streaming paths (gateway, tests) just drop the receiver —
-        // the tool will fall back to returning the [CLARIFY] marker.
-        let clarify_tx_for_dispatch = Some(clarify_req_tx);
-        let approval_tx_for_dispatch = Some(approval_req_tx);
+        // In non-streaming paths the interactive relays do not exist, so the
+        // tools fall back to explicit markers instead of hanging on a reply that
+        // can never arrive.
+        let clarify_tx_for_dispatch = if event_tx.is_some() {
+            Some(clarify_req_tx)
+        } else {
+            None
+        };
+        let approval_tx_for_dispatch = if event_tx.is_some() {
+            Some(approval_req_tx)
+        } else {
+            None
+        };
         let delegation_tx_for_dispatch = if event_tx.is_some() {
             Some(delegation_req_tx)
         } else {
@@ -1003,6 +1272,8 @@ impl Agent {
         let mut budget_exhausted = false;
         // Accumulate per-tool-call error records — mirrors hermes AgentResult.tool_errors.
         let mut tool_errors_acc: Vec<edgecrab_types::ToolErrorRecord> = Vec::new();
+        let mut failure_tracker = ConsecutiveFailureTracker::new(3);
+        let mut dedup_tracker = DuplicateToolCallDetector::new();
         let capability_suppressions: Arc<Mutex<HashMap<String, ToolErrorResponse>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let spill_seq = Arc::new(crate::tool_result_spill::SpillSequence::new());
@@ -1011,6 +1282,12 @@ impl Agent {
         // so we do not spam the UI on every iteration when compression fails to
         // bring usage below the warning level.
         let mut pressure_warned = false;
+        // Compression circuit breaker (FP12): after 3 consecutive LLM compression
+        // failures, disable LLM summarization for the rest of the session and
+        // use structural fallback only. This prevents burning tokens on repeated
+        // compression attempts that always fail.
+        let mut compression_llm_failures: u32 = 0;
+        const MAX_COMPRESSION_LLM_FAILURES: u32 = 3;
 
         'conversation_loop: loop {
             if tool_defs_dirty {
@@ -1080,6 +1357,21 @@ impl Agent {
             // building the next provider payload.
             sanitize_orphaned_tool_results(&mut session.messages);
 
+            // FP21: Strip stale budget-warning annotations from prior turns.
+            //
+            // WHY: `inject_budget_warning()` appends a `_budget_warning` key (or text
+            // suffix) to the last tool result at the END of each turn.  Without this
+            // strip call, every subsequent turn's API payload carries forward all
+            // previous turns' stale warnings.  The LLM sees "70% used — wrap up" even
+            // when it has 30% of its budget remaining, causing premature truncation.
+            //
+            // Strip BEFORE compression so stale warnings are never baked into summaries.
+            // The only budget signal the LLM sees is the one freshly injected at the
+            // END of the current turn by `inject_budget_warning`.
+            //
+            // Cross-ref: Hermes `_strip_budget_warnings_from_history()` in `run_agent.py`.
+            strip_budget_warnings_from_history(&mut session.messages);
+
             // Context compression: check status, emit pressure warning, compress if needed.
             //
             // WHY before the API call: Compressing after the call is too late —
@@ -1115,18 +1407,86 @@ impl Agent {
                         },
                         seq: &spill_seq,
                     };
-                    session.messages = compress_with_llm(
-                        &session.messages,
-                        &compression_params,
-                        &provider,
-                        Some(&spill_ctx),
-                    )
-                    .await;
+                    // FP12: Compression circuit breaker — if LLM compression has
+                    // failed 3 times consecutively, skip the LLM call and use
+                    // structural-only compression (cheap, never fails).
+                    if compression_llm_failures >= MAX_COMPRESSION_LLM_FAILURES {
+                        tracing::warn!(
+                            failures = compression_llm_failures,
+                            "compression circuit breaker active — using structural fallback only"
+                        );
+                        session.messages = crate::compression::compress_structural_only(
+                            &session.messages,
+                            &compression_params,
+                            Some(&spill_ctx),
+                        );
+                    } else {
+                        // FP29: Return (messages, llm_succeeded) — use the bool to drive
+                        // the circuit breaker instead of the unreliable length comparison.
+                        // Structural fallback also reduces message count, so length comparison
+                        // never tripped the counter; the bool is the correct signal.
+                        let (compressed, llm_succeeded) = compress_with_llm(
+                            &session.messages,
+                            &compression_params,
+                            &provider,
+                            Some(&spill_ctx),
+                        )
+                        .await;
+                        session.messages = compressed;
+                        if llm_succeeded {
+                            // Successful LLM compression — reset failure count.
+                            compression_llm_failures = 0;
+                        } else {
+                            compression_llm_failures += 1;
+                            tracing::warn!(
+                                failures = compression_llm_failures,
+                                "LLM compression fell back to structural, tracking for circuit breaker (FP29)"
+                            );
+                        }
+                    }
+                    // FP33: On the FIRST compression in this session, append a one-shot
+                    // note to the cached system prompt.  This tells the model that earlier
+                    // turns have been compacted into a summary so it builds on that summary
+                    // rather than re-deriving state from scratch.
+                    //
+                    // WHY one-shot: Appending the note more than once would cause Anthropic
+                    // to treat the system prompt as changed on every subsequent turn,
+                    // invalidating the prompt cache breakpoint and doubling token costs.
+                    // We set the flag immediately so even a structural-only compression
+                    // triggers the note (both pathways compact context).
+                    if !session.first_compression_done {
+                        session.first_compression_done = true;
+                        const COMPRESSION_NOTE: &str = concat!(
+                            "\n\n[Note: Earlier conversation turns have been compacted into a ",
+                            "handoff summary to stay within the context window. The current ",
+                            "session state already reflects that earlier work — build on it ",
+                            "rather than re-doing completed steps.]"
+                        );
+                        if let Some(ref mut sys) = session.cached_system_prompt {
+                            sys.push_str(COMPRESSION_NOTE);
+                            tracing::debug!(
+                                "FP33: appended compression note to cached system prompt"
+                            );
+                        }
+                    }
                     // Re-inject active todo items preserved outside message history.
                     // Compression can summarize away earlier plan-tracking turns.
                     if let Some(snapshot) = self.todo_store.format_for_injection() {
                         session.messages.push(Message::user(&snapshot));
                     }
+                    // FP17: Reset the per-session read dedup cache after compression.
+                    //
+                    // WHY: Compression discards old messages, including earlier
+                    // read_file results. After compression the model no longer has
+                    // those file contents, so the dedup cache would incorrectly
+                    // suppress necessary re-reads on the next turn.
+                    //
+                    // Cross-ref: Hermes reset_file_dedup() in context_compressor.py.
+                    edgecrab_tools::read_tracker::reset_read_dedup(&conversation_session_id);
+                    tracing::debug!(
+                        session_id = %conversation_session_id,
+                        "read dedup cache cleared after compression (FP17)"
+                    );
                     // Re-check: if compression succeeded, clear the pressure flag.
                     let recomputed_prompt_tokens = estimate_request_prompt_tokens(
                         session.cached_system_prompt.as_deref(),
@@ -1376,6 +1736,9 @@ impl Agent {
             if let Some(cache_tokens) = response.cache_hit_tokens {
                 session.session_cache_read_tokens += cache_tokens as u64;
             }
+            if let Some(cache_write) = response.cache_write_tokens {
+                session.session_cache_write_tokens += cache_write as u64;
+            }
             if let Some(reasoning_tokens) = response.thinking_tokens {
                 session.session_reasoning_tokens += reasoning_tokens as u64;
             }
@@ -1425,6 +1788,8 @@ impl Agent {
                 &mut session,
                 &dctx,
                 &mut tool_errors_acc,
+                &mut failure_tracker,
+                &mut dedup_tracker,
             )
             .await
             {
@@ -1438,6 +1803,18 @@ impl Agent {
 
             match action {
                 LoopAction::Done(text) => {
+                    if response.finish_reason.as_deref() == Some(FINISH_REASON_STREAM_INTERRUPTED) {
+                        tracing::warn!(
+                            partial_len = text.len(),
+                            "streamed tool call was interrupted after visible output; continuing via a safe non-streaming recovery turn"
+                        );
+                        session.messages.push(Message::user(
+                            "[system: your previous response was interrupted while emitting a tool call. Continue from where you left off using the information already gathered. If a tool call is still needed, emit it again now.]",
+                        ));
+                        self.publish_session_state(&session).await;
+                        continue;
+                    }
+
                     // Length truncation continuation: if finish_reason is "length",
                     // the model was cut off mid-response. Auto-continue by appending
                     // the partial text and asking for more.
@@ -1453,6 +1830,37 @@ impl Agent {
                         ));
                         continue;
                     }
+
+                    let todo = snapshot_todo_state(&self.todo_store);
+                    let provisional_outcome = assess_completion(&run_progress.completion_context(
+                        &text,
+                        &session.messages,
+                        false,
+                        false,
+                        todo,
+                    ));
+
+                    if should_continue_after_model_text(&provisional_outcome) {
+                        tracing::info!(
+                            state = provisional_outcome.state.as_str(),
+                            active_tasks = todo.active,
+                            blocked_tasks = todo.blocked,
+                            pending_approvals =
+                                run_progress.pending_approvals.load(Ordering::Relaxed),
+                            pending_clarifications =
+                                run_progress.pending_clarifications.load(Ordering::Relaxed),
+                            child_runs = run_progress.child_runs_in_flight.load(Ordering::Relaxed),
+                            "model returned final text before the harness considered the task complete; continuing the loop"
+                        );
+                        session
+                            .messages
+                            .push(Message::user(&build_completion_follow_up_message(
+                                &provisional_outcome,
+                            )));
+                        self.publish_session_state(&session).await;
+                        continue;
+                    }
+
                     final_response = text;
                     break;
                 }
@@ -1566,6 +1974,22 @@ impl Agent {
         }
         self.publish_session_state(&session).await;
 
+        let todo = snapshot_todo_state(&self.todo_store);
+        let run_outcome = assess_completion(&run_progress.completion_context(
+            &final_response,
+            &session.messages,
+            interrupted,
+            budget_exhausted,
+            todo,
+        ));
+        session.last_run_outcome = Some(run_outcome.clone());
+        self.publish_session_state(&session).await;
+        if let Some(tx) = event_tx {
+            let _ = tx.send(crate::StreamEvent::RunFinished {
+                outcome: run_outcome.clone(),
+            });
+        }
+
         // Resolve session_id: prefer SessionState's, then config's, then generate.
         let session_id = session
             .session_id
@@ -1645,11 +2069,7 @@ impl Agent {
                 parent_session_id: None,
                 started_at: now,
                 ended_at: Some(now),
-                end_reason: if interrupted {
-                    Some("interrupted".to_string())
-                } else {
-                    None
-                },
+                end_reason: Some(run_outcome.exit_reason.as_str().to_string()),
                 message_count: session.messages.len() as i64,
                 tool_call_count: session.session_tool_call_count as i64,
                 input_tokens: session.session_input_tokens as i64,
@@ -1682,7 +2102,7 @@ impl Agent {
             }
         }
 
-        let completed = !interrupted && !final_response.trim().is_empty();
+        let completed = run_outcome.is_success();
         if let Some(discovery) = discovered_plugins.as_ref() {
             for plugin in discovery
                 .plugins
@@ -1698,6 +2118,10 @@ impl Agent {
                         "interrupted": interrupted,
                         "model": &config.model,
                         "platform": config.platform.to_string(),
+                        "completion_state": run_outcome.state.as_str(),
+                        "exit_reason": run_outcome.exit_reason.as_str(),
+                        "active_tasks": run_outcome.active_tasks,
+                        "blocked_tasks": run_outcome.blocked_tasks,
                     }),
                 )
                 .await
@@ -1743,6 +2167,7 @@ impl Agent {
             api_calls,
             interrupted,
             budget_exhausted,
+            run_outcome,
             model,
             usage,
             cost,
@@ -1890,23 +2315,52 @@ fn suppressed_retry_response(
     args_json: &str,
     prior: &ToolErrorResponse,
 ) -> ToolErrorResponse {
-    let mut error = ToolError::capability_denied(
-        name,
-        "suppressed_capability_retry",
-        format!(
-            "EdgeCrab already blocked an equivalent `{name}` call earlier in this conversation because `{}` is unresolved. Repeating the same call would be flaky. Change the approach or complete the required user action first.",
-            prior.code
-        ),
-    )
-    .with_suppression_key(tool_attempt_fingerprint(name, args_json));
+    let suggested_action = prior.suggested_action.clone().or_else(|| {
+        if prior.category == "arguments" {
+            Some(format!(
+                "Correct the JSON arguments for `{name}` before retrying. Include all required fields and valid values in the next tool call."
+            ))
+        } else {
+            Some(
+                "Change the approach or complete the required prerequisite before retrying."
+                    .to_string(),
+            )
+        }
+    });
 
-    if let Some(suggested_tool) = &prior.suggested_tool {
-        error = error.with_suggested_tool(suggested_tool.clone());
+    // Build an enriched error message that includes the original error text
+    // so the LLM can self-correct without guessing what went wrong.
+    let mut error_msg = format!(
+        "EdgeCrab already saw the same `{name}` call fail earlier in this conversation. \
+         Repeating identical arguments would be flaky, so that retry was suppressed.\n\
+         Original error [{code}]: {original_error}",
+        code = prior.code,
+        original_error = prior.error,
+    );
+    if let Some(ref hint) = prior.usage_hint {
+        error_msg.push_str(&format!("\nHint: {hint}"));
     }
-    if let Some(suggested_action) = &prior.suggested_action {
-        error = error.with_suggested_action(suggested_action.clone());
+    if let Some(ref action) = suggested_action {
+        error_msg.push_str(&format!("\nSuggested fix: {action}"));
     }
-    error.to_llm_payload()
+    if let Some(ref alt_tool) = prior.suggested_tool {
+        error_msg.push_str(&format!("\nAlternative tool: {alt_tool}"));
+    }
+
+    ToolErrorResponse {
+        response_type: "tool_error".into(),
+        category: prior.category.clone(),
+        code: "suppressed_repeated_tool_error".into(),
+        error: error_msg,
+        retryable: false,
+        suppress_retry: true,
+        suppression_key: Some(tool_attempt_fingerprint(name, args_json)),
+        tool: Some(name.to_string()),
+        suggested_tool: prior.suggested_tool.clone(),
+        suggested_action,
+        required_fields: prior.required_fields.clone(),
+        usage_hint: prior.usage_hint.clone(),
+    }
 }
 
 #[inline]
@@ -1956,6 +2410,52 @@ fn make_tool_progress_tx(
         }
     });
     Some(tool_progress_tx)
+}
+
+fn should_continue_after_model_text(outcome: &edgecrab_types::RunOutcome) -> bool {
+    matches!(
+        outcome.state,
+        edgecrab_types::CompletionDecision::Incomplete
+            | edgecrab_types::CompletionDecision::NeedsVerification
+            | edgecrab_types::CompletionDecision::Failed
+    )
+}
+
+fn build_completion_follow_up_message(outcome: &edgecrab_types::RunOutcome) -> String {
+    let mut notes = Vec::new();
+
+    match outcome.state {
+        edgecrab_types::CompletionDecision::Incomplete => {
+            notes
+                .push("There is still unfinished work or at least one remaining step.".to_string());
+        }
+        edgecrab_types::CompletionDecision::NeedsVerification => {
+            notes.push(
+                "Concrete verification evidence is still missing, so the task is not done yet."
+                    .to_string(),
+            );
+        }
+        edgecrab_types::CompletionDecision::Failed => {
+            notes.push("The last response did not produce a usable completion.".to_string());
+        }
+        _ => {}
+    }
+
+    if outcome.active_tasks > 0 || outcome.blocked_tasks > 0 {
+        notes.push(format!(
+            "Task ledger snapshot: {} active, {} blocked.",
+            outcome.active_tasks, outcome.blocked_tasks
+        ));
+    }
+
+    if let Some(reason) = outcome.verification.debt_reason.as_deref() {
+        notes.push(reason.to_string());
+    }
+
+    format!(
+        "[system: do not stop yet. {} Continue working until the request is actually complete or explicitly blocked. Briefly communicate progress, use report_task_status after the next milestone, and only finish once you have concrete evidence.]",
+        notes.join(" ")
+    )
 }
 
 fn summarize_tool_result_preview(name: &str, tool_result: &str, is_error: bool) -> Option<String> {
@@ -2014,6 +2514,34 @@ fn summarize_tool_result_preview(name: &str, tool_result: &str, is_error: bool) 
                 Some(format!(
                     "{completed}/{total} done, {in_progress} in progress"
                 ))
+            }
+            "report_task_status" => {
+                let status = obj
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("in_progress");
+                let summary = obj
+                    .get("summary")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim();
+                let remaining = obj
+                    .get("remaining_steps")
+                    .and_then(|v| v.as_array())
+                    .map(|steps| steps.len())
+                    .unwrap_or(0);
+                let label = match status {
+                    "completed" => "completed",
+                    "blocked" => "blocked",
+                    _ => "progress",
+                };
+                if summary.is_empty() {
+                    Some(label.to_string())
+                } else if remaining > 0 {
+                    Some(format!("{label}: {summary} · {remaining} step(s) left"))
+                } else {
+                    Some(format!("{label}: {summary}"))
+                }
             }
             "delegate_task" => {
                 let results = obj.get("results")?.as_array()?;
@@ -2213,7 +2741,19 @@ async fn api_call_streaming(
 
     loop {
         let next_chunk = if saw_meaningful_chunk {
-            stream.next().await
+            // Inter-chunk timeout — detect stale streams (FP10).
+            match tokio::time::timeout(STREAM_INTER_CHUNK_TIMEOUT, stream.next()).await {
+                Ok(chunk) => chunk,
+                Err(_) => {
+                    tracing::warn!(
+                        "api_call_streaming: inter-chunk timeout ({:?}) elapsed — \
+                         stream stale, returning partial content",
+                        STREAM_INTER_CHUNK_TIMEOUT,
+                    );
+                    finish_reason = Some(FINISH_REASON_STREAM_INTERRUPTED.to_string());
+                    break;
+                }
+            }
         } else {
             let remaining = first_chunk_deadline
                 .checked_duration_since(tokio::time::Instant::now())
@@ -2288,12 +2828,35 @@ async fn api_call_streaming(
         response.thinking_content = Some(thinking);
     }
 
-    response.tool_calls = finalize_streamed_tool_calls(tool_calls)?;
+    response.tool_calls = match finalize_streamed_tool_calls(tool_calls) {
+        Ok(tool_calls) => tool_calls,
+        Err(err)
+            if is_retryable_stream_tool_assembly_error(&err)
+                && (!response.content.trim().is_empty()
+                    || response
+                        .thinking_content
+                        .as_deref()
+                        .is_some_and(|t| !t.trim().is_empty())) =>
+        {
+            tracing::warn!(
+                provider = provider.name(),
+                model = provider.model(),
+                error = %err,
+                "streamed tool-call assembly failed after visible output; preserving the partial response and switching future turns to non-streaming recovery"
+            );
+            response.finish_reason = Some(FINISH_REASON_STREAM_INTERRUPTED.to_string());
+            Vec::new()
+        }
+        Err(err) => return Err(err),
+    };
 
     if let Some(usage) = final_usage {
         response = response.with_usage(usage.prompt_tokens, usage.completion_tokens);
         if let Some(cache_hit_tokens) = usage.cache_hit_tokens {
             response = response.with_cache_hit_tokens(cache_hit_tokens);
+        }
+        if let Some(cache_write_tokens) = usage.cache_write_tokens {
+            response = response.with_cache_write_tokens(cache_write_tokens);
         }
         if let Some(authoritative_thinking_tokens) = usage.thinking_tokens {
             response = response.with_thinking_tokens(authoritative_thinking_tokens);
@@ -2529,11 +3092,25 @@ async fn api_call_with_retry(
     //
     // We enforce this in the Err arm below.
     let retry_budget = max_retries;
+    // FP19: Provider-stated retry-after delay, set when we receive a rate limit
+    // error with an embedded "try again in X.Ys" hint. Used in the next
+    // iteration's backoff instead of the fixed BASE_BACKOFF.
+    let mut rate_limit_delay: Option<Duration> = None;
 
     'attempt_loop: for attempt in 0..=retry_budget {
         // ── Backoff sleep — interruptible ──────────────────────────────
         if attempt > 0 {
-            let delay = BASE_BACKOFF * 2u32.saturating_pow(attempt - 1);
+            // FP19: Use provider-stated wait time when available; fall back to
+            // exponential backoff. This avoids under-sleeping (hit limit again)
+            // and over-sleeping (wastes wall time).
+            let delay = rate_limit_delay
+                .take()
+                .unwrap_or_else(|| BASE_BACKOFF * 2u32.saturating_pow(attempt - 1));
+            tracing::debug!(
+                attempt,
+                delay_ms = delay.as_millis(),
+                "api_call_with_retry: sleeping before retry"
+            );
             tokio::select! {
                 biased;
                 _ = ctx.cancel.cancelled() => {
@@ -2619,6 +3196,9 @@ async fn api_call_with_retry(
                         request_started_at,
                     )
                     .await;
+                    if response.finish_reason.as_deref() == Some(FINISH_REASON_STREAM_INTERRUPTED) {
+                        disabled_native_tool_streaming = true;
+                    }
                     if let Some(tx) = ctx.event_tx {
                         let ctx_json = serde_json::json!({
                             "event": "llm:post",
@@ -2664,10 +3244,12 @@ async fn api_call_with_retry(
                                 model = provider.model(),
                                 attempt,
                                 error = %e,
-                                "streamed tool-call assembly failed before any visible output; retrying request"
+                                "streamed tool-call assembly failed before any visible output; downgrading this session to non-streaming tool calls"
                             );
-                            last_err = Some(e.to_string());
-                            break;
+                            use_native_streaming_this_attempt = false;
+                            native_tool_streaming_enabled = false;
+                            disabled_native_tool_streaming = true;
+                            continue;
                         }
                         if !visible_output_sent
                             && !tool_defs.is_empty()
@@ -2713,20 +3295,54 @@ async fn api_call_with_retry(
                     ) {
                         break 'attempt_loop;
                     }
+                    // FP19: For rate-limit errors, parse the provider-stated
+                    // retry-after duration so the next backoff sleeps the
+                    // correct amount rather than a fixed BASE_BACKOFF.
+                    if let edgequake_llm::LlmError::RateLimited(msg) = &e {
+                        rate_limit_delay = parse_retry_after(msg);
+                        if let Some(d) = rate_limit_delay {
+                            tracing::info!(
+                                provider = provider.name(),
+                                model = provider.model(),
+                                wait_ms = d.as_millis(),
+                                "rate limited — using provider-stated retry-after delay"
+                            );
+                        }
+                    }
                     break;
                 }
             }
         }
     }
 
-    Err(AgentError::Llm(format!(
-        "API call failed after {} retries: {}",
-        retry_budget,
-        last_err.map_or_else(
-            || "unknown error".to_string(),
-            |e| augment_provider_error(provider, e)
+    let raw_err = last_err.map_or_else(
+        || "unknown error".to_string(),
+        |e| augment_provider_error(provider, e),
+    );
+
+    // FP18: For rate-limit errors, produce a clear message that names the model
+    // and suggests the user wait before retrying — mirrors hermes-agent guidance.
+    let final_err_msg = if raw_err.to_ascii_lowercase().contains("rate limit")
+        || raw_err.to_ascii_lowercase().contains("rate_limit")
+        || raw_err.to_ascii_lowercase().contains("429")
+        || raw_err.to_ascii_lowercase().contains("too many requests")
+    {
+        format!(
+            "Rate limit exceeded for model {} after {} retries. \
+             Wait a minute and retry, or reduce context size / switch to a model with higher TPM limits. \
+             Provider error: {}",
+            provider.model(),
+            retry_budget,
+            raw_err
         )
-    )))
+    } else {
+        format!(
+            "API call failed after {} retries: {}",
+            retry_budget, raw_err
+        )
+    };
+
+    Err(AgentError::Llm(final_err_msg))
 }
 
 #[derive(Debug)]
@@ -2809,6 +3425,103 @@ fn inject_budget_warning(messages: &mut Vec<Message>, warning: &str) {
         tracing::debug!("no tool messages found, injecting budget warning as user message");
         messages.push(Message::user(warning));
     }
+}
+
+/// Strip stale budget-warning annotations from message history.
+///
+/// WHY: `inject_budget_warning()` appends a `_budget_warning` key to the last
+/// tool-result JSON (or plain text suffix) at the END of each tool turn.  That
+/// warning is turn-scoped — it signals "you have N% of iterations left RIGHT NOW".
+/// On every subsequent turn the signal is stale:
+///
+///   Turn 63/90 → injects "[BUDGET: 70% … wrap up]" into tool result
+///   Turn 64/90 → LLM still sees "[BUDGET: 70%]" even though usage is now 71%
+///   Turn 67/90 → LLM sees THREE stacked warnings (70%, 74%, 74%) — confused
+///
+/// After compression the warnings can be baked into the summary as if they are
+/// a permanent attribute of the conversation, further corrupting LLM behaviour.
+///
+/// We strip ALL injected warnings at the very top of each loop iteration —
+/// BEFORE compression and BEFORE building the API payload.  The only budget
+/// signal the LLM ever sees is the one freshly injected at the END of the
+/// *current* turn (via `inject_budget_warning`).
+///
+/// Cross-ref: Hermes `_strip_budget_warnings_from_history()` in `run_agent.py`.
+///
+/// Handled cases:
+///   1. Tool-role message with JSON content — removes the `_budget_warning` key.
+///   2. Tool-role message with plain text — strips the `\n\n[BUDGET...]` /
+///      `\n\n[URGENT...]` suffix appended by the plain-text fallback path.
+///   3. User-role message whose *entire* content is a budget warning (injected
+///      when there are no tool messages in history) — removed from the vec.
+fn strip_budget_warnings_from_history(messages: &mut Vec<Message>) {
+    // --- Pass 1: strip warnings embedded in tool-result messages ---------------
+    for msg in messages.iter_mut().filter(|m| m.role == Role::Tool) {
+        let current = match &msg.content {
+            Some(Content::Text(t)) => t.clone(),
+            _ => continue,
+        };
+
+        // Case 1: JSON object — remove the `_budget_warning` key if present.
+        if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&current) {
+            if let Some(obj) = v.as_object_mut() {
+                if obj.remove("_budget_warning").is_some() {
+                    if let Ok(cleaned) = serde_json::to_string(obj) {
+                        msg.content = Some(Content::Text(cleaned));
+                    }
+                }
+            }
+            // If it was valid JSON but had no key, nothing to do.
+            continue;
+        }
+
+        // Case 2: plain text — strip `\n\n[BUDGET...]` / `\n\n[URGENT...]` suffixes.
+        // The inject_budget_warning fallback path appends exactly "\n\n{warning}" where
+        // the warning starts with "[BUDGET:" or "[URGENT:".
+        let cleaned = strip_budget_text_suffix(&current);
+        if cleaned.len() < current.len() {
+            msg.content = Some(Content::Text(cleaned));
+        }
+    }
+
+    // --- Pass 2: remove pure-budget-warning user messages ----------------------
+    // When inject_budget_warning finds no tool messages it pushes a standalone
+    // Message::user(warning).  Such messages have no other content and start
+    // with "[BUDGET:" or "[URGENT:".  Remove them entirely.
+    messages.retain(|m| {
+        if m.role != Role::User {
+            return true;
+        }
+        let text = m.text_content();
+        !(text.starts_with("[BUDGET:") || text.starts_with("[URGENT:"))
+    });
+}
+
+/// Remove all `\n\n[BUDGET:...]` / `\n\n[URGENT:...]` suffixes from a string.
+///
+/// The suffix is appended verbatim by `inject_budget_warning`'s plain-text
+/// fallback: `format!("{}\n\n{}", current, warning)` where `warning` starts
+/// with "[BUDGET:" or "[URGENT:".  We scan backwards for the last occurrence.
+fn strip_budget_text_suffix(text: &str) -> String {
+    // Fast path: nothing to strip.
+    if !text.contains("\n\n[BUDGET:") && !text.contains("\n\n[URGENT:") {
+        return text.to_string();
+    }
+
+    let mut result = text.to_string();
+    // Iteratively strip all stacked suffixes (multiple turns can stack them).
+    loop {
+        let before = result.len();
+        for marker in &["\n\n[BUDGET:", "\n\n[URGENT:"] {
+            if let Some(pos) = result.rfind(marker) {
+                result.truncate(pos);
+            }
+        }
+        if result.len() == before {
+            break;
+        }
+    }
+    result
 }
 
 fn build_trajectory(
@@ -2923,6 +3636,8 @@ async fn process_response(
     session: &mut SessionState,
     dctx: &DispatchContext,
     tool_errors: &mut Vec<edgecrab_types::ToolErrorRecord>,
+    failure_tracker: &mut ConsecutiveFailureTracker,
+    dedup_tracker: &mut DuplicateToolCallDetector,
 ) -> Result<LoopAction, AgentError> {
     // Check for tool calls
     if response.has_tool_calls() {
@@ -2958,12 +3673,21 @@ async fn process_response(
         // for any task that panics — otherwise the assistant message has
         // tool_calls with no matching tool_results and the next API call fails.
         let mut parallel_submitted: Vec<(String, String)> = Vec::new();
+        // Path-overlap tracking: tools that declare path_arguments() can run
+        // in parallel if they target different files. (FP9: Parallel Safety)
+        let mut claimed_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         for tc in &effective_tool_calls {
             let is_parallel = dctx
                 .registry
                 .as_ref()
-                .map(|r| r.is_parallel_safe(&tc.function.name))
+                .map(|r| {
+                    r.can_parallelize_in_batch(
+                        &tc.function.name,
+                        &tc.function.arguments,
+                        &claimed_paths,
+                    )
+                })
                 .unwrap_or(false);
 
             // Notify TUI that a tool execution is starting
@@ -2976,6 +3700,12 @@ async fn process_response(
             }
 
             if is_parallel {
+                // Claim paths so subsequent tools targeting the same file go sequential.
+                if let Some(ref reg) = dctx.registry {
+                    for p in reg.extract_paths(&tc.function.name, &tc.function.arguments) {
+                        claimed_paths.insert(p);
+                    }
+                }
                 // Track the tool call so we can detect panics after join_next.
                 parallel_submitted.push((tc.id.clone(), tc.function.name.clone()));
                 // Spawn parallel-safe tools concurrently
@@ -3069,8 +3799,13 @@ async fn process_response(
                             error: extract_tool_error_text(&tool_result),
                             tool_result: tool_result.clone(),
                         });
+                        failure_tracker.record_failure(&extract_tool_error_text(&tool_result));
+                    } else {
+                        failure_tracker.record_success();
                     }
                     received_parallel_ids.insert(tc_id.clone());
+                    // Record for duplicate detection (FP11)
+                    dedup_tracker.record(&tc_name, &args_json, &tool_result);
                     session
                         .messages
                         .push(Message::tool_result(&tc_id, &tc_name, &tool_result));
@@ -3105,6 +3840,39 @@ async fn process_response(
 
         // Dispatch sequential tools in order
         for tc in sequential_calls {
+            // ── Duplicate tool call detection (FP11) ─────────────────
+            // If the exact same tool+args was called in the previous turn,
+            // skip re-execution and return the cached result with a nudge.
+            if let Some(cached) = dedup_tracker
+                .check_duplicate(&tc.function.name, &tc.function.arguments)
+                .map(|s| s.to_owned())
+            {
+                tracing::info!(
+                    tool = %tc.function.name,
+                    "duplicate tool call detected — returning cached result (FP11)"
+                );
+                let dedup_result = format!(
+                    "{cached}\n\n[Note: This is a cached result — you already called `{}` with identical arguments in the previous turn. Try a different approach or different arguments.]",
+                    tc.function.name
+                );
+                emit_tool_done(
+                    dctx.event_tx.as_ref(),
+                    &tc.id,
+                    &tc.function.name,
+                    &tc.function.arguments,
+                    &dedup_result,
+                    0,
+                    false,
+                );
+                session.messages.push(Message::tool_result(
+                    &tc.id,
+                    &tc.function.name,
+                    &dedup_result,
+                ));
+                dedup_tracker.record(&tc.function.name, &tc.function.arguments, &cached);
+                continue;
+            }
+
             let started = std::time::Instant::now();
             let (tool_result, injected_messages) =
                 dispatch_single_tool(&tc.id, &tc.function.name, &tc.function.arguments, dctx).await;
@@ -3134,7 +3902,12 @@ async fn process_response(
                     error: extract_tool_error_text(&tool_result),
                     tool_result: tool_result.clone(),
                 });
+                failure_tracker.record_failure(&extract_tool_error_text(&tool_result));
+            } else {
+                failure_tracker.record_success();
             }
+            // Record for duplicate detection (FP11)
+            dedup_tracker.record(&tc.function.name, &tc.function.arguments, &tool_result);
             session.messages.push(Message::tool_result(
                 &tc.id,
                 &tc.function.name,
@@ -3142,6 +3915,25 @@ async fn process_response(
             ));
             session.messages.extend(injected_messages);
         }
+
+        // ── Consecutive failure escalation ───────────────────────────
+        // After all tools in this turn have run, check whether the
+        // failure tracker has hit its threshold. If so, inject a system
+        // guidance message that tells the LLM to stop retrying and
+        // reconsider its approach.
+        if failure_tracker.count >= failure_tracker.max_before_escalation {
+            let escalation = failure_tracker.escalation_message();
+            tracing::warn!(
+                consecutive_failures = failure_tracker.count,
+                "consecutive failure escalation triggered"
+            );
+            session.messages.push(Message::user(&escalation));
+            // Reset so the tracker can fire again after another streak.
+            failure_tracker.record_success();
+        }
+
+        // End-of-turn: rotate dedup tracker (FP11)
+        dedup_tracker.end_turn();
 
         return Ok(LoopAction::Continue);
     }
@@ -3217,12 +4009,145 @@ fn cap_delegate_task_calls(
 }
 
 /// Dispatch a single tool call through the registry.
+// ── Tool call argument repair ────────────────────────────────────────
+// Self-heal common LLM JSON errors locally instead of wasting an API turn.
+// Inspired by hermes-agent `_repair_tool_call_arguments()`.
+//
+// FP7: Self-Heal Before Failing — the cheapest fix never reaches the LLM.
+fn repair_tool_call_arguments(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "null" || trimmed == "None" {
+        return "{}".to_string();
+    }
+    let mut s = trimmed.to_string();
+
+    // Python-style booleans / None (whole-value tokens after a colon)
+    s = s
+        .replace(": True", ": true")
+        .replace(":True", ":true")
+        .replace(": False", ": false")
+        .replace(":False", ":false")
+        .replace(": None", ": null")
+        .replace(":None", ":null");
+
+    // Trailing commas: `,<whitespace>}` or `,<whitespace>]`
+    // Walk backwards from each closing bracket to strip the preceding comma.
+    let mut out = String::with_capacity(s.len());
+    let chars: Vec<char> = s.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+    while i < len {
+        if chars[i] == '}' || chars[i] == ']' {
+            // Look backwards in `out` for a trailing comma (skip whitespace)
+            let trimmed_end = out.trim_end_matches(|c: char| c.is_ascii_whitespace());
+            if trimmed_end.ends_with(',') {
+                let comma_pos = trimmed_end.len() - 1;
+                out.truncate(comma_pos);
+                // Re-add the whitespace that was between comma and bracket
+                // (just a newline/space for readability)
+            }
+            out.push(chars[i]);
+        } else {
+            out.push(chars[i]);
+        }
+        i += 1;
+    }
+    s = out;
+
+    // Unclosed braces
+    let opens = s.chars().filter(|c| *c == '{').count();
+    let closes = s.chars().filter(|c| *c == '}').count();
+    for _ in 0..opens.saturating_sub(closes) {
+        s.push('}');
+    }
+    // Unclosed brackets
+    let opens_sq = s.chars().filter(|c| *c == '[').count();
+    let closes_sq = s.chars().filter(|c| *c == ']').count();
+    for _ in 0..opens_sq.saturating_sub(closes_sq) {
+        s.push(']');
+    }
+
+    s
+}
+
+/// Sanitize a tool call name that arrived from an LLM response.
+///
+/// WHY: Some models — particularly NousResearch Hermes 3 family on OpenRouter —
+/// bleed chatml special tokens such as `<|channel|>commentary` into the function
+/// name field.  Others output `"read file"` (spaces) or `"web-extract"` (hyphens)
+/// instead of the snake_case names published in the tool schema.
+///
+/// This is a **trust-boundary sanitizer** applied at the single point where all
+/// tool calls from all code paths enter `dispatch_single_tool`.  One fix covers
+/// every execution path.
+///
+/// # What it strips
+/// 1. `<|…|>` special tokens: truncates at the first `<|` (covers ALL chatml
+///    channel annotations regardless of token content).
+/// 2. Space → underscore normalization (`"read file"` → `"read_file"`).
+/// 3. Hyphen → underscore normalization (`"web-extract"` → `"web_extract"`).
+/// 4. Leading/trailing whitespace.
+///
+/// # What it does NOT do
+/// - Does not rewrite unknown tool names to their closest match (the registry's
+///   fuzzy match layer is responsible for that and must remain visible).
+/// - Does not lowercase (tool names are already lowercase in edgecrab; third-party
+///   engine schemas should not be silently recased).
+/// - Does not touch the argument JSON.
+///
+/// # Performance
+/// The fast path is a single `contains` check — no allocation for already-clean
+/// names.  Returns `Cow::Borrowed` in that case.
+fn sanitize_tool_name(name: &str) -> std::borrow::Cow<'_, str> {
+    let trimmed = name.trim();
+
+    // Fast path: the name is already well-formed.
+    // Valid tool names contain only ASCII alphanumeric chars and underscores.
+    let needs_clean = trimmed.contains("<|")
+        || trimmed.contains(' ')
+        || trimmed.contains('-');
+    if !needs_clean {
+        return std::borrow::Cow::Borrowed(trimmed);
+    }
+
+    // Strip special-token suffix — keep only the base name before `<|`.
+    let base = if let Some(pos) = trimmed.find("<|") {
+        trimmed[..pos].trim_end()
+    } else {
+        trimmed
+    };
+
+    // Normalize word separators to underscore (snake_case).
+    let cleaned = base.replace([' ', '-'], "_");
+    std::borrow::Cow::Owned(cleaned)
+}
+
 async fn dispatch_single_tool(
     tool_call_id: &str,
     name: &str,
     args_json: &str,
     dctx: &DispatchContext,
 ) -> (String, Vec<Message>) {
+    // FP54: Sanitize the tool name before anything else.
+    //
+    // Some models (e.g. Hermes 3 / NousResearch on OpenRouter) bleed chatml
+    // special tokens like `<|channel|>commentary` into the function name field,
+    // and some weaker models output spaces instead of underscores.
+    //
+    // Keep `original_name` for diagnostics, then shadow `name` with the clean
+    // form so all downstream code — fingerprinting, hook dispatch, engine routing,
+    // registry lookup — sees the canonical name.
+    let original_name = name;
+    let sanitized_name = sanitize_tool_name(name);
+    let name: &str = sanitized_name.as_ref();
+    if original_name != name {
+        tracing::info!(
+            original = %original_name,
+            clean = %name,
+            "tool call name sanitized (special tokens or non-underscore separators stripped)"
+        );
+    }
+
     let Some(reg) = dctx.registry.as_ref() else {
         return (
             format!(
@@ -3335,24 +4260,42 @@ async fn dispatch_single_tool(
 
     let args: serde_json::Value = match serde_json::from_str(args_json) {
         Ok(v) => v,
-        Err(e) => {
-            // Malformed JSON arguments — report as a tool error so the LLM
-            // can self-correct (e.g. fix quoting or truncated output) rather
-            // than silently receiving `{}` and producing nonsensical output.
-            tracing::warn!(tool_name = %name, error = %e, args_json = %args_json, "malformed tool arguments JSON");
-            return (
-                ToolError::InvalidArgs {
-                    tool: name.to_string(),
-                    message: format!("invalid JSON arguments: {e}"),
+        Err(_first_err) => {
+            // Attempt self-healing repair before giving up (FP7).
+            let repaired = repair_tool_call_arguments(args_json);
+            match serde_json::from_str(&repaired) {
+                Ok(v) => {
+                    tracing::info!(tool_name = %name, "repaired malformed tool arguments JSON");
+                    v
                 }
-                .to_llm_response(),
-                Vec::new(),
-            );
+                Err(e) => {
+                    // Repair failed too — report as a tool error so the LLM
+                    // can self-correct.
+                    tracing::warn!(tool_name = %name, error = %e, args_json = %args_json, "malformed tool arguments JSON (repair also failed)");
+                    return (
+                        ToolError::InvalidArgs {
+                            tool: name.to_string(),
+                            message: format!("invalid JSON arguments: {e}"),
+                        }
+                        .to_llm_response(),
+                        Vec::new(),
+                    );
+                }
+            }
         }
     };
 
     let result = match reg.dispatch(name, args, &ctx).await {
         Ok(output) => output,
+        Err(ref e @ ToolError::InvalidArgs { .. }) => {
+            // Enrich InvalidArgs with required_fields + usage_hint from schema.
+            // This gives the LLM a precise corrective checklist on the next turn.
+            if let Some(enriched) = reg.enrich_invalid_args_error(name, e) {
+                serde_json::to_string(&enriched).expect("enriched error serializes")
+            } else {
+                e.to_llm_response()
+            }
+        }
         Err(e) => e.to_llm_response(),
     };
 
@@ -3629,7 +4572,18 @@ and stop — do NOT call any tools.";
     // Use process_response — it appends messages and runs tools properly.
     // Reflection tool errors are non-fatal and not surfaced to the caller.
     let mut _reflection_tool_errors: Vec<edgecrab_types::ToolErrorRecord> = Vec::new();
-    if let Err(e) = process_response(&response, session, dctx, &mut _reflection_tool_errors).await {
+    let mut _reflection_failure_tracker = ConsecutiveFailureTracker::new(3);
+    let mut _reflection_dedup_tracker = DuplicateToolCallDetector::new();
+    if let Err(e) = process_response(
+        &response,
+        session,
+        dctx,
+        &mut _reflection_tool_errors,
+        &mut _reflection_failure_tracker,
+        &mut _reflection_dedup_tracker,
+    )
+    .await
+    {
         tracing::debug!(error = %e, "learning reflection tool dispatch failed (non-fatal)");
     }
 }
@@ -4375,6 +5329,70 @@ def register(ctx):
     }
 
     #[tokio::test]
+    async fn api_call_with_retry_recovers_after_visible_streamed_tool_json_breaks() {
+        let provider: Arc<dyn LLMProvider> = Arc::new(StreamingUsageProvider {
+            chunks: vec![
+                StreamChunk::Content(
+                    "Perfect! Now I have sufficient information. Let me create a comprehensive audit document:".into(),
+                ),
+                StreamChunk::ToolCallDelta {
+                    index: 0,
+                    id: Some("call_write".into()),
+                    function_name: Some("write_file".into()),
+                    function_arguments: Some("{\"path\":".into()),
+                    thought_signature: None,
+                },
+                StreamChunk::Finished {
+                    reason: "tool_use".to_string(),
+                    ttft_ms: None,
+                    usage: None,
+                },
+            ],
+        });
+        let cancel = CancellationToken::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let tool_defs = vec![ToolDefinition::function(
+            "write_file",
+            "Write a file",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"}
+                },
+                "required": ["path", "content"]
+            }),
+        )];
+
+        let outcome = api_call_with_retry(
+            &provider,
+            &[ChatMessage::user("hello")],
+            &tool_defs,
+            0,
+            ApiCallContext {
+                options: None,
+                cancel: &cancel,
+                event_tx: Some(&tx),
+                use_native_streaming: true,
+                discovered_plugins: None,
+                conversation_session_id: "test-session",
+                platform: edgecrab_types::Platform::Cli,
+                api_call_count: 0,
+            },
+        )
+        .await
+        .expect("visible partial text should be preserved and recovered instead of crashing");
+
+        assert!(outcome.disabled_native_tool_streaming);
+        assert_eq!(
+            outcome.response.finish_reason.as_deref(),
+            Some(FINISH_REASON_STREAM_INTERRUPTED)
+        );
+        assert!(outcome.response.tool_calls.is_empty());
+        assert!(outcome.response.content.contains("sufficient information"));
+    }
+
+    #[tokio::test]
     async fn api_call_with_retry_does_not_double_retry_copilot_requests() {
         let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let provider: Arc<dyn LLMProvider> = Arc::new(RetryCountingProvider {
@@ -4453,18 +5471,30 @@ def register(ctx):
     }
 
     #[tokio::test]
-    async fn api_call_with_retry_retries_malformed_streamed_tool_calls() {
+    async fn api_call_with_retry_falls_back_after_malformed_streamed_tool_calls() {
         let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let provider: Arc<dyn LLMProvider> = Arc::new(FlakyToolStreamProvider {
             attempts: attempts.clone(),
         });
         let cancel = CancellationToken::new();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let tool_defs = vec![ToolDefinition::function(
+            "write_file",
+            "Write a file",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"}
+                },
+                "required": ["path", "content"]
+            }),
+        )];
 
         let outcome = api_call_with_retry(
             &provider,
             &[ChatMessage::user("hello")],
-            &[],
+            &tool_defs,
             1,
             ApiCallContext {
                 options: None,
@@ -4478,12 +5508,13 @@ def register(ctx):
             },
         )
         .await
-        .expect("malformed tool stream should be retried once");
+        .expect("malformed tool stream should downgrade to the safe non-streaming path");
 
         let response = outcome.response;
-        assert_eq!(response.content, "recovered");
-        assert_eq!(response.finish_reason.as_deref(), Some("stop"));
-        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(response.content, "non-stream");
+        assert_eq!(response.finish_reason.as_deref(), None);
+        assert!(outcome.disabled_native_tool_streaming);
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -5261,6 +6292,138 @@ def register(ctx):
         );
     }
 
+    // ── strip_budget_warnings_from_history ────────────────────────────────
+
+    #[test]
+    fn strip_budget_warnings_strips_json_key() {
+        // Tool result with JSON content that has a _budget_warning key injected
+        let tool_content = r#"{"result":"ok","_budget_warning":"[BUDGET: 70% ...]"}"#;
+        let mut messages = vec![
+            Message::user("task"),
+            Message {
+                role: Role::Tool,
+                content: Some(Content::Text(tool_content.to_string())),
+                name: Some("my_tool".to_string()),
+                tool_call_id: Some("call-1".to_string()),
+                ..Default::default()
+            },
+        ];
+        strip_budget_warnings_from_history(&mut messages);
+        let text = messages[1].text_content();
+        assert!(
+            !text.contains("_budget_warning"),
+            "JSON key should be removed"
+        );
+        assert!(text.contains("\"result\":\"ok\""), "other fields preserved");
+    }
+
+    #[test]
+    fn strip_budget_warnings_strips_plain_text_suffix() {
+        // Tool result with plain text content with an appended budget warning
+        let tool_content = "Here is the file content.\n\n[BUDGET: 70% of iteration budget used (7/10). Start wrapping up.]";
+        let mut messages = vec![
+            Message::user("task"),
+            Message {
+                role: Role::Tool,
+                content: Some(Content::Text(tool_content.to_string())),
+                name: Some("read_file".to_string()),
+                tool_call_id: Some("call-2".to_string()),
+                ..Default::default()
+            },
+        ];
+        strip_budget_warnings_from_history(&mut messages);
+        let text = messages[1].text_content();
+        assert_eq!(text, "Here is the file content.");
+        assert!(!text.contains("BUDGET"), "BUDGET text should be removed");
+    }
+
+    #[test]
+    fn strip_budget_warnings_strips_urgent_text_suffix() {
+        let tool_content =
+            "Result data\n\n[URGENT: 90% of iteration budget used (9/10). You MUST respond now.]";
+        let mut messages = vec![Message {
+            role: Role::Tool,
+            content: Some(Content::Text(tool_content.to_string())),
+            name: Some("terminal".to_string()),
+            tool_call_id: Some("call-3".to_string()),
+            ..Default::default()
+        }];
+        strip_budget_warnings_from_history(&mut messages);
+        let text = messages[0].text_content();
+        assert_eq!(text, "Result data");
+    }
+
+    #[test]
+    fn strip_budget_warnings_removes_standalone_user_message() {
+        // inject_budget_warning fallback: pushes a plain user message when there are
+        // no tool messages. strip_budget_warnings_from_history should remove it.
+        let mut messages = vec![
+            Message::user("write me a poem"),
+            Message::assistant("Here is a poem."),
+            Message::user("[BUDGET: 70% of iteration budget used. Start wrapping up.]"),
+        ];
+        strip_budget_warnings_from_history(&mut messages);
+        assert_eq!(messages.len(), 2, "standalone budget user message removed");
+        assert_eq!(messages[0].text_content(), "write me a poem");
+    }
+
+    #[test]
+    fn strip_budget_warnings_removes_standalone_urgent_user_message() {
+        let mut messages = vec![
+            Message::user("help"),
+            Message::user(
+                "[URGENT: 90% of iteration budget used (9/10). You MUST provide a final response NOW — do not make further tool calls.]",
+            ),
+        ];
+        strip_budget_warnings_from_history(&mut messages);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].text_content(), "help");
+    }
+
+    #[test]
+    fn strip_budget_warnings_noop_on_clean_history() {
+        let mut messages = vec![
+            Message::user("task"),
+            Message {
+                role: Role::Tool,
+                content: Some(Content::Text(r#"{"result":"clean"}"#.to_string())),
+                name: Some("tool".to_string()),
+                tool_call_id: Some("call-4".to_string()),
+                ..Default::default()
+            },
+            Message::assistant("done"),
+        ];
+        let original_len = messages.len();
+        strip_budget_warnings_from_history(&mut messages);
+        assert_eq!(
+            messages.len(),
+            original_len,
+            "no messages removed from clean history"
+        );
+        assert_eq!(messages[1].text_content(), r#"{"result":"clean"}"#);
+    }
+
+    #[test]
+    fn strip_budget_warnings_strips_multiple_stacked_warnings() {
+        // Multiple warnings stacked by multiple inject calls (turns 63, 67, 70)
+        let tool_content = "actual content\n\n[BUDGET: 70% ...]\n\n[URGENT: 90% ...]";
+        let mut messages = vec![Message {
+            role: Role::Tool,
+            content: Some(Content::Text(tool_content.to_string())),
+            name: Some("tool".to_string()),
+            tool_call_id: Some("call-5".to_string()),
+            ..Default::default()
+        }];
+        strip_budget_warnings_from_history(&mut messages);
+        assert_eq!(messages[0].text_content(), "actual content");
+    }
+
+    #[test]
+    fn strip_budget_text_suffix_no_op_when_absent() {
+        let text = "just normal content";
+        assert_eq!(strip_budget_text_suffix(text), text);
+    }
+
     // ── Sanitize edge cases ───────────────────────────────────────────────
 
     #[test]
@@ -5358,6 +6521,17 @@ def register(ctx):
         )
         .expect("preview");
         assert_eq!(preview, "2/3 task(s) completed in 1.25s");
+    }
+
+    #[test]
+    fn summarize_tool_result_preview_summarizes_reported_task_status() {
+        let preview = summarize_tool_result_preview(
+            "report_task_status",
+            r#"{"status":"in_progress","summary":"wired the TUI banners","remaining_steps":["run tests"]}"#,
+            false,
+        )
+        .expect("preview");
+        assert_eq!(preview, "progress: wired the TUI banners · 1 step(s) left");
     }
 
     // ── build_chat_messages edge cases ───────────────────────────────────
@@ -5509,8 +6683,44 @@ def register(ctx):
             dispatch_single_tool("call-terminal-2", "terminal", args_json, &dctx).await;
         assert!(second_injected.is_empty());
         let second_payload = parse_tool_error_response(&second).expect("structured error");
-        assert_eq!(second_payload.code, "suppressed_capability_retry");
-        assert!(second_payload.error.contains("already blocked"));
+        assert_eq!(second_payload.code, "suppressed_repeated_tool_error");
+        assert!(second_payload.error.contains("same `terminal` call fail"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_single_tool_suppresses_repeated_invalid_argument_retry() {
+        let registry = Arc::new(ToolRegistry::new());
+        let cancel = CancellationToken::new();
+        let state_db = None;
+        let process_table = Arc::new(ProcessTable::new());
+        let capability_suppressions = Arc::new(Mutex::new(HashMap::new()));
+        let mut dctx = make_dispatch_context_for_test(
+            &registry,
+            &cancel,
+            &state_db,
+            &process_table,
+            capability_suppressions.clone(),
+        );
+
+        let workspace = TempDir::new().expect("workspace");
+        std::fs::write(workspace.path().join("audit.md"), "existing content").expect("seed");
+        dctx.cwd = workspace.path().to_path_buf();
+        let args_json = r#"{"path":"audit.md"}"#;
+
+        let (first, first_injected) =
+            dispatch_single_tool("call-write-1", "write_file", args_json, &dctx).await;
+        assert!(first_injected.is_empty());
+        let first_payload = parse_tool_error_response(&first).expect("structured error");
+        assert_eq!(first_payload.code, "invalid_arguments");
+        remember_tool_suppression(&capability_suppressions, "write_file", args_json, &first);
+
+        let (second, second_injected) =
+            dispatch_single_tool("call-write-2", "write_file", args_json, &dctx).await;
+        assert!(second_injected.is_empty());
+        let second_payload = parse_tool_error_response(&second).expect("structured error");
+        assert_eq!(second_payload.code, "suppressed_repeated_tool_error");
+        assert_eq!(second_payload.category, "arguments");
+        assert!(second_payload.error.contains("same `write_file` call fail"));
     }
 
     // ── Cancellation ─────────────────────────────────────────────────────
@@ -5543,5 +6753,317 @@ def register(ctx):
             "normal completion must not set interrupted"
         );
         assert!(!result.final_response.is_empty());
+    }
+
+    #[test]
+    fn consecutive_failure_tracker_escalates_after_threshold() {
+        let mut tracker = ConsecutiveFailureTracker::new(3);
+        assert!(!tracker.record_failure("error 1"));
+        assert!(!tracker.record_failure("error 2"));
+        assert!(
+            tracker.record_failure("error 3"),
+            "should escalate after 3 failures"
+        );
+        let msg = tracker.escalation_message();
+        assert!(
+            msg.contains("3 consecutive tool calls"),
+            "message should mention count"
+        );
+        assert!(
+            msg.contains("error 3"),
+            "message should include recent errors"
+        );
+    }
+
+    #[test]
+    fn consecutive_failure_tracker_resets_on_success() {
+        let mut tracker = ConsecutiveFailureTracker::new(3);
+        tracker.record_failure("error 1");
+        tracker.record_failure("error 2");
+        tracker.record_success();
+        assert_eq!(tracker.count, 0);
+        assert!(tracker.last_errors.is_empty());
+        // After reset, need 3 more failures to escalate again
+        assert!(!tracker.record_failure("error a"));
+        assert!(!tracker.record_failure("error b"));
+        assert!(tracker.record_failure("error c"));
+    }
+
+    // ── Duplicate Tool Call Detector tests (FP11) ─────────────────
+
+    #[test]
+    fn dedup_tracker_detects_same_call_across_turns() {
+        let mut tracker = DuplicateToolCallDetector::new();
+        // Turn 1: record a call
+        tracker.record(
+            "read_file",
+            r#"{"path":"src/main.rs"}"#,
+            "file contents here",
+        );
+        tracker.end_turn();
+        // Turn 2: same call should be detected as duplicate
+        let cached = tracker.check_duplicate("read_file", r#"{"path":"src/main.rs"}"#);
+        assert!(cached.is_some(), "should detect duplicate tool call");
+        assert_eq!(cached.unwrap(), "file contents here");
+    }
+
+    #[test]
+    fn dedup_tracker_allows_different_args() {
+        let mut tracker = DuplicateToolCallDetector::new();
+        tracker.record("read_file", r#"{"path":"src/main.rs"}"#, "main contents");
+        tracker.end_turn();
+        // Different args — should NOT be detected as duplicate
+        let cached = tracker.check_duplicate("read_file", r#"{"path":"src/lib.rs"}"#);
+        assert!(cached.is_none(), "different args should not be duplicate");
+    }
+
+    #[test]
+    fn dedup_tracker_allows_different_tools() {
+        let mut tracker = DuplicateToolCallDetector::new();
+        tracker.record("read_file", r#"{"path":"src/main.rs"}"#, "contents");
+        tracker.end_turn();
+        // Different tool — should NOT be detected
+        let cached = tracker.check_duplicate("write_file", r#"{"path":"src/main.rs"}"#);
+        assert!(cached.is_none(), "different tool should not be duplicate");
+    }
+
+    #[test]
+    fn dedup_tracker_does_not_detect_within_same_turn() {
+        let mut tracker = DuplicateToolCallDetector::new();
+        tracker.record("read_file", r#"{"path":"foo"}"#, "result");
+        // Same turn — prev_turn is empty, so no duplicate
+        let cached = tracker.check_duplicate("read_file", r#"{"path":"foo"}"#);
+        assert!(
+            cached.is_none(),
+            "should not detect duplicate within same turn"
+        );
+    }
+
+    #[test]
+    fn dedup_tracker_clears_after_two_turns() {
+        let mut tracker = DuplicateToolCallDetector::new();
+        tracker.record("read_file", r#"{"path":"foo"}"#, "result1");
+        tracker.end_turn();
+        // Turn 2: record something different
+        tracker.record("write_file", r#"{"path":"bar"}"#, "result2");
+        tracker.end_turn();
+        // Turn 3: the original read_file("foo") is no longer in prev_turn
+        let cached = tracker.check_duplicate("read_file", r#"{"path":"foo"}"#);
+        assert!(
+            cached.is_none(),
+            "old calls should be evicted after 2 turns"
+        );
+    }
+
+    #[test]
+    fn suppressed_retry_includes_original_error_and_hints() {
+        use edgecrab_types::ToolErrorResponse;
+
+        let prior = ToolErrorResponse {
+            response_type: "tool_error".into(),
+            category: "arguments".into(),
+            code: "invalid_args".into(),
+            error: "missing field `path`".into(),
+            retryable: true,
+            suppress_retry: false,
+            suppression_key: None,
+            tool: Some("read_file".into()),
+            suggested_tool: Some("search_files".into()),
+            suggested_action: None,
+            required_fields: Some(vec!["path".into()]),
+            usage_hint: Some("Required: path: string".into()),
+        };
+
+        let resp = suppressed_retry_response("read_file", r#"{"wrong":"args"}"#, &prior);
+        assert!(
+            resp.error.contains("missing field `path`"),
+            "should include original error"
+        );
+        assert!(
+            resp.error.contains("Required: path: string"),
+            "should include usage hint"
+        );
+        assert!(
+            resp.error.contains("search_files"),
+            "should include alternative tool"
+        );
+        assert_eq!(
+            resp.required_fields.as_deref(),
+            Some(&["path".to_string()][..])
+        );
+        assert!(resp.usage_hint.is_some());
+    }
+
+    // ── repair_tool_call_arguments tests ─────────────────────────────
+    #[test]
+    fn repair_empty_string() {
+        assert_eq!(repair_tool_call_arguments(""), "{}");
+        assert_eq!(repair_tool_call_arguments("   "), "{}");
+    }
+
+    #[test]
+    fn repair_null_and_none() {
+        assert_eq!(repair_tool_call_arguments("null"), "{}");
+        assert_eq!(repair_tool_call_arguments("None"), "{}");
+    }
+
+    #[test]
+    fn repair_python_booleans() {
+        let input = r#"{"flag": True, "other": False, "val": None}"#;
+        let repaired = repair_tool_call_arguments(input);
+        let v: serde_json::Value = serde_json::from_str(&repaired).unwrap();
+        assert_eq!(v["flag"], serde_json::Value::Bool(true));
+        assert_eq!(v["other"], serde_json::Value::Bool(false));
+        assert!(v["val"].is_null());
+    }
+
+    #[test]
+    fn repair_trailing_comma() {
+        let input = r#"{"a": 1, "b": 2, }"#;
+        let repaired = repair_tool_call_arguments(input);
+        let v: serde_json::Value = serde_json::from_str(&repaired).unwrap();
+        assert_eq!(v["a"], 1);
+        assert_eq!(v["b"], 2);
+    }
+
+    #[test]
+    fn repair_trailing_comma_in_array() {
+        let input = r#"{"items": [1, 2, 3, ]}"#;
+        let repaired = repair_tool_call_arguments(input);
+        let v: serde_json::Value = serde_json::from_str(&repaired).unwrap();
+        assert_eq!(v["items"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn repair_unclosed_braces() {
+        let input = r#"{"a": {"b": 1}"#;
+        let repaired = repair_tool_call_arguments(input);
+        let v: serde_json::Value = serde_json::from_str(&repaired).unwrap();
+        assert_eq!(v["a"]["b"], 1);
+    }
+
+    #[test]
+    fn repair_valid_json_passthrough() {
+        let input = r#"{"path": "foo.rs", "line": 42}"#;
+        let repaired = repair_tool_call_arguments(input);
+        assert_eq!(repaired, input); // no changes
+        let v: serde_json::Value = serde_json::from_str(&repaired).unwrap();
+        assert_eq!(v["path"], "foo.rs");
+    }
+
+    // ── FP19: parse_retry_after tests ──────────────────────────────────────
+
+    #[test]
+    fn parse_retry_after_try_again_in_pattern() {
+        // OpenAI "try again in X.Ys" format
+        let msg = "rate_limit_exceeded: You are sending requests too quickly. Try again in 1.197s.";
+        let dur = parse_retry_after(msg).expect("should parse retry-after");
+        // 1.197s + 200ms margin = 1397ms
+        assert!(dur.as_millis() >= 1397, "should include safety margin");
+        assert!(dur.as_millis() < 2000, "should not be wildly over");
+    }
+
+    #[test]
+    fn parse_retry_after_retry_after_pattern() {
+        let msg = "Too Many Requests. Retry after 3s.";
+        let dur = parse_retry_after(msg).expect("should parse retry-after");
+        assert!(dur.as_millis() >= 3200, "3s + 200ms margin");
+        assert!(dur.as_millis() < 4000);
+    }
+
+    #[test]
+    fn parse_retry_after_please_wait_pattern() {
+        let msg = "Please wait 2 seconds before retrying.";
+        let dur = parse_retry_after(msg).expect("should parse retry-after");
+        assert!(dur.as_millis() >= 2200);
+    }
+
+    #[test]
+    fn parse_retry_after_returns_none_for_no_hint() {
+        let msg = "Internal Server Error: upstream timeout";
+        assert!(
+            parse_retry_after(msg).is_none(),
+            "no retry hint should return None"
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_rejects_zero_wait() {
+        let msg = "Try again in 0s.";
+        assert!(
+            parse_retry_after(msg).is_none(),
+            "zero wait is not a valid retry hint"
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_rejects_unreasonably_large_wait() {
+        let msg = "Try again in 999s.";
+        assert!(
+            parse_retry_after(msg).is_none(),
+            "wait > 300s should be rejected as implausible"
+        );
+    }
+
+    // ─── FP54: sanitize_tool_name unit tests ─────────────────────────────────
+
+    #[test]
+    fn sanitize_tool_name_clean_is_borrowed() {
+        // Clean names must not allocate — fast path returns Borrowed.
+        let result = sanitize_tool_name("web_extract");
+        assert!(
+            matches!(result, std::borrow::Cow::Borrowed(_)),
+            "clean name should be Borrowed (zero allocation)"
+        );
+        assert_eq!(result, "web_extract");
+    }
+
+    #[test]
+    fn sanitize_tool_name_strips_channel_token() {
+        // NousResearch Hermes 3: `<|channel|>commentary` suffix
+        let result = sanitize_tool_name("web_extract<|channel|>commentary");
+        assert_eq!(result, "web_extract");
+    }
+
+    #[test]
+    fn sanitize_tool_name_strips_im_end_token() {
+        // Generic chatml end token
+        let result = sanitize_tool_name("read_file<|im_end|>");
+        assert_eq!(result, "read_file");
+    }
+
+    #[test]
+    fn sanitize_tool_name_normalizes_spaces() {
+        // Some models output "read file" instead of "read_file"
+        let result = sanitize_tool_name("read file");
+        assert_eq!(result, "read_file");
+    }
+
+    #[test]
+    fn sanitize_tool_name_normalizes_hyphens() {
+        // Some models output "web-extract" instead of "web_extract"
+        let result = sanitize_tool_name("web-extract");
+        assert_eq!(result, "web_extract");
+    }
+
+    #[test]
+    fn sanitize_tool_name_combined() {
+        // Spaces + channel token (worst case)
+        let result = sanitize_tool_name("apply patch<|channel|>action");
+        assert_eq!(result, "apply_patch");
+    }
+
+    #[test]
+    fn sanitize_tool_name_trims_whitespace() {
+        let result = sanitize_tool_name("  file_write  ");
+        assert_eq!(result, "file_write");
+    }
+
+    #[test]
+    fn sanitize_tool_name_only_token_yields_empty() {
+        // If the entire name is a special token, result is empty — registry
+        // will return a NotFound error (correct; we don't invent a name).
+        let result = sanitize_tool_name("<|channel|>commentary");
+        assert_eq!(result, "");
     }
 }

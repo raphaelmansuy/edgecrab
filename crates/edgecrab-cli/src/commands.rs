@@ -11,7 +11,7 @@
 //!   Model         /model /cheap_model /vision_model /image_model /moa /provider /reasoning /stream
 //!   Session       /session /retry /undo /stop /history /save /export /title /resume
 //!   Config        /config /prompt /verbose /personality /statusbar /log
-//!   Tools         /tools /toolsets /mcp /reload-mcp /plugins
+//!   Tools         /tools /toolsets /mcp /reload-mcp /plugins /hooks
 //!   Memory        /memory
 //!   Analysis      /cost /usage /compress /insights
 //!   Appearance    /skin /paste
@@ -177,6 +177,8 @@ pub enum CommandResult {
     ShowCronStatus(String),
     /// Manage plugins and open the local plugin browser overlay.
     ShowPlugins(String),
+    /// Inspect, reload, and browse the local hook registry.
+    ShowHooks(String),
     /// Open the interactive local plugin browser overlay.
     ShowPluginToggle {
         name: Option<String>,
@@ -902,7 +904,12 @@ impl CommandRegistry {
             description: "Run diagnostics",
             handler: |_| {
                 let api_key_status = if std::env::var("OPENAI_API_KEY").is_ok()
-                    || std::env::var("ANTHROPIC_API_KEY").is_ok()
+                    || std::env::var("ANTHROPIC_API_KEY")
+                        .ok()
+                        .is_some_and(|value| !value.trim().is_empty())
+                    || std::env::var("ANTHROPIC_AUTH_TOKEN")
+                        .ok()
+                        .is_some_and(|value| !value.trim().is_empty())
                     || std::env::var("GEMINI_API_KEY").is_ok()
                     || std::env::var("GITHUB_COPILOT_TOKEN").is_ok()
                 {
@@ -1089,6 +1096,13 @@ impl CommandRegistry {
             aliases: &["plugin"],
             description: "Browse/manage plugins: overlay, info, status, install, enable, disable, toggle, audit, hub",
             handler: |args| parse_plugins_command(args),
+        });
+
+        self.register(Command {
+            name: "hooks",
+            aliases: &["hook"],
+            description: "Inspect or reload local lifecycle hooks: /hooks [list|status|help|reload]",
+            handler: |args| CommandResult::ShowHooks(args.trim().to_string()),
         });
 
         // ── Advanced ──────────────────────────────────────────────────
@@ -2392,6 +2406,19 @@ mod tests {
                 assert!(options.purge_data);
             }
             _ => panic!("expected UninstallCommand"),
+        }
+    }
+
+    #[test]
+    fn dispatch_hooks_command() {
+        let reg = CommandRegistry::new();
+        match reg.dispatch("/hooks") {
+            Some(CommandResult::ShowHooks(args)) => assert!(args.is_empty()),
+            _ => panic!("expected ShowHooks for bare /hooks"),
+        }
+        match reg.dispatch("/hooks list") {
+            Some(CommandResult::ShowHooks(args)) => assert_eq!(args, "list"),
+            _ => panic!("expected ShowHooks for /hooks list"),
         }
     }
 }

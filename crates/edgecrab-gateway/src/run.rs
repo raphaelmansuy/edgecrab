@@ -1758,14 +1758,34 @@ impl Gateway {
                             .map(|x| x.1)
                             .unwrap_or("")
                             .to_string();
-                        self.hook_registry.emit(
+                        let command_hook_result = self.hook_registry.emit_cancellable(
                             &format!("command:{cmd}"),
                             &HookContext::new(format!("command:{cmd}"))
                                 .with_user(&msg.user_id)
+                                .with_session(&session_key)
                                 .with_platform(format!("{:?}", msg.platform).to_lowercase())
                                 .with_str("command", &cmd)
                                 .with_str("args", &args_text),
                         ).await;
+
+                        if let crate::hooks::HookResult::Cancel { reason } = command_hook_result {
+                            let text = if reason.trim().is_empty() {
+                                "⛔ Command cancelled by a local hook.".to_string()
+                            } else {
+                                format!("⛔ Command cancelled by a local hook\n{reason}")
+                            };
+                            if let Some(adapter) = origin_adapter.clone() {
+                                let _ = adapter
+                                    .send(crate::platform::OutgoingMessage {
+                                        text,
+                                        metadata: msg.metadata.clone(),
+                                    })
+                                    .await;
+                            } else {
+                                let _ = delivery_router.deliver(&text, msg.platform, &msg.metadata).await;
+                            }
+                            continue;
+                        }
 
                         let reply_text: Option<String> = match cmd.as_str() {
                             "help" => {
@@ -2468,6 +2488,23 @@ impl Gateway {
                                                 edgecrab_core::StreamEvent::SecretRequest { response_tx, .. } => {
                                                     let _ = response_tx.send(String::new());
                                                 }
+                                                edgecrab_core::StreamEvent::RunFinished { outcome }
+                                                    if !outcome.is_success() => {
+                                                        if let Some(adapter) = adapter.as_ref() {
+                                                            let status_text = if task_id_for_spawn.is_empty() {
+                                                                crate::event_processor::format_run_outcome_status(&outcome)
+                                                            } else {
+                                                                format!(
+                                                                    "{} {}",
+                                                                    task_id_for_spawn,
+                                                                    crate::event_processor::format_run_outcome_status(&outcome)
+                                                                )
+                                                            };
+                                                            let _ = adapter
+                                                                .send_status(&status_text, &metadata)
+                                                                .await;
+                                                        }
+                                                    }
                                                 edgecrab_core::StreamEvent::Error(err) => {
                                                     stream_error = Some(err);
                                                 }
@@ -2640,13 +2677,38 @@ impl Gateway {
                     }
 
                     // Emit hook
-                    self.hook_registry.emit(
+                    let start_hook_result = self.hook_registry.emit_cancellable(
                         "agent:start",
                         &HookContext::new("agent:start")
                             .with_user(&msg.user_id)
+                            .with_session(&session_key)
                             .with_platform(format!("{:?}", msg.platform).to_lowercase())
                             .with_str("message", &msg.text),
                     ).await;
+
+                    if let crate::hooks::HookResult::Cancel { reason } = start_hook_result {
+                        let text = if reason.trim().is_empty() {
+                            "⛔ Request cancelled by a local hook before the agent started.".to_string()
+                        } else {
+                            format!("⛔ Request cancelled by a local hook\n{reason}")
+                        };
+                        if let Some(adapter) = self
+                            .adapters
+                            .iter()
+                            .find(|a| a.platform() == msg.platform)
+                            .cloned()
+                        {
+                            let _ = adapter
+                                .send(crate::platform::OutgoingMessage {
+                                    text,
+                                    metadata: msg.metadata.clone(),
+                                })
+                                .await;
+                        } else {
+                            let _ = delivery_router.deliver(&text, msg.platform, &msg.metadata).await;
+                        }
+                        continue;
+                    }
 
                     // Dispatch to Agent
                     if let Some(ref base_agent) = self.agent {
@@ -2841,12 +2903,79 @@ impl Gateway {
                                             response_len,
                                             "agent response delivered"
                                         );
+
+                                        let run_outcome = session_agent.last_run_outcome().await.unwrap_or_else(|| {
+                                            edgecrab_types::RunOutcome::new(
+                                                edgecrab_types::CompletionDecision::Incomplete,
+                                                edgecrab_types::ExitReason::NoMoreToolCalls,
+                                                "Run finished without an explicit terminal outcome.",
+                                            )
+                                        });
+
+                                        let base_context = HookContext::new("agent:response_delivered")
+                                            .with_user(&msg_clone.user_id)
+                                            .with_session(&task_session_key)
+                                            .with_platform(msg_clone.platform.to_string())
+                                            .with_value("response_len", response_len as u64)
+                                            .with_str("completion_state", run_outcome.state.as_str())
+                                            .with_str("exit_reason", run_outcome.exit_reason.as_str())
+                                            .with_str("summary", run_outcome.user_summary.clone())
+                                            .with_value("active_tasks", run_outcome.active_tasks as u64)
+                                            .with_value("blocked_tasks", run_outcome.blocked_tasks as u64);
+
+                                        hooks.emit("agent:response_delivered", &base_context).await;
+                                        hooks.emit(
+                                            "agent:run_finished",
+                                            &HookContext::new("agent:run_finished")
+                                                .with_user(&msg_clone.user_id)
+                                                .with_session(&task_session_key)
+                                                .with_platform(msg_clone.platform.to_string())
+                                                .with_str("completion_state", run_outcome.state.as_str())
+                                                .with_str("exit_reason", run_outcome.exit_reason.as_str())
+                                                .with_str("summary", run_outcome.user_summary.clone())
+                                                .with_value("active_tasks", run_outcome.active_tasks as u64)
+                                                .with_value("blocked_tasks", run_outcome.blocked_tasks as u64),
+                                        )
+                                        .await;
                                         hooks.emit(
                                             "agent:done",
                                             &HookContext::new("agent:done")
-                                                .with_user(&msg_clone.user_id),
+                                                .with_user(&msg_clone.user_id)
+                                                .with_session(&task_session_key)
+                                                .with_platform(msg_clone.platform.to_string())
+                                                .with_str("completion_state", run_outcome.state.as_str())
+                                                .with_str("exit_reason", run_outcome.exit_reason.as_str())
+                                                .with_str("summary", run_outcome.user_summary.clone()),
                                         )
                                         .await;
+
+                                        if run_outcome.is_success() {
+                                            hooks.emit(
+                                                "agent:task_completed",
+                                                &HookContext::new("agent:task_completed")
+                                                    .with_user(&msg_clone.user_id)
+                                                    .with_session(&task_session_key)
+                                                    .with_platform(msg_clone.platform.to_string())
+                                                    .with_str("summary", run_outcome.user_summary.clone()),
+                                            )
+                                            .await;
+                                        } else if matches!(
+                                            run_outcome.state,
+                                            edgecrab_types::CompletionDecision::Blocked
+                                                | edgecrab_types::CompletionDecision::NeedsUserInput
+                                        ) {
+                                            hooks.emit(
+                                                "agent:task_blocked",
+                                                &HookContext::new("agent:task_blocked")
+                                                    .with_user(&msg_clone.user_id)
+                                                    .with_session(&task_session_key)
+                                                    .with_platform(msg_clone.platform.to_string())
+                                                    .with_str("completion_state", run_outcome.state.as_str())
+                                                    .with_str("exit_reason", run_outcome.exit_reason.as_str())
+                                                    .with_str("summary", run_outcome.user_summary.clone()),
+                                            )
+                                            .await;
+                                        }
                                     }
                                     Err(e) => {
                                         tracing::error!(
@@ -2854,6 +2983,28 @@ impl Gateway {
                                             platform = ?msg_clone.platform,
                                             "agent dispatch failed"
                                         );
+                                        hooks.emit(
+                                            "agent:run_finished",
+                                            &HookContext::new("agent:run_finished")
+                                                .with_user(&msg_clone.user_id)
+                                                .with_session(&task_session_key)
+                                                .with_platform(msg_clone.platform.to_string())
+                                                .with_str("completion_state", "failed")
+                                                .with_str("exit_reason", "dispatch_failed")
+                                                .with_str("summary", e.to_string()),
+                                        )
+                                        .await;
+                                        hooks.emit(
+                                            "agent:done",
+                                            &HookContext::new("agent:done")
+                                                .with_user(&msg_clone.user_id)
+                                                .with_session(&task_session_key)
+                                                .with_platform(msg_clone.platform.to_string())
+                                                .with_str("completion_state", "failed")
+                                                .with_str("exit_reason", "dispatch_failed")
+                                                .with_str("summary", e.to_string()),
+                                        )
+                                        .await;
                                     }
                                 }
                             })

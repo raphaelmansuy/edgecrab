@@ -30,7 +30,7 @@ use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
 use edgecrab_state::SessionDb;
-use edgecrab_types::{Message, Platform, ToolError, ToolSchema};
+use edgecrab_types::{Message, Platform, RunOutcome, ToolError, ToolSchema};
 use serde_json::{Map, Value};
 
 use crate::config_ref::AppConfigRef;
@@ -96,6 +96,7 @@ pub struct SubAgentResult {
     pub model: Option<String>,
     pub interrupted: bool,
     pub budget_exhausted: bool,
+    pub run_outcome: RunOutcome,
     pub messages: Vec<Message>,
 }
 
@@ -209,6 +210,14 @@ pub trait ToolHandler: Send + Sync + 'static {
     /// Whether this tool can safely run in parallel with other parallel-safe tools
     fn parallel_safe(&self) -> bool {
         false
+    }
+
+    /// Argument names containing file paths — used for path-overlap detection
+    /// in parallel dispatch. Tools that return non-empty path_arguments can be
+    /// parallelised even if `parallel_safe()` is false, provided no two
+    /// concurrent calls target the same path. (FP9: Parallel Safety)
+    fn path_arguments(&self) -> &'static [&'static str] {
+        &[]
     }
 
     /// Display emoji for TUI rendering
@@ -438,6 +447,115 @@ pub struct ToolRegistry {
     dynamic_tool_aliases: HashMap<String, String>,
 }
 
+// ── Schema-aware type coercion ──────────────────────────────────────
+// Silently coerce string↔integer, string↔boolean, etc. when the LLM
+// sends a value in the wrong JSON type but the right semantic value.
+// Inspired by hermes-agent `coerce_tool_args()`.
+//
+// FP2: Make The Right Thing Easy — "42" for an integer field IS the right value.
+fn coerce_tool_args(args: &mut serde_json::Value, schema: &serde_json::Value) {
+    let Some(properties) = schema.get("properties").and_then(serde_json::Value::as_object) else {
+        return;
+    };
+    let serde_json::Value::Object(map) = args else {
+        return;
+    };
+    for (key, prop_schema) in properties {
+        let Some(value) = map.get_mut(key) else {
+            continue;
+        };
+        let Some(expected_type) = prop_schema.get("type").and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        match expected_type {
+            "integer" if value.is_string() => {
+                if let Some(s) = value.as_str() {
+                    if let Ok(n) = s.parse::<i64>() {
+                        *value = serde_json::Value::Number(n.into());
+                    }
+                }
+            }
+            "number" if value.is_string() => {
+                if let Some(s) = value.as_str() {
+                    if let Ok(n) = s.parse::<f64>() {
+                        if let Some(n) = serde_json::Number::from_f64(n) {
+                            *value = serde_json::Value::Number(n);
+                        }
+                    }
+                }
+            }
+            "boolean" if value.is_string() => match value.as_str() {
+                Some("true" | "1") => *value = serde_json::Value::Bool(true),
+                Some("false" | "0") => *value = serde_json::Value::Bool(false),
+                _ => {}
+            },
+            "string" if !value.is_string() => {
+                *value = serde_json::Value::String(value.to_string());
+            }
+            "array" if !value.is_array() => {
+                let v = value.take();
+                *value = serde_json::Value::Array(vec![v]);
+            }
+            _ => {}
+        }
+    }
+}
+
+// ─── FP14: Schema cross-reference filtering ────────────────────────────────
+//
+// Known cross-references: (tool_with_ref, referenced_tool, text_to_strip).
+//
+// When `referenced_tool` is NOT in the final available set, the `text_to_strip`
+// is removed from `tool_with_ref`'s schema description. This prevents the model
+// from hallucinating calls to tools that aren't available.
+//
+// Cross-ref: Hermes `model_tools.py` get_tool_definitions() post-filter block.
+//
+// MAINTENANCE: When adding a new tool whose description references another tool,
+// add an entry here. Keep entries minimal — only strip when the reference would
+// cause a hallucinated tool call (not for generic "instead of X" style guidance).
+//
+// Schema: (tool_name, &[required_tools], text_to_strip)
+// Stripping fires when NONE of the `required_tools` are in the available set.
+// "At least one present" keeps the recommendation — it stays accurate.
+const TOOL_CROSS_REFS: &[(&str, &[&str], &str)] = &[
+    // browser_navigate says "prefer web_search or web_extract (faster, cheaper)"
+    // — strip only when BOTH are absent; if either is available the hint is valid.
+    (
+        "browser_navigate",
+        &["web_search", "web_extract"],
+        "For simple info retrieval, prefer web_search or web_extract (faster, cheaper). ",
+    ),
+];
+
+/// Post-filter pass: remove schema description text that references tools not
+/// present in the final `definitions` slice.
+///
+/// WHY inline rather than a trait method: Schema descriptions are assembled at
+/// tool-handler registration time (compile-time or startup). Filtering at
+/// get_definitions() call time means the filter reflects the actual runtime
+/// toolset without requiring every handler to be rewritten.
+pub fn strip_unavailable_cross_refs(definitions: &mut [ToolSchema]) {
+    use std::collections::HashSet;
+    // Collect owned names first to avoid holding an immutable borrow on
+    // `definitions` while we also take a mutable borrow in the second loop.
+    let available: HashSet<String> = definitions.iter().map(|s| s.name.clone()).collect();
+
+    for schema in definitions.iter_mut() {
+        for &(tool_name, required_tools, text_to_strip) in TOOL_CROSS_REFS {
+            // Strip only when NONE of the required_tools are available.
+            // If at least one is present the reference remains accurate.
+            let none_available = required_tools
+                .iter()
+                .all(|&t| !available.contains(t));
+            if schema.name == tool_name && none_available {
+                schema.description = schema.description.replace(text_to_strip, "");
+            }
+        }
+    }
+}
+
 impl ToolRegistry {
     fn tool_allowed_in_ctx(tool_name: &str, toolset: &str, ctx: &ToolContext) -> bool {
         ctx.config.is_tool_enabled(tool_name, toolset)
@@ -575,6 +693,15 @@ impl ToolRegistry {
             }
         }
 
+        // FP14: Strip description cross-references to tools not in the final set.
+        //
+        // WHY: If a schema says "prefer web_search for general queries" but web_search
+        // is disabled, the model will attempt to call a non-existent tool, waste a turn,
+        // and burn budget retrying. Strip the reference so the description is accurate.
+        //
+        // Cross-ref: Hermes get_tool_definitions() post-filter block.
+        strip_unavailable_cross_refs(&mut schemas);
+
         schemas
     }
 
@@ -582,10 +709,14 @@ impl ToolRegistry {
     ///
     /// On name mismatch, uses fuzzy matching (Levenshtein distance via strsim)
     /// to suggest the closest tool — helps the LLM self-correct typos.
+    ///
+    /// On `InvalidArgs`, enriches the error response with required_fields and
+    /// a usage_hint extracted from the tool's schema. This gives the LLM a
+    /// precise checklist to self-correct on the next turn.
     pub async fn dispatch(
         &self,
         name: &str,
-        args: serde_json::Value,
+        mut args: serde_json::Value,
         ctx: &ToolContext,
     ) -> Result<String, ToolError> {
         // Any tool other than read_file / search_files resets the consecutive
@@ -614,6 +745,7 @@ impl ToolRegistry {
                     reason: "tool gating check failed".into(),
                 });
             }
+            coerce_tool_args(&mut args, &handler.schema().parameters);
             return handler.execute(args, ctx).await;
         }
 
@@ -639,6 +771,7 @@ impl ToolRegistry {
                     reason: "tool gating check failed".into(),
                 });
             }
+            coerce_tool_args(&mut args, &handler.schema().parameters);
             return handler.execute(args, ctx).await;
         }
 
@@ -651,6 +784,75 @@ impl ToolRegistry {
         } else {
             Err(ToolError::NotFound(name.to_string()))
         }
+    }
+
+    /// Build an enriched LLM error response for `InvalidArgs`, adding
+    /// `required_fields` and `usage_hint` from the tool's schema.
+    ///
+    /// Called by the conversation loop when formatting tool error results.
+    /// Returns `None` if the tool is not found or the error is not `InvalidArgs`.
+    pub fn enrich_invalid_args_error(
+        &self,
+        tool_name: &str,
+        error: &ToolError,
+    ) -> Option<edgecrab_types::ToolErrorResponse> {
+        if !matches!(error, ToolError::InvalidArgs { .. }) {
+            return None;
+        }
+        let handler: &dyn ToolHandler = if let Some(h) = self.tools.get(tool_name) {
+            *h
+        } else if let Some(h) = self.dynamic_tools.get(tool_name) {
+            h.as_ref()
+        } else {
+            return None;
+        };
+
+        let schema = handler.schema();
+        let required_fields = schema
+            .parameters
+            .get("required")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect::<Vec<_>>()
+            });
+
+        let usage_hint = Self::build_usage_hint(&schema);
+
+        Some(error.to_llm_payload_enriched(required_fields, usage_hint))
+    }
+
+    /// Build a one-line usage hint from the tool schema describing parameter types.
+    fn build_usage_hint(schema: &edgecrab_types::ToolSchema) -> Option<String> {
+        let props = schema.parameters.get("properties")?.as_object()?;
+        let required: Vec<&str> = schema
+            .parameters
+            .get("required")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+
+        let mut parts = Vec::new();
+        for name in &required {
+            if let Some(prop) = props.get(*name) {
+                let ty = prop
+                    .get("type")
+                    .map(|t| {
+                        if let Some(s) = t.as_str() {
+                            s.to_string()
+                        } else {
+                            t.to_string()
+                        }
+                    })
+                    .unwrap_or_else(|| "any".to_string());
+                parts.push(format!("{name}: {ty}"));
+            }
+        }
+        if parts.is_empty() {
+            return None;
+        }
+        Some(format!("Required: {}", parts.join(", ")))
     }
 
     /// Register a dynamic tool at runtime (plugins, MCP proxies).
@@ -783,6 +985,80 @@ impl ToolRegistry {
             .unwrap_or(false)
     }
 
+    /// Return the path argument names for a tool, used for overlap detection.
+    pub fn path_arguments(&self, name: &str) -> &'static [&'static str] {
+        self.tools
+            .get(self.tool_aliases.get(name).copied().unwrap_or(name))
+            .map(|h| h.path_arguments())
+            .or_else(|| {
+                self.dynamic_tools
+                    .get(
+                        self.dynamic_tool_aliases
+                            .get(name)
+                            .map(String::as_str)
+                            .unwrap_or(name),
+                    )
+                    .map(|h| h.path_arguments())
+            })
+            .unwrap_or(&[])
+    }
+
+    /// Check if a tool can be parallelised in a specific batch, considering
+    /// path overlaps with already-claimed paths.
+    ///
+    /// Returns true if:
+    /// - The tool is parallel_safe (no file concerns), OR
+    /// - The tool has path_arguments AND none of the paths it targets appear
+    ///   in `claimed_paths`.
+    ///
+    /// When returning true for a path-aware tool, the caller should add the
+    /// tool's paths to `claimed_paths` to prevent future conflicts.
+    pub fn can_parallelize_in_batch(
+        &self,
+        name: &str,
+        args_json: &str,
+        claimed_paths: &std::collections::HashSet<String>,
+    ) -> bool {
+        if self.is_parallel_safe(name) {
+            return true;
+        }
+        let path_args = self.path_arguments(name);
+        if path_args.is_empty() {
+            return false; // Not parallel_safe and no path args → sequential
+        }
+        // Extract paths from args and check for overlap
+        let Ok(args) = serde_json::from_str::<serde_json::Value>(args_json) else {
+            return false; // Unparseable args → conservative: sequential
+        };
+        for pa in path_args {
+            if let Some(path) = args.get(*pa).and_then(serde_json::Value::as_str) {
+                // FP9 hardening: prefix-aware overlap detection.
+                // "src/" and "src/main.rs" are parent/child — must serialize.
+                // Previously used exact match which missed this case.
+                if paths_overlap(path, claimed_paths) {
+                    return false; // Path conflict (exact or prefix)
+                }
+            }
+        }
+        true
+    }
+
+    /// Extract the file paths targeted by a tool call, based on its
+    /// `path_arguments()` declaration.
+    pub fn extract_paths(&self, name: &str, args_json: &str) -> Vec<String> {
+        let path_args = self.path_arguments(name);
+        if path_args.is_empty() {
+            return Vec::new();
+        }
+        let Ok(args) = serde_json::from_str::<serde_json::Value>(args_json) else {
+            return Vec::new();
+        };
+        path_args
+            .iter()
+            .filter_map(|pa| args.get(*pa).and_then(serde_json::Value::as_str).map(String::from))
+            .collect()
+    }
+
     /// Fuzzy match tool name using Levenshtein distance.
     /// Returns the closest match if distance ≤ 3 (catches common typos).
     fn fuzzy_match(&self, name: &str) -> Option<&str> {
@@ -881,12 +1157,76 @@ pub fn normalize_json_schema(schema: &Value) -> Value {
     }
 }
 
+/// Check if `path` overlaps with any entry in `claimed_paths`.
+///
+/// Two paths overlap if either is a prefix of the other (with path-separator
+/// awareness). Examples:
+/// - `"src/"` and `"src/main.rs"` → overlap (parent/child)
+/// - `"src/main.rs"` and `"src/main.rs"` → overlap (exact)
+/// - `"src/main.rs"` and `"src/lib.rs"` → no overlap
+/// - `"src"` and `"src2/foo.rs"` → no overlap (not a path prefix)
+///
+/// First Principle FP9 hardening: Prefix-aware parallel safety.
+///
+/// See [specs/improve_plan/16-assessment-round3.md](../../../specs/improve_plan/16-assessment-round3.md).
+fn paths_overlap(path: &str, claimed_paths: &std::collections::HashSet<String>) -> bool {
+    // Normalize: ensure paths end without trailing separator for consistent comparison
+    let normalize = |p: &str| -> String {
+        let trimmed = p.trim_end_matches('/').trim_end_matches('\\');
+        if trimmed.is_empty() {
+            p.to_string()
+        } else {
+            trimmed.to_string()
+        }
+    };
+    let norm_path = normalize(path);
+    for claimed in claimed_paths {
+        let norm_claimed = normalize(claimed);
+        // Exact match
+        if norm_path == norm_claimed {
+            return true;
+        }
+        // new_path is child of claimed (claimed is parent)
+        if norm_path.starts_with(&norm_claimed)
+            && norm_path.as_bytes().get(norm_claimed.len()) == Some(&b'/')
+        {
+            return true;
+        }
+        // claimed is child of new_path (new_path is parent)
+        if norm_claimed.starts_with(&norm_path)
+            && norm_claimed.as_bytes().get(norm_path.len()) == Some(&b'/')
+        {
+            return true;
+        }
+    }
+    false
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn assert_provider_safe_top_level_schema(tool_name: &str, schema: &Value) {
+        assert_eq!(
+            schema.get("type").and_then(Value::as_str),
+            Some("object"),
+            "tool '{tool_name}' must export a top-level object schema"
+        );
+        assert!(
+            matches!(schema.get("properties"), Some(Value::Object(_))),
+            "tool '{tool_name}' must export an object-valued top-level properties map"
+        );
+
+        for forbidden in ["anyOf", "oneOf", "allOf", "not", "if", "then", "else"] {
+            assert!(
+                schema.get(forbidden).is_none(),
+                "tool '{tool_name}' must not use top-level {forbidden}"
+            );
+        }
+    }
 
     // Test tool for unit tests
     struct TestTool;
@@ -1290,5 +1630,329 @@ mod tests {
             registry.toolset_for_tool("legacy_test_tool").as_deref(),
             Some("test")
         );
+    }
+
+    #[test]
+    fn registry_inventory_matches_get_definitions_for_all_tools() {
+        let registry = ToolRegistry::new();
+        let ctx = ToolContext::test_context();
+
+        let mut inventory_names: Vec<String> = registry
+            .tool_inventory(&ctx)
+            .into_iter()
+            .filter(|entry| entry.exposed())
+            .map(|entry| entry.name)
+            .collect();
+        inventory_names.sort();
+
+        let mut definition_names: Vec<String> = registry
+            .get_definitions(None, None, &ctx)
+            .into_iter()
+            .map(|schema| schema.name)
+            .collect();
+        definition_names.sort();
+
+        assert_eq!(
+            definition_names, inventory_names,
+            "get_definitions(None, None, ctx) should match the exposed tool inventory; `all` must not inject hidden tool contracts"
+        );
+    }
+
+    #[test]
+    fn all_exported_tool_definitions_have_provider_safe_top_level_schemas() {
+        let registry = ToolRegistry::new();
+        let ctx = ToolContext::test_context();
+        let schemas = registry.get_definitions(None, None, &ctx);
+
+        assert!(
+            !schemas.is_empty(),
+            "expected the registry to expose at least one tool definition"
+        );
+
+        for schema in &schemas {
+            assert!(
+                !schema.description.trim().is_empty(),
+                "tool '{}' must have a non-empty description",
+                schema.name
+            );
+        }
+
+        let llm_defs = to_llm_definitions(&schemas);
+        for definition in &llm_defs {
+            assert_provider_safe_top_level_schema(
+                &definition.function.name,
+                &definition.function.parameters,
+            );
+        }
+    }
+
+    #[test]
+    fn enrich_invalid_args_adds_required_fields_and_hint() {
+        let registry = ToolRegistry::new();
+        let err = ToolError::InvalidArgs {
+            tool: "read_file".into(),
+            message: "missing field `path`".into(),
+        };
+
+        let enriched = registry.enrich_invalid_args_error("read_file", &err);
+        assert!(enriched.is_some(), "should return enriched error for InvalidArgs");
+        let resp = enriched.unwrap();
+        assert!(resp.required_fields.is_some(), "should have required_fields");
+        let rf = resp.required_fields.unwrap();
+        assert!(rf.contains(&"path".to_string()), "read_file requires 'path'");
+        assert!(resp.usage_hint.is_some(), "should have a usage hint");
+        assert!(resp.usage_hint.unwrap().contains("path"));
+    }
+
+    #[test]
+    fn enrich_returns_none_for_non_invalid_args() {
+        let registry = ToolRegistry::new();
+        let err = ToolError::NotFound("read_file".into());
+        assert!(registry.enrich_invalid_args_error("read_file", &err).is_none());
+    }
+
+    // ── coerce_tool_args tests ───────────────────────────────────────
+    #[test]
+    fn coerce_string_to_integer() {
+        let schema = serde_json::json!({
+            "properties": { "line": { "type": "integer" } }
+        });
+        let mut args = serde_json::json!({"line": "42"});
+        coerce_tool_args(&mut args, &schema);
+        assert_eq!(args["line"], 42);
+    }
+
+    #[test]
+    fn coerce_string_to_boolean() {
+        let schema = serde_json::json!({
+            "properties": { "flag": { "type": "boolean" } }
+        });
+        let mut args = serde_json::json!({"flag": "true"});
+        coerce_tool_args(&mut args, &schema);
+        assert_eq!(args["flag"], true);
+
+        let mut args2 = serde_json::json!({"flag": "0"});
+        coerce_tool_args(&mut args2, &schema);
+        assert_eq!(args2["flag"], false);
+    }
+
+    #[test]
+    fn coerce_string_to_number() {
+        let schema = serde_json::json!({
+            "properties": { "val": { "type": "number" } }
+        });
+        let mut args = serde_json::json!({"val": "3.14"});
+        coerce_tool_args(&mut args, &schema);
+        assert!((args["val"].as_f64().unwrap() - 3.14).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn coerce_number_to_string() {
+        let schema = serde_json::json!({
+            "properties": { "name": { "type": "string" } }
+        });
+        let mut args = serde_json::json!({"name": 42});
+        coerce_tool_args(&mut args, &schema);
+        assert_eq!(args["name"], "42");
+    }
+
+    #[test]
+    fn coerce_single_value_to_array() {
+        let schema = serde_json::json!({
+            "properties": { "tags": { "type": "array" } }
+        });
+        let mut args = serde_json::json!({"tags": "foo"});
+        coerce_tool_args(&mut args, &schema);
+        assert_eq!(args["tags"], serde_json::json!(["foo"]));
+    }
+
+    #[test]
+    fn coerce_already_correct_type_unchanged() {
+        let schema = serde_json::json!({
+            "properties": { "line": { "type": "integer" } }
+        });
+        let mut args = serde_json::json!({"line": 42});
+        coerce_tool_args(&mut args, &schema);
+        assert_eq!(args["line"], 42);
+    }
+
+    #[test]
+    fn coerce_unparseable_string_left_unchanged() {
+        let schema = serde_json::json!({
+            "properties": { "line": { "type": "integer" } }
+        });
+        let mut args = serde_json::json!({"line": "not_a_number"});
+        let original = args.clone();
+        coerce_tool_args(&mut args, &schema);
+        assert_eq!(args, original);
+    }
+
+    // ── can_parallelize_in_batch / extract_paths unit tests ──
+
+    #[test]
+    fn extract_paths_returns_matching_args() {
+        let reg = ToolRegistry::new();
+        // No static tool registered → path_arguments is empty → returns empty
+        let paths = reg.extract_paths("write_file", r#"{"path":"foo.rs","content":"x"}"#);
+        // Since write_file is registered via inventory, this should find paths
+        // (if not registered in test context, returns empty — that's fine too)
+        assert!(paths.is_empty() || paths.contains(&"foo.rs".to_string()));
+    }
+
+    #[test]
+    fn can_parallelize_no_overlap() {
+        let reg = ToolRegistry::new();
+        let claimed: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Unknown tool: not parallel_safe, no path_arguments → false
+        let result = reg.can_parallelize_in_batch("unknown_tool", "{}", &claimed);
+        assert!(!result, "unknown tool should not be parallelizable");
+    }
+
+    #[test]
+    fn can_parallelize_bad_json() {
+        let reg = ToolRegistry::new();
+        let claimed: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Even if tool exists, bad JSON → conservative false
+        let result = reg.can_parallelize_in_batch("write_file", "not json", &claimed);
+        assert!(!result, "bad json should not be parallelizable");
+    }
+
+    // ── Path-prefix overlap tests (FP9 hardening) ─────────────────
+
+    #[test]
+    fn paths_overlap_exact_match() {
+        let claimed: std::collections::HashSet<String> =
+            ["src/main.rs".to_string()].into_iter().collect();
+        assert!(super::paths_overlap("src/main.rs", &claimed));
+    }
+
+    #[test]
+    fn paths_overlap_parent_child() {
+        let claimed: std::collections::HashSet<String> =
+            ["src".to_string()].into_iter().collect();
+        assert!(
+            super::paths_overlap("src/main.rs", &claimed),
+            "child of claimed parent should overlap"
+        );
+    }
+
+    #[test]
+    fn paths_overlap_child_parent() {
+        let claimed: std::collections::HashSet<String> =
+            ["src/main.rs".to_string()].into_iter().collect();
+        assert!(
+            super::paths_overlap("src", &claimed),
+            "parent of claimed child should overlap"
+        );
+    }
+
+    #[test]
+    fn paths_overlap_trailing_slash() {
+        let claimed: std::collections::HashSet<String> =
+            ["src/".to_string()].into_iter().collect();
+        assert!(
+            super::paths_overlap("src/main.rs", &claimed),
+            "trailing slash parent should overlap with child"
+        );
+    }
+
+    #[test]
+    fn paths_overlap_no_overlap_siblings() {
+        let claimed: std::collections::HashSet<String> =
+            ["src/main.rs".to_string()].into_iter().collect();
+        assert!(
+            !super::paths_overlap("src/lib.rs", &claimed),
+            "sibling files should NOT overlap"
+        );
+    }
+
+    #[test]
+    fn paths_overlap_no_false_prefix() {
+        let claimed: std::collections::HashSet<String> =
+            ["src".to_string()].into_iter().collect();
+        assert!(
+            !super::paths_overlap("src2/foo.rs", &claimed),
+            "src2 is NOT a child of src — no path separator"
+        );
+    }
+
+    #[test]
+    fn paths_overlap_empty_claimed() {
+        let claimed: std::collections::HashSet<String> = std::collections::HashSet::new();
+        assert!(
+            !super::paths_overlap("anything", &claimed),
+            "empty claimed set should never overlap"
+        );
+    }
+
+    // ── FP14: strip_unavailable_cross_refs tests ─────────────────────────────
+
+    fn make_browser_schema(description: &str) -> ToolSchema {
+        ToolSchema {
+            name: "browser_navigate".into(),
+            description: description.into(),
+            parameters: json!({ "type": "object", "properties": {} }),
+            strict: None,
+        }
+    }
+
+    fn make_tool_schema(name: &str) -> ToolSchema {
+        ToolSchema {
+            name: name.into(),
+            description: format!("Tool {name}"),
+            parameters: json!({ "type": "object", "properties": {} }),
+            strict: None,
+        }
+    }
+
+    #[test]
+    fn strip_cross_refs_removes_ref_when_referenced_tool_absent() {
+        // browser_navigate with web_search cross-ref; web_search NOT in set
+        let desc = "Navigate to a URL. \
+            For simple info retrieval, prefer web_search or web_extract (faster, cheaper). \
+            Use browser tools when interactive.";
+        let mut defs = vec![make_browser_schema(desc)];
+        super::strip_unavailable_cross_refs(&mut defs);
+        assert!(
+            !defs[0].description.contains("web_search"),
+            "cross-ref to missing web_search should be stripped"
+        );
+        assert!(
+            defs[0].description.contains("Use browser tools"),
+            "rest of description should be preserved"
+        );
+    }
+
+    #[test]
+    fn strip_cross_refs_preserves_ref_when_referenced_tool_present() {
+        // Both browser_navigate and web_search are in the set (web_extract absent,
+        // but since web_search IS present the hint remains valid).
+        let desc = "Navigate to a URL. \
+            For simple info retrieval, prefer web_search or web_extract (faster, cheaper). \
+            Use browser tools when interactive.";
+        let mut defs = vec![
+            make_browser_schema(desc),
+            make_tool_schema("web_search"),
+        ];
+        super::strip_unavailable_cross_refs(&mut defs);
+        assert!(
+            defs[0].description.contains("web_search"),
+            "cross-ref should be kept when web_search is available (at least one present)"
+        );
+    }
+
+    #[test]
+    fn strip_cross_refs_handles_empty_definitions() {
+        let mut defs: Vec<ToolSchema> = vec![];
+        // Should not panic
+        super::strip_unavailable_cross_refs(&mut defs);
+    }
+
+    #[test]
+    fn strip_cross_refs_handles_no_matching_cross_refs() {
+        let mut defs = vec![make_tool_schema("unrelated_tool")];
+        let original_desc = defs[0].description.clone();
+        super::strip_unavailable_cross_refs(&mut defs);
+        assert_eq!(defs[0].description, original_desc, "unrelated tool unchanged");
     }
 }

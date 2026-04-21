@@ -28,11 +28,31 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+/// Format apply_patch errors as a single visible line.
+///
+/// WHY (FP18): TUI activity feed shows only the first line of a tool result.
+/// Multi-line errors with `\n` mean the user and model see `"Errors:"` but
+/// no error details — the body is below the fold. Semicolon-joined errors fit
+/// on one visible line in both TUI summary and LLM tool-result context.
+fn format_patch_errors(errors: &[String]) -> String {
+    if errors.is_empty() {
+        "apply_patch failed and was rolled back (no error detail)".into()
+    } else if errors.len() == 1 {
+        format!("apply_patch failed and was rolled back: {}", errors[0])
+    } else {
+        format!(
+            "apply_patch failed and was rolled back ({} errors): {}",
+            errors.len(),
+            errors.join("; ")
+        )
+    }
+}
+
 use edgecrab_types::{ToolError, ToolSchema};
 
 use crate::edit_contract::{
-    MAX_MUTATION_PAYLOAD_BYTES, MAX_MUTATION_PAYLOAD_KIB, enforce_apply_patch_payload_limit,
-    enforce_patch_payload_limit,
+    DEFAULT_MAX_MUTATION_PAYLOAD_BYTES, DEFAULT_MAX_MUTATION_PAYLOAD_KIB,
+    enforce_apply_patch_payload_limit_with_max, enforce_patch_payload_limit_with_max,
 };
 use crate::fuzzy_match::fuzzy_find_and_replace;
 use crate::path_utils::jail_read_path;
@@ -79,10 +99,11 @@ fn should_use_v4a_mode(args: &PatchArgs) -> bool {
 }
 
 async fn execute_replace_patch(args: ReplaceArgs, ctx: &ToolContext) -> Result<String, ToolError> {
-    enforce_patch_payload_limit(
+    enforce_patch_payload_limit_with_max(
         "patch",
         &args.path,
         args.old_string.len() + args.new_string.len(),
+        ctx.config.max_write_payload_bytes(),
     )?;
 
     // Auto-checkpoint before mutation
@@ -90,6 +111,8 @@ async fn execute_replace_patch(args: ReplaceArgs, ctx: &ToolContext) -> Result<S
 
     let path_policy = ctx.config.file_path_policy(&ctx.cwd);
     let resolved = jail_read_path(&args.path, &path_policy)?;
+
+    crate::read_tracker::guard_file_freshness(&ctx.session_id, "patch", &args.path, &resolved)?;
 
     let content = tokio::fs::read_to_string(&resolved)
         .await
@@ -112,6 +135,8 @@ async fn execute_replace_patch(args: ReplaceArgs, ctx: &ToolContext) -> Result<S
     tokio::fs::write(&resolved, &new_content)
         .await
         .map_err(|e| ToolError::Other(format!("Cannot write '{}': {}", args.path, e)))?;
+
+    let _ = crate::read_tracker::record_file_snapshot(&ctx.session_id, &resolved);
 
     Ok(format!(
         "Patched '{}': {} replacement(s), {} → {} bytes",
@@ -136,6 +161,10 @@ impl ToolHandler for PatchTool {
         "🩹"
     }
 
+    fn path_arguments(&self) -> &'static [&'static str] {
+        &["path"]
+    }
+
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "patch".into(),
@@ -146,11 +175,12 @@ impl ToolHandler for PatchTool {
                  escape-norm → trimmed-boundary → block-anchor → context-aware). \
                  Patch mode: pass a V4A multi-file patch block in the patch field \
                  (hermes-compatible). Replace-mode hard limit: combined old_string + \
-                 new_string payload must stay at or under {MAX_MUTATION_PAYLOAD_BYTES} \
-                 bytes ({MAX_MUTATION_PAYLOAD_KIB} KiB) per call."
+                 new_string payload must stay at or under {DEFAULT_MAX_MUTATION_PAYLOAD_BYTES} \
+                 bytes ({DEFAULT_MAX_MUTATION_PAYLOAD_KIB} KiB) per call."
             ),
             parameters: json!({
                 "type": "object",
+                "additionalProperties": false,
                 "properties": {
                     "mode": {
                         "type": "string",
@@ -158,28 +188,29 @@ impl ToolHandler for PatchTool {
                         "description": "replace = targeted find-and-replace, patch = V4A multi-file patch block"
                     },
                     "path": {
-                        "type": "string",
-                        "description": "File path relative to working directory (required for replace mode)"
+                        "type": ["string", "null"],
+                        "description": "File path relative to working directory. Required for replace mode; use null for patch mode."
                     },
                     "old_string": {
-                        "type": "string",
-                        "description": "String to find and replace (required for replace mode; fuzzy-matched)"
+                        "type": ["string", "null"],
+                        "description": "String to find and replace. Required for replace mode; use null for patch mode."
                     },
                     "new_string": {
-                        "type": "string",
-                        "description": "String to replace old_string with (required for replace mode)"
+                        "type": ["string", "null"],
+                        "description": "String to replace old_string with. Required for replace mode; use empty string to delete text and null for patch mode."
                     },
                     "replace_all": {
                         "type": "boolean",
-                        "description": "Replace all occurrences (default false — require unique match)"
+                        "description": "Replace all occurrences. Set explicitly to true or false."
                     },
                     "patch": {
-                        "type": "string",
-                        "description": "V4A patch block for patch mode, starting with '*** Begin Patch'"
+                        "type": ["string", "null"],
+                        "description": "V4A patch block for patch mode, starting with '*** Begin Patch'. Use null for replace mode."
                     }
-                }
+                },
+                "required": ["mode", "path", "old_string", "new_string", "replace_all", "patch"]
             }),
-            strict: None,
+            strict: Some(true),
         }
     }
 
@@ -535,7 +566,7 @@ async fn restore_backups(backups: &BTreeMap<PathBuf, Option<Vec<u8>>>) {
 }
 
 async fn execute_v4a_patch(patch_text: &str, ctx: &ToolContext) -> Result<String, ToolError> {
-    enforce_apply_patch_payload_limit(patch_text)?;
+    enforce_apply_patch_payload_limit_with_max(patch_text, ctx.config.max_write_payload_bytes())?;
 
     let (ops, parse_err) = parse_v4a(patch_text);
     if let Some(e) = parse_err {
@@ -601,6 +632,20 @@ async fn execute_v4a_patch(patch_text: &str, ctx: &ToolContext) -> Result<String
                     target: Some(target),
                 });
             }
+        }
+    }
+
+    for prepared_op in &prepared {
+        match &prepared_op.op.kind {
+            V4AOpKind::Update | V4AOpKind::Delete | V4AOpKind::Move { .. } => {
+                crate::read_tracker::guard_file_freshness(
+                    &ctx.session_id,
+                    "apply_patch",
+                    &prepared_op.op.file_path,
+                    &prepared_op.source,
+                )?;
+            }
+            V4AOpKind::Add => {}
         }
     }
 
@@ -724,16 +769,32 @@ async fn execute_v4a_patch(patch_text: &str, ctx: &ToolContext) -> Result<String
     }
 
     if errors.is_empty() {
+        for prepared_op in &prepared {
+            match &prepared_op.op.kind {
+                V4AOpKind::Update | V4AOpKind::Add => {
+                    let _ = crate::read_tracker::record_file_snapshot(
+                        &ctx.session_id,
+                        &prepared_op.source,
+                    );
+                }
+                V4AOpKind::Delete => {
+                    crate::read_tracker::clear_file_snapshot(&ctx.session_id, &prepared_op.source);
+                }
+                V4AOpKind::Move { .. } => {
+                    crate::read_tracker::clear_file_snapshot(&ctx.session_id, &prepared_op.source);
+                    if let Some(target) = &prepared_op.target {
+                        let _ = crate::read_tracker::record_file_snapshot(&ctx.session_id, target);
+                    }
+                }
+            }
+        }
         Ok(format!(
             "apply_patch succeeded. {}",
             summary_parts.join("; ")
         ))
     } else {
         restore_backups(&backups).await;
-        Err(ToolError::Other(format!(
-            "apply_patch failed and was rolled back. Errors:\n{}",
-            errors.join("\n")
-        )))
+        Err(ToolError::Other(format_patch_errors(&errors)))
     }
 }
 
@@ -751,6 +812,10 @@ impl ToolHandler for ApplyPatchTool {
         "📋"
     }
 
+    fn path_arguments(&self) -> &'static [&'static str] {
+        &["path"]
+    }
+
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "apply_patch".into(),
@@ -758,7 +823,7 @@ impl ToolHandler for ApplyPatchTool {
                 "\
 Apply a V4A multi-file patch atomically. Supports Update, Add, Delete, and Move operations \
 on multiple files in a single call. Use this for complex refactors spanning many files. \
-Hard patch limit: {MAX_MUTATION_PAYLOAD_BYTES} bytes ({MAX_MUTATION_PAYLOAD_KIB} KiB) per call. \
+Hard patch limit: {DEFAULT_MAX_MUTATION_PAYLOAD_BYTES} bytes ({DEFAULT_MAX_MUTATION_PAYLOAD_KIB} KiB) per call. \
 Split larger refactors into multiple focused apply_patch calls.\n\n\
 Format:\n\
 ```\n\
@@ -777,6 +842,7 @@ Format:\n\
             ),
             parameters: json!({
                 "type": "object",
+                "additionalProperties": false,
                 "properties": {
                     "patch": {
                         "type": "string",
@@ -785,7 +851,7 @@ Format:\n\
                 },
                 "required": ["patch"]
             }),
-            strict: None,
+            strict: Some(true),
         }
     }
 
@@ -814,6 +880,7 @@ inventory::submit!(&ApplyPatchTool as &dyn ToolHandler);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::file_read::ReadFileTool;
     use tempfile::TempDir;
 
     fn ctx_in(dir: &std::path::Path) -> ToolContext {
@@ -868,6 +935,74 @@ mod tests {
             .await;
 
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn patch_rejects_stale_replace_after_external_edit() {
+        let dir = TempDir::new().expect("tmpdir");
+        std::fs::write(
+            dir.path().join("stale.rs"),
+            "fn main() {\n    println!(\"old\");\n}\n",
+        )
+        .expect("write");
+
+        let mut ctx = ctx_in(dir.path());
+        ctx.session_id = "patch-stale-guard".into();
+
+        ReadFileTool
+            .execute(json!({"path": "stale.rs", "line_numbers": false}), &ctx)
+            .await
+            .expect("read");
+
+        std::fs::write(
+            dir.path().join("stale.rs"),
+            "fn main() {\n    println!(\"new\");\n}\n",
+        )
+        .expect("modify");
+
+        let err = execute_replace_patch(
+            ReplaceArgs {
+                path: "stale.rs".into(),
+                old_string: "println!(\"old\");".into(),
+                new_string: "println!(\"patched\");".into(),
+                replace_all: false,
+            },
+            &ctx,
+        )
+        .await
+        .expect_err("stale patch should be rejected");
+
+        assert!(err.to_string().contains("modified since you last read it"));
+    }
+
+    #[test]
+    fn patch_schema_is_strict_and_uses_nullable_mode_specific_fields() {
+        let schema = PatchTool.schema();
+        assert_eq!(schema.strict, Some(true));
+        assert_eq!(schema.parameters["type"], "object");
+        assert_eq!(schema.parameters["additionalProperties"], false);
+        assert_eq!(
+            schema.parameters["required"],
+            json!(["mode", "path", "old_string", "new_string", "replace_all", "patch"])
+        );
+        assert_eq!(
+            schema.parameters["properties"]["path"]["type"],
+            json!(["string", "null"])
+        );
+        assert_eq!(
+            schema.parameters["properties"]["patch"]["type"],
+            json!(["string", "null"])
+        );
+    }
+
+    #[test]
+    fn apply_patch_schema_is_strict() {
+        let schema = ApplyPatchTool.schema();
+        assert_eq!(schema.strict, Some(true));
+        assert_eq!(schema.parameters["type"], "object");
+        assert_eq!(schema.parameters["additionalProperties"], false);
+        assert_eq!(schema.parameters["required"], json!(["patch"]));
+        assert_eq!(schema.parameters["properties"]["patch"]["type"], "string");
     }
 
     #[tokio::test]
@@ -930,7 +1065,7 @@ mod tests {
         let dir = TempDir::new().expect("workspace");
         std::fs::write(dir.path().join("code.rs"), "fn main() {}\n").expect("seed");
         let ctx = ctx_in(dir.path());
-        let oversized = "x".repeat(MAX_MUTATION_PAYLOAD_BYTES);
+        let oversized = "x".repeat(DEFAULT_MAX_MUTATION_PAYLOAD_BYTES);
 
         let result = PatchTool
             .execute(
@@ -1280,7 +1415,7 @@ mod tests {
     async fn apply_patch_rejects_oversized_payloads() {
         let dir = TempDir::new().expect("workspace");
         let ctx = ctx_in(dir.path());
-        let oversized_body = "x".repeat(MAX_MUTATION_PAYLOAD_BYTES);
+        let oversized_body = "x".repeat(DEFAULT_MAX_MUTATION_PAYLOAD_BYTES);
         let patch = format!(
             "*** Begin Patch\n*** Add File: huge.txt\n+{}\n*** End Patch",
             oversized_body

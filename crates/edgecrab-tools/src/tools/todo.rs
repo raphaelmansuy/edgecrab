@@ -33,7 +33,7 @@ pub struct TodoTool;
 pub struct TodoItem {
     pub id: u32,
     pub title: String,
-    pub status: String, // "not-started" | "in-progress" | "completed" | "cancelled"
+    pub status: String, // "not-started" | "in-progress" | "completed" | "blocked" | "cancelled"
 }
 
 #[derive(Deserialize)]
@@ -161,13 +161,16 @@ impl TodoStore {
     /// WHY only active items: Re-injecting completed/cancelled items
     /// causes the model to re-do finished work. Narrowing to "not-started"
     /// and "in-progress" gives the model exactly what it needs to continue.
+    /// Blocked items are also injected so the model sees the unresolved dependency.
     ///
     /// Returns None when there are no active items (nothing to inject).
     pub fn format_for_injection(&self) -> Option<String> {
         let guard = self.items.lock().expect("todo store mutex poisoned");
         let active: Vec<&TodoItem> = guard
             .iter()
-            .filter(|i| i.status == "not-started" || i.status == "in-progress")
+            .filter(|i| {
+                i.status == "not-started" || i.status == "in-progress" || i.status == "blocked"
+            })
             .collect();
         if active.is_empty() {
             return None;
@@ -177,6 +180,8 @@ impl TodoStore {
         for item in active {
             let marker = if item.status == "in-progress" {
                 "[>]"
+            } else if item.status == "blocked" {
+                "[!]"
             } else {
                 "[ ]"
             };
@@ -218,7 +223,8 @@ impl ToolHandler for TodoTool {
                           - merge=false (default): replace the entire list with a fresh plan\n\
                           - merge=true: update existing items by id, add any new ones\n\n\
                           Each item: {id: integer, title: string, \
-                          status: not-started|in-progress|completed|cancelled}\n\
+                          status: not-started|in-progress|completed|blocked|cancelled}\n\
+                          Use `blocked` when a dependency, approval, or user input is still required.\n\
                           Hermes-compatible calls using `todo` with `todos`, `content`, and \
                           pending|in_progress statuses are also accepted.\n\
                           Only ONE item in-progress at a time. \
@@ -237,7 +243,7 @@ impl ToolHandler for TodoTool {
                                 "title": { "type": "string" },
                                 "status": {
                                     "type": "string",
-                                    "enum": ["not-started", "in-progress", "completed", "cancelled"]
+                                    "enum": ["not-started", "in-progress", "completed", "blocked", "cancelled"]
                                 }
                             },
                             "required": ["id", "title", "status"]
@@ -312,6 +318,7 @@ fn format_response(items: Vec<TodoItem>) -> Result<String, ToolError> {
     let not_started = items.iter().filter(|i| i.status == "not-started").count();
     let in_progress = items.iter().filter(|i| i.status == "in-progress").count();
     let completed = items.iter().filter(|i| i.status == "completed").count();
+    let blocked = items.iter().filter(|i| i.status == "blocked").count();
     let cancelled = items.iter().filter(|i| i.status == "cancelled").count();
 
     let todos: Vec<serde_json::Value> = items
@@ -326,6 +333,7 @@ fn format_response(items: Vec<TodoItem>) -> Result<String, ToolError> {
             "not_started": not_started,
             "in_progress": in_progress,
             "completed": completed,
+            "blocked": blocked,
             "cancelled": cancelled
         }
     });
@@ -338,7 +346,7 @@ fn normalize_status(item: &mut TodoItem) {
     if item.status == "pending"
         || !matches!(
             item.status.as_str(),
-            "not-started" | "in-progress" | "completed" | "cancelled"
+            "not-started" | "in-progress" | "completed" | "blocked" | "cancelled"
         )
     {
         item.status = "not-started".to_string();

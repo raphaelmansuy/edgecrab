@@ -8,6 +8,7 @@
 use edgecrab_lsp as _;
 
 pub mod agent;
+pub mod completion_assessor;
 pub mod compression;
 pub mod config;
 pub mod context_engine;
@@ -25,6 +26,7 @@ pub use agent::{
     Agent, AgentBuilder, AgentConfig, ApprovalChoice, ConversationResult, IsolatedAgentOptions,
     IterationBudget, SessionSnapshot, SessionState, StreamEvent,
 };
+pub use completion_assessor::{CompletionContext, CompletionPolicy, DefaultCompletionPolicy};
 pub use compression::{PRUNED_TOOL_PLACEHOLDER, SUMMARY_PREFIX};
 pub use config::{
     AppConfig, CliOverrides, SmartRoutingYaml, ToolProgressMode, edgecrab_home,

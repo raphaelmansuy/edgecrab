@@ -59,49 +59,10 @@ pub fn is_safe_tool(tool_name: &str) -> bool {
 
 /// Tools that are exposed in ACP mode (coding-focused subset).
 ///
+/// DRY: Re-exported from `edgecrab_tools::ACP_TOOLS` — single source of truth.
 /// Intentionally excludes messaging, cronjob, TTS, and other
 /// non-editor tools per the spec in docs/004_tools_system/003_toolset_composition.md.
-pub const ACP_TOOLS: &[&str] = &[
-    "web_search",
-    "web_extract",
-    "web_crawl",
-    "terminal",
-    "run_process",
-    "list_processes",
-    "kill_process",
-    "read_file",
-    "write_file",
-    "patch",
-    "search_files",
-    "skills_list",
-    "skill_view",
-    "skill_manage",
-    "skills_hub",
-    "browser_navigate",
-    "browser_snapshot",
-    "browser_screenshot",
-    "browser_click",
-    "browser_type",
-    "browser_scroll",
-    "browser_console",
-    "browser_back",
-    "browser_press",
-    "browser_close",
-    "browser_get_images",
-    "browser_vision",
-    "browser_wait_for",
-    "browser_select",
-    "browser_hover",
-    "manage_todo_list",
-    "memory_read",
-    "memory_write",
-    "session_search",
-    "checkpoint",
-    "execute_code",
-    "delegate_task",
-    "mcp_list_tools",
-    "mcp_call_tool",
-];
+pub use edgecrab_tools::ACP_TOOLS;
 
 /// Check whether a tool is allowed in ACP mode.
 pub fn is_acp_tool(tool_name: &str) -> bool {
@@ -142,6 +103,9 @@ mod tests {
         assert!(is_acp_tool("browser_select"));
         assert!(is_acp_tool("browser_hover"));
         assert!(is_acp_tool("browser_vision"));
+        // LSP tools are included in ACP (editor context)
+        assert!(is_acp_tool("lsp_goto_definition"));
+        assert!(is_acp_tool("lsp_find_references"));
     }
 
     #[test]

@@ -197,7 +197,7 @@ edgecrab/
 | Fact | Value | Source |
 |---|---|---|
 | Rust edition | 2024 | `Cargo.toml` |
-| MSRV | 1.86.0 | `workspace.package.rust-version` |
+| MSRV | 1.95.0 | `workspace.package.rust-version` |
 | Default model | `ollama/gemma4:latest` | `edgecrab-core/src/config.rs` |
 | Default max iterations | 90 | `AgentConfig` default impl |
 | Registered core tools | 91 | `edgecrab-tools/src/toolsets.rs` `CORE_TOOLS` |

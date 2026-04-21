@@ -68,7 +68,7 @@ regex = "1"
 url = "2"
 
 # LLM backend
-edgequake-llm = { version = "0.6.9", features = ["bedrock"] }
+edgequake-llm = { version = "0.6.11", features = ["bedrock"] }
 
 # Image processing (vision tool: resize/compress before base64 encoding)
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
@@ -137,6 +137,9 @@ proptest = "1"
 insta = "1"
 criterion = "0.5"
 tokio-test = "0.4"
+
+[patch.crates-io]
+edgequake-llm = { path = "../edgequake-llm" }
 
 [profile.release]
 lto = true

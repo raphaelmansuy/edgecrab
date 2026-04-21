@@ -217,6 +217,11 @@ impl AppConfig {
                 self.tools.result_spill_preview_lines = n;
             }
         }
+        if let Ok(val) = std::env::var("EDGECRAB_MAX_WRITE_PAYLOAD_KIB") {
+            if let Ok(n) = val.parse() {
+                self.tools.file.max_write_payload_kib = Some(n);
+            }
+        }
         if let Ok(val) = std::env::var("EDGECRAB_PLUGINS_ENABLED") {
             self.plugins.enabled = parse_bool_env(&val);
         }
@@ -946,6 +951,13 @@ pub struct FileToolsConfig {
     ///
     /// The active workspace root is always allowed implicitly.
     pub allowed_roots: Vec<PathBuf>,
+    /// Maximum write payload size in KiB for file mutation tools (write_file,
+    /// patch, apply_patch). Clamped to [8, 256] KiB.
+    ///
+    /// WHY FP16: Default 32 KiB is safe for most LLM providers. Users with
+    /// models that handle larger JSON tool arguments can raise this limit.
+    /// Override with `EDGECRAB_MAX_WRITE_PAYLOAD_KIB` env var.
+    pub max_write_payload_kib: Option<u32>,
 }
 
 /// Policy for handling messages originating from group chats.

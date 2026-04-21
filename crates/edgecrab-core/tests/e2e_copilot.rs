@@ -311,6 +311,7 @@ async fn e2e_agent_streaming_with_copilot() {
             StreamEvent::SubAgentReasoning { .. } => {} // delegated progress — not relevant here
             StreamEvent::SubAgentToolExec { .. } => {} // delegated progress — not relevant here
             StreamEvent::SubAgentFinish { .. } => {} // delegated progress — not relevant here
+            StreamEvent::RunFinished { .. } => {} // terminal outcome is surfaced separately from transport done
             StreamEvent::Done => {
                 got_done = true;
                 break;

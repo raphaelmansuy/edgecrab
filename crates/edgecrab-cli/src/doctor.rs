@@ -445,6 +445,7 @@ fn check_provider_keys() -> Vec<Check> {
         ),
         ("OPENAI_API_KEY", "OpenAI"),
         ("ANTHROPIC_API_KEY", "Anthropic"),
+        ("ANTHROPIC_AUTH_TOKEN", "Anthropic-compatible"),
         ("GOOGLE_API_KEY", "Google Gemini"),
         ("OPENROUTER_API_KEY", "OpenRouter"),
         ("XAI_API_KEY", "xAI Grok"),
@@ -657,8 +658,11 @@ fn detect_best_provider() -> String {
     {
         "openai".into()
     } else if std::env::var("ANTHROPIC_API_KEY")
-        .map(|v| !v.is_empty())
+        .map(|v| !v.trim().is_empty())
         .unwrap_or(false)
+        || std::env::var("ANTHROPIC_AUTH_TOKEN")
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
     {
         "anthropic".into()
     } else if check_local_port(11434) {

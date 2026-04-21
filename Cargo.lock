@@ -1980,6 +1980,7 @@ dependencies = [
  "futures",
  "insta",
  "mockall",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",
@@ -2329,9 +2330,7 @@ dependencies = [
 
 [[package]]
 name = "edgequake-llm"
-version = "0.6.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "12ee72eb8b26ef32bcbf10c21d34bbada328868ab239ca2abeb27d5fe5de1e9e"
+version = "0.6.11"
 dependencies = [
  "anyhow",
  "async-openai",

@@ -98,6 +98,12 @@ use runtime::{
 ///   MockProvider                        ← fallback for dev/test
 /// ```
 pub(crate) fn create_provider(model: &str) -> anyhow::Result<Arc<dyn edgequake_llm::LLMProvider>> {
+    let normalized_model = model.trim().to_ascii_lowercase();
+    if normalized_model == "mock" || normalized_model.starts_with("mock/") {
+        tracing::info!(model, "using explicit mock provider");
+        return Ok(Arc::new(edgequake_llm::MockProvider::new()));
+    }
+
     if let Some((provider_name, model_name)) = explicit_provider_request(model) {
         let canonical = normalize_provider_name(provider_name);
         tracing::info!(
@@ -2189,7 +2195,7 @@ fn format_command_for_display(cmd: &std::process::Command) -> String {
 
 fn provider_environment_hint(provider: &str) -> &'static str {
     match provider {
-        "anthropic" => "ANTHROPIC_API_KEY",
+        "anthropic" => "ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN",
         "azure" => "AZURE_OPENAI_API_KEY",
         "bedrock" => "AWS_ACCESS_KEY_ID",
         "copilot" => "GITHUB_TOKEN",
@@ -2350,9 +2356,10 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        activate_runtime_home_from_config, builtin_cli_command_names, detect_plugin_cli_candidate,
-        explicit_provider_request, forwarded_interactive_slash, parse_editor_command,
-        render_version_report, runtime_home_for_config_override, set_config_value,
+        activate_runtime_home_from_config, builtin_cli_command_names, create_provider,
+        detect_plugin_cli_candidate, explicit_provider_request, forwarded_interactive_slash,
+        parse_editor_command, render_version_report, runtime_home_for_config_override,
+        set_config_value,
     };
     use crate::cli_args::Command;
 
@@ -2426,6 +2433,38 @@ mod tests {
                 std::env::set_var("EDGECRAB_HOME", value);
             } else {
                 std::env::remove_var("EDGECRAB_HOME");
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(provider_selection_env)]
+    fn create_provider_honors_mock_even_when_anthropic_env_is_present() {
+        let _guard = crate::gateway_catalog::lock_test_env();
+        let previous_base = std::env::var_os("ANTHROPIC_BASE_URL");
+        let previous_token = std::env::var_os("ANTHROPIC_AUTH_TOKEN");
+
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var("ANTHROPIC_BASE_URL", "https://api.example.com");
+            std::env::set_var("ANTHROPIC_AUTH_TOKEN", "dummy-token");
+        }
+
+        let provider = create_provider("mock").expect("mock provider");
+        assert_eq!(provider.name(), "mock");
+        assert_eq!(provider.model(), "mock-model");
+
+        #[allow(unsafe_code)]
+        unsafe {
+            if let Some(value) = previous_base {
+                std::env::set_var("ANTHROPIC_BASE_URL", value);
+            } else {
+                std::env::remove_var("ANTHROPIC_BASE_URL");
+            }
+            if let Some(value) = previous_token {
+                std::env::set_var("ANTHROPIC_AUTH_TOKEN", value);
+            } else {
+                std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
             }
         }
     }

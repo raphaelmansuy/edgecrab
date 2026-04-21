@@ -1350,6 +1350,21 @@ pub fn build_tool_running_line_width(
     emoji_overrides: &std::collections::HashMap<String, String>,
     widths: &DisplayWidths,
 ) -> Vec<Span<'static>> {
+    build_tool_running_line_width_elapsed(tool_name, args_json, detail, None, emoji_overrides, widths)
+}
+
+/// Like `build_tool_running_line_width` but also shows elapsed time in the placeholder.
+///
+/// FP49: After 3s, the `  ···` tail becomes `  ···  Xs` so the output-area placeholder
+/// provides temporal feedback without requiring the user to look at the status bar.
+pub fn build_tool_running_line_width_elapsed(
+    tool_name: &str,
+    args_json: &str,
+    detail: Option<&str>,
+    elapsed_secs: Option<u64>,
+    emoji_overrides: &std::collections::HashMap<String, String>,
+    widths: &DisplayWidths,
+) -> Vec<Span<'static>> {
     let preview = extract_tool_preview_width(tool_name, args_json, widths.preview);
     let emoji: &str = emoji_overrides
         .get(tool_name)
@@ -1367,6 +1382,12 @@ pub fn build_tool_running_line_width(
         .map(|detail| format!("  {}", unicode_trunc(detail, detail_width)))
         .unwrap_or_default();
 
+    // FP49: Show elapsed time in the running placeholder after 3s.
+    let elapsed_part = match elapsed_secs {
+        Some(secs) if secs >= 3 => format!("  {secs}s"),
+        _ => String::new(),
+    };
+
     let bar_style = Style::default()
         .fg(Color::Rgb(55, 58, 70))
         .add_modifier(Modifier::DIM);
@@ -1378,6 +1399,9 @@ pub fn build_tool_running_line_width(
     let running_style = Style::default()
         .fg(category.name_color())
         .add_modifier(Modifier::DIM);
+    let elapsed_style = Style::default()
+        .fg(Color::Rgb(100, 112, 135))
+        .add_modifier(Modifier::DIM);
 
     vec![
         Span::styled("  ┊ ", bar_style),
@@ -1386,6 +1410,7 @@ pub fn build_tool_running_line_width(
         Span::styled(preview_col, preview_style),
         Span::styled(detail_part, preview_style),
         Span::styled("  ···".to_string(), running_style),
+        Span::styled(elapsed_part, elapsed_style),
     ]
 }
 
