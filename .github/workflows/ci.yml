@@ -180,7 +180,7 @@ jobs:
           fetch-tags: true
       - uses: pnpm/action-setup@v6
         with:
-          version: 10.13.1
+          package_json_file: site/package.json
       - uses: actions/setup-node@v6
         with:
           node-version: '24'

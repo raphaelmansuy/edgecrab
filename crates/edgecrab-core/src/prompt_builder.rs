@@ -3705,14 +3705,21 @@ Run `${CLAUDE_SKILL_DIR}/scripts/helper.py --session ${CLAUDE_SESSION_ID}`.\n",
         assert!(cli.is_some(), "CLI should find the skill");
         assert!(tg.is_some(), "Telegram should find the skill");
 
-        // Cache must contain 2 independent entries (different platforms)
-        let count = {
+        // Cache must contain 2 independent entries for this home (different platforms),
+        // regardless of what other parallel tests may have inserted for their own temp dirs.
+        let count_for_home = {
             let guard = SKILLS_CACHE
                 .lock()
                 .expect("skills cache lock should not be poisoned");
-            guard.as_ref().map(|m| m.len()).unwrap_or(0)
+            guard
+                .as_ref()
+                .map(|m| m.keys().filter(|(path, _)| path == home).count())
+                .unwrap_or(0)
         };
-        assert_eq!(count, 2, "Skills cache must have one entry per platform");
+        assert_eq!(
+            count_for_home, 2,
+            "Skills cache must have one entry per platform for the same home"
+        );
     }
 
     // ─── FP25: Regex injection scanner ────────────────────────────────
