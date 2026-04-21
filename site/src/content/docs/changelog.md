@@ -8,11 +8,35 @@ sidebar:
 All notable changes to EdgeCrab are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-Last updated: 2026-04-18
+Last updated: 2026-04-21
 
 ---
 
 ## [Unreleased]
+
+## [0.8.0] — 2026-04-21
+
+### Added
+
+- **Mission Steering** — live steer injection for the running agent loop with `Ctrl+S` in the TUI, steer-aware gateway handling, and a dedicated Astro guide.
+
+### Changed
+
+- **Prompt cache architecture split into stable and dynamic system-prompt blocks** — long-lived behavior guidance is now separated from session-specific content so future provider cache-control support can reuse a much larger stable prefix.
+- **Skills prompt invalidation now uses a manifest instead of a short TTL** — newly installed or edited skills show up immediately in the prompt path.
+- **Published runtime dependency handoff** — EdgeCrab now consumes `edgequake-llm 0.6.12` from crates.io rather than a local path override.
+- **Accessibility pass for the TUI palette** — semantic colors were centralized and lifted to WCAG-compliant contrast ranges for dark terminals.
+
+### Verification
+
+| Check | Result |
+|--------|--------|
+| `./scripts/release-version.sh check` | **passed locally before cut** |
+| `cargo fmt --all --check` | **passed locally before cut** |
+| `cargo clippy --workspace --all-targets -- -D warnings` | **passed locally before cut** |
+| `cargo test --workspace --exclude edgecrab-lsp` | **passed locally before cut** |
+| `cargo test -p edgecrab-lsp --all-targets` | **passed locally before cut** |
+| `fnm exec --using v22.12.0 pnpm build` in `site/` | **passed locally before cut** |
 
 ## [0.7.0] — 2026-04-18
 

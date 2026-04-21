@@ -249,13 +249,14 @@ fn strip_ascii_prefix<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
 }
 
 fn parse_numeric_thread_target(target: &str) -> Option<ResolvedTarget> {
-    if let Some((chat_id, thread_id)) = target.split_once(':') {
-        if is_numeric_id(chat_id) && thread_id.chars().all(|c| c.is_ascii_digit()) {
-            return Some(ResolvedTarget {
-                channel_id: chat_id.to_string(),
-                thread_id: Some(thread_id.to_string()),
-            });
-        }
+    if let Some((chat_id, thread_id)) = target.split_once(':')
+        && is_numeric_id(chat_id)
+        && thread_id.chars().all(|c| c.is_ascii_digit())
+    {
+        return Some(ResolvedTarget {
+            channel_id: chat_id.to_string(),
+            thread_id: Some(thread_id.to_string()),
+        });
     }
     if is_numeric_id(target) {
         return Some(ResolvedTarget {

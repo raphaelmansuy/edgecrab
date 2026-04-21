@@ -78,13 +78,12 @@ use crate::profile::{ProfileManager, ProfileSummary};
 use crate::runtime::{
     build_agent, build_tool_registry_with_mcp_discovery, load_runtime, open_state_db,
 };
-use crate::theme::{SkinConfig, Theme};
+use crate::theme::{SkinConfig, Theme, palette as P};
 use crate::tool_display::{
     DisplayWidths, build_context_gauge, build_subagent_done_line_width,
     build_subagent_running_line_width, build_tool_done_line_width, build_tool_running_line_width,
-    build_tool_running_line_width_elapsed,
-    build_tool_verbose_lines_width, tool_action_verb, tool_category, tool_icon, tool_signature,
-    tool_status_preview, tool_status_preview_width,
+    build_tool_running_line_width_elapsed, build_tool_verbose_lines_width, tool_action_verb,
+    tool_category, tool_icon, tool_signature, tool_status_preview, tool_status_preview_width,
 };
 use crate::vision_models::{
     available_vision_model_options_with_dynamic, canonical_provider, current_model_supports_vision,
@@ -346,16 +345,15 @@ fn terminal_ui_profile_for(
             | "Hyper" | "HyperTerm" | "contour" | "JetBrains-JediTerm",
         ) => TerminalUiProfile::Standard,
         _ => {
-            if let Some(term_name) = term.map(|value| value.to_ascii_lowercase()) {
-                if matches!(term_name.as_str(), "linux" | "vt100" | "vt220" | "ansi")
+            if let Some(term_name) = term.map(|value| value.to_ascii_lowercase())
+                && (matches!(term_name.as_str(), "linux" | "vt100" | "vt220" | "ansi")
                     || term_name.starts_with("rxvt")
                     || term_name.starts_with("screen")
                     || term_name.starts_with("tmux")
                     || term_name.starts_with("eterm")
-                    || term_name.starts_with("putty")
-                {
-                    return TerminalUiProfile::ReducedMotion;
-                }
+                    || term_name.starts_with("putty"))
+            {
+                return TerminalUiProfile::ReducedMotion;
             }
             TerminalUiProfile::Standard
         }
@@ -383,10 +381,10 @@ fn detect_terminal_ui_profile() -> TerminalUiProfile {
 
     // Narrow terminals (< 60 cols): fall back to compact mode to avoid
     // layout overflow on small screens.
-    if let Ok((cols, _)) = crossterm::terminal::size() {
-        if cols < 60 {
-            return TerminalUiProfile::BasicCompat;
-        }
+    if let Ok((cols, _)) = crossterm::terminal::size()
+        && cols < 60
+    {
+        return TerminalUiProfile::BasicCompat;
     }
 
     // Fast-path capability markers from terminal envs. These are more reliable
@@ -735,6 +733,26 @@ async fn forward_stream_event_to_tui(
                 threshold_tokens,
             )));
         }
+
+        // Steering events — update the TUI's pending steer counter and status bar.
+        // These events originate from the agent loop (conversation.rs) and are
+        // informational; no AgentResponse forwarding is needed.
+        StreamEvent::SteerPending { count } => {
+            tracing::debug!(count, "TUI←agent: steer pending notification");
+            // Pending count is managed optimistically in the TUI already —
+            // this event can be used to synchronise if needed in the future.
+        }
+
+        StreamEvent::SteerApplied { message } => {
+            tracing::info!(
+                len = message.len(),
+                "TUI←agent: steer applied — agent received new guidance"
+            );
+            let _ = tx.send(AgentResponse::Notice(format!(
+                "⛵ Steering applied ({})",
+                message.chars().take(72).collect::<String>()
+            )));
+        }
     }
 
     false
@@ -792,10 +810,8 @@ async fn forward_agent_stream_to_tui(
                             recovered_reasoning = turn.reasoning.is_some(),
                             "TUI→agent: recovered assistant reply after missing terminal stream event"
                         );
-                        if !saw_reasoning_event {
-                            if let Some(reasoning) = turn.reasoning {
-                                let _ = tx.send(AgentResponse::Reasoning(reasoning));
-                            }
+                        if !saw_reasoning_event && let Some(reasoning) = turn.reasoning {
+                            let _ = tx.send(AgentResponse::Reasoning(reasoning));
                         }
                         if !saw_token_event && !turn.text.is_empty() {
                             let _ = tx.send(AgentResponse::Token(turn.text));
@@ -857,54 +873,54 @@ async fn forward_agent_stream_to_tui(
 }
 
 fn normalize_terminal_control_key(mut key: event::KeyEvent) -> event::KeyEvent {
-    if key.modifiers.is_empty() {
-        if let KeyCode::Char(ch) = key.code {
-            match ch {
-                '\u{2}' => {
-                    key.code = KeyCode::Char('b');
-                    key.modifiers = KeyModifiers::CONTROL;
-                }
-                '\u{3}' => {
-                    key.code = KeyCode::Char('c');
-                    key.modifiers = KeyModifiers::CONTROL;
-                }
-                '\u{4}' => {
-                    key.code = KeyCode::Char('d');
-                    key.modifiers = KeyModifiers::CONTROL;
-                }
-                '\u{6}' => {
-                    key.code = KeyCode::Char('f');
-                    key.modifiers = KeyModifiers::CONTROL;
-                }
-                '\u{7}' => {
-                    key.code = KeyCode::Char('g');
-                    key.modifiers = KeyModifiers::CONTROL;
-                }
-                // In basic PTYs a bare LF/CR is usually just Enter. Treating it
-                // as Ctrl+J makes Terminal.app open compose mode instead of
-                // submitting, which can strand the user before the agent runs.
-                '\n' | '\r' => {
-                    key.code = KeyCode::Enter;
-                    key.modifiers = KeyModifiers::NONE;
-                }
-                '\u{c}' => {
-                    key.code = KeyCode::Char('l');
-                    key.modifiers = KeyModifiers::CONTROL;
-                }
-                '\u{f}' => {
-                    key.code = KeyCode::Char('o');
-                    key.modifiers = KeyModifiers::CONTROL;
-                }
-                '\u{13}' => {
-                    key.code = KeyCode::Char('s');
-                    key.modifiers = KeyModifiers::CONTROL;
-                }
-                '\u{15}' => {
-                    key.code = KeyCode::Char('u');
-                    key.modifiers = KeyModifiers::CONTROL;
-                }
-                _ => {}
+    if key.modifiers.is_empty()
+        && let KeyCode::Char(ch) = key.code
+    {
+        match ch {
+            '\u{2}' => {
+                key.code = KeyCode::Char('b');
+                key.modifiers = KeyModifiers::CONTROL;
             }
+            '\u{3}' => {
+                key.code = KeyCode::Char('c');
+                key.modifiers = KeyModifiers::CONTROL;
+            }
+            '\u{4}' => {
+                key.code = KeyCode::Char('d');
+                key.modifiers = KeyModifiers::CONTROL;
+            }
+            '\u{6}' => {
+                key.code = KeyCode::Char('f');
+                key.modifiers = KeyModifiers::CONTROL;
+            }
+            '\u{7}' => {
+                key.code = KeyCode::Char('g');
+                key.modifiers = KeyModifiers::CONTROL;
+            }
+            // In basic PTYs a bare LF/CR is usually just Enter. Treating it
+            // as Ctrl+J makes Terminal.app open compose mode instead of
+            // submitting, which can strand the user before the agent runs.
+            '\n' | '\r' => {
+                key.code = KeyCode::Enter;
+                key.modifiers = KeyModifiers::NONE;
+            }
+            '\u{c}' => {
+                key.code = KeyCode::Char('l');
+                key.modifiers = KeyModifiers::CONTROL;
+            }
+            '\u{f}' => {
+                key.code = KeyCode::Char('o');
+                key.modifiers = KeyModifiers::CONTROL;
+            }
+            '\u{13}' => {
+                key.code = KeyCode::Char('s');
+                key.modifiers = KeyModifiers::CONTROL;
+            }
+            '\u{15}' => {
+                key.code = KeyCode::Char('u');
+                key.modifiers = KeyModifiers::CONTROL;
+            }
+            _ => {}
         }
     }
     key
@@ -1629,10 +1645,8 @@ fn spawn_audio_recorder(
         std::process::Stdio::null()
     });
     let mut child = command.spawn()?;
-    if use_ffmpeg_monitor {
-        if let Some(stderr) = child.stderr.take() {
-            spawn_ffmpeg_silence_monitor(child.id(), stderr);
-        }
+    if use_ffmpeg_monitor && let Some(stderr) = child.stderr.take() {
+        spawn_ffmpeg_silence_monitor(child.id(), stderr);
     }
     Ok((child, backend))
 }
@@ -4966,6 +4980,22 @@ pub struct App {
     /// Consecutive automatic resume attempts triggered by local stop hooks.
     /// Prevents an unconditional `agent:stop` hook from causing an infinite loop.
     stop_hook_retry_count: u8,
+
+    // ── Mission Steering (Phase 3) ────────────────────────────────────────
+    /// Cloned sender for injecting SteeringEvent into the running agent loop.
+    /// Set by `set_agent()`; cleared to None when the channel is closed.
+    steer_tx: Option<edgecrab_core::SteeringSender>,
+    /// Optimistic count of steers sent but not yet acknowledged by the loop.
+    pending_steer_count: usize,
+    /// Timestamp when the last steer was applied (for timed status bar fade).
+    steer_applied_at: Option<Instant>,
+    /// Whether the compact steering overlay is open.
+    steering_overlay_active: bool,
+    /// The kind of steer the user is composing (Hint / Redirect / Stop).
+    steering_kind: edgecrab_core::SteeringKind,
+    /// Single-line input textarea for the steer message.
+    /// Rendered inside the compact overlay; focussed while overlay is active.
+    steering_textarea: tui_textarea::TextArea<'static>,
 }
 
 #[derive(Debug, Clone)]
@@ -5427,6 +5457,134 @@ impl App {
         had_active_request
     }
 
+    // ── Mission Steering helpers ───────────────────────────────────────────
+
+    /// Open the compact steering overlay, resetting its input and kind.
+    fn open_steering_overlay(&mut self) {
+        // Clear any previous text in the steering textarea.
+        let lines: Vec<String> = self
+            .steering_textarea
+            .lines()
+            .iter()
+            .map(|l| l.to_string())
+            .collect();
+        for _ in 0..lines.len() {
+            self.steering_textarea
+                .move_cursor(tui_textarea::CursorMove::End);
+            self.steering_textarea.delete_line_by_head();
+        }
+        self.steering_overlay_active = true;
+        self.needs_redraw = true;
+    }
+
+    /// Handle a key event while the steering overlay is open.
+    fn handle_steering_overlay_key(&mut self, key: event::KeyEvent) {
+        match (key.modifiers, key.code) {
+            // Esc or Ctrl+S (toggle) — close without sending
+            (_, KeyCode::Esc) | (KeyModifiers::CONTROL, KeyCode::Char('s')) => {
+                self.steering_overlay_active = false;
+                self.needs_redraw = true;
+            }
+            // Tab — cycle SteeringKind: Hint → Redirect → Stop → Hint
+            (_, KeyCode::Tab) => {
+                use edgecrab_core::SteeringKind;
+                self.steering_kind = match self.steering_kind {
+                    SteeringKind::Hint => SteeringKind::Redirect,
+                    SteeringKind::Redirect => SteeringKind::Stop,
+                    SteeringKind::Stop => SteeringKind::Hint,
+                };
+                self.needs_redraw = true;
+            }
+            // Enter — send the steer and close
+            (_, KeyCode::Enter) => {
+                self.send_steer_from_overlay();
+            }
+            // All other keys — route to the steering textarea
+            _ => {
+                self.steering_textarea.input(key);
+                self.needs_redraw = true;
+            }
+        }
+    }
+
+    /// Send the steer composed in the overlay, then close it.
+    fn send_steer_from_overlay(&mut self) {
+        let text: String = self.steering_textarea.lines().join("\n");
+        let text = text.trim().to_string();
+        self.steering_overlay_active = false;
+        self.needs_redraw = true;
+
+        if text.is_empty() {
+            return;
+        }
+
+        let kind = self.steering_kind.clone();
+
+        // EC-04: agent is idle → treat as new user message promoted with tag.
+        if !self.is_processing {
+            let promoted = format!(
+                "[⛵ STEER/{kind}] {text}",
+                kind = match &kind {
+                    edgecrab_core::SteeringKind::Hint => "HINT",
+                    edgecrab_core::SteeringKind::Redirect => "REDIRECT",
+                    edgecrab_core::SteeringKind::Stop => "STOP",
+                },
+            );
+            self.push_output(
+                "⛵ Steering → sent as new message (agent idle)".to_string(),
+                OutputRole::System,
+            );
+            self.process_input(&promoted);
+            return;
+        }
+
+        // Agent is running — send via steering channel.
+        let send_result = self.steer_tx.as_ref().map(|tx| {
+            tx.send(edgecrab_core::SteeringEvent::new(
+                kind.clone(),
+                text.clone(),
+            ))
+        });
+
+        match send_result {
+            Some(Ok(())) => {
+                self.pending_steer_count += 1;
+                // Show a brief acknowledgement in the output.
+                self.push_output(
+                    format!(
+                        "⛵ Steer queued ({}/{})",
+                        match &kind {
+                            edgecrab_core::SteeringKind::Hint => "HINT",
+                            edgecrab_core::SteeringKind::Redirect => "REDIRECT",
+                            edgecrab_core::SteeringKind::Stop => "STOP",
+                        },
+                        edgecrab_core::safe_truncate(&text, 60),
+                    ),
+                    OutputRole::System,
+                );
+                self.needs_redraw = true;
+            }
+            Some(Err(_)) => {
+                // Channel closed — clear steer_tx and notify.
+                self.steer_tx = None;
+                self.push_output(
+                    "⚠ Steer channel closed (new session?). Steering as new message.".to_string(),
+                    OutputRole::Error,
+                );
+                // Fallback: send as new queued message.
+                let promoted = format!("[⛵ STEER] {text}");
+                self.process_input(&promoted);
+            }
+            None => {
+                // No steer_tx — no agent set yet
+                self.push_output(
+                    "⚠ No active agent for steering. Send as new message instead.".to_string(),
+                    OutputRole::Error,
+                );
+            }
+        }
+    }
+
     fn flush_buffered_assistant_output(&mut self) {
         if self.buffered_assistant_output.is_empty() {
             return;
@@ -5501,8 +5659,9 @@ impl App {
         textarea.set_style(theme.input_text);
         textarea.set_placeholder_text("Type a message or /help for commands...");
         textarea.set_placeholder_style(
+            // WCAG AA: Rgb(135,135,148) L=0.22 CR=5.0:1 vs black; ITALIC has no luminance effect.
             Style::default()
-                .fg(Color::Rgb(100, 100, 100))
+                .fg(Color::Rgb(135, 135, 148))
                 .add_modifier(Modifier::ITALIC),
         );
 
@@ -5665,6 +5824,27 @@ impl App {
             hook_registry: std::sync::Arc::new(edgecrab_gateway::hooks::HookRegistry::new()),
             hook_registry_loaded: false,
             stop_hook_retry_count: 0,
+            // ── Mission Steering ────────────────────────────────────────────
+            steer_tx: None,
+            pending_steer_count: 0,
+            steer_applied_at: None,
+            steering_overlay_active: false,
+            steering_kind: edgecrab_core::SteeringKind::Hint,
+            steering_textarea: {
+                let mut ta = tui_textarea::TextArea::default();
+                ta.set_cursor_line_style(ratatui::style::Style::default());
+                ta.set_block(
+                    ratatui::widgets::Block::default().borders(ratatui::widgets::Borders::NONE),
+                );
+                ta.set_placeholder_text("Type your steering hint...");
+                ta.set_placeholder_style(
+                    ratatui::style::Style::default()
+                        // WCAG AA: Rgb(135,145,165) L=0.27 CR=6.4:1 vs black.
+                        .fg(ratatui::style::Color::Rgb(135, 145, 165))
+                        .add_modifier(ratatui::style::Modifier::ITALIC),
+                );
+                ta
+            },
         };
 
         app.apply_textarea_editor_style();
@@ -5684,6 +5864,12 @@ impl App {
     pub fn set_agent(&mut self, agent: Arc<Agent>) {
         self.active_skills = agent.preloaded_skills_snapshot();
         self.refresh_skills_list();
+        // Capture the steering sender so Ctrl+S can inject guidance into the loop.
+        self.steer_tx = Some(agent.steer_sender());
+        // Reset steering UI state for the new session.
+        self.pending_steer_count = 0;
+        self.steer_applied_at = None;
+        self.steering_overlay_active = false;
         self.agent = Some(agent);
     }
 
@@ -5896,15 +6082,11 @@ impl App {
                     self.push_output(format!("> {}", message.text_content()), OutputRole::User);
                 }
                 edgecrab_types::Role::Assistant => {
-                    if self.show_reasoning {
-                        if let Some(reasoning) = message.reasoning.clone() {
-                            if !reasoning.trim().is_empty() {
-                                self.push_output(
-                                    format!("Thinking\n{reasoning}"),
-                                    OutputRole::Reasoning,
-                                );
-                            }
-                        }
+                    if self.show_reasoning
+                        && let Some(reasoning) = message.reasoning.clone()
+                        && !reasoning.trim().is_empty()
+                    {
+                        self.push_output(format!("Thinking\n{reasoning}"), OutputRole::Reasoning);
                     }
                     self.push_output(message.text_content(), OutputRole::Assistant);
                 }
@@ -5981,6 +6163,23 @@ impl App {
             });
         }
         self.yolo_enabled = false;
+        // ── Reset UI-layer counters that the status bar reads ──────────────────
+        // WHY: agent.new_session() clears the agent-side SessionState, but the
+        // App struct caches derived display values (total_tokens, session_cost,
+        // turn_count, etc.) that are only updated when a response arrives.
+        // Without resetting them here the status bar continues to show the
+        // previous session's token count / cost until the first new API call
+        // completes — giving the misleading impression that the new session
+        // already has a large context.
+        self.total_tokens = 0;
+        self.session_cost = 0.0;
+        self.turn_count = 0;
+        self.last_response_time = None;
+        self.last_agent_response_text.clear();
+        self.in_flight_tool_count = 0;
+        self.active_subagents.clear();
+        self.last_run_outcome = None;
+        self.display_state = DisplayState::Idle;
         self.clear_output();
         if show_banner {
             let model = self.model_name.clone();
@@ -6025,20 +6224,14 @@ impl App {
         let name_style = Style::default()
             .fg(Color::Rgb(255, 215, 0))
             .add_modifier(Modifier::BOLD); // gold
-        let dot_style = Style::default().fg(Color::Rgb(100, 100, 120)); // dim separator
-        let tagline_style = Style::default()
-            .fg(Color::Rgb(184, 134, 11))
-            .add_modifier(Modifier::DIM); // dark gold
-        let rule_style = Style::default()
-            .fg(Color::Rgb(70, 60, 40))
-            .add_modifier(Modifier::DIM); // very dim amber
-        let label_style = Style::default()
-            .fg(Color::Rgb(140, 140, 155))
-            .add_modifier(Modifier::DIM); // muted
+        let dot_style = Style::default().fg(Color::Rgb(148, 148, 165)); // WCAG AA: L=0.29 CR=6.3:1
+        let tagline_style = Style::default().fg(Color::Rgb(184, 134, 11)); // dark gold — base CR=6.5:1; DIM removed for AA compliance
+        let rule_style = Style::default().fg(P::SEP_LINE).add_modifier(Modifier::DIM); // purely decorative rule — DIM OK (SC 1.4.3 exempt)
+        // WCAG AA: SECONDARY_WARM Rgb(165,165,178) CR=9.2:1; DIM removed (DIM breaks AA).
+        let label_style = Style::default().fg(P::SECONDARY_WARM);
         let value_style = Style::default().fg(Color::Rgb(255, 191, 0)); // amber
-        let hint_style = Style::default()
-            .fg(Color::Rgb(120, 120, 135))
-            .add_modifier(Modifier::DIM); // dim hint
+        // WCAG AA: SECONDARY_WARM for welcome hint; DIM removed for AA compliance.
+        let hint_style = Style::default().fg(P::SECONDARY_WARM);
 
         // ── Row 0: blank breathing room ────────────────────────────────────────
         self.push_output_spans(vec![Span::raw("")], OutputRole::System);
@@ -6216,8 +6409,9 @@ impl App {
         fresh.set_style(self.theme.input_text);
         fresh.set_placeholder_text("Type a message or /help for commands...");
         fresh.set_placeholder_style(
+            // WCAG AA: Rgb(135,135,148) L=0.22 CR=5.0:1 vs black; ITALIC has no luminance effect.
             Style::default()
-                .fg(Color::Rgb(100, 100, 100))
+                .fg(Color::Rgb(135, 135, 148))
                 .add_modifier(Modifier::ITALIC),
         );
         fresh.set_block(
@@ -6248,12 +6442,12 @@ impl App {
 
     fn input_panel_title(&self, prompt_symbol: &str) -> String {
         let mut title = self.editor_mode.input_title(prompt_symbol);
-        if matches!(self.editor_mode, InputEditorMode::ComposeNormal) {
-            if let Some(pending) = self.vim_pending {
-                title.pop();
-                title.push_str(pending.input_title_suffix());
-                title.push(' ');
-            }
+        if matches!(self.editor_mode, InputEditorMode::ComposeNormal)
+            && let Some(pending) = self.vim_pending
+        {
+            title.pop();
+            title.push_str(pending.input_title_suffix());
+            title.push(' ');
         }
         title
     }
@@ -6457,12 +6651,12 @@ impl App {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_dir() {
-                    if let Some(leaf) = path.file_name().and_then(|n| n.to_str()) {
-                        if leaf == name {
-                            let md = path.join("SKILL.md");
-                            if md.is_file() {
-                                return Some(md);
-                            }
+                    if let Some(leaf) = path.file_name().and_then(|n| n.to_str())
+                        && leaf == name
+                    {
+                        let md = path.join("SKILL.md");
+                        if md.is_file() {
+                            return Some(md);
                         }
                     }
                     stack.push(path);
@@ -8213,11 +8407,9 @@ impl App {
                 }
                 let (row, col) = self.textarea.cursor();
                 let at_eol = col >= self.textarea.lines().get(row).map(|s| s.len()).unwrap_or(0);
-                if at_eol {
-                    if let Some(hint) = self.ghost_hint() {
-                        for ch in hint.chars() {
-                            self.textarea.insert_char(ch);
-                        }
+                if at_eol && let Some(hint) = self.ghost_hint() {
+                    for ch in hint.chars() {
+                        self.textarea.insert_char(ch);
                     }
                 }
             }
@@ -8233,39 +8425,39 @@ impl App {
             (KeyModifiers::NONE, KeyCode::Right) => {
                 let (row, col) = self.textarea.cursor();
                 let line_len = self.textarea.lines().get(row).map(|s| s.len()).unwrap_or(0);
-                if col >= line_len {
-                    if let Some(hint) = self.ghost_hint() {
-                        for ch in hint.chars() {
-                            self.textarea.insert_char(ch);
-                        }
-                        return;
+                if col >= line_len
+                    && let Some(hint) = self.ghost_hint()
+                {
+                    for ch in hint.chars() {
+                        self.textarea.insert_char(ch);
                     }
+                    return;
                 }
                 self.textarea.input(key);
             }
             (KeyModifiers::ALT, KeyCode::Right) => {
                 let (row, col) = self.textarea.cursor();
                 let line_len = self.textarea.lines().get(row).map(|s| s.len()).unwrap_or(0);
-                if col >= line_len {
-                    if let Some(word) = self.ghost_hint_next_word() {
-                        for ch in word.chars() {
-                            self.textarea.insert_char(ch);
-                        }
-                        return;
+                if col >= line_len
+                    && let Some(word) = self.ghost_hint_next_word()
+                {
+                    for ch in word.chars() {
+                        self.textarea.insert_char(ch);
                     }
+                    return;
                 }
                 self.textarea.input(key);
             }
             (KeyModifiers::NONE, KeyCode::End) => {
                 let (row, col) = self.textarea.cursor();
                 let line_len = self.textarea.lines().get(row).map(|s| s.len()).unwrap_or(0);
-                if col >= line_len {
-                    if let Some(hint) = self.ghost_hint() {
-                        for ch in hint.chars() {
-                            self.textarea.insert_char(ch);
-                        }
-                        return;
+                if col >= line_len
+                    && let Some(hint) = self.ghost_hint()
+                {
+                    for ch in hint.chars() {
+                        self.textarea.insert_char(ch);
                     }
+                    return;
                 }
                 self.textarea.input(key);
             }
@@ -8526,20 +8718,20 @@ impl App {
 
     /// Load history from disk (called once at startup).
     fn load_history_file(&mut self) {
-        if let Some(path) = Self::history_path() {
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                self.input_history = content
-                    .lines()
-                    .filter(|l| !l.is_empty())
-                    .map(String::from)
-                    .collect();
-                // Cap at 500
-                if self.input_history.len() > 500 {
-                    let excess = self.input_history.len() - 500;
-                    self.input_history.drain(..excess);
-                }
-                self.history_pos = self.input_history.len();
+        if let Some(path) = Self::history_path()
+            && let Ok(content) = std::fs::read_to_string(&path)
+        {
+            self.input_history = content
+                .lines()
+                .filter(|l| !l.is_empty())
+                .map(String::from)
+                .collect();
+            // Cap at 500
+            if self.input_history.len() > 500 {
+                let excess = self.input_history.len() - 500;
+                self.input_history.drain(..excess);
             }
+            self.history_pos = self.input_history.len();
         }
     }
 
@@ -9182,10 +9374,9 @@ impl App {
         }
 
         if let Some(intent) = paging_intent_for_key(raw_key).or_else(|| paging_intent_for_key(key))
+            && self.handle_paging_intent(intent)
         {
-            if self.handle_paging_intent(intent) {
-                return;
-            }
+            return;
         }
 
         // Approval overlay active — intercept all keys for choice navigation
@@ -9216,6 +9407,44 @@ impl App {
                 KeyCode::End => self.set_document_overlay_scroll(u16::MAX),
                 _ => {}
             }
+            return;
+        }
+
+        // ── Steering overlay active — intercept all keys ──────────────────
+        if self.steering_overlay_active {
+            self.handle_steering_overlay_key(key);
+            return;
+        }
+
+        // Ctrl+S — open steering overlay (when agent is running) or send steer
+        // as a new message if idle (EC-04).
+        if matches!(
+            (key.modifiers, key.code),
+            (KeyModifiers::CONTROL, KeyCode::Char('s'))
+        ) && !matches!(
+            self.editor_mode,
+            InputEditorMode::ComposeInsert | InputEditorMode::ComposeNormal
+        ) {
+            self.open_steering_overlay();
+            return;
+        }
+
+        // ── Steering overlay active — intercept all keys ──────────────────
+        if self.steering_overlay_active {
+            self.handle_steering_overlay_key(key);
+            return;
+        }
+
+        // Ctrl+S — open steering overlay (when agent is running) or send steer
+        // as a new message if idle (EC-04).
+        if matches!(
+            (key.modifiers, key.code),
+            (KeyModifiers::CONTROL, KeyCode::Char('s'))
+        ) && !matches!(
+            self.editor_mode,
+            InputEditorMode::ComposeInsert | InputEditorMode::ComposeNormal
+        ) {
+            self.open_steering_overlay();
             return;
         }
 
@@ -9905,11 +10134,11 @@ impl App {
                     }
                 }
                 KeyCode::Delete => {
-                    if let Some(entry) = self.mcp_selector.current() {
-                        if let Some(command) = entry.remove_command() {
-                            self.mcp_selector.active = false;
-                            self.handle_mcp_command(command);
-                        }
+                    if let Some(entry) = self.mcp_selector.current()
+                        && let Some(command) = entry.remove_command()
+                    {
+                        self.mcp_selector.active = false;
+                        self.handle_mcp_command(command);
                     }
                 }
                 KeyCode::Up => {
@@ -9966,12 +10195,12 @@ impl App {
                     self.reset_detail_fullscreen_scroll(DetailSurface::McpSelector);
                 }
                 KeyCode::Char(' ') => {
-                    if let Some(entry) = self.mcp_selector.current() {
-                        if let Some(command) = entry.toggle_command() {
-                            let query = self.mcp_selector.query.clone();
-                            self.handle_mcp_command(command);
-                            self.open_mcp_selector(Some(&query), false);
-                        }
+                    if let Some(entry) = self.mcp_selector.current()
+                        && let Some(command) = entry.toggle_command()
+                    {
+                        let query = self.mcp_selector.query.clone();
+                        self.handle_mcp_command(command);
+                        self.open_mcp_selector(Some(&query), false);
                     }
                 }
                 _ if selector_action_key(&key, 'v') => {
@@ -9982,37 +10211,37 @@ impl App {
                     }
                 }
                 _ if selector_action_key(&key, 'i') => {
-                    if let Some(entry) = self.mcp_selector.current() {
-                        if let Some(command) = entry.install_command() {
-                            self.mcp_selector.active = false;
-                            self.handle_mcp_command(command);
-                        }
+                    if let Some(entry) = self.mcp_selector.current()
+                        && let Some(command) = entry.install_command()
+                    {
+                        self.mcp_selector.active = false;
+                        self.handle_mcp_command(command);
                     }
                 }
                 _ if selector_action_key(&key, 't') => {
-                    if let Some(entry) = self.mcp_selector.current() {
-                        if entry.kind == McpEntryKind::ConfiguredServer {
-                            let command = entry.test_command();
-                            self.mcp_selector.active = false;
-                            self.handle_mcp_command(command);
-                        }
+                    if let Some(entry) = self.mcp_selector.current()
+                        && entry.kind == McpEntryKind::ConfiguredServer
+                    {
+                        let command = entry.test_command();
+                        self.mcp_selector.active = false;
+                        self.handle_mcp_command(command);
                     }
                 }
                 _ if selector_action_key(&key, 'c') => {
-                    if let Some(entry) = self.mcp_selector.current() {
-                        if entry.kind == McpEntryKind::ConfiguredServer {
-                            let command = entry.doctor_command();
-                            self.mcp_selector.active = false;
-                            self.handle_mcp_command(command);
-                        }
+                    if let Some(entry) = self.mcp_selector.current()
+                        && entry.kind == McpEntryKind::ConfiguredServer
+                    {
+                        let command = entry.doctor_command();
+                        self.mcp_selector.active = false;
+                        self.handle_mcp_command(command);
                     }
                 }
                 _ if selector_action_key(&key, 'd') => {
-                    if let Some(entry) = self.mcp_selector.current() {
-                        if let Some(command) = entry.remove_command() {
-                            self.mcp_selector.active = false;
-                            self.handle_mcp_command(command);
-                        }
+                    if let Some(entry) = self.mcp_selector.current()
+                        && let Some(command) = entry.remove_command()
+                    {
+                        self.mcp_selector.active = false;
+                        self.handle_mcp_command(command);
                     }
                 }
                 KeyCode::Char(c) if selector_search_char(&key) == Some(c) => {
@@ -12161,14 +12390,13 @@ impl App {
         if matches!(
             choice,
             edgecrab_core::ApprovalChoice::Session | edgecrab_core::ApprovalChoice::Always
-        ) {
-            if let Some(full_command) = full_command.as_deref() {
-                use std::hash::{Hash, Hasher};
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                full_command.hash(&mut hasher);
-                self.session_approvals
-                    .insert(format!("{:x}", hasher.finish()));
-            }
+        ) && let Some(full_command) = full_command.as_deref()
+        {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            full_command.hash(&mut hasher);
+            self.session_approvals
+                .insert(format!("{:x}", hasher.finish()));
         }
 
         if let Some(tx) = self.approval_pending_tx.take() {
@@ -12429,12 +12657,10 @@ impl App {
                     // useful calibration metric for model-selection decisions.
                     if matches!(self.display_state, DisplayState::AwaitingFirstToken { .. })
                         && self.last_ttfb_secs.is_none()
-                    {
-                        if let DisplayState::AwaitingFirstToken { ref started, .. } =
+                        && let DisplayState::AwaitingFirstToken { ref started, .. } =
                             self.display_state
-                        {
-                            self.last_ttfb_secs = Some(started.elapsed().as_secs_f32());
-                        }
+                    {
+                        self.last_ttfb_secs = Some(started.elapsed().as_secs_f32());
                     }
                     // Transition to streaming state on first token of a new phase.
                     if self.streaming_enabled
@@ -12501,6 +12727,11 @@ impl App {
                     self.last_agent_response_text.push_str(&text);
                 }
                 AgentResponse::Notice(text) => {
+                    // Detect steering-applied notices to update steer state.
+                    if text.starts_with("⛵ Steering applied") {
+                        self.steer_applied_at = Some(Instant::now());
+                        self.pending_steer_count = self.pending_steer_count.saturating_sub(1);
+                    }
                     self.push_output(text, OutputRole::System);
                     self.needs_redraw = true;
                 }
@@ -12641,10 +12872,9 @@ impl App {
                         detail: active_detail,
                         ..
                     } = &mut self.display_state
+                        && active_tool_call_id == &tool_call_id
                     {
-                        if active_tool_call_id == &tool_call_id {
-                            *active_detail = Some(detail.clone());
-                        }
+                        *active_detail = Some(detail.clone());
                     }
                     if self.hidden_tool_calls.contains(&tool_call_id) {
                         if self.at_bottom {
@@ -12661,7 +12891,9 @@ impl App {
                     }) = self.pending_tool_lines.get(&tool_call_id).cloned()
                     {
                         if line_idx < self.output.len() {
-                            let elapsed = self.active_tools.get(&tool_call_id)
+                            let elapsed = self
+                                .active_tools
+                                .get(&tool_call_id)
                                 .map(|s| s.started_at.elapsed().as_secs());
                             self.output[line_idx].prebuilt_spans =
                                 Some(build_tool_running_line_width_elapsed(
@@ -12981,13 +13213,13 @@ impl App {
                     // Show TTFB calibration hint when the wait was noticeable (>1s).
                     // This surfaces the model's latency characteristics to the user
                     // without requiring any external tooling.
-                    if let Some(ttfb) = self.last_ttfb_secs.take() {
-                        if ttfb >= 1.0 {
-                            self.push_output(
-                                format!("  \u{21b3} ttfb: {ttfb:.1}s"),
-                                OutputRole::System,
-                            );
-                        }
+                    if let Some(ttfb) = self.last_ttfb_secs.take()
+                        && ttfb >= 1.0
+                    {
+                        self.push_output(
+                            format!("  \u{21b3} ttfb: {ttfb:.1}s"),
+                            OutputRole::System,
+                        );
                     }
 
                     // Auto-update status bar tokens/cost from agent
@@ -13425,20 +13657,18 @@ impl App {
                 if let DisplayState::WaitingForApproval {
                     ref mut selected, ..
                 } = self.display_state
+                    && *selected > 0
                 {
-                    if *selected > 0 {
-                        *selected -= 1;
-                    }
+                    *selected -= 1;
                 }
             }
             KeyCode::Right | KeyCode::Char('l') => {
                 if let DisplayState::WaitingForApproval {
                     ref mut selected, ..
                 } = self.display_state
+                    && *selected + 1 < CHOICES
                 {
-                    if *selected + 1 < CHOICES {
-                        *selected += 1;
-                    }
+                    *selected += 1;
                 }
             }
             KeyCode::Char('v') => {
@@ -13923,7 +14153,7 @@ impl App {
         if advance_verb {
             self.thinking_verb_idx = self.thinking_verb_idx.wrapping_add(1);
             // Advance kaomoji face every 3 verb changes (slower rotation)
-            if self.thinking_verb_idx % 3 == 0 {
+            if self.thinking_verb_idx.is_multiple_of(3) {
                 self.kaomoji_frame_idx = self.kaomoji_frame_idx.wrapping_add(1);
             }
         }
@@ -13962,9 +14192,8 @@ impl App {
                 .collect();
             for (_id, line_idx, tool_name, args_json, detail, elapsed) in updates {
                 if line_idx < self.output.len() {
-                    let widths = DisplayWidths::from_terminal_width(
-                        self.last_terminal_width as usize,
-                    );
+                    let widths =
+                        DisplayWidths::from_terminal_width(self.last_terminal_width as usize);
                     self.output[line_idx].prebuilt_spans =
                         Some(build_tool_running_line_width_elapsed(
                             &tool_name,
@@ -16906,20 +17135,20 @@ impl App {
             ],
         };
 
-        if let Some(session_id) = snapshot.session_id.as_deref() {
-            if let Some(db) = agent.state_db_handle() {
-                match db.get_session(session_id) {
-                    Ok(Some(record)) => {
-                        meta.id = record.id;
-                        meta.title = record.title.unwrap_or_else(|| "Current session".into());
-                        meta.source = record.source;
-                        meta.model = record.model.unwrap_or(snapshot.model);
-                        meta.started_label = format_session_timestamp(record.started_at);
-                        meta.last_active_label = "active now".into();
-                    }
-                    Ok(None) => {}
-                    Err(e) => self.push_output(format!("DB error: {e}"), OutputRole::Error),
+        if let Some(session_id) = snapshot.session_id.as_deref()
+            && let Some(db) = agent.state_db_handle()
+        {
+            match db.get_session(session_id) {
+                Ok(Some(record)) => {
+                    meta.id = record.id;
+                    meta.title = record.title.unwrap_or_else(|| "Current session".into());
+                    meta.source = record.source;
+                    meta.model = record.model.unwrap_or(snapshot.model);
+                    meta.started_label = format_session_timestamp(record.started_at);
+                    meta.last_active_label = "active now".into();
                 }
+                Ok(None) => {}
+                Err(e) => self.push_output(format!("DB error: {e}"), OutputRole::Error),
             }
         }
 
@@ -17318,14 +17547,14 @@ impl App {
             let mut stream_error: Option<String> = None;
             let mut last_progress: Option<String> = None;
             while let Some(event) = event_rx.recv().await {
-                if let Some(text) = background_progress_text(task_num, &event) {
-                    if last_progress.as_deref() != Some(text.as_str()) {
-                        let _ = tx.send(AgentResponse::BackgroundPromptProgress {
-                            task_id: task_id.clone(),
-                            text: text.clone(),
-                        });
-                        last_progress = Some(text);
-                    }
+                if let Some(text) = background_progress_text(task_num, &event)
+                    && last_progress.as_deref() != Some(text.as_str())
+                {
+                    let _ = tx.send(AgentResponse::BackgroundPromptProgress {
+                        task_id: task_id.clone(),
+                        text: text.clone(),
+                    });
+                    last_progress = Some(text);
                 }
 
                 match event {
@@ -18353,18 +18582,18 @@ impl App {
     }
 
     fn remove_reasoning_output_block(&mut self) {
-        if let Some(idx) = self.reasoning_line.take() {
-            if idx < self.output.len() {
-                self.output.remove(idx);
-                if let Some(stream_idx) = self.streaming_line {
-                    self.streaming_line = match stream_idx.cmp(&idx) {
-                        std::cmp::Ordering::Greater => Some(stream_idx - 1),
-                        std::cmp::Ordering::Equal => None,
-                        std::cmp::Ordering::Less => Some(stream_idx),
-                    };
-                }
-                self.needs_redraw = true;
+        if let Some(idx) = self.reasoning_line.take()
+            && idx < self.output.len()
+        {
+            self.output.remove(idx);
+            if let Some(stream_idx) = self.streaming_line {
+                self.streaming_line = match stream_idx.cmp(&idx) {
+                    std::cmp::Ordering::Greater => Some(stream_idx - 1),
+                    std::cmp::Ordering::Equal => None,
+                    std::cmp::Ordering::Less => Some(stream_idx),
+                };
             }
+            self.needs_redraw = true;
         }
     }
 
@@ -21393,18 +21622,18 @@ impl App {
                 //          (reads DevToolsActivePort files + port scan)
                 let detected = self.rt_handle.block_on(auto_detect_running_chrome_cdp());
 
-                if let Some(ref found_ep) = detected {
-                    if found_ep.port != probe_port {
-                        self.push_output(
-                            format!(
-                                "  ℹ Detected running Chrome with CDP on port {} \
+                if let Some(ref found_ep) = detected
+                    && found_ep.port != probe_port
+                {
+                    self.push_output(
+                        format!(
+                            "  ℹ Detected running Chrome with CDP on port {} \
                                  (you requested {probe_port}).\n\
                                  Tip: use `/browser connect {}` to attach to it.",
-                                found_ep.port, found_ep.port
-                            ),
-                            OutputRole::System,
-                        );
-                    }
+                            found_ep.port, found_ep.port
+                        ),
+                        OutputRole::System,
+                    );
                 }
 
                 // Step 2b: try auto-launching a new headless Chrome on the requested port
@@ -21593,10 +21822,10 @@ impl App {
                 lines.push_str("🌐 Browser: local headless Chrome/Chromium\n");
                 // Try to get info from default endpoint (may not be running)
                 let info = self.rt_handle.block_on(get_chrome_info());
-                if let Some(ci) = info {
-                    if !ci.browser.is_empty() {
-                        lines.push_str(&format!("   Browser:  {}\n", ci.browser));
-                    }
+                if let Some(ci) = info
+                    && !ci.browser.is_empty()
+                {
+                    lines.push_str(&format!("   Browser:  {}\n", ci.browser));
                 }
 
                 // Auto-detect any already-running Chrome with CDP
@@ -21885,6 +22114,11 @@ impl App {
             self.render_statusbar_selector(frame, frame.area());
         }
 
+        // Steering overlay (compact floating panel — lower screen half)
+        if self.steering_overlay_active {
+            self.render_steering_overlay(frame, frame.area());
+        }
+
         if self.document_overlay.is_some() {
             self.render_document_overlay(frame, frame.area());
         }
@@ -22007,23 +22241,25 @@ impl App {
                     Span::styled(
                         "\u{258e} ",
                         Style::default()
-                            .fg(Color::Rgb(50, 90, 110))
-                            .add_modifier(Modifier::DIM),
+                            .fg(P::GUTTER_BAR)
+                            .add_modifier(Modifier::DIM), // decorative glyph — DIM OK
                     ),
                     Span::styled(
                         ghost_text,
                         Style::default()
-                            .fg(Color::Rgb(80, 110, 130))
-                            .add_modifier(Modifier::ITALIC | Modifier::DIM),
+                            // WCAG AA: P::TERTIARY_COOL Rgb(125,138,162) CR=6.0:1.
+                            // DIM removed — this is semantic text the user must read.
+                            .fg(P::TERTIARY_COOL)
+                            .add_modifier(Modifier::ITALIC),
                     ),
                 ]));
             }
-            DisplayState::Thinking { frame, started } => {
+            DisplayState::Thinking { frame, started }
                 // Only show when reasoning is not already streaming in the output
                 // area (show_reasoning=true with tokens arriving). When
                 // reasoning_line is Some, the user already sees live reasoning
                 // text — adding a ghost line would duplicate the signal.
-                if self.reasoning_line.is_none() {
+                if self.reasoning_line.is_none() => {
                     let spinner = SPINNER_FRAMES[*frame % SPINNER_FRAMES.len()];
                     let elapsed = started.elapsed().as_secs();
                     let ghost_text: String = if elapsed > 3 {
@@ -22035,18 +22271,18 @@ impl App {
                         Span::styled(
                             "\u{258e} ",
                             Style::default()
-                                .fg(Color::Rgb(70, 60, 100))
-                                .add_modifier(Modifier::DIM),
+                                .fg(P::GUTTER_BAR)
+                                .add_modifier(Modifier::DIM), // decorative glyph — DIM OK
                         ),
                         Span::styled(
                             ghost_text,
                             Style::default()
-                                .fg(Color::Rgb(100, 85, 130))
-                                .add_modifier(Modifier::ITALIC | Modifier::DIM),
+                                // WCAG AA: P::SECONDARY_WARM CR=9.2:1. DIM removed.
+                                .fg(P::SECONDARY_WARM)
+                                .add_modifier(Modifier::ITALIC),
                         ),
                     ]));
                 }
-            }
             _ => {}
         }
 
@@ -22238,8 +22474,9 @@ impl App {
                 lines.push(Line::from(Span::styled(
                     ghost,
                     Style::default()
-                        .fg(Color::Rgb(80, 100, 120))
-                        .add_modifier(Modifier::ITALIC | Modifier::DIM),
+                        // WCAG AA: P::TERTIARY_COOL CR=6.0:1. DIM removed.
+                        .fg(P::TERTIARY_COOL)
+                        .add_modifier(Modifier::ITALIC),
                 )));
             }
             DisplayState::Thinking { frame, started } if self.reasoning_line.is_none() => {
@@ -22253,8 +22490,10 @@ impl App {
                 lines.push(Line::from(Span::styled(
                     ghost,
                     Style::default()
-                        .fg(Color::Rgb(100, 85, 130))
-                        .add_modifier(Modifier::ITALIC | Modifier::DIM),
+                        // WCAG AA: P::SECONDARY_WARM CR=9.2:1 (thinking = higher priority signal).
+                        // DIM removed.
+                        .fg(P::SECONDARY_WARM)
+                        .add_modifier(Modifier::ITALIC),
                 )));
             }
             _ => {}
@@ -22474,16 +22713,13 @@ impl App {
                     .unwrap_or(name.as_str());
                 let base_color = tool_category(category_name).name_color();
                 let bar_color = if elapsed_secs >= 15 {
-                    Color::Rgb(255, 140, 50)  // orange: stalled / very slow
+                    Color::Rgb(255, 140, 50) // orange: stalled / very slow
                 } else if elapsed_secs >= 5 {
-                    Color::Rgb(255, 200, 80)  // amber: slow
+                    Color::Rgb(255, 200, 80) // amber: slow
                 } else {
                     base_color
                 };
-                left_spans.push(Span::styled(
-                    content,
-                    Style::default().fg(bar_color),
-                ));
+                left_spans.push(Span::styled(content, Style::default().fg(bar_color)));
             }
             DisplayState::BgOp {
                 label,
@@ -22706,6 +22942,38 @@ impl App {
             }
         }
 
+        // ── Steering indicator ────────────────────────────────────────────
+        // Show pending count in amber, or a brief "applied" flash in green
+        // (fades after 3 seconds).
+        if self.pending_steer_count > 0 {
+            left_spans.push(Span::styled(
+                " │ ",
+                Style::default().fg(Color::Rgb(50, 50, 65)),
+            ));
+            left_spans.push(Span::styled(
+                format!(" ⛵ {} pending ", self.pending_steer_count),
+                Style::default()
+                    .fg(Color::Rgb(20, 20, 28))
+                    .bg(Color::Rgb(255, 190, 50))
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else if self
+            .steer_applied_at
+            .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(4))
+        {
+            left_spans.push(Span::styled(
+                " │ ",
+                Style::default().fg(Color::Rgb(50, 50, 65)),
+            ));
+            left_spans.push(Span::styled(
+                " ⛵ applied ",
+                Style::default()
+                    .fg(Color::Rgb(18, 32, 26))
+                    .bg(Color::Rgb(100, 215, 140))
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+
         // Right side: keyboard hints + turn counter
         let mut right_spans = Vec::new();
         if self.turn_count > 0 {
@@ -22769,7 +23037,7 @@ impl App {
                 ));
             } else if self.is_processing {
                 right_spans.push(Span::styled(
-                    " ^C=cancel  ↕scroll ",
+                    " ^C=cancel  ^S=steer  ↕scroll ",
                     Style::default().fg(Color::Rgb(70, 75, 95)),
                 ));
             } else if matches!(self.editor_mode, InputEditorMode::ComposeInsert) {
@@ -23698,29 +23966,29 @@ impl App {
     }
 
     fn reset_detail_fullscreen_scroll(&mut self, surface: DetailSurface) {
-        if let Some(state) = self.detail_fullscreen.as_mut() {
-            if state.surface == surface {
-                state.scroll = 0;
-                self.needs_redraw = true;
-            }
+        if let Some(state) = self.detail_fullscreen.as_mut()
+            && state.surface == surface
+        {
+            state.scroll = 0;
+            self.needs_redraw = true;
         }
     }
 
     fn page_up_detail_fullscreen(&mut self, surface: DetailSurface) {
-        if let Some(state) = self.detail_fullscreen.as_mut() {
-            if state.surface == surface {
-                state.scroll = state.scroll.saturating_sub(8);
-                self.needs_redraw = true;
-            }
+        if let Some(state) = self.detail_fullscreen.as_mut()
+            && state.surface == surface
+        {
+            state.scroll = state.scroll.saturating_sub(8);
+            self.needs_redraw = true;
         }
     }
 
     fn page_down_detail_fullscreen(&mut self, surface: DetailSurface) {
-        if let Some(state) = self.detail_fullscreen.as_mut() {
-            if state.surface == surface {
-                state.scroll = state.scroll.saturating_add(8);
-                self.needs_redraw = true;
-            }
+        if let Some(state) = self.detail_fullscreen.as_mut()
+            && state.surface == surface
+        {
+            state.scroll = state.scroll.saturating_add(8);
+            self.needs_redraw = true;
         }
     }
 
@@ -24204,16 +24472,15 @@ impl App {
             if let Some(crate::mcp_catalog::McpInstallPlan::Http {
                 required_headers, ..
             }) = &entry.install
+                && !required_headers.is_empty()
             {
-                if !required_headers.is_empty() {
-                    detail_lines.push(Line::from(vec![
-                        Span::styled("Auth: ", Style::default().fg(Color::Rgb(145, 170, 170))),
-                        Span::raw(format!(
-                            "manual header setup required: {}",
-                            required_headers.join(", ")
-                        )),
-                    ]));
-                }
+                detail_lines.push(Line::from(vec![
+                    Span::styled("Auth: ", Style::default().fg(Color::Rgb(145, 170, 170))),
+                    Span::raw(format!(
+                        "manual header setup required: {}",
+                        required_headers.join(", ")
+                    )),
+                ]));
             }
             if !entry.tags.is_empty() {
                 detail_lines.push(Line::from(vec![
@@ -28847,6 +29114,127 @@ impl App {
         frame.render_widget(Paragraph::new(picker_help_line(accent)), chunks[2]);
     }
 
+    /// Render the compact mission-steering overlay.
+    ///
+    /// The overlay appears as a small floating panel over the lower-half of the
+    /// output area when `steering_overlay_active` is true.  It contains:
+    ///   – A header showing the active steering kind with Tab cycling hint
+    ///   – A single-line textarea for the steer message
+    ///   – A footer help bar
+    fn render_steering_overlay(&mut self, frame: &mut Frame, area: Rect) {
+        use edgecrab_core::SteeringKind;
+
+        // Compact popup: 60 wide × 7 tall — below centre so output stays visible.
+        let pw: u16 = 60.min(area.width);
+        let ph: u16 = 7;
+        let popup = Rect {
+            x: area.x + area.width.saturating_sub(pw) / 2,
+            // Position at 70 % down the screen so the output is not obscured.
+            y: area.y + (area.height.saturating_sub(ph) * 7 / 10),
+            width: pw,
+            height: ph,
+        };
+        frame.render_widget(Clear, popup);
+
+        // Render the border block and obtain the inner area to layout within.
+        let border_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Rgb(120, 180, 255)))
+            .title(Span::styled(
+                " ⛵ Mission Steer ",
+                Style::default()
+                    .fg(Color::Rgb(200, 230, 255))
+                    .add_modifier(Modifier::BOLD),
+            ));
+        let inner = border_block.inner(popup);
+        frame.render_widget(border_block, popup);
+
+        // Split inner area: header(1) | textarea(min) | help(1)
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1), // kind selector header
+                Constraint::Min(1),    // textarea
+                Constraint::Length(1), // help bar
+            ])
+            .split(inner);
+
+        // ── Kind selector row ─────────────────────────────────────────────
+        let (hint_s, redir_s, stop_s) = match self.steering_kind {
+            SteeringKind::Hint => (
+                Style::default()
+                    .fg(Color::Rgb(10, 18, 30))
+                    .bg(Color::Rgb(120, 220, 165))
+                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(Color::Rgb(90, 110, 140)),
+                Style::default().fg(Color::Rgb(90, 110, 140)),
+            ),
+            SteeringKind::Redirect => (
+                Style::default().fg(Color::Rgb(90, 110, 140)),
+                Style::default()
+                    .fg(Color::Rgb(10, 18, 30))
+                    .bg(Color::Rgb(255, 200, 80))
+                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(Color::Rgb(90, 110, 140)),
+            ),
+            SteeringKind::Stop => (
+                Style::default().fg(Color::Rgb(90, 110, 140)),
+                Style::default().fg(Color::Rgb(90, 110, 140)),
+                Style::default()
+                    .fg(Color::Rgb(10, 18, 30))
+                    .bg(Color::Rgb(255, 100, 80))
+                    .add_modifier(Modifier::BOLD),
+            ),
+        };
+        let kind_line = Line::from(vec![
+            Span::styled("  kind: ", Style::default().fg(Color::Rgb(130, 150, 180))),
+            Span::styled(" HINT ", hint_s),
+            Span::raw(" "),
+            Span::styled(" REDIRECT ", redir_s),
+            Span::raw(" "),
+            Span::styled(" STOP ", stop_s),
+            Span::styled(
+                "  (Tab=cycle)",
+                Style::default().fg(Color::Rgb(70, 85, 110)),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(kind_line), sections[0]);
+
+        // ── Steering textarea ─────────────────────────────────────────────
+        self.steering_textarea.set_style(
+            Style::default()
+                .fg(Color::Rgb(220, 235, 255))
+                .bg(Color::Rgb(16, 20, 30)),
+        );
+        frame.render_widget(&self.steering_textarea, sections[1]);
+
+        // ── Help bar ──────────────────────────────────────────────────────
+        let help = Line::from(vec![
+            Span::styled(
+                " Enter",
+                Style::default()
+                    .fg(Color::Rgb(120, 220, 165))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" send  ", Style::default().fg(Color::Rgb(100, 130, 160))),
+            Span::styled(
+                "Tab",
+                Style::default()
+                    .fg(Color::Rgb(120, 220, 165))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" kind  ", Style::default().fg(Color::Rgb(100, 130, 160))),
+            Span::styled(
+                "Esc",
+                Style::default()
+                    .fg(Color::Rgb(200, 100, 80))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" cancel ", Style::default().fg(Color::Rgb(100, 130, 160))),
+        ]);
+        frame.render_widget(Paragraph::new(help), sections[2]);
+    }
+
     fn render_approval_overlay(&self, frame: &mut Frame, area: Rect) {
         // Only render when in WaitingForApproval state
         let (command, full_command, selected, scroll_offset) =
@@ -28999,21 +29387,22 @@ impl App {
         frame.render_widget(&self.textarea, area);
 
         // Ghost text overlay (Fish-style hint)
-        if self.show_ghost_hint && matches!(self.editor_mode, InputEditorMode::Inline) {
-            if let Some(hint) = self.ghost_hint() {
-                let (row, col) = self.textarea.cursor();
-                let ghost_x = area.x + 1 + col as u16; // +1 for border
-                let ghost_y = area.y + 1 + row as u16;
-                if ghost_x < area.x + area.width - 1 {
-                    let max_width = (area.x + area.width - 1 - ghost_x) as usize;
-                    let display = edgecrab_core::safe_truncate(&hint, max_width);
-                    let ghost_area = Rect::new(ghost_x, ghost_y, display.len() as u16, 1);
-                    let ghost = Paragraph::new(Span::styled(
-                        display.to_string(),
-                        Style::default().fg(Color::DarkGray),
-                    ));
-                    frame.render_widget(ghost, ghost_area);
-                }
+        if self.show_ghost_hint
+            && matches!(self.editor_mode, InputEditorMode::Inline)
+            && let Some(hint) = self.ghost_hint()
+        {
+            let (row, col) = self.textarea.cursor();
+            let ghost_x = area.x + 1 + col as u16; // +1 for border
+            let ghost_y = area.y + 1 + row as u16;
+            if ghost_x < area.x + area.width - 1 {
+                let max_width = (area.x + area.width - 1 - ghost_x) as usize;
+                let display = edgecrab_core::safe_truncate(&hint, max_width);
+                let ghost_area = Rect::new(ghost_x, ghost_y, display.len() as u16, 1);
+                let ghost = Paragraph::new(Span::styled(
+                    display.to_string(),
+                    Style::default().fg(Color::DarkGray),
+                ));
+                frame.render_widget(ghost, ghost_area);
             }
         }
 

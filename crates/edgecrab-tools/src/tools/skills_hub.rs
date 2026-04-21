@@ -807,13 +807,13 @@ pub fn load_official_skill_bundle(
 /// Extract a short description from SKILL.md content.
 fn extract_description(content: &str) -> String {
     let trimmed = content.trim_start();
-    if let Some(frontmatter) = trimmed.strip_prefix("---") {
-        if let Some(end) = frontmatter.find("\n---") {
-            let fm = &frontmatter[..end];
-            for line in fm.lines() {
-                if let Some(desc) = line.strip_prefix("description:") {
-                    return desc.trim().trim_matches('"').trim_matches('\'').to_string();
-                }
+    if let Some(frontmatter) = trimmed.strip_prefix("---")
+        && let Some(end) = frontmatter.find("\n---")
+    {
+        let fm = &frontmatter[..end];
+        for line in fm.lines() {
+            if let Some(desc) = line.strip_prefix("description:") {
+                return desc.trim().trim_matches('"').trim_matches('\'').to_string();
             }
         }
     }
@@ -1088,15 +1088,15 @@ fn collect_skill_files_from_disk(root: &Path, dir: &Path, files: &mut HashMap<St
         let p = entry.path();
         if p.is_dir() {
             collect_skill_files_from_disk(root, &p, files);
-        } else if p.is_file() {
-            if let Ok(content) = std::fs::read_to_string(&p) {
-                let rel = p
-                    .strip_prefix(root)
-                    .unwrap_or(&p)
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                files.insert(rel, content);
-            }
+        } else if p.is_file()
+            && let Ok(content) = std::fs::read_to_string(&p)
+        {
+            let rel = p
+                .strip_prefix(root)
+                .unwrap_or(&p)
+                .to_string_lossy()
+                .replace('\\', "/");
+            files.insert(rel, content);
         }
     }
 }

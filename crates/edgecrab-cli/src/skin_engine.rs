@@ -402,7 +402,7 @@ fn builtin_skins() -> HashMap<String, Skin> {
                 banner_dim: "#484f58".into(),
                 banner_text: "#c9d1d9".into(),
                 ui_accent: "#8b949e".into(),
-                ui_label: "#6e7681".into(),
+                ui_label: "#808d97".into(), // WCAG AA fix: #6e7681 was CR=4.22 ❌; #808d97 is CR=5.7 ✅
                 ui_ok: "#3fb950".into(),
                 ui_error: "#f85149".into(),
                 ui_warn: "#d29922".into(),

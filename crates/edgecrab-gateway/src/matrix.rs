@@ -281,17 +281,16 @@ impl PlatformAdapter for MatrixAdapter {
                     if let Ok(sync) = resp.json::<SyncResponse>().await {
                         since = sync.next_batch.clone().or(since);
 
-                        if let Some(rooms) = sync.rooms {
-                            if let Some(joined) = rooms.join {
-                                for (room_id, room_data) in joined {
-                                    if let Some(timeline) = room_data.get("timeline") {
-                                        if let Some(events) = timeline.get("events") {
-                                            if let Some(events) = events.as_array() {
-                                                for event in events {
-                                                    self.handle_event(&tx, &room_id, event).await;
-                                                }
-                                            }
-                                        }
+                        if let Some(rooms) = sync.rooms
+                            && let Some(joined) = rooms.join
+                        {
+                            for (room_id, room_data) in joined {
+                                if let Some(timeline) = room_data.get("timeline")
+                                    && let Some(events) = timeline.get("events")
+                                    && let Some(events) = events.as_array()
+                                {
+                                    for event in events {
+                                        self.handle_event(&tx, &room_id, event).await;
                                     }
                                 }
                             }

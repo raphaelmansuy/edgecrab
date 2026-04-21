@@ -151,24 +151,21 @@ mod tests {
 
         // 16 KiB limit, 10 KiB content → OK
         let content = "x".repeat(10 * 1024);
-        assert!(enforce_write_payload_limit_with_max(
-            "write_file",
-            "test.txt",
-            &path,
-            &content,
-            16 * 1024,
-        )
-        .is_ok());
+        assert!(
+            enforce_write_payload_limit_with_max(
+                "write_file",
+                "test.txt",
+                &path,
+                &content,
+                16 * 1024,
+            )
+            .is_ok()
+        );
 
         // 16 KiB limit, 20 KiB content → rejected
         let big = "x".repeat(20 * 1024);
-        let err = enforce_write_payload_limit_with_max(
-            "write_file",
-            "test.txt",
-            &path,
-            &big,
-            16 * 1024,
-        );
+        let err =
+            enforce_write_payload_limit_with_max("write_file", "test.txt", &path, &big, 16 * 1024);
         assert!(err.is_err());
         let msg = format!("{}", err.unwrap_err());
         assert!(msg.contains("16 KiB"));
@@ -176,12 +173,8 @@ mod tests {
 
     #[test]
     fn test_enforce_patch_limit_configurable() {
-        assert!(
-            enforce_patch_payload_limit_with_max("patch", "f.rs", 10_000, 16 * 1024).is_ok()
-        );
-        assert!(
-            enforce_patch_payload_limit_with_max("patch", "f.rs", 20_000, 16 * 1024).is_err()
-        );
+        assert!(enforce_patch_payload_limit_with_max("patch", "f.rs", 10_000, 16 * 1024).is_ok());
+        assert!(enforce_patch_payload_limit_with_max("patch", "f.rs", 20_000, 16 * 1024).is_err());
     }
 
     #[test]

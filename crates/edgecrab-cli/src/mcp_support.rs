@@ -46,12 +46,12 @@ pub fn parse_inline_command_tokens(input: &str) -> Result<Vec<String>, String> {
     while let Some(ch) = chars.next() {
         if let Some(active_quote) = quote {
             if ch == '\\' {
-                if let Some(&next) = chars.peek() {
-                    if next == active_quote || next == '\\' {
-                        current.push(next);
-                        let _ = chars.next();
-                        continue;
-                    }
+                if let Some(&next) = chars.peek()
+                    && (next == active_quote || next == '\\')
+                {
+                    current.push(next);
+                    let _ = chars.next();
+                    continue;
                 }
                 current.push(ch);
                 continue;

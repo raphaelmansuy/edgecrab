@@ -204,12 +204,12 @@ fn resolve_program_path(command: &str, cwd: Option<&Path>) -> Option<PathBuf> {
         return Some(command_path.to_path_buf());
     }
 
-    if command_path.components().count() > 1 {
-        if let Some(base) = cwd {
-            let candidate = base.join(command_path);
-            if is_file(&candidate) {
-                return Some(candidate);
-            }
+    if command_path.components().count() > 1
+        && let Some(base) = cwd
+    {
+        let candidate = base.join(command_path);
+        if is_file(&candidate) {
+            return Some(candidate);
         }
     }
 

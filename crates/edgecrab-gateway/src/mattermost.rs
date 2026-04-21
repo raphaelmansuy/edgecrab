@@ -219,12 +219,11 @@ impl PlatformAdapter for MattermostAdapter {
                     while let Some(msg) = read.next().await {
                         match msg {
                             Ok(WsMessage::Text(text)) => {
-                                if let Ok(event) = serde_json::from_str::<MmWsEvent>(&text) {
-                                    if event.event.as_deref() == Some("posted") {
-                                        if let Some(data) = event.data {
-                                            self.handle_posted(&tx, &data).await;
-                                        }
-                                    }
+                                if let Ok(event) = serde_json::from_str::<MmWsEvent>(&text)
+                                    && event.event.as_deref() == Some("posted")
+                                    && let Some(data) = event.data
+                                {
+                                    self.handle_posted(&tx, &data).await;
                                 }
                             }
                             Ok(WsMessage::Close(_)) => {

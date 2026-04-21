@@ -1932,12 +1932,12 @@ fn resolve_installed_skill(
 
 fn extract_skill_description(content: &str) -> String {
     let trimmed = content.trim_start();
-    if let Some(frontmatter) = trimmed.strip_prefix("---") {
-        if let Some(end) = frontmatter.find("\n---") {
-            for line in frontmatter[..end].lines() {
-                if let Some(desc) = line.strip_prefix("description:") {
-                    return desc.trim().trim_matches('"').trim_matches('\'').to_string();
-                }
+    if let Some(frontmatter) = trimmed.strip_prefix("---")
+        && let Some(end) = frontmatter.find("\n---")
+    {
+        for line in frontmatter[..end].lines() {
+            if let Some(desc) = line.strip_prefix("description:") {
+                return desc.trim().trim_matches('"').trim_matches('\'').to_string();
             }
         }
     }

@@ -204,7 +204,9 @@ pub fn record_read_dedup(
     start_line: Option<u64>,
     end_line: Option<u64>,
 ) {
-    let Ok(meta) = std::fs::metadata(path) else { return };
+    let Ok(meta) = std::fs::metadata(path) else {
+        return;
+    };
     let mtime = meta.modified().ok();
     // Only cache when we have a valid mtime — otherwise every re-read appears
     // to need dedup but we can't compare timestamps.
@@ -398,8 +400,14 @@ mod tests {
         let result = check_read_dedup(session, &path, None, None);
         assert!(result.is_some(), "unchanged file must produce dedup stub");
         let stub = result.unwrap();
-        assert!(stub.contains("unchanged since last read"), "stub must mention unchanged");
-        assert!(stub.contains("already in your context"), "stub must guide model");
+        assert!(
+            stub.contains("unchanged since last read"),
+            "stub must mention unchanged"
+        );
+        assert!(
+            stub.contains("already in your context"),
+            "stub must guide model"
+        );
     }
 
     #[test]

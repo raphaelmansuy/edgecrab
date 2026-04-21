@@ -300,15 +300,11 @@ impl ToolHandler for ReadFileTool {
         // Cast to u64 for the DedupKey (line numbers are small; no overflow risk here).
         let dedup_start = line_start.map(|v| v as u64);
         let dedup_end = line_end.map(|v| v as u64);
-        if count < 3 {
-            if let Some(stub) = read_tracker::check_read_dedup(
-                &ctx.session_id,
-                &resolved,
-                dedup_start,
-                dedup_end,
-            ) {
-                return Ok(stub);
-            }
+        if count < 3
+            && let Some(stub) =
+                read_tracker::check_read_dedup(&ctx.session_id, &resolved, dedup_start, dedup_end)
+        {
+            return Ok(stub);
         }
 
         let content = tokio::fs::read_to_string(&resolved)

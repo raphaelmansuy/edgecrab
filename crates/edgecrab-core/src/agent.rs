@@ -94,6 +94,24 @@ pub struct Agent {
     /// WHY Option: The default `BuiltinCompressorEngine` is used when None.
     /// External engines inject additional tool schemas at session start.
     pub(crate) context_engine: Option<Arc<dyn crate::context_engine::ContextEngine>>,
+
+    // ── Steering ──────────────────────────────────────────────────────────
+    //
+    // Mission steering allows the TUI (or gateway) to inject guidance text
+    // into the running agent loop without stopping it.
+    //
+    // WHY separate channel from cancel: cancel is a one-way latch; steering
+    // needs to carry text payloads and allow multiple events per turn.
+    //
+    // WHY Mutex<Option<SteeringReceiver>>: the receiver is moved into
+    // execute_loop for its duration.  Using Mutex<Option<Receiver>> lets
+    // execute_loop take ownership while still being accessible to public API.
+    // The channel is recreated at the start of each new conversation turn.
+    //
+    // WHY steer_tx is public(crate): The TUI (edgecrab-cli) accesses it via
+    // Agent::steer_sender() which clones the Arc-less Sender.
+    pub(crate) steer_tx: crate::steering::SteeringSender,
+    pub(crate) steer_rx: std::sync::Mutex<Option<crate::steering::SteeringReceiver>>,
 }
 
 /// Options for cloning an agent into a fresh isolated session.
@@ -410,6 +428,16 @@ pub struct SessionState {
     pub session_id: Option<String>,
     pub messages: Vec<Message>,
     pub cached_system_prompt: Option<String>,
+    /// Stable (cacheable) zone of the system prompt — set alongside
+    /// `cached_system_prompt` when the prompt is built via `build_blocks()`.
+    ///
+    /// When Some, the conversation layer splits the combined prompt at this
+    /// boundary and sends two system messages to Anthropic: the stable block
+    /// with `cache_control: ephemeral` (cross-session cache hit) and the
+    /// dynamic remainder without cache_control.
+    ///
+    /// Always cleared together with `cached_system_prompt`.
+    pub cached_stable_prompt: Option<String>,
     pub user_turn_count: u32,
     pub api_call_count: u32,
     pub session_input_tokens: u64,
@@ -534,6 +562,7 @@ impl Agent {
         let process_table = Arc::new(ProcessTable::new());
         process_table.spawn_gc_task(gc_cancel.clone());
 
+        let (steer_tx, steer_rx) = crate::steering::steering_channel();
         Self {
             config: RwLock::new(config),
             provider: RwLock::new(provider),
@@ -548,6 +577,8 @@ impl Agent {
             gc_cancel,
             todo_store: Arc::new(TodoStore::new()),
             context_engine,
+            steer_tx,
+            steer_rx: std::sync::Mutex::new(Some(steer_rx)),
         }
     }
 
@@ -797,6 +828,22 @@ impl Agent {
             .is_cancelled()
     }
 
+    /// Return the sender half of the steering channel.
+    ///
+    /// The caller (TUI, gateway) stores this sender and calls `send()` to inject
+    /// guidance into the running agent loop.  The sender is `Clone`, so multiple
+    /// independent senders (main input + steer overlay) can coexist.
+    ///
+    /// ## Example
+    ///
+    /// ```ignore
+    /// let steer_tx = agent.steer_sender();
+    /// steer_tx.send(SteeringEvent::new(SteeringKind::Hint, "focus on auth")).ok();
+    /// ```
+    pub fn steer_sender(&self) -> crate::steering::SteeringSender {
+        self.steer_tx.clone()
+    }
+
     /// Reset session state for a new conversation.
     pub async fn new_session(&self) {
         let previous_session_id = self.session.read().await.session_id.clone();
@@ -990,6 +1037,7 @@ impl Agent {
     pub async fn invalidate_system_prompt(&self) {
         let mut session = self.session.write().await;
         session.cached_system_prompt = None;
+        session.cached_stable_prompt = None;
     }
 
     pub async fn set_personality_addon(&self, addon: Option<String>) {
@@ -1414,11 +1462,17 @@ impl SessionSnapshot {
     }
 
     pub fn context_pressure_tokens(&self) -> u64 {
-        if self.last_prompt_tokens > 0 {
-            self.last_prompt_tokens
-        } else {
-            self.prompt_tokens()
-        }
+        // Return the per-call context size — how much of the context window
+        // the current conversation occupies.  This is set from the last
+        // API response's prompt_tokens + cache_hit_tokens, or from a
+        // character-count estimate when the provider omits usage data.
+        //
+        // We intentionally do NOT fall back to the cumulative
+        // session_input_tokens counter here: that counter grows by
+        // prompt_tokens on every turn and would roughly double (or more)
+        // across a multi-turn conversation, which is the wrong signal for
+        // "how full is the context window right now?".
+        self.last_prompt_tokens
     }
 }
 
@@ -1577,6 +1631,23 @@ pub enum StreamEvent {
         /// Compression threshold in tokens (context_window × threshold_fraction).
         threshold_tokens: usize,
     },
+    /// A steering event is waiting in the channel (pending injection).
+    ///
+    /// Emitted when the TUI sends a steer but before the loop has reached
+    /// a tool boundary. The TUI uses this to show "⛵ N pending" in the
+    /// status bar. Count is the total number of pending events.
+    SteerPending { count: usize },
+    /// A steering message was successfully injected into the conversation.
+    ///
+    /// Emitted immediately after the steer is appended to `session.messages`,
+    /// before the next API call. The TUI uses this to:
+    /// - Clear the `SteerPending` count from the status bar.
+    /// - Show a brief "⛵ steer applied" confirmation.
+    /// - Append the steer text to the output scroll buffer.
+    SteerApplied {
+        /// The full combined steer message that was injected.
+        message: String,
+    },
 }
 
 impl std::fmt::Debug for StreamEvent {
@@ -1672,6 +1743,11 @@ impl std::fmt::Debug for StreamEvent {
                 f,
                 "ContextPressure(est={estimated_tokens}, threshold={threshold_tokens})"
             ),
+            Self::SteerPending { count } => write!(f, "SteerPending({count})"),
+            Self::SteerApplied { message } => {
+                let preview = &message[..message.len().min(60)];
+                write!(f, "SteerApplied({preview:?}…)")
+            }
         }
     }
 }
@@ -2723,8 +2799,10 @@ def register(ctx):
 
     #[test]
     fn session_state_first_compression_done_can_be_set() {
-        let mut s = SessionState::default();
-        s.first_compression_done = true;
+        let s = SessionState {
+            first_compression_done: true,
+            ..SessionState::default()
+        };
         assert!(s.first_compression_done);
     }
 }

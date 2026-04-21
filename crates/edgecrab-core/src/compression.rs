@@ -511,25 +511,25 @@ pub fn prune_tool_outputs(
                 let tool_name = m.name.as_deref().unwrap_or("tool");
 
                 // When spill context is available, attempt to spill to artifact
-                if let Some(ctx) = spill_ctx {
-                    if ctx.config.enabled {
-                        let result = m.text_content();
-                        match crate::tool_result_spill::maybe_spill(
-                            tool_name,
-                            tool_call_id,
-                            result,
-                            ctx.session_id,
-                            ctx.cwd,
-                            ctx.config,
-                            ctx.seq,
-                        ) {
-                            SpillOutcome::Spilled { stub, .. } => {
-                                return Message::tool_result(tool_call_id, tool_name, &stub);
-                            }
-                            SpillOutcome::Inline(_) => {
-                                // Below spill threshold but above prune threshold (200 chars)
-                                // — fall through to placeholder
-                            }
+                if let Some(ctx) = spill_ctx
+                    && ctx.config.enabled
+                {
+                    let result = m.text_content();
+                    match crate::tool_result_spill::maybe_spill(
+                        tool_name,
+                        tool_call_id,
+                        result,
+                        ctx.session_id,
+                        ctx.cwd,
+                        ctx.config,
+                        ctx.seq,
+                    ) {
+                        SpillOutcome::Spilled { stub, .. } => {
+                            return Message::tool_result(tool_call_id, tool_name, &stub);
+                        }
+                        SpillOutcome::Inline(_) => {
+                            // Below spill threshold but above prune threshold (200 chars)
+                            // — fall through to placeholder
                         }
                     }
                 }
@@ -725,16 +725,14 @@ fn sanitize_orphan_pairs(messages: Vec<Message>) -> Vec<Message> {
         let is_assistant = m.role == edgecrab_types::Role::Assistant;
         let tool_calls = m.tool_calls.clone();
         patched.push(m);
-        if is_assistant {
-            if let Some(tcs) = tool_calls {
-                for tc in tcs {
-                    if missing_results.contains(&tc.id) {
-                        patched.push(Message::tool_result(
-                            &tc.id,
-                            &tc.function.name,
-                            STUB_TOOL_RESULT,
-                        ));
-                    }
+        if is_assistant && let Some(tcs) = tool_calls {
+            for tc in tcs {
+                if missing_results.contains(&tc.id) {
+                    patched.push(Message::tool_result(
+                        &tc.id,
+                        &tc.function.name,
+                        STUB_TOOL_RESULT,
+                    ));
                 }
             }
         }
@@ -1477,8 +1475,14 @@ mod tests {
         };
         let result = compress_structural_only(&msgs, &params, None);
         // Last message should be preserved
-        let last_original = msgs.last().unwrap().text_content();
-        let last_result = result.last().unwrap().text_content();
+        let last_original = msgs
+            .last()
+            .expect("test messages should contain a last item")
+            .text_content();
+        let last_result = result
+            .last()
+            .expect("compressed result should preserve the last item")
+            .text_content();
         assert_eq!(last_original, last_result, "last message must be preserved");
     }
 

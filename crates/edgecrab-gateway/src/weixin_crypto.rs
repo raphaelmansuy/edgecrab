@@ -58,7 +58,7 @@ pub fn parse_aes128_key(input: &[u8]) -> Result<[u8; 16], &'static str> {
 }
 
 fn hex_decode(s: &str) -> Result<Vec<u8>, &'static str> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err("odd-length hex string");
     }
     (0..s.len())

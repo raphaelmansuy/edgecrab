@@ -624,14 +624,14 @@ async fn drain_reader(
                     .await;
 
                 // Check watch patterns if configured
-                if let Some(ref sink) = watch_sink {
-                    if let Some(entry) = table.get_record(process_id) {
-                        let mut rec = entry.lock().await;
-                        if let Some(ref mut watch) = rec.watch_state {
-                            crate::process_table::check_watch_patterns(
-                                trimmed, process_id, watch, sink,
-                            );
-                        }
+                if let Some(ref sink) = watch_sink
+                    && let Some(entry) = table.get_record(process_id)
+                {
+                    let mut rec = entry.lock().await;
+                    if let Some(ref mut watch) = rec.watch_state {
+                        crate::process_table::check_watch_patterns(
+                            trimmed, process_id, watch, sink,
+                        );
                     }
                 }
             }

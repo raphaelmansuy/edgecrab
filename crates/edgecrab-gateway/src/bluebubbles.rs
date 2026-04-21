@@ -153,17 +153,16 @@ impl BlueBubblesAdapter {
             let list: serde_json::Value = list_resp.json().await?;
             if let Some(webhooks) = list["data"].as_array() {
                 for wh in webhooks {
-                    if let Some(url) = wh["url"].as_str() {
-                        if url == callback_url {
-                            if let Some(id) = wh["id"].as_i64() {
-                                let _ = self
-                                    .client
-                                    .delete(self.api_url(&format!("/webhook/{id}")))
-                                    .send()
-                                    .await;
-                                debug!(id, "Removed stale webhook");
-                            }
-                        }
+                    if let Some(url) = wh["url"].as_str()
+                        && url == callback_url
+                        && let Some(id) = wh["id"].as_i64()
+                    {
+                        let _ = self
+                            .client
+                            .delete(self.api_url(&format!("/webhook/{id}")))
+                            .send()
+                            .await;
+                        debug!(id, "Removed stale webhook");
                     }
                 }
             }
@@ -209,15 +208,15 @@ impl BlueBubblesAdapter {
 
         if let Some(webhooks) = list["data"].as_array() {
             for wh in webhooks {
-                if wh["url"].as_str() == Some(&callback_url) {
-                    if let Some(id) = wh["id"].as_i64() {
-                        let _ = self
-                            .client
-                            .delete(self.api_url(&format!("/webhook/{id}")))
-                            .send()
-                            .await;
-                        debug!(id, "Unregistered webhook on shutdown");
-                    }
+                if wh["url"].as_str() == Some(&callback_url)
+                    && let Some(id) = wh["id"].as_i64()
+                {
+                    let _ = self
+                        .client
+                        .delete(self.api_url(&format!("/webhook/{id}")))
+                        .send()
+                        .await;
+                    debug!(id, "Unregistered webhook on shutdown");
                 }
             }
         }
@@ -391,14 +390,14 @@ impl BlueBubblesAdapter {
             }
             // Links: [text](url) → text
             while let Some(start) = processed.find('[') {
-                if let Some(mid) = processed[start..].find("](") {
-                    if let Some(end) = processed[start + mid..].find(')') {
-                        let link_text = &processed[start + 1..start + mid];
-                        let before = &processed[..start];
-                        let after = &processed[start + mid + end + 1..];
-                        processed = format!("{before}{link_text}{after}");
-                        continue;
-                    }
+                if let Some(mid) = processed[start..].find("](")
+                    && let Some(end) = processed[start + mid..].find(')')
+                {
+                    let link_text = &processed[start + 1..start + mid];
+                    let before = &processed[..start];
+                    let after = &processed[start + mid + end + 1..];
+                    processed = format!("{before}{link_text}{after}");
+                    continue;
                 }
                 break;
             }
@@ -520,11 +519,11 @@ async fn webhook_handler(
     }
 
     // Skip tapback reactions.
-    if let Some(assoc_type) = msg.associated_message_type {
-        if TAPBACK_RANGE.contains(&assoc_type) {
-            debug!("Skipping tapback reaction type {assoc_type}");
-            return StatusCode::OK;
-        }
+    if let Some(assoc_type) = msg.associated_message_type
+        && TAPBACK_RANGE.contains(&assoc_type)
+    {
+        debug!("Skipping tapback reaction type {assoc_type}");
+        return StatusCode::OK;
     }
 
     let text = msg.text.unwrap_or_default();
@@ -565,27 +564,21 @@ async fn webhook_handler(
                         let dir = std::env::temp_dir().join("edgecrab_bb_attachments");
                         let _ = tokio::fs::create_dir_all(&dir).await;
                         let dest = dir.join(&fname);
-                        if let Ok(bytes) = resp.bytes().await {
-                            if tokio::fs::write(&dest, &bytes).await.is_ok() {
-                                let kind = match att.mime_type.as_deref() {
-                                    Some(m) if m.starts_with("image/") => {
-                                        MessageAttachmentKind::Image
-                                    }
-                                    Some(m) if m.starts_with("audio/") => {
-                                        MessageAttachmentKind::Audio
-                                    }
-                                    Some(m) if m.starts_with("video/") => {
-                                        MessageAttachmentKind::Video
-                                    }
-                                    _ => MessageAttachmentKind::Document,
-                                };
-                                attachments.push(MessageAttachment {
-                                    kind,
-                                    file_name: Some(fname),
-                                    local_path: Some(dest.display().to_string()),
-                                    ..Default::default()
-                                });
-                            }
+                        if let Ok(bytes) = resp.bytes().await
+                            && tokio::fs::write(&dest, &bytes).await.is_ok()
+                        {
+                            let kind = match att.mime_type.as_deref() {
+                                Some(m) if m.starts_with("image/") => MessageAttachmentKind::Image,
+                                Some(m) if m.starts_with("audio/") => MessageAttachmentKind::Audio,
+                                Some(m) if m.starts_with("video/") => MessageAttachmentKind::Video,
+                                _ => MessageAttachmentKind::Document,
+                            };
+                            attachments.push(MessageAttachment {
+                                kind,
+                                file_name: Some(fname),
+                                local_path: Some(dest.display().to_string()),
+                                ..Default::default()
+                            });
                         }
                     }
                     Ok(resp) => {

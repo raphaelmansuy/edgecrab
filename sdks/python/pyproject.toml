@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "edgecrab"
-version = "0.7.0"
+version = "0.8.0"
 description = "EdgeCrab AI Agent SDK — build autonomous agents with Python"
 readme = "README.md"
 license = { text = "Apache-2.0" }

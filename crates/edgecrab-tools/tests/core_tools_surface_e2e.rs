@@ -55,7 +55,10 @@ fn browser_advantage_tools_are_exposed_in_core_and_acp_surfaces() {
 #[test]
 fn moa_tool_is_in_dedicated_constant_and_acp() {
     // MOA moved to on-demand MOA_TOOLS, but still in ACP (editor context)
-    assert!(!CORE_TOOLS.contains(&"moa"), "MOA should not be in CORE_TOOLS");
+    assert!(
+        !CORE_TOOLS.contains(&"moa"),
+        "MOA should not be in CORE_TOOLS"
+    );
     assert_tool_in_acp_surface("moa");
 }
 

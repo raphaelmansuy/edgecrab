@@ -11,6 +11,8 @@ use ratatui::{
     text::{Line, Span},
 };
 
+use crate::theme::palette as P;
+
 /// Render a markdown string into a vector of styled ratatui Lines.
 pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
@@ -25,6 +27,7 @@ pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
                 lines.push(Line::from(""));
                 if !lang.is_empty() {
                     // Language badge: ─── rust ──────
+                    // Rgb(205,150,60) base CR=8.0:1 passes AA even with DIM; kept as-is.
                     let badge_style = Style::default()
                         .fg(Color::Rgb(205, 150, 60))
                         .add_modifier(Modifier::DIM);
@@ -40,13 +43,14 @@ pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
         }
 
         if in_code_block {
-            // Code block lines: dimmed vertical bar prefix
+            // Code block lines: vertical bar prefix indicates code extent.
+            // WCAG AA: code body white text unchanged. Bar upgraded to TERTIARY_WARM
+            // (Rgb(128,138,152) CR=5.9:1); DIM removed from structural glyph.
             let code_style = Style::default()
                 .fg(Color::Rgb(200, 200, 200))
                 .add_modifier(Modifier::DIM);
-            let bar_style = Style::default()
-                .fg(Color::Rgb(100, 100, 100))
-                .add_modifier(Modifier::DIM);
+            // WCAG AA: TERTIARY_WARM — code block bar glyph "\u2502" is structural.
+            let bar_style = Style::default().fg(P::TERTIARY_WARM);
             lines.push(Line::from(vec![
                 Span::styled("  │ ", bar_style),
                 Span::styled(raw_line.to_string(), code_style),
@@ -54,14 +58,13 @@ pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
             continue;
         }
 
-        // Horizontal rule
+        // Horizontal rule — purely decorative (WCAG SC 1.4.3 exempts decoration).
         if raw_line.trim() == "---" || raw_line.trim() == "***" || raw_line.trim() == "___" {
             let rule = "─".repeat(60);
             lines.push(Line::from(Span::styled(
                 rule,
-                Style::default()
-                    .fg(Color::Rgb(100, 100, 100))
-                    .add_modifier(Modifier::DIM),
+                // Rgb(60,60,70) — decorative; DIM is acceptable for decoration.
+                Style::default().fg(P::SEP_LINE).add_modifier(Modifier::DIM),
             )));
             continue;
         }
@@ -97,9 +100,8 @@ pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
 
         // Blockquote
         if let Some(rest) = raw_line.strip_prefix("> ") {
-            let bar_style = Style::default()
-                .fg(Color::Rgb(100, 100, 100))
-                .add_modifier(Modifier::DIM);
+            // WCAG AA: TERTIARY_COOL for blockquote bar glyph; DIM removed.
+            let bar_style = Style::default().fg(P::TERTIARY_COOL);
             let text_style = Style::default()
                 .fg(Color::Rgb(180, 180, 180))
                 .add_modifier(Modifier::ITALIC);

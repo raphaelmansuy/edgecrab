@@ -173,22 +173,22 @@ pub fn check_watch_patterns(
             // Track overload duration
             if state.overload_since.is_none() {
                 state.overload_since = Some(now);
-            } else if let Some(since) = state.overload_since {
-                if now.duration_since(since).as_secs() >= WATCH_OVERLOAD_KILL_SECONDS {
-                    state.disabled = true;
-                    debug!(
-                        process_id,
-                        "Watch patterns permanently disabled (sustained overload)"
-                    );
-                    let _ = sink.send(WatchEvent {
-                        process_id: process_id.to_string(),
-                        pattern: pattern.clone(),
-                        matched_output: trim_watch_output(line),
-                        suppressed_count: state.suppressed,
-                        event_type: WatchEventType::Disabled,
-                    });
-                    state.suppressed = 0;
-                }
+            } else if let Some(since) = state.overload_since
+                && now.duration_since(since).as_secs() >= WATCH_OVERLOAD_KILL_SECONDS
+            {
+                state.disabled = true;
+                debug!(
+                    process_id,
+                    "Watch patterns permanently disabled (sustained overload)"
+                );
+                let _ = sink.send(WatchEvent {
+                    process_id: process_id.to_string(),
+                    pattern: pattern.clone(),
+                    matched_output: trim_watch_output(line),
+                    suppressed_count: state.suppressed,
+                    event_type: WatchEventType::Disabled,
+                });
+                state.suppressed = 0;
             }
             return; // suppress this notification
         }

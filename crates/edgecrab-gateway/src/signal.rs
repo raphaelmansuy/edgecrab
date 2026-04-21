@@ -209,17 +209,18 @@ fn classify_signal_attachment(attachment: &SignalAttachment) -> MessageAttachmen
         return MessageAttachmentKind::Audio;
     }
 
-    if let Some(file_name) = attachment.filename.as_deref() {
-        if let Some(extension) = file_name.rsplit('.').next() {
-            return match extension.to_ascii_lowercase().as_str() {
-                "jpg" | "jpeg" | "png" | "gif" | "webp" => MessageAttachmentKind::Image,
-                "mp4" | "mov" | "avi" | "mkv" | "webm" => MessageAttachmentKind::Video,
-                "ogg" | "opus" | "mp3" | "wav" | "m4a" | "aac" => MessageAttachmentKind::Audio,
-                "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "txt" | "csv"
-                | "zip" => MessageAttachmentKind::Document,
-                _ => MessageAttachmentKind::Other,
-            };
-        }
+    if let Some(file_name) = attachment.filename.as_deref()
+        && let Some(extension) = file_name.rsplit('.').next()
+    {
+        return match extension.to_ascii_lowercase().as_str() {
+            "jpg" | "jpeg" | "png" | "gif" | "webp" => MessageAttachmentKind::Image,
+            "mp4" | "mov" | "avi" | "mkv" | "webm" => MessageAttachmentKind::Video,
+            "ogg" | "opus" | "mp3" | "wav" | "m4a" | "aac" => MessageAttachmentKind::Audio,
+            "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "txt" | "csv" | "zip" => {
+                MessageAttachmentKind::Document
+            }
+            _ => MessageAttachmentKind::Other,
+        };
     }
 
     MessageAttachmentKind::Other

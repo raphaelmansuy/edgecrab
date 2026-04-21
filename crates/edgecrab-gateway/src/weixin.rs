@@ -93,15 +93,14 @@ impl DeduplicationMap {
             return false;
         }
         // Cap at max entries — evict oldest if needed
-        if self.entries.len() >= DEDUP_MAX_ENTRIES {
-            if let Some(oldest_key) = self
+        if self.entries.len() >= DEDUP_MAX_ENTRIES
+            && let Some(oldest_key) = self
                 .entries
                 .iter()
                 .min_by_key(|(_, ts)| *ts)
                 .map(|(k, _)| k.clone())
-            {
-                self.entries.remove(&oldest_key);
-            }
+        {
+            self.entries.remove(&oldest_key);
         }
         self.entries.insert(msg_id.to_string(), Instant::now());
         true
@@ -555,10 +554,10 @@ impl WeixinAdapter {
         }
 
         // Fallback: direct content field
-        if parts.is_empty() {
-            if let Some(content) = msg.get("content").and_then(|v| v.as_str()) {
-                parts.push(content.to_string());
-            }
+        if parts.is_empty()
+            && let Some(content) = msg.get("content").and_then(|v| v.as_str())
+        {
+            parts.push(content.to_string());
         }
 
         parts.join("\n")

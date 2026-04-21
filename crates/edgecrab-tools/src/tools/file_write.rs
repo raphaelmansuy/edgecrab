@@ -184,10 +184,7 @@ impl ToolHandler for WriteFileTool {
                     // immediate retry passes the freshness guard. Failure
                     // here is non-fatal — the model will retry, fail freshness,
                     // and learn to read_file. Logging would be noise.
-                    let _ = crate::read_tracker::record_file_snapshot(
-                        &ctx.session_id,
-                        &resolved,
-                    );
+                    let _ = crate::read_tracker::record_file_snapshot(&ctx.session_id, &resolved);
 
                     return Err(ToolError::InvalidArgs {
                         tool: "write_file".into(),
@@ -241,21 +238,20 @@ impl ToolHandler for WriteFileTool {
 
         // R17: Atomic TOCTOU re-check — confirm the file has not changed since
         // the freshness guard above.
-        if let Some((size_snap, mtime_snap)) = pre_write_snap {
-            if let Ok(current) = tokio::fs::metadata(&resolved).await {
-                let changed =
-                    current.len() != size_snap || current.modified().ok() != mtime_snap;
-                if changed {
-                    return Err(ToolError::ContentMismatch {
-                        tool: "write_file".into(),
-                        path: args.path.clone(),
-                        message: format!(
-                            "'{}' was modified by another process between freshness check and \
+        if let Some((size_snap, mtime_snap)) = pre_write_snap
+            && let Ok(current) = tokio::fs::metadata(&resolved).await
+        {
+            let changed = current.len() != size_snap || current.modified().ok() != mtime_snap;
+            if changed {
+                return Err(ToolError::ContentMismatch {
+                    tool: "write_file".into(),
+                    path: args.path.clone(),
+                    message: format!(
+                        "'{}' was modified by another process between freshness check and \
                              write (TOCTOU). Re-read with read_file and retry.",
-                            args.path
-                        ),
-                    });
-                }
+                        args.path
+                    ),
+                });
             }
         }
 
@@ -324,7 +320,10 @@ mod tests {
         let ctx = ctx_in(dir.path());
 
         let result = WriteFileTool
-            .execute(json!({"path": "scaffold.md", "content": "", "create_dirs": false}), &ctx)
+            .execute(
+                json!({"path": "scaffold.md", "content": "", "create_dirs": false}),
+                &ctx,
+            )
             .await
             .expect("create scaffold");
 
@@ -373,7 +372,10 @@ mod tests {
         ctx.session_id = "write-file-empty-scaffold".into();
 
         let result = WriteFileTool
-            .execute(json!({"path": "audit.md", "content": "", "create_dirs": false}), &ctx)
+            .execute(
+                json!({"path": "audit.md", "content": "", "create_dirs": false}),
+                &ctx,
+            )
             .await
             .expect("existing empty scaffold should be reusable with empty string");
 
@@ -541,7 +543,10 @@ mod tests {
         std::fs::write(dir.path().join("stale.txt"), "external change\n").expect("modify");
 
         let err = WriteFileTool
-            .execute(json!({"path": "stale.txt", "content": "replacement\n"}), &ctx)
+            .execute(
+                json!({"path": "stale.txt", "content": "replacement\n"}),
+                &ctx,
+            )
             .await
             .expect_err("stale overwrite should be rejected");
 
@@ -559,7 +564,10 @@ mod tests {
         ctx.session_id = "write-file-blind-overwrite".into();
 
         let err = WriteFileTool
-            .execute(json!({"path": "blind.txt", "content": "replacement\n"}), &ctx)
+            .execute(
+                json!({"path": "blind.txt", "content": "replacement\n"}),
+                &ctx,
+            )
             .await
             .expect_err("blind overwrite should be rejected");
 
@@ -601,7 +609,10 @@ mod tests {
             .expect("reread");
 
         WriteFileTool
-            .execute(json!({"path": "fresh.txt", "content": "replacement\n"}), &ctx)
+            .execute(
+                json!({"path": "fresh.txt", "content": "replacement\n"}),
+                &ctx,
+            )
             .await
             .expect("fresh overwrite after reread");
 
@@ -812,7 +823,9 @@ mod tests {
         assert_eq!(if_exists["type"], "string");
         assert_eq!(if_exists["enum"], json!(["overwrite", "abort"]));
         // if_exists must NOT be in the required list — keeps backward compat.
-        let required = schema.parameters["required"].as_array().expect("required arr");
+        let required = schema.parameters["required"]
+            .as_array()
+            .expect("required arr");
         assert!(
             !required.iter().any(|v| v == "if_exists"),
             "if_exists must remain optional to avoid breaking existing callers"

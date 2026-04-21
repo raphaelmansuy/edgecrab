@@ -381,14 +381,14 @@ impl GatewayEventProcessor {
                     summary,
                     ..
                 } => {
-                    if let Some(batch) = subagent_batches.get_mut(&task_index) {
-                        if !batch.is_empty() {
-                            let buffered = batch.join(", ");
-                            batch.clear();
-                            let status_line =
-                                format!("🔀 [{}/{}] {}", task_index + 1, task_count, buffered);
-                            self.send_status(&status_line).await;
-                        }
+                    if let Some(batch) = subagent_batches.get_mut(&task_index)
+                        && !batch.is_empty()
+                    {
+                        let buffered = batch.join(", ");
+                        batch.clear();
+                        let status_line =
+                            format!("🔀 [{}/{}] {}", task_index + 1, task_count, buffered);
+                        self.send_status(&status_line).await;
                     }
                     let summary = summary
                         .lines()
@@ -538,6 +538,19 @@ impl GatewayEventProcessor {
                         );
                     }
                     let _ = response_tx.send(value);
+                }
+
+                // Steering events are TUI-only — the gateway logs them but takes
+                // no further action.  The agent loop has already handled the steer.
+                StreamEvent::SteerPending { count } => {
+                    tracing::debug!(count, "gateway: steering pending (informational, ignored)");
+                }
+
+                StreamEvent::SteerApplied { message } => {
+                    tracing::info!(
+                        len = message.len(),
+                        "gateway: steering applied — agent received new guidance"
+                    );
                 }
             }
         }

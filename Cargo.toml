@@ -22,7 +22,7 @@ members = [
     "sdks/nodejs-native",
 ]
 [workspace.package]
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 rust-version = "1.95.0"
 license = "Apache-2.0"
@@ -31,21 +31,21 @@ authors = ["Raphael Mansuy"]
 
 [workspace.dependencies]
 # Internal crates
-edgecrab-command-catalog = { path = "crates/edgecrab-command-catalog", version = "0.7.0" }
-edgecrab-types = { path = "crates/edgecrab-types", version = "0.7.0" }
-edgecrab-security = { path = "crates/edgecrab-security", version = "0.7.0" }
-edgecrab-state = { path = "crates/edgecrab-state", version = "0.7.0" }
-edgecrab-plugins = { path = "crates/edgecrab-plugins", version = "0.7.0" }
-edgecrab-cron = { path = "crates/edgecrab-cron", version = "0.7.0" }
-edgecrab-lsp = { path = "crates/edgecrab-lsp", version = "0.7.0" }
-edgecrab-tools = { path = "crates/edgecrab-tools", version = "0.7.0" }
-edgecrab-core = { path = "crates/edgecrab-core", version = "0.7.0" }
-edgecrab-gateway = { path = "crates/edgecrab-gateway", version = "0.7.0" }
-edgecrab-acp = { path = "crates/edgecrab-acp", version = "0.7.0" }
-edgecrab-migrate = { path = "crates/edgecrab-migrate", version = "0.7.0" }
-edgecrab-sdk-core = { path = "crates/edgecrab-sdk-core", version = "0.7.0" }
-edgecrab-sdk-macros = { path = "crates/edgecrab-sdk-macros", version = "0.7.0" }
-edgecrab-sdk = { path = "crates/edgecrab-sdk", version = "0.7.0" }
+edgecrab-command-catalog = { path = "crates/edgecrab-command-catalog", version = "0.8.0" }
+edgecrab-types = { path = "crates/edgecrab-types", version = "0.8.0" }
+edgecrab-security = { path = "crates/edgecrab-security", version = "0.8.0" }
+edgecrab-state = { path = "crates/edgecrab-state", version = "0.8.0" }
+edgecrab-plugins = { path = "crates/edgecrab-plugins", version = "0.8.0" }
+edgecrab-cron = { path = "crates/edgecrab-cron", version = "0.8.0" }
+edgecrab-lsp = { path = "crates/edgecrab-lsp", version = "0.8.0" }
+edgecrab-tools = { path = "crates/edgecrab-tools", version = "0.8.0" }
+edgecrab-core = { path = "crates/edgecrab-core", version = "0.8.0" }
+edgecrab-gateway = { path = "crates/edgecrab-gateway", version = "0.8.0" }
+edgecrab-acp = { path = "crates/edgecrab-acp", version = "0.8.0" }
+edgecrab-migrate = { path = "crates/edgecrab-migrate", version = "0.8.0" }
+edgecrab-sdk-core = { path = "crates/edgecrab-sdk-core", version = "0.8.0" }
+edgecrab-sdk-macros = { path = "crates/edgecrab-sdk-macros", version = "0.8.0" }
+edgecrab-sdk = { path = "crates/edgecrab-sdk", version = "0.8.0" }
 
 # Shared across workspace — single version for consistency
 serde = { version = "1", features = ["derive"] }
@@ -68,7 +68,7 @@ regex = "1"
 url = "2"
 
 # LLM backend
-edgequake-llm = { version = "0.6.11", features = ["bedrock"] }
+edgequake-llm = { version = "0.6.12", features = ["bedrock"] }
 
 # Image processing (vision tool: resize/compress before base64 encoding)
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
@@ -137,9 +137,6 @@ proptest = "1"
 insta = "1"
 criterion = "0.5"
 tokio-test = "0.4"
-
-[patch.crates-io]
-edgequake-llm = { path = "../edgequake-llm" }
 
 [profile.release]
 lto = true

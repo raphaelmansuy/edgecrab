@@ -675,10 +675,10 @@ impl SessionDb {
         // Find the highest number
         let mut max_num: u32 = 1; // The unnumbered original counts as #1
         for t in &existing {
-            if let Some(idx) = t.rfind(" #") {
-                if let Ok(n) = t[idx + 2..].parse::<u32>() {
-                    max_num = max_num.max(n);
-                }
+            if let Some(idx) = t.rfind(" #")
+                && let Ok(n) = t[idx + 2..].parse::<u32>()
+            {
+                max_num = max_num.max(n);
             }
         }
 
@@ -1340,10 +1340,10 @@ impl SessionDb {
     fn maybe_checkpoint(&self) {
         if let Ok(mut count) = self.write_count.lock() {
             *count += 1;
-            if *count % CHECKPOINT_EVERY_N_WRITES == 0 {
-                if let Ok(conn) = self.conn.lock() {
-                    let _ = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE)");
-                }
+            if *count % CHECKPOINT_EVERY_N_WRITES == 0
+                && let Ok(conn) = self.conn.lock()
+            {
+                let _ = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE)");
             }
         }
     }
@@ -1467,16 +1467,16 @@ impl SessionDb {
                 .filter_map(|r| r.ok())
                 .collect();
             for raw in rows {
-                if let Ok(calls) = serde_json::from_str::<serde_json::Value>(&raw) {
-                    if let Some(arr) = calls.as_array() {
-                        for call in arr {
-                            if let Some(name) = call
-                                .get("function")
-                                .and_then(|f| f.get("name"))
-                                .and_then(|n| n.as_str())
-                            {
-                                *tool_counts.entry(name.to_string()).or_insert(0) += 1;
-                            }
+                if let Ok(calls) = serde_json::from_str::<serde_json::Value>(&raw)
+                    && let Some(arr) = calls.as_array()
+                {
+                    for call in arr {
+                        if let Some(name) = call
+                            .get("function")
+                            .and_then(|f| f.get("name"))
+                            .and_then(|n| n.as_str())
+                        {
+                            *tool_counts.entry(name.to_string()).or_insert(0) += 1;
                         }
                     }
                 }
