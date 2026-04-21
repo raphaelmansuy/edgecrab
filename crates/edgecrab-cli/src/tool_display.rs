@@ -2050,10 +2050,21 @@ pub fn format_tool_result(tool_name: &str, result: &str, max_cols: usize) -> Str
     // ── 3. Plain-text tools with known formats ──────────────────────────
     match tool_name {
         "write_file" => {
-            // "Wrote N bytes to 'path'"
-            // Show `✓ N bytes` — concise success signal with size.
+            // R18: JSON result {"ok":true,"action":"create|overwrite","bytes":N,"path":"..."}
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(result_trimmed) {
+                if v.get("ok") == Some(&serde_json::Value::Bool(true)) {
+                    if let Some(bytes) = v.get("bytes").and_then(|b| b.as_u64()) {
+                        let size = if bytes >= 1024 {
+                            format!("{:.1}k bytes", bytes as f64 / 1024.0)
+                        } else {
+                            format!("{bytes} bytes")
+                        };
+                        return unicode_trunc(&format!("✓ {size}"), max_cols);
+                    }
+                }
+            }
+            // Legacy prose fallback: "Wrote N bytes to 'path'"
             if let Some(rest) = result_trimmed.strip_prefix("Wrote ") {
-                // rest = "N bytes to 'path'"
                 let end = rest.find(" to ").unwrap_or(rest.len());
                 let size_part = rest[..end].trim();
                 if !size_part.is_empty() {
@@ -2062,32 +2073,72 @@ pub fn format_tool_result(tool_name: &str, result: &str, max_cols: usize) -> Str
             }
             return unicode_trunc(&oneline(result_trimmed), max_cols);
         }
-        "apply_patch" if result_trimmed.contains("succeeded") => {
-            // "apply_patch succeeded. Modified: src/a.rs; Created: src/b.rs"
-            let detail = result_trimmed
-                .find(". ")
-                .map(|i| &result_trimmed[i + 2..])
-                .unwrap_or(result_trimmed)
-                .trim();
-            // Count comma-separated items in each section.
-            let count_section = |label: &str, text: &str| -> usize {
-                text.split(label)
-                    .nth(1)
-                    .map(|s| s.split(';').next().unwrap_or(""))
-                    .map(|s| s.split(',').filter(|t| !t.trim().is_empty()).count())
-                    .unwrap_or(0)
-            };
-            let total = count_section("Modified: ", detail)
-                + count_section("Created: ", detail)
-                + count_section("Deleted: ", detail);
-            let summary = if total == 0 {
-                "✓ ok".to_string()
-            } else if total == 1 {
-                "✓ 1 file".to_string()
-            } else {
-                format!("✓ {total} files")
-            };
-            return unicode_trunc(&summary, max_cols);
+        "patch" => {
+            // R18: JSON result {"ok":true,"replacements":N,"before_bytes":M,"after_bytes":K,"path":"..."}
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(result_trimmed) {
+                if v.get("ok") == Some(&serde_json::Value::Bool(true)) {
+                    if let Some(n) = v.get("replacements").and_then(|r| r.as_u64()) {
+                        let s = if n == 1 {
+                            "1 replacement".to_string()
+                        } else {
+                            format!("{n} replacements")
+                        };
+                        return unicode_trunc(&format!("✓ {s}"), max_cols);
+                    }
+                }
+            }
+            return unicode_trunc(&oneline(result_trimmed), max_cols);
+        }
+        "apply_patch" => {
+            // R18: JSON result {"ok":true,"modified":[...],"created":[...],"deleted":[...]}
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(result_trimmed) {
+                if v.get("ok") == Some(&serde_json::Value::Bool(true)) {
+                    let total: usize = ["modified", "created", "deleted"]
+                        .iter()
+                        .map(|k| {
+                            v.get(k)
+                                .and_then(|a| a.as_array())
+                                .map(|a| a.len())
+                                .unwrap_or(0)
+                        })
+                        .sum();
+                    let summary = if total == 0 {
+                        "✓ ok".to_string()
+                    } else if total == 1 {
+                        "✓ 1 file".to_string()
+                    } else {
+                        format!("✓ {total} files")
+                    };
+                    return unicode_trunc(&summary, max_cols);
+                }
+            }
+            // Legacy prose fallback: "apply_patch succeeded. Modified: ...; Created: ..."
+            if result_trimmed.contains("succeeded") {
+                let detail = result_trimmed
+                    .find(". ")
+                    .map(|i| &result_trimmed[i + 2..])
+                    .unwrap_or(result_trimmed)
+                    .trim();
+                let count_section = |label: &str, text: &str| -> usize {
+                    text.split(label)
+                        .nth(1)
+                        .map(|s| s.split(';').next().unwrap_or(""))
+                        .map(|s| s.split(',').filter(|t| !t.trim().is_empty()).count())
+                        .unwrap_or(0)
+                };
+                let total = count_section("Modified: ", detail)
+                    + count_section("Created: ", detail)
+                    + count_section("Deleted: ", detail);
+                let summary = if total == 0 {
+                    "✓ ok".to_string()
+                } else if total == 1 {
+                    "✓ 1 file".to_string()
+                } else {
+                    format!("✓ {total} files")
+                };
+                return unicode_trunc(&summary, max_cols);
+            }
+            return unicode_trunc(&oneline(result_trimmed), max_cols);
         }
         "read_file" => {
             // Result is the raw file content.  Show line count + first meaningful line.
@@ -2360,7 +2411,7 @@ mod tests {
         let spans = build_tool_done_line(
             "write_file",
             r#"{"path":"src/main.rs"}"#,
-            Some("Wrote 42 bytes to 'src/main.rs'"),
+            Some(r#"{"ok":true,"action":"create","bytes":42,"path":"src/main.rs"}"#),
             250,
             false,
             &std::collections::HashMap::new(),
@@ -2651,15 +2702,24 @@ mod tests {
 
     #[test]
     fn test_format_tool_result_write_file_extracts_size() {
-        let out = format_tool_result("write_file", "Wrote 1234 bytes to 'src/main.rs'", 80);
+        let out = format_tool_result(
+            "write_file",
+            r#"{"ok":true,"action":"create","bytes":1234,"path":"src/main.rs"}"#,
+            80,
+        );
         assert!(out.contains("✓"), "should have success badge, got: {out}");
-        assert!(out.contains("1234 bytes"), "should show size, got: {out}");
+        // 1234 >= 1024 so displayed as "1.2k bytes"
+        assert!(
+            out.contains("bytes"),
+            "should show size unit, got: {out}"
+        );
     }
 
     #[test]
     fn test_format_tool_result_apply_patch_counts_files() {
+        // R18: JSON result
         let result =
-            "apply_patch succeeded. Modified: src/main.rs, src/lib.rs; Created: src/new.rs";
+            r#"{"ok":true,"modified":["src/main.rs","src/lib.rs"],"created":["src/new.rs"],"deleted":[]}"#;
         let out = format_tool_result("apply_patch", result, 80);
         assert!(out.contains("✓"), "should have success badge, got: {out}");
         assert!(out.contains("3 files"), "should show 3 files, got: {out}");
@@ -2667,7 +2727,7 @@ mod tests {
 
     #[test]
     fn test_format_tool_result_apply_patch_single_file() {
-        let result = "apply_patch succeeded. Modified: src/main.rs";
+        let result = r#"{"ok":true,"modified":["src/main.rs"],"created":[],"deleted":[]}"#;
         let out = format_tool_result("apply_patch", result, 80);
         assert!(out.contains("✓ 1 file"), "should show 1 file, got: {out}");
     }
@@ -2771,7 +2831,7 @@ mod tests {
         let lines = build_tool_verbose_lines_width(
             "write_file",
             r#"{"path":"src/main.rs","content":"fn main() {}"}"#,
-            Some("Wrote 12 bytes to 'src/main.rs'"),
+            Some(r#"{"ok":true,"action":"create","bytes":12,"path":"src/main.rs"}"#),
             false,
             DisplayWidths::DEFAULT.verbose_content,
         );

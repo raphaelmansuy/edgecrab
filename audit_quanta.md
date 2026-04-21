@@ -1,152 +1,199 @@
 # Quantalogic – Deep Research Audit Document
 
-**Date:** 21 April 2026  
-**Prepared for:** Internal review  
-**Scope:** Quantalogic (France) – legal status, funding, technology, market positioning, and risks.
+**Date:** 2026-04-21  
+**Prepared for:** Homelab profile analysis  
+**Scope:** Company overview, legal status, leadership, products, technology, market positioning, and available financials.
 
 ---
 
 ## Executive Summary
 
-Quantalogic is a French AI agent platform company incorporated as a SAS (Société par Actions Simplifiée) on 2 July 2024, headquartered in Neuilly‑sur‑Seine (92200). The company focuses on “sovereign” AI solutions for enterprises, offering a platform (QuantaLogic AI Agent Platform) and a flagship product, **QAtlas**, which combines retrieval‑augmented generation (RAG) with knowledge‑graph techniques to deliver document intelligence that is secure, explainable, and high‑performance.
+Quantalogic is a French AI agent platform founded in July 2024, headquartered in Neuilly-sur‑Seine (Hauts‑de‑Seine). The company offers a sovereign, cloud‑agnostic AI framework enabling developers to build advanced agents that combine reasoning (ReAct) and code execution (CodeAct). Its flagship product, **QAtlas**, provides sovereign document intelligence using RAG vectorization coupled with a knowledge graph. Quantalogic emphasizes data sovereignty, European hosting (via OVHcloud), and a no‑code/low‑code approach for business users.
 
-In early 2024 the founders announced a **$13.5 M seed round** led by Playground Global, with participation from AIX Ventures, E14 Fund, and MS&AD Ventures. The round was publicized via Raphael Mansuy’s X/Twitter account in January 2024. Despite some conflicting data from private‑company databases (e.g., Tracxn labeling the firm “unfunded”), the seed round appears to have been closed and the company is actively developing its platform.
-
-The technology stack emphasizes data sovereignty, RAG‑vectorization, and knowledge‑graph integration to reduce hallucinations and enable multi‑hop reasoning. Quantalogic positions itself as a European alternative to US‑hyperscaler‑dependent AI agent frameworks.
+The company is in its very early stages, with a small team and no published financial statements. It describes itself as unfunded in private company databases, though maintains an active development and public presence.
 
 ---
 
-## 1. Company Overview
+## Company Information
 
-| Item | Detail |
-|------|--------|
-| **Legal Name** | QUANTALOGIC |
-| **Legal Form** | SAS, société par actions simplifiée |
+| Item | Details |
+|------|---------|
+| **Legal Name** | QUANTALOGIC SAS |
 | **SIREN** | 930 719 851 |
-| **SIRET (Headquarters)** | 930 719 851 00014 |
-| **Date of Incorporation** | 2 July 2024 |
-| **Registered Office** | Bâtiment D, 171 ter Avenue Charles de Gaulle, 92200 Neuilly‑sur‑Seine, France |
-| **Primary Activity (NAF/APE)** | Computer programming (62.01Z) |
-| **Employee Count** | No salariés (as per INSEE declaration) |
-| **VAT Intracommunautaire** | FR15930719851 (per Pappers) |
-| **EORI** | No valid EORI number |
-| **Website** | https://www.quantalogic.app |
-| **LinkedIn** | https://fr.linkedin.com/company/quantalogic |
-| **GitHub** | https://github.com/quantalogic |
-| **Twitter/X** | https://x.com/raphaelmansuy (founder Raphael Mansuy) |
+| **SIRET** | 930 719 851 00014 |
+| **RCS** | Nanterre B 930 719 851 |
+| **NAF/APE** | 6201Z – Computer programming activities |
+| **Date of Incorporation** | 02 July 2024 |
+| **Registered Office** | 171 ter Avenue Charles de Gaulle, Bâtiment D, 92200 Neuilly‑sur‑Seine, France |
+| **Legal Form** | Société par actions simplifiée (SAS) |
+| **Share Capital** | 5 000 € |
+| **VAT ID** | FR 44 930719851 |
+| **Website** | <https://www.quantalogic.app> |
+| **LinkedIn** | <https://fr.linkedin.com/company/quantalogic> |
+| **GitHub** | <https://github.com/quantalogic> |
 
-*Sources:* INSEE Sirene extract, Annuaire des Entreprises (data.gouv.fr), LinkedIn company page, Pappers, founder social media.
-
----
-
-## 2. Ownership & Leadership
-
-The company was founded by a trio of French entrepreneurs:
-
-| Founder | Role (per public statements) | Background |
-|---------|-----------------------------|------------|
-| **Olivier Lefievre** | Co‑founder, President (per early filings) | Serial entrepreneur; previously involved in Lunalogic Group (Paris). |
-| **Raphaël Mansuy** | Co‑founder, CTO (per LinkedIn & public talks) | Data engineering, AI agent architecture; previously CTO of Elitizon, contributor to EdgeCrab (open‑source AI agent framework). |
-| **Hubert Stefani** | Co‑founder | Mentioned in incorporation documents and Tracxn profile. |
-
-The company’s leadership appears to be technical‑focused, with an emphasis on open‑source agent frameworks and sovereign AI.
-
-*Sources:* Tracxn company profile, LinkedIn posts, incorporation filing (Annuaire des Entreprises).
+*Sources: societe.com, annuaire-entreprises.data.gouv.fr, LinkedIn.*
 
 ---
 
-## 3. Funding & Financials
+## Leadership & Governance
 
-| Round | Date | Amount | Lead Investor | Participants |
-|-------|------|--------|---------------|--------------|
-| Seed | Jan 2024 (announced) | **$13.5 million** | Playground Global | AIX Ventures, E14 Fund, MS&AD Ventures |
+| Name | Position | Background |
+|------|----------|------------|
+| **Raphaël MANSUY** | President (since 10 Jul 2024) | AI entrepreneur, French expat based in Hong Kong, advocate of sovereign AI. Involved in ventures such as StudentCentral.ai. Contributor to EdgeCrab open-source agent framework. |
+| **Olivier LEFIEVRE** | General Director (since 10 Jul 2024) | Technical architect, previously CTO at Novagen Conseil. |
+| **Hubert STEFANI** | General Director (since 10 Jul 2024) | Expert in AI platforms and partnerships. |
 
-The announcement was made by Raphael Mansuy on X/Twitter: “Today we're coming out of stealth with $13.5 M in seed funding led by @PlaygroundGlobal, with participation from @aixventureshq, @e14fund, and MS&AD Ventures.” No further financing rounds have been disclosed as of April 2026.
-
-*Note:* Some private‑company databases (e.g., Tracxn) list Quantalogic as “unfunded,” possibly due to a lag in updating their records or differing definitions of funding. The seed round announcement on a verifiable social‑media channel, combined with Playground Global’s public portfolio tracking, supports the existence of the round.
-
-*Sources:* X/Twitter post (via web search), Playground Global portfolio pages (CB Insights, Vestbee), Tracxn company profile.
+*Sources: societe.com, LinkedIn profiles.*
 
 ---
 
-## 4. Product & Technology
+## Products & Services
 
-### 4.1 QuantaLogic AI Agent Platform
-- **Positioning:** European AI platform for enterprise, enabling customers to build, deploy, and scale AI agents with **complete data sovereignty**.
-- **Core Promise:** Avoid dependency on US hyperscalers (AWS, Azure, GCP) by offering a sovereign stack that can be deployed on‑premises or in European clouds.
+### QuantaLogic AI Agent Platform
+- **Core Framework**: Flexible AI framework for building agents that understand, reason, and execute complex tasks via natural language.
+- **Paradigms Supported**:
+  - **ReAct** (Reasoning & Action) – step‑by‑step reasoning with tool use.
+  - **CodeAct** – agents generate and execute Python code as the primary action loop, iterating on results.
+- **LLM Agnostic**: Integration with multiple providers (OpenAI, Anthropic, Mistral, DeepSeek, local/open‑source models).
+- **Secure Tool System**: Uses Docker sandboxes for code execution and file manipulation.
+- **Real‑time Monitoring**: Web UI for event visualization.
+- **Memory Management**: Intelligent context handling and optimization.
 
-### 4.2 QAtlas – Sovereign Document Intelligence
-- **Description:** Enterprise‑grade document search solution that fuses **RAG vectorization** with **knowledge‑graph** techniques.
-- **Key Claims:**
-  - **Performance:** Search engine designed for high speed.
-  - **Precision:** Eliminates noise and hallucinations by coupling knowledge graph with vector retrieval.
-  - **Sovereignty:** Customer data remains exclusive property in compartmentalized environments.
-  - **Explainability:** Answers trace back to source documents and graph relationships.
-- **Technical Approach:** Hybrid Retrieval‑Augmented Generation (Graph RAG) where vector similarity provides broad recall and the knowledge graph supplies relational context for multi‑hop queries.
+### QAtlas – Sovereign Document Intelligence
+- **Description**: Enterprise‑grade document search combining RAG vectorization and knowledge‑graph enrichment.
+- **Key Claims**:
+  - **Performance**: Engine designed for high speed.
+  - **Precision**: Reduces noise and hallucinations via knowledge‑graph + vector coupling.
+  - **Sovereignty**: Data remains exclusive property in compartmentalized environments.
+  - **Contextual Understanding**: Maps relationships between entities for deeper relevance.
 
-### 4.3 Additional Features (inferred)
-- **Workflow Manager:** Mentioned in LinkedIn posts as a tool to orchestrate LLM‑based AI workflows from Python scripts to production.
-- **Model Agnosticism:** Platform reportedly supports multiple LLMs (e.g., Mistral Large 3, Ministral, DeepSeek V3/R1, Qwen 2.5) via a plug‑in tool system.
-- **Tool System:** Inspired by the EdgeCrab framework; includes built‑in tools for file I/O, web search, code execution, etc., enabling agents to interact with external systems.
+### Additional Offerings (from howto guide & platform)
+- Web‑based ultra‑responsive multi‑LLM chat.
+- Prompt & workflow creation, optimization, storage & sharing (“brain bank”).
+- Autonomous agents connected to internal systems/applications.
+- Deep‑Search agent for specialized research.
+- 15 sovereign LLMs (French/open‑source hosted in France) available on request.
+- Instant generation of high‑quality PowerPoints and images.
+- No‑code/low‑code interface enabling business users to leverage AI without technical expertise.
 
-*Sources:* Company landing page (quantalogic.app), YouTube demo “Introducing Knowledge Graph RAG”, LinkedIn posts on Mistral models availability, blog posts on Graph RAG vs Vector RAG, founder talks on sovereign AI.
-
----
-
-## 5. Market Position & Competitive Landscape
-
-| Dimension | Assessment |
-|-----------|------------|
-| **Geographic Focus** | France/Europe – emphasis on data sovereignty and compliance with GDPR/EU AI Act. |
-| **Target Customers** | Enterprises needing secure, explainable AI for document‑heavy workflows (legal, finance, healthcare, administration). |
-| **Differentiation** | Sovereign deployment + hybrid Graph RAG architecture; founder expertise in open‑source agent frameworks. |
-| **Competitors** | - **Mistral AI** (France) – foundation models, less focus on agent orchestration.<br>- **Hyro** (US/Israel) – adaptive communications platform.<br>- **Inflection** (US) – personal AI (Pi).<br>- **US‑based agent platforms** (LangChain, LlamaIndex, Haystack, AutoGPT) – but often rely on US cloud infra.<br>- **European AI startups** (Aleph Alpha, Hugging Face (though US‑based), Silo AI) – varying focus. |
-| **Traction Indicators** | - Public demo of QAtlas on YouTube.<br>- Integration of Mistral models announced Dec 2023/Jan 2024.<br>- Active social media presence of founders.<br>- Participation in AI‑agent community discussions (e.g., Context Engineering blog). |
-
-Overall, Quantalogic occupies a niche as a **European‑born, sovereign‑by‑design agent platform** with a strong technical pedigree in agent orchestration and knowledge‑graph‑enhanced RAG.
-
-*Sources:* Product page, competitive analysis from web search, founder blog posts, market mentions.
+*Sources: howto.md, quantalogic.app landing page, LinkedIn updates.*
 
 ---
 
-## 6. Risks & Opportunities
+## Technology Stack (inferred)
 
-### Risks
-1. **Execution Risk:** The company is very early (founded 2024) with a small team; delivering a differentiated enterprise platform at scale is challenging.
-2. **Adoption Risk:** Enterprises may hesitate to adopt a nascent vendor over established players (even if those require data to leave Europe).
-3. **Funding Sustainability:** The seed round provides runway, but future Series A will depend on demonstrable revenue and product‑market fit.
-4. **Technical Complexity:** Maintaining a high‑performance hybrid Graph RAG system requires ongoing expertise in both vector databases and graph databases.
-5. **Regulatory Evolution:** While sovereignty is a strength, evolving EU AI Act provisions could impose new compliance burdens.
+| Layer | Technology / Approach |
+|-------|-----------------------|
+| **Language** | Python (≥3.12) – primary implementation language |
+| **Agent Framework** | Custom ReAct + CodeAct implementation |
+| **LLM Integration** | Provider‑agnostic; supports OpenAI, Anthropic, Mistral, DeepSeek, local models |
+| **Execution Sandbox** | Docker containers for secure code/file operations |
+| **Orchestration** | Event‑driven architecture with observable hooks (task start/end, tool execution) |
+| **Document Intelligence (QAtlas)** | Retrieval‑Augmented Generation (RAG) + Knowledge Graph |
+| **Vector Store** | Likely FAISS, Qdrant, or similar (not explicitly stated) |
+| **Frontend** | Web interface (likely React/Vue) for monitoring & chat |
+| **Deployment** | Cloud‑agnostic; highlighted partnership with OVHcloud for European hosting |
+| **DevOps** | pip/pipx installation; source install via git; testing framework (unspecified) |
+| **Security** | Data compartmentalization, sovereign LLMs, no reliance on US hyperscalers (AWS/GCP/Azure) for core AI workloads |
+
+*Sources: howto.md, LinkedIn post about Python sandbox, platform claims.*
+
+---
+
+## Market Position & Competitors
+
+- **Industry**: AI agent platforms, enterprise AI, sovereign AI solutions.
+- **Direct Competitors (per Tracxn)**:
+  - Mistral AI (France)
+  - Inflection (US)
+  - Hyro (US)
+  - Rasa (open‑source conversational AI)
+  - Numerous other AI agent/framework startups.
+- **Differentiators**:
+  - Emphasis on **data sovereignty** and European hosting.
+  - Dual ReAct/CodeAct paradigm offering flexibility.
+  - Integrated sovereign document intelligence (QAtlas).
+  - No‑code/low‑code accessibility for non‑technical users.
+  - Multi‑LLM support avoiding vendor lock‑in.
+- **Market Traction**:
+  - 234 LinkedIn followers (as of April 2026).
+  - Team size: 2‑10 employees (LinkedIn indicates ~5 engineers).
+  - Participation in AI Leadership Tour by Scottish SME Delegation (British Embassy).
+  - Early adopter messaging targeting startups, PMEs, ETIs, and large European enterprises seeking sovereign AI.
+
+*Sources: Tracxn profile, LinkedIn, press mentions.*
+
+---
+
+## Partnerships & Ecosystem
+
+- **OVHcloud**: Cited as hosting partner for the platform, providing cloud‑agnostic, European‑based infrastructure.
+- **Novagen Conseil**: Founders’ prior affiliation; possible commercial or technical collaboration.
+- **Open‑Source LLMs**: Platform claims to host and enrich 15 sovereign LLMs (French/open‑source) on demand.
+- **Community**: Active GitHub repository (465 stars, 86 forks as of scraped date) indicating developer interest.
+
+*Sources: landing page, LinkedIn, GitHub.*
+
+---
+
+## Financial Performance
+
+- **Published Accounts**: As of the latest societe.com report, **no financial statements have been filed**; the company is listed as “Entreprise en défaut de publication de ses comptes (sauf exception)”.
+- **Capital**: €5 000 share capital at incorporation.
+- **Funding**: According to Tracxn and societe.com, QuantaLogic has **not raised any external funding rounds** (unfunded).
+- **Revenue / Profit**: Not available in public filings.
+- **Sovereignty Score**: 98/100 (per societe.com), indicating strong alignment with French/EU data‑sovereignty criteria.
+- **Impact Score**: Not yet available.
+
+*Sources: societe.com, Tracxn.*
+
+---
+
+## SWOT Analysis
+
+### Strengths
+- Strong founding team with AI and technical architecture background.
+- Clear sovereign AI positioning appealing to European data‑privacy concerns.
+- Dual ReAct/CodeAct framework offers flexibility for diverse use cases.
+- Integrated document intelligence product (QAtlas) addressing a high‑value enterprise need.
+- Partnership with OVHcloud ensures GDPR‑compliant hosting.
+- No‑code/low‑code lowers adoption barrier for business units.
+
+### Weaknesses
+- Very early stage (founded 2024) – limited track record and customer references.
+- No published financials; revenue model and traction unclear.
+- Small team size may limit scalability of sales and support.
+- Dependence on third‑party LLM providers for cutting‑edge models (though sovereign options offered).
 
 ### Opportunities
-1. **Data Sovereignty Demand:** Growing EU‑based concern over data privacy and US cloud reliance creates a tailwind for sovereign AI providers.
-2. **Government & Public Sector:** French administration and EU institutions are potential early adopters for secure document‑intelligence tools.
-3. **Partnerships:** Collaborations with European cloud providers (OVHcloud, Scaleway, Hetzner) or AI‑hardware firms could strengthen the stack.
-4. **Open‑Source Credibility:** Founders’ involvement in open‑source agent frameworks (EdgeCrab) can attract developer community and reduce vendor lock‑in perceptions.
-5. **Vertical Solutions:** QAtlas can be tailored to industry‑specific knowledge graphs (e.g., legal case law, medical ontologies) to create defensible moats.
+- Growing demand for sovereign AI solutions in EU (post‑Schrems II, AI Act).
+- Expansion into regulated sectors (finance, healthcare, public administration) requiring data localization.
+- Potential to monetize QAtlas as a standalone SaaS offering.
+- Channel partnerships with SIEs and system integrators in France/EU.
+- Leveraging open‑source LLMs to reduce dependency on costly proprietary APIs.
+
+### Threats
+- Intense competition from well‑funded US AI agent startups (e.g., Inflection, Adept) and established players (Microsoft Copilot, Google Vertex AI Agent Builder).
+- Rapid evolution of LLM landscape could make current tech stack obsolete if not continuously updated.
+- Regulatory changes (EU AI Act) may impose additional compliance burdens.
+- Risk of talent attrition in competitive AI job market.
 
 ---
 
-## 7. Conclusion
+## Sources & References
 
-Quantalogic represents a promising early‑stage effort to build a **European sovereign AI agent platform** that addresses key enterprise concerns: data privacy, explainability, and reduced hallucination through knowledge‑graph‑enhanced RAG. The announced $13.5 M seed round provides financial backing to pursue product development and market entry. While the company faces typical early‑stage risks, its founding team’s technical background, clear differentiation on sovereignty, and timing with rising EU demand for trustworthy AI position it well for growth—provided it can convert technology demonstrations into paying customers and navigate the competitive landscape of both US incumbents and emerging European rivals.
+1. **LinkedIn Company Page** – Quantalogic. <https://fr.linkedin.com/company/quantalogic>  
+2. **Tracxn Company Profile** – QuantaLogic. <https://tracxn.com/d/companies/quantalogic/__PBbvh7zWyCEW1GY36wwVJj4w7GBfbldFSEA1X7JEdJU>  
+3. **Societe.com** – Société QUANTALOGIC. <https://www.societe.com/societe/quantalogic-930719851.html>  
+4. **Annuaire des Entreprises (INSEE)** – Quantalogic entry. <https://annuaire-entreprises.data.gouv.fr/entreprise/quantalogic-930719851>  
+5. **Pappers.fr** – Company details (referenced in search results).  
+6. **Quantalogic Official Website** – <https://www.quantalogic.app>  
+7. **Quantalogic How‑to Guide** – GitHub. <https://github.com/quantalogic/quantalogic/blob/main/docs/howto/howto.md>  
+8. **GitHub Repository** – <https://github.com/quantalogic/quantalogic>  
+9. **Press/Mentions** – AI Leadership Tour, Scottish SME Delegation (LinkedIn posts).  
+10. **OVHcloud Partnership** – Referenced in platform landing page and LinkedIn updates.  
 
 ---
 
-## 8. Sources
-
-1. INSEE Sirene extract – Annuaire des Entreprises (data.gouv.fr): https://annuaire-entreprises.data.gouv.fr/entreprise/quantalogic-930719851  
-2. LinkedIn Company Page: https://fr.linkedin.com/company/quantalogic  
-3. Founder Raphael Mansuy X/Twitter post announcing seed funding: https://x.com/raphaelmansuy/highlights  
-4. Playground Global portfolio references (CB Insights, Vestbee, etc.)  
-5. Quantalogic product landing page: https://www.quantalogic.app/  
-6. YouTube demo – “Introducing Knowledge Graph RAG”: https://www.youtube.com/watch?v=nvEsw3xkrGw  
-7. LinkedIn post – Mistral models on QuantaLogic (Dec 2023): https://www.linkedin.com/posts/raphaelmansuy_mistral-ais-new-models-are-already-available-activity-7402383437212577793-4P_C  
-8. Tracxn company profile: https://tracxn.com/d/companies/quantalogic/__PBbvh7zWyCEW1GY36wwVJj4w7GBfbldFSEA1X7JEdJU  
-9. Pappers company extract: https://www.pappers.fr/entreprise/quantalogic-930719851  
-10. Various web searches on Quantalogic, QAtlas, Graph RAG, and sovereign AI (performed 21 Apr 2026).  
-
-*All sources accessed between 15‑21 April 2026.*
-
----  
-*End of Document*  
+**Disclaimer**: This document compiles publicly available information as of 21 April 2026. Financial data is limited due to non‑filing of accounts. For formal due‑diligence, direct engagement with the company and consultation of official registries (INPI, INSEE, tax authorities) is recommended.

@@ -118,19 +118,80 @@ async fn execute_replace_patch(args: ReplaceArgs, ctx: &ToolContext) -> Result<S
         .await
         .map_err(|e| ToolError::Other(format!("Cannot read '{}': {}", args.path, e)))?;
 
+    // R17: Capture file metadata immediately after reading so we can detect
+    // any external modification in the window between read and write (TOCTOU).
+    let pre_write_snap = tokio::fs::metadata(&resolved)
+        .await
+        .ok()
+        .map(|m| (m.len(), m.modified().ok()));
+
     // 8-strategy fuzzy replacement (mirrors hermes fuzzy_match.py)
-    let (new_content, count) = fuzzy_find_and_replace(
+    let (new_content, count) = match fuzzy_find_and_replace(
         &content,
         &args.old_string,
         &args.new_string,
         args.replace_all,
-    )
-    .map_err(|msg| {
-        ToolError::Other(format!(
-            "{msg}\n[Hint: Use read_file to verify the current content of '{}']",
-            args.path
-        ))
-    })?;
+    ) {
+        Ok(result) => result,
+        Err(msg) => {
+            // R15: old_string not found — record current snapshot so the model
+            // can retry with a corrected old_string without needing read_file.
+            let _ = crate::read_tracker::record_file_snapshot(&ctx.session_id, &resolved);
+
+            // Embed a 600-char preview of the actual file content so the model
+            // can see what to match against when composing the retry.
+            const PREVIEW_LIMIT: usize = 600;
+            let preview = crate::safe_truncate(&content, PREVIEW_LIMIT);
+            let truncated = preview.len() < content.len();
+            let trunc_note = if truncated {
+                format!(
+                    "\n[...truncated — file has {} total bytes; \
+                     read_file gives full content if needed.]",
+                    content.len()
+                )
+            } else {
+                String::new()
+            };
+
+            return Err(ToolError::ContentMismatch {
+                tool: "patch".into(),
+                path: args.path.clone(),
+                message: format!(
+                    "{msg}\n\
+                     Snapshot recorded — retry patch with the corrected old_string \
+                     (no read_file needed).\n\
+                     \n\
+                     Current file content (preview):\n\
+                     ---\n\
+                     {preview}{trunc_note}\n\
+                     ---"
+                ),
+            });
+        }
+    };
+
+    // R17: Atomic TOCTOU re-check — confirm the file has not been modified by
+    // another process in the window between our read and the upcoming write.
+    if let Some((size_at_read, mtime_at_read)) = pre_write_snap {
+        if let Ok(current) = tokio::fs::metadata(&resolved).await {
+            let changed = current.len() != size_at_read
+                || current.modified().ok() != mtime_at_read;
+            if changed {
+                return Err(ToolError::ContentMismatch {
+                    tool: "patch".into(),
+                    path: args.path.clone(),
+                    message: format!(
+                        "'{}' was modified by another process between read and write (TOCTOU). \
+                         Re-read the file with read_file and retry the patch.",
+                        args.path
+                    ),
+                });
+            }
+        }
+    }
+
+    let before_bytes = content.len();
+    let after_bytes = new_content.len();
 
     tokio::fs::write(&resolved, &new_content)
         .await
@@ -138,13 +199,16 @@ async fn execute_replace_patch(args: ReplaceArgs, ctx: &ToolContext) -> Result<S
 
     let _ = crate::read_tracker::record_file_snapshot(&ctx.session_id, &resolved);
 
-    Ok(format!(
-        "Patched '{}': {} replacement(s), {} → {} bytes",
-        args.path,
-        count,
-        args.old_string.len(),
-        args.new_string.len()
-    ))
+    // R18: Structured JSON result (FP57) — enables the display layer and the
+    // conversation loop to branch on machine-readable fields instead of parsing prose.
+    let result = serde_json::json!({
+        "ok": true,
+        "replacements": count,
+        "before_bytes": before_bytes,
+        "after_bytes": after_bytes,
+        "path": args.path,
+    });
+    Ok(result.to_string())
 }
 
 #[async_trait]
@@ -788,10 +852,14 @@ async fn execute_v4a_patch(patch_text: &str, ctx: &ToolContext) -> Result<String
                 }
             }
         }
-        Ok(format!(
-            "apply_patch succeeded. {}",
-            summary_parts.join("; ")
-        ))
+        // R18: Structured JSON result (FP57).
+        let result = serde_json::json!({
+            "ok": true,
+            "modified": files_modified,
+            "created": files_created,
+            "deleted": files_deleted,
+        });
+        Ok(result.to_string())
     } else {
         restore_backups(&backups).await;
         Err(ToolError::Other(format_patch_errors(&errors)))
@@ -911,7 +979,7 @@ mod tests {
             .await
             .expect("patch");
 
-        assert!(result.contains("Patched"));
+        assert!(result.contains("\"ok\":true") || result.contains("\"ok\": true"), "expected JSON ok result, got: {result}");
         let content = std::fs::read_to_string(dir.path().join("code.rs")).expect("read");
         assert!(content.contains("println!(\"new\")"));
         assert!(!content.contains("println!(\"old\")"));
@@ -1258,7 +1326,12 @@ mod tests {
             .await
             .expect("apply_patch add");
 
-        assert!(result.contains("Created"), "Got: {result}");
+        let v: serde_json::Value = serde_json::from_str(&result).expect("JSON result");
+        assert_eq!(v["ok"], true, "Got: {result}");
+        assert!(
+            v["created"].as_array().map(|a| !a.is_empty()).unwrap_or(false),
+            "Expected non-empty 'created' array, got: {result}"
+        );
         let content = std::fs::read_to_string(dir.path().join("hello.txt")).expect("read");
         assert_eq!(content.trim(), "Hello, World!");
     }
@@ -1275,7 +1348,12 @@ mod tests {
             .await
             .expect("apply_patch delete");
 
-        assert!(result.contains("Deleted"), "Got: {result}");
+        let v: serde_json::Value = serde_json::from_str(&result).expect("JSON result");
+        assert_eq!(v["ok"], true, "Got: {result}");
+        assert!(
+            v["deleted"].as_array().map(|a| !a.is_empty()).unwrap_or(false),
+            "Expected non-empty 'deleted' array, got: {result}"
+        );
         assert!(!dir.path().join("remove_me.txt").exists());
     }
 
@@ -1291,10 +1369,8 @@ mod tests {
             .await
             .expect("apply_patch move");
 
-        assert!(
-            result.contains("→") || result.contains("Modified"),
-            "Got: {result}"
-        );
+        let v: serde_json::Value = serde_json::from_str(&result).expect("JSON result");
+        assert_eq!(v["ok"], true, "Got: {result}");
         assert!(!dir.path().join("old.txt").exists());
         assert!(dir.path().join("new.txt").exists());
     }
@@ -1357,7 +1433,12 @@ mod tests {
             .await
             .expect("apply_patch update");
 
-        assert!(result.contains("Modified"), "Got: {result}");
+        let v: serde_json::Value = serde_json::from_str(&result).expect("JSON result");
+        assert_eq!(v["ok"], true, "Got: {result}");
+        assert!(
+            v["modified"].as_array().map(|a| !a.is_empty()).unwrap_or(false),
+            "Expected non-empty 'modified' array, got: {result}"
+        );
         let content = std::fs::read_to_string(dir.path().join("greet.py")).expect("read");
         assert!(content.contains("print('world')"), "Got: {content}");
         assert!(!content.contains("print('hello')"), "Got: {content}");

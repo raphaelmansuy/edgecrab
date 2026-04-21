@@ -217,6 +217,18 @@ impl ToolHandler for WriteFileTool {
             )?;
         }
 
+        // R17: Capture file metadata immediately after the freshness guard so we
+        // can detect any external modification in the window between guard and write
+        // (TOCTOU). Only relevant when we are overwriting an existing file.
+        let pre_write_snap = if file_exists {
+            tokio::fs::metadata(&resolved)
+                .await
+                .ok()
+                .map(|m| (m.len(), m.modified().ok()))
+        } else {
+            None
+        };
+
         let content = args.content;
 
         enforce_write_payload_limit_with_max(
@@ -226,6 +238,26 @@ impl ToolHandler for WriteFileTool {
             &content,
             ctx.config.max_write_payload_bytes(),
         )?;
+
+        // R17: Atomic TOCTOU re-check — confirm the file has not changed since
+        // the freshness guard above.
+        if let Some((size_snap, mtime_snap)) = pre_write_snap {
+            if let Ok(current) = tokio::fs::metadata(&resolved).await {
+                let changed =
+                    current.len() != size_snap || current.modified().ok() != mtime_snap;
+                if changed {
+                    return Err(ToolError::ContentMismatch {
+                        tool: "write_file".into(),
+                        path: args.path.clone(),
+                        message: format!(
+                            "'{}' was modified by another process between freshness check and \
+                             write (TOCTOU). Re-read with read_file and retry.",
+                            args.path
+                        ),
+                    });
+                }
+            }
+        }
 
         let bytes_written = content.len();
 
@@ -241,7 +273,15 @@ impl ToolHandler for WriteFileTool {
                 args.path
             ))
         } else {
-            Ok(format!("Wrote {} bytes to '{}'", bytes_written, args.path))
+            // R18: Structured JSON result (FP57).
+            let action = if file_exists { "overwrite" } else { "create" };
+            Ok(serde_json::json!({
+                "ok": true,
+                "action": action,
+                "bytes": bytes_written,
+                "path": args.path,
+            })
+            .to_string())
         }
     }
 }
@@ -270,7 +310,10 @@ mod tests {
             .await
             .expect("write");
 
-        assert!(result.contains("11 bytes"));
+        let v: serde_json::Value = serde_json::from_str(&result).expect("JSON");
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["bytes"], 11);
+        assert_eq!(v["action"], "create");
         let content = std::fs::read_to_string(dir.path().join("new.txt")).expect("read");
         assert_eq!(content, "hello world");
     }
@@ -352,7 +395,9 @@ mod tests {
             .await
             .expect("write");
 
-        assert!(result.contains("6 bytes"));
+        let v: serde_json::Value = serde_json::from_str(&result).expect("JSON");
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["bytes"], 6);
         let content = std::fs::read_to_string(dir.path().join("sub/dir/file.txt")).expect("read");
         assert_eq!(content, "nested");
     }
