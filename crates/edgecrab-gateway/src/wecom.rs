@@ -554,15 +554,17 @@ where
                     .unwrap_or_default()
                     .to_string();
 
-                if !req_id.is_empty() && !is_callback_command(&cmd) && cmd != APP_CMD_PING {
-                    if let Some(waiter) = pending.lock().await.remove(&req_id) {
-                        let _ = waiter.send(payload);
-                        continue;
-                    }
+                if !req_id.is_empty()
+                    && !is_callback_command(&cmd)
+                    && cmd != APP_CMD_PING
+                    && let Some(waiter) = pending.lock().await.remove(&req_id)
+                {
+                    let _ = waiter.send(payload);
+                    continue;
                 }
 
-                if is_callback_command(&cmd) {
-                    if let Some(message) = parse_callback(
+                if is_callback_command(&cmd)
+                    && let Some(message) = parse_callback(
                         &payload,
                         &allowed_users,
                         &seen_messages,
@@ -570,80 +572,78 @@ where
                         group_policy,
                     )
                     .await?
+                {
+                    // Text batching: accumulate rapid successive messages from same user
+                    let user_key = message.user_id.clone();
+                    let text_len = message.text.len();
+                    let should_flush;
                     {
-                        // Text batching: accumulate rapid successive messages from same user
-                        let user_key = message.user_id.clone();
-                        let text_len = message.text.len();
-                        let should_flush;
-                        {
-                            let mut batch = text_batch.lock().await;
-                            let entry =
-                                batch.entry(user_key.clone()).or_insert_with(|| TextBatch {
-                                    parts: Vec::new(),
-                                    started: Instant::now(),
-                                });
-                            entry.parts.push(message.text.clone());
+                        let mut batch = text_batch.lock().await;
+                        let entry = batch.entry(user_key.clone()).or_insert_with(|| TextBatch {
+                            parts: Vec::new(),
+                            started: Instant::now(),
+                        });
+                        entry.parts.push(message.text.clone());
 
-                            // Determine quiet window based on text length
-                            let quiet_window = if text_len >= BATCH_LONG_THRESHOLD {
-                                BATCH_QUIET_LONG
-                            } else {
-                                BATCH_QUIET_NORMAL
-                            };
-
-                            // If this is the first part, start the timer
-                            if entry.parts.len() == 1 {
-                                should_flush = false;
-                            } else {
-                                // Check if the batch has been quiet for long enough
-                                should_flush = entry.started.elapsed() >= quiet_window;
-                            }
-                        }
-
-                        if let Some(message_id) = message.metadata.message_id.clone() {
-                            reply_req_ids.lock().await.insert(message_id, req_id);
-                        }
-
-                        // Spawn a delayed flush task for this user's batch
-                        let tx_clone = tx.clone();
-                        let batch_clone = text_batch.clone();
-                        let msg_template = message.clone();
+                        // Determine quiet window based on text length
                         let quiet_window = if text_len >= BATCH_LONG_THRESHOLD {
                             BATCH_QUIET_LONG
                         } else {
                             BATCH_QUIET_NORMAL
                         };
 
-                        let user_key_spawn = user_key.clone();
-                        tokio::spawn(async move {
-                            tokio::time::sleep(quiet_window).await;
-                            let mut batch = batch_clone.lock().await;
-                            if let Some(entry) = batch.remove(&user_key_spawn) {
-                                if !entry.parts.is_empty() {
-                                    let merged_text = entry.parts.join("\n");
-                                    let merged_msg = IncomingMessage {
-                                        text: merged_text,
-                                        ..msg_template
-                                    };
-                                    let _ = tx_clone.send(merged_msg).await;
-                                }
-                            }
-                        });
+                        // If this is the first part, start the timer
+                        if entry.parts.len() == 1 {
+                            should_flush = false;
+                        } else {
+                            // Check if the batch has been quiet for long enough
+                            should_flush = entry.started.elapsed() >= quiet_window;
+                        }
+                    }
 
-                        // If should_flush (batch already waited long enough), cancel the delayed flush
-                        // by removing the entry now — the spawned task will find nothing
-                        if should_flush {
-                            let mut batch = text_batch.lock().await;
-                            if let Some(entry) = batch.remove(&user_key) {
-                                if !entry.parts.is_empty() {
-                                    let merged_text = entry.parts.join("\n");
-                                    let merged_msg = IncomingMessage {
-                                        text: merged_text,
-                                        ..message
-                                    };
-                                    let _ = tx.send(merged_msg).await;
-                                }
-                            }
+                    if let Some(message_id) = message.metadata.message_id.clone() {
+                        reply_req_ids.lock().await.insert(message_id, req_id);
+                    }
+
+                    // Spawn a delayed flush task for this user's batch
+                    let tx_clone = tx.clone();
+                    let batch_clone = text_batch.clone();
+                    let msg_template = message.clone();
+                    let quiet_window = if text_len >= BATCH_LONG_THRESHOLD {
+                        BATCH_QUIET_LONG
+                    } else {
+                        BATCH_QUIET_NORMAL
+                    };
+
+                    let user_key_spawn = user_key.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(quiet_window).await;
+                        let mut batch = batch_clone.lock().await;
+                        if let Some(entry) = batch.remove(&user_key_spawn)
+                            && !entry.parts.is_empty()
+                        {
+                            let merged_text = entry.parts.join("\n");
+                            let merged_msg = IncomingMessage {
+                                text: merged_text,
+                                ..msg_template
+                            };
+                            let _ = tx_clone.send(merged_msg).await;
+                        }
+                    });
+
+                    // If should_flush (batch already waited long enough), cancel the delayed flush
+                    // by removing the entry now — the spawned task will find nothing
+                    if should_flush {
+                        let mut batch = text_batch.lock().await;
+                        if let Some(entry) = batch.remove(&user_key)
+                            && !entry.parts.is_empty()
+                        {
+                            let merged_text = entry.parts.join("\n");
+                            let merged_msg = IncomingMessage {
+                                text: merged_text,
+                                ..message
+                            };
+                            let _ = tx.send(merged_msg).await;
                         }
                     }
                 }

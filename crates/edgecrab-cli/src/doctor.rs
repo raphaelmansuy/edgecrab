@@ -347,30 +347,30 @@ fn check_mcp_servers() -> Vec<Check> {
 /// misconfiguration early so the user isn't left with a silent MockProvider fallback.
 fn check_vertexai_adc() -> Check {
     // 1. Is GOOGLE_CLOUD_PROJECT already set in environment?
-    if let Ok(project) = std::env::var("GOOGLE_CLOUD_PROJECT") {
-        if !project.is_empty() {
-            // 2. Verify ADC credentials file exists
-            let adc_file = dirs_home().map(|h| {
-                h.join(".config")
-                    .join("gcloud")
-                    .join("application_default_credentials.json")
-            });
-            let adc_ok = adc_file.as_ref().map(|p| p.exists()).unwrap_or(false);
-            return if adc_ok {
-                Check::pass(
-                    "VertexAI ADC",
-                    format!("project={project}, ADC credentials found — ready"),
-                )
-            } else {
-                Check::warn(
-                    "VertexAI ADC",
-                    format!(
-                        "project={project} set but no ADC credentials found; \
+    if let Ok(project) = std::env::var("GOOGLE_CLOUD_PROJECT")
+        && !project.is_empty()
+    {
+        // 2. Verify ADC credentials file exists
+        let adc_file = dirs_home().map(|h| {
+            h.join(".config")
+                .join("gcloud")
+                .join("application_default_credentials.json")
+        });
+        let adc_ok = adc_file.as_ref().map(|p| p.exists()).unwrap_or(false);
+        return if adc_ok {
+            Check::pass(
+                "VertexAI ADC",
+                format!("project={project}, ADC credentials found — ready"),
+            )
+        } else {
+            Check::warn(
+                "VertexAI ADC",
+                format!(
+                    "project={project} set but no ADC credentials found; \
                          run `gcloud auth application-default login`"
-                    ),
-                )
-            };
-        }
+                ),
+            )
+        };
     }
 
     // 3. Try gcloud config to detect the project
@@ -445,6 +445,7 @@ fn check_provider_keys() -> Vec<Check> {
         ),
         ("OPENAI_API_KEY", "OpenAI"),
         ("ANTHROPIC_API_KEY", "Anthropic"),
+        ("ANTHROPIC_AUTH_TOKEN", "Anthropic-compatible"),
         ("GOOGLE_API_KEY", "Google Gemini"),
         ("OPENROUTER_API_KEY", "OpenRouter"),
         ("XAI_API_KEY", "xAI Grok"),
@@ -657,8 +658,11 @@ fn detect_best_provider() -> String {
     {
         "openai".into()
     } else if std::env::var("ANTHROPIC_API_KEY")
-        .map(|v| !v.is_empty())
+        .map(|v| !v.trim().is_empty())
         .unwrap_or(false)
+        || std::env::var("ANTHROPIC_AUTH_TOKEN")
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
     {
         "anthropic".into()
     } else if check_local_port(11434) {

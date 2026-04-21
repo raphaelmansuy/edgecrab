@@ -100,16 +100,16 @@ impl CdpEndpoint {
 /// Get the active CDP endpoint — either from override or default localhost.
 fn active_cdp_endpoint() -> CdpEndpoint {
     // Check runtime override first
-    if let Ok(guard) = CDP_OVERRIDE.lock() {
-        if let Some(ref ep) = *guard {
-            return ep.clone();
-        }
+    if let Ok(guard) = CDP_OVERRIDE.lock()
+        && let Some(ref ep) = *guard
+    {
+        return ep.clone();
     }
     // Check env var
-    if let Ok(url) = std::env::var("BROWSER_CDP_URL") {
-        if let Some(ep) = parse_cdp_url(&url) {
-            return ep;
-        }
+    if let Ok(url) = std::env::var("BROWSER_CDP_URL")
+        && let Some(ep) = parse_cdp_url(&url)
+    {
+        return ep;
     }
     CdpEndpoint {
         host: "127.0.0.1".into(),
@@ -598,10 +598,10 @@ impl ScreencastRecorder {
     /// Returns the path to the saved recording file/directory.
     async fn stop(self, recordings_dir: &Path, task_id: &str) -> Option<PathBuf> {
         // Signal the background task to stop.
-        if let Ok(mut guard) = self.stop_tx.lock() {
-            if let Some(tx) = guard.take() {
-                let _ = tx.send(());
-            }
+        if let Ok(mut guard) = self.stop_tx.lock()
+            && let Some(tx) = guard.take()
+        {
+            let _ = tx.send(());
         }
 
         // Wait up to 5 s for the collection task to finish.
@@ -678,15 +678,14 @@ async fn run_screencast_task(
                         let session_id = params["sessionId"].as_u64().unwrap_or(0);
 
                         // Decode and write frame to disk immediately (avoids memory bloat).
-                        if let Some(data) = params["data"].as_str() {
-                            if let Ok(bytes) =
+                        if let Some(data) = params["data"].as_str()
+                            && let Ok(bytes) =
                                 base64::engine::general_purpose::STANDARD.decode(data)
                             {
                                 let n = frame_count.fetch_add(1, Ordering::Relaxed) + 1;
                                 let path = frame_dir.join(format!("frame_{n:06}.png"));
                                 let _ = std::fs::write(path, bytes);
                             }
-                        }
 
                         // Acknowledge frame — Chrome stops sending if we don't.
                         let ack_id = REQUEST_ID.fetch_add(1, Ordering::Relaxed);
@@ -1041,14 +1040,14 @@ async fn create_tab_via_target_api() -> Option<(String, String)> {
         let tabs = cdp_http_get("/json/list").await.ok()?;
         if let serde_json::Value::Array(arr) = tabs {
             for tab in &arr {
-                if tab["id"].as_str() == Some(target_id.as_str()) {
-                    if let Some(ws) = tab["webSocketDebuggerUrl"].as_str() {
-                        tracing::debug!(
-                            "create_tab_via_target_api: target {target_id} ready after \
+                if tab["id"].as_str() == Some(target_id.as_str())
+                    && let Some(ws) = tab["webSocketDebuggerUrl"].as_str()
+                {
+                    tracing::debug!(
+                        "create_tab_via_target_api: target {target_id} ready after \
                              {attempt} poll(s)"
-                        );
-                        return Some((ws.to_string(), target_id));
-                    }
+                    );
+                    return Some((ws.to_string(), target_id));
                 }
             }
         }
@@ -1336,14 +1335,14 @@ pub fn find_cdp_from_active_port_file() -> Option<CdpEndpoint> {
         let candidate = dir.join("DevToolsActivePort");
         if let Ok(contents) = std::fs::read_to_string(&candidate) {
             let port_str = contents.lines().next().unwrap_or("").trim();
-            if let Ok(port) = port_str.parse::<u16>() {
-                if port > 0 {
-                    tracing::info!("found DevToolsActivePort={port} in {}", candidate.display());
-                    return Some(CdpEndpoint {
-                        host: "127.0.0.1".into(),
-                        port,
-                    });
-                }
+            if let Ok(port) = port_str.parse::<u16>()
+                && port > 0
+            {
+                tracing::info!("found DevToolsActivePort={port} in {}", candidate.display());
+                return Some(CdpEndpoint {
+                    host: "127.0.0.1".into(),
+                    port,
+                });
             }
         }
     }
@@ -1439,20 +1438,20 @@ async fn ensure_chrome_running() -> Result<(), ToolError> {
 
     // No override: attempt auto-detection of an already-running debugging Chrome
     // before launching a new headless instance.
-    if let Some(found_ep) = auto_detect_running_chrome_cdp().await {
-        if found_ep.port != ep.port {
-            // Found Chrome on a different port than configured — tell the caller
-            // but don't silently switch the global endpoint.
-            tracing::info!(
-                "auto-detected Chrome CDP on port {} (configured port is {}); \
+    if let Some(found_ep) = auto_detect_running_chrome_cdp().await
+        && found_ep.port != ep.port
+    {
+        // Found Chrome on a different port than configured — tell the caller
+        // but don't silently switch the global endpoint.
+        tracing::info!(
+            "auto-detected Chrome CDP on port {} (configured port is {}); \
                  using detected port for this session",
-                found_ep.port,
-                ep.port
-            );
-            // We can't return `found_ep` from here — `ensure_chrome_running`
-            // only validates / launches; the caller uses `active_cdp_endpoint()`.
-            // So we surface the info as a log trace and fall through to launch.
-        }
+            found_ep.port,
+            ep.port
+        );
+        // We can't return `found_ep` from here — `ensure_chrome_running`
+        // only validates / launches; the caller uses `active_cdp_endpoint()`.
+        // So we surface the info as a log trace and fall through to launch.
     }
 
     let chrome = chrome_binary()
@@ -2326,13 +2325,13 @@ impl ToolHandler for BrowserNavigateTool {
         }
 
         // Check for navigation errors
-        if let Some(err) = nav_result.get("errorText").and_then(|e| e.as_str()) {
-            if !err.is_empty() {
-                return Err(ToolError::ExecutionFailed {
-                    tool: "browser_navigate".into(),
-                    message: format!("Navigation error: {err}"),
-                });
-            }
+        if let Some(err) = nav_result.get("errorText").and_then(|e| e.as_str())
+            && !err.is_empty()
+        {
+            return Err(ToolError::ExecutionFailed {
+                tool: "browser_navigate".into(),
+                message: format!("Navigation error: {err}"),
+            });
         }
 
         // Build response

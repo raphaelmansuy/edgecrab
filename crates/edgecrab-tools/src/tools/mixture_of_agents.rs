@@ -292,11 +292,11 @@ fn build_reference_execution_plan(
     let active_model_spec = active_model_spec(active_provider_name, active_model);
     let mut implicit_fallback_model = None;
 
-    if let Some(active_model_spec) = active_model_spec {
-        if !models.iter().any(|model| model == &active_model_spec) {
-            models.push(active_model_spec.clone());
-            implicit_fallback_model = Some(active_model_spec);
-        }
+    if let Some(active_model_spec) = active_model_spec
+        && !models.iter().any(|model| model == &active_model_spec)
+    {
+        models.push(active_model_spec.clone());
+        implicit_fallback_model = Some(active_model_spec);
     }
 
     ReferenceExecutionPlan {

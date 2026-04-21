@@ -1333,55 +1333,54 @@ fn extract_tool_filter(server_config: &serde_json::Value) -> (Vec<String>, Vec<S
 }
 
 fn load_mcp_config(include_disabled: bool) -> Result<serde_json::Value, ToolError> {
-    if let Some(path) = yaml_config_path() {
-        if path.is_file() {
-            let content =
-                std::fs::read_to_string(&path).map_err(|e| ToolError::ExecutionFailed {
-                    tool: "mcp_client".into(),
-                    message: format!("Failed to read config.yaml: {e}"),
-                })?;
-            let config: YamlConfigFile =
-                serde_yml::from_str(&content).map_err(|e| ToolError::ExecutionFailed {
-                    tool: "mcp_client".into(),
-                    message: format!("Invalid config.yaml: {e}"),
-                })?;
+    if let Some(path) = yaml_config_path()
+        && path.is_file()
+    {
+        let content = std::fs::read_to_string(&path).map_err(|e| ToolError::ExecutionFailed {
+            tool: "mcp_client".into(),
+            message: format!("Failed to read config.yaml: {e}"),
+        })?;
+        let config: YamlConfigFile =
+            serde_yml::from_str(&content).map_err(|e| ToolError::ExecutionFailed {
+                tool: "mcp_client".into(),
+                message: format!("Invalid config.yaml: {e}"),
+            })?;
 
-            if !config.mcp_servers.is_empty() {
-                let mut servers = serde_json::Map::new();
-                for (name, server) in config.mcp_servers {
-                    if !include_disabled && !server.enabled {
-                        continue;
-                    }
-                    // HTTP server: url must be present
-                    // Stdio server: command must be non-empty
-                    if server.url.is_none() && server.command.trim().is_empty() {
-                        continue;
-                    }
-                    servers.insert(
-                        name,
-                        json!({
-                            "command": server.command,
-                            "args": server.args,
-                            "env": server.env,
-                            "cwd": server.cwd,
-                            "enabled": server.enabled,
-                            "url": server.url,
-                            "bearer_token": server.bearer_token,
-                            "oauth": server.oauth,
-                            "headers": server.headers,
-                            "timeout": server.timeout,
-                            "connect_timeout": server.connect_timeout,
-                            "tools": {
-                                "include": server.tools.include,
-                                "exclude": server.tools.exclude,
-                                "resources": server.tools.resources,
-                                "prompts": server.tools.prompts,
-                            },
-                        }),
-                    );
+        if !config.mcp_servers.is_empty() {
+            let mut servers = serde_json::Map::new();
+            for (name, server) in config.mcp_servers {
+                if !include_disabled && !server.enabled {
+                    continue;
                 }
-                return Ok(json!({ "mcpServers": servers }));
+                // HTTP server: url must be present
+                // Stdio server: command must be non-empty
+                if server.url.is_none() && server.command.trim().is_empty() {
+                    continue;
+                }
+                servers.insert(
+                    name,
+                    json!({
+                        "command": server.command,
+                        "args": server.args,
+                        "env": server.env,
+                        "cwd": server.cwd,
+                        "enabled": server.enabled,
+                        "url": server.url,
+                        "bearer_token": server.bearer_token,
+                        "oauth": server.oauth,
+                        "headers": server.headers,
+                        "timeout": server.timeout,
+                        "connect_timeout": server.connect_timeout,
+                        "tools": {
+                            "include": server.tools.include,
+                            "exclude": server.tools.exclude,
+                            "resources": server.tools.resources,
+                            "prompts": server.tools.prompts,
+                        },
+                    }),
+                );
             }
+            return Ok(json!({ "mcpServers": servers }));
         }
     }
 
@@ -1556,10 +1555,10 @@ impl ToolHandler for McpListToolsTool {
 
         let mut all_tools = Vec::new();
         for server in configured_servers()? {
-            if let Some(ref filter) = args.server {
-                if &server.name != filter {
-                    continue;
-                }
+            if let Some(ref filter) = args.server
+                && &server.name != filter
+            {
+                continue;
             }
 
             if ctx.cancel.is_cancelled() {

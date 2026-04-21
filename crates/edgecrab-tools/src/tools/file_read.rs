@@ -279,6 +279,34 @@ impl ToolHandler for ReadFileTool {
             )));
         }
 
+        // Consecutive re-read loop detection runs FIRST — before dedup — so that
+        // the counter always increments on every attempted read, ensuring warn/block
+        // thresholds fire even when dedup would short-circuit the actual file I/O.
+        let key = read_tracker::read_key(&resolved.to_string_lossy(), line_start, line_end);
+        let count = read_tracker::check_and_update(&ctx.session_id, key);
+
+        if count >= 4 {
+            return Err(ToolError::Other(format!(
+                "BLOCKED: You have read '{}' (lines {:?}–{:?}) {} times in a row. \
+                 The content has NOT changed. You already have this information. \
+                 Stop re-reading and proceed with your task.",
+                args.path, line_start, line_end, count
+            )));
+        }
+
+        // FP13: mtime-based read dedup — skip re-read if file unchanged since last read.
+        // Only applies when below the warning threshold (count < 3): at count == 3 we
+        // must return the actual content alongside the warning so the user can verify.
+        // Cast to u64 for the DedupKey (line numbers are small; no overflow risk here).
+        let dedup_start = line_start.map(|v| v as u64);
+        let dedup_end = line_end.map(|v| v as u64);
+        if count < 3
+            && let Some(stub) =
+                read_tracker::check_read_dedup(&ctx.session_id, &resolved, dedup_start, dedup_end)
+        {
+            return Ok(stub);
+        }
+
         let content = tokio::fs::read_to_string(&resolved)
             .await
             .map_err(|e| ToolError::Other(format!("Cannot read '{}': {}", args.path, e)))?;
@@ -315,19 +343,13 @@ impl ToolHandler for ReadFileTool {
             output
         };
 
-        // Consecutive re-read loop detection — matches the prior read-loop guard.
-        // Warn at 3 identical consecutive reads; hard-block at 4.
-        let key = read_tracker::read_key(&args.path, line_start, line_end);
-        let count = read_tracker::check_and_update(&ctx.session_id, key);
+        // Record snapshot for freshness guards (patch/write stale-read detection).
+        let _ = read_tracker::record_file_snapshot(&ctx.session_id, &resolved);
 
-        if count >= 4 {
-            return Err(ToolError::Other(format!(
-                "BLOCKED: You have read '{}' (lines {:?}–{:?}) {} times in a row. \
-                 The content has NOT changed. You already have this information. \
-                 Stop re-reading and proceed with your task.",
-                args.path, line_start, line_end, count
-            )));
-        } else if count >= 3 {
+        // FP13: Record dedup entry so next identical read can short-circuit.
+        read_tracker::record_read_dedup(&ctx.session_id, &resolved, dedup_start, dedup_end);
+
+        if count >= 3 {
             let warning = format!(
                 "[WARNING: You have read this exact region {} times consecutively. \
                  The content has not changed since your last read. \

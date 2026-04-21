@@ -267,15 +267,15 @@ fn do_create(
     if let Some(n) = a.name.as_deref() {
         builder = builder.name(n);
     }
-    if let Some(skills) = a.skills {
-        if !skills.is_empty() {
-            builder = builder.skills(skills);
-        }
+    if let Some(skills) = a.skills
+        && !skills.is_empty()
+    {
+        builder = builder.skills(skills);
     }
-    if let Some(r) = a.repeat {
-        if r > 0 {
-            builder = builder.repeat(r);
-        }
+    if let Some(r) = a.repeat
+        && r > 0
+    {
+        builder = builder.repeat(r);
     }
     if let Some(origin_chat) = origin_chat {
         builder = builder.origin(Origin {

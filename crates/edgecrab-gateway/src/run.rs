@@ -325,10 +325,10 @@ fn parse_approval_reply(text: &str) -> Option<edgecrab_core::ApprovalChoice> {
 
 fn parse_clarify_answer(text: &str, choices: &[String]) -> String {
     let trimmed = text.trim();
-    if let Ok(index) = trimmed.parse::<usize>() {
-        if (1..=choices.len()).contains(&index) {
-            return choices[index - 1].clone();
-        }
+    if let Ok(index) = trimmed.parse::<usize>()
+        && (1..=choices.len()).contains(&index)
+    {
+        return choices[index - 1].clone();
     }
     trimmed.to_string()
 }
@@ -686,10 +686,10 @@ async fn deliver_text_and_media(
     platform: edgecrab_types::Platform,
     metadata: &crate::platform::MessageMetadata,
 ) -> anyhow::Result<usize> {
-    if let Some(webhook_delivery) = metadata.webhook_delivery.as_ref() {
-        if should_use_custom_webhook_delivery(platform, webhook_delivery) {
-            return deliver_webhook_response(delivery, response, webhook_delivery).await;
-        }
+    if let Some(webhook_delivery) = metadata.webhook_delivery.as_ref()
+        && should_use_custom_webhook_delivery(platform, webhook_delivery)
+    {
+        return deliver_webhook_response(delivery, response, webhook_delivery).await;
     }
 
     let (cleaned, media_refs) = crate::platform::extract_media_from_response(response);
@@ -704,23 +704,23 @@ async fn deliver_text_and_media(
         0
     };
 
-    if !media_refs.is_empty() {
-        if let Some(adapter) = adapter {
-            for mref in &media_refs {
-                let result = if mref.is_image {
-                    adapter.send_photo(&mref.path, None, metadata).await
-                } else if crate::platform::MediaRef::detect_audio(&mref.path) {
-                    adapter.send_voice(&mref.path, None, metadata).await
-                } else {
-                    adapter.send_document(&mref.path, None, metadata).await
-                };
-                if let Err(e) = result {
-                    tracing::warn!(
-                        path = %mref.path,
-                        error = %e,
-                        "media delivery failed"
-                    );
-                }
+    if !media_refs.is_empty()
+        && let Some(adapter) = adapter
+    {
+        for mref in &media_refs {
+            let result = if mref.is_image {
+                adapter.send_photo(&mref.path, None, metadata).await
+            } else if crate::platform::MediaRef::detect_audio(&mref.path) {
+                adapter.send_voice(&mref.path, None, metadata).await
+            } else {
+                adapter.send_document(&mref.path, None, metadata).await
+            };
+            if let Err(e) = result {
+                tracing::warn!(
+                    path = %mref.path,
+                    error = %e,
+                    "media delivery failed"
+                );
             }
         }
     }
@@ -1053,6 +1053,10 @@ pub struct Gateway {
     voice_mode_path: PathBuf,
     /// Pairing store for DM code-based approval.
     pairing_store: Arc<PairingStore>,
+    /// Steering senders per session — populated when a session task starts,
+    /// removed when it exits.  Used by `SecondMessageMode::Steer` to inject
+    /// live guidance into a running agent loop.
+    steer_senders: Arc<tokio::sync::Mutex<HashMap<String, edgecrab_core::SteeringSender>>>,
 }
 
 impl Gateway {
@@ -1081,6 +1085,7 @@ impl Gateway {
             ))),
             voice_mode_path: gateway_voice_mode_path(),
             pairing_store: Arc::new(PairingStore::new()),
+            steer_senders: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -1547,10 +1552,10 @@ impl Gateway {
             }
         }
 
-        if let Some(agent) = self.agent.as_ref() {
-            if let Some(db) = agent.state_db().await {
-                let _ = crate::channel_directory::build_from_sessions(&db);
-            }
+        if let Some(agent) = self.agent.as_ref()
+            && let Some(db) = agent.state_db().await
+        {
+            let _ = crate::channel_directory::build_from_sessions(&db);
         }
 
         // Build axum router
@@ -1719,8 +1724,8 @@ impl Gateway {
                             &msg.user_id,
                             &self.pairing_store,
                         );
-                        if let Some(text) = reply {
-                            if let Some(adapter) = self
+                        if let Some(text) = reply
+                            && let Some(adapter) = self
                                 .adapters
                                 .iter()
                                 .find(|a| a.platform() == msg.platform)
@@ -1733,7 +1738,6 @@ impl Gateway {
                                     })
                                     .await;
                             }
-                        }
                         continue;
                     }
 
@@ -1758,14 +1762,34 @@ impl Gateway {
                             .map(|x| x.1)
                             .unwrap_or("")
                             .to_string();
-                        self.hook_registry.emit(
+                        let command_hook_result = self.hook_registry.emit_cancellable(
                             &format!("command:{cmd}"),
                             &HookContext::new(format!("command:{cmd}"))
                                 .with_user(&msg.user_id)
+                                .with_session(&session_key)
                                 .with_platform(format!("{:?}", msg.platform).to_lowercase())
                                 .with_str("command", &cmd)
                                 .with_str("args", &args_text),
                         ).await;
+
+                        if let crate::hooks::HookResult::Cancel { reason } = command_hook_result {
+                            let text = if reason.trim().is_empty() {
+                                "⛔ Command cancelled by a local hook.".to_string()
+                            } else {
+                                format!("⛔ Command cancelled by a local hook\n{reason}")
+                            };
+                            if let Some(adapter) = origin_adapter.clone() {
+                                let _ = adapter
+                                    .send(crate::platform::OutgoingMessage {
+                                        text,
+                                        metadata: msg.metadata.clone(),
+                                    })
+                                    .await;
+                            } else {
+                                let _ = delivery_router.deliver(&text, msg.platform, &msg.metadata).await;
+                            }
+                            continue;
+                        }
 
                         let reply_text: Option<String> = match cmd.as_str() {
                             "help" => {
@@ -2331,8 +2355,8 @@ impl Gateway {
                                                         crate::event_processor::should_surface_tool_completion(
                                                             &name, preview,
                                                         )
-                                                    }) {
-                                                        if let Some(adapter) = adapter.as_ref() {
+                                                    })
+                                                        && let Some(adapter) = adapter.as_ref() {
                                                             let _ = adapter
                                                                 .send_status(
                                                                     &format!(
@@ -2346,7 +2370,6 @@ impl Gateway {
                                                                 )
                                                                 .await;
                                                         }
-                                                    }
                                                 }
                                                 edgecrab_core::StreamEvent::SubAgentStart {
                                                     task_index,
@@ -2422,8 +2445,8 @@ impl Gateway {
                                                     duration_ms,
                                                     ..
                                                 } => {
-                                                    if let Some(batch) = subagent_batches.get_mut(&task_index) {
-                                                        if !batch.is_empty() {
+                                                    if let Some(batch) = subagent_batches.get_mut(&task_index)
+                                                        && !batch.is_empty() {
                                                             let summary = batch.join(", ");
                                                             batch.clear();
                                                             if let Some(adapter) = adapter.as_ref() {
@@ -2441,7 +2464,6 @@ impl Gateway {
                                                                     .await;
                                                             }
                                                         }
-                                                    }
                                                     if let Some(adapter) = adapter.as_ref() {
                                                         let _ = adapter
                                                             .send_status(
@@ -2468,6 +2490,23 @@ impl Gateway {
                                                 edgecrab_core::StreamEvent::SecretRequest { response_tx, .. } => {
                                                     let _ = response_tx.send(String::new());
                                                 }
+                                                edgecrab_core::StreamEvent::RunFinished { outcome }
+                                                    if !outcome.is_success() => {
+                                                        if let Some(adapter) = adapter.as_ref() {
+                                                            let status_text = if task_id_for_spawn.is_empty() {
+                                                                crate::event_processor::format_run_outcome_status(&outcome)
+                                                            } else {
+                                                                format!(
+                                                                    "{} {}",
+                                                                    task_id_for_spawn,
+                                                                    crate::event_processor::format_run_outcome_status(&outcome)
+                                                                )
+                                                            };
+                                                            let _ = adapter
+                                                                .send_status(&status_text, &metadata)
+                                                                .await;
+                                                        }
+                                                    }
                                                 edgecrab_core::StreamEvent::Error(err) => {
                                                     stream_error = Some(err);
                                                 }
@@ -2640,13 +2679,38 @@ impl Gateway {
                     }
 
                     // Emit hook
-                    self.hook_registry.emit(
+                    let start_hook_result = self.hook_registry.emit_cancellable(
                         "agent:start",
                         &HookContext::new("agent:start")
                             .with_user(&msg.user_id)
+                            .with_session(&session_key)
                             .with_platform(format!("{:?}", msg.platform).to_lowercase())
                             .with_str("message", &msg.text),
                     ).await;
+
+                    if let crate::hooks::HookResult::Cancel { reason } = start_hook_result {
+                        let text = if reason.trim().is_empty() {
+                            "⛔ Request cancelled by a local hook before the agent started.".to_string()
+                        } else {
+                            format!("⛔ Request cancelled by a local hook\n{reason}")
+                        };
+                        if let Some(adapter) = self
+                            .adapters
+                            .iter()
+                            .find(|a| a.platform() == msg.platform)
+                            .cloned()
+                        {
+                            let _ = adapter
+                                .send(crate::platform::OutgoingMessage {
+                                    text,
+                                    metadata: msg.metadata.clone(),
+                                })
+                                .await;
+                        } else {
+                            let _ = delivery_router.deliver(&text, msg.platform, &msg.metadata).await;
+                        }
+                        continue;
+                    }
 
                     // Dispatch to Agent
                     if let Some(ref base_agent) = self.agent {
@@ -2677,21 +2741,91 @@ impl Gateway {
                         {
                             let running = self.running_sessions.lock().await;
                             if running.contains_key(&session_key) {
-                                // Queue the message — don't cancel the running task.
-                                let mut pending = self.pending_messages.lock().await;
-                                pending.insert(session_key.clone(), msg.clone());
-                                drop(pending);
-                                drop(running);
-                                // Notify the user so they know the message was received.
-                                if let Some(ref adapter) = origin_adapter {
-                                    let _ = adapter
-                                        .send(crate::platform::OutgoingMessage {
-                                            text: "⏳ Message queued. I'll respond after the current request finishes.".into(),
-                                            metadata: msg.metadata.clone(),
-                                        })
-                                        .await;
+                                use crate::config::SecondMessageMode;
+                                match self.config.second_message_mode {
+                                    SecondMessageMode::Steer => {
+                                        // Inject as a Redirect steer into the running agent
+                                        // rather than queuing.  If the steer channel is gone
+                                        // (e.g. agent just finished), fall back to queue.
+                                        let steer_senders = self.steer_senders.lock().await;
+                                        let sent = if let Some(steer_tx) = steer_senders.get(&session_key) {
+                                            steer_tx.send(edgecrab_core::SteeringEvent::new(
+                                                edgecrab_core::SteeringKind::Redirect,
+                                                msg.text.clone(),
+                                            )).is_ok()
+                                        } else {
+                                            false
+                                        };
+                                        drop(steer_senders);
+                                        if sent {
+                                            if let Some(ref adapter) = origin_adapter {
+                                                let _ = adapter
+                                                    .send(crate::platform::OutgoingMessage {
+                                                        text: "⛵ Steering the agent with your new message...".into(),
+                                                        metadata: msg.metadata.clone(),
+                                                    })
+                                                    .await;
+                                            }
+                                            drop(running);
+                                            continue;
+                                        }
+                                        // Steer channel closed — fall through to queue.
+                                        drop(running);
+                                        let mut pending = self.pending_messages.lock().await;
+                                        pending.insert(session_key.clone(), msg.clone());
+                                        drop(pending);
+                                        if let Some(ref adapter) = origin_adapter {
+                                            let _ = adapter
+                                                .send(crate::platform::OutgoingMessage {
+                                                    text: "⏳ Message queued. I'll respond after the current request finishes.".into(),
+                                                    metadata: msg.metadata.clone(),
+                                                })
+                                                .await;
+                                        }
+                                        continue;
+                                    }
+                                    SecondMessageMode::Interrupt => {
+                                        // Cancel the running task and let the new message
+                                        // start a fresh turn.  We remove the running token
+                                        // which cancels it, then fall through to spawn.
+                                        let cancel_token = running.get(&session_key).cloned();
+                                        drop(running);
+                                        if let Some(token) = cancel_token {
+                                            token.cancel();
+                                            // Clear any previously queued pending message.
+                                            let mut pending = self.pending_messages.lock().await;
+                                            pending.remove(&session_key);
+                                            drop(pending);
+                                        }
+                                        // Remove the session registration so the new task
+                                        // can register itself below.
+                                        let mut guard = self.running_sessions.lock().await;
+                                        guard.remove(&session_key);
+                                        drop(guard);
+                                        // Remove the stale steer sender.
+                                        let mut steer_senders = self.steer_senders.lock().await;
+                                        steer_senders.remove(&session_key);
+                                        drop(steer_senders);
+                                        // Fall through to the spawn logic below.
+                                    }
+                                    SecondMessageMode::Queue => {
+                                        // Queue the message — don't cancel the running task.
+                                        let mut pending = self.pending_messages.lock().await;
+                                        pending.insert(session_key.clone(), msg.clone());
+                                        drop(pending);
+                                        drop(running);
+                                        // Notify the user so they know the message was received.
+                                        if let Some(ref adapter) = origin_adapter {
+                                            let _ = adapter
+                                                .send(crate::platform::OutgoingMessage {
+                                                    text: "⏳ Message queued. I'll respond after the current request finishes.".into(),
+                                                    metadata: msg.metadata.clone(),
+                                                })
+                                                .await;
+                                        }
+                                        continue; // Don't spawn a second task
+                                    }
                                 }
-                                continue; // Don't spawn a second task
                             }
                         }
 
@@ -2748,6 +2882,15 @@ impl Gateway {
                         let msg_tx = tx.clone();
                         let hook_registry_for_spawn = self.hook_registry.clone();
                         let interaction_broker = self.interaction_broker.clone();
+
+                        // Register the steering sender so SecondMessageMode::Steer can
+                        // inject guidance into this session's running agent loop.
+                        {
+                            let mut steer_guard = self.steer_senders.lock().await;
+                            steer_guard.insert(session_key.clone(), session_agent.steer_sender());
+                        }
+                        let steer_senders_for_task = self.steer_senders.clone();
+
                         // The token is registered in running_sessions; drop the local copy.
                         // /stop cancels the map-held token via running_sessions.remove().cancel().
                         drop(task_cancel);
@@ -2841,12 +2984,79 @@ impl Gateway {
                                             response_len,
                                             "agent response delivered"
                                         );
+
+                                        let run_outcome = session_agent.last_run_outcome().await.unwrap_or_else(|| {
+                                            edgecrab_types::RunOutcome::new(
+                                                edgecrab_types::CompletionDecision::Incomplete,
+                                                edgecrab_types::ExitReason::NoMoreToolCalls,
+                                                "Run finished without an explicit terminal outcome.",
+                                            )
+                                        });
+
+                                        let base_context = HookContext::new("agent:response_delivered")
+                                            .with_user(&msg_clone.user_id)
+                                            .with_session(&task_session_key)
+                                            .with_platform(msg_clone.platform.to_string())
+                                            .with_value("response_len", response_len as u64)
+                                            .with_str("completion_state", run_outcome.state.as_str())
+                                            .with_str("exit_reason", run_outcome.exit_reason.as_str())
+                                            .with_str("summary", run_outcome.user_summary.clone())
+                                            .with_value("active_tasks", run_outcome.active_tasks as u64)
+                                            .with_value("blocked_tasks", run_outcome.blocked_tasks as u64);
+
+                                        hooks.emit("agent:response_delivered", &base_context).await;
+                                        hooks.emit(
+                                            "agent:run_finished",
+                                            &HookContext::new("agent:run_finished")
+                                                .with_user(&msg_clone.user_id)
+                                                .with_session(&task_session_key)
+                                                .with_platform(msg_clone.platform.to_string())
+                                                .with_str("completion_state", run_outcome.state.as_str())
+                                                .with_str("exit_reason", run_outcome.exit_reason.as_str())
+                                                .with_str("summary", run_outcome.user_summary.clone())
+                                                .with_value("active_tasks", run_outcome.active_tasks as u64)
+                                                .with_value("blocked_tasks", run_outcome.blocked_tasks as u64),
+                                        )
+                                        .await;
                                         hooks.emit(
                                             "agent:done",
                                             &HookContext::new("agent:done")
-                                                .with_user(&msg_clone.user_id),
+                                                .with_user(&msg_clone.user_id)
+                                                .with_session(&task_session_key)
+                                                .with_platform(msg_clone.platform.to_string())
+                                                .with_str("completion_state", run_outcome.state.as_str())
+                                                .with_str("exit_reason", run_outcome.exit_reason.as_str())
+                                                .with_str("summary", run_outcome.user_summary.clone()),
                                         )
                                         .await;
+
+                                        if run_outcome.is_success() {
+                                            hooks.emit(
+                                                "agent:task_completed",
+                                                &HookContext::new("agent:task_completed")
+                                                    .with_user(&msg_clone.user_id)
+                                                    .with_session(&task_session_key)
+                                                    .with_platform(msg_clone.platform.to_string())
+                                                    .with_str("summary", run_outcome.user_summary.clone()),
+                                            )
+                                            .await;
+                                        } else if matches!(
+                                            run_outcome.state,
+                                            edgecrab_types::CompletionDecision::Blocked
+                                                | edgecrab_types::CompletionDecision::NeedsUserInput
+                                        ) {
+                                            hooks.emit(
+                                                "agent:task_blocked",
+                                                &HookContext::new("agent:task_blocked")
+                                                    .with_user(&msg_clone.user_id)
+                                                    .with_session(&task_session_key)
+                                                    .with_platform(msg_clone.platform.to_string())
+                                                    .with_str("completion_state", run_outcome.state.as_str())
+                                                    .with_str("exit_reason", run_outcome.exit_reason.as_str())
+                                                    .with_str("summary", run_outcome.user_summary.clone()),
+                                            )
+                                            .await;
+                                        }
                                     }
                                     Err(e) => {
                                         tracing::error!(
@@ -2854,6 +3064,28 @@ impl Gateway {
                                             platform = ?msg_clone.platform,
                                             "agent dispatch failed"
                                         );
+                                        hooks.emit(
+                                            "agent:run_finished",
+                                            &HookContext::new("agent:run_finished")
+                                                .with_user(&msg_clone.user_id)
+                                                .with_session(&task_session_key)
+                                                .with_platform(msg_clone.platform.to_string())
+                                                .with_str("completion_state", "failed")
+                                                .with_str("exit_reason", "dispatch_failed")
+                                                .with_str("summary", e.to_string()),
+                                        )
+                                        .await;
+                                        hooks.emit(
+                                            "agent:done",
+                                            &HookContext::new("agent:done")
+                                                .with_user(&msg_clone.user_id)
+                                                .with_session(&task_session_key)
+                                                .with_platform(msg_clone.platform.to_string())
+                                                .with_str("completion_state", "failed")
+                                                .with_str("exit_reason", "dispatch_failed")
+                                                .with_str("summary", e.to_string()),
+                                        )
+                                        .await;
                                     }
                                 }
                             })
@@ -2883,6 +3115,12 @@ impl Gateway {
                             {
                                 let mut guard = running_sessions.lock().await;
                                 guard.remove(&task_session_key);
+                            }
+
+                            // Remove the steering sender for this session.
+                            {
+                                let mut steer_guard = steer_senders_for_task.lock().await;
+                                steer_guard.remove(&task_session_key);
                             }
 
                             // Re-dispatch any message that arrived while we were running.

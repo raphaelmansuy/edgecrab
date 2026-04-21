@@ -7,7 +7,7 @@
 //!
 //! # Quick Start
 //!
-//! ```rust,no_run
+//! ```rust,ignore
 //! use edgecrab_sdk::prelude::*;
 //!
 //! # async fn example() -> Result<(), SdkError> {

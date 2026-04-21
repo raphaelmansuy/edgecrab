@@ -204,6 +204,9 @@ impl ToolHandler for TerminalTool {
             message: e.to_string(),
         })?;
 
+        // Soft guardrail: detect file I/O anti-patterns (cat, head, echo >, etc.)
+        let antipattern_warning = detect_file_io_antipattern(&args.command);
+
         if args.background {
             let started = crate::tools::process::start_background_process(
                 "terminal",
@@ -216,9 +219,20 @@ impl ToolHandler for TerminalTool {
             .await?;
             return Ok(
                 if args.timeout.is_some() || args.timeout_seconds != default_timeout() {
-                    format!(
-                        "{started}\n[terminal note] background mode ignores terminal timeout; use process(action=\"wait\", session_id=..., timeout=...) to block for completion."
-                    )
+                    // Embed the timeout-ignored note inside the JSON so the result stays parseable
+                    if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&started) {
+                        if let Some(obj) = v.as_object_mut() {
+                            obj.insert(
+                                "note".to_string(),
+                                serde_json::Value::String(
+                                    "background mode ignores timeout; use wait_for_process to block for completion".to_string(),
+                                ),
+                            );
+                        }
+                        serde_json::to_string(&v).unwrap_or(started)
+                    } else {
+                        started
+                    }
                 } else {
                     started
                 },
@@ -308,20 +322,21 @@ impl ToolHandler for TerminalTool {
                     .await;
 
                 // Check for retryable errors before consuming the value.
-                if let Err(ref e) = result {
-                    if attempt < MAX_RETRIES && is_backend_retryable(e) {
-                        let wait = Duration::from_secs(1u64 << (attempt + 1)); // 2, 4, 8 s
-                        tracing::warn!(
-                            task_id = %ctx.task_id,
-                            attempt = attempt + 1,
-                            wait_secs = wait.as_secs(),
-                            error = %e,
-                            "terminal backend error; retrying",
-                        );
-                        attempt += 1;
-                        tokio::time::sleep(wait).await;
-                        continue;
-                    }
+                if let Err(ref e) = result
+                    && attempt < MAX_RETRIES
+                    && is_backend_retryable(e)
+                {
+                    let wait = Duration::from_secs(1u64 << (attempt + 1)); // 2, 4, 8 s
+                    tracing::warn!(
+                        task_id = %ctx.task_id,
+                        attempt = attempt + 1,
+                        wait_secs = wait.as_secs(),
+                        error = %e,
+                        "terminal backend error; retrying",
+                    );
+                    attempt += 1;
+                    tokio::time::sleep(wait).await;
+                    continue;
                 }
 
                 match result {
@@ -357,6 +372,11 @@ impl ToolHandler for TerminalTool {
         } else {
             format!("{header}\n{result}")
         };
+
+        // Prepend soft-guardrail warning when a file I/O anti-pattern was detected.
+        if let Some(warning) = antipattern_warning {
+            result = format!("[NOTE: {warning}]\n\n{result}");
+        }
 
         Ok(result)
     }
@@ -411,6 +431,68 @@ fn destructive_checkpoint_label(command: &str) -> String {
 /// non-zero exit — retrying won't change the result).
 fn is_backend_retryable(err: &ToolError) -> bool {
     matches!(err, ToolError::Unavailable { .. } | ToolError::Other(_))
+}
+
+// ── Terminal anti-pattern guard ──────────────────────────────────────
+// Detects when the LLM uses `terminal` as an escape hatch for simple
+// file I/O that has a dedicated, faster, path-safe tool.
+// Returns a soft warning prepended to output — does NOT block execution.
+
+use regex::Regex;
+use std::sync::LazyLock;
+
+static FILE_IO_PATTERNS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
+    vec![
+        (
+            Regex::new(r"^cat\s+").expect("valid cat anti-pattern regex"),
+            "Use `read_file` instead of `cat` — it handles encoding and large files safely.",
+        ),
+        (
+            Regex::new(r"^head\s+").expect("valid head anti-pattern regex"),
+            "Use `read_file` with line range instead of `head`.",
+        ),
+        (
+            Regex::new(r"^tail\s+").expect("valid tail anti-pattern regex"),
+            "Use `read_file` with line range instead of `tail`.",
+        ),
+        (
+            Regex::new(r"python3?\s+-c\s+.*open\(").expect("valid python open anti-pattern regex"),
+            "Use `read_file` instead of python file I/O — it's faster and path-safe.",
+        ),
+        (
+            Regex::new(r"^less\s+|^more\s+").expect("valid pager anti-pattern regex"),
+            "Use `read_file` instead of `less`/`more`.",
+        ),
+        (
+            Regex::new(r#"^echo\s+.*>\s*\S+"#).expect("valid echo redirect anti-pattern regex"),
+            "Use `write_file` instead of `echo >` — it creates parent dirs and validates paths.",
+        ),
+        (
+            Regex::new(r"^sed\s+-i").expect("valid sed anti-pattern regex"),
+            "Use `patch` instead of `sed -i` — it has fuzzy matching and creates backups.",
+        ),
+    ]
+});
+
+fn detect_file_io_antipattern(command: &str) -> Option<&'static str> {
+    let trimmed = command.trim();
+    for (pattern, suggestion) in FILE_IO_PATTERNS.iter() {
+        if pattern.is_match(trimmed) {
+            return Some(suggestion);
+        }
+    }
+    // Also check first segment of piped commands
+    if let Some(first_cmd) = trimmed.split('|').next() {
+        let first_trimmed = first_cmd.trim();
+        if first_trimmed != trimmed {
+            for (pattern, suggestion) in FILE_IO_PATTERNS.iter() {
+                if pattern.is_match(first_trimmed) {
+                    return Some(suggestion);
+                }
+            }
+        }
+    }
+    None
 }
 
 inventory::submit!(&TerminalTool as &dyn ToolHandler);
@@ -546,8 +628,15 @@ mod tests {
             .await
             .expect("background process");
 
-        assert!(result.contains("Process started"), "got: {result}");
-        assert!(result.contains("id=proc-"), "got: {result}");
+        assert!(result.contains("proc-"), "got: {result}");
+        // R18: result is JSON with process_id field
+        let v: serde_json::Value =
+            serde_json::from_str(&result).expect("background result must be JSON");
+        assert_eq!(v["ok"], serde_json::Value::Bool(true));
+        assert!(
+            v["process_id"].as_str().unwrap_or("").starts_with("proc-"),
+            "got: {result}"
+        );
     }
 
     #[tokio::test]
@@ -730,5 +819,45 @@ mod tests {
 
         drop(held_clone);
         let _ = cleanup_all_backends().await;
+    }
+
+    #[test]
+    fn detect_cat_antipattern() {
+        assert!(detect_file_io_antipattern("cat main.rs").is_some());
+        assert!(detect_file_io_antipattern("  cat  README.md").is_some());
+    }
+
+    #[test]
+    fn detect_head_tail_antipattern() {
+        assert!(detect_file_io_antipattern("head -n 20 file.txt").is_some());
+        assert!(detect_file_io_antipattern("tail -f /var/log/syslog").is_some());
+    }
+
+    #[test]
+    fn detect_echo_redirect_antipattern() {
+        assert!(detect_file_io_antipattern("echo hello > output.txt").is_some());
+    }
+
+    #[test]
+    fn detect_sed_inplace_antipattern() {
+        assert!(detect_file_io_antipattern("sed -i 's/foo/bar/' file.rs").is_some());
+    }
+
+    #[test]
+    fn detect_python_file_read_antipattern() {
+        assert!(detect_file_io_antipattern("python3 -c 'print(open(\"f\").read())'").is_some());
+    }
+
+    #[test]
+    fn detect_piped_antipattern() {
+        assert!(detect_file_io_antipattern("cat file.txt | grep foo").is_some());
+    }
+
+    #[test]
+    fn no_false_positive_for_legitimate_commands() {
+        assert!(detect_file_io_antipattern("cargo test --workspace").is_none());
+        assert!(detect_file_io_antipattern("ls -la").is_none());
+        assert!(detect_file_io_antipattern("grep -rn pattern src/").is_none());
+        assert!(detect_file_io_antipattern("git status").is_none());
     }
 }

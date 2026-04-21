@@ -1,6 +1,6 @@
 # 🦀 Hooks
 
-> **WHY**: Platform adapters need to run custom logic at specific lifecycle points — log to an audit service when a session starts, block certain users, transform messages in flight — without modifying the core runtime or the gateway crate. Hooks are the extension point.
+> **WHY**: Operators and platform adapters often need custom logic at specific lifecycle points — audit logging, policy enforcement, auto-resume gates, completion reviews, or message/session controls — without modifying the core runtime. Hooks are the extension point across both the CLI/TUI and the gateway.
 
 **Source**: `crates/edgecrab-gateway/src/hooks.rs`
 
@@ -8,7 +8,7 @@
 
 ## Two Hook Types
 
-```
+```text
 ┌───────────────────────────────────────────────┐
 │                  HookRegistry                  │
 │                                                │
@@ -68,7 +68,7 @@ pub struct HookManifest {
 
 ## Script Hook Layout
 
-```
+```text
 ~/.edgecrab/hooks/
 └── my-audit-hook/
     ├── HOOK.yaml         ← manifest
@@ -115,6 +115,8 @@ if __name__ == "__main__":
 
 Python hooks run via `python3`. JavaScript/TypeScript hooks run via `bun`.
 
+Use `/hooks` in the TUI to inspect loaded hooks, see which events they subscribe to, and reload the registry after edits.
+
 ### `handler.ts` Contract (TypeScript via Bun)
 
 ```typescript
@@ -149,7 +151,7 @@ console.log(JSON.stringify(handle(ctx)));
 ### Gateway Lifecycle
 
 | Event | Fires when | Key `fields` |
-|---|---|---|
+| --- | --- | --- |
 | `gateway:startup` | Gateway process starts | `platform`, `adapter_version` |
 | `session:start` | New session created | `source`, `user_id` |
 | `session:end` | Session ends normally | `turn_count`, `total_tokens` |
@@ -158,36 +160,44 @@ console.log(JSON.stringify(handle(ctx)));
 ### Agent Lifecycle
 
 | Event | Fires when | Key `fields` |
-|---|---|---|
-| `agent:start` | Agent begins processing a turn | `model`, `toolset` |
+| --- | --- | --- |
+| `agent:start` | Agent begins processing a turn | `model`, `toolset`, `message` |
 | `agent:step` | Each ReAct loop iteration | `iteration`, `tool_name` (if tool call) |
 | `agent:end` | Agent finishes a turn | `iterations`, `tokens` |
+| `agent:run_finished` | A run reaches a terminal harness outcome | `completion_state`, `exit_reason`, `summary` |
+| `agent:done` | Final lifecycle notification after a run ends | `completion_state`, `exit_reason`, `summary` |
+| `agent:stop` | Final stop-review gate before a run is accepted | `completion_state`, `exit_reason`, `summary`, `active_tasks`, `blocked_tasks` |
+| `agent:task_completed` | Run completed successfully | `summary` |
+| `agent:task_blocked` | Run ended blocked or awaiting user input | `completion_state`, `summary` |
+| `agent:needs_input` | Run needs clarification from the user | `completion_state`, `summary` |
+| `agent:needs_verification` | Run lacks fresh evidence for completion | `summary`, `evidence_count` |
+| `agent:task_incomplete` | Run stopped with work still pending | `summary`, `active_tasks`, `blocked_tasks` |
 
 ### Tool Events
 
 | Event | Fires when | Key `fields` |
-|---|---|---|
+| --- | --- | --- |
 | `tool:pre` | Before tool execution | `tool_name`, `arguments` |
 | `tool:post` | After tool execution | `tool_name`, `success`, `output_bytes` |
 
 ### LLM Events
 
 | Event | Fires when | Key `fields` |
-|---|---|---|
+| --- | --- | --- |
 | `llm:pre` | Before sending request to provider | `model`, `message_count`, `prompt_tokens_est` |
 | `llm:post` | After receiving response | `model`, `finish_reason`, `tokens` |
 
 ### CLI Events
 
 | Event | Fires when | Key `fields` |
-|---|---|---|
+| --- | --- | --- |
 | `cli:start` | CLI process starts | `args` |
 | `cli:end` | CLI process exits | `exit_code` |
 
 ### Command Events
 
 | Pattern | Fires when |
-|---|---|
+| --- | --- |
 | `command:*` | Any slash command (`/reset`, `/memory`, `/skills`…) |
 | `command:reset` | Specifically `/reset` |
 
@@ -197,7 +207,7 @@ console.log(JSON.stringify(handle(ctx)));
 
 The `HookRegistry` supports three matching modes:
 
-```
+```text
 Exact match:    "session:start"  → only that event
 Prefix wildcard: "command:*"     → any event starting with "command:"
 Global wildcard: "*"             → every event (use sparingly)
@@ -218,7 +228,7 @@ events:
 
 When an event fires:
 
-```
+```text
 event fires
      │
      ▼
@@ -237,6 +247,8 @@ execute in registration order
 ```
 
 A single `Cancel` short-circuits the rest of the hook chain.
+
+In live behavior, `command:*`, `agent:start`, and `agent:stop` are especially useful because they can block or defer execution with a human-readable reason.
 
 ---
 

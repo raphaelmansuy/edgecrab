@@ -25,42 +25,41 @@ use tracing::{debug, warn};
 /// 6. `None`
 pub fn resolve_proxy_url(platform_env_var: Option<&str>) -> Option<String> {
     // 1. Platform-specific var
-    if let Some(var_name) = platform_env_var {
-        if let Ok(url) = std::env::var(var_name) {
-            if !url.is_empty() {
-                debug!(var = var_name, url = %url, "Using platform-specific proxy");
-                return Some(url);
-            }
-        }
+    if let Some(var_name) = platform_env_var
+        && let Ok(url) = std::env::var(var_name)
+        && !url.is_empty()
+    {
+        debug!(var = var_name, url = %url, "Using platform-specific proxy");
+        return Some(url);
     }
 
     // 2. HTTPS_PROXY (uppercase then lowercase)
     for var in &["HTTPS_PROXY", "https_proxy"] {
-        if let Ok(url) = std::env::var(var) {
-            if !url.is_empty() {
-                debug!(var, url = %url, "Using HTTPS proxy");
-                return Some(url);
-            }
+        if let Ok(url) = std::env::var(var)
+            && !url.is_empty()
+        {
+            debug!(var, url = %url, "Using HTTPS proxy");
+            return Some(url);
         }
     }
 
     // 3. HTTP_PROXY (uppercase then lowercase)
     for var in &["HTTP_PROXY", "http_proxy"] {
-        if let Ok(url) = std::env::var(var) {
-            if !url.is_empty() {
-                debug!(var, url = %url, "Using HTTP proxy");
-                return Some(url);
-            }
+        if let Ok(url) = std::env::var(var)
+            && !url.is_empty()
+        {
+            debug!(var, url = %url, "Using HTTP proxy");
+            return Some(url);
         }
     }
 
     // 4. ALL_PROXY (uppercase then lowercase)
     for var in &["ALL_PROXY", "all_proxy"] {
-        if let Ok(url) = std::env::var(var) {
-            if !url.is_empty() {
-                debug!(var, url = %url, "Using ALL_PROXY");
-                return Some(url);
-            }
+        if let Ok(url) = std::env::var(var)
+            && !url.is_empty()
+        {
+            debug!(var, url = %url, "Using ALL_PROXY");
+            return Some(url);
         }
     }
 

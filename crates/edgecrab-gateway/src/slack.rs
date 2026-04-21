@@ -705,13 +705,12 @@ impl PlatformAdapter for SlackAdapter {
                 }
 
                 if envelope.event_type.as_deref() == Some("slash_commands") {
-                    if let Some(payload) = envelope.payload {
-                        if let Some(incoming) = self.parse_slash_command(payload) {
-                            if tx.send(incoming).await.is_err() {
-                                info!("Slack adapter: receiver dropped, shutting down");
-                                return Ok(());
-                            }
-                        }
+                    if let Some(payload) = envelope.payload
+                        && let Some(incoming) = self.parse_slash_command(payload)
+                        && tx.send(incoming).await.is_err()
+                    {
+                        info!("Slack adapter: receiver dropped, shutting down");
+                        return Ok(());
                     }
                     continue;
                 }

@@ -180,10 +180,10 @@ fn resolve_preview_write_path(
     // case where it doesn't exist yet.
     let tmp_dir = config.file_tools_tmp_dir();
     allowed_roots.push(tmp_dir.clone());
-    if let Ok(root) = tmp_dir.canonicalize() {
-        if root != tmp_dir {
-            allowed_roots.push(root);
-        }
+    if let Ok(root) = tmp_dir.canonicalize()
+        && root != tmp_dir
+    {
+        allowed_roots.push(root);
     }
     for root in &config.file_allowed_roots {
         let resolved = if root.is_absolute() {
@@ -233,11 +233,11 @@ fn extract_apply_patch_paths(patch_text: &str) -> Vec<String> {
             paths.push(path.trim().to_string());
             continue;
         }
-        if let Some(rest) = line.strip_prefix("*** Move File:") {
-            if let Some((old_path, new_path)) = rest.split_once("->") {
-                paths.push(old_path.trim().to_string());
-                paths.push(new_path.trim().to_string());
-            }
+        if let Some(rest) = line.strip_prefix("*** Move File:")
+            && let Some((old_path, new_path)) = rest.split_once("->")
+        {
+            paths.push(old_path.trim().to_string());
+            paths.push(new_path.trim().to_string());
         }
     }
 

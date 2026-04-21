@@ -105,15 +105,14 @@ fn collect_files(cwd: &Path) -> Vec<PathBuf> {
         .arg("ls-files")
         .current_dir(cwd)
         .output()
+        && out.status.success()
     {
-        if out.status.success() {
-            return String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .map(PathBuf::from)
-                .filter(|p| cwd.join(p).is_file())
-                .take(2000)
-                .collect();
-        }
+        return String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(PathBuf::from)
+            .filter(|p| cwd.join(p).is_file())
+            .take(2000)
+            .collect();
     }
     let mut v = Vec::new();
     collect_recursive(cwd, cwd, 0, 4, &mut v);
@@ -244,37 +243,59 @@ fn action_create(ctx: &ToolContext, reason: &str) -> Result<String, ToolError> {
     git(&["add", "-A"], &shadow)?;
     let status = git(&["status", "--porcelain"], &shadow)?;
     if status.is_empty() {
-        return Ok(format!(
-            "Checkpoint created (no file changes, {count} files tracked)."
-        ));
+        return Ok(serde_json::to_string(&json!({
+            "ok": true,
+            "action": "created",
+            "n": serde_json::Value::Null,
+            "label": reason,
+            "files": count,
+            "has_new_commit": false
+        }))
+        .expect("infallible"));
     }
     git(&["commit", "-m", reason, "--quiet"], &shadow)?;
     let n = log_entries(&shadow).len();
-    Ok(format!(
-        "Checkpoint #{n} '{reason}' created ({count} files tracked)."
-    ))
+    Ok(serde_json::to_string(&json!({
+        "ok": true,
+        "action": "created",
+        "n": n,
+        "label": reason,
+        "files": count,
+        "has_new_commit": true
+    }))
+    .expect("infallible"))
 }
 
 fn action_list(ctx: &ToolContext) -> Result<String, ToolError> {
     let shadow = shadow_dir(&ctx.config.edgecrab_home, &ctx.cwd);
     if !shadow.join(".git").exists() {
-        return Ok("No checkpoints found.".into());
+        let result = json!({"ok": true, "action": "list", "total": 0, "checkpoints": []});
+        return Ok(serde_json::to_string(&result).expect("infallible"));
     }
     let entries = log_entries(&shadow);
     if entries.is_empty() {
-        return Ok("No checkpoints found.".into());
+        let result = json!({"ok": true, "action": "list", "total": 0, "checkpoints": []});
+        return Ok(serde_json::to_string(&result).expect("infallible"));
     }
-    let mut out = format!("Checkpoints ({}):\n", entries.len());
-    for (i, (hash, subj, date)) in entries.iter().enumerate() {
-        out.push_str(&format!(
-            "  {:>3}  {}  {}  ({})\n",
-            i + 1,
-            crate::safe_truncate(hash, 8),
-            subj,
-            date
-        ));
-    }
-    Ok(out)
+    let checkpoints: Vec<serde_json::Value> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, (hash, subj, date))| {
+            json!({
+                "n": i + 1,
+                "hash": crate::safe_truncate(hash, 8),
+                "label": subj,
+                "date": date
+            })
+        })
+        .collect();
+    let result = json!({
+        "ok": true,
+        "action": "list",
+        "total": checkpoints.len(),
+        "checkpoints": checkpoints
+    });
+    Ok(serde_json::to_string(&result).expect("infallible"))
 }
 
 fn action_restore(ctx: &ToolContext, n: u32) -> Result<String, ToolError> {
@@ -299,9 +320,13 @@ fn action_restore(ctx: &ToolContext, n: u32) -> Result<String, ToolError> {
         })?;
         restored += 1;
     }
-    Ok(format!(
-        "Checkpoint #{n} restored ({restored} files written)."
-    ))
+    Ok(serde_json::to_string(&json!({
+        "ok": true,
+        "action": "restored",
+        "n": n,
+        "files_restored": restored
+    }))
+    .expect("infallible"))
 }
 
 fn action_diff(ctx: &ToolContext, n: u32) -> Result<String, ToolError> {
@@ -345,25 +370,26 @@ fn action_diff(ctx: &ToolContext, n: u32) -> Result<String, ToolError> {
     }
 
     if added.is_empty() && modified.is_empty() && deleted.is_empty() {
-        return Ok(format!("Checkpoint #{n}: no changes vs current state."));
+        return Ok(serde_json::to_string(&json!({
+            "ok": true,
+            "action": "diff",
+            "n": n,
+            "message": "no changes vs current state",
+            "added": serde_json::Value::Array(vec![]),
+            "modified": serde_json::Value::Array(vec![]),
+            "deleted": serde_json::Value::Array(vec![])
+        }))
+        .expect("infallible"));
     }
-    let mut out = format!("Diff vs checkpoint #{n}:\n");
-    for f in &added {
-        out.push_str(&format!("  + {f}  (added)\n"));
-    }
-    for f in &modified {
-        out.push_str(&format!("  ~ {f}  (modified)\n"));
-    }
-    for f in &deleted {
-        out.push_str(&format!("  - {f}  (deleted)\n"));
-    }
-    out.push_str(&format!(
-        "\n{} added, {} modified, {} deleted",
-        added.len(),
-        modified.len(),
-        deleted.len()
-    ));
-    Ok(out)
+    Ok(serde_json::to_string(&json!({
+        "ok": true,
+        "action": "diff",
+        "n": n,
+        "added": added,
+        "modified": modified,
+        "deleted": deleted
+    }))
+    .expect("infallible"))
 }
 
 fn action_restore_file(ctx: &ToolContext, n: u32, file: &str) -> Result<String, ToolError> {
@@ -386,7 +412,13 @@ fn action_restore_file(ctx: &ToolContext, n: u32, file: &str) -> Result<String, 
         tool: "checkpoint".into(),
         message: format!("Failed to write {file}: {e}"),
     })?;
-    Ok(format!("File '{file}' restored from checkpoint #{n}."))
+    Ok(serde_json::to_string(&json!({
+        "ok": true,
+        "action": "restore_file",
+        "n": n,
+        "file": file
+    }))
+    .expect("infallible"))
 }
 
 // ── Tool handler ──────────────────────────────────────────────────────────────

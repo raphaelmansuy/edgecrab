@@ -181,10 +181,10 @@ impl AppConfig {
         if let Ok(val) = std::env::var("EDGECRAB_MODEL") {
             self.model.default_model = val;
         }
-        if let Ok(val) = std::env::var("EDGECRAB_MAX_ITERATIONS") {
-            if let Ok(n) = val.parse() {
-                self.model.max_iterations = n;
-            }
+        if let Ok(val) = std::env::var("EDGECRAB_MAX_ITERATIONS")
+            && let Ok(n) = val.parse()
+        {
+            self.model.max_iterations = n;
         }
         if let Ok(val) = std::env::var("EDGECRAB_LOG_LEVEL") {
             self.logging.level = val;
@@ -207,15 +207,20 @@ impl AppConfig {
         if let Ok(val) = std::env::var("EDGECRAB_TOOL_RESULT_SPILL") {
             self.tools.result_spill = parse_bool_env(&val);
         }
-        if let Ok(val) = std::env::var("EDGECRAB_TOOL_RESULT_SPILL_THRESHOLD") {
-            if let Ok(n) = val.parse() {
-                self.tools.result_spill_threshold = n;
-            }
+        if let Ok(val) = std::env::var("EDGECRAB_TOOL_RESULT_SPILL_THRESHOLD")
+            && let Ok(n) = val.parse()
+        {
+            self.tools.result_spill_threshold = n;
         }
-        if let Ok(val) = std::env::var("EDGECRAB_TOOL_RESULT_SPILL_PREVIEW_LINES") {
-            if let Ok(n) = val.parse() {
-                self.tools.result_spill_preview_lines = n;
-            }
+        if let Ok(val) = std::env::var("EDGECRAB_TOOL_RESULT_SPILL_PREVIEW_LINES")
+            && let Ok(n) = val.parse()
+        {
+            self.tools.result_spill_preview_lines = n;
+        }
+        if let Ok(val) = std::env::var("EDGECRAB_MAX_WRITE_PAYLOAD_KIB")
+            && let Ok(n) = val.parse()
+        {
+            self.tools.file.max_write_payload_kib = Some(n);
         }
         if let Ok(val) = std::env::var("EDGECRAB_PLUGINS_ENABLED") {
             self.plugins.enabled = parse_bool_env(&val);
@@ -223,10 +228,10 @@ impl AppConfig {
         if let Ok(val) = std::env::var("EDGECRAB_PLUGINS_AUTO_ENABLE") {
             self.plugins.auto_enable = parse_bool_env(&val);
         }
-        if let Ok(val) = std::env::var("EDGECRAB_PLUGINS_CALL_TIMEOUT") {
-            if let Ok(seconds) = val.parse() {
-                self.plugins.call_timeout_secs = seconds;
-            }
+        if let Ok(val) = std::env::var("EDGECRAB_PLUGINS_CALL_TIMEOUT")
+            && let Ok(seconds) = val.parse()
+        {
+            self.plugins.call_timeout_secs = seconds;
         }
         if let Ok(val) = std::env::var("EDGECRAB_PLUGINS_HUB_ENABLED") {
             self.plugins.hub.enabled = parse_bool_env(&val);
@@ -260,10 +265,10 @@ impl AppConfig {
         if let Ok(val) = std::env::var("EDGECRAB_GATEWAY_HOST") {
             self.gateway.host = val;
         }
-        if let Ok(val) = std::env::var("EDGECRAB_GATEWAY_PORT") {
-            if let Ok(port) = val.parse() {
-                self.gateway.port = port;
-            }
+        if let Ok(val) = std::env::var("EDGECRAB_GATEWAY_PORT")
+            && let Ok(port) = val.parse()
+        {
+            self.gateway.port = port;
         }
         if let Ok(val) = std::env::var("EDGECRAB_GATEWAY_WEBHOOK") {
             self.gateway.webhook_enabled = parse_bool_env(&val);
@@ -339,10 +344,10 @@ impl AppConfig {
         if let Ok(val) = std::env::var("WHATSAPP_ALLOWED_USERS") {
             self.gateway.whatsapp.allowed_users = parse_csv_env(&val);
         }
-        if let Ok(val) = std::env::var("WHATSAPP_BRIDGE_PORT") {
-            if let Ok(port) = val.parse() {
-                self.gateway.whatsapp.bridge_port = port;
-            }
+        if let Ok(val) = std::env::var("WHATSAPP_BRIDGE_PORT")
+            && let Ok(port) = val.parse()
+        {
+            self.gateway.whatsapp.bridge_port = port;
         }
         if let Ok(val) = std::env::var("WHATSAPP_BRIDGE_URL") {
             self.gateway.whatsapp.bridge_url = Some(val);
@@ -946,6 +951,13 @@ pub struct FileToolsConfig {
     ///
     /// The active workspace root is always allowed implicitly.
     pub allowed_roots: Vec<PathBuf>,
+    /// Maximum write payload size in KiB for file mutation tools (write_file,
+    /// patch, apply_patch). Clamped to [8, 256] KiB.
+    ///
+    /// WHY FP16: Default 32 KiB is safe for most LLM providers. Users with
+    /// models that handle larger JSON tool arguments can raise this limit.
+    /// Override with `EDGECRAB_MAX_WRITE_PAYLOAD_KIB` env var.
+    pub max_write_payload_kib: Option<u32>,
 }
 
 /// Policy for handling messages originating from group chats.

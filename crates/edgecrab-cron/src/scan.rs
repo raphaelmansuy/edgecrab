@@ -77,13 +77,13 @@ pub fn scan_cron_prompt(prompt: &str) -> Result<(), String> {
 
     // 2. Threat pattern check (case-insensitive)
     for &(pattern, pid) in THREAT_PATTERNS {
-        if let Ok(re) = Regex::new(&format!("(?i){pattern}")) {
-            if re.is_match(prompt) {
-                return Err(format!(
-                    "Blocked: prompt matches threat pattern '{pid}'. \
-                     Cron prompts must not contain injection or exfiltration payloads."
-                ));
-            }
+        if let Ok(re) = Regex::new(&format!("(?i){pattern}"))
+            && re.is_match(prompt)
+        {
+            return Err(format!(
+                "Blocked: prompt matches threat pattern '{pid}'. \
+                 Cron prompts must not contain injection or exfiltration payloads."
+            ));
         }
     }
 

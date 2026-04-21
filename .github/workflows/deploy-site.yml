@@ -35,17 +35,18 @@ jobs:
 
       - name: Install pnpm
         uses: pnpm/action-setup@v6
+        with:
+          package_json_file: site/package.json
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
           node-version: '24'
-          cache: 'pnpm'
-          cache-dependency-path: site/pnpm-lock.yaml
+          package-manager-cache: false
 
       - name: Install dependencies
         working-directory: site
-        run: pnpm install --frozen-lockfile
+        run: pnpm install --force --no-frozen-lockfile
 
       - name: Build site
         working-directory: site

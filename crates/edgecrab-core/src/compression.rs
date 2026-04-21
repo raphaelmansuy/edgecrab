@@ -361,18 +361,25 @@ fn build_summary(messages: &[Message]) -> String {
 /// 4. **Summarise** — call LLM with 8-section template; fall back to structural
 ///    summary on LLM failure (never silently drops context).
 /// 5. **Assemble** — head messages + summary message + tail messages.
+///    Role-collision check: if the last head message has the same role as
+///    the summary role (system), pick `user` instead to avoid adjacent
+///    same-role messages that break strict-alternation providers (FP30).
 /// 6. **Sanitize** — remove orphaned tool results; inject stub results for
 ///    orphaned tool_calls so the assembled list is always API-compliant.
+///
+/// Returns `(compressed_messages, llm_succeeded)`. The bool is `true` when the
+/// LLM summarization call succeeded; `false` when it fell back to structural.
+/// Callers use this to implement the circuit breaker (FP29).
 pub async fn compress_with_llm(
     messages: &[Message],
     params: &CompressionParams,
     provider: &Arc<dyn LLMProvider>,
     spill_ctx: Option<&PruneSpillContext<'_>>,
-) -> Vec<Message> {
+) -> (Vec<Message>, bool) {
     let n = messages.len();
     // Need at least: protected head + 1 message to summarise + protected tail.
     if n <= PROTECT_FIRST_N + params.protect_last_n {
-        return messages.to_vec();
+        return (messages.to_vec(), true);
     }
 
     // Phase 1: prune tool outputs (cheap, no LLM).
@@ -391,7 +398,7 @@ pub async fn compress_with_llm(
 
     if head_end >= tail_start {
         // Nothing in the middle — history is too short to compress.
-        return messages.to_vec();
+        return (messages.to_vec(), true);
     }
 
     let turns_to_summarize = &pruned[head_end..tail_start];
@@ -400,26 +407,81 @@ pub async fn compress_with_llm(
     let prior_summary = extract_prior_summary(messages);
 
     // Phase 4: LLM summarization with 8-section template.
-    let summary_text = llm_summarize(
+    let (summary_text, llm_succeeded) = match llm_summarize(
         turns_to_summarize,
         params.context_window,
         provider,
         prior_summary.as_deref(),
     )
     .await
-    .unwrap_or_else(|e: edgequake_llm::LlmError| {
-        tracing::warn!(error = %e, "LLM compression failed, using structural fallback");
-        build_summary(turns_to_summarize)
-    });
+    {
+        Ok(text) => (text, true),
+        Err(e) => {
+            tracing::warn!(error = %e, "LLM compression failed, using structural fallback");
+            (build_summary(turns_to_summarize), false)
+        }
+    };
 
     // Phase 5: assemble head + summary + tail.
+    //
+    // FP30: Role-collision guard — mirrors hermes-agent `context_compressor.py`.
+    // If the last head message is already `System` role, injecting another
+    // `system_summary` (also System) would create adjacent system messages.
+    // Strict-alternation providers (Gemini, Mistral) reject this.
+    // Pick `User` role for the summary when the head ends with System.
+    let prefixed = format!("{SUMMARY_PREFIX}{summary_text}");
+    let last_head_role = pruned
+        .get(head_end.saturating_sub(1))
+        .map(|m| m.role.clone());
+    let summary_msg = if last_head_role == Some(edgecrab_types::Role::System) {
+        // Head ends with a system message (e.g. a prior summary_prefix block
+        // that landed in the protected head window). Use user role to avoid
+        // adjacent system+system which breaks strict-alternation providers.
+        Message::user(&prefixed)
+    } else {
+        Message::system_summary(prefixed)
+    };
+    let mut result = Vec::with_capacity(head_end + 1 + (n - tail_start));
+    result.extend_from_slice(&pruned[..head_end]);
+    result.push(summary_msg);
+    result.extend_from_slice(&pruned[tail_start..]);
+
+    // Phase 6: fix orphaned tool pairs.
+    (sanitize_orphan_pairs(result), llm_succeeded)
+}
+
+/// Structural-only compression — no LLM call, just prune + summarize stats.
+///
+/// Used when the compression circuit breaker has tripped (FP12: "Fail once,
+/// learn; fail thrice, stop"). Runs the same phases as `compress_with_llm`
+/// but replaces Phase 4 (LLM summarization) with `build_summary()`.
+///
+/// See [specs/improve_plan/16-assessment-round3.md](../../../specs/improve_plan/16-assessment-round3.md).
+pub fn compress_structural_only(
+    messages: &[Message],
+    params: &CompressionParams,
+    spill_ctx: Option<&PruneSpillContext<'_>>,
+) -> Vec<Message> {
+    let n = messages.len();
+    if n <= PROTECT_FIRST_N + params.protect_last_n {
+        return messages.to_vec();
+    }
+    let pruned = prune_tool_outputs(messages, spill_ctx);
+    let head_end = align_boundary_forward(&pruned, PROTECT_FIRST_N);
+    let threshold_tokens = (params.context_window as f32 * params.threshold) as usize;
+    let tail_token_budget = (threshold_tokens as f32 * params.target_ratio) as usize;
+    let tail_start =
+        find_tail_cut_by_tokens(&pruned, head_end, tail_token_budget, params.protect_last_n);
+    if head_end >= tail_start {
+        return messages.to_vec();
+    }
+    let turns_to_summarize = &pruned[head_end..tail_start];
+    let summary_text = build_summary(turns_to_summarize);
     let prefixed = format!("{SUMMARY_PREFIX}{summary_text}");
     let mut result = Vec::with_capacity(head_end + 1 + (n - tail_start));
     result.extend_from_slice(&pruned[..head_end]);
     result.push(Message::system_summary(prefixed));
     result.extend_from_slice(&pruned[tail_start..]);
-
-    // Phase 6: fix orphaned tool pairs.
     sanitize_orphan_pairs(result)
 }
 
@@ -449,25 +511,25 @@ pub fn prune_tool_outputs(
                 let tool_name = m.name.as_deref().unwrap_or("tool");
 
                 // When spill context is available, attempt to spill to artifact
-                if let Some(ctx) = spill_ctx {
-                    if ctx.config.enabled {
-                        let result = m.text_content();
-                        match crate::tool_result_spill::maybe_spill(
-                            tool_name,
-                            tool_call_id,
-                            result,
-                            ctx.session_id,
-                            ctx.cwd,
-                            ctx.config,
-                            ctx.seq,
-                        ) {
-                            SpillOutcome::Spilled { stub, .. } => {
-                                return Message::tool_result(tool_call_id, tool_name, &stub);
-                            }
-                            SpillOutcome::Inline(_) => {
-                                // Below spill threshold but above prune threshold (200 chars)
-                                // — fall through to placeholder
-                            }
+                if let Some(ctx) = spill_ctx
+                    && ctx.config.enabled
+                {
+                    let result = m.text_content();
+                    match crate::tool_result_spill::maybe_spill(
+                        tool_name,
+                        tool_call_id,
+                        result,
+                        ctx.session_id,
+                        ctx.cwd,
+                        ctx.config,
+                        ctx.seq,
+                    ) {
+                        SpillOutcome::Spilled { stub, .. } => {
+                            return Message::tool_result(tool_call_id, tool_name, &stub);
+                        }
+                        SpillOutcome::Inline(_) => {
+                            // Below spill threshold but above prune threshold (200 chars)
+                            // — fall through to placeholder
                         }
                     }
                 }
@@ -663,16 +725,14 @@ fn sanitize_orphan_pairs(messages: Vec<Message>) -> Vec<Message> {
         let is_assistant = m.role == edgecrab_types::Role::Assistant;
         let tool_calls = m.tool_calls.clone();
         patched.push(m);
-        if is_assistant {
-            if let Some(tcs) = tool_calls {
-                for tc in tcs {
-                    if missing_results.contains(&tc.id) {
-                        patched.push(Message::tool_result(
-                            &tc.id,
-                            &tc.function.name,
-                            STUB_TOOL_RESULT,
-                        ));
-                    }
+        if is_assistant && let Some(tcs) = tool_calls {
+            for tc in tcs {
+                if missing_results.contains(&tc.id) {
+                    patched.push(Message::tool_result(
+                        &tc.id,
+                        &tc.function.name,
+                        STUB_TOOL_RESULT,
+                    ));
                 }
             }
         }
@@ -1348,5 +1408,349 @@ mod tests {
         ];
         let extracted = extract_prior_summary(&messages);
         assert!(extracted.is_none());
+    }
+
+    // ── compress_structural_only tests (FP12 circuit breaker) ─────
+
+    #[test]
+    fn structural_only_returns_original_when_too_few_messages() {
+        let msgs = make_messages(5);
+        let params = CompressionParams {
+            context_window: 128_000,
+            threshold: 0.50,
+            target_ratio: 0.20,
+            protect_last_n: 20,
+        };
+        let result = compress_structural_only(&msgs, &params, None);
+        assert_eq!(
+            result.len(),
+            msgs.len(),
+            "should return original when below protect threshold"
+        );
+    }
+
+    #[test]
+    fn structural_only_compresses_large_history() {
+        // 200 messages, tiny context window → must compress
+        let msgs: Vec<Message> = (0..200)
+            .map(|i| {
+                if i % 2 == 0 {
+                    Message::user(&format!("question {i} {}", "x".repeat(100)))
+                } else {
+                    Message::assistant(&format!("answer {i} {}", "y".repeat(100)))
+                }
+            })
+            .collect();
+        let params = CompressionParams {
+            context_window: 500,
+            threshold: 0.10,
+            target_ratio: 0.20,
+            protect_last_n: 5,
+        };
+        let result = compress_structural_only(&msgs, &params, None);
+        assert!(result.len() < msgs.len(), "should produce fewer messages");
+        // Should contain a summary message with SUMMARY_PREFIX
+        let has_summary = result
+            .iter()
+            .any(|m| m.text_content().contains(SUMMARY_PREFIX));
+        assert!(has_summary, "should contain a structural summary message");
+    }
+
+    #[test]
+    fn structural_only_preserves_recent_messages() {
+        let msgs: Vec<Message> = (0..100)
+            .map(|i| {
+                if i % 2 == 0 {
+                    Message::user(&format!("q{i}"))
+                } else {
+                    Message::assistant(&format!("a{i}"))
+                }
+            })
+            .collect();
+        let params = CompressionParams {
+            context_window: 200,
+            threshold: 0.05,
+            target_ratio: 0.20,
+            protect_last_n: 5,
+        };
+        let result = compress_structural_only(&msgs, &params, None);
+        // Last message should be preserved
+        let last_original = msgs
+            .last()
+            .expect("test messages should contain a last item")
+            .text_content();
+        let last_result = result
+            .last()
+            .expect("compressed result should preserve the last item")
+            .text_content();
+        assert_eq!(last_original, last_result, "last message must be preserved");
+    }
+
+    // ── FP29 / FP30 — compress_with_llm bool return + role-collision ──
+
+    /// FP29: compress_with_llm falls back to structural when LLM fails and
+    /// returns `llm_succeeded = false`.
+    #[tokio::test]
+    async fn compress_with_llm_returns_false_on_llm_failure() {
+        use async_trait::async_trait;
+        use edgequake_llm::error::LlmError;
+        use edgequake_llm::traits::{
+            ChatMessage, CompletionOptions, LLMProvider, LLMResponse, ToolChoice, ToolDefinition,
+        };
+        // futures::stream::BoxStream not needed
+
+        struct FailingProvider;
+
+        #[async_trait]
+        impl LLMProvider for FailingProvider {
+            fn name(&self) -> &str {
+                "failing"
+            }
+            fn model(&self) -> &str {
+                "test-model"
+            }
+            fn max_context_length(&self) -> usize {
+                128_000
+            }
+
+            async fn complete(&self, _: &str) -> edgequake_llm::Result<LLMResponse> {
+                Err(LlmError::ApiError("simulated failure".to_string()))
+            }
+            async fn complete_with_options(
+                &self,
+                _: &str,
+                _: &CompletionOptions,
+            ) -> edgequake_llm::Result<LLMResponse> {
+                Err(LlmError::ApiError("simulated failure".to_string()))
+            }
+            async fn chat(
+                &self,
+                _: &[ChatMessage],
+                _: Option<&CompletionOptions>,
+            ) -> edgequake_llm::Result<LLMResponse> {
+                Err(LlmError::ApiError("simulated failure".to_string()))
+            }
+            async fn chat_with_tools(
+                &self,
+                _: &[ChatMessage],
+                _: &[ToolDefinition],
+                _: Option<ToolChoice>,
+                _: Option<&CompletionOptions>,
+            ) -> edgequake_llm::Result<LLMResponse> {
+                Err(LlmError::ApiError("simulated failure".to_string()))
+            }
+        }
+
+        // Build enough messages to trigger compression.
+        let msgs: Vec<Message> = (0..40)
+            .map(|i| {
+                if i % 2 == 0 {
+                    Message::user(&format!("question {i} {}", "x".repeat(200)))
+                } else {
+                    Message::assistant(&format!("answer {i} {}", "y".repeat(200)))
+                }
+            })
+            .collect();
+
+        let params = CompressionParams {
+            context_window: 1_000,
+            threshold: 0.10,
+            target_ratio: 0.20,
+            protect_last_n: 5,
+        };
+
+        let provider: Arc<dyn LLMProvider> = Arc::new(FailingProvider);
+        let (compressed, llm_succeeded) = compress_with_llm(&msgs, &params, &provider, None).await;
+
+        // LLM failed → bool must be false.
+        assert!(
+            !llm_succeeded,
+            "expected llm_succeeded=false when provider errors"
+        );
+        // But structural fallback should have reduced message count.
+        assert!(
+            compressed.len() < msgs.len(),
+            "structural fallback must still compress"
+        );
+    }
+
+    /// FP29: compress_with_llm returns `true` when LLM succeeds.
+    #[tokio::test]
+    async fn compress_with_llm_returns_true_on_llm_success() {
+        use async_trait::async_trait;
+        use edgequake_llm::traits::{
+            ChatMessage, CompletionOptions, LLMProvider, LLMResponse, ToolChoice, ToolDefinition,
+        };
+
+        struct SuccessProvider;
+
+        #[async_trait]
+        impl LLMProvider for SuccessProvider {
+            fn name(&self) -> &str {
+                "success"
+            }
+            fn model(&self) -> &str {
+                "test-model"
+            }
+            fn max_context_length(&self) -> usize {
+                128_000
+            }
+
+            async fn complete(&self, _: &str) -> edgequake_llm::Result<LLMResponse> {
+                Ok(LLMResponse::new("summary text", "test-model"))
+            }
+            async fn complete_with_options(
+                &self,
+                _: &str,
+                _: &CompletionOptions,
+            ) -> edgequake_llm::Result<LLMResponse> {
+                Ok(LLMResponse::new("summary text", "test-model"))
+            }
+            async fn chat(
+                &self,
+                _: &[ChatMessage],
+                _: Option<&CompletionOptions>,
+            ) -> edgequake_llm::Result<LLMResponse> {
+                Ok(LLMResponse::new("summary text", "test-model"))
+            }
+            async fn chat_with_tools(
+                &self,
+                _: &[ChatMessage],
+                _: &[ToolDefinition],
+                _: Option<ToolChoice>,
+                _: Option<&CompletionOptions>,
+            ) -> edgequake_llm::Result<LLMResponse> {
+                Ok(LLMResponse::new("summary text", "test-model"))
+            }
+        }
+
+        let msgs: Vec<Message> = (0..40)
+            .map(|i| {
+                if i % 2 == 0 {
+                    Message::user(&format!("question {i} {}", "x".repeat(200)))
+                } else {
+                    Message::assistant(&format!("answer {i} {}", "y".repeat(200)))
+                }
+            })
+            .collect();
+
+        let params = CompressionParams {
+            context_window: 1_000,
+            threshold: 0.10,
+            target_ratio: 0.20,
+            protect_last_n: 5,
+        };
+
+        let provider: Arc<dyn LLMProvider> = Arc::new(SuccessProvider);
+        let (_compressed, llm_succeeded) = compress_with_llm(&msgs, &params, &provider, None).await;
+
+        assert!(
+            llm_succeeded,
+            "expected llm_succeeded=true when provider succeeds"
+        );
+    }
+
+    /// FP30: Role-collision guard — when the compressible head ends with a
+    /// System message, the summary must use User role to avoid adjacent system+system.
+    #[tokio::test]
+    async fn compress_with_llm_fp30_avoids_adjacent_system_messages() {
+        use async_trait::async_trait;
+        use edgequake_llm::traits::{
+            ChatMessage, CompletionOptions, LLMProvider, LLMResponse, ToolChoice, ToolDefinition,
+        };
+
+        struct SuccessProvider;
+
+        #[async_trait]
+        impl LLMProvider for SuccessProvider {
+            fn name(&self) -> &str {
+                "success"
+            }
+            fn model(&self) -> &str {
+                "test-model"
+            }
+            fn max_context_length(&self) -> usize {
+                128_000
+            }
+
+            async fn complete(&self, _: &str) -> edgequake_llm::Result<LLMResponse> {
+                Ok(LLMResponse::new("summary text", "test-model"))
+            }
+            async fn complete_with_options(
+                &self,
+                _: &str,
+                _: &CompletionOptions,
+            ) -> edgequake_llm::Result<LLMResponse> {
+                Ok(LLMResponse::new("summary text", "test-model"))
+            }
+            async fn chat(
+                &self,
+                _: &[ChatMessage],
+                _: Option<&CompletionOptions>,
+            ) -> edgequake_llm::Result<LLMResponse> {
+                Ok(LLMResponse::new("summary text", "test-model"))
+            }
+            async fn chat_with_tools(
+                &self,
+                _: &[ChatMessage],
+                _: &[ToolDefinition],
+                _: Option<ToolChoice>,
+                _: Option<&CompletionOptions>,
+            ) -> edgequake_llm::Result<LLMResponse> {
+                Ok(LLMResponse::new("summary text", "test-model"))
+            }
+        }
+
+        // Build a message list where position PROTECT_FIRST_N is a System message.
+        // PROTECT_FIRST_N = 4 (head is always kept)
+        // So the first 4 messages form the protected head.
+        // We make message[3] (0-indexed) a System message → head_end boundary
+        // will land just after it → last_head_role == System.
+        let mut msgs = vec![
+            Message::user("system context"), // 0
+            Message::assistant("ok"),        // 1
+            Message::user("follow up"),      // 2
+            Message::system("extra system"), // 3  ← PROTECT_FIRST_N-1 (last in head)
+        ];
+        // Add enough body messages to trigger compression.
+        for i in 0..30 {
+            if i % 2 == 0 {
+                msgs.push(Message::user(&format!("body q{i} {}", "x".repeat(300))));
+            } else {
+                msgs.push(Message::assistant(&format!(
+                    "body a{i} {}",
+                    "y".repeat(300)
+                )));
+            }
+        }
+
+        let params = CompressionParams {
+            context_window: 2_000,
+            threshold: 0.10,
+            target_ratio: 0.20,
+            protect_last_n: 3,
+        };
+
+        let provider: Arc<dyn LLMProvider> = Arc::new(SuccessProvider);
+        let (compressed, _) = compress_with_llm(&msgs, &params, &provider, None).await;
+
+        // Find the summary message (contains SUMMARY_PREFIX).
+        let summary_msg = compressed
+            .iter()
+            .find(|m| m.text_content().contains(SUMMARY_PREFIX));
+
+        if let Some(_s) = summary_msg {
+            // When head ends with System, the summary must NOT be System.
+            // Check adjacent pairs: no two consecutive System messages.
+            for window in compressed.windows(2) {
+                assert!(
+                    !(window[0].role == edgecrab_types::Role::System
+                        && window[1].role == edgecrab_types::Role::System),
+                    "FP30: adjacent system+system messages found in compressed output"
+                );
+            }
+        }
+        // Whether or not compression triggered, the output must be non-empty.
+        assert!(!compressed.is_empty());
     }
 }

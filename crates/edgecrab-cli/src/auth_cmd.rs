@@ -41,8 +41,8 @@ const PROVIDER_AUTH_SPECS: &[ProviderAuthSpec] = &[
     ProviderAuthSpec {
         canonical: "anthropic",
         aliases: &[],
-        env_vars: &["ANTHROPIC_API_KEY"],
-        description: "Anthropic API key",
+        env_vars: &["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"],
+        description: "Anthropic-compatible API key",
         interactive_login: false,
     },
     ProviderAuthSpec {

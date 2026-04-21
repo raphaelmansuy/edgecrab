@@ -31,10 +31,10 @@ fn expand_path_with_env(path_str: &str) -> PathBuf {
     let mut result = path_str.to_string();
 
     // Expand ~ to home directory
-    if result.starts_with('~') {
-        if let Some(home) = dirs::home_dir() {
-            result = result.replacen("~", home.to_string_lossy().as_ref(), 1);
-        }
+    if result.starts_with('~')
+        && let Some(home) = dirs::home_dir()
+    {
+        result = result.replacen("~", home.to_string_lossy().as_ref(), 1);
     }
 
     // Expand ${VAR} and $VAR environment variables
@@ -99,10 +99,11 @@ fn find_skill_dir(skills_base: &std::path::Path, name: &str) -> Option<std::path
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                if let Some(leaf) = path.file_name().and_then(|n| n.to_str()) {
-                    if leaf == name && path.join("SKILL.md").is_file() {
-                        return Some(path);
-                    }
+                if let Some(leaf) = path.file_name().and_then(|n| n.to_str())
+                    && leaf == name
+                    && path.join("SKILL.md").is_file()
+                {
+                    return Some(path);
                 }
                 stack.push(path);
             }

@@ -17,6 +17,8 @@ use ratatui::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::theme::palette as P;
+
 // ── DisplayWidths — single source of truth for column budgets ───────────────
 
 /// Column budget calculator that adapts all display widths to the terminal size.
@@ -248,10 +250,10 @@ fn extract_patch_targets(patch_text: &str) -> Vec<String> {
             .or_else(|| line.strip_prefix("*** Delete File: "))
             .or_else(|| line.strip_prefix("*** Move to: "))
             .map(str::trim);
-        if let Some(path) = path.filter(|path| !path.is_empty()) {
-            if !targets.iter().any(|existing| existing == path) {
-                targets.push(path.to_string());
-            }
+        if let Some(path) = path.filter(|path| !path.is_empty())
+            && !targets.iter().any(|existing| existing == path)
+        {
+            targets.push(path.to_string());
         }
     }
     targets
@@ -494,10 +496,10 @@ fn extract_generic_preview(
     ];
 
     for &key in PRIORITY {
-        if let Some(val) = obj.get(key) {
-            if let Some(preview) = json_value_preview(val) {
-                return unicode_trunc(&format!("{key}: {preview}"), max_cols);
-            }
+        if let Some(val) = obj.get(key)
+            && let Some(preview) = json_value_preview(val)
+        {
+            return unicode_trunc(&format!("{key}: {preview}"), max_cols);
         }
     }
 
@@ -1026,7 +1028,7 @@ pub fn build_tool_verbose_lines_width(
     let indent = Span::styled(
         "     ",
         Style::default()
-            .fg(Color::Rgb(48, 52, 62))
+            .fg(P::INDENT_SPACE)
             .add_modifier(Modifier::DIM),
     );
     let label_style = Style::default()
@@ -1040,9 +1042,9 @@ pub fn build_tool_verbose_lines_width(
         Span::styled(unicode_pad_right(&label, 9), label_style),
         Span::styled(
             args_summary,
-            Style::default()
-                .fg(Color::Rgb(115, 128, 150))
-                .add_modifier(Modifier::DIM),
+            // WCAG AA: SECONDARY_COOL Rgb(148,162,185) → CR 8.0:1 vs black.
+            // DIM removed: DIM is terminal-dependent and can drop contrast below AA.
+            Style::default().fg(P::SECONDARY_COOL),
         ),
     ]);
 
@@ -1052,15 +1054,13 @@ pub fn build_tool_verbose_lines_width(
             indent.clone(),
             Span::styled(
                 unicode_pad_right("", 9),
-                Style::default()
-                    .fg(Color::Rgb(80, 92, 112))
-                    .add_modifier(Modifier::DIM),
+                // WCAG AA: SECONDARY_COOL — label column padding (secondary info).
+                Style::default().fg(P::SECONDARY_COOL),
             ),
             Span::styled(
                 unicode_trunc(&stat, verbose_width),
-                Style::default()
-                    .fg(Color::Rgb(90, 102, 125))
-                    .add_modifier(Modifier::DIM),
+                // WCAG AA: SECONDARY_COOL Rgb(148,162,185) → CR 8.0:1 vs black.
+                Style::default().fg(P::SECONDARY_COOL),
             ),
         ]);
     }
@@ -1081,18 +1081,17 @@ pub fn build_tool_verbose_lines_width(
             indent,
             Span::styled(
                 unicode_pad_right("result", 9),
-                Style::default()
-                    .fg(Color::Rgb(100, 112, 135))
-                    .add_modifier(Modifier::DIM),
+                // WCAG AA: SECONDARY_COOL — "result" key label.
+                Style::default().fg(P::SECONDARY_COOL),
             ),
             Span::styled(
                 display,
                 if is_error {
                     Style::default()
-                        .fg(Color::Rgb(255, 120, 120))
+                        .fg(P::TOOL_RESULT_ERR)
                         .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(Color::Rgb(148, 208, 168))
+                    Style::default().fg(P::TOOL_RESULT_OK)
                 },
             ),
         ]);
@@ -1122,24 +1121,24 @@ fn build_todo_verbose_lines(
         .unwrap_or(mode);
 
     lines.push(vec![
+        // Indent whitespace — purely structural, DIM OK (SC 1.4.3 exempt).
         Span::styled(
             "     ",
             Style::default()
-                .fg(Color::Rgb(52, 56, 66))
+                .fg(P::INDENT_SPACE)
                 .add_modifier(Modifier::DIM),
         ),
         Span::styled(
             unicode_pad_right("plan", 9),
-            Style::default()
-                .fg(Color::Rgb(108, 118, 138))
-                .add_modifier(Modifier::DIM),
+            // WCAG AA: SECONDARY_COOL — "plan" key label.
+            Style::default().fg(P::SECONDARY_COOL),
         ),
         Span::styled(
             unicode_trunc(summary, verbose_width),
             if is_error {
-                Style::default().fg(Color::Rgb(235, 170, 170))
+                Style::default().fg(P::TOOL_RESULT_ERR)
             } else {
-                Style::default().fg(Color::Rgb(156, 208, 188))
+                Style::default().fg(P::TOOL_RESULT_OK)
             },
         ),
     ]);
@@ -1178,7 +1177,7 @@ fn build_todo_verbose_lines(
             Span::styled(
                 "     ",
                 Style::default()
-                    .fg(Color::Rgb(52, 56, 66))
+                    .fg(P::INDENT_SPACE)
                     .add_modifier(Modifier::DIM),
             ),
             Span::styled(format!("{badge} "), badge_style),
@@ -1194,14 +1193,13 @@ fn build_todo_verbose_lines(
             Span::styled(
                 "     ",
                 Style::default()
-                    .fg(Color::Rgb(52, 56, 66))
+                    .fg(P::INDENT_SPACE)
                     .add_modifier(Modifier::DIM),
             ),
             Span::styled(
                 format!("+{} more task(s)", items.len() - 6),
-                Style::default()
-                    .fg(Color::Rgb(120, 132, 152))
-                    .add_modifier(Modifier::DIM),
+                // WCAG AA: TERTIARY_COOL — "+N more" overflow label.
+                Style::default().fg(P::TERTIARY_COOL),
             ),
         ]);
     }
@@ -1285,8 +1283,8 @@ pub fn build_tool_done_line_width(
     // visually distinguish file edits, terminal commands, web searches, etc.
     let category = tool_category(tool_name);
     let bar_style = Style::default()
-        .fg(Color::Rgb(55, 58, 70))
-        .add_modifier(Modifier::DIM);
+        .fg(P::GUTTER_BAR)
+        .add_modifier(Modifier::DIM); // decorative glyph — DIM OK (SC 1.4.3 exempt)
     let emoji_style = if is_error {
         Style::default()
             .fg(Color::Rgb(255, 80, 80))
@@ -1299,19 +1297,18 @@ pub fn build_tool_done_line_width(
     } else {
         Style::default().fg(category.name_color())
     };
-    let preview_style = Style::default()
-        .fg(Color::Rgb(90, 102, 125))
-        .add_modifier(Modifier::DIM);
+    // WCAG AA: TERTIARY_COOL Rgb(125,138,162) → CR 6.0:1 vs black.
+    // DIM removed — terminal DIM is non-deterministic and can drop contrast below AA.
+    let preview_style = Style::default().fg(P::TERTIARY_COOL);
     let result_style = if is_error {
         Style::default()
-            .fg(Color::Rgb(255, 125, 125))
+            .fg(P::TOOL_RESULT_ERR)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::Rgb(148, 208, 168))
+        Style::default().fg(P::TOOL_RESULT_OK)
     };
-    let dur_style = Style::default()
-        .fg(Color::Rgb(72, 79, 98))
-        .add_modifier(Modifier::DIM);
+    // WCAG AA: TERTIARY_WARM Rgb(128,138,152) → CR 5.9:1 vs black.
+    let dur_style = Style::default().fg(P::TERTIARY_WARM);
 
     vec![
         Span::styled("  ┊ ", bar_style),
@@ -1350,6 +1347,28 @@ pub fn build_tool_running_line_width(
     emoji_overrides: &std::collections::HashMap<String, String>,
     widths: &DisplayWidths,
 ) -> Vec<Span<'static>> {
+    build_tool_running_line_width_elapsed(
+        tool_name,
+        args_json,
+        detail,
+        None,
+        emoji_overrides,
+        widths,
+    )
+}
+
+/// Like `build_tool_running_line_width` but also shows elapsed time in the placeholder.
+///
+/// FP49: After 3s, the `  ···` tail becomes `  ···  Xs` so the output-area placeholder
+/// provides temporal feedback without requiring the user to look at the status bar.
+pub fn build_tool_running_line_width_elapsed(
+    tool_name: &str,
+    args_json: &str,
+    detail: Option<&str>,
+    elapsed_secs: Option<u64>,
+    emoji_overrides: &std::collections::HashMap<String, String>,
+    widths: &DisplayWidths,
+) -> Vec<Span<'static>> {
     let preview = extract_tool_preview_width(tool_name, args_json, widths.preview);
     let emoji: &str = emoji_overrides
         .get(tool_name)
@@ -1367,17 +1386,25 @@ pub fn build_tool_running_line_width(
         .map(|detail| format!("  {}", unicode_trunc(detail, detail_width)))
         .unwrap_or_default();
 
+    // FP49: Show elapsed time in the running placeholder after 3s.
+    let elapsed_part = match elapsed_secs {
+        Some(secs) if secs >= 3 => format!("  {secs}s"),
+        _ => String::new(),
+    };
+
     let bar_style = Style::default()
-        .fg(Color::Rgb(55, 58, 70))
-        .add_modifier(Modifier::DIM);
+        .fg(P::GUTTER_BAR)
+        .add_modifier(Modifier::DIM); // decorative glyph — DIM OK (SC 1.4.3 exempt)
     let indicator_style = Style::default().fg(category.name_color());
     let name_style = Style::default().fg(category.name_color());
-    let preview_style = Style::default()
-        .fg(Color::Rgb(90, 102, 125))
-        .add_modifier(Modifier::DIM);
+    // WCAG AA: TERTIARY_COOL → CR 6.0:1 vs black; DIM removed.
+    let preview_style = Style::default().fg(P::TERTIARY_COOL);
+    // "···" pulse is a purely decorative indicator; DIM is acceptable here.
     let running_style = Style::default()
         .fg(category.name_color())
         .add_modifier(Modifier::DIM);
+    // WCAG AA: TERTIARY_COOL for elapsed time text; DIM removed.
+    let elapsed_style = Style::default().fg(P::TERTIARY_COOL);
 
     vec![
         Span::styled("  ┊ ", bar_style),
@@ -1386,6 +1413,7 @@ pub fn build_tool_running_line_width(
         Span::styled(preview_col, preview_style),
         Span::styled(detail_part, preview_style),
         Span::styled("  ···".to_string(), running_style),
+        Span::styled(elapsed_part, elapsed_style),
     ]
 }
 
@@ -1428,22 +1456,20 @@ pub fn build_subagent_running_line_width(
     let elapsed_str = format_duration_aligned(elapsed_secs * 1_000);
 
     let bar_style = Style::default()
-        .fg(Color::Rgb(55, 60, 70))
-        .add_modifier(Modifier::DIM);
-    let icon_style = Style::default().fg(Color::Rgb(95, 175, 255)); // blue → "in progress"
-    let badge_style = Style::default()
-        .fg(Color::Rgb(115, 128, 150))
-        .add_modifier(Modifier::DIM);
-    let goal_style = Style::default().fg(Color::Rgb(185, 198, 218));
-    let detail_style = Style::default()
-        .fg(Color::Rgb(90, 102, 125))
-        .add_modifier(Modifier::DIM);
+        .fg(P::GUTTER_BAR)
+        .add_modifier(Modifier::DIM); // decorative glyph — DIM OK
+    let icon_style = Style::default().fg(Color::Rgb(95, 175, 255)); // blue → "in progress" — CR 9.5:1 ✅
+    // WCAG AA: SECONDARY_COOL for sub-agent badge text; DIM removed.
+    let badge_style = Style::default().fg(P::SECONDARY_COOL);
+    let goal_style = Style::default().fg(Color::Rgb(185, 198, 218)); // L=0.570 CR=12.4:1 ✅
+    // WCAG AA: TERTIARY_COOL for detail column; DIM removed.
+    let detail_style = Style::default().fg(P::TERTIARY_COOL);
+    // "···" pulse — decorative; DIM is acceptable.
     let running_style = Style::default()
         .fg(Color::Rgb(95, 175, 255))
         .add_modifier(Modifier::DIM);
-    let dur_style = Style::default()
-        .fg(Color::Rgb(72, 79, 98))
-        .add_modifier(Modifier::DIM);
+    // WCAG AA: TERTIARY_WARM for elapsed time; DIM removed.
+    let dur_style = Style::default().fg(P::TERTIARY_WARM);
 
     vec![
         Span::styled("  ┊ ", bar_style),
@@ -1502,32 +1528,29 @@ pub fn build_subagent_done_line_width(
     let summary_col = unicode_trunc(summary_first, summary_budget);
 
     let bar_style = Style::default()
-        .fg(Color::Rgb(55, 60, 70))
-        .add_modifier(Modifier::DIM);
+        .fg(P::GUTTER_BAR)
+        .add_modifier(Modifier::DIM); // decorative glyph — DIM OK
     let icon_style = if is_error {
         Style::default()
             .fg(Color::Rgb(255, 80, 80))
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::Rgb(104, 196, 129))
+        Style::default().fg(Color::Rgb(104, 196, 129)) // CR 8.6:1 ✅
     };
-    let badge_style = Style::default()
-        .fg(Color::Rgb(115, 128, 150))
-        .add_modifier(Modifier::DIM);
+    // WCAG AA: SECONDARY_COOL for sub-agent badge; DIM removed.
+    let badge_style = Style::default().fg(P::SECONDARY_COOL);
     let summary_style = if is_error {
         Style::default()
-            .fg(Color::Rgb(255, 125, 125))
+            .fg(P::TOOL_RESULT_ERR)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::Rgb(200, 210, 226))
+        Style::default().fg(Color::Rgb(200, 210, 226)) // L=0.629 CR=13.6:1 ✅
     };
-    let stats_style = Style::default()
-        .fg(Color::Rgb(100, 112, 135))
-        .add_modifier(Modifier::DIM);
-    let model_style = Style::default().fg(Color::Rgb(185, 145, 240)); // violet = Ai category
-    let dur_style = Style::default()
-        .fg(Color::Rgb(72, 79, 98))
-        .add_modifier(Modifier::DIM);
+    // WCAG AA: SECONDARY_COOL for stats pill; DIM removed.
+    let stats_style = Style::default().fg(P::SECONDARY_COOL);
+    let model_style = Style::default().fg(Color::Rgb(185, 145, 240)); // violet = Ai category — CR 8.4:1 ✅
+    // WCAG AA: TERTIARY_WARM for duration; DIM removed.
+    let dur_style = Style::default().fg(P::TERTIARY_WARM);
 
     let icon: &str = if is_error { "❌" } else { "✅" };
     let model_part = if model_short.is_empty() {
@@ -1984,6 +2007,99 @@ fn format_ha_result(val: &serde_json::Value, max_cols: usize) -> String {
     }
 }
 
+// ── R18 JSON helpers (private) ─────────────────────────────────────────────
+
+fn format_memory_write_result(v: &serde_json::Value, max_cols: usize) -> String {
+    let action = v.get("action").and_then(|a| a.as_str()).unwrap_or("?");
+    let file = v.get("file").and_then(|f| f.as_str()).unwrap_or("memory");
+    let pct = v.get("used_pct").and_then(|p| p.as_u64()).unwrap_or(0);
+    if action == "duplicate_skipped" {
+        return unicode_trunc(&format!("✓ duplicate skipped ({pct}% used)"), max_cols);
+    }
+    unicode_trunc(&format!("✓ {action} → {file} ({pct}%)"), max_cols)
+}
+
+fn format_checkpoint_result(v: &serde_json::Value, max_cols: usize) -> String {
+    let action = v.get("action").and_then(|a| a.as_str()).unwrap_or("?");
+    match action {
+        "created" => {
+            if let Some(n) = v.get("n").and_then(|n| n.as_u64()) {
+                return unicode_trunc(&format!("✓ #{n} created"), max_cols);
+            }
+            unicode_trunc("✓ created (no new commit)", max_cols)
+        }
+        "list" => {
+            let total = v.get("total").and_then(|t| t.as_u64()).unwrap_or(0);
+            if total == 0 {
+                return unicode_trunc("no checkpoints", max_cols);
+            }
+            let s = if total == 1 {
+                "1 checkpoint".to_string()
+            } else {
+                format!("{total} checkpoints")
+            };
+            unicode_trunc(&format!("✓ {s}"), max_cols)
+        }
+        "restored" => {
+            let n = v.get("n").and_then(|n| n.as_u64()).unwrap_or(0);
+            unicode_trunc(&format!("✓ #{n} restored"), max_cols)
+        }
+        "diff" => {
+            let added = v
+                .get("added")
+                .and_then(|a| a.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            let modified = v
+                .get("modified")
+                .and_then(|a| a.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            let deleted = v
+                .get("deleted")
+                .and_then(|a| a.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            let total = added + modified + deleted;
+            if total == 0 {
+                unicode_trunc("✓ no changes", max_cols)
+            } else {
+                unicode_trunc(
+                    &format!("✓ diff: +{added} ~{modified} -{deleted}"),
+                    max_cols,
+                )
+            }
+        }
+        "restore_file" => {
+            let file = v.get("file").and_then(|f| f.as_str()).unwrap_or("?");
+            let name = file.split('/').next_back().unwrap_or(file);
+            unicode_trunc(&format!("✓ {name} restored"), max_cols)
+        }
+        _ => unicode_trunc("✓ ok", max_cols),
+    }
+}
+
+fn format_todo_result(v: &serde_json::Value, max_cols: usize) -> String {
+    if let Some(summary) = v.get("summary") {
+        let total = summary.get("total").and_then(|t| t.as_u64()).unwrap_or(0);
+        let completed = summary
+            .get("completed")
+            .and_then(|c| c.as_u64())
+            .unwrap_or(0);
+        let in_progress = summary
+            .get("in_progress")
+            .and_then(|ip| ip.as_u64())
+            .unwrap_or(0);
+        let detail = if in_progress > 0 {
+            format!(", {in_progress} active")
+        } else {
+            String::new()
+        };
+        return unicode_trunc(&format!("✓ {completed}/{total} done{detail}"), max_cols);
+    }
+    unicode_trunc("✓ plan updated", max_cols)
+}
+
 /// Format a tool result string for the **compact done-line** and the **verbose result line**.
 ///
 /// Applies per-tool rich formatting (exit codes, counts, titles) and falls back to
@@ -2018,6 +2134,24 @@ pub fn format_tool_result(tool_name: &str, result: &str, max_cols: usize) -> Str
             "web_crawl" => return format_web_crawl_result(&val, max_cols),
             "session_search" => return format_session_search_result(&val, max_cols),
             _ if tool_name.starts_with("ha_") => return format_ha_result(&val, max_cols),
+            // R18: memory_write / memory alias JSON result
+            "memory_write" | "memory" if val.get("ok") == Some(&serde_json::Value::Bool(true)) => {
+                return format_memory_write_result(&val, max_cols);
+            }
+            // R18: checkpoint JSON result
+            "checkpoint" if val.get("ok") == Some(&serde_json::Value::Bool(true)) => {
+                return format_checkpoint_result(&val, max_cols);
+            }
+            // R18: run_process JSON result (also covers terminal background mode)
+            "run_process" | "terminal" if val.get("process_id").is_some() => {
+                if let Some(pid) = val.get("process_id").and_then(|p| p.as_str()) {
+                    return unicode_trunc(&format!("✓ {pid} started"), max_cols);
+                }
+            }
+            // R18: manage_todo_list / todo JSON result
+            "manage_todo_list" | "todo" => {
+                return format_todo_result(&val, max_cols);
+            }
             _ => {}
         }
     }
@@ -2025,10 +2159,20 @@ pub fn format_tool_result(tool_name: &str, result: &str, max_cols: usize) -> Str
     // ── 3. Plain-text tools with known formats ──────────────────────────
     match tool_name {
         "write_file" => {
-            // "Wrote N bytes to 'path'"
-            // Show `✓ N bytes` — concise success signal with size.
+            // R18: JSON result {"ok":true,"action":"create|overwrite","bytes":N,"path":"..."}
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(result_trimmed)
+                && v.get("ok") == Some(&serde_json::Value::Bool(true))
+                && let Some(bytes) = v.get("bytes").and_then(|b| b.as_u64())
+            {
+                let size = if bytes >= 1024 {
+                    format!("{:.1}k bytes", bytes as f64 / 1024.0)
+                } else {
+                    format!("{bytes} bytes")
+                };
+                return unicode_trunc(&format!("✓ {size}"), max_cols);
+            }
+            // Legacy prose fallback: "Wrote N bytes to 'path'"
             if let Some(rest) = result_trimmed.strip_prefix("Wrote ") {
-                // rest = "N bytes to 'path'"
                 let end = rest.find(" to ").unwrap_or(rest.len());
                 let size_part = rest[..end].trim();
                 if !size_part.is_empty() {
@@ -2037,32 +2181,71 @@ pub fn format_tool_result(tool_name: &str, result: &str, max_cols: usize) -> Str
             }
             return unicode_trunc(&oneline(result_trimmed), max_cols);
         }
-        "apply_patch" if result_trimmed.contains("succeeded") => {
-            // "apply_patch succeeded. Modified: src/a.rs; Created: src/b.rs"
-            let detail = result_trimmed
-                .find(". ")
-                .map(|i| &result_trimmed[i + 2..])
-                .unwrap_or(result_trimmed)
-                .trim();
-            // Count comma-separated items in each section.
-            let count_section = |label: &str, text: &str| -> usize {
-                text.split(label)
-                    .nth(1)
-                    .map(|s| s.split(';').next().unwrap_or(""))
-                    .map(|s| s.split(',').filter(|t| !t.trim().is_empty()).count())
-                    .unwrap_or(0)
-            };
-            let total = count_section("Modified: ", detail)
-                + count_section("Created: ", detail)
-                + count_section("Deleted: ", detail);
-            let summary = if total == 0 {
-                "✓ ok".to_string()
-            } else if total == 1 {
-                "✓ 1 file".to_string()
-            } else {
-                format!("✓ {total} files")
-            };
-            return unicode_trunc(&summary, max_cols);
+        "patch" => {
+            // R18: JSON result {"ok":true,"replacements":N,"before_bytes":M,"after_bytes":K,"path":"..."}
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(result_trimmed)
+                && v.get("ok") == Some(&serde_json::Value::Bool(true))
+                && let Some(n) = v.get("replacements").and_then(|r| r.as_u64())
+            {
+                let s = if n == 1 {
+                    "1 replacement".to_string()
+                } else {
+                    format!("{n} replacements")
+                };
+                return unicode_trunc(&format!("✓ {s}"), max_cols);
+            }
+            return unicode_trunc(&oneline(result_trimmed), max_cols);
+        }
+        "apply_patch" => {
+            // R18: JSON result {"ok":true,"modified":[...],"created":[...],"deleted":[...]}
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(result_trimmed)
+                && v.get("ok") == Some(&serde_json::Value::Bool(true))
+            {
+                let total: usize = ["modified", "created", "deleted"]
+                    .iter()
+                    .map(|k| {
+                        v.get(k)
+                            .and_then(|a| a.as_array())
+                            .map(|a| a.len())
+                            .unwrap_or(0)
+                    })
+                    .sum();
+                let summary = if total == 0 {
+                    "✓ ok".to_string()
+                } else if total == 1 {
+                    "✓ 1 file".to_string()
+                } else {
+                    format!("✓ {total} files")
+                };
+                return unicode_trunc(&summary, max_cols);
+            }
+            // Legacy prose fallback: "apply_patch succeeded. Modified: ...; Created: ..."
+            if result_trimmed.contains("succeeded") {
+                let detail = result_trimmed
+                    .find(". ")
+                    .map(|i| &result_trimmed[i + 2..])
+                    .unwrap_or(result_trimmed)
+                    .trim();
+                let count_section = |label: &str, text: &str| -> usize {
+                    text.split(label)
+                        .nth(1)
+                        .map(|s| s.split(';').next().unwrap_or(""))
+                        .map(|s| s.split(',').filter(|t| !t.trim().is_empty()).count())
+                        .unwrap_or(0)
+                };
+                let total = count_section("Modified: ", detail)
+                    + count_section("Created: ", detail)
+                    + count_section("Deleted: ", detail);
+                let summary = if total == 0 {
+                    "✓ ok".to_string()
+                } else if total == 1 {
+                    "✓ 1 file".to_string()
+                } else {
+                    format!("✓ {total} files")
+                };
+                return unicode_trunc(&summary, max_cols);
+            }
+            return unicode_trunc(&oneline(result_trimmed), max_cols);
         }
         "read_file" => {
             // Result is the raw file content.  Show line count + first meaningful line.
@@ -2335,7 +2518,7 @@ mod tests {
         let spans = build_tool_done_line(
             "write_file",
             r#"{"path":"src/main.rs"}"#,
-            Some("Wrote 42 bytes to 'src/main.rs'"),
+            Some(r#"{"ok":true,"action":"create","bytes":42,"path":"src/main.rs"}"#),
             250,
             false,
             &std::collections::HashMap::new(),
@@ -2626,15 +2809,20 @@ mod tests {
 
     #[test]
     fn test_format_tool_result_write_file_extracts_size() {
-        let out = format_tool_result("write_file", "Wrote 1234 bytes to 'src/main.rs'", 80);
+        let out = format_tool_result(
+            "write_file",
+            r#"{"ok":true,"action":"create","bytes":1234,"path":"src/main.rs"}"#,
+            80,
+        );
         assert!(out.contains("✓"), "should have success badge, got: {out}");
-        assert!(out.contains("1234 bytes"), "should show size, got: {out}");
+        // 1234 >= 1024 so displayed as "1.2k bytes"
+        assert!(out.contains("bytes"), "should show size unit, got: {out}");
     }
 
     #[test]
     fn test_format_tool_result_apply_patch_counts_files() {
-        let result =
-            "apply_patch succeeded. Modified: src/main.rs, src/lib.rs; Created: src/new.rs";
+        // R18: JSON result
+        let result = r#"{"ok":true,"modified":["src/main.rs","src/lib.rs"],"created":["src/new.rs"],"deleted":[]}"#;
         let out = format_tool_result("apply_patch", result, 80);
         assert!(out.contains("✓"), "should have success badge, got: {out}");
         assert!(out.contains("3 files"), "should show 3 files, got: {out}");
@@ -2642,7 +2830,7 @@ mod tests {
 
     #[test]
     fn test_format_tool_result_apply_patch_single_file() {
-        let result = "apply_patch succeeded. Modified: src/main.rs";
+        let result = r#"{"ok":true,"modified":["src/main.rs"],"created":[],"deleted":[]}"#;
         let out = format_tool_result("apply_patch", result, 80);
         assert!(out.contains("✓ 1 file"), "should show 1 file, got: {out}");
     }
@@ -2677,16 +2865,71 @@ mod tests {
 
     #[test]
     fn test_format_tool_result_memory_saved() {
+        // Legacy prose fallback (backward compat)
         let out = format_tool_result("memory", "Added to user memory file.", 80);
         assert_eq!(out, "✓ saved");
     }
 
     #[test]
+    fn test_format_tool_result_memory_write_json() {
+        // R18 JSON result for memory_write
+        let json = r#"{"ok":true,"action":"add","file":"MEMORY.md","used_chars":110,"max_chars":2200,"used_pct":5}"#;
+        let out = format_tool_result("memory_write", json, 80);
+        assert!(out.contains("add"), "expected 'add' in: {out}");
+        assert!(out.contains("MEMORY.md"), "expected 'MEMORY.md' in: {out}");
+        assert!(out.contains("5%"), "expected '5%' in: {out}");
+    }
+
+    #[test]
+    fn test_format_tool_result_memory_duplicate_json() {
+        let json = r#"{"ok":true,"action":"duplicate_skipped","file":"MEMORY.md","used_chars":110,"max_chars":2200,"used_pct":5}"#;
+        let out = format_tool_result("memory", json, 80);
+        assert!(out.contains("duplicate skipped"), "got: {out}");
+    }
+
+    #[test]
     fn test_format_tool_result_todo_plan_updated() {
+        // Legacy prose fallback (backward compat)
         let out = format_tool_result("todo", "TodoList updated.", 80);
         assert_eq!(out, "✓ plan updated");
         let out2 = format_tool_result("manage_todo_list", "ok", 80);
         assert_eq!(out2, "✓ plan updated");
+    }
+
+    #[test]
+    fn test_format_tool_result_todo_json() {
+        // R18 JSON result for manage_todo_list
+        let json = r#"{"todos":[],"summary":{"total":5,"completed":2,"in_progress":1,"not_started":2,"blocked":0,"cancelled":0}}"#;
+        let out = format_tool_result("manage_todo_list", json, 80);
+        assert!(out.contains("2/5"), "expected '2/5' in: {out}");
+        assert!(out.contains("active"), "expected 'active' in: {out}");
+    }
+
+    #[test]
+    fn test_format_tool_result_checkpoint_json() {
+        // created
+        let json = r#"{"ok":true,"action":"created","n":3,"label":"pre-deploy","files":45,"has_new_commit":true}"#;
+        let out = format_tool_result("checkpoint", json, 80);
+        assert!(out.contains("#3"), "got: {out}");
+        assert!(out.contains("created"), "got: {out}");
+
+        // list
+        let json2 = r#"{"ok":true,"action":"list","total":3,"checkpoints":[]}"#;
+        let out2 = format_tool_result("checkpoint", json2, 80);
+        assert!(out2.contains("3 checkpoints"), "got: {out2}");
+
+        // diff no changes
+        let json3 = r#"{"ok":true,"action":"diff","n":1,"message":"no changes vs current state","added":[],"modified":[],"deleted":[]}"#;
+        let out3 = format_tool_result("checkpoint", json3, 80);
+        assert!(out3.contains("no changes"), "got: {out3}");
+    }
+
+    #[test]
+    fn test_format_tool_result_run_process_json() {
+        let json = r#"{"ok":true,"process_id":"proc-42","command":"cargo test"}"#;
+        let out = format_tool_result("run_process", json, 80);
+        assert!(out.contains("proc-42"), "got: {out}");
+        assert!(out.contains("started"), "got: {out}");
     }
 
     #[test]
@@ -2746,7 +2989,7 @@ mod tests {
         let lines = build_tool_verbose_lines_width(
             "write_file",
             r#"{"path":"src/main.rs","content":"fn main() {}"}"#,
-            Some("Wrote 12 bytes to 'src/main.rs'"),
+            Some(r#"{"ok":true,"action":"create","bytes":12,"path":"src/main.rs"}"#),
             false,
             DisplayWidths::DEFAULT.verbose_content,
         );

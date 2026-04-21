@@ -278,10 +278,10 @@ impl FeishuAdapter {
             .filter(|value| !value.is_empty())
             .map(str::to_string);
 
-        if let Some(bot_name) = bot_name {
-            if let Ok(mut slot) = self.bot_name.write() {
-                *slot = Some(bot_name);
-            }
+        if let Some(bot_name) = bot_name
+            && let Ok(mut slot) = self.bot_name.write()
+        {
+            *slot = Some(bot_name);
         }
     }
 
@@ -397,10 +397,10 @@ impl FeishuAdapter {
     async fn tenant_access_token(&self) -> anyhow::Result<String> {
         {
             let guard = self.tenant_token.read().await;
-            if let Some(token) = guard.as_ref() {
-                if token.expires_at > Instant::now() + TOKEN_REFRESH_SKEW {
-                    return Ok(token.value.clone());
-                }
+            if let Some(token) = guard.as_ref()
+                && token.expires_at > Instant::now() + TOKEN_REFRESH_SKEW
+            {
+                return Ok(token.value.clone());
             }
         }
 
@@ -1064,10 +1064,10 @@ async fn handle_webhook(
         })
         .map(str::to_string);
 
-    if let Some(id) = event_id {
-        if state.adapter.is_duplicate_event(&id).await {
-            return (StatusCode::OK, Json(json!({ "code": 0 })));
-        }
+    if let Some(id) = event_id
+        && state.adapter.is_duplicate_event(&id).await
+    {
+        return (StatusCode::OK, Json(json!({ "code": 0 })));
     }
 
     match parse_webhook_event(&state.adapter, &payload).await {
@@ -1215,12 +1215,12 @@ async fn parse_event(
         return Ok(None);
     }
 
-    if let Some(message_id) = message_id.as_deref() {
-        if !normalized.resources.is_empty() {
-            adapter
-                .enrich_incoming_resources(message_id, &mut normalized)
-                .await;
-        }
+    if let Some(message_id) = message_id.as_deref()
+        && !normalized.resources.is_empty()
+    {
+        adapter
+            .enrich_incoming_resources(message_id, &mut normalized)
+            .await;
     }
 
     let thread_id = message
@@ -1875,10 +1875,10 @@ fn render_post_element(
         "at" => {
             let mentioned_id =
                 first_non_empty_text(&[object.get("open_id"), object.get("user_id")]);
-            if let Some(mentioned_id) = mentioned_id {
-                if !mentioned_ids.contains(&mentioned_id) {
-                    mentioned_ids.push(mentioned_id);
-                }
+            if let Some(mentioned_id) = mentioned_id
+                && !mentioned_ids.contains(&mentioned_id)
+            {
+                mentioned_ids.push(mentioned_id);
             }
             let display_name = first_non_empty_text(&[
                 object.get("user_name"),
@@ -2284,11 +2284,11 @@ fn persist_seen_event_ids(path: Option<&Path>, cache: &HashMap<String, Instant>)
     recent.truncate(FEISHU_DEDUP_CACHE_SIZE);
 
     let payload: HashMap<String, u64> = recent.into_iter().collect();
-    if let Some(parent) = path.parent() {
-        if let Err(error) = std::fs::create_dir_all(parent) {
-            tracing::warn!(%error, path = %path.display(), "Feishu dedup state dir create failed");
-            return;
-        }
+    if let Some(parent) = path.parent()
+        && let Err(error) = std::fs::create_dir_all(parent)
+    {
+        tracing::warn!(%error, path = %path.display(), "Feishu dedup state dir create failed");
+        return;
     }
     let body = match serde_json::to_vec(&payload) {
         Ok(body) => body,

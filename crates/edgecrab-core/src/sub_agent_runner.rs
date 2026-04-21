@@ -166,6 +166,7 @@ impl SubAgentRunner for CoreSubAgentRunner {
             model: Some(result.model),
             interrupted: result.interrupted,
             budget_exhausted: result.budget_exhausted,
+            run_outcome: result.run_outcome,
             messages: result.messages,
         })
     }

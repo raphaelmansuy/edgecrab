@@ -389,10 +389,12 @@ async fn spawn_local_process(
         }
     });
 
-    Ok(format!(
-        "Process started: {} (id={}). Use list_processes to monitor.",
-        command, process_id
-    ))
+    Ok(serde_json::to_string(&json!({
+        "ok": true,
+        "process_id": process_id,
+        "command": command
+    }))
+    .expect("infallible"))
 }
 
 async fn spawn_remote_process(
@@ -514,10 +516,13 @@ async fn spawn_remote_process(
         }
     });
 
-    Ok(format!(
-        "Process started: {} (id={}) via {} backend. Use list_processes to monitor.",
-        command, process_id, backend_kind
-    ))
+    Ok(serde_json::to_string(&json!({
+        "ok": true,
+        "process_id": process_id,
+        "command": command,
+        "backend": backend_kind.to_string()
+    }))
+    .expect("infallible"))
 }
 
 async fn refresh_remote_output(
@@ -619,14 +624,14 @@ async fn drain_reader(
                     .await;
 
                 // Check watch patterns if configured
-                if let Some(ref sink) = watch_sink {
-                    if let Some(entry) = table.get_record(process_id) {
-                        let mut rec = entry.lock().await;
-                        if let Some(ref mut watch) = rec.watch_state {
-                            crate::process_table::check_watch_patterns(
-                                trimmed, process_id, watch, sink,
-                            );
-                        }
+                if let Some(ref sink) = watch_sink
+                    && let Some(entry) = table.get_record(process_id)
+                {
+                    let mut rec = entry.lock().await;
+                    if let Some(ref mut watch) = rec.watch_state {
+                        crate::process_table::check_watch_patterns(
+                            trimmed, process_id, watch, sink,
+                        );
                     }
                 }
             }

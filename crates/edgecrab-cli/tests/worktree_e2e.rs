@@ -12,6 +12,8 @@ fn clear_provider_envs(cmd: &mut Command) -> &mut Command {
         "OPENAI_API_KEY",
         "OPENROUTER_API_KEY",
         "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_BASE_URL",
         "GOOGLE_API_KEY",
         "GEMINI_API_KEY",
         "HF_TOKEN",

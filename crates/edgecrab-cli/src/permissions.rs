@@ -141,12 +141,12 @@ fn render_permission_report(snapshot: &PermissionSnapshot, notes: Option<Vec<Str
     lines.push(String::new());
     lines.extend(next_step_lines(snapshot));
 
-    if let Some(notes) = notes {
-        if !notes.is_empty() {
-            lines.push(String::new());
-            lines.push("Actions:".into());
-            lines.extend(notes.into_iter().map(|note| format!("- {note}")));
-        }
+    if let Some(notes) = notes
+        && !notes.is_empty()
+    {
+        lines.push(String::new());
+        lines.push("Actions:".into());
+        lines.extend(notes.into_iter().map(|note| format!("- {note}")));
     }
 
     lines.push(String::new());

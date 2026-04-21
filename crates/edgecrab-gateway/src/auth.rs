@@ -130,10 +130,10 @@ pub fn check_authorization(
     //   filters to source_device=1 (primary/linked-device self-messages).
     // Telegram/Discord/Slack/etc.: set {PREFIX}_SELF_CHAT=true when running
     //   as a single-owner personal bot.
-    if let Some(prefix) = platform_env_prefix(platform) {
-        if is_env_truthy(&format!("{prefix}_SELF_CHAT")) {
-            return AuthResult::Allowed(AuthReason::PlatformBypass);
-        }
+    if let Some(prefix) = platform_env_prefix(platform)
+        && is_env_truthy(&format!("{prefix}_SELF_CHAT"))
+    {
+        return AuthResult::Allowed(AuthReason::PlatformBypass);
     }
 
     // 2. Group policy check (before auth, groups are a separate policy axis)

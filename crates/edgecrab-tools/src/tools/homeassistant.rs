@@ -194,10 +194,10 @@ impl ToolHandler for HaListEntitiesTool {
 
         for entity in entities {
             let eid = entity["entity_id"].as_str().unwrap_or("");
-            if let Some(ref domain) = args.domain {
-                if !eid.starts_with(&format!("{domain}.")) {
-                    continue;
-                }
+            if let Some(ref domain) = args.domain
+                && !eid.starts_with(&format!("{domain}."))
+            {
+                continue;
             }
             results.push(json!({
                 "entity_id": eid,
@@ -346,10 +346,10 @@ impl ToolHandler for HaListServicesTool {
         let mut results: Vec<serde_json::Value> = Vec::new();
         for svc_domain in services_arr {
             let domain = svc_domain["domain"].as_str().unwrap_or("");
-            if let Some(ref filter) = args.domain {
-                if domain != filter.as_str() {
-                    continue;
-                }
+            if let Some(ref filter) = args.domain
+                && domain != filter.as_str()
+            {
+                continue;
             }
             if let Some(svcs) = svc_domain["services"].as_object() {
                 for (name, details) in svcs {

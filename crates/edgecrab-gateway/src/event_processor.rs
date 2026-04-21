@@ -100,6 +100,30 @@ fn format_pending_interaction(view: &PendingInteractionView) -> String {
     }
 }
 
+pub(crate) fn format_run_outcome_status(outcome: &edgecrab_types::RunOutcome) -> String {
+    let headline = format!("{} {}", outcome.state.emoji(), outcome.state.headline());
+
+    let summary = outcome.user_summary.trim();
+    let mut text = if summary.is_empty() || summary == outcome.state.headline() {
+        headline
+    } else {
+        format!("{headline} — {summary}")
+    };
+
+    if let Some(hint) = outcome.state.operator_hint() {
+        text.push_str(&format!(" {hint}"));
+    }
+
+    if outcome.active_tasks > 0 || outcome.blocked_tasks > 0 {
+        text.push_str(&format!(
+            " ({} active, {} blocked)",
+            outcome.active_tasks, outcome.blocked_tasks
+        ));
+    }
+
+    text
+}
+
 // ─── Processor ────────────────────────────────────────────────────────────
 
 /// Translates `StreamEvent`s from the agent into platform-appropriate messages.
@@ -357,14 +381,14 @@ impl GatewayEventProcessor {
                     summary,
                     ..
                 } => {
-                    if let Some(batch) = subagent_batches.get_mut(&task_index) {
-                        if !batch.is_empty() {
-                            let buffered = batch.join(", ");
-                            batch.clear();
-                            let status_line =
-                                format!("🔀 [{}/{}] {}", task_index + 1, task_count, buffered);
-                            self.send_status(&status_line).await;
-                        }
+                    if let Some(batch) = subagent_batches.get_mut(&task_index)
+                        && !batch.is_empty()
+                    {
+                        let buffered = batch.join(", ");
+                        batch.clear();
+                        let status_line =
+                            format!("🔀 [{}/{}] {}", task_index + 1, task_count, buffered);
+                        self.send_status(&status_line).await;
                     }
                     let summary = summary
                         .lines()
@@ -404,6 +428,12 @@ impl GatewayEventProcessor {
                     let _ = self.delta_tx.send(StreamItem::Delta(text)).await;
                 }
 
+                StreamEvent::RunFinished { outcome } => {
+                    if !outcome.is_success() || (self.cfg.enabled && self.cfg.tool_progress) {
+                        self.send_status(&format_run_outcome_status(&outcome)).await;
+                    }
+                }
+
                 StreamEvent::Done => {
                     cancel_typing!();
                     subagent_batches.clear();
@@ -417,7 +447,7 @@ impl GatewayEventProcessor {
                     subagent_batches.clear();
                     tracing::error!(error = %msg, "agent streaming error");
                     // Send an error message to the user.
-                    let err_text = format!("⚠️ An error occurred: {}", msg);
+                    let err_text = format!("⚠️ Run failed — {msg}");
                     self.send_status(&err_text).await;
                     // Terminate the consumer — do not send a partial response.
                     let _ = self.delta_tx.send(StreamItem::Done).await;
@@ -508,6 +538,19 @@ impl GatewayEventProcessor {
                         );
                     }
                     let _ = response_tx.send(value);
+                }
+
+                // Steering events are TUI-only — the gateway logs them but takes
+                // no further action.  The agent loop has already handled the steer.
+                StreamEvent::SteerPending { count } => {
+                    tracing::debug!(count, "gateway: steering pending (informational, ignored)");
+                }
+
+                StreamEvent::SteerApplied { message } => {
+                    tracing::info!(
+                        len = message.len(),
+                        "gateway: steering applied — agent received new guidance"
+                    );
                 }
             }
         }
@@ -952,11 +995,11 @@ mod tests {
     fn surfaces_file_edit_completions_but_not_generic_searches() {
         assert!(should_surface_tool_completion(
             "write_file",
-            "Wrote 42 bytes to 'src/main.rs'"
+            r#"{"ok":true,"action":"create","bytes":42,"path":"src/main.rs"}"#
         ));
         assert!(should_surface_tool_completion(
             "apply_patch",
-            "Patched 'src/lib.rs': 2 replacement(s)"
+            r#"{"ok":true,"replacements":2,"before_bytes":10,"after_bytes":15,"path":"src/lib.rs"}"#
         ));
         assert!(!should_surface_tool_completion(
             "web_search",

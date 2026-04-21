@@ -68,17 +68,17 @@ pub fn bundled_skills_dir() -> Option<PathBuf> {
     }
 
     // Relative to current binary
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(bin_dir) = exe.parent() {
-            let candidate = bin_dir.join("../..").join("skills");
-            if candidate.is_dir() {
-                return Some(candidate);
-            }
-            // Also try alongside the binary (flat install layout)
-            let flat = bin_dir.join("skills");
-            if flat.is_dir() {
-                return Some(flat);
-            }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(bin_dir) = exe.parent()
+    {
+        let candidate = bin_dir.join("../..").join("skills");
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+        // Also try alongside the binary (flat install layout)
+        let flat = bin_dir.join("skills");
+        if flat.is_dir() {
+            return Some(flat);
         }
     }
 
@@ -100,16 +100,16 @@ pub fn optional_skills_dir() -> Option<PathBuf> {
         }
     }
 
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(bin_dir) = exe.parent() {
-            let candidate = bin_dir.join("../..").join("optional-skills");
-            if candidate.is_dir() {
-                return Some(candidate);
-            }
-            let flat = bin_dir.join("optional-skills");
-            if flat.is_dir() {
-                return Some(flat);
-            }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(bin_dir) = exe.parent()
+    {
+        let candidate = bin_dir.join("../..").join("optional-skills");
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+        let flat = bin_dir.join("optional-skills");
+        if flat.is_dir() {
+            return Some(flat);
         }
     }
 

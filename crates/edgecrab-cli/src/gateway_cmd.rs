@@ -414,16 +414,15 @@ async fn run_foreground(args: &CliArgs) -> anyhow::Result<()> {
 
 fn start_background_report(args: &CliArgs) -> anyhow::Result<String> {
     // Guard: refuse to start a second instance
-    if let Ok(status) = snapshot() {
-        if status.running {
-            if let Some(pid) = status.pid {
-                anyhow::bail!(
-                    "Gateway is already running (pid {pid}).\n\
+    if let Ok(status) = snapshot()
+        && status.running
+        && let Some(pid) = status.pid
+    {
+        anyhow::bail!(
+            "Gateway is already running (pid {pid}).\n\
                      Run `edgecrab gateway status` for health details,\n\
                      or `edgecrab gateway restart` to roll it cleanly."
-                );
-            }
-        }
+        );
     }
 
     let current_exe = std::env::current_exe().context("cannot resolve current executable")?;
@@ -442,10 +441,10 @@ fn start_background_report(args: &CliArgs) -> anyhow::Result<String> {
     if let Some(model) = &args.model {
         cmd.arg("--model").arg(model);
     }
-    if let Some(toolsets) = &args.toolset {
-        if !toolsets.is_empty() {
-            cmd.arg("--toolset").arg(toolsets.join(","));
-        }
+    if let Some(toolsets) = &args.toolset
+        && !toolsets.is_empty()
+    {
+        cmd.arg("--toolset").arg(toolsets.join(","));
     }
     cmd.args(["gateway", "start", "--foreground"]);
     cmd.stdin(Stdio::null());
@@ -1406,10 +1405,10 @@ fn detect_java_home_for_signal() -> Option<String> {
                         {
                             let vt = String::from_utf8_lossy(&vo.stderr).to_string()
                                 + String::from_utf8_lossy(&vo.stdout).as_ref();
-                            if let Some(maj) = parse_java_major(&vt) {
-                                if best.as_ref().is_none_or(|(bv, _)| maj > *bv) {
-                                    best = Some((maj, h));
-                                }
+                            if let Some(maj) = parse_java_major(&vt)
+                                && best.as_ref().is_none_or(|(bv, _)| maj > *bv)
+                            {
+                                best = Some((maj, h));
                             }
                         }
                     }
@@ -1423,10 +1422,10 @@ fn detect_java_home_for_signal() -> Option<String> {
         // 3. Existing JAVA_HOME if it's ≥ 21.
         if let Ok(existing) = std::env::var("JAVA_HOME") {
             let existing = existing.trim().to_string();
-            if !existing.is_empty() {
-                if let Some(h) = check(&existing) {
-                    return Some(h);
-                }
+            if !existing.is_empty()
+                && let Some(h) = check(&existing)
+            {
+                return Some(h);
             }
         }
 
@@ -1442,22 +1441,21 @@ fn detect_java_home_for_signal() -> Option<String> {
 #[cfg(target_os = "macos")]
 fn parse_java_major(version_output: &str) -> Option<u32> {
     for line in version_output.lines() {
-        if line.contains("version") {
-            if let Some(start) = line.find('"') {
-                if let Some(end) = line[start + 1..].find('"') {
-                    let ver = &line[start + 1..start + 1 + end];
-                    let parts: Vec<&str> = ver.split('.').collect();
-                    if let Some(first) = parts.first() {
-                        if let Ok(n) = first.parse::<u32>() {
-                            if n == 1 {
-                                if let Some(second) = parts.get(1) {
-                                    return second.parse().ok();
-                                }
-                            }
-                            return Some(n);
-                        }
-                    }
+        if line.contains("version")
+            && let Some(start) = line.find('"')
+            && let Some(end) = line[start + 1..].find('"')
+        {
+            let ver = &line[start + 1..start + 1 + end];
+            let parts: Vec<&str> = ver.split('.').collect();
+            if let Some(first) = parts.first()
+                && let Ok(n) = first.parse::<u32>()
+            {
+                if n == 1
+                    && let Some(second) = parts.get(1)
+                {
+                    return second.parse().ok();
                 }
+                return Some(n);
             }
         }
     }

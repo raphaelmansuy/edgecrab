@@ -256,21 +256,20 @@ pub async fn tick_due_jobs(
                     tracing::debug!("Job '{}' reported [SILENT] — no delivery.", job.id);
                 }
                 // Deliver to external platform (hermes parity)
-                if !silent {
-                    if let Err(e) = deliver_cron_output(
+                if !silent
+                    && let Err(e) = deliver_cron_output(
                         job,
                         &response,
                         output_path.as_deref(),
                         sender.as_deref(),
                     )
                     .await
-                    {
-                        tracing::warn!(
-                            job = %job.id,
-                            error = %e,
-                            "cron delivery failed — output saved locally"
-                        );
-                    }
+                {
+                    tracing::warn!(
+                        job = %job.id,
+                        error = %e,
+                        "cron delivery failed — output saved locally"
+                    );
                 }
                 // Notify the TUI of completion so the user sees output
                 // in the chat window, regardless of the deliver= setting.

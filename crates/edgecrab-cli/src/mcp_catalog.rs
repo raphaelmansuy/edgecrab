@@ -963,16 +963,14 @@ pub fn render_search_report(query: Option<&str>, report: &McpSearchReport) -> St
 
 pub async fn load_official_catalog(prefer_refresh: bool) -> Vec<OfficialCatalogEntry> {
     let cache = read_cached_official_catalog();
-    if !prefer_refresh {
-        if let Some(cache) = cache.as_ref() {
-            return cache.entries.clone();
-        }
+    if !prefer_refresh && let Some(cache) = cache.as_ref() {
+        return cache.entries.clone();
     }
 
-    if prefer_refresh || official_catalog_needs_refresh(cache.as_ref()) {
-        if let Ok(entries) = refresh_official_catalog().await {
-            return entries;
-        }
+    if (prefer_refresh || official_catalog_needs_refresh(cache.as_ref()))
+        && let Ok(entries) = refresh_official_catalog().await
+    {
+        return entries;
     }
 
     cache

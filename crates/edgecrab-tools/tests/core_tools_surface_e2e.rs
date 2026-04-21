@@ -1,13 +1,9 @@
-use edgecrab_tools::{ACP_TOOLS, AppConfigRef, CORE_TOOLS, ToolContext, ToolRegistry};
+use edgecrab_tools::{ACP_TOOLS, AppConfigRef, CORE_TOOLS, LSP_TOOLS, ToolContext, ToolRegistry};
 use edgecrab_types::{Platform, ToolError};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
-fn assert_tool_in_surface(tool_name: &str) {
-    assert!(
-        CORE_TOOLS.contains(&tool_name),
-        "CORE_TOOLS should expose {tool_name}"
-    );
+fn assert_tool_in_acp_surface(tool_name: &str) {
     assert!(
         ACP_TOOLS.contains(&tool_name),
         "ACP_TOOLS should expose {tool_name}"
@@ -48,35 +44,49 @@ const EDGECRAB_LSP_ADVANTAGE: &[&str] = &[
 #[test]
 fn browser_advantage_tools_are_exposed_in_core_and_acp_surfaces() {
     for tool_name in ["browser_wait_for", "browser_select", "browser_hover"] {
-        assert_tool_in_surface(tool_name);
+        assert!(
+            CORE_TOOLS.contains(&tool_name),
+            "CORE_TOOLS should expose {tool_name}"
+        );
+        assert_tool_in_acp_surface(tool_name);
     }
 }
 
 #[test]
-fn moa_tool_is_exposed_in_core_and_acp_surfaces() {
-    assert_tool_in_surface("moa");
+fn moa_tool_is_in_dedicated_constant_and_acp() {
+    // MOA moved to on-demand MOA_TOOLS, but still in ACP (editor context)
+    assert!(
+        !CORE_TOOLS.contains(&"moa"),
+        "MOA should not be in CORE_TOOLS"
+    );
+    assert_tool_in_acp_surface("moa");
 }
 
 #[test]
-fn claude_code_lsp_parity_tools_are_exposed_in_core_and_acp_surfaces() {
+fn claude_code_lsp_parity_tools_are_in_lsp_tools_and_acp() {
     for tool_name in CLAUDE_CODE_LSP_BASELINE {
-        assert_tool_in_surface(tool_name);
+        assert!(
+            LSP_TOOLS.contains(tool_name),
+            "LSP_TOOLS should expose {tool_name}"
+        );
+        assert_tool_in_acp_surface(tool_name);
     }
 }
 
 #[test]
-fn edgecrab_lsp_advantage_tools_are_exposed_in_core_and_acp_surfaces() {
+fn edgecrab_lsp_advantage_tools_are_in_lsp_tools_and_acp() {
     for tool_name in EDGECRAB_LSP_ADVANTAGE {
-        assert_tool_in_surface(tool_name);
+        assert!(
+            LSP_TOOLS.contains(tool_name),
+            "LSP_TOOLS should expose {tool_name}"
+        );
+        assert_tool_in_acp_surface(tool_name);
     }
 }
 
 #[test]
 fn edgecrab_lsp_surface_exceeds_claude_code_baseline() {
-    let core_lsp_count = CORE_TOOLS
-        .iter()
-        .filter(|name| name.starts_with("lsp_"))
-        .count();
+    let lsp_tools_count = LSP_TOOLS.len();
     let acp_lsp_count = ACP_TOOLS
         .iter()
         .filter(|name| name.starts_with("lsp_"))
@@ -88,17 +98,17 @@ fn edgecrab_lsp_surface_exceeds_claude_code_baseline() {
         "baseline list should track Claude Code's 9 documented LSP operations"
     );
     assert!(
-        core_lsp_count > CLAUDE_CODE_LSP_BASELINE.len(),
-        "CORE_TOOLS should expose more LSP operations than the 9-operation baseline"
+        lsp_tools_count > CLAUDE_CODE_LSP_BASELINE.len(),
+        "LSP_TOOLS should expose more LSP operations than the 9-operation baseline"
     );
     assert!(
         acp_lsp_count > CLAUDE_CODE_LSP_BASELINE.len(),
         "ACP_TOOLS should expose more LSP operations than the 9-operation baseline"
     );
     assert_eq!(
-        core_lsp_count,
+        lsp_tools_count,
         CLAUDE_CODE_LSP_BASELINE.len() + EDGECRAB_LSP_ADVANTAGE.len(),
-        "CORE_TOOLS should expose the full parity-plus LSP surface"
+        "LSP_TOOLS should expose the full parity-plus LSP surface"
     );
     assert_eq!(
         acp_lsp_count,

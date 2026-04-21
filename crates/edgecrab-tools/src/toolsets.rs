@@ -16,13 +16,17 @@
 ///
 /// Editing this list once updates all platforms. Platform differentiation
 /// happens via runtime gating (check_fn), not static tool lists.
-/// Mirrors hermes-agent's `_HERMES_CORE_TOOLS`.
+///
+/// Design principle (hermes-agent `_HERMES_CORE_TOOLS` pattern):
+/// Keep the core set minimal (~45 tools) so the LLM schema payload stays
+/// under ~18K tokens. Specialised tools (LSP, MOA) live in on-demand
+/// toolsets loaded via `enabled_toolsets: ["core", "lsp"]`.
 pub const CORE_TOOLS: &[&str] = &[
-    // Web
+    // Web (3)
     "web_search",
     "web_extract",
     "web_crawl",
-    // Terminal + process management
+    // Terminal + process management (8)
     "terminal",
     "run_process",
     "list_processes",
@@ -30,18 +34,20 @@ pub const CORE_TOOLS: &[&str] = &[
     "get_process_output",
     "wait_for_process",
     "write_stdin",
-    // File manipulation
+    "process",
+    // File manipulation (5)
     "read_file",
     "write_file",
     "patch",
     "search_files",
     "pdf_to_markdown",
-    // Skills
+    // Skills (5)
     "skills_list",
     "skills_categories",
     "skill_view",
     "skill_manage",
     "skills_hub",
+    // Browser (14)
     "browser_navigate",
     "browser_snapshot",
     "browser_screenshot",
@@ -57,38 +63,52 @@ pub const CORE_TOOLS: &[&str] = &[
     "browser_wait_for",
     "browser_select",
     "browser_hover",
-    // TTS
+    // Media (4)
     "text_to_speech",
-    // Vision
     "vision_analyze",
-    // Audio transcription
     "transcribe_audio",
-    // Planning & memory
+    "generate_image",
+    // Planning & memory (4)
     "manage_todo_list",
+    "report_task_status",
     "memory_read",
     "memory_write",
-    // Honcho — persistent cross-session user modeling
+    // Honcho — persistent cross-session user modeling (6, runtime-gated)
     "honcho_conclude",
     "honcho_search",
     "honcho_list",
     "honcho_remove",
     "honcho_profile",
     "honcho_context",
-    // Home Assistant smart home control (runtime-gated)
+    // Home Assistant smart home control (4, runtime-gated)
     "ha_list_entities",
     "ha_get_state",
     "ha_list_services",
     "ha_call_service",
-    // Session history search
+    // Session history search (1)
     "session_search",
-    // Checkpoints
+    // Checkpoints (1)
     "checkpoint",
-    // Clarifying questions
+    // Clarifying questions (1)
     "clarify",
-    // Code execution + delegation
+    // Code execution + delegation (2)
     "execute_code",
     "delegate_task",
-    // Language server protocol
+    // Cron job management (1)
+    "manage_cron_jobs",
+    // MCP core (2) — extended MCP tools available via "mcp_ext" toolset
+    "mcp_list_tools",
+    "mcp_call_tool",
+    // Cross-platform messaging (1, runtime-gated)
+    "send_message",
+];
+
+/// On-demand LSP tools — loaded via `enabled_toolsets: ["core", "lsp"]`.
+///
+/// WHY separate: 19 LSP tools add ~7.6K tokens to schema payload.
+/// Most tasks don't need semantic code intelligence; loading LSP tools
+/// by default wastes 6% of the context window on every API call.
+pub const LSP_TOOLS: &[&str] = &[
     "lsp_goto_definition",
     "lsp_find_references",
     "lsp_hover",
@@ -114,25 +134,53 @@ pub const CORE_TOOLS: &[&str] = &[
     "lsp_enrich_diagnostics",
     "lsp_select_and_apply_action",
     "lsp_workspace_type_errors",
-    // Mixture of Agents — multi-model consensus reasoning
-    "moa",
-    // Cron job management
-    "manage_cron_jobs",
-    // MCP
-    "mcp_list_tools",
-    "mcp_call_tool",
+];
+
+/// On-demand extended MCP tools — loaded via `enabled_toolsets: ["core", "mcp_ext"]`.
+pub const MCP_EXTENDED_TOOLS: &[&str] = &[
     "mcp_list_resources",
     "mcp_read_resource",
     "mcp_list_prompts",
     "mcp_get_prompt",
-    // Cross-platform messaging (runtime-gated, stub)
-    "send_message",
-    // Image generation (runtime-gated, stub)
-    "generate_image",
 ];
 
-/// ACP (editor integration) tools — coding-focused subset.
-/// No clarify, send_message, generate_image, text_to_speech.
+/// On-demand Mixture-of-Agents tool — loaded via `enabled_toolsets: ["core", "moa"]`.
+pub const MOA_TOOLS: &[&str] = &["moa"];
+
+/// Tools EXCLUDED from ACP (editor integration) mode.
+///
+/// DRY: Instead of duplicating the full CORE_TOOLS list, we define only
+/// the exclusions. `acp_tools()` derives the ACP set from CORE_TOOLS
+/// minus these exclusions. Mirrors hermes-agent's pattern.
+const ACP_EXCLUDED: &[&str] = &[
+    "clarify",
+    "send_message",
+    "generate_image",
+    "text_to_speech",
+    "transcribe_audio",
+    "vision_analyze",
+    "ha_list_entities",
+    "ha_get_state",
+    "ha_list_services",
+    "ha_call_service",
+];
+
+/// ACP (editor integration) tools — coding-focused subset of CORE_TOOLS.
+///
+/// Derived from CORE_TOOLS minus interactive/messaging/media tools.
+/// Also includes LSP tools (always relevant in editor context).
+pub fn acp_tools() -> Vec<&'static str> {
+    let mut tools: Vec<&str> = CORE_TOOLS
+        .iter()
+        .filter(|t| !ACP_EXCLUDED.contains(t))
+        .copied()
+        .collect();
+    tools.extend_from_slice(LSP_TOOLS);
+    tools
+}
+
+/// Static ACP_TOOLS for backward compatibility with const contexts.
+/// Prefer `acp_tools()` for runtime use.
 pub const ACP_TOOLS: &[&str] = &[
     "web_search",
     "web_extract",
@@ -144,6 +192,7 @@ pub const ACP_TOOLS: &[&str] = &[
     "get_process_output",
     "wait_for_process",
     "write_stdin",
+    "process",
     "read_file",
     "write_file",
     "patch",
@@ -170,9 +219,9 @@ pub const ACP_TOOLS: &[&str] = &[
     "browser_select",
     "browser_hover",
     "manage_todo_list",
+    "report_task_status",
     "memory_read",
     "memory_write",
-    // Honcho — persistent cross-session user modeling
     "honcho_conclude",
     "honcho_search",
     "honcho_list",
@@ -183,6 +232,10 @@ pub const ACP_TOOLS: &[&str] = &[
     "checkpoint",
     "execute_code",
     "delegate_task",
+    "manage_cron_jobs",
+    "mcp_list_tools",
+    "mcp_call_tool",
+    // LSP tools always included in editor context
     "lsp_goto_definition",
     "lsp_find_references",
     "lsp_hover",
@@ -208,13 +261,13 @@ pub const ACP_TOOLS: &[&str] = &[
     "lsp_enrich_diagnostics",
     "lsp_select_and_apply_action",
     "lsp_workspace_type_errors",
-    "moa",
-    "mcp_list_tools",
-    "mcp_call_tool",
+    // Extended MCP in ACP context
     "mcp_list_resources",
     "mcp_read_resource",
     "mcp_list_prompts",
     "mcp_get_prompt",
+    // MOA in editor context
+    "moa",
 ];
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -238,7 +291,7 @@ pub struct ToolsetEnableSync {
 /// - `"browser"`      → browser_navigate, browser_snapshot, …
 /// - `"memory"`       → memory_read, memory_write, honcho_*
 /// - `"skills"`       → skills_list, skills_categories, skill_view, skill_manage, skills_hub
-/// - `"meta"`         → manage_todo_list, clarify
+/// - `"meta"`         → manage_todo_list, report_task_status, clarify
 /// - `"scheduling"`   → manage_cron_jobs
 /// - `"delegation"`   → delegate_task
 /// - `"code_execution"` → execute_code
@@ -252,8 +305,11 @@ pub fn resolve_alias(alias: &str) -> Option<&'static [&'static str]> {
     match alias {
         // "core" is the meta-alias users get from `edgecrab setup`. It expands
         // to all built-in non-specialty toolsets so the agent has a full capability
-        // set out of the box. Without this expansion the user's config
-        // `enabled_toolsets: [core, …]` only enables the `checkpoint` tool.
+        // set out of the box.
+        //
+        // DESIGN: LSP (19 tools, ~7.6K tokens) and MOA (1 tool) are excluded
+        // from core to keep the default schema payload under ~18K tokens.
+        // Users enable them explicitly: `enabled_toolsets: ["core", "lsp", "moa"]`
         //
         // WHY include scheduling/delegation/session/mcp/messaging/media in "core":
         // These are fundamental agent capabilities (cron, sub-agents, history,
@@ -261,30 +317,24 @@ pub fn resolve_alias(alias: &str) -> Option<&'static [&'static str]> {
         // Every standard installation should have them. Messaging is still
         // runtime-gated by `check_fn` and `gateway_sender`, mirroring
         // hermes-agent's model. Media is included because gateway platforms
-        // can receive images/audio by default; excluding `vision_analyze` and
-        // `transcribe_audio` from the default tool surface causes attached
-        // media scenarios to fail even though the transport itself works.
+        // can receive images/audio by default.
         //
         // WHY include "browser" in core: Browser tools are runtime-gated by
         // browser_is_available() (requires Chrome binary OR CDP override), so
         // including the toolset label here is safe — tools silently absent when
-        // no browser is reachable. Without "browser" in core the LLM only sees
-        // mcp_call_tool and calls mcp_call_tool(tool_name="browser_navigate")
-        // instead of the direct browser_navigate tool.
+        // no browser is reachable.
         "core" => Some(&[
             "core",           // checkpoint tool
             "file",           // read_file, write_file, patch, search_files
-            "meta",           // manage_todo_list, clarify
+            "meta",           // manage_todo_list, report_task_status, clarify
             "scheduling",     // manage_cron_jobs
             "delegation",     // delegate_task
             "code_execution", // execute_code
-            "lsp",            // lsp_* language-server tools
             "session",        // session_search
             "mcp",            // mcp_list_tools, mcp_call_tool
             "messaging",      // send_message (runtime-gated in non-gateway sessions)
             "media",          // vision_analyze, transcribe_audio, text_to_speech
             "browser",        // browser_navigate, browser_snapshot, … (runtime-gated)
-            "moa",            // multi-model consensus reasoning
         ]),
         "coding" => Some(&["file", "terminal", "search", "code_execution", "lsp"]),
         "research" => Some(&["web", "browser", "vision"]),
@@ -475,6 +525,40 @@ mod tests {
     }
 
     #[test]
+    fn lsp_tools_in_dedicated_constant() {
+        assert!(!LSP_TOOLS.is_empty());
+        assert!(LSP_TOOLS.contains(&"lsp_goto_definition"));
+        assert!(LSP_TOOLS.contains(&"lsp_find_references"));
+        assert!(LSP_TOOLS.contains(&"lsp_workspace_type_errors"));
+        // LSP tools should NOT be in CORE_TOOLS (moved to on-demand)
+        for tool in LSP_TOOLS {
+            assert!(
+                !CORE_TOOLS.contains(tool),
+                "LSP tool '{tool}' should not be in CORE_TOOLS (moved to on-demand LSP_TOOLS)"
+            );
+        }
+    }
+
+    #[test]
+    fn moa_not_in_core_tools() {
+        assert!(
+            !CORE_TOOLS.contains(&"moa"),
+            "MOA should not be in CORE_TOOLS (moved to on-demand MOA_TOOLS)"
+        );
+        assert!(MOA_TOOLS.contains(&"moa"));
+    }
+
+    #[test]
+    fn mcp_extended_not_in_core_tools() {
+        for tool in MCP_EXTENDED_TOOLS {
+            assert!(
+                !CORE_TOOLS.contains(tool),
+                "MCP extended tool '{tool}' should not be in CORE_TOOLS"
+            );
+        }
+    }
+
+    #[test]
     fn acp_tools_no_interactive() {
         assert!(!ACP_TOOLS.contains(&"clarify"));
         assert!(!ACP_TOOLS.contains(&"send_message"));
@@ -486,6 +570,22 @@ mod tests {
         assert!(ACP_TOOLS.contains(&"browser_wait_for"));
         assert!(ACP_TOOLS.contains(&"browser_select"));
         assert!(ACP_TOOLS.contains(&"browser_hover"));
+        // ACP includes LSP (editor context) and MOA
+        assert!(ACP_TOOLS.contains(&"lsp_goto_definition"));
+        assert!(ACP_TOOLS.contains(&"lsp_workspace_type_errors"));
+        assert!(ACP_TOOLS.contains(&"moa"));
+    }
+
+    #[test]
+    fn acp_tools_fn_matches_static_const() {
+        let dynamic = acp_tools();
+        // Every tool in the dynamic list should be in the static list
+        for tool in &dynamic {
+            assert!(
+                ACP_TOOLS.contains(tool),
+                "acp_tools() produced '{tool}' not in ACP_TOOLS const"
+            );
+        }
     }
 
     #[test]
@@ -580,11 +680,11 @@ mod tests {
 
     #[test]
     fn resolve_alias_core_includes_meta_toolset() {
-        // "meta" contains manage_todo_list and clarify — needed for every session.
+        // "meta" contains manage_todo_list, report_task_status, and clarify — needed for every session.
         let expanded = resolve_alias("core").expect("'core' must be a registered alias");
         assert!(
             expanded.contains(&"meta"),
-            "'core' alias must include 'meta' toolset (manage_todo_list, clarify)"
+            "'core' alias must include 'meta' toolset (manage_todo_list, report_task_status, clarify)"
         );
     }
 
@@ -599,11 +699,21 @@ mod tests {
 
     #[test]
     fn resolve_alias_core_includes_lsp_toolset() {
+        // LSP is no longer in "core" — it's an on-demand toolset.
+        // Users enable it via `enabled_toolsets: ["core", "lsp"]`.
         let expanded = resolve_alias("core").expect("'core' must be a registered alias");
         assert!(
-            expanded.contains(&"lsp"),
-            "'core' alias must include 'lsp' so default sessions expose semantic code intelligence"
+            !expanded.contains(&"lsp"),
+            "'core' alias should NOT include 'lsp' — LSP is on-demand to reduce default tool count"
         );
+    }
+
+    #[test]
+    fn resolve_alias_lsp_available_as_explicit_toolset() {
+        // LSP can be enabled explicitly alongside core
+        let names = vec!["core".to_string(), "lsp".to_string()];
+        let expanded = expand_toolset_names(&names);
+        assert!(expanded.contains(&"lsp".to_string()));
     }
 
     #[test]
@@ -622,11 +732,12 @@ mod tests {
     }
 
     #[test]
-    fn resolve_alias_core_includes_moa_toolset() {
+    fn resolve_alias_core_excludes_moa_toolset() {
+        // MOA is no longer in "core" — it's an on-demand toolset.
         let expanded = resolve_alias("core").expect("'core' must be a registered alias");
         assert!(
-            expanded.contains(&"moa"),
-            "'core' alias must include 'moa' so Mixture-of-Agents is exposed in default sessions"
+            !expanded.contains(&"moa"),
+            "'core' alias should NOT include 'moa' — MOA is on-demand"
         );
     }
 
@@ -680,9 +791,14 @@ mod tests {
             expanded.contains(&"media".to_string()),
             "media must be in expanded list"
         );
+        // LSP and MOA are NOT in core expansion (on-demand)
         assert!(
-            expanded.contains(&"moa".to_string()),
-            "moa must be in expanded list"
+            !expanded.contains(&"lsp".to_string()),
+            "lsp must NOT be in core-only expansion"
+        );
+        assert!(
+            !expanded.contains(&"moa".to_string()),
+            "moa must NOT be in core-only expansion"
         );
         // Must still contain explicit ones
         assert!(expanded.contains(&"web".to_string()));
@@ -728,7 +844,10 @@ mod tests {
     #[test]
     fn toolset_enabled_respects_alias_expansion() {
         let enabled = vec!["core".to_string()];
-        assert!(toolset_enabled(Some(&enabled), None, "moa"));
+        // MOA is no longer in "core" — needs explicit enable
+        assert!(!toolset_enabled(Some(&enabled), None, "moa"));
+        // But file toolset IS in core
+        assert!(toolset_enabled(Some(&enabled), None, "file"));
     }
 
     #[test]

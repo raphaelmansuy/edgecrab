@@ -377,16 +377,14 @@ fn build_arg_extractions(params: &[ToolParam]) -> Vec<proc_macro2::TokenStream> 
 fn extract_doc_comment(attrs: &[syn::Attribute]) -> Option<String> {
     let mut lines = Vec::new();
     for attr in attrs {
-        if attr.path().is_ident("doc") {
-            if let Meta::NameValue(nv) = &attr.meta {
-                if let syn::Expr::Lit(syn::ExprLit {
-                    lit: syn::Lit::Str(s),
-                    ..
-                }) = &nv.value
-                {
-                    lines.push(s.value().trim().to_string());
-                }
-            }
+        if attr.path().is_ident("doc")
+            && let Meta::NameValue(nv) = &attr.meta
+            && let syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Str(s),
+                ..
+            }) = &nv.value
+        {
+            lines.push(s.value().trim().to_string());
         }
     }
     if lines.is_empty() {

@@ -727,10 +727,10 @@ fn setup_gateway_section(config: &mut CurrentConfig, config_path: &Path) -> anyh
                 config.gateway_host = trimmed.to_string();
             }
             let new_port = prompt_line(&format!("  Gateway port [{}]", config.gateway_port))?;
-            if let Ok(p) = new_port.trim().parse::<u16>() {
-                if p > 0 {
-                    config.gateway_port = p;
-                }
+            if let Ok(p) = new_port.trim().parse::<u16>()
+                && p > 0
+            {
+                config.gateway_port = p;
             }
         }
         _ => {

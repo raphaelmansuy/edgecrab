@@ -379,10 +379,10 @@ pub fn terminal_supports_extended_unicode() -> bool {
                     }
                 }
                 // If COLORTERM=truecolor it's almost certainly a modern emulator
-                if let Ok(ct) = std::env::var("COLORTERM") {
-                    if ct == "truecolor" || ct == "24bit" {
-                        return true;
-                    }
+                if let Ok(ct) = std::env::var("COLORTERM")
+                    && (ct == "truecolor" || ct == "24bit")
+                {
+                    return true;
                 }
                 // TERM_PROGRAM_VERSION exists → likely a modern terminal
                 if std::env::var("TERM_PROGRAM_VERSION").is_ok() {
@@ -415,10 +415,10 @@ pub fn terminal_supports_extended_unicode() -> bool {
     }
 
     // 3. COLORTERM alone
-    if let Ok(ct) = std::env::var("COLORTERM") {
-        if ct == "truecolor" || ct == "24bit" {
-            return true;
-        }
+    if let Ok(ct) = std::env::var("COLORTERM")
+        && (ct == "truecolor" || ct == "24bit")
+    {
+        return true;
     }
 
     false
@@ -588,6 +588,89 @@ impl Theme {
     pub fn load() -> Self {
         let skin = SkinConfig::load();
         Self::from_skin(&skin)
+    }
+}
+
+// ─── TuiPalette — WCAG-certified colour constants ─────────────────────────
+//
+// Single source of truth for every non-brand colour used in the TUI.
+// All values are verified against a pure black background (worst case).
+//
+// Hierarchy (WCAG 2.1):
+//   Primary   ≥ 7:1 AAA  — tool name, result text, errors
+//   Secondary ≥ 4.5:1 AA — preview args, verbose labels, hints
+//   Tertiary  ≥ 4.5:1 AA — elapsed time, duration, row prefixes
+//   Decorative < 3:1      — gutter ┊, indent spaces, rule lines (SC 1.4.3 exempt)
+//
+// DIM modifier policy:
+//   DO NOT apply Modifier::DIM to any of the constants below.
+//   DIM is terminal-dependent (typically −30 to −40 % luminance) and can push
+//   even passing colours below the AA threshold.  Reserve DIM only for
+//   GUTTER_BAR, INDENT_SPACE, SEP_LINE, and the "···" running-pulse indicator.
+pub mod palette {
+    use ratatui::style::Color;
+
+    // ── Primary text (≥ 7:1 = WCAG AAA) ─────────────────────────────────────
+    /// Success result text — sage green.  L = 0.543, CR = 11.9 : 1.
+    pub const TOOL_RESULT_OK: Color = Color::Rgb(148, 208, 168);
+    /// Error result text — soft red.  L = 0.361, CR = 8.2 : 1.
+    pub const TOOL_RESULT_ERR: Color = Color::Rgb(255, 120, 120);
+    #[allow(dead_code)]
+    /// Inline code / fence badge — gold.  L = 0.701, CR = 15.0 : 1.
+    pub const TOOL_INLINE_CODE: Color = Color::Rgb(255, 215, 0);
+
+    // ── Secondary text (≥ 4.5:1 = WCAG AA+) ─────────────────────────────────
+    /// Secondary cool — blue-grey for verbose labels, args, hints.
+    /// Rgb(148, 162, 185).  L = 0.351, CR = 8.0 : 1.
+    pub const SECONDARY_COOL: Color = Color::Rgb(148, 162, 185);
+    /// Secondary warm — neutral-grey for model labels, banner hints.
+    /// Rgb(165, 165, 178).  L = 0.410, CR = 9.2 : 1.
+    pub const SECONDARY_WARM: Color = Color::Rgb(165, 165, 178);
+
+    // ── Tertiary text (≥ 4.5:1 = WCAG AA) ───────────────────────────────────
+    /// Tertiary cool — muted blue for preview args column, elapsed.
+    /// Rgb(125, 138, 162).  L = 0.251, CR = 6.0 : 1.
+    pub const TERTIARY_COOL: Color = Color::Rgb(125, 138, 162);
+    /// Tertiary warm — muted neutral for duration, timing stamps.
+    /// Rgb(128, 138, 152).  L = 0.247, CR = 5.9 : 1.
+    pub const TERTIARY_WARM: Color = Color::Rgb(128, 138, 152);
+
+    // ── Decorative — not for readable text (SC 1.4.3 exempt) ────────────────
+    /// Gutter bar "  ┊ " — intentionally subtle, purely structural.
+    /// Rgb(55, 58, 70).  L = 0.043, CR = 1.85 : 1.  DIM is acceptable here.
+    pub const GUTTER_BAR: Color = Color::Rgb(55, 58, 70);
+    /// Indent whitespace — invisible spacer spans (only spaces).
+    /// Rgb(48, 52, 62).  No contrast requirement; content = whitespace.
+    pub const INDENT_SPACE: Color = Color::Rgb(48, 52, 62);
+    /// Decorative separator line "─".
+    /// Rgb(60, 60, 70).  Purely structural; DIM is acceptable.
+    pub const SEP_LINE: Color = Color::Rgb(60, 60, 70);
+
+    // ── Helpers ──────────────────────────────────────────────────────────────
+
+    /// Compute the relative luminance of an sRGB triple per IEC 61966-2-1.
+    ///
+    /// Used in tests to assert WCAG contrast ratios at compile / test time.
+    #[allow(dead_code)]
+    pub fn relative_luminance(r: u8, g: u8, b: u8) -> f64 {
+        fn linearise(c: u8) -> f64 {
+            let s = c as f64 / 255.0;
+            if s <= 0.04045 {
+                s / 12.92
+            } else {
+                ((s + 0.055) / 1.055_f64).powf(2.4)
+            }
+        }
+        0.2126 * linearise(r) + 0.7152 * linearise(g) + 0.0722 * linearise(b)
+    }
+
+    /// WCAG contrast ratio between two colours.
+    #[allow(dead_code)]
+    pub fn contrast_ratio(fg: (u8, u8, u8), bg: (u8, u8, u8)) -> f64 {
+        let l1 = relative_luminance(fg.0, fg.1, fg.2);
+        let l2 = relative_luminance(bg.0, bg.1, bg.2);
+        let (lighter, darker) = if l1 > l2 { (l1, l2) } else { (l2, l1) };
+        (lighter + 0.05) / (darker + 0.05)
     }
 }
 
@@ -862,5 +945,104 @@ mod tests {
             use unicode_width::UnicodeWidthStr;
             assert!(face.width() > 0, "kaomoji_thinking '{face}' has zero width");
         }
+    }
+
+    // ── WCAG 2.1 palette contrast tests ─────────────────────────────────────
+
+    /// All semantic (non-decorative) palette entries must achieve WCAG AA
+    /// (4.5 : 1) against a pure black background — the worst-case dark terminal.
+    ///
+    /// This test encodes the accessibility contract and guards against regressions
+    /// when palette values are updated.  See `specs/accessibility_and_color_audit.md`.
+    #[test]
+    fn palette_wcag_aa_semantic_colours() {
+        use palette::{
+            SECONDARY_COOL, SECONDARY_WARM, TERTIARY_COOL, TERTIARY_WARM, TOOL_INLINE_CODE,
+            TOOL_RESULT_ERR, TOOL_RESULT_OK, contrast_ratio,
+        };
+        use ratatui::style::Color;
+
+        let black = (0u8, 0u8, 0u8);
+        let min_aa = 4.5_f64;
+
+        let semantic: &[(&str, Color)] = &[
+            ("TOOL_RESULT_OK", TOOL_RESULT_OK),
+            ("TOOL_RESULT_ERR", TOOL_RESULT_ERR),
+            ("TOOL_INLINE_CODE", TOOL_INLINE_CODE),
+            ("SECONDARY_COOL", SECONDARY_COOL),
+            ("SECONDARY_WARM", SECONDARY_WARM),
+            ("TERTIARY_COOL", TERTIARY_COOL),
+            ("TERTIARY_WARM", TERTIARY_WARM),
+        ];
+
+        for (name, colour) in semantic {
+            let (r, g, b) = match colour {
+                Color::Rgb(r, g, b) => (*r, *g, *b),
+                other => panic!("palette constant {name} must be Rgb, got {other:?}"),
+            };
+            let cr = contrast_ratio((r, g, b), black);
+            assert!(
+                cr >= min_aa,
+                "palette::{name} Rgb({r},{g},{b}) contrast {cr:.2} : 1 < {min_aa} (WCAG AA) \
+                 — update the value to a lighter colour"
+            );
+        }
+    }
+
+    /// Decorative palette entries are intentionally below AA — this test
+    /// documents that they are EXEMPT (SC 1.4.3) and must not be used for text.
+    #[test]
+    fn palette_decorative_colours_are_below_aa() {
+        use palette::{GUTTER_BAR, INDENT_SPACE, SEP_LINE, contrast_ratio};
+        use ratatui::style::Color;
+
+        let black = (0u8, 0u8, 0u8);
+        // Decorative entries are below 4.5:1 by design — they carry no information.
+        for (name, colour) in &[
+            ("GUTTER_BAR", GUTTER_BAR),
+            ("INDENT_SPACE", INDENT_SPACE),
+            ("SEP_LINE", SEP_LINE),
+        ] {
+            let (r, g, b) = match colour {
+                Color::Rgb(r, g, b) => (*r, *g, *b),
+                other => panic!("palette constant {name} must be Rgb, got {other:?}"),
+            };
+            let cr = contrast_ratio((r, g, b), black);
+            // These must remain below 4.5 (they are for decoration only)
+            // and above 1:1 (black-on-black would be broken).
+            assert!(
+                cr < 4.5,
+                "palette::{name} Rgb({r},{g},{b}) CR={cr:.2} is too bright \
+                 for a decorative constant — use a semantic constant instead"
+            );
+            assert!(
+                cr > 1.0,
+                "palette::{name} Rgb({r},{g},{b}) CR={cr:.2} is completely invisible"
+            );
+        }
+    }
+
+    /// Theme default colours that are WCAG AAA (≥ 7 : 1) are asserted here to
+    /// prevent accidental darkening during refactors.
+    #[test]
+    fn theme_primary_colours_wcag_aaa() {
+        use palette::contrast_ratio;
+
+        let black = (0u8, 0u8, 0u8);
+        // assistant cyan  Rgb(77, 208, 225) — AAA
+        assert!(
+            contrast_ratio((77, 208, 225), black) >= 7.0,
+            "assistant_fg must be WCAG AAA"
+        );
+        // input text cornsilk  Rgb(255, 248, 220) — AAA
+        assert!(
+            contrast_ratio((255, 248, 220), black) >= 7.0,
+            "input_text must be WCAG AAA"
+        );
+        // error red  Rgb(239, 83, 80) — AA
+        assert!(
+            contrast_ratio((239, 83, 80), black) >= 4.5,
+            "error_fg must be at least WCAG AA"
+        );
     }
 }

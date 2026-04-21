@@ -247,26 +247,24 @@ fn walk_and_search(
         let path = entry.path();
 
         // Skip hidden dirs and common large dirs
-        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            if name.starts_with('.')
+        if let Some(name) = path.file_name().and_then(|n| n.to_str())
+            && (name.starts_with('.')
                 || name == "node_modules"
                 || name == "target"
-                || name == "__pycache__"
-            {
-                continue;
-            }
+                || name == "__pycache__")
+        {
+            continue;
         }
 
         if path.is_dir() {
             walk_and_search(&path, regex, include_glob, cwd, context, results);
         } else if path.is_file() {
             // Check glob filter
-            if let Some(glob) = include_glob {
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if !simple_glob_match(glob, name) {
-                        continue;
-                    }
-                }
+            if let Some(glob) = include_glob
+                && let Some(name) = path.file_name().and_then(|n| n.to_str())
+                && !simple_glob_match(glob, name)
+            {
+                continue;
             }
 
             // Read and search (skip binary files)
@@ -321,14 +319,13 @@ fn walk_and_find_files(
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            if name.starts_with('.')
+        if let Some(name) = path.file_name().and_then(|n| n.to_str())
+            && (name.starts_with('.')
                 || name == "node_modules"
                 || name == "target"
-                || name == "__pycache__"
-            {
-                continue;
-            }
+                || name == "__pycache__")
+        {
+            continue;
         }
 
         if path.is_dir() {
@@ -337,10 +334,10 @@ fn walk_and_find_files(
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
-            if let Some(glob) = include_glob {
-                if !simple_glob_match(glob, name) {
-                    continue;
-                }
+            if let Some(glob) = include_glob
+                && !simple_glob_match(glob, name)
+            {
+                continue;
             }
             if simple_glob_match(pattern, name) || name.contains(pattern) {
                 results.push(

@@ -126,6 +126,22 @@ pub enum ToolError {
         suggested_action: Option<String>,
     },
 
+    /// Content-mismatch error — the tool's expected content (e.g. `old_string`) did not
+    /// match the actual file contents, or the file changed between a read and a write
+    /// (TOCTOU). The `message` field embeds a 600-char file preview when available so the
+    /// model can retry with corrected arguments without an extra `read_file` round-trip.
+    ///
+    /// Numeric code: 1008 (`content_mismatch`).
+    #[error("{message}")]
+    ContentMismatch {
+        /// Tool that produced the mismatch (e.g. `"patch"`, `"write_file"`).
+        tool: String,
+        /// Display path of the affected file.
+        path: String,
+        /// Human-readable description, optionally including a content preview.
+        message: String,
+    },
+
     #[error("{0}")]
     Other(String),
 }
@@ -136,6 +152,20 @@ pub struct ToolErrorResponse {
     pub response_type: String,
     pub category: String,
     pub code: String,
+    /// Numeric error code for fast loop branching.
+    ///
+    /// | code_num | code string           | variant            |
+    /// |----------|-----------------------|--------------------|
+    /// | 1001     | tool_not_found        | NotFound           |
+    /// | 1002     | invalid_arguments     | InvalidArgs        |
+    /// | 1003     | tool_unavailable      | Unavailable        |
+    /// | 1004     | tool_timeout          | Timeout            |
+    /// | 1005     | permission_denied     | PermissionDenied   |
+    /// | 1006     | execution_failed      | ExecutionFailed    |
+    /// | 1007     | capability_denied     | CapabilityDenied   |
+    /// | 1008     | content_mismatch      | ContentMismatch    |
+    /// | 1099     | tool_error            | Other              |
+    pub code_num: u16,
     pub error: String,
     pub retryable: bool,
     pub suppress_retry: bool,
@@ -147,6 +177,13 @@ pub struct ToolErrorResponse {
     pub suggested_tool: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suggested_action: Option<String>,
+    /// Required parameter names — populated from tool schema on InvalidArgs.
+    /// Gives the LLM a precise checklist of what to fix.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub required_fields: Option<Vec<String>>,
+    /// One-line corrective hint — e.g. "content must be a non-null string".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage_hint: Option<String>,
 }
 
 impl ToolError {
@@ -233,6 +270,7 @@ impl ToolError {
             response_type: "tool_error".into(),
             category: self.category().into(),
             code: self.code().into(),
+            code_num: self.code_num(),
             error: self.to_string(),
             retryable: self.is_retryable(),
             suppress_retry: self.should_suppress_retry(),
@@ -240,7 +278,27 @@ impl ToolError {
             tool: self.tool_name().map(str::to_string),
             suggested_tool: self.suggested_tool().map(str::to_string),
             suggested_action: self.suggested_action().map(str::to_string),
+            required_fields: None,
+            usage_hint: None,
         }
+    }
+
+    /// Build an enriched LLM payload with schema-derived corrective hints.
+    ///
+    /// WHY: When the LLM sends invalid arguments, a bare "missing field X"
+    /// message forces it to guess the full schema from memory. By echoing
+    /// the required fields and a usage hint, we give it a precise checklist.
+    /// Hermes-agent's `coerce_tool_args` + schema echo pattern reduced
+    /// retry loops by ~40% in their production telemetry.
+    pub fn to_llm_payload_enriched(
+        &self,
+        required_fields: Option<Vec<String>>,
+        usage_hint: Option<String>,
+    ) -> ToolErrorResponse {
+        let mut payload = self.to_llm_payload();
+        payload.required_fields = required_fields;
+        payload.usage_hint = usage_hint;
+        payload
     }
 
     /// Convert to a JSON string suitable for the LLM to parse.
@@ -259,9 +317,11 @@ impl ToolError {
     pub fn should_suppress_retry(&self) -> bool {
         matches!(
             self,
-            ToolError::Unavailable { .. }
+            ToolError::InvalidArgs { .. }
+                | ToolError::Unavailable { .. }
                 | ToolError::PermissionDenied(_)
                 | ToolError::CapabilityDenied { .. }
+                | ToolError::ContentMismatch { .. }
         )
     }
 
@@ -274,6 +334,7 @@ impl ToolError {
             ToolError::PermissionDenied(_) => "permission",
             ToolError::ExecutionFailed { .. } => "execution",
             ToolError::CapabilityDenied { .. } => "capability",
+            ToolError::ContentMismatch { .. } => "content",
             ToolError::Other(_) => "other",
         }
     }
@@ -287,7 +348,27 @@ impl ToolError {
             ToolError::PermissionDenied(_) => "permission_denied",
             ToolError::ExecutionFailed { .. } => "execution_failed",
             ToolError::CapabilityDenied { code, .. } => code,
+            ToolError::ContentMismatch { .. } => "content_mismatch",
             ToolError::Other(_) => "tool_error",
+        }
+    }
+
+    /// Numeric error code for fast loop branching.
+    ///
+    /// Maps each variant to a stable integer that survives refactors to the
+    /// string code. The conversation loop can branch on `code_num` instead of
+    /// `code.as_str()` comparisons for better performance and clarity.
+    pub fn code_num(&self) -> u16 {
+        match self {
+            ToolError::NotFound(_) => 1001,
+            ToolError::InvalidArgs { .. } => 1002,
+            ToolError::Unavailable { .. } => 1003,
+            ToolError::Timeout { .. } => 1004,
+            ToolError::PermissionDenied(_) => 1005,
+            ToolError::ExecutionFailed { .. } => 1006,
+            ToolError::CapabilityDenied { .. } => 1007,
+            ToolError::ContentMismatch { .. } => 1008,
+            ToolError::Other(_) => 1099,
         }
     }
 
@@ -297,7 +378,8 @@ impl ToolError {
             | ToolError::Unavailable { tool, .. }
             | ToolError::Timeout { tool, .. }
             | ToolError::ExecutionFailed { tool, .. }
-            | ToolError::CapabilityDenied { tool, .. } => Some(tool),
+            | ToolError::CapabilityDenied { tool, .. }
+            | ToolError::ContentMismatch { tool, .. } => Some(tool),
             ToolError::NotFound(_) | ToolError::PermissionDenied(_) | ToolError::Other(_) => None,
         }
     }
@@ -323,6 +405,9 @@ impl ToolError {
                     .clone()
                     .unwrap_or_else(|| format!("{tool}:{code}")),
             ),
+            ToolError::ContentMismatch { tool, path, .. } => {
+                Some(format!("{tool}:content_mismatch:{path}"))
+            }
             _ => None,
         }
     }
@@ -358,6 +443,7 @@ mod tests {
         assert_eq!(json["retryable"], true);
         assert_eq!(json["category"], "timeout");
         assert_eq!(json["code"], "tool_timeout");
+        assert_eq!(json["code_num"], 1004);
         assert_eq!(json["tool"], "terminal");
     }
 
@@ -368,6 +454,7 @@ mod tests {
             serde_json::from_str(&err.to_llm_response()).expect("valid json");
         assert_eq!(json["retryable"], false);
         assert_eq!(json["suppress_retry"], false);
+        assert_eq!(json["code_num"], 1001);
     }
 
     #[test]
@@ -411,6 +498,24 @@ mod tests {
             "Invalid arguments for read_file: path is required"
         );
         assert!(!err.is_retryable());
+        assert!(err.should_suppress_retry());
+    }
+
+    #[test]
+    fn content_mismatch_code_num_and_category() {
+        let err = ToolError::ContentMismatch {
+            tool: "patch".into(),
+            path: "src/main.rs".into(),
+            message: "old_string not found in file".into(),
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&err.to_llm_response()).expect("valid json");
+        assert_eq!(json["code"], "content_mismatch");
+        assert_eq!(json["code_num"], 1008);
+        assert_eq!(json["category"], "content");
+        assert_eq!(json["tool"], "patch");
+        assert_eq!(json["suppress_retry"], true);
+        assert_eq!(json["retryable"], false);
     }
 
     #[test]

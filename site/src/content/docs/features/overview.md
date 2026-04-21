@@ -33,8 +33,9 @@ A full-featured terminal UI with:
 - Slash command autocomplete (all installed skills appear as commands)
 - Keyboard-driven interface
 - Customizable skins, symbols, and personality presets
+- **Mission Steering** (`Ctrl+S`) — inject hints, redirects, or stop signals into a running agent loop mid-turn
 
-See [TUI Interface](/features/tui/)
+See [TUI Interface](/features/tui/) and [Mission Steering](/features/steering/)
 
 ### 15 LLM Providers
 

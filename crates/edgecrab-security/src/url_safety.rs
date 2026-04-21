@@ -56,11 +56,11 @@ pub fn is_safe_url(raw_url: &str) -> Result<bool, AgentError> {
             }
             // Fallback: attempt to parse domain-form IP strings such as
             // "127.0.0.1" or "::1" that weren't bracketed in the URL.
-            if let Ok(ip) = name.parse::<IpAddr>() {
-                if is_private_or_reserved(&ip) {
-                    tracing::warn!(%ip, "Blocked private/reserved IP (domain form)");
-                    return Ok(false);
-                }
+            if let Ok(ip) = name.parse::<IpAddr>()
+                && is_private_or_reserved(&ip)
+            {
+                tracing::warn!(%ip, "Blocked private/reserved IP (domain form)");
+                return Ok(false);
             }
         }
     }
