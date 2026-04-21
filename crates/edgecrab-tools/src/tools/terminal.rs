@@ -219,9 +219,22 @@ impl ToolHandler for TerminalTool {
             .await?;
             return Ok(
                 if args.timeout.is_some() || args.timeout_seconds != default_timeout() {
-                    format!(
-                        "{started}\n[terminal note] background mode ignores terminal timeout; use process(action=\"wait\", session_id=..., timeout=...) to block for completion."
-                    )
+                    // Embed the timeout-ignored note inside the JSON so the result stays parseable
+                    if let Ok(mut v) =
+                        serde_json::from_str::<serde_json::Value>(&started)
+                    {
+                        if let Some(obj) = v.as_object_mut() {
+                            obj.insert(
+                                "note".to_string(),
+                                serde_json::Value::String(
+                                    "background mode ignores timeout; use wait_for_process to block for completion".to_string(),
+                                ),
+                            );
+                        }
+                        serde_json::to_string(&v).unwrap_or(started)
+                    } else {
+                        started
+                    }
                 } else {
                     started
                 },
@@ -616,8 +629,15 @@ mod tests {
             .await
             .expect("background process");
 
-        assert!(result.contains("Process started"), "got: {result}");
-        assert!(result.contains("id=proc-"), "got: {result}");
+        assert!(result.contains("proc-"), "got: {result}");
+        // R18: result is JSON with process_id field
+        let v: serde_json::Value =
+            serde_json::from_str(&result).expect("background result must be JSON");
+        assert_eq!(v["ok"], serde_json::Value::Bool(true));
+        assert!(
+            v["process_id"].as_str().unwrap_or("").starts_with("proc-"),
+            "got: {result}"
+        );
     }
 
     #[tokio::test]

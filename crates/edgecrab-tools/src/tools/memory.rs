@@ -247,13 +247,15 @@ impl ToolHandler for MemoryWriteTool {
                     .collect();
                 if existing_entries.contains(&content) {
                     let pct = (existing.len() * 100) / max_chars;
-                    return Ok(format!(
-                        "Entry already exists in {} — no duplicate added. {}% used ({}/{} chars)",
-                        filename,
-                        pct,
-                        existing.len(),
-                        max_chars
-                    ));
+                    return Ok(serde_json::to_string(&json!({
+                        "ok": true,
+                        "action": "duplicate_skipped",
+                        "file": filename,
+                        "used_chars": existing.len(),
+                        "max_chars": max_chars,
+                        "used_pct": pct
+                    }))
+                    .expect("infallible"));
                 }
                 // Full security scan: injection + exfiltration + invisible unicode
                 if let Err(msg) = check_memory_content(content) {
@@ -429,21 +431,16 @@ impl ToolHandler for MemoryWriteTool {
             ToolError::Other(format!("Cannot commit {} (rename failed): {}", filename, e))
         })?;
 
-        let action_past = match action.as_str() {
-            "add" => "Added entry to",
-            "replace" => "Replaced entry in",
-            "remove" => "Removed entry from",
-            _ => "Updated",
-        };
         let pct = (new_content.len() * 100) / max_chars;
-        Ok(format!(
-            "{} {} — {}% used ({}/{} chars)",
-            action_past,
-            filename,
-            pct,
-            new_content.len(),
-            max_chars
-        ))
+        Ok(serde_json::to_string(&json!({
+            "ok": true,
+            "action": action.as_str(),
+            "file": filename,
+            "used_chars": new_content.len(),
+            "max_chars": max_chars,
+            "used_pct": pct
+        }))
+        .expect("infallible"))
     }
 }
 
@@ -600,9 +597,13 @@ mod tests {
             .execute(json!({"content": "Unique entry"}), &ctx)
             .await
             .expect("second add returns ok");
-        assert!(
-            result.contains("already exists"),
-            "Expected 'already exists' in: {result}"
+        // R18: result is JSON with action == "duplicate_skipped"
+        let v: serde_json::Value =
+            serde_json::from_str(&result).expect("result must be valid JSON");
+        assert_eq!(
+            v["action"],
+            serde_json::Value::String("duplicate_skipped".to_string()),
+            "Expected action=duplicate_skipped in: {result}"
         );
 
         // File must contain only one copy

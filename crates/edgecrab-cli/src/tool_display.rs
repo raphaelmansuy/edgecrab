@@ -2009,6 +2009,93 @@ fn format_ha_result(val: &serde_json::Value, max_cols: usize) -> String {
     }
 }
 
+// ── R18 JSON helpers (private) ─────────────────────────────────────────────
+
+fn format_memory_write_result(v: &serde_json::Value, max_cols: usize) -> String {
+    let action = v.get("action").and_then(|a| a.as_str()).unwrap_or("?");
+    let file = v.get("file").and_then(|f| f.as_str()).unwrap_or("memory");
+    let pct = v.get("used_pct").and_then(|p| p.as_u64()).unwrap_or(0);
+    if action == "duplicate_skipped" {
+        return unicode_trunc(&format!("✓ duplicate skipped ({pct}% used)"), max_cols);
+    }
+    unicode_trunc(&format!("✓ {action} → {file} ({pct}%)"), max_cols)
+}
+
+fn format_checkpoint_result(v: &serde_json::Value, max_cols: usize) -> String {
+    let action = v.get("action").and_then(|a| a.as_str()).unwrap_or("?");
+    match action {
+        "created" => {
+            if let Some(n) = v.get("n").and_then(|n| n.as_u64()) {
+                return unicode_trunc(&format!("✓ #{n} created"), max_cols);
+            }
+            unicode_trunc("✓ created (no new commit)", max_cols)
+        }
+        "list" => {
+            let total = v.get("total").and_then(|t| t.as_u64()).unwrap_or(0);
+            if total == 0 {
+                return unicode_trunc("no checkpoints", max_cols);
+            }
+            let s = if total == 1 {
+                "1 checkpoint".to_string()
+            } else {
+                format!("{total} checkpoints")
+            };
+            unicode_trunc(&format!("✓ {s}"), max_cols)
+        }
+        "restored" => {
+            let n = v.get("n").and_then(|n| n.as_u64()).unwrap_or(0);
+            unicode_trunc(&format!("✓ #{n} restored"), max_cols)
+        }
+        "diff" => {
+            let added = v
+                .get("added")
+                .and_then(|a| a.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            let modified = v
+                .get("modified")
+                .and_then(|a| a.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            let deleted = v
+                .get("deleted")
+                .and_then(|a| a.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            let total = added + modified + deleted;
+            if total == 0 {
+                unicode_trunc("✓ no changes", max_cols)
+            } else {
+                unicode_trunc(&format!("✓ diff: +{added} ~{modified} -{deleted}"), max_cols)
+            }
+        }
+        "restore_file" => {
+            let file = v.get("file").and_then(|f| f.as_str()).unwrap_or("?");
+            let name = file.split('/').next_back().unwrap_or(file);
+            unicode_trunc(&format!("✓ {name} restored"), max_cols)
+        }
+        _ => unicode_trunc("✓ ok", max_cols),
+    }
+}
+
+fn format_todo_result(v: &serde_json::Value, max_cols: usize) -> String {
+    if let Some(summary) = v.get("summary") {
+        let total = summary.get("total").and_then(|t| t.as_u64()).unwrap_or(0);
+        let completed = summary.get("completed").and_then(|c| c.as_u64()).unwrap_or(0);
+        let in_progress = summary
+            .get("in_progress")
+            .and_then(|ip| ip.as_u64())
+            .unwrap_or(0);
+        let detail = if in_progress > 0 {
+            format!(", {in_progress} active")
+        } else {
+            String::new()
+        };
+        return unicode_trunc(&format!("✓ {completed}/{total} done{detail}"), max_cols);
+    }
+    unicode_trunc("✓ plan updated", max_cols)
+}
+
 /// Format a tool result string for the **compact done-line** and the **verbose result line**.
 ///
 /// Applies per-tool rich formatting (exit codes, counts, titles) and falls back to
@@ -2043,6 +2130,26 @@ pub fn format_tool_result(tool_name: &str, result: &str, max_cols: usize) -> Str
             "web_crawl" => return format_web_crawl_result(&val, max_cols),
             "session_search" => return format_session_search_result(&val, max_cols),
             _ if tool_name.starts_with("ha_") => return format_ha_result(&val, max_cols),
+            // R18: memory_write / memory alias JSON result
+            "memory_write" | "memory"
+                if val.get("ok") == Some(&serde_json::Value::Bool(true)) =>
+            {
+                return format_memory_write_result(&val, max_cols);
+            }
+            // R18: checkpoint JSON result
+            "checkpoint" if val.get("ok") == Some(&serde_json::Value::Bool(true)) => {
+                return format_checkpoint_result(&val, max_cols);
+            }
+            // R18: run_process JSON result (also covers terminal background mode)
+            "run_process" | "terminal" if val.get("process_id").is_some() => {
+                if let Some(pid) = val.get("process_id").and_then(|p| p.as_str()) {
+                    return unicode_trunc(&format!("✓ {pid} started"), max_cols);
+                }
+            }
+            // R18: manage_todo_list / todo JSON result
+            "manage_todo_list" | "todo" => {
+                return format_todo_result(&val, max_cols);
+            }
             _ => {}
         }
     }
@@ -2762,16 +2869,71 @@ mod tests {
 
     #[test]
     fn test_format_tool_result_memory_saved() {
+        // Legacy prose fallback (backward compat)
         let out = format_tool_result("memory", "Added to user memory file.", 80);
         assert_eq!(out, "✓ saved");
     }
 
     #[test]
+    fn test_format_tool_result_memory_write_json() {
+        // R18 JSON result for memory_write
+        let json = r#"{"ok":true,"action":"add","file":"MEMORY.md","used_chars":110,"max_chars":2200,"used_pct":5}"#;
+        let out = format_tool_result("memory_write", json, 80);
+        assert!(out.contains("add"), "expected 'add' in: {out}");
+        assert!(out.contains("MEMORY.md"), "expected 'MEMORY.md' in: {out}");
+        assert!(out.contains("5%"), "expected '5%' in: {out}");
+    }
+
+    #[test]
+    fn test_format_tool_result_memory_duplicate_json() {
+        let json = r#"{"ok":true,"action":"duplicate_skipped","file":"MEMORY.md","used_chars":110,"max_chars":2200,"used_pct":5}"#;
+        let out = format_tool_result("memory", json, 80);
+        assert!(out.contains("duplicate skipped"), "got: {out}");
+    }
+
+    #[test]
     fn test_format_tool_result_todo_plan_updated() {
+        // Legacy prose fallback (backward compat)
         let out = format_tool_result("todo", "TodoList updated.", 80);
         assert_eq!(out, "✓ plan updated");
         let out2 = format_tool_result("manage_todo_list", "ok", 80);
         assert_eq!(out2, "✓ plan updated");
+    }
+
+    #[test]
+    fn test_format_tool_result_todo_json() {
+        // R18 JSON result for manage_todo_list
+        let json = r#"{"todos":[],"summary":{"total":5,"completed":2,"in_progress":1,"not_started":2,"blocked":0,"cancelled":0}}"#;
+        let out = format_tool_result("manage_todo_list", json, 80);
+        assert!(out.contains("2/5"), "expected '2/5' in: {out}");
+        assert!(out.contains("active"), "expected 'active' in: {out}");
+    }
+
+    #[test]
+    fn test_format_tool_result_checkpoint_json() {
+        // created
+        let json = r#"{"ok":true,"action":"created","n":3,"label":"pre-deploy","files":45,"has_new_commit":true}"#;
+        let out = format_tool_result("checkpoint", json, 80);
+        assert!(out.contains("#3"), "got: {out}");
+        assert!(out.contains("created"), "got: {out}");
+
+        // list
+        let json2 = r#"{"ok":true,"action":"list","total":3,"checkpoints":[]}"#;
+        let out2 = format_tool_result("checkpoint", json2, 80);
+        assert!(out2.contains("3 checkpoints"), "got: {out2}");
+
+        // diff no changes
+        let json3 = r#"{"ok":true,"action":"diff","n":1,"message":"no changes vs current state","added":[],"modified":[],"deleted":[]}"#;
+        let out3 = format_tool_result("checkpoint", json3, 80);
+        assert!(out3.contains("no changes"), "got: {out3}");
+    }
+
+    #[test]
+    fn test_format_tool_result_run_process_json() {
+        let json = r#"{"ok":true,"process_id":"proc-42","command":"cargo test"}"#;
+        let out = format_tool_result("run_process", json, 80);
+        assert!(out.contains("proc-42"), "got: {out}");
+        assert!(out.contains("started"), "got: {out}");
     }
 
     #[test]

@@ -1174,11 +1174,10 @@ mod tests {
 
         let result = PatchTool.execute(json!({"patch": patch}), &ctx).await;
 
-        assert!(
-            result
-                .expect("v4a patch via patch tool")
-                .contains("apply_patch succeeded")
-        );
+        // R18: apply_patch now returns JSON {"ok":true,"modified":[...],"created":[...],"deleted":[...]}
+        let out = result.expect("v4a patch via patch tool");
+        let v: serde_json::Value = serde_json::from_str(&out).expect("JSON result");
+        assert_eq!(v["ok"], serde_json::Value::Bool(true));
         let content = std::fs::read_to_string(dir.path().join("code.rs")).expect("read");
         assert!(content.contains("println!(\"new\")"));
     }
@@ -1200,11 +1199,10 @@ mod tests {
             .execute(json!({"path": "code.rs", "patch": patch}), &ctx)
             .await;
 
-        assert!(
-            result
-                .expect("legacy mixed patch args")
-                .contains("apply_patch succeeded")
-        );
+        // R18: apply_patch now returns JSON {"ok":true,...}
+        let out = result.expect("legacy mixed patch args");
+        let v: serde_json::Value = serde_json::from_str(&out).expect("JSON result");
+        assert_eq!(v["ok"], serde_json::Value::Bool(true));
         let content = std::fs::read_to_string(dir.path().join("code.rs")).expect("read");
         assert!(content.contains("const N: i32 = 2;"));
     }

@@ -583,6 +583,13 @@ fn make_ctx(dir: &Path) -> ToolContext {
 }
 
 fn extract_process_id(result: &str) -> String {
+    // R18: result is JSON {"ok":true,"process_id":"proc-X","command":"..."}
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(result) {
+        if let Some(pid) = v.get("process_id").and_then(|p| p.as_str()) {
+            return pid.to_string();
+        }
+    }
+    // Legacy prose fallback: "Process started: <cmd> (id=proc-X)."
     let marker = "id=";
     let start = result.find(marker).expect("process id marker") + marker.len();
     let rest = &result[start..];
