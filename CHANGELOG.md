@@ -7,6 +7,34 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-04-22
+
+### Added
+
+- **Shadow Judge completion oracle** — EdgeCrab can now run an opt-in secondary LLM verdict before accepting a run as complete. The judge is session-scoped, bounded by a per-session cap, and can veto likely premature stops by injecting a concrete continuation hint back into the loop instead of forcing the user to type `continue` manually.
+- **`/shadow-judge` TUI command and picker** — New slash command with `on`, `off`, `toggle`, and `status` modes, plus an interactive picker when invoked without arguments. The status bar now surfaces whether the completion oracle is active and briefly shows intervention notices when it keeps a run going.
+- **Structured task-status signaling for the harness** — New `report_task_status` tool and shared harness types let the model declare `in_progress`, `blocked`, or `completed` milestones with evidence and remaining steps, without letting the tool itself terminate the run.
+
+### Changed
+
+- **Completion gating is more robust after tool use** — repeated malformed tool retries are now suppressed semantically instead of only by exact payload fingerprint, and the conversation loop injects a corrective user nudge when it detects an argument-retry loop.
+- **File and terminal tools now return better machine-readable execution metadata** — `write_file` reports line counts, `patch` reports before/after line totals, `terminal` reports truncation in its header, and `search_files` emits pagination summaries so the agent can paginate instead of re-running the same search blindly.
+- **Tool schemas were tightened to reduce avoidable self-inflicted tool failures** — `write_file` no longer falsely requires `create_dirs`, several tools now spell out required arguments more clearly, and delegate/search/terminal/web parameter docs now better match runtime behavior.
+
+### Documentation
+
+- Added the Shadow Judge and harness hardening story to the release-facing README, changelog, and Astro docs so the new release is documented consistently across the CLI repo and site.
+
+### Verification
+
+| Check | Result |
+|-------|--------|
+| `./scripts/release-version.sh check` | **passed locally before cut** |
+| `cargo test -p edgecrab-core --lib` | **passed locally before cut** |
+| `cargo test -p edgecrab-tools --lib` | **passed locally before cut** |
+| `cargo test --workspace` | **passed locally before cut** |
+| `fnm exec --using v22.12.0 pnpm build` in `site/` | **passed locally before cut** |
+
 ## [0.8.0] — 2026-04-21
 
 ### Added

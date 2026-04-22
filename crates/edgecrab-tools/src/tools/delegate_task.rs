@@ -363,7 +363,9 @@ impl ToolHandler for DelegateTaskToolReal {
                            Each child gets its own execute_loop with tools and independent context. \
                            Pass all relevant paths, errors, and constraints via `context` because \
                            child agents do not inherit your full conversation. Use this for \
-                           reasoning-heavy or parallel subtasks, not for single direct tool calls."
+                           reasoning-heavy or parallel subtasks, not for single direct tool calls. \
+                           Required: provide either `goal` (single task) or `tasks` (batch) — \
+                           calling without either returns an error."
                 .into(),
             parameters: json!({
                 "type": "object",

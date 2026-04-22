@@ -14,7 +14,7 @@
 
 EdgeCrab is a **SuperAgent** — a personal assistant and coding agent forged in Rust. It carries the soul of **Nous Hermes Agent** (autonomous reasoning, persistent memory, user-first alignment) and the always-on presence of **OpenClaw** (17 messaging gateways, smart-home integration), packaged as a stripped native release binary of about **49 MB** on current macOS arm64 builds, with zero Python or Node.js runtime dependencies. Runs on Linux, macOS, and Android (Termux).
 
-> **Latest release: v0.8.0** — mission steering in the TUI and gateway, prompt-cache-aware system prompt blocks, accessibility-tuned terminal colors, and the published `edgequake-llm 0.6.12` runtime handoff.
+> **Latest release: v0.9.0** — an opt-in Shadow Judge completion oracle, structured `report_task_status` harness signals, and tighter anti-loop tool contracts that help EdgeCrab recover from premature stops and repeated malformed tool retries.
 
 
 ## Architecture

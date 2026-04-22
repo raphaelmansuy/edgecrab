@@ -25,6 +25,11 @@ reasons about a task, calls a tool, observes the result, then repeats.
 The loop runs up to `model.max_iterations` tool calls (default: 90)
 before stopping.
 
+For weaker models or long tool-heavy runs, EdgeCrab can also enable an
+opt-in **Shadow Judge** completion oracle. It performs a cheap secondary
+LLM verdict before the loop accepts a final answer, helping catch
+premature "I'm done" stops that still have missing sub-steps.
+
 ### Ratatui TUI
 
 A full-featured terminal UI with:
@@ -34,6 +39,7 @@ A full-featured terminal UI with:
 - Keyboard-driven interface
 - Customizable skins, symbols, and personality presets
 - **Mission Steering** (`Ctrl+S`) — inject hints, redirects, or stop signals into a running agent loop mid-turn
+- **Shadow Judge controls** (`/shadow-judge`) — toggle the completion oracle per session and see intervention badges when it keeps the run alive
 
 See [TUI Interface](/features/tui/) and [Mission Steering](/features/steering/)
 

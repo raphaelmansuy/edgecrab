@@ -1310,6 +1310,22 @@ impl Agent {
         let mut compression_llm_failures: u32 = 0;
         const MAX_COMPRESSION_LLM_FAILURES: u32 = 3;
 
+        // ── Shadow Judge setup ────────────────────────────────────────────────
+        // Clone config snapshot so the judge resolution has stable values even
+        // if the config is hot-swapped mid-session.
+        let shadow_judge_cfg = config.shadow_judge.clone();
+        let mut shadow_judge_invocations: u32 = 0;
+        let (shadow_judge_provider, shadow_judge_model) = if shadow_judge_cfg.enabled {
+            crate::shadow_judge::resolve_shadow_provider_and_model(
+                &shadow_judge_cfg,
+                config.auxiliary.model.as_deref(),
+                effective_provider.clone(),
+                &config.model,
+            )
+        } else {
+            (effective_provider.clone(), config.model.clone())
+        };
+
         'conversation_loop: loop {
             if tool_defs_dirty {
                 active_tool_defs = if let Some(ref registry) = tool_registry {
@@ -1917,6 +1933,80 @@ impl Agent {
                         continue;
                     }
 
+                    // ── Shadow Judge veto ────────────────────────────────────
+                    // Fires only when:
+                    //   1. Shadow judge is enabled in config.
+                    //   2. The per-session invocation cap has not been reached.
+                    //   3. The conversation is long enough to warrant it.
+                    // Non-fatal: any error falls through to normal loop break.
+                    if shadow_judge_cfg.enabled
+                        && shadow_judge_invocations < shadow_judge_cfg.max_per_session
+                        && session.messages.len() >= shadow_judge_cfg.min_messages_before_enable
+                    {
+                        shadow_judge_invocations += 1;
+                        tracing::debug!(
+                            invocation = shadow_judge_invocations,
+                            max = shadow_judge_cfg.max_per_session,
+                            messages = session.messages.len(),
+                            model = %shadow_judge_model,
+                            "shadow judge: invoking completion oracle"
+                        );
+                        let verdict = crate::shadow_judge::run_shadow_judge(
+                            &shadow_judge_provider,
+                            &shadow_judge_model,
+                            &session.messages,
+                            &shadow_judge_cfg,
+                        )
+                        .await;
+
+                        if let Some(verdict) = verdict {
+                            // Attribute tokens to session cost regardless of verdict.
+                            session.session_input_tokens += u64::from(verdict.input_tokens);
+                            session.session_output_tokens += u64::from(verdict.output_tokens);
+
+                            tracing::info!(
+                                is_complete = verdict.is_complete,
+                                confidence = verdict.confidence,
+                                reason = %verdict.reason,
+                                invocation = shadow_judge_invocations,
+                                "shadow judge: verdict"
+                            );
+
+                            let confidence_above_threshold =
+                                verdict.confidence >= shadow_judge_cfg.confidence_threshold;
+
+                            if !verdict.is_complete && confidence_above_threshold {
+                                // Veto: inject steering hint and continue the loop.
+                                let hint = verdict.steering_hint.as_deref().unwrap_or(
+                                    "Continue working until all parts of the request are complete.",
+                                );
+                                let msg = build_shadow_judge_message(hint, &verdict.reason);
+                                tracing::info!(
+                                    hint = %hint,
+                                    "shadow judge: vetoing completion, injecting continuation nudge"
+                                );
+                                if let Some(tx) = event_tx {
+                                    let _ = tx.send(crate::StreamEvent::ToolExec {
+                                        name: "shadow_judge".to_string(),
+                                        args_json: serde_json::json!({
+                                            "verdict": "incomplete",
+                                            "confidence": verdict.confidence,
+                                            "reason": verdict.reason,
+                                        })
+                                        .to_string(),
+                                        tool_call_id: "sj".to_string(),
+                                    });
+                                }
+                                session.messages.push(Message::user(&msg));
+                                self.publish_session_state(&session).await;
+                                continue 'conversation_loop;
+                            }
+                            // If incomplete but confidence is below threshold, or if
+                            // verdict is complete — fall through to break normally.
+                        }
+                        // None = API error — non-fatal, fall through.
+                    }
+
                     final_response = text;
                     break;
                 }
@@ -2486,6 +2576,42 @@ fn tool_attempt_fingerprint(name: &str, args_json: &str) -> String {
     format!("{name}:{normalized_args}")
 }
 
+fn invalid_args_missing_fields_suppression_key(
+    name: &str,
+    args_json: &str,
+    required_fields: &[String],
+) -> Option<String> {
+    let args = serde_json::from_str::<serde_json::Value>(args_json).ok()?;
+    let obj = args.as_object()?;
+
+    let mut missing: Vec<String> = required_fields
+        .iter()
+        .filter(|field| !obj.contains_key(field.as_str()))
+        .cloned()
+        .collect();
+
+    if missing.is_empty() {
+        return None;
+    }
+
+    missing.sort();
+    Some(format!("invalid_args:{name}:missing:{}", missing.join(",")))
+}
+
+fn invalid_args_semantic_key(
+    registry: &ToolRegistry,
+    name: &str,
+    args_json: &str,
+) -> Option<String> {
+    let required = registry.required_fields_for_tool(name)?;
+    invalid_args_missing_fields_suppression_key(name, args_json, &required)
+}
+
+#[inline]
+fn is_suppressed_argument_retry(payload: &ToolErrorResponse) -> bool {
+    payload.category == "arguments" && payload.code == "suppressed_repeated_tool_error"
+}
+
 fn suppressed_retry_response(
     name: &str,
     args_json: &str,
@@ -2632,6 +2758,20 @@ fn build_completion_follow_up_message(outcome: &edgecrab_types::RunOutcome) -> S
     format!(
         "[system: do not stop yet. {} Continue working until the request is actually complete or explicitly blocked. Briefly communicate progress, use report_task_status after the next milestone, and only finish once you have concrete evidence.]",
         notes.join(" ")
+    )
+}
+
+/// Build the user message injected when the Shadow Judge vetoes a "completed" verdict.
+///
+/// The message is designed to be:
+/// - Specific (uses the judge's `steering_hint` rather than a generic nudge).
+/// - Non-repetitive with `build_completion_follow_up_message`.
+/// - Clearly marked as a system injection so the model understands context.
+fn build_shadow_judge_message(steering_hint: &str, reason: &str) -> String {
+    format!(
+        "[system: verification check indicates the task is not yet complete — {reason}. \
+        {steering_hint} \
+        Continue working and only stop once all parts of the original request are done with concrete evidence.]"
     )
 }
 
@@ -3845,6 +3985,7 @@ async fn process_response(
         // Partition tools into parallel-safe and sequential
         let mut parallel_tasks = tokio::task::JoinSet::new();
         let mut sequential_calls = Vec::new();
+        let mut argument_loop_blocked = false;
         // Track parallel tool call IDs/names so we can inject error results
         // for any task that panics — otherwise the assistant message has
         // tool_calls with no matching tool_results and the next API call fails.
@@ -3975,6 +4116,11 @@ async fn process_response(
                             error: extract_tool_error_text(&tool_result),
                             tool_result: tool_result.clone(),
                         });
+                        if let Some(payload) = parse_tool_error_response(&tool_result)
+                            && is_suppressed_argument_retry(&payload)
+                        {
+                            argument_loop_blocked = true;
+                        }
                         failure_tracker.record_failure(&extract_tool_error_text(&tool_result));
                     } else {
                         failure_tracker.record_success();
@@ -4078,6 +4224,11 @@ async fn process_response(
                     error: extract_tool_error_text(&tool_result),
                     tool_result: tool_result.clone(),
                 });
+                if let Some(payload) = parse_tool_error_response(&tool_result)
+                    && is_suppressed_argument_retry(&payload)
+                {
+                    argument_loop_blocked = true;
+                }
                 failure_tracker.record_failure(&extract_tool_error_text(&tool_result));
             } else {
                 failure_tracker.record_success();
@@ -4090,6 +4241,12 @@ async fn process_response(
                 &tool_result,
             ));
             session.messages.extend(injected_messages);
+        }
+
+        if argument_loop_blocked {
+            session.messages.push(Message::user(
+                "Argument loop detected: do not retry the same malformed tool call. Read the tool error required_fields/usage_hint and either (1) provide all required JSON fields in the next tool call, or (2) ask the user for the missing value before any further tool calls.",
+            ));
         }
 
         // ── Consecutive failure escalation ───────────────────────────
@@ -4333,13 +4490,23 @@ async fn dispatch_single_tool(
     };
 
     let attempt_key = tool_attempt_fingerprint(name, args_json);
-    if let Some(prior) = dctx
-        .capability_suppressions
-        .lock()
-        .expect("capability suppression cache lock poisoned")
-        .get(&attempt_key)
-        .cloned()
-    {
+    let semantic_key = dctx
+        .registry
+        .as_ref()
+        .and_then(|reg| invalid_args_semantic_key(reg, name, args_json));
+
+    let prior = {
+        let guard = dctx
+            .capability_suppressions
+            .lock()
+            .expect("capability suppression cache lock poisoned");
+        guard.get(&attempt_key).cloned().or_else(|| {
+            semantic_key
+                .as_ref()
+                .and_then(|key| guard.get(key).cloned())
+        })
+    };
+    if let Some(prior) = prior {
         return (
             serde_json::to_string(&suppressed_retry_response(name, args_json, &prior))
                 .expect("suppressed retry payload serializes"),
@@ -4464,7 +4631,16 @@ async fn dispatch_single_tool(
         Err(ref e @ ToolError::InvalidArgs { .. }) => {
             // Enrich InvalidArgs with required_fields + usage_hint from schema.
             // This gives the LLM a precise corrective checklist on the next turn.
-            if let Some(enriched) = reg.enrich_invalid_args_error(name, e) {
+            if let Some(mut enriched) = reg.enrich_invalid_args_error(name, e) {
+                if enriched.suppression_key.is_none()
+                    && let Some(ref required_fields) = enriched.required_fields
+                {
+                    enriched.suppression_key = invalid_args_missing_fields_suppression_key(
+                        name,
+                        args_json,
+                        required_fields,
+                    );
+                }
                 serde_json::to_string(&enriched).expect("enriched error serializes")
             } else {
                 e.to_llm_response()
@@ -6968,6 +7144,46 @@ def register(ctx):
         assert!(second_payload.error.contains("same `write_file` call fail"));
     }
 
+    #[tokio::test]
+    async fn dispatch_single_tool_suppresses_semantic_invalid_argument_retry() {
+        let registry = Arc::new(ToolRegistry::new());
+        let cancel = CancellationToken::new();
+        let state_db = None;
+        let process_table = Arc::new(ProcessTable::new());
+        let capability_suppressions = Arc::new(Mutex::new(HashMap::new()));
+        let dctx = make_dispatch_context_for_test(
+            &registry,
+            &cancel,
+            &state_db,
+            &process_table,
+            capability_suppressions.clone(),
+        );
+
+        // write_file requires both path and content. Both calls below omit
+        // path, but differ in payload shape so exact-fingerprint matching alone
+        // would miss the loop.
+        let first_args = r#"{"content":"first"}"#;
+        let second_args = r#"{"content":"second","if_exists":"overwrite"}"#;
+
+        let (first, first_injected) =
+            dispatch_single_tool("call-write-semantic-1", "write_file", first_args, &dctx).await;
+        assert!(first_injected.is_empty());
+        let first_payload = parse_tool_error_response(&first).expect("structured error");
+        assert_eq!(first_payload.code, "invalid_arguments");
+        remember_tool_suppression(&capability_suppressions, "write_file", first_args, &first);
+
+        let (second, second_injected) =
+            dispatch_single_tool("call-write-semantic-2", "write_file", second_args, &dctx).await;
+        assert!(second_injected.is_empty());
+        let second_payload = parse_tool_error_response(&second).expect("structured error");
+        assert_eq!(second_payload.code, "suppressed_repeated_tool_error");
+        assert_eq!(second_payload.category, "arguments");
+        assert!(
+            second_payload.error.contains("same `write_file` call fail"),
+            "semantic suppression should block varied malformed retries"
+        );
+    }
+
     // ── Cancellation ─────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -7141,6 +7357,18 @@ def register(ctx):
             Some(&["path".to_string()][..])
         );
         assert!(resp.usage_hint.is_some());
+    }
+
+    #[test]
+    fn invalid_args_missing_fields_key_detects_missing_required_fields() {
+        let required = vec!["path".to_string(), "content".to_string()];
+        let key = invalid_args_missing_fields_suppression_key(
+            "write_file",
+            r#"{"content":"hello"}"#,
+            &required,
+        )
+        .expect("missing path should generate a semantic suppression key");
+        assert_eq!(key, "invalid_args:write_file:missing:path");
     }
 
     // ── repair_tool_call_arguments tests ─────────────────────────────

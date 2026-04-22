@@ -519,9 +519,13 @@ async fn forward_stream_event_to_tui(
 
     match event {
         StreamEvent::Token(text) => {
-            *saw_token_event = true;
-            tracing::info!(len = text.len(), "TUI→agent: forwarding token");
-            let _ = tx.send(AgentResponse::Token(text));
+            if text.is_empty() {
+                tracing::debug!("TUI→agent: dropping empty token delta");
+            } else {
+                *saw_token_event = true;
+                tracing::info!(len = text.len(), "TUI→agent: forwarding token");
+                let _ = tx.send(AgentResponse::Token(text));
+            }
         }
         StreamEvent::Reasoning(text) => {
             *saw_reasoning_event = true;
@@ -2389,12 +2393,13 @@ fn wait_urgency_color(elapsed_secs: u64) -> Color {
 
 fn format_waiting_first_token_status(
     theme: &Theme,
+    glyphs: TerminalGlyphProfile,
     frame_idx: usize,
     verb_idx: usize,
     face_idx: usize,
     elapsed_secs: u64,
 ) -> String {
-    let spinner = SPINNER_FRAMES[frame_idx % SPINNER_FRAMES.len()];
+    let spinner = compact_spinner_frame(frame_idx, glyphs);
     let verb = if theme.waiting_verbs.is_empty() {
         "awaiting"
     } else {
@@ -2415,12 +2420,13 @@ fn format_waiting_first_token_status(
 
 fn format_thinking_status(
     theme: &Theme,
+    glyphs: TerminalGlyphProfile,
     frame_idx: usize,
     verb_idx: usize,
     face_idx: usize,
     elapsed_secs: u64,
 ) -> String {
-    let spinner = SPINNER_FRAMES[frame_idx % SPINNER_FRAMES.len()];
+    let spinner = compact_spinner_frame(frame_idx, glyphs);
     let verb = if theme.thinking_verbs.is_empty() {
         "thinking"
     } else {
@@ -4705,6 +4711,8 @@ pub struct App {
     show_status_bar: bool,
     /// Whether dangerous command approvals are bypassed for the current session.
     yolo_enabled: bool,
+    /// Whether the Shadow Judge completion oracle is active for this session.
+    shadow_judge_enabled: bool,
     /// Queued prompts to run after the current one completes
     prompt_queue: Vec<String>,
     /// Display state machine (spinner animation)
@@ -4833,6 +4841,16 @@ pub struct App {
     statusbar_selector_active: bool,
     /// Which row is highlighted in the statusbar picker (0=Visible, 1=Hidden)
     statusbar_selector_cursor: usize,
+    /// Shadow Judge picker overlay (activated by `/shadow-judge` with no args)
+    shadow_judge_selector_active: bool,
+    /// Which row is highlighted in the shadow judge picker (0=ON, 1=OFF)
+    shadow_judge_selector_cursor: usize,
+    /// Timestamp for the most recent Shadow Judge intervention notice.
+    shadow_judge_intervention_at: Option<Instant>,
+    /// Latest Shadow Judge intervention summary line.
+    shadow_judge_intervention_text: Option<String>,
+    /// Latest Shadow Judge intervention confidence (0.0..1.0).
+    shadow_judge_intervention_confidence: Option<f32>,
     /// Cached skill names (without leading /) for completion suggestions
     skills_completion_names: Vec<String>,
     /// Skills currently activated for injection into agent prompts.
@@ -5704,6 +5722,7 @@ impl App {
             tool_progress_mode: display_preferences.tool_progress_mode,
             show_status_bar: display_preferences.show_status_bar,
             yolo_enabled: false,
+            shadow_judge_enabled: runtime_config.shadow_judge.enabled,
             prompt_queue: Vec::new(),
             display_state: DisplayState::Idle,
             completion: CompletionState {
@@ -5772,6 +5791,11 @@ impl App {
             stream_selector_cursor: 0, // default to ON
             statusbar_selector_active: false,
             statusbar_selector_cursor: 0, // default to Visible
+            shadow_judge_selector_active: false,
+            shadow_judge_selector_cursor: 0,
+            shadow_judge_intervention_at: None,
+            shadow_judge_intervention_text: None,
+            shadow_judge_intervention_confidence: None,
             skills_completion_names: Vec::new(),
             active_skills: Vec::new(),
             last_terminal_width: 80,
@@ -9179,6 +9203,7 @@ impl App {
                 self.personality_selector_active = false;
                 self.stream_selector_active = false;
                 self.statusbar_selector_active = false;
+                self.shadow_judge_selector_active = false;
                 self.needs_redraw = true;
                 let now = Instant::now();
                 let is_double = self
@@ -9572,6 +9597,32 @@ impl App {
                     };
                     self.statusbar_selector_active = false;
                     self.handle_status_bar_command(arg.to_string());
+                    self.needs_redraw = true;
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // Shadow Judge picker overlay active — intercept all keys
+        if self.shadow_judge_selector_active {
+            match key.code {
+                KeyCode::Esc => {
+                    self.shadow_judge_selector_active = false;
+                    self.needs_redraw = true;
+                }
+                KeyCode::Up | KeyCode::BackTab | KeyCode::Down | KeyCode::Tab => {
+                    self.shadow_judge_selector_cursor = 1 - self.shadow_judge_selector_cursor;
+                    self.needs_redraw = true;
+                }
+                KeyCode::Enter => {
+                    let arg = if self.shadow_judge_selector_cursor == 0 {
+                        "on"
+                    } else {
+                        "off"
+                    };
+                    self.shadow_judge_selector_active = false;
+                    self.handle_set_shadow_judge(arg.to_string());
                     self.needs_redraw = true;
                 }
                 _ => {}
@@ -12296,6 +12347,16 @@ impl App {
             CommandResult::SetYolo(mode) => {
                 self.handle_set_yolo(mode);
             }
+            CommandResult::SetShadowJudge(mode) => {
+                if mode.trim().is_empty() {
+                    self.shadow_judge_selector_cursor =
+                        if self.shadow_judge_enabled { 0 } else { 1 };
+                    self.shadow_judge_selector_active = true;
+                    self.needs_redraw = true;
+                } else {
+                    self.handle_set_shadow_judge(mode);
+                }
+            }
             CommandResult::ApprovalChoice(choice) => {
                 self.handle_approval_choice_command(choice);
             }
@@ -12781,6 +12842,11 @@ impl App {
                     name,
                     args_json,
                 } => {
+                    if name == "shadow_judge" {
+                        self.handle_shadow_judge_intervention_notice(&args_json);
+                        self.needs_redraw = true;
+                        continue;
+                    }
                     self.flush_buffered_assistant_output();
                     // CRITICAL: Break the streaming buffer at the tool boundary.
                     // Without this, tokens arriving after the tool call append to
@@ -17615,6 +17681,106 @@ impl App {
             .and_then(|snap| snap.session_id)
     }
 
+    fn handle_shadow_judge_intervention_notice(&mut self, args_json: &str) {
+        let parsed: serde_json::Value = match serde_json::from_str(args_json) {
+            Ok(v) => v,
+            Err(_) => {
+                self.push_output(
+                    "🧭 Shadow Judge intervened and requested continuation.",
+                    OutputRole::System,
+                );
+                self.shadow_judge_intervention_at = Some(Instant::now());
+                self.shadow_judge_intervention_text = Some("requested continuation".to_string());
+                self.shadow_judge_intervention_confidence = None;
+                return;
+            }
+        };
+
+        let verdict = parsed
+            .get("verdict")
+            .and_then(|v| v.as_str())
+            .unwrap_or("incomplete");
+        let reason = parsed
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("task appears incomplete");
+        let confidence = parsed
+            .get("confidence")
+            .and_then(|v| v.as_f64())
+            .map(|v| v as f32)
+            .unwrap_or(0.0);
+
+        if verdict == "incomplete" {
+            let reason_short = edgecrab_core::safe_truncate(reason, 120);
+            let pct = (confidence * 100.0).clamp(0.0, 100.0);
+            self.push_output(
+                format!(
+                    "🧭 Shadow Judge intervention ({pct:.0}% confidence): {reason_short}. Continuing automatically."
+                ),
+                OutputRole::System,
+            );
+            self.shadow_judge_intervention_at = Some(Instant::now());
+            self.shadow_judge_intervention_text = Some(reason_short.to_string());
+            self.shadow_judge_intervention_confidence = Some(confidence);
+        }
+    }
+
+    fn handle_set_shadow_judge(&mut self, mode: String) {
+        let action = mode.trim().to_ascii_lowercase();
+        match action.as_str() {
+            "" | "toggle" => {
+                self.shadow_judge_enabled = !self.shadow_judge_enabled;
+            }
+            "on" | "enable" | "enabled" => {
+                self.shadow_judge_enabled = true;
+            }
+            "off" | "disable" | "disabled" => {
+                self.shadow_judge_enabled = false;
+            }
+            "status" => {
+                self.push_output(
+                    format!(
+                        "Shadow Judge is {} for this session.",
+                        if self.shadow_judge_enabled {
+                            "ON"
+                        } else {
+                            "OFF"
+                        }
+                    ),
+                    OutputRole::System,
+                );
+                return;
+            }
+            other => {
+                self.push_output(
+                    format!(
+                        "Unknown argument '{other}'. Use: /shadow-judge [on|off|toggle|status]"
+                    ),
+                    OutputRole::System,
+                );
+                return;
+            }
+        }
+        // Propagate the change to the live agent so the next turn picks it up.
+        if let Some(agent) = self.agent.clone() {
+            let enabled = self.shadow_judge_enabled;
+            self.rt_handle.spawn(async move {
+                agent.set_shadow_judge_enabled(enabled).await;
+            });
+        }
+        self.push_output(
+            format!(
+                "Shadow Judge {} for this session.",
+                if self.shadow_judge_enabled {
+                    "enabled \u{2014} the completion oracle will verify task completion"
+                } else {
+                    "disabled"
+                }
+            ),
+            OutputRole::System,
+        );
+    }
+
     fn handle_set_yolo(&mut self, mode: String) {
         let Some(session_key) = self.current_session_key() else {
             self.push_output(
@@ -22114,6 +22280,11 @@ impl App {
             self.render_statusbar_selector(frame, frame.area());
         }
 
+        // Shadow Judge picker overlay (compact centered popup)
+        if self.shadow_judge_selector_active {
+            self.render_shadow_judge_selector(frame, frame.area());
+        }
+
         // Steering overlay (compact floating panel — lower screen half)
         if self.steering_overlay_active {
             self.render_steering_overlay(frame, frame.area());
@@ -22228,7 +22399,7 @@ impl App {
         // status bar. The ghost line disappears naturally once real tokens arrive.
         match &self.display_state {
             DisplayState::AwaitingFirstToken { frame, started } => {
-                let spinner = SPINNER_FRAMES[*frame % SPINNER_FRAMES.len()];
+                let spinner = compact_spinner_frame(*frame, self.terminal_glyph_profile);
                 let elapsed = started.elapsed().as_secs();
                 let ghost_text: String = if elapsed > 10 {
                     format!("  {spinner}  awaiting response\u{2026}  {elapsed}s  (^C to stop)")
@@ -22260,7 +22431,7 @@ impl App {
                 // reasoning_line is Some, the user already sees live reasoning
                 // text — adding a ghost line would duplicate the signal.
                 if self.reasoning_line.is_none() => {
-                    let spinner = SPINNER_FRAMES[*frame % SPINNER_FRAMES.len()];
+                    let spinner = compact_spinner_frame(*frame, self.terminal_glyph_profile);
                     let elapsed = started.elapsed().as_secs();
                     let ghost_text: String = if elapsed > 3 {
                         format!("  {spinner}  thinking\u{2026}  {elapsed}s")
@@ -22464,7 +22635,7 @@ impl App {
         // ── Ghost waiting line (FP45) compact variant ─────────────────
         match &self.display_state {
             DisplayState::AwaitingFirstToken { frame, started } => {
-                let spinner = SPINNER_FRAMES[*frame % SPINNER_FRAMES.len()];
+                let spinner = compact_spinner_frame(*frame, glyphs);
                 let elapsed = started.elapsed().as_secs();
                 let ghost: String = if elapsed > 3 {
                     format!("  {spinner}  awaiting\u{2026}  {elapsed}s")
@@ -22480,7 +22651,7 @@ impl App {
                 )));
             }
             DisplayState::Thinking { frame, started } if self.reasoning_line.is_none() => {
-                let spinner = SPINNER_FRAMES[*frame % SPINNER_FRAMES.len()];
+                let spinner = compact_spinner_frame(*frame, glyphs);
                 let elapsed = started.elapsed().as_secs();
                 let ghost: String = if elapsed > 3 {
                     format!("  {spinner}  thinking\u{2026}  {elapsed}s")
@@ -22607,6 +22778,7 @@ impl App {
                 let elapsed_secs = started.elapsed().as_secs();
                 let msg = format_waiting_first_token_status(
                     &self.theme,
+                    self.terminal_glyph_profile,
                     *f,
                     self.thinking_verb_idx,
                     self.kaomoji_frame_idx,
@@ -22620,6 +22792,7 @@ impl App {
                 let elapsed_secs = started.elapsed().as_secs();
                 let msg = format_thinking_status(
                     &self.theme,
+                    self.terminal_glyph_profile,
                     *f,
                     self.thinking_verb_idx,
                     self.kaomoji_frame_idx,
@@ -22671,7 +22844,7 @@ impl App {
                 started,
                 ..
             } => {
-                let spinner = SPINNER_FRAMES[*f % SPINNER_FRAMES.len()];
+                let spinner = compact_spinner_frame(*f, self.terminal_glyph_profile);
                 let summary = summarize_active_tools(&self.active_tools);
                 let elapsed_secs = summary
                     .as_ref()
@@ -22726,7 +22899,7 @@ impl App {
                 frame: f,
                 started,
             } => {
-                let spinner = SPINNER_FRAMES[*f % SPINNER_FRAMES.len()];
+                let spinner = compact_spinner_frame(*f, self.terminal_glyph_profile);
                 let elapsed = started.elapsed().as_secs();
                 let msg = if elapsed > 3 {
                     format!(" {spinner} {label} {elapsed}s ")
@@ -22974,6 +23147,50 @@ impl App {
             ));
         }
 
+        // ── Shadow Judge indicator ────────────────────────────────────────
+        // Show a compact " SJ " badge when the completion oracle is active.
+        if self.shadow_judge_enabled {
+            left_spans.push(Span::styled(
+                " │ ",
+                Style::default().fg(Color::Rgb(50, 50, 65)),
+            ));
+            left_spans.push(Span::styled(
+                " SJ ",
+                Style::default()
+                    .fg(Color::Rgb(18, 32, 26))
+                    .bg(Color::Rgb(130, 200, 255))
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        if self
+            .shadow_judge_intervention_at
+            .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(10))
+        {
+            let confidence = self
+                .shadow_judge_intervention_confidence
+                .map(|c| (c * 100.0).clamp(0.0, 100.0));
+            let reason = self
+                .shadow_judge_intervention_text
+                .as_deref()
+                .map(|text| edgecrab_core::safe_truncate(text, 42).to_string())
+                .unwrap_or_else(|| "continuation requested".to_string());
+            left_spans.push(Span::styled(
+                " │ ",
+                Style::default().fg(Color::Rgb(50, 50, 65)),
+            ));
+            left_spans.push(Span::styled(
+                if let Some(conf) = confidence {
+                    format!(" SJ veto {conf:.0}%: {reason} ")
+                } else {
+                    format!(" SJ veto: {reason} ")
+                },
+                Style::default()
+                    .fg(Color::Rgb(30, 22, 8))
+                    .bg(Color::Rgb(255, 200, 90))
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+
         // Right side: keyboard hints + turn counter
         let mut right_spans = Vec::new();
         if self.turn_count > 0 {
@@ -23217,7 +23434,7 @@ impl App {
             }
         );
         let left = format!(
-            "{}{}{}{}{}{}${:.4}{}{}{}{}",
+            "{}{}{}{}{}{}${:.4}{}{}{}{}{}{}",
             state,
             divider,
             edgecrab_core::safe_truncate(&self.model_name, 18),
@@ -23229,6 +23446,19 @@ impl App {
             transport,
             divider,
             profile,
+            if self.shadow_judge_enabled {
+                " | SJ"
+            } else {
+                ""
+            },
+            if self
+                .shadow_judge_intervention_at
+                .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(10))
+            {
+                " | SJ veto"
+            } else {
+                ""
+            },
         );
         let right_width = right.width().min(area.width as usize) as u16;
         let left_area = Rect {
@@ -29114,6 +29344,131 @@ impl App {
         frame.render_widget(Paragraph::new(picker_help_line(accent)), chunks[2]);
     }
 
+    /// Render the shadow judge picker (2 options: on / off).
+    fn render_shadow_judge_selector(&self, frame: &mut Frame, area: Rect) {
+        let popup = popup_rect(area, 74, 18);
+        frame.render_widget(Clear, popup);
+        let chunks = picker_three_layout(popup);
+        let body = picker_two_cols(chunks[1], 42);
+
+        const ENTRIES: [(&str, &str, &str); 2] = [
+            (
+                "on",
+                "ON",
+                "Run the completion oracle before finalizing; vetoes likely-incomplete stops.",
+            ),
+            (
+                "off",
+                "OFF",
+                "Skip completion verification and trust the normal completion policy only.",
+            ),
+        ];
+
+        let accent = Color::Rgb(130, 200, 255);
+        let cursor = self.shadow_judge_selector_cursor;
+        let cur_label = if self.shadow_judge_enabled {
+            "on"
+        } else {
+            "off"
+        };
+
+        let header = Paragraph::new(Line::from(vec![
+            Span::styled("  ◈  ", Style::default().fg(accent)),
+            Span::styled(
+                "Shadow Judge",
+                Style::default()
+                    .fg(Color::Rgb(210, 235, 255))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!("current: {}", cur_label.to_uppercase()),
+                Style::default().fg(Color::Rgb(145, 190, 230)),
+            ),
+        ]))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Rgb(90, 145, 195)))
+                .title(" /shadow-judge "),
+        );
+        frame.render_widget(header, chunks[0]);
+
+        let items: Vec<ListItem> = ENTRIES
+            .iter()
+            .enumerate()
+            .map(|(i, (key, label, _))| {
+                let is_cursor = i == cursor;
+                let is_active = *key == cur_label;
+                let bg = if is_cursor {
+                    Color::Rgb(28, 52, 74)
+                } else {
+                    Color::Reset
+                };
+                let fg = if is_cursor {
+                    Color::White
+                } else {
+                    Color::Rgb(185, 215, 240)
+                };
+                ListItem::new(Line::from(vec![
+                    selector_marker(is_cursor, accent, Some(bg)),
+                    Span::styled(
+                        format!("  {label:<4}", label = *label),
+                        Style::default().fg(fg).bg(bg),
+                    ),
+                    Span::styled(
+                        if is_active { " ✓" } else { "" },
+                        Style::default().fg(Color::Rgb(105, 210, 125)).bg(bg),
+                    ),
+                ]))
+            })
+            .collect();
+        frame.render_widget(
+            List::new(items).block(Block::default().borders(Borders::LEFT | Borders::RIGHT)),
+            body[0],
+        );
+
+        let (key, label, desc) = ENTRIES[cursor];
+        let is_active_cur = key == cur_label;
+        let action_hint = if is_active_cur {
+            "Already active"
+        } else {
+            "Press Enter to apply"
+        };
+        let detail = Paragraph::new(vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("  {label}"),
+                Style::default()
+                    .fg(Color::Rgb(210, 235, 255))
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("  {desc}"),
+                Style::default().fg(Color::Rgb(170, 205, 232)),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("  {action_hint}"),
+                Style::default().fg(if is_active_cur {
+                    Color::Rgb(100, 200, 100)
+                } else {
+                    Color::Rgb(220, 180, 80)
+                }),
+            )),
+        ])
+        .wrap(Wrap { trim: true })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Rgb(65, 105, 145))),
+        );
+        frame.render_widget(detail, body[1]);
+
+        frame.render_widget(Paragraph::new(picker_help_line(accent)), chunks[2]);
+    }
+
     /// Render the compact mission-steering overlay.
     ///
     /// The overlay appears as a small floating panel over the lower-half of the
@@ -29346,9 +29701,10 @@ impl App {
         // feedback appear immediately on the current frame.
         let text = self.textarea_text();
         let block = if self.is_processing {
-            // FP53: Animate the waiting title using the same braille spinner frame
+            // FP53: Animate the waiting title using the same spinner frame
             // as the status bar — zero extra state, perfect sync.
-            let spinner = SPINNER_FRAMES[self.current_spinner_frame() % SPINNER_FRAMES.len()];
+            let spinner =
+                compact_spinner_frame(self.current_spinner_frame(), self.terminal_glyph_profile);
             let waiting_label = format!("{spinner} waiting…");
             Block::default()
                 .borders(Borders::ALL)
@@ -32915,11 +33271,21 @@ kind = "skill"
     #[test]
     fn waiting_first_token_status_surfaces_the_right_message() {
         let theme = Theme::default();
-        let early = format_waiting_first_token_status(&theme, 0, 0, 0, 2);
-        let long = format_waiting_first_token_status(&theme, 0, 0, 0, 12);
+        let early =
+            format_waiting_first_token_status(&theme, TerminalGlyphProfile::Unicode, 0, 0, 0, 2);
+        let long =
+            format_waiting_first_token_status(&theme, TerminalGlyphProfile::Unicode, 0, 0, 0, 12);
         assert!(early.contains("first token"));
         assert!(long.contains("waiting for first token"));
         assert!(long.contains("^C=stop"));
+    }
+
+    #[test]
+    fn waiting_first_token_status_uses_ascii_spinner_when_requested() {
+        let theme = Theme::default();
+        let status =
+            format_waiting_first_token_status(&theme, TerminalGlyphProfile::Ascii, 0, 0, 0, 2);
+        assert!(status.starts_with("- "));
     }
 
     #[test]
