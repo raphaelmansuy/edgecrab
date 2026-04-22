@@ -255,7 +255,8 @@ mod tests {
     #[test]
     fn parse_complete_verdict_ok() {
         let json = r#"{"verdict":"complete","confidence":0.95,"reason":"All files created.","steering_hint":null}"#;
-        let v = parse_shadow_verdict(json, 100, 20).unwrap();
+        let v =
+            parse_shadow_verdict(json, 100, 20).expect("expected valid complete shadow verdict");
         assert!(v.is_complete);
         assert!((v.confidence - 0.95).abs() < 0.01);
         assert_eq!(v.reason, "All files created.");
@@ -267,24 +268,30 @@ mod tests {
     #[test]
     fn parse_incomplete_verdict_with_hint() {
         let json = r#"{"verdict":"incomplete","confidence":0.88,"reason":"CSS file missing.","steering_hint":"Create style.css with the game styles."}"#;
-        let v = parse_shadow_verdict(json, 200, 30).unwrap();
+        let v = parse_shadow_verdict(json, 200, 30)
+            .expect("expected valid incomplete shadow verdict with hint");
         assert!(!v.is_complete);
         assert!((v.confidence - 0.88).abs() < 0.01);
         assert!(v.steering_hint.is_some());
-        assert!(v.steering_hint.unwrap().contains("style.css"));
+        assert!(v
+            .steering_hint
+            .as_deref()
+            .is_some_and(|hint| hint.contains("style.css")));
     }
 
     #[test]
     fn parse_strips_markdown_fences() {
         let json = "```json\n{\"verdict\":\"complete\",\"confidence\":0.9,\"reason\":\"done\",\"steering_hint\":null}\n```";
-        let v = parse_shadow_verdict(json, 10, 5).unwrap();
+        let v =
+            parse_shadow_verdict(json, 10, 5).expect("expected fenced JSON shadow verdict");
         assert!(v.is_complete);
     }
 
     #[test]
     fn parse_json_fence_no_lang_tag() {
         let json = "```\n{\"verdict\":\"incomplete\",\"confidence\":0.7,\"reason\":\"not done\",\"steering_hint\":\"keep going\"}\n```";
-        let v = parse_shadow_verdict(json, 0, 0).unwrap();
+        let v = parse_shadow_verdict(json, 0, 0)
+            .expect("expected fenced JSON shadow verdict without language tag");
         assert!(!v.is_complete);
     }
 
@@ -303,7 +310,8 @@ mod tests {
     fn parse_json_with_leading_prose() {
         // Some models prepend a sentence despite the system prompt.
         let json = r#"Here is my verdict: {"verdict":"incomplete","confidence":0.75,"reason":"JS missing.","steering_hint":"Write game.js."}"#;
-        let v = parse_shadow_verdict(json, 0, 0).unwrap();
+        let v = parse_shadow_verdict(json, 0, 0)
+            .expect("expected parser to recover JSON shadow verdict after prose prefix");
         assert!(!v.is_complete);
         assert!(v.steering_hint.is_some());
     }
@@ -311,7 +319,8 @@ mod tests {
     #[test]
     fn parse_null_string_steering_hint_becomes_none() {
         let json = r#"{"verdict":"complete","confidence":0.99,"reason":"All done.","steering_hint":"null"}"#;
-        let v = parse_shadow_verdict(json, 0, 0).unwrap();
+        let v = parse_shadow_verdict(json, 0, 0)
+            .expect("expected valid shadow verdict with string null steering hint");
         assert!(v.steering_hint.is_none());
     }
 
@@ -319,7 +328,8 @@ mod tests {
     fn parse_empty_string_steering_hint_becomes_none() {
         let json =
             r#"{"verdict":"complete","confidence":0.99,"reason":"All done.","steering_hint":""}"#;
-        let v = parse_shadow_verdict(json, 0, 0).unwrap();
+        let v = parse_shadow_verdict(json, 0, 0)
+            .expect("expected valid shadow verdict with empty steering hint");
         assert!(v.steering_hint.is_none());
     }
 

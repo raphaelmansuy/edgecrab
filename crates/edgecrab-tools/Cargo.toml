@@ -31,7 +31,6 @@ tokio-tungstenite = { workspace = true }
 futures = { workspace = true }
 strip-ansi-escapes = { workspace = true }
 tracing = { workspace = true }
-edgeparse-core = "0.2.3"
 uuid = { workspace = true }
 image = { workspace = true }
 url = { workspace = true }

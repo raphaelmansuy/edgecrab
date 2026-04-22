@@ -5,7 +5,8 @@
 # RUSTSEC-2026-0098 and RUSTSEC-2026-0099 affect rustls-webpki 0.101.7.
 # This version is pulled in transitively by aws-smithy-http-client (via rustls 0.21.x),
 # which is part of the AWS SDK for Bedrock. The 0.101.x branch of rustls-webpki
-# has no patched release; the fix only exists in >= 0.103.12. The AWS SDK has not yet
+# has no patched release; fixes only exist in >= 0.103.12 / >= 0.103.13 depending on advisory.
+# The AWS SDK has not yet
 # updated to use rustls 0.23.x (which would bring in rustls-webpki 0.103.12+).
 # Impact is limited: the vulnerability requires certificate misissuance and is only
 # reachable after signature verification. We already use rustls-webpki 0.103.12 for
@@ -14,4 +15,8 @@
 ignore = [
     "RUSTSEC-2026-0098",
     "RUSTSEC-2026-0099",
+    "RUSTSEC-2026-0104",
+    # Transitive via wreq -> lru ^0.13; no patched 0.13.x release is available.
+    # Track upstream migration to wreq >= 6.x (or another backend) to remove this.
+    "RUSTSEC-2026-0002",
 ]
