@@ -273,17 +273,17 @@ mod tests {
         assert!(!v.is_complete);
         assert!((v.confidence - 0.88).abs() < 0.01);
         assert!(v.steering_hint.is_some());
-        assert!(v
-            .steering_hint
-            .as_deref()
-            .is_some_and(|hint| hint.contains("style.css")));
+        assert!(
+            v.steering_hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("style.css"))
+        );
     }
 
     #[test]
     fn parse_strips_markdown_fences() {
         let json = "```json\n{\"verdict\":\"complete\",\"confidence\":0.9,\"reason\":\"done\",\"steering_hint\":null}\n```";
-        let v =
-            parse_shadow_verdict(json, 10, 5).expect("expected fenced JSON shadow verdict");
+        let v = parse_shadow_verdict(json, 10, 5).expect("expected fenced JSON shadow verdict");
         assert!(v.is_complete);
     }
 
