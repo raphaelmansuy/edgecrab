@@ -19,6 +19,7 @@ pub mod model_discovery;
 pub mod model_router;
 pub mod pricing;
 pub mod prompt_builder;
+pub mod shadow_judge;
 pub mod steering;
 pub mod sub_agent_runner;
 pub mod tool_result_spill;

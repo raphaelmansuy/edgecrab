@@ -904,6 +904,37 @@ impl ToolRegistry {
             })
     }
 
+    /// Required argument names declared in the tool schema.
+    ///
+    /// Returns `None` when the tool is unknown.
+    pub fn required_fields_for_tool(&self, name: &str) -> Option<Vec<String>> {
+        let static_name = self.tool_aliases.get(name).copied().unwrap_or(name);
+        let schema = if let Some(handler) = self.tools.get(static_name) {
+            handler.schema()
+        } else {
+            let dynamic_name = self
+                .dynamic_tool_aliases
+                .get(name)
+                .map(String::as_str)
+                .unwrap_or(name);
+            let handler = self.dynamic_tools.get(dynamic_name)?;
+            handler.schema()
+        };
+
+        Some(
+            schema
+                .parameters
+                .get("required")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
+        )
+    }
+
     /// Summary of toolsets with tool counts.
     pub fn toolset_summary(&self) -> Vec<(String, usize)> {
         let mut counts: std::collections::BTreeMap<String, usize> = self
@@ -1833,6 +1864,17 @@ mod tests {
         // Even if tool exists, bad JSON → conservative false
         let result = reg.can_parallelize_in_batch("write_file", "not json", &claimed);
         assert!(!result, "bad json should not be parallelizable");
+    }
+
+    #[test]
+    fn required_fields_for_write_file_reflect_schema() {
+        let reg = ToolRegistry::new();
+        let required = reg
+            .required_fields_for_tool("write_file")
+            .expect("write_file should be registered");
+        assert!(required.contains(&"path".to_string()));
+        assert!(required.contains(&"content".to_string()));
+        assert!(!required.contains(&"create_dirs".to_string()));
     }
 
     // ── Path-prefix overlap tests (FP9 hardening) ─────────────────

@@ -229,6 +229,15 @@ display:
   update_check_interval_hours: 24
   skin: "default"
 
+# ── Completion Oracle ─────────────────────────────────────────────────
+shadow_judge:
+  enabled: false                # opt-in secondary completion verdict
+  model: ~                      # null = auxiliary.model → main model fallback
+  max_per_session: 5            # guardrail against correction loops
+  confidence_threshold: 0.70    # below this, let the main loop finish normally
+  context_messages: 20          # tail message window sent to the judge (0 = all)
+  min_messages_before_enable: 4 # skip trivial one-shot sessions
+
 # ── Privacy ────────────────────────────────────────────────────────────
 privacy:
   redact_pii: false

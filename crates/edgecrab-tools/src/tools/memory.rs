@@ -169,7 +169,12 @@ impl ToolHandler for MemoryWriteTool {
             description: "Manage the agent's persistent memory. Actions: 'add' appends a new \
                            entry, 'replace' swaps old_content with content, 'remove' deletes \
                            the entry matching old_content. Hermes-compatible calls using \
-                           `memory` and `old_text` are also accepted."
+                           `memory` and `old_text` are also accepted. \
+                           Required fields per action: \
+                           'add': content must be non-empty; \
+                           'replace': content (new text) AND old_content (text to find) both required; \
+                           'remove': old_content (text to find) required. \
+                           Calling with no arguments returns the current memory contents."
                 .into(),
             parameters: json!({
                 "type": "object",
@@ -181,11 +186,11 @@ impl ToolHandler for MemoryWriteTool {
                     },
                     "content": {
                         "type": "string",
-                        "description": "Memory entry to add, or new content for replace"
+                        "description": "Memory entry to add, or new content for replace. Required for 'add' and 'replace' actions."
                     },
                     "old_content": {
                         "type": "string",
-                        "description": "Substring to match for replace/remove actions"
+                        "description": "Substring to match for replace/remove actions. Required for 'replace' and 'remove' actions."
                     },
                     "old_text": {
                         "type": "string",
@@ -194,9 +199,10 @@ impl ToolHandler for MemoryWriteTool {
                     "target": {
                         "type": "string",
                         "enum": ["memory", "user"],
-                        "description": "Which memory file to write to"
+                        "description": "Which memory file to write to (default: memory)"
                     }
-                }
+                },
+                "required": []
             }),
             strict: None,
         }

@@ -8,11 +8,35 @@ sidebar:
 All notable changes to EdgeCrab are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-Last updated: 2026-04-21
+Last updated: 2026-04-22
 
 ---
 
 ## [Unreleased]
+
+## [0.9.0] — 2026-04-22
+
+### Added
+
+- **Shadow Judge completion oracle** — EdgeCrab can now run an opt-in secondary LLM verdict before accepting a run as complete, then inject a continuation hint when a model appears to stop one step too early.
+- **`/shadow-judge` TUI control surface** — session-scoped on/off/toggle/status command plus a picker UI and status-bar intervention badge.
+- **Structured `report_task_status` tool** — the model can now emit milestone and blocked-state signals with evidence and remaining steps for the harness to interpret.
+
+### Changed
+
+- **Completion and retry guards are stricter after tool activity** — repeated malformed tool retries are suppressed semantically, not only by identical payload fingerprint.
+- **Tool results carry richer machine-readable metadata** — file writes and patches expose line counts, terminal results expose truncation, and searches expose pagination headers so the agent can continue intelligently.
+- **Several tool schemas now align more closely with runtime behavior** — clearer required arguments and fewer misleading schema-level requirements reduce avoidable invalid-argument loops.
+
+### Verification
+
+| Check | Result |
+|--------|--------|
+| `./scripts/release-version.sh check` | **passed locally before cut** |
+| `cargo test -p edgecrab-core --lib` | **passed locally before cut** |
+| `cargo test -p edgecrab-tools --lib` | **passed locally before cut** |
+| `cargo test --workspace` | **passed locally before cut** |
+| `fnm exec --using v22.12.0 pnpm build` in `site/` | **passed locally before cut** |
 
 ## [0.8.0] — 2026-04-21
 

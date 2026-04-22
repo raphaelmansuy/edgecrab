@@ -101,7 +101,7 @@ impl ToolHandler for WriteFileTool {
                         "description": "Intent when the file already exists. 'overwrite' (default): rejection on collision returns a content preview and records a session snapshot — retry the SAME call to succeed. 'abort': cheap rejection with no preview and no snapshot — use when intent is to create a NEW file and a different path should be chosen on collision."
                     }
                 },
-                "required": ["path", "content", "create_dirs"]
+                "required": ["path", "content"]
             }),
             strict: Some(true),
         }
@@ -270,11 +270,17 @@ impl ToolHandler for WriteFileTool {
             ))
         } else {
             // R18: Structured JSON result (FP57).
+            // `lines` gives the agent a measurement signal without a re-read:
+            // it can verify the write produced the expected number of lines and
+            // decide next action (patch a specific line, read a range, etc.)
+            // without a redundant read_file round-trip.
             let action = if file_exists { "overwrite" } else { "create" };
+            let lines = content.lines().count();
             Ok(serde_json::json!({
                 "ok": true,
                 "action": action,
                 "bytes": bytes_written,
+                "lines": lines,
                 "path": args.path,
             })
             .to_string())
@@ -310,6 +316,8 @@ mod tests {
         assert_eq!(v["ok"], true);
         assert_eq!(v["bytes"], 11);
         assert_eq!(v["action"], "create");
+        // "hello world" has no newlines → 1 line
+        assert_eq!(v["lines"], 1, "lines must reflect actual line count");
         let content = std::fs::read_to_string(dir.path().join("new.txt")).expect("read");
         assert_eq!(content, "hello world");
     }
@@ -338,10 +346,7 @@ mod tests {
         assert_eq!(schema.strict, Some(true));
         assert_eq!(schema.parameters["type"], "object");
         assert_eq!(schema.parameters["additionalProperties"], false);
-        assert_eq!(
-            schema.parameters["required"],
-            json!(["path", "content", "create_dirs"])
-        );
+        assert_eq!(schema.parameters["required"], json!(["path", "content"]));
         // content must be "string" — NOT ["string", "null"]
         assert_eq!(
             schema.parameters["properties"]["content"]["type"],

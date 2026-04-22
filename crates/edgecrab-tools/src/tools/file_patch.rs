@@ -200,11 +200,16 @@ async fn execute_replace_patch(args: ReplaceArgs, ctx: &ToolContext) -> Result<S
 
     // R18: Structured JSON result (FP57) — enables the display layer and the
     // conversation loop to branch on machine-readable fields instead of parsing prose.
+    // `before_lines`/`after_lines` give the agent a measurement signal without a
+    // re-read: it can verify the net line delta (e.g. +1 line as expected from
+    // a single-line insertion) without an extra read_file round-trip.
     let result = serde_json::json!({
         "ok": true,
         "replacements": count,
         "before_bytes": before_bytes,
         "after_bytes": after_bytes,
+        "before_lines": content.lines().count(),
+        "after_lines": new_content.lines().count(),
         "path": args.path,
     });
     Ok(result.to_string())
@@ -981,6 +986,18 @@ mod tests {
         assert!(
             result.contains("\"ok\":true") || result.contains("\"ok\": true"),
             "expected JSON ok result, got: {result}"
+        );
+        // Verify before_lines/after_lines are present and correct.
+        // The file has 3 lines ("fn main() {\n    println!(...);\n}\n").
+        // Replacing one token inside a line preserves the line count.
+        let v: serde_json::Value = serde_json::from_str(&result).expect("result JSON");
+        assert_eq!(
+            v["before_lines"], 3,
+            "before_lines must equal source line count"
+        );
+        assert_eq!(
+            v["after_lines"], 3,
+            "after_lines must equal patched line count"
         );
         let content = std::fs::read_to_string(dir.path().join("code.rs")).expect("read");
         assert!(content.contains("println!(\"new\")"));

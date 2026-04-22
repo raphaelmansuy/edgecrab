@@ -1628,7 +1628,7 @@ impl ToolHandler for ExecuteCodeToolReal {
                 "properties": {
                     "code": {
                         "type": "string",
-                        "description": "Python code to execute. Import tools with `from edgecrab_tools import web_search, terminal, ...` and print your final result to stdout."
+                        "description": "Python code to execute. Must be non-empty — only call when you already have a concrete code payload to run. Import tools with `from edgecrab_tools import web_search, terminal, ...` and print your final result to stdout."
                     },
                     "language": {
                         "type": "string",

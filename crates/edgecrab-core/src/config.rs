@@ -61,6 +61,7 @@ pub struct AppConfig {
     pub voice: VoiceConfig,
     pub honcho: HonchoConfig,
     pub auxiliary: AuxiliaryConfig,
+    pub shadow_judge: ShadowJudgeConfig,
     pub moa: MoaConfig,
     pub reasoning_effort: Option<String>,
     pub context: ContextConfig,
@@ -1997,6 +1998,59 @@ pub struct AuxiliaryConfig {
     pub base_url: Option<String>,
     /// Environment variable holding the API key.
     pub api_key_env: Option<String>,
+}
+
+/// Shadow judge configuration — lightweight LLM completion oracle.
+///
+/// When enabled, the shadow judge fires after the synchronous
+/// `DefaultCompletionPolicy` returns `Completed`. It makes a single
+/// LLM classification call to verify that the original user request is
+/// actually satisfied before allowing the loop to break.
+///
+/// # Design constraints
+///
+/// - The shadow call NEVER mutates `session.messages` (read-only borrow).
+/// - The main session system prompt is NEVER rebuilt (no cache invalidation).
+/// - Non-fatal: any API error falls through to normal loop termination.
+/// - Opt-in only: `enabled: false` is the default (no impact on existing sessions).
+/// - Per-session invocation cap prevents infinite correction spirals.
+///
+/// Default: all fields produce a safe **disabled** state.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ShadowJudgeConfig {
+    /// Enable shadow judge. Default: `false` (opt-in).
+    pub enabled: bool,
+    /// Judge model (e.g. `"anthropic/claude-haiku-4-20250514"`).
+    /// `null` → falls back to `auxiliary.model` → then to the main model.
+    pub model: Option<String>,
+    /// Hard cap on shadow judge invocations per session.
+    /// Prevents infinite correction loops. Default: `5`.
+    pub max_per_session: u32,
+    /// Confidence threshold below which the judge verdict is treated as
+    /// "complete" (i.e. low confidence → don't block). Range `[0.0, 1.0]`.
+    /// Default: `0.70`.
+    pub confidence_threshold: f32,
+    /// Number of most-recent messages to pass to the judge.
+    /// `0` = send all messages (caution: more tokens). Default: `20`.
+    pub context_messages: usize,
+    /// Minimum conversation length before the judge is eligible to fire.
+    /// Prevents trivial one-shot Q&A sessions from being judged.
+    /// Default: `4`.
+    pub min_messages_before_enable: usize,
+}
+
+impl Default for ShadowJudgeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model: None,
+            max_per_session: 5,
+            confidence_threshold: 0.70,
+            context_messages: 20,
+            min_messages_before_enable: 4,
+        }
+    }
 }
 
 /// Default Mixture-of-Agents configuration.

@@ -32,6 +32,8 @@ impl CompletionPolicy for DefaultCompletionPolicy {
         let pending_clarification = ctx.pending_clarification || has_clarify_marker(ctx);
         let pending_approval = ctx.pending_approval || has_approval_marker(ctx);
         let verification = collect_verification_summary(ctx.messages);
+        let recent_tool_activity = has_recent_tool_activity(ctx.messages);
+        let deferred_work = recent_tool_activity && has_deferred_work_signal(ctx.final_response);
         let reported_progress = collect_reported_progress_state(ctx.messages);
         let reported_blocked = matches!(
             reported_progress.latest_status,
@@ -80,6 +82,12 @@ impl CompletionPolicy for DefaultCompletionPolicy {
                 CompletionDecision::Incomplete,
                 ExitReason::PendingTasks,
                 "Incomplete — progress was reported but work still remains.",
+            )
+        } else if deferred_work {
+            RunOutcome::new(
+                CompletionDecision::Incomplete,
+                ExitReason::PendingTasks,
+                "Incomplete — the assistant described a next step instead of executing it.",
             )
         } else if ctx.final_response.trim().is_empty() {
             RunOutcome::new(
@@ -132,6 +140,70 @@ fn has_approval_marker(ctx: &CompletionContext<'_>) -> bool {
             let lower = msg.text_content().to_ascii_lowercase();
             approval_tokens.iter().any(|needle| lower.contains(needle))
         })
+}
+
+fn has_recent_tool_activity(messages: &[Message]) -> bool {
+    messages
+        .iter()
+        .rev()
+        .take(6)
+        .any(|msg| msg.role == Role::Tool)
+}
+
+fn has_deferred_work_signal(text: &str) -> bool {
+    if text.trim().is_empty() {
+        return false;
+    }
+
+    let normalized = text
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let window: String = normalized.chars().take(240).collect();
+
+    let intent_markers = [
+        "let me ",
+        "i'll ",
+        "i will ",
+        "now i'll ",
+        "now i will ",
+        "next i'll ",
+        "next i will ",
+        "then i'll ",
+        "then i will ",
+        "i'm going to ",
+        "i am going to ",
+    ];
+    let action_verbs = [
+        "create",
+        "write",
+        "build",
+        "update",
+        "fix",
+        "run",
+        "retry",
+        "try",
+        "inspect",
+        "check",
+        "search",
+        "edit",
+        "patch",
+        "implement",
+        "add",
+        "continue",
+        "open",
+        "read",
+    ];
+
+    intent_markers.iter().any(|marker| {
+        window.match_indices(marker).any(|(index, _)| {
+            let after = &window[index + marker.len()..];
+            action_verbs
+                .iter()
+                .any(|verb| after.find(verb).is_some_and(|pos| pos <= 48))
+        })
+    })
 }
 
 #[derive(Debug, Default)]
@@ -414,6 +486,71 @@ mod tests {
         let outcome = assess_completion(&ctx);
         assert_eq!(outcome.state, CompletionDecision::Completed);
         assert!(outcome.verification.evidence_present);
+    }
+
+    #[test]
+    fn deferred_work_after_tool_activity_keeps_run_incomplete() {
+        let messages = vec![Message::tool_result(
+            "tc_1",
+            "write_file",
+            "Created empty scaffold at './game2'.",
+        )];
+        let ctx = CompletionContext {
+            final_response: "I see the issue. The directory already exists. Let me try writing the file directly without creating directories first.",
+            messages: &messages,
+            interrupted: false,
+            budget_exhausted: false,
+            pending_approval: false,
+            pending_clarification: false,
+            active_todos: 0,
+            blocked_todos: 0,
+            child_runs_in_flight: 0,
+        };
+
+        let outcome = assess_completion(&ctx);
+        assert_eq!(outcome.state, CompletionDecision::Incomplete);
+        assert_eq!(outcome.exit_reason, ExitReason::PendingTasks);
+    }
+
+    #[test]
+    fn final_answer_after_tool_activity_can_still_complete() {
+        let messages = vec![Message::tool_result(
+            "tc_1",
+            "write_file",
+            "Wrote ./game2/index.html successfully.",
+        )];
+        let ctx = CompletionContext {
+            final_response: "The file is in place and the task is complete.",
+            messages: &messages,
+            interrupted: false,
+            budget_exhausted: false,
+            pending_approval: false,
+            pending_clarification: false,
+            active_todos: 0,
+            blocked_todos: 0,
+            child_runs_in_flight: 0,
+        };
+
+        let outcome = assess_completion(&ctx);
+        assert_eq!(outcome.state, CompletionDecision::Completed);
+    }
+
+    #[test]
+    fn deferred_work_without_recent_tool_activity_does_not_trigger_heuristic() {
+        let ctx = CompletionContext {
+            final_response: "Let me explain the result in more detail.",
+            messages: &[],
+            interrupted: false,
+            budget_exhausted: false,
+            pending_approval: false,
+            pending_clarification: false,
+            active_todos: 0,
+            blocked_todos: 0,
+            child_runs_in_flight: 0,
+        };
+
+        let outcome = assess_completion(&ctx);
+        assert_eq!(outcome.state, CompletionDecision::Completed);
     }
 
     #[test]

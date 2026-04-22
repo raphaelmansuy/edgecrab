@@ -188,6 +188,8 @@ pub struct AgentConfig {
     pub compression: crate::config::CompressionConfig,
     /// Auxiliary side-task routing (vision, compression, other helper calls).
     pub auxiliary: crate::config::AuxiliaryConfig,
+    /// Shadow judge configuration (completion oracle).
+    pub shadow_judge: crate::config::ShadowJudgeConfig,
     /// Default Mixture-of-Agents roster and aggregator.
     pub moa: crate::config::MoaConfig,
     /// Voice output configuration projected from AppConfig.
@@ -260,6 +262,7 @@ impl Default for AgentConfig {
                 edgecrab_tools::tools::backends::SingularityBackendConfig::default(),
             compression: crate::config::CompressionConfig::default(),
             auxiliary: crate::config::AuxiliaryConfig::default(),
+            shadow_judge: crate::config::ShadowJudgeConfig::default(),
             moa: crate::config::MoaConfig::default(),
             tts: crate::config::TtsConfig::default(),
             stt: crate::config::SttConfig::default(),
@@ -599,6 +602,19 @@ impl Agent {
     /// Inject or replace the gateway-backed outbound sender used by `send_message`.
     pub async fn set_gateway_sender(&self, sender: Arc<dyn GatewaySender>) {
         *self.gateway_sender.write().await = Some(sender);
+    }
+
+    /// Toggle the shadow judge completion oracle for this session.
+    ///
+    /// Safe to call while a conversation is running — the value is read at
+    /// the next `LoopAction::Done` decision point, not during the LLM call.
+    pub async fn set_shadow_judge_enabled(&self, enabled: bool) {
+        self.config.write().await.shadow_judge.enabled = enabled;
+    }
+
+    /// Returns the current shadow judge enabled state.
+    pub async fn shadow_judge_enabled(&self) -> bool {
+        self.config.read().await.shadow_judge.enabled
     }
 
     /// Gateway interface — send a message with origin context (platform + chat_id).
@@ -1847,6 +1863,7 @@ impl AgentBuilder {
                 terminal_singularity: config.terminal.singularity.clone(),
                 compression: config.compression.clone(),
                 auxiliary: config.auxiliary.clone(),
+                shadow_judge: config.shadow_judge.clone(),
                 moa: config.moa.clone(),
                 tts: config.tts.clone(),
                 stt: config.stt.clone(),

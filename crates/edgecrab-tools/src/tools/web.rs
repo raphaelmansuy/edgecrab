@@ -1600,7 +1600,7 @@ impl ToolHandler for WebSearchTool {
                     },
                     "max_results": {
                         "type": "integer",
-                        "description": "Maximum results to return (default: 5)"
+                        "description": "Maximum results to return (default: 5, max: 20)"
                     },
                     "backend": {
                         "type": "string",
@@ -1893,7 +1893,7 @@ impl ToolHandler for WebExtractTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "web_extract".into(),
-            description: "Extract readable content from one or more URLs. Accepts EdgeCrab's single `url` form and `urls` arrays (up to 5 URLs). Returns structured JSON with content, metadata, backend selection, PDF extraction via EdgeParse, and browser-rendered fallback for JS-heavy pages.".into(),
+            description: "Extract readable content from one or more URLs. Accepts EdgeCrab's single `url` form and `urls` arrays (up to 5 URLs). Returns structured JSON with content, metadata, backend selection, PDF extraction via EdgeParse, and browser-rendered fallback for JS-heavy pages. Either `url` (single) or `urls` (batch) must be provided — calling without either returns an error.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -1919,7 +1919,8 @@ impl ToolHandler for WebExtractTool {
                         "type": "boolean",
                         "description": "When true (default), try a browser-rendered fallback for JS-heavy pages when native extraction is too thin"
                     }
-                }
+                },
+                "required": []
             }),
             strict: None,
         }

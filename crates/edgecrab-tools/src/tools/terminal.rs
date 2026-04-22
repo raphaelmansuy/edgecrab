@@ -175,7 +175,7 @@ impl ToolHandler for TerminalTool {
                     },
                     "timeout": {
                         "type": "integer",
-                        "description": "Timeout alias in seconds."
+                        "description": "Alias for `timeout_seconds`. Takes precedence over `timeout_seconds` when both are set (default: 120, max: 600)."
                     },
                     "pty": {
                         "type": "boolean",
@@ -356,6 +356,12 @@ impl ToolHandler for TerminalTool {
         // Format output (includes stdout/stderr/exit-code)
         let max_stdout = ctx.config.max_terminal_output;
         let max_stderr = ctx.config.max_terminal_output / 4;
+        // Compute truncation BEFORE format() discards the raw lengths.
+        // This gives the agent an exact, deterministic signal rather than
+        // requiring it to guess from "... [N bytes omitted] ..." prose.
+        let was_truncated =
+            exec_output.stdout.len() > max_stdout || exec_output.stderr.len() > max_stderr;
+        let total_output_chars = exec_output.stdout.len() + exec_output.stderr.len();
         let mut result = exec_output.format(max_stdout, max_stderr);
 
         // Strip ANSI escape codes for clean LLM consumption.
@@ -367,6 +373,21 @@ impl ToolHandler for TerminalTool {
 
         let header =
             terminal_result_header(&ctx.config.terminal_backend, &cwd, exec_output.exit_code);
+        // Augment the header with truncation info when output was cut off.
+        // The agent needs this signal BEFORE reading the (truncated) body so it
+        // knows to narrow the command (grep, head, tail) rather than blindly
+        // re-running and getting the same truncated result.
+        // Implementation: strip the closing `]` and append new key=value pairs.
+        // The header is always ASCII, so byte-level slicing is safe here.
+        let header = if was_truncated {
+            format!(
+                "{} truncated=true output_chars={}]",
+                &header[..header.len() - 1],
+                total_output_chars
+            )
+        } else {
+            header
+        };
         result = if result.is_empty() {
             header
         } else {

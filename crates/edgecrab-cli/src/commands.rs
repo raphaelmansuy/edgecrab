@@ -214,6 +214,8 @@ pub enum CommandResult {
     MouseMode(String),
     /// Toggle or inspect YOLO approval bypass for the current session.
     SetYolo(String),
+    /// Toggle the Shadow Judge completion oracle (on/off/toggle/status).
+    SetShadowJudge(String),
     /// Resolve the current approval prompt from a slash command.
     ApprovalChoice(edgecrab_core::ApprovalChoice),
     /// macOS permission diagnostics and bootstrap workflow.
@@ -1268,6 +1270,13 @@ impl CommandRegistry {
             aliases: &[],
             description: "Toggle YOLO mode (skip dangerous command approvals for this session)",
             handler: |args| CommandResult::SetYolo(args.trim().to_string()),
+        });
+
+        self.register(Command {
+            name: "shadow-judge",
+            aliases: &["sj", "shadow_judge"],
+            description: "Toggle shadow judge completion oracle (on/off/toggle/status)",
+            handler: |args| CommandResult::SetShadowJudge(args.trim().to_string()),
         });
 
         // ── Scheduling ────────────────────────────────────────────────

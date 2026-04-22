@@ -102,7 +102,7 @@ impl ToolHandler for SearchFilesTool {
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "Maximum number of results to return (Hermes-compatible alias)"
+                        "description": "Maximum number of results to return (Hermes-compatible alias for `max_results`; takes precedence over `max_results` when both are set, max: 200)"
                     },
                     "offset": {
                         "type": "integer",
@@ -121,7 +121,7 @@ impl ToolHandler for SearchFilesTool {
                     },
                     "max_results": {
                         "type": "integer",
-                        "description": "Maximum number of results to return (default: 50)"
+                        "description": "Maximum number of results to return (default: 50, max: 200). Use `limit` as an alias."
                     }
                 },
                 "required": ["pattern"]
@@ -155,7 +155,7 @@ impl ToolHandler for SearchFilesTool {
         let output_mode = args.output_mode.to_ascii_lowercase();
         let cwd = ctx.cwd.clone();
 
-        let output = if target == "files" {
+        let (raw_text, total_matches, returned_matches) = if target == "files" {
             let pattern = args.pattern.clone();
             let include_glob_for_walk = include_glob.clone();
             let matches = tokio::task::spawn_blocking(move || {
@@ -198,6 +198,23 @@ impl ToolHandler for SearchFilesTool {
 
             format_content_results(matches, &output_mode, offset, max)
         };
+
+        // Build a machine-readable pagination summary prepended to the output.
+        // This prevents re-search loops: the agent can see `has_more=true` and
+        // knows to use `offset` to paginate rather than blindly re-running.
+        // Cost: ~10-15 tokens per call; benefit: avoids 50-200+ token re-searches.
+        let has_more = offset + returned_matches < total_matches;
+        let summary = if has_more {
+            format!(
+                "[search_result returned={returned_matches} total={total_matches} has_more=true next_offset={}]",
+                offset + returned_matches
+            )
+        } else {
+            format!(
+                "[search_result returned={returned_matches} total={total_matches} has_more=false]"
+            )
+        };
+        let output = format!("{summary}\n{raw_text}");
 
         // Consecutive re-search loop detection — mirrors hermes-agent file_tools.py.
         // Warn at 3 identical consecutive searches; hard-block at 4.
@@ -351,24 +368,47 @@ fn walk_and_find_files(
     }
 }
 
-fn format_file_results(matches: Vec<String>, offset: usize, limit: usize) -> String {
+/// Returns `(text, total_before_limit, returned_count)`.
+///
+/// `total_before_limit` is the number of raw matches collected before paging.
+/// `returned_count` is the number of items actually present in `text` (after
+/// applying `offset` + `limit`).  The caller uses these to build a machine-
+/// readable `[search_result ...]` summary that lets the agent decide whether
+/// to paginate rather than blindly re-running the same query.
+fn format_file_results(
+    matches: Vec<String>,
+    offset: usize,
+    limit: usize,
+) -> (String, usize, usize) {
+    let total = matches.len();
     let page: Vec<String> = matches.into_iter().skip(offset).take(limit).collect();
-    if page.is_empty() {
+    let returned = page.len();
+    let text = if page.is_empty() {
         "No matches found.".to_string()
     } else {
         page.join("\n")
-    }
+    };
+    (text, total, returned)
 }
 
+/// Returns `(text, total_before_limit, returned_count)`.
+///
+/// `total_before_limit` is the raw match count before paging.  For
+/// `files_only` and `count` modes this is the raw hit count (not the
+/// deduplicated file count) — useful as a relative signal; the agent cares
+/// mainly about `has_more`, which is computed from total vs offset+returned.
+/// `returned_count` is the number of entries in the output text.
 fn format_content_results(
     matches: Vec<(String, usize, String, usize)>,
     output_mode: &str,
     offset: usize,
     limit: usize,
-) -> String {
+) -> (String, usize, usize) {
     if matches.is_empty() {
-        return "No matches found.".to_string();
+        return ("No matches found.".to_string(), 0, 0);
     }
+
+    let total = matches.len();
 
     match output_mode {
         "files_only" => {
@@ -379,11 +419,13 @@ fn format_content_results(
                 }
             }
             let page: Vec<String> = files.into_iter().skip(offset).take(limit).collect();
-            if page.is_empty() {
+            let returned = page.len();
+            let text = if page.is_empty() {
                 "No matches found.".to_string()
             } else {
                 page.join("\n")
-            }
+            };
+            (text, total, returned)
         }
         "count" => {
             let mut counts = std::collections::BTreeMap::<String, usize>::new();
@@ -396,11 +438,13 @@ fn format_content_results(
                 .take(limit)
                 .map(|(path, count)| format!("{path}: {count}"))
                 .collect();
-            if page.is_empty() {
+            let returned = page.len();
+            let text = if page.is_empty() {
                 "No matches found.".to_string()
             } else {
                 page.join("\n")
-            }
+            };
+            (text, total, returned)
         }
         _ => {
             let page: Vec<String> = matches
@@ -415,11 +459,13 @@ fn format_content_results(
                     }
                 })
                 .collect();
-            if page.is_empty() {
+            let returned = page.len();
+            let text = if page.is_empty() {
                 "No matches found.".to_string()
             } else {
                 page.join("\n")
-            }
+            };
+            (text, total, returned)
         }
     }
 }
@@ -548,5 +594,111 @@ mod tests {
         assert!(!simple_glob_match("*.rs", "main.py"));
         assert!(simple_glob_match("Makefile", "Makefile"));
         assert!(!simple_glob_match("Makefile", "makefile"));
+    }
+
+    // ── Pagination summary header tests ──────────────────────────────────────
+    // These tests verify the machine-readable [search_result ...] header that
+    // the agent uses to decide whether to paginate or stop searching.
+
+    #[tokio::test]
+    async fn search_result_header_present_on_match() {
+        let dir = TempDir::new().expect("tmpdir");
+        std::fs::write(dir.path().join("a.rs"), "needle\n").expect("w");
+
+        let ctx = ctx_in(dir.path());
+        let result = SearchFilesTool
+            .execute(json!({"pattern": "needle"}), &ctx)
+            .await
+            .expect("search");
+
+        assert!(
+            result.starts_with("[search_result returned="),
+            "must start with machine-readable summary header; got: {result}"
+        );
+        assert!(
+            result.contains("has_more=false"),
+            "single-page result must report has_more=false; got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_result_header_no_matches() {
+        let dir = TempDir::new().expect("tmpdir");
+        std::fs::write(dir.path().join("test.txt"), "nothing here").expect("w");
+
+        let ctx = ctx_in(dir.path());
+        let result = SearchFilesTool
+            .execute(json!({"pattern": "zzzzz_unique_zzzzz"}), &ctx)
+            .await
+            .expect("search");
+
+        assert!(
+            result.starts_with("[search_result returned=0 total=0 has_more=false]"),
+            "zero-match result must report returned=0 total=0; got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_result_header_has_more_with_offset() {
+        let dir = TempDir::new().expect("tmpdir");
+        // Create 5 files that each match "needle"; limit to 2 per page.
+        for i in 0..5 {
+            std::fs::write(dir.path().join(format!("f{i}.rs")), "needle_unique_abc\n").expect("w");
+        }
+
+        let ctx = ctx_in(dir.path());
+        // First page: offset=0, limit=2.
+        let result = SearchFilesTool
+            .execute(
+                json!({"pattern": "needle_unique_abc", "limit": 2, "offset": 0}),
+                &ctx,
+            )
+            .await
+            .expect("search page1");
+
+        assert!(
+            result.contains("has_more=true"),
+            "first page of 5 matches with limit=2 must report has_more=true; got: {result}"
+        );
+        assert!(
+            result.contains("next_offset=2"),
+            "must report next_offset=2; got: {result}"
+        );
+
+        // Second page: offset=2, limit=2 (should still have more).
+        let result2 = SearchFilesTool
+            .execute(
+                json!({"pattern": "needle_unique_abc", "limit": 2, "offset": 2}),
+                &ctx,
+            )
+            .await
+            .expect("search page2");
+
+        assert!(
+            result2.contains("has_more=true"),
+            "second page must still report has_more=true; got: {result2}"
+        );
+        assert!(
+            result2.contains("next_offset=4"),
+            "must report next_offset=4; got: {result2}"
+        );
+
+        // Last page: offset=4, limit=2 — only 1 item left.
+        let result3 = SearchFilesTool
+            .execute(
+                json!({"pattern": "needle_unique_abc", "limit": 2, "offset": 4}),
+                &ctx,
+            )
+            .await
+            .expect("search page3");
+
+        assert!(
+            result3.contains("has_more=false"),
+            "last page must report has_more=false; got: {result3}"
+        );
+        assert!(
+            !result3.contains("next_offset"),
+            "no next_offset on last page; got: {result3}"
+        );
     }
 }

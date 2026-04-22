@@ -1,6 +1,6 @@
 {
   "name": "@edgecrab/wasm",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "WASM bindings for the EdgeCrab AI agent SDK — browser & edge runtime",
   "license": "MIT OR Apache-2.0",
   "repository": {

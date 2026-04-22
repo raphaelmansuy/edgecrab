@@ -30,7 +30,7 @@ edgecrab slash btw "sanity-check this migration plan"
 Navigation   /help /quit /clear /new /status /version
 Model        /model /cheap_model /vision_model /image_model /moa /provider /reasoning /stream
 Session      /session /sessions /retry /undo /stop /btw /history /save /export /title /resume /branch
-Config       /config /prompt /verbose /personality /statusbar /worktree /yolo
+Config       /config /prompt /verbose /personality /statusbar /worktree /yolo /shadow-judge
 Tools        /tools /toolsets /mcp /reload-mcp /plugins
 Memory       /memory /skills /profile /profiles
 Analysis     /cost /usage /compress /insights
@@ -110,6 +110,7 @@ MCP          /mcp /mcp-token
 | `/log [open\|level <level>]` | Open the log browser, live-follow local log tails, or persist the default log level (alias: `/logs`) |
 | `/worktree [status\|on\|off\|toggle]` | Open the git-worktree status overlay or change the saved default for future launches (alias: `/w`) |
 | `/yolo [on\|off\|toggle\|status]` | Toggle session-scoped dangerous-command approval bypass |
+| `/shadow-judge [on\|off\|toggle\|status]` | Toggle the session-scoped completion oracle that vetoes likely premature run termination (aliases: `/sj`, `/shadow_judge`) |
 
 ---
 
