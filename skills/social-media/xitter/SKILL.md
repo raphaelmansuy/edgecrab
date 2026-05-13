@@ -87,6 +87,25 @@ If this setup feels heavier than it should be, that is because it is. X’s offi
 
 If the user wants the least brittle long-term setup, use this skill. If they want a zero-setup or unofficial path, that is a different trade-off and not what this skill is for.
 
+## Optional Hermes Tweet Plugin Route
+
+If the user wants EdgeCrab-native plugin tools instead of configuring `x-cli`,
+Hermes Tweet can provide X/Twitter tools through Xquik:
+
+```bash
+edgecrab plugins install github:Xquik-dev/hermes-tweet/hermes_tweet
+export XQUIK_API_KEY=your_xquik_api_key
+export HERMES_TWEET_ENABLE_ACTIONS=false
+```
+
+Use `tweet_explore` and `tweet_read` for read-focused workflows: scrape/search
+tweets, search Twitter/X, read tweet replies, look up users, monitor tweets,
+and export followers. Keep `tweet_action` disabled unless the user explicitly
+confirms the target and intent for post tweets/replies, send DMs, or automate X
+actions.
+
+Keep `x-cli` as the official X API route. Use Hermes Tweet when the task needs
+Hermes-style plugin tools or Xquik-backed automation inside EdgeCrab.
 
 ## Where to Store Credentials
 
