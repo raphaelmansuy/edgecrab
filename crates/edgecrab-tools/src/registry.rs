@@ -929,6 +929,7 @@ impl ToolRegistry {
         &self,
         tool_name: &str,
         error: &ToolError,
+        args_json: Option<&str>,
     ) -> Option<edgecrab_types::ToolErrorResponse> {
         if !matches!(error.core_error(), ToolError::InvalidArgs { .. }) {
             return None;
@@ -942,15 +943,8 @@ impl ToolRegistry {
         };
 
         let schema = handler.schema();
-        let required_fields = schema
-            .parameters
-            .get("required")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect::<Vec<_>>()
-            });
+        let required_fields =
+            required_fields_from_parameters(&schema.parameters, args_json);
 
         let usage_hint = Self::build_usage_hint(&schema);
 
@@ -1077,16 +1071,7 @@ impl ToolRegistry {
         };
 
         Some(
-            schema
-                .parameters
-                .get("required")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default(),
+            required_fields_from_parameters(&schema.parameters, None).unwrap_or_default(),
         )
     }
 
@@ -1266,10 +1251,150 @@ pub fn to_llm_definitions(schemas: &[ToolSchema]) -> Vec<edgequake_llm::ToolDefi
             edgequake_llm::ToolDefinition::function(
                 &s.name,
                 &s.description,
-                normalize_json_schema(&s.parameters),
+                openai_compatible_tool_parameters(&s.parameters),
             )
         })
         .collect()
+}
+
+/// OpenAI-compatible wire shape: top-level `type: "object"` only (LM Studio rejects `oneOf`).
+pub fn openai_compatible_tool_parameters(schema: &Value) -> Value {
+    if let Some(one_of) = schema.get("oneOf").and_then(Value::as_array) {
+        return flatten_oneof_object_schema(one_of);
+    }
+    normalize_json_schema(schema)
+}
+
+fn flatten_oneof_object_schema(branches: &[Value]) -> Value {
+    let mut properties = Map::new();
+    for branch in branches {
+        if let Some(props) = branch.get("properties").and_then(Value::as_object) {
+            for (key, value) in props {
+                properties.entry(key.clone()).or_insert_with(|| value.clone());
+            }
+        }
+    }
+    Value::Object(Map::from_iter([
+        ("type".into(), Value::String("object".into())),
+        ("additionalProperties".into(), Value::Bool(false)),
+        ("properties".into(), Value::Object(properties)),
+        (
+            "required".into(),
+            Value::Array(vec![Value::String("mode".into())]),
+        ),
+    ]))
+}
+
+/// Append live output-geometry limits to mutation-tool descriptions (local providers only).
+pub fn annotate_llm_definitions_for_local_turn(
+    defs: Vec<edgequake_llm::ToolDefinition>,
+    provider_name: &str,
+    local_turn_budget: Option<(usize, usize)>,
+) -> Vec<edgequake_llm::ToolDefinition> {
+    let Some((max_arg_bytes, max_output_tokens)) = local_turn_budget else {
+        return defs;
+    };
+    if !matches!(provider_name, "lmstudio" | "ollama") {
+        return defs;
+    }
+    let suffix =
+        crate::mutation_turn_policy::local_tool_budget_schema_suffix(max_arg_bytes, max_output_tokens);
+    defs.into_iter()
+        .map(|mut def| {
+            if crate::mutation_turn_policy::is_large_payload_tool(&def.function.name) {
+                def.function.description.push_str(&suffix);
+            }
+            def
+        })
+        .collect()
+}
+
+fn patch_mode_required_fields(mode: &str) -> Vec<String> {
+    match mode {
+        "patch" => vec![
+            "mode".into(),
+            "patch".into(),
+        ],
+        _ => vec![
+            "mode".into(),
+            "path".into(),
+            "old_string".into(),
+            "new_string".into(),
+        ],
+    }
+}
+
+fn is_patch_flat_schema(parameters: &Value) -> bool {
+    parameters.get("type").and_then(Value::as_str) == Some("object")
+        && parameters
+            .get("properties")
+            .and_then(|p| p.get("mode"))
+            .and_then(|m| m.get("enum"))
+            .is_some()
+        && parameters
+            .get("properties")
+            .and_then(|p| p.get("patch"))
+            .is_some()
+        && parameters
+            .get("properties")
+            .and_then(|p| p.get("old_string"))
+            .is_some()
+}
+
+fn required_fields_from_parameters(
+    parameters: &Value,
+    args_json: Option<&str>,
+) -> Option<Vec<String>> {
+    if let Some(one_of) = parameters.get("oneOf").and_then(Value::as_array) {
+        let mode = args_json
+            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+            .and_then(|v| v.get("mode").and_then(Value::as_str).map(String::from))
+            .unwrap_or_else(|| "replace".to_string());
+        for branch in one_of {
+            let branch_mode = branch
+                .get("properties")
+                .and_then(|p| p.get("mode"))
+                .and_then(|m| m.get("const"))
+                .and_then(Value::as_str);
+            if branch_mode == Some(mode.as_str()) {
+                return branch
+                    .get("required")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    });
+            }
+        }
+        return one_of.first().and_then(|branch| {
+            branch
+                .get("required")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+        });
+    }
+
+    if is_patch_flat_schema(parameters) {
+        let mode = args_json
+            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+            .and_then(|v| v.get("mode").and_then(Value::as_str).map(String::from))
+            .unwrap_or_else(|| "replace".to_string());
+        return Some(patch_mode_required_fields(&mode));
+    }
+
+    parameters
+        .get("required")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
 }
 
 /// Normalize JSON Schema into a provider-safe shape.
@@ -1843,7 +1968,7 @@ mod tests {
             message: "missing field `path`".into(),
         };
 
-        let enriched = registry.enrich_invalid_args_error("read_file", &err);
+        let enriched = registry.enrich_invalid_args_error("read_file", &err, None);
         assert!(
             enriched.is_some(),
             "should return enriched error for InvalidArgs"
@@ -1868,9 +1993,86 @@ mod tests {
         let err = ToolError::NotFound("read_file".into());
         assert!(
             registry
-                .enrich_invalid_args_error("read_file", &err)
+                .enrich_invalid_args_error("read_file", &err, None)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn lh61_annotate_llm_definitions_appends_budget_suffix_for_local_mutation_tools() {
+        let defs = vec![edgequake_llm::ToolDefinition::function(
+            "write_file",
+            "Write a file.",
+            serde_json::json!({}),
+        )];
+        let out = annotate_llm_definitions_for_local_turn(defs, "lmstudio", Some((27_852, 8192)));
+        assert!(out[0].function.description.contains("27852"));
+        assert!(out[0].function.description.contains("8192"));
+
+        let unchanged =
+            annotate_llm_definitions_for_local_turn(out.clone(), "anthropic", Some((27_852, 8192)));
+        assert_eq!(unchanged[0].function.description, out[0].function.description);
+
+        let no_budget = annotate_llm_definitions_for_local_turn(
+            vec![edgequake_llm::ToolDefinition::function(
+                "write_file",
+                "Write a file.",
+                serde_json::json!({}),
+            )],
+            "lmstudio",
+            None,
+        );
+        assert!(!no_budget[0].function.description.contains("Local turn limit"));
+    }
+
+    #[test]
+    fn lh62_required_fields_from_patch_flat_schema_respects_mode() {
+        let params = crate::tools::file_patch::patch_tool_parameters_json();
+        let replace_args = r#"{"mode":"replace","path":"a.md"}"#;
+        let fields =
+            required_fields_from_parameters(&params, Some(replace_args)).expect("fields");
+        assert!(fields.contains(&"path".to_string()));
+        assert!(fields.contains(&"old_string".to_string()));
+        assert!(!fields.contains(&"patch".to_string()));
+
+        let patch_args = r#"{"mode":"patch"}"#;
+        let patch_fields =
+            required_fields_from_parameters(&params, Some(patch_args)).expect("patch fields");
+        assert_eq!(patch_fields, vec!["mode".to_string(), "patch".to_string()]);
+    }
+
+    #[test]
+    fn lh64_patch_schema_passes_openai_compatible_provider_safe_gate() {
+        let params = crate::tools::file_patch::patch_tool_parameters_json();
+        let wire = openai_compatible_tool_parameters(&params);
+        assert_provider_safe_top_level_schema("patch", &wire);
+    }
+
+    #[test]
+    fn openai_compatible_tool_parameters_flattens_top_level_oneof() {
+        let oneof = json!({
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "mode": { "const": "a" },
+                        "foo": { "type": "string" }
+                    }
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "mode": { "const": "b" },
+                        "bar": { "type": "string" }
+                    }
+                }
+            ]
+        });
+        let flat = openai_compatible_tool_parameters(&oneof);
+        assert_eq!(flat["type"], "object");
+        assert!(flat.get("oneOf").is_none());
+        assert!(flat["properties"].get("foo").is_some());
+        assert!(flat["properties"].get("bar").is_some());
     }
 
     // ── coerce_tool_args tests ───────────────────────────────────────

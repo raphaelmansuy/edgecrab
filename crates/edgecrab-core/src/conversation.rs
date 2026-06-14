@@ -1856,14 +1856,52 @@ impl Agent {
             // stable zone (8K-12K tokens of binary constants) is cached across
             // sessions.  The combined prompt keeps the stable zone as a prefix so
             // split_dynamic_from_stable() can safely extract the dynamic suffix.
-            // Build API messages, optionally appending ephemeral goal context as a
-            // user-role message (cache-safe — never mutates cached_system_prompt).
+            // Build API messages, optionally appending ephemeral goal context and local
+            // tool-turn geometry nudges as user-role messages (cache-safe).
             let goal_block = crate::goals::render_goal_block(
                 &self
                     .goal_store
                     .active(&conversation_session_id)
                     .unwrap_or_default(),
             );
+            let base_completion_options = completion_options_for(&config);
+            let max_mutation_payload_bytes = app_config_ref.max_write_payload_bytes();
+            let local_abs_max = app_config_ref.local_max_tool_turn_tokens;
+            let completion_options = crate::local_provider_policy::effective_completion_options(
+                &base_completion_options,
+                effective_provider.as_ref(),
+                !active_tool_defs.is_empty(),
+                max_mutation_payload_bytes,
+                local_abs_max,
+            );
+            let prompt_tokens_for_plan = estimate_request_prompt_tokens(
+                session.cached_system_prompt.as_deref(),
+                &session.messages,
+                &active_tool_defs,
+            );
+            let local_tool_turn_plan = if active_tool_defs.is_empty() {
+                None
+            } else {
+                crate::local_provider_policy::local_tool_turn_plan(
+                    effective_provider.as_ref(),
+                    &completion_options,
+                    prompt_tokens_for_plan,
+                    max_mutation_payload_bytes,
+                    base_completion_options.reasoning_effort.as_deref(),
+                    local_abs_max,
+                )
+            };
+            if let Some(ref plan) = local_tool_turn_plan {
+                crate::local_provider_policy::log_local_tool_turn_plan(plan);
+                if let Some(tx) = event_tx {
+                    let _ = tx.send(crate::StreamEvent::ActivityNotice(
+                        edgecrab_tools::tool_progress_tail::format_local_tool_turn_preflight(
+                            &plan.log_line(),
+                        ),
+                    ));
+                }
+            }
+
             let messages_for_api = if goal_block.is_empty() {
                 session.messages.clone()
             } else {
@@ -1879,37 +1917,6 @@ impl Agent {
                 effective_provider.as_ref(),
                 &app_config_ref,
             );
-            let base_completion_options = completion_options_for(&config);
-            let max_mutation_payload_bytes = app_config_ref.max_write_payload_bytes();
-            let completion_options = crate::local_provider_policy::effective_completion_options(
-                &base_completion_options,
-                effective_provider.as_ref(),
-                !active_tool_defs.is_empty(),
-                max_mutation_payload_bytes,
-            );
-            let prompt_tokens_for_plan = estimate_request_prompt_tokens(
-                session.cached_system_prompt.as_deref(),
-                &session.messages,
-                &active_tool_defs,
-            );
-            if !active_tool_defs.is_empty()
-                && let Some(plan) = crate::local_provider_policy::local_tool_turn_plan(
-                    effective_provider.as_ref(),
-                    &completion_options,
-                    prompt_tokens_for_plan,
-                    max_mutation_payload_bytes,
-                    base_completion_options.reasoning_effort.as_deref(),
-                )
-            {
-                crate::local_provider_policy::log_local_tool_turn_plan(&plan);
-                if let Some(tx) = event_tx {
-                    let _ = tx.send(crate::StreamEvent::ActivityNotice(
-                        edgecrab_tools::tool_progress_tail::format_local_tool_turn_preflight(
-                            &plan.log_line(),
-                        ),
-                    ));
-                }
-            }
 
             // API call with retry — sends tool definitions so LLM can request tool calls.
             // On failure, attempt the fallback provider if configured.
@@ -1929,10 +1936,19 @@ impl Agent {
                 event_tx.is_some(),
             ) && (!session.native_tool_streaming_disabled
                 || active_tool_defs.is_empty());
+            let local_turn_budget = local_tool_turn_plan
+                .as_ref()
+                .map(|plan| (plan.max_tool_argument_bytes, plan.max_tokens));
+            let api_tool_defs = edgecrab_tools::registry::annotate_llm_definitions_for_local_turn(
+                active_tool_defs.clone(),
+                effective_provider.name(),
+                local_turn_budget,
+            );
+
             let api_outcome = match api_call_with_retry(
                 &effective_provider,
                 &chat_messages,
-                &active_tool_defs,
+                &api_tool_defs,
                 MAX_RETRIES,
                 ApiCallContext {
                     options: Some(&completion_options),
@@ -2116,11 +2132,18 @@ impl Agent {
                                         fb_prov.as_ref(),
                                         !active_tool_defs.is_empty(),
                                         max_mutation_payload_bytes,
+                                        local_abs_max,
+                                    );
+                                let fb_tool_defs =
+                                    edgecrab_tools::registry::annotate_llm_definitions_for_local_turn(
+                                        active_tool_defs.clone(),
+                                        fb_prov.name(),
+                                        local_turn_budget,
                                     );
                                 match api_call_with_retry(
                                     &fb_prov,
                                     &chat_messages,
-                                    &active_tool_defs,
+                                    &fb_tool_defs,
                                     1,
                                     ApiCallContext {
                                         options: Some(&fb_completion_options),
@@ -3249,7 +3272,7 @@ fn format_preflight_tool_error(
     err: &ToolError,
 ) -> String {
     if matches!(err.core_error(), ToolError::InvalidArgs { .. })
-        && let Some(mut enriched) = reg.enrich_invalid_args_error(name, err)
+        && let Some(mut enriched) = reg.enrich_invalid_args_error(name, err, Some(args_json))
     {
         if enriched.suppression_key.is_none() {
             enriched.suppression_key = enriched
@@ -5833,7 +5856,7 @@ async fn dispatch_single_tool(
         Err(ref e) if matches!(e.core_error(), ToolError::InvalidArgs { .. }) => {
             // Enrich InvalidArgs with required_fields + usage_hint from schema.
             // This gives the LLM a precise corrective checklist on the next turn.
-            if let Some(mut enriched) = reg.enrich_invalid_args_error(name, e) {
+            if let Some(mut enriched) = reg.enrich_invalid_args_error(name, e, Some(&normalized_args_json)) {
                 if enriched.suppression_key.is_none()
                     && let Some(ref required_fields) = enriched.required_fields
                 {

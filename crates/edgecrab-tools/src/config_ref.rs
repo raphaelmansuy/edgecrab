@@ -296,6 +296,8 @@ pub struct AppConfigRef {
     pub max_write_payload_kib: usize,
     /// Default `write_file` create_dirs when the model omits the flag.
     pub local_write_create_dirs: bool,
+    /// Absolute completion cap for local tool turns (yaml default; env overrides).
+    pub local_max_tool_turn_tokens: usize,
     /// Pluggable web search backend chain configuration.
     pub web_search: WebSearchConfigRef,
     /// Hermes-aligned web tool backend overrides (`web:` in config.yaml).
@@ -382,6 +384,8 @@ impl Default for AppConfigRef {
             result_turn_budget_chars: 200_000,
             max_write_payload_kib: crate::edit_contract::DEFAULT_MAX_MUTATION_PAYLOAD_KIB,
             local_write_create_dirs: true,
+            local_max_tool_turn_tokens:
+                crate::mutation_turn_policy::LOCAL_TOOL_TURN_ABS_MAX_TOKENS,
             web_search: WebSearchConfigRef::default(),
             web: WebToolsConfigRef::default(),
         }

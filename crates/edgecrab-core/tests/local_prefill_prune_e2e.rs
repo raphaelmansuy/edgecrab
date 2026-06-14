@@ -183,7 +183,7 @@ fn lh11_length_recovery_prune_drops_tokens_in_mid_band() {
     assert_eq!(direct_outcome.tools_pruned, outcome.tools_pruned);
 }
 
-/// High-band fixture: ~57k+ tokens, above 22% structural compress, below 50% LLM compress.
+/// High-band fixture: ~57k+ tokens, above 20% structural compress, below 50% LLM compress.
 const HIGH_BAND_TOOL_ROUNDS: usize = 12;
 const HIGH_BAND_BODY_CHARS: usize = 20_000;
 
@@ -263,4 +263,36 @@ fn lh33_local_structural_compress_reduces_high_band_tokens() {
     assert_eq!(tokens_before, before);
     assert!(tokens_after < tokens_before / 2);
     assert!(compressed.len() < messages.len());
+}
+
+/// **LH-63** — homelab ~57k signature must exceed 20% mid-band threshold (was gap @ 0.22).
+#[test]
+fn lh63_homelab_57k_band_triggers_structural_compress_at_20pct() {
+    use edgecrab_core::local_provider_policy::{
+        local_structural_compress_token_threshold, should_local_structural_compress,
+    };
+
+    let messages = high_band_messages();
+    let before = estimate_tokens(&messages);
+    let mid = local_structural_compress_token_threshold(LMSTUDIO_SYNCED_CTX);
+
+    assert_eq!(mid, 52_428, "262144 × 0.20");
+    assert!(
+        before > mid,
+        "fixture must exceed mid-band threshold (before={before} mid={mid})"
+    );
+    assert!(
+        57_000 > mid,
+        "homelab-reported ~57k must exceed 20% threshold (mid={mid})"
+    );
+    assert!(should_local_structural_compress(
+        before,
+        LMSTUDIO_SYNCED_CTX,
+        COMPRESSION_THRESHOLD_AT_50PCT,
+    ));
+    assert!(should_local_structural_compress(
+        57_000,
+        LMSTUDIO_SYNCED_CTX,
+        COMPRESSION_THRESHOLD_AT_50PCT,
+    ));
 }

@@ -251,6 +251,8 @@ pub struct AgentConfig {
     pub max_write_payload_kib: Option<u32>,
     /// Default `write_file` create_dirs when the model omits the flag (local homelab paths).
     pub local_write_create_dirs: bool,
+    /// Absolute completion cap for local tool turns (yaml; env overrides).
+    pub local_max_tool_turn_tokens: usize,
     /// Per-turn file-mutation footers (success log + failure advisory).
     pub file_mutation_verifier: bool,
     /// Cross-session Anthropic prompt prefix cache (stable/dynamic split + TTL).
@@ -329,6 +331,8 @@ impl Default for AgentConfig {
             result_turn_budget_chars: 200_000,
             max_write_payload_kib: None,
             local_write_create_dirs: true,
+            local_max_tool_turn_tokens:
+                edgecrab_tools::mutation_turn_policy::LOCAL_TOOL_TURN_ABS_MAX_TOKENS,
             file_mutation_verifier: true,
             cache: crate::config::CacheConfig::default(),
             web_search: crate::config::WebSearchConfig::default(),
@@ -496,6 +500,7 @@ impl AgentConfig {
                 self.local_write_create_dirs,
                 &self.model,
             ),
+            local_max_tool_turn_tokens: self.local_max_tool_turn_tokens,
             web_search: edgecrab_tools::config_ref::WebSearchConfigRef {
                 primary: self.web_search.primary.clone(),
                 fallbacks: self.web_search.fallbacks.clone(),
@@ -2589,6 +2594,7 @@ impl AgentBuilder {
                 result_turn_budget_chars: config.tools.result_turn_budget_chars,
                 max_write_payload_kib: config.tools.file.max_write_payload_kib,
                 local_write_create_dirs: config.local_inference.write_create_dirs,
+                local_max_tool_turn_tokens: config.local_inference.max_tool_turn_tokens,
                 file_mutation_verifier: config.display.file_mutation_verifier,
                 cache: config.cache.clone(),
                 web_search: config.web_search.clone(),

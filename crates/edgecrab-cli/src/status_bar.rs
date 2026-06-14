@@ -163,9 +163,8 @@ pub fn render_status_bar(frame: &mut Frame, area: Rect, params: &StatusBarRender
                 let elapsed_secs = started.elapsed().as_secs();
                 let long_label = params
                     .turn_activity
-                    .llm_wait_label()
-                    .map(|label| edgecrab_core::safe_truncate(label, 42).to_string())
-                    .unwrap_or_else(|| "waiting for first token".to_string());
+                    .llm_wait_compact_label()
+                    .unwrap_or("waiting for first token");
                 let msg = format_waiting_first_token_status(
                     params.theme,
                     params.status_indicator,

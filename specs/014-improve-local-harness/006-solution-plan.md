@@ -34,6 +34,10 @@ A change enters **Verified plan** only when **all** of the following hold:
   P3     L1      SHIPPED   LH-32..33 (mid-band structural compress @ 22% ctx)
   P4     tools   SHIPPED   LH-40 (local_write_create_dirs config)
   P5     UX      SHIPPED   LH-50..51 (shelf max_arg_bytes)
+  P6     L2      SHIPPED   LH-62 + LH-64 (patch flat object schema; LM Studio GEN=0 fix)
+  P7     L2      SHIPPED   LH-61 (live budget on tool defs)
+  P8     L2      SHIPPED   LH-60 (max_tool_turn_tokens config @ 8192)
+  P9     L1      SHIPPED   LH-63 (mid-band @ 20% — homelab 57k gap)
 ```
 
 ### P0 — Local tool-turn completion policy ✅ VERIFIED
@@ -113,12 +117,68 @@ A change enters **Verified plan** only when **all** of the following hold:
 
 | Change | Gate |
 |--------|------|
-| `LOCAL_STRUCTURAL_COMPRESS_THRESHOLD_RATIO = 0.22` | **LH-32** |
+| `LOCAL_STRUCTURAL_COMPRESS_THRESHOLD_RATIO = 0.20` | **LH-32**, **LH-63** |
 | `try_local_midband_structural_compress` → `compress_structural_only` | **LH-33** |
 | Wired in `conversation.rs` before preflight prune | **LH-33** |
 | Shelf `format_local_structural_compress_notice` | **LH-50** |
 
-**Formula:** `estimated > ctx × 0.22` **and** `estimated < ctx × 0.50` (local tool turns only).
+**Formula:** `estimated > ctx × 0.20` **and** `estimated < ctx × 0.50` (local tool turns only).
+
+**Why 0.20 (not 0.22):** homelab agent.jsonl reports ~56–57k @ 262k ctx; at 0.22 threshold = 57 671 — sessions at 57 000 never compress.
+
+Override: `EDGECRAB_LOCAL_STRUCTURAL_COMPRESS_RATIO`.
+
+---
+
+### P6 — Patch flat `object` schema (LM Studio GEN=0) ✅ VERIFIED
+
+**WHY (two constraints):**
+
+1. `mode:replace` and `mode:patch` require different fields — flat `required` caused InvalidArgs loops on homelab outline fix.
+2. LM Studio / OpenAI-compatible validators require top-level `type: "object"`. A top-level `oneOf` is rejected **before inference** (`invalid_union_discriminator` → **GEN stays 0** while EdgeCrab waits on HTTP).
+
+**First-principles fix:** flat nullable object on the wire; mode-specific requirements enforced in Rust only.
+
+| Change | Gate |
+|--------|------|
+| `patch_tool_parameters_json()` — `type: "object"`, nullable mode fields | **LH-62** |
+| `required_fields_from_parameters(..., args_json)` mode-aware | **LH-62** |
+| `openai_compatible_tool_parameters()` flattens stray top-level `oneOf` | **LH-64** |
+| `all_exported_tool_definitions_have_provider_safe_top_level_schemas` | **LH-64** |
+
+---
+
+### P7 — Live byte budget on mutation tool defs ✅ VERIFIED
+
+**WHY:** Model sees exact arg cap at API time, not stale prompt text.
+
+| Change | Gate |
+|--------|------|
+| `annotate_llm_definitions_for_local_turn` | **LH-61** |
+| Wired in `conversation.rs` before local API | **LH-61** (e2e) |
+
+---
+
+### P8 — `local_inference.max_tool_turn_tokens` ✅ VERIFIED
+
+**WHY:** 2048 completion cap → ~6963 B arg budget; homelab PPT scaffolds hit `finish_reason=length`.
+
+| Change | Gate |
+|--------|------|
+| Default **8192** → ~**27852 B** arg cap | **LH-60** |
+| `local_tool_turn_absolute_max_tokens` env > yaml > default | **LH-60** |
+| `local_inference.max_tool_turn_tokens` in config | **LH-60** |
+
+---
+
+### P9 — Mid-band threshold lowered to 20% ✅ VERIFIED
+
+**WHY:** Deterministic gap at homelab 57k with 0.22 ratio (57 671 threshold).
+
+| Change | Gate |
+|--------|------|
+| `LOCAL_STRUCTURAL_COMPRESS_THRESHOLD_RATIO = 0.20` | **LH-63** |
+| `local_structural_compress_threshold_ratio()` env override | **LH-63** |
 
 ---
 
@@ -160,14 +220,14 @@ local_inference:
   [compress @ 50% ctx]          only if estimated > 131k @ 262k ctx
          │
          ▼
-  [P3 mid-band compress?]         IF 22% < prompt < 50% ctx         ← LH-32..33
+  [P3 mid-band compress?]         IF 20% < prompt < 50% ctx         ← LH-32..33, LH-63
          │
          ▼
   [P1a preflight prune?]        IF prompt > min(32k, ctx/8)     ← LH-06..09, LH-30..31
          │                        prune_tool_outputs + spill
          ▼
-  [P0 completion policy]        reasoning=none, max_tokens=2048,
-         │                        tool_choice=required            ← LH-01..05
+  [P0 completion policy]        reasoning=none, max_tokens=8192,
+         │                        tool_choice=required            ← LH-01..05, LH-60
          ▼
   POST /v1/chat/completions (non-streaming, no retry)           ← LH-03
          │
@@ -225,6 +285,10 @@ These violate admission rules or official transport semantics. Do not re-propose
   DONE     P3  ── LH-32/33 mid-band structural compress
   DONE     P4  ── LH-40 local_write_create_dirs
   DONE     P5  ── LH-50/51 shelf max_arg_bytes
+  DONE     P6  ── LH-62 patch flat object + LH-64 provider-safe gate
+  DONE     P7  ── LH-61 annotate tool defs
+  DONE     P8  ── LH-60 max_tool_turn_tokens @ 8192
+  DONE     P9  ── LH-63 mid-band @ 20%
   FROZEN   B6 only (optional AGENTS.md link)
 ```
 
@@ -232,7 +296,8 @@ These violate admission rules or official transport semantics. Do not re-propose
 
 ```bash
 cargo test -p edgecrab-core --test local_prefill_prune_e2e
-cargo test -p edgecrab-core prefill structural_prefill
+cargo test -p edgecrab-core --test local_harness_geometry_e2e
+cargo test -p edgecrab-core prefill structural_prefill lh60 lh61 lh62 lh63
 cargo test -p edgecrab-tools mutation_turn lh20_length local_prefill
 cargo clippy -p edgecrab-core -p edgecrab-tools -- -D warnings
 ```

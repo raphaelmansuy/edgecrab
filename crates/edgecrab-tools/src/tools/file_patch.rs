@@ -228,6 +228,44 @@ async fn execute_replace_patch(args: ReplaceArgs, ctx: &ToolContext) -> Result<S
     Ok(result.to_string())
 }
 
+pub(crate) fn patch_tool_parameters_json() -> serde_json::Value {
+    // LM Studio / OpenAI-compatible validators require top-level `type: "object"`.
+    // `oneOf` is rejected before inference (GEN stays 0). Mode-specific requirements
+    // are enforced in Rust (`PatchArgs` + `required_fields_from_parameters`).
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "mode": {
+                "type": "string",
+                "enum": ["replace", "patch"],
+                "description": "replace: targeted find-and-replace; patch: V4A multi-file block"
+            },
+            "path": {
+                "type": ["string", "null"],
+                "description": "File path relative to working directory (replace mode)"
+            },
+            "old_string": {
+                "type": ["string", "null"],
+                "description": "Exact or fuzzy-matched text to replace (replace mode)"
+            },
+            "new_string": {
+                "type": ["string", "null"],
+                "description": "Replacement text — empty string deletes old_string (replace mode)"
+            },
+            "replace_all": {
+                "type": "boolean",
+                "description": "Replace all occurrences (default false — unique match required)"
+            },
+            "patch": {
+                "type": ["string", "null"],
+                "description": "V4A patch block starting with '*** Begin Patch' (patch mode)"
+            }
+        },
+        "required": ["mode", "path", "old_string", "new_string", "replace_all", "patch"]
+    })
+}
+
 #[async_trait]
 impl ToolHandler for PatchTool {
     fn name(&self) -> &'static str {
@@ -259,38 +297,7 @@ impl ToolHandler for PatchTool {
                  new_string payload must stay at or under {DEFAULT_MAX_MUTATION_PAYLOAD_BYTES} \
                  bytes ({DEFAULT_MAX_MUTATION_PAYLOAD_KIB} KiB) per call."
             ),
-            parameters: json!({
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                    "mode": {
-                        "type": "string",
-                        "enum": ["replace", "patch"],
-                        "description": "replace = targeted find-and-replace, patch = V4A multi-file patch block"
-                    },
-                    "path": {
-                        "type": ["string", "null"],
-                        "description": "File path relative to working directory. Required for replace mode; use null for patch mode."
-                    },
-                    "old_string": {
-                        "type": ["string", "null"],
-                        "description": "String to find and replace. Required for replace mode; use null for patch mode."
-                    },
-                    "new_string": {
-                        "type": ["string", "null"],
-                        "description": "String to replace old_string with. Required for replace mode; use empty string to delete text and null for patch mode."
-                    },
-                    "replace_all": {
-                        "type": "boolean",
-                        "description": "Replace all occurrences. Set explicitly to true or false."
-                    },
-                    "patch": {
-                        "type": ["string", "null"],
-                        "description": "V4A patch block for patch mode, starting with '*** Begin Patch'. Use null for replace mode."
-                    }
-                },
-                "required": ["mode", "path", "old_string", "new_string", "replace_all", "patch"]
-            }),
+            parameters: patch_tool_parameters_json(),
             strict: Some(true),
         }
     }
@@ -1603,5 +1610,20 @@ mod tests {
                 .contains("Split the refactor into multiple focused apply_patch calls")
         );
         assert!(!dir.path().join("huge.txt").exists());
+    }
+
+    #[test]
+    fn lh62_patch_schema_replace_mode_fields() {
+        let params = super::patch_tool_parameters_json();
+        assert_eq!(params["type"], "object");
+        assert!(params.get("oneOf").is_none());
+        assert_eq!(params["properties"]["mode"]["enum"], json!(["replace", "patch"]));
+    }
+
+    #[test]
+    fn lh62_patch_schema_patch_mode_fields() {
+        let params = super::patch_tool_parameters_json();
+        assert_eq!(params["properties"]["patch"]["type"], json!(["string", "null"]));
+        assert_eq!(params["properties"]["path"]["type"], json!(["string", "null"]));
     }
 }

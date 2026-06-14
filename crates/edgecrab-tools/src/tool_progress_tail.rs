@@ -848,12 +848,20 @@ fn nonstreaming_wait_liveness(provider: &str, phase: NonStreamingWaitPhase) -> &
                 "non-streaming — still waiting on Copilot API"
             }
         },
-        _ => match phase {
+        "bedrock" => match phase {
             NonStreamingWaitPhase::Start => {
-                "non-streaming — waiting on provider until complete"
+                "Bedrock Converse — tool JSON arrives when complete (no tool stream yet)"
             }
             NonStreamingWaitPhase::Heartbeat => {
-                "non-streaming — provider may still be working"
+                "Bedrock Converse — still generating tool call"
+            }
+        },
+        _ => match phase {
+            NonStreamingWaitPhase::Start => {
+                "buffered API — response arrives when complete"
+            }
+            NonStreamingWaitPhase::Heartbeat => {
+                "buffered API — provider may still be working"
             }
         },
     }
@@ -1023,6 +1031,20 @@ pub fn llm_wait_progress_label(
     }
 }
 
+/// Compact status-bar label — avoids truncating the full shelf line mid-word.
+pub fn llm_wait_status_compact(
+    provider: &str,
+    has_tools: bool,
+    ctx: LlmWaitContext,
+) -> String {
+    let task = if has_tools { "tool turn" } else { "reply" };
+    if let Some(hint) = format_ctx_hint(ctx.prompt_tokens_estimated, ctx.context_length) {
+        format!("{provider} {task} · {hint}")
+    } else {
+        format!("{provider} {task}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1092,6 +1114,25 @@ mod tests {
     }
 
     #[test]
+    fn llm_wait_label_bedrock_uses_converse_not_local_nonstreaming() {
+        let ctx = LlmWaitContext {
+            prompt_tokens_estimated: Some(33_000),
+            context_length: Some(300_000),
+            prefill_pct: None,
+        };
+        let start = llm_wait_progress_label("bedrock", 0, true, ctx);
+        let wait = llm_wait_progress_label("bedrock", 31, true, ctx);
+        assert!(start.contains("Bedrock Converse"));
+        assert!(!start.contains("LM Studio"));
+        assert!(!start.contains("GEN/tok"));
+        assert!(wait.contains("Bedrock Converse"));
+        let compact = llm_wait_status_compact("bedrock", true, ctx);
+        assert!(compact.contains("bedrock tool turn"));
+        assert!(compact.contains("33k/300k"));
+        assert!(compact.len() < 48, "compact label must fit status bar: {compact}");
+    }
+
+    #[test]
     fn llm_wait_label_ollama_never_mentions_lm_studio() {
         let ctx = LlmWaitContext {
             prompt_tokens_estimated: Some(40_000),
@@ -1151,9 +1192,9 @@ mod tests {
     #[test]
     fn lh51_local_tool_turn_preflight_passes_through_max_arg_plan_line() {
         let plan_line =
-            "local tool turn: lmstudio / qwen · max_tokens=2048 · max_arg=6963B · reasoning=none";
+            "local tool turn: lmstudio / qwen · max_tokens=8192 · max_arg=27852B · reasoning=none";
         let shelf = format_local_tool_turn_preflight(plan_line);
-        assert!(shelf.contains("max_arg=6963B"));
+        assert!(shelf.contains("max_arg=27852B"));
     }
 
     #[test]

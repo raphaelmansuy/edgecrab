@@ -15,8 +15,8 @@ This spec formalizes **why** EdgeCrab appears “stuck” on local providers, wh
 | [003-official-references.md](./003-official-references.md) | LM Studio, OpenAI, Qwen3, vLLM — authoritative external grounding |
 | [004-homelab-evidence.md](./004-homelab-evidence.md) | Logs + SQLite sessions; quantitative failure signatures |
 | [005-code-anchors.md](./005-code-anchors.md) | EdgeCrab / edgequake-llm implementation cross-ref |
-| [006-solution-plan.md](./006-solution-plan.md) | **Verified plan** (P0–P5 complete) |
-| [007-acceptance-criteria.md](./007-acceptance-criteria.md) | CI gates LH-01..LH-51 |
+| [006-solution-plan.md](./006-solution-plan.md) | **Verified plan** (P0–P9 complete) |
+| [007-acceptance-criteria.md](./007-acceptance-criteria.md) | CI gates LH-01..LH-64 |
 
 **Related specs (cross-ref):**
 
@@ -40,7 +40,7 @@ This spec formalizes **why** EdgeCrab appears “stuck” on local providers, wh
   ROOT CAUSE STACK (independent constraints)
   ┌──────────────────────────────────────────────────────────────┐
   │ L1 INPUT  — large prompt (34–57k) → slow prefill             │
-  │ L2 OUTPUT — tool JSON must fit in max_tokens=2048 (~6963 B) │
+  │ L2 OUTPUT — tool JSON must fit in max_tokens=8192 (~27852 B) │
   │ L3 CONTROL— recovery adds tokens; preflight now covers 34k+ band │
   └──────────────────────────────────────────────────────────────┘
 ```
@@ -59,8 +59,9 @@ This spec formalizes **why** EdgeCrab appears “stuck” on local providers, wh
 | **Tool turn** | ReAct iteration where `tools` non-empty and model must emit `tool_calls` |
 | **Non-streaming tool turn** | Single HTTP response after full generation (EdgeCrab policy for LM Studio) |
 | **Output budget** | `max_tokens` cap on completion stream (includes reasoning on some stacks) |
-| **Arg budget** | Max JSON argument bytes derivable from output budget (~6963 B local) |
+| **Arg budget** | Max JSON argument bytes derivable from output budget (~27852 B local @ 8192 tok) |
 | **Structural prefill prune** | `prune_tool_outputs` + spill — no LLM summarization |
+| **GEN=0** | LM Studio generation counter stuck at 0 — usually schema rejection (400) before prefill, not slow model |
 
 ---
 
@@ -69,7 +70,9 @@ This spec formalizes **why** EdgeCrab appears “stuck” on local providers, wh
 | Variable | Default | Effect |
 |----------|---------|--------|
 | `EDGECRAB_LOCAL_PREFILL_PRUNE_TOKENS` | `min(32000, ctx/8)` | Preflight prune threshold |
-| `local_inference.write_create_dirs` | `false` | Default `write_file` create_dirs when omitted |
-| `EDGECRAB_LOCAL_TOOL_MAX_TOKENS` | `2048` | Absolute completion cap for local tool turns |
+| `EDGECRAB_LOCAL_STRUCTURAL_COMPRESS_RATIO` | `0.20` | Mid-band structural compress threshold (ctx × ratio) |
+| `local_inference.write_create_dirs` | `true` | Default `write_file` create_dirs when omitted |
+| `local_inference.max_tool_turn_tokens` | `8192` | Absolute completion cap (env overrides) |
+| `EDGECRAB_LOCAL_TOOL_MAX_TOKENS` | `8192` | Env override for absolute completion cap |
 | `LMSTUDIO_TIMEOUT_SECONDS` | `600` | HTTP client timeout (no retry on local) |
 | `RUST_LOG=edgecrab::local_llm=info` | — | Structured investigation logs |

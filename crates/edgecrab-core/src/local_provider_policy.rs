@@ -34,7 +34,18 @@ pub const LOCAL_PREFILL_CONTEXT_DIVISOR: usize = 8;
 /// Local mid-band structural compress threshold as a fraction of active context (no LLM).
 ///
 /// Fills the gap between preflight prune (~32k @ 262k) and LLM compress (50% ctx).
-pub const LOCAL_STRUCTURAL_COMPRESS_THRESHOLD_RATIO: f32 = 0.22;
+/// **0.20** (not 0.22): homelab agent.jsonl reports ~56–57k prompts @ 262k ctx; at 0.22
+/// the threshold is 57 671 — sessions at 57 000 never compress (deterministic gap).
+pub const LOCAL_STRUCTURAL_COMPRESS_THRESHOLD_RATIO: f32 = 0.20;
+
+/// Resolve mid-band structural compress ratio: env override > compile-time default.
+pub fn local_structural_compress_threshold_ratio() -> f32 {
+    std::env::var("EDGECRAB_LOCAL_STRUCTURAL_COMPRESS_RATIO")
+        .ok()
+        .and_then(|value| value.parse::<f32>().ok())
+        .filter(|ratio| *ratio > 0.0 && *ratio < 1.0)
+        .unwrap_or(LOCAL_STRUCTURAL_COMPRESS_THRESHOLD_RATIO)
+}
 
 /// Providers that run on localhost and queue generations server-side.
 pub fn is_local_inference_provider(provider_name: &str) -> bool {
@@ -151,23 +162,31 @@ pub fn local_http_timeout_secs(provider_name: &str) -> u64 {
     }
 }
 
-/// Absolute completion cap for local tool turns (env override for transport tuning).
-pub fn local_tool_turn_absolute_max_tokens() -> usize {
+/// Resolve absolute completion cap: env `EDGECRAB_LOCAL_TOOL_MAX_TOKENS` > config > compile-time default.
+pub fn local_tool_turn_absolute_max_tokens(config_value: usize) -> usize {
     std::env::var("EDGECRAB_LOCAL_TOOL_MAX_TOKENS")
         .ok()
         .and_then(|value| value.parse().ok())
-        .unwrap_or(edgecrab_tools::mutation_turn_policy::LOCAL_TOOL_TURN_ABS_MAX_TOKENS)
+        .unwrap_or(config_value)
+}
+
+/// Compile-time default when no session config is available (prompt assembly).
+pub fn local_tool_turn_absolute_max_tokens_default() -> usize {
+    local_tool_turn_absolute_max_tokens(
+        edgecrab_tools::mutation_turn_policy::LOCAL_TOOL_TURN_ABS_MAX_TOKENS,
+    )
 }
 
 /// Deterministic `max_tokens` for a local tool turn (DRY with pre-dispatch guards).
 pub fn local_tool_turn_max_tokens(
     provider: &dyn LLMProvider,
     max_mutation_payload_bytes: usize,
+    config_absolute_max: usize,
 ) -> usize {
     edgecrab_tools::mutation_turn_policy::output_token_budget_for_tool_turn(
         max_mutation_payload_bytes,
         provider,
-        local_tool_turn_absolute_max_tokens(),
+        local_tool_turn_absolute_max_tokens(config_absolute_max),
     )
 }
 
@@ -224,12 +243,14 @@ pub fn local_tool_turn_plan(
     prompt_tokens_estimated: usize,
     max_mutation_payload_bytes: usize,
     base_reasoning_effort: Option<&str>,
+    config_absolute_max: usize,
 ) -> Option<LocalToolTurnPlan> {
     if !is_local_inference_provider(provider.name()) {
         return None;
     }
+    let absolute = local_tool_turn_absolute_max_tokens(config_absolute_max);
     let max_tokens = options.max_tokens.unwrap_or_else(|| {
-        local_tool_turn_max_tokens(provider, max_mutation_payload_bytes)
+        local_tool_turn_max_tokens(provider, max_mutation_payload_bytes, config_absolute_max)
     });
     let reasoning_effort = options
         .reasoning_effort
@@ -243,7 +264,7 @@ pub fn local_tool_turn_plan(
         reasoning_effort,
         tool_choice_required: true,
         max_mutation_payload_bytes,
-        absolute_max_tokens: local_tool_turn_absolute_max_tokens(),
+        absolute_max_tokens: absolute,
         http_timeout_secs: local_http_timeout_secs(provider.name()),
         context_length: provider.max_context_length(),
         prompt_tokens_estimated,
@@ -261,11 +282,12 @@ pub fn effective_completion_options(
     provider: &dyn LLMProvider,
     has_tools: bool,
     max_mutation_payload_bytes: usize,
+    config_absolute_max: usize,
 ) -> CompletionOptions {
     if !has_tools || !is_local_inference_provider(provider.name()) {
         return base.clone();
     }
-    let cap = local_tool_turn_max_tokens(provider, max_mutation_payload_bytes);
+    let cap = local_tool_turn_max_tokens(provider, max_mutation_payload_bytes, config_absolute_max);
     let mut options = base.clone();
     options.max_tokens = Some(base.max_tokens.map(|tokens| tokens.min(cap)).unwrap_or(cap));
 
@@ -402,7 +424,7 @@ pub fn local_structural_compress_token_threshold(active_context_length: usize) -
     if active_context_length == 0 {
         return 0;
     }
-    (active_context_length as f32 * LOCAL_STRUCTURAL_COMPRESS_THRESHOLD_RATIO) as usize
+    (active_context_length as f32 * local_structural_compress_threshold_ratio()) as usize
 }
 
 /// Whether to run `compress_structural_only` on local tool turns (between prefill and LLM compress).
@@ -605,6 +627,16 @@ mod tests {
     }
 
     const TEST_MUTATION_BYTES: usize = 32 * 1024;
+    const TEST_ABS_MAX: usize = edgecrab_tools::mutation_turn_policy::LOCAL_TOOL_TURN_ABS_MAX_TOKENS;
+
+    #[test]
+    fn lh60_local_tool_turn_absolute_max_tokens_honors_config_before_default() {
+        let custom = 12_288;
+        assert_eq!(
+            super::local_tool_turn_absolute_max_tokens(custom),
+            custom
+        );
+    }
 
     #[test]
     fn local_provider_detection() {
@@ -668,10 +700,11 @@ mod tests {
             synced.as_ref(),
             true,
             TEST_MUTATION_BYTES,
+            TEST_ABS_MAX,
         );
         assert_eq!(
             capped.max_tokens,
-            Some(local_tool_turn_max_tokens(synced.as_ref(), TEST_MUTATION_BYTES))
+            Some(local_tool_turn_max_tokens(synced.as_ref(), TEST_MUTATION_BYTES, TEST_ABS_MAX))
         );
         assert_eq!(
             capped.reasoning_effort.as_deref(),
@@ -687,6 +720,7 @@ mod tests {
             synced.as_ref(),
             true,
             TEST_MUTATION_BYTES,
+            TEST_ABS_MAX,
         );
         assert_eq!(kept.max_tokens, Some(512));
         assert_eq!(
@@ -694,7 +728,7 @@ mod tests {
             Some(LOCAL_TOOL_TURN_REASONING_EFFORT)
         );
 
-        let plain = effective_completion_options(&base, synced.as_ref(), false, TEST_MUTATION_BYTES);
+        let plain = effective_completion_options(&base, synced.as_ref(), false, TEST_MUTATION_BYTES, TEST_ABS_MAX);
         assert_eq!(plain.max_tokens, Some(16_384));
         assert_eq!(plain.reasoning_effort.as_deref(), Some("high"));
     }
@@ -711,6 +745,7 @@ mod tests {
             provider.as_ref(),
             true,
             TEST_MUTATION_BYTES,
+            TEST_ABS_MAX,
         );
         assert_eq!(
             options.reasoning_effort.as_deref(),
@@ -722,6 +757,7 @@ mod tests {
             50_000,
             TEST_MUTATION_BYTES,
             Some("none"),
+            TEST_ABS_MAX,
         )
         .expect("plan");
         assert!(!plan.reasoning_overridden);
@@ -740,6 +776,7 @@ mod tests {
             provider.as_ref(),
             true,
             TEST_MUTATION_BYTES,
+            TEST_ABS_MAX,
         );
         let plan = local_tool_turn_plan(
             provider.as_ref(),
@@ -747,6 +784,7 @@ mod tests {
             50_000,
             TEST_MUTATION_BYTES,
             Some("high"),
+            TEST_ABS_MAX,
         )
         .expect("plan");
         assert!(plan.reasoning_overridden);
@@ -760,6 +798,7 @@ mod tests {
             provider.as_ref(),
             true,
             TEST_MUTATION_BYTES,
+            TEST_ABS_MAX,
         );
         let plan = local_tool_turn_plan(
             provider.as_ref(),
@@ -767,11 +806,12 @@ mod tests {
             50_000,
             TEST_MUTATION_BYTES,
             None,
+            TEST_ABS_MAX,
         )
         .expect("plan");
         assert_eq!(
             plan.max_tokens,
-            local_tool_turn_max_tokens(provider.as_ref(), TEST_MUTATION_BYTES)
+            local_tool_turn_max_tokens(provider.as_ref(), TEST_MUTATION_BYTES, TEST_ABS_MAX)
         );
         assert_eq!(plan.context_length, 262_144);
         assert_eq!(plan.http_timeout_secs, DEFAULT_LOCAL_HTTP_TIMEOUT_SECS);
@@ -903,7 +943,7 @@ mod tests {
     fn should_local_structural_compress_mid_band_only() {
         let ctx = 262_144;
         let mid = local_structural_compress_token_threshold(ctx);
-        assert_eq!(mid, 57_671);
+        assert_eq!(mid, 52_428);
         let llm = (ctx as f32 * 0.5) as usize;
         assert!(should_local_structural_compress(58_000, ctx, llm));
         assert!(!should_local_structural_compress(40_000, ctx, llm));
@@ -918,6 +958,7 @@ mod tests {
             provider.as_ref(),
             true,
             TEST_MUTATION_BYTES,
+            TEST_ABS_MAX,
         );
         let plan = local_tool_turn_plan(
             provider.as_ref(),
@@ -925,6 +966,7 @@ mod tests {
             50_000,
             TEST_MUTATION_BYTES,
             None,
+            TEST_ABS_MAX,
         )
         .expect("plan");
         let expected = edgecrab_tools::mutation_turn_policy::max_tool_argument_bytes(

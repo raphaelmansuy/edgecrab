@@ -22,6 +22,9 @@ Cross-ref: [006-solution-plan.md](./006-solution-plan.md) · [005-code-anchors.m
   P3      LH-32 .. LH-33      cargo test -p edgecrab-core --test local_prefill_prune_e2e lh3
   P4      LH-40               cargo test -p edgecrab-tools lh40
   P5      LH-50 .. LH-51      cargo test -p edgecrab-tools lh5
+  P6-P8   LH-60 .. LH-64      cargo test -p edgecrab-core --test local_harness_geometry_e2e
+                               cargo test -p edgecrab-tools --lib lh64 all_exported_tool
+  P9      LH-63               cargo test -p edgecrab-core --test local_prefill_prune_e2e lh63
   BACKLOG B6                  optional AGENTS.md link
 ```
 
@@ -35,7 +38,7 @@ Cross-ref: [006-solution-plan.md](./006-solution-plan.md) · [005-code-anchors.m
 | **LH-02** | `tool_choice: required` when tools + local provider | `local_provider_policy::local_tool_choice_required_for_local_tool_turns` |
 | **LH-03** | No transport retry on local Timeout/NetworkError | `local_provider_policy::blocks_transport_retry_only_for_local_timeout_and_network` |
 | **LH-04** | API `max_tokens` = `output_token_budget_for_tool_turn` | `mutation_turn_policy` + `local_provider_policy` DRY tests |
-| **LH-05** | Max arg bytes = **6963** @ default (`2048×4×0.85`) | `mutation_turn_policy` unit (`assert_eq!(max, 6963)`) |
+| **LH-05** | Max arg bytes = **27852** @ default (`8192×4×0.85`) | `mutation_turn_policy` unit (`local_default_max_tool_argument_bytes`) |
 | **LH-10** | Non-streaming tool request serializes `reasoning_effort` | `edgequake-llm` `test_chat_request_with_tools_reasoning_effort_serialized` |
 
 ### P0 optional live (ignored — not plan gate)
@@ -115,6 +118,23 @@ cargo test -p edgecrab-tools lh20_length
 | **LH-33** | Structural compress shrinks high-band fixture >2× | `local_prefill_prune_e2e::lh33_local_structural_compress_reduces_high_band_tokens` |
 | **LH-33b** | Gate formula mid-band only | `local_provider_policy::should_local_structural_compress_mid_band_only` |
 | **LH-50** | Shelf compress notice shows token drop | `tool_progress_tail::lh50_local_structural_compress_notice_mentions_token_drop` |
+| **LH-63** | Homelab ~57k exceeds 20% threshold (was gap @ 0.22) | `local_prefill_prune_e2e::lh63_homelab_57k_band_triggers_structural_compress_at_20pct` |
+
+---
+
+## P6–P8 — Output geometry + schema (CI required)
+
+| ID | Invariant | Test |
+|----|-----------|------|
+| **LH-60** | Config `max_tool_turn_tokens` resolves; default 8192 → 27852 B | `local_harness_geometry_e2e::lh60_e2e_*`, `local_provider_policy::lh60_*` |
+| **LH-61** | Local turn annotates mutation tool defs with live budget | `local_harness_geometry_e2e::lh61_e2e_*`, `registry::lh61_*` |
+| **LH-62** | Patch flat object + mode-aware `required_fields` on InvalidArgs | `local_harness_geometry_e2e::lh62_e2e_patch_flat_schema_*`, `file_patch::lh62_*`, `registry::lh62_*` |
+| **LH-64** | Every exported tool has top-level `type: "object"` (no `oneOf` on wire) | `registry::all_exported_tool_definitions_have_provider_safe_top_level_schemas`, `registry::lh64_*`, `registry::openai_compatible_tool_parameters_*` |
+
+```bash
+cargo test -p edgecrab-core --test local_harness_geometry_e2e
+cargo test -p edgecrab-tools --lib all_exported_tool_definitions lh64 openai_compatible
+```
 
 ---
 

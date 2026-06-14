@@ -631,6 +631,24 @@ fn code_editing_guidance() -> String {
     edgecrab_tools::mutation_turn_policy::default_code_editing_guidance()
 }
 
+fn code_editing_guidance_for_model(model_str: &str) -> String {
+    let provider = model_str.split('/').next().unwrap_or(model_str);
+    if matches!(provider, "lmstudio" | "ollama") {
+        let max_bytes = edgecrab_tools::mutation_turn_policy::local_default_max_tool_argument_bytes();
+        let max_kib = max_bytes.div_ceil(1024);
+        edgecrab_tools::mutation_turn_policy::code_editing_guidance(max_bytes, max_kib)
+    } else {
+        code_editing_guidance()
+    }
+}
+
+fn is_local_inference_model(model_str: &str) -> bool {
+    matches!(
+        model_str.split('/').next().unwrap_or(model_str),
+        "lmstudio" | "ollama"
+    )
+}
+
 const SKILLS_GUIDANCE: &str = "\
 After completing a complex task (5+ tool calls), fixing a tricky error, or discovering \
 a non-trivial workflow, save the approach as a skill with skill_manage so you can reuse \
@@ -1249,7 +1267,7 @@ impl PromptBuilder {
 
         // 14. Direct code-editing guidance — only when file-mutation tools are present.
         if self.has_any_tool(&["apply_patch", "write_file"]) {
-            stable.push(Cow::Owned(code_editing_guidance()));
+            stable.push(Cow::Owned(code_editing_guidance_for_model(model_str)));
         }
 
         // 15a. File-output enforcement guidance (FP34) — injected whenever write_file
@@ -1304,6 +1322,22 @@ impl PromptBuilder {
                 }
             }
             dynamic.push(Cow::Owned(ts));
+        }
+
+        // D1b. Local inference output geometry — dynamic because model/provider is session config.
+        if is_local_inference_model(model_str)
+            && self.has_any_tool(&["write_file", "patch", "apply_patch", "execute_code"])
+        {
+            let max_tokens = crate::local_provider_policy::local_tool_turn_absolute_max_tokens_default();
+            let max_arg =
+                edgecrab_tools::mutation_turn_policy::local_max_tool_argument_bytes_for_output_tokens(
+                    max_tokens,
+                );
+            dynamic.push(Cow::Owned(
+                edgecrab_tools::mutation_turn_policy::local_inference_geometry_guidance(
+                    max_arg, max_tokens,
+                ),
+            ));
         }
 
         // D2. Execution environment guidance (cwd, allowed paths, etc.)
@@ -3304,6 +3338,36 @@ Run `${CLAUDE_SKILL_DIR}/scripts/helper.py --session ${CLAUDE_SESSION_ID}`.\n",
         assert!(
             !prompt.contains("## Code Editing Execution"),
             "code-editing guidance must not appear without mutation tools"
+        );
+    }
+
+    #[test]
+    fn lh55_local_model_code_editing_guidance_uses_output_geometry_not_config_kib() {
+        let builder = PromptBuilder::new(Platform::Cli)
+            .skip_context_files(true)
+            .model_name(Some("lmstudio/qwen/qwen3.6-35b-a3b".into()))
+            .available_tools(vec![
+                "write_file".to_string(),
+                "patch".to_string(),
+                "execute_code".to_string(),
+            ]);
+        let blocks = builder.build_blocks(None, None, &[], None);
+        let combined = blocks.combined();
+        assert!(
+            combined.contains("27852 bytes"),
+            "local model must cite output-geometry arg cap, not 32 KiB config limit"
+        );
+        assert!(
+            !combined.contains("32768 bytes (32 KiB)"),
+            "local model must not cite cloud config cap in code-editing guidance"
+        );
+        assert!(
+            combined.contains("## Local Inference Tool Geometry"),
+            "local model must include dynamic geometry block"
+        );
+        assert!(
+            combined.contains("max completion tokens: 8192"),
+            "geometry block must cite local max_tokens default"
         );
     }
 

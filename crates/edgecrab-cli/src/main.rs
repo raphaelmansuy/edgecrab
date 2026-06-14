@@ -203,7 +203,13 @@ fn explicit_provider_request(model: &str) -> Option<(&str, &str)> {
 }
 
 async fn prepare_super_grok_oauth_env() -> anyhow::Result<()> {
-    let auth_path = edgecrab_proxy::default_auth_path();
+    if std::env::var("XAI_API_KEY")
+        .ok()
+        .is_some_and(|v| !v.trim().is_empty())
+    {
+        return Ok(());
+    }
+    let auth_path = edgecrab_proxy::auth_path_for_provider(edgecrab_proxy::XAI_OAUTH_PROVIDER);
     let (bearer, base_url) = edgecrab_proxy::resolve_xai_credentials_async(
         &auth_path,
         edgecrab_proxy::XAI_OAUTH_PROVIDER,
@@ -212,7 +218,15 @@ async fn prepare_super_grok_oauth_env() -> anyhow::Result<()> {
         false,
     )
     .await
-    .map_err(|e| anyhow!("SuperGrok OAuth unavailable: {e}"))?;
+    .map_err(|e| {
+        anyhow!(
+            "SuperGrok OAuth unavailable: {e}\n\
+             Active profile likely uses super-grok. Fix one of:\n\
+               edgecrab auth add grok     # browser OAuth → ~/.edgecrab/auth.json\n\
+               /profile use default       # switch to ollama (or another profile)\n\
+               export XAI_API_KEY=...     # static xAI API key"
+        )
+    })?;
 
     // SAFETY: Provider construction intentionally updates process-wide env credentials.
     unsafe {

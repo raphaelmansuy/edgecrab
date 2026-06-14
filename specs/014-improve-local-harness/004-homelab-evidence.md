@@ -142,7 +142,27 @@ Recovery text (verbatim from DB):
 
 ---
 
-## 6. Screenshot correlation (2026-06-14 ~16:35 local)
+## 6. GEN=0 — schema rejection (2026-06-14, gemma-4-e4b)
+
+**Symptom:** LM Studio **GEN 0** for 26–88s+; EdgeCrab shelf shows `composing tool call`.
+
+**Log signature (40× in `agent.jsonl`):**
+
+```text
+lmstudio API 400 — invalid_union_discriminator
+path: [N, "function", "parameters", "type"]
+Expected 'object'
+```
+
+**Cause:** `patch` tool exported top-level `oneOf` instead of `type: "object"`. LM Studio Zod validator rejects the request **before** the model runs.
+
+**Fix:** P6 — flat object schema + `openai_compatible_tool_parameters()` safety net (**LH-64**).
+
+**Distinguish from slow prefill:** After fix, GEN climbs within seconds once prefill completes; 400 errors disappear from logs.
+
+---
+
+## 7. Screenshot correlation (2026-06-14 ~16:35 local)
 
 | UI signal | Evidence interpretation |
 |-----------|-------------------------|
@@ -155,7 +175,7 @@ Recovery text (verbatim from DB):
 
 ---
 
-## 7. Evidence → layer mapping
+## 8. Evidence → layer mapping
 
 ```text
   OBSERVATION                          LAYER

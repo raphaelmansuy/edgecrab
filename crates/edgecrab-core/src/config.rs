@@ -89,12 +89,16 @@ pub struct LocalInferenceConfig {
     /// When true, `write_file` treats omitted `create_dirs` as true (nested homelab paths).
     /// Default **true**; auto-enabled on lmstudio/ollama even when set false in yaml.
     pub write_create_dirs: bool,
+    /// Absolute completion cap for local tool turns (`max_tokens` on lmstudio/ollama).
+    /// Override precedence: `EDGECRAB_LOCAL_TOOL_MAX_TOKENS` env > this field > compile-time default.
+    pub max_tool_turn_tokens: usize,
 }
 
 impl Default for LocalInferenceConfig {
     fn default() -> Self {
         Self {
             write_create_dirs: true,
+            max_tool_turn_tokens: edgecrab_tools::mutation_turn_policy::LOCAL_TOOL_TURN_ABS_MAX_TOKENS,
         }
     }
 }

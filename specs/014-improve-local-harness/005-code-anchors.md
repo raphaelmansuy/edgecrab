@@ -23,8 +23,8 @@ Implementation map from first principles to source files.
 | `LocalStructuralPrunePhase` | `Preflight` \| `LengthRecovery` |
 | `gate_local_structural_prune` | Phase-specific gate (threshold vs always) |
 | `try_apply_structural_tool_output_prune` | Gate + apply; returns `StructuralPruneOutcome` |
-| `local_structural_compress_token_threshold` | `ctx × 0.22` (P3 mid-band) |
-| `should_local_structural_compress` | Between 22% and 50% ctx |
+| `local_structural_compress_token_threshold` | `ctx × 0.20` (P3/P9 mid-band; env override) |
+| `should_local_structural_compress` | Between 20% and 50% ctx |
 | `try_local_midband_structural_compress` | Applies `compress_structural_only` when gated |
 | `log_local_prefill_prune` | Structured INFO (`preflight` \| `length_recovery`) |
 | `log_local_tool_length_failure` | Structured WARN for investigation |
@@ -39,11 +39,11 @@ Implementation map from first principles to source files.
   output_token_budget_for_tool_turn()
        │
        └── min(provider_cap, mutation_payload_tokens + envelope, LOCAL_TOOL_TURN_ABS_MAX_TOKENS)
-                    default 2048
+                    default 8192
 
   max_tool_argument_bytes()
        │
-       └── output_budget × TOOL_ARG_CHARS_PER_TOKEN (4) × 0.85  →  ~6963 B
+       └── output_budget × TOOL_ARG_CHARS_PER_TOKEN (4) × 0.85  →  ~27852 B @ 8192
 ```
 
 | Symbol | Role |
@@ -51,7 +51,10 @@ Implementation map from first principles to source files.
 | `check_tool_argument_budget` | Pre-dispatch reject (only if tool_calls parsed) |
 | `length_without_tools_recovery_message` | After `finish_reason=length` + no tools (P2) |
 | `stream_interrupted_recovery_message` | After stream interrupt / timeout mid-draft |
-| `LOCAL_TOOL_TURN_ABS_MAX_TOKENS` | `2048` (env: `EDGECRAB_LOCAL_TOOL_MAX_TOKENS`) |
+| `LOCAL_TOOL_TURN_ABS_MAX_TOKENS` | `8192` (env: `EDGECRAB_LOCAL_TOOL_MAX_TOKENS`; yaml: `local_inference.max_tool_turn_tokens`) |
+| `annotate_llm_definitions_for_local_turn` | P7 — appends live budget suffix to mutation tools |
+| `patch_tool_parameters_json` | P6 — flat `type: "object"` (nullable mode fields; no top-level `oneOf`) |
+| `openai_compatible_tool_parameters` | P6/LH-64 — wire-safe export; flattens top-level `oneOf` before API |
 
 **Gap (documented):** guard runs **post-API**, not pre-API — see [002-first-principles-why.md](./002-first-principles-why.md) Layer 3.
 

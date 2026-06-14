@@ -20,10 +20,23 @@ pub const TOOL_ARG_BUDGET_SAFETY_RATIO: f32 = 0.85;
 /// Minimum argument budget — below this, incremental edits are impractical.
 pub const MIN_TOOL_ARGUMENT_BYTES: usize = 1024;
 
-/// Hard transport-bound for one local tool-turn completion (seconds-scale HTTP window).
+/// Default completion cap for one local tool turn (deterministic; not failure-adaptive).
 ///
-/// Overridable at runtime via `EDGECRAB_LOCAL_TOOL_MAX_TOKENS` in edgecrab-core.
-pub const LOCAL_TOOL_TURN_ABS_MAX_TOKENS: usize = 2048;
+/// 8192 tokens → ~27 KiB max tool-argument bytes (enough for typical single-file scaffolds).
+/// Override at runtime via `EDGECRAB_LOCAL_TOOL_MAX_TOKENS` in edgecrab-core.
+pub const LOCAL_TOOL_TURN_ABS_MAX_TOKENS: usize = 8192;
+
+/// Max tool-argument bytes derivable from a fixed output-token budget (geometry formula).
+pub fn local_max_tool_argument_bytes_for_output_tokens(output_tokens: usize) -> usize {
+    let completion_cap = ((output_tokens * TOOL_ARG_CHARS_PER_TOKEN) as f32
+        * TOOL_ARG_BUDGET_SAFETY_RATIO) as usize;
+    DEFAULT_MAX_MUTATION_PAYLOAD_BYTES.min(completion_cap.max(MIN_TOOL_ARGUMENT_BYTES))
+}
+
+/// Default max tool-argument bytes when no live `LLMProvider` is available (prompt assembly).
+pub fn local_default_max_tool_argument_bytes() -> usize {
+    local_max_tool_argument_bytes_for_output_tokens(LOCAL_TOOL_TURN_ABS_MAX_TOKENS)
+}
 
 /// Fixed JSON envelope overhead (`id`, `name`, escaping) atop argument tokens.
 const TOOL_CALL_ENVELOPE_TOKENS: usize = 64;
@@ -183,11 +196,39 @@ pub fn length_without_tools_recovery_message(
     let hint = tool_turn_budget_hint(max_mutation_payload_bytes, provider);
     format!(
         "[System: Your previous completion hit max_tokens (finish_reason=length) without \
-         emitting tool_calls. The output budget (~{} completion tokens) cannot fit a large \
-         monolithic tool argument (max {} bytes). Do NOT retry the same oversized call. \
-         Use incremental edits: (1) minimal write_file scaffold (≤{} KiB), \
-         (2) extend with patch/apply_patch. Each tool call must stay under {} bytes.]",
+         emitting tool_calls. The output budget (~{} completion tokens, max {} bytes per tool \
+         argument) cannot fit a large monolithic tool payload. Do NOT retry the same oversized \
+         call. Use incremental edits: (1) minimal write_file scaffold (≤{} KiB), (2) extend with \
+         patch/apply_patch. Each tool call must stay under {} bytes.]",
         hint.output_budget, hint.max_bytes, hint.max_kib, hint.max_bytes
+    )
+}
+
+/// Suffix appended to mutation-tool descriptions on local provider tool turns.
+pub fn local_tool_budget_schema_suffix(max_arg_bytes: usize, max_output_tokens: usize) -> String {
+    format!(
+        " Local turn limit: max argument ~{max_arg_bytes} bytes (~{max_output_tokens} completion tokens)."
+    )
+}
+
+/// Stable dynamic-zone block: local provider output geometry (Layer 2).
+///
+/// WHY separate from cloud `code_editing_guidance`: cloud stable prompt cites the 32 KiB config
+/// cap; local tool turns share one completion bounded by `max_output_tokens` × chars/token × safety.
+pub fn local_inference_geometry_guidance(max_arg_bytes: usize, max_output_tokens: usize) -> String {
+    let max_kib = max_arg_bytes.div_ceil(1024);
+    format!(
+        "\
+## Local Inference Tool Geometry (binding)
+
+You are on a local provider (LM Studio / Ollama). Each tool turn has a hard output ceiling:
+  - max completion tokens: {max_output_tokens}
+  - max tool-argument size: {max_arg_bytes} bytes (~{max_kib} KiB)
+
+Rules:
+  - A tool-call argument must fit in one completion — oversized write_file / execute_code payloads \
+will hit max_tokens without parseable tool_calls.
+  - For artifacts larger than ~{max_kib} KiB: minimal write_file scaffold, then patch/apply_patch chunks."
     )
 }
 
@@ -450,7 +491,27 @@ mod tests {
         assert!(msg.contains("finish_reason=length"));
         assert!(msg.contains("without emitting tool_calls"));
         assert!(msg.contains(&max_bytes.to_string()));
+        assert!(msg.contains("scaffold"));
         assert!(!msg.contains("interrupted"));
         assert!(!msg.contains("draft was interrupted"));
+        assert!(!msg.contains("manage_todo_list"));
+    }
+
+    #[test]
+    fn lh52_local_default_max_tool_argument_bytes_matches_abs_max_geometry() {
+        assert_eq!(
+            local_default_max_tool_argument_bytes(),
+            local_max_tool_argument_bytes_for_output_tokens(LOCAL_TOOL_TURN_ABS_MAX_TOKENS)
+        );
+        assert_eq!(local_default_max_tool_argument_bytes(), 27_852);
+    }
+
+    #[test]
+    fn lh54_local_inference_geometry_guidance_cites_arg_cap_not_config_kib() {
+        let block = local_inference_geometry_guidance(27_852, LOCAL_TOOL_TURN_ABS_MAX_TOKENS);
+        assert!(block.contains("27852"));
+        assert!(block.contains("8192"));
+        assert!(!block.contains("32768"));
+        assert!(!block.contains("manage_todo_list"));
     }
 }

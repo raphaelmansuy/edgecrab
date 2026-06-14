@@ -140,6 +140,8 @@ pub struct TurnActivityState {
     pub hint: Option<String>,
     /// Human-readable detail for blocking non-streaming LLM waits (LM Studio, Ollama).
     pub llm_wait_detail: Option<String>,
+    /// Short status-bar label for the same wait (no mid-word truncation).
+    pub llm_wait_compact: Option<String>,
     /// Short rolling notices (long-run charms, onboarding) — Hermes Activity feed.
     pub activity_feed: Vec<ActivityNotice>,
     long_run_hints_per_tool: HashMap<String, usize>,
@@ -171,6 +173,7 @@ impl TurnActivityState {
             tool_token_acc: 0,
             hint: None,
             llm_wait_detail: None,
+            llm_wait_compact: None,
             activity_feed: Vec::new(),
             long_run_hints_per_tool: HashMap::new(),
             long_run_last_at: HashMap::new(),
@@ -202,6 +205,7 @@ impl TurnActivityState {
         self.tool_token_acc = 0;
         self.hint = None;
         self.llm_wait_detail = None;
+        self.llm_wait_compact = None;
         self.activity_feed.clear();
         self.long_run_hints_per_tool.clear();
         self.long_run_last_at.clear();
@@ -217,6 +221,7 @@ impl TurnActivityState {
             self.set_phase(ShelfPhase::Streaming);
         }
         self.llm_wait_detail = None;
+        self.llm_wait_compact = None;
     }
 
     /// Clear in-flight streamed tool draft UI (non-streaming retry / stall abort).
@@ -239,6 +244,9 @@ impl TurnActivityState {
         let detail = edgecrab_tools::tool_progress_tail::llm_wait_progress_label(
             provider, elapsed_secs, has_tools, ctx,
         );
+        self.llm_wait_compact = Some(edgecrab_tools::tool_progress_tail::llm_wait_status_compact(
+            provider, has_tools, ctx,
+        ));
         self.llm_wait_detail = Some(detail.clone());
         self.set_phase(ShelfPhase::AwaitingFirstToken);
         let tone = if elapsed_secs >= 45 {
@@ -283,11 +291,16 @@ impl TurnActivityState {
     }
 
     /// Short label for status bar / ghost line during blocking LLM waits.
+    pub fn llm_wait_compact_label(&self) -> Option<&str> {
+        self.llm_wait_compact.as_deref()
+    }
+
+    /// Full shelf line during blocking LLM waits (activity feed).
     pub fn llm_wait_label(&self) -> Option<&str> {
         self.llm_wait_detail.as_deref().or_else(|| {
             self.activity_feed.iter().rev().find_map(|n| {
                 let t = n.text.as_str();
-                if t.contains("composing") || t.contains("non-streaming") {
+                if t.contains("composing") || t.contains("non-streaming") || t.contains("Bedrock") {
                     Some(t)
                 } else {
                     None
