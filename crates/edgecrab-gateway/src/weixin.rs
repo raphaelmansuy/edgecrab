@@ -282,7 +282,8 @@ impl WeixinAdapter {
         let mut headers = HeaderMap::new();
         // Random X-WECHAT-UIN: base64-encoded 4-byte random uint
         let rand_bytes: [u8; 4] = rand::random();
-        let uin = base64::engine::general_purpose::STANDARD.encode(rand_bytes);
+        let rand_u32 = u32::from_le_bytes(rand_bytes);
+        let uin = base64::engine::general_purpose::STANDARD.encode(rand_u32.to_string());
 
         if let Ok(v) = HeaderValue::from_str("ilink_bot_token") {
             headers.insert(HeaderName::from_static("authorizationtype"), v);
@@ -315,10 +316,7 @@ impl WeixinAdapter {
                 break;
             }
 
-            let url = format!(
-                "{}/ilink/bot/getupdates?timeout={}",
-                self.base_url, POLL_TIMEOUT_SECS
-            );
+            let url = format!("{}/ilink/bot/getupdates", self.base_url);
 
             // Build POST body with sync buffer
             let sync_buf_val = {
@@ -327,6 +325,7 @@ impl WeixinAdapter {
             };
             let payload = serde_json::json!({
                 "get_updates_buf": sync_buf_val,
+                "base_info": self.get_base_info(),
             });
 
             let result = self
@@ -364,8 +363,11 @@ impl WeixinAdapter {
                                 body.get("get_updates_buf").and_then(|v| v.as_str())
                             {
                                 let mut buf = self.sync_buf.lock().await;
-                                *buf = new_buf.to_string();
-                                self.persist_sync_buf(&buf);
+                                if *buf != new_buf {
+                                    *buf = new_buf.to_string();
+                                    self.persist_sync_buf(&buf);
+                                    debug!("Weixin: sync_buf updated to new position");
+                                }
                             }
 
                             self.process_updates(&body, &tx).await;
@@ -408,23 +410,29 @@ impl WeixinAdapter {
     }
 
     async fn process_updates(&self, body: &serde_json::Value, tx: &mpsc::Sender<IncomingMessage>) {
-        let Some(messages) = body.get("messages").and_then(|v| v.as_array()) else {
+        let Some(messages) = body.get("msgs").and_then(|v| v.as_array()) else {
             return;
         };
 
         for msg in messages {
+            debug!("Weixin: raw msg={}", msg);
             let msg_id = msg
-                .get("msg_id")
-                .and_then(|v| v.as_str())
+                .get("message_id")
+                .and_then(|v| match v {
+                        serde_json::Value::Number(n) => Some(n.to_string()),
+                        serde_json::Value::String(s) => Some(s.clone()),
+                        _ => None,
+                })
                 .unwrap_or_default();
             if msg_id.is_empty() {
+                warn!("Weixin: malformed msg, msg_id={msg_id}, full={msg}");
                 continue;
             }
 
             // Dedup
             {
                 let mut seen = self.seen_messages.lock().await;
-                if !seen.check_and_insert(msg_id) {
+                if !seen.check_and_insert(&msg_id) {
                     debug!("Weixin: skipping duplicate msg {msg_id}");
                     continue;
                 }
@@ -432,11 +440,12 @@ impl WeixinAdapter {
 
             // Extract sender
             let from_user = msg
-                .get("from_user")
+                .get("from_user_id")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string();
             if from_user.is_empty() {
+                warn!("Weixin: malformed msg, from_user={from_user}, full={}", msg);
                 continue;
             }
 
@@ -448,8 +457,9 @@ impl WeixinAdapter {
 
             // Determine chat type
             let is_group = msg
-                .get("is_group")
-                .and_then(|v| v.as_bool())
+                .get("group_id")
+                .and_then(|v| v.as_str())
+                .map(|s| !s.is_empty())
                 .unwrap_or(false);
             let chat_type = if is_group {
                 ChatType::Group
@@ -523,6 +533,7 @@ impl WeixinAdapter {
 
     fn extract_text(msg: &serde_json::Value) -> String {
         let mut parts = Vec::new();
+        debug!("Weixin: extract_text input={}", msg);
 
         // Check for referenced message (引用)
         if let Some(ref_msg) = msg.get("reference").and_then(|v| v.as_object()) {
@@ -535,22 +546,35 @@ impl WeixinAdapter {
 
         // Extract text from item_list (type=1 is text)
         if let Some(items) = msg.get("item_list").and_then(|v| v.as_array()) {
+            debug!("Weixin: item_list len={}", items.len());
             for item in items {
                 let item_type = item.get("type").and_then(|v| v.as_u64()).unwrap_or(0);
+                debug!("Weixin: item type={}", item_type);
                 match item_type {
                     1 => {
                         // Text item
-                        if let Some(content) = item.get("content").and_then(|v| v.as_str()) {
-                            parts.push(content.to_string());
+                        if let Some(text) = item
+                            .get("text_item")
+                            .and_then(|v| v.get("text"))
+                            .and_then(|v| v.as_str())
+                        {
+                            parts.push(text.to_string());
+                        } else {
+                            debug!("Weixin: text_item missing or malformed");
                         }
                     }
-                    3 => parts.push("[图片]".to_string()), // Image
-                    34 => parts.push("[语音]".to_string()), // Voice
-                    43 => parts.push("[视频]".to_string()), // Video
-                    49 => parts.push("[文件]".to_string()), // File
+                    2 => parts.push("[图片]".to_string()), // iLink, wechat 3
+                    3 => parts.push("[语音]".to_string()), // iLink
+                    4 => parts.push("[视频]".to_string()), // iLink
+                    5 => parts.push("[文件]".to_string()), // iLink
+                    34 => parts.push("[语音]".to_string()), // wechat
+                    43 => parts.push("[视频]".to_string()), // wechat
+                    49 => parts.push("[文件]".to_string()), // wechat
                     _ => {}
                 }
             }
+        } else {
+            debug!("Weixin: no item_list found");
         }
 
         // Fallback: direct content field
@@ -560,19 +584,26 @@ impl WeixinAdapter {
             parts.push(content.to_string());
         }
 
-        parts.join("\n")
+        //parts.join("\n")
+        let result = parts.join("\n");
+        debug!("Weixin: extract_text result={}", result);
+        result
     }
 
     /// Extract media attachments from iLink message items.
     fn extract_attachments(msg: &serde_json::Value) -> Vec<MediaItem> {
         let Some(items) = msg.get("item_list").and_then(|v| v.as_array()) else {
+            debug!("Weixin: no item_list for attachments");
             return Vec::new();
         };
         let mut media = Vec::new();
         for item in items {
             let item_type = item.get("type").and_then(|v| v.as_u64()).unwrap_or(0);
             let kind = match item_type {
-                3 => MessageAttachmentKind::Image,
+                2 => MessageAttachmentKind::Image,
+                3 => MessageAttachmentKind::Voice,
+                4 => MessageAttachmentKind::Video,
+                5 => MessageAttachmentKind::Document,
                 34 => MessageAttachmentKind::Voice,
                 43 => MessageAttachmentKind::Video,
                 49 => MessageAttachmentKind::Document,
@@ -763,20 +794,33 @@ impl WeixinAdapter {
             store.get(to_user).cloned()
         };
 
-        let mut payload = serde_json::json!({
-            "to_user": to_user,
-            "msg_type": "text",
-            "content": text,
+        let mut msg = serde_json::json!({
+            "from_user_id": "",
+            "to_user_id": to_user,
+            "client_id": format!("edgecrab-{}", uuid::Uuid::new_v4()),
+            "message_type": 2,
+            "message_state": 2,
+            "item_list": [
+                {
+                    "type": 1,
+                    "text_item": { "text": text }
+                }
+            ]
         });
 
         if let Some(token) = ctx_token {
-            payload.as_object_mut().map(|obj| {
+            msg.as_object_mut().map(|obj| {
                 obj.insert(
                     "context_token".to_string(),
                     serde_json::Value::String(token),
                 )
             });
         }
+
+        let payload = serde_json::json!({
+            "msg": msg,
+            "base_info": self.get_base_info()
+        });
 
         let resp = self
             .client
@@ -833,7 +877,7 @@ impl WeixinAdapter {
         &self,
         data: &[u8],
         to_user: &str,
-        file_type: &str,
+        file_type: u32,
     ) -> anyhow::Result<(String, String)> {
         // Generate random AES key
         let key: [u8; 16] = rand::random();
@@ -847,13 +891,14 @@ impl WeixinAdapter {
         let raw_md5 = format!("{:x}", md5::compute(data));
         let filekey = format!("weixin_{}_{}", to_user, uuid::Uuid::new_v4());
         let payload = serde_json::json!({
-            "to_user": to_user,
+            "to_user_id": to_user,
             "filekey": filekey,
             "rawsize": data.len(),
             "filesize": ciphertext.len(),
             "md5": raw_md5,
             "aeskey": aes_key_hex,
             "file_type": file_type,
+            "base_info": self.get_base_info(),
         });
 
         let resp = self
@@ -913,7 +958,7 @@ impl WeixinAdapter {
         &self,
         to_user: &str,
         file_path: &str,
-        msg_type: &str,
+        msg_type: u32,
         caption: Option<&str>,
     ) -> anyhow::Result<()> {
         let data = tokio::fs::read(file_path).await?;
@@ -925,21 +970,29 @@ impl WeixinAdapter {
             store.get(to_user).cloned()
         };
 
-        let mut payload = serde_json::json!({
-            "to_user": to_user,
-            "msg_type": msg_type,
+        let mut msg = serde_json::json!({
+            "from_user_id": "",
+            "to_user_id": to_user,
+            "client_id": format!("edgecrab-{}", uuid::Uuid::new_v4()),
+            "message_type": 2,
+            "message_state": 2,
             "encrypt_query_param": encrypted_query_param,
             "aes_key": aes_key,
         });
 
         if let Some(token) = ctx_token {
-            payload.as_object_mut().map(|obj| {
+            msg.as_object_mut().map(|obj| {
                 obj.insert(
                     "context_token".to_string(),
                     serde_json::Value::String(token),
                 )
             });
         }
+
+        let payload = serde_json::json!({
+            "msg": msg,
+            "base_info": self.get_base_info(),
+        });
 
         let url = format!("{}/ilink/bot/sendmessage", self.base_url);
         let resp = self
@@ -963,6 +1016,12 @@ impl WeixinAdapter {
         }
 
         Ok(())
+    }
+
+    fn get_base_info(&self) -> serde_json::Value {
+        serde_json::json!({
+            "channel_version": "1.0.3"
+        })
     }
 }
 
@@ -1030,12 +1089,15 @@ impl PlatformAdapter for WeixinAdapter {
             t
         } else {
             // Fetch new typing ticket
-            let url = format!("{}/ilink/bot/gettyping_ticket", self.base_url);
+            let url = format!("{}/ilink/bot/getconfig", self.base_url);
             let resp = self
                 .client
                 .post(&url)
                 .headers(self.auth_headers())
-                .json(&serde_json::json!({"to_user": to_user}))
+                .json(&serde_json::json!({
+                    "to_user_id": to_user,
+                    "base_info": self.get_base_info(),
+                }))
                 .timeout(Duration::from_secs(10))
                 .send()
                 .await?;
@@ -1062,8 +1124,12 @@ impl PlatformAdapter for WeixinAdapter {
             .post(&url)
             .headers(self.auth_headers())
             .json(&serde_json::json!({
-                "to_user": to_user,
-                "typing_ticket": ticket,
+                "msg": {
+                    "to_user_id": to_user,
+                    "ticket": ticket,
+                    "status": 1
+                },
+                "base_info": self.get_base_info(),
             }))
             .timeout(Duration::from_secs(5))
             .send()
@@ -1082,7 +1148,7 @@ impl PlatformAdapter for WeixinAdapter {
             .channel_id
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("Weixin send_photo: missing channel_id"))?;
-        self.send_media_file(to_user, path, "image", caption).await
+        self.send_media_file(to_user, path, 2, caption).await
     }
 
     async fn send_document(
@@ -1095,7 +1161,7 @@ impl PlatformAdapter for WeixinAdapter {
             .channel_id
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("Weixin send_document: missing channel_id"))?;
-        self.send_media_file(to_user, path, "file", caption).await
+        self.send_media_file(to_user, path, 5, caption).await
     }
 
     async fn send_voice(
@@ -1108,7 +1174,7 @@ impl PlatformAdapter for WeixinAdapter {
             .channel_id
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("Weixin send_voice: missing channel_id"))?;
-        self.send_media_file(to_user, path, "voice", caption).await
+        self.send_media_file(to_user, path, 3, caption).await
     }
 }
 
@@ -1239,11 +1305,11 @@ mod tests {
     fn extract_text_from_item_list() {
         let msg = serde_json::json!({
             "msg_id": "123",
-            "from_user": "test",
+            "from_user_id": "test",
             "item_list": [
-                {"type": 1, "content": "Hello"},
+                {"type": 1, "text_item": {"text": "Hello"}},
                 {"type": 2, "content": "image.jpg"},
-                {"type": 1, "content": "World"}
+                {"type": 1, "text_item": {"text": "World"}}
             ]
         });
         let text = WeixinAdapter::extract_text(&msg);
@@ -1254,9 +1320,9 @@ mod tests {
     fn extract_text_with_reference() {
         let msg = serde_json::json!({
             "msg_id": "456",
-            "from_user": "test",
+            "from_user_id": "test",
             "reference": {"content": "original message"},
-            "item_list": [{"type": 1, "content": "reply text"}]
+            "item_list": [{"type": 1, "text_item": {"text": "reply text"}}]
         });
         let text = WeixinAdapter::extract_text(&msg);
         assert!(text.contains("[引用: original message]"));
