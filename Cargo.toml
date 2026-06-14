@@ -69,8 +69,8 @@ lsp-types = { version = "0.97.0", features = ["proposed"] }
 regex = "1"
 url = "2"
 
-# LLM backend — crates.io pin (git tag stripped on `cargo publish`; v0.9.0 used version-only).
-edgequake-llm = { path = "../edgequake-llm", features = ["bedrock"] }
+# LLM backend — crates.io pin (v0.6.25: LM Studio metadata + tool-turn reasoning_effort).
+edgequake-llm = { version = "0.6.25", features = ["bedrock"] }
 
 # Image processing (vision tool: resize/compress before base64 encoding)
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
