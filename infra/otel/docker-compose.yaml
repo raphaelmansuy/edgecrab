@@ -1,0 +1,14 @@
+# Local OTLP collector for EdgeCrab observability dev/CI.
+#
+#   docker compose -f infra/otel/docker-compose.yaml up -d
+#   OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 edgecrab
+#   cargo test -p edgecrab-core --test otel_collector_e2e -- --ignored
+
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector:0.120.0
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "4317:4317"

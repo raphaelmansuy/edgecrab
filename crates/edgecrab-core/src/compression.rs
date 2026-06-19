@@ -13,9 +13,8 @@
 //!
 //! Pipeline (v0.4.0 — matching hermes-agent 0.4.x):
 //!
-//! 1. **Tool output pruning** — replace gigantic tool results in old
-//!    messages with `PRUNED_TOOL_PLACEHOLDER` (cheap, no LLM needed).
-//!    This alone often halves the prompt size.
+//! 1. **Tool output pruning** — tail-protected semantic summaries (Hermes parity),
+//!    optional artifact spill for large results (cheap, no LLM needed).
 //!
 //! 2. **Boundary determination** — tail is token-budget based (walks
 //!    backward accumulating token estimates until `threshold × target_ratio`
@@ -61,12 +60,13 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use edgecrab_types::{Content, ContentPart, Message, Role};
+use edgecrab_types::{Content, ContentPart, Message, Role, ToolCall};
 use edgequake_llm::LLMProvider;
 
 use crate::config::CompressionConfig;
 use crate::model_catalog::ModelCatalog;
 use crate::tool_result_spill::{SpillConfig, SpillOutcome, SpillSequence};
+use crate::tool_result_summary::{DUPLICATE_TOOL_OUTPUT, summarize_tool_result_for_history};
 
 // ─── Constants ────────────────────────────────────────────────────────
 
@@ -94,7 +94,31 @@ pub const FIRST_COMPRESSION_NOTE: &str = concat!(
 pub const HANDOFF_COMPRESSION_NOTE: &str =
     "[Note: Earlier turns were auto-compressed for the target model's context window.]";
 
-/// Replacement text for pruned tool output blocks.
+/// Minimum tool-result size (chars) before pruning replaces content.
+pub const PRUNE_MIN_TOOL_CHARS: usize = 200;
+
+/// Options for tail-protected pruning (Hermes parity).
+#[derive(Debug, Clone, Copy)]
+pub struct PruneToolOutputsOptions {
+    /// Minimum messages to keep verbatim at the tail.
+    pub protect_tail_count: usize,
+    /// Optional token budget for tail protection (takes priority over count floor).
+    pub protect_tail_tokens: Option<usize>,
+}
+
+impl Default for PruneToolOutputsOptions {
+    fn default() -> Self {
+        Self {
+            protect_tail_count: DEFAULT_PROTECT_LAST_N,
+            protect_tail_tokens: None,
+        }
+    }
+}
+
+/// Default `protect_last_n` — matches [`CompressionParams::protect_last_n`].
+pub const DEFAULT_PROTECT_LAST_N: usize = 20;
+
+/// Legacy generic placeholder — only used when semantic summary cannot be built.
 ///
 /// WHY prune first: Tool results (file contents, shell output) can be
 /// thousands of tokens each. Replacing them before the LLM call keeps
@@ -438,17 +462,19 @@ pub async fn compress_with_llm(
         return (messages.to_vec(), true);
     }
 
-    // Phase 1: prune tool outputs (cheap, no LLM).
-    // When spill context is available, large results are written to artifact
-    // files on disk instead of being replaced with a generic placeholder.
-    let pruned = prune_tool_outputs(messages, spill_ctx);
+    // Phase 1: prune tool outputs (cheap, no LLM) — tail-protected semantic summaries.
+    let threshold_tokens = (params.context_window as f32 * params.threshold) as usize;
+    let tail_token_budget = (threshold_tokens as f32 * params.target_ratio) as usize;
+    let prune_options = PruneToolOutputsOptions {
+        protect_tail_count: params.protect_last_n,
+        protect_tail_tokens: Some(tail_token_budget),
+    };
+    let pruned = prune_tool_outputs_with_options(messages, spill_ctx, &prune_options);
 
     // Phase 2: determine compression boundaries.
     // Head: always keep system prompt + first exchange (PROTECT_FIRST_N messages).
     let head_end = align_boundary_forward(&pruned, PROTECT_FIRST_N);
     // Tail: walk backward until token budget exhausted.
-    let threshold_tokens = (params.context_window as f32 * params.threshold) as usize;
-    let tail_token_budget = (threshold_tokens as f32 * params.target_ratio) as usize;
     let tail_start =
         find_tail_cut_by_tokens(&pruned, head_end, tail_token_budget, params.protect_last_n);
 
@@ -522,10 +548,14 @@ pub fn compress_structural_only(
     if n <= PROTECT_FIRST_N + params.protect_last_n {
         return messages.to_vec();
     }
-    let pruned = prune_tool_outputs(messages, spill_ctx);
-    let head_end = align_boundary_forward(&pruned, PROTECT_FIRST_N);
     let threshold_tokens = (params.context_window as f32 * params.threshold) as usize;
     let tail_token_budget = (threshold_tokens as f32 * params.target_ratio) as usize;
+    let prune_options = PruneToolOutputsOptions {
+        protect_tail_count: params.protect_last_n,
+        protect_tail_tokens: Some(tail_token_budget),
+    };
+    let pruned = prune_tool_outputs_with_options(messages, spill_ctx, &prune_options);
+    let head_end = align_boundary_forward(&pruned, PROTECT_FIRST_N);
     let tail_start =
         find_tail_cut_by_tokens(&pruned, head_end, tail_token_budget, params.protect_last_n);
     if head_end >= tail_start {
@@ -541,25 +571,12 @@ pub fn compress_structural_only(
     sanitize_orphan_pairs(result)
 }
 
-/// Count tool results that [`prune_tool_outputs`] would replace (>200 chars).
+/// Count tool results eligible for pruning (>200 chars, not already summarized).
 pub fn count_long_tool_outputs(messages: &[Message]) -> usize {
     messages
         .iter()
-        .filter(|m| m.role == edgecrab_types::Role::Tool && m.text_content().len() > 200)
+        .filter(|m| is_prunable_tool_message(m))
         .count()
-}
-
-/// Cheap structural prefill prune for local inference — prune/spill oversized tool results only.
-///
-/// Returns `(pruned_messages, long_tool_outputs_replaced)`.
-pub fn structural_prefill_prune(
-    messages: &[Message],
-    spill_ctx: Option<&PruneSpillContext<'_>>,
-) -> (Vec<Message>, usize) {
-    let before = count_long_tool_outputs(messages);
-    let pruned = prune_tool_outputs(messages, spill_ctx);
-    let after = count_long_tool_outputs(&pruned);
-    (pruned, before.saturating_sub(after))
 }
 
 /// Metrics from a successful structural tool-output prune (message tokens only).
@@ -571,16 +588,32 @@ pub struct StructuralPruneOutcome {
     pub long_tool_outputs_remaining: usize,
 }
 
+/// Cheap structural prefill prune for local inference — semantic summaries, budget-fit.
+///
+/// Exceeds Hermes on local path: greedily prunes oldest fat tool results until
+/// `token_budget` is met (or no more prunable tools), never generic amnesia.
+pub fn structural_prefill_prune(
+    messages: &[Message],
+    spill_ctx: Option<&PruneSpillContext<'_>>,
+    token_budget: usize,
+) -> (Vec<Message>, usize) {
+    prune_tool_results_to_budget(messages, spill_ctx, token_budget)
+}
+
 /// Prune oversized tool results when any exist; returns `None` if nothing would change.
 pub fn apply_structural_tool_output_prune(
     messages: &[Message],
     spill_ctx: Option<&PruneSpillContext<'_>>,
+    token_budget: usize,
 ) -> Option<(Vec<Message>, StructuralPruneOutcome)> {
     if count_long_tool_outputs(messages) == 0 {
         return None;
     }
     let message_tokens_before = estimate_tokens(messages);
-    let (pruned, tools_pruned) = structural_prefill_prune(messages, spill_ctx);
+    if token_budget > 0 && message_tokens_before <= token_budget {
+        return None;
+    }
+    let (pruned, tools_pruned) = structural_prefill_prune(messages, spill_ctx, token_budget);
     if tools_pruned == 0 {
         return None;
     }
@@ -597,62 +630,265 @@ pub fn apply_structural_tool_output_prune(
     ))
 }
 
-/// Replace large tool-result messages with a placeholder, or spill to disk.
-///
-/// WHY: Tool outputs (file contents, grep results, command output) are
-/// often thousands of tokens. Replacing them with a 10-token placeholder
-/// before summarisation halves the LLM input cost at no semantic loss —
-/// the summary will describe *what* the tool found, not dump raw bytes.
-///
-/// When `spill_ctx` is `Some` and spilling is enabled, large results are
-/// written to artifact files on disk instead of being replaced with a
-/// generic placeholder. The message body becomes a compact stub with a
-/// preview and a file path — the agent can still `read_file` the full data.
-///
-/// Threshold: tool results over 200 chars are pruned. This preserves
-/// short "ok" / "error" responses that carry semantic meaning.
+/// Tail-protected prune for LLM compression (Hermes parity + spill + semantic summaries).
 pub fn prune_tool_outputs(
     messages: &[Message],
     spill_ctx: Option<&PruneSpillContext<'_>>,
 ) -> Vec<Message> {
-    messages
-        .iter()
-        .map(|m| {
-            if m.role == edgecrab_types::Role::Tool && m.text_content().len() > 200 {
-                let tool_call_id = m.tool_call_id.as_deref().unwrap_or("unknown");
-                let tool_name = m.name.as_deref().unwrap_or("tool");
+    prune_tool_outputs_with_options(messages, spill_ctx, &PruneToolOutputsOptions::default())
+}
 
-                // When spill context is available, attempt to spill to artifact
-                if let Some(ctx) = spill_ctx
-                    && ctx.config.enabled
-                {
-                    let result = m.text_content();
-                    match crate::tool_result_spill::maybe_spill(
-                        tool_name,
-                        tool_call_id,
-                        result,
-                        ctx.session_id,
-                        ctx.cwd,
-                        ctx.config,
-                        ctx.seq,
-                    ) {
-                        SpillOutcome::Spilled { stub, .. } => {
-                            return Message::tool_result(tool_call_id, tool_name, &stub);
-                        }
-                        SpillOutcome::Inline(_) => {
-                            // Below spill threshold but above prune threshold (200 chars)
-                            // — fall through to placeholder
-                        }
-                    }
-                }
+/// Prune old tool outputs with explicit tail protection.
+pub fn prune_tool_outputs_with_options(
+    messages: &[Message],
+    spill_ctx: Option<&PruneSpillContext<'_>>,
+    options: &PruneToolOutputsOptions,
+) -> Vec<Message> {
+    let (pruned, _) = prune_old_tool_results(messages, spill_ctx, options);
+    pruned
+}
 
-                // Default: replace with generic placeholder
-                Message::tool_result(tool_call_id, tool_name, PRUNED_TOOL_PLACEHOLDER)
-            } else {
-                m.clone()
+/// Hermes-style prune: dedup, semantic summaries, tail protection, arg truncation.
+pub fn prune_old_tool_results(
+    messages: &[Message],
+    spill_ctx: Option<&PruneSpillContext<'_>>,
+    options: &PruneToolOutputsOptions,
+) -> (Vec<Message>, usize) {
+    if messages.is_empty() {
+        return (messages.to_vec(), 0);
+    }
+
+    let mut result: Vec<Message> = messages.to_vec();
+    let mut pruned = 0;
+
+    let call_index = build_tool_call_index(&result);
+    let prune_boundary = compute_prune_boundary(
+        &result,
+        options.protect_tail_count,
+        options.protect_tail_tokens,
+    );
+
+    // Pass 1: deduplicate identical tool results (newest keeps full copy).
+    let mut content_hashes: std::collections::HashMap<String, ()> =
+        std::collections::HashMap::new();
+    for i in (0..result.len()).rev() {
+        let Some(content) = result[i].tool_text_content() else {
+            continue;
+        };
+        if content.chars().count() < PRUNE_MIN_TOOL_CHARS {
+            continue;
+        }
+        let h = hash_tool_content(&content);
+        if content_hashes.insert(h, ()).is_some()
+            && let Some(m) = result.get_mut(i)
+        {
+            replace_tool_content(m, DUPLICATE_TOOL_OUTPUT);
+            pruned += 1;
+        }
+    }
+
+    // Pass 2: semantic prune outside tail.
+    for msg in result.iter_mut().take(prune_boundary) {
+        if !is_prunable_tool_message(msg) {
+            continue;
+        }
+        if replace_tool_with_summary(msg, spill_ctx, &call_index) {
+            pruned += 1;
+        }
+    }
+
+    // Pass 3: truncate large tool_call arguments on old assistant messages.
+    for msg in result.iter_mut().take(prune_boundary) {
+        if msg.role != Role::Assistant || !msg.has_tool_calls() {
+            continue;
+        }
+        if truncate_assistant_tool_calls(msg) {
+            pruned += 1;
+        }
+    }
+
+    (result, pruned)
+}
+
+/// Greedily prune oldest fat tool results until under `token_budget`.
+pub fn prune_tool_results_to_budget(
+    messages: &[Message],
+    spill_ctx: Option<&PruneSpillContext<'_>>,
+    token_budget: usize,
+) -> (Vec<Message>, usize) {
+    let mut result = messages.to_vec();
+    let mut pruned = 0;
+    let call_index = build_tool_call_index(&result);
+
+    while estimate_tokens(&result) > token_budget {
+        let Some(idx) = result.iter().position(is_prunable_tool_message) else {
+            break;
+        };
+        if replace_tool_with_summary(&mut result[idx], spill_ctx, &call_index) {
+            pruned += 1;
+        } else {
+            break;
+        }
+    }
+
+    (result, pruned)
+}
+
+fn compute_prune_boundary(
+    messages: &[Message],
+    protect_tail_count: usize,
+    protect_tail_tokens: Option<usize>,
+) -> usize {
+    let n = messages.len();
+    if let Some(t) = protect_tail_tokens.filter(|&t| t > 0) {
+        find_tail_cut_by_tokens(messages, 0, t, protect_tail_count)
+    } else {
+        n.saturating_sub(protect_tail_count)
+    }
+}
+
+fn build_tool_call_index(
+    messages: &[Message],
+) -> std::collections::HashMap<String, (String, String)> {
+    let mut map = std::collections::HashMap::new();
+    for msg in messages {
+        if msg.role != Role::Assistant {
+            continue;
+        }
+        for tc in msg.tool_calls() {
+            let id = tc.id.clone();
+            let name = tc.function.name.clone();
+            let args = tc.function.arguments.clone();
+            map.insert(id, (name, args));
+        }
+    }
+    map
+}
+
+fn is_prunable_tool_message(msg: &Message) -> bool {
+    let Some(content) = msg.tool_text_content() else {
+        return false;
+    };
+    if content.chars().count() <= PRUNE_MIN_TOOL_CHARS {
+        return false;
+    }
+    !crate::tool_result_summary::is_already_pruned_marker(&content)
+}
+
+fn hash_tool_content(content: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    content.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn replace_tool_with_summary(
+    msg: &mut Message,
+    spill_ctx: Option<&PruneSpillContext<'_>>,
+    call_index: &std::collections::HashMap<String, (String, String)>,
+) -> bool {
+    let Some(content) = msg.tool_text_content() else {
+        return false;
+    };
+    let tool_call_id = msg.tool_call_id.as_deref().unwrap_or("unknown");
+    let tool_name = msg
+        .name
+        .as_deref()
+        .or_else(|| call_index.get(tool_call_id).map(|(n, _)| n.as_str()))
+        .unwrap_or("tool");
+    let (name, args) = call_index
+        .get(tool_call_id)
+        .map(|(n, a)| (n.as_str(), a.as_str()))
+        .unwrap_or((tool_name, ""));
+
+    if let Some(ctx) = spill_ctx
+        && ctx.config.enabled
+        && let SpillOutcome::Spilled { stub, .. } = crate::tool_result_spill::maybe_spill(
+            name,
+            tool_call_id,
+            content.to_string(),
+            ctx.session_id,
+            ctx.cwd,
+            ctx.config,
+            ctx.seq,
+        )
+    {
+        replace_tool_content(msg, &stub);
+        return true;
+    }
+
+    let is_error = content.contains("\"tool_error\"")
+        || content.contains("\"category\"") && content.contains("\"error\"");
+    let summary = summarize_tool_result_for_history(name, args, &content, is_error);
+    replace_tool_content(msg, &summary);
+    true
+}
+
+fn replace_tool_content(msg: &mut Message, body: &str) {
+    let tool_call_id = msg.tool_call_id.clone().unwrap_or_else(|| "unknown".into());
+    let name = msg.name.clone().unwrap_or_else(|| "tool".into());
+    *msg = Message::tool_result(&tool_call_id, &name, body);
+}
+
+fn truncate_assistant_tool_calls(msg: &mut Message) -> bool {
+    let Some(calls) = msg.tool_calls.as_mut() else {
+        return false;
+    };
+    let mut changed = false;
+    for tc in calls.iter_mut() {
+        if tc.function.arguments.chars().count() > 500 {
+            tc.function.arguments = truncate_tool_call_args_json(&tc.function.arguments);
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn truncate_tool_call_args_json(args: &str) -> String {
+    let Ok(mut parsed) = serde_json::from_str::<serde_json::Value>(args) else {
+        return args.to_string();
+    };
+    shrink_json_strings(&mut parsed, 200);
+    serde_json::to_string(&parsed).unwrap_or_else(|_| args.to_string())
+}
+
+fn shrink_json_strings(value: &mut serde_json::Value, head_chars: usize) {
+    match value {
+        serde_json::Value::String(s) if s.chars().count() > head_chars => {
+            let truncated: String = s.chars().take(head_chars).collect();
+            *s = format!("{truncated}... [truncated]");
+        }
+        serde_json::Value::Object(map) => {
+            for v in map.values_mut() {
+                shrink_json_strings(v, head_chars);
             }
-        })
-        .collect()
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                shrink_json_strings(v, head_chars);
+            }
+        }
+        _ => {}
+    }
+}
+
+trait ToolTextContent {
+    fn tool_text_content(&self) -> Option<String>;
+    fn tool_calls(&self) -> &[ToolCall];
+}
+
+impl ToolTextContent for Message {
+    fn tool_text_content(&self) -> Option<String> {
+        if self.role != Role::Tool {
+            return None;
+        }
+        let text = self.text_content();
+        if text.is_empty() { None } else { Some(text) }
+    }
+
+    fn tool_calls(&self) -> &[ToolCall] {
+        self.tool_calls.as_deref().unwrap_or(&[])
+    }
 }
 
 /// Strip `computer_use` screenshot images from older tool results, keeping only
@@ -1499,17 +1735,33 @@ mod tests {
     }
 
     #[test]
-    fn prune_tool_outputs_replaces_long_results() {
-        let messages = vec![
-            Message::user("run a command"),
-            Message::tool_result("id1", "shell_exec", &"x".repeat(500)),
-        ];
-        let pruned = prune_tool_outputs(&messages, None);
-        assert_eq!(pruned.len(), 2);
-        // User message unchanged
-        assert_eq!(pruned[0].text_content(), "run a command");
-        // Tool result replaced with placeholder
-        assert_eq!(pruned[1].text_content(), PRUNED_TOOL_PLACEHOLDER);
+    fn prune_tool_outputs_replaces_long_results_outside_tail() {
+        let mut messages = vec![Message::user("run commands")];
+        for i in 0..25 {
+            messages.push(Message::tool_result(
+                &format!("id{i}"),
+                "shell_exec",
+                &format!("output {i} {}", "x".repeat(500)),
+            ));
+        }
+        let pruned = prune_tool_outputs_with_options(
+            &messages,
+            None,
+            &PruneToolOutputsOptions {
+                protect_tail_count: 5,
+                protect_tail_tokens: None,
+            },
+        );
+        assert_eq!(pruned.len(), messages.len());
+        // Oldest tool result replaced with semantic summary (not generic placeholder).
+        let first_tool = pruned[1].text_content();
+        assert!(
+            first_tool.contains("shell_exec") || first_tool.contains("terminal"),
+            "expected semantic summary, got: {first_tool}"
+        );
+        assert_ne!(first_tool, "x".repeat(500));
+        // Tail tool within protect window stays verbatim.
+        assert!(pruned[25].text_content().contains(&"x".repeat(100)));
     }
 
     #[test]
@@ -1525,13 +1777,17 @@ mod tests {
             .collect();
         let tokens_before = estimate_tokens(&messages);
         assert_eq!(count_long_tool_outputs(&messages), 8);
+        let budget = 4_000;
 
-        let (pruned, replaced) = structural_prefill_prune(&messages, None);
-        assert_eq!(replaced, 8);
-        assert_eq!(count_long_tool_outputs(&pruned), 0);
+        let (pruned, replaced) = structural_prefill_prune(&messages, None, budget);
+        assert!(replaced >= 1, "expected at least one pruned tool output");
         let tokens_after = estimate_tokens(&pruned);
         assert!(
-            tokens_after < tokens_before / 4,
+            tokens_after <= budget,
+            "expected under budget: before={tokens_before} after={tokens_after} budget={budget}"
+        );
+        assert!(
+            tokens_after < tokens_before / 2,
             "expected large token drop: before={tokens_before} after={tokens_after}"
         );
     }
@@ -1539,13 +1795,13 @@ mod tests {
     #[test]
     fn apply_structural_tool_output_prune_returns_none_when_nothing_long() {
         let messages = vec![Message::tool_result("id", "shell_exec", "ok")];
-        assert!(apply_structural_tool_output_prune(&messages, None).is_none());
+        assert!(apply_structural_tool_output_prune(&messages, None, 32_000).is_none());
     }
 
     #[test]
     fn apply_structural_tool_output_prune_reports_outcome() {
         let messages = vec![Message::tool_result("id", "web_extract", &"x".repeat(500))];
-        let (pruned, outcome) = apply_structural_tool_output_prune(&messages, None)
+        let (pruned, outcome) = apply_structural_tool_output_prune(&messages, None, 0)
             .expect("long tool output should prune");
         assert_eq!(outcome.tools_pruned, 1);
         assert_eq!(outcome.long_tool_outputs_remaining, 0);
@@ -1660,11 +1916,16 @@ mod tests {
             Message::user("search files"),
             Message::tool_result("id1", "file_search", &big_result),
         ];
-        let pruned = prune_tool_outputs(&messages, Some(&spill_ctx));
+        let pruned = prune_tool_outputs_with_options(
+            &messages,
+            Some(&spill_ctx),
+            &PruneToolOutputsOptions {
+                protect_tail_count: 0,
+                protect_tail_tokens: None,
+            },
+        );
         assert_eq!(pruned.len(), 2);
-        // User message unchanged
         assert_eq!(pruned[0].text_content(), "search files");
-        // Tool result should be a spill stub, NOT the generic placeholder
         let result_content = pruned[1].text_content();
         assert!(
             result_content.contains("[tool_result_spill]"),
@@ -1695,9 +1956,21 @@ mod tests {
 
         // 500 chars > prune threshold (200) but < spill threshold (10_000)
         let messages = vec![Message::tool_result("id1", "shell_exec", &"x".repeat(500))];
-        let pruned = prune_tool_outputs(&messages, Some(&spill_ctx));
-        // Should fall back to generic placeholder since below spill threshold
-        assert_eq!(pruned[0].text_content(), PRUNED_TOOL_PLACEHOLDER);
+        let pruned = prune_tool_outputs_with_options(
+            &messages,
+            Some(&spill_ctx),
+            &PruneToolOutputsOptions {
+                protect_tail_count: 0,
+                protect_tail_tokens: None,
+            },
+        );
+        // Semantic summary (not generic amnesia placeholder)
+        let summary = pruned[0].text_content();
+        assert!(
+            summary.contains("shell_exec"),
+            "expected semantic summary, got: {summary}"
+        );
+        assert!(!summary.contains(&"x".repeat(100)));
     }
 
     #[test]
@@ -1719,9 +1992,20 @@ mod tests {
         };
 
         let messages = vec![Message::tool_result("id1", "shell_exec", &"x".repeat(500))];
-        let pruned = prune_tool_outputs(&messages, Some(&spill_ctx));
-        // Should use generic placeholder since spill is disabled
-        assert_eq!(pruned[0].text_content(), PRUNED_TOOL_PLACEHOLDER);
+        let pruned = prune_tool_outputs_with_options(
+            &messages,
+            Some(&spill_ctx),
+            &PruneToolOutputsOptions {
+                protect_tail_count: 0,
+                protect_tail_tokens: None,
+            },
+        );
+        let summary = pruned[0].text_content();
+        assert!(
+            summary.contains("shell_exec"),
+            "expected semantic summary when spill disabled, got: {summary}"
+        );
+        assert_ne!(summary, PRUNED_TOOL_PLACEHOLDER);
     }
 
     #[test]

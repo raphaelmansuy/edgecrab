@@ -1,7 +1,7 @@
 //! Kanban orchestration settings — Hermes `/orchestration` API parity.
 
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use edgecrab_types::AgentError;
 
@@ -67,21 +67,13 @@ pub fn patch_orchestration_settings(
     if let Some(raw) = patch.orchestrator_profile {
         let name = raw.trim().to_string();
         validate_profile_name(&root, &name)?;
-        cfg.kanban.orchestrator_profile = if name.is_empty() {
-            None
-        } else {
-            Some(name)
-        };
+        cfg.kanban.orchestrator_profile = if name.is_empty() { None } else { Some(name) };
     }
 
     if let Some(raw) = patch.default_assignee {
         let name = raw.trim().to_string();
         validate_profile_name(&root, &name)?;
-        cfg.kanban.default_assignee = if name.is_empty() {
-            None
-        } else {
-            Some(name)
-        };
+        cfg.kanban.default_assignee = if name.is_empty() { None } else { Some(name) };
     }
 
     if let Some(v) = patch.auto_decompose {

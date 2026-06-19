@@ -49,10 +49,12 @@ use edgecrab_plugins::{
     invoke_hermes_hook,
 };
 use edgecrab_tools::config_ref::AppConfigRef;
+use edgecrab_tools::read_materialized_set;
 use edgecrab_tools::registry::{
     ApprovalRequest, ApprovalResponse, DelegationEvent, ToolContext, ToolRegistry,
-    to_llm_definitions,
+    build_wire_llm_definitions, to_llm_definitions_with_mode,
 };
+use edgecrab_tools::{ToolSchemaMode, deferred_tool_error_response, is_deferred_not_on_wire};
 use edgecrab_types::trajectory::{
     TrajectoryMetadata, convert_scratchpad_to_think, save_trajectory,
 };
@@ -63,6 +65,7 @@ use edgequake_llm::traits::{CacheControl, StreamChunk, StreamUsage};
 use edgequake_llm::{CachePromptConfig, LLMProvider, apply_cache_control};
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
 use crate::agent::{Agent, ConversationResult, SessionState, resolve_tool_policy};
 use crate::completion_assessor::{CompletionContext, assess_completion};
@@ -75,7 +78,7 @@ use crate::model_router::{RoutingThresholds, SmartRoutingConfig, resolve_turn_ro
 use crate::pricing::{CanonicalUsage, estimate_cost};
 use crate::prompt_builder::{
     PromptBlocks, PromptBuilder, load_global_soul, load_memory_sections, load_preloaded_skills,
-    load_skill_summary,
+    load_skill_prompt_parts,
 };
 use crate::sub_agent_runner::CoreSubAgentRunner;
 
@@ -139,6 +142,7 @@ impl RunProgressState {
         interrupted: bool,
         budget_exhausted: bool,
         todo: TodoStateSnapshot,
+        harness: edgecrab_tools::HarnessSnapshot,
     ) -> CompletionContext<'a> {
         CompletionContext {
             final_response,
@@ -150,6 +154,7 @@ impl RunProgressState {
             active_todos: todo.active,
             blocked_todos: todo.blocked,
             child_runs_in_flight: self.child_runs_in_flight.load(Ordering::Relaxed),
+            harness,
         }
     }
 }
@@ -393,6 +398,7 @@ fn build_tool_context(
     lsp_gate: Option<Arc<dyn edgecrab_tools::LspGate>>,
     delegate_ctx: Option<ExecuteLoopDelegateCtx>,
     kanban_task_id: Option<String>,
+    materialized_tools: Option<Arc<std::sync::RwLock<std::collections::HashSet<String>>>>,
 ) -> ToolContext {
     let (delegate_depth, delegate_agent_id, delegate_parent_id) = match &delegate_ctx {
         Some(d) => (d.depth, Some(d.agent_id.clone()), d.parent_id.clone()),
@@ -445,6 +451,7 @@ fn build_tool_context(
         mutation_turn,
         lsp_gate,
         kanban_task_id,
+        materialized_tools,
     }
 }
 
@@ -635,6 +642,7 @@ struct DispatchContext {
     /// Child delegation identity when this loop runs inside a sub-agent.
     delegate_ctx: Option<ExecuteLoopDelegateCtx>,
     kanban_task_id: Option<String>,
+    materialized_tools: Option<Arc<std::sync::RwLock<std::collections::HashSet<String>>>>,
 }
 
 fn post_write_lsp_gate(
@@ -741,6 +749,8 @@ impl Agent {
                 std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
             });
 
+        let materialized_tools = Arc::new(std::sync::RwLock::new(std::collections::HashSet::new()));
+
         // Expand parent toolset configuration once and reuse for schema filtering,
         // ToolContext propagation, and child delegation restrictions.
         let gateway_running = self.gateway_sender.read().await.is_some();
@@ -766,7 +776,7 @@ impl Agent {
         // session_search, skills) on whether the corresponding tools are
         // actually enabled. Without this, the agent gets instructions for tools
         // it cannot use.
-        let (mut active_tool_defs, tool_names_for_prompt) =
+        let (mut active_tool_defs, tool_names_for_prompt, session_tool_schemas) =
             if let Some(ref registry) = tool_registry {
                 let ctx = build_tool_context(
                     &cwd,
@@ -794,6 +804,7 @@ impl Agent {
                     None, // lsp_gate not needed for schema resolution
                     delegate_ctx.clone(),
                     config.kanban_task_id.clone(),
+                    Some(materialized_tools.clone()),
                 );
 
                 // "all" sentinel / genuinely empty → pass None (no filtering).
@@ -813,9 +824,21 @@ impl Agent {
 
                 let schemas = registry.get_definitions(enabled_filter, disabled_filter, &ctx);
                 let names: Vec<String> = schemas.iter().map(|s| s.name.clone()).collect();
-                (to_llm_definitions(&schemas), names)
+                let materialized = read_materialized_set(Some(&materialized_tools));
+                (
+                    build_wire_llm_definitions(
+                        registry,
+                        &ctx,
+                        enabled_filter,
+                        disabled_filter,
+                        config.tool_schema_mode,
+                        &materialized,
+                    ),
+                    names,
+                    Some(schemas),
+                )
             } else {
-                (Vec::new(), Vec::new())
+                (Vec::new(), Vec::new(), None)
             };
 
         // Inject context engine tool schemas (if any) — added once at session start.
@@ -828,7 +851,10 @@ impl Agent {
                     let capped = &engine_schemas[..engine_schemas
                         .len()
                         .min(crate::context_engine::MAX_ENGINE_TOOLS)];
-                    active_tool_defs.extend(to_llm_definitions(capped));
+                    active_tool_defs.extend(to_llm_definitions_with_mode(
+                        capped,
+                        config.tool_schema_mode,
+                    ));
                     capped.iter().map(|s| s.name.clone()).collect()
                 } else {
                     std::collections::HashSet::new()
@@ -871,14 +897,14 @@ impl Agent {
                 } else {
                     Vec::new()
                 };
-                let skill_summary = load_skill_summary(
+                let skill_parts = load_skill_prompt_parts(
                     &home,
                     &disabled_skills,
                     Some(&tool_names_for_prompt),
                     Some(&toolsets_for_prompt),
                 );
                 // Load preloaded skills (from -s/--skill flag or config.skills.preloaded)
-                // and prepend their full content before the auto-discovered skill summary.
+                // and prepend their full content before plugin skill prompts.
                 let preloaded_content = load_preloaded_skills(
                     &home,
                     &config.skills_config.external_dirs,
@@ -888,28 +914,15 @@ impl Agent {
                 let plugin_skill_prompt = discovered_plugins
                     .as_ref()
                     .and_then(build_plugin_skill_prompt);
-                let combined_skill_prompt: Option<String> = match (
-                    preloaded_content.is_empty(),
-                    skill_summary,
-                    plugin_skill_prompt,
-                ) {
-                    (false, Some(summary), Some(plugin_summary)) => Some(format!(
-                        "{preloaded_content}\n\n{summary}\n\n{plugin_summary}"
-                    )),
-                    (false, Some(summary), None) => {
-                        Some(format!("{preloaded_content}\n\n{summary}"))
-                    }
-                    (false, None, Some(plugin_summary)) => {
-                        Some(format!("{preloaded_content}\n\n{plugin_summary}"))
-                    }
-                    (false, None, None) => Some(preloaded_content),
-                    (true, Some(summary), Some(plugin_summary)) => {
-                        Some(format!("{summary}\n\n{plugin_summary}"))
-                    }
-                    (true, Some(summary), None) => Some(summary),
-                    (true, None, Some(plugin_summary)) => Some(plugin_summary),
-                    (true, None, None) => None,
-                };
+                let extra_skill_dynamic: Option<String> =
+                    match (preloaded_content.is_empty(), plugin_skill_prompt) {
+                        (false, Some(plugin_summary)) => {
+                            Some(format!("{preloaded_content}\n\n{plugin_summary}"))
+                        }
+                        (false, None) => Some(preloaded_content),
+                        (true, Some(plugin_summary)) => Some(plugin_summary),
+                        (true, None) => None,
+                    };
                 // Load global SOUL.md from ~/.edgecrab/SOUL.md as identity override (slot #1).
                 // WHY: hermes-agent loads SOUL.md from HERMES_HOME as the agent's baseline
                 // identity. We do the same here — the global SOUL.md replaces DEFAULT_IDENTITY.
@@ -935,13 +948,15 @@ impl Agent {
                     .skip_context_files(config.skip_context_files)
                     .execution_environment_guidance(execution_guidance)
                     .available_tools(tool_names_for_prompt)
+                    .tool_schema_mode(config.tool_schema_mode)
                     .model_name(Some(config.model.clone()))
                     .session_id(Some(conversation_session_id.clone()))
                     .build_blocks(
                         global_soul.as_deref(), // global SOUL.md is identity override
                         Some(&cwd),
                         &memory_sections,
-                        combined_skill_prompt.as_deref(),
+                        skill_parts.as_ref(),
+                        extra_skill_dynamic.as_deref(),
                     );
                 // Personality addons are session-specific → append to the dynamic zone
                 // so the stable (cacheable) prefix is never invalidated by addon changes.
@@ -958,13 +973,35 @@ impl Agent {
                     }
                     dynamic.push_str(&format!("## Personality\n\n{addon}"));
                 }
+                if config.tool_schema_mode == edgecrab_tools::ToolSchemaMode::Indexed
+                    && let Some(ref schemas) = session_tool_schemas
+                {
+                    let (_, deferred) = edgecrab_tools::partition_schemas(
+                        schemas,
+                        &std::collections::HashSet::new(),
+                    );
+                    let index = edgecrab_tools::format_deferred_index(&deferred);
+                    if !index.is_empty() {
+                        if !dynamic.is_empty() {
+                            dynamic.push_str("\n\n");
+                        }
+                        dynamic.push_str(&index);
+                    }
+                }
                 let stable = blocks.stable;
+                let semi_stable = blocks.semi_stable;
                 let combined = PromptBlocks {
                     stable: stable.clone(),
+                    semi_stable: semi_stable.clone(),
                     dynamic,
                 }
                 .combined();
                 session.cached_stable_prompt = Some(stable);
+                session.cached_semi_stable_prompt = if semi_stable.is_empty() {
+                    None
+                } else {
+                    Some(semi_stable)
+                };
                 session.cached_system_prompt = Some(combined);
             }
         }
@@ -1498,6 +1535,7 @@ impl Agent {
                         None,
                         delegate_ctx.clone(),
                         config.kanban_task_id.clone(),
+                        Some(materialized_tools.clone()),
                     );
                     let enabled_filter = if config.enabled_toolsets.is_empty()
                         || edgecrab_tools::toolsets::contains_all_sentinel(&config.enabled_toolsets)
@@ -1512,9 +1550,15 @@ impl Agent {
                     } else {
                         Some(expanded_disabled.as_slice())
                     };
-                    let schemas =
-                        registry.get_definitions(enabled_filter, disabled_filter, &schema_ctx);
-                    to_llm_definitions(&schemas)
+                    let materialized = read_materialized_set(Some(&materialized_tools));
+                    build_wire_llm_definitions(
+                        registry,
+                        &schema_ctx,
+                        enabled_filter,
+                        disabled_filter,
+                        config.tool_schema_mode,
+                        &materialized,
+                    )
                 } else {
                     Vec::new()
                 };
@@ -1750,8 +1794,7 @@ impl Agent {
             if crate::local_provider_policy::local_tool_harness_active(
                 effective_provider.name(),
                 !active_tool_defs.is_empty(),
-            )
-            {
+            ) {
                 let spill_config = local_prune_spill_config(&app_config_ref);
                 let spill_ctx = build_prune_spill_context(
                     &conversation_session_id,
@@ -1798,8 +1841,7 @@ impl Agent {
             if crate::local_provider_policy::local_tool_harness_active(
                 effective_provider.name(),
                 !active_tool_defs.is_empty(),
-            )
-            {
+            ) {
                 let spill_config = local_prune_spill_config(&app_config_ref);
                 let spill_ctx = build_prune_spill_context(
                     &conversation_session_id,
@@ -1846,17 +1888,18 @@ impl Agent {
             // WHY cache config here: Anthropic prompt caching requires stable
             // cache_control breakpoints on the system prompt and last N messages.
             // We derive the config from the user's prompt_caching setting.
-            let cache_cfg = prompt_cache_config_for(
-                &effective_provider,
+            let resolved_cache = crate::prompt_cache_policy::resolve_prompt_cache(
+                effective_provider.name(),
+                effective_provider.model(),
+                config.model_config.base_url.as_deref(),
                 config.model_config.prompt_caching,
                 &config.cache.prompt_prefix,
-                config.model_config.base_url.as_deref(),
             );
             // When cached_stable_prompt is set (built via build_blocks()) AND
-            // Anthropic prompt caching is active, use the two-block path so the
-            // stable zone (8K-12K tokens of binary constants) is cached across
-            // sessions.  The combined prompt keeps the stable zone as a prefix so
-            // split_dynamic_from_stable() can safely extract the dynamic suffix.
+            // Anthropic prompt caching is active with native inner layout, use
+            // the two-block path so the stable zone is cached across sessions.
+            // Envelope-layout providers (OpenRouter Claude) use single-block
+            // caching via apply_cache_control instead.
             // Build API messages, optionally appending ephemeral goal context and local
             // tool-turn geometry nudges as user-role messages (cache-safe).
             let goal_block = crate::goals::render_goal_block(
@@ -1914,7 +1957,7 @@ impl Agent {
             let mut chat_messages = build_api_chat_messages(
                 &session,
                 &messages_for_api,
-                cache_cfg.as_ref(),
+                resolved_cache.as_ref(),
                 effective_provider.as_ref(),
                 &app_config_ref,
             );
@@ -1924,11 +1967,13 @@ impl Agent {
             // WHY cancel passed here: api_call_with_retry now races every sleep
             // and every API future against the CancellationToken so Ctrl+C takes
             // effect within one event-loop tick rather than after all retries finish.
-            tracing::info!(
-                provider = effective_provider.name(),
-                tool_count = active_tool_defs.len(),
-                messages = chat_messages.len(),
-                "execute_loop: about to call api_call_with_retry"
+            crate::observability::log_harness_api_iteration(
+                &conversation_session_id,
+                session.api_call_count,
+                effective_provider.name(),
+                effective_provider.model(),
+                active_tool_defs.len(),
+                chat_messages.len(),
             );
             let native_streaming_active = should_use_native_streaming(
                 effective_provider.as_ref(),
@@ -1994,7 +2039,7 @@ impl Agent {
                             chat_messages = build_api_chat_messages(
                                 &session,
                                 &messages_for_api,
-                                cache_cfg.as_ref(),
+                                resolved_cache.as_ref(),
                                 effective_provider.as_ref(),
                                 &app_config_ref,
                             );
@@ -2339,19 +2384,19 @@ impl Agent {
                             .into(),
                     ));
                 }
-                let recovery = edgecrab_tools::mutation_turn_policy::stream_interrupted_recovery_message(
-                    &[],
-                    app_config_ref.max_write_payload_bytes(),
-                    Some(provider.as_ref()),
-                );
+                let recovery =
+                    edgecrab_tools::mutation_turn_policy::stream_interrupted_recovery_message(
+                        &[],
+                        app_config_ref.max_write_payload_bytes(),
+                        Some(provider.as_ref()),
+                    );
                 session.messages.push(Message::user(&recovery));
                 continue;
             }
 
             // Empty response nudge: if the LLM returned no content and no
             // tool calls, inject a "please continue" prompt and retry.
-            if response.content.trim().is_empty()
-                && !response.has_tool_calls()
+            if !response_has_visible_output(&response)
                 && response.finish_reason.as_deref() != Some("length")
             {
                 tracing::info!("empty response from LLM, nudging to continue");
@@ -2391,6 +2436,7 @@ impl Agent {
                 watch_notification_tx: watch_notification_tx.clone(),
                 delegate_ctx: delegate_ctx.clone(),
                 kanban_task_id: config.kanban_task_id.clone(),
+                materialized_tools: Some(materialized_tools.clone()),
             };
             let action = match process_response(
                 &response,
@@ -2467,6 +2513,7 @@ impl Agent {
                         false,
                         false,
                         todo,
+                        edgecrab_tools::HarnessSnapshot::default(),
                     ));
 
                     if should_continue_after_model_text(&provisional_outcome) {
@@ -2671,6 +2718,27 @@ impl Agent {
             }
         }
 
+        let harness_snapshot = edgecrab_tools::build_harness_snapshot(
+            edgecrab_tools::HarnessBuildInput {
+                messages: &session.messages,
+                mutation_turn: &mutation_turn,
+                cwd: &cwd,
+                post_mutation_oracles: crate::config::harness_post_mutation_oracles_enabled(
+                    config.harness_post_mutation_oracles,
+                ),
+            },
+        );
+        if let Some(gate_footer) = harness_snapshot.render_gate_footer() {
+            if let Some(tx) = event_tx {
+                let _ = tx.send(crate::StreamEvent::Footer(gate_footer.clone()));
+            }
+            session.messages.push(Message::user(&format!(
+                "[harness-gates]\n{gate_footer}"
+            )));
+            final_response = format!("{}\n\n{}", final_response.trim_end(), gate_footer);
+            self.publish_session_state(&session).await;
+        }
+
         // ─── Learning reflection ──────────────────────────────────────────
         // If this session involved 5+ tool calls (complex task) and the agent
         // has a tool registry with skill_manage / memory_write available,
@@ -2747,8 +2815,18 @@ impl Agent {
             interrupted,
             budget_exhausted,
             todo,
+            harness_snapshot.clone(),
         ));
         session.last_run_outcome = Some(run_outcome.clone());
+        crate::observability::log_harness_completion(
+            &conversation_session_id,
+            &config.platform.to_string(),
+            run_outcome.state.as_str(),
+            run_outcome.exit_reason.as_str(),
+            harness_snapshot.blocks_completion(),
+            harness_snapshot.oracle_failures.len(),
+            harness_snapshot.unresolved_mutation_failures.len(),
+        );
         self.publish_session_state(&session).await;
         if let Some(tx) = event_tx {
             let _ = tx.send(crate::StreamEvent::RunFinished {
@@ -2963,7 +3041,7 @@ impl Agent {
 fn build_api_chat_messages(
     session: &SessionState,
     messages_for_api: &[Message],
-    cache_cfg: Option<&CachePromptConfig>,
+    cache: Option<&crate::prompt_cache_policy::ResolvedPromptCache>,
     provider: &dyn LLMProvider,
     app_cfg: &edgecrab_tools::config_ref::AppConfigRef,
 ) -> Vec<edgequake_llm::ChatMessage> {
@@ -2976,11 +3054,18 @@ fn build_api_chat_messages(
         app_cfg,
         &session.tool_result_image_downgrades,
     );
-    let mut out = match (session.cached_stable_prompt.as_deref(), cache_cfg) {
-        (Some(stable), Some(cfg)) => {
+    let cache_cfg = cache.map(|resolved| &resolved.config);
+    let native_inner_layout = cache.is_some_and(|resolved| resolved.decision.native_inner_layout);
+    let mut out = match (
+        session.cached_stable_prompt.as_deref(),
+        cache_cfg,
+        native_inner_layout,
+    ) {
+        (Some(stable), Some(cfg), true) => {
             let combined = session.cached_system_prompt.as_deref().unwrap_or("");
-            let dynamic = split_dynamic_from_stable(combined, stable);
-            build_chat_messages_blocks(stable, dynamic, messages_for_api, Some(cfg), attach)
+            let semi = session.cached_semi_stable_prompt.as_deref().unwrap_or("");
+            let dynamic = split_dynamic_after_cache_prefixes(combined, stable, semi);
+            build_chat_messages_blocks(stable, semi, dynamic, messages_for_api, Some(cfg), attach)
         }
         _ => build_chat_messages(
             session.cached_system_prompt.as_deref(),
@@ -3042,15 +3127,29 @@ fn append_conversation_messages(
     }
 }
 
-/// Extract the dynamic portion of a combined system prompt given the stable prefix.
+/// Extract the dynamic portion of a combined system prompt given stable + semi-stable prefixes.
 ///
-/// Returns the combined string unchanged when the stable prefix is not found,
-/// guarding against any accidental mismatch after an `append_to_system_prompt` call.
-fn split_dynamic_from_stable<'a>(combined: &'a str, stable: &'a str) -> &'a str {
-    if stable.is_empty() || !combined.starts_with(stable) {
-        return combined;
+/// Returns the combined string unchanged when prefixes do not match in order,
+/// guarding against accidental mismatch after an `append_to_system_prompt` call.
+pub fn split_dynamic_after_cache_prefixes<'a>(
+    combined: &'a str,
+    stable: &'a str,
+    semi_stable: &'a str,
+) -> &'a str {
+    let mut rest = combined;
+    if !stable.is_empty() {
+        if !rest.starts_with(stable) {
+            return combined;
+        }
+        rest = rest[stable.len()..].trim_start_matches('\n');
     }
-    combined[stable.len()..].trim_start_matches('\n')
+    if !semi_stable.is_empty() {
+        if !rest.starts_with(semi_stable) {
+            return combined;
+        }
+        rest = rest[semi_stable.len()..].trim_start_matches('\n');
+    }
+    rest
 }
 
 /// Cache marker for the stable system prefix (cross-session 1h tier when configured).
@@ -3063,41 +3162,38 @@ fn stable_cache_control(cache_config: Option<&CachePromptConfig>) -> Option<Cach
     })
 }
 
-/// Build edgequake-llm `ChatMessage`s using the stable/dynamic system prompt split.
+/// Build edgequake-llm `ChatMessage`s using the stable/semi-stable/dynamic system split.
 ///
 /// ## Cache strategy
-/// - `stable` block → emitted as `ChatMessage::system(stable)` with
-///   `cache_control: ephemeral`.  Because the stable zone contains only
-///   binary constants (no datetime, no file content), Anthropic keeps it
-///   cached across sessions and turns, reducing input-token cost by up to 90%.
-/// - `dynamic` block → emitted as `ChatMessage::system(dynamic)` with no
-///   cache_control.  Changes every session so caching would never hit.
-/// - User messages → `apply_cache_control` marks the last N with
-///   `cache_control: ephemeral` (same as the single-block path), with
-///   `cache_system_prompt: false` to avoid double-marking.
+/// - `stable` block → `cache_control` with configured TTL (default 1h).
+/// - `semi_stable` block → `cache_control` with 5m TTL (skills index churn).
+/// - `dynamic` block → no cache_control (datetime, context files, memory).
+/// - User messages → `apply_cache_control` marks the last N with ephemeral.
 ///
-/// When `stable` is empty, falls back to single-block behaviour (only the
-/// dynamic message is emitted, without cache_control).
+/// When `stable` is empty, falls back to single-block behaviour for the
+/// remaining zones (without cache_control on dynamic-only paths).
 pub fn build_chat_messages_blocks(
     stable: &str,
+    semi_stable: &str,
     dynamic: &str,
     messages: &[Message],
     cache_config: Option<&CachePromptConfig>,
     attach_computer_use_images: bool,
 ) -> Vec<edgequake_llm::ChatMessage> {
-    let mut out = Vec::with_capacity(messages.len() + 2);
+    let mut out = Vec::with_capacity(messages.len() + 3);
 
-    // Stable system block — mark as cacheable so Anthropic can amortise the
-    // one-time cache-write cost across every turn of the session and across
-    // all sessions that share the same model/toolset configuration.
     if !stable.is_empty() {
         let mut sys = edgequake_llm::ChatMessage::system(stable);
         sys.cache_control = stable_cache_control(cache_config);
         out.push(sys);
     }
 
-    // Dynamic system block — emitted without cache_control because its content
-    // (datetime, context files, memory) differs between sessions.
+    if !semi_stable.is_empty() {
+        let mut sys = edgequake_llm::ChatMessage::system(semi_stable);
+        sys.cache_control = Some(CacheControl::ephemeral_ttl("5m"));
+        out.push(sys);
+    }
+
     if !dynamic.is_empty() {
         out.push(edgequake_llm::ChatMessage::system(dynamic));
     }
@@ -3164,28 +3260,6 @@ pub fn build_chat_messages(
     out
 }
 
-fn prompt_cache_config_for(
-    provider: &Arc<dyn LLMProvider>,
-    prompt_caching_enabled: bool,
-    prefix_cfg: &crate::config::PromptPrefixCacheConfig,
-    base_url: Option<&str>,
-) -> Option<CachePromptConfig> {
-    if !(prompt_caching_enabled
-        && prefix_cfg.enabled
-        && crate::prompt_cache_policy::provider_supports_prompt_caching(
-            provider.name(),
-            provider.model(),
-            base_url,
-        ))
-    {
-        return None;
-    }
-    Some(CachePromptConfig {
-        cache_ttl: Some(prefix_cfg.normalized_ttl().to_string()),
-        ..Default::default()
-    })
-}
-
 fn augment_provider_error(provider: &Arc<dyn LLMProvider>, error: String) -> String {
     if provider.name() == "vscode-copilot" {
         let lower = error.to_ascii_lowercase();
@@ -3227,8 +3301,7 @@ fn augment_provider_error(provider: &Arc<dyn LLMProvider>, error: String) -> Str
 /// sequential dispatch arms of `process_response`.
 #[inline]
 fn parse_tool_error_response(result: &str) -> Option<ToolErrorResponse> {
-    let parsed = serde_json::from_str::<ToolErrorResponse>(result).ok()?;
-    (parsed.response_type == "tool_error").then_some(parsed)
+    edgecrab_types::parse_tool_error_payload(result)
 }
 
 fn tool_attempt_fingerprint(name: &str, args_json: &str) -> String {
@@ -3373,6 +3446,7 @@ fn emit_tool_done(
     duration_ms: u64,
     is_error: bool,
 ) {
+    crate::stream_observability::log_tool_done(tool_call_id, name, duration_ms, is_error);
     if let Some(tx) = tx {
         let _ = tx.send(crate::StreamEvent::ToolDone {
             tool_call_id: tool_call_id.to_string(),
@@ -3464,267 +3538,7 @@ fn build_shadow_judge_message(steering_hint: &str, reason: &str) -> String {
 }
 
 fn summarize_tool_result_preview(name: &str, tool_result: &str, is_error: bool) -> Option<String> {
-    fn first_nonempty_line(text: &str) -> Option<String> {
-        text.lines()
-            .map(str::trim)
-            .find(|line| !line.is_empty())
-            .map(ToOwned::to_owned)
-    }
-
-    fn truncate(text: &str, limit: usize) -> String {
-        crate::safe_truncate(text, limit).to_string()
-    }
-
-    fn count_truthy_entries(arr: &[serde_json::Value], key: &str) -> usize {
-        arr.iter()
-            .filter(|entry| entry.get(key).and_then(|v| v.as_bool()).unwrap_or(false))
-            .count()
-    }
-
-    fn summarize_structured_result(
-        name: &str,
-        obj: &serde_json::Map<String, serde_json::Value>,
-    ) -> Option<String> {
-        match name {
-            "web_search" => {
-                let count = obj
-                    .get("results")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| arr.len())?;
-                let backend = obj.get("backend").and_then(|v| v.as_str()).unwrap_or("web");
-                let fallback = obj
-                    .get("fallback_from")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty());
-                let skipped = obj
-                    .get("skipped_tool_override")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty());
-                Some(edgecrab_tools::format_web_search_status_line(
-                    count, backend, fallback, skipped,
-                ))
-            }
-            "web_extract" | "web_crawl" => {
-                let backend = obj.get("backend").and_then(|v| v.as_str()).unwrap_or("web");
-                if let Some(results) = obj.get("results").and_then(|v| v.as_array()) {
-                    let success = count_truthy_entries(results, "success");
-                    return Some(format!("{success}/{} page(s) via {backend}", results.len()));
-                }
-                if obj.get("result").is_some() {
-                    return Some(format!("1 page via {backend}"));
-                }
-                None
-            }
-            "todo" | "manage_todo_list" => {
-                let summary = obj.get("summary")?.as_object()?;
-                let total = summary.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
-                let completed = summary
-                    .get("completed")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                let in_progress = summary
-                    .get("in_progress")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                Some(format!(
-                    "{completed}/{total} done, {in_progress} in progress"
-                ))
-            }
-            "report_task_status" => {
-                let status = obj
-                    .get("status")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("in_progress");
-                let summary = obj
-                    .get("summary")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .trim();
-                let remaining = obj
-                    .get("remaining_steps")
-                    .and_then(|v| v.as_array())
-                    .map(|steps| steps.len())
-                    .unwrap_or(0);
-                let label = match status {
-                    "completed" => "completed",
-                    "blocked" => "blocked",
-                    _ => "progress",
-                };
-                if summary.is_empty() {
-                    Some(label.to_string())
-                } else if remaining > 0 {
-                    Some(format!("{label}: {summary} · {remaining} step(s) left"))
-                } else {
-                    Some(format!("{label}: {summary}"))
-                }
-            }
-            "delegate_task" => {
-                let results = obj.get("results")?.as_array()?;
-                let completed = results
-                    .iter()
-                    .filter(|entry| {
-                        matches!(
-                            entry.get("status").and_then(|v| v.as_str()),
-                            Some("success" | "completed")
-                        )
-                    })
-                    .count();
-                let duration = obj
-                    .get("total_duration_seconds")
-                    .and_then(|v| v.as_f64())
-                    .map(|secs| format!(" in {secs:.2}s"))
-                    .unwrap_or_default();
-                Some(format!(
-                    "{completed}/{} task(s) completed{duration}",
-                    results.len()
-                ))
-            }
-            "generate_image" | "image_generate" => {
-                let files = obj.get("files").and_then(|v| v.as_array())?;
-                let provider = obj
-                    .get("provider")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("image");
-                Some(format!("{} image(s) via {provider}", files.len()))
-            }
-            "send_message" => {
-                let platform = obj.get("platform").and_then(|v| v.as_str()).unwrap_or("?");
-                let recipient = obj
-                    .get("recipient")
-                    .and_then(|v| v.as_str())
-                    .filter(|value| !value.is_empty())
-                    .unwrap_or("home");
-                Some(format!("sent via {platform} to {recipient}"))
-            }
-            "cronjob" | "cron" | "manage_cron_jobs" => {
-                if let Some(message) = obj.get("message").and_then(|v| v.as_str()) {
-                    return Some(message.trim().to_string());
-                }
-                if let Some(total) = obj.get("total").and_then(|v| v.as_u64()) {
-                    return Some(format!("{total} cron job(s)"));
-                }
-                if let Some(total_jobs) = obj.get("total_jobs").and_then(|v| v.as_u64()) {
-                    let active = obj.get("active_jobs").and_then(|v| v.as_u64()).unwrap_or(0);
-                    return Some(format!("{active}/{total_jobs} active cron job(s)"));
-                }
-                None
-            }
-            "mcp_list_tools" | "mcp_list_resources" | "mcp_list_prompts" => {
-                for key in ["tools", "resources", "prompts"] {
-                    if let Some(count) =
-                        obj.get(key).and_then(|v| v.as_array()).map(|arr| arr.len())
-                    {
-                        return Some(format!("{count} {key}"));
-                    }
-                }
-                None
-            }
-            _ => None,
-        }
-    }
-
-    if tool_result.trim().starts_with("[tool_result_spill]") {
-        if name == "computer_use" {
-            for line in tool_result.lines() {
-                if line.starts_with("--- BEGIN PREVIEW") {
-                    continue;
-                }
-                if line.starts_with("--- END PREVIEW") {
-                    break;
-                }
-                let trimmed = line.trim();
-                if trimmed.is_empty()
-                    || trimmed.starts_with("tool:")
-                    || trimmed.starts_with("bytes:")
-                {
-                    continue;
-                }
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                    if let Some(msg) = val.get("message").and_then(|v| v.as_str()) {
-                        return Some(truncate(msg, 88));
-                    }
-                    if let Some(summary) = val
-                        .get("text_summary")
-                        .or_else(|| val.get("summary"))
-                        .and_then(|v| v.as_str())
-                    {
-                        let first = summary.lines().next().unwrap_or(summary);
-                        return Some(truncate(first, 88));
-                    }
-                }
-                if trimmed.contains("capture mode=") {
-                    return Some(truncate(trimmed, 88));
-                }
-            }
-        }
-        return Some(truncate("[spilled — use read_file on artifact]", 88));
-    }
-
-    if is_error {
-        let line = extract_tool_error_text(tool_result);
-        let line = if line.trim().is_empty() {
-            first_nonempty_line(tool_result)?
-        } else {
-            line
-        };
-        return Some(truncate(&line, 88));
-    }
-
-    if name == "computer_use"
-        && let Ok(value) = serde_json::from_str::<serde_json::Value>(tool_result)
-    {
-        if let Some(msg) = value.get("message").and_then(|v| v.as_str()) {
-            return Some(truncate(msg.trim(), 88));
-        }
-        if value.get("_multimodal").and_then(|v| v.as_bool()) == Some(true) {
-            let summary = value
-                .get("text_summary")
-                .and_then(|v| v.as_str())
-                .unwrap_or("capture");
-            let first = summary.lines().next().unwrap_or(summary);
-            return Some(truncate(first, 88));
-        }
-        if let Some(summary) = value.get("summary").and_then(|v| v.as_str()) {
-            let first = summary.lines().next().unwrap_or(summary);
-            return Some(truncate(first, 88));
-        }
-    }
-
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(tool_result)
-        && let Some(obj) = value.as_object()
-    {
-        if let Some(summary) = summarize_structured_result(name, obj) {
-            return Some(truncate(&summary, 88));
-        }
-        for key in ["summary", "message", "status", "result", "path"] {
-            if let Some(text) = obj.get(key).and_then(|v| v.as_str()) {
-                let text = text.trim();
-                if !text.is_empty() {
-                    return Some(truncate(text, 88));
-                }
-            }
-        }
-    }
-
-    if name == "terminal" {
-        let mut lines = tool_result.lines();
-        let _header = lines.next();
-        let body = lines
-            .map(str::trim)
-            .find(|line| !line.is_empty() && !line.starts_with("exit code:"));
-        if let Some(body) = body {
-            return Some(truncate(body, 88));
-        }
-        if let Some(exit_line) = tool_result
-            .lines()
-            .map(str::trim)
-            .find(|line| line.starts_with("exit code:"))
-        {
-            return Some(truncate(exit_line, 88));
-        }
-    }
-
-    first_nonempty_line(tool_result).map(|line| truncate(&line, 88))
+    crate::tool_result_summary::summarize_tool_result_preview(name, tool_result, is_error)
 }
 
 #[derive(Default)]
@@ -3797,8 +3611,10 @@ fn emit_tool_generating_progress(
         let Some(name) = entry.function_name.clone() else {
             continue;
         };
-        if !edgecrab_tools::tool_progress_tail::should_emit_progress(entry.last_generating_emit, now)
-        {
+        if !edgecrab_tools::tool_progress_tail::should_emit_progress(
+            entry.last_generating_emit,
+            now,
+        ) {
             continue;
         }
         entry.last_generating_emit = Some(now);
@@ -3814,9 +3630,7 @@ fn emit_tool_generating_progress(
     }
 }
 
-fn tool_arg_stall_break(
-    tool_calls: &BTreeMap<usize, PartialToolCall>,
-) -> Option<(String, usize)> {
+fn tool_arg_stall_break(tool_calls: &BTreeMap<usize, PartialToolCall>) -> Option<(String, usize)> {
     for entry in tool_calls.values() {
         let Some(name) = entry.function_name.as_ref() else {
             continue;
@@ -3880,10 +3694,7 @@ async fn api_call_streaming(
                 Err(_) => {
                     for entry in tool_calls.values() {
                         if entry.function_name.is_some() {
-                            let name = entry
-                                .function_name
-                                .as_deref()
-                                .unwrap_or("tool");
+                            let name = entry.function_name.as_deref().unwrap_or("tool");
                             let _ = event_tx.send(crate::StreamEvent::ActivityNotice(
                                 edgecrab_tools::tool_progress_tail::format_tool_args_stream_stall(
                                     name,
@@ -3916,8 +3727,7 @@ async fn api_call_streaming(
         };
         match chunk? {
             StreamChunk::PrefillProgress { progress } => {
-                let prefill_pct =
-                    Some((progress.clamp(0.0, 1.0) * 100.0) as f32);
+                let prefill_pct = Some((progress.clamp(0.0, 1.0) * 100.0) as f32);
                 let _ = event_tx.send(crate::StreamEvent::LlmWaitProgress {
                     provider: provider.name().to_string(),
                     elapsed_secs: stream_started.elapsed().as_secs(),
@@ -4107,6 +3917,28 @@ async fn api_call_streaming(
     Ok(response)
 }
 
+/// User-visible assistant text: `content` when present, else OpenAI `refusal`.
+fn assistant_display_text(response: &edgequake_llm::LLMResponse) -> String {
+    if !response.content.trim().is_empty() {
+        return response.content.clone();
+    }
+    response.refusal.clone().unwrap_or_default()
+}
+
+/// Whether the model produced anything worth keeping (not an empty nudge candidate).
+fn response_has_visible_output(response: &edgequake_llm::LLMResponse) -> bool {
+    !response.content.trim().is_empty()
+        || response
+            .refusal
+            .as_deref()
+            .is_some_and(|r| !r.trim().is_empty())
+        || response
+            .thinking_content
+            .as_deref()
+            .is_some_and(|t| !t.trim().is_empty())
+        || response.has_tool_calls()
+}
+
 fn estimate_stream_prompt_tokens(
     messages: &[edgequake_llm::ChatMessage],
     tool_defs: &[edgequake_llm::ToolDefinition],
@@ -4169,15 +4001,15 @@ fn try_local_structural_prune_request(
     active_context_length: usize,
 ) -> Option<(Vec<Message>, usize, usize, usize)> {
     let prompt_before = estimate_request_prompt_tokens(system_prompt, messages, tool_defs);
-    let (pruned_messages, outcome) = crate::local_provider_policy::try_apply_structural_tool_output_prune(
-        phase,
-        prompt_before,
-        active_context_length,
-        messages,
-        Some(spill_ctx),
-    )?;
-    let prompt_after =
-        estimate_request_prompt_tokens(system_prompt, &pruned_messages, tool_defs);
+    let (pruned_messages, outcome) =
+        crate::local_provider_policy::try_apply_structural_tool_output_prune(
+            phase,
+            prompt_before,
+            active_context_length,
+            messages,
+            Some(spill_ctx),
+        )?;
+    let prompt_after = estimate_request_prompt_tokens(system_prompt, &pruned_messages, tool_defs);
     Some((
         pruned_messages,
         outcome.tools_pruned,
@@ -4344,29 +4176,25 @@ fn spawn_nonstreaming_wait_heartbeat(
     let tx = event_tx.cloned()?;
     let provider_name = provider.name().to_string();
     let cancel = cancel.clone();
-    let timeout_warn_at =
-        ((http_timeout_secs as f64) * crate::local_provider_policy::LOCAL_HTTP_TIMEOUT_WARN_RATIO)
-            as u64;
+    let timeout_warn_at = ((http_timeout_secs as f64)
+        * crate::local_provider_policy::LOCAL_HTTP_TIMEOUT_WARN_RATIO)
+        as u64;
     Some(tokio::spawn(async move {
         let started = std::time::Instant::now();
         let mut pulses = 0u32;
         let mut timeout_warned = false;
         loop {
             let elapsed = started.elapsed().as_secs();
-            if has_tools
-                && !timeout_warned
-                && http_timeout_secs > 0
-                && elapsed >= timeout_warn_at
-            {
+            if has_tools && !timeout_warned && http_timeout_secs > 0 && elapsed >= timeout_warn_at {
                 timeout_warned = true;
                 tracing::warn!(
-                    target: "edgecrab::local_llm",
+                    target: crate::observability::TARGET_PROVIDER_LLM,
                     provider = %provider_name,
                     elapsed_secs = elapsed,
                     http_timeout_secs,
                     prompt_tokens_estimated = ?wait_ctx.prompt_tokens_estimated,
                     context_length = ?wait_ctx.context_length,
-                    "local_llm: approaching HTTP timeout while composing tool call"
+                    "provider_llm: approaching HTTP timeout while composing tool call"
                 );
                 let notice =
                     edgecrab_tools::tool_progress_tail::format_local_timeout_proximity_notice(
@@ -4508,42 +4336,33 @@ async fn api_call_with_retry(
                 !tool_defs.is_empty(),
             );
             let tool_choice_required = tool_choice.is_some();
-            if crate::local_provider_policy::is_local_inference_provider(provider.name()) {
-                tracing::info!(
-                    target: "edgecrab::local_llm",
-                    attempt,
-                    streaming = use_native_streaming_this_attempt,
-                    provider = provider.name(),
-                    model = provider.model(),
-                    has_tools = !tool_defs.is_empty(),
-                    max_tokens = ctx.options.and_then(|o| o.max_tokens),
-                    reasoning_effort = ctx.options.and_then(|o| o.reasoning_effort.as_deref()),
-                    tool_choice_required,
-                    prompt_tokens_estimated = prompt_tokens_est,
-                    context_length = provider.max_context_length(),
-                    http_timeout_secs,
-                    "local_llm: request start"
-                );
-            }
-            tracing::info!(
+            let correlation = crate::observability::LlmCorrelation {
+                session_id: ctx.conversation_session_id,
+                api_call_count: ctx.api_call_count,
                 attempt,
-                streaming = use_native_streaming_this_attempt,
-                provider = provider.name(),
-                "api_call_with_retry: sending API request"
-            );
+                platform: ctx.platform,
+            };
+            let request_start = crate::observability::LlmRequestStart {
+                correlation,
+                provider: provider.name(),
+                model: provider.model(),
+                streaming: use_native_streaming_this_attempt,
+                tool_count: tool_defs.len(),
+                prompt_tokens_estimated: prompt_tokens_est,
+                context_length: provider.max_context_length(),
+                http_timeout_secs,
+                tool_choice_required,
+                max_tokens: ctx.options.and_then(|o| o.max_tokens),
+                reasoning_effort: ctx.options.and_then(|o| o.reasoning_effort.as_deref()),
+            };
+            let attempt_span = crate::observability::llm_attempt_span(&request_start);
 
             // ── API call — interruptible ────────────────────────────────
             // We race the provider future against the cancel token.
             // Dropping the provider future is safe: HTTP futures in reqwest
             // are cancel-safe (the TCP connection is simply closed).
             if let Some(tx) = ctx.event_tx {
-                let ctx_json = serde_json::json!({
-                    "event": "llm:pre",
-                    "model": provider.model(),
-                    "attempt": attempt,
-                    "native_tool_streaming": use_native_streaming_this_attempt,
-                })
-                .to_string();
+                let ctx_json = crate::observability::llm_pre_hook_json(&request_start).to_string();
                 let _ = tx.send(crate::StreamEvent::HookEvent {
                     event: "llm:pre".to_string(),
                     context_json: ctx_json,
@@ -4551,28 +4370,33 @@ async fn api_call_with_retry(
             }
 
             let call_fut = async {
-                if use_native_streaming_this_attempt {
-                    let tx = ctx
-                        .event_tx
-                        .expect("native streaming requires event channel");
-                    api_call_streaming(
-                        provider,
-                        messages,
-                        tool_defs,
-                        tool_choice.clone(),
-                        ctx.options,
-                        tx,
-                        &tokens_sent,
-                    )
-                    .await
-                } else if tool_defs.is_empty() {
-                    provider.chat(messages, ctx.options).await
-                } else {
-                    provider
-                        .chat_with_tools(messages, tool_defs, tool_choice, ctx.options)
+                let platform = ctx.platform.to_string();
+                edgequake_llm::with_trace_context(ctx.conversation_session_id, &platform, async {
+                    if use_native_streaming_this_attempt {
+                        let tx = ctx
+                            .event_tx
+                            .expect("native streaming requires event channel");
+                        api_call_streaming(
+                            provider,
+                            messages,
+                            tool_defs,
+                            tool_choice.clone(),
+                            ctx.options,
+                            tx,
+                            &tokens_sent,
+                        )
                         .await
-                }
-            };
+                    } else if tool_defs.is_empty() {
+                        provider.chat(messages, ctx.options).await
+                    } else {
+                        provider
+                            .chat_with_tools(messages, tool_defs, tool_choice, ctx.options)
+                            .await
+                    }
+                })
+                .await
+            }
+            .instrument(attempt_span);
 
             let heartbeat = if !use_native_streaming_this_attempt {
                 let wait_ctx = edgecrab_tools::tool_progress_tail::LlmWaitContext {
@@ -4608,22 +4432,6 @@ async fn api_call_with_retry(
             match result {
                 Ok(response) => {
                     let elapsed_ms = request_started_at.elapsed().as_millis() as u64;
-                    let response_metrics = crate::local_provider_policy::LocalLlmResponseMetrics {
-                        elapsed_ms,
-                        finish_reason: response.finish_reason.clone(),
-                        prompt_tokens: response.prompt_tokens,
-                        completion_tokens: response.completion_tokens,
-                        thinking_tokens: response.thinking_tokens,
-                        tool_call_count: response.tool_calls.len(),
-                        content_len: response.content.len(),
-                        has_reasoning_content: response.thinking_content.is_some(),
-                        max_tokens: ctx.options.and_then(|o| o.max_tokens),
-                        tool_choice_required,
-                    };
-                    crate::local_provider_policy::log_local_llm_response(
-                        provider.as_ref(),
-                        &response_metrics,
-                    );
                     invoke_post_api_request_hooks(
                         &ctx,
                         provider,
@@ -4634,17 +4442,34 @@ async fn api_call_with_retry(
                         request_started_at,
                     )
                     .await;
+                    let operation = if use_native_streaming_this_attempt {
+                        "chat_with_tools_stream"
+                    } else if tool_defs.is_empty() {
+                        "chat"
+                    } else {
+                        "chat_with_tools"
+                    };
+                    crate::observability::record_llm_operation(
+                        correlation,
+                        provider.name(),
+                        provider.model(),
+                        operation,
+                        elapsed_ms,
+                        true,
+                        Some(&response),
+                    );
                     if response.finish_reason.as_deref() == Some(FINISH_REASON_STREAM_INTERRUPTED) {
                         disabled_native_tool_streaming = true;
                     }
                     if let Some(tx) = ctx.event_tx {
-                        let ctx_json = serde_json::json!({
-                            "event": "llm:post",
-                            "model": provider.model(),
-                            "prompt_tokens": response.prompt_tokens,
-                            "completion_tokens": response.completion_tokens,
-                            "native_tool_streaming": use_native_streaming_this_attempt,
-                        })
+                        let ctx_json = crate::observability::llm_post_hook_json(
+                            correlation,
+                            provider.name(),
+                            provider.model(),
+                            use_native_streaming_this_attempt,
+                            elapsed_ms,
+                            &response,
+                        )
                         .to_string();
                         let _ = tx.send(crate::StreamEvent::HookEvent {
                             event: "llm:post".to_string(),
@@ -4658,21 +4483,21 @@ async fn api_call_with_retry(
                 }
                 Err(e) => {
                     let elapsed_ms = request_started_at.elapsed().as_millis() as u64;
-                    if crate::local_provider_policy::blocks_transport_retry(provider.as_ref(), &e)
-                    {
+                    crate::observability::log_llm_attempt_failure(
+                        correlation,
+                        provider.name(),
+                        provider.model(),
+                        use_native_streaming_this_attempt,
+                        elapsed_ms,
+                        &e.to_string(),
+                    );
+                    if crate::local_provider_policy::blocks_transport_retry(provider.as_ref(), &e) {
                         crate::local_provider_policy::log_local_llm_transport_failure(
                             provider.as_ref(),
                             elapsed_ms,
                             attempt,
                             &e.to_string(),
                         );
-                    }
-                    tracing::warn!(attempt, error = %e, "API call failed");
-
-                    if crate::local_provider_policy::blocks_transport_retry(
-                        provider.as_ref(),
-                        &e,
-                    ) {
                         emit_local_transport_stall_notice(ctx.event_tx, provider.as_ref());
                         last_err = Some(e.to_string());
                         break 'attempt_loop;
@@ -4779,14 +4604,16 @@ async fn api_call_with_retry(
         |e| augment_provider_error(provider, e),
     );
 
-    let transport_stall = crate::local_provider_policy::is_local_inference_provider(provider.name())
-        && crate::local_provider_policy::transport_stall_error_suffix(provider.name()).is_some()
-        && {
-            let lower = raw_err.to_ascii_lowercase();
-            lower.contains("timeout")
-                || lower.contains("timed out")
-                || lower.contains("network")
-        };
+    let transport_stall =
+        crate::local_provider_policy::is_local_inference_provider(provider.name())
+            && crate::local_provider_policy::transport_stall_error_suffix(provider.name())
+                .is_some()
+            && {
+                let lower = raw_err.to_ascii_lowercase();
+                lower.contains("timeout")
+                    || lower.contains("timed out")
+                    || lower.contains("network")
+            };
 
     // FP18: For rate-limit errors, produce a clear message that names the model
     // and suggests the user wait before retrying — mirrors hermes-agent guidance.
@@ -5174,8 +5001,9 @@ async fn process_response(
             })
             .collect();
 
-        let assistant_text = response.content.clone();
-        let mut assistant_msg = Message::assistant_with_tool_calls(&assistant_text, our_tool_calls.clone());
+        let assistant_text = assistant_display_text(response);
+        let mut assistant_msg =
+            Message::assistant_with_tool_calls(&assistant_text, our_tool_calls.clone());
         if let Some(ref thinking) = response.thinking_content {
             assistant_msg.reasoning = Some(thinking.clone());
         }
@@ -5361,6 +5189,7 @@ async fn process_response(
                 let watch_notification_tx = dctx.watch_notification_tx.clone();
                 let delegate_ctx = dctx.delegate_ctx.clone();
                 let kanban_task_id = dctx.kanban_task_id.clone();
+                let materialized_tools = dctx.materialized_tools.clone();
 
                 parallel_tasks.spawn(async move {
                     let started = std::time::Instant::now();
@@ -5393,6 +5222,7 @@ async fn process_response(
                         watch_notification_tx,
                         delegate_ctx,
                         kanban_task_id,
+                        materialized_tools,
                     };
                     let result = dispatch_single_tool(&tc_id, &tc_name, &tc_args, &inner).await;
                     let duration_ms = started.elapsed().as_millis() as u64;
@@ -5439,8 +5269,7 @@ async fn process_response(
                             argument_loop_blocked = true;
                         }
                         if should_count_failure_for_escalation(&tool_result) {
-                            failure_tracker
-                                .record_failure(&extract_tool_error_text(&tool_result));
+                            failure_tracker.record_failure(&extract_tool_error_text(&tool_result));
                         } else {
                             failure_tracker.record_success();
                         }
@@ -5624,7 +5453,7 @@ async fn process_response(
 
     // Text response — we're done.
     // Extract reasoning/thinking content from the LLM response if present.
-    let text = response.content.clone();
+    let text = assistant_display_text(response);
     let mut msg = Message::assistant(&text);
     if let Some(ref thinking) = response.thinking_content {
         msg.reasoning = Some(thinking.clone());
@@ -5711,6 +5540,25 @@ async fn dispatch_single_tool(
     args_json: &str,
     dctx: &DispatchContext,
 ) -> (String, Vec<Message>) {
+    let span = crate::stream_observability::tool_execution_span(
+        tool_call_id,
+        name,
+        &dctx.conversation_session_id,
+        dctx.platform,
+    );
+    async {
+        dispatch_single_tool_impl(tool_call_id, name, args_json, dctx).await
+    }
+    .instrument(span)
+    .await
+}
+
+async fn dispatch_single_tool_impl(
+    tool_call_id: &str,
+    name: &str,
+    args_json: &str,
+    dctx: &DispatchContext,
+) -> (String, Vec<Message>) {
     let Some(reg) = dctx.registry.as_ref() else {
         return (
             format!(
@@ -5749,7 +5597,17 @@ async fn dispatch_single_tool(
         );
     }
 
-    let prepared = match edgecrab_tools::tool_call_pipeline::prepare_tool_call(reg, name, args_json) {
+    if dctx.app_config_ref.tool_schema_mode == ToolSchemaMode::Indexed
+        && is_deferred_not_on_wire(
+            &lookup_name,
+            &read_materialized_set(dctx.materialized_tools.as_ref()),
+        )
+    {
+        return (deferred_tool_error_response(&lookup_name), Vec::new());
+    }
+
+    let prepared = match edgecrab_tools::tool_call_pipeline::prepare_tool_call(reg, name, args_json)
+    {
         Ok(prepared) => {
             if prepared.name_repaired || prepared.original_name.trim() != prepared.name {
                 tracing::info!(
@@ -5761,7 +5619,12 @@ async fn dispatch_single_tool(
             }
             prepared
         }
-        Err(e) => return (format_preflight_tool_error(reg, &lookup_name, args_json, &e), Vec::new()),
+        Err(e) => {
+            return (
+                format_preflight_tool_error(reg, &lookup_name, args_json, &e),
+                Vec::new(),
+            );
+        }
     };
     let name = prepared.name.as_str();
     let normalized_args_json = prepared.args_json;
@@ -5854,6 +5717,7 @@ async fn dispatch_single_tool(
         dctx.lsp_gate.clone(),
         dctx.delegate_ctx.clone(),
         dctx.kanban_task_id.clone(),
+        dctx.materialized_tools.clone(),
     );
 
     let args_for_mutation = prepared_args.clone();
@@ -5862,7 +5726,9 @@ async fn dispatch_single_tool(
         Err(ref e) if matches!(e.core_error(), ToolError::InvalidArgs { .. }) => {
             // Enrich InvalidArgs with required_fields + usage_hint from schema.
             // This gives the LLM a precise corrective checklist on the next turn.
-            if let Some(mut enriched) = reg.enrich_invalid_args_error(name, e, Some(&normalized_args_json)) {
+            if let Some(mut enriched) =
+                reg.enrich_invalid_args_error(name, e, Some(&normalized_args_json))
+            {
                 if enriched.suppression_key.is_none()
                     && let Some(ref required_fields) = enriched.required_fields
                 {
@@ -6091,6 +5957,7 @@ async fn run_learning_reflection_bg(ctx: BackgroundReflectionCtx) {
         watch_notification_tx: None,
         delegate_ctx: None,
         kanban_task_id: None,
+        materialized_tools: None,
     };
 
     // Work on local session clone — we don't need results propagated back.
@@ -6234,6 +6101,23 @@ mod tests {
     use edgequake_llm::{ChatMessage, CompletionOptions, FunctionCall, ToolChoice, ToolDefinition};
     use serde_json::json;
     use tempfile::TempDir;
+
+    #[test]
+    fn assistant_display_text_prefers_content_then_refusal() {
+        let mut response = edgequake_llm::LLMResponse::new("hello", "m");
+        assert_eq!(assistant_display_text(&response), "hello");
+        response.content.clear();
+        response.refusal = Some("policy decline".into());
+        assert_eq!(assistant_display_text(&response), "policy decline");
+    }
+
+    #[test]
+    fn response_has_visible_output_includes_refusal() {
+        let mut response = edgequake_llm::LLMResponse::new("", "m");
+        assert!(!response_has_visible_output(&response));
+        response.refusal = Some("declined".into());
+        assert!(response_has_visible_output(&response));
+    }
 
     #[derive(Clone)]
     struct StreamingUsageProvider {
@@ -7080,7 +6964,8 @@ def register(ctx):
 
         assert!(matches!(err, AgentError::Llm(_)));
         assert!(
-            err.to_string().contains("did not start a duplicate request"),
+            err.to_string()
+                .contains("did not start a duplicate request"),
             "unexpected error: {err}"
         );
         assert_eq!(
@@ -7789,16 +7674,26 @@ def register(ctx):
     #[test]
     fn build_chat_messages_blocks_emits_two_system_messages() {
         let msgs = vec![Message::user("hello")];
-        let out = build_chat_messages_blocks("STABLE", "DYNAMIC", &msgs, None, true);
+        let out = build_chat_messages_blocks("STABLE", "", "DYNAMIC", &msgs, None, true);
         // stable + dynamic + user = 3 messages
         assert_eq!(out.len(), 3);
+    }
+
+    #[test]
+    fn build_chat_messages_blocks_emits_three_system_messages_with_semi_stable() {
+        let msgs = vec![Message::user("hello")];
+        let out = build_chat_messages_blocks("STABLE", "SEMI", "DYNAMIC", &msgs, None, true);
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[0].content, "STABLE");
+        assert_eq!(out[1].content, "SEMI");
+        assert_eq!(out[2].content, "DYNAMIC");
     }
 
     #[test]
     fn build_chat_messages_blocks_stable_has_cache_control() {
         let msgs: Vec<Message> = vec![];
         let out =
-            build_chat_messages_blocks("STABLE CONTENT", "DYNAMIC CONTENT", &msgs, None, true);
+            build_chat_messages_blocks("STABLE CONTENT", "", "DYNAMIC CONTENT", &msgs, None, true);
         assert_eq!(out.len(), 2);
         assert!(
             out[0].cache_control.is_some(),
@@ -7811,9 +7706,23 @@ def register(ctx):
     }
 
     #[test]
+    fn build_chat_messages_blocks_semi_stable_has_5m_cache_control() {
+        let msgs: Vec<Message> = vec![];
+        let out =
+            build_chat_messages_blocks("STABLE", "SKILLS INDEX", "DYNAMIC", &msgs, None, true);
+        assert_eq!(out.len(), 3);
+        assert_eq!(
+            out[1].cache_control.as_ref().and_then(|c| c.ttl.as_deref()),
+            Some("5m"),
+            "semi-stable block must use 5m cache tier"
+        );
+        assert!(out[2].cache_control.is_none());
+    }
+
+    #[test]
     fn build_chat_messages_blocks_dynamic_has_no_cache_control() {
         let msgs: Vec<Message> = vec![];
-        let out = build_chat_messages_blocks("", "DYNAMIC ONLY", &msgs, None, true);
+        let out = build_chat_messages_blocks("", "", "DYNAMIC ONLY", &msgs, None, true);
         // Only dynamic message — no stable block
         assert_eq!(out.len(), 1);
         assert!(
@@ -7826,7 +7735,7 @@ def register(ctx):
     fn build_chat_messages_blocks_with_cache_config_does_not_double_mark_system() {
         let msgs = vec![Message::user("hi")];
         let cfg = CachePromptConfig::default();
-        let out = build_chat_messages_blocks("STABLE", "DYNAMIC", &msgs, Some(&cfg), true);
+        let out = build_chat_messages_blocks("STABLE", "", "DYNAMIC", &msgs, Some(&cfg), true);
         // stable[0] already has cache_control set by us, not apply_cache_control
         assert!(out[0].cache_control.is_some());
         // dynamic[1] must NOT get cache_control even with cache config active
@@ -7834,41 +7743,88 @@ def register(ctx):
     }
 
     #[test]
-    fn split_dynamic_from_stable_extracts_suffix() {
+    fn split_dynamic_after_cache_prefixes_extracts_suffix() {
         let stable = "STABLE CONTENT";
-        let combined = "STABLE CONTENT\n\nDYNAMIC CONTENT";
-        let dynamic = split_dynamic_from_stable(combined, stable);
+        let semi = "SKILLS INDEX";
+        let combined = "STABLE CONTENT\n\nSKILLS INDEX\n\nDYNAMIC CONTENT";
+        let dynamic = split_dynamic_after_cache_prefixes(combined, stable, semi);
         assert_eq!(dynamic, "DYNAMIC CONTENT");
     }
 
     #[test]
-    fn split_dynamic_from_stable_fallback_when_prefix_mismatch() {
+    fn split_dynamic_after_cache_prefixes_stable_only() {
+        let stable = "STABLE CONTENT";
+        let combined = "STABLE CONTENT\n\nDYNAMIC CONTENT";
+        let dynamic = split_dynamic_after_cache_prefixes(combined, stable, "");
+        assert_eq!(dynamic, "DYNAMIC CONTENT");
+    }
+
+    #[test]
+    fn split_dynamic_after_cache_prefixes_fallback_when_prefix_mismatch() {
         let combined = "SOMETHING ELSE\n\nDYNAMIC";
-        let dynamic = split_dynamic_from_stable(combined, "STABLE");
-        // When stable prefix not found, return combined unchanged
+        let dynamic = split_dynamic_after_cache_prefixes(combined, "STABLE", "");
         assert_eq!(dynamic, combined);
     }
 
     #[test]
-    fn split_dynamic_from_stable_empty_stable_returns_combined() {
+    fn split_dynamic_after_cache_prefixes_empty_stable_returns_combined() {
         let combined = "ALL CONTENT";
-        let dynamic = split_dynamic_from_stable(combined, "");
+        let dynamic = split_dynamic_after_cache_prefixes(combined, "", "");
         assert_eq!(dynamic, combined);
     }
 
     #[test]
     fn prompt_cache_config_is_provider_aware() {
-        let provider: Arc<dyn LLMProvider> = Arc::new(edgequake_llm::MockProvider::new());
         let prefix = crate::config::PromptPrefixCacheConfig::default();
         assert!(
-            prompt_cache_config_for(&provider, true, &prefix, None).is_none(),
+            crate::prompt_cache_policy::resolve_prompt_cache(
+                "mock",
+                "gpt-4o",
+                None,
+                true,
+                &prefix,
+            )
+            .is_none(),
             "non-Anthropic providers should not receive Anthropic cache markers"
         );
-        assert!(crate::prompt_cache_policy::provider_supports_prompt_caching(
-            "anthropic",
-            "claude-sonnet-4",
-            None,
-        ));
+        assert!(
+            crate::prompt_cache_policy::provider_supports_prompt_caching(
+                "anthropic",
+                "claude-sonnet-4",
+                None,
+            )
+        );
+    }
+
+    #[test]
+    fn envelope_layout_uses_single_system_block() {
+        let mut session = SessionState::default();
+        session.cached_stable_prompt = Some("STABLE".into());
+        session.cached_system_prompt = Some("STABLE\nDYNAMIC".into());
+        let msgs = vec![Message::user("hi")];
+        let decision = crate::prompt_cache_policy::PromptCacheDecision {
+            should_cache: true,
+            native_inner_layout: false,
+        };
+        let resolved = crate::prompt_cache_policy::ResolvedPromptCache {
+            decision,
+            config: CachePromptConfig::default(),
+        };
+        let out = build_api_chat_messages(
+            &session,
+            &msgs,
+            Some(&resolved),
+            &edgequake_llm::MockProvider::new(),
+            &edgecrab_tools::config_ref::AppConfigRef::default(),
+        );
+        let system_count = out
+            .iter()
+            .filter(|m| matches!(m.role, edgequake_llm::ChatRole::System))
+            .count();
+        assert_eq!(
+            system_count, 1,
+            "envelope-layout providers must not emit two system blocks"
+        );
     }
 
     #[test]
@@ -8556,7 +8512,56 @@ def register(ctx):
             watch_notification_tx: None,
             delegate_ctx: None,
             kanban_task_id: None,
+            materialized_tools: None,
         }
+    }
+
+    #[tokio::test]
+    async fn dispatch_single_tool_blocks_deferred_until_materialized() {
+        use edgecrab_tools::ToolSchemaMode;
+        use std::collections::HashSet;
+        use std::sync::{Arc, RwLock};
+
+        let registry = Arc::new(ToolRegistry::new());
+        let cancel = CancellationToken::new();
+        let state_db = None;
+        let process_table = Arc::new(ProcessTable::new());
+        let capability_suppressions = Arc::new(Mutex::new(HashMap::new()));
+        let mut dctx = make_dispatch_context_for_test(
+            &registry,
+            &cancel,
+            &state_db,
+            &process_table,
+            capability_suppressions,
+        );
+        dctx.app_config_ref.tool_schema_mode = ToolSchemaMode::Indexed;
+
+        let (blocked, _) = dispatch_single_tool(
+            "call-browser",
+            "browser_navigate",
+            r#"{"url":"https://example.com"}"#,
+            &dctx,
+        )
+        .await;
+        assert!(
+            blocked.contains("tool_search"),
+            "deferred tool should require materialization: {blocked}"
+        );
+
+        dctx.materialized_tools = Some(Arc::new(RwLock::new(HashSet::from([
+            "browser_navigate".into()
+        ]))));
+        let (allowed, _) = dispatch_single_tool(
+            "call-browser-2",
+            "browser_navigate",
+            r#"{"url":"https://example.com"}"#,
+            &dctx,
+        )
+        .await;
+        assert!(
+            !allowed.contains("not on your wire schema"),
+            "materialized tool should pass wire gate: {allowed}"
+        );
     }
 
     #[tokio::test]
@@ -9037,7 +9042,8 @@ def register(ctx):
     fn dispatch_tool_name_normalization_combined() {
         let reg = edgecrab_tools::ToolRegistry::new();
         assert_eq!(
-            reg.resolve_tool_call_name("apply patch<|channel|>action").canonical,
+            reg.resolve_tool_call_name("apply patch<|channel|>action")
+                .canonical,
             "apply_patch"
         );
     }
@@ -9055,7 +9061,8 @@ def register(ctx):
     fn dispatch_tool_name_only_token_yields_empty() {
         let reg = edgecrab_tools::ToolRegistry::new();
         assert_eq!(
-            reg.resolve_tool_call_name("<|channel|>commentary").canonical,
+            reg.resolve_tool_call_name("<|channel|>commentary")
+                .canonical,
             ""
         );
     }

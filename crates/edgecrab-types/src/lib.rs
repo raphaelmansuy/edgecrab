@@ -26,10 +26,7 @@ pub mod trajectory;
 pub mod usage;
 
 pub use config::{ApiMode, DEFAULT_MODEL, OPENROUTER_BASE_URL, OriginChat, Platform};
-pub use error::{AgentError, ToolError, ToolErrorRecord, ToolErrorResponse};
-pub use recovery_feedback::{
-    RecoveryAction, RecoveryFeedback, RecoveryFeedbackBuilder, RecoverySuggestion,
-};
+pub use error::{AgentError, ToolError, ToolErrorRecord, ToolErrorResponse, parse_tool_error_payload};
 pub use harness::{
     CompletionDecision, ExitReason, ReportedTaskStatus, RunOutcome, TaskStatusKind,
     VerificationSummary,
@@ -39,6 +36,9 @@ pub use multimodal::{
     MULTIMODAL_IMAGE_TOKEN_ESTIMATE, capture_has_image_reference, is_multimodal_tool_json,
     multimodal_disk_image_from_content, multimodal_has_image, multimodal_text_summary,
     parse_multimodal_value, strip_inline_images_from_tool_output,
+};
+pub use recovery_feedback::{
+    RecoveryAction, RecoveryFeedback, RecoveryFeedbackBuilder, RecoverySuggestion,
 };
 pub use tool::{FunctionCall, ToolCall, ToolSchema};
 pub use trajectory::Trajectory;

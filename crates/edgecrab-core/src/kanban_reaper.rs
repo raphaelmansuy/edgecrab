@@ -34,13 +34,11 @@ fn tick_boards(
                 })
                 .ok();
             let promoted = db.recompute_ready(dispatch_cfg.failure_limit).ok();
-            reclaimed.map(|reclaimed| {
-                crate::kanban_dispatcher::KanbanDispatchResult {
-                    reclaimed,
-                    timed_out: timed_out.unwrap_or(0),
-                    promoted: promoted.unwrap_or(0),
-                    ..Default::default()
-                }
+            reclaimed.map(|reclaimed| crate::kanban_dispatcher::KanbanDispatchResult {
+                reclaimed,
+                timed_out: timed_out.unwrap_or(0),
+                promoted: promoted.unwrap_or(0),
+                ..Default::default()
             })
         };
         if let Some(r) = board_result {
@@ -74,11 +72,14 @@ pub fn spawn_kanban_watcher(
             let spawn = spawn_fn.clone();
             let cfg = dispatch_cfg.clone();
             let home = home.clone();
-            let run = tokio::task::spawn_blocking(move || tick_boards(&home, &cfg, spawn.as_ref()))
-                .await;
+            let run =
+                tokio::task::spawn_blocking(move || tick_boards(&home, &cfg, spawn.as_ref())).await;
             if let Ok(Some(result)) = run {
                 if result.reclaimed > 0 {
-                    tracing::info!(reclaimed = result.reclaimed, "kanban: reclaimed stale claims");
+                    tracing::info!(
+                        reclaimed = result.reclaimed,
+                        "kanban: reclaimed stale claims"
+                    );
                 }
                 if result.promoted > 0 {
                     tracing::info!(promoted = result.promoted, "kanban: promoted ready tasks");
@@ -87,7 +88,10 @@ pub fn spawn_kanban_watcher(
                     tracing::info!(spawned = result.spawned, "kanban: dispatched workers");
                 }
                 if result.timed_out > 0 {
-                    tracing::info!(timed_out = result.timed_out, "kanban: timed out long-running workers");
+                    tracing::info!(
+                        timed_out = result.timed_out,
+                        "kanban: timed out long-running workers"
+                    );
                 }
                 if result.skipped_per_profile_capped > 0 {
                     tracing::debug!(
@@ -107,7 +111,10 @@ pub fn spawn_kanban_watcher(
 }
 
 /// Back-compat alias — reclaim-only watcher when no spawn callback is provided.
-pub fn spawn_kanban_reaper(home: impl AsRef<Path>, interval_secs: u64) -> tokio::task::JoinHandle<()> {
+pub fn spawn_kanban_reaper(
+    home: impl AsRef<Path>,
+    interval_secs: u64,
+) -> tokio::task::JoinHandle<()> {
     spawn_kanban_watcher(
         home,
         interval_secs,

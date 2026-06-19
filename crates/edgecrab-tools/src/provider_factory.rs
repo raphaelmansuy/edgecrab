@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use edgequake_llm::{LLMProvider, ProviderFactory, VsCodeCopilotProvider};
 
+use crate::provider_tracing::wrap_provider_with_tracing;
 use crate::vision_models::{normalize_model_name, normalize_provider_name};
 
 const COPILOT_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
@@ -36,7 +37,7 @@ pub fn create_provider_for_model(
 
     if canonical == "vscode-copilot" {
         return build_copilot_provider(&normalized_model, true)
-            .map(|provider| Arc::new(provider) as Arc<dyn LLMProvider>);
+            .map(|provider| wrap_provider_with_tracing(Arc::new(provider) as Arc<dyn LLMProvider>));
     }
 
     if canonical == "vertexai" {
@@ -44,10 +45,12 @@ pub fn create_provider_for_model(
         maybe_set_vertex_global_region(&normalized_model);
         let vertex_model = format!("vertexai:{normalized_model}");
         return ProviderFactory::create_llm_provider(&canonical, &vertex_model)
+            .map(wrap_provider_with_tracing)
             .map_err(|err| err.to_string());
     }
 
     ProviderFactory::create_llm_provider(&canonical, &normalized_model)
+        .map(wrap_provider_with_tracing)
         .map_err(|err| err.to_string())
 }
 
@@ -57,7 +60,7 @@ pub fn create_copilot_provider_for_model(
 ) -> Result<Arc<dyn LLMProvider>, String> {
     let normalized_model = normalize_model_name("vscode-copilot", model_name);
     build_copilot_provider(&normalized_model, supports_vision)
-        .map(|provider| Arc::new(provider) as Arc<dyn LLMProvider>)
+        .map(|provider| wrap_provider_with_tracing(Arc::new(provider) as Arc<dyn LLMProvider>))
 }
 
 fn ensure_google_cloud_project() -> Result<(), String> {

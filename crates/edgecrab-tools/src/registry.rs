@@ -352,6 +352,8 @@ pub struct ToolContext {
     pub lsp_gate: Option<Arc<dyn crate::lsp_gate::LspGate>>,
     /// Kanban worker task scope (dispatcher-spawned agents).
     pub kanban_task_id: Option<String>,
+    /// Session-scoped deferred tools materialized via `tool_search` (indexed schema mode).
+    pub materialized_tools: Option<Arc<std::sync::RwLock<std::collections::HashSet<String>>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -440,6 +442,7 @@ impl ToolContext {
             mutation_turn: None,
             lsp_gate: None,
             kanban_task_id: None,
+            materialized_tools: None,
         }
     }
 
@@ -513,14 +516,20 @@ fn normalize_schema_field_aliases(args: &mut serde_json::Value, schema: &serde_j
 fn schema_allows_null(prop_schema: &serde_json::Value) -> bool {
     match prop_schema.get("type") {
         Some(serde_json::Value::String(t)) if t == "null" => true,
-        Some(serde_json::Value::Array(types)) if types.iter().any(|t| t.as_str() == Some("null")) => {
+        Some(serde_json::Value::Array(types))
+            if types.iter().any(|t| t.as_str() == Some("null")) =>
+        {
             true
         }
         _ => prop_schema.get("nullable").and_then(|v| v.as_bool()) == Some(true),
     }
 }
 
-fn coerce_string_value(value: &str, expected_type: &str, prop_schema: &serde_json::Value) -> Option<serde_json::Value> {
+fn coerce_string_value(
+    value: &str,
+    expected_type: &str,
+    prop_schema: &serde_json::Value,
+) -> Option<serde_json::Value> {
     if schema_allows_null(prop_schema) && value.trim().eq_ignore_ascii_case("null") {
         return Some(serde_json::Value::Null);
     }
@@ -943,8 +952,7 @@ impl ToolRegistry {
         };
 
         let schema = handler.schema();
-        let required_fields =
-            required_fields_from_parameters(&schema.parameters, args_json);
+        let required_fields = required_fields_from_parameters(&schema.parameters, args_json);
 
         let usage_hint = Self::build_usage_hint(&schema);
 
@@ -1014,9 +1022,7 @@ impl ToolRegistry {
         if self.dynamic_tools.contains_key(name) {
             return Some(name.to_string());
         }
-        self.dynamic_tool_aliases
-            .get(name)
-            .cloned()
+        self.dynamic_tool_aliases.get(name).cloned()
     }
 
     /// Normalize a raw model-emitted tool name (pollution strip + Hermes repair).
@@ -1070,9 +1076,7 @@ impl ToolRegistry {
             handler.schema()
         };
 
-        Some(
-            required_fields_from_parameters(&schema.parameters, None).unwrap_or_default(),
-        )
+        Some(required_fields_from_parameters(&schema.parameters, None).unwrap_or_default())
     }
 
     /// Summary of toolsets with tool counts.
@@ -1243,9 +1247,32 @@ impl Default for ToolRegistry {
 
 // ─── edgequake-llm bridge ─────────────────────────────────────────────
 
-/// Convert our ToolSchema to edgequake-llm's ToolDefinition for API calls.
+/// Convert tool schemas to edgequake-llm definitions (full wire shape).
 pub fn to_llm_definitions(schemas: &[ToolSchema]) -> Vec<edgequake_llm::ToolDefinition> {
-    schemas
+    to_llm_definitions_with_mode(schemas, crate::schema_mode::ToolSchemaMode::Full)
+}
+
+/// Convert tool schemas with optional compaction (spec 007 L1.2).
+pub fn to_llm_definitions_with_mode(
+    schemas: &[ToolSchema],
+    mode: crate::schema_mode::ToolSchemaMode,
+) -> Vec<edgequake_llm::ToolDefinition> {
+    to_llm_definitions_with_materialized(schemas, mode, &std::collections::HashSet::new())
+}
+
+/// Convert schemas for the LLM wire, honoring indexed materialization state.
+pub fn to_llm_definitions_with_materialized(
+    schemas: &[ToolSchema],
+    mode: crate::schema_mode::ToolSchemaMode,
+    materialized: &std::collections::HashSet<String>,
+) -> Vec<edgequake_llm::ToolDefinition> {
+    let prepared = match mode {
+        crate::schema_mode::ToolSchemaMode::Indexed => {
+            crate::tool_schema_index::wire_schemas(schemas, materialized)
+        }
+        other => crate::schema_mode::prepare_schemas_for_mode(schemas, other),
+    };
+    prepared
         .iter()
         .map(|s| {
             edgequake_llm::ToolDefinition::function(
@@ -1255,6 +1282,19 @@ pub fn to_llm_definitions(schemas: &[ToolSchema]) -> Vec<edgequake_llm::ToolDefi
             )
         })
         .collect()
+}
+
+/// Build LLM wire definitions from registry filters + schema mode (DRY for execute_loop).
+pub fn build_wire_llm_definitions(
+    registry: &ToolRegistry,
+    ctx: &ToolContext,
+    enabled: Option<&[String]>,
+    disabled: Option<&[String]>,
+    mode: crate::schema_mode::ToolSchemaMode,
+    materialized: &std::collections::HashSet<String>,
+) -> Vec<edgequake_llm::ToolDefinition> {
+    let schemas = registry.get_definitions(enabled, disabled, ctx);
+    to_llm_definitions_with_materialized(&schemas, mode, materialized)
 }
 
 /// OpenAI-compatible wire shape: top-level `type: "object"` only (LM Studio rejects `oneOf`).
@@ -1270,7 +1310,9 @@ fn flatten_oneof_object_schema(branches: &[Value]) -> Value {
     for branch in branches {
         if let Some(props) = branch.get("properties").and_then(Value::as_object) {
             for (key, value) in props {
-                properties.entry(key.clone()).or_insert_with(|| value.clone());
+                properties
+                    .entry(key.clone())
+                    .or_insert_with(|| value.clone());
             }
         }
     }
@@ -1297,8 +1339,10 @@ pub fn annotate_llm_definitions_for_local_turn(
     if !matches!(provider_name, "lmstudio" | "ollama") {
         return defs;
     }
-    let suffix =
-        crate::mutation_turn_policy::local_tool_budget_schema_suffix(max_arg_bytes, max_output_tokens);
+    let suffix = crate::mutation_turn_policy::local_tool_budget_schema_suffix(
+        max_arg_bytes,
+        max_output_tokens,
+    );
     defs.into_iter()
         .map(|mut def| {
             if crate::mutation_turn_policy::is_large_payload_tool(&def.function.name) {
@@ -1311,10 +1355,7 @@ pub fn annotate_llm_definitions_for_local_turn(
 
 fn patch_mode_required_fields(mode: &str) -> Vec<String> {
     match mode {
-        "patch" => vec![
-            "mode".into(),
-            "patch".into(),
-        ],
+        "patch" => vec!["mode".into(), "patch".into()],
         _ => vec![
             "mode".into(),
             "path".into(),
@@ -2011,7 +2052,10 @@ mod tests {
 
         let unchanged =
             annotate_llm_definitions_for_local_turn(out.clone(), "anthropic", Some((27_852, 8192)));
-        assert_eq!(unchanged[0].function.description, out[0].function.description);
+        assert_eq!(
+            unchanged[0].function.description,
+            out[0].function.description
+        );
 
         let no_budget = annotate_llm_definitions_for_local_turn(
             vec![edgequake_llm::ToolDefinition::function(
@@ -2022,15 +2066,19 @@ mod tests {
             "lmstudio",
             None,
         );
-        assert!(!no_budget[0].function.description.contains("Local turn limit"));
+        assert!(
+            !no_budget[0]
+                .function
+                .description
+                .contains("Local turn limit")
+        );
     }
 
     #[test]
     fn lh62_required_fields_from_patch_flat_schema_respects_mode() {
         let params = crate::tools::file_patch::patch_tool_parameters_json();
         let replace_args = r#"{"mode":"replace","path":"a.md"}"#;
-        let fields =
-            required_fields_from_parameters(&params, Some(replace_args)).expect("fields");
+        let fields = required_fields_from_parameters(&params, Some(replace_args)).expect("fields");
         assert!(fields.contains(&"path".to_string()));
         assert!(fields.contains(&"old_string".to_string()));
         assert!(!fields.contains(&"patch".to_string()));

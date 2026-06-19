@@ -593,11 +593,7 @@ pub fn extract_tool_preview(tool_name: &str, args_json: &str) -> String {
 
 /// Preview for in-flight streamed tool JSON — tolerates invalid partial payloads.
 pub fn extract_streaming_tool_preview(tool_name: &str, partial_args: &str) -> String {
-    extract_streaming_tool_preview_width(
-        tool_name,
-        partial_args,
-        DisplayWidths::DEFAULT.preview,
-    )
+    extract_streaming_tool_preview_width(tool_name, partial_args, DisplayWidths::DEFAULT.preview)
 }
 
 pub fn extract_streaming_tool_preview_width(
@@ -609,10 +605,8 @@ pub fn extract_streaming_tool_preview_width(
     if !complete.is_empty() {
         return complete;
     }
-    let partial = edgecrab_tools::tool_progress_tail::streaming_tool_field_preview(
-        tool_name,
-        partial_args,
-    );
+    let partial =
+        edgecrab_tools::tool_progress_tail::streaming_tool_field_preview(tool_name, partial_args);
     if !partial.is_empty() {
         return unicode_trunc(&partial, max_preview_cols);
     }

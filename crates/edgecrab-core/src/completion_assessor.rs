@@ -1,6 +1,7 @@
+use edgecrab_tools::HarnessSnapshot;
 use edgecrab_types::{
     CompletionDecision, ExitReason, Message, ReportedTaskStatus, Role, RunOutcome, TaskStatusKind,
-    VerificationSummary,
+    VerificationSummary, parse_tool_error_payload,
 };
 
 /// Snapshot of end-of-run state inspected by the completion policy.
@@ -14,6 +15,8 @@ pub struct CompletionContext<'a> {
     pub active_todos: usize,
     pub blocked_todos: usize,
     pub child_runs_in_flight: usize,
+    /// Deterministic harness gates (mutation debt, oracles, structured tool errors).
+    pub harness: HarnessSnapshot,
 }
 
 pub trait CompletionPolicy: Send + Sync {
@@ -32,8 +35,6 @@ impl CompletionPolicy for DefaultCompletionPolicy {
         let pending_clarification = ctx.pending_clarification || has_clarify_marker(ctx);
         let pending_approval = ctx.pending_approval || has_approval_marker(ctx);
         let verification = collect_verification_summary(ctx.messages);
-        let recent_tool_activity = has_recent_tool_activity(ctx.messages);
-        let deferred_work = recent_tool_activity && has_deferred_work_signal(ctx.final_response);
         let reported_progress = collect_reported_progress_state(ctx.messages);
         let reported_blocked = matches!(
             reported_progress.latest_status,
@@ -44,6 +45,7 @@ impl CompletionPolicy for DefaultCompletionPolicy {
             Some(TaskStatusKind::InProgress)
         );
         let has_remaining_steps = !reported_progress.remaining_steps.is_empty();
+        let harness_blocked = ctx.harness.blocks_completion();
 
         let mut outcome = if ctx.interrupted {
             RunOutcome::new(
@@ -83,11 +85,14 @@ impl CompletionPolicy for DefaultCompletionPolicy {
                 ExitReason::PendingTasks,
                 "Incomplete — progress was reported but work still remains.",
             )
-        } else if deferred_work {
+        } else if harness_blocked {
+            let reason = ctx.harness.completion_block_reason().unwrap_or_else(|| {
+                "Incomplete — deterministic harness gates did not pass.".into()
+            });
             RunOutcome::new(
                 CompletionDecision::Incomplete,
-                ExitReason::PendingTasks,
-                "Incomplete — the assistant described a next step instead of executing it.",
+                ExitReason::NoMoreToolCalls,
+                reason,
             )
         } else if has_recent_critical_tool_failure(ctx.messages) {
             RunOutcome::new(
@@ -148,77 +153,13 @@ fn has_approval_marker(ctx: &CompletionContext<'_>) -> bool {
         })
 }
 
-fn has_recent_tool_activity(messages: &[Message]) -> bool {
-    messages
-        .iter()
-        .rev()
-        .take(6)
-        .any(|msg| msg.role == Role::Tool)
-}
-
-/// Recent failure on tools that commonly gate user-facing answers (web search, etc.).
+/// Recent structured failure on tools that gate user-facing answers.
 fn has_recent_critical_tool_failure(messages: &[Message]) -> bool {
     const CRITICAL: &[&str] = &["web_search", "web_extract", "web_crawl"];
     messages.iter().rev().take(12).any(|msg| {
         msg.role == Role::Tool
             && msg.name.as_deref().is_some_and(|n| CRITICAL.contains(&n))
-            && looks_like_error(&msg.text_content())
-    })
-}
-
-fn has_deferred_work_signal(text: &str) -> bool {
-    if text.trim().is_empty() {
-        return false;
-    }
-
-    let normalized = text
-        .to_ascii_lowercase()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    let window: String = normalized.chars().take(240).collect();
-
-    let intent_markers = [
-        "let me ",
-        "i'll ",
-        "i will ",
-        "now i'll ",
-        "now i will ",
-        "next i'll ",
-        "next i will ",
-        "then i'll ",
-        "then i will ",
-        "i'm going to ",
-        "i am going to ",
-    ];
-    let action_verbs = [
-        "create",
-        "write",
-        "build",
-        "update",
-        "fix",
-        "run",
-        "retry",
-        "try",
-        "inspect",
-        "check",
-        "search",
-        "edit",
-        "patch",
-        "implement",
-        "add",
-        "continue",
-        "open",
-        "read",
-    ];
-
-    intent_markers.iter().any(|marker| {
-        window.match_indices(marker).any(|(index, _)| {
-            let after = &window[index + marker.len()..];
-            action_verbs
-                .iter()
-                .any(|verb| after.find(verb).is_some_and(|pos| pos <= 48))
-        })
+            && parse_tool_error_payload(&msg.text_content()).is_some()
     })
 }
 
@@ -301,7 +242,13 @@ fn collect_verification_summary(messages: &[Message]) -> VerificationSummary {
         }
 
         required = true;
-        if looks_like_error(&content) {
+        if parse_tool_error_payload(&content).is_some() {
+            continue;
+        }
+
+        if is_mutation_verification_tool(name)
+            && !edgecrab_tools::file_mutation_result_landed(name, &content)
+        {
             continue;
         }
 
@@ -324,6 +271,10 @@ fn collect_verification_summary(messages: &[Message]) -> VerificationSummary {
     }
 }
 
+fn is_mutation_verification_tool(name: &str) -> bool {
+    matches!(name, "write_file" | "patch" | "apply_patch")
+}
+
 fn is_verification_tool(name: &str) -> bool {
     matches!(
         name,
@@ -342,15 +293,6 @@ fn is_verification_tool(name: &str) -> bool {
     )
 }
 
-fn looks_like_error(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    lower.contains("tool error")
-        || lower.contains("\"response_type\":\"tool_error\"")
-        || lower.contains("permission denied")
-        || lower.contains("failed")
-        || lower.contains("error")
-}
-
 fn first_nonempty_line(text: &str) -> Option<&str> {
     text.lines().map(str::trim).find(|line| !line.is_empty())
 }
@@ -362,21 +304,19 @@ fn truncate(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use edgecrab_tools::{HarnessBuildInput, MutationTurnState, build_harness_snapshot};
     use edgecrab_types::Message;
+    use std::fs;
+    use tempfile::TempDir;
 
-    #[test]
-    fn failed_web_search_is_not_reported_complete() {
-        let err = serde_json::json!({
-            "type": "tool_error",
-            "category": "execution",
-            "code": "execution_failed",
-            "message": "Web search via ddgs failed: bot-challenge"
-        })
-        .to_string();
-        let messages = vec![Message::tool_result("tc_1", "web_search", &err)];
-        let ctx = CompletionContext {
-            final_response: "I'm sorry, I cannot provide that information.",
-            messages: &messages,
+    fn base_ctx<'a>(
+        final_response: &'a str,
+        messages: &'a [Message],
+        harness: HarnessSnapshot,
+    ) -> CompletionContext<'a> {
+        CompletionContext {
+            final_response,
+            messages,
             interrupted: false,
             budget_exhausted: false,
             pending_approval: false,
@@ -384,9 +324,28 @@ mod tests {
             active_todos: 0,
             blocked_todos: 0,
             child_runs_in_flight: 0,
-        };
+            harness,
+        }
+    }
 
-        let outcome = assess_completion(&ctx);
+    #[test]
+    fn failed_web_search_is_not_reported_complete() {
+        let err = serde_json::json!({
+            "type": "tool_error",
+            "category": "execution",
+            "code": "execution_failed",
+            "code_num": 1006,
+            "error": "Web search via ddgs failed: bot-challenge",
+            "retryable": true,
+            "suppress_retry": false
+        })
+        .to_string();
+        let messages = vec![Message::tool_result("tc_1", "web_search", &err)];
+        let outcome = assess_completion(&base_ctx(
+            "I'm sorry, I cannot provide that information.",
+            &messages,
+            HarnessSnapshot::default(),
+        ));
         assert_eq!(outcome.state, CompletionDecision::Incomplete);
         assert!(!outcome.is_success());
     }
@@ -403,6 +362,7 @@ mod tests {
             active_todos: 0,
             blocked_todos: 0,
             child_runs_in_flight: 0,
+            harness: HarnessSnapshot::default(),
         };
 
         let outcome = assess_completion(&ctx);
@@ -422,6 +382,7 @@ mod tests {
             active_todos: 2,
             blocked_todos: 0,
             child_runs_in_flight: 0,
+            harness: HarnessSnapshot::default(),
         };
 
         let outcome = assess_completion(&ctx);
@@ -432,19 +393,11 @@ mod tests {
     fn clarify_marker_maps_to_needs_user_input() {
         let msg = Message::assistant("[CLARIFY] Which file should I edit?");
         let messages = vec![msg];
-        let ctx = CompletionContext {
-            final_response: "[CLARIFY] Which file should I edit?",
-            messages: &messages,
-            interrupted: false,
-            budget_exhausted: false,
-            pending_approval: false,
-            pending_clarification: false,
-            active_todos: 0,
-            blocked_todos: 0,
-            child_runs_in_flight: 0,
-        };
-
-        let outcome = assess_completion(&ctx);
+        let outcome = assess_completion(&base_ctx(
+            "[CLARIFY] Which file should I edit?",
+            &messages,
+            HarnessSnapshot::default(),
+        ));
         assert_eq!(outcome.state, CompletionDecision::NeedsUserInput);
     }
 
@@ -460,6 +413,7 @@ mod tests {
             active_todos: 0,
             blocked_todos: 1,
             child_runs_in_flight: 0,
+            harness: HarnessSnapshot::default(),
         };
 
         let outcome = assess_completion(&ctx);
@@ -478,6 +432,7 @@ mod tests {
             active_todos: 0,
             blocked_todos: 0,
             child_runs_in_flight: 0,
+            harness: HarnessSnapshot::default(),
         };
 
         let outcome = assess_completion(&ctx);
@@ -497,6 +452,7 @@ mod tests {
             active_todos: 0,
             blocked_todos: 0,
             child_runs_in_flight: 0,
+            harness: HarnessSnapshot::default(),
         };
 
         let outcome = assess_completion(&ctx);
@@ -514,45 +470,28 @@ mod tests {
         })
         .to_string();
         let messages = vec![Message::tool_result("tc_1", "report_task_status", &report)];
-        let ctx = CompletionContext {
-            final_response: "All set.",
-            messages: &messages,
-            interrupted: false,
-            budget_exhausted: false,
-            pending_approval: false,
-            pending_clarification: false,
-            active_todos: 0,
-            blocked_todos: 0,
-            child_runs_in_flight: 0,
-        };
-
-        let outcome = assess_completion(&ctx);
+        let outcome = assess_completion(&base_ctx(
+            "All set.",
+            &messages,
+            HarnessSnapshot::default(),
+        ));
         assert_eq!(outcome.state, CompletionDecision::Completed);
         assert!(outcome.verification.evidence_present);
     }
 
     #[test]
-    fn deferred_work_after_tool_activity_keeps_run_incomplete() {
+    fn deferred_work_prose_no_longer_blocks_completion() {
         let messages = vec![Message::tool_result(
             "tc_1",
             "write_file",
-            "Created empty scaffold at './game2'.",
+            r#"{"ok":true,"bytes":12,"lines":1,"path":"game2.txt"}"#,
         )];
-        let ctx = CompletionContext {
-            final_response: "I see the issue. The directory already exists. Let me try writing the file directly without creating directories first.",
-            messages: &messages,
-            interrupted: false,
-            budget_exhausted: false,
-            pending_approval: false,
-            pending_clarification: false,
-            active_todos: 0,
-            blocked_todos: 0,
-            child_runs_in_flight: 0,
-        };
-
-        let outcome = assess_completion(&ctx);
-        assert_eq!(outcome.state, CompletionDecision::Incomplete);
-        assert_eq!(outcome.exit_reason, ExitReason::PendingTasks);
+        let outcome = assess_completion(&base_ctx(
+            "I see the issue. Let me try writing the file directly without creating directories first.",
+            &messages,
+            HarnessSnapshot::default(),
+        ));
+        assert_eq!(outcome.state, CompletionDecision::Completed);
     }
 
     #[test]
@@ -560,39 +499,13 @@ mod tests {
         let messages = vec![Message::tool_result(
             "tc_1",
             "write_file",
-            "Wrote ./game2/index.html successfully.",
+            r#"{"ok":true,"bytes":12,"lines":1,"path":"./game2/index.html"}"#,
         )];
-        let ctx = CompletionContext {
-            final_response: "The file is in place and the task is complete.",
-            messages: &messages,
-            interrupted: false,
-            budget_exhausted: false,
-            pending_approval: false,
-            pending_clarification: false,
-            active_todos: 0,
-            blocked_todos: 0,
-            child_runs_in_flight: 0,
-        };
-
-        let outcome = assess_completion(&ctx);
-        assert_eq!(outcome.state, CompletionDecision::Completed);
-    }
-
-    #[test]
-    fn deferred_work_without_recent_tool_activity_does_not_trigger_heuristic() {
-        let ctx = CompletionContext {
-            final_response: "Let me explain the result in more detail.",
-            messages: &[],
-            interrupted: false,
-            budget_exhausted: false,
-            pending_approval: false,
-            pending_clarification: false,
-            active_todos: 0,
-            blocked_todos: 0,
-            child_runs_in_flight: 0,
-        };
-
-        let outcome = assess_completion(&ctx);
+        let outcome = assess_completion(&base_ctx(
+            "The file is in place and the task is complete.",
+            &messages,
+            HarnessSnapshot::default(),
+        ));
         assert_eq!(outcome.state, CompletionDecision::Completed);
     }
 
@@ -606,19 +519,11 @@ mod tests {
         })
         .to_string();
         let messages = vec![Message::tool_result("tc_2", "report_task_status", &report)];
-        let ctx = CompletionContext {
-            final_response: "Almost done.",
-            messages: &messages,
-            interrupted: false,
-            budget_exhausted: false,
-            pending_approval: false,
-            pending_clarification: false,
-            active_todos: 0,
-            blocked_todos: 0,
-            child_runs_in_flight: 0,
-        };
-
-        let outcome = assess_completion(&ctx);
+        let outcome = assess_completion(&base_ctx(
+            "Almost done.",
+            &messages,
+            HarnessSnapshot::default(),
+        ));
         assert_eq!(outcome.state, CompletionDecision::Incomplete);
     }
 
@@ -632,19 +537,64 @@ mod tests {
         })
         .to_string();
         let messages = vec![Message::tool_result("tc_3", "report_task_status", &report)];
-        let ctx = CompletionContext {
-            final_response: "Done.",
-            messages: &messages,
-            interrupted: false,
-            budget_exhausted: false,
-            pending_approval: false,
-            pending_clarification: false,
-            active_todos: 0,
-            blocked_todos: 0,
-            child_runs_in_flight: 0,
-        };
+        let outcome = assess_completion(&base_ctx(
+            "Done.",
+            &messages,
+            HarnessSnapshot::default(),
+        ));
+        assert_eq!(outcome.state, CompletionDecision::Incomplete);
+    }
 
-        let outcome = assess_completion(&ctx);
+    #[test]
+    fn harness_oracle_failure_blocks_completion() {
+        let dir = TempDir::new().expect("tempdir");
+        fs::write(dir.path().join("bad.js"), "const x = ;\n").expect("write");
+        let turn = MutationTurnState::new();
+        turn.push_success(edgecrab_tools::MutationRecord {
+            path: "bad.js".into(),
+            kind: edgecrab_tools::MutationKind::Modify,
+            lines_added: 1,
+            lines_removed: 0,
+        });
+        let harness = build_harness_snapshot(HarnessBuildInput {
+            messages: &[],
+            mutation_turn: &turn,
+            cwd: dir.path(),
+            post_mutation_oracles: true,
+        });
+        let ok = serde_json::json!({"ok": true, "replacements": 1}).to_string();
+        let messages = vec![Message::tool_result("t1", "patch", &ok)];
+        let outcome = assess_completion(&base_ctx(
+            "All done!",
+            &messages,
+            harness,
+        ));
+        assert_eq!(outcome.state, CompletionDecision::Incomplete);
+        assert!(outcome
+            .user_summary
+            .contains("post-mutation gate failed"));
+    }
+
+    #[test]
+    fn terminal_patch_error_blocks_even_with_cheerful_final_text() {
+        let err = serde_json::json!({
+            "type": "tool_error",
+            "category": "arguments",
+            "code": "invalid_arguments",
+            "code_num": 1002,
+            "error": "Invalid arguments for patch",
+            "retryable": false,
+            "suppress_retry": true
+        })
+        .to_string();
+        let messages = vec![Message::tool_result("t1", "patch", &err)];
+        let harness = build_harness_snapshot(HarnessBuildInput {
+            messages: &messages,
+            mutation_turn: &MutationTurnState::new(),
+            cwd: std::path::Path::new("."),
+            post_mutation_oracles: false,
+        });
+        let outcome = assess_completion(&base_ctx("Done!", &messages, harness));
         assert_eq!(outcome.state, CompletionDecision::Incomplete);
     }
 }

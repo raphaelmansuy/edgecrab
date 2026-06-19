@@ -274,216 +274,216 @@ pub async fn apply_memory_write_public(
     let existing = tokio::fs::read_to_string(&path).await.unwrap_or_default();
 
     let new_content = match action {
-            "add" => {
-                let content = payload.content.as_deref().unwrap_or("").trim();
-                if content.is_empty() {
-                    return Err(ToolError::InvalidArgs {
-                        tool: "memory_write".into(),
-                        message: "Content cannot be empty for 'add' action".into(),
-                    });
-                }
-                // Duplicate detection: reject exact matches before touching the file
-                let existing_entries: Vec<&str> = existing
-                    .split('§')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                if existing_entries.contains(&content) {
-                    let pct = (existing.len() * 100) / max_chars;
-                    return Ok(serde_json::to_string(&json!({
-                        "ok": true,
-                        "action": "duplicate_skipped",
-                        "file": filename,
-                        "used_chars": existing.len(),
-                        "max_chars": max_chars,
-                        "used_pct": pct
-                    }))
-                    .expect("infallible"));
-                }
-                // Full security scan: injection + exfiltration + invisible unicode
-                if let Err(msg) = check_memory_content(content) {
-                    return Err(ToolError::PermissionDenied(msg));
-                }
-                let mut result = existing.clone();
-                if !result.is_empty() && !result.ends_with('\n') {
-                    result.push('\n');
-                }
-                if !result.is_empty() {
-                    result.push_str(ENTRY_DELIMITER.trim_start_matches('\n'));
-                }
-                result.push_str(content);
-                result.push('\n');
-
-                // Enforce char limit
-                if result.len() > max_chars {
-                    return Err(ToolError::Other(format!(
-                        "{} would exceed {}-char limit ({} chars). Remove old entries first.",
-                        filename,
-                        max_chars,
-                        result.len()
-                    )));
-                }
-                result
-            }
-            "replace" => {
-                let old = old_content.unwrap_or("").trim();
-                let new = payload.content.as_deref().unwrap_or("").trim();
-                if old.is_empty() {
-                    return Err(ToolError::InvalidArgs {
-                        tool: "memory_write".into(),
-                        message: "old_content required for 'replace' action".into(),
-                    });
-                }
-                if new.is_empty() {
-                    return Err(ToolError::InvalidArgs {
-                        tool: "memory_write".into(),
-                        message: "content required for 'replace' action".into(),
-                    });
-                }
-                if let Err(msg) = check_memory_content(new) {
-                    return Err(ToolError::PermissionDenied(msg));
-                }
-                // Collect all entries and locate matches
-                let entries: Vec<String> = existing
-                    .split('§')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                let matches: Vec<(usize, &str)> = entries
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, e)| e.contains(old))
-                    .map(|(i, e)| (i, e.as_str()))
-                    .collect();
-                if matches.is_empty() {
-                    return Err(ToolError::NotFound(format!(
-                        "No entry matching '{}' found in {}",
-                        old, filename
-                    )));
-                }
-                // Multiple distinct matches → ambiguous; require a more specific selector
-                if matches.len() > 1 {
-                    let unique: std::collections::HashSet<&str> =
-                        matches.iter().map(|(_, e)| *e).collect();
-                    if unique.len() > 1 {
-                        let previews = matches
-                            .iter()
-                            .map(|(_, e)| format!("  - {}", e.chars().take(80).collect::<String>()))
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        return Err(ToolError::InvalidArgs {
-                            tool: "memory_write".into(),
-                            message: format!(
-                                "'{}' matched {} distinct entries in {}. Be more specific.\n{}",
-                                old,
-                                matches.len(),
-                                filename,
-                                previews
-                            ),
-                        });
-                    }
-                }
-                // Replace the first (or only) match
-                let mut result_entries = entries.clone();
-                result_entries[matches[0].0] = new.to_string();
-                let result = result_entries.join(ENTRY_DELIMITER) + "\n";
-                if result.len() > max_chars {
-                    return Err(ToolError::Other(format!(
-                        "{} would exceed {}-char limit after replace",
-                        filename, max_chars
-                    )));
-                }
-                result
-            }
-            "remove" => {
-                let old = old_content.unwrap_or("").trim();
-                if old.is_empty() {
-                    return Err(ToolError::InvalidArgs {
-                        tool: "memory_write".into(),
-                        message: "old_content required for 'remove' action".into(),
-                    });
-                }
-                // Collect all entries and locate matches
-                let entries: Vec<String> = existing
-                    .split('§')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                let matches: Vec<(usize, &str)> = entries
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, e)| e.contains(old))
-                    .map(|(i, e)| (i, e.as_str()))
-                    .collect();
-                if matches.is_empty() {
-                    return Err(ToolError::NotFound(format!(
-                        "No entry matching '{}' found in {}",
-                        old, filename
-                    )));
-                }
-                // Multiple distinct matches → ambiguous; require a more specific selector
-                if matches.len() > 1 {
-                    let unique: std::collections::HashSet<&str> =
-                        matches.iter().map(|(_, e)| *e).collect();
-                    if unique.len() > 1 {
-                        let previews = matches
-                            .iter()
-                            .map(|(_, e)| format!("  - {}", e.chars().take(80).collect::<String>()))
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        return Err(ToolError::InvalidArgs {
-                            tool: "memory_write".into(),
-                            message: format!(
-                                "'{}' matched {} distinct entries in {}. Be more specific.\n{}",
-                                old,
-                                matches.len(),
-                                filename,
-                                previews
-                            ),
-                        });
-                    }
-                }
-                // Remove the first (or only) match
-                let idx_to_remove = matches[0].0;
-                let result_entries: Vec<&str> = entries
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| *i != idx_to_remove)
-                    .map(|(_, e)| e.as_str())
-                    .collect();
-                if result_entries.is_empty() {
-                    String::new()
-                } else {
-                    result_entries.join(ENTRY_DELIMITER) + "\n"
-                }
-            }
-            other => {
+        "add" => {
+            let content = payload.content.as_deref().unwrap_or("").trim();
+            if content.is_empty() {
                 return Err(ToolError::InvalidArgs {
                     tool: "memory_write".into(),
-                    message: format!("Unknown action '{}'. Use add, replace, or remove.", other),
+                    message: "Content cannot be empty for 'add' action".into(),
                 });
             }
-        };
+            // Duplicate detection: reject exact matches before touching the file
+            let existing_entries: Vec<&str> = existing
+                .split('§')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
+            if existing_entries.contains(&content) {
+                let pct = (existing.len() * 100) / max_chars;
+                return Ok(serde_json::to_string(&json!({
+                    "ok": true,
+                    "action": "duplicate_skipped",
+                    "file": filename,
+                    "used_chars": existing.len(),
+                    "max_chars": max_chars,
+                    "used_pct": pct
+                }))
+                .expect("infallible"));
+            }
+            // Full security scan: injection + exfiltration + invisible unicode
+            if let Err(msg) = check_memory_content(content) {
+                return Err(ToolError::PermissionDenied(msg));
+            }
+            let mut result = existing.clone();
+            if !result.is_empty() && !result.ends_with('\n') {
+                result.push('\n');
+            }
+            if !result.is_empty() {
+                result.push_str(ENTRY_DELIMITER.trim_start_matches('\n'));
+            }
+            result.push_str(content);
+            result.push('\n');
 
-        // Atomic write: stage to temp file then rename to avoid partial writes on crash
-        let tmp_path = path.with_extension("tmp");
-        tokio::fs::write(&tmp_path, &new_content)
-            .await
-            .map_err(|e| ToolError::Other(format!("Cannot write {}: {}", filename, e)))?;
-        tokio::fs::rename(&tmp_path, &path).await.map_err(|e| {
-            ToolError::Other(format!("Cannot commit {} (rename failed): {}", filename, e))
-        })?;
+            // Enforce char limit
+            if result.len() > max_chars {
+                return Err(ToolError::Other(format!(
+                    "{} would exceed {}-char limit ({} chars). Remove old entries first.",
+                    filename,
+                    max_chars,
+                    result.len()
+                )));
+            }
+            result
+        }
+        "replace" => {
+            let old = old_content.unwrap_or("").trim();
+            let new = payload.content.as_deref().unwrap_or("").trim();
+            if old.is_empty() {
+                return Err(ToolError::InvalidArgs {
+                    tool: "memory_write".into(),
+                    message: "old_content required for 'replace' action".into(),
+                });
+            }
+            if new.is_empty() {
+                return Err(ToolError::InvalidArgs {
+                    tool: "memory_write".into(),
+                    message: "content required for 'replace' action".into(),
+                });
+            }
+            if let Err(msg) = check_memory_content(new) {
+                return Err(ToolError::PermissionDenied(msg));
+            }
+            // Collect all entries and locate matches
+            let entries: Vec<String> = existing
+                .split('§')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            let matches: Vec<(usize, &str)> = entries
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| e.contains(old))
+                .map(|(i, e)| (i, e.as_str()))
+                .collect();
+            if matches.is_empty() {
+                return Err(ToolError::NotFound(format!(
+                    "No entry matching '{}' found in {}",
+                    old, filename
+                )));
+            }
+            // Multiple distinct matches → ambiguous; require a more specific selector
+            if matches.len() > 1 {
+                let unique: std::collections::HashSet<&str> =
+                    matches.iter().map(|(_, e)| *e).collect();
+                if unique.len() > 1 {
+                    let previews = matches
+                        .iter()
+                        .map(|(_, e)| format!("  - {}", e.chars().take(80).collect::<String>()))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    return Err(ToolError::InvalidArgs {
+                        tool: "memory_write".into(),
+                        message: format!(
+                            "'{}' matched {} distinct entries in {}. Be more specific.\n{}",
+                            old,
+                            matches.len(),
+                            filename,
+                            previews
+                        ),
+                    });
+                }
+            }
+            // Replace the first (or only) match
+            let mut result_entries = entries.clone();
+            result_entries[matches[0].0] = new.to_string();
+            let result = result_entries.join(ENTRY_DELIMITER) + "\n";
+            if result.len() > max_chars {
+                return Err(ToolError::Other(format!(
+                    "{} would exceed {}-char limit after replace",
+                    filename, max_chars
+                )));
+            }
+            result
+        }
+        "remove" => {
+            let old = old_content.unwrap_or("").trim();
+            if old.is_empty() {
+                return Err(ToolError::InvalidArgs {
+                    tool: "memory_write".into(),
+                    message: "old_content required for 'remove' action".into(),
+                });
+            }
+            // Collect all entries and locate matches
+            let entries: Vec<String> = existing
+                .split('§')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            let matches: Vec<(usize, &str)> = entries
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| e.contains(old))
+                .map(|(i, e)| (i, e.as_str()))
+                .collect();
+            if matches.is_empty() {
+                return Err(ToolError::NotFound(format!(
+                    "No entry matching '{}' found in {}",
+                    old, filename
+                )));
+            }
+            // Multiple distinct matches → ambiguous; require a more specific selector
+            if matches.len() > 1 {
+                let unique: std::collections::HashSet<&str> =
+                    matches.iter().map(|(_, e)| *e).collect();
+                if unique.len() > 1 {
+                    let previews = matches
+                        .iter()
+                        .map(|(_, e)| format!("  - {}", e.chars().take(80).collect::<String>()))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    return Err(ToolError::InvalidArgs {
+                        tool: "memory_write".into(),
+                        message: format!(
+                            "'{}' matched {} distinct entries in {}. Be more specific.\n{}",
+                            old,
+                            matches.len(),
+                            filename,
+                            previews
+                        ),
+                    });
+                }
+            }
+            // Remove the first (or only) match
+            let idx_to_remove = matches[0].0;
+            let result_entries: Vec<&str> = entries
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != idx_to_remove)
+                .map(|(_, e)| e.as_str())
+                .collect();
+            if result_entries.is_empty() {
+                String::new()
+            } else {
+                result_entries.join(ENTRY_DELIMITER) + "\n"
+            }
+        }
+        other => {
+            return Err(ToolError::InvalidArgs {
+                tool: "memory_write".into(),
+                message: format!("Unknown action '{}'. Use add, replace, or remove.", other),
+            });
+        }
+    };
 
-        let pct = (new_content.len() * 100) / max_chars;
-        Ok(serde_json::to_string(&json!({
-            "ok": true,
-            "action": action,
-            "file": filename,
-            "used_chars": new_content.len(),
-            "max_chars": max_chars,
-            "used_pct": pct
-        }))
-        .expect("infallible"))
+    // Atomic write: stage to temp file then rename to avoid partial writes on crash
+    let tmp_path = path.with_extension("tmp");
+    tokio::fs::write(&tmp_path, &new_content)
+        .await
+        .map_err(|e| ToolError::Other(format!("Cannot write {}: {}", filename, e)))?;
+    tokio::fs::rename(&tmp_path, &path).await.map_err(|e| {
+        ToolError::Other(format!("Cannot commit {} (rename failed): {}", filename, e))
+    })?;
+
+    let pct = (new_content.len() * 100) / max_chars;
+    Ok(serde_json::to_string(&json!({
+        "ok": true,
+        "action": action,
+        "file": filename,
+        "used_chars": new_content.len(),
+        "max_chars": max_chars,
+        "used_pct": pct
+    }))
+    .expect("infallible"))
 }
 
 /// Resolve the memories directory relative to workspace root

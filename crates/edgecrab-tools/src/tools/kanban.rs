@@ -27,9 +27,8 @@ fn open_board(ctx: &ToolContext) -> Result<std::sync::Arc<KanbanDb>, ToolError> 
                 .into(),
         ));
     }
-    let db = KanbanDb::open_default(Some(&ctx.config.edgecrab_home)).map_err(|e| {
-        ToolError::Other(format!("kanban db: {e}"))
-    })?;
+    let db = KanbanDb::open_default(Some(&ctx.config.edgecrab_home))
+        .map_err(|e| ToolError::Other(format!("kanban db: {e}")))?;
     let _ = db.reclaim_stale_claims();
     Ok(db)
 }
@@ -136,14 +135,23 @@ impl ToolHandler for KanbanCreateTool {
         }
     }
 
-    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String, ToolError> {
-        let args: CreateArgs = serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs {
-            tool: "kanban_create".into(),
-            message: e.to_string(),
-        })?;
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<String, ToolError> {
+        let args: CreateArgs =
+            serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs {
+                tool: "kanban_create".into(),
+                message: e.to_string(),
+            })?;
         let db = open_board(ctx)?;
         let max_runtime = resolve_max_runtime(ctx, args.max_runtime_seconds);
-        let assignee = args.assignee.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let assignee = args
+            .assignee
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
         let task = db
             .create_task_with_assignee(
                 &args.title,
@@ -204,7 +212,11 @@ impl ToolHandler for KanbanListTool {
         }
     }
 
-    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String, ToolError> {
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<String, ToolError> {
         let args: ListArgs = serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs {
             tool: "kanban_list".into(),
             message: e.to_string(),
@@ -252,7 +264,8 @@ impl ToolHandler for KanbanClaimTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "kanban_claim".into(),
-            description: "Claim a todo/blocked kanban card for this worker (sets status=doing).".into(),
+            description: "Claim a todo/blocked kanban card for this worker (sets status=doing)."
+                .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -265,7 +278,11 @@ impl ToolHandler for KanbanClaimTool {
         }
     }
 
-    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String, ToolError> {
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<String, ToolError> {
         let args: ClaimArgs = serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs {
             tool: "kanban_claim".into(),
             message: e.to_string(),
@@ -322,18 +339,24 @@ impl ToolHandler for KanbanCompleteTool {
         }
     }
 
-    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String, ToolError> {
-        let args: CompleteArgs = serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs {
-            tool: "kanban_complete".into(),
-            message: e.to_string(),
-        })?;
-        let db = open_board(ctx)?;
-        let task_id = kanban_gating::resolve_task_id(ctx, args.task_id.as_deref()).ok_or_else(|| {
-            ToolError::InvalidArgs {
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<String, ToolError> {
+        let args: CompleteArgs =
+            serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs {
                 tool: "kanban_complete".into(),
-                message: "task_id is required (or set EDGECRAB_KANBAN_TASK)".into(),
-            }
-        })?;
+                message: e.to_string(),
+            })?;
+        let db = open_board(ctx)?;
+        let task_id =
+            kanban_gating::resolve_task_id(ctx, args.task_id.as_deref()).ok_or_else(|| {
+                ToolError::InvalidArgs {
+                    tool: "kanban_complete".into(),
+                    message: "task_id is required (or set EDGECRAB_KANBAN_TASK)".into(),
+                }
+            })?;
         let w = worker_id(ctx);
         let task = db
             .complete_task(&task_id, Some(&w), args.result.as_deref())
@@ -379,11 +402,16 @@ impl ToolHandler for KanbanReleaseTool {
         }
     }
 
-    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String, ToolError> {
-        let args: ReleaseArgs = serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs {
-            tool: "kanban_release".into(),
-            message: e.to_string(),
-        })?;
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<String, ToolError> {
+        let args: ReleaseArgs =
+            serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs {
+                tool: "kanban_release".into(),
+                message: e.to_string(),
+            })?;
         let db = open_board(ctx)?;
         let w = worker_id(ctx);
         let task = db
@@ -434,18 +462,24 @@ impl ToolHandler for KanbanHeartbeatTool {
         }
     }
 
-    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String, ToolError> {
-        let args: HeartbeatArgs = serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs {
-            tool: "kanban_heartbeat".into(),
-            message: e.to_string(),
-        })?;
-        let db = open_board(ctx)?;
-        let task_id = kanban_gating::resolve_task_id(ctx, args.task_id.as_deref()).ok_or_else(|| {
-            ToolError::InvalidArgs {
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<String, ToolError> {
+        let args: HeartbeatArgs =
+            serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs {
                 tool: "kanban_heartbeat".into(),
-                message: "task_id is required (or set EDGECRAB_KANBAN_TASK)".into(),
-            }
-        })?;
+                message: e.to_string(),
+            })?;
+        let db = open_board(ctx)?;
+        let task_id =
+            kanban_gating::resolve_task_id(ctx, args.task_id.as_deref()).ok_or_else(|| {
+                ToolError::InvalidArgs {
+                    tool: "kanban_heartbeat".into(),
+                    message: "task_id is required (or set EDGECRAB_KANBAN_TASK)".into(),
+                }
+            })?;
         db.heartbeat_task(&task_id, &worker_id(ctx), ttl_secs(ctx))
             .map_err(|e| ToolError::Other(e.to_string()))?;
         Ok(json!({ "success": true, "task_id": task_id }).to_string())
@@ -479,7 +513,8 @@ impl ToolHandler for KanbanShowTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "kanban_show".into(),
-            description: "Show a kanban task with comments (defaults to EDGECRAB_KANBAN_TASK).".into(),
+            description: "Show a kanban task with comments (defaults to EDGECRAB_KANBAN_TASK)."
+                .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -489,17 +524,22 @@ impl ToolHandler for KanbanShowTool {
             strict: None,
         }
     }
-    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String, ToolError> {
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<String, ToolError> {
         let args: ShowArgs = serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs {
             tool: "kanban_show".into(),
             message: e.to_string(),
         })?;
-        let task_id = kanban_gating::resolve_task_id(ctx, args.task_id.as_deref()).ok_or_else(|| {
-            ToolError::InvalidArgs {
-                tool: "kanban_show".into(),
-                message: "task_id is required (or set EDGECRAB_KANBAN_TASK)".into(),
-            }
-        })?;
+        let task_id =
+            kanban_gating::resolve_task_id(ctx, args.task_id.as_deref()).ok_or_else(|| {
+                ToolError::InvalidArgs {
+                    tool: "kanban_show".into(),
+                    message: "task_id is required (or set EDGECRAB_KANBAN_TASK)".into(),
+                }
+            })?;
         let db = open_board(ctx)?;
         let task = db
             .get_task(&task_id)
@@ -572,17 +612,22 @@ impl ToolHandler for KanbanBlockTool {
             strict: None,
         }
     }
-    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String, ToolError> {
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<String, ToolError> {
         let args: BlockArgs = serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs {
             tool: "kanban_block".into(),
             message: e.to_string(),
         })?;
-        let task_id = kanban_gating::resolve_task_id(ctx, args.task_id.as_deref()).ok_or_else(|| {
-            ToolError::InvalidArgs {
-                tool: "kanban_block".into(),
-                message: "task_id is required (or set EDGECRAB_KANBAN_TASK)".into(),
-            }
-        })?;
+        let task_id =
+            kanban_gating::resolve_task_id(ctx, args.task_id.as_deref()).ok_or_else(|| {
+                ToolError::InvalidArgs {
+                    tool: "kanban_block".into(),
+                    message: "task_id is required (or set EDGECRAB_KANBAN_TASK)".into(),
+                }
+            })?;
         let db = open_board(ctx)?;
         let w = worker_id(ctx);
         let task = db
@@ -630,11 +675,16 @@ impl ToolHandler for KanbanUnblockTool {
             strict: None,
         }
     }
-    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String, ToolError> {
-        let args: UnblockArgs = serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs {
-            tool: "kanban_unblock".into(),
-            message: e.to_string(),
-        })?;
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<String, ToolError> {
+        let args: UnblockArgs =
+            serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs {
+                tool: "kanban_unblock".into(),
+                message: e.to_string(),
+            })?;
         let db = open_board(ctx)?;
         let task = db
             .unblock_task(&args.task_id)
@@ -686,20 +736,24 @@ impl ToolHandler for KanbanCommentTool {
             strict: None,
         }
     }
-    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String, ToolError> {
-        let args: CommentArgs = serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs {
-            tool: "kanban_comment".into(),
-            message: e.to_string(),
-        })?;
-        let task_id = kanban_gating::resolve_task_id(ctx, args.task_id.as_deref()).ok_or_else(|| {
-            ToolError::InvalidArgs {
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<String, ToolError> {
+        let args: CommentArgs =
+            serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs {
                 tool: "kanban_comment".into(),
-                message: "task_id is required (or set EDGECRAB_KANBAN_TASK)".into(),
-            }
-        })?;
-        let author = args
-            .author
-            .unwrap_or_else(|| worker_id(ctx));
+                message: e.to_string(),
+            })?;
+        let task_id =
+            kanban_gating::resolve_task_id(ctx, args.task_id.as_deref()).ok_or_else(|| {
+                ToolError::InvalidArgs {
+                    tool: "kanban_comment".into(),
+                    message: "task_id is required (or set EDGECRAB_KANBAN_TASK)".into(),
+                }
+            })?;
+        let author = args.author.unwrap_or_else(|| worker_id(ctx));
         let db = open_board(ctx)?;
         let comment = db
             .add_comment(&task_id, &author, &args.body)
@@ -752,7 +806,11 @@ impl ToolHandler for KanbanLinkTool {
             strict: None,
         }
     }
-    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String, ToolError> {
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<String, ToolError> {
         let args: LinkArgs = serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs {
             tool: "kanban_link".into(),
             message: e.to_string(),

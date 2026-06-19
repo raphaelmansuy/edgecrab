@@ -9,9 +9,9 @@ use edgecrab_core::compression::{
     structural_prefill_prune,
 };
 use edgecrab_core::local_provider_policy::{
-    gate_local_structural_prune, local_prefill_prune_token_budget,
-    should_structural_prefill_prune, try_apply_structural_tool_output_prune,
-    LocalStructuralPrunePhase, LOCAL_PREFILL_CONTEXT_DIVISOR, LOCAL_PREFILL_PRUNE_TOKEN_BUDGET,
+    LOCAL_PREFILL_CONTEXT_DIVISOR, LOCAL_PREFILL_PRUNE_TOKEN_BUDGET, LocalStructuralPrunePhase,
+    gate_local_structural_prune, local_prefill_prune_token_budget, should_structural_prefill_prune,
+    try_apply_structural_tool_output_prune,
 };
 use edgecrab_tools::mutation_turn_policy::length_without_tools_recovery_message;
 use edgecrab_types::Message;
@@ -24,7 +24,11 @@ fn research_heavy_messages(tool_count: usize, body_chars: usize) -> Vec<Message>
     for i in 0..tool_count {
         messages.push(Message::tool_result(
             &format!("web_{i}"),
-            if i % 2 == 0 { "web_search" } else { "web_extract" },
+            if i % 2 == 0 {
+                "web_search"
+            } else {
+                "web_extract"
+            },
             &format!("result {i}\n{}", "x".repeat(body_chars)),
         ));
     }
@@ -73,16 +77,23 @@ fn structural_prefill_prune_breaks_length_failure_loop_signature() {
     let before = estimate_tokens(&messages);
     assert!(should_structural_prefill_prune(before, LMSTUDIO_SYNCED_CTX));
 
-    let (pruned, replaced) = structural_prefill_prune(&messages, None);
-    assert!(replaced >= RESEARCH_TOOL_COUNT, "expected all research tool outputs pruned");
-    let after = estimate_tokens(&pruned);
-    assert!(
-        after < before / 3,
-        "prune must reclaim most tool mass: before={before} after={after}"
+    let (pruned, replaced) = structural_prefill_prune(
+        &messages,
+        None,
+        local_prefill_prune_token_budget(LMSTUDIO_SYNCED_CTX),
     );
     assert!(
-        !should_structural_prefill_prune(after, LMSTUDIO_SYNCED_CTX),
-        "after prune, preflight should not re-fire immediately"
+        replaced >= 1,
+        "expected at least one research tool output pruned"
+    );
+    let after = estimate_tokens(&pruned);
+    assert!(
+        after <= local_prefill_prune_token_budget(LMSTUDIO_SYNCED_CTX),
+        "after prune, prompt must be at or below preflight budget (after={after})"
+    );
+    assert!(
+        after < before,
+        "prune must shrink prompt: before={before} after={after}"
     );
 }
 
@@ -90,8 +101,7 @@ fn structural_prefill_prune_breaks_length_failure_loop_signature() {
 fn prefill_budget_formula_matches_first_principles_cap() {
     assert_eq!(
         local_prefill_prune_token_budget(LMSTUDIO_SYNCED_CTX),
-        LOCAL_PREFILL_PRUNE_TOKEN_BUDGET
-            .min(LMSTUDIO_SYNCED_CTX / LOCAL_PREFILL_CONTEXT_DIVISOR)
+        LOCAL_PREFILL_PRUNE_TOKEN_BUDGET.min(LMSTUDIO_SYNCED_CTX / LOCAL_PREFILL_CONTEXT_DIVISOR)
     );
     assert_eq!(
         local_prefill_prune_token_budget(8192),
@@ -139,8 +149,10 @@ fn lh31_mid_band_preflight_prune_drops_below_budget() {
     )
     .expect("preflight must prune mid-band fixture");
 
-    assert_eq!(count_long_tool_outputs(&pruned), 0);
-    assert_eq!(outcome.long_tool_outputs_remaining, 0);
+    assert_eq!(
+        outcome.long_tool_outputs_remaining,
+        count_long_tool_outputs(&pruned)
+    );
     let after = estimate_tokens(&pruned);
     assert!(
         after <= budget,
@@ -178,7 +190,7 @@ fn lh11_length_recovery_prune_drops_tokens_in_mid_band() {
         after = estimate_tokens(&pruned)
     );
 
-    let (_, direct_outcome) = apply_structural_tool_output_prune(&messages, None)
+    let (_, direct_outcome) = apply_structural_tool_output_prune(&messages, None, 0)
         .expect("direct apply matches try_apply outcome");
     assert_eq!(direct_outcome.tools_pruned, outcome.tools_pruned);
 }
@@ -192,7 +204,11 @@ fn high_band_messages() -> Vec<Message> {
     for i in 0..HIGH_BAND_TOOL_ROUNDS {
         messages.push(Message::tool_result(
             &format!("web_{i}"),
-            if i % 2 == 0 { "web_search" } else { "web_extract" },
+            if i % 2 == 0 {
+                "web_search"
+            } else {
+                "web_extract"
+            },
             &format!("chunk {i}\n{}", "y".repeat(HIGH_BAND_BODY_CHARS)),
         ));
         messages.push(Message::user(&format!("Summarize chunk {i} and continue")));
@@ -213,9 +229,7 @@ fn lmstudio_compression_params() -> edgecrab_core::compression::CompressionParam
 /// **LH-32** — ~57k band triggers local structural compress, not LLM compress @ 50%.
 #[test]
 fn lh32_high_band_triggers_local_structural_compress_not_llm() {
-    use edgecrab_core::compression::{
-        check_compression_status_for_estimate, CompressionStatus,
-    };
+    use edgecrab_core::compression::{CompressionStatus, check_compression_status_for_estimate};
     use edgecrab_core::local_provider_policy::{
         local_structural_compress_token_threshold, should_local_structural_compress,
     };

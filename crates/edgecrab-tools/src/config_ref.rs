@@ -302,6 +302,8 @@ pub struct AppConfigRef {
     pub web_search: WebSearchConfigRef,
     /// Hermes-aligned web tool backend overrides (`web:` in config.yaml).
     pub web: WebToolsConfigRef,
+    /// Tool schema wire mode (`tools.schema_mode` in config.yaml).
+    pub tool_schema_mode: crate::schema_mode::ToolSchemaMode,
 }
 
 impl Default for AppConfigRef {
@@ -384,10 +386,10 @@ impl Default for AppConfigRef {
             result_turn_budget_chars: 200_000,
             max_write_payload_kib: crate::edit_contract::DEFAULT_MAX_MUTATION_PAYLOAD_KIB,
             local_write_create_dirs: true,
-            local_max_tool_turn_tokens:
-                crate::mutation_turn_policy::LOCAL_TOOL_TURN_ABS_MAX_TOKENS,
+            local_max_tool_turn_tokens: crate::mutation_turn_policy::LOCAL_TOOL_TURN_ABS_MAX_TOKENS,
             web_search: WebSearchConfigRef::default(),
             web: WebToolsConfigRef::default(),
+            tool_schema_mode: crate::schema_mode::ToolSchemaMode::Indexed,
         }
     }
 }

@@ -2,19 +2,20 @@
 
 use std::time::Duration;
 
+use axum::Json;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use edgecrab_core::{
-    check_kanban_token, decompose_outcome_json, decompose_task_by_id, describe_outcome_json,
-    describe_profile, edgecrab_home, ensure_kanban_api_token, get_orchestration_settings,
-    install_root, kanban_api, load_kanban_api_token, patch_orchestration_settings,
-    profiles_api_json, write_profile_description, AppConfig, OrchestrationSettingsPatch, TaskPatch,
+    AppConfig, OrchestrationSettingsPatch, TaskPatch, check_kanban_token, decompose_outcome_json,
+    decompose_task_by_id, describe_outcome_json, describe_profile, edgecrab_home,
+    ensure_kanban_api_token, get_orchestration_settings, install_root, kanban_api,
+    load_kanban_api_token, patch_orchestration_settings, profiles_api_json,
+    write_profile_description,
 };
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::run::GatewayState;
 
@@ -54,17 +55,11 @@ fn api_err(e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
 }
 
 fn not_found(msg: impl Into<String>) -> (StatusCode, Json<Value>) {
-    (
-        StatusCode::NOT_FOUND,
-        Json(json!({ "error": msg.into() })),
-    )
+    (StatusCode::NOT_FOUND, Json(json!({ "error": msg.into() })))
 }
 
 fn unauthorized(msg: &'static str) -> (StatusCode, Json<Value>) {
-    (
-        StatusCode::UNAUTHORIZED,
-        Json(json!({ "error": msg })),
-    )
+    (StatusCode::UNAUTHORIZED, Json(json!({ "error": msg })))
 }
 
 fn kanban_cfg() -> AppConfig {
@@ -108,14 +103,8 @@ fn auth_or_err(
     let hdr_owned = header_token(headers);
     let bearer = bearer_owned.as_deref();
     let hdr = hdr_owned.as_deref();
-    check_kanban_token(
-        &cfg.kanban,
-        &state.gateway_host,
-        bearer,
-        hdr,
-        query_token,
-    )
-    .map_err(unauthorized)
+    check_kanban_token(&cfg.kanban, &state.gateway_host, bearer, hdr, query_token)
+        .map_err(unauthorized)
 }
 
 /// `GET /kanban` — dashboard HTML with embedded API token when configured.
@@ -184,11 +173,7 @@ pub async fn kanban_task_detail(
         return Err(kanban_disabled());
     }
     auth_or_err(&state, &headers, params.token.as_deref())?;
-    match kanban_api::task_detail(
-        Some(&edgecrab_home()),
-        params.board.as_deref(),
-        &task_id,
-    ) {
+    match kanban_api::task_detail(Some(&edgecrab_home()), params.board.as_deref(), &task_id) {
         Ok(v) => Ok(Json(v)),
         Err(edgecrab_types::AgentError::Validation(msg)) => Err(not_found(msg)),
         Err(e) => Err(api_err(e)),
@@ -214,14 +199,8 @@ pub async fn kanban_decompose_task(
 
     let provider = agent.provider_handle().await;
     let model = agent.model().await;
-    let outcome = decompose_task_by_id(
-        Some(&edgecrab_home()),
-        &task_id,
-        provider,
-        &model,
-        &cfg,
-    )
-    .await;
+    let outcome =
+        decompose_task_by_id(Some(&edgecrab_home()), &task_id, provider, &model, &cfg).await;
     Ok(Json(decompose_outcome_json(&outcome)))
 }
 
@@ -261,11 +240,7 @@ pub async fn kanban_task_delete(
         return Err(kanban_disabled());
     }
     auth_or_err(&state, &headers, params.token.as_deref())?;
-    match kanban_api::delete_task(
-        Some(&edgecrab_home()),
-        params.board.as_deref(),
-        &task_id,
-    ) {
+    match kanban_api::delete_task(Some(&edgecrab_home()), params.board.as_deref(), &task_id) {
         Ok(v) => Ok(Json(v)),
         Err(edgecrab_types::AgentError::Validation(msg)) => Err(not_found(msg)),
         Err(e) => Err(api_err(e)),
@@ -293,7 +268,9 @@ pub async fn kanban_profile_describe_auto(
     auth_or_err(&state, &headers, params.token.as_deref())?;
 
     let Some(agent) = state.agent.clone() else {
-        return Err(api_err("profile describer requires a running gateway agent"));
+        return Err(api_err(
+            "profile describer requires a running gateway agent",
+        ));
     };
 
     let provider = agent.provider_handle().await;
@@ -314,14 +291,9 @@ pub async fn kanban_events_poll(
     }
     auth_or_err(&state, &headers, params.token.as_deref())?;
     let (board, since, limit) = events_params(&params);
-    kanban_api::events_since(
-        Some(&edgecrab_home()),
-        board.as_deref(),
-        since,
-        limit,
-    )
-    .map(Json)
-    .map_err(api_err)
+    kanban_api::events_since(Some(&edgecrab_home()), board.as_deref(), since, limit)
+        .map(Json)
+        .map_err(api_err)
 }
 
 /// `GET /api/kanban/events/ws?since=<id>&board=<slug>&token=<token>`
@@ -378,11 +350,7 @@ async fn kanban_events_stream(
             }
             Ok(Err(e)) => {
                 let err = json!({ "error": e.to_string() });
-                if socket
-                    .send(Message::Text(err.to_string()))
-                    .await
-                    .is_err()
-                {
+                if socket.send(Message::Text(err.to_string())).await.is_err() {
                     break;
                 }
             }
@@ -469,8 +437,8 @@ pub async fn kanban_profile_patch(
     }
     auth_or_err(&state, &headers, params.token.as_deref())?;
     let text = body.description.unwrap_or_default();
-    let saved = write_profile_description(&install_root(), &profile_name, &text)
-        .map_err(validation_err)?;
+    let saved =
+        write_profile_description(&install_root(), &profile_name, &text).map_err(validation_err)?;
     Ok(Json(json!({
         "ok": true,
         "profile": profile_name,

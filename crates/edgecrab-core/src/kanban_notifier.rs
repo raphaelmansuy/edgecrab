@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use edgecrab_state::{
-    KanbanDb, KanbanEvent, KanbanNotifySub, KanbanTask, KANBAN_NOTIFY_TERMINAL_KINDS,
+    KANBAN_NOTIFY_TERMINAL_KINDS, KanbanDb, KanbanEvent, KanbanNotifySub, KanbanTask,
     kanban_db_path_for_board, list_board_slugs,
 };
 
@@ -65,13 +65,9 @@ pub fn format_notifier_message(
             let err = payload_field(event.payload.as_deref(), "error")
                 .map(|e| format!("\n{}", safe_truncate_local(&e, 200)))
                 .unwrap_or_default();
-            format!(
-                "✖ {tag}Kanban {task_id} gave up after repeated failures{err}"
-            )
+            format!("✖ {tag}Kanban {task_id} gave up after repeated failures{err}")
         }
-        "crashed" => format!(
-            "✖ {tag}Kanban {task_id} worker crashed; dispatcher will retry"
-        ),
+        "crashed" => format!("✖ {tag}Kanban {task_id} worker crashed; dispatcher will retry"),
         "timed_out" => {
             let limit = payload_field(event.payload.as_deref(), "limit_seconds")
                 .unwrap_or_else(|| "0".into());
@@ -258,10 +254,7 @@ pub fn spawn_kanban_notifier(
                     batch.sub.chat_id.clone(),
                     batch.sub.thread_id.clone(),
                 );
-                let worker = batch
-                    .task
-                    .as_ref()
-                    .and_then(|t| t.worker_id.as_deref());
+                let worker = batch.task.as_ref().and_then(|t| t.worker_id.as_deref());
                 let title = batch
                     .task
                     .as_ref()
@@ -269,9 +262,13 @@ pub fn spawn_kanban_notifier(
                     .unwrap_or(&batch.sub.task_id);
                 let mut send_failed = false;
                 for ev in &batch.events {
-                    let Some(message) =
-                        format_notifier_message(&batch.sub.task_id, title, worker, ev, batch.task.as_ref())
-                    else {
+                    let Some(message) = format_notifier_message(
+                        &batch.sub.task_id,
+                        title,
+                        worker,
+                        ev,
+                        batch.task.as_ref(),
+                    ) else {
                         continue;
                     };
                     let is_completed = ev.kind == "completed";
@@ -355,8 +352,8 @@ mod tests {
             payload: Some(r#"{"summary":"Shipped auth refactor"}"#.into()),
             created_at: 0,
         };
-        let msg = format_notifier_message("kb-1", "Auth", Some("worker-a"), &ev, None)
-            .expect("msg");
+        let msg =
+            format_notifier_message("kb-1", "Auth", Some("worker-a"), &ev, None).expect("msg");
         assert!(msg.contains("done"));
         assert!(msg.contains("Shipped"));
     }

@@ -44,7 +44,9 @@ pub fn patch_kanban_task(
     install_root: &Path,
 ) -> Result<Value, AgentError> {
     if db.get_task(task_id)?.is_none() {
-        return Err(AgentError::Validation(format!("task '{task_id}' not found")));
+        return Err(AgentError::Validation(format!(
+            "task '{task_id}' not found"
+        )));
     }
 
     if let Some(ref raw) = patch.assignee {
@@ -94,10 +96,7 @@ fn apply_status(
 ) -> Result<(), AgentError> {
     match status {
         "done" => {
-            let result = patch
-                .result
-                .as_deref()
-                .or(patch.summary.as_deref());
+            let result = patch.result.as_deref().or(patch.summary.as_deref());
             db.complete_task(task_id, None, result)?;
         }
         "blocked" => {
@@ -173,6 +172,10 @@ mod tests {
             panic!("expected validation conflict");
         };
         let body = parse_conflict(&msg).expect("conflict json");
-        assert!(body.get("blockers").and_then(|v| v.as_array()).is_some_and(|a| !a.is_empty()));
+        assert!(
+            body.get("blockers")
+                .and_then(|v| v.as_array())
+                .is_some_and(|a| !a.is_empty())
+        );
     }
 }

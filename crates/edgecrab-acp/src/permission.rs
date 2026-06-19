@@ -57,16 +57,14 @@ pub fn is_safe_tool(tool_name: &str) -> bool {
     )
 }
 
-/// Tools that are exposed in ACP mode (coding-focused subset).
-///
-/// DRY: Re-exported from `edgecrab_tools::ACP_TOOLS` — single source of truth.
-/// Intentionally excludes messaging, cronjob, TTS, and other
-/// non-editor tools per the spec in docs/004_tools_system/003_toolset_composition.md.
-pub use edgecrab_tools::ACP_TOOLS;
+/// Tools exposed in ACP mode — derived from `edgecrab_tools::acp_tools()`.
+pub fn acp_tool_list() -> Vec<&'static str> {
+    edgecrab_tools::acp_tools()
+}
 
 /// Check whether a tool is allowed in ACP mode.
 pub fn is_acp_tool(tool_name: &str) -> bool {
-    ACP_TOOLS.contains(&tool_name)
+    edgecrab_tools::is_acp_tool(tool_name)
 }
 
 #[cfg(test)]
@@ -93,7 +91,7 @@ mod tests {
     fn acp_tools_include_coding_set() {
         assert!(is_acp_tool("terminal"));
         assert!(is_acp_tool("read_file"));
-        assert!(is_acp_tool("web_crawl"));
+        assert!(!is_acp_tool("web_crawl"));
         assert!(is_acp_tool("write_file"));
         assert!(is_acp_tool("patch"));
         assert!(is_acp_tool("search_files"));
@@ -103,7 +101,7 @@ mod tests {
         assert!(is_acp_tool("browser_select"));
         assert!(is_acp_tool("browser_hover"));
         assert!(is_acp_tool("browser_vision"));
-        // LSP loads via enabled_toolsets in ACP runtime, not static ACP_TOOLS.
+        // LSP loads via enabled_toolsets in ACP runtime, not base acp_tools().
         assert!(!is_acp_tool("lsp_goto_definition"));
         assert!(!is_acp_tool("lsp_find_references"));
     }

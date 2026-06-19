@@ -28,8 +28,8 @@ pub const LOCAL_TOOL_TURN_ABS_MAX_TOKENS: usize = 8192;
 
 /// Max tool-argument bytes derivable from a fixed output-token budget (geometry formula).
 pub fn local_max_tool_argument_bytes_for_output_tokens(output_tokens: usize) -> usize {
-    let completion_cap = ((output_tokens * TOOL_ARG_CHARS_PER_TOKEN) as f32
-        * TOOL_ARG_BUDGET_SAFETY_RATIO) as usize;
+    let completion_cap =
+        ((output_tokens * TOOL_ARG_CHARS_PER_TOKEN) as f32 * TOOL_ARG_BUDGET_SAFETY_RATIO) as usize;
     DEFAULT_MAX_MUTATION_PAYLOAD_BYTES.min(completion_cap.max(MIN_TOOL_ARGUMENT_BYTES))
 }
 
@@ -67,9 +67,8 @@ pub fn output_token_budget_for_tool_turn(
     absolute_max_tokens: usize,
 ) -> usize {
     let provider_cap = provider_output_token_budget(provider);
-    let tokens_for_mutation = max_mutation_payload_bytes
-        .div_ceil(TOOL_ARG_CHARS_PER_TOKEN)
-        + TOOL_CALL_ENVELOPE_TOKENS;
+    let tokens_for_mutation =
+        max_mutation_payload_bytes.div_ceil(TOOL_ARG_CHARS_PER_TOKEN) + TOOL_CALL_ENVELOPE_TOKENS;
     provider_cap
         .min(tokens_for_mutation)
         .min(absolute_max_tokens)
@@ -118,8 +117,8 @@ pub fn max_tool_argument_bytes(
 
     let output_tokens = effective_output_token_budget(max_mutation_payload_bytes, Some(provider));
 
-    let completion_cap = ((output_tokens * TOOL_ARG_CHARS_PER_TOKEN) as f32 * TOOL_ARG_BUDGET_SAFETY_RATIO)
-        as usize;
+    let completion_cap =
+        ((output_tokens * TOOL_ARG_CHARS_PER_TOKEN) as f32 * TOOL_ARG_BUDGET_SAFETY_RATIO) as usize;
     mutation_cap.min(completion_cap.max(MIN_TOOL_ARGUMENT_BYTES))
 }
 
@@ -361,10 +360,7 @@ mod tests {
             _options: Option<&CompletionOptions>,
         ) -> edgequake_llm::Result<edgequake_llm::LLMResponse> {
             Ok(edgequake_llm::LLMResponse::new(
-                messages
-                    .last()
-                    .map(|m| m.content.as_str())
-                    .unwrap_or(""),
+                messages.last().map(|m| m.content.as_str()).unwrap_or(""),
                 self.model(),
             ))
         }
@@ -454,13 +450,9 @@ mod tests {
         });
         let big = "x".repeat(20_000);
         let args = format!(r#"{{"path":"a.md","content":{big:?}}}"#);
-        let err = check_tool_argument_budget(
-            "write_file",
-            &args,
-            32 * 1024,
-            Some(provider.as_ref()),
-        )
-        .expect_err("oversized");
+        let err =
+            check_tool_argument_budget("write_file", &args, 32 * 1024, Some(provider.as_ref()))
+                .expect_err("oversized");
         assert_eq!(err.tool_name, "write_file");
         assert!(err.argument_bytes > err.max_bytes);
     }
@@ -474,11 +466,7 @@ mod tests {
 
     #[test]
     fn recovery_message_names_tools_and_limits() {
-        let msg = stream_interrupted_recovery_message(
-            &["write_file".into()],
-            32 * 1024,
-            None,
-        );
+        let msg = stream_interrupted_recovery_message(&["write_file".into()], 32 * 1024, None);
         assert!(msg.contains("write_file"));
         assert!(msg.contains("KiB"));
         assert!(msg.contains("scaffold"));

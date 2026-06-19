@@ -82,10 +82,7 @@ impl App {
                     self.turn_activity.on_model_resuming();
                     if matches!(self.display_state, DisplayState::Streaming { .. })
                         || !self.turn_activity.tools.is_empty()
-                        || matches!(
-                            self.turn_activity.phase,
-                            ShelfPhase::AwaitingFirstToken
-                        )
+                        || matches!(self.turn_activity.phase, ShelfPhase::AwaitingFirstToken)
                     {
                         self.turn_activity.set_phase(ShelfPhase::Streaming);
                     }

@@ -143,7 +143,9 @@ pub async fn import_hub_snapshot(
         }
     }
     if approvals_restored > 0 {
-        out.push_str(&format!("Restored {approvals_restored} trust approval(s).\n"));
+        out.push_str(&format!(
+            "Restored {approvals_restored} trust approval(s).\n"
+        ));
     }
 
     if snapshot.skills.is_empty() {

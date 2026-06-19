@@ -594,6 +594,7 @@ impl ToolHandler for DelegateTaskToolReal {
                     mutation_turn: None,
                     lsp_gate: None,
                     kanban_task_id: None,
+                    materialized_tools: None,
                 };
 
                 let goal = t.goal.clone();

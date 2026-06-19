@@ -12,20 +12,18 @@
 //!       └── return Set<toolset_name>
 //! ```
 
-/// Core tools shared across CLI and all gateway platforms.
+/// Built-in tools in the **default `core` alias** surface (ACP derivation base).
 ///
-/// Editing this list once updates all platforms. Platform differentiation
-/// happens via runtime gating (check_fn), not static tool lists.
+/// **Law:** Runtime policy is `enabled_toolsets: ["core"]` → `resolve_alias("core")`.
+/// This list documents tools on that surface for tests and `acp_tools()` — not every
+/// registered tool in the binary.
 ///
-/// Design principle (hermes-agent `_HERMES_CORE_TOOLS` pattern):
-/// Keep the core set minimal (~45 tools) so the LLM schema payload stays
-/// under ~18K tokens. Specialised tools (LSP, MOA) live in on-demand
-/// toolsets loaded via `enabled_toolsets: ["core", "lsp"]`.
+/// Opt-in surfaces (not listed here): `LSP_TOOLS`, `MOA_TOOLS`, `HONCHO_TOOLS`,
+/// `RESEARCH_EXTRA_TOOLS`, `MCP_EXTENDED_TOOLS`, `kanban`, `computer_use`.
 pub const CORE_TOOLS: &[&str] = &[
-    // Web (3)
+    // Web (2) — web_crawl is `research` toolset only (heavy schema)
     "web_search",
     "web_extract",
-    "web_crawl",
     // Terminal + process management (8)
     "terminal",
     "run_process",
@@ -35,12 +33,11 @@ pub const CORE_TOOLS: &[&str] = &[
     "wait_for_process",
     "write_stdin",
     "process",
-    // File manipulation (5)
+    // File manipulation (4) — pdf_to_markdown is `research` toolset only
     "read_file",
     "write_file",
     "patch",
     "search_files",
-    "pdf_to_markdown",
     // Skills (5)
     "skills_list",
     "skills_categories",
@@ -68,18 +65,11 @@ pub const CORE_TOOLS: &[&str] = &[
     "vision_analyze",
     "transcribe_audio",
     "generate_image",
-    // Planning & memory (4)
+    // Planning & memory (4) — honcho is opt-in `honcho` toolset
     "manage_todo_list",
     "report_task_status",
     "memory_read",
     "memory_write",
-    // Honcho — persistent cross-session user modeling (6, runtime-gated)
-    "honcho_conclude",
-    "honcho_search",
-    "honcho_list",
-    "honcho_remove",
-    "honcho_profile",
-    "honcho_context",
     // Home Assistant smart home control (4, runtime-gated)
     "ha_list_entities",
     "ha_get_state",
@@ -94,6 +84,8 @@ pub const CORE_TOOLS: &[&str] = &[
     // Code execution + delegation (2)
     "execute_code",
     "delegate_task",
+    // Deferred schema loader (indexed mode)
+    "tool_search",
     // Cron job management (1)
     "manage_cron_jobs",
     // MCP core (2) — extended MCP tools available via "mcp_ext" toolset
@@ -102,6 +94,19 @@ pub const CORE_TOOLS: &[&str] = &[
     // Cross-platform messaging (1, runtime-gated)
     "send_message",
 ];
+
+/// Opt-in Honcho cross-session modeling — `enabled_toolsets: ["core", "honcho"]`.
+pub const HONCHO_TOOLS: &[&str] = &[
+    "honcho_conclude",
+    "honcho_search",
+    "honcho_list",
+    "honcho_remove",
+    "honcho_profile",
+    "honcho_context",
+];
+
+/// Heavy research tools — `enabled_toolsets: ["core", "research"]` (web_crawl not in `web`).
+pub const RESEARCH_EXTRA_TOOLS: &[&str] = &["web_crawl", "pdf_to_markdown"];
 
 /// On-demand LSP tools — loaded via `enabled_toolsets: ["core", "lsp"]`.
 ///
@@ -146,6 +151,25 @@ pub const MCP_EXTENDED_TOOLS: &[&str] = &[
 
 /// On-demand Mixture-of-Agents tool — loaded via `enabled_toolsets: ["core", "moa"]`.
 pub const MOA_TOOLS: &[&str] = &["moa"];
+
+/// Hot tools always on the wire when `tools.schema_mode: indexed` (spec 007 L3).
+///
+/// Everything else in the enabled surface is deferred — listed in the system
+/// prompt and materialized via `tool_search`.
+pub const INDEXED_HOT_TOOLS: &[&str] = &[
+    "read_file",
+    "write_file",
+    "patch",
+    "search_files",
+    "terminal",
+    "web_search",
+    "web_extract",
+    "memory_read",
+    "memory_write",
+    "manage_todo_list",
+    "delegate_task",
+    "skill_view",
+];
 
 /// Multi-agent kanban board — opt-in via `kanban.enabled` + `enabled_toolsets: ["kanban"]`.
 pub const KANBAN_TOOLS: &[&str] = &[
@@ -196,63 +220,10 @@ pub fn acp_tools() -> Vec<&'static str> {
         .collect()
 }
 
-/// Static ACP_TOOLS for backward compatibility with const contexts.
-/// Prefer `acp_tools()` for runtime use.
-pub const ACP_TOOLS: &[&str] = &[
-    "web_search",
-    "web_extract",
-    "web_crawl",
-    "terminal",
-    "run_process",
-    "list_processes",
-    "kill_process",
-    "get_process_output",
-    "wait_for_process",
-    "write_stdin",
-    "process",
-    "read_file",
-    "write_file",
-    "patch",
-    "search_files",
-    "pdf_to_markdown",
-    "skills_list",
-    "skills_categories",
-    "skill_view",
-    "skill_manage",
-    "skills_hub",
-    "browser_navigate",
-    "browser_snapshot",
-    "browser_screenshot",
-    "browser_click",
-    "browser_type",
-    "browser_scroll",
-    "browser_console",
-    "browser_back",
-    "browser_press",
-    "browser_close",
-    "browser_get_images",
-    "browser_vision",
-    "browser_wait_for",
-    "browser_select",
-    "browser_hover",
-    "manage_todo_list",
-    "report_task_status",
-    "memory_read",
-    "memory_write",
-    "honcho_conclude",
-    "honcho_search",
-    "honcho_list",
-    "honcho_remove",
-    "honcho_profile",
-    "honcho_context",
-    "session_search",
-    "checkpoint",
-    "execute_code",
-    "delegate_task",
-    "manage_cron_jobs",
-    "mcp_list_tools",
-    "mcp_call_tool",
-];
+/// Whether `tool_name` is in the ACP coding subset (derived from `CORE_TOOLS`).
+pub fn is_acp_tool(tool_name: &str) -> bool {
+    acp_tools().contains(&tool_name)
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ToolsetEnableSync {
@@ -271,7 +242,7 @@ pub struct ToolsetEnableSync {
 /// ## Toolset name → tools mapping
 /// - `"file"`         → read_file, write_file, patch, search_files
 /// - `"terminal"`     → terminal, run_process, list_processes, kill_process
-/// - `"web"`          → web_search, web_extract, web_crawl
+/// - `"web"`          → web_search, web_extract (web_crawl → `research` extras)
 /// - `"browser"`      → browser_navigate, browser_snapshot, …
 /// - `"memory"`       → memory_read, memory_write
 /// - `"honcho"`       → honcho_* cross-session modeling (opt-in)
@@ -326,7 +297,7 @@ pub fn resolve_alias(alias: &str) -> Option<&'static [&'static str]> {
             "browser",        // browser_navigate, browser_snapshot, … (runtime-gated)
         ]),
         "coding" => Some(&["file", "terminal", "search", "code_execution", "lsp"]),
-        "research" => Some(&["web", "browser", "vision"]),
+        "research" => Some(&["web", "browser", "vision", "research"]),
         "debugging" => Some(&["terminal", "web", "file"]),
         "safe" => Some(&["web", "vision", "image_gen", "moa"]),
         "all" => Some(&[]), // sentinel: include everything
@@ -502,7 +473,8 @@ mod tests {
         assert!(CORE_TOOLS.contains(&"read_file"));
         assert!(CORE_TOOLS.contains(&"terminal"));
         assert!(CORE_TOOLS.contains(&"web_search"));
-        assert!(CORE_TOOLS.contains(&"web_crawl"));
+        assert!(!CORE_TOOLS.contains(&"web_crawl"));
+        assert!(RESEARCH_EXTRA_TOOLS.contains(&"web_crawl"));
         assert!(CORE_TOOLS.contains(&"clarify"));
         assert!(CORE_TOOLS.contains(&"memory_read"));
         assert!(CORE_TOOLS.contains(&"manage_todo_list"));
@@ -529,6 +501,44 @@ mod tests {
     }
 
     #[test]
+    fn honcho_not_in_core_tools() {
+        for tool in HONCHO_TOOLS {
+            assert!(
+                !CORE_TOOLS.contains(tool),
+                "Honcho tool '{tool}' should be opt-in via honcho toolset"
+            );
+        }
+    }
+
+    #[test]
+    fn research_extras_not_in_core_tools() {
+        for tool in RESEARCH_EXTRA_TOOLS {
+            assert!(
+                !CORE_TOOLS.contains(tool),
+                "Research extra '{tool}' should not be in default CORE_TOOLS"
+            );
+        }
+    }
+
+    #[test]
+    fn research_alias_includes_research_toolset() {
+        let expanded = expand_toolset_names(&["research".to_string()]);
+        assert!(
+            expanded.iter().any(|n| n == "research"),
+            "research alias must expand to literal research toolset (web_crawl, pdf_to_markdown)"
+        );
+    }
+
+    #[test]
+    fn core_tools_count_is_honest() {
+        assert!(
+            CORE_TOOLS.len() <= 57,
+            "CORE_TOOLS grew past budget accountability ({} names); use opt-in toolsets",
+            CORE_TOOLS.len()
+        );
+    }
+
+    #[test]
     fn moa_not_in_core_tools() {
         assert!(
             !CORE_TOOLS.contains(&"moa"),
@@ -549,28 +559,37 @@ mod tests {
 
     #[test]
     fn acp_tools_no_interactive() {
-        assert!(!ACP_TOOLS.contains(&"clarify"));
-        assert!(!ACP_TOOLS.contains(&"send_message"));
-        assert!(!ACP_TOOLS.contains(&"generate_image"));
-        assert!(!ACP_TOOLS.contains(&"text_to_speech"));
-        assert!(ACP_TOOLS.contains(&"web_crawl"));
-        assert!(ACP_TOOLS.contains(&"checkpoint"));
-        assert!(ACP_TOOLS.contains(&"mcp_list_tools"));
-        assert!(ACP_TOOLS.contains(&"browser_wait_for"));
-        assert!(ACP_TOOLS.contains(&"browser_select"));
-        assert!(ACP_TOOLS.contains(&"browser_hover"));
-        // LSP/MOA are opt-in via enabled_toolsets — not in the base ACP surface.
-        assert!(!ACP_TOOLS.contains(&"lsp_goto_definition"));
-        assert!(!ACP_TOOLS.contains(&"moa"));
+        let acp = acp_tools();
+        assert!(!acp.contains(&"clarify"));
+        assert!(!acp.contains(&"send_message"));
+        assert!(!acp.contains(&"generate_image"));
+        assert!(!acp.contains(&"text_to_speech"));
+        assert!(!acp.contains(&"web_crawl"));
+        assert!(!acp.contains(&"pdf_to_markdown"));
+        assert!(acp.contains(&"checkpoint"));
+        assert!(acp.contains(&"mcp_list_tools"));
+        assert!(acp.contains(&"browser_wait_for"));
+        assert!(acp.contains(&"browser_select"));
+        assert!(acp.contains(&"browser_hover"));
+        assert!(!acp.contains(&"lsp_goto_definition"));
+        assert!(!acp.contains(&"moa"));
     }
 
     #[test]
-    fn acp_tools_fn_matches_static_const() {
-        let mut dynamic = acp_tools();
-        dynamic.sort_unstable();
-        let mut expected: Vec<&str> = ACP_TOOLS.to_vec();
-        expected.sort_unstable();
-        assert_eq!(dynamic, expected, "acp_tools() must match ACP_TOOLS const");
+    fn is_acp_tool_matches_acp_tools() {
+        assert!(is_acp_tool("terminal"));
+        assert!(!is_acp_tool("clarify"));
+        assert!(!is_acp_tool("web_crawl"));
+    }
+
+    #[test]
+    fn acp_tools_is_subset_of_core() {
+        for tool in acp_tools() {
+            assert!(
+                CORE_TOOLS.contains(&tool),
+                "ACP tool '{tool}' must be listed in CORE_TOOLS"
+            );
+        }
     }
 
     #[test]

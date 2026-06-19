@@ -196,6 +196,15 @@ pub struct ToolErrorResponse {
     pub recovery_feedback: Option<crate::RecoveryFeedback>,
 }
 
+/// Parse a tool-result string as a structured [`ToolErrorResponse`].
+///
+/// DRY entry point for harness gates and the conversation loop — avoids prose
+/// heuristics (`looks_like_error`) when branching on tool failures.
+pub fn parse_tool_error_payload(text: &str) -> Option<ToolErrorResponse> {
+    let parsed = serde_json::from_str::<ToolErrorResponse>(text).ok()?;
+    (parsed.response_type == "tool_error").then_some(parsed)
+}
+
 impl ToolError {
     /// Unwrap [`Self::WithRecovery`] to the underlying error.
     pub fn core_error(&self) -> &ToolError {
@@ -479,8 +488,8 @@ mod tests {
 
     #[test]
     fn tool_error_with_recovery_serializes_feedback_block() {
-        use crate::RecoveryFeedbackBuilder;
         use crate::RecoveryAction;
+        use crate::RecoveryFeedbackBuilder;
         use serde_json::json;
 
         let err = ToolError::InvalidArgs {

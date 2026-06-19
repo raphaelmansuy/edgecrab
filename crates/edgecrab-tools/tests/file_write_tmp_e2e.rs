@@ -42,6 +42,7 @@ fn ctx_in(workspace: &std::path::Path, edgecrab_home: &std::path::Path) -> ToolC
         mutation_turn: None,
         lsp_gate: None,
         kanban_task_id: None,
+        materialized_tools: None,
     }
 }
 

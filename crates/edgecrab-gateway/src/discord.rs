@@ -361,7 +361,11 @@ impl DiscordAdapter {
         let mut buttons = Vec::new();
         for (idx, choice) in choices.iter().take(24).enumerate() {
             let label = if choice.len() > 75 {
-                format!("{}. {}...", idx + 1, choice.chars().take(72).collect::<String>())
+                format!(
+                    "{}. {}...",
+                    idx + 1,
+                    choice.chars().take(72).collect::<String>()
+                )
             } else {
                 format!("{}. {choice}", idx + 1)
             };
@@ -414,10 +418,8 @@ impl DiscordAdapter {
                 "value": "Pick one below, or click ✏️ Other to type a custom answer.",
                 "inline": false,
             }]);
-            payload["components"] = serde_json::Value::Array(Self::build_clarify_components(
-                interaction_id,
-                choices,
-            ));
+            payload["components"] =
+                serde_json::Value::Array(Self::build_clarify_components(interaction_id, choices));
         } else {
             payload["embeds"][0]["fields"] = serde_json::json!([{
                 "name": "Reply",
@@ -501,9 +503,7 @@ impl DiscordAdapter {
             .as_str()
             .or_else(|| d["user"]["id"].as_str())
             .unwrap_or("");
-        if !self.allowed_users.is_empty()
-            && !self.allowed_users.iter().any(|u| u == user_id)
-        {
+        if !self.allowed_users.is_empty() && !self.allowed_users.iter().any(|u| u == user_id) {
             let _ = self
                 .respond_interaction_ephemeral_v10(interaction_id_str, token, "Not authorized.")
                 .await;

@@ -7,7 +7,7 @@
 //!   edgecrab-tools
 //!     ├── registry.rs     — ToolHandler trait, ToolRegistry, ToolContext
 //!     ├── config_ref.rs   — AppConfigRef (lightweight config for tool context)
-//!     ├── toolsets.rs      — CORE_TOOLS, ACP_TOOLS, alias resolution
+//!     ├── toolsets.rs      — CORE_TOOLS, acp_tools(), alias resolution
 //!     └── tools/           — individual tool implementations (Phase 2.2+)
 //! ```
 
@@ -24,30 +24,34 @@ pub mod edit_contract;
 pub mod execution_fs;
 pub mod execution_tmp;
 pub mod fuzzy_match;
-mod local_pty;
+pub mod harness_gates;
 pub mod kanban_gating;
+mod local_pty;
 pub mod lsp_gate;
 #[cfg(target_os = "macos")]
 pub mod macos_permissions;
 #[cfg(not(target_os = "macos"))]
 #[path = "macos_permissions_stub.rs"]
 pub mod macos_permissions;
-pub mod mutations;
 pub mod mutation_turn_policy;
+pub mod mutations;
 pub mod path_utils;
 pub mod process_table;
 pub mod provider_factory;
+pub mod provider_tracing;
 pub mod read_tracker;
 pub mod recovery_catalog;
 pub mod registry;
+pub mod schema_mode;
 mod shell_syntax;
 pub mod skills;
 pub mod smart_approval;
 pub mod subagent_ids;
-pub mod tool_call_pipeline;
 pub mod tool_argument_pipeline;
+pub mod tool_call_pipeline;
 pub mod tool_name_repair;
 pub mod tool_progress_tail;
+pub mod tool_schema_index;
 pub mod tools;
 pub mod toolsets;
 pub mod vision_models;
@@ -71,9 +75,14 @@ pub use artifact_spill::{
     WEB_SEARCH_INLINE_BYTES,
 };
 pub use config_ref::AppConfigRef;
+pub use edgecrab_security::approval::ApprovalMode;
 pub use execution_fs::{ExecutionFilesystemView, describe_execution_filesystem};
 pub use lsp_gate::{
     LspEditContext, LspGate, LspWriteHook, ToolDiagnostic, attach_post_write_diagnostics,
+};
+pub use harness_gates::{
+    HarnessBuildInput, HarnessSnapshot, OracleGateFailure, TerminalMutationToolError,
+    UnresolvedMutationFailure, build_harness_snapshot, terminal_mutation_tool_error,
 };
 pub use mutations::{
     MutationKind, MutationRecord, MutationTurnState, extract_file_mutation_targets,
@@ -82,23 +91,30 @@ pub use mutations::{
 };
 pub use process_table::ProcessTable;
 pub use provider_factory::{build_copilot_provider, create_provider_for_model};
+pub use provider_tracing::{llm_tracing_enabled, wrap_provider_with_tracing};
 pub use registry::{
     SubAgentResult, SubAgentRunner, ToolContext, ToolHandler, ToolProgressUpdate, ToolRegistry,
-    to_llm_definitions,
+    build_wire_llm_definitions, to_llm_definitions, to_llm_definitions_with_materialized,
+    to_llm_definitions_with_mode,
 };
+pub use schema_mode::{ToolSchemaMode, compact_tool_schema, prepare_schemas_for_mode};
+pub use smart_approval::handle_approvals_slash;
 pub use tool_argument_pipeline::{
     canonical_tool_args_json, parse_tool_arguments_json, prepare_parsed_tool_arguments,
     repair_stream_tool_arguments, repair_tool_arguments,
 };
 pub use tool_call_pipeline::{
-    PreparedToolCall, MAX_INVALID_TOOL_RETRIES, classify_unknown_tool_batch,
-    is_tool_registered, normalize_incoming_tool_call, prepare_tool_call,
-    repair_tool_call_arguments_for_api, sanitize_assistant_tool_calls_for_api,
-    unknown_tool_error_response, unknown_tool_names,
+    MAX_INVALID_TOOL_RETRIES, PreparedToolCall, classify_unknown_tool_batch, is_tool_registered,
+    normalize_incoming_tool_call, prepare_tool_call, repair_tool_call_arguments_for_api,
+    sanitize_assistant_tool_calls_for_api, unknown_tool_error_response, unknown_tool_names,
 };
-pub use tool_name_repair::{ResolvedToolName, fuzzy_match_tool_name, repair_tool_name, resolve_tool_call_name};
-pub use smart_approval::handle_approvals_slash;
-pub use edgecrab_security::approval::ApprovalMode;
+pub use tool_name_repair::{
+    ResolvedToolName, fuzzy_match_tool_name, repair_tool_name, resolve_tool_call_name,
+};
+pub use tool_schema_index::{
+    TOOL_SEARCH_NAME, deferred_tool_error_response, format_deferred_index, is_deferred_not_on_wire,
+    partition_schemas, read_materialized_set, wire_partition_counts,
+};
 pub use tools::checkpoint::{
     AutoPruneResult, CheckpointConfig, CheckpointManager, PruneCounts, RollbackOutcome,
     checkpoint_new_turn, clear_all, clear_legacy, format_checkpoint_list, format_store_status,
@@ -134,8 +150,8 @@ pub use tools::web::{
     web_search_is_available, web_search_result_note, web_status_one_liner,
 };
 pub use toolsets::{
-    ACP_TOOLS, CORE_TOOLS, LSP_TOOLS, MCP_EXTENDED_TOOLS, MOA_TOOLS, acp_tools,
-    resolve_active_toolsets, resolve_alias,
+    CORE_TOOLS, HONCHO_TOOLS, LSP_TOOLS, MCP_EXTENDED_TOOLS, MOA_TOOLS, RESEARCH_EXTRA_TOOLS,
+    acp_tools, is_acp_tool, resolve_active_toolsets, resolve_alias,
 };
 
 #[cfg(test)]

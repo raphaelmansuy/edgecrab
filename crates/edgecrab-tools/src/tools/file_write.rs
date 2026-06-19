@@ -428,11 +428,7 @@ mod tests {
 
         let v: serde_json::Value = serde_json::from_str(&result).expect("JSON");
         assert_eq!(v["ok"], true);
-        assert!(
-            dir.path()
-                .join("tmp/pptx_builder/script.py")
-                .exists()
-        );
+        assert!(dir.path().join("tmp/pptx_builder/script.py").exists());
     }
 
     #[tokio::test]

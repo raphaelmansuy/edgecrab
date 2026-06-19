@@ -23,12 +23,18 @@ pub fn handle_kanban_slash(
     let _ = db.reclaim_stale_claims();
 
     let trimmed = args.trim();
-    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("list") || trimmed.eq_ignore_ascii_case("ls") {
+    if trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("list")
+        || trimmed.eq_ignore_ascii_case("ls")
+    {
         return format_task_list(&db, None, 20);
     }
 
     let mut tokens = trimmed.split_whitespace().collect::<Vec<_>>();
-    let sub = tokens.first().map(|s| s.to_ascii_lowercase()).unwrap_or_default();
+    let sub = tokens
+        .first()
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
 
     match sub.as_str() {
         "status" => format_board_status(&db),
@@ -349,10 +355,7 @@ fn format_task_line(t: &KanbanTask) -> String {
         .as_deref()
         .map(|w| format!(" @{w}"))
         .unwrap_or_default();
-    format!(
-        "  [{}] {} — {}{}",
-        t.status, t.id, t.title, worker
-    )
+    format!("  [{}] {} — {}{}", t.status, t.id, t.title, worker)
 }
 
 fn format_task_detail(t: &KanbanTask) -> String {
@@ -417,14 +420,9 @@ pub async fn handle_kanban_slash_gateway(
         }
         let provider = agent.provider_handle().await;
         let model = agent.model().await;
-        let outcome = crate::kanban_decompose::decompose_task_by_id(
-            home,
-            task_id,
-            provider,
-            &model,
-            &cfg,
-        )
-        .await;
+        let outcome =
+            crate::kanban_decompose::decompose_task_by_id(home, task_id, provider, &model, &cfg)
+                .await;
         return crate::kanban_decompose::format_decompose_outcome(&outcome);
     }
     handle_kanban_slash(args, home, notify)
@@ -451,7 +449,8 @@ mod tests {
             None,
         );
         assert!(scheduled.contains("Scheduled"));
-        let cleared = handle_kanban_slash(&format!("schedule {id} --clear"), Some(dir.path()), None);
+        let cleared =
+            handle_kanban_slash(&format!("schedule {id} --clear"), Some(dir.path()), None);
         assert!(cleared.contains("Cleared"));
     }
 }

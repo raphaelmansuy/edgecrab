@@ -80,10 +80,7 @@ pub fn unknown_tool_names(
 }
 
 /// Structured tool-not-found payload with optional fuzzy suggestion.
-pub fn unknown_tool_error_response(
-    registry: &ToolRegistry,
-    invalid_name: &str,
-) -> String {
+pub fn unknown_tool_error_response(registry: &ToolRegistry, invalid_name: &str) -> String {
     let suggestion = tool_name_repair::repair_tool_name(registry, invalid_name);
     let sample: Vec<String> = registry
         .tool_names()
@@ -278,7 +275,11 @@ mod tests {
             },
             thought_signature: None,
         }];
-        assert!(!is_tool_registered(&registry, &HashSet::new(), "TotallyFakeTool_xyz"));
+        assert!(!is_tool_registered(
+            &registry,
+            &HashSet::new(),
+            "TotallyFakeTool_xyz"
+        ));
         assert_eq!(
             unknown_tool_names(&registry, &HashSet::new(), &calls),
             vec!["TotallyFakeTool_xyz".to_string()]

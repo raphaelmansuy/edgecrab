@@ -54,14 +54,14 @@ impl KanbanDispatchConfig {
             failure_limit: cfg.failure_limit.max(1),
             default_assignee: crate::kanban_profiles::resolve_default_assignee(cfg, &root),
             install_root: root,
-            respawn_guard: crate::kanban_respawn_guard::KanbanRespawnGuardConfig::from_kanban_config(cfg),
+            respawn_guard:
+                crate::kanban_respawn_guard::KanbanRespawnGuardConfig::from_kanban_config(cfg),
         }
     }
 }
 
 fn task_assignee(task: &edgecrab_state::KanbanTask, cfg: &KanbanDispatchConfig) -> Option<String> {
-    task
-        .assignee
+    task.assignee
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -102,9 +102,7 @@ pub fn dispatch_once(
     let slots = cfg.max_workers as usize - doing;
     let candidates = db.list_claimable_tasks(slots)?;
     let mut per_profile_running = db.count_doing_by_assignee()?;
-    let per_profile_cap = cfg
-        .max_in_progress_per_profile
-        .map(|n| n as usize);
+    let per_profile_cap = cfg.max_in_progress_per_profile.map(|n| n as usize);
 
     for task in candidates {
         if db.count_doing_tasks()? >= cfg.max_workers as usize {
@@ -128,7 +126,12 @@ pub fn dispatch_once(
             }
         }
 
-        if task.assignee.as_deref().map(str::trim).filter(|s| !s.is_empty()).is_none()
+        if task
+            .assignee
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .is_none()
             && !cfg.default_assignee.is_empty()
         {
             let _ = db.apply_default_assignee(&task.id, &cfg.default_assignee);
@@ -140,12 +143,17 @@ pub fn dispatch_once(
             continue;
         }
 
-        if crate::kanban_respawn_guard::check_respawn_guard(db, &task.id, &cfg.respawn_guard).is_some() {
+        if crate::kanban_respawn_guard::check_respawn_guard(db, &task.id, &cfg.respawn_guard)
+            .is_some()
+        {
             result.respawn_guarded += 1;
             continue;
         }
 
-        let worker_id = format!("dispatcher-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+        let worker_id = format!(
+            "dispatcher-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        );
         if db
             .claim_task(&task.id, &worker_id, cfg.claim_ttl_secs)
             .is_err()
@@ -153,13 +161,7 @@ pub fn dispatch_once(
             continue;
         }
         let worker_context = edgecrab_state::build_worker_context(db, &task.id)
-            .unwrap_or_else(|_| {
-                format!(
-                    "# Kanban task {}: {}\n",
-                    task.id,
-                    task.title
-                )
-            });
+            .unwrap_or_else(|_| format!("# Kanban task {}: {}\n", task.id, task.title));
         let ok = spawn(KanbanSpawnRequest {
             task_id: task.id.clone(),
             title: task.title.clone(),
@@ -182,8 +184,8 @@ pub fn dispatch_once(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
     use edgecrab_state::KanbanDb;
+    use std::path::Path;
     use tempfile::TempDir;
 
     fn test_db() -> (TempDir, std::sync::Arc<KanbanDb>) {
@@ -259,14 +261,8 @@ mod tests {
         cfg.max_workers = 10;
         cfg.max_in_progress_per_profile = Some(1);
         for i in 0..3 {
-            db.create_task_with_assignee(
-                &format!("Task {i}"),
-                None,
-                0,
-                None,
-                Some("default"),
-            )
-            .expect("create");
+            db.create_task_with_assignee(&format!("Task {i}"), None, 0, None, Some("default"))
+                .expect("create");
         }
         let result = dispatch_once(&db, &cfg, |_| true).expect("dispatch");
         assert_eq!(result.spawned, 1);

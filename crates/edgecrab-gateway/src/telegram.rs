@@ -902,7 +902,11 @@ impl TelegramAdapter {
         }
     }
 
-    async fn answer_callback_query(&self, callback_id: &str, text: Option<&str>) -> anyhow::Result<()> {
+    async fn answer_callback_query(
+        &self,
+        callback_id: &str,
+        text: Option<&str>,
+    ) -> anyhow::Result<()> {
         let url = self.api_url("answerCallbackQuery");
         #[derive(Serialize)]
         struct Body<'a> {
@@ -949,21 +953,14 @@ impl TelegramAdapter {
             return;
         };
 
-        let _ = self
-            .answer_callback_query(&cb.id, Some("Got it"))
-            .await;
+        let _ = self.answer_callback_query(&cb.id, Some("Got it")).await;
 
         if choice_key == "other" {
             if let Some(msg) = &cb.message {
                 let chat_id = msg.chat.id.to_string();
                 let thread_id = msg.message_thread_id;
                 let _ = self
-                    .send_clarify_prompt(
-                        &chat_id,
-                        "✏️ Type your answer:",
-                        thread_id,
-                        None,
-                    )
+                    .send_clarify_prompt(&chat_id, "✏️ Type your answer:", thread_id, None)
                     .await;
             }
             return;
@@ -984,12 +981,7 @@ impl TelegramAdapter {
             let chat_id = msg.chat.id.to_string();
             let thread_id = msg.message_thread_id;
             let _ = self
-                .send_clarify_prompt(
-                    &chat_id,
-                    "✅ Answer received. Continuing…",
-                    thread_id,
-                    None,
-                )
+                .send_clarify_prompt(&chat_id, "✅ Answer received. Continuing…", thread_id, None)
                 .await;
         }
     }
@@ -1246,7 +1238,10 @@ impl PlatformAdapter for TelegramAdapter {
                 .join("\n");
             text.push_str("\n\n");
             text.push_str(&option_lines);
-            Some(Self::build_clarify_keyboard(prompt.interaction_id, choices.len()))
+            Some(Self::build_clarify_keyboard(
+                prompt.interaction_id,
+                choices.len(),
+            ))
         } else {
             None
         };

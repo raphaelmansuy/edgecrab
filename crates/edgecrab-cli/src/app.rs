@@ -113,9 +113,8 @@ use crate::theme::{SkinConfig, Theme, palette as P};
 use crate::tool_display::{
     DisplayWidths, build_subagent_done_line_width, build_subagent_running_line_width,
     build_tool_done_line_width, build_tool_running_line_width,
-    build_tool_running_line_width_elapsed, build_tool_verbose_lines_width, extract_tool_preview,
-    extract_streaming_tool_preview,
-    tool_signature, tool_status_preview,
+    build_tool_running_line_width_elapsed, build_tool_verbose_lines_width,
+    extract_streaming_tool_preview, extract_tool_preview, tool_signature, tool_status_preview,
 };
 use crate::transcript::{
     OutputLine, OutputRole, TranscriptRenderParams, TranscriptScrollMetrics,
@@ -15143,13 +15142,12 @@ impl App {
             || trimmed.starts_with("rm "))
             && let Some(reply) = {
                 let config = edgecrab_core::AppConfig::load().unwrap_or_default();
-                self.rt_handle.block_on(
-                    edgecrab_tools::tools::skills_hub::handle_skills_hub_slash(
+                self.rt_handle
+                    .block_on(edgecrab_tools::tools::skills_hub::handle_skills_hub_slash(
                         trimmed,
                         &skills_dir,
                         config.skills.hub_url.as_deref(),
-                    ),
-                )
+                    ))
             }
         {
             if edgecrab_tools::tools::skills_hub::hub_slash_mutates_skills(trimmed) {
@@ -16651,6 +16649,7 @@ impl App {
             mutation_turn: None,
             lsp_gate: None,
             kanban_task_id: None,
+            materialized_tools: None,
         }
     }
 

@@ -272,12 +272,15 @@ impl GatewayEventProcessor {
                     }
                 }
 
-                StreamEvent::ToolGenerating { name, partial_args, .. } => {
+                StreamEvent::ToolGenerating {
+                    name, partial_args, ..
+                } => {
                     if self.cfg.tool_progress {
-                        let status = edgecrab_tools::tool_progress_tail::format_tool_generating_status(
-                            &name,
-                            &partial_args,
-                        );
+                        let status =
+                            edgecrab_tools::tool_progress_tail::format_tool_generating_status(
+                                &name,
+                                &partial_args,
+                            );
                         self.send_status(&status).await;
                     }
                 }

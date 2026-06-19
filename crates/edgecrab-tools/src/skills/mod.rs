@@ -15,14 +15,14 @@ mod discovery;
 mod filters;
 mod invocation;
 mod invocation_extras;
+mod memory_write_approval;
+mod pending_store;
 mod preprocess;
 mod protected;
 mod scheduler;
 mod slug;
 mod usage;
 mod write_approval;
-mod memory_write_approval;
-mod pending_store;
 
 pub use archive::{
     ArchiveEligibility, archive_skill, check_archive_eligibility, format_archived_list,
@@ -64,6 +64,12 @@ pub use invocation::{
 pub use invocation_extras::{
     format_slash_setup_note, format_slash_supporting_files, list_supporting_files,
 };
+pub use memory_write_approval::{
+    MemorySubcommandContext, MemoryWriteGate, MemoryWritePayload, apply_pending_memory_write,
+    format_memory_pending_state, handle_memory_pending_subcommand, maybe_gate_memory_write,
+    memory_write_approval_enabled,
+};
+pub use pending_store::PendingWriteRecord;
 pub use preprocess::{
     PreprocessOptions, expand_inline_shell, format_skill_config_block,
     preprocess_options_from_config, preprocess_skill_content, substitute_template_vars,
@@ -75,12 +81,6 @@ pub use scheduler::{
 pub use slug::slugify;
 pub use usage::{
     activity_count, bump_patch, bump_use, bump_view, format_usage_summary, is_pinned, set_pinned,
-};
-pub use pending_store::PendingWriteRecord;
-pub use memory_write_approval::{
-    MemorySubcommandContext, MemoryWriteGate, MemoryWritePayload, apply_pending_memory_write,
-    format_memory_pending_state, handle_memory_pending_subcommand, maybe_gate_memory_write,
-    memory_write_approval_enabled,
 };
 pub use write_approval::{
     SkillManageGate, SkillsSubcommandContext, apply_pending_skill_write,

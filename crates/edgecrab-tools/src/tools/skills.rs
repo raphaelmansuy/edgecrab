@@ -1785,11 +1785,8 @@ impl ToolHandler for SkillManageTool {
             crate::skills::SkillManageGate::Allow => {}
         }
 
-        let result = crate::skills::apply_skill_manage_payload(
-            &ctx.config.edgecrab_home,
-            &payload,
-        )
-        .await?;
+        let result =
+            crate::skills::apply_skill_manage_payload(&ctx.config.edgecrab_home, &payload).await?;
         if let Some(ref f) = ctx.on_skills_changed {
             f();
         }

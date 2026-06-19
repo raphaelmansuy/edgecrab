@@ -26,10 +26,10 @@ pub fn unregister_worker(task_id: &str) {
 
 /// Hard-interrupt a running worker (e.g. max_runtime exceeded).
 pub fn cancel_worker(task_id: &str) -> bool {
-    let agent = registry().lock().ok().and_then(|map| {
-        map.get(task_id)
-            .and_then(|weak| weak.upgrade())
-    });
+    let agent = registry()
+        .lock()
+        .ok()
+        .and_then(|map| map.get(task_id).and_then(|weak| weak.upgrade()));
     if let Some(agent) = agent {
         agent.interrupt();
         true

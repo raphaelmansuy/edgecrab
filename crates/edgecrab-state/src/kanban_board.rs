@@ -115,9 +115,8 @@ pub fn list_board_slugs(home: &Path) -> Vec<String> {
 
 /// Ensure a non-default board directory exists.
 pub fn ensure_board(home: &Path, slug: &str) -> Result<PathBuf, AgentError> {
-    let slug = normalize_board_slug(Some(slug)).ok_or_else(|| {
-        AgentError::Validation(format!("invalid board slug '{slug}'"))
-    })?;
+    let slug = normalize_board_slug(Some(slug))
+        .ok_or_else(|| AgentError::Validation(format!("invalid board slug '{slug}'")))?;
     if slug == DEFAULT_BOARD {
         return Ok(kanban_db_path_for_board(home, Some(DEFAULT_BOARD)));
     }

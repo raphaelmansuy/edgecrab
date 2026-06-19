@@ -10,7 +10,7 @@
 //! - **`reasoning_effort: none`** always on tool turns (reasoning burns the completion budget).
 //! - **`tool_choice: required`** when tools are present (model must emit tool JSON, not prose).
 
-use edgequake_llm::{CompletionOptions, LlmError, ToolChoice, LLMProvider};
+use edgequake_llm::{CompletionOptions, LLMProvider, LlmError, ToolChoice};
 
 /// Default HTTP timeout for LM Studio chat/completions (seconds).
 pub const DEFAULT_LOCAL_HTTP_TIMEOUT_SECS: u64 = 600;
@@ -54,7 +54,10 @@ pub fn is_local_inference_provider(provider_name: &str) -> bool {
 
 /// First segment of `provider/model` or bare provider name.
 pub fn provider_prefix(model_or_provider: &str) -> &str {
-    model_or_provider.split('/').next().unwrap_or(model_or_provider)
+    model_or_provider
+        .split('/')
+        .next()
+        .unwrap_or(model_or_provider)
 }
 
 /// Homelab write path default: config flag OR auto-on for local providers.
@@ -94,10 +97,7 @@ pub fn log_local_harness_activated(provider_name: &str, has_tools: bool, write_c
 ///
 /// Copilot is included here for the same buffering reasons as local servers.
 pub fn prefers_nonstreaming_tool_turns(provider: &dyn LLMProvider) -> bool {
-    matches!(
-        provider.name(),
-        "vscode-copilot" | "lmstudio" | "ollama"
-    )
+    matches!(provider.name(), "vscode-copilot" | "lmstudio" | "ollama")
 }
 
 /// Whether EdgeCrab must not retry a failed transport call.
@@ -108,10 +108,7 @@ pub fn blocks_transport_retry(provider: &dyn LLMProvider, error: &LlmError) -> b
     if !is_local_inference_provider(provider.name()) {
         return false;
     }
-    matches!(
-        error,
-        LlmError::Timeout | LlmError::NetworkError(_)
-    )
+    matches!(error, LlmError::Timeout | LlmError::NetworkError(_))
 }
 
 /// Whether streaming→non-streaming fallback must be skipped for this error.
@@ -228,7 +225,11 @@ impl LocalToolTurnPlan {
             self.max_tokens,
             self.max_tool_argument_bytes,
             self.reasoning_effort,
-            if self.reasoning_overridden { " (forced)" } else { "" },
+            if self.reasoning_overridden {
+                " (forced)"
+            } else {
+                ""
+            },
             self.prompt_tokens_estimated / 1000,
             self.context_length / 1000,
             self.http_timeout_secs,
@@ -412,11 +413,21 @@ pub fn try_apply_structural_tool_output_prune(
     active_context_length: usize,
     messages: &[edgecrab_types::Message],
     spill_ctx: Option<&crate::compression::PruneSpillContext<'_>>,
-) -> Option<(Vec<edgecrab_types::Message>, crate::compression::StructuralPruneOutcome)> {
+) -> Option<(
+    Vec<edgecrab_types::Message>,
+    crate::compression::StructuralPruneOutcome,
+)> {
     if !gate_local_structural_prune(phase, estimated_prompt_tokens, active_context_length) {
         return None;
     }
-    crate::compression::apply_structural_tool_output_prune(messages, spill_ctx)
+    let token_budget = match phase {
+        LocalStructuralPrunePhase::Preflight => {
+            local_prefill_prune_token_budget(active_context_length)
+        }
+        // Force aggressive prune of all fat tool outputs (budget-fit with target 0).
+        LocalStructuralPrunePhase::LengthRecovery => 0,
+    };
+    crate::compression::apply_structural_tool_output_prune(messages, spill_ctx, token_budget)
 }
 
 /// Token threshold for local mid-band structural compress (no LLM).
@@ -457,7 +468,8 @@ pub fn try_local_midband_structural_compress(
         return None;
     }
     let tokens_before = crate::compression::estimate_tokens(messages);
-    let compressed = crate::compression::compress_structural_only(messages, compression_params, spill_ctx);
+    let compressed =
+        crate::compression::compress_structural_only(messages, compression_params, spill_ctx);
     let tokens_after = crate::compression::estimate_tokens(&compressed);
     if tokens_after >= tokens_before {
         return None;
@@ -627,15 +639,13 @@ mod tests {
     }
 
     const TEST_MUTATION_BYTES: usize = 32 * 1024;
-    const TEST_ABS_MAX: usize = edgecrab_tools::mutation_turn_policy::LOCAL_TOOL_TURN_ABS_MAX_TOKENS;
+    const TEST_ABS_MAX: usize =
+        edgecrab_tools::mutation_turn_policy::LOCAL_TOOL_TURN_ABS_MAX_TOKENS;
 
     #[test]
     fn lh60_local_tool_turn_absolute_max_tokens_honors_config_before_default() {
         let custom = 12_288;
-        assert_eq!(
-            super::local_tool_turn_absolute_max_tokens(custom),
-            custom
-        );
+        assert_eq!(super::local_tool_turn_absolute_max_tokens(custom), custom);
     }
 
     #[test]
@@ -650,7 +660,10 @@ mod tests {
         assert!(effective_local_write_create_dirs(false, "lmstudio/qwen"));
         assert!(effective_local_write_create_dirs(false, "ollama"));
         assert!(effective_local_write_create_dirs(true, "anthropic/claude"));
-        assert!(!effective_local_write_create_dirs(false, "anthropic/claude"));
+        assert!(!effective_local_write_create_dirs(
+            false,
+            "anthropic/claude"
+        ));
     }
 
     #[test]
@@ -681,10 +694,7 @@ mod tests {
             lmstudio.as_ref(),
             &LlmError::RateLimited("429".into())
         ));
-        assert!(!blocks_transport_retry(
-            openai.as_ref(),
-            &LlmError::Timeout
-        ));
+        assert!(!blocks_transport_retry(openai.as_ref(), &LlmError::Timeout));
     }
 
     #[test]
@@ -704,7 +714,11 @@ mod tests {
         );
         assert_eq!(
             capped.max_tokens,
-            Some(local_tool_turn_max_tokens(synced.as_ref(), TEST_MUTATION_BYTES, TEST_ABS_MAX))
+            Some(local_tool_turn_max_tokens(
+                synced.as_ref(),
+                TEST_MUTATION_BYTES,
+                TEST_ABS_MAX
+            ))
         );
         assert_eq!(
             capped.reasoning_effort.as_deref(),
@@ -728,7 +742,13 @@ mod tests {
             Some(LOCAL_TOOL_TURN_REASONING_EFFORT)
         );
 
-        let plain = effective_completion_options(&base, synced.as_ref(), false, TEST_MUTATION_BYTES, TEST_ABS_MAX);
+        let plain = effective_completion_options(
+            &base,
+            synced.as_ref(),
+            false,
+            TEST_MUTATION_BYTES,
+            TEST_ABS_MAX,
+        );
         assert_eq!(plain.max_tokens, Some(16_384));
         assert_eq!(plain.reasoning_effort.as_deref(), Some("high"));
     }

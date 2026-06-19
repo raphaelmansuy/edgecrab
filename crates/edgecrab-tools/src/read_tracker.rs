@@ -178,7 +178,10 @@ pub fn guard_file_freshness(
         return Ok(());
     }
 
-    Err(crate::recovery_catalog::stale_file_context(tool, display_path))
+    Err(crate::recovery_catalog::stale_file_context(
+        tool,
+        display_path,
+    ))
 }
 
 // ─── FP13: mtime-based read dedup cache ────────────────────────────────────

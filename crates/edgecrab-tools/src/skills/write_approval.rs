@@ -5,7 +5,7 @@ use regex::Regex;
 use serde_json::Value;
 
 use super::pending_store::{
-    SUBSYSTEM_SKILLS, PendingWriteRecord, discard_pending, get_pending, list_pending, stage_write,
+    PendingWriteRecord, SUBSYSTEM_SKILLS, discard_pending, get_pending, list_pending, stage_write,
 };
 use super::usage::{bump_patch, format_usage_summary, is_pinned, set_pinned};
 
@@ -583,7 +583,6 @@ fn set_inline_shell_mode(
         enabled
     )
 }
-
 
 #[cfg(test)]
 mod tests {

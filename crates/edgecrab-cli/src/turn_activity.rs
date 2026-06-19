@@ -214,10 +214,7 @@ impl TurnActivityState {
 
     /// Hermes `pruneTransient()` — clear bridge phases when the model resumes.
     pub fn on_model_resuming(&mut self) {
-        if matches!(
-            self.phase,
-            ShelfPhase::AwaitingFirstToken
-        ) {
+        if matches!(self.phase, ShelfPhase::AwaitingFirstToken) {
             self.set_phase(ShelfPhase::Streaming);
         }
         self.llm_wait_detail = None;
@@ -242,7 +239,10 @@ impl TurnActivityState {
         ctx: edgecrab_tools::tool_progress_tail::LlmWaitContext,
     ) {
         let detail = edgecrab_tools::tool_progress_tail::llm_wait_progress_label(
-            provider, elapsed_secs, has_tools, ctx,
+            provider,
+            elapsed_secs,
+            has_tools,
+            ctx,
         );
         self.llm_wait_compact = Some(edgecrab_tools::tool_progress_tail::llm_wait_status_compact(
             provider, has_tools, ctx,
@@ -264,10 +264,8 @@ impl TurnActivityState {
         if self.activity_feed.len() >= SHELF_ACTIVITY_FEED_MAX {
             self.activity_feed.remove(0);
         }
-        self.activity_feed.push(ActivityNotice {
-            text: detail,
-            tone,
-        });
+        self.activity_feed
+            .push(ActivityNotice { text: detail, tone });
         self.hint = self.llm_wait_detail.clone();
     }
 
@@ -665,14 +663,11 @@ impl TurnActivityState {
             let (_, name) = self.generating_tool.as_ref()?;
             return Some(TurnToolSummary {
                 primary_name: name.clone(),
-                detail: self
-                    .generating_preview
-                    .clone()
-                    .unwrap_or_else(|| {
-                        edgecrab_tools::tool_progress_tail::format_streaming_args_progress(
-                            self.generating_args_bytes,
-                        )
-                    }),
+                detail: self.generating_preview.clone().unwrap_or_else(|| {
+                    edgecrab_tools::tool_progress_tail::format_streaming_args_progress(
+                        self.generating_args_bytes,
+                    )
+                }),
                 active_count: 0,
                 elapsed_secs: self.phase_started.elapsed().as_secs(),
                 preparing: true,
@@ -798,8 +793,7 @@ impl TurnActivityState {
         self.push_activity(line, ActivityTone::Warn);
         self.long_run_hints_per_tool
             .insert(tool_call_id.to_string(), per_tool + 1);
-        self.long_run_last_at
-            .insert(tool_call_id.to_string(), now);
+        self.long_run_last_at.insert(tool_call_id.to_string(), now);
         self.long_run_hint_count += 1;
     }
 }

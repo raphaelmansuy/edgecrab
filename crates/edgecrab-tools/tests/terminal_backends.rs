@@ -584,6 +584,7 @@ fn make_ctx(dir: &Path) -> ToolContext {
         mutation_turn: None,
         lsp_gate: None,
         kanban_task_id: None,
+        materialized_tools: None,
     }
 }
 

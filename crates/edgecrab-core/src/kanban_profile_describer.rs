@@ -166,8 +166,7 @@ pub async fn describe_profile(
         return DescribeProfileOutcome {
             profile_name: canon,
             ok: false,
-            reason: "profile already has a user-authored description (use overwrite=true)"
-                .into(),
+            reason: "profile already has a user-authored description (use overwrite=true)".into(),
             description: None,
         };
     }

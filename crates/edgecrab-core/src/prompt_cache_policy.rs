@@ -2,7 +2,9 @@
 //!
 //! Mirrors `hermes-agent/agent/agent_runtime_helpers.py::anthropic_prompt_cache_policy`.
 //! EdgeCrab's two-block stable/dynamic split only helps when the provider honours
-//! Anthropic-style `cache_control` markers.
+//! Anthropic-style `cache_control` markers on inner content blocks
+//! (`native_inner_layout == true`). OpenRouter and similar gateways use envelope
+//! layout (`native_inner_layout == false`) and must take the single-block path.
 
 /// Whether prompt caching should be active for this provider/model pair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -45,8 +47,8 @@ pub fn decide_prompt_cache(
     let is_nous_portal = base_url
         .map(|u| u.to_ascii_lowercase().contains("nousresearch"))
         .unwrap_or(false);
-    let is_native_anthropic = provider_lower == "anthropic"
-        || host_matches(base_url, "api.anthropic.com");
+    let is_native_anthropic =
+        provider_lower == "anthropic" || host_matches(base_url, "api.anthropic.com");
 
     if is_native_anthropic {
         return PromptCacheDecision {
@@ -115,6 +117,37 @@ pub fn provider_supports_prompt_caching(
     decide_prompt_cache(provider_name, model, base_url).should_cache
 }
 
+/// Resolved prompt-cache settings for a provider turn.
+#[derive(Debug, Clone)]
+pub struct ResolvedPromptCache {
+    pub decision: PromptCacheDecision,
+    pub config: edgequake_llm::CachePromptConfig,
+}
+
+/// Build cache config when user settings and provider policy both allow caching.
+pub fn resolve_prompt_cache(
+    provider_name: &str,
+    model: &str,
+    base_url: Option<&str>,
+    prompt_caching_enabled: bool,
+    prefix_cfg: &crate::config::PromptPrefixCacheConfig,
+) -> Option<ResolvedPromptCache> {
+    if !(prompt_caching_enabled && prefix_cfg.enabled) {
+        return None;
+    }
+    let decision = decide_prompt_cache(provider_name, model, base_url);
+    if !decision.should_cache {
+        return None;
+    }
+    Some(ResolvedPromptCache {
+        decision,
+        config: edgequake_llm::CachePromptConfig {
+            cache_ttl: Some(prefix_cfg.normalized_ttl().to_string()),
+            ..Default::default()
+        },
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,5 +195,23 @@ mod tests {
     fn gpt4o_disables_cache() {
         let d = decide_prompt_cache("openai", "gpt-4o", None);
         assert!(!d.should_cache);
+    }
+
+    #[test]
+    fn resolve_prompt_cache_respects_user_toggle() {
+        let prefix = crate::config::PromptPrefixCacheConfig::default();
+        assert!(
+            resolve_prompt_cache("anthropic", "claude-sonnet-4", None, false, &prefix).is_none()
+        );
+        let resolved = resolve_prompt_cache(
+            "anthropic",
+            "claude-sonnet-4",
+            Some("https://api.anthropic.com"),
+            true,
+            &prefix,
+        )
+        .expect("anthropic should cache");
+        assert!(resolved.decision.native_inner_layout);
+        assert_eq!(resolved.config.cache_ttl.as_deref(), Some("1h"));
     }
 }

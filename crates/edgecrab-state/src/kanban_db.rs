@@ -229,7 +229,10 @@ impl KanbanDb {
     }
 
     fn init_schema(&self) -> Result<(), AgentError> {
-        let conn = self.conn.lock().map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS kanban_tasks (
                 id            TEXT PRIMARY KEY,
@@ -266,7 +269,10 @@ impl KanbanDb {
     }
 
     fn migrate_schema(&self) -> Result<(), AgentError> {
-        let conn = self.conn.lock().map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
         let mut cols = std::collections::HashSet::new();
         {
             let mut stmt = conn
@@ -276,7 +282,9 @@ impl KanbanDb {
                 .query_map([], |row| row.get::<_, String>(1))
                 .map_err(|e| AgentError::Database(format!("kanban pragma rows: {e}")))?;
             for row in rows {
-                cols.insert(row.map_err(|e| AgentError::Database(format!("kanban pragma map: {e}")))?);
+                cols.insert(
+                    row.map_err(|e| AgentError::Database(format!("kanban pragma map: {e}")))?,
+                );
             }
         }
         let add_col = |name: &str, ddl: &str| -> Result<(), AgentError> {
@@ -294,7 +302,10 @@ impl KanbanDb {
             "last_failure_error",
             "ALTER TABLE kanban_tasks ADD COLUMN last_failure_error TEXT",
         )?;
-        add_col("max_retries", "ALTER TABLE kanban_tasks ADD COLUMN max_retries INTEGER")?;
+        add_col(
+            "max_retries",
+            "ALTER TABLE kanban_tasks ADD COLUMN max_retries INTEGER",
+        )?;
         add_col(
             "current_run_id",
             "ALTER TABLE kanban_tasks ADD COLUMN current_run_id INTEGER",
@@ -303,7 +314,10 @@ impl KanbanDb {
             "max_runtime_seconds",
             "ALTER TABLE kanban_tasks ADD COLUMN max_runtime_seconds INTEGER",
         )?;
-        add_col("assignee", "ALTER TABLE kanban_tasks ADD COLUMN assignee TEXT")?;
+        add_col(
+            "assignee",
+            "ALTER TABLE kanban_tasks ADD COLUMN assignee TEXT",
+        )?;
         add_col(
             "scheduled_at",
             "ALTER TABLE kanban_tasks ADD COLUMN scheduled_at INTEGER",
@@ -354,9 +368,17 @@ impl KanbanDb {
         Ok(())
     }
 
-    fn append_event(&self, task_id: &str, kind: &str, payload: Option<&str>) -> Result<(), AgentError> {
+    fn append_event(
+        &self,
+        task_id: &str,
+        kind: &str,
+        payload: Option<&str>,
+    ) -> Result<(), AgentError> {
         let now = now_secs();
-        let conn = self.conn.lock().map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
         conn.execute(
             "INSERT INTO kanban_task_events (task_id, kind, payload, created_at) VALUES (?1, ?2, ?3, ?4)",
             params![task_id, kind, payload, now],
@@ -372,7 +394,10 @@ impl KanbanDb {
         limit: usize,
     ) -> Result<(i64, Vec<KanbanEvent>), AgentError> {
         let limit = limit.clamp(1, 500);
-        let conn = self.conn.lock().map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
         let mut stmt = conn
             .prepare(
                 "SELECT id, task_id, kind, payload, created_at FROM kanban_task_events
@@ -401,7 +426,10 @@ impl KanbanDb {
     }
 
     fn has_sticky_block(&self, task_id: &str) -> Result<bool, AgentError> {
-        let conn = self.conn.lock().map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
         let kind: Option<String> = conn
             .query_row(
                 "SELECT kind FROM kanban_task_events
@@ -427,7 +455,10 @@ impl KanbanDb {
         claim_expires: i64,
     ) -> Result<i64, AgentError> {
         let now = now_secs();
-        let conn = self.conn.lock().map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
         conn.execute(
             "INSERT INTO kanban_task_runs (task_id, status, worker_id, claim_expires, started_at)
              VALUES (?1, 'doing', ?2, ?3, ?4)",
@@ -452,7 +483,10 @@ impl KanbanDb {
         error: Option<&str>,
     ) -> Result<(), AgentError> {
         let now = now_secs();
-        let conn = self.conn.lock().map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
         conn.execute(
             "UPDATE kanban_task_runs SET status = ?1, outcome = ?2, summary = ?3,
              error = ?4, ended_at = ?5, claim_expires = NULL
@@ -477,7 +511,10 @@ impl KanbanDb {
             self.end_run(run_id, status, outcome, summary, error)?;
         }
         let now = now_secs();
-        let conn = self.conn.lock().map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
         conn.execute(
             "UPDATE kanban_tasks SET current_run_id = NULL, updated_at = ?1 WHERE id = ?2",
             params![now, task_id],
@@ -499,7 +536,10 @@ impl KanbanDb {
         let limit = self.effective_failure_limit(&task, failure_limit);
         let failures = task.consecutive_failures + 1;
         let now = now_secs();
-        let conn = self.conn.lock().map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
         let tripped = failures >= limit as i32;
         if tripped {
             conn.execute(
@@ -552,7 +592,10 @@ impl KanbanDb {
                 }
             }
             let now = now_secs();
-            let conn = self.conn.lock().map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
+            let conn = self
+                .conn
+                .lock()
+                .map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
             let updated = conn
                 .execute(
                     "UPDATE kanban_tasks SET status = 'todo', updated_at = ?1
@@ -569,9 +612,16 @@ impl KanbanDb {
         Ok(promoted)
     }
 
-    pub fn list_task_runs(&self, task_id: &str, limit: usize) -> Result<Vec<KanbanRun>, AgentError> {
+    pub fn list_task_runs(
+        &self,
+        task_id: &str,
+        limit: usize,
+    ) -> Result<Vec<KanbanRun>, AgentError> {
         let limit = limit.clamp(1, 100);
-        let conn = self.conn.lock().map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
         let mut stmt = conn
             .prepare(
                 "SELECT id, task_id, status, worker_id, claim_expires, started_at, ended_at,
@@ -627,9 +677,18 @@ impl KanbanDb {
         worker_id: &str,
         error: &str,
     ) -> Result<(), AgentError> {
-        self.close_current_run(task_id, "rate_limited", Some("rate_limited"), None, Some(error))?;
+        self.close_current_run(
+            task_id,
+            "rate_limited",
+            Some("rate_limited"),
+            None,
+            Some(error),
+        )?;
         let now = now_secs();
-        let conn = self.conn.lock().map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
         conn.execute(
             "UPDATE kanban_tasks SET status = 'todo', worker_id = NULL, claim_expires = NULL,
              last_failure_error = ?1, updated_at = ?2 WHERE id = ?3",
@@ -645,7 +704,10 @@ impl KanbanDb {
 
     /// Most recent ended run for respawn guard checks.
     pub fn latest_ended_run(&self, task_id: &str) -> Result<Option<KanbanRun>, AgentError> {
-        let conn = self.conn.lock().map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
         let mut stmt = conn
             .prepare(
                 "SELECT id, task_id, status, worker_id, claim_expires, started_at, ended_at,
@@ -681,10 +743,15 @@ impl KanbanDb {
     /// Set or clear future dispatch time (Unix seconds). `None` clears the gate.
     pub fn set_scheduled_at(&self, task_id: &str, at: Option<i64>) -> Result<(), AgentError> {
         if self.get_task(task_id)?.is_none() {
-            return Err(AgentError::Validation(format!("task '{task_id}' not found")));
+            return Err(AgentError::Validation(format!(
+                "task '{task_id}' not found"
+            )));
         }
         let now = now_secs();
-        let conn = self.conn.lock().map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
         conn.execute(
             "UPDATE kanban_tasks SET scheduled_at = ?1, updated_at = ?2 WHERE id = ?3",
             params![at, now, task_id],
@@ -737,7 +804,10 @@ impl KanbanDb {
         let id = format!("kb-{}", &Uuid::new_v4().simple().to_string()[..12]);
         let now = now_secs();
         let assignee = assignee.map(str::trim).filter(|s| !s.is_empty());
-        let conn = self.conn.lock().map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
         conn.execute(
             "INSERT INTO kanban_tasks (id, title, body, status, priority, max_runtime_seconds, assignee, created_at, updated_at)
              VALUES (?1, ?2, ?3, 'todo', ?4, ?5, ?6, ?7, ?7)",
@@ -769,7 +839,10 @@ impl KanbanDb {
         let id = format!("kb-{}", &Uuid::new_v4().simple().to_string()[..12]);
         let now = now_secs();
         let assignee = assignee.map(str::trim).filter(|s| !s.is_empty());
-        let conn = self.conn.lock().map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
         conn.execute(
             "INSERT INTO kanban_tasks (id, title, body, status, priority, assignee, created_at, updated_at)
              VALUES (?1, ?2, ?3, 'triage', ?4, ?5, ?6, ?6)",
@@ -803,7 +876,10 @@ impl KanbanDb {
             assignee.map(str::trim).filter(|s| !s.is_empty())
         };
         let now = now_secs();
-        let conn = self.conn.lock().map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
         let updated = if let Some(a) = assignee_val {
             conn.execute(
                 "UPDATE kanban_tasks SET title = ?1, body = ?2, status = 'todo', assignee = ?3, updated_at = ?4
@@ -831,13 +907,20 @@ impl KanbanDb {
     }
 
     /// Apply `kanban.default_assignee` before dispatch (Hermes auto-assign).
-    pub fn apply_default_assignee(&self, task_id: &str, assignee: &str) -> Result<bool, AgentError> {
+    pub fn apply_default_assignee(
+        &self,
+        task_id: &str,
+        assignee: &str,
+    ) -> Result<bool, AgentError> {
         let assignee = assignee.trim();
         if assignee.is_empty() {
             return Ok(false);
         }
         let now = now_secs();
-        let conn = self.conn.lock().map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
         let updated = conn
             .execute(
                 "UPDATE kanban_tasks SET assignee = ?1, updated_at = ?2
@@ -859,11 +942,15 @@ impl KanbanDb {
 
     fn validate_decompose_children(children: &[KanbanDecomposeChild]) -> Result<(), AgentError> {
         if children.is_empty() {
-            return Err(AgentError::Validation("decompose requires at least one child".into()));
+            return Err(AgentError::Validation(
+                "decompose requires at least one child".into(),
+            ));
         }
         for (idx, child) in children.iter().enumerate() {
             if child.title.trim().is_empty() {
-                return Err(AgentError::Validation(format!("child[{idx}].title is required")));
+                return Err(AgentError::Validation(format!(
+                    "child[{idx}].title is required"
+                )));
             }
             for p in &child.parents {
                 if *p >= children.len() {
@@ -929,7 +1016,10 @@ impl KanbanDb {
         let author = author.unwrap_or("decomposer");
         let mut child_ids = Vec::with_capacity(children.len());
 
-        let conn = self.conn.lock().map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
         let tx = conn
             .unchecked_transaction()
             .map_err(|e| AgentError::Database(format!("kanban decompose txn: {e}")))?;
@@ -1004,12 +1094,24 @@ impl KanbanDb {
     }
 
     pub fn get_task(&self, id: &str) -> Result<Option<KanbanTask>, AgentError> {
-        let conn = self.conn.lock().map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
         let sql = format!("SELECT {SELECT_COLS} FROM kanban_tasks WHERE id = ?1");
-        let mut stmt = conn.prepare(&sql).map_err(|e| AgentError::Database(format!("kanban get prepare: {e}")))?;
-        let mut rows = stmt.query(params![id]).map_err(|e| AgentError::Database(format!("kanban get query: {e}")))?;
-        if let Some(row) = rows.next().map_err(|e| AgentError::Database(format!("kanban get row: {e}")))? {
-            return map_row(row).map(Some).map_err(|e| AgentError::Database(format!("kanban get map: {e}")));
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| AgentError::Database(format!("kanban get prepare: {e}")))?;
+        let mut rows = stmt
+            .query(params![id])
+            .map_err(|e| AgentError::Database(format!("kanban get query: {e}")))?;
+        if let Some(row) = rows
+            .next()
+            .map_err(|e| AgentError::Database(format!("kanban get row: {e}")))?
+        {
+            return map_row(row)
+                .map(Some)
+                .map_err(|e| AgentError::Database(format!("kanban get map: {e}")));
         }
         Ok(None)
     }
@@ -1020,7 +1122,10 @@ impl KanbanDb {
         limit: usize,
     ) -> Result<Vec<KanbanTask>, AgentError> {
         let limit = limit.clamp(1, 200);
-        let conn = self.conn.lock().map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
         let (sql, status_param) = match status {
             Some(s) => (
                 format!(
@@ -1037,7 +1142,9 @@ impl KanbanDb {
                 None,
             ),
         };
-        let mut stmt = conn.prepare(&sql).map_err(|e| AgentError::Database(format!("kanban list prepare: {e}")))?;
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| AgentError::Database(format!("kanban list prepare: {e}")))?;
         let rows = if let Some(st) = status_param {
             stmt.query_map(params![st, limit as i64], map_row)
         } else {
@@ -1059,7 +1166,10 @@ impl KanbanDb {
     ) -> Result<KanbanTask, AgentError> {
         let now = now_secs();
         let expires = now + ttl_secs.max(1);
-        let conn = self.conn.lock().map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
         let updated = conn
             .execute(
                 "UPDATE kanban_tasks SET status = 'doing', worker_id = ?1,
@@ -1086,9 +1196,16 @@ impl KanbanDb {
             .ok_or_else(|| AgentError::Validation(format!("task '{task_id}' missing after claim")))
     }
 
-    pub fn release_task(&self, task_id: &str, worker_id: Option<&str>) -> Result<KanbanTask, AgentError> {
+    pub fn release_task(
+        &self,
+        task_id: &str,
+        worker_id: Option<&str>,
+    ) -> Result<KanbanTask, AgentError> {
         let now = now_secs();
-        let conn = self.conn.lock().map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
         let updated = if let Some(w) = worker_id {
             conn.execute(
                 "UPDATE kanban_tasks SET status = 'todo', worker_id = NULL,
@@ -1112,8 +1229,9 @@ impl KanbanDb {
         }
         drop(conn);
         self.close_current_run(task_id, "released", Some("released"), None, None)?;
-        self.get_task(task_id)?
-            .ok_or_else(|| AgentError::Validation(format!("task '{task_id}' missing after release")))
+        self.get_task(task_id)?.ok_or_else(|| {
+            AgentError::Validation(format!("task '{task_id}' missing after release"))
+        })
     }
 
     pub fn complete_task(
@@ -1123,7 +1241,10 @@ impl KanbanDb {
         result: Option<&str>,
     ) -> Result<KanbanTask, AgentError> {
         let now = now_secs();
-        let conn = self.conn.lock().map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
         let updated = if let Some(w) = worker_id {
             conn.execute(
                 "UPDATE kanban_tasks SET status = 'done', result = ?1,
@@ -1146,13 +1267,7 @@ impl KanbanDb {
             )));
         }
         drop(conn);
-        self.close_current_run(
-            task_id,
-            "done",
-            Some("completed"),
-            result,
-            None,
-        )?;
+        self.close_current_run(task_id, "done", Some("completed"), result, None)?;
         let completed_payload = result.map(|r| {
             let first_line = r.lines().next().unwrap_or(r);
             let summary: String = first_line.chars().take(400).collect();
@@ -1162,13 +1277,12 @@ impl KanbanDb {
             })
             .to_string()
         });
-        self.append_event(
-            task_id,
-            "completed",
-            completed_payload.as_deref(),
-        )?;
+        self.append_event(task_id, "completed", completed_payload.as_deref())?;
         let now = now_secs();
-        let conn = self.conn.lock().map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
         conn.execute(
             "UPDATE kanban_tasks SET consecutive_failures = 0, last_failure_error = NULL,
              updated_at = ?1 WHERE id = ?2",
@@ -1177,14 +1291,23 @@ impl KanbanDb {
         .map_err(|e| AgentError::Database(format!("kanban complete reset failures: {e}")))?;
         drop(conn);
         let _ = self.recompute_ready(DEFAULT_FAILURE_LIMIT);
-        self.get_task(task_id)?
-            .ok_or_else(|| AgentError::Validation(format!("task '{task_id}' missing after complete")))
+        self.get_task(task_id)?.ok_or_else(|| {
+            AgentError::Validation(format!("task '{task_id}' missing after complete"))
+        })
     }
 
-    pub fn heartbeat_task(&self, task_id: &str, worker_id: &str, ttl_secs: i64) -> Result<(), AgentError> {
+    pub fn heartbeat_task(
+        &self,
+        task_id: &str,
+        worker_id: &str,
+        ttl_secs: i64,
+    ) -> Result<(), AgentError> {
         let now = now_secs();
         let expires = now + ttl_secs.max(1);
-        let conn = self.conn.lock().map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
         let updated = conn
             .execute(
                 "UPDATE kanban_tasks SET claim_expires = ?1, updated_at = ?2
@@ -1201,9 +1324,14 @@ impl KanbanDb {
     }
 
     pub fn parent_ids(&self, task_id: &str) -> Result<Vec<String>, AgentError> {
-        let conn = self.conn.lock().map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
         let mut stmt = conn
-            .prepare("SELECT parent_id FROM kanban_task_links WHERE child_id = ?1 ORDER BY parent_id")
+            .prepare(
+                "SELECT parent_id FROM kanban_task_links WHERE child_id = ?1 ORDER BY parent_id",
+            )
             .map_err(|e| AgentError::Database(format!("kanban parents prepare: {e}")))?;
         let rows = stmt
             .query_map(params![task_id], |row| row.get::<_, String>(0))
@@ -1217,7 +1345,10 @@ impl KanbanDb {
 
     /// Parents that prevent promoting a task to dispatchable `todo`.
     pub fn parents_blocking_todo(&self, task_id: &str) -> Result<Vec<ParentBlocker>, AgentError> {
-        let conn = self.conn.lock().map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
         let mut stmt = conn
             .prepare(
                 "SELECT t.id, t.title, t.status FROM kanban_tasks t
@@ -1237,15 +1368,22 @@ impl KanbanDb {
             .map_err(|e| AgentError::Database(format!("kanban parent blockers query: {e}")))?;
         let mut out = Vec::new();
         for row in rows {
-            out.push(row.map_err(|e| AgentError::Database(format!("kanban parent blockers map: {e}")))?);
+            out.push(
+                row.map_err(|e| AgentError::Database(format!("kanban parent blockers map: {e}")))?,
+            );
         }
         Ok(out)
     }
 
     pub fn child_ids(&self, task_id: &str) -> Result<Vec<String>, AgentError> {
-        let conn = self.conn.lock().map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
         let mut stmt = conn
-            .prepare("SELECT child_id FROM kanban_task_links WHERE parent_id = ?1 ORDER BY child_id")
+            .prepare(
+                "SELECT child_id FROM kanban_task_links WHERE parent_id = ?1 ORDER BY child_id",
+            )
             .map_err(|e| AgentError::Database(format!("kanban children prepare: {e}")))?;
         let rows = stmt
             .query_map(params![task_id], |row| row.get::<_, String>(0))
@@ -1286,7 +1424,10 @@ impl KanbanDb {
                 "linking {parent_id} -> {child_id} would create a cycle"
             )));
         }
-        let conn = self.conn.lock().map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
         conn.execute(
             "INSERT OR IGNORE INTO kanban_task_links (parent_id, child_id) VALUES (?1, ?2)",
             params![parent_id, child_id],
@@ -1299,7 +1440,10 @@ impl KanbanDb {
     pub fn list_claimable_tasks(&self, limit: usize) -> Result<Vec<KanbanTask>, AgentError> {
         let limit = limit.clamp(1, 200);
         let now = now_secs();
-        let conn = self.conn.lock().map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
         let sql = format!(
             "SELECT {SELECT_COLS} FROM kanban_tasks t
              WHERE t.status = 'todo'
@@ -1326,7 +1470,10 @@ impl KanbanDb {
     }
 
     pub fn count_doing_tasks(&self) -> Result<usize, AgentError> {
-        let conn = self.conn.lock().map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
         let n: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM kanban_tasks WHERE status = 'doing'",
@@ -1338,8 +1485,13 @@ impl KanbanDb {
     }
 
     /// Count in-flight tasks per assignee profile (Hermes per-profile cap).
-    pub fn count_doing_by_assignee(&self) -> Result<std::collections::HashMap<String, usize>, AgentError> {
-        let conn = self.conn.lock().map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
+    pub fn count_doing_by_assignee(
+        &self,
+    ) -> Result<std::collections::HashMap<String, usize>, AgentError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
         let mut stmt = conn
             .prepare(
                 "SELECT assignee, COUNT(*) FROM kanban_tasks
@@ -1348,11 +1500,14 @@ impl KanbanDb {
             )
             .map_err(|e| AgentError::Database(format!("kanban doing-by-assignee prepare: {e}")))?;
         let rows = stmt
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize)))
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
+            })
             .map_err(|e| AgentError::Database(format!("kanban doing-by-assignee query: {e}")))?;
         let mut out = std::collections::HashMap::new();
         for row in rows {
-            let (assignee, n) = row.map_err(|e| AgentError::Database(format!("kanban doing-by-assignee map: {e}")))?;
+            let (assignee, n) = row
+                .map_err(|e| AgentError::Database(format!("kanban doing-by-assignee map: {e}")))?;
             out.insert(assignee, n);
         }
         Ok(out)
@@ -1376,7 +1531,10 @@ impl KanbanDb {
             )?;
         }
         let now = now_secs();
-        let conn = self.conn.lock().map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
         let updated = conn
             .execute(
                 "UPDATE kanban_tasks SET status = 'archived', worker_id = NULL,
@@ -1386,13 +1544,16 @@ impl KanbanDb {
             )
             .map_err(|e| AgentError::Database(format!("kanban archive: {e}")))?;
         if updated == 0 {
-            return Err(AgentError::Validation(format!("task '{task_id}' not archived")));
+            return Err(AgentError::Validation(format!(
+                "task '{task_id}' not archived"
+            )));
         }
         drop(conn);
         self.append_event(task_id, "archived", None)?;
         let _ = self.recompute_ready(DEFAULT_FAILURE_LIMIT);
-        self.get_task(task_id)?
-            .ok_or_else(|| AgentError::Validation(format!("task '{task_id}' missing after archive")))
+        self.get_task(task_id)?.ok_or_else(|| {
+            AgentError::Validation(format!("task '{task_id}' missing after archive"))
+        })
     }
 
     /// Hard-delete a task and cascade related rows (Hermes `delete_task`).
@@ -1400,20 +1561,35 @@ impl KanbanDb {
         if self.get_task(task_id)?.is_none() {
             return Ok(false);
         }
-        let conn = self.conn.lock().map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
         conn.execute(
             "DELETE FROM kanban_task_links WHERE parent_id = ?1 OR child_id = ?1",
             params![task_id],
         )
         .map_err(|e| AgentError::Database(format!("kanban delete links: {e}")))?;
-        conn.execute("DELETE FROM kanban_task_comments WHERE task_id = ?1", params![task_id])
-            .map_err(|e| AgentError::Database(format!("kanban delete comments: {e}")))?;
-        conn.execute("DELETE FROM kanban_task_events WHERE task_id = ?1", params![task_id])
-            .map_err(|e| AgentError::Database(format!("kanban delete events: {e}")))?;
-        conn.execute("DELETE FROM kanban_task_runs WHERE task_id = ?1", params![task_id])
-            .map_err(|e| AgentError::Database(format!("kanban delete runs: {e}")))?;
-        conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?1", params![task_id])
-            .map_err(|e| AgentError::Database(format!("kanban delete subs: {e}")))?;
+        conn.execute(
+            "DELETE FROM kanban_task_comments WHERE task_id = ?1",
+            params![task_id],
+        )
+        .map_err(|e| AgentError::Database(format!("kanban delete comments: {e}")))?;
+        conn.execute(
+            "DELETE FROM kanban_task_events WHERE task_id = ?1",
+            params![task_id],
+        )
+        .map_err(|e| AgentError::Database(format!("kanban delete events: {e}")))?;
+        conn.execute(
+            "DELETE FROM kanban_task_runs WHERE task_id = ?1",
+            params![task_id],
+        )
+        .map_err(|e| AgentError::Database(format!("kanban delete runs: {e}")))?;
+        conn.execute(
+            "DELETE FROM kanban_notify_subs WHERE task_id = ?1",
+            params![task_id],
+        )
+        .map_err(|e| AgentError::Database(format!("kanban delete subs: {e}")))?;
         let deleted = conn
             .execute("DELETE FROM kanban_tasks WHERE id = ?1", params![task_id])
             .map_err(|e| AgentError::Database(format!("kanban delete task: {e}")))?;
@@ -1432,7 +1608,10 @@ impl KanbanDb {
     pub fn reclaim_stale_claims_with_limit(&self, failure_limit: u32) -> Result<usize, AgentError> {
         let now = now_secs();
         let stale: Vec<(String, Option<String>, Option<i64>)> = {
-            let conn = self.conn.lock().map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
+            let conn = self
+                .conn
+                .lock()
+                .map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
             let mut stmt = conn
                 .prepare(
                     "SELECT id, worker_id, current_run_id FROM kanban_tasks
@@ -1446,16 +1625,27 @@ impl KanbanDb {
                 .map_err(|e| AgentError::Database(format!("kanban reclaim query: {e}")))?;
             let mut out = Vec::new();
             for row in rows {
-                out.push(row.map_err(|e| AgentError::Database(format!("kanban reclaim map: {e}")))?);
+                out.push(
+                    row.map_err(|e| AgentError::Database(format!("kanban reclaim map: {e}")))?,
+                );
             }
             out
         };
         let mut reclaimed = 0usize;
         for (task_id, worker_id, run_id) in stale {
             if let Some(rid) = run_id {
-                let _ = self.end_run(rid, "reclaimed", Some("reclaimed"), Some("stale claim"), None);
+                let _ = self.end_run(
+                    rid,
+                    "reclaimed",
+                    Some("reclaimed"),
+                    Some("stale claim"),
+                    None,
+                );
             }
-            let conn = self.conn.lock().map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
+            let conn = self
+                .conn
+                .lock()
+                .map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
             conn.execute(
                 "UPDATE kanban_tasks SET status = 'todo', worker_id = NULL,
                  claim_expires = NULL, current_run_id = NULL, updated_at = ?1
@@ -1465,7 +1655,11 @@ impl KanbanDb {
             .map_err(|e| AgentError::Database(format!("kanban reclaim: {e}")))?;
             drop(conn);
             let wid = worker_id.as_deref().unwrap_or("unknown");
-            let _ = self.record_task_failure(&task_id, &format!("stale claim (worker {wid})"), failure_limit);
+            let _ = self.record_task_failure(
+                &task_id,
+                &format!("stale claim (worker {wid})"),
+                failure_limit,
+            );
             reclaimed += 1;
         }
         Ok(reclaimed)
@@ -1487,7 +1681,10 @@ impl KanbanDb {
     {
         let now = now_secs();
         let overdue: Vec<(String, i64, i32, i64)> = {
-            let conn = self.conn.lock().map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
+            let conn = self
+                .conn
+                .lock()
+                .map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
             let mut stmt = conn
                 .prepare(
                     "SELECT t.id, t.current_run_id, t.max_runtime_seconds, r.started_at
@@ -1522,14 +1719,11 @@ impl KanbanDb {
             on_overdue(&task_id);
             let elapsed = now.saturating_sub(started);
             let error = format!("elapsed {elapsed}s > limit {limit}s");
-            let _ = self.end_run(
-                run_id,
-                "timed_out",
-                Some("timed_out"),
-                None,
-                Some(&error),
-            );
-            let conn = self.conn.lock().map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
+            let _ = self.end_run(run_id, "timed_out", Some("timed_out"), None, Some(&error));
+            let conn = self
+                .conn
+                .lock()
+                .map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
             let updated = conn
                 .execute(
                     "UPDATE kanban_tasks SET status = 'todo', worker_id = NULL,
@@ -1572,7 +1766,10 @@ impl KanbanDb {
             return Err(AgentError::Validation(format!("unknown task {task_id}")));
         }
         let now = now_secs();
-        let conn = self.conn.lock().map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
         conn.execute(
             "INSERT INTO kanban_task_comments (task_id, author, body, created_at)
              VALUES (?1, ?2, ?3, ?4)",
@@ -1591,7 +1788,10 @@ impl KanbanDb {
     }
 
     pub fn list_comments(&self, task_id: &str) -> Result<Vec<KanbanComment>, AgentError> {
-        let conn = self.conn.lock().map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
         let mut stmt = conn
             .prepare(
                 "SELECT id, task_id, author, body, created_at
@@ -1623,7 +1823,10 @@ impl KanbanDb {
         reason: Option<&str>,
     ) -> Result<KanbanTask, AgentError> {
         let now = now_secs();
-        let conn = self.conn.lock().map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
         let updated = if let Some(w) = worker_id {
             conn.execute(
                 "UPDATE kanban_tasks SET status = 'blocked', worker_id = NULL,
@@ -1647,20 +1850,10 @@ impl KanbanDb {
             )));
         }
         drop(conn);
-        self.close_current_run(
-            task_id,
-            "blocked",
-            Some("blocked"),
-            reason,
-            None,
-        )?;
+        self.close_current_run(task_id, "blocked", Some("blocked"), reason, None)?;
         if worker_id.is_some() {
             let payload = reason.map(|r| serde_json::json!({ "reason": r }).to_string());
-            self.append_event(
-                task_id,
-                "blocked",
-                payload.as_deref(),
-            )?;
+            self.append_event(task_id, "blocked", payload.as_deref())?;
         }
         self.get_task(task_id)?
             .ok_or_else(|| AgentError::Validation(format!("task '{task_id}' missing after block")))
@@ -1668,7 +1861,10 @@ impl KanbanDb {
 
     pub fn unblock_task(&self, task_id: &str) -> Result<KanbanTask, AgentError> {
         let now = now_secs();
-        let conn = self.conn.lock().map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
         let updated = conn
             .execute(
                 "UPDATE kanban_tasks SET status = 'todo', worker_id = NULL,
@@ -1685,7 +1881,10 @@ impl KanbanDb {
         drop(conn);
         self.close_current_run(task_id, "reclaimed", Some("reclaimed"), None, None)?;
         let now = now_secs();
-        let conn = self.conn.lock().map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
         conn.execute(
             "UPDATE kanban_tasks SET consecutive_failures = 0, last_failure_error = NULL,
              current_run_id = NULL, updated_at = ?1 WHERE id = ?2",
@@ -1695,8 +1894,9 @@ impl KanbanDb {
         drop(conn);
         self.append_event(task_id, "unblocked", None)?;
         let _ = self.recompute_ready(DEFAULT_FAILURE_LIMIT);
-        self.get_task(task_id)?
-            .ok_or_else(|| AgentError::Validation(format!("task '{task_id}' missing after unblock")))
+        self.get_task(task_id)?.ok_or_else(|| {
+            AgentError::Validation(format!("task '{task_id}' missing after unblock"))
+        })
     }
 
     /// Assign or reassign a task (Hermes `assign_task` subset).
@@ -1717,7 +1917,10 @@ impl KanbanDb {
         let new_assignee = assignee.map(str::trim).filter(|s| !s.is_empty());
         let changed = task.assignee.as_deref() != new_assignee;
         let now = now_secs();
-        let conn = self.conn.lock().map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
         if changed {
             conn.execute(
                 "UPDATE kanban_tasks SET assignee = ?1, consecutive_failures = 0,
@@ -1765,7 +1968,10 @@ impl KanbanDb {
             self.close_current_run(task_id, "reclaimed", Some("reclaimed"), None, None)?;
         }
         let now = now_secs();
-        let conn = self.conn.lock().map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
         let updated = conn
             .execute(
                 "UPDATE kanban_tasks SET status = ?1, updated_at = ?2 WHERE id = ?3",
@@ -1773,23 +1979,31 @@ impl KanbanDb {
             )
             .map_err(|e| AgentError::Database(format!("kanban set status: {e}")))?;
         if updated == 0 {
-            return Err(AgentError::Validation(format!("task '{task_id}' not found")));
+            return Err(AgentError::Validation(format!(
+                "task '{task_id}' not found"
+            )));
         }
         drop(conn);
         let payload = serde_json::json!({ "status": status }).to_string();
         self.append_event(task_id, "status", Some(&payload))?;
         let _ = self.recompute_ready(DEFAULT_FAILURE_LIMIT);
-        self.get_task(task_id)?
-            .ok_or_else(|| AgentError::Validation(format!("task '{task_id}' missing after status set")))
+        self.get_task(task_id)?.ok_or_else(|| {
+            AgentError::Validation(format!("task '{task_id}' missing after status set"))
+        })
     }
 
     /// Update task priority and emit reprioritized event.
     pub fn set_task_priority(&self, task_id: &str, priority: i32) -> Result<(), AgentError> {
         if self.get_task(task_id)?.is_none() {
-            return Err(AgentError::Validation(format!("task '{task_id}' not found")));
+            return Err(AgentError::Validation(format!(
+                "task '{task_id}' not found"
+            )));
         }
         let now = now_secs();
-        let conn = self.conn.lock().map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
         conn.execute(
             "UPDATE kanban_tasks SET priority = ?1, updated_at = ?2 WHERE id = ?3",
             params![priority, now, task_id],
@@ -1809,7 +2023,9 @@ impl KanbanDb {
         body: Option<&str>,
     ) -> Result<(), AgentError> {
         if self.get_task(task_id)?.is_none() {
-            return Err(AgentError::Validation(format!("task '{task_id}' not found")));
+            return Err(AgentError::Validation(format!(
+                "task '{task_id}' not found"
+            )));
         }
         if let Some(t) = title
             && t.trim().is_empty()
@@ -1817,26 +2033,23 @@ impl KanbanDb {
             return Err(AgentError::Validation("title cannot be empty".into()));
         }
         let now = now_secs();
-        let conn = self.conn.lock().map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
         match (title, body) {
-            (Some(t), Some(b)) => {
-                conn.execute(
-                    "UPDATE kanban_tasks SET title = ?1, body = ?2, updated_at = ?3 WHERE id = ?4",
-                    params![t.trim(), b, now, task_id],
-                )
-            }
-            (Some(t), None) => {
-                conn.execute(
-                    "UPDATE kanban_tasks SET title = ?1, updated_at = ?2 WHERE id = ?3",
-                    params![t.trim(), now, task_id],
-                )
-            }
-            (None, Some(b)) => {
-                conn.execute(
-                    "UPDATE kanban_tasks SET body = ?1, updated_at = ?2 WHERE id = ?3",
-                    params![b, now, task_id],
-                )
-            }
+            (Some(t), Some(b)) => conn.execute(
+                "UPDATE kanban_tasks SET title = ?1, body = ?2, updated_at = ?3 WHERE id = ?4",
+                params![t.trim(), b, now, task_id],
+            ),
+            (Some(t), None) => conn.execute(
+                "UPDATE kanban_tasks SET title = ?1, updated_at = ?2 WHERE id = ?3",
+                params![t.trim(), now, task_id],
+            ),
+            (None, Some(b)) => conn.execute(
+                "UPDATE kanban_tasks SET body = ?1, updated_at = ?2 WHERE id = ?3",
+                params![b, now, task_id],
+            ),
             (None, None) => return Ok(()),
         }
         .map_err(|e| AgentError::Database(format!("kanban edit: {e}")))?;
@@ -1854,7 +2067,10 @@ impl KanbanDb {
     ) -> Result<(), AgentError> {
         let now = now_secs();
         let thread = thread_id.unwrap_or("");
-        let conn = self.conn.lock().map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
         conn.execute(
             "INSERT OR IGNORE INTO kanban_notify_subs
              (task_id, platform, chat_id, thread_id, user_id, created_at, last_event_id)
@@ -1866,7 +2082,10 @@ impl KanbanDb {
     }
 
     pub fn list_notify_subs(&self) -> Result<Vec<KanbanNotifySub>, AgentError> {
-        let conn = self.conn.lock().map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
         let mut stmt = conn
             .prepare(
                 "SELECT task_id, platform, chat_id, thread_id, user_id, created_at, last_event_id
@@ -1888,7 +2107,9 @@ impl KanbanDb {
             .map_err(|e| AgentError::Database(format!("kanban notify list query: {e}")))?;
         let mut out = Vec::new();
         for row in rows {
-            out.push(row.map_err(|e| AgentError::Database(format!("kanban notify list map: {e}")))?);
+            out.push(
+                row.map_err(|e| AgentError::Database(format!("kanban notify list map: {e}")))?,
+            );
         }
         Ok(out)
     }
@@ -1920,10 +2141,8 @@ impl KanbanDb {
              WHERE task_id = ?1 AND id > ?2 AND kind IN ({placeholders})
              ORDER BY id ASC"
         );
-        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![
-            Box::new(task_id.to_string()),
-            Box::new(cursor),
-        ];
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> =
+            vec![Box::new(task_id.to_string()), Box::new(cursor)];
         for kind in kinds {
             params_vec.push(Box::new(kind.to_string()));
         }
@@ -1945,7 +2164,8 @@ impl KanbanDb {
         let mut out = Vec::new();
         let mut max_id = cursor;
         for row in rows {
-            let ev = row.map_err(|e| AgentError::Database(format!("kanban notify events map: {e}")))?;
+            let ev =
+                row.map_err(|e| AgentError::Database(format!("kanban notify events map: {e}")))?;
             max_id = max_id.max(ev.id);
             out.push(ev);
         }
@@ -1962,7 +2182,10 @@ impl KanbanDb {
         kinds: &[&str],
     ) -> Result<(i64, i64, Vec<KanbanEvent>), AgentError> {
         let thread = thread_id.unwrap_or("");
-        let conn = self.conn.lock().map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
         conn.execute("BEGIN IMMEDIATE", [])
             .map_err(|e| AgentError::Database(format!("kanban notify txn: {e}")))?;
         let result = (|| {
@@ -1978,9 +2201,8 @@ impl KanbanDb {
             let Some(old_cursor) = old_row else {
                 return Ok((0, 0, Vec::new()));
             };
-            let (new_cursor, events) = self.unseen_events_for_sub(
-                &conn, task_id, platform, chat_id, thread, kinds,
-            )?;
+            let (new_cursor, events) =
+                self.unseen_events_for_sub(&conn, task_id, platform, chat_id, thread, kinds)?;
             if events.is_empty() {
                 return Ok((old_cursor, old_cursor, events));
             }
@@ -2020,13 +2242,23 @@ impl KanbanDb {
         old_cursor: i64,
     ) -> Result<bool, AgentError> {
         let thread = thread_id.unwrap_or("");
-        let conn = self.conn.lock().map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
         let updated = conn
             .execute(
                 "UPDATE kanban_notify_subs SET last_event_id = ?1
                  WHERE task_id = ?2 AND platform = ?3 AND chat_id = ?4 AND thread_id = ?5
                  AND last_event_id = ?6",
-                params![old_cursor, task_id, platform, chat_id, thread, claimed_cursor],
+                params![
+                    old_cursor,
+                    task_id,
+                    platform,
+                    chat_id,
+                    thread,
+                    claimed_cursor
+                ],
             )
             .map_err(|e| AgentError::Database(format!("kanban notify rewind: {e}")))?;
         Ok(updated > 0)
@@ -2034,9 +2266,15 @@ impl KanbanDb {
 
     /// Drop subscriptions when a task reaches a final status.
     pub fn remove_notify_subs_for_task(&self, task_id: &str) -> Result<usize, AgentError> {
-        let conn = self.conn.lock().map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AgentError::Database("kanban db lock poisoned".into()))?;
         let n = conn
-            .execute("DELETE FROM kanban_notify_subs WHERE task_id = ?1", params![task_id])
+            .execute(
+                "DELETE FROM kanban_notify_subs WHERE task_id = ?1",
+                params![task_id],
+            )
             .map_err(|e| AgentError::Database(format!("kanban notify remove: {e}")))?;
         Ok(n)
     }
@@ -2066,13 +2304,12 @@ mod tests {
             .expect("create");
         assert_eq!(task.status, "todo");
 
-        let claimed = db
-            .claim_task(&task.id, "worker-a", 900)
-            .expect("claim");
+        let claimed = db.claim_task(&task.id, "worker-a", 900).expect("claim");
         assert_eq!(claimed.status, "doing");
         assert_eq!(claimed.worker_id.as_deref(), Some("worker-a"));
 
-        db.heartbeat_task(&task.id, "worker-a", 900).expect("heartbeat");
+        db.heartbeat_task(&task.id, "worker-a", 900)
+            .expect("heartbeat");
 
         let done = db
             .complete_task(&task.id, Some("worker-a"), Some("shipped"))
@@ -2114,7 +2351,8 @@ mod tests {
         let child = db.create_task("Child", None, 0).expect("child");
         db.link_tasks(&parent.id, &child.id).expect("link");
         assert!(db.claim_task(&child.id, "w", 900).is_err());
-        db.complete_task(&parent.id, None, Some("ok")).expect("done");
+        db.complete_task(&parent.id, None, Some("ok"))
+            .expect("done");
         db.claim_task(&child.id, "w", 900).expect("claim child");
     }
 
@@ -2190,8 +2428,13 @@ mod tests {
     #[test]
     fn decompose_creates_children_and_promotes_root() {
         let (_dir, db) = test_db();
-        let tid = db.create_triage_task("ship a feature", None, 0).expect("triage");
-        assert_eq!(db.get_task(&tid.id).expect("get").expect("row").status, "triage");
+        let tid = db
+            .create_triage_task("ship a feature", None, 0)
+            .expect("triage");
+        assert_eq!(
+            db.get_task(&tid.id).expect("get").expect("row").status,
+            "triage"
+        );
 
         let children = vec![
             KanbanDecomposeChild {
@@ -2217,7 +2460,8 @@ mod tests {
         assert_eq!(root.status, "todo");
         let c0 = db.get_task(&child_ids[0]).expect("get").expect("c0");
         assert_eq!(c0.status, "todo");
-        db.claim_task(&child_ids[0], "w1", 900).expect("claim first");
+        db.claim_task(&child_ids[0], "w1", 900)
+            .expect("claim first");
         assert!(db.claim_task(&child_ids[1], "w2", 900).is_err());
     }
 
@@ -2239,24 +2483,28 @@ mod tests {
                 parents: vec![0],
             },
         ];
-        assert!(db
-            .decompose_triage_task(&tid.id, None, &children, None)
-            .is_err());
+        assert!(
+            db.decompose_triage_task(&tid.id, None, &children, None)
+                .is_err()
+        );
     }
 
     #[test]
     fn specify_promotes_triage_to_todo() {
         let (_dir, db) = test_db();
-        let t = db.create_triage_task("vague idea", None, 0).expect("triage");
-        assert!(db
-            .specify_triage_task(
+        let t = db
+            .create_triage_task("vague idea", None, 0)
+            .expect("triage");
+        assert!(
+            db.specify_triage_task(
                 &t.id,
                 "Concrete title",
                 Some("spec body"),
                 Some("work"),
                 Some("user"),
             )
-            .expect("spec"));
+            .expect("spec")
+        );
         let row = db.get_task(&t.id).expect("get").expect("row");
         assert_eq!(row.status, "todo");
         assert_eq!(row.title, "Concrete title");
@@ -2338,9 +2586,11 @@ mod tests {
         let (_dir, db) = test_db();
         let task = db.create_task("Later", None, 0).expect("create");
         let future = now_secs() + 3600;
-        db.set_scheduled_at(&task.id, Some(future)).expect("schedule");
+        db.set_scheduled_at(&task.id, Some(future))
+            .expect("schedule");
         assert!(db.claim_task(&task.id, "w", 900).is_err());
-        db.set_scheduled_at(&task.id, Some(now_secs() - 1)).expect("unschedule");
+        db.set_scheduled_at(&task.id, Some(now_secs() - 1))
+            .expect("unschedule");
         db.claim_task(&task.id, "w", 900).expect("claim");
     }
 }

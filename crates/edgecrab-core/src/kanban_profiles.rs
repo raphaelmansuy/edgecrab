@@ -136,7 +136,9 @@ pub fn write_profile_meta(
         serde_yml::Value::Mapping(serde_yml::Mapping::new())
     };
     let Some(map) = existing.as_mapping_mut() else {
-        return Err(AgentError::Validation("profile.yaml is not a mapping".into()));
+        return Err(AgentError::Validation(
+            "profile.yaml is not a mapping".into(),
+        ));
     };
     let text = description.trim().to_string();
     map.insert(
@@ -247,7 +249,11 @@ pub fn format_roster_for_prompt(roster: &[KanbanProfileEntry]) -> String {
     roster
         .iter()
         .map(|e| {
-            let tag = if e.has_description { "" } else { " ⚠ undescribed" };
+            let tag = if e.has_description {
+                ""
+            } else {
+                " ⚠ undescribed"
+            };
             format!("  - {}{}: {}", e.name, tag, e.description)
         })
         .collect::<Vec<_>>()
@@ -259,7 +265,10 @@ fn resolve_named_profile(
     install_root: &Path,
     fallback: impl FnOnce() -> String,
 ) -> String {
-    let Some(name) = explicit.map(normalize_profile_name).filter(|s| !s.is_empty()) else {
+    let Some(name) = explicit
+        .map(normalize_profile_name)
+        .filter(|s| !s.is_empty())
+    else {
         return fallback();
     };
     if profile_exists(install_root, &name) {
@@ -271,20 +280,16 @@ fn resolve_named_profile(
 
 /// Resolve orchestrator profile for root task after fan-out.
 pub fn resolve_orchestrator_profile(cfg: &KanbanConfig, install_root: &Path) -> String {
-    resolve_named_profile(
-        cfg.orchestrator_profile.as_deref(),
-        install_root,
-        || read_active_profile(install_root),
-    )
+    resolve_named_profile(cfg.orchestrator_profile.as_deref(), install_root, || {
+        read_active_profile(install_root)
+    })
 }
 
 /// Resolve default assignee for unroutable / null decomposer picks.
 pub fn resolve_default_assignee(cfg: &KanbanConfig, install_root: &Path) -> String {
-    resolve_named_profile(
-        cfg.default_assignee.as_deref(),
-        install_root,
-        || read_active_profile(install_root),
-    )
+    resolve_named_profile(cfg.default_assignee.as_deref(), install_root, || {
+        read_active_profile(install_root)
+    })
 }
 
 /// Normalize LLM assignee choice; invalid names fall back to `default_assignee`.
@@ -340,12 +345,19 @@ mod tests {
         .expect("write");
         let roster = list_profile_roster(root);
         assert!(roster.iter().any(|e| e.name == "default"));
-        assert!(roster.iter().any(|e| e.name == "research" && e.has_description));
+        assert!(
+            roster
+                .iter()
+                .any(|e| e.name == "research" && e.has_description)
+        );
     }
 
     #[test]
     fn invalid_assignee_falls_back() {
-        let valid: HashSet<String> = ["default", "work"].into_iter().map(str::to_string).collect();
+        let valid: HashSet<String> = ["default", "work"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
         assert_eq!(
             normalize_assignee_choice(Some("unknown"), "default", &valid),
             "default"

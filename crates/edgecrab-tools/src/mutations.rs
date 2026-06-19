@@ -89,6 +89,33 @@ impl MutationTurnState {
         }
     }
 
+    /// Peek successful mutation records without draining (harness gate input).
+    pub fn peek_success_records(&self) -> Vec<MutationRecord> {
+        if let Ok(guard) = self.inner.lock() {
+            guard.records.clone()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Peek unresolved per-path mutation failures without clearing state.
+    pub fn peek_failed(&self) -> HashMap<String, (String, String)> {
+        if let Ok(guard) = self.inner.lock() {
+            guard
+                .failed
+                .iter()
+                .map(|(path, info)| {
+                    (
+                        path.clone(),
+                        (info.tool.clone(), info.error_preview.clone()),
+                    )
+                })
+                .collect()
+        } else {
+            HashMap::new()
+        }
+    }
+
     pub fn record_tool_outcome(&self, tool_name: &str, args: &Value, result: &str, is_error: bool) {
         if !FILE_MUTATING_TOOLS.contains(&tool_name) {
             return;

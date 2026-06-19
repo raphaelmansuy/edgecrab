@@ -148,7 +148,9 @@ pub fn parse_approval_mode(token: &str) -> Result<ApprovalMode, String> {
         "manual" => Ok(ApprovalMode::Manual),
         "smart" => Ok(ApprovalMode::Smart),
         "off" | "disable" | "disabled" => Ok(ApprovalMode::Off),
-        other => Err(format!("Unknown approvals mode '{other}'. Use: manual, smart, off")),
+        other => Err(format!(
+            "Unknown approvals mode '{other}'. Use: manual, smart, off"
+        )),
     }
 }
 
@@ -164,7 +166,11 @@ pub fn handle_approvals_slash(
     }
 
     let tokens: Vec<&str> = trimmed.split_whitespace().collect();
-    if tokens.first().map(|t| t.eq_ignore_ascii_case("mode")).unwrap_or(false) {
+    if tokens
+        .first()
+        .map(|t| t.eq_ignore_ascii_case("mode"))
+        .unwrap_or(false)
+    {
         let Some(mode_token) = tokens.get(1) else {
             return format!(
                 "{}\nUsage: /approvals mode manual|smart|off",
@@ -219,10 +225,7 @@ mod tests {
 
     #[test]
     fn parse_mode_tokens() {
-        assert_eq!(
-            parse_approval_mode("smart").unwrap(),
-            ApprovalMode::Smart
-        );
+        assert_eq!(parse_approval_mode("smart").unwrap(), ApprovalMode::Smart);
         assert!(parse_approval_mode("bogus").is_err());
     }
 }

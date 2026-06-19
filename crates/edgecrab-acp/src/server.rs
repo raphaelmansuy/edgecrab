@@ -443,7 +443,7 @@ impl AcpServer {
                 Some(format!("Current model: {model}"))
             }
             "tools" => {
-                let tools = crate::permission::ACP_TOOLS;
+                let tools = edgecrab_tools::acp_tools();
                 let mut lines = vec![format!("Available tools ({}):", tools.len())];
                 for tool in tools {
                     lines.push(format!("  {tool}"));

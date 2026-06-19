@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
 use edgecrab_plugins::{discover_plugins, hermes_supports_hook, invoke_hermes_hook};
 use edgecrab_state::SessionDb;
@@ -256,12 +257,16 @@ pub struct AgentConfig {
     pub local_max_tool_turn_tokens: usize,
     /// Per-turn file-mutation footers (success log + failure advisory).
     pub file_mutation_verifier: bool,
+    /// Post-mutation deterministic oracle gates (`node --check`, etc.).
+    pub harness_post_mutation_oracles: bool,
     /// Cross-session Anthropic prompt prefix cache (stable/dynamic split + TTL).
     pub cache: crate::config::CacheConfig,
     /// Pluggable web search backend chain.
     pub web_search: crate::config::WebSearchConfig,
     /// Hermes-aligned `web:` capability overrides (search_backend / extract_backend / backend).
     pub web: crate::config::WebToolsConfig,
+    /// Tool JSON schema wire shape (`full` | `compact`, spec 007 L1.2).
+    pub tool_schema_mode: edgecrab_tools::ToolSchemaMode,
 }
 
 impl Default for AgentConfig {
@@ -335,9 +340,11 @@ impl Default for AgentConfig {
             local_max_tool_turn_tokens:
                 edgecrab_tools::mutation_turn_policy::LOCAL_TOOL_TURN_ABS_MAX_TOKENS,
             file_mutation_verifier: true,
+            harness_post_mutation_oracles: true,
             cache: crate::config::CacheConfig::default(),
             web_search: crate::config::WebSearchConfig::default(),
             web: crate::config::WebToolsConfig::default(),
+            tool_schema_mode: edgecrab_tools::ToolSchemaMode::Indexed,
         }
     }
 }
@@ -497,10 +504,11 @@ impl AgentConfig {
                 edgecrab_tools::edit_contract::DEFAULT_MAX_MUTATION_PAYLOAD_KIB,
                 |kib| kib as usize,
             ),
-            local_write_create_dirs: crate::local_provider_policy::effective_local_write_create_dirs(
-                self.local_write_create_dirs,
-                &self.model,
-            ),
+            local_write_create_dirs:
+                crate::local_provider_policy::effective_local_write_create_dirs(
+                    self.local_write_create_dirs,
+                    &self.model,
+                ),
             local_max_tool_turn_tokens: self.local_max_tool_turn_tokens,
             web_search: edgecrab_tools::config_ref::WebSearchConfigRef {
                 primary: self.web_search.primary.clone(),
@@ -528,6 +536,7 @@ impl AgentConfig {
                 extract_backend: self.web.extract_backend.clone(),
                 backend: self.web.backend.clone(),
             },
+            tool_schema_mode: self.tool_schema_mode,
             gateway_running,
             ..Default::default()
         }
@@ -552,6 +561,11 @@ pub struct SessionState {
     ///
     /// Always cleared together with `cached_system_prompt`.
     pub cached_stable_prompt: Option<String>,
+    /// Semi-stable middle tier (skills name index) — 5m cache when native layout is active.
+    ///
+    /// Populated alongside `cached_stable_prompt` when `build_blocks()` emits a
+    /// skills compact index. Cleared with `cached_system_prompt`.
+    pub cached_semi_stable_prompt: Option<String>,
     pub user_turn_count: u32,
     pub api_call_count: u32,
     pub session_input_tokens: u64,
@@ -595,6 +609,7 @@ impl SessionState {
     ) {
         self.cached_system_prompt = None;
         self.cached_stable_prompt = None;
+        self.cached_semi_stable_prompt = None;
         if outcome.compressed {
             self.first_compression_done = true;
         }
@@ -852,8 +867,13 @@ impl Agent {
             }
         });
 
+        let (session_id, platform) = self.trace_conversation_identity().await;
         match self
             .execute_loop(message, None, None, Some(&event_tx), None, None)
+            .instrument(crate::observability::agent_conversation_span(
+                &session_id,
+                platform,
+            ))
             .await
         {
             Ok(result) => {
@@ -906,6 +926,7 @@ impl Agent {
         system_message: Option<&str>,
         conversation_history: Option<Vec<Message>>,
     ) -> Result<ConversationResult, AgentError> {
+        let (session_id, platform) = self.trace_conversation_identity().await;
         self.execute_loop(
             user_message,
             system_message,
@@ -914,6 +935,10 @@ impl Agent {
             None,
             None,
         )
+        .instrument(crate::observability::agent_conversation_span(
+            &session_id,
+            platform,
+        ))
         .await
     }
 
@@ -925,6 +950,7 @@ impl Agent {
         conversation_history: Option<Vec<Message>>,
         cwd: &Path,
     ) -> Result<ConversationResult, AgentError> {
+        let (session_id, platform) = self.trace_conversation_identity().await;
         self.execute_loop(
             user_message,
             system_message,
@@ -933,7 +959,31 @@ impl Agent {
             Some(cwd),
             None,
         )
+        .instrument(crate::observability::agent_conversation_span(
+            &session_id,
+            platform,
+        ))
         .await
+    }
+
+    /// Best-effort session identity for root `agent_conversation` spans.
+    ///
+    /// Persists a generated id on `SessionState` so the span matches `execute_loop`.
+    async fn trace_conversation_identity(&self) -> (String, Platform) {
+        let config = self.config.read().await;
+        let platform = config.platform;
+        let configured = config.session_id.clone();
+        drop(config);
+
+        let mut session = self.session.write().await;
+        if session.session_id.is_none() {
+            session.session_id = configured.or_else(|| Some(uuid::Uuid::new_v4().to_string()));
+        }
+        let session_id = session
+            .session_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        (session_id, platform)
     }
 
     /// Clone the agent runtime into a fresh isolated session.
@@ -958,7 +1008,8 @@ impl Agent {
                 crate::kanban_profiles::load_config_for_profile(&root, &profile_name)?;
             let model = profile_cfg.model.default_model.clone();
             let provider = if let Some((provider_name, model_name)) = model.split_once('/') {
-                let canonical = edgecrab_tools::vision_models::normalize_provider_name(provider_name);
+                let canonical =
+                    edgecrab_tools::vision_models::normalize_provider_name(provider_name);
                 edgecrab_tools::create_provider_for_model(&canonical, model_name)
                     .map_err(|e| AgentError::Config(format!("kanban worker provider: {e}")))?
             } else {
@@ -966,8 +1017,7 @@ impl Agent {
                     "kanban worker profile '{profile_name}' model must be provider/model form, got '{model}'"
                 )));
             };
-            let profile_home =
-                crate::kanban_profiles::profile_effective_home(&root, &profile_name);
+            let profile_home = crate::kanban_profiles::profile_effective_home(&root, &profile_name);
             let db = Arc::new(
                 edgecrab_state::SessionDb::open(&profile_home.join("state.db"))
                     .map_err(|e| AgentError::Database(format!("profile state db: {e}")))?,
@@ -1358,7 +1408,7 @@ impl Agent {
                     .unwrap_or_else(|| "context-budget".into()),
                 user_task: None,
                 cancel: CancellationToken::new(),
-                config: app_config_ref,
+                config: app_config_ref.clone(),
                 state_db: self.state_db.clone(),
                 platform: config.platform,
                 process_table: Some(self.process_table.clone()),
@@ -1384,31 +1434,56 @@ impl Agent {
                 mutation_turn: None,
                 lsp_gate: None,
                 kanban_task_id: config.kanban_task_id.clone(),
+                materialized_tools: None,
             };
+            let materialized = std::collections::HashSet::new();
             let schemas = registry.get_definitions(enabled_filter, disabled_filter, &ctx);
-            edgecrab_tools::to_llm_definitions(&schemas)
+            let (_, deferred) = edgecrab_tools::wire_partition_counts(&schemas, &materialized);
+            let defs = edgecrab_tools::build_wire_llm_definitions(
+                registry,
+                &ctx,
+                enabled_filter,
+                disabled_filter,
+                config.tool_schema_mode,
+                &materialized,
+            );
+            (defs, deferred)
         } else {
-            Vec::new()
+            (Vec::new(), 0)
         };
+
+        let (tool_defs, deferred_count) = tool_defs;
+        let tools_deferred_count = (config.tool_schema_mode
+            == edgecrab_tools::ToolSchemaMode::Indexed
+            && deferred_count > 0)
+            .then_some(deferred_count);
 
         let dynamic_prompt = match (
             session.cached_stable_prompt.as_deref(),
+            session.cached_semi_stable_prompt.as_deref(),
             session.cached_system_prompt.as_deref(),
         ) {
-            (Some(stable), Some(combined)) if combined.starts_with(stable) => {
-                Some(combined[stable.len()..].trim_start_matches('\n').to_string())
-            }
+            (Some(stable), semi, Some(combined)) => Some(
+                crate::conversation::split_dynamic_after_cache_prefixes(
+                    combined,
+                    stable,
+                    semi.unwrap_or(""),
+                )
+                .to_string(),
+            ),
             _ => None,
         };
 
         crate::context_budget::estimate_context_budget(
             session.cached_stable_prompt.as_deref(),
+            session.cached_semi_stable_prompt.as_deref(),
             dynamic_prompt.as_deref(),
             session.cached_system_prompt.as_deref(),
             &session.messages,
             &tool_defs,
             context_window,
         )
+        .with_deferred_tools(tools_deferred_count)
     }
 
     /// Best-effort synchronous snapshot accessor for non-async inspection paths.
@@ -1479,6 +1554,7 @@ impl Agent {
         let mut session = self.session.write().await;
         session.cached_system_prompt = None;
         session.cached_stable_prompt = None;
+        session.cached_semi_stable_prompt = None;
     }
 
     pub async fn set_personality_addon(&self, addon: Option<String>) {
@@ -1999,6 +2075,7 @@ impl Agent {
             mutation_turn: None,
             lsp_gate: None,
             kanban_task_id: config.kanban_task_id.clone(),
+            materialized_tools: None,
         };
         registry.tool_inventory(&ctx)
     }
@@ -2691,9 +2768,11 @@ impl AgentBuilder {
                 local_write_create_dirs: config.local_inference.write_create_dirs,
                 local_max_tool_turn_tokens: config.local_inference.max_tool_turn_tokens,
                 file_mutation_verifier: config.display.file_mutation_verifier,
+                harness_post_mutation_oracles: config.display.harness_post_mutation_oracles,
                 cache: config.cache.clone(),
                 web_search: config.web_search.clone(),
                 web: config.web.clone(),
+                tool_schema_mode: edgecrab_tools::ToolSchemaMode::parse(&config.tools.schema_mode),
                 ..Default::default()
             },
             provider: None,

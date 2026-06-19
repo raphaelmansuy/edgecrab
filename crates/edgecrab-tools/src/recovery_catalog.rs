@@ -321,10 +321,7 @@ mod tests {
     #[test]
     fn stale_context_suggests_read_file_first() {
         let err = stale_file_context("write_file", "lib.rs");
-        let recovery = err
-            .to_llm_payload()
-            .recovery_feedback
-            .expect("recovery");
+        let recovery = err.to_llm_payload().recovery_feedback.expect("recovery");
         assert!(
             recovery
                 .suggestions

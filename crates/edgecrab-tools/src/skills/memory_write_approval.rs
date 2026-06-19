@@ -120,12 +120,11 @@ pub async fn apply_memory_write_payload(
 pub async fn apply_pending_memory_write(home: &Path, id: &str) -> Result<String, ToolError> {
     let record = get_pending(home, SUBSYSTEM_MEMORY, id)
         .ok_or_else(|| ToolError::NotFound(format!("Pending {id} not found")))?;
-    let payload: MemoryWritePayload = serde_json::from_value(record.payload).map_err(|e| {
-        ToolError::InvalidArgs {
+    let payload: MemoryWritePayload =
+        serde_json::from_value(record.payload).map_err(|e| ToolError::InvalidArgs {
             tool: "memory_write".into(),
             message: format!("invalid pending payload: {e}"),
-        }
-    })?;
+        })?;
     let result = apply_memory_write_payload(home, &payload).await?;
     let _ = discard_pending(home, SUBSYSTEM_MEMORY, id);
     Ok(result)
@@ -320,10 +319,7 @@ mod tests {
             MemoryWriteGate::Staged(msg) => assert!(msg.contains("Pending id:")),
             MemoryWriteGate::Allow => panic!("expected staged"),
         }
-        assert_eq!(
-            list_pending(home.path(), SUBSYSTEM_MEMORY).len(),
-            1
-        );
+        assert_eq!(list_pending(home.path(), SUBSYSTEM_MEMORY).len(), 1);
     }
 
     #[test]

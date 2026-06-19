@@ -63,14 +63,18 @@ tokio-util = { version = "0.7", features = ["rt"] }
 futures = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+opentelemetry = { version = "0.27", features = ["trace", "metrics"] }
+opentelemetry_sdk = { version = "0.27", features = ["trace", "metrics", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic", "trace", "metrics"] }
+tracing-opentelemetry = { version = "0.28" }
 async-trait = "0.1"
 async-lsp = { version = "0.2.3", features = ["omni-trait", "tokio"] }
 lsp-types = { version = "0.97.0", features = ["proposed"] }
 regex = "1"
 url = "2"
 
-# LLM backend — crates.io pin (v0.6.25: LM Studio metadata + tool-turn reasoning_effort).
-edgequake-llm = { version = "0.6.25", features = ["bedrock"] }
+# LLM backend — local path (v0.6.27: OpenAI wire conformance, Magistral SSE, refusal); publish then repin crates.io.
+edgequake-llm = { path = "../edgequake-llm", features = ["bedrock", "otel"] }
 
 # Image processing (vision tool: resize/compress before base64 encoding)
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }

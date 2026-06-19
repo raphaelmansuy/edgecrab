@@ -54,6 +54,7 @@ pub mod skills_hub;
 pub mod skills_sync;
 pub mod terminal;
 pub mod todo;
+pub mod tool_search;
 pub mod transcribe;
 pub mod tts;
 pub mod vision;

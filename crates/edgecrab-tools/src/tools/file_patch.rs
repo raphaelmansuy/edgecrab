@@ -1617,13 +1617,22 @@ mod tests {
         let params = super::patch_tool_parameters_json();
         assert_eq!(params["type"], "object");
         assert!(params.get("oneOf").is_none());
-        assert_eq!(params["properties"]["mode"]["enum"], json!(["replace", "patch"]));
+        assert_eq!(
+            params["properties"]["mode"]["enum"],
+            json!(["replace", "patch"])
+        );
     }
 
     #[test]
     fn lh62_patch_schema_patch_mode_fields() {
         let params = super::patch_tool_parameters_json();
-        assert_eq!(params["properties"]["patch"]["type"], json!(["string", "null"]));
-        assert_eq!(params["properties"]["path"]["type"], json!(["string", "null"]));
+        assert_eq!(
+            params["properties"]["patch"]["type"],
+            json!(["string", "null"])
+        );
+        assert_eq!(
+            params["properties"]["path"]["type"],
+            json!(["string", "null"])
+        );
     }
 }

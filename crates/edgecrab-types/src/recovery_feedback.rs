@@ -8,7 +8,7 @@
 //! for AI Agent Recovery" (arXiv:2606.05037).
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Typed recovery verbs — EdgeCrab domain vocabulary (discrete, mergeable params).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,7 +88,8 @@ impl RecoveryFeedbackBuilder {
     }
 
     pub fn suggestion(mut self, action: RecoveryAction, parameters: Value) -> Self {
-        self.suggestions.push(RecoverySuggestion::new(action, parameters));
+        self.suggestions
+            .push(RecoverySuggestion::new(action, parameters));
         self
     }
 

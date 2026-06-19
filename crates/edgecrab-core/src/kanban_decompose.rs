@@ -3,7 +3,9 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use edgecrab_state::{KanbanDb, KanbanDecomposeChild, KanbanStatus, kanban_db_path_for_board, list_board_slugs};
+use edgecrab_state::{
+    KanbanDb, KanbanDecomposeChild, KanbanStatus, kanban_db_path_for_board, list_board_slugs,
+};
 use edgequake_llm::LLMProvider;
 use serde::Deserialize;
 use serde_json::Value;
@@ -127,7 +129,10 @@ fn llm_tasks_to_children(tasks: Vec<LlmTask>, ctx: &DecomposeContext) -> Vec<Kan
         .into_iter()
         .map(|t| KanbanDecomposeChild {
             title: t.title.trim().chars().take(200).collect(),
-            body: t.body.map(|b| b.trim().to_string()).filter(|b| !b.is_empty()),
+            body: t
+                .body
+                .map(|b| b.trim().to_string())
+                .filter(|b| !b.is_empty()),
             assignee: Some(normalize_assignee_choice(
                 t.assignee.as_deref(),
                 &ctx.default_assignee,
@@ -465,7 +470,10 @@ pub fn format_decompose_outcome(outcome: &DecomposeOutcome) -> String {
                 .as_ref()
                 .map(|v| v.join(", "))
                 .unwrap_or_default();
-            format!("✅ Decomposed `{}` → {ids}\n{}", outcome.task_id, outcome.reason)
+            format!(
+                "✅ Decomposed `{}` → {ids}\n{}",
+                outcome.task_id, outcome.reason
+            )
         } else {
             format!(
                 "✅ Specified `{}` (single task, triage → todo)\n{}",
@@ -473,7 +481,10 @@ pub fn format_decompose_outcome(outcome: &DecomposeOutcome) -> String {
             )
         }
     } else {
-        format!("❌ Decompose `{}` failed: {}", outcome.task_id, outcome.reason)
+        format!(
+            "❌ Decompose `{}` failed: {}",
+            outcome.task_id, outcome.reason
+        )
     }
 }
 

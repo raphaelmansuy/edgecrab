@@ -1,12 +1,13 @@
-use edgecrab_tools::{ACP_TOOLS, AppConfigRef, CORE_TOOLS, LSP_TOOLS, ToolContext, ToolRegistry};
+use edgecrab_tools::{AppConfigRef, CORE_TOOLS, LSP_TOOLS, ToolContext, ToolRegistry, acp_tools};
 use edgecrab_types::{Platform, ToolError};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 fn assert_tool_in_acp_surface(tool_name: &str) {
+    let acp = acp_tools();
     assert!(
-        ACP_TOOLS.contains(&tool_name),
-        "ACP_TOOLS should expose {tool_name}"
+        acp.contains(&tool_name),
+        "acp_tools() should expose {tool_name}"
     );
 }
 
@@ -59,8 +60,8 @@ fn moa_tool_is_opt_in_not_in_core_or_base_acp() {
         "MOA should not be in CORE_TOOLS"
     );
     assert!(
-        !ACP_TOOLS.contains(&"moa"),
-        "MOA should be opt-in via enabled_toolsets, not base ACP_TOOLS"
+        !acp_tools().contains(&"moa"),
+        "MOA should be opt-in via enabled_toolsets, not base acp_tools()"
     );
 }
 
@@ -72,8 +73,8 @@ fn lsp_tools_are_opt_in_not_in_base_acp_const() {
             "LSP_TOOLS should expose {tool_name}"
         );
         assert!(
-            !ACP_TOOLS.contains(tool_name),
-            "LSP should load via enabled_toolsets in ACP, not static ACP_TOOLS"
+            !acp_tools().contains(tool_name),
+            "LSP should load via enabled_toolsets in ACP, not base acp_tools()"
         );
     }
 }
@@ -86,8 +87,8 @@ fn edgecrab_lsp_advantage_tools_are_in_lsp_tools_only() {
             "LSP_TOOLS should expose {tool_name}"
         );
         assert!(
-            !ACP_TOOLS.contains(tool_name),
-            "LSP advantage tools are opt-in, not base ACP_TOOLS"
+            !acp_tools().contains(tool_name),
+            "LSP advantage tools are opt-in, not base acp_tools()"
         );
     }
 }
@@ -147,12 +148,11 @@ async fn browser_advantage_tools_dispatch_through_registry_with_edge_case_valida
         mutation_turn: None,
         lsp_gate: None,
         kanban_task_id: None,
+        materialized_tools: None,
     };
 
     for tool_name in ["browser_wait_for", "browser_select", "browser_hover"] {
-        let wait_for_err = registry
-            .dispatch(tool_name, json!({}), &ctx)
-            .await;
+        let wait_for_err = registry.dispatch(tool_name, json!({}), &ctx).await;
         // Without a live browser, dispatch may return InvalidArgs (validation) or
         // a runtime unavailable error — either is acceptable.
         assert!(

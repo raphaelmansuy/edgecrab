@@ -81,7 +81,10 @@ fn append_prior_attempts(
     }
     let (omitted, shown): (usize, Vec<KanbanRun>) = if all.len() > MAX_PRIOR_ATTEMPTS {
         let omitted = all.len() - MAX_PRIOR_ATTEMPTS;
-        (omitted, all.into_iter().take(MAX_PRIOR_ATTEMPTS).rev().collect())
+        (
+            omitted,
+            all.into_iter().take(MAX_PRIOR_ATTEMPTS).rev().collect(),
+        )
     } else {
         (0, all.into_iter().rev().collect())
     };
@@ -138,8 +141,7 @@ fn append_parent_results(
         if let Some(run) = runs.first() {
             if let Some(summary) = run.summary.as_deref().filter(|s| !s.trim().is_empty()) {
                 lines.push(cap(summary, MAX_FIELD_BYTES));
-            } else if let Some(result) = parent.result.as_deref().filter(|s| !s.trim().is_empty())
-            {
+            } else if let Some(result) = parent.result.as_deref().filter(|s| !s.trim().is_empty()) {
                 lines.push(cap(result, MAX_FIELD_BYTES));
             } else {
                 lines.push("(no result recorded)".into());
@@ -199,12 +201,16 @@ mod tests {
     fn context_includes_prior_attempts_and_parent_handoff() {
         let dir = TempDir::new().expect("tmpdir");
         let db = KanbanDb::open_default(Some(dir.path())).expect("open");
-        let parent = db.create_task("Parent", Some("parent body"), 0).expect("parent");
+        let parent = db
+            .create_task("Parent", Some("parent body"), 0)
+            .expect("parent");
         db.claim_task(&parent.id, "w0", 900).expect("claim p");
         db.complete_task(&parent.id, Some("w0"), Some("parent shipped summary"))
             .expect("done p");
 
-        let child = db.create_task("Child", Some("child body"), 0).expect("child");
+        let child = db
+            .create_task("Child", Some("child body"), 0)
+            .expect("child");
         db.link_tasks(&parent.id, &child.id).expect("link");
 
         db.claim_task(&child.id, "w1", 900).expect("claim c");

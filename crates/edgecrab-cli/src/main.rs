@@ -180,7 +180,9 @@ pub(crate) async fn create_provider_async(
 fn create_provider_inner(model: &str) -> anyhow::Result<Arc<dyn edgequake_llm::LLMProvider>> {
     let normalized_model = model.trim().to_ascii_lowercase();
     if normalized_model == "mock" || normalized_model.starts_with("mock/") {
-        return Ok(Arc::new(edgequake_llm::MockProvider::new()));
+        return Ok(edgecrab_tools::wrap_provider_with_tracing(Arc::new(
+            edgequake_llm::MockProvider::new(),
+        )));
     }
 
     if let Some((provider_name, model_name)) = explicit_provider_request(model) {
@@ -191,11 +193,13 @@ fn create_provider_inner(model: &str) -> anyhow::Result<Arc<dyn edgequake_llm::L
     // Fallback: environment auto-detection (only reached when no explicit
     // "provider/model" syntax was used).
     if let Ok((llm, _embedding)) = edgequake_llm::ProviderFactory::from_env() {
-        return Ok(llm);
+        return Ok(edgecrab_tools::wrap_provider_with_tracing(llm));
     }
 
     tracing::warn!("no provider configured, falling back to mock");
-    Ok(Arc::new(edgequake_llm::MockProvider::new()))
+    Ok(edgecrab_tools::wrap_provider_with_tracing(Arc::new(
+        edgequake_llm::MockProvider::new(),
+    )))
 }
 
 fn explicit_provider_request(model: &str) -> Option<(&str, &str)> {
@@ -258,6 +262,7 @@ fn create_explicit_provider_raw(
             "openai-compatible",
             model_name,
         )
+        .map(edgecrab_tools::wrap_provider_with_tracing)
         .map_err(|e| {
             anyhow::anyhow!(
                 "openai-codex (ChatGPT Pro) provider failed: {e}\n\
@@ -493,6 +498,12 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Acp { .. }) => LoggingMode::Acp,
         _ => LoggingMode::Agent,
     };
+    let default_service_name = match logging_mode {
+        LoggingMode::Gateway => "edgecrab-gateway",
+        LoggingMode::Acp => "edgecrab-acp",
+        LoggingMode::Agent => "edgecrab",
+    };
+    let _ = edgecrab_core::load_app_config_and_apply_observability(default_service_name);
     let _logging_guards = init_logging(
         &logging_home,
         logging_mode,
@@ -1455,8 +1466,7 @@ async fn run_acp(args: &CliArgs) -> anyhow::Result<()> {
         args.model.as_deref(),
         args.toolset.as_deref(),
     )?;
-    runtime.config.tools.enabled_toolsets =
-        Some(vec!["core".to_string(), "lsp".to_string()]);
+    runtime.config.tools.enabled_toolsets = Some(vec!["core".to_string(), "lsp".to_string()]);
     let model_str = runtime.config.model.default_model.clone();
     let provider = create_provider_async(&model_str).await?;
     let state_db = open_state_db(&runtime.state_db_path)?;

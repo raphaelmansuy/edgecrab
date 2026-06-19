@@ -108,7 +108,10 @@ fn copy_state_entry(home: &Path, snap_dir: &Path, rel: &str, manifest: &mut BTre
 }
 
 /// Create a quick state snapshot. Returns snapshot id or None if nothing copied.
-pub fn create_quick_snapshot(label: Option<&str>, home: Option<&Path>) -> io::Result<Option<String>> {
+pub fn create_quick_snapshot(
+    label: Option<&str>,
+    home: Option<&Path>,
+) -> io::Result<Option<String>> {
     let id = create_quick_snapshot_inner(label, home)?;
     if id.is_some() {
         prune_quick_snapshots(DEFAULT_KEEP, home)?;
@@ -128,7 +131,10 @@ pub fn create_pre_update_snapshot(keep: usize, home: Option<&Path>) -> io::Resul
     Ok(id)
 }
 
-fn create_quick_snapshot_inner(label: Option<&str>, home: Option<&Path>) -> io::Result<Option<String>> {
+fn create_quick_snapshot_inner(
+    label: Option<&str>,
+    home: Option<&Path>,
+) -> io::Result<Option<String>> {
     let home = home_path(home);
     let root = snapshot_root(Some(home.as_path()));
     fs::create_dir_all(&root)?;
@@ -155,7 +161,10 @@ fn create_quick_snapshot_inner(label: Option<&str>, home: Option<&Path>) -> io::
     let meta = SnapshotManifest {
         id: snap_id.clone(),
         timestamp: ts,
-        label: label.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string),
+        label: label
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
         file_count: manifest.len(),
         total_size,
         files: manifest,
@@ -435,11 +444,7 @@ mod tests {
         let dir = TempDir::new().expect("tmpdir");
         fs::write(dir.path().join("config.yaml"), "model: test\n").expect("write");
         fs::create_dir_all(dir.path().join("pairing")).expect("mkdir");
-        fs::write(
-            dir.path().join("pairing/telegram-approved.json"),
-            "{}",
-        )
-        .expect("write");
+        fs::write(dir.path().join("pairing/telegram-approved.json"), "{}").expect("write");
         dir
     }
 

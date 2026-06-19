@@ -724,7 +724,10 @@ pub fn extract_partial_json_string_field(partial: &str, field: &str) -> Option<S
 pub fn format_tool_generating_status(name: &str, partial_args: &str) -> String {
     let preview = streaming_tool_field_preview(name, partial_args);
     if preview.is_empty() {
-        format!("📝 preparing {name} · {}", format_streaming_args_progress(partial_args.len()))
+        format!(
+            "📝 preparing {name} · {}",
+            format_streaming_args_progress(partial_args.len())
+        )
     } else {
         format!(
             "📝 preparing {name} · {}",
@@ -801,11 +804,9 @@ fn format_token_k(n: u64) -> String {
 
 fn format_ctx_hint(prompt: Option<u64>, ctx: Option<u64>) -> Option<String> {
     match (prompt, ctx) {
-        (Some(p), Some(c)) if c > 0 => Some(format!(
-            "~{}/{} ctx",
-            format_token_k(p),
-            format_token_k(c)
-        )),
+        (Some(p), Some(c)) if c > 0 => {
+            Some(format!("~{}/{} ctx", format_token_k(p), format_token_k(c)))
+        }
         (Some(p), None) => Some(format!("~{} prompt tok", format_token_k(p))),
         (None, Some(c)) => Some(format!("{} ctx window", format_token_k(c))),
         _ => None,
@@ -836,33 +837,21 @@ fn nonstreaming_wait_liveness(provider: &str, phase: NonStreamingWaitPhase) -> &
             NonStreamingWaitPhase::Start => {
                 "non-streaming — Ollama generates server-side until complete"
             }
-            NonStreamingWaitPhase::Heartbeat => {
-                "non-streaming — Ollama may still be generating"
-            }
+            NonStreamingWaitPhase::Heartbeat => "non-streaming — Ollama may still be generating",
         },
         "vscode-copilot" => match phase {
-            NonStreamingWaitPhase::Start => {
-                "non-streaming — waiting on Copilot API until complete"
-            }
-            NonStreamingWaitPhase::Heartbeat => {
-                "non-streaming — still waiting on Copilot API"
-            }
+            NonStreamingWaitPhase::Start => "non-streaming — waiting on Copilot API until complete",
+            NonStreamingWaitPhase::Heartbeat => "non-streaming — still waiting on Copilot API",
         },
         "bedrock" => match phase {
             NonStreamingWaitPhase::Start => {
                 "Bedrock Converse — tool JSON arrives when complete (no tool stream yet)"
             }
-            NonStreamingWaitPhase::Heartbeat => {
-                "Bedrock Converse — still generating tool call"
-            }
+            NonStreamingWaitPhase::Heartbeat => "Bedrock Converse — still generating tool call",
         },
         _ => match phase {
-            NonStreamingWaitPhase::Start => {
-                "buffered API — response arrives when complete"
-            }
-            NonStreamingWaitPhase::Heartbeat => {
-                "buffered API — provider may still be working"
-            }
+            NonStreamingWaitPhase::Start => "buffered API — response arrives when complete",
+            NonStreamingWaitPhase::Heartbeat => "buffered API — provider may still be working",
         },
     }
 }
@@ -910,11 +899,7 @@ pub fn format_nonstreaming_llm_wait(
     has_tools: bool,
     ctx: LlmWaitContext,
 ) -> String {
-    let task = if has_tools {
-        "tool call"
-    } else {
-        "response"
-    };
+    let task = if has_tools { "tool call" } else { "response" };
     let liveness = nonstreaming_wait_liveness(provider, NonStreamingWaitPhase::Heartbeat);
     let mut hints: Vec<String> = Vec::new();
     if let Some(pct) = ctx.prefill_pct {
@@ -1032,11 +1017,7 @@ pub fn llm_wait_progress_label(
 }
 
 /// Compact status-bar label — avoids truncating the full shelf line mid-word.
-pub fn llm_wait_status_compact(
-    provider: &str,
-    has_tools: bool,
-    ctx: LlmWaitContext,
-) -> String {
+pub fn llm_wait_status_compact(provider: &str, has_tools: bool, ctx: LlmWaitContext) -> String {
     let task = if has_tools { "tool turn" } else { "reply" };
     if let Some(hint) = format_ctx_hint(ctx.prompt_tokens_estimated, ctx.context_length) {
         format!("{provider} {task} · {hint}")
@@ -1129,7 +1110,10 @@ mod tests {
         let compact = llm_wait_status_compact("bedrock", true, ctx);
         assert!(compact.contains("bedrock tool turn"));
         assert!(compact.contains("33k/300k"));
-        assert!(compact.len() < 48, "compact label must fit status bar: {compact}");
+        assert!(
+            compact.len() < 48,
+            "compact label must fit status bar: {compact}"
+        );
     }
 
     #[test]
@@ -1172,7 +1156,8 @@ mod tests {
 
     #[test]
     fn local_prefill_prune_notice_mentions_token_drop() {
-        let preflight = format_local_prefill_prune_notice("lmstudio", 52_000, 18_000, 6, "preflight");
+        let preflight =
+            format_local_prefill_prune_notice("lmstudio", 52_000, 18_000, 6, "preflight");
         assert!(preflight.contains("~52k→~18k"));
         assert!(preflight.contains("6 tool output"));
         assert!(preflight.contains("before tool turn"));

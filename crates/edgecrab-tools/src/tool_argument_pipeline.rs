@@ -85,7 +85,9 @@ pub fn parse_tool_arguments_json(raw: &str) -> Result<serde_json::Value, ToolErr
             serde_json::from_str(&repaired)
                 .map_err(|e| ToolError::InvalidArgs {
                     tool: "tool_call".into(),
-                    message: format!("invalid JSON arguments after repair: {e} (initial: {first_err})"),
+                    message: format!(
+                        "invalid JSON arguments after repair: {e} (initial: {first_err})"
+                    ),
                 })
                 .and_then(ensure_object)
         }
@@ -373,15 +375,20 @@ one",}"#;
         let registry = ToolRegistry::new();
         let err = prepare_parsed_tool_arguments(&registry, "write_file", r#"{"text":"ok"}"#)
             .expect_err("missing path");
-        assert!(err.to_llm_response().contains("missing required field 'path'"));
+        assert!(
+            err.to_llm_response()
+                .contains("missing required field 'path'")
+        );
     }
 
     #[test]
     fn ta11_write_file_missing_content() {
         let registry = ToolRegistry::new();
-        let err =
-            prepare_parsed_tool_arguments(&registry, "write_file", r#"{"path":"/tmp/x.md"}"#)
-                .expect_err("missing content");
-        assert!(err.to_llm_response().contains("missing required field 'content'"));
+        let err = prepare_parsed_tool_arguments(&registry, "write_file", r#"{"path":"/tmp/x.md"}"#)
+            .expect_err("missing content");
+        assert!(
+            err.to_llm_response()
+                .contains("missing required field 'content'")
+        );
     }
 }

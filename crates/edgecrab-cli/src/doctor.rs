@@ -108,6 +108,7 @@ pub async fn run(config_override: Option<&str>) -> anyhow::Result<bool> {
     checks.push(check_skills(&context.home));
     if let Ok(config) = edgecrab_core::AppConfig::load() {
         checks.push(check_toolset_policy(&config));
+        checks.push(check_schema_mode(&config));
     }
     checks.extend(check_mcp_servers());
     checks.extend(check_provider_keys());
@@ -223,15 +224,31 @@ fn check_toolset_policy(config: &edgecrab_core::AppConfig) -> Check {
             "enabled_toolsets unset — all eligible tools load (~15K+ schema tokens). \
              Set tools.enabled_toolsets: [core] in config.yaml (default for new installs)",
         ),
-        Some(names) if names.is_empty() => Check::warn(
-            "Toolsets",
-            "enabled_toolsets is empty — no tools will load",
-        ),
+        Some(names) if names.is_empty() => {
+            Check::warn("Toolsets", "enabled_toolsets is empty — no tools will load")
+        }
         Some(names) if edgecrab_tools::toolsets::contains_all_sentinel(names) => Check::warn(
             "Toolsets",
             "enabled_toolsets includes 'all' — maximum schema payload on every turn",
         ),
         Some(names) => Check::pass("Toolsets", names.join(", ")),
+    }
+}
+
+fn check_schema_mode(config: &edgecrab_core::AppConfig) -> Check {
+    match edgecrab_tools::ToolSchemaMode::parse(&config.tools.schema_mode) {
+        edgecrab_tools::ToolSchemaMode::Indexed => Check::pass(
+            "Schema mode",
+            "indexed — hot tools on wire; call tool_search to load deferred schemas",
+        ),
+        edgecrab_tools::ToolSchemaMode::Compact => Check::pass(
+            "Schema mode",
+            "compact — all enabled tools on wire with shortened descriptions",
+        ),
+        edgecrab_tools::ToolSchemaMode::Full => Check::pass(
+            "Schema mode",
+            "full — all enabled tools on wire with verbose descriptions",
+        ),
     }
 }
 

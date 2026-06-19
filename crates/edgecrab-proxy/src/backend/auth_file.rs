@@ -220,10 +220,7 @@ mod tests {
             std::env::set_var("EDGECRAB_HOME", ec.to_str().expect("utf8"));
             std::env::set_var("HOME", dir.path().to_str().expect("utf8"));
         }
-        assert_eq!(
-            auth_path_for_provider("xai-oauth"),
-            ec.join("auth.json")
-        );
+        assert_eq!(auth_path_for_provider("xai-oauth"), ec.join("auth.json"));
     }
 
     #[test]
@@ -239,9 +236,6 @@ mod tests {
             std::env::set_var("EDGECRAB_HOME", ec.to_str().expect("utf8"));
             std::env::set_var("HOME", dir.path().to_str().expect("utf8"));
         }
-        assert_eq!(
-            auth_path_for_provider("xai-oauth"),
-            ec.join("auth.json")
-        );
+        assert_eq!(auth_path_for_provider("xai-oauth"), ec.join("auth.json"));
     }
 }

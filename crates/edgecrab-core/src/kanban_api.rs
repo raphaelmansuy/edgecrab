@@ -8,9 +8,9 @@ use edgecrab_state::{
     kanban_db_path_for_board, kanban_home, list_board_slugs,
 };
 use edgecrab_types::AgentError;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use crate::kanban_task_patch::{patch_kanban_task, TaskPatch};
+use crate::kanban_task_patch::{TaskPatch, patch_kanban_task};
 
 pub fn task_to_json(t: &KanbanTask) -> Value {
     json!({
@@ -171,7 +171,9 @@ pub fn task_detail(
     let home = kanban_home(home);
     let (slug, db) = open_board_db(&home, board)?;
     let Some(task) = db.get_task(task_id)? else {
-        return Err(AgentError::Validation(format!("task '{task_id}' not found")));
+        return Err(AgentError::Validation(format!(
+            "task '{task_id}' not found"
+        )));
     };
     let runs = db
         .list_task_runs(task_id, 20)?
@@ -234,7 +236,9 @@ pub fn delete_task(
     let home = kanban_home(home);
     let (slug, db) = open_board_db(&home, board)?;
     if !db.delete_task(task_id)? {
-        return Err(AgentError::Validation(format!("task '{task_id}' not found")));
+        return Err(AgentError::Validation(format!(
+            "task '{task_id}' not found"
+        )));
     }
     Ok(json!({
         "deleted": true,
@@ -269,7 +273,8 @@ mod tests {
         let db = KanbanDb::open_default(Some(home)).expect("open");
         let t = db.create_task("Evt", None, 0).expect("create");
         db.claim_task(&t.id, "w1", 900).expect("claim");
-        db.complete_task(&t.id, Some("w1"), Some("ok")).expect("done");
+        db.complete_task(&t.id, Some("w1"), Some("ok"))
+            .expect("done");
 
         let body = events_since(Some(home), None, 0, 100).expect("events");
         assert_eq!(body["board"], "default");

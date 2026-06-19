@@ -6,15 +6,15 @@
 use std::sync::Arc;
 
 use edgecrab_core::local_provider_policy::{
-    effective_completion_options, local_tool_turn_absolute_max_tokens,
-    local_tool_turn_plan, LocalToolTurnPlan,
+    LocalToolTurnPlan, effective_completion_options, local_tool_turn_absolute_max_tokens,
+    local_tool_turn_plan,
 };
-use edgecrab_tools::{AppConfigRef, ToolContext, ToolRegistry};
 use edgecrab_tools::mutation_turn_policy::{
-    local_default_max_tool_argument_bytes, local_max_tool_argument_bytes_for_output_tokens,
-    LOCAL_TOOL_TURN_ABS_MAX_TOKENS,
+    LOCAL_TOOL_TURN_ABS_MAX_TOKENS, local_default_max_tool_argument_bytes,
+    local_max_tool_argument_bytes_for_output_tokens,
 };
 use edgecrab_tools::registry::{annotate_llm_definitions_for_local_turn, to_llm_definitions};
+use edgecrab_tools::{AppConfigRef, ToolContext, ToolRegistry};
 use edgecrab_types::{Platform, ToolError};
 use edgequake_llm::{CompletionOptions, LLMProvider};
 use tokio_util::sync::CancellationToken;
@@ -54,6 +54,7 @@ fn minimal_tool_ctx() -> ToolContext {
         mutation_turn: None,
         lsp_gate: None,
         kanban_task_id: None,
+        materialized_tools: None,
     }
 }
 
@@ -91,10 +92,7 @@ impl LLMProvider for NamedProvider {
         self.default_output
     }
 
-    async fn complete(
-        &self,
-        prompt: &str,
-    ) -> edgequake_llm::Result<edgequake_llm::LLMResponse> {
+    async fn complete(&self, prompt: &str) -> edgequake_llm::Result<edgequake_llm::LLMResponse> {
         Ok(edgequake_llm::LLMResponse::new(prompt, self.model()))
     }
 
@@ -178,11 +176,7 @@ fn lh61_e2e_registry_definitions_annotated_for_local_turn() {
         "baseline schema must not embed budget"
     );
 
-    let annotated = annotate_llm_definitions_for_local_turn(
-        defs,
-        "lmstudio",
-        Some((27_852, 8192)),
-    );
+    let annotated = annotate_llm_definitions_for_local_turn(defs, "lmstudio", Some((27_852, 8192)));
     let write_annotated = annotated
         .iter()
         .find(|d| d.function.name == "write_file")
@@ -195,7 +189,10 @@ fn lh61_e2e_registry_definitions_annotated_for_local_turn() {
         .find(|d| d.function.name == "read_file")
         .expect("read_file");
     assert!(
-        !read_annotated.function.description.contains("Local turn limit"),
+        !read_annotated
+            .function
+            .description
+            .contains("Local turn limit"),
         "non-mutation tools unchanged"
     );
 }

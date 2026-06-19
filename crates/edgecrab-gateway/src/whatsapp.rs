@@ -477,17 +477,15 @@ impl WhatsAppAdapter {
 
         if !status.is_success() {
             return Err(BridgeSendFailure {
-                detail: parse_bridge_error(&raw_body).unwrap_or_else(|| {
-                    format!("clarify relay returned HTTP {status}: {raw_body}")
-                }),
+                detail: parse_bridge_error(&raw_body)
+                    .unwrap_or_else(|| format!("clarify relay returned HTTP {status}: {raw_body}")),
             });
         }
 
-        let payload: SendClarifyResponse = serde_json::from_str(&raw_body).map_err(|error| {
-            BridgeSendFailure {
+        let payload: SendClarifyResponse =
+            serde_json::from_str(&raw_body).map_err(|error| BridgeSendFailure {
                 detail: format!("invalid clarify relay response: {error}; body={raw_body}"),
-            }
-        })?;
+            })?;
         if !payload.success {
             return Err(BridgeSendFailure {
                 detail: payload

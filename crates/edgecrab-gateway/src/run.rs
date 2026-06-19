@@ -620,6 +620,7 @@ async fn build_effective_text(agent: &Agent, msg: &IncomingMessage) -> String {
             mutation_turn: None,
             lsp_gate: None,
             kanban_task_id: None,
+            materialized_tools: None,
         };
 
         match VisionAnalyzeTool
@@ -689,6 +690,7 @@ async fn build_effective_text(agent: &Agent, msg: &IncomingMessage) -> String {
             mutation_turn: None,
             lsp_gate: None,
             kanban_task_id: None,
+            materialized_tools: None,
         };
 
         match TranscribeAudioTool
@@ -1017,6 +1019,7 @@ async fn maybe_send_voice_reply(
         mutation_turn: None,
         lsp_gate: None,
         kanban_task_id: None,
+        materialized_tools: None,
     };
 
     let result = match TextToSpeechTool
@@ -1922,7 +1925,8 @@ impl Gateway {
                     let agent = agent.clone();
                     let kanban_home = home;
                     tokio::spawn(async move {
-                        let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval.max(15)));
+                        let mut tick =
+                            tokio::time::interval(std::time::Duration::from_secs(interval.max(15)));
                         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                         loop {
                             tick.tick().await;
@@ -4100,7 +4104,10 @@ fn build_router(state: GatewayState) -> Router {
         .route("/health", get(health_handler))
         .route("/kanban", get(crate::kanban_routes::kanban_dashboard))
         .route("/api/kanban/board", get(crate::kanban_routes::kanban_board))
-        .route("/api/kanban/boards", get(crate::kanban_routes::kanban_boards))
+        .route(
+            "/api/kanban/boards",
+            get(crate::kanban_routes::kanban_boards),
+        )
         .route(
             "/api/kanban/tasks/:id",
             get(crate::kanban_routes::kanban_task_detail)

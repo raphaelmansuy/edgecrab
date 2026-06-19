@@ -168,6 +168,37 @@ jobs:
       - run: cargo install cargo-audit --locked
       - run: cargo audit
 
+  otel-collector:
+    name: OTEL — collector e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Start OTLP collector
+        run: docker compose -f infra/otel/docker-compose.yaml up -d
+      - name: Wait for collector
+        run: |
+          for _ in $(seq 1 30); do
+            if nc -z localhost 4317; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "OTLP collector did not become ready on :4317"
+          docker compose -f infra/otel/docker-compose.yaml logs
+          exit 1
+      - name: Collector integration smoke test
+        run: cargo test -p edgecrab-core --test otel_collector_e2e -- --ignored
+      - name: Offline OTEL unit tests
+        run: cargo test -p edgecrab-core otel
+      - name: Stop collector
+        if: always()
+        run: docker compose -f infra/otel/docker-compose.yaml down
+
   site:
     name: Site — build check
     runs-on: ubuntu-latest

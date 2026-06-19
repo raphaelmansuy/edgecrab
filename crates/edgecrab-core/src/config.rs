@@ -35,6 +35,7 @@ pub struct AppConfig {
     pub model: ModelConfig,
     pub agent: AgentConfig,
     pub logging: LoggingConfig,
+    pub observability: ObservabilityConfig,
     pub tools: ToolsConfig,
     pub lsp: LspConfig,
     pub worktree: bool,
@@ -98,7 +99,8 @@ impl Default for LocalInferenceConfig {
     fn default() -> Self {
         Self {
             write_create_dirs: true,
-            max_tool_turn_tokens: edgecrab_tools::mutation_turn_policy::LOCAL_TOOL_TURN_ABS_MAX_TOKENS,
+            max_tool_turn_tokens:
+                edgecrab_tools::mutation_turn_policy::LOCAL_TOOL_TURN_ABS_MAX_TOKENS,
         }
     }
 }
@@ -209,6 +211,40 @@ impl Default for LoggingConfig {
     }
 }
 
+/// OpenTelemetry / harness observability (`config.yaml` + env overrides).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ObservabilityConfig {
+    /// Enable OTLP span export (`OTEL_EXPORTER_OTLP_ENDPOINT` or localhost default).
+    pub otel_export: bool,
+    /// OTLP gRPC endpoint, e.g. `http://localhost:4317`.
+    pub otel_endpoint: Option<String>,
+    /// Override `OTEL_SERVICE_NAME` (CLI picks `edgecrab` / `edgecrab-gateway` / `edgecrab-acp`).
+    pub service_name: Option<String>,
+    /// Wrap LLM providers with GenAI tracing spans (`EDGECRAB_TRACE_LLM`).
+    pub trace_llm: bool,
+    /// Capture prompt/completion in spans — privacy-sensitive (`EDGECODE_CAPTURE_CONTENT`).
+    pub capture_content: bool,
+    /// Export OTLP metrics (`EDGECRAB_OTEL_METRICS`, default on when OTLP on).
+    pub otel_metrics: bool,
+    /// Export OTLP trace spans (`EDGECRAB_OTEL_TRACES`, default on when OTLP on).
+    pub otel_traces: bool,
+}
+
+impl Default for ObservabilityConfig {
+    fn default() -> Self {
+        Self {
+            otel_export: false,
+            otel_endpoint: None,
+            service_name: None,
+            trace_llm: true,
+            capture_content: false,
+            otel_metrics: true,
+            otel_traces: true,
+        }
+    }
+}
+
 impl AppConfig {
     /// Load config from disk → env → defaults, in resolution order.
     pub fn load() -> Result<Self, AgentError> {
@@ -224,6 +260,7 @@ impl AppConfig {
 
         config.apply_env_overrides();
         config.moa = config.moa.sanitized();
+        sanitize_tools_policy(&mut config.tools);
         edgecrab_tools::ensure_web_search_config_coherence_at(&path);
         Ok(config)
     }
@@ -234,6 +271,7 @@ impl AppConfig {
         let mut config: Self = Self::parse_compat_yaml(&content, path)?;
         config.apply_env_overrides();
         config.moa = config.moa.sanitized();
+        sanitize_tools_policy(&mut config.tools);
         edgecrab_tools::ensure_web_search_config_coherence_at(path);
         Ok(config)
     }
@@ -245,6 +283,7 @@ impl AppConfig {
 
         normalize_model_keys(&mut raw);
         normalize_tools_file_keys(&mut raw);
+        normalize_tools_policy_keys(&mut raw);
 
         serde_yml::from_value(raw).map_err(|e| AgentError::Config(format!("{path:?}: {e}")))
     }
@@ -272,7 +311,7 @@ impl AppConfig {
         if let Some(list) = toolsets {
             list.retain(|entry| !entry.eq_ignore_ascii_case(name));
             if list.is_empty() {
-                *toolsets = None;
+                *toolsets = Some(vec!["core".to_string()]);
             }
         }
     }
@@ -322,7 +361,9 @@ impl AppConfig {
     }
 
     /// Update `approvals.mode` and persist to `~/.edgecrab/config.yaml`.
-    pub fn persist_approvals_mode(mode: edgecrab_security::approval::ApprovalMode) -> Result<(), AgentError> {
+    pub fn persist_approvals_mode(
+        mode: edgecrab_security::approval::ApprovalMode,
+    ) -> Result<(), AgentError> {
         let mut config = Self::load()?;
         config.approvals.mode = mode;
         config.save()
@@ -628,6 +669,34 @@ impl AppConfig {
         if let Ok(val) = std::env::var("EDGECRAB_REASONING_EFFORT") {
             self.reasoning_effort = Some(val);
         }
+        if let Ok(val) = std::env::var("EDGECRAB_OTEL_EXPORT") {
+            self.observability.otel_export = parse_bool_env(&val);
+        }
+        if let Ok(val) = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT") {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                self.observability.otel_endpoint = Some(trimmed.to_string());
+                self.observability.otel_export = true;
+            }
+        }
+        if let Ok(val) = std::env::var("OTEL_SERVICE_NAME") {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                self.observability.service_name = Some(trimmed.to_string());
+            }
+        }
+        if let Ok(val) = std::env::var("EDGECRAB_TRACE_LLM") {
+            self.observability.trace_llm = parse_bool_env(&val);
+        }
+        if let Ok(val) = std::env::var("EDGECODE_CAPTURE_CONTENT") {
+            self.observability.capture_content = parse_bool_env(&val);
+        }
+        if let Ok(val) = std::env::var("EDGECRAB_OTEL_METRICS") {
+            self.observability.otel_metrics = parse_bool_env(&val);
+        }
+        if let Ok(val) = std::env::var("EDGECRAB_OTEL_TRACES") {
+            self.observability.otel_traces = parse_bool_env(&val);
+        }
         if std::env::var("EDGECRAB_MANAGED").as_deref() == Ok("1") {
             // Managed mode — mark config as read-only downstream
             self.security.managed_mode = true;
@@ -794,6 +863,64 @@ fn normalize_tools_file_keys(root: &mut serde_yml::Value) {
     file_map.insert(allowed_roots_key, legacy_allowed_paths);
 }
 
+/// Migrate legacy tool-policy shapes at YAML parse time (spec 007 L0.3).
+///
+/// `enabled_toolsets: null` in old Hermes-migrated configs meant "load everything".
+/// Product default is now `["core"]`.
+fn normalize_tools_policy_keys(root: &mut serde_yml::Value) {
+    let serde_yml::Value::Mapping(root_map) = root else {
+        return;
+    };
+
+    let tools_key = serde_yml::Value::String("tools".into());
+    let tools_value = root_map
+        .entry(tools_key)
+        .or_insert_with(|| serde_yml::Value::Mapping(serde_yml::Mapping::new()));
+
+    let serde_yml::Value::Mapping(tools_map) = tools_value else {
+        return;
+    };
+
+    let enabled_key = serde_yml::Value::String("enabled_toolsets".into());
+    match tools_map.get(&enabled_key) {
+        None | Some(serde_yml::Value::Null) => {
+            tools_map.insert(
+                enabled_key,
+                serde_yml::Value::Sequence(vec![serde_yml::Value::String("core".into())]),
+            );
+        }
+        Some(serde_yml::Value::Sequence(seq)) if seq.is_empty() => {
+            tools_map.insert(
+                enabled_key,
+                serde_yml::Value::Sequence(vec![serde_yml::Value::String("core".into())]),
+            );
+        }
+        _ => {}
+    }
+
+    let schema_key = serde_yml::Value::String("schema_mode".into());
+    let needs_compact_default = match tools_map.get(&schema_key) {
+        None | Some(serde_yml::Value::Null) => true,
+        Some(serde_yml::Value::String(s)) => s.trim().is_empty(),
+        _ => false,
+    };
+    if needs_compact_default {
+        tools_map.insert(schema_key, serde_yml::Value::String("compact".into()));
+    }
+}
+
+/// Post-deserialize guard — catches `None`/empty toolsets after env overrides.
+fn sanitize_tools_policy(tools: &mut ToolsConfig) {
+    if tools.enabled_toolsets.is_none()
+        || tools.enabled_toolsets.as_ref().is_some_and(Vec::is_empty)
+    {
+        tools.enabled_toolsets = Some(vec!["core".to_string()]);
+    }
+    if tools.schema_mode.trim().is_empty() {
+        tools.schema_mode = "indexed".to_string();
+    }
+}
+
 fn has_explicit_provider_prefix(model_name: &str) -> bool {
     let Some((provider, _)) = model_name.split_once('/') else {
         return false;
@@ -932,6 +1059,10 @@ pub struct ToolsConfig {
     pub custom_groups: HashMap<String, Vec<String>>,
     #[serde(default)]
     pub file: FileToolsConfig,
+    /// `compact` — first-sentence descriptions, strip property prose (default).
+    /// `full` — verbatim tool schemas.
+    #[serde(default)]
+    pub schema_mode: String,
     pub tool_delay: f32,
     pub parallel_execution: bool,
     pub max_parallel_workers: usize,
@@ -960,6 +1091,7 @@ impl Default for ToolsConfig {
             disabled_tools: None,
             custom_groups: HashMap::new(),
             file: FileToolsConfig::default(),
+            schema_mode: "indexed".into(),
             tool_delay: 1.0,
             parallel_execution: true,
             max_parallel_workers: 8,
@@ -1908,6 +2040,8 @@ pub struct DisplayConfig {
     pub skin: String,
     /// Append per-turn file-mutation footers (success log + failure advisory).
     pub file_mutation_verifier: bool,
+    /// Run deterministic post-mutation oracles (e.g. `node --check` for `.js`).
+    pub harness_post_mutation_oracles: bool,
     /// Live activity shelf between transcript and status bar (TUI).
     pub activity_shelf: bool,
     /// Shelf accordion disclosure (`/details`) — Hermes `details_mode` parity.
@@ -1952,6 +2086,7 @@ impl Default for DisplayConfig {
             update_check_interval_hours: 24,
             skin: "default".into(),
             file_mutation_verifier: true,
+            harness_post_mutation_oracles: true,
             activity_shelf: true,
             shelf_details: ShelfDetailsConfig::default(),
             status_indicator: "kaomoji".into(),
@@ -1964,6 +2099,17 @@ impl Default for DisplayConfig {
 /// `EDGECRAB_FILE_MUTATION_VERIFIER` overrides `display.file_mutation_verifier`.
 pub fn file_mutation_verifier_enabled(config_default: bool) -> bool {
     if let Ok(env) = std::env::var("EDGECRAB_FILE_MUTATION_VERIFIER") {
+        let lower = env.trim().to_ascii_lowercase();
+        return !matches!(lower.as_str(), "0" | "false" | "no" | "off");
+    }
+    config_default
+}
+
+/// Whether post-mutation oracle gates run at end-of-turn.
+///
+/// `EDGECRAB_HARNESS_ORACLES` overrides `display.harness_post_mutation_oracles`.
+pub fn harness_post_mutation_oracles_enabled(config_default: bool) -> bool {
+    if let Ok(env) = std::env::var("EDGECRAB_HARNESS_ORACLES") {
         let lower = env.trim().to_ascii_lowercase();
         return !matches!(lower.as_str(), "0" | "false" | "no" | "off");
     }
@@ -2918,6 +3064,31 @@ model:
     }
 
     #[test]
+    fn observability_yaml_parses_and_defaults() {
+        let yaml = r#"
+observability:
+  otel_export: true
+  otel_endpoint: "http://tempo:4317"
+  service_name: homelab-edgecrab
+  trace_llm: false
+"#;
+        let cfg: AppConfig = serde_yml::from_str(yaml).expect("parse observability");
+        assert!(cfg.observability.otel_export);
+        assert_eq!(
+            cfg.observability.otel_endpoint.as_deref(),
+            Some("http://tempo:4317")
+        );
+        assert_eq!(
+            cfg.observability.service_name.as_deref(),
+            Some("homelab-edgecrab")
+        );
+        assert!(!cfg.observability.trace_llm);
+        assert!(cfg.observability.otel_metrics);
+        assert!(cfg.observability.otel_traces);
+        assert!(!cfg.observability.capture_content);
+    }
+
+    #[test]
     fn ensure_toolset_enabled_appends_computer_use() {
         let mut toolsets = Some(vec!["core".into()]);
         AppConfig::ensure_toolset_enabled(&mut toolsets, "computer_use");
@@ -3225,6 +3396,33 @@ tools:
         gateway.disable_platform("telegram");
         assert!(gateway.platform_disabled("telegram"));
         assert!(!gateway.platform_requested("telegram", gateway.telegram.enabled));
+    }
+
+    #[test]
+    fn legacy_null_enabled_toolsets_resolves_to_core() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, "tools:\n  enabled_toolsets: null\n").expect("write");
+        let cfg = AppConfig::load_from(&path).expect("load");
+        assert_eq!(cfg.tools.enabled_toolsets, Some(vec!["core".to_string()]));
+    }
+
+    #[test]
+    fn empty_enabled_toolsets_resolves_to_core() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, "tools:\n  enabled_toolsets: []\n").expect("write");
+        let cfg = AppConfig::load_from(&path).expect("load");
+        assert_eq!(cfg.tools.enabled_toolsets, Some(vec!["core".to_string()]));
+    }
+
+    #[test]
+    fn missing_schema_mode_defaults_to_indexed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, "tools:\n  enabled_toolsets: [core]\n").expect("write");
+        let cfg = AppConfig::load_from(&path).expect("load");
+        assert_eq!(cfg.tools.schema_mode, "indexed");
     }
 
     #[test]

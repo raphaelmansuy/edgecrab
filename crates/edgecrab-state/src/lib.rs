@@ -8,8 +8,8 @@
 
 pub mod session_db;
 
-pub mod kanban_db;
 pub mod kanban_board;
+pub mod kanban_db;
 pub mod kanban_rate_limit;
 pub mod kanban_worker_context;
 
@@ -18,8 +18,9 @@ pub use kanban_board::{
     list_board_slugs, set_current_board,
 };
 pub use kanban_db::{
-    KanbanComment, KanbanDb, KanbanDecomposeChild, KanbanEvent, KanbanNotifySub, KanbanRun,
-    KanbanStatus, KanbanTask, DEFAULT_FAILURE_LIMIT, KANBAN_NOTIFY_TERMINAL_KINDS, kanban_db_path,
+    DEFAULT_FAILURE_LIMIT, KANBAN_NOTIFY_TERMINAL_KINDS, KanbanComment, KanbanDb,
+    KanbanDecomposeChild, KanbanEvent, KanbanNotifySub, KanbanRun, KanbanStatus, KanbanTask,
+    kanban_db_path,
 };
 pub use kanban_worker_context::build_worker_context;
 pub use session_db::{
