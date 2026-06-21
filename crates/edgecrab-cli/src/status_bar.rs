@@ -75,6 +75,8 @@ pub struct StatusBarRenderParams<'a> {
     pub model_name: &'a str,
     pub context_window: Option<u64>,
     pub total_tokens: u64,
+    /// Indexed schema mode: (on_wire, deferred) tool counts for HA-07 chip.
+    pub wire_tools: Option<(usize, usize)>,
     pub session_cost: f64,
     pub voice_presence: Option<VoicePresenceState>,
     pub voice_presence_frame_idx: usize,
@@ -99,6 +101,11 @@ pub struct StatusBarRenderParams<'a> {
     pub inline_compose_hint: &'a str,
     pub remote_terminal_session: bool,
     pub terminal_ui_profile: StatusBarUiProfile,
+}
+
+/// HA-07 operator chip — tools on wire vs deferred (indexed schema mode).
+pub fn format_wire_tools_chip(on_wire: usize, deferred: usize) -> String {
+    format!(" wire:{on_wire}/def:{deferred}")
 }
 
 fn unicode_trunc(s: &str, max_cols: usize) -> String {
@@ -457,6 +464,13 @@ pub fn render_status_bar(frame: &mut Frame, area: Rect, params: &StatusBarRender
         format!(" {}", format_token_count(params.total_tokens))
     };
     left_spans.push(Span::styled(token_display, token_style));
+
+    if let Some((on_wire, deferred)) = params.wire_tools {
+        left_spans.push(Span::styled(
+            format_wire_tools_chip(on_wire, deferred),
+            Style::default().fg(Color::Rgb(120, 140, 180)),
+        ));
+    }
 
     // Cost with color threshold
     let cost_style = if params.session_cost >= 1.0 {
@@ -885,14 +899,21 @@ fn render_compact_status_bar_inner(frame: &mut Frame, area: Rect, params: &Statu
         .goal_status_chip
         .map(|chip| format!("{divider}{}", chip.label))
         .unwrap_or_default();
+    let wire_part = params
+        .wire_tools
+        .map(|(on_wire, deferred)| {
+            format!("{divider}{}", format_wire_tools_chip(on_wire, deferred))
+        })
+        .unwrap_or_default();
     let left = format!(
-        "{}{}{}{}{}{}{}${:.4}{}{}{}{}{}{}",
+        "{}{}{}{}{}{}{}${:.4}{}{}{}{}{}{}{}",
         state,
         goal_part,
         divider,
         edgecrab_core::safe_truncate(params.model_name, 18),
         divider,
         token_display,
+        wire_part,
         divider,
         params.session_cost,
         divider,
@@ -941,4 +962,15 @@ fn render_compact_status_bar_inner(frame: &mut Frame, area: Rect, params: &Statu
         .alignment(Alignment::Right),
         right_area,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ha07_wire_tools_chip_format() {
+        assert_eq!(format_wire_tools_chip(55, 52), " wire:55/def:52");
+        assert_eq!(format_wire_tools_chip(13, 0), " wire:13/def:0");
+    }
 }

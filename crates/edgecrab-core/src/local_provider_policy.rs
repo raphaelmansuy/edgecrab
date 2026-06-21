@@ -95,9 +95,10 @@ pub fn log_local_harness_activated(provider_name: &str, has_tools: bool, write_c
 
 /// Tool turns that should use atomic non-streaming completion.
 ///
-/// Copilot is included here for the same buffering reasons as local servers.
+/// Local servers buffer large tool JSON; Copilot now uses native SSE tool deltas
+/// (edgequake-llm + post-connect timeout) so it is excluded here.
 pub fn prefers_nonstreaming_tool_turns(provider: &dyn LLMProvider) -> bool {
-    matches!(provider.name(), "vscode-copilot" | "lmstudio" | "ollama")
+    matches!(provider.name(), "lmstudio" | "ollama")
 }
 
 /// Whether EdgeCrab must not retry a failed transport call.
@@ -857,7 +858,7 @@ mod tests {
     }
 
     #[test]
-    fn prefers_nonstreaming_for_local_and_copilot() {
+    fn prefers_nonstreaming_for_local_servers() {
         let lmstudio: Arc<dyn LLMProvider> = Arc::new(NamedProvider::lmstudio(8192, None));
         let copilot: Arc<dyn LLMProvider> = Arc::new(NamedProvider {
             name: "vscode-copilot",
@@ -871,7 +872,7 @@ mod tests {
         });
 
         assert!(prefers_nonstreaming_tool_turns(lmstudio.as_ref()));
-        assert!(prefers_nonstreaming_tool_turns(copilot.as_ref()));
+        assert!(!prefers_nonstreaming_tool_turns(copilot.as_ref()));
         assert!(!prefers_nonstreaming_tool_turns(openai.as_ref()));
     }
 

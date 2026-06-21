@@ -37,13 +37,6 @@
 //! proactively during the session. The explicit reflection step at the end
 //! provides a reliable second trigger with zero user effort.
 
-use std::collections::{BTreeMap, HashMap};
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicUsize, Ordering},
-};
-use std::time::Duration;
-
 use edgecrab_plugins::{
     build_plugin_skill_prompt, discover_plugins, extract_pre_llm_context, hermes_supports_hook,
     invoke_hermes_hook,
@@ -61,14 +54,17 @@ use edgecrab_types::trajectory::{
 use edgecrab_types::{
     AgentError, Content, Cost, Message, Role, ToolError, ToolErrorResponse, Trajectory, Usage,
 };
-use edgequake_llm::traits::{CacheControl, StreamChunk, StreamUsage};
+use edgequake_llm::traits::CacheControl;
 use edgequake_llm::{CachePromptConfig, LLMProvider, apply_cache_control};
-use futures::StreamExt;
+use std::collections::HashMap;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use crate::agent::{Agent, ConversationResult, SessionState, resolve_tool_policy};
-use crate::completion_assessor::{CompletionContext, assess_completion};
 use crate::compression::{
     CompressionParams, CompressionStatus, check_compression_status_for_estimate, compress_with_llm,
 };
@@ -76,51 +72,32 @@ use crate::config::edgecrab_home;
 use crate::context_references::expand_context_refs_with_policy;
 use crate::model_router::{RoutingThresholds, SmartRoutingConfig, resolve_turn_route};
 use crate::pricing::{CanonicalUsage, estimate_cost};
+use crate::progress_sink::emit_activity;
 use crate::prompt_builder::{
     PromptBlocks, PromptBuilder, load_global_soul, load_memory_sections, load_preloaded_skills,
     load_skill_prompt_parts,
 };
+#[cfg(test)]
+use crate::provider_call::api_call_streaming;
+use crate::provider_call::{
+    ApiCallContext, FINISH_REASON_STREAM_INTERRUPTED, api_call_with_retry, assistant_display_text,
+    estimate_request_prompt_tokens, response_has_visible_output,
+};
 use crate::sub_agent_runner::CoreSubAgentRunner;
+use crate::task_class::{
+    apply_visual_ux_session_preview, classify_from_messages, task_class_advisory,
+};
+use crate::turn_dispatch::{
+    ToolTurnFinalizeParams, TurnDispatchTrackers, TurnDispatchTrackersView, apply_guardrail_result,
+    finalize_tool_turn, forward_process_watch_event, guardrail_before_dispatch_checked,
+};
 
 /// Maximum API retries before giving up.
 const MAX_RETRIES: u32 = 3;
 
-/// Internal finish-reason marker used when a native streamed response emitted
-/// visible text successfully, but the subsequent tool-call JSON was truncated.
-///
-/// WHY: Anthropic's streaming docs explicitly allow recovery from interrupted
-/// streams by continuing from the last visible text block. We preserve the text,
-/// disable native tool streaming for the session, and let the main loop issue a
-/// non-streaming continuation turn rather than crashing the whole run.
-const FINISH_REASON_STREAM_INTERRUPTED: &str = "stream_interrupted";
-
-/// Base backoff delay between retries (doubles each attempt).
-const BASE_BACKOFF: Duration = Duration::from_millis(500);
-#[cfg(test)]
-const STREAM_FIRST_CHUNK_TIMEOUT: Duration = Duration::from_millis(50);
-#[cfg(not(test))]
-const STREAM_FIRST_CHUNK_TIMEOUT: Duration = Duration::from_secs(20);
-
-/// Maximum time between consecutive stream chunks before declaring the stream
-/// stale. Providers can silently hang mid-stream (FP10: Stale-Stream Detect).
-/// In tests this is set very short; in production 60s covers provider variance.
-#[cfg(test)]
-const STREAM_INTER_CHUNK_TIMEOUT: Duration = Duration::from_millis(50);
-#[cfg(not(test))]
-const STREAM_INTER_CHUNK_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// Emit a shelf notice when a provider names a tool but stops sending arg deltas.
-const TOOL_ARGS_STALL_NOTICE_SECS: u64 =
-    edgecrab_tools::tool_progress_tail::TOOL_ARGS_STALL_NOTICE_SECS;
-
-/// Abort streamed tool drafting when args stall — independent of thinking keepalive.
-const TOOL_ARGS_STALL_BREAK_SECS: u64 =
-    edgecrab_tools::tool_progress_tail::TOOL_ARGS_STALL_BREAK_SECS;
-
-/// Minimum tool-call count in a session before the end-of-session
-/// learning reflection fires. Mirrors hermes-agent's "5+ tool calls" rule.
 const SKILL_REFLECTION_THRESHOLD: u32 = 5;
 
+/// Internal finish-reason marker — see [`provider_call::FINISH_REASON_STREAM_INTERRUPTED`].
 #[derive(Debug, Clone, Copy, Default)]
 struct TodoStateSnapshot {
     active: usize,
@@ -132,31 +109,6 @@ struct RunProgressState {
     pending_approvals: Arc<AtomicUsize>,
     pending_clarifications: Arc<AtomicUsize>,
     child_runs_in_flight: Arc<AtomicUsize>,
-}
-
-impl RunProgressState {
-    fn completion_context<'a>(
-        &self,
-        final_response: &'a str,
-        messages: &'a [Message],
-        interrupted: bool,
-        budget_exhausted: bool,
-        todo: TodoStateSnapshot,
-        harness: edgecrab_tools::HarnessSnapshot,
-    ) -> CompletionContext<'a> {
-        CompletionContext {
-            final_response,
-            messages,
-            interrupted,
-            budget_exhausted,
-            pending_approval: self.pending_approvals.load(Ordering::Relaxed) > 0,
-            pending_clarification: self.pending_clarifications.load(Ordering::Relaxed) > 0,
-            active_todos: todo.active,
-            blocked_todos: todo.blocked,
-            child_runs_in_flight: self.child_runs_in_flight.load(Ordering::Relaxed),
-            harness,
-        }
-    }
 }
 
 fn snapshot_todo_state(todo_store: &edgecrab_tools::TodoStore) -> TodoStateSnapshot {
@@ -174,122 +126,6 @@ fn saturating_dec(counter: &AtomicUsize) {
     let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
         Some(value.saturating_sub(1))
     });
-}
-
-struct ApiCallContext<'a> {
-    options: Option<&'a edgequake_llm::CompletionOptions>,
-    cancel: &'a CancellationToken,
-    event_tx: Option<&'a tokio::sync::mpsc::UnboundedSender<crate::StreamEvent>>,
-    use_native_streaming: bool,
-    discovered_plugins: Option<&'a edgecrab_plugins::PluginDiscovery>,
-    conversation_session_id: &'a str,
-    platform: edgecrab_types::Platform,
-    api_call_count: u32,
-}
-
-fn provider_manages_transport_retries(provider: &dyn LLMProvider) -> bool {
-    matches!(provider.name(), "vscode-copilot")
-}
-
-fn is_transport_retry_error(error: &edgequake_llm::LlmError) -> bool {
-    matches!(
-        error,
-        edgequake_llm::LlmError::RateLimited(_)
-            | edgequake_llm::LlmError::NetworkError(_)
-            | edgequake_llm::LlmError::Timeout
-            | edgequake_llm::LlmError::AuthError(_)
-    )
-}
-
-fn is_retryable_nonvisible_stream_error(error: &edgequake_llm::LlmError) -> bool {
-    matches!(
-        error,
-        edgequake_llm::LlmError::RateLimited(_)
-            | edgequake_llm::LlmError::NetworkError(_)
-            | edgequake_llm::LlmError::Timeout
-            | edgequake_llm::LlmError::ProviderError(_)
-            | edgequake_llm::LlmError::NotSupported(_)
-    )
-}
-
-/// FP19: Parse a provider-suggested retry-after duration from a rate limit error message.
-///
-/// WHY: Providers embed a "try again in X.Ys" hint in their error body. Using the
-/// provider-stated wait instead of our fixed BASE_BACKOFF avoids under-sleeping
-/// (which immediately re-hits the limit) and over-sleeping (which wastes wall time).
-///
-/// Cross-ref: Hermes `_parse_retry_after(error_str)` in `run_agent.py`.
-///
-/// Recognised patterns (case-insensitive):
-///   "try again in 1.197s"   → 1.197s + 200ms safety margin
-///   "retry after 2s"        → 2.0s  + 200ms safety margin
-///   "please wait 3 seconds" → 3.0s  + 200ms safety margin
-///
-/// Returns `None` if no numeric wait hint is found.
-fn parse_retry_after(error_msg: &str) -> Option<Duration> {
-    let lower = error_msg.to_ascii_lowercase();
-
-    // Walk the string looking for candidate float values that follow a retry keyword.
-    let keywords = ["try again in ", "retry after ", "please wait ", "wait "];
-
-    for keyword in &keywords {
-        if let Some(pos) = lower.find(keyword) {
-            let after = &lower[pos + keyword.len()..];
-            // Collect leading digit/dot chars to form the number string.
-            let num_str: String = after
-                .chars()
-                .take_while(|c| c.is_ascii_digit() || *c == '.')
-                .collect();
-            if let Ok(seconds) = num_str.parse::<f64>()
-                && seconds > 0.0
-                && seconds < 300.0
-            {
-                // Add 200ms safety margin so we don't arrive just as the
-                // quota window resets and immediately hit the limit again.
-                let millis = (seconds * 1000.0) as u64 + 200;
-                return Some(Duration::from_millis(millis));
-            }
-        }
-    }
-    None
-}
-
-fn is_retryable_stream_tool_assembly_error(error: &edgequake_llm::LlmError) -> bool {
-    let message = match error {
-        edgequake_llm::LlmError::ApiError(message)
-        | edgequake_llm::LlmError::InvalidRequest(message)
-        | edgequake_llm::LlmError::ProviderError(message)
-        | edgequake_llm::LlmError::NotSupported(message) => message,
-        _ => return false,
-    };
-
-    let normalized = message.to_ascii_lowercase();
-    normalized.contains("streamed tool call")
-        && (normalized.contains("without arguments")
-            || normalized.contains("without a function name")
-            || normalized.contains("invalid json arguments")
-            || normalized.contains("arguments must be a json object"))
-}
-
-fn is_streamed_tool_capability_error(error: &edgequake_llm::LlmError) -> bool {
-    let message = match error {
-        edgequake_llm::LlmError::ApiError(message)
-        | edgequake_llm::LlmError::InvalidRequest(message)
-        | edgequake_llm::LlmError::ProviderError(message)
-        | edgequake_llm::LlmError::NotSupported(message) => message,
-        _ => return false,
-    };
-
-    let normalized = message.to_ascii_lowercase();
-    let mentions_streaming = normalized.contains("stream");
-    let mentions_tools = normalized.contains("tool")
-        || normalized.contains("function call")
-        || normalized.contains("function calling");
-    let rejects_capability = normalized.contains("not supported")
-        || normalized.contains("unsupported")
-        || normalized.contains("does not support");
-
-    mentions_streaming && mentions_tools && rejects_capability
 }
 
 fn completion_options_for(config: &crate::agent::AgentConfig) -> edgequake_llm::CompletionOptions {
@@ -320,33 +156,6 @@ pub(crate) fn should_use_native_streaming(
     }
 
     !provider_prefers_nonstreaming_tool_turns(provider)
-}
-
-fn forward_process_watch_event(
-    event: edgecrab_tools::process_table::WatchEvent,
-    ev_tx: &tokio::sync::mpsc::UnboundedSender<crate::StreamEvent>,
-) {
-    use edgecrab_tools::process_table::WatchEventType;
-    match event.event_type {
-        WatchEventType::TailPreview => {
-            let command_preview = crate::safe_truncate(&event.command, 80).to_string();
-            let _ = ev_tx.send(crate::StreamEvent::BackgroundProcessTail {
-                process_id: event.process_id,
-                command_preview,
-                tail: event.matched_output,
-            });
-        }
-        WatchEventType::Exited => {
-            let _ = ev_tx.send(crate::StreamEvent::BackgroundProcessFinished {
-                process_id: event.process_id,
-                exit_code: event.exit_code,
-            });
-        }
-        _ => {
-            let notice = edgecrab_tools::process_table::format_watch_activity_notice(&event);
-            let _ = ev_tx.send(crate::StreamEvent::ActivityNotice(notice));
-        }
-    }
 }
 
 /// Delegation identity passed into child `execute_loop` runs.
@@ -463,127 +272,11 @@ enum LoopAction {
     Done(String),
     /// Model exceeded invalid-tool retry budget (Hermes 3-strike partial abort).
     PartialAbort { reason: String },
+    /// Tool-loop guardrail halt — stop with typed outcome (HA-46).
+    GuardrailHalt,
 }
 
 const MAX_DELEGATE_TASK_CALLS_PER_TURN: usize = 3;
-
-/// Detects when the LLM emits the exact same tool call across consecutive turns.
-///
-/// WHY: A stuck model repeatedly calls the same tool with identical arguments,
-/// burning budget for zero progress (e.g. re-reading a file it just read, or
-/// retrying a failed command with the same flags). By caching `(name, args_hash)`
-/// from the previous turn, we can detect this loop and short-circuit: inject
-/// the cached result and a "try a different approach" nudge instead of
-/// re-executing.
-///
-/// First Principle FP11: *"Detect loops, don't ride them."*
-///
-/// See [specs/improve_plan/16-assessment-round3.md](../../../specs/improve_plan/16-assessment-round3.md).
-struct DuplicateToolCallDetector {
-    /// Previous turn's tool calls: (name, args_hash) → result text.
-    prev_turn: HashMap<(String, u64), String>,
-    /// Current turn accumulator (swapped into prev_turn at end of turn).
-    current_turn: HashMap<(String, u64), String>,
-}
-
-impl DuplicateToolCallDetector {
-    fn new() -> Self {
-        Self {
-            prev_turn: HashMap::new(),
-            current_turn: HashMap::new(),
-        }
-    }
-
-    /// Hash the tool arguments for dedup lookup.
-    fn hash_args(args: &str) -> u64 {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        args.hash(&mut hasher);
-        hasher.finish()
-    }
-
-    /// Check if this exact call was made in the previous turn.
-    /// Returns `Some(cached_result)` if duplicate detected.
-    fn check_duplicate(&self, name: &str, args: &str) -> Option<&str> {
-        let key = (name.to_string(), Self::hash_args(args));
-        self.prev_turn.get(&key).map(|s| s.as_str())
-    }
-
-    /// Record a tool call and its result in the current turn.
-    fn record(&mut self, name: &str, args: &str, result: &str) {
-        let key = (name.to_string(), Self::hash_args(args));
-        self.current_turn.insert(key, result.to_string());
-    }
-
-    /// End-of-turn: move current → prev and clear current.
-    fn end_turn(&mut self) {
-        std::mem::swap(&mut self.prev_turn, &mut self.current_turn);
-        self.current_turn.clear();
-    }
-}
-
-/// Tracks consecutive tool failures to detect stuck error loops.
-///
-/// Reset on any successful tool call. When `max_before_escalation` consecutive
-/// failures are hit, the conversation loop injects a guidance message telling
-/// the LLM to pause and reconsider its approach (or ask the user for help).
-///
-/// WHY: Without this, the agent can burn 10–30 iterations retrying doomed
-/// tool calls with trivially different arguments, consuming $5–15 of API
-/// budget for zero productive output. With the tracker, a 3-failure streak
-/// triggers an explicit "stop and rethink" message at a cost of ~$0.50.
-///
-/// See [specs/improve_plan/05-failure-escalation.md](../../../specs/improve_plan/05-failure-escalation.md).
-struct ConsecutiveFailureTracker {
-    count: u32,
-    max_before_escalation: u32,
-    last_errors: Vec<String>,
-}
-
-impl ConsecutiveFailureTracker {
-    fn new(max: u32) -> Self {
-        Self {
-            count: 0,
-            max_before_escalation: max,
-            last_errors: Vec::new(),
-        }
-    }
-
-    /// Record a tool error. Returns `true` when escalation threshold is reached.
-    fn record_failure(&mut self, error_summary: &str) -> bool {
-        self.count += 1;
-        self.last_errors.push(error_summary.to_string());
-        // Keep a bounded window of recent errors
-        if self.last_errors.len() > 5 {
-            self.last_errors.remove(0);
-        }
-        self.count >= self.max_before_escalation
-    }
-
-    /// Reset on any successful tool call.
-    fn record_success(&mut self) {
-        self.count = 0;
-        self.last_errors.clear();
-    }
-
-    /// Build a guidance message when escalation fires.
-    fn escalation_message(&self) -> String {
-        let recent = self
-            .last_errors
-            .iter()
-            .map(|e| format!("  - {e}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        format!(
-            "⚠ {count} consecutive tool calls have failed. Recent errors:\n{recent}\n\n\
-             Please stop retrying with similar arguments. Instead:\n\
-             1. Re-read the error messages carefully.\n\
-             2. Consider a completely different approach or tool.\n\
-             3. If you are stuck, ask the user for guidance.",
-            count = self.count
-        )
-    }
-}
 
 /// Shared context passed to `process_response` and `dispatch_single_tool`.
 ///
@@ -1259,6 +952,20 @@ impl Agent {
         session.messages.push(Message::user(&expansion.expanded));
         session.user_turn_count += 1;
 
+        if !session.task_class_advisory_sent {
+            let class = classify_from_messages(&session.messages);
+            if apply_visual_ux_session_preview(class, &config.security_preview) {
+                tracing::info!(
+                    ?class,
+                    "harness: session-scoped security.preview enabled for visual_ux task"
+                );
+            }
+            if let Some(advisory) = task_class_advisory(class, Some(cwd.as_path())) {
+                session.messages.push(Message::user(&advisory));
+                session.task_class_advisory_sent = true;
+            }
+        }
+
         // Snapshot the tool call count at the start of this turn so we can
         // compute the per-turn delta later for the reflection gate.
         let initial_turn_tool_call_count = session.session_tool_call_count;
@@ -1324,9 +1031,10 @@ impl Agent {
             tokio::spawn(async move {
                 while let Some(req) = approval_req_rx.recv().await {
                     pending_approvals.fetch_add(1, Ordering::Relaxed);
-                    let _ = approval_ev_tx.send(crate::StreamEvent::ActivityNotice(
+                    emit_activity(
+                        Some(&approval_ev_tx),
                         edgecrab_tools::tool_progress_tail::format_approval_waiting(&req.command),
-                    ));
+                    );
                     let (decision_tx, decision_rx) =
                         tokio::sync::oneshot::channel::<crate::ApprovalChoice>();
                     if approval_ev_tx
@@ -1459,21 +1167,14 @@ impl Agent {
         let mut budget_exhausted = false;
         // Accumulate per-tool-call error records — mirrors hermes AgentResult.tool_errors.
         let mut tool_errors_acc: Vec<edgecrab_types::ToolErrorRecord> = Vec::new();
-        let mut failure_tracker = ConsecutiveFailureTracker::new(3);
-        let mut dedup_tracker = DuplicateToolCallDetector::new();
+        let turn = crate::turn_prologue::TurnPrologueState::begin(&config.harness);
+        let mut trackers = turn.trackers;
         let capability_suppressions: Arc<Mutex<HashMap<String, ToolErrorResponse>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let spill_seq = Arc::new(crate::tool_result_spill::SpillSequence::new());
         let mut tool_defs_dirty = false;
-        // Track whether we already emitted a ContextPressure warning this turn
-        // so we do not spam the UI on every iteration when compression fails to
-        // bring usage below the warning level.
-        let mut pressure_warned = false;
-        // Compression circuit breaker (FP12): after 3 consecutive LLM compression
-        // failures, disable LLM summarization for the rest of the session and
-        // use structural fallback only. This prevents burning tokens on repeated
-        // compression attempts that always fail.
-        let mut compression_llm_failures: u32 = 0;
+        let mut pressure_warned = turn.pressure_warned;
+        let mut compression_llm_failures = turn.compression_llm_failures;
         const MAX_COMPRESSION_LLM_FAILURES: u32 = 3;
 
         // ── Shadow Judge setup ────────────────────────────────────────────────
@@ -1647,11 +1348,10 @@ impl Agent {
                 &compression_params,
             ) {
                 CompressionStatus::NeedsCompression => {
-                    if let Some(tx) = event_tx {
-                        let _ = tx.send(crate::StreamEvent::ActivityNotice(
-                            edgecrab_tools::tool_progress_tail::format_compression_started(),
-                        ));
-                    }
+                    emit_activity(
+                        event_tx,
+                        edgecrab_tools::tool_progress_tail::format_compression_started(),
+                    );
                     tracing::info!(
                         messages = session.messages.len(),
                         estimated_prompt_tokens,
@@ -1671,13 +1371,12 @@ impl Agent {
                     // failed 3 times consecutively, skip the LLM call and use
                     // structural-only compression (cheap, never fails).
                     if compression_llm_failures >= MAX_COMPRESSION_LLM_FAILURES {
-                        if let Some(tx) = event_tx {
-                            let _ = tx.send(crate::StreamEvent::ActivityNotice(
-                                edgecrab_tools::tool_progress_tail::format_compression_circuit_breaker(
-                                    compression_llm_failures,
-                                ),
-                            ));
-                        }
+                        emit_activity(
+                            event_tx,
+                            edgecrab_tools::tool_progress_tail::format_compression_circuit_breaker(
+                                compression_llm_failures,
+                            ),
+                        );
                         tracing::warn!(
                             failures = compression_llm_failures,
                             "compression circuit breaker active — using structural fallback only"
@@ -1711,50 +1410,28 @@ impl Agent {
                             );
                         }
                     }
-                    // FP33: On the FIRST compression in this session, append a one-shot
-                    // note to the cached system prompt.  This tells the model that earlier
-                    // turns have been compacted into a summary so it builds on that summary
-                    // rather than re-deriving state from scratch.
-                    //
-                    // WHY one-shot: Appending the note more than once would cause Anthropic
-                    // to treat the system prompt as changed on every subsequent turn,
-                    // invalidating the prompt cache breakpoint and doubling token costs.
-                    // We set the flag immediately so even a structural-only compression
-                    // triggers the note (both pathways compact context).
-                    if !session.first_compression_done {
-                        session.first_compression_done = true;
-                        if let Some(ref mut sys) = session.cached_system_prompt {
-                            sys.push_str(crate::compression::FIRST_COMPRESSION_NOTE);
-                            tracing::debug!(
-                                "FP33: appended compression note to cached system prompt"
-                            );
-                        }
+                    // FP33 + HA-19 + FP17 — shared post-compress hooks (all compression paths).
+                    {
+                        let first_compression_done = &mut session.first_compression_done;
+                        let cached_system_prompt = &mut session.cached_system_prompt;
+                        crate::compression::apply_first_compression_system_note(
+                            crate::compression::FirstCompressionNoteState {
+                                first_compression_done,
+                                cached_system_prompt,
+                            },
+                        );
                     }
-                    // Re-inject active todo items preserved outside message history.
-                    // Compression can summarize away earlier plan-tracking turns.
-                    if let Some(snapshot) = self.todo_store.format_for_injection() {
-                        session.messages.push(Message::user(&snapshot));
-                    }
-                    // FP17: Reset the per-session read dedup cache after compression.
-                    //
-                    // WHY: Compression discards old messages, including earlier
-                    // read_file results. After compression the model no longer has
-                    // those file contents, so the dedup cache would incorrectly
-                    // suppress necessary re-reads on the next turn.
-                    //
-                    // Cross-ref: Hermes reset_file_dedup() in context_compressor.py.
-                    edgecrab_tools::read_tracker::reset_read_dedup(&conversation_session_id);
-                    tracing::debug!(
-                        session_id = %conversation_session_id,
-                        "read dedup cache cleared after compression (FP17)"
+                    crate::compression::apply_post_compress_message_hooks(
+                        &mut session.messages,
+                        self.todo_store.as_ref(),
+                        &conversation_session_id,
                     );
-                    if let Some(tx) = event_tx {
-                        let _ = tx.send(crate::StreamEvent::ActivityNotice(
-                            edgecrab_tools::tool_progress_tail::format_compression_done(
-                                session.messages.len(),
-                            ),
-                        ));
-                    }
+                    crate::progress_sink::emit_activity(
+                        event_tx,
+                        edgecrab_tools::tool_progress_tail::format_compression_done(
+                            session.messages.len(),
+                        ),
+                    );
                     // Re-check: if compression succeeded, clear the pressure flag.
                     let recomputed_prompt_tokens = estimate_request_prompt_tokens(
                         session.cached_system_prompt.as_deref(),
@@ -1822,16 +1499,29 @@ impl Agent {
                         tokens_after,
                     );
                     session.messages = compressed;
-                    edgecrab_tools::read_tracker::reset_read_dedup(&conversation_session_id);
-                    if let Some(tx) = event_tx {
-                        let _ = tx.send(crate::StreamEvent::ActivityNotice(
-                            edgecrab_tools::tool_progress_tail::format_local_structural_compress_notice(
-                                effective_provider.name(),
-                                tokens_before,
-                                tokens_after,
-                            ),
-                        ));
+                    {
+                        let first_compression_done = &mut session.first_compression_done;
+                        let cached_system_prompt = &mut session.cached_system_prompt;
+                        crate::compression::apply_first_compression_system_note(
+                            crate::compression::FirstCompressionNoteState {
+                                first_compression_done,
+                                cached_system_prompt,
+                            },
+                        );
                     }
+                    crate::compression::apply_post_compress_message_hooks(
+                        &mut session.messages,
+                        self.todo_store.as_ref(),
+                        &conversation_session_id,
+                    );
+                    crate::progress_sink::emit_activity(
+                        event_tx,
+                        edgecrab_tools::tool_progress_tail::format_local_structural_compress_notice(
+                            effective_provider.name(),
+                            tokens_before,
+                            tokens_after,
+                        ),
+                    );
                     self.publish_session_state(&session).await;
                 }
             }
@@ -1868,17 +1558,16 @@ impl Agent {
                     );
                     session.messages = pruned_messages;
                     edgecrab_tools::read_tracker::reset_read_dedup(&conversation_session_id);
-                    if let Some(tx) = event_tx {
-                        let _ = tx.send(crate::StreamEvent::ActivityNotice(
-                            edgecrab_tools::tool_progress_tail::format_local_prefill_prune_notice(
-                                effective_provider.name(),
-                                prompt_before,
-                                prompt_after,
-                                tools_pruned,
-                                "preflight",
-                            ),
-                        ));
-                    }
+                    emit_activity(
+                        event_tx,
+                        edgecrab_tools::tool_progress_tail::format_local_prefill_prune_notice(
+                            effective_provider.name(),
+                            prompt_before,
+                            prompt_after,
+                            tools_pruned,
+                            "preflight",
+                        ),
+                    );
                     self.publish_session_state(&session).await;
                 }
             }
@@ -1937,13 +1626,12 @@ impl Agent {
             };
             if let Some(ref plan) = local_tool_turn_plan {
                 crate::local_provider_policy::log_local_tool_turn_plan(plan);
-                if let Some(tx) = event_tx {
-                    let _ = tx.send(crate::StreamEvent::ActivityNotice(
-                        edgecrab_tools::tool_progress_tail::format_local_tool_turn_preflight(
-                            &plan.log_line(),
-                        ),
-                    ));
-                }
+                emit_activity(
+                    event_tx,
+                    edgecrab_tools::tool_progress_tail::format_local_tool_turn_preflight(
+                        &plan.log_line(),
+                    ),
+                );
             }
 
             let messages_for_api = if goal_block.is_empty() {
@@ -1990,6 +1678,11 @@ impl Agent {
                 effective_provider.name(),
                 local_turn_budget,
             );
+            let classify_session = crate::provider_call::classify_session_for_call(
+                effective_provider.as_ref(),
+                &chat_messages,
+                prompt_tokens_for_plan as u32,
+            );
 
             let api_outcome = match api_call_with_retry(
                 &effective_provider,
@@ -2005,6 +1698,7 @@ impl Agent {
                     conversation_session_id: &conversation_session_id,
                     platform: config.platform,
                     api_call_count: session.api_call_count,
+                    session: classify_session,
                 },
             )
             .await
@@ -2065,6 +1759,7 @@ impl Agent {
                                     conversation_session_id: &conversation_session_id,
                                     platform: config.platform,
                                     api_call_count: session.api_call_count,
+                                    session: classify_session,
                                 },
                             )
                             .await
@@ -2124,6 +1819,7 @@ impl Agent {
                                 conversation_session_id: &conversation_session_id,
                                 platform: config.platform,
                                 api_call_count: session.api_call_count,
+                                session: classify_session,
                             },
                         )
                         .await
@@ -2200,6 +1896,11 @@ impl Agent {
                                         conversation_session_id: &conversation_session_id,
                                         platform: config.platform,
                                         api_call_count: session.api_call_count,
+                                        session: crate::provider_call::classify_session_for_call(
+                                            fb_prov.as_ref(),
+                                            &chat_messages,
+                                            prompt_tokens_for_plan as u32,
+                                        ),
                                     },
                                 )
                                 .await
@@ -2307,17 +2008,16 @@ impl Agent {
                     provider.as_ref(),
                     &length_metrics,
                 );
-                if crate::local_provider_policy::is_local_inference_provider(provider.name())
-                    && let Some(tx) = event_tx.as_ref()
-                {
-                    let _ = tx.send(crate::StreamEvent::ActivityNotice(
+                if crate::local_provider_policy::is_local_inference_provider(provider.name()) {
+                    emit_activity(
+                        event_tx,
                         edgecrab_tools::tool_progress_tail::format_local_length_without_tools_notice(
                             provider.name(),
                             response.completion_tokens,
                             thinking_tokens,
                             max_tokens,
                         ),
-                    ));
+                    );
                 }
                 if crate::local_provider_policy::is_local_inference_provider(provider.name()) {
                     let spill_config = local_prune_spill_config(&app_config_ref);
@@ -2346,28 +2046,29 @@ impl Agent {
                         );
                         session.messages = pruned_messages;
                         edgecrab_tools::read_tracker::reset_read_dedup(&conversation_session_id);
-                        if let Some(tx) = event_tx.as_ref() {
-                            let _ = tx.send(crate::StreamEvent::ActivityNotice(
-                                edgecrab_tools::tool_progress_tail::format_local_prefill_prune_notice(
-                                    provider.name(),
-                                    prompt_before,
-                                    prompt_after,
-                                    tools_pruned,
-                                    "length_recovery",
-                                ),
-                            ));
-                        }
+                        emit_activity(
+                            event_tx,
+                            edgecrab_tools::tool_progress_tail::format_local_prefill_prune_notice(
+                                provider.name(),
+                                prompt_before,
+                                prompt_after,
+                                tools_pruned,
+                                "length_recovery",
+                            ),
+                        );
                     }
                 }
                 let recovery =
-                    edgecrab_tools::mutation_turn_policy::length_without_tools_recovery_message(
+                    edgecrab_tools::mutation_turn_policy::continuation_user_message(
+                        edgecrab_tools::mutation_turn_policy::ContinuationFailureClass::LengthWithoutTools,
+                        &[],
                         app_config_ref.max_write_payload_bytes(),
                         Some(provider.as_ref()),
                     );
                 session.messages.push(Message::user(&recovery));
                 self.publish_session_state(&session).await;
                 // API geometry failure — not a tool dispatch streak.
-                failure_tracker.record_success();
+                trackers.failure.record_success();
                 continue;
             }
 
@@ -2378,14 +2079,13 @@ impl Agent {
                 tracing::warn!(
                     "tool-call draft interrupted before delivery — injecting incremental-edit recovery"
                 );
-                if let Some(tx) = event_tx.as_ref() {
-                    let _ = tx.send(crate::StreamEvent::ActivityNotice(
-                        "↻ Tool draft interrupted — use scaffold + patch steps (see recovery message)"
-                            .into(),
-                    ));
-                }
+                emit_activity(
+                    event_tx,
+                    "↻ Tool draft interrupted — use scaffold + patch steps (see recovery message)",
+                );
                 let recovery =
-                    edgecrab_tools::mutation_turn_policy::stream_interrupted_recovery_message(
+                    edgecrab_tools::mutation_turn_policy::continuation_user_message(
+                        edgecrab_tools::mutation_turn_policy::ContinuationFailureClass::StreamInterruptedNoTools,
                         &[],
                         app_config_ref.max_write_payload_bytes(),
                         Some(provider.as_ref()),
@@ -2443,8 +2143,7 @@ impl Agent {
                 &mut session,
                 &dctx,
                 &mut tool_errors_acc,
-                &mut failure_tracker,
-                &mut dedup_tracker,
+                &mut trackers,
             )
             .await
             {
@@ -2463,13 +2162,13 @@ impl Agent {
                             partial_len = text.len(),
                             "streamed tool call was interrupted after visible output; continuing via a safe non-streaming recovery turn"
                         );
-                        if let Some(tx) = event_tx.as_ref() {
-                            let _ = tx.send(crate::StreamEvent::ActivityNotice(
-                                "↻ Retrying tool call via non-streaming completion — split large payloads into patch steps.".into(),
-                            ));
-                        }
+                        emit_activity(
+                            event_tx,
+                            "↻ Retrying tool call via non-streaming completion — split large payloads into patch steps.",
+                        );
                         let recovery =
-                            edgecrab_tools::mutation_turn_policy::stream_interrupted_recovery_message(
+                            edgecrab_tools::mutation_turn_policy::continuation_user_message(
+                                edgecrab_tools::mutation_turn_policy::ContinuationFailureClass::StreamInterruptedAfterPartial,
                                 &[],
                                 app_config_ref.max_write_payload_bytes(),
                                 Some(provider.as_ref()),
@@ -2507,16 +2206,43 @@ impl Agent {
                     }
 
                     let todo = snapshot_todo_state(&self.todo_store);
-                    let provisional_outcome = assess_completion(&run_progress.completion_context(
-                        &text,
-                        &session.messages,
-                        false,
-                        false,
-                        todo,
-                        edgecrab_tools::HarnessSnapshot::default(),
-                    ));
+                    let task_class = classify_from_messages(&session.messages);
+                    let provisional_harness = crate::turn_epilogue::build_turn_harness_snapshot(
+                        crate::turn_epilogue::TurnHarnessBuildParams {
+                            messages: &session.messages,
+                            mutation_turn: &mutation_turn,
+                            cwd: &cwd,
+                            post_mutation_oracles: false,
+                            harness_advisory: &trackers.harness_advisory,
+                            guardrail_halt: trackers.guardrail_halt,
+                            task_class,
+                        },
+                    );
+                    let provisional_outcome = crate::turn_epilogue::assess_turn_outcome(
+                        crate::turn_epilogue::TurnAssessParams {
+                            final_response: &text,
+                            messages: &session.messages,
+                            interrupted: false,
+                            budget_exhausted: false,
+                            pending_approval: run_progress
+                                .pending_approvals
+                                .load(Ordering::Relaxed)
+                                > 0,
+                            pending_clarification: run_progress
+                                .pending_clarifications
+                                .load(Ordering::Relaxed)
+                                > 0,
+                            active_todos: todo.active,
+                            blocked_todos: todo.blocked,
+                            child_runs_in_flight: run_progress
+                                .child_runs_in_flight
+                                .load(Ordering::Relaxed),
+                            harness: provisional_harness,
+                            harness_config: &config.harness,
+                        },
+                    );
 
-                    if should_continue_after_model_text(&provisional_outcome) {
+                    if crate::turn_epilogue::should_reopen_loop(&provisional_outcome) {
                         tracing::info!(
                             state = provisional_outcome.state.as_str(),
                             active_tasks = todo.active,
@@ -2528,11 +2254,11 @@ impl Agent {
                             child_runs = run_progress.child_runs_in_flight.load(Ordering::Relaxed),
                             "model returned final text before the harness considered the task complete; continuing the loop"
                         );
-                        session
-                            .messages
-                            .push(Message::user(&build_completion_follow_up_message(
+                        session.messages.push(Message::user(
+                            &crate::turn_epilogue::completion_follow_up_message(
                                 &provisional_outcome,
-                            )));
+                            ),
+                        ));
                         self.publish_session_state(&session).await;
                         continue;
                     }
@@ -2614,14 +2340,20 @@ impl Agent {
                     final_response = text;
                     break;
                 }
+                LoopAction::GuardrailHalt => {
+                    tracing::warn!("tool-loop guardrail halt — ending turn");
+                    final_response = String::new();
+                    break;
+                }
                 LoopAction::PartialAbort { reason } => {
                     tracing::warn!(%reason, "invalid tool retry budget exhausted — partial abort");
-                    if let Some(tx) = event_tx.as_ref() {
-                        let _ = tx.send(crate::StreamEvent::ActivityNotice(format!(
+                    emit_activity(
+                        event_tx,
+                        format!(
                             "⚠️ {reason} (max {} invalid-tool retries)",
                             edgecrab_tools::MAX_INVALID_TOOL_RETRIES
-                        )));
-                    }
+                        ),
+                    );
                     session.invalid_tool_call_retries = 0;
                     final_response = reason;
                     break;
@@ -2684,14 +2416,22 @@ impl Agent {
         // and the session appears to have silently failed.  Hermes-agent mirrors
         // this pattern, returning a budget-exhausted notice.
         if budget_exhausted && final_response.is_empty() {
-            let msg = format!(
-                "[Agent reached the {} iteration limit before completing the task. \
-                 Please try rephrasing your request or increase the iteration budget.]",
-                self.budget.max()
+            let chat_messages = build_chat_messages(
+                session.cached_system_prompt.as_deref(),
+                &session.messages,
+                None,
+                false,
             );
+            let msg = crate::turn_epilogue::synthesize_budget_exhausted_message(
+                &effective_provider,
+                chat_messages,
+                self.budget.used(),
+                self.budget.max(),
+            )
+            .await;
             tracing::warn!(
                 max = self.budget.max(),
-                "emitting budget-exhausted fallback response"
+                "emitting budget-exhausted summary response"
             );
             // Push as an assistant message so history is consistent.
             session.messages.push(Message::assistant(&msg));
@@ -2718,23 +2458,27 @@ impl Agent {
             }
         }
 
-        let harness_snapshot = edgecrab_tools::build_harness_snapshot(
-            edgecrab_tools::HarnessBuildInput {
+        let task_class = classify_from_messages(&session.messages);
+        let harness_snapshot = crate::turn_epilogue::build_turn_harness_snapshot(
+            crate::turn_epilogue::TurnHarnessBuildParams {
                 messages: &session.messages,
                 mutation_turn: &mutation_turn,
                 cwd: &cwd,
                 post_mutation_oracles: crate::config::harness_post_mutation_oracles_enabled(
                     config.harness_post_mutation_oracles,
                 ),
+                harness_advisory: &trackers.harness_advisory,
+                guardrail_halt: trackers.guardrail_halt,
+                task_class,
             },
         );
         if let Some(gate_footer) = harness_snapshot.render_gate_footer() {
             if let Some(tx) = event_tx {
                 let _ = tx.send(crate::StreamEvent::Footer(gate_footer.clone()));
             }
-            session.messages.push(Message::user(&format!(
-                "[harness-gates]\n{gate_footer}"
-            )));
+            session
+                .messages
+                .push(Message::user(&format!("[harness-gates]\n{gate_footer}")));
             final_response = format!("{}\n\n{}", final_response.trim_end(), gate_footer);
             self.publish_session_state(&session).await;
         }
@@ -2809,14 +2553,27 @@ impl Agent {
         self.publish_session_state(&session).await;
 
         let todo = snapshot_todo_state(&self.todo_store);
-        let run_outcome = assess_completion(&run_progress.completion_context(
-            &final_response,
+        let mut run_outcome =
+            crate::turn_epilogue::assess_turn_outcome(crate::turn_epilogue::TurnAssessParams {
+                final_response: &final_response,
+                messages: &session.messages,
+                interrupted,
+                budget_exhausted,
+                pending_approval: run_progress.pending_approvals.load(Ordering::Relaxed) > 0,
+                pending_clarification: run_progress.pending_clarifications.load(Ordering::Relaxed)
+                    > 0,
+                active_todos: todo.active,
+                blocked_todos: todo.blocked,
+                child_runs_in_flight: run_progress.child_runs_in_flight.load(Ordering::Relaxed),
+                harness: harness_snapshot.clone(),
+                harness_config: &config.harness,
+            });
+        run_outcome = crate::turn_epilogue::enrich_turn_outcome(
+            run_outcome,
             &session.messages,
-            interrupted,
-            budget_exhausted,
-            todo,
-            harness_snapshot.clone(),
-        ));
+            &harness_snapshot,
+            effective_provider.name() == "vscode-copilot" && session.native_tool_streaming_disabled,
+        );
         session.last_run_outcome = Some(run_outcome.clone());
         crate::observability::log_harness_completion(
             &conversation_session_id,
@@ -2828,11 +2585,7 @@ impl Agent {
             harness_snapshot.unresolved_mutation_failures.len(),
         );
         self.publish_session_state(&session).await;
-        if let Some(tx) = event_tx {
-            let _ = tx.send(crate::StreamEvent::RunFinished {
-                outcome: run_outcome.clone(),
-            });
-        }
+        crate::progress_sink::emit_run_finished(event_tx, run_outcome.clone());
 
         // Resolve session_id: prefer SessionState's, then config's, then generate.
         let session_id = session
@@ -3260,45 +3013,6 @@ pub fn build_chat_messages(
     out
 }
 
-fn augment_provider_error(provider: &Arc<dyn LLMProvider>, error: String) -> String {
-    if provider.name() == "vscode-copilot" {
-        let lower = error.to_ascii_lowercase();
-        if lower.contains("bad credentials")
-            || lower.contains("copilot token request failed: 401")
-            || lower.contains("no github copilot credential")
-        {
-            return format!(
-                "{error} GitHub Copilot needs a fresh login. Exit to a shell and run edgecrab auth login copilot, or rerun edgecrab setup, to perform the official GitHub device flow."
-            );
-        }
-        if lower.contains("user_weekly_rate_limited")
-            || lower.contains("user_global_rate_limited")
-            || lower.contains("global-chat:global-cogs-7-day-key")
-        {
-            return format!(
-                "GitHub Copilot authentication succeeded, but GitHub is currently rate limiting chat requests for this account. {error} If you are not already using Auto, try /model copilot/auto. If Auto is already selected, this is an account-wide GitHub limit, so wait for the reset window shown above or use another provider."
-            );
-        }
-        if error.contains("api.githubcopilot.com") {
-            return format!(
-                "{error} GitHub Copilot direct mode could not reach the remote API. If you rely on a local Copilot proxy, set `VSCODE_COPILOT_DIRECT=false` or configure `VSCODE_COPILOT_PROXY_URL`."
-            );
-        }
-        if lower.contains("unsupported_api_for_model")
-            || (lower.contains("not accessible via the /chat/completions endpoint"))
-        {
-            return format!(
-                "{error} This Copilot model cannot drive the agent loop via /chat/completions. Run `/model copilot/auto` or choose a chat-capable model (not a `*-picker` routing model)."
-            );
-        }
-    }
-    error
-}
-
-/// Check whether a tool result string represents an error.
-///
-/// Extracted to eliminate the duplicated condition in the parallel and
-/// sequential dispatch arms of `process_response`.
 #[inline]
 fn parse_tool_error_response(result: &str) -> Option<ToolErrorResponse> {
     edgecrab_types::parse_tool_error_payload(result)
@@ -3447,16 +3161,17 @@ fn emit_tool_done(
     is_error: bool,
 ) {
     crate::stream_observability::log_tool_done(tool_call_id, name, duration_ms, is_error);
-    if let Some(tx) = tx {
-        let _ = tx.send(crate::StreamEvent::ToolDone {
+    crate::progress_sink::emit_optional(
+        tx,
+        crate::StreamEvent::ToolDone {
             tool_call_id: tool_call_id.to_string(),
             name: name.to_string(),
             args_json: args_json.to_string(),
             result_preview: summarize_tool_result_preview(name, tool_result, is_error),
             duration_ms,
             is_error,
-        });
-    }
+        },
+    );
 }
 
 fn make_tool_progress_tx(
@@ -3477,52 +3192,6 @@ fn make_tool_progress_tx(
     Some(tool_progress_tx)
 }
 
-fn should_continue_after_model_text(outcome: &edgecrab_types::RunOutcome) -> bool {
-    matches!(
-        outcome.state,
-        edgecrab_types::CompletionDecision::Incomplete
-            | edgecrab_types::CompletionDecision::NeedsVerification
-            | edgecrab_types::CompletionDecision::Failed
-    )
-}
-
-fn build_completion_follow_up_message(outcome: &edgecrab_types::RunOutcome) -> String {
-    let mut notes = Vec::new();
-
-    match outcome.state {
-        edgecrab_types::CompletionDecision::Incomplete => {
-            notes
-                .push("There is still unfinished work or at least one remaining step.".to_string());
-        }
-        edgecrab_types::CompletionDecision::NeedsVerification => {
-            notes.push(
-                "Concrete verification evidence is still missing, so the task is not done yet."
-                    .to_string(),
-            );
-        }
-        edgecrab_types::CompletionDecision::Failed => {
-            notes.push("The last response did not produce a usable completion.".to_string());
-        }
-        _ => {}
-    }
-
-    if outcome.active_tasks > 0 || outcome.blocked_tasks > 0 {
-        notes.push(format!(
-            "Task ledger snapshot: {} active, {} blocked.",
-            outcome.active_tasks, outcome.blocked_tasks
-        ));
-    }
-
-    if let Some(reason) = outcome.verification.debt_reason.as_deref() {
-        notes.push(reason.to_string());
-    }
-
-    format!(
-        "[system: do not stop yet. {} Continue working until the request is actually complete or explicitly blocked. Briefly communicate progress, use report_task_status after the next milestone, and only finish once you have concrete evidence.]",
-        notes.join(" ")
-    )
-}
-
 /// Build the user message injected when the Shadow Judge vetoes a "completed" verdict.
 ///
 /// The message is designed to be:
@@ -3535,436 +3204,6 @@ fn build_shadow_judge_message(steering_hint: &str, reason: &str) -> String {
         {steering_hint} \
         Continue working and only stop once all parts of the original request are done with concrete evidence.]"
     )
-}
-
-fn summarize_tool_result_preview(name: &str, tool_result: &str, is_error: bool) -> Option<String> {
-    crate::tool_result_summary::summarize_tool_result_preview(name, tool_result, is_error)
-}
-
-#[derive(Default)]
-struct PartialToolCall {
-    id: Option<String>,
-    function_name: Option<String>,
-    arguments: String,
-    thought_signature: Option<String>,
-    last_generating_emit: Option<std::time::Instant>,
-    /// When the provider first sent the tool name (args may still be empty).
-    name_received_at: Option<std::time::Instant>,
-    /// Last time a non-empty arg delta arrived.
-    last_arg_at: Option<std::time::Instant>,
-    stall_notice_sent: bool,
-}
-
-fn finalize_streamed_tool_calls(
-    partials: BTreeMap<usize, PartialToolCall>,
-) -> edgequake_llm::Result<Vec<edgequake_llm::ToolCall>> {
-    partials
-        .into_iter()
-        .map(|(index, partial)| {
-            let id = partial.id.unwrap_or_else(|| format!("stream_call_{index}"));
-            let function_name = partial.function_name.ok_or_else(|| {
-                edgequake_llm::LlmError::ApiError(format!(
-                    "streamed tool call {id} finished without a function name"
-                ))
-            })?;
-            let arguments_raw = partial.arguments.trim();
-            if arguments_raw.is_empty() {
-                return Err(edgequake_llm::LlmError::ApiError(format!(
-                    "streamed tool call {id} ({function_name}) finished without arguments"
-                )));
-            }
-
-            let repaired =
-                edgecrab_tools::tool_argument_pipeline::repair_stream_tool_arguments(arguments_raw);
-            let parsed: serde_json::Value = serde_json::from_str(&repaired).map_err(|err| {
-                edgequake_llm::LlmError::ApiError(format!(
-                    "streamed tool call {id} ({function_name}) produced invalid JSON arguments: \
-                     {err}"
-                ))
-            })?;
-            if !parsed.is_object() {
-                return Err(edgequake_llm::LlmError::ApiError(format!(
-                    "streamed tool call {id} ({function_name}) arguments must be a JSON object"
-                )));
-            }
-            let arguments =
-                edgecrab_tools::tool_argument_pipeline::canonical_tool_args_json(&parsed);
-            Ok(edgequake_llm::ToolCall {
-                id,
-                call_type: "function".to_string(),
-                function: edgequake_llm::FunctionCall {
-                    name: function_name,
-                    arguments,
-                },
-                thought_signature: partial.thought_signature,
-            })
-        })
-        .collect()
-}
-
-fn emit_tool_generating_progress(
-    tool_calls: &mut BTreeMap<usize, PartialToolCall>,
-    event_tx: &tokio::sync::mpsc::UnboundedSender<crate::StreamEvent>,
-) {
-    let now = std::time::Instant::now();
-    for (index, entry) in tool_calls.iter_mut() {
-        let Some(name) = entry.function_name.clone() else {
-            continue;
-        };
-        if !edgecrab_tools::tool_progress_tail::should_emit_progress(
-            entry.last_generating_emit,
-            now,
-        ) {
-            continue;
-        }
-        entry.last_generating_emit = Some(now);
-        let tool_id = entry
-            .id
-            .clone()
-            .unwrap_or_else(|| format!("stream-tool-{index}"));
-        let _ = event_tx.send(crate::StreamEvent::ToolGenerating {
-            tool_call_id: tool_id,
-            name,
-            partial_args: entry.arguments.clone(),
-        });
-    }
-}
-
-fn tool_arg_stall_break(tool_calls: &BTreeMap<usize, PartialToolCall>) -> Option<(String, usize)> {
-    for entry in tool_calls.values() {
-        let Some(name) = entry.function_name.as_ref() else {
-            continue;
-        };
-        let Some(name_at) = entry.name_received_at else {
-            continue;
-        };
-        let stall_from = entry.last_arg_at.unwrap_or(name_at);
-        if stall_from.elapsed() < Duration::from_secs(TOOL_ARGS_STALL_BREAK_SECS) {
-            continue;
-        }
-        return Some((name.clone(), entry.arguments.len()));
-    }
-    None
-}
-
-/// Native provider-streaming path used by the TUI.
-///
-/// WHY separate helper: real-time streaming and tool-call accumulation are a
-/// different concern from retry logic. This function turns provider-native
-/// `StreamChunk`s back into one normalized `LLMResponse` while also forwarding
-/// text/reasoning deltas to the UI.
-async fn api_call_streaming(
-    provider: &Arc<dyn LLMProvider>,
-    messages: &[edgequake_llm::ChatMessage],
-    tool_defs: &[edgequake_llm::ToolDefinition],
-    tool_choice: Option<edgequake_llm::ToolChoice>,
-    options: Option<&edgequake_llm::CompletionOptions>,
-    event_tx: &tokio::sync::mpsc::UnboundedSender<crate::StreamEvent>,
-    any_tokens_sent: &std::sync::atomic::AtomicBool,
-) -> edgequake_llm::Result<edgequake_llm::LLMResponse> {
-    tracing::info!(
-        provider = provider.name(),
-        "api_call_streaming: opening SSE stream"
-    );
-    let mut stream = provider
-        .chat_with_tools_stream(messages, tool_defs, tool_choice, options)
-        .await?;
-    tracing::info!("api_call_streaming: SSE stream opened, waiting for first chunk");
-
-    let mut content = String::new();
-    let mut thinking = String::new();
-    let mut thinking_tokens = 0usize;
-    let mut final_usage: Option<StreamUsage> = None;
-    let mut finish_reason: Option<String> = None;
-    let mut tool_calls: BTreeMap<usize, PartialToolCall> = BTreeMap::new();
-    let first_chunk_deadline = tokio::time::Instant::now() + STREAM_FIRST_CHUNK_TIMEOUT;
-    let mut saw_meaningful_chunk = false;
-    let stream_started = std::time::Instant::now();
-    let wait_ctx_base = edgecrab_tools::tool_progress_tail::LlmWaitContext {
-        prompt_tokens_estimated: Some(estimate_stream_prompt_tokens(messages, tool_defs) as u64),
-        context_length: Some(provider.max_context_length() as u64),
-        prefill_pct: None,
-    };
-
-    loop {
-        let next_chunk = if saw_meaningful_chunk {
-            // Inter-chunk timeout — detect stale streams (FP10).
-            match tokio::time::timeout(STREAM_INTER_CHUNK_TIMEOUT, stream.next()).await {
-                Ok(chunk) => chunk,
-                Err(_) => {
-                    for entry in tool_calls.values() {
-                        if entry.function_name.is_some() {
-                            let name = entry.function_name.as_deref().unwrap_or("tool");
-                            let _ = event_tx.send(crate::StreamEvent::ActivityNotice(
-                                edgecrab_tools::tool_progress_tail::format_tool_args_stream_stall(
-                                    name,
-                                    entry.arguments.len(),
-                                    STREAM_INTER_CHUNK_TIMEOUT.as_secs(),
-                                ),
-                            ));
-                        }
-                    }
-                    tracing::warn!(
-                        "api_call_streaming: inter-chunk timeout ({:?}) elapsed — \
-                         stream stale, returning partial content",
-                        STREAM_INTER_CHUNK_TIMEOUT,
-                    );
-                    finish_reason = Some(FINISH_REASON_STREAM_INTERRUPTED.to_string());
-                    break;
-                }
-            }
-        } else {
-            let remaining = first_chunk_deadline
-                .checked_duration_since(tokio::time::Instant::now())
-                .unwrap_or(Duration::ZERO);
-            match tokio::time::timeout(remaining, stream.next()).await {
-                Ok(chunk) => chunk,
-                Err(_) => return Err(edgequake_llm::LlmError::Timeout),
-            }
-        };
-        let Some(chunk) = next_chunk else {
-            break;
-        };
-        match chunk? {
-            StreamChunk::PrefillProgress { progress } => {
-                let prefill_pct = Some((progress.clamp(0.0, 1.0) * 100.0) as f32);
-                let _ = event_tx.send(crate::StreamEvent::LlmWaitProgress {
-                    provider: provider.name().to_string(),
-                    elapsed_secs: stream_started.elapsed().as_secs(),
-                    has_tools: !tool_defs.is_empty(),
-                    prompt_tokens_estimated: wait_ctx_base.prompt_tokens_estimated,
-                    context_length: wait_ctx_base.context_length,
-                    prefill_pct,
-                });
-            }
-            StreamChunk::Content(delta) => {
-                if !delta.is_empty() {
-                    saw_meaningful_chunk = true;
-                    any_tokens_sent.store(true, std::sync::atomic::Ordering::Relaxed);
-                    content.push_str(&delta);
-                    let _ = event_tx.send(crate::StreamEvent::Token(delta));
-                }
-            }
-            StreamChunk::ThinkingContent {
-                text, tokens_used, ..
-            } => {
-                if !text.is_empty() {
-                    saw_meaningful_chunk = true;
-                    any_tokens_sent.store(true, std::sync::atomic::Ordering::Relaxed);
-                    thinking.push_str(&text);
-                    let _ = event_tx.send(crate::StreamEvent::Reasoning(text));
-                }
-                if let Some(tokens) = tokens_used {
-                    thinking_tokens += tokens;
-                }
-            }
-            StreamChunk::ToolCallDelta {
-                index,
-                id,
-                function_name,
-                function_arguments,
-                thought_signature,
-            } => {
-                let entry = tool_calls.entry(index).or_default();
-                if let Some(id) = id {
-                    entry.id = Some(id);
-                }
-                let args_just_arrived = function_arguments.is_some();
-                if let Some(args) = function_arguments {
-                    if !args.is_empty() {
-                        entry.last_arg_at = Some(std::time::Instant::now());
-                    }
-                    entry.arguments.push_str(&args);
-                }
-                if thought_signature.is_some() {
-                    entry.thought_signature = thought_signature;
-                }
-                saw_meaningful_chunk = true;
-                let name_just_arrived = function_name.is_some();
-                let tool_id = entry
-                    .id
-                    .clone()
-                    .unwrap_or_else(|| format!("stream-tool-{index}"));
-                if let Some(name) = function_name {
-                    entry.function_name = Some(name.clone());
-                    if entry.name_received_at.is_none() {
-                        entry.name_received_at = Some(std::time::Instant::now());
-                    }
-                }
-                let emit_name = entry
-                    .function_name
-                    .clone()
-                    .unwrap_or_else(|| "tool".to_string());
-                let now = std::time::Instant::now();
-                if name_just_arrived
-                    || (args_just_arrived
-                        && edgecrab_tools::tool_progress_tail::should_emit_progress(
-                            entry.last_generating_emit,
-                            now,
-                        ))
-                {
-                    entry.last_generating_emit = Some(now);
-                    let _ = event_tx.send(crate::StreamEvent::ToolGenerating {
-                        tool_call_id: tool_id,
-                        name: emit_name.clone(),
-                        partial_args: entry.arguments.clone(),
-                    });
-                }
-                if !entry.stall_notice_sent
-                    && entry.arguments.is_empty()
-                    && entry.name_received_at.is_some_and(|at| {
-                        at.elapsed() >= Duration::from_secs(TOOL_ARGS_STALL_NOTICE_SECS)
-                    })
-                {
-                    entry.stall_notice_sent = true;
-                    let _ = event_tx.send(crate::StreamEvent::ActivityNotice(
-                        edgecrab_tools::tool_progress_tail::format_tool_args_stream_stall(
-                            &emit_name,
-                            0,
-                            TOOL_ARGS_STALL_NOTICE_SECS,
-                        ),
-                    ));
-                }
-            }
-            StreamChunk::Finished { reason, usage, .. } => {
-                saw_meaningful_chunk = true;
-                finish_reason = Some(reason);
-                if usage.is_some() {
-                    final_usage = usage;
-                }
-            }
-        }
-
-        emit_tool_generating_progress(&mut tool_calls, event_tx);
-
-        if let Some((stalled_name, arg_bytes)) = tool_arg_stall_break(&tool_calls) {
-            let notice = edgecrab_tools::mutation_turn_policy::tool_draft_stall_recovery_notice(
-                &stalled_name,
-                arg_bytes,
-                edgecrab_tools::edit_contract::DEFAULT_MAX_MUTATION_PAYLOAD_BYTES,
-                Some(provider.as_ref()),
-            );
-            let _ = event_tx.send(crate::StreamEvent::ActivityNotice(notice));
-            tracing::warn!(
-                tool = %stalled_name,
-                arg_bytes,
-                stall_secs = TOOL_ARGS_STALL_BREAK_SECS,
-                "api_call_streaming: tool-arg stall — aborting streamed draft"
-            );
-            finish_reason = Some(FINISH_REASON_STREAM_INTERRUPTED.to_string());
-            break;
-        }
-    }
-
-    let mut response = edgequake_llm::LLMResponse::new(content, provider.model().to_string());
-    if let Some(reason) = finish_reason {
-        response.finish_reason = Some(reason);
-    }
-    if !thinking.is_empty() {
-        response.thinking_content = Some(thinking);
-    }
-
-    response.tool_calls = match finalize_streamed_tool_calls(tool_calls) {
-        Ok(tool_calls) => tool_calls,
-        Err(err)
-            if is_retryable_stream_tool_assembly_error(&err)
-                && (!response.content.trim().is_empty()
-                    || response
-                        .thinking_content
-                        .as_deref()
-                        .is_some_and(|t| !t.trim().is_empty())) =>
-        {
-            tracing::warn!(
-                provider = provider.name(),
-                model = provider.model(),
-                error = %err,
-                "streamed tool-call assembly failed after visible output; preserving the partial response and switching future turns to non-streaming recovery"
-            );
-            response.finish_reason = Some(FINISH_REASON_STREAM_INTERRUPTED.to_string());
-            Vec::new()
-        }
-        Err(err) => return Err(err),
-    };
-
-    if let Some(usage) = final_usage {
-        response = response.with_usage(usage.prompt_tokens, usage.completion_tokens);
-        if let Some(cache_hit_tokens) = usage.cache_hit_tokens {
-            response = response.with_cache_hit_tokens(cache_hit_tokens);
-        }
-        if let Some(cache_write_tokens) = usage.cache_write_tokens {
-            response = response.with_cache_write_tokens(cache_write_tokens);
-        }
-        if let Some(authoritative_thinking_tokens) = usage.thinking_tokens {
-            response = response.with_thinking_tokens(authoritative_thinking_tokens);
-        } else if thinking_tokens > 0 {
-            response = response.with_thinking_tokens(thinking_tokens);
-        }
-    } else {
-        let estimated_prompt_tokens = estimate_stream_prompt_tokens(messages, tool_defs);
-        let estimated_completion_tokens = estimate_stream_completion_tokens(
-            &response.content,
-            response.thinking_content.as_deref(),
-            &response.tool_calls,
-        );
-        if estimated_prompt_tokens > 0 || estimated_completion_tokens > 0 {
-            response = response.with_usage(estimated_prompt_tokens, estimated_completion_tokens);
-        }
-        if thinking_tokens > 0 {
-            response = response.with_thinking_tokens(thinking_tokens);
-        }
-    }
-
-    Ok(response)
-}
-
-/// User-visible assistant text: `content` when present, else OpenAI `refusal`.
-fn assistant_display_text(response: &edgequake_llm::LLMResponse) -> String {
-    if !response.content.trim().is_empty() {
-        return response.content.clone();
-    }
-    response.refusal.clone().unwrap_or_default()
-}
-
-/// Whether the model produced anything worth keeping (not an empty nudge candidate).
-fn response_has_visible_output(response: &edgequake_llm::LLMResponse) -> bool {
-    !response.content.trim().is_empty()
-        || response
-            .refusal
-            .as_deref()
-            .is_some_and(|r| !r.trim().is_empty())
-        || response
-            .thinking_content
-            .as_deref()
-            .is_some_and(|t| !t.trim().is_empty())
-        || response.has_tool_calls()
-}
-
-fn estimate_stream_prompt_tokens(
-    messages: &[edgequake_llm::ChatMessage],
-    tool_defs: &[edgequake_llm::ToolDefinition],
-) -> usize {
-    use edgecrab_types::MULTIMODAL_IMAGE_TOKEN_ESTIMATE;
-
-    let mut total = estimate_tokens_from_json(tool_defs);
-    for m in messages {
-        total += estimate_tokens_from_text(&m.content);
-        if let Some(images) = &m.images {
-            total += images.len() * MULTIMODAL_IMAGE_TOKEN_ESTIMATE;
-        }
-    }
-    total
-}
-
-fn estimate_request_prompt_tokens(
-    system_prompt: Option<&str>,
-    messages: &[Message],
-    tool_defs: &[edgequake_llm::ToolDefinition],
-) -> usize {
-    let mut total = estimate_tokens_from_json(tool_defs);
-    if let Some(sp) = system_prompt {
-        total += estimate_tokens_from_text(sp);
-    }
-    total + crate::compression::estimate_tokens(messages)
 }
 
 fn build_prune_spill_context<'a>(
@@ -4018,111 +3257,6 @@ fn try_local_structural_prune_request(
     ))
 }
 
-async fn invoke_pre_api_request_hooks(
-    ctx: &ApiCallContext<'_>,
-    provider: &Arc<dyn LLMProvider>,
-    messages: &[edgequake_llm::ChatMessage],
-    tool_defs: &[edgequake_llm::ToolDefinition],
-    attempt: u32,
-) {
-    let Some(discovery) = ctx.discovered_plugins else {
-        return;
-    };
-
-    let approx_input_tokens = estimate_stream_prompt_tokens(messages, tool_defs);
-    let request_char_count = serde_json::to_string(messages)
-        .map(|serialized| serialized.chars().count())
-        .unwrap_or_default();
-    let max_tokens = ctx
-        .options
-        .and_then(|options| options.max_tokens)
-        .unwrap_or(0);
-
-    for plugin in discovery
-        .plugins
-        .iter()
-        .filter(|plugin| hermes_supports_hook(plugin, "pre_api_request"))
-    {
-        if let Err(error) = invoke_hermes_hook(
-            plugin,
-            "pre_api_request",
-            serde_json::json!({
-                "task_id": ctx.conversation_session_id,
-                "session_id": ctx.conversation_session_id,
-                "platform": ctx.platform.to_string(),
-                "model": provider.model(),
-                "provider": provider.name(),
-                "base_url": serde_json::Value::Null,
-                "api_mode": if tool_defs.is_empty() { "chat" } else { "chat_with_tools" },
-                "api_call_count": ctx.api_call_count + attempt + 1,
-                "message_count": messages.len(),
-                "tool_count": tool_defs.len(),
-                "approx_input_tokens": approx_input_tokens,
-                "request_char_count": request_char_count,
-                "max_tokens": max_tokens,
-            }),
-        )
-        .await
-        {
-            tracing::warn!(plugin = %plugin.name, ?error, "Hermes pre_api_request hook failed");
-        }
-    }
-}
-
-async fn invoke_post_api_request_hooks(
-    ctx: &ApiCallContext<'_>,
-    provider: &Arc<dyn LLMProvider>,
-    messages: &[edgequake_llm::ChatMessage],
-    tool_defs: &[edgequake_llm::ToolDefinition],
-    response: &edgequake_llm::LLMResponse,
-    attempt: u32,
-    started_at: std::time::Instant,
-) {
-    let Some(discovery) = ctx.discovered_plugins else {
-        return;
-    };
-
-    let usage = serde_json::json!({
-        "prompt_tokens": response.prompt_tokens,
-        "completion_tokens": response.completion_tokens,
-        "total_tokens": response.total_tokens,
-        "cache_hit_tokens": response.cache_hit_tokens,
-        "thinking_tokens": response.thinking_tokens,
-    });
-
-    for plugin in discovery
-        .plugins
-        .iter()
-        .filter(|plugin| hermes_supports_hook(plugin, "post_api_request"))
-    {
-        if let Err(error) = invoke_hermes_hook(
-            plugin,
-            "post_api_request",
-            serde_json::json!({
-                "task_id": ctx.conversation_session_id,
-                "session_id": ctx.conversation_session_id,
-                "platform": ctx.platform.to_string(),
-                "model": provider.model(),
-                "provider": provider.name(),
-                "base_url": serde_json::Value::Null,
-                "api_mode": if tool_defs.is_empty() { "chat" } else { "chat_with_tools" },
-                "api_call_count": ctx.api_call_count + attempt + 1,
-                "api_duration": started_at.elapsed().as_secs_f64(),
-                "finish_reason": response.finish_reason.clone().unwrap_or_else(|| "stop".into()),
-                "message_count": messages.len(),
-                "response_model": response.model.clone(),
-                "usage": usage,
-                "assistant_content_chars": response.content.chars().count(),
-                "assistant_tool_call_count": response.tool_calls.len(),
-            }),
-        )
-        .await
-        {
-            tracing::warn!(plugin = %plugin.name, ?error, "Hermes post_api_request hook failed");
-        }
-    }
-}
-
 fn available_toolsets_for_prompt(
     registry: &edgecrab_tools::registry::ToolRegistry,
     tool_names: &[String],
@@ -4136,521 +3270,8 @@ fn available_toolsets_for_prompt(
     toolsets
 }
 
-fn estimate_stream_completion_tokens(
-    content: &str,
-    thinking: Option<&str>,
-    tool_calls: &[edgequake_llm::ToolCall],
-) -> usize {
-    estimate_tokens_from_json(&(content, thinking, tool_calls))
-}
-
-fn estimate_tokens_from_json<T: serde::Serialize + ?Sized>(value: &T) -> usize {
-    let serialized = match serde_json::to_string(value) {
-        Ok(serialized) => serialized,
-        Err(_) => return 0,
-    };
-    estimate_tokens_from_text(&serialized)
-}
-
-fn estimate_tokens_from_text(text: &str) -> usize {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return 0;
-    }
-
-    // Heuristic fallback only: most modern BPE tokenizers average ~4 chars/token
-    // on mixed code+English payloads. This is intentionally used only when the
-    // provider cannot supply authoritative streaming usage.
-    trimmed.chars().count().div_ceil(4)
-}
-
-/// Emit periodic shelf notices while a non-streaming LLM request blocks (local servers, Copilot, etc.).
-fn spawn_nonstreaming_wait_heartbeat(
-    event_tx: Option<&tokio::sync::mpsc::UnboundedSender<crate::StreamEvent>>,
-    cancel: &tokio_util::sync::CancellationToken,
-    provider: &dyn LLMProvider,
-    has_tools: bool,
-    wait_ctx: edgecrab_tools::tool_progress_tail::LlmWaitContext,
-    http_timeout_secs: u64,
-) -> Option<tokio::task::JoinHandle<()>> {
-    let tx = event_tx.cloned()?;
-    let provider_name = provider.name().to_string();
-    let cancel = cancel.clone();
-    let timeout_warn_at = ((http_timeout_secs as f64)
-        * crate::local_provider_policy::LOCAL_HTTP_TIMEOUT_WARN_RATIO)
-        as u64;
-    Some(tokio::spawn(async move {
-        let started = std::time::Instant::now();
-        let mut pulses = 0u32;
-        let mut timeout_warned = false;
-        loop {
-            let elapsed = started.elapsed().as_secs();
-            if has_tools && !timeout_warned && http_timeout_secs > 0 && elapsed >= timeout_warn_at {
-                timeout_warned = true;
-                tracing::warn!(
-                    target: crate::observability::TARGET_PROVIDER_LLM,
-                    provider = %provider_name,
-                    elapsed_secs = elapsed,
-                    http_timeout_secs,
-                    prompt_tokens_estimated = ?wait_ctx.prompt_tokens_estimated,
-                    context_length = ?wait_ctx.context_length,
-                    "provider_llm: approaching HTTP timeout while composing tool call"
-                );
-                let notice =
-                    edgecrab_tools::tool_progress_tail::format_local_timeout_proximity_notice(
-                        &provider_name,
-                        elapsed,
-                        http_timeout_secs,
-                    );
-                let _ = tx.send(crate::StreamEvent::ActivityNotice(notice));
-            }
-            let _ = tx.send(crate::StreamEvent::LlmWaitProgress {
-                provider: provider_name.clone(),
-                elapsed_secs: elapsed,
-                has_tools,
-                prompt_tokens_estimated: wait_ctx.prompt_tokens_estimated,
-                context_length: wait_ctx.context_length,
-                prefill_pct: wait_ctx.prefill_pct,
-            });
-            pulses += 1;
-            let delay = if pulses == 1 {
-                Duration::from_secs(12)
-            } else {
-                Duration::from_secs(15)
-            };
-            tokio::select! {
-                _ = cancel.cancelled() => break,
-                _ = tokio::time::sleep(delay) => {}
-            }
-        }
-    }))
-}
-
-fn emit_local_transport_stall_notice(
-    event_tx: Option<&tokio::sync::mpsc::UnboundedSender<crate::StreamEvent>>,
-    provider: &dyn LLMProvider,
-) {
-    if let Some(tx) = event_tx {
-        let _ = tx.send(crate::StreamEvent::ActivityNotice(
-            crate::local_provider_policy::transport_stall_user_notice(provider),
-        ));
-    }
-}
-
-/// API call with exponential backoff retry.
-///
-/// WHY application-level retry: edgequake-llm doesn't retry internally.
-/// Transient 429/503/529 errors are common with high-traffic providers.
-/// 3 retries with 500ms/1s/2s backoff covers most transient failures
-/// without being so aggressive that we anger rate limiters further.
-///
-/// WHY chat_with_tools when tools present: The LLM must see tool
-/// definitions to request tool calls. Without them it can only
-/// produce text responses, breaking the REACT loop.
-/// Make an LLM API call with exponential-backoff retries, aborting
-/// immediately when the `cancel` token is triggered (Ctrl+C).
-///
-/// WHY cancellation-aware:
-/// - CancellationToken is a one-way latch set by `agent.interrupt()`.
-/// - Without `tokio::select!` the function would finish all retries and
-///   their sleep delays before the outer loop could notice the token,
-///   leaving the TUI unresponsive for several seconds after Ctrl+C.
-/// - We race both the backoff sleep and the in-flight API call against
-///   `cancel.cancelled()` so cancellation takes effect immediately.
-/// - Dropping the in-flight provider future is safe: reqwest/hyper
-///   futures are cancel-safe (no protocol-level cleanup needed).
-async fn api_call_with_retry(
-    provider: &Arc<dyn LLMProvider>,
-    messages: &[edgequake_llm::ChatMessage],
-    tool_defs: &[edgequake_llm::ToolDefinition],
-    max_retries: u32,
-    ctx: ApiCallContext<'_>,
-) -> Result<ApiCallOutcome, AgentError> {
-    let mut last_err: Option<String> = None;
-    let mut native_tool_streaming_enabled = ctx.use_native_streaming;
-    let mut disabled_native_tool_streaming = false;
-    // WHY max_retries for both streaming and non-streaming:
-    //
-    // The old code used `retry_budget = 0` for native streaming to avoid
-    // re-sending duplicate tokens to the TUI on retry.  That protection was
-    // too broad: it also prevented retrying *pre-stream* errors (e.g. HTTP 429
-    // "Resource Exhausted") that are returned by the provider before any SSE
-    // byte is emitted — so no token has ever been pushed to the channel.
-    //
-    // The correct invariant is:
-    //   • LlmError::RateLimited  → always pre-stream; safe to retry.
-    //   • LlmError::NetworkError / Timeout → connection-level errors before
-    //     any streaming data; safe to retry.
-    //   • LlmError::ApiError during streaming → may be mid-stream (partial
-    //     tokens already sent); NOT safe to retry (would produce duplicates).
-    //
-    // We enforce this in the Err arm below.
-    let retry_budget = max_retries;
-    // FP19: Provider-stated retry-after delay, set when we receive a rate limit
-    // error with an embedded "try again in X.Ys" hint. Used in the next
-    // iteration's backoff instead of the fixed BASE_BACKOFF.
-    let mut rate_limit_delay: Option<Duration> = None;
-
-    'attempt_loop: for attempt in 0..=retry_budget {
-        // ── Backoff sleep — interruptible ──────────────────────────────
-        if attempt > 0 {
-            // FP19: Use provider-stated wait time when available; fall back to
-            // exponential backoff. This avoids under-sleeping (hit limit again)
-            // and over-sleeping (wastes wall time).
-            let delay = rate_limit_delay
-                .take()
-                .unwrap_or_else(|| BASE_BACKOFF * 2u32.saturating_pow(attempt - 1));
-            tracing::debug!(
-                attempt,
-                delay_ms = delay.as_millis(),
-                "api_call_with_retry: sleeping before retry"
-            );
-            tokio::select! {
-                biased;
-                _ = ctx.cancel.cancelled() => {
-                    tracing::debug!(attempt, "api_call_with_retry: cancelled during backoff sleep");
-                    return Err(AgentError::Interrupted);
-                }
-                _ = tokio::time::sleep(delay) => {
-                    tracing::debug!(attempt, "retrying API call after backoff");
-                }
-            }
-        }
-
-        // WHY per-attempt AtomicBool: tracks whether api_call_streaming
-        // emitted at least one token (Content, Thinking, or ToolCallDelta)
-        // before erroring. If tokens arrived, the error is mid-stream and
-        // retrying would produce duplicate TUI content — so we abort instead.
-        // A fresh AtomicBool for each attempt resets the flag correctly.
-        let mut use_native_streaming_this_attempt = native_tool_streaming_enabled;
-
-        loop {
-            let tokens_sent = std::sync::atomic::AtomicBool::new(false);
-            invoke_pre_api_request_hooks(&ctx, provider, messages, tool_defs, attempt).await;
-            let request_started_at = std::time::Instant::now();
-            let prompt_tokens_est = estimate_stream_prompt_tokens(messages, tool_defs);
-            let http_timeout_secs =
-                crate::local_provider_policy::local_http_timeout_secs(provider.name());
-            let tool_choice = crate::local_provider_policy::local_tool_choice(
-                provider.as_ref(),
-                !tool_defs.is_empty(),
-            );
-            let tool_choice_required = tool_choice.is_some();
-            let correlation = crate::observability::LlmCorrelation {
-                session_id: ctx.conversation_session_id,
-                api_call_count: ctx.api_call_count,
-                attempt,
-                platform: ctx.platform,
-            };
-            let request_start = crate::observability::LlmRequestStart {
-                correlation,
-                provider: provider.name(),
-                model: provider.model(),
-                streaming: use_native_streaming_this_attempt,
-                tool_count: tool_defs.len(),
-                prompt_tokens_estimated: prompt_tokens_est,
-                context_length: provider.max_context_length(),
-                http_timeout_secs,
-                tool_choice_required,
-                max_tokens: ctx.options.and_then(|o| o.max_tokens),
-                reasoning_effort: ctx.options.and_then(|o| o.reasoning_effort.as_deref()),
-            };
-            let attempt_span = crate::observability::llm_attempt_span(&request_start);
-
-            // ── API call — interruptible ────────────────────────────────
-            // We race the provider future against the cancel token.
-            // Dropping the provider future is safe: HTTP futures in reqwest
-            // are cancel-safe (the TCP connection is simply closed).
-            if let Some(tx) = ctx.event_tx {
-                let ctx_json = crate::observability::llm_pre_hook_json(&request_start).to_string();
-                let _ = tx.send(crate::StreamEvent::HookEvent {
-                    event: "llm:pre".to_string(),
-                    context_json: ctx_json,
-                });
-            }
-
-            let call_fut = async {
-                let platform = ctx.platform.to_string();
-                edgequake_llm::with_trace_context(ctx.conversation_session_id, &platform, async {
-                    if use_native_streaming_this_attempt {
-                        let tx = ctx
-                            .event_tx
-                            .expect("native streaming requires event channel");
-                        api_call_streaming(
-                            provider,
-                            messages,
-                            tool_defs,
-                            tool_choice.clone(),
-                            ctx.options,
-                            tx,
-                            &tokens_sent,
-                        )
-                        .await
-                    } else if tool_defs.is_empty() {
-                        provider.chat(messages, ctx.options).await
-                    } else {
-                        provider
-                            .chat_with_tools(messages, tool_defs, tool_choice, ctx.options)
-                            .await
-                    }
-                })
-                .await
-            }
-            .instrument(attempt_span);
-
-            let heartbeat = if !use_native_streaming_this_attempt {
-                let wait_ctx = edgecrab_tools::tool_progress_tail::LlmWaitContext {
-                    prompt_tokens_estimated: Some(prompt_tokens_est as u64),
-                    context_length: Some(provider.max_context_length() as u64),
-                    prefill_pct: None,
-                };
-                spawn_nonstreaming_wait_heartbeat(
-                    ctx.event_tx,
-                    ctx.cancel,
-                    provider.as_ref(),
-                    !tool_defs.is_empty(),
-                    wait_ctx,
-                    http_timeout_secs,
-                )
-            } else {
-                None
-            };
-
-            let result = tokio::select! {
-                biased;
-                _ = ctx.cancel.cancelled() => {
-                    tracing::debug!(attempt, "api_call_with_retry: cancelled during API call");
-                    return Err(AgentError::Interrupted);
-                }
-                r = call_fut => r,
-            };
-
-            if let Some(handle) = heartbeat {
-                handle.abort();
-            }
-
-            match result {
-                Ok(response) => {
-                    let elapsed_ms = request_started_at.elapsed().as_millis() as u64;
-                    invoke_post_api_request_hooks(
-                        &ctx,
-                        provider,
-                        messages,
-                        tool_defs,
-                        &response,
-                        attempt,
-                        request_started_at,
-                    )
-                    .await;
-                    let operation = if use_native_streaming_this_attempt {
-                        "chat_with_tools_stream"
-                    } else if tool_defs.is_empty() {
-                        "chat"
-                    } else {
-                        "chat_with_tools"
-                    };
-                    crate::observability::record_llm_operation(
-                        correlation,
-                        provider.name(),
-                        provider.model(),
-                        operation,
-                        elapsed_ms,
-                        true,
-                        Some(&response),
-                    );
-                    if response.finish_reason.as_deref() == Some(FINISH_REASON_STREAM_INTERRUPTED) {
-                        disabled_native_tool_streaming = true;
-                    }
-                    if let Some(tx) = ctx.event_tx {
-                        let ctx_json = crate::observability::llm_post_hook_json(
-                            correlation,
-                            provider.name(),
-                            provider.model(),
-                            use_native_streaming_this_attempt,
-                            elapsed_ms,
-                            &response,
-                        )
-                        .to_string();
-                        let _ = tx.send(crate::StreamEvent::HookEvent {
-                            event: "llm:post".to_string(),
-                            context_json: ctx_json,
-                        });
-                    }
-                    return Ok(ApiCallOutcome {
-                        response,
-                        disabled_native_tool_streaming,
-                    });
-                }
-                Err(e) => {
-                    let elapsed_ms = request_started_at.elapsed().as_millis() as u64;
-                    crate::observability::log_llm_attempt_failure(
-                        correlation,
-                        provider.name(),
-                        provider.model(),
-                        use_native_streaming_this_attempt,
-                        elapsed_ms,
-                        &e.to_string(),
-                    );
-                    if crate::local_provider_policy::blocks_transport_retry(provider.as_ref(), &e) {
-                        crate::local_provider_policy::log_local_llm_transport_failure(
-                            provider.as_ref(),
-                            elapsed_ms,
-                            attempt,
-                            &e.to_string(),
-                        );
-                        emit_local_transport_stall_notice(ctx.event_tx, provider.as_ref());
-                        last_err = Some(e.to_string());
-                        break 'attempt_loop;
-                    }
-
-                    let provider_handles_error =
-                        provider_manages_transport_retries(provider.as_ref())
-                            && is_transport_retry_error(&e);
-
-                    if use_native_streaming_this_attempt {
-                        let visible_output_sent =
-                            tokens_sent.load(std::sync::atomic::Ordering::Relaxed);
-                        if !visible_output_sent && matches!(e, edgequake_llm::LlmError::Timeout) {
-                            tracing::warn!(
-                                provider = provider.name(),
-                                model = provider.model(),
-                                attempt,
-                                "native streaming stalled before first visible chunk; falling back to non-streaming for this request"
-                            );
-                            use_native_streaming_this_attempt = false;
-                            continue;
-                        }
-                        if !visible_output_sent && is_retryable_stream_tool_assembly_error(&e) {
-                            tracing::warn!(
-                                provider = provider.name(),
-                                model = provider.model(),
-                                attempt,
-                                error = %e,
-                                "streamed tool-call assembly failed before any visible output; downgrading this session to non-streaming tool calls"
-                            );
-                            use_native_streaming_this_attempt = false;
-                            native_tool_streaming_enabled = false;
-                            disabled_native_tool_streaming = true;
-                            continue;
-                        }
-                        if !visible_output_sent
-                            && !tool_defs.is_empty()
-                            && is_streamed_tool_capability_error(&e)
-                        {
-                            tracing::warn!(
-                                provider = provider.name(),
-                                model = provider.model(),
-                                "provider rejected streamed tool turns; downgrading this session to non-streaming tool calls"
-                            );
-                            use_native_streaming_this_attempt = false;
-                            native_tool_streaming_enabled = false;
-                            disabled_native_tool_streaming = true;
-                            continue;
-                        }
-
-                        // For native streaming, only continue retrying if the error
-                        // happened before any visible output was emitted. Tool-call
-                        // deltas are buffered locally and are not user-visible, so a
-                        // malformed streamed tool call can safely be retried.
-                        if visible_output_sent || !is_retryable_nonvisible_stream_error(&e) {
-                            let err = augment_provider_error(provider, e.to_string());
-                            return Err(AgentError::Llm(format!(
-                                "API call failed after {} retries: {}",
-                                attempt, err
-                            )));
-                        }
-                    }
-
-                    last_err = Some(e.to_string());
-                    if provider_handles_error {
-                        break 'attempt_loop;
-                    }
-                    // Non-retryable errors: abort immediately instead of
-                    // burning through the retry budget on a permanent failure
-                    // (geo-block, bad API key, invalid request, etc.).
-                    if matches!(
-                        &e,
-                        edgequake_llm::LlmError::AuthError(_)
-                            | edgequake_llm::LlmError::InvalidRequest(_)
-                            | edgequake_llm::LlmError::ModelNotFound(_)
-                            | edgequake_llm::LlmError::TokenLimitExceeded { .. }
-                    ) || crate::multimodal_tool_content::is_tool_message_order_error(
-                        &e.to_string(),
-                    ) {
-                        break 'attempt_loop;
-                    }
-                    // FP19: For rate-limit errors, parse the provider-stated
-                    // retry-after duration so the next backoff sleeps the
-                    // correct amount rather than a fixed BASE_BACKOFF.
-                    if let edgequake_llm::LlmError::RateLimited(msg) = &e {
-                        rate_limit_delay = parse_retry_after(msg);
-                        if let Some(d) = rate_limit_delay {
-                            tracing::info!(
-                                provider = provider.name(),
-                                model = provider.model(),
-                                wait_ms = d.as_millis(),
-                                "rate limited — using provider-stated retry-after delay"
-                            );
-                        }
-                    }
-                    break;
-                }
-            }
-        }
-    }
-
-    let raw_err = last_err.map_or_else(
-        || "unknown error".to_string(),
-        |e| augment_provider_error(provider, e),
-    );
-
-    let transport_stall =
-        crate::local_provider_policy::is_local_inference_provider(provider.name())
-            && crate::local_provider_policy::transport_stall_error_suffix(provider.name())
-                .is_some()
-            && {
-                let lower = raw_err.to_ascii_lowercase();
-                lower.contains("timeout")
-                    || lower.contains("timed out")
-                    || lower.contains("network")
-            };
-
-    // FP18: For rate-limit errors, produce a clear message that names the model
-    // and suggests the user wait before retrying — mirrors hermes-agent guidance.
-    let final_err_msg = if transport_stall {
-        format!(
-            "{} Provider error: {}",
-            crate::local_provider_policy::transport_stall_error_suffix(provider.name())
-                .expect("checked above"),
-            raw_err
-        )
-    } else if raw_err.to_ascii_lowercase().contains("rate limit")
-        || raw_err.to_ascii_lowercase().contains("rate_limit")
-        || raw_err.to_ascii_lowercase().contains("429")
-        || raw_err.to_ascii_lowercase().contains("too many requests")
-    {
-        format!(
-            "Rate limit exceeded for model {} after {} retries. \
-             Wait a minute and retry, or reduce context size / switch to a model with higher TPM limits. \
-             Provider error: {}",
-            provider.model(),
-            retry_budget,
-            raw_err
-        )
-    } else {
-        format!(
-            "API call failed after {} retries: {}",
-            retry_budget, raw_err
-        )
-    };
-
-    Err(AgentError::Llm(final_err_msg))
-}
-
-#[derive(Debug)]
-struct ApiCallOutcome {
-    response: edgequake_llm::LLMResponse,
-    disabled_native_tool_streaming: bool,
+fn summarize_tool_result_preview(name: &str, tool_result: &str, is_error: bool) -> Option<String> {
+    crate::tool_result_summary::summarize_tool_result_preview(name, tool_result, is_error)
 }
 
 // ─── Budget pressure warnings ─────────────────────────────────────────────
@@ -4974,8 +3595,7 @@ async fn process_response(
     session: &mut SessionState,
     dctx: &DispatchContext,
     tool_errors: &mut Vec<edgecrab_types::ToolErrorRecord>,
-    failure_tracker: &mut ConsecutiveFailureTracker,
-    dedup_tracker: &mut DuplicateToolCallDetector,
+    trackers: &mut TurnDispatchTrackers,
 ) -> Result<LoopAction, AgentError> {
     // Check for tool calls
     if response.has_tool_calls() {
@@ -5052,13 +3672,14 @@ async fn process_response(
                         &tool_result,
                     );
                 }
-                dedup_tracker.end_turn();
+                trackers.dedup.end_turn();
                 return Ok(LoopAction::Continue);
             }
             session.invalid_tool_call_retries = 0;
         }
 
         let tool_turn_start = session.messages.len();
+        trackers.tool_guardrail.reset_for_turn();
         let dispatch_calls: Vec<edgequake_llm::ToolCall> = effective_tool_calls
             .iter()
             .zip(our_tool_calls.iter())
@@ -5106,11 +3727,15 @@ async fn process_response(
                 );
                 let tool_result = tool_err.to_llm_response();
                 if should_count_failure_for_escalation(&tool_result) {
-                    failure_tracker.record_failure(&extract_tool_error_text(&tool_result));
+                    trackers
+                        .failure
+                        .record_failure(&extract_tool_error_text(&tool_result));
                 } else {
-                    failure_tracker.record_success();
+                    trackers.failure.record_success();
                 }
-                dedup_tracker.record(&tc.function.name, &tc.function.arguments, &tool_result);
+                trackers
+                    .dedup
+                    .record(&tc.function.name, &tc.function.arguments, &tool_result);
                 tool_errors.push(edgecrab_types::ToolErrorRecord {
                     turn: session.api_call_count,
                     tool_name: tc.function.name.clone(),
@@ -5150,6 +3775,37 @@ async fn process_response(
             }
 
             if is_parallel {
+                let trackers_view = TurnDispatchTrackersView {
+                    harness_advisory: &trackers.harness_advisory,
+                    tool_guardrail: &trackers.tool_guardrail,
+                };
+                if let Some(blocked) = guardrail_before_dispatch_checked(
+                    &trackers_view,
+                    &session.messages,
+                    &tc.function.name,
+                    &tc.function.arguments,
+                ) {
+                    emit_tool_done(
+                        dctx.event_tx.as_ref(),
+                        &tc.id,
+                        &tc.function.name,
+                        &tc.function.arguments,
+                        &blocked,
+                        0,
+                        true,
+                    );
+                    append_tool_result_to_session(
+                        session,
+                        dctx,
+                        &tc.id,
+                        &tc.function.name,
+                        &blocked,
+                    );
+                    trackers
+                        .dedup
+                        .record(&tc.function.name, &tc.function.arguments, &blocked);
+                    continue;
+                }
                 // Claim paths so subsequent tools targeting the same file go sequential.
                 if let Some(ref reg) = dctx.registry {
                     for p in reg.extract_paths(&tc.function.name, &tc.function.arguments) {
@@ -5239,6 +3895,13 @@ async fn process_response(
         while let Some(join_result) = parallel_tasks.join_next().await {
             match join_result {
                 Ok((tc_id, tc_name, args_json, (tool_result, injected_messages), duration_ms)) => {
+                    let tool_result = apply_guardrail_result(
+                        &mut trackers.tool_guardrail,
+                        &tc_name,
+                        &args_json,
+                        &tool_result,
+                        is_tool_error(&tool_result),
+                    );
                     let is_error = is_tool_error(&tool_result);
                     emit_tool_done(
                         dctx.event_tx.as_ref(),
@@ -5269,16 +3932,18 @@ async fn process_response(
                             argument_loop_blocked = true;
                         }
                         if should_count_failure_for_escalation(&tool_result) {
-                            failure_tracker.record_failure(&extract_tool_error_text(&tool_result));
+                            trackers
+                                .failure
+                                .record_failure(&extract_tool_error_text(&tool_result));
                         } else {
-                            failure_tracker.record_success();
+                            trackers.failure.record_success();
                         }
                     } else {
-                        failure_tracker.record_success();
+                        trackers.failure.record_success();
                     }
                     received_parallel_ids.insert(tc_id.clone());
                     // Record for duplicate detection (FP11)
-                    dedup_tracker.record(&tc_name, &args_json, &tool_result);
+                    trackers.dedup.record(&tc_name, &args_json, &tool_result);
                     append_tool_result_to_session(session, dctx, &tc_id, &tc_name, &tool_result);
                     crate::compression::maybe_prune_computer_use_screenshots(
                         &mut session.messages,
@@ -5318,7 +3983,8 @@ async fn process_response(
             // ── Duplicate tool call detection (FP11) ─────────────────
             // If the exact same tool+args was called in the previous turn,
             // skip re-execution and return the cached result with a nudge.
-            if let Some(cached) = dedup_tracker
+            if let Some(cached) = trackers
+                .dedup
                 .check_duplicate(&tc.function.name, &tc.function.arguments)
                 .map(|s| s.to_owned())
             {
@@ -5344,13 +4010,35 @@ async fn process_response(
                     &tc.function.name,
                     &dedup_result,
                 ));
-                dedup_tracker.record(&tc.function.name, &tc.function.arguments, &cached);
+                trackers
+                    .dedup
+                    .record(&tc.function.name, &tc.function.arguments, &cached);
                 continue;
             }
 
             let started = std::time::Instant::now();
-            let (tool_result, injected_messages) =
-                dispatch_single_tool(&tc.id, &tc.function.name, &tc.function.arguments, dctx).await;
+            let trackers_view = TurnDispatchTrackersView {
+                harness_advisory: &trackers.harness_advisory,
+                tool_guardrail: &trackers.tool_guardrail,
+            };
+            let (mut tool_result, injected_messages) = if let Some(blocked) =
+                guardrail_before_dispatch_checked(
+                    &trackers_view,
+                    &session.messages,
+                    &tc.function.name,
+                    &tc.function.arguments,
+                ) {
+                (blocked, Vec::new())
+            } else {
+                dispatch_single_tool(&tc.id, &tc.function.name, &tc.function.arguments, dctx).await
+            };
+            tool_result = apply_guardrail_result(
+                &mut trackers.tool_guardrail,
+                &tc.function.name,
+                &tc.function.arguments,
+                &tool_result,
+                is_tool_error(&tool_result),
+            );
             let duration_ms = started.elapsed().as_millis() as u64;
 
             let is_error = is_tool_error(&tool_result);
@@ -5383,15 +4071,19 @@ async fn process_response(
                     argument_loop_blocked = true;
                 }
                 if should_count_failure_for_escalation(&tool_result) {
-                    failure_tracker.record_failure(&extract_tool_error_text(&tool_result));
+                    trackers
+                        .failure
+                        .record_failure(&extract_tool_error_text(&tool_result));
                 } else {
-                    failure_tracker.record_success();
+                    trackers.failure.record_success();
                 }
             } else {
-                failure_tracker.record_success();
+                trackers.failure.record_success();
             }
             // Record for duplicate detection (FP11)
-            dedup_tracker.record(&tc.function.name, &tc.function.arguments, &tool_result);
+            trackers
+                .dedup
+                .record(&tc.function.name, &tc.function.arguments, &tool_result);
             append_tool_result_to_session(session, dctx, &tc.id, &tc.function.name, &tool_result);
             crate::compression::maybe_prune_computer_use_screenshots(
                 &mut session.messages,
@@ -5400,53 +4092,72 @@ async fn process_response(
             session.messages.extend(injected_messages);
         }
 
-        if dctx.app_config_ref.result_turn_budget_chars > 0 {
-            let spill_config = crate::tool_result_spill::SpillConfig {
-                enabled: dctx.app_config_ref.result_spill,
-                threshold: dctx.app_config_ref.result_spill_threshold,
-                preview_lines: dctx.app_config_ref.result_spill_preview_lines,
-            };
-            let spilled = crate::tool_result_spill::enforce_turn_budget(
-                &mut session.messages[tool_turn_start..],
-                dctx.app_config_ref.result_turn_budget_chars,
-                &spill_config,
-                &dctx.conversation_session_id,
-                &dctx.cwd,
-                &dctx.spill_seq,
-            );
-            if spilled > 0 {
-                tracing::info!(
-                    spilled,
-                    turn_budget = dctx.app_config_ref.result_turn_budget_chars,
-                    "per-turn tool result budget enforced"
-                );
-            }
-        }
-
-        if argument_loop_blocked {
-            session.messages.push(Message::user(
-                "Argument loop detected: do not retry the same malformed tool call. Read the tool error required_fields/usage_hint and either (1) provide all required JSON fields in the next tool call, or (2) ask the user for the missing value before any further tool calls.",
-            ));
-        }
+        let tool_names: Vec<&str> = effective_tool_calls
+            .iter()
+            .map(|tc| tc.function.name.as_str())
+            .collect();
+        let browser_results: Vec<String> = session.messages[tool_turn_start..]
+            .iter()
+            .filter(|m| m.role == Role::Tool && m.name.as_deref() == Some("browser_navigate"))
+            .map(|m| m.text_content())
+            .collect();
+        let browser_refs: Vec<&str> = browser_results.iter().map(String::as_str).collect();
+        let known_dev_ports = dctx.process_table.list_running_http_server_ports().await;
+        let blocked_tools: Vec<String> = if argument_loop_blocked {
+            effective_tool_calls
+                .iter()
+                .map(|tc| tc.function.name.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        finalize_tool_turn(
+            trackers,
+            ToolTurnFinalizeParams {
+                messages: &mut session.messages,
+                tool_turn_start,
+                tool_names: &tool_names,
+                browser_navigate_results: &browser_refs,
+                known_dev_ports: &known_dev_ports,
+                result_turn_budget_chars: dctx.app_config_ref.result_turn_budget_chars,
+                spill_config: crate::tool_result_spill::SpillConfig {
+                    enabled: dctx.app_config_ref.result_spill,
+                    threshold: dctx.app_config_ref.result_spill_threshold,
+                    preview_lines: dctx.app_config_ref.result_spill_preview_lines,
+                },
+                session_id: &dctx.conversation_session_id,
+                cwd: &dctx.cwd,
+                spill_seq: &dctx.spill_seq,
+                max_write_payload_bytes: dctx.app_config_ref.max_write_payload_bytes(),
+                provider: dctx.provider.as_deref(),
+                argument_loop_blocked,
+                blocked_tool_names: blocked_tools,
+            },
+        )
+        .await;
 
         // ── Consecutive failure escalation ───────────────────────────
         // After all tools in this turn have run, check whether the
         // failure tracker has hit its threshold. If so, inject a system
         // guidance message that tells the LLM to stop retrying and
         // reconsider its approach.
-        if failure_tracker.count >= failure_tracker.max_before_escalation {
-            let escalation = failure_tracker.escalation_message();
+        if trackers.failure.should_escalate() {
+            let escalation = trackers.failure.escalation_message();
             tracing::warn!(
-                consecutive_failures = failure_tracker.count,
+                consecutive_failures = trackers.failure.count,
                 "consecutive failure escalation triggered"
             );
             session.messages.push(Message::user(&escalation));
             // Reset so the tracker can fire again after another streak.
-            failure_tracker.record_success();
+            trackers.failure.record_success();
         }
 
         // End-of-turn: rotate dedup tracker (FP11)
-        dedup_tracker.end_turn();
+        trackers.dedup.end_turn();
+
+        if trackers.guardrail_halt {
+            return Ok(LoopAction::GuardrailHalt);
+        }
 
         return Ok(LoopAction::Continue);
     }
@@ -5546,11 +4257,9 @@ async fn dispatch_single_tool(
         &dctx.conversation_session_id,
         dctx.platform,
     );
-    async {
-        dispatch_single_tool_impl(tool_call_id, name, args_json, dctx).await
-    }
-    .instrument(span)
-    .await
+    async { dispatch_single_tool_impl(tool_call_id, name, args_json, dctx).await }
+        .instrument(span)
+        .await
 }
 
 async fn dispatch_single_tool_impl(
@@ -5805,6 +4514,8 @@ async fn dispatch_single_tool_impl(
             threshold: dctx.app_config_ref.result_spill_threshold,
             preview_lines: dctx.app_config_ref.result_spill_preview_lines,
         };
+        let spill_ctx =
+            edgecrab_tools::artifact_spill::spill_context_from_args(name, &args_for_mutation);
         match crate::tool_result_spill::maybe_spill(
             name,
             tool_call_id,
@@ -5813,6 +4524,7 @@ async fn dispatch_single_tool_impl(
             &dctx.cwd,
             &spill_config,
             &dctx.spill_seq,
+            Some(&spill_ctx),
         ) {
             crate::tool_result_spill::SpillOutcome::Inline(s) => s,
             crate::tool_result_spill::SpillOutcome::Spilled { stub, .. } => stub,
@@ -6034,15 +4746,13 @@ and stop — do NOT call any tools.";
     // Use process_response — it appends messages and runs tools properly.
     // Reflection tool errors are non-fatal and not surfaced to the caller.
     let mut _reflection_tool_errors: Vec<edgecrab_types::ToolErrorRecord> = Vec::new();
-    let mut _reflection_failure_tracker = ConsecutiveFailureTracker::new(3);
-    let mut _reflection_dedup_tracker = DuplicateToolCallDetector::new();
+    let mut _reflection_trackers = TurnDispatchTrackers::new(3);
     if let Err(e) = process_response(
         &response,
         session,
         dctx,
         &mut _reflection_tool_errors,
-        &mut _reflection_failure_tracker,
-        &mut _reflection_dedup_tracker,
+        &mut _reflection_trackers,
     )
     .await
     {
@@ -6097,27 +4807,10 @@ mod tests {
     use crate::goals::GoalStore;
     use async_trait::async_trait;
     use edgecrab_tools::{ProcessTable, ToolRegistry};
-    use edgequake_llm::traits::StreamUsage;
+    use edgequake_llm::traits::{StreamChunk, StreamUsage};
     use edgequake_llm::{ChatMessage, CompletionOptions, FunctionCall, ToolChoice, ToolDefinition};
     use serde_json::json;
     use tempfile::TempDir;
-
-    #[test]
-    fn assistant_display_text_prefers_content_then_refusal() {
-        let mut response = edgequake_llm::LLMResponse::new("hello", "m");
-        assert_eq!(assistant_display_text(&response), "hello");
-        response.content.clear();
-        response.refusal = Some("policy decline".into());
-        assert_eq!(assistant_display_text(&response), "policy decline");
-    }
-
-    #[test]
-    fn response_has_visible_output_includes_refusal() {
-        let mut response = edgequake_llm::LLMResponse::new("", "m");
-        assert!(!response_has_visible_output(&response));
-        response.refusal = Some("declined".into());
-        assert!(response_has_visible_output(&response));
-    }
 
     #[derive(Clone)]
     struct StreamingUsageProvider {
@@ -6328,6 +5021,10 @@ mod tests {
                 "synthetic network failure".into(),
             ))
         }
+
+        fn supports_tool_streaming(&self) -> bool {
+            true
+        }
     }
 
     #[async_trait]
@@ -6396,7 +5093,7 @@ mod tests {
                     StreamChunk::ToolCallDelta {
                         index: 0,
                         id: Some("call_write".into()),
-                        function_name: Some("write_file".into()),
+                        function_name: None,
                         function_arguments: None,
                         thought_signature: None,
                     },
@@ -6752,6 +5449,7 @@ def register(ctx):
             }),
             &tx,
             &tokens_sent,
+            Some(1),
         )
         .await
         .expect("stream call");
@@ -6809,6 +5507,7 @@ def register(ctx):
             }),
             &tx,
             &tokens_sent,
+            Some(1),
         )
         .await
         .expect("stream call");
@@ -6827,6 +5526,7 @@ def register(ctx):
 
     #[tokio::test]
     async fn api_call_streaming_rejects_tool_calls_without_arguments() {
+        unsafe { std::env::set_var("EDGECRAB_TOOL_ARGS_EMPTY_FALLBACK", "0") };
         let provider: Arc<dyn LLMProvider> = Arc::new(StreamingUsageProvider {
             chunks: vec![
                 StreamChunk::ToolCallDelta {
@@ -6854,6 +5554,7 @@ def register(ctx):
             None,
             &tx,
             &tokens_sent,
+            Some(1),
         )
         .await
         .expect_err("missing streamed arguments must be rejected");
@@ -6870,6 +5571,9 @@ def register(ctx):
 
     #[tokio::test]
     async fn api_call_with_retry_recovers_after_visible_streamed_tool_json_breaks() {
+        // Default empty-arg fallback would repair truncated stream JSON to `{}` and
+        // skip the stream-interrupted recovery path this test exercises.
+        unsafe { std::env::set_var("EDGECRAB_TOOL_ARGS_EMPTY_FALLBACK", "0") };
         let provider: Arc<dyn LLMProvider> = Arc::new(StreamingUsageProvider {
             chunks: vec![
                 StreamChunk::Content(
@@ -6918,12 +5622,13 @@ def register(ctx):
                 conversation_session_id: "test-session",
                 platform: edgecrab_types::Platform::Cli,
                 api_call_count: 0,
+                session: crate::failover::ClassifyContext::default(),
             },
         )
         .await
         .expect("visible partial text should be preserved and recovered instead of crashing");
 
-        assert!(outcome.disabled_native_tool_streaming);
+        assert!(!outcome.disabled_native_tool_streaming);
         assert_eq!(
             outcome.response.finish_reason.as_deref(),
             Some(FINISH_REASON_STREAM_INTERRUPTED)
@@ -6957,6 +5662,7 @@ def register(ctx):
                 conversation_session_id: "test-session",
                 platform: edgecrab_types::Platform::Cli,
                 api_call_count: 0,
+                session: crate::failover::ClassifyContext::default(),
             },
         )
         .await
@@ -7007,6 +5713,7 @@ def register(ctx):
                 conversation_session_id: "test-session",
                 platform: edgecrab_types::Platform::Cli,
                 api_call_count: 0,
+                session: crate::failover::ClassifyContext::default(),
             },
         )
         .await
@@ -7051,6 +5758,7 @@ def register(ctx):
                 conversation_session_id: "test-session",
                 platform: edgecrab_types::Platform::Cli,
                 api_call_count: 0,
+                session: crate::failover::ClassifyContext::default(),
             },
         )
         .await;
@@ -7062,7 +5770,7 @@ def register(ctx):
     }
 
     #[tokio::test]
-    async fn api_call_with_retry_falls_back_after_malformed_streamed_tool_calls() {
+    async fn api_call_with_retry_retries_streaming_after_malformed_tool_name_stream() {
         let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let provider: Arc<dyn LLMProvider> = Arc::new(FlakyToolStreamProvider {
             attempts: attempts.clone(),
@@ -7096,16 +5804,16 @@ def register(ctx):
                 conversation_session_id: "test-session",
                 platform: edgecrab_types::Platform::Cli,
                 api_call_count: 0,
+                session: crate::failover::ClassifyContext::default(),
             },
         )
         .await
-        .expect("malformed tool stream should downgrade to the safe non-streaming path");
+        .expect("malformed tool stream should retry streaming and recover");
 
         let response = outcome.response;
-        assert_eq!(response.content, "non-stream");
-        assert_eq!(response.finish_reason.as_deref(), None);
-        assert!(outcome.disabled_native_tool_streaming);
-        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(response.content, "recovered");
+        assert!(!outcome.disabled_native_tool_streaming);
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -7145,6 +5853,7 @@ def register(ctx):
                 conversation_session_id: "test-session",
                 platform: edgecrab_types::Platform::Cli,
                 api_call_count: 0,
+                session: crate::failover::ClassifyContext::default(),
             },
         )
         .await
@@ -7184,6 +5893,7 @@ def register(ctx):
                 conversation_session_id: "test-session",
                 platform: edgecrab_types::Platform::Cli,
                 api_call_count: 0,
+                session: crate::failover::ClassifyContext::default(),
             },
         )
         .await
@@ -7221,6 +5931,7 @@ def register(ctx):
                 conversation_session_id: "api-hook-session",
                 platform: edgecrab_types::Platform::Cli,
                 api_call_count: 0,
+                session: crate::failover::ClassifyContext::default(),
             },
         )
         .await
@@ -7231,18 +5942,6 @@ def register(ctx):
         assert!(log.contains("pre_api_request"));
         assert!(log.contains("post_api_request"));
         assert!(log.contains("api-hook-session"));
-    }
-
-    #[test]
-    fn streamed_tool_capability_error_detection_is_specific() {
-        assert!(is_streamed_tool_capability_error(
-            &edgequake_llm::LlmError::InvalidRequest(
-                "Tool calling is not supported in streaming mode".into(),
-            )
-        ));
-        assert!(!is_streamed_tool_capability_error(
-            &edgequake_llm::LlmError::InvalidRequest("temperature must be <= 2".into())
-        ));
     }
 
     #[test]
@@ -7265,7 +5964,7 @@ def register(ctx):
     }
 
     #[test]
-    fn native_streaming_policy_disables_copilot_and_local_for_tool_turns() {
+    fn native_streaming_policy_enables_copilot_tool_streaming() {
         let copilot_provider: Arc<dyn LLMProvider> = Arc::new(RetryCountingProvider {
             provider_name: "vscode-copilot",
             attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -7293,8 +5992,8 @@ def register(ctx):
         )];
 
         assert!(
-            !should_use_native_streaming(copilot_provider.as_ref(), &tool_defs, true, true),
-            "Copilot tool turns should use the safer non-native path"
+            should_use_native_streaming(copilot_provider.as_ref(), &tool_defs, true, true),
+            "Copilot tool turns should stream via edgequake-llm SSE"
         );
         assert!(
             !should_use_native_streaming(lmstudio_provider.as_ref(), &tool_defs, true, true),
@@ -7835,28 +6534,6 @@ def register(ctx):
         };
         let cc = stable_cache_control(Some(&cfg)).expect("cache marker");
         assert_eq!(cc.ttl.as_deref(), Some("1h"));
-    }
-
-    #[test]
-    fn estimate_request_prompt_tokens_includes_fixed_prompt_mass() {
-        let messages = vec![Message::user("hi")];
-        let tool_defs = vec![edgequake_llm::ToolDefinition::function(
-            "terminal",
-            "Run shell commands.",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string"}
-                }
-            }),
-        )];
-
-        let bare = estimate_request_prompt_tokens(None, &messages, &[]);
-        let inflated = estimate_request_prompt_tokens(Some("system prompt"), &messages, &tool_defs);
-        assert!(
-            inflated > bare,
-            "system prompt + tool schemas must increase request pressure"
-        );
     }
 
     #[test]
@@ -8787,109 +7464,6 @@ def register(ctx):
     }
 
     #[test]
-    fn consecutive_failure_tracker_escalates_after_threshold() {
-        let mut tracker = ConsecutiveFailureTracker::new(3);
-        assert!(!tracker.record_failure("error 1"));
-        assert!(!tracker.record_failure("error 2"));
-        assert!(
-            tracker.record_failure("error 3"),
-            "should escalate after 3 failures"
-        );
-        let msg = tracker.escalation_message();
-        assert!(
-            msg.contains("3 consecutive tool calls"),
-            "message should mention count"
-        );
-        assert!(
-            msg.contains("error 3"),
-            "message should include recent errors"
-        );
-    }
-
-    #[test]
-    fn consecutive_failure_tracker_resets_on_success() {
-        let mut tracker = ConsecutiveFailureTracker::new(3);
-        tracker.record_failure("error 1");
-        tracker.record_failure("error 2");
-        tracker.record_success();
-        assert_eq!(tracker.count, 0);
-        assert!(tracker.last_errors.is_empty());
-        // After reset, need 3 more failures to escalate again
-        assert!(!tracker.record_failure("error a"));
-        assert!(!tracker.record_failure("error b"));
-        assert!(tracker.record_failure("error c"));
-    }
-
-    // ── Duplicate Tool Call Detector tests (FP11) ─────────────────
-
-    #[test]
-    fn dedup_tracker_detects_same_call_across_turns() {
-        let mut tracker = DuplicateToolCallDetector::new();
-        // Turn 1: record a call
-        tracker.record(
-            "read_file",
-            r#"{"path":"src/main.rs"}"#,
-            "file contents here",
-        );
-        tracker.end_turn();
-        // Turn 2: same call should be detected as duplicate
-        let cached = tracker.check_duplicate("read_file", r#"{"path":"src/main.rs"}"#);
-        assert!(cached.is_some(), "should detect duplicate tool call");
-        assert_eq!(
-            cached.expect("cached duplicate result should be present"),
-            "file contents here"
-        );
-    }
-
-    #[test]
-    fn dedup_tracker_allows_different_args() {
-        let mut tracker = DuplicateToolCallDetector::new();
-        tracker.record("read_file", r#"{"path":"src/main.rs"}"#, "main contents");
-        tracker.end_turn();
-        // Different args — should NOT be detected as duplicate
-        let cached = tracker.check_duplicate("read_file", r#"{"path":"src/lib.rs"}"#);
-        assert!(cached.is_none(), "different args should not be duplicate");
-    }
-
-    #[test]
-    fn dedup_tracker_allows_different_tools() {
-        let mut tracker = DuplicateToolCallDetector::new();
-        tracker.record("read_file", r#"{"path":"src/main.rs"}"#, "contents");
-        tracker.end_turn();
-        // Different tool — should NOT be detected
-        let cached = tracker.check_duplicate("write_file", r#"{"path":"src/main.rs"}"#);
-        assert!(cached.is_none(), "different tool should not be duplicate");
-    }
-
-    #[test]
-    fn dedup_tracker_does_not_detect_within_same_turn() {
-        let mut tracker = DuplicateToolCallDetector::new();
-        tracker.record("read_file", r#"{"path":"foo"}"#, "result");
-        // Same turn — prev_turn is empty, so no duplicate
-        let cached = tracker.check_duplicate("read_file", r#"{"path":"foo"}"#);
-        assert!(
-            cached.is_none(),
-            "should not detect duplicate within same turn"
-        );
-    }
-
-    #[test]
-    fn dedup_tracker_clears_after_two_turns() {
-        let mut tracker = DuplicateToolCallDetector::new();
-        tracker.record("read_file", r#"{"path":"foo"}"#, "result1");
-        tracker.end_turn();
-        // Turn 2: record something different
-        tracker.record("write_file", r#"{"path":"bar"}"#, "result2");
-        tracker.end_turn();
-        // Turn 3: the original read_file("foo") is no longer in prev_turn
-        let cached = tracker.check_duplicate("read_file", r#"{"path":"foo"}"#);
-        assert!(
-            cached.is_none(),
-            "old calls should be evicted after 2 turns"
-        );
-    }
-
-    #[test]
     fn suppressed_retry_includes_original_error_and_hints() {
         use edgecrab_types::ToolErrorResponse;
 
@@ -8940,60 +7514,6 @@ def register(ctx):
         )
         .expect("missing path should generate a semantic suppression key");
         assert_eq!(key, "invalid_args:write_file:missing:path");
-    }
-
-    // ── FP19: parse_retry_after tests ──────────────────────────────────────
-
-    #[test]
-    fn parse_retry_after_try_again_in_pattern() {
-        // OpenAI "try again in X.Ys" format
-        let msg = "rate_limit_exceeded: You are sending requests too quickly. Try again in 1.197s.";
-        let dur = parse_retry_after(msg).expect("should parse retry-after");
-        // 1.197s + 200ms margin = 1397ms
-        assert!(dur.as_millis() >= 1397, "should include safety margin");
-        assert!(dur.as_millis() < 2000, "should not be wildly over");
-    }
-
-    #[test]
-    fn parse_retry_after_retry_after_pattern() {
-        let msg = "Too Many Requests. Retry after 3s.";
-        let dur = parse_retry_after(msg).expect("should parse retry-after");
-        assert!(dur.as_millis() >= 3200, "3s + 200ms margin");
-        assert!(dur.as_millis() < 4000);
-    }
-
-    #[test]
-    fn parse_retry_after_please_wait_pattern() {
-        let msg = "Please wait 2 seconds before retrying.";
-        let dur = parse_retry_after(msg).expect("should parse retry-after");
-        assert!(dur.as_millis() >= 2200);
-    }
-
-    #[test]
-    fn parse_retry_after_returns_none_for_no_hint() {
-        let msg = "Internal Server Error: upstream timeout";
-        assert!(
-            parse_retry_after(msg).is_none(),
-            "no retry hint should return None"
-        );
-    }
-
-    #[test]
-    fn parse_retry_after_rejects_zero_wait() {
-        let msg = "Try again in 0s.";
-        assert!(
-            parse_retry_after(msg).is_none(),
-            "zero wait is not a valid retry hint"
-        );
-    }
-
-    #[test]
-    fn parse_retry_after_rejects_unreasonably_large_wait() {
-        let msg = "Try again in 999s.";
-        assert!(
-            parse_retry_after(msg).is_none(),
-            "wait > 300s should be rejected as implausible"
-        );
     }
 
     // ─── FP54: tool name normalization (see edgecrab-tools::tool_name_repair) ─

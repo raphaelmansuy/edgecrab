@@ -2560,7 +2560,6 @@ mod tests {
         let builder = PromptBuilder::new(Platform::Cli);
         let mem = vec!["USER.md content here".into()];
         let prompt = builder.build(None, None, &mem, None);
-        assert!(prompt.contains("persistent memory"));
         assert!(prompt.contains("USER.md content here"));
     }
 
@@ -2569,9 +2568,8 @@ mod tests {
         let builder =
             PromptBuilder::new(Platform::Cli).available_tools(vec!["report_task_status".into()]);
         let prompt = builder.build(None, None, &[], None);
-        assert!(prompt.contains("## Progress communication"));
-        assert!(prompt.contains("Communicate advancement after meaningful milestones"));
-        assert!(prompt.contains("Do not stop at a plan"));
+        assert!(prompt.contains("report_task_status after milestones"));
+        assert!(prompt.contains("Calling it does not end the run"));
     }
 
     #[test]
@@ -3265,10 +3263,6 @@ Run `${CLAUDE_SKILL_DIR}/scripts/helper.py --session ${CLAUDE_SESSION_ID}`.\n",
             prompt.contains("Do not claim you cannot send messages when send_message is available"),
             "message delivery guidance must explicitly block false inability claims"
         );
-        assert!(
-            prompt.contains("redundant confirmation"),
-            "message delivery guidance must discourage unnecessary send confirmations"
-        );
     }
 
     #[test]
@@ -3350,8 +3344,8 @@ Run `${CLAUDE_SKILL_DIR}/scripts/helper.py --session ${CLAUDE_SESSION_ID}`.\n",
             ]);
         let prompt = builder.build(None, None, &[], None);
         assert!(
-            prompt.contains("NEVER call browser_vision"),
-            "vision guidance must include unambiguous rule against browser_vision for local files"
+            prompt.contains("vision_analyze once, then reply"),
+            "vision guidance must direct local files to vision_analyze"
         );
         assert!(
             prompt.contains("vision_analyze"),
@@ -3372,7 +3366,7 @@ Run `${CLAUDE_SKILL_DIR}/scripts/helper.py --session ${CLAUDE_SESSION_ID}`.\n",
             .available_tools(vec!["read_file".to_string(), "write_file".to_string()]);
         let prompt = builder.build(None, None, &[], None);
         assert!(
-            !prompt.contains("NEVER call browser_vision"),
+            !prompt.contains("## Image Analysis"),
             "vision guidance must NOT appear when vision_analyze is not in tool list"
         );
     }
@@ -3392,8 +3386,8 @@ Run `${CLAUDE_SKILL_DIR}/scripts/helper.py --session ${CLAUDE_SESSION_ID}`.\n",
             "LSP guidance must be injected when LSP tools are available"
         );
         assert!(
-            prompt.contains("exceeds the common 9-operation baseline"),
-            "LSP guidance should make the richer EdgeCrab surface explicit to the model"
+            prompt.contains("Prefer LSP tools for semantic code work"),
+            "LSP guidance should steer the model toward semantic navigation"
         );
     }
 
@@ -3657,15 +3651,15 @@ Run `${CLAUDE_SKILL_DIR}/scripts/helper.py --session ${CLAUDE_SESSION_ID}`.\n",
             .available_tools(vec!["read_file".to_string(), "write_file".to_string()]);
         let prompt = builder.build(None, None, &[], None);
         assert!(
-            prompt.contains("File Output \u{2014} Mandatory Rules"),
+            prompt.contains("## File Output"),
             "file-output enforcement must be injected when write_file is in the tool list"
         );
         assert!(
-            prompt.contains("CALL write_file with that exact path"),
+            prompt.contains("call write_file with that path"),
             "enforcement must include an unambiguous call-to-action"
         );
         assert!(
-            prompt.contains("task is NOT complete until write_file has been called"),
+            prompt.contains("Response text is not delivery"),
             "enforcement must define completion criteria"
         );
     }
@@ -3677,7 +3671,7 @@ Run `${CLAUDE_SKILL_DIR}/scripts/helper.py --session ${CLAUDE_SESSION_ID}`.\n",
             .available_tools(vec!["read_file".to_string(), "search_files".to_string()]);
         let prompt = builder.build(None, None, &[], None);
         assert!(
-            !prompt.contains("File Output \u{2014} Mandatory Rules"),
+            !prompt.contains("## File Output"),
             "file-output enforcement must NOT appear when write_file is not available"
         );
     }
@@ -3695,11 +3689,11 @@ Run `${CLAUDE_SKILL_DIR}/scripts/helper.py --session ${CLAUDE_SESSION_ID}`.\n",
             ]);
         let prompt = builder.build(None, None, &[], None);
         assert!(
-            prompt.contains("Research-to-File Tasks"),
+            prompt.contains("Research-to-File"),
             "research task guidance must appear when write_file + web_search are present"
         );
         assert!(
-            prompt.contains("Build the full document content"),
+            prompt.contains("compose → write_file"),
             "guidance must direct model to compose before writing"
         );
     }
@@ -3711,7 +3705,7 @@ Run `${CLAUDE_SKILL_DIR}/scripts/helper.py --session ${CLAUDE_SESSION_ID}`.\n",
             .available_tools(vec!["write_file".to_string(), "fetch_url".to_string()]);
         let prompt = builder.build(None, None, &[], None);
         assert!(
-            prompt.contains("Research-to-File Tasks"),
+            prompt.contains("Research-to-File"),
             "research task guidance must appear when write_file + fetch_url are present"
         );
     }
@@ -3723,7 +3717,7 @@ Run `${CLAUDE_SKILL_DIR}/scripts/helper.py --session ${CLAUDE_SESSION_ID}`.\n",
             .available_tools(vec!["write_file".to_string(), "read_file".to_string()]);
         let prompt = builder.build(None, None, &[], None);
         assert!(
-            !prompt.contains("Research-to-File Tasks"),
+            !prompt.contains("Research-to-File"),
             "research task guidance must NOT appear when no web/search tools are present"
         );
     }
@@ -3735,7 +3729,7 @@ Run `${CLAUDE_SKILL_DIR}/scripts/helper.py --session ${CLAUDE_SESSION_ID}`.\n",
             .available_tools(vec!["web_search".to_string(), "read_file".to_string()]);
         let prompt = builder.build(None, None, &[], None);
         assert!(
-            !prompt.contains("Research-to-File Tasks"),
+            !prompt.contains("Research-to-File"),
             "research task guidance must NOT appear when write_file is not available"
         );
     }
@@ -4061,7 +4055,7 @@ timestamp (offset {ts_pos}) so it can be Anthropic-cache-eligible"
         // Both must contain the same key markers; ordering may differ between
         // the two code paths but all content must be present.
         for marker in &[
-            "persistent memory across sessions",
+            "memory_write for durable facts",
             "Conversation started:",
             "combined-test-session",
             "some note",

@@ -577,6 +577,12 @@ fn coerce_value_for_schema(value: &mut serde_json::Value, prop_schema: &serde_js
         return;
     };
 
+    if expected_type == "array" && value.is_string() {
+        let v = value.take();
+        *value = serde_json::Value::Array(vec![v]);
+        return;
+    }
+
     if let Some(s) = value.as_str()
         && let Some(coerced) = coerce_string_value(s, expected_type, prop_schema)
     {

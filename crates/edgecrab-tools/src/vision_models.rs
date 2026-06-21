@@ -36,6 +36,7 @@ pub fn normalize_provider_name(provider: &str) -> String {
 pub fn normalize_model_name(provider: &str, model: &str) -> String {
     let trimmed = model.trim();
     match normalize_provider_name(provider).as_str() {
+        "vscode-copilot" => crate::copilot_model_normalize::normalize_copilot_model_id(trimmed),
         "vertexai" => trimmed
             .strip_prefix("vertexai:")
             .unwrap_or(trimmed)

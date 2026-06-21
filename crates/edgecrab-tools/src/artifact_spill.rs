@@ -3,6 +3,10 @@
 //! Large tool outputs are written under `cwd/.edgecrab-artifacts/<session_id>/`
 //! with a compact preview stub returned to the model.
 
+use crate::budget_config::{exempt_from_turn_budget_spill, is_artifact_spill_path};
+
+use edgecrab_types::{Message, Role};
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -16,6 +20,24 @@ pub const WEB_EXTRACT_INLINE_BYTES: usize = 4_096;
 
 /// Proactive inline cap for `web_search` JSON payload.
 pub const WEB_SEARCH_INLINE_BYTES: usize = 8_192;
+
+/// Optional context from the originating tool call (improves spill stub actionability).
+#[derive(Debug, Clone, Default)]
+pub struct SpillContext {
+    pub source_path: Option<String>,
+}
+
+/// Extract spill context from tool arguments when available.
+pub fn spill_context_from_args(tool_name: &str, args: &serde_json::Value) -> SpillContext {
+    let source_path = match tool_name {
+        "read_file" | "search_files" | "write_file" | "patch" => args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        _ => None,
+    };
+    SpillContext { source_path }
+}
 
 /// Configuration for tool result spilling.
 #[derive(Debug, Clone)]
@@ -129,6 +151,7 @@ pub fn web_search_inline_threshold(config: &SpillConfig) -> usize {
 }
 
 /// Attempt to spill a tool result to an artifact file (conversation post-dispatch).
+#[allow(clippy::too_many_arguments)]
 pub fn maybe_spill(
     tool_name: &str,
     _tool_call_id: &str,
@@ -137,12 +160,26 @@ pub fn maybe_spill(
     cwd: &Path,
     config: &SpillConfig,
     seq: &SpillSequence,
+    spill_ctx: Option<&SpillContext>,
 ) -> SpillOutcome {
     if !config.enabled {
         return SpillOutcome::Inline(result);
     }
 
-    if result.len() <= config.threshold {
+    if result.contains("[tool_result_spill]") {
+        return SpillOutcome::Inline(result);
+    }
+
+    if tool_name == "read_file"
+        && spill_ctx
+            .and_then(|c| c.source_path.as_deref())
+            .is_some_and(is_artifact_spill_path)
+    {
+        return SpillOutcome::Inline(result);
+    }
+
+    let threshold = crate::budget_config::resolve_proactive_spill_threshold(tool_name, config);
+    if result.len() <= threshold {
         return SpillOutcome::Inline(result);
     }
 
@@ -160,6 +197,8 @@ pub fn maybe_spill(
                 written.total_lines,
                 &written.preview,
                 written.preview_line_count,
+                spill_ctx,
+                config,
             );
             tracing::info!(
                 tool = %tool_name,
@@ -274,6 +313,9 @@ pub fn enforce_turn_budget(
             break;
         }
         let tool_name = messages[idx].name.as_deref().unwrap_or("tool");
+        if exempt_from_turn_budget_spill(tool_name) {
+            continue;
+        }
         let tool_call_id = messages[idx].tool_call_id.as_deref().unwrap_or("budget");
         let body = messages[idx].text_content();
         match maybe_spill(
@@ -284,6 +326,7 @@ pub fn enforce_turn_budget(
             cwd,
             spill_config,
             seq,
+            None,
         ) {
             SpillOutcome::Spilled { stub, .. } => {
                 total = total.saturating_sub(size).saturating_add(stub.len());
@@ -407,6 +450,7 @@ pub fn apply_web_extract_content_spill(
     doc
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_conversation_stub(
     tool_name: &str,
     _full_result: &str,
@@ -415,6 +459,8 @@ fn build_conversation_stub(
     original_lines: usize,
     preview: &str,
     preview_line_count: usize,
+    spill_ctx: Option<&SpillContext>,
+    config: &SpillConfig,
 ) -> String {
     let pct = if original_lines > 0 {
         (preview_line_count as f64 / original_lines as f64 * 100.0).round() as usize
@@ -422,21 +468,40 @@ fn build_conversation_stub(
         100
     };
 
+    let source_path = spill_ctx
+        .and_then(|c| c.source_path.as_deref())
+        .unwrap_or("");
+    let source_line = if source_path.is_empty() {
+        String::new()
+    } else {
+        format!("source_path: {source_path}\n")
+    };
+
+    let next_offset = preview_line_count;
+    let next_limit = config.preview_lines.max(1);
+    let artifact_display = rel_path.display();
+    let next_read = format!(
+        "next: read_file(path: \"{artifact}\", offset: {next_offset}, limit: {next_limit})",
+        artifact = artifact_display
+    );
+
     format!(
         "[tool_result_spill]\n\
          tool: {tool_name}\n\
+         {source_line}\
          lines: {original_lines}\n\
          bytes: {original_bytes}\n\
          artifact: {rel}\n\
          showing: {preview_line_count}/{original_lines} lines (first {pct}%)\n\
+         {next_read}\n\
          \n\
          --- BEGIN PREVIEW ({preview_line_count} lines) ---\n\
          {preview}\n\
          --- END PREVIEW ---\n\
          \n\
          Full result saved to: {rel}\n\
-         Use read_file or file_search to explore the full content.",
-        rel = rel_path.display(),
+         Use read_file with offset/limit on the artifact path to continue.",
+        rel = artifact_display,
     )
 }
 
@@ -559,6 +624,25 @@ fn ensure_gitignore(cwd: &Path) {
     }
 }
 
+/// True when a `[tool_result_spill]` stub was never followed by `read_file` (HA-23).
+pub fn detect_spill_without_read(messages: &[Message]) -> bool {
+    let mut pending_spill = false;
+    for msg in messages {
+        if msg.role != Role::Tool {
+            continue;
+        }
+        let content = msg.text_content();
+        if content.contains("[tool_result_spill]") {
+            pending_spill = true;
+            continue;
+        }
+        if pending_spill && msg.name.as_deref() == Some("read_file") {
+            pending_spill = false;
+        }
+    }
+    pending_spill
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -570,6 +654,28 @@ mod tests {
             threshold,
             preview_lines,
         }
+    }
+
+    #[test]
+    fn ha23_detect_spill_without_read() {
+        let messages = vec![
+            edgecrab_types::Message::tool_result(
+                "t1",
+                "read_file",
+                "[tool_result_spill]\nartifact: .edgecrab-artifacts/s/x.txt",
+            ),
+            edgecrab_types::Message::tool_result("t2", "write_file", "ok"),
+        ];
+        assert!(detect_spill_without_read(&messages));
+        let cleared = vec![
+            edgecrab_types::Message::tool_result(
+                "t1",
+                "read_file",
+                "[tool_result_spill]\nartifact: .edgecrab-artifacts/s/x.txt",
+            ),
+            edgecrab_types::Message::tool_result("t2", "read_file", "content"),
+        ];
+        assert!(!detect_spill_without_read(&cleared));
     }
 
     #[test]
@@ -587,6 +693,7 @@ mod tests {
             tmp.path(),
             &config,
             &seq,
+            None,
         ) {
             SpillOutcome::Inline(s) => assert_eq!(s, result),
             SpillOutcome::Spilled { .. } => panic!("should not spill when disabled"),
@@ -609,6 +716,7 @@ mod tests {
             tmp.path(),
             &config,
             &seq,
+            None,
         ) {
             SpillOutcome::Spilled {
                 stub,
@@ -683,6 +791,7 @@ mod tests {
             tmp.path(),
             &config,
             &seq,
+            None,
         ) {
             SpillOutcome::Inline(s) => assert_eq!(s, result),
             SpillOutcome::Spilled { .. } => panic!("computer_use must not spill"),
@@ -734,5 +843,69 @@ mod tests {
         assert!(stub["artifact"].as_str().is_some());
         assert_eq!(stub["result_count"], 20);
         assert!(stub.to_string().len() < json_str.len() / 2);
+    }
+
+    #[test]
+    fn ha24_read_file_skipped_in_turn_budget_enforcement() {
+        use edgecrab_types::{Message, Role};
+
+        let tmp = TempDir::new().expect("tempdir");
+        let seq = SpillSequence::new();
+        let config = test_config(true, 100, 5);
+        let big = "x".repeat(500);
+        let mut messages = vec![
+            Message {
+                role: Role::Tool,
+                content: Some(edgecrab_types::Content::Text(big.clone())),
+                tool_calls: None,
+                tool_call_id: Some("tc1".into()),
+                name: Some("read_file".into()),
+                reasoning: None,
+                finish_reason: None,
+            },
+            Message {
+                role: Role::Tool,
+                content: Some(edgecrab_types::Content::Text(big)),
+                tool_calls: None,
+                tool_call_id: Some("tc2".into()),
+                name: Some("terminal".into()),
+                reasoning: None,
+                finish_reason: None,
+            },
+        ];
+        let spilled = enforce_turn_budget(&mut messages, 200, &config, "ses", tmp.path(), &seq);
+        assert_eq!(spilled, 1);
+        assert!(messages[0].text_content().contains('x'));
+        assert!(messages[1].text_content().contains("[tool_result_spill]"));
+    }
+
+    #[test]
+    fn spill_stub_actionable_includes_source_path_and_next_read() {
+        let tmp = TempDir::new().expect("tempdir");
+        let seq = SpillSequence::new();
+        let config = test_config(true, 100, 80);
+        let lines: Vec<String> = (1..=120).map(|i| format!("line {i}")).collect();
+        let result = lines.join("\n");
+        let ctx = SpillContext {
+            source_path: Some("demo/games003/index.html".into()),
+        };
+
+        match maybe_spill(
+            "read_file",
+            "tc1",
+            result,
+            "ses1",
+            tmp.path(),
+            &config,
+            &seq,
+            Some(&ctx),
+        ) {
+            SpillOutcome::Spilled { stub, .. } => {
+                assert!(stub.contains("source_path: demo/games003/index.html"));
+                assert!(stub.contains("next: read_file"));
+                assert!(stub.contains("offset: 80"));
+            }
+            SpillOutcome::Inline(_) => panic!("expected spill"),
+        }
     }
 }

@@ -214,7 +214,14 @@ impl ToolHandler for SearchFilesTool {
                 "[search_result returned={returned_matches} total={total_matches} has_more=false]"
             )
         };
-        let output = format!("{summary}\n{raw_text}");
+        let output = if total_matches == 0 {
+            match zero_hit_discovery_hint(&args) {
+                Some(hint) => format!("{summary}\n{raw_text}\n{hint}"),
+                None => format!("{summary}\n{raw_text}"),
+            }
+        } else {
+            format!("{summary}\n{raw_text}")
+        };
 
         // Consecutive re-search loop detection — mirrors hermes-agent file_tools.py.
         // Warn at 3 identical consecutive searches; hard-block at 4.
@@ -470,6 +477,19 @@ fn format_content_results(
     }
 }
 
+fn zero_hit_discovery_hint(args: &Args) -> Option<String> {
+    let display_dir = args
+        .path
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .unwrap_or(".");
+    Some(format!(
+        "discovery_hint: no matches under '{display_dir}'. Try search_files(pattern: \"*\", \
+         target: \"files\", path: \"{display_dir}\") to list files, or read_file on a known path."
+    ))
+}
+
 /// Simple glob matching for file name patterns like "*.rs", "*.py"
 fn simple_glob_match(pattern: &str, name: &str) -> bool {
     if let Some(ext) = pattern.strip_prefix("*.") {
@@ -619,6 +639,22 @@ mod tests {
             result.contains("has_more=false"),
             "single-page result must report has_more=false; got: {result}"
         );
+    }
+
+    #[tokio::test]
+    async fn ha22_zero_hit_suggests_file_discovery() {
+        let dir = TempDir::new().expect("tmpdir");
+        std::fs::create_dir_all(dir.path().join("demo/games003")).expect("dir");
+        std::fs::write(dir.path().join("demo/games003/index.html"), "<html></html>").expect("w");
+
+        let ctx = ctx_in(dir.path());
+        let result = SearchFilesTool
+            .execute(json!({"pattern": "zzzzz", "path": "demo/games003"}), &ctx)
+            .await
+            .expect("search");
+
+        assert!(result.contains("discovery_hint"));
+        assert!(result.contains("target: \"files\""));
     }
 
     #[tokio::test]

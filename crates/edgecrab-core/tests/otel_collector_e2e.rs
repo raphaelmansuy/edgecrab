@@ -10,11 +10,11 @@
 use std::time::Duration;
 
 use edgecrab_core::{
-    apply_runtime_from_config, collector_reachable, maybe_otel_layer,
+    ObservabilityConfig, apply_runtime_from_config, collector_reachable, maybe_otel_layer,
     observability::{
-        agent_conversation_span, record_llm_operation, record_tool_operation, LlmCorrelation,
+        LlmCorrelation, agent_conversation_span, record_llm_operation, record_tool_operation,
     },
-    otel_export_enabled, otel_metrics_enabled, otel_traces_enabled, ObservabilityConfig,
+    otel_export_enabled, otel_metrics_enabled, otel_traces_enabled,
 };
 use edgecrab_types::Platform;
 use tracing::Instrument;
@@ -39,16 +39,16 @@ async fn setup_otel_subscriber() -> edgecrab_core::OtelGuard {
 
     let (otel_layer, guard) = maybe_otel_layer();
     let otel_layer = otel_layer.expect("OTLP layer should initialize under Tokio test runtime");
-    let _ = tracing_subscriber::registry()
-        .with(otel_layer)
-        .try_init();
+    let _ = tracing_subscriber::registry().with(otel_layer).try_init();
     guard
 }
 
 #[tokio::test]
 async fn otel_collector_auto_skips_when_unreachable() {
     if collector_reachable(COLLECTOR_ENDPOINT).await {
-        eprintln!("collector reachable — run `cargo test -p edgecrab-core --test otel_collector_e2e -- --ignored` for full smoke test");
+        eprintln!(
+            "collector reachable — run `cargo test -p edgecrab-core --test otel_collector_e2e -- --ignored` for full smoke test"
+        );
         return;
     }
     record_tool_operation("read_file", 12, false);

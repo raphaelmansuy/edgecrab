@@ -7,10 +7,56 @@
 //! - Redirect-based SSRF (302 → private IP)
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use edgecrab_types::AgentError;
 use url::Host;
+
+/// Loopback preview policy for local dev servers (`security.preview` in config).
+#[derive(Debug, Clone, Default)]
+pub struct PreviewPolicy {
+    pub enabled: bool,
+    pub allowed_ports: Vec<u16>,
+    /// When true, any loopback HTTP(S) port is allowed (homelab / visual-UX dogfood).
+    pub allow_any_loopback_port: bool,
+}
+
+static PREVIEW_POLICY: OnceLock<Mutex<PreviewPolicy>> = OnceLock::new();
+
+fn preview_policy_cell() -> &'static Mutex<PreviewPolicy> {
+    PREVIEW_POLICY.get_or_init(|| Mutex::new(PreviewPolicy::default()))
+}
+
+/// Install preview SSRF allowlist (startup from config; tests may update).
+pub fn set_preview_policy(policy: PreviewPolicy) {
+    *preview_policy_cell().lock().expect("preview policy lock") = policy;
+}
+
+/// Current preview policy snapshot (for tests and diagnostics).
+#[doc(hidden)]
+pub fn current_preview_policy() -> PreviewPolicy {
+    preview_policy_cell()
+        .lock()
+        .expect("preview policy lock")
+        .clone()
+}
+
+static PREVIEW_TEST_SERIAL: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+
+/// Serialize tests that mutate or assert on the global preview policy.
+#[doc(hidden)]
+pub fn preview_policy_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    PREVIEW_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("preview test serial lock")
+}
+
+fn active_preview_policy() -> Option<PreviewPolicy> {
+    let guard = preview_policy_cell().lock().expect("preview policy lock");
+    guard.enabled.then(|| guard.clone())
+}
 
 /// Check if a URL is safe to fetch.
 pub fn is_safe_url(raw_url: &str) -> Result<bool, AgentError> {
@@ -36,7 +82,7 @@ pub fn is_safe_url(raw_url: &str) -> Result<bool, AgentError> {
     match host {
         Host::Ipv4(v4) => {
             if is_private_ipv4(&v4) {
-                if allow_loopback_in_e2e(&host) {
+                if allow_loopback_in_e2e(&host) || allow_preview_loopback(&parsed) {
                     return Ok(true);
                 }
                 tracing::warn!(%v4, "Blocked private/reserved IPv4");
@@ -45,7 +91,7 @@ pub fn is_safe_url(raw_url: &str) -> Result<bool, AgentError> {
         }
         Host::Ipv6(v6) => {
             if is_private_ipv6(&v6) {
-                if allow_loopback_in_e2e(&host) {
+                if allow_loopback_in_e2e(&host) || allow_preview_loopback(&parsed) {
                     return Ok(true);
                 }
                 tracing::warn!(%v6, "Blocked private/reserved IPv6");
@@ -57,7 +103,7 @@ pub fn is_safe_url(raw_url: &str) -> Result<bool, AgentError> {
             const BLOCKED_HOSTS: &[&str] =
                 &["localhost", "metadata.google.internal", "169.254.169.254"];
             if BLOCKED_HOSTS.contains(&name) {
-                if allow_loopback_in_e2e(&host) {
+                if allow_loopback_in_e2e(&host) || allow_preview_loopback(&parsed) {
                     return Ok(true);
                 }
                 tracing::warn!(host = %name, "Blocked dangerous hostname");
@@ -68,7 +114,7 @@ pub fn is_safe_url(raw_url: &str) -> Result<bool, AgentError> {
             if let Ok(ip) = name.parse::<IpAddr>()
                 && is_private_or_reserved(&ip)
             {
-                if allow_loopback_in_e2e(&host) {
+                if allow_loopback_in_e2e(&host) || allow_preview_loopback(&parsed) {
                     return Ok(true);
                 }
                 tracing::warn!(%ip, "Blocked private/reserved IP (domain form)");
@@ -78,6 +124,43 @@ pub fn is_safe_url(raw_url: &str) -> Result<bool, AgentError> {
     }
 
     Ok(true)
+}
+
+fn is_loopback_preview_host(parsed: &url::Url) -> bool {
+    match parsed.host() {
+        Some(Host::Ipv4(v4)) => v4.is_loopback(),
+        Some(Host::Ipv6(v6)) => v6.is_loopback(),
+        Some(Host::Domain(name)) => {
+            name == "localhost"
+                || name
+                    .parse::<IpAddr>()
+                    .ok()
+                    .is_some_and(|ip| is_loopback_ip(&ip))
+        }
+        None => false,
+    }
+}
+
+fn allow_preview_loopback(parsed: &url::Url) -> bool {
+    let Some(policy) = active_preview_policy() else {
+        return false;
+    };
+    if !is_loopback_preview_host(parsed) {
+        return false;
+    }
+    let port = parsed.port_or_known_default().unwrap_or(80);
+    policy.allow_any_loopback_port || policy.allowed_ports.contains(&port)
+}
+
+/// True when `security.preview` allows this loopback HTTP(S) URL (for browser + SSRF).
+pub fn is_preview_loopback_url(raw_url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(raw_url) else {
+        return false;
+    };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return false;
+    }
+    allow_preview_loopback(&parsed)
 }
 
 /// Build a [`reqwest::Client`] that re-validates every redirect target against
@@ -228,8 +311,10 @@ mod tests {
     fn without_e2e_localhost<F: FnOnce()>(f: F) {
         let prev = std::env::var("EDGECRAB_E2E_SSRF_ALLOW_LOCALHOST").ok();
         unsafe { std::env::remove_var("EDGECRAB_E2E_SSRF_ALLOW_LOCALHOST") };
+        set_preview_policy(PreviewPolicy::default());
         f();
         unsafe { std::env::remove_var("EDGECRAB_E2E_SSRF_ALLOW_LOCALHOST") };
+        set_preview_policy(PreviewPolicy::default());
         if let Some(v) = prev {
             unsafe { std::env::set_var("EDGECRAB_E2E_SSRF_ALLOW_LOCALHOST", v) };
         }
@@ -352,5 +437,33 @@ mod tests {
         if let Some(v) = prev {
             unsafe { std::env::set_var("EDGECRAB_E2E_SSRF_ALLOW_LOCALHOST", v) };
         }
+    }
+
+    #[test]
+    fn ha05_preview_policy_allows_allowlisted_localhost_port() {
+        let _lock = url_safety_test_lock();
+        without_e2e_localhost(|| {
+            set_preview_policy(PreviewPolicy {
+                enabled: true,
+                allowed_ports: vec![5173],
+                allow_any_loopback_port: false,
+            });
+            assert!(is_safe_url("http://127.0.0.1:5173/").expect("ok"));
+            assert!(!is_safe_url("http://127.0.0.1:9999/").expect("ok"));
+        });
+    }
+
+    #[test]
+    fn ha07_preview_allow_any_loopback_port() {
+        let _lock = url_safety_test_lock();
+        without_e2e_localhost(|| {
+            set_preview_policy(PreviewPolicy {
+                enabled: true,
+                allowed_ports: vec![],
+                allow_any_loopback_port: true,
+            });
+            assert!(is_safe_url("http://127.0.0.1:7777/").expect("ok"));
+            assert!(is_preview_loopback_url("http://localhost:9999/"));
+        });
     }
 }

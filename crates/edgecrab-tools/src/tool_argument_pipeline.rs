@@ -21,7 +21,7 @@ static TRAILING_COMMA: LazyLock<Regex> =
 /// Deterministic passes only — no failure-count logic. When parsing still fails and
 /// `EDGECRAB_TOOL_ARGS_EMPTY_FALLBACK=1`, returns `"{}"` (Hermes last-resort survival).
 pub fn repair_tool_arguments(raw: &str) -> String {
-    repair_tool_arguments_inner(raw, empty_fallback_enabled())
+    repair_tool_arguments_inner(raw, empty_args_fallback_enabled())
 }
 
 fn repair_tool_arguments_inner(raw: &str, allow_empty_fallback: bool) -> String {
@@ -94,9 +94,28 @@ pub fn parse_tool_arguments_json(raw: &str) -> Result<serde_json::Value, ToolErr
     }
 }
 
-/// Canonical JSON string for fingerprints and suppression keys.
+/// Canonical JSON string for fingerprints and suppression keys (sorted object keys).
 pub fn canonical_tool_args_json(args: &serde_json::Value) -> String {
-    serde_json::to_string(args).unwrap_or_else(|_| "{}".to_string())
+    serde_json::to_string(&canonicalize_json_keys(args)).unwrap_or_else(|_| "{}".to_string())
+}
+
+fn canonicalize_json_keys(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut sorted = serde_json::Map::new();
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            for key in keys {
+                let entry = map.get(key).expect("key present");
+                sorted.insert(key.clone(), canonicalize_json_keys(entry));
+            }
+            serde_json::Value::Object(sorted)
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(canonicalize_json_keys).collect())
+        }
+        other => other.clone(),
+    }
 }
 
 /// Full pipeline: repair → parse → schema alias/coerce via registry.
@@ -252,7 +271,8 @@ fn escape_invalid_chars_in_json_strings(raw: &str) -> String {
     out
 }
 
-fn empty_fallback_enabled() -> bool {
+/// Whether empty/unrepairable streamed tool args normalize to `"{}"` (Hermes parity).
+pub fn empty_args_fallback_enabled() -> bool {
     match std::env::var("EDGECRAB_TOOL_ARGS_EMPTY_FALLBACK")
         .ok()
         .as_deref()

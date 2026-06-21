@@ -320,6 +320,7 @@ impl App {
             model_name: &self.model_name,
             context_window: self.context_window,
             total_tokens: self.total_tokens,
+            wire_tools: self.wire_tools,
             session_cost: self.session_cost,
             voice_presence: self.voice_presence_state(),
             voice_presence_frame_idx: self.voice_presence_frame_idx,

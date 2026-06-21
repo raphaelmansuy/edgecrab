@@ -27,7 +27,7 @@ pub fn is_deferred_not_on_wire(name: &str, materialized: &HashSet<String>) -> bo
 pub fn deferred_tool_error_response(tool_name: &str) -> String {
     format!(
         "Tool `{tool_name}` is enabled but not on your wire schema yet. \
-         Call `tool_search` with tool_names: [\"{tool_name}\"] first, then retry."
+         Call `tool_search` with tool_names: [\"{tool_name}\"] or query: \"<what you need>\" first, then retry."
     )
 }
 

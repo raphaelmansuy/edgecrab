@@ -3839,6 +3839,8 @@ pub struct App {
     /// This tracks the latest prompt sent to the model rather than cumulative
     /// session spend, so the indicator reflects current context pressure.
     total_tokens: u64,
+    /// Indexed tool schema: wire/deferred counts for status bar chip (HA-07).
+    wire_tools: Option<(usize, usize)>,
     session_cost: f64,
     /// Session cost at turn start — used for per-turn spawn diff deltas.
     turn_baseline_cost: f64,
@@ -4294,6 +4296,8 @@ enum AgentResponse {
         prompt_tokens_estimated: Option<u64>,
         context_length: Option<u64>,
         prefill_pct: Option<f32>,
+        api_iteration: Option<u32>,
+        native_streaming: bool,
     },
     /// Agent-reported count of steering events waiting for injection.
     SteerPending {
@@ -4959,6 +4963,7 @@ impl App {
             model_name: "none".into(),
             context_window: None,
             total_tokens: 0,
+            wire_tools: None,
             session_cost: 0.0,
             turn_baseline_cost: 0.0,
             agent: None,
@@ -10072,6 +10077,13 @@ impl App {
             self.model_name = snap.model;
             self.update_context_window();
 
+            let breakdown = self
+                .rt_handle
+                .block_on(async { agent.context_budget_breakdown().await });
+            self.wire_tools = breakdown
+                .tools_deferred_count
+                .map(|deferred| (breakdown.tool_count, deferred));
+
             let usage = edgecrab_core::CanonicalUsage {
                 input_tokens: snap.input_tokens,
                 output_tokens: snap.output_tokens,
@@ -10352,6 +10364,16 @@ impl App {
                     let _ = tx.send(AgentResponse::BgOp(BackgroundOpResult::ModelChangeDone {
                         outcome: edgecrab_core::ModelChangeOutcome::Fast(outcome),
                     }));
+                    if edgecrab_core::copilot_model_policy::is_copilot_model_spec(&target)
+                        && let Err(err) = agent.probe_copilot_agent_turn().await
+                    {
+                        let msg = if edgecrab_core::copilot_agent_probe::is_copilot_model_not_supported_error(&err) {
+                            format!("{err} {}", edgecrab_core::copilot_agent_probe::MODEL_NOT_SUPPORTED_HINT)
+                        } else {
+                            format!("Copilot agent probe failed after model switch: {err}")
+                        };
+                        let _ = tx.send(AgentResponse::BgOp(BackgroundOpResult::SystemMsg(msg)));
+                    }
                 }
                 Err(err) => {
                     let _ = tx.send(AgentResponse::BgOp(BackgroundOpResult::SystemMsg(

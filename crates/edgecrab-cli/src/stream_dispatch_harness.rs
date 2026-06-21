@@ -133,6 +133,8 @@ impl TurnStreamHarness {
                 prompt_tokens_estimated,
                 context_length,
                 prefill_pct,
+                api_iteration,
+                native_streaming,
             } => {
                 apply_llm_wait_progress(
                     &mut self.activity,
@@ -143,6 +145,8 @@ impl TurnStreamHarness {
                         prompt_tokens_estimated,
                         context_length,
                         prefill_pct,
+                        api_iteration,
+                        native_streaming,
                     },
                 );
             }
@@ -324,6 +328,25 @@ mod tests {
         );
         let preview = h.activity.generating_preview.as_deref().unwrap_or("");
         assert!(preview.contains("cargo test"));
+    }
+
+    #[test]
+    fn ha03_tool_exec_caches_path_for_done_resolution() {
+        let mut h = TurnStreamHarness::new();
+        let now = Instant::now();
+        let args = r#"{"path":"demo/games003/index.html","limit":120}"#;
+        h.apply(
+            StreamEvent::ToolExec {
+                tool_call_id: "tc-ha03".into(),
+                name: "read_file".into(),
+                args_json: args.into(),
+            },
+            now,
+        );
+        let resolved = h.activity.resolve_args_at_done("tc-ha03", "");
+        let preview = crate::tool_display::extract_tool_preview("read_file", &resolved);
+        assert!(preview.contains("games003"));
+        assert!(!preview.contains('?'));
     }
 
     #[test]

@@ -8,8 +8,8 @@ use edgequake_llm::{LLMProvider, MockProvider};
 #[test]
 fn create_provider_for_model_wraps_mock_with_tracing() {
     unsafe { std::env::remove_var("EDGECRAB_TRACE_LLM") };
-    let provider = create_provider_for_model("mock", "mock-model")
-        .expect("mock provider should construct");
+    let provider =
+        create_provider_for_model("mock", "mock-model").expect("mock provider should construct");
     assert_eq!(provider.name(), "mock");
     assert_ne!(
         std::any::type_name_of_val(provider.as_ref()),

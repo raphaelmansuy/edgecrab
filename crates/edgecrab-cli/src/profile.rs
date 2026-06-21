@@ -1277,7 +1277,7 @@ fn effective_home_for_existing(name: &str) -> Result<PathBuf> {
 fn read_profile_config(home: &Path) -> AppConfig {
     let config_path = home.join("config.yaml");
     if config_path.is_file() {
-        AppConfig::load_from(&config_path).unwrap_or_default()
+        AppConfig::load_from_with_global_inheritance(&config_path).unwrap_or_default()
     } else {
         AppConfig::default()
     }

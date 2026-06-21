@@ -17,11 +17,16 @@ pub mod context_budget;
 pub mod context_engine;
 pub mod context_references;
 pub mod conversation;
+pub mod copilot_agent_probe;
 pub mod copilot_model_policy;
+pub mod failover;
 pub mod file_manifest;
 pub mod gateway_home;
 pub mod goal_judge;
 pub mod goals;
+pub mod harness_advisory;
+pub mod harness_analyzer;
+pub mod harness_loop_policy;
 pub mod kanban_api;
 pub mod kanban_auth;
 pub mod kanban_decompose;
@@ -36,6 +41,7 @@ pub mod kanban_slash;
 pub mod kanban_task_patch;
 pub mod kanban_workers;
 pub mod local_provider_policy;
+pub mod logging;
 pub mod model_catalog;
 pub mod model_cost_guard;
 pub mod model_discovery;
@@ -43,50 +49,40 @@ pub mod model_router;
 pub mod model_transfer;
 pub mod multimodal_tool_content;
 pub mod oauth;
-pub mod logging;
 pub mod observability;
 pub mod otel_export;
 pub mod otel_metrics;
-pub mod stream_observability;
 pub mod pricing;
+pub mod progress_sink;
 pub mod prompt_builder;
 pub mod prompt_cache_policy;
+pub mod provider_call;
+pub mod provider_error_class;
 pub mod session_handoff;
 pub mod shadow_judge;
 pub mod state_snapshot;
 pub mod steering;
+pub mod stream_observability;
 pub mod sub_agent_runner;
 pub mod subagent_registry;
+pub mod task_class;
 pub mod tool_result_spill;
 pub mod tool_result_summary;
+pub mod turn_completion;
+pub mod turn_dispatch;
+pub mod turn_epilogue;
+pub mod turn_prologue;
 
 pub use agent::{
     Agent, AgentBuilder, AgentConfig, ApprovalChoice, ConversationResult, IsolatedAgentOptions,
     IterationBudget, SessionSnapshot, SessionState, StreamEvent,
-};
-pub use completion_assessor::{CompletionContext, CompletionPolicy, DefaultCompletionPolicy};
-pub use edgecrab_tools::{
-    HarnessBuildInput, HarnessSnapshot, build_harness_snapshot, terminal_mutation_tool_error,
-};
-pub use observability::{
-    OBSERVABILITY_FILTER_DIRECTIVES, TARGET_GENAI_SPANS, TARGET_HARNESS, TARGET_LOCAL_LLM,
-    TARGET_PROVIDER_LLM, apply_runtime_from_config, load_app_config_and_apply_observability,
-};
-pub use logging::{
-    HARNESS_JSON_LOG_NAME, LogFileInfo, LogLevelSetting, LoggingMode, LoggingGuards, StderrMode,
-    default_tail_lines, effective_log_level, format_log_size, format_relative_time, init_logging,
-    list_log_files, persist_log_level, read_last_lines, reload_runtime_log_level, tail_preview,
-};
-pub use otel_export::{
-    OtelGuard, collector_reachable, maybe_otel_layer, otel_export_enabled, otel_metrics_enabled,
-    otel_traces_enabled,
 };
 pub use compression::{PRUNED_TOOL_PLACEHOLDER, SUMMARY_PREFIX};
 pub use config::{
     AppConfig, CliOverrides, ForwardAdapterKind, ForwardUpstreamConfig, GoalJudgeConfig,
     GoalsConfig, ObservabilityConfig, ProxyConfig, ShelfDetailsConfig, SmartRoutingYaml,
     ToolProgressMode, edgecrab_home, ensure_edgecrab_home, gateway_image_cache_dir,
-    gateway_media_dir,
+    gateway_media_dir, install_edgecrab_home, merge_global_inherited,
 };
 pub use context_budget::{ContextBudgetBreakdown, estimate_context_budget};
 pub use context_engine::{
@@ -94,6 +90,9 @@ pub use context_engine::{
     load_context_engine,
 };
 pub use context_references::{ContextRef, ExpansionResult, expand_context_refs};
+pub use edgecrab_tools::{
+    HarnessBuildInput, HarnessSnapshot, build_harness_snapshot, terminal_mutation_tool_error,
+};
 pub use gateway_home::{
     HANDOFF_PLATFORM_HINT, handoff_platform_from_name, resolve_gateway_home_channel,
 };
@@ -103,6 +102,9 @@ pub use goals::{
     evaluate_goal_after_turn, goal_flash_from_decision, goal_store_for_db,
     is_goal_continuation_text, looks_like_slash_command, next_continuation_prompt,
     prompt_queue_has_real_user_message, render_goal_block, render_subgoals_list, status_line,
+};
+pub use harness_analyzer::{
+    HarnessLogReport, analyze_harness_file, analyze_harness_log, format_harness_report,
 };
 pub use kanban_auth::{
     check_kanban_token, default_kanban_token_path, ensure_kanban_api_token, load_kanban_api_token,
@@ -135,6 +137,11 @@ pub use kanban_profiles::{
 pub use kanban_reaper::{KanbanSpawnFn, spawn_kanban_reaper, spawn_kanban_watcher};
 pub use kanban_slash::{KanbanNotifyOrigin, handle_kanban_slash, handle_kanban_slash_gateway};
 pub use kanban_task_patch::{CONFLICT_PREFIX, TaskPatch, parse_conflict, patch_kanban_task};
+pub use logging::{
+    HARNESS_JSON_LOG_NAME, LogFileInfo, LogLevelSetting, LoggingGuards, LoggingMode, StderrMode,
+    default_tail_lines, effective_log_level, format_log_size, format_relative_time, init_logging,
+    list_log_files, persist_log_level, read_last_lines, reload_runtime_log_level, tail_preview,
+};
 pub use model_catalog::{
     CatalogData, ModelCatalog, ModelEntry, ModelTier, PricingPair, ProviderEntry, ResolvedModelSpec,
 };
@@ -160,6 +167,14 @@ pub use model_transfer::{
     format_model_transfer_result, format_model_transfer_user_message,
     generate_model_transfer_brief, maybe_compress_for_model_transfer,
     resolve_model_transfer_target, session_requires_model_transfer,
+};
+pub use observability::{
+    OBSERVABILITY_FILTER_DIRECTIVES, TARGET_GENAI_SPANS, TARGET_HARNESS, TARGET_LOCAL_LLM,
+    TARGET_PROVIDER_LLM, apply_runtime_from_config, load_app_config_and_apply_observability,
+};
+pub use otel_export::{
+    OtelGuard, collector_reachable, maybe_otel_layer, otel_export_enabled, otel_metrics_enabled,
+    otel_traces_enabled,
 };
 pub use pricing::{
     CanonicalUsage, CostResult, CostSource, CostStatus, PricingEntry, estimate_cost, get_pricing,

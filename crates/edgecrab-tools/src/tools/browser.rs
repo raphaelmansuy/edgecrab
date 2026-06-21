@@ -2163,9 +2163,31 @@ fn detect_bot_warning(title: &str) -> Option<String> {
 // browser_navigate
 // ═══════════════════════════════════════════════════════════════
 
+/// Ensure loopback dev URLs have an explicit `http://` scheme before SSRF/CDP checks.
+fn normalize_browser_nav_url(url: &str) -> String {
+    let t = url.trim();
+    if t.is_empty() {
+        return String::new();
+    }
+    if t.starts_with("http://") || t.starts_with("https://") {
+        return t.to_string();
+    }
+    let lower = t.to_ascii_lowercase();
+    if lower.starts_with("127.0.0.1")
+        || lower.starts_with("localhost")
+        || lower.starts_with("[::1]")
+        || lower.starts_with("0.0.0.0")
+    {
+        format!("http://{t}")
+    } else {
+        format!("https://{t}")
+    }
+}
+
 async fn navigate_session(
     session: &Arc<BrowserSession>,
     url: &str,
+    known_ports: &[u16],
 ) -> Result<(serde_json::Value, String, String), ToolError> {
     let nav_result = cdp_call(&session.ws_url, "Page.navigate", json!({ "url": url }), 30).await?;
 
@@ -2179,7 +2201,11 @@ async fn navigate_session(
         .await
         .unwrap_or_else(|_| "(untitled)".to_string());
 
-    if is_redirect_to_private_ip(&final_url) {
+    // Post-redirect SSRF guard: block public→private hops, but never block intentional
+    // loopback preview targets (pre-navigation already allowed them).
+    if is_redirect_to_private_ip(&final_url)
+        && !is_allowed_loopback_preview(&final_url, known_ports)
+    {
         let _ = cdp_call(
             &session.ws_url,
             "Page.navigate",
@@ -2200,10 +2226,11 @@ pub(crate) async fn render_page_text(
     url: &str,
     ctx: &ToolContext,
 ) -> Result<RenderedPage, ToolError> {
-    validate_browser_url(url)?;
+    let known_ports = browser_known_ports(ctx).await;
+    validate_browser_url(url, &known_ports)?;
 
     let session = get_session(ctx).await?;
-    let (_nav_result, final_url, title) = navigate_session(&session, url).await?;
+    let (_nav_result, final_url, title) = navigate_session(&session, url, &known_ports).await?;
 
     let rendered = cdp_evaluate(
         &session.ws_url,
@@ -2309,13 +2336,22 @@ impl ToolHandler for BrowserNavigateTool {
                 message: e.to_string(),
             })?;
 
+        let url = normalize_browser_nav_url(&args.url);
+        if url.is_empty() {
+            return Err(ToolError::InvalidArgs {
+                tool: "browser_navigate".into(),
+                message: "url must not be empty".into(),
+            });
+        }
+
         // Pre-navigation SSRF check
-        validate_browser_url(&args.url)?;
+        let known_ports = browser_known_ports(ctx).await;
+        validate_browser_url(&url, &known_ports)?;
 
         let session = get_session(ctx).await?;
-        browser_progress(ctx, "navigating", &args.url);
+        browser_progress(ctx, "navigating", &url);
 
-        let (nav_result, final_url, title) = navigate_session(&session, &args.url).await?;
+        let (nav_result, final_url, title) = navigate_session(&session, &url, &known_ports).await?;
         browser_progress(ctx, "loaded", &title);
 
         // Auto-start recording on first navigation if enabled.
@@ -4089,7 +4125,58 @@ fn escape_js_string(s: &str) -> String {
 /// Used for **pre-navigation** checks before Chrome opens any page. Blocks
 /// dangerous/internal schemes (`file://`, `javascript:`, `data:`, `chrome://`,
 /// `about:`) in addition to private-IP SSRF.
-fn validate_browser_url(url: &str) -> Result<(), ToolError> {
+async fn browser_known_ports(ctx: &ToolContext) -> Vec<u16> {
+    let process_ports = if let Some(pt) = ctx.process_table.as_ref() {
+        pt.list_running_http_server_ports().await
+    } else {
+        Vec::new()
+    };
+    crate::dev_server::merge_dev_server_ports(&ctx.session_id, &process_ports)
+}
+
+fn is_loopback_url_host(host: Option<url::Host<&str>>) -> bool {
+    let Some(host) = host else {
+        return false;
+    };
+    match host {
+        url::Host::Ipv4(v4) => v4.is_loopback(),
+        url::Host::Ipv6(v6) => v6.is_loopback(),
+        url::Host::Domain(name) => {
+            name == "localhost"
+                || name
+                    .parse::<std::net::IpAddr>()
+                    .ok()
+                    .is_some_and(|ip| match ip {
+                        std::net::IpAddr::V4(v) => v.is_loopback(),
+                        std::net::IpAddr::V6(v) => v.is_loopback(),
+                    })
+        }
+    }
+}
+
+/// Allow loopback preview to agent-started http.server ports even when the port
+/// is absent from `security.preview.allow_localhost_ports` in yaml.
+fn is_session_dev_server_loopback(url: &str, known_ports: &[u16]) -> bool {
+    if known_ports.is_empty() {
+        return false;
+    }
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return false;
+    }
+    let port = parsed.port_or_known_default().unwrap_or(80);
+    known_ports.contains(&port) && is_loopback_url_host(parsed.host())
+}
+
+/// Loopback preview allowed by yaml policy or session-started dev server.
+fn is_allowed_loopback_preview(url: &str, known_ports: &[u16]) -> bool {
+    is_session_dev_server_loopback(url, known_ports)
+        || edgecrab_security::url_safety::is_preview_loopback_url(url)
+}
+
+fn validate_browser_url(url: &str, known_ports: &[u16]) -> Result<(), ToolError> {
     let lower = url.to_lowercase();
     if lower.starts_with("file://")
         || lower.starts_with("javascript:")
@@ -4097,15 +4184,23 @@ fn validate_browser_url(url: &str) -> Result<(), ToolError> {
         || lower.starts_with("chrome://")
         || lower.starts_with("about:")
     {
-        return Err(ToolError::PermissionDenied(format!(
-            "URL scheme not allowed for browser navigation: {url}"
-        )));
+        return Err(crate::recovery_catalog::browser_navigate_blocked(
+            url,
+            "disallowed scheme (use http://127.0.0.1:PORT with security.preview)",
+            known_ports,
+        ));
+    }
+
+    if is_session_dev_server_loopback(url, known_ports)
+        || edgecrab_security::url_safety::is_preview_loopback_url(url)
+    {
+        return Ok(());
     }
 
     match edgecrab_security::url_validation::validate_outbound_url(url) {
         Ok(()) => Ok(()),
         Err(edgecrab_security::url_validation::UrlValidationError::SsrfBlocked(_)) => Err(
-            ToolError::PermissionDenied(format!("URL blocked by SSRF policy: {url}")),
+            crate::recovery_catalog::browser_navigate_blocked(url, "SSRF policy", known_ports),
         ),
         Err(edgecrab_security::url_validation::UrlValidationError::WebsitePolicyBlocked(msg)) => {
             Err(ToolError::PermissionDenied(msg))
@@ -4271,32 +4366,66 @@ mod tests {
 
     #[test]
     fn validate_url_blocks_file() {
-        assert!(validate_browser_url("file:///etc/passwd").is_err());
+        assert!(validate_browser_url("file:///etc/passwd", &[]).is_err());
+    }
+
+    #[test]
+    fn allowed_loopback_preview_exempts_intentional_localhost_nav() {
+        edgecrab_security::url_safety::set_preview_policy(
+            edgecrab_security::url_safety::PreviewPolicy {
+                enabled: true,
+                allowed_ports: vec![8000],
+                allow_any_loopback_port: false,
+            },
+        );
+        assert!(is_allowed_loopback_preview("http://127.0.0.1:8000/", &[]));
+        assert!(is_redirect_to_private_ip("http://127.0.0.1:8000/"));
+        edgecrab_security::url_safety::set_preview_policy(
+            edgecrab_security::url_safety::PreviewPolicy::default(),
+        );
+    }
+
+    #[test]
+    fn normalize_browser_nav_url_adds_http_for_loopback() {
+        assert_eq!(
+            normalize_browser_nav_url("127.0.0.1:3000"),
+            "http://127.0.0.1:3000"
+        );
+        assert_eq!(
+            normalize_browser_nav_url("http://127.0.0.1:8000/"),
+            "http://127.0.0.1:8000/"
+        );
+    }
+
+    #[test]
+    fn session_dev_server_port_bypasses_yaml_allowlist() {
+        assert!(validate_browser_url("http://127.0.0.1:7777/", &[7777]).is_ok());
+        assert!(validate_browser_url("http://127.0.0.1:7777/", &[]).is_err());
     }
 
     #[test]
     fn validate_url_blocks_javascript() {
-        assert!(validate_browser_url("javascript:alert(1)").is_err());
+        assert!(validate_browser_url("javascript:alert(1)", &[]).is_err());
     }
 
     #[test]
     fn validate_url_blocks_data() {
-        assert!(validate_browser_url("data:text/html,<h1>hi</h1>").is_err());
+        assert!(validate_browser_url("data:text/html,<h1>hi</h1>", &[]).is_err());
     }
 
     #[test]
     fn validate_url_blocks_chrome() {
-        assert!(validate_browser_url("chrome://settings").is_err());
+        assert!(validate_browser_url("chrome://settings", &[]).is_err());
     }
 
     #[test]
     fn validate_url_allows_https() {
-        assert!(validate_browser_url("https://example.com").is_ok());
+        assert!(validate_browser_url("https://example.com", &[]).is_ok());
     }
 
     #[test]
     fn validate_url_blocks_localhost() {
-        assert!(validate_browser_url("http://127.0.0.1:8080").is_err());
+        assert!(validate_browser_url("http://127.0.0.1:8080", &[]).is_err());
     }
 
     #[test]
@@ -4318,8 +4447,8 @@ security:
         .expect("write config");
         unsafe { std::env::set_var("EDGECRAB_HOME", dir.path()) };
 
-        let err =
-            validate_browser_url("https://docs.blocked.example/page").expect_err("policy block");
+        let err = validate_browser_url("https://docs.blocked.example/page", &[])
+            .expect_err("policy block");
         assert!(err.to_string().contains("website policy"));
 
         unsafe { std::env::remove_var("EDGECRAB_HOME") };
@@ -4808,12 +4937,16 @@ security:
             .execute(json!({"url": "file:///etc/passwd"}), &ctx)
             .await;
         assert!(result.is_err());
-        match result.expect_err("dangerous URL should be rejected") {
-            ToolError::PermissionDenied(msg) => {
-                assert!(msg.contains("not allowed") || msg.contains("blocked"));
-            }
-            other => panic!("Expected PermissionDenied, got: {other:?}"),
-        }
+        let err = result.expect_err("dangerous URL should be rejected");
+        let payload = err.to_llm_payload();
+        assert!(
+            payload.error.contains("blocked") || payload.error.contains("not allowed"),
+            "got: {}",
+            payload.error
+        );
+        let recovery = payload.recovery_feedback.expect("preview recovery");
+        let blob = serde_json::to_string(&recovery.suggestions).expect("json");
+        assert!(blob.contains("security.preview"));
     }
 
     #[tokio::test]

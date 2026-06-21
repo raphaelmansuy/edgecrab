@@ -412,6 +412,8 @@ impl ToolHandler for TerminalTool {
             result = format!("[NOTE: {warning}]\n\n{result}");
         }
 
+        crate::dev_server::record_session_http_server(&ctx.session_id, &args.command);
+
         Ok(result)
     }
 }

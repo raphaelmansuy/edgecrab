@@ -81,6 +81,57 @@ pub struct AppConfig {
     pub web: WebToolsConfig,
     /// LM Studio / Ollama harness tuning (prefill prune lives in code; see spec 014).
     pub local_inference: LocalInferenceConfig,
+    /// Harness completion / verification policy (spec 015).
+    pub harness: HarnessConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct HarnessConfig {
+    /// When true, visual/UX tasks require preview evidence before `Completed`.
+    pub verification_strict: bool,
+    /// When true, repeated tool failures may block or halt the turn (useful default).
+    pub guardrails_hard_stop: bool,
+}
+
+impl Default for HarnessConfig {
+    fn default() -> Self {
+        Self {
+            verification_strict: false,
+            guardrails_hard_stop: true,
+        }
+    }
+}
+
+/// Local dev preview SSRF allowlist (`security.preview` in config.yaml).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct PreviewConfig {
+    pub enabled: bool,
+    pub allow_localhost_ports: Vec<u16>,
+    /// Allow any loopback port when preview is enabled (homelab visual-UX workflows).
+    pub allow_any_loopback_port: bool,
+}
+
+impl Default for PreviewConfig {
+    fn default() -> Self {
+        Self {
+            // Dev-friendly default: localhost preview ON for visual-UX / homelab workflows.
+            enabled: true,
+            allow_localhost_ports: vec![8000, 3000, 5173, 8080, 8888, 5500, 7777, 4173, 5000],
+            allow_any_loopback_port: true,
+        }
+    }
+}
+
+impl PreviewConfig {
+    pub fn to_preview_policy(&self) -> edgecrab_security::url_safety::PreviewPolicy {
+        edgecrab_security::url_safety::PreviewPolicy {
+            enabled: self.enabled,
+            allowed_ports: self.allow_localhost_ports.clone(),
+            allow_any_loopback_port: self.allow_any_loopback_port,
+        }
+    }
 }
 
 /// Local inference provider harness options (deterministic; active by default on lmstudio/ollama).
@@ -247,33 +298,101 @@ impl Default for ObservabilityConfig {
 
 impl AppConfig {
     /// Load config from disk → env → defaults, in resolution order.
+    ///
+    /// When `EDGECRAB_HOME` points at a profile directory, merges unset keys
+    /// (including `security.preview`) from install-root `~/.edgecrab/config.yaml`.
     pub fn load() -> Result<Self, AgentError> {
         let home = edgecrab_home();
         let path = home.join("config.yaml");
 
-        let mut config = if path.exists() {
-            let content = std::fs::read_to_string(&path).map_err(AgentError::Io)?;
-            Self::parse_compat_yaml(&content, &path)?
-        } else {
-            Self::default()
-        };
+        if path.exists() {
+            return Self::load_from_with_global_inheritance(&path);
+        }
 
+        let mut config = Self::default();
+        if let Ok(global) = Self::load_install_global_config() {
+            merge_global_inherited(&mut config, &global, "");
+        }
         config.apply_env_overrides();
         config.moa = config.moa.sanitized();
         sanitize_tools_policy(&mut config.tools);
         edgecrab_tools::ensure_web_search_config_coherence_at(&path);
+        config.apply_security_runtime();
         Ok(config)
+    }
+
+    /// Apply security runtime hooks (preview SSRF allowlist, etc.).
+    pub fn apply_security_runtime(&self) {
+        edgecrab_security::url_safety::set_preview_policy(
+            self.security.preview.to_preview_policy(),
+        );
     }
 
     /// Load from a specific path (for testing / managed deployments).
     pub fn load_from(path: &Path) -> Result<Self, AgentError> {
         let content = std::fs::read_to_string(path).map_err(AgentError::Io)?;
+        Self::load_from_parsed(content, path)
+    }
+
+    /// Load profile (or explicit) config, inheriting unset keys from install-root global config.
+    ///
+    /// When `EDGECRAB_HOME` points at `~/.edgecrab/profiles/<name>/`, global keys such as
+    /// `security.preview` live in `~/.edgecrab/config.yaml` and must merge in (spec 015 HA-41).
+    pub fn load_from_with_global_inheritance(path: &Path) -> Result<Self, AgentError> {
+        let content = std::fs::read_to_string(path).map_err(AgentError::Io)?;
+        let mut config = Self::parse_compat_yaml(&content, path)?;
+        if let Ok(global) = Self::load_install_global_config() {
+            merge_global_inherited(&mut config, &global, &content);
+        }
+        config.apply_env_overrides();
+        config.moa = config.moa.sanitized();
+        sanitize_tools_policy(&mut config.tools);
+        edgecrab_tools::ensure_web_search_config_coherence_at(path);
+        config.apply_security_runtime();
+        Ok(config)
+    }
+
+    fn load_from_parsed(content: String, path: &Path) -> Result<Self, AgentError> {
         let mut config: Self = Self::parse_compat_yaml(&content, path)?;
         config.apply_env_overrides();
         config.moa = config.moa.sanitized();
         sanitize_tools_policy(&mut config.tools);
         edgecrab_tools::ensure_web_search_config_coherence_at(path);
+        config.apply_security_runtime();
         Ok(config)
+    }
+
+    /// Load `config.yaml` from the install root (not the active profile home).
+    pub fn load_install_global_config() -> Result<Self, AgentError> {
+        let path = install_edgecrab_home().join("config.yaml");
+        if path.exists() {
+            Self::load_from(&path)
+        } else {
+            Ok(Self::default())
+        }
+    }
+
+    /// Persist missing `security.preview` from install-global into a profile config file.
+    pub fn migrate_profile_preview_from_global(
+        profile_config_path: &Path,
+    ) -> Result<bool, AgentError> {
+        if !profile_config_path.is_file() {
+            return Ok(false);
+        }
+        let content = std::fs::read_to_string(profile_config_path).map_err(AgentError::Io)?;
+        let raw: serde_yml::Value = serde_yml::from_str(&content)
+            .map_err(|e| AgentError::Config(format!("{profile_config_path:?}: {e}")))?;
+        if raw.get("security").and_then(|s| s.get("preview")).is_some() {
+            return Ok(false);
+        }
+        let global = Self::load_install_global_config()?;
+        if !global.security.preview.enabled {
+            return Ok(false);
+        }
+        let mut profile: Self = Self::parse_compat_yaml(&content, profile_config_path)?;
+        profile.security.preview = global.security.preview.clone();
+        profile.save_to(profile_config_path)?;
+        Ok(true)
     }
 
     /// Parse config YAML with compatibility normalization for legacy keys.
@@ -391,7 +510,9 @@ impl AppConfig {
         sanitized.moa = sanitized.moa.sanitized();
         let yaml = serde_yml::to_string(&sanitized)
             .map_err(|e| AgentError::Config(format!("failed to serialize config: {e}")))?;
-        std::fs::write(path, yaml).map_err(AgentError::Io)
+        std::fs::write(path, yaml).map_err(AgentError::Io)?;
+        self.apply_security_runtime();
+        Ok(())
     }
 
     /// Merge CLI arguments over config (highest priority wins).
@@ -445,6 +566,9 @@ impl AppConfig {
         }
         if let Ok(val) = std::env::var("EDGECRAB_SKIP_MEMORY") {
             self.skip_memory = parse_bool_env(&val);
+        }
+        if let Ok(val) = std::env::var("EDGECRAB_SECURITY_PREVIEW") {
+            self.security.preview.enabled = parse_bool_env(&val);
         }
         if let Ok(val) = std::env::var("EDGECRAB_LSP_ENABLED") {
             self.lsp.enabled = parse_bool_env(&val);
@@ -899,13 +1023,13 @@ fn normalize_tools_policy_keys(root: &mut serde_yml::Value) {
     }
 
     let schema_key = serde_yml::Value::String("schema_mode".into());
-    let needs_compact_default = match tools_map.get(&schema_key) {
+    let needs_schema_mode_default = match tools_map.get(&schema_key) {
         None | Some(serde_yml::Value::Null) => true,
         Some(serde_yml::Value::String(s)) => s.trim().is_empty(),
         _ => false,
     };
-    if needs_compact_default {
-        tools_map.insert(schema_key, serde_yml::Value::String("compact".into()));
+    if needs_schema_mode_default {
+        tools_map.insert(schema_key, serde_yml::Value::String("indexed".into()));
     }
 }
 
@@ -1914,6 +2038,8 @@ pub struct SecurityConfig {
     pub injection_scanning: bool,
     pub url_safety: bool,
     pub website_blocklist: WebsiteBlocklistConfig,
+    /// Allow loopback HTTP preview for visual UX verification (dev profile).
+    pub preview: PreviewConfig,
     /// Set by EDGECRAB_MANAGED=1 — blocks config writes.
     #[serde(skip)]
     pub managed_mode: bool,
@@ -1928,6 +2054,7 @@ impl Default for SecurityConfig {
             injection_scanning: true,
             url_safety: true,
             website_blocklist: WebsiteBlocklistConfig::default(),
+            preview: PreviewConfig::default(),
             managed_mode: false,
         }
     }
@@ -2949,11 +3076,64 @@ impl MoaConfig {
 pub fn edgecrab_home() -> PathBuf {
     std::env::var("EDGECRAB_HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            dirs::home_dir()
-                .expect("no home directory found")
-                .join(".edgecrab")
-        })
+        .unwrap_or_else(|_| default_install_edgecrab_home())
+}
+
+/// Default install root before profile `EDGECRAB_HOME` override.
+pub fn default_install_edgecrab_home() -> PathBuf {
+    dirs::home_dir()
+        .expect("no home directory found")
+        .join(".edgecrab")
+}
+
+/// Install root when `EDGECRAB_HOME` points at a profile directory.
+pub fn install_edgecrab_home() -> PathBuf {
+    normalize_install_home(edgecrab_home())
+}
+
+fn normalize_install_home(path: PathBuf) -> PathBuf {
+    let Some(parent) = path.parent() else {
+        return path;
+    };
+    let in_profiles_dir = parent
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "profiles");
+    if in_profiles_dir {
+        parent.parent().map(Path::to_path_buf).unwrap_or(path)
+    } else {
+        path
+    }
+}
+
+/// Merge unset profile keys from install-global config (spec 015 P0.9 / HA-41).
+pub fn merge_global_inherited(profile: &mut AppConfig, global: &AppConfig, profile_yaml: &str) {
+    let raw: serde_yml::Value = serde_yml::from_str(profile_yaml).unwrap_or_default();
+    let preview_explicit = raw.get("security").and_then(|s| s.get("preview")).is_some();
+    if !preview_explicit {
+        profile.security.preview = global.security.preview.clone();
+        if !profile.security.preview.enabled && global.security.preview.enabled {
+            profile.security.preview.enabled = true;
+        }
+        if !profile.security.preview.allow_any_loopback_port
+            && global.security.preview.allow_any_loopback_port
+        {
+            profile.security.preview.allow_any_loopback_port = true;
+        }
+    } else if !profile.security.preview.enabled {
+        // Explicit `preview:` block with enabled:false — still inherit port list from global.
+        if !global.security.preview.allow_localhost_ports.is_empty() {
+            profile.security.preview.allow_localhost_ports =
+                global.security.preview.allow_localhost_ports.clone();
+        }
+    }
+    let harness_strict_explicit = raw
+        .get("harness")
+        .and_then(|h| h.get("verification_strict"))
+        .is_some();
+    if !harness_strict_explicit && global.harness.verification_strict {
+        profile.harness.verification_strict = global.harness.verification_strict;
+    }
 }
 
 /// Directory where the WhatsApp Baileys bridge caches inbound images.
@@ -3114,6 +3294,125 @@ observability:
         config.save_to(&path).expect("save on");
         let loaded = AppConfig::load_from(&path).expect("load on");
         assert!(loaded.lsp.enabled);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn save_to_persists_security_preview_and_applies_runtime() {
+        use edgecrab_security::url_safety::{
+            PreviewPolicy, current_preview_policy, is_safe_url, preview_policy_test_guard,
+            set_preview_policy,
+        };
+
+        let _guard = preview_policy_test_guard();
+        set_preview_policy(PreviewPolicy::default());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.yaml");
+        let mut config = AppConfig::default();
+        config.security.preview.enabled = true;
+        config.security.preview.allow_localhost_ports = vec![8000];
+        config.save_to(&path).expect("save");
+
+        let yaml = std::fs::read_to_string(&path).expect("read yaml");
+        assert!(
+            yaml.contains("preview:"),
+            "save_to must persist security.preview"
+        );
+        assert!(yaml.contains("8000"));
+
+        let applied = current_preview_policy();
+        assert!(applied.enabled, "save_to must call apply_security_runtime");
+        assert!(applied.allowed_ports.contains(&8000));
+
+        assert!(
+            is_safe_url("http://127.0.0.1:8000/demo").expect("check allowlisted port"),
+            "allowlisted localhost port must be reachable after save_to"
+        );
+        assert!(
+            !is_safe_url("http://127.0.0.1:9999/demo").expect("check non-allowlisted port"),
+            "non-allowlisted port must stay blocked"
+        );
+
+        set_preview_policy(PreviewPolicy::default());
+    }
+
+    #[test]
+    fn ha41_profile_inherits_global_preview_when_omitted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let global_path = dir.path().join("config.yaml");
+        let profile_dir = dir.path().join("profiles").join("homelab");
+        std::fs::create_dir_all(&profile_dir).expect("mkdir");
+        let profile_path = profile_dir.join("config.yaml");
+
+        let mut global = AppConfig::default();
+        global.security.preview.enabled = true;
+        global.security.preview.allow_localhost_ports = vec![8000, 8888];
+        global.save_to(&global_path).expect("save global");
+
+        std::fs::write(
+            &profile_path,
+            "model:\n  default: copilot/claude-haiku-4.5\nsecurity:\n  url_safety: true\n",
+        )
+        .expect("write profile");
+
+        unsafe { std::env::set_var("EDGECRAB_HOME", profile_dir.as_os_str()) };
+        let loaded = AppConfig::load_from_with_global_inheritance(&profile_path).expect("load");
+        assert!(
+            loaded.security.preview.enabled,
+            "profile must inherit global preview.enabled"
+        );
+        assert!(
+            loaded
+                .security
+                .preview
+                .allow_localhost_ports
+                .contains(&8000)
+        );
+        unsafe { std::env::remove_var("EDGECRAB_HOME") };
+    }
+
+    #[test]
+    fn load_uses_global_preview_inheritance_for_profile() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let global_path = dir.path().join("config.yaml");
+        let profile_dir = dir.path().join("profiles").join("homelab");
+        std::fs::create_dir_all(&profile_dir).expect("mkdir");
+        let profile_path = profile_dir.join("config.yaml");
+
+        let mut global = AppConfig::default();
+        global.security.preview.enabled = true;
+        global.security.preview.allow_localhost_ports = vec![8000, 8765];
+        global.save_to(&global_path).expect("save global");
+
+        std::fs::write(&profile_path, "model:\n  default: test/model\n").expect("write profile");
+
+        unsafe { std::env::set_var("EDGECRAB_HOME", profile_dir.as_os_str()) };
+        let loaded = AppConfig::load().expect("load");
+        assert!(loaded.security.preview.enabled);
+        assert!(
+            loaded
+                .security
+                .preview
+                .allow_localhost_ports
+                .contains(&8765)
+        );
+        unsafe { std::env::remove_var("EDGECRAB_HOME") };
+    }
+
+    #[test]
+    fn preview_default_ports_include_8000() {
+        let ports = PreviewConfig::default().allow_localhost_ports;
+        assert!(
+            ports.contains(&8000),
+            "http.server default port must be allowlisted"
+        );
+    }
+
+    #[test]
+    fn normalize_install_home_strips_profile_leaf() {
+        let root = normalize_install_home(PathBuf::from("/tmp/.edgecrab/profiles/homelab"));
+        assert_eq!(root, PathBuf::from("/tmp/.edgecrab"));
     }
 
     #[test]

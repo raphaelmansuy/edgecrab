@@ -273,6 +273,15 @@ pub async fn apply_memory_write_public(
 
     let existing = tokio::fs::read_to_string(&path).await.unwrap_or_default();
 
+    if !existing.trim().is_empty()
+        && let Some(bak) = detect_memory_external_drift(&path, &existing, max_chars)
+    {
+        return Err(crate::recovery_catalog::memory_external_drift(
+            filename,
+            &bak.display().to_string(),
+        ));
+    }
+
     let new_content = match action {
         "add" => {
             let content = payload.content.as_deref().unwrap_or("").trim();
@@ -316,12 +325,12 @@ pub async fn apply_memory_write_public(
 
             // Enforce char limit
             if result.len() > max_chars {
-                return Err(ToolError::Other(format!(
-                    "{} would exceed {}-char limit ({} chars). Remove old entries first.",
+                return Err(crate::recovery_catalog::memory_write_char_limit_exceeded(
                     filename,
+                    existing.len(),
                     max_chars,
-                    result.len()
-                )));
+                    content.len(),
+                ));
             }
             result
         }
@@ -388,10 +397,12 @@ pub async fn apply_memory_write_public(
             result_entries[matches[0].0] = new.to_string();
             let result = result_entries.join(ENTRY_DELIMITER) + "\n";
             if result.len() > max_chars {
-                return Err(ToolError::Other(format!(
-                    "{} would exceed {}-char limit after replace",
-                    filename, max_chars
-                )));
+                return Err(crate::recovery_catalog::memory_write_char_limit_exceeded(
+                    filename,
+                    existing.len(),
+                    max_chars,
+                    new.len(),
+                ));
             }
             result
         }
@@ -489,6 +500,43 @@ pub async fn apply_memory_write_public(
 /// Resolve the memories directory relative to workspace root
 fn memory_dir(edgecrab_home: &std::path::Path) -> std::path::PathBuf {
     edgecrab_home.join("memories")
+}
+
+/// Detect external drift in a memory file (Hermes `memory_tool._detect_external_drift`).
+///
+/// Returns backup path when on-disk content is not tool-shaped (round-trip mismatch or
+/// entry larger than the whole-file char limit).
+pub fn detect_memory_external_drift(
+    path: &std::path::Path,
+    raw: &str,
+    char_limit: usize,
+) -> Option<std::path::PathBuf> {
+    if raw.trim().is_empty() {
+        return None;
+    }
+    let parsed: Vec<String> = raw
+        .split('§')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let roundtrip = if parsed.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", parsed.join(ENTRY_DELIMITER))
+    };
+    let max_entry_len = parsed.iter().map(|e| e.len()).max().unwrap_or(0);
+    let drift_detected = raw.trim() != roundtrip.trim() || max_entry_len > char_limit;
+    if !drift_detected {
+        return None;
+    }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    let file_name = path.file_name()?.to_str()?;
+    let bak_path = path.parent()?.join(format!("{file_name}.bak.{ts}"));
+    std::fs::write(&bak_path, raw).ok()?;
+    Some(bak_path)
 }
 
 #[cfg(test)]
@@ -774,5 +822,44 @@ mod tests {
 
         let result = MemoryReadTool.execute(json!({}), &ctx).await.expect("read");
         assert!(result.contains("Editor: vscode"));
+    }
+
+    #[test]
+    fn detect_drift_on_oversized_entry() {
+        let dir = TempDir::new().expect("tmpdir");
+        let path = dir.path().join("memories").join("MEMORY.md");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        let huge = "x".repeat(MEMORY_MAX_CHARS + 50);
+        std::fs::write(&path, format!("{huge}\n")).expect("write drift");
+        let bak =
+            detect_memory_external_drift(&path, &huge, MEMORY_MAX_CHARS).expect("drift backup");
+        assert!(bak.exists());
+    }
+
+    #[tokio::test]
+    async fn memory_write_refuses_external_drift() {
+        let dir = TempDir::new().expect("tmpdir");
+        let mem_path = dir.path().join("memories");
+        std::fs::create_dir_all(&mem_path).expect("mkdir");
+        let path = mem_path.join("MEMORY.md");
+        // External writer pasted a blob without § delimiters — one entry > char limit.
+        let blob = format!("## External paste\n{}", "x".repeat(MEMORY_MAX_CHARS + 100));
+        std::fs::write(&path, blob).expect("plant drift");
+
+        let ctx = ctx_in(dir.path());
+        let err = MemoryWriteTool
+            .execute(json!({"content": "new fact"}), &ctx)
+            .await
+            .expect_err("drift should block");
+        let payload = err.to_llm_payload();
+        assert!(payload.error.contains("drift"));
+    }
+
+    #[test]
+    fn clean_memory_file_no_drift() {
+        let dir = TempDir::new().expect("tmpdir");
+        let path = dir.path().join("MEMORY.md");
+        let content = format!("entry one{ENTRY_DELIMITER}entry two\n");
+        assert!(detect_memory_external_drift(&path, &content, MEMORY_MAX_CHARS).is_none());
     }
 }

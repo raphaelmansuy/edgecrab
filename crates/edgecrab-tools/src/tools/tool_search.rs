@@ -1,8 +1,4 @@
-//! # tool_search — Materialize deferred tool schemas on demand (spec 007 L3).
-//!
-//! When `tools.schema_mode` is `indexed`, only hot tools are on the wire.
-//! Call this tool with exact `tool_names` to load full compact schemas into
-//! the session before invoking deferred tools.
+//! Call with exact `tool_names` or a BM25 `query` over deferred tools (Hermes parity).
 
 use std::collections::HashSet;
 
@@ -14,14 +10,46 @@ use edgecrab_types::{ToolError, ToolSchema};
 
 use crate::registry::{ToolContext, ToolHandler};
 use crate::schema_mode::compact_tool_schema;
-use crate::tool_schema_index::{self, TOOL_SEARCH_NAME};
+use crate::tool_schema_index::{self, TOOL_SEARCH_NAME, read_materialized_set};
+use crate::tool_search_bm25::{build_deferred_catalog, search_deferred_catalog};
 
 pub struct ToolSearchTool;
 
 #[derive(Deserialize)]
 struct Args {
     /// Exact tool names to materialize (e.g. `["browser_navigate", "lsp_hover"]`).
+    #[serde(default)]
     tool_names: Vec<String>,
+    /// BM25 search over deferred tools when exact names are unknown.
+    #[serde(default)]
+    query: Option<String>,
+    /// Max results when using `query` (default 5, max 20).
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+fn resolve_tool_names(args: &Args, ctx: &ToolContext, all_schemas: &[ToolSchema]) -> Vec<String> {
+    let explicit: Vec<String> = args
+        .tool_names
+        .iter()
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty())
+        .collect();
+    if !explicit.is_empty() {
+        return explicit;
+    }
+    let Some(query) = args
+        .query
+        .as_ref()
+        .map(|q| q.trim())
+        .filter(|q| !q.is_empty())
+    else {
+        return Vec::new();
+    };
+    let limit = args.limit.unwrap_or(5).clamp(1, 20);
+    let materialized = read_materialized_set(ctx.materialized_tools.as_ref());
+    let catalog = build_deferred_catalog(all_schemas, &materialized);
+    search_deferred_catalog(&catalog, query, limit)
 }
 
 #[async_trait]
@@ -42,7 +70,8 @@ impl ToolHandler for ToolSearchTool {
         ToolSchema {
             name: TOOL_SEARCH_NAME.into(),
             description: "Load full schemas for deferred tools before calling them. \
-                Required when a tool is listed under Deferred tools but not in your tool list."
+                Use `tool_names` for exact activation or `query` for BM25 search over \
+                the deferred catalog."
                 .into(),
             parameters: json!({
                 "type": "object",
@@ -51,9 +80,16 @@ impl ToolHandler for ToolSearchTool {
                         "type": "array",
                         "items": { "type": "string" },
                         "description": "Exact tool names to activate"
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Natural-language search over deferred tools (BM25)"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max tools to return for query search (default 5)"
                     }
-                },
-                "required": ["tool_names"]
+                }
             }),
             strict: None,
         }
@@ -68,13 +104,6 @@ impl ToolHandler for ToolSearchTool {
             tool: TOOL_SEARCH_NAME.into(),
             message: e.to_string(),
         })?;
-        if args.tool_names.is_empty() {
-            return Err(ToolError::InvalidArgs {
-                tool: TOOL_SEARCH_NAME.into(),
-                message: "tool_names must contain at least one tool name".into(),
-            });
-        }
-
         let registry = ctx
             .tool_registry
             .as_ref()
@@ -84,6 +113,14 @@ impl ToolHandler for ToolSearchTool {
             })?;
 
         let all_schemas = registry.get_definitions(None, None, ctx);
+        let names_to_activate = resolve_tool_names(&args, ctx, &all_schemas);
+        if names_to_activate.is_empty() {
+            return Err(ToolError::InvalidArgs {
+                tool: TOOL_SEARCH_NAME.into(),
+                message: "provide tool_names or a non-empty query".into(),
+            });
+        }
+
         let known: HashSet<&str> = all_schemas.iter().map(|s| s.name.as_str()).collect();
 
         let mut activated = Vec::new();
@@ -93,7 +130,7 @@ impl ToolHandler for ToolSearchTool {
 
         let materialized = ctx.materialized_tools.as_ref();
 
-        for name in args.tool_names {
+        for name in names_to_activate {
             let trimmed = name.trim();
             if trimmed.is_empty() {
                 continue;
@@ -122,6 +159,7 @@ impl ToolHandler for ToolSearchTool {
             "already_on_wire": already_wire,
             "not_found": not_found,
             "schemas": schemas_out,
+            "query": args.query,
             "hint": "Deferred tools are now on your tool list for subsequent turns."
         })
         .to_string())
@@ -140,6 +178,59 @@ mod tests {
 
     use crate::config_ref::AppConfigRef;
     use crate::registry::ToolRegistry;
+
+    #[tokio::test]
+    async fn bm25_query_materializes_deferred_tool() {
+        let registry = Arc::new(ToolRegistry::new());
+        let materialized = Arc::new(RwLock::new(HashSet::new()));
+        let ctx = ToolContext {
+            task_id: "t".into(),
+            cwd: std::env::temp_dir(),
+            session_id: "s".into(),
+            user_task: None,
+            cancel: CancellationToken::new(),
+            config: AppConfigRef::default(),
+            state_db: None,
+            platform: Platform::Cli,
+            process_table: None,
+            provider: None,
+            tool_registry: Some(registry.clone()),
+            delegate_depth: 0,
+            delegate_agent_id: None,
+            delegate_parent_id: None,
+            sub_agent_runner: None,
+            delegation_event_tx: None,
+            clarify_tx: None,
+            approval_tx: None,
+            on_skills_changed: None,
+            gateway_sender: None,
+            origin_chat: None,
+            session_key: None,
+            todo_store: None,
+            current_tool_call_id: None,
+            current_tool_name: None,
+            injected_messages: None,
+            tool_progress_tx: None,
+            watch_notification_tx: None,
+            mutation_turn: None,
+            lsp_gate: None,
+            kanban_task_id: None,
+            materialized_tools: Some(materialized.clone()),
+        };
+
+        let tool = ToolSearchTool;
+        let out = tool
+            .execute(json!({ "query": "browser navigate url" }), &ctx)
+            .await
+            .expect("execute");
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("json");
+        assert!(
+            parsed["activated"]
+                .as_array()
+                .is_some_and(|a| !a.is_empty()),
+            "BM25 query should activate at least one tool: {out}"
+        );
+    }
 
     #[tokio::test]
     async fn materializes_deferred_tool() {

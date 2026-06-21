@@ -238,6 +238,18 @@ impl TurnActivityState {
         has_tools: bool,
         ctx: edgecrab_tools::tool_progress_tail::LlmWaitContext,
     ) {
+        // Tool JSON streaming and in-flight execution are more specific than generic
+        // "streaming tool call" heartbeats — do not overwrite those captions.
+        if self.generating_tool.is_some()
+            || self.tools.values().any(|t| !t.finished)
+            || matches!(
+                self.phase,
+                ShelfPhase::GeneratingTool | ShelfPhase::ToolExec
+            )
+        {
+            return;
+        }
+
         let detail = edgecrab_tools::tool_progress_tail::llm_wait_progress_label(
             provider,
             elapsed_secs,
@@ -261,12 +273,34 @@ impl TurnActivityState {
         {
             return;
         }
+        if let Some(last) = self.activity_feed.last_mut()
+            && Self::is_llm_wait_shelf_line(&last.text)
+            && Self::is_llm_wait_shelf_line(&detail)
+        {
+            last.text = detail;
+            last.tone = tone;
+            self.hint = self.llm_wait_detail.clone();
+            return;
+        }
+        // Keep at most one LLM-wait line in the feed — heartbeats update in place above.
+        self.activity_feed
+            .retain(|n| !Self::is_llm_wait_shelf_line(&n.text));
         if self.activity_feed.len() >= SHELF_ACTIVITY_FEED_MAX {
             self.activity_feed.remove(0);
         }
         self.activity_feed
             .push(ActivityNotice { text: detail, tone });
         self.hint = self.llm_wait_detail.clone();
+    }
+
+    fn is_llm_wait_shelf_line(text: &str) -> bool {
+        text.contains("composing")
+            || text.contains("streaming")
+            || text.contains("still streaming")
+            || text.contains("non-streaming")
+            || text.contains("Bedrock")
+            || text.contains("Copilot SSE")
+            || text.starts_with("↳ vscode-copilot:")
     }
 
     pub fn push_activity(&mut self, text: String, tone: ActivityTone) {
@@ -279,6 +313,15 @@ impl TurnActivityState {
             .last()
             .is_some_and(|last| last.text == notice.text)
         {
+            return;
+        }
+        if let Some(last) = self.activity_feed.last_mut()
+            && Self::is_llm_wait_shelf_line(&last.text)
+            && Self::is_llm_wait_shelf_line(&notice.text)
+        {
+            last.text = notice.text.clone();
+            last.tone = notice.tone;
+            self.hint = Some(notice.text.clone());
             return;
         }
         if self.activity_feed.len() >= SHELF_ACTIVITY_FEED_MAX {
@@ -298,7 +341,11 @@ impl TurnActivityState {
         self.llm_wait_detail.as_deref().or_else(|| {
             self.activity_feed.iter().rev().find_map(|n| {
                 let t = n.text.as_str();
-                if t.contains("composing") || t.contains("non-streaming") || t.contains("Bedrock") {
+                if t.contains("composing")
+                    || t.contains("streaming")
+                    || t.contains("non-streaming")
+                    || t.contains("Bedrock")
+                {
                     Some(t)
                 } else {
                     None
@@ -362,6 +409,20 @@ impl TurnActivityState {
 
     pub fn contains_tool(&self, tool_call_id: &str) -> bool {
         self.tools.contains_key(tool_call_id)
+    }
+
+    /// Resolve tool args at `ToolDone` when the event carries empty JSON (HA-03 / P0.2).
+    ///
+    /// Copilot non-streaming and pruned history can drop args on the done event; the shelf
+    /// caches the full payload from `ToolExec`.
+    pub fn resolve_args_at_done(&self, tool_call_id: &str, args_json: &str) -> String {
+        if !args_json.trim().is_empty() && args_json.trim() != "{}" {
+            return args_json.to_string();
+        }
+        self.tool_row(tool_call_id)
+            .map(|row| row.args_json.clone())
+            .filter(|cached| !cached.trim().is_empty() && cached.trim() != "{}")
+            .unwrap_or_else(|| args_json.to_string())
     }
 
     pub fn latest_active_tool(&self) -> Option<(&str, &ShelfToolRow)> {
@@ -537,6 +598,12 @@ impl TurnActivityState {
         match self.phase {
             ShelfPhase::Idle => None,
             ShelfPhase::AwaitingFirstToken => {
+                if let Some(caption) = self
+                    .generating_caption()
+                    .or_else(|| self.active_tool_caption())
+                {
+                    return Some(caption);
+                }
                 if let Some(detail) = self.llm_wait_label() {
                     Some(format!(
                         "{} ({elapsed}s)",
@@ -562,18 +629,18 @@ impl TurnActivityState {
 
     /// Single-line caption for shelf compact mode, input title, and status hints.
     pub fn live_caption(&self) -> Option<String> {
+        if let Some(text) = self.generating_caption() {
+            return Some(text);
+        }
+        if let Some(text) = self.active_tool_caption() {
+            return Some(text);
+        }
         if let Some(detail) = self.llm_wait_label() {
             let elapsed = self.phase_started.elapsed().as_secs();
             return Some(format!(
                 "{} ({elapsed}s)",
                 edgecrab_core::safe_truncate(detail, 72)
             ));
-        }
-        if let Some(text) = self.generating_caption() {
-            return Some(text);
-        }
-        if let Some(text) = self.active_tool_caption() {
-            return Some(text);
         }
         if !self.subagents.is_empty() {
             let total_tools = self.subagent_tool_total();
@@ -898,6 +965,22 @@ mod tests {
     }
 
     #[test]
+    fn ha03_resolve_args_at_done_uses_cached_tool_exec_payload() {
+        let mut state = TurnActivityState::new(true);
+        state.on_tool_exec(
+            "tc-ha03".into(),
+            "read_file".into(),
+            r#"{"path":"demo/games003/index.html"}"#.into(),
+            "demo/games003/index.html".into(),
+            1,
+        );
+        let resolved = state.resolve_args_at_done("tc-ha03", "");
+        assert!(resolved.contains("games003"));
+        let preview = crate::tool_display::extract_tool_preview("read_file", &resolved);
+        assert!(!preview.contains('?'));
+    }
+
+    #[test]
     fn reasoning_and_tool_tokens_accumulate() {
         let mut state = TurnActivityState::new(true);
         state.on_reasoning("Let me think about this problem carefully.");
@@ -991,5 +1074,33 @@ mod tests {
         let summary = state.tool_summary().unwrap();
         assert_eq!(summary.active_count, 2);
         assert_eq!(summary.primary_name, "read_file");
+    }
+
+    #[test]
+    fn llm_wait_heartbeats_suppressed_during_tool_exec() {
+        let mut state = TurnActivityState::new(true);
+        state.on_tool_exec(
+            "t1".into(),
+            "terminal".into(),
+            r#"{"command":"cd demo"}"#.into(),
+            "cd demo".into(),
+            1,
+        );
+        state.on_llm_wait_progress(
+            "vscode-copilot",
+            91,
+            true,
+            edgecrab_tools::tool_progress_tail::LlmWaitContext {
+                prompt_tokens_estimated: Some(20_000),
+                context_length: Some(128_000),
+                prefill_pct: None,
+                api_iteration: Some(24),
+                native_streaming: true,
+            },
+        );
+        let caption = state.live_caption().unwrap();
+        assert!(caption.contains("terminal"));
+        assert!(!caption.contains("still streaming"));
+        assert!(state.llm_wait_detail.is_none());
     }
 }

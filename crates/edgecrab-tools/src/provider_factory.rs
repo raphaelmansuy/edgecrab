@@ -36,8 +36,9 @@ pub fn create_provider_for_model(
     let normalized_model = normalize_model_name(&canonical, model_name);
 
     if canonical == "vscode-copilot" {
-        return build_copilot_provider(&normalized_model, true)
-            .map(|provider| wrap_provider_with_tracing(Arc::new(provider) as Arc<dyn LLMProvider>));
+        return build_copilot_provider(&normalized_model, true).map(|provider| {
+            wrap_provider_with_tracing(Arc::new(provider) as Arc<dyn LLMProvider>)
+        });
     }
 
     if canonical == "vertexai" {

@@ -259,6 +259,10 @@ pub struct AgentConfig {
     pub file_mutation_verifier: bool,
     /// Post-mutation deterministic oracle gates (`node --check`, etc.).
     pub harness_post_mutation_oracles: bool,
+    /// Harness completion / verification policy (spec 015).
+    pub harness: crate::config::HarnessConfig,
+    /// Localhost preview SSRF allowlist (spec 015 P0.4 / P0.9).
+    pub security_preview: crate::config::PreviewConfig,
     /// Cross-session Anthropic prompt prefix cache (stable/dynamic split + TTL).
     pub cache: crate::config::CacheConfig,
     /// Pluggable web search backend chain.
@@ -341,6 +345,8 @@ impl Default for AgentConfig {
                 edgecrab_tools::mutation_turn_policy::LOCAL_TOOL_TURN_ABS_MAX_TOKENS,
             file_mutation_verifier: true,
             harness_post_mutation_oracles: true,
+            harness: crate::config::HarnessConfig::default(),
+            security_preview: crate::config::PreviewConfig::default(),
             cache: crate::config::CacheConfig::default(),
             web_search: crate::config::WebSearchConfig::default(),
             web: crate::config::WebToolsConfig::default(),
@@ -585,6 +591,10 @@ pub struct SessionState {
     /// runtime. Once observed, repeating the same request wastes latency and
     /// spams users with avoidable 400s. Plain text streaming still remains on.
     pub native_tool_streaming_disabled: bool,
+    /// Legacy session flag (no longer set — Copilot streams all tool turns).
+    pub copilot_tool_stream_locked: bool,
+    /// Task-class harness advisory injected once per session.
+    pub task_class_advisory_sent: bool,
     /// Provider/model pairs that rejected multimodal tool-result content (Hermes parity).
     pub tool_result_image_downgrades: std::collections::HashSet<(String, String)>,
     /// Terminal harness outcome for the most recent completed run.
@@ -1226,6 +1236,16 @@ impl Agent {
         })
     }
 
+    /// Probe Copilot agent chat+tools after a model switch (no-op for other providers).
+    pub async fn probe_copilot_agent_turn(&self) -> Result<(), String> {
+        let provider = self.provider.read().await.clone();
+        let name = provider.name();
+        if name != "vscode-copilot" && !name.contains("copilot") {
+            return Ok(());
+        }
+        crate::copilot_agent_probe::probe_agent_chat_with_tools(provider.as_ref()).await
+    }
+
     /// Transfer the live session to another model with brief + window check.
     ///
     /// Used by `/transfer-model` in CLI and gateway. For instant hot-swap use
@@ -1454,8 +1474,7 @@ impl Agent {
 
         let (tool_defs, deferred_count) = tool_defs;
         let tools_deferred_count = (config.tool_schema_mode
-            == edgecrab_tools::ToolSchemaMode::Indexed
-            && deferred_count > 0)
+            == edgecrab_tools::ToolSchemaMode::Indexed)
             .then_some(deferred_count);
 
         let dynamic_prompt = match (
@@ -1651,6 +1670,21 @@ impl Agent {
             crate::compression::compress_with_llm(&session.messages, &params, &provider, None)
                 .await;
         session.messages = compressed;
+        let session_id = session
+            .session_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        if !session.first_compression_done {
+            session.first_compression_done = true;
+            if let Some(ref mut sys) = session.cached_system_prompt {
+                sys.push_str(crate::compression::FIRST_COMPRESSION_NOTE);
+            }
+        }
+        crate::compression::apply_post_compress_message_hooks(
+            &mut session.messages,
+            &self.todo_store,
+            &session_id,
+        );
     }
 
     /// Set the session title (persisted on next DB write).
@@ -2458,6 +2492,10 @@ pub enum StreamEvent {
         context_length: Option<u64>,
         /// LM Studio native prefill progress (0–100), when streaming.
         prefill_pct: Option<f32>,
+        /// ReAct loop iteration (1-based) for long multi-tool turns.
+        api_iteration: Option<u32>,
+        /// True when [`api_call_streaming`] is active (not buffered HTTP).
+        native_streaming: bool,
     },
     /// Throttled tail from a background process (survives after `run_process` ToolDone).
     BackgroundProcessTail {
@@ -2604,10 +2642,13 @@ impl std::fmt::Debug for StreamEvent {
                 prompt_tokens_estimated,
                 context_length,
                 prefill_pct,
+                api_iteration,
+                native_streaming,
             } => write!(
                 f,
                 "LlmWaitProgress({provider}, {elapsed_secs}s, tools={has_tools}, \
-                 prompt={prompt_tokens_estimated:?}, ctx={context_length:?}, prefill={prefill_pct:?})"
+                 prompt={prompt_tokens_estimated:?}, ctx={context_length:?}, prefill={prefill_pct:?}, \
+                 iter={api_iteration:?}, stream={native_streaming})"
             ),
             Self::BackgroundProcessTail {
                 process_id, tail, ..
@@ -2701,6 +2742,7 @@ impl AgentBuilder {
 
     /// Construct from an existing AppConfig.
     pub fn from_config(config: &AppConfig) -> Self {
+        config.apply_security_runtime();
         // Resolve personality preset → persona instruction addon
         let personality_addon =
             crate::config::resolve_personality(config, &config.display.personality);
@@ -2769,6 +2811,8 @@ impl AgentBuilder {
                 local_max_tool_turn_tokens: config.local_inference.max_tool_turn_tokens,
                 file_mutation_verifier: config.display.file_mutation_verifier,
                 harness_post_mutation_oracles: config.display.harness_post_mutation_oracles,
+                harness: config.harness.clone(),
+                security_preview: config.security.preview.clone(),
                 cache: config.cache.clone(),
                 web_search: config.web_search.clone(),
                 web: config.web.clone(),

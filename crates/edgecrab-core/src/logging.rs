@@ -729,7 +729,10 @@ mod tests {
             decision = "completed",
             "harness: turn complete"
         );
-        tracing::info!(noise = true, "generic info should not land in harness jsonl");
+        tracing::info!(
+            noise = true,
+            "generic info should not land in harness jsonl"
+        );
 
         let log_path = temp.path().join("logs").join("agent.log");
         let agent_log = fs::read_to_string(&log_path).expect("read agent.log");

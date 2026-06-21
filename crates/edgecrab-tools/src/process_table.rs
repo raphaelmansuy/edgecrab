@@ -326,6 +326,8 @@ pub struct ProcessRecord {
     pub last_tail_notify: Option<Instant>,
     /// Optional sink for tail previews and lifecycle events (set by `run_process`).
     watch_sink: Option<mpsc::UnboundedSender<WatchEvent>>,
+    /// Whether http.server ready was already surfaced on the activity shelf.
+    http_ready_notified: bool,
 }
 
 /// Process lifecycle states.
@@ -485,6 +487,7 @@ impl ProcessTable {
             watch_state: None,
             last_tail_notify: None,
             watch_sink: None,
+            http_ready_notified: false,
         };
         self.records
             .insert(id.clone(), Arc::new(Mutex::new(record)));
@@ -602,6 +605,18 @@ impl ProcessTable {
         self.records.get(process_id).map(|e| Arc::clone(e.value()))
     }
 
+    /// Infer http.server ports from running background processes (spec 015 P1.7).
+    pub async fn list_running_http_server_ports(&self) -> Vec<u16> {
+        let mut commands = Vec::new();
+        for entry in self.records.iter() {
+            let rec = entry.value().lock().await;
+            if rec.status == ProcessStatus::Running {
+                commands.push(rec.command.clone());
+            }
+        }
+        crate::dev_server::collect_http_server_ports(commands.iter().map(String::as_str))
+    }
+
     /// Register remote-process kill control for a non-local backend task.
     pub fn set_remote_kill(&self, process_id: &str, tx: mpsc::UnboundedSender<()>) {
         self.controls.insert(
@@ -658,6 +673,22 @@ impl ProcessTable {
             return;
         }
         let command = rec.command.clone();
+        if !rec.http_ready_notified
+            && let Some(sink) = rec.watch_sink.as_ref()
+            && let Some(notice) =
+                crate::dev_server::maybe_http_server_ready_notice(&command, trimmed)
+        {
+            rec.http_ready_notified = true;
+            let _ = sink.send(WatchEvent {
+                process_id: process_id.to_string(),
+                command: command.clone(),
+                pattern: "http.server".into(),
+                matched_output: notice,
+                suppressed_count: 0,
+                event_type: WatchEventType::Match,
+                exit_code: None,
+            });
+        }
         if let (Some(watch), Some(sink)) = (&mut rec.watch_state, rec.watch_sink.as_ref()) {
             check_watch_patterns(trimmed, process_id, &command, watch, sink);
         }
@@ -1054,6 +1085,37 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].process_id, id);
         assert_eq!(records[0].status, ProcessStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn ha20c_lists_running_http_server_ports() {
+        let table = ProcessTable::new();
+        table.register("python3 -m http.server 8000", "/tmp", "");
+        table.register("python3 -m http.server 8888", "/tmp", "");
+        table.register("cargo test", "/tmp", "");
+        assert_eq!(
+            table.list_running_http_server_ports().await,
+            vec![8000, 8888]
+        );
+    }
+
+    #[tokio::test]
+    async fn ha26_http_server_ready_emits_watch_event() {
+        use tokio::sync::mpsc;
+
+        let table = ProcessTable::new();
+        let id = table.register("python3 -m http.server 8000", "/tmp", "");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        table.set_watch_sink(&id, tx).await;
+        table
+            .append_output(
+                &id,
+                vec!["Serving HTTP on :: port 8000 (http://[::]:8000/) ...".into()],
+            )
+            .await;
+        let event = rx.try_recv().expect("ready notice");
+        assert!(event.matched_output.contains("8000"));
+        assert!(event.matched_output.contains("preview"));
     }
 
     #[tokio::test]

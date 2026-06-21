@@ -94,6 +94,44 @@ pub const FIRST_COMPRESSION_NOTE: &str = concat!(
 pub const HANDOFF_COMPRESSION_NOTE: &str =
     "[Note: Earlier turns were auto-compressed for the target model's context window.]";
 
+/// Re-inject active todos after compression (Hermes `todo_snapshot` parity, HA-19).
+///
+/// Returns a synthetic user message when pending/in-progress items exist; completed
+/// items are omitted by `TodoStore::format_for_injection`.
+pub fn todo_snapshot_user_message(store: &edgecrab_tools::TodoStore) -> Option<Message> {
+    store
+        .format_for_injection()
+        .map(|snapshot| Message::user(&snapshot))
+}
+
+/// One-shot system prompt note on first compression (FP33 / Anthropic cache-safe).
+pub struct FirstCompressionNoteState<'a> {
+    pub first_compression_done: &'a mut bool,
+    pub cached_system_prompt: &'a mut Option<String>,
+}
+
+pub fn apply_first_compression_system_note(state: FirstCompressionNoteState<'_>) {
+    if *state.first_compression_done {
+        return;
+    }
+    *state.first_compression_done = true;
+    if let Some(sys) = state.cached_system_prompt.as_mut() {
+        sys.push_str(FIRST_COMPRESSION_NOTE);
+    }
+}
+
+/// Post-compress message hooks shared by LLM, structural, local, and `/compress` paths.
+pub fn apply_post_compress_message_hooks(
+    messages: &mut Vec<Message>,
+    todo_store: &edgecrab_tools::TodoStore,
+    conversation_session_id: &str,
+) {
+    if let Some(snapshot) = todo_snapshot_user_message(todo_store) {
+        messages.push(snapshot);
+    }
+    edgecrab_tools::read_tracker::reset_read_dedup(conversation_session_id);
+}
+
 /// Minimum tool-result size (chars) before pruning replaces content.
 pub const PRUNE_MIN_TOOL_CHARS: usize = 200;
 
@@ -811,6 +849,7 @@ fn replace_tool_with_summary(
             ctx.cwd,
             ctx.config,
             ctx.seq,
+            None,
         )
     {
         replace_tool_content(msg, &stub);
@@ -2371,5 +2410,62 @@ mod tests {
         }
         // Whether or not compression triggered, the output must be non-empty.
         assert!(!compressed.is_empty());
+    }
+
+    #[test]
+    fn ha19_todo_snapshot_user_message_active_only() {
+        use edgecrab_tools::TodoStore;
+        use edgecrab_tools::tools::todo::TodoItem;
+
+        let store = TodoStore::new();
+        store.write(vec![
+            TodoItem {
+                id: 1,
+                title: "Start preview server".into(),
+                status: "in-progress".into(),
+            },
+            TodoItem {
+                id: 2,
+                title: "Done item".into(),
+                status: "completed".into(),
+            },
+        ]);
+        let msg = todo_snapshot_user_message(&store).expect("snapshot");
+        assert_eq!(msg.role, edgecrab_types::Role::User);
+        let text = msg.text_content();
+        assert!(text.contains("in-progress"));
+        assert!(!text.contains("Done item"));
+    }
+
+    #[test]
+    fn ha19_apply_post_compress_hooks_injects_todo_and_clears_read_dedup() {
+        use edgecrab_tools::TodoStore;
+        use edgecrab_tools::read_tracker::{check_read_dedup, record_read_dedup, reset_read_dedup};
+        use edgecrab_tools::tools::todo::TodoItem;
+        use tempfile::TempDir;
+
+        let store = TodoStore::new();
+        store.write(vec![TodoItem {
+            id: 1,
+            title: "Verify preview".into(),
+            status: "not-started".into(),
+        }]);
+        let session_id = "compress-hook-test";
+        let dir = TempDir::new().expect("tmpdir");
+        let path = dir.path().join("ha19.txt");
+        std::fs::write(&path, "seed").expect("write");
+        record_read_dedup(session_id, &path, None, None);
+        assert!(check_read_dedup(session_id, &path, None, None).is_some());
+
+        let mut messages = vec![Message::user("hello")];
+        apply_post_compress_message_hooks(&mut messages, &store, session_id);
+
+        assert_eq!(messages.len(), 2);
+        assert!(messages[1].text_content().contains("Verify preview"));
+        assert!(
+            check_read_dedup(session_id, &path, None, None).is_none(),
+            "read dedup must reset after compress hooks"
+        );
+        reset_read_dedup(session_id);
     }
 }

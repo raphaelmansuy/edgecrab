@@ -1717,6 +1717,8 @@ impl ToolHandler for ExecuteCodeToolReal {
             });
         }
 
+        crate::dev_server::record_session_http_from_text(&ctx.session_id, &args.code);
+
         if ctx.cancel.is_cancelled() {
             return Err(ToolError::Other("Cancelled".into()));
         }

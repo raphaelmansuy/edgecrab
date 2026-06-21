@@ -56,7 +56,7 @@ impl ContextBudgetBreakdown {
             String::new()
         };
         let tools_line = match self.tools_deferred_count {
-            Some(deferred) if deferred > 0 => format!(
+            Some(deferred) => format!(
                 "tools:     {:>6} tok ({} on wire, {} deferred)\n",
                 self.tools_tokens, self.tool_count, deferred
             ),
@@ -331,5 +331,22 @@ mod tests {
         };
         let text = breakdown.format_report();
         assert!(text.contains("13 on wire, 31 deferred"));
+    }
+
+    #[test]
+    fn format_report_shows_zero_deferred_in_indexed_mode() {
+        let breakdown = ContextBudgetBreakdown {
+            stable_tokens: 2000,
+            semi_stable_tokens: 0,
+            dynamic_tokens: 800,
+            tools_tokens: 4500,
+            tool_count: 44,
+            tools_deferred_count: Some(0),
+            history_tokens: 0,
+            total_tokens: 7300,
+            context_window: 128_000,
+        };
+        let text = breakdown.format_report();
+        assert!(text.contains("44 on wire, 0 deferred"));
     }
 }

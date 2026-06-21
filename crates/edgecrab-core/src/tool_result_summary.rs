@@ -34,7 +34,10 @@ pub fn summarize_tool_result_for_history(
     let line_count = content.lines().count().max(1);
 
     if content.trim().starts_with("[tool_result_spill]") {
-        return format!("[{tool_name}] spilled to artifact ({content_len} chars)");
+        let path_hint = infer_source_path_from_spill(content)
+            .map(|p| format!(" ({p})"))
+            .unwrap_or_default();
+        return format!("[{tool_name}] spilled to artifact{path_hint} ({content_len} chars)");
     }
 
     if is_error {
@@ -51,13 +54,17 @@ pub fn summarize_tool_result_for_history(
         && let Some(obj) = value.as_object()
         && let Some(summary) = summarize_structured_json(tool_name, obj)
     {
+        if tool_name == "web_search" {
+            let query = arg_str_or(&args, "query", "?");
+            return format!("[web_search] query='{query}' — {summary}");
+        }
         return summary;
     }
 
     match tool_name {
         "terminal" => summarize_terminal(&args, content, line_count),
         "read_file" => {
-            let path = arg_str_or(&args, "path", "?");
+            let path = resolve_path_hint(&args, content);
             let offset = args_obj
                 .and_then(|o| o.get("offset").or_else(|| o.get("line_start")))
                 .and_then(|v| v.as_u64())
@@ -65,9 +72,7 @@ pub fn summarize_tool_result_for_history(
             format!("[read_file] read {path} from line {offset} ({content_len} chars)")
         }
         "write_file" | "patch" => {
-            let path = arg_str(&args, "path")
-                .or_else(|| arg_str(&args, "file_path"))
-                .unwrap_or_else(|| "?".to_string());
+            let path = resolve_path_hint(&args, content);
             if tool_name == "patch" {
                 let mode = arg_str_or(&args, "mode", "replace");
                 format!("[patch] {mode} in {path} ({content_len} chars result)")
@@ -275,6 +280,31 @@ fn arg_str(args: &Value, key: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// Resolve a file path from tool args (aliases) or spilled result metadata.
+fn resolve_path_hint(args: &Value, tool_content: &str) -> String {
+    for key in ["path", "file_path", "file", "filename"] {
+        if let Some(p) = arg_str(args, key)
+            && !p.is_empty()
+        {
+            return p;
+        }
+    }
+    infer_source_path_from_spill(tool_content).unwrap_or_else(|| "?".into())
+}
+
+fn infer_source_path_from_spill(content: &str) -> Option<String> {
+    if !content.contains("[tool_result_spill]") {
+        return None;
+    }
+    content.lines().find_map(|line| {
+        line.strip_prefix("source_path:")
+            .or_else(|| line.strip_prefix("source_path: "))
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(String::from)
+    })
+}
+
 fn web_extract_url_desc(args: &Value) -> String {
     if let Some(url) = arg_str(args, "url") {
         return url;
@@ -441,5 +471,22 @@ mod tests {
         let s = summarize_tool_result_for_history("terminal", args, body, false);
         assert!(s.contains("npm test"));
         assert!(s.contains("exit"));
+    }
+
+    #[test]
+    fn ha03_read_file_summary_uses_spill_source_path_when_args_empty() {
+        let body = "[tool_result_spill]\nsource_path: demo/games003/index.html\nnext: read_file";
+        let s = summarize_tool_result_for_history("read_file", "{}", body, false);
+        assert!(s.contains("games003"));
+        assert!(!s.contains("read ?"));
+    }
+
+    #[test]
+    fn infer_source_path_from_spill_stub() {
+        let body = "[tool_result_spill]\nsource_path: src/main.rs\nnext: read_file";
+        assert_eq!(
+            infer_source_path_from_spill(body).as_deref(),
+            Some("src/main.rs")
+        );
     }
 }

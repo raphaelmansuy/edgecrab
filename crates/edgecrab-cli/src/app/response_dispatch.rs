@@ -132,6 +132,8 @@ impl App {
                     prompt_tokens_estimated,
                     context_length,
                     prefill_pct,
+                    api_iteration,
+                    native_streaming,
                 } => {
                     stream_bridge::apply_llm_wait_progress(
                         &mut self.turn_activity,
@@ -142,6 +144,8 @@ impl App {
                             prompt_tokens_estimated,
                             context_length,
                             prefill_pct,
+                            api_iteration,
+                            native_streaming,
                         },
                     );
                     if !matches!(
@@ -472,6 +476,20 @@ impl App {
                     duration_ms,
                     is_error,
                 } => {
+                    let resolved_args = {
+                        let cached = self
+                            .turn_activity
+                            .resolve_args_at_done(&tool_call_id, &args_json);
+                        if cached.trim().is_empty() || cached.trim() == "{}" {
+                            self.pending_tool_lines
+                                .get(&tool_call_id)
+                                .map(|p| p.args_json.clone())
+                                .filter(|a| !a.trim().is_empty() && a.trim() != "{}")
+                                .unwrap_or(args_json)
+                        } else {
+                            cached
+                        }
+                    };
                     let hidden = self.hidden_tool_calls.remove(&tool_call_id);
                     // Build the final styled completion spans.
                     let pending = self.pending_tool_lines.remove(&tool_call_id);
@@ -489,7 +507,7 @@ impl App {
                             DisplayWidths::from_terminal_width(self.last_terminal_width as usize);
                         let spans = build_tool_done_line_width(
                             &name,
-                            &args_json,
+                            &resolved_args,
                             result_preview.as_deref(),
                             duration_ms,
                             is_error,
@@ -531,7 +549,7 @@ impl App {
                         {
                             for line in build_tool_verbose_lines_width(
                                 &name,
-                                &args_json,
+                                &resolved_args,
                                 result_preview.as_deref(),
                                 is_error,
                                 widths.verbose_content,
@@ -541,7 +559,7 @@ impl App {
                         }
                         if let Some(diff_lines) = render_edit_diff_lines(
                             &name,
-                            &args_json,
+                            &resolved_args,
                             is_error,
                             pending
                                 .as_ref()
@@ -568,7 +586,7 @@ impl App {
                                 Self::parse_run_process_id(result_preview.as_deref())
                             && !self.bg_process_lines.contains_key(&process_id)
                         {
-                            let command_preview = extract_tool_preview(&name, &args_json);
+                            let command_preview = extract_tool_preview(&name, &resolved_args);
                             self.upsert_bg_process_line(&process_id, &command_preview, "starting…");
                         }
                     }

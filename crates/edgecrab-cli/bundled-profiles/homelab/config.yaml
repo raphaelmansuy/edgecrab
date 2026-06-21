@@ -11,8 +11,18 @@ display:
   show_status_bar: true
   tool_progress: "verbose"
 
+# Visual UX / games003 dogfood — port-scoped localhost preview (spec 015 P0.4).
+security:
+  preview:
+    enabled: true
+    allow_any_loopback_port: true
+    allow_localhost_ports: [8000, 8888, 5173, 3000, 8080, 5500, 7777, 4173, 5000]
+
 honcho:
   enabled: true
   cloud_sync: false
 
 reasoning_effort: "medium"
+
+harness:
+  verification_strict: true

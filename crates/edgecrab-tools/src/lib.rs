@@ -17,9 +17,12 @@
 
 pub mod approval_runtime;
 pub mod artifact_spill;
+pub mod budget_config;
 mod command_interaction;
 pub mod config_ref;
+pub mod copilot_model_normalize;
 pub mod delegation_state;
+pub mod dev_server;
 pub mod edit_contract;
 pub mod execution_fs;
 pub mod execution_tmp;
@@ -49,9 +52,11 @@ pub mod smart_approval;
 pub mod subagent_ids;
 pub mod tool_argument_pipeline;
 pub mod tool_call_pipeline;
+pub mod tool_loop_guardrails;
 pub mod tool_name_repair;
 pub mod tool_progress_tail;
 pub mod tool_schema_index;
+pub mod tool_search_bm25;
 pub mod tools;
 pub mod toolsets;
 pub mod vision_models;
@@ -71,18 +76,19 @@ pub(crate) fn safe_truncate(s: &str, max_bytes: usize) -> &str {
 }
 
 pub use artifact_spill::{
-    SpillConfig, SpillOutcome, SpillSequence, SpillWritten, WEB_EXTRACT_INLINE_BYTES,
-    WEB_SEARCH_INLINE_BYTES,
+    SpillConfig, SpillContext, SpillOutcome, SpillSequence, SpillWritten, WEB_EXTRACT_INLINE_BYTES,
+    WEB_SEARCH_INLINE_BYTES, detect_spill_without_read,
 };
 pub use config_ref::AppConfigRef;
 pub use edgecrab_security::approval::ApprovalMode;
 pub use execution_fs::{ExecutionFilesystemView, describe_execution_filesystem};
+pub use harness_gates::{
+    HarnessAdvisorySignals, HarnessBuildInput, HarnessSnapshot, OracleGateFailure,
+    TerminalMutationToolError, UnresolvedMutationFailure, build_harness_snapshot,
+    terminal_mutation_tool_error,
+};
 pub use lsp_gate::{
     LspEditContext, LspGate, LspWriteHook, ToolDiagnostic, attach_post_write_diagnostics,
-};
-pub use harness_gates::{
-    HarnessBuildInput, HarnessSnapshot, OracleGateFailure, TerminalMutationToolError,
-    UnresolvedMutationFailure, build_harness_snapshot, terminal_mutation_tool_error,
 };
 pub use mutations::{
     MutationKind, MutationRecord, MutationTurnState, extract_file_mutation_targets,

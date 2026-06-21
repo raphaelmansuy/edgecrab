@@ -15,12 +15,16 @@ First-principles spec for making EdgeCrab a **reliable long-horizon agent harnes
 | [002-first-principles.md](./002-first-principles.md) | Four harness questions · seven jobs · concept separation |
 | [003-official-thesis.md](./003-official-thesis.md) | External grounding (providers, security, agent safety literature) |
 | [004-code-anchors.md](./004-code-anchors.md) | **Code is law** — current implementation map |
-| [005-evidence-games003.md](./005-evidence-games003.md) | Battle-tested case study (sessions `927f4d85`, `e22c0a28`) |
+| [005-evidence-games003.md](./005-evidence-games003.md) | Battle-tested case study (`927f4d85`, `e22c0a28`, **`2e720f47`**) |
 | [006-comparator-hermes-claude-pi.md](./006-comparator-hermes-claude-pi.md) | Hermes · Claude Code · PI-style verify loops |
 | [007-architecture-target.md](./007-architecture-target.md) | Target shape (ProgressSink · CompletionPolicy · Perception) |
 | [008-improvement-plan.md](./008-improvement-plan.md) | Phased plan (P0–P3) · DRY · SOLID module boundaries |
 | [009-acceptance-criteria.md](./009-acceptance-criteria.md) | CI gates **HA-01..HA-40** |
 | [010-battle-test-matrix.md](./010-battle-test-matrix.md) | Scenario matrix · expected harness behavior |
+| [011-hermes-parity-map.md](./011-hermes-parity-map.md) | Hermes-agent borrow list · module mapping |
+| [012-brutal-assessment-jun2026.md](./012-brutal-assessment-jun2026.md) | **Honest scorecard** · R1–R8 · 4-session forensics |
+| [013-impact-ranked-backlog.md](./013-impact-ranked-backlog.md) | **Rank 1–13** backlog · HA-41..43 · 90-day metrics |
+| [014-post-implementation-reassessment.md](./014-post-implementation-reassessment.md) | **Post-fix scorecard** · remaining gaps · homelab expectation |
 
 ---
 
@@ -50,8 +54,15 @@ First-principles spec for making EdgeCrab a **reliable long-horizon agent harnes
   107 tools / 55 on wire      + Operator-visible wire/deferred partition
   OTEL on but collector off   + Fail-soft observability (no log spam)
   Copilot non-streaming 30s+  + Provider-accurate liveness + streaming recovery
+  memory_write cap blind fail + Structured limit recovery (Hermes parity)
+  Todo without verify step    + Task-class verify targets + todo compress snapshot
 
-  ROOT INSIGHT (first principles)
+  4 VISUAL SESSIONS (Jun 18–19): 0/4 browser preview success
+  ┌────────────────────────────────────────────────────────────┐
+  │ games003 ×3 + race_gamey (0aeef965): 59 API iters each class │
+  │ ROOT: profile config preview OFF while global ON (no merge)  │
+  │ → config read jail → terminal storm → markdown theater       │
+  └────────────────────────────────────────────────────────────┘
   ┌────────────────────────────────────────────────────────────┐
   │ The harness must close: INTENT → PLAN → ACT → VERIFY → DONE │
   │ EdgeCrab is strong on ACT and weak on VERIFY and DONE.      │

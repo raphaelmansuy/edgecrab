@@ -762,6 +762,21 @@ pub fn format_tool_args_stream_stall(name: &str, arg_bytes: usize, timeout_secs:
     )
 }
 
+/// Shelf notice when Copilot SSE is open but the model has not emitted a tool delta yet.
+pub fn format_copilot_stream_sse_open(
+    prompt_tokens_estimated: Option<u64>,
+    context_length: Option<u64>,
+) -> String {
+    let mut hints = vec!["SSE open".to_string()];
+    if let Some(ctx_hint) = format_ctx_hint(prompt_tokens_estimated, context_length) {
+        hints.push(ctx_hint);
+    }
+    format!(
+        "vscode-copilot: {} · streaming tool call — Copilot prefill can take 30–90s on large prompts",
+        hints.join(" · ")
+    )
+}
+
 /// Activity line when EdgeCrab aborts a streamed tool draft and retries.
 pub fn format_tool_draft_aborted(
     provider: &str,
@@ -792,6 +807,23 @@ pub struct LlmWaitContext {
     pub context_length: Option<u64>,
     /// Prefill progress 0–100 when the provider streams `prompt_processing.progress`.
     pub prefill_pct: Option<f32>,
+    /// ReAct loop iteration (1-based) for long multi-tool turns.
+    pub api_iteration: Option<u32>,
+    /// True during native SSE streaming (tool deltas), false for buffered HTTP.
+    pub native_streaming: bool,
+}
+
+/// Seconds between [`StreamEvent::LlmWaitProgress`] pulses during buffered HTTP waits.
+///
+/// First principle: cloud APIs hide all progress until the full response arrives — the shelf
+/// must refresh often enough that 30s never feels like a hang. Local backends expose GEN/tok
+/// in their own UI, so slower pulses are acceptable.
+pub fn nonstreaming_wait_heartbeat_secs(provider: &str) -> u64 {
+    match provider {
+        "vscode-copilot" | "bedrock" | "openai" | "anthropic" | "google" | "xai" | "mistral" => 3,
+        "lmstudio" | "ollama" => 8,
+        _ => 5,
+    }
 }
 
 fn format_token_k(n: u64) -> String {
@@ -864,6 +896,72 @@ fn timeout_env_hint(provider: &str) -> &'static str {
     }
 }
 
+/// Shelf notice when a native-streaming LLM request starts (SSE tool deltas).
+pub fn format_streaming_llm_start(provider: &str, has_tools: bool, ctx: LlmWaitContext) -> String {
+    let task = if has_tools { "tool call" } else { "response" };
+    let liveness = streaming_wait_liveness(provider, NonStreamingWaitPhase::Start);
+    let mut hints: Vec<String> = Vec::new();
+    if let Some(iter) = ctx.api_iteration {
+        hints.push(format!("iter {iter}"));
+    }
+    if let Some(pct) = ctx.prefill_pct {
+        hints.push(format!("prefill {pct:.0}%"));
+    }
+    if let Some(ctx_hint) = format_ctx_hint(ctx.prompt_tokens_estimated, ctx.context_length) {
+        hints.push(ctx_hint);
+    }
+    if hints.is_empty() {
+        return format!("{provider}: streaming {task} — {liveness}");
+    }
+    format!(
+        "{provider}: {} · streaming {task} — {liveness}",
+        hints.join(" · ")
+    )
+}
+
+/// Periodic heartbeat while a native-streaming LLM request is in flight.
+pub fn format_streaming_llm_wait(
+    provider: &str,
+    elapsed_secs: u64,
+    has_tools: bool,
+    ctx: LlmWaitContext,
+) -> String {
+    let task = if has_tools { "tool call" } else { "response" };
+    let liveness = streaming_wait_liveness(provider, NonStreamingWaitPhase::Heartbeat);
+    let mut hints: Vec<String> = Vec::new();
+    if let Some(iter) = ctx.api_iteration {
+        hints.push(format!("iter {iter}"));
+    }
+    if let Some(pct) = ctx.prefill_pct {
+        hints.push(format!("prefill {pct:.0}%"));
+    }
+    if let Some(ctx_hint) = format_ctx_hint(ctx.prompt_tokens_estimated, ctx.context_length) {
+        hints.push(ctx_hint);
+    }
+    hints.push(format!("{elapsed_secs}s"));
+    format!(
+        "{provider}: still streaming {task} · {} ({liveness})",
+        hints.join(" · ")
+    )
+}
+
+fn streaming_wait_liveness(provider: &str, phase: NonStreamingWaitPhase) -> &'static str {
+    match provider {
+        "vscode-copilot" => match phase {
+            NonStreamingWaitPhase::Start => {
+                "Copilot SSE open — prefill / tool deltas (30–90s on large prompts)"
+            }
+            NonStreamingWaitPhase::Heartbeat => {
+                "Copilot may still be prefill-composing before first tool delta"
+            }
+        },
+        _ => match phase {
+            NonStreamingWaitPhase::Start => "SSE open — streaming tool JSON deltas",
+            NonStreamingWaitPhase::Heartbeat => "provider still streaming tool JSON",
+        },
+    }
+}
+
 /// Shelf notice when a non-streaming LLM request starts (buffered server-side or cloud API).
 pub fn format_nonstreaming_llm_start(
     provider: &str,
@@ -877,6 +975,9 @@ pub fn format_nonstreaming_llm_start(
     };
     let liveness = nonstreaming_wait_liveness(provider, NonStreamingWaitPhase::Start);
     let mut hints: Vec<String> = Vec::new();
+    if let Some(iter) = ctx.api_iteration {
+        hints.push(format!("iter {iter}"));
+    }
     if let Some(pct) = ctx.prefill_pct {
         hints.push(format!("prefill {pct:.0}%"));
     }
@@ -884,10 +985,10 @@ pub fn format_nonstreaming_llm_start(
         hints.push(ctx_hint);
     }
     if hints.is_empty() {
-        return format!("↳ {provider}: composing {task} — {liveness}");
+        return format!("{provider}: composing {task} — {liveness}");
     }
     format!(
-        "↳ {provider}: {} · composing {task} — {liveness}",
+        "{provider}: {} · composing {task} — {liveness}",
         hints.join(" · ")
     )
 }
@@ -902,6 +1003,9 @@ pub fn format_nonstreaming_llm_wait(
     let task = if has_tools { "tool call" } else { "response" };
     let liveness = nonstreaming_wait_liveness(provider, NonStreamingWaitPhase::Heartbeat);
     let mut hints: Vec<String> = Vec::new();
+    if let Some(iter) = ctx.api_iteration {
+        hints.push(format!("iter {iter}"));
+    }
     if let Some(pct) = ctx.prefill_pct {
         hints.push(format!("prefill {pct:.0}%"));
     }
@@ -910,7 +1014,7 @@ pub fn format_nonstreaming_llm_wait(
     }
     hints.push(format!("{elapsed_secs}s"));
     format!(
-        "↳ {provider}: still composing {task} · {} ({liveness})",
+        "{provider}: still composing {task} · {} ({liveness})",
         hints.join(" · ")
     )
 }
@@ -1009,6 +1113,12 @@ pub fn llm_wait_progress_label(
     has_tools: bool,
     ctx: LlmWaitContext,
 ) -> String {
+    if ctx.native_streaming {
+        if elapsed_secs == 0 {
+            return format_streaming_llm_start(provider, has_tools, ctx);
+        }
+        return format_streaming_llm_wait(provider, elapsed_secs, has_tools, ctx);
+    }
     if elapsed_secs == 0 {
         format_nonstreaming_llm_start(provider, has_tools, ctx)
     } else {
@@ -1018,11 +1128,19 @@ pub fn llm_wait_progress_label(
 
 /// Compact status-bar label — avoids truncating the full shelf line mid-word.
 pub fn llm_wait_status_compact(provider: &str, has_tools: bool, ctx: LlmWaitContext) -> String {
-    let task = if has_tools { "tool turn" } else { "reply" };
-    if let Some(hint) = format_ctx_hint(ctx.prompt_tokens_estimated, ctx.context_length) {
-        format!("{provider} {task} · {hint}")
+    let task = if has_tools {
+        "composing tool"
     } else {
-        format!("{provider} {task}")
+        "composing reply"
+    };
+    let iter = ctx
+        .api_iteration
+        .map(|n| format!("iter {n} · "))
+        .unwrap_or_default();
+    if let Some(hint) = format_ctx_hint(ctx.prompt_tokens_estimated, ctx.context_length) {
+        format!("{provider} {iter}{task} · {hint}")
+    } else {
+        format!("{provider} {iter}{task}")
     }
 }
 
@@ -1071,6 +1189,7 @@ mod tests {
             prompt_tokens_estimated: Some(56_000),
             context_length: Some(64_000),
             prefill_pct: None,
+            ..Default::default()
         };
         let msg = llm_wait_progress_label("lmstudio", 120, true, ctx);
         assert!(msg.contains("56k/64k"));
@@ -1084,6 +1203,7 @@ mod tests {
             prompt_tokens_estimated: Some(33_000),
             context_length: Some(128_000),
             prefill_pct: None,
+            ..Default::default()
         };
         let start = llm_wait_progress_label("vscode-copilot", 0, true, ctx);
         let wait = llm_wait_progress_label("vscode-copilot", 27, true, ctx);
@@ -1100,6 +1220,7 @@ mod tests {
             prompt_tokens_estimated: Some(33_000),
             context_length: Some(300_000),
             prefill_pct: None,
+            ..Default::default()
         };
         let start = llm_wait_progress_label("bedrock", 0, true, ctx);
         let wait = llm_wait_progress_label("bedrock", 31, true, ctx);
@@ -1108,7 +1229,7 @@ mod tests {
         assert!(!start.contains("GEN/tok"));
         assert!(wait.contains("Bedrock Converse"));
         let compact = llm_wait_status_compact("bedrock", true, ctx);
-        assert!(compact.contains("bedrock tool turn"));
+        assert!(compact.contains("bedrock composing tool"));
         assert!(compact.contains("33k/300k"));
         assert!(
             compact.len() < 48,
@@ -1122,10 +1243,34 @@ mod tests {
             prompt_tokens_estimated: Some(40_000),
             context_length: Some(64_000),
             prefill_pct: None,
+            ..Default::default()
         };
         let msg = llm_wait_progress_label("ollama", 15, true, ctx);
         assert!(msg.contains("Ollama"));
         assert!(!msg.to_lowercase().contains("lm studio"));
+    }
+
+    #[test]
+    fn nonstreaming_wait_heartbeat_secs_cloud_is_frequent() {
+        assert_eq!(nonstreaming_wait_heartbeat_secs("vscode-copilot"), 3);
+        assert_eq!(nonstreaming_wait_heartbeat_secs("bedrock"), 3);
+        assert_eq!(nonstreaming_wait_heartbeat_secs("lmstudio"), 8);
+    }
+
+    #[test]
+    fn llm_wait_label_includes_api_iteration() {
+        let ctx = LlmWaitContext {
+            prompt_tokens_estimated: Some(33_000),
+            context_length: Some(128_000),
+            prefill_pct: None,
+            api_iteration: Some(9),
+            native_streaming: true,
+        };
+        let start = llm_wait_progress_label("vscode-copilot", 0, true, ctx);
+        let wait = llm_wait_progress_label("vscode-copilot", 12, true, ctx);
+        assert!(start.contains("iter 9"));
+        assert!(wait.contains("iter 9"));
+        assert!(wait.contains("12s"));
     }
 
     #[test]
@@ -1134,6 +1279,7 @@ mod tests {
             prompt_tokens_estimated: Some(40_000),
             context_length: Some(64_000),
             prefill_pct: Some(73.0),
+            ..Default::default()
         };
         let msg = llm_wait_progress_label("lmstudio", 0, false, ctx);
         assert!(msg.contains("prefill 73%"));

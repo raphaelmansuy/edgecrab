@@ -4,8 +4,8 @@
 
 use std::sync::OnceLock;
 
-use opentelemetry::metrics::{Counter, Histogram, MeterProvider};
 use opentelemetry::KeyValue;
+use opentelemetry::metrics::{Counter, Histogram, MeterProvider};
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 
 static METRICS: OnceLock<Option<HarnessMetrics>> = OnceLock::new();

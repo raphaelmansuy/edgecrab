@@ -21,7 +21,63 @@ Cross-ref: [002-terminal-ux-ui/006-stuck-scenarios](../002-terminal-ux-ui/006-st
   S22 spill artifact read same turn                   model still blind
   S23 goal + UX     goal inject + verify advisory      goal in system prompt
   S24 kanban worker same RunOutcome as CLI             divergent completion
+  S25 memory cap       structured recovery + no blind retry  silent fail
+  S26 todo + UX        todo items include verify step        plan without perceive
+  S27 terminal storm   WARN after N shell w/o perception     churn loops
+  S28 wrong port       navigate hint uses detected port      8888 vs 8000
 ```
+
+---
+
+## S25 — Memory write cap (`2e720f47`)
+
+**Setup:** MEMORY.md near 2200 chars; model calls `memory_write`.
+
+| Expected | |
+|----------|--|
+| Tool error | `used_chars`, `max_chars`, prune/session_search hint |
+| No | immediate identical retry |
+
+**Code:** `tools/memory.rs` + `recovery_catalog.rs` · Gate HA-17.
+
+---
+
+## S26 — Todo plan includes verification
+
+**Setup:** `manage_todo_list` on visual UX task.
+
+| Expected | |
+|----------|--|
+| TaskClassifier advisory | preview or `browser_vision` before "done" todo |
+| Optional | todo template suggests verify item for `VisualUx` |
+
+**Gate:** HA-20d, HA-19.
+
+---
+
+## S27 — Terminal iteration storm
+
+**Setup:** Mock 6× `terminal` without `browser_*` / `vision_*`.
+
+| Expected | |
+|----------|--|
+| Harness WARN | `iteration_storm` or equivalent in JSONL |
+| Shelf | optional activity notice |
+
+**Gate:** HA-20e.
+
+---
+
+## S28 — Dev server port mismatch
+
+**Setup:** `python -m http.server 8000`; model navigates `localhost:8888`.
+
+| Expected | |
+|----------|--|
+| Error or steer | cites port 8000 from process table |
+| With preview | navigate `http://127.0.0.1:8000/...` succeeds |
+
+**Gate:** HA-20c, HA-05.
 
 ---
 

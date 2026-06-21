@@ -204,6 +204,7 @@ pub fn tool_argument_budget_exceeded(
                 json!({
                     "from_tool": tool_name,
                     "to_tool": "patch",
+                    "recommended_tools": ["patch"],
                     "reason": "incremental edits fit local provider completion budgets"
                 }),
             )
@@ -266,6 +267,149 @@ pub fn write_file_missing_content(max_argument_bytes: Option<usize>) -> ToolErro
     )
 }
 
+/// `browser_navigate` blocked by SSRF or disallowed scheme (spec 015 HA-16).
+pub fn browser_navigate_blocked(url: &str, reason: &str, known_ports: &[u16]) -> ToolError {
+    let port_hint = crate::dev_server::format_dev_server_ports_hint(known_ports);
+    let message = if let Some(hint) = port_hint.as_deref() {
+        format!("URL blocked for browser navigation: {url} ({reason}). {hint}")
+    } else {
+        format!("URL blocked for browser navigation: {url} ({reason})")
+    };
+    let mut builder = recovery_guidance()
+        .message("Browser navigation blocked — use HTTP preview, not file://")
+        .suggestion(
+            RecoveryAction::SetParameter,
+            json!({
+                "tool": "browser_navigate",
+                "url_shape": "http://127.0.0.1:PORT/path",
+                "fix_via": "/config set security.preview.enabled true",
+                "do_not": ["read_file on ~/.edgecrab/config.yaml", "terminal cat/grep on home config"],
+                "security_preview_yaml": {
+                    "security": {
+                        "preview": {
+                            "enabled": true,
+                            "allow_localhost_ports": [8000, 8888, 5173, 3000]
+                        }
+                    }
+                },
+                "then_verify": ["browser_snapshot", "vision_analyze"],
+                "note": "file:// is never allowed; operator enables security.preview — agent cannot read home config"
+            }),
+        );
+    if !known_ports.is_empty() {
+        builder = builder.suggestion(
+            RecoveryAction::SetParameter,
+            json!({
+                "tool": "browser_navigate",
+                "detected_http_server_ports": known_ports,
+                "recommended_urls": known_ports
+                    .iter()
+                    .map(|p| format!("http://127.0.0.1:{p}/"))
+                    .collect::<Vec<_>>(),
+            }),
+        );
+    }
+    ToolError::PermissionDenied(message).with_recovery(builder.build())
+}
+
+/// `memory_write` exceeded per-file char cap (spec 015 HA-17).
+pub fn memory_write_char_limit_exceeded(
+    filename: &str,
+    used_chars: usize,
+    max_chars: usize,
+    attempted_add: usize,
+) -> ToolError {
+    ToolError::InvalidArgs {
+        tool: "memory_write".into(),
+        message: format!(
+            "{filename} would exceed {max_chars}-char limit ({used_chars} used + {attempted_add} new). \
+             Prune old entries or use session_search before adding."
+        ),
+    }
+    .with_recovery(
+        recovery_guidance()
+            .message("Memory file at capacity")
+            .suggestion(
+                RecoveryAction::CallToolFirst,
+                json!({
+                    "tool": "memory_read",
+                    "target": if filename == "USER.md" { "user" } else { "memory" },
+                    "then": "prune stale entries with replace/remove actions"
+                }),
+            )
+            .suggestion(
+                RecoveryAction::SwitchTool,
+                json!({
+                    "tool": "session_search",
+                    "reason": "find prior session facts instead of duplicating memory",
+                    "suggested_actions": ["prune_old", "session_search"]
+                }),
+            )
+            .build(),
+    )
+}
+
+/// Memory file modified externally — refuse mutation until operator resolves drift (HA-17 extension).
+pub fn memory_external_drift(filename: &str, drift_backup: &str) -> ToolError {
+    ToolError::InvalidArgs {
+        tool: "memory_write".into(),
+        message: format!(
+            "{filename} shows external drift (manual edit, patch tool, or sister session). \
+             A backup was saved to {drift_backup}. Read memory_read, prune stale entries, \
+             or restore from backup before writing."
+        ),
+    }
+    .with_recovery(
+        recovery_guidance()
+            .message("Memory file drift detected")
+            .suggestion(
+                RecoveryAction::CallToolFirst,
+                json!({
+                    "tool": "memory_read",
+                    "target": if filename == "USER.md" { "user" } else { "memory" },
+                    "then": "prune or replace entries to fit char limit"
+                }),
+            )
+            .suggestion(
+                RecoveryAction::SwitchTool,
+                json!({
+                    "tool": "session_search",
+                    "reason": "recover facts without duplicating drifted memory",
+                    "drift_backup": drift_backup,
+                    "suggested_actions": ["prune_old", "session_search"]
+                }),
+            )
+            .build(),
+    )
+}
+
+/// Shell heredoc rejected — steer to file tools (spec 015 HA-18).
+pub fn terminal_heredoc_unsupported(command: &str) -> ToolError {
+    ToolError::capability_denied(
+        "terminal",
+        "shell_heredoc_unsupported",
+        format!(
+            "Shell heredocs are not supported in `terminal`. A heredoc embeds multi-line input \
+             directly inside the tool-call command string, which is unreliable for edits or \
+             large stdin payloads.\nCommand: `{command}`"
+        ),
+    )
+    .with_recovery(
+        recovery_guidance()
+            .message("Use write_file or patch instead of shell heredocs")
+            .suggestion(
+                RecoveryAction::SwitchTool,
+                json!({
+                    "from_tool": "terminal",
+                    "to_tool": "write_file",
+                    "recommended_tools": ["write_file", "patch"],
+                    "reason": "file tools are the supported content-transport path"
+                }),
+            )
+            .build(),
+    )
+}
+
 /// Unknown / hallucinated tool name after repair (Hermes conversation_loop parity + structured recovery).
 pub fn unknown_tool(
     invalid_name: &str,
@@ -319,14 +463,56 @@ mod tests {
     }
 
     #[test]
-    fn stale_context_suggests_read_file_first() {
-        let err = stale_file_context("write_file", "lib.rs");
+    fn ha04_budget_exceeded_recommends_patch() {
+        let err = tool_argument_budget_exceeded("write_file", 30_546, 27_852, 7_000);
         let recovery = err.to_llm_payload().recovery_feedback.expect("recovery");
-        assert!(
-            recovery
-                .suggestions
-                .iter()
-                .any(|s| s.action == RecoveryAction::CallToolFirst)
-        );
+        let blob = serde_json::to_string(&recovery.suggestions).expect("json");
+        assert!(blob.contains("patch"), "expected patch in {blob}");
+    }
+
+    #[test]
+    fn ha16_browser_blocked_includes_preview_hint() {
+        let err = browser_navigate_blocked("http://127.0.0.1:8000/", "SSRF policy", &[]);
+        let recovery = err.to_llm_payload().recovery_feedback.expect("recovery");
+        let blob = serde_json::to_string(&recovery.suggestions).expect("json");
+        assert!(blob.contains("security.preview"));
+        assert!(blob.contains("127.0.0.1"));
+    }
+
+    #[test]
+    fn ha20c_browser_blocked_cites_detected_ports() {
+        let err = browser_navigate_blocked("http://127.0.0.1:8888/", "SSRF policy", &[8000, 8888]);
+        let payload = err.to_llm_payload();
+        assert!(payload.error.contains("8000"));
+        let recovery = payload.recovery_feedback.expect("recovery");
+        let blob = serde_json::to_string(&recovery.suggestions).expect("json");
+        assert!(blob.contains("detected_http_server_ports"));
+        assert!(blob.contains("8888"));
+    }
+
+    #[test]
+    fn ha17_memory_limit_includes_prune_guidance() {
+        let err = memory_write_char_limit_exceeded("MEMORY.md", 2100, 2200, 150);
+        let payload = err.to_llm_payload();
+        assert!(payload.error.contains("2200"));
+        let recovery = payload.recovery_feedback.expect("recovery");
+        let blob = serde_json::to_string(&recovery.suggestions).expect("json");
+        assert!(blob.contains("prune_old") || blob.contains("session_search"));
+    }
+
+    #[test]
+    fn ha17_memory_drift_includes_backup_path() {
+        let err = memory_external_drift("MEMORY.md", "/tmp/MEMORY.md.bak.123");
+        let payload = err.to_llm_payload();
+        assert!(payload.error.contains("drift"));
+        assert!(payload.error.contains(".bak.123"));
+    }
+
+    #[test]
+    fn ha18_heredoc_recommends_write_file() {
+        let err = terminal_heredoc_unsupported("cat <<'EOF'\nhello\nEOF");
+        let recovery = err.to_llm_payload().recovery_feedback.expect("recovery");
+        let blob = serde_json::to_string(&recovery.suggestions).expect("json");
+        assert!(blob.contains("write_file"));
     }
 }

@@ -4,6 +4,8 @@ use edgecrab_types::{
     VerificationSummary, parse_tool_error_payload,
 };
 
+use crate::task_class::{TaskClass, classify_from_messages, is_verification_tool_for_class};
+
 /// Snapshot of end-of-run state inspected by the completion policy.
 pub struct CompletionContext<'a> {
     pub final_response: &'a str,
@@ -17,6 +19,8 @@ pub struct CompletionContext<'a> {
     pub child_runs_in_flight: usize,
     /// Deterministic harness gates (mutation debt, oracles, structured tool errors).
     pub harness: HarnessSnapshot,
+    /// When true, visual tasks require preview evidence before `Completed`.
+    pub verification_strict: bool,
 }
 
 pub trait CompletionPolicy: Send + Sync {
@@ -34,7 +38,9 @@ impl CompletionPolicy for DefaultCompletionPolicy {
     fn assess(&self, ctx: &CompletionContext<'_>) -> RunOutcome {
         let pending_clarification = ctx.pending_clarification || has_clarify_marker(ctx);
         let pending_approval = ctx.pending_approval || has_approval_marker(ctx);
-        let verification = collect_verification_summary(ctx.messages);
+        let task_class = classify_from_messages(ctx.messages);
+        let verification =
+            collect_verification_summary(ctx.messages, task_class, ctx.verification_strict);
         let reported_progress = collect_reported_progress_state(ctx.messages);
         let reported_blocked = matches!(
             reported_progress.latest_status,
@@ -86,14 +92,16 @@ impl CompletionPolicy for DefaultCompletionPolicy {
                 "Incomplete — progress was reported but work still remains.",
             )
         } else if harness_blocked {
-            let reason = ctx.harness.completion_block_reason().unwrap_or_else(|| {
-                "Incomplete — deterministic harness gates did not pass.".into()
-            });
-            RunOutcome::new(
-                CompletionDecision::Incomplete,
-                ExitReason::NoMoreToolCalls,
-                reason,
-            )
+            let reason = ctx
+                .harness
+                .completion_block_reason()
+                .unwrap_or_else(|| "Incomplete — deterministic harness gates did not pass.".into());
+            let exit = if ctx.harness.guardrail_halt {
+                ExitReason::GuardrailHalt
+            } else {
+                ExitReason::NoMoreToolCalls
+            };
+            RunOutcome::new(CompletionDecision::Incomplete, exit, reason)
         } else if has_recent_critical_tool_failure(ctx.messages) {
             RunOutcome::new(
                 CompletionDecision::Incomplete,
@@ -105,6 +113,35 @@ impl CompletionPolicy for DefaultCompletionPolicy {
                 CompletionDecision::Failed,
                 ExitReason::NoMoreToolCalls,
                 "Failed — the run ended without a usable final response.",
+            )
+        } else if ctx.verification_strict
+            && task_class == TaskClass::VisualUx
+            && visual_browser_navigate_exhausted(ctx.messages)
+        {
+            RunOutcome::new(
+                CompletionDecision::NeedsVerification,
+                ExitReason::VerificationPending,
+                "Needs verification — browser navigation failed repeatedly with no successful page load. \
+                 Enable security.preview for localhost URLs, then browser_navigate + browser_snapshot.",
+            )
+        } else if ctx.verification_strict
+            && task_class == TaskClass::VisualUx
+            && markdown_theater_without_perception(ctx.messages)
+        {
+            RunOutcome::new(
+                CompletionDecision::NeedsVerification,
+                ExitReason::VerificationPending,
+                "Needs verification — markdown report files are not browser/screenshot evidence.",
+            )
+        } else if ctx.verification_strict
+            && task_class == TaskClass::VisualUx
+            && verification.required
+            && !verification.evidence_present
+        {
+            RunOutcome::new(
+                CompletionDecision::NeedsVerification,
+                ExitReason::VerificationPending,
+                "Needs verification — visual/UX tasks require browser or screenshot evidence.",
             )
         } else if verification.required && !verification.evidence_present {
             RunOutcome::new(
@@ -192,9 +229,14 @@ fn collect_reported_progress_state(messages: &[Message]) -> ReportedProgressStat
     state
 }
 
-fn collect_verification_summary(messages: &[Message]) -> VerificationSummary {
+fn collect_verification_summary(
+    messages: &[Message],
+    task_class: TaskClass,
+    verification_strict: bool,
+) -> VerificationSummary {
     let mut required = false;
     let mut evidence = Vec::new();
+    let mut debt_reason: Option<String> = None;
 
     for msg in messages {
         if msg.role != Role::Tool {
@@ -237,7 +279,7 @@ fn collect_verification_summary(messages: &[Message]) -> VerificationSummary {
             continue;
         }
 
-        if !is_verification_tool(name) {
+        if !is_verification_tool_for_class(name, task_class) {
             continue;
         }
 
@@ -262,11 +304,22 @@ fn collect_verification_summary(messages: &[Message]) -> VerificationSummary {
     evidence.sort();
     evidence.dedup();
 
+    if task_class == TaskClass::VisualUx && verification_strict {
+        required = true;
+    }
+
+    if task_class == TaskClass::VisualUx && verification_strict && required && evidence.is_empty() {
+        debt_reason = Some(
+            "Visual/UX task: enable security.preview and verify with browser or screenshot."
+                .to_string(),
+        );
+    }
+
     VerificationSummary {
         required,
         evidence_present: !evidence.is_empty(),
-        debt_reason: (required && evidence.is_empty())
-            .then_some("No structured verification evidence was recorded.".to_string()),
+        debt_reason: debt_reason.or((required && evidence.is_empty())
+            .then_some("No structured verification evidence was recorded.".to_string())),
         evidence,
     }
 }
@@ -275,22 +328,64 @@ fn is_mutation_verification_tool(name: &str) -> bool {
     matches!(name, "write_file" | "patch" | "apply_patch")
 }
 
-fn is_verification_tool(name: &str) -> bool {
-    matches!(
-        name,
-        "terminal"
-            | "run_process"
-            | "write_file"
-            | "patch"
-            | "execute_code"
-            | "delegate_task"
-            | "manage_cron_jobs"
-            | "checkpoint"
-            | "lsp_apply_code_action"
-            | "lsp_rename"
-            | "lsp_format_document"
-            | "lsp_format_range"
-    )
+/// Visual-UX sessions with repeated `browser_navigate` failures and zero successful loads (games003).
+fn visual_browser_navigate_exhausted(messages: &[Message]) -> bool {
+    let mut failed = 0usize;
+    let mut ok = 0usize;
+    for msg in messages {
+        if msg.role != Role::Tool || msg.name.as_deref() != Some("browser_navigate") {
+            continue;
+        }
+        if parse_tool_error_payload(&msg.text_content()).is_some() {
+            failed += 1;
+        } else {
+            ok += 1;
+        }
+    }
+    failed >= 3 && ok == 0
+}
+
+/// Visual-UX sessions that wrote multiple report-like markdown files without perception (HA-43).
+fn markdown_theater_without_perception(messages: &[Message]) -> bool {
+    let mut report_writes = 0usize;
+    let mut perception_ok = false;
+    for msg in messages {
+        if msg.role != Role::Tool {
+            continue;
+        }
+        let Some(name) = msg.name.as_deref() else {
+            continue;
+        };
+        if matches!(
+            name,
+            "browser_navigate" | "browser_snapshot" | "vision" | "analyze_image"
+        ) && parse_tool_error_payload(&msg.text_content()).is_none()
+        {
+            perception_ok = true;
+        }
+        if name != "write_file" {
+            continue;
+        }
+        let content = msg.text_content();
+        if is_report_like_write_path(&content) {
+            report_writes += 1;
+        }
+    }
+    report_writes >= 3 && !perception_ok
+}
+
+fn is_report_like_write_path(tool_result: &str) -> bool {
+    let lower = tool_result.to_ascii_lowercase();
+    const MARKERS: &[&str] = &[
+        "verification.md",
+        "delivery.md",
+        "final_report",
+        "evidence",
+        "readme.md",
+        "report.txt",
+        "checklist.md",
+    ];
+    MARKERS.iter().any(|m| lower.contains(m))
 }
 
 fn first_nonempty_line(text: &str) -> Option<&str> {
@@ -304,7 +399,9 @@ fn truncate(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use edgecrab_tools::{HarnessBuildInput, MutationTurnState, build_harness_snapshot};
+    use edgecrab_tools::{
+        HarnessAdvisorySignals, HarnessBuildInput, MutationTurnState, build_harness_snapshot,
+    };
     use edgecrab_types::Message;
     use std::fs;
     use tempfile::TempDir;
@@ -325,6 +422,7 @@ mod tests {
             blocked_todos: 0,
             child_runs_in_flight: 0,
             harness,
+            verification_strict: false,
         }
     }
 
@@ -363,6 +461,7 @@ mod tests {
             blocked_todos: 0,
             child_runs_in_flight: 0,
             harness: HarnessSnapshot::default(),
+            verification_strict: false,
         };
 
         let outcome = assess_completion(&ctx);
@@ -383,6 +482,7 @@ mod tests {
             blocked_todos: 0,
             child_runs_in_flight: 0,
             harness: HarnessSnapshot::default(),
+            verification_strict: false,
         };
 
         let outcome = assess_completion(&ctx);
@@ -414,6 +514,7 @@ mod tests {
             blocked_todos: 1,
             child_runs_in_flight: 0,
             harness: HarnessSnapshot::default(),
+            verification_strict: false,
         };
 
         let outcome = assess_completion(&ctx);
@@ -433,6 +534,7 @@ mod tests {
             blocked_todos: 0,
             child_runs_in_flight: 0,
             harness: HarnessSnapshot::default(),
+            verification_strict: false,
         };
 
         let outcome = assess_completion(&ctx);
@@ -453,6 +555,7 @@ mod tests {
             blocked_todos: 0,
             child_runs_in_flight: 0,
             harness: HarnessSnapshot::default(),
+            verification_strict: false,
         };
 
         let outcome = assess_completion(&ctx);
@@ -470,11 +573,8 @@ mod tests {
         })
         .to_string();
         let messages = vec![Message::tool_result("tc_1", "report_task_status", &report)];
-        let outcome = assess_completion(&base_ctx(
-            "All set.",
-            &messages,
-            HarnessSnapshot::default(),
-        ));
+        let outcome =
+            assess_completion(&base_ctx("All set.", &messages, HarnessSnapshot::default()));
         assert_eq!(outcome.state, CompletionDecision::Completed);
         assert!(outcome.verification.evidence_present);
     }
@@ -537,11 +637,7 @@ mod tests {
         })
         .to_string();
         let messages = vec![Message::tool_result("tc_3", "report_task_status", &report)];
-        let outcome = assess_completion(&base_ctx(
-            "Done.",
-            &messages,
-            HarnessSnapshot::default(),
-        ));
+        let outcome = assess_completion(&base_ctx("Done.", &messages, HarnessSnapshot::default()));
         assert_eq!(outcome.state, CompletionDecision::Incomplete);
     }
 
@@ -561,18 +657,125 @@ mod tests {
             mutation_turn: &turn,
             cwd: dir.path(),
             post_mutation_oracles: true,
+            advisory: HarnessAdvisorySignals::default(),
+            unanswered_tool_calls: 0,
         });
         let ok = serde_json::json!({"ok": true, "replacements": 1}).to_string();
         let messages = vec![Message::tool_result("t1", "patch", &ok)];
-        let outcome = assess_completion(&base_ctx(
-            "All done!",
-            &messages,
-            harness,
-        ));
+        let outcome = assess_completion(&base_ctx("All done!", &messages, harness));
         assert_eq!(outcome.state, CompletionDecision::Incomplete);
-        assert!(outcome
-            .user_summary
-            .contains("post-mutation gate failed"));
+        assert!(outcome.user_summary.contains("post-mutation gate failed"));
+    }
+
+    #[test]
+    fn ha30_strict_visual_without_preview_evidence_needs_verification() {
+        let messages = vec![
+            Message::user("make the demo UI more beautiful"),
+            Message::tool_result("t1", "terminal", "Syntax OK"),
+        ];
+        let ctx = CompletionContext {
+            final_response: "Looks great!",
+            messages: &messages,
+            interrupted: false,
+            budget_exhausted: false,
+            pending_approval: false,
+            pending_clarification: false,
+            active_todos: 0,
+            blocked_todos: 0,
+            child_runs_in_flight: 0,
+            harness: HarnessSnapshot::default(),
+            verification_strict: true,
+        };
+        let outcome = assess_completion(&ctx);
+        assert_eq!(outcome.state, CompletionDecision::NeedsVerification);
+    }
+
+    #[test]
+    fn ha30_browser_navigate_failures_block_visual_completion() {
+        let err = serde_json::json!({
+            "type": "tool_error",
+            "category": "security",
+            "code": "ssrf_blocked",
+            "code_num": 1005,
+            "error": "SSRF blocked",
+            "retryable": false,
+            "suppress_retry": true
+        })
+        .to_string();
+        let messages = vec![
+            Message::user("make demo/games003 beautiful UX"),
+            Message::tool_result("n1", "browser_navigate", &err),
+            Message::tool_result("n2", "browser_navigate", &err),
+            Message::tool_result("n3", "browser_navigate", &err),
+        ];
+        let ctx = CompletionContext {
+            final_response: "Done — game looks great!",
+            messages: &messages,
+            interrupted: false,
+            budget_exhausted: false,
+            pending_approval: false,
+            pending_clarification: false,
+            active_todos: 0,
+            blocked_todos: 0,
+            child_runs_in_flight: 0,
+            harness: HarnessSnapshot::default(),
+            verification_strict: true,
+        };
+        let outcome = assess_completion(&ctx);
+        assert_eq!(outcome.state, CompletionDecision::NeedsVerification);
+        assert!(outcome.user_summary.contains("browser navigation"));
+    }
+
+    #[test]
+    fn ha43_markdown_theater_blocks_visual_completion() {
+        let messages = vec![
+            Message::user("create beautiful 3D race game demo/race_gamey"),
+            Message::tool_result("w1", "write_file", r#"{"path":"VERIFICATION.md"}"#),
+            Message::tool_result("w2", "write_file", r#"{"path":"DELIVERY.md"}"#),
+            Message::tool_result("w3", "write_file", r#"{"path":"FINAL_REPORT.txt"}"#),
+        ];
+        let ctx = CompletionContext {
+            final_response: "Game delivered with full verification docs.",
+            messages: &messages,
+            interrupted: false,
+            budget_exhausted: false,
+            pending_approval: false,
+            pending_clarification: false,
+            active_todos: 0,
+            blocked_todos: 0,
+            child_runs_in_flight: 0,
+            harness: HarnessSnapshot::default(),
+            verification_strict: true,
+        };
+        let outcome = assess_completion(&ctx);
+        assert_eq!(outcome.state, CompletionDecision::NeedsVerification);
+        assert!(outcome.user_summary.contains("markdown"));
+    }
+
+    #[test]
+    fn ha51_unanswered_tool_calls_incomplete() {
+        let messages = vec![Message::assistant_with_tool_calls(
+            "",
+            vec![edgecrab_types::ToolCall {
+                id: "t1".into(),
+                r#type: "function".into(),
+                function: edgecrab_types::FunctionCall {
+                    name: "terminal".into(),
+                    arguments: "{}".into(),
+                },
+                thought_signature: None,
+            }],
+        )];
+        let harness = build_harness_snapshot(HarnessBuildInput {
+            messages: &messages,
+            mutation_turn: &MutationTurnState::new(),
+            cwd: std::path::Path::new("."),
+            post_mutation_oracles: false,
+            advisory: HarnessAdvisorySignals::default(),
+            unanswered_tool_calls: 1,
+        });
+        let outcome = assess_completion(&base_ctx("Done.", &messages, harness));
+        assert_eq!(outcome.state, CompletionDecision::Incomplete);
     }
 
     #[test]
@@ -593,6 +796,8 @@ mod tests {
             mutation_turn: &MutationTurnState::new(),
             cwd: std::path::Path::new("."),
             post_mutation_oracles: false,
+            advisory: HarnessAdvisorySignals::default(),
+            unanswered_tool_calls: 0,
         });
         let outcome = assess_completion(&base_ctx("Done!", &messages, harness));
         assert_eq!(outcome.state, CompletionDecision::Incomplete);

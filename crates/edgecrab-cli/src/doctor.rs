@@ -19,7 +19,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use edgecrab_core::{AppConfig, edgecrab_home};
+use edgecrab_core::{AppConfig, copilot_agent_probe, edgecrab_home};
 use edgequake_llm::{ProviderFactory, ProviderType};
 
 use crate::runtime::load_dot_env;
@@ -168,6 +168,52 @@ pub async fn run(config_override: Option<&str>) -> anyhow::Result<bool> {
     Ok(failures == 0)
 }
 
+/// Analyze `harness.jsonl` for spill/perception/exit_reason metrics (spec 015 P2.6).
+pub fn run_harness(config_override: Option<&str>) -> anyhow::Result<()> {
+    let context = DoctorContext::new(config_override);
+    let log_dir = context.home.join("logs");
+    println!("\n🔍 EdgeCrab Doctor — harness log analysis\n");
+    println!("  Log dir: {}\n", log_dir.display());
+
+    let _ = AppConfig::migrate_profile_preview_from_global(&context.config_path);
+
+    match AppConfig::load_from_with_global_inheritance(&context.config_path) {
+        Ok(cfg) if cfg.security.preview.enabled => {
+            println!(
+                "  ✓ security.preview enabled — ports: {:?}\n",
+                cfg.security.preview.allow_localhost_ports
+            );
+        }
+        _ => {
+            println!(
+                "  ⚠ security.preview disabled — visual tasks cannot browser_navigate localhost.\n\
+                 Fix: /config set security.preview.enabled true\n\
+                 Or add to active profile config.yaml:\n\
+                   security:\n\
+                     preview:\n\
+                       enabled: true\n\
+                       allow_localhost_ports: [8000, 8888, 5173, 3000]\n\
+                 Note: install-global ~/.edgecrab/config.yaml merges when profile omits preview.\n"
+            );
+        }
+    }
+
+    match edgecrab_core::analyze_harness_file(&log_dir) {
+        Ok(report) => {
+            println!("{}", edgecrab_core::format_harness_report(&report));
+            println!();
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            println!("  ⚠ harness.jsonl not found — run an agent session first.");
+            println!("    Expected: {}/harness.jsonl", log_dir.display());
+            println!();
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
 fn check_computer_use(config: &edgecrab_core::AppConfig) -> Check {
     use edgecrab_tools::{ComputerUseReportContext, ComputerUseStatusConfig, collect_snapshot};
 
@@ -239,7 +285,7 @@ fn check_schema_mode(config: &edgecrab_core::AppConfig) -> Check {
     match edgecrab_tools::ToolSchemaMode::parse(&config.tools.schema_mode) {
         edgecrab_tools::ToolSchemaMode::Indexed => Check::pass(
             "Schema mode",
-            "indexed — hot tools on wire; call tool_search to load deferred schemas",
+            "indexed — hot tools on wire; /context budget shows wire:N deferred:M",
         ),
         edgecrab_tools::ToolSchemaMode::Compact => Check::pass(
             "Schema mode",
@@ -693,38 +739,55 @@ async fn check_provider_ping(context: &DoctorContext) -> Check {
         );
     };
 
+    let agent_tools_probe = provider == ProviderType::VsCodeCopilot;
+    let check_label = if agent_tools_probe {
+        "Provider ping (agent tools)"
+    } else {
+        "Provider ping"
+    };
+
     let start = Instant::now();
-    let result: anyhow::Result<String> = async {
+    let result: anyhow::Result<()> = async {
         let (_, model_name) = split_model_identifier(&model);
         let (llm, _) = ProviderFactory::create_with_model(provider, model_name.as_deref())
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        // Use the simple `complete` API (takes &str prompt directly)
-        let resp = llm
-            .complete("ping")
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        Ok(resp.content.chars().take(40).collect())
+        if agent_tools_probe {
+            copilot_agent_probe::probe_agent_chat_with_tools(llm.as_ref())
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        } else {
+            llm.complete("ping")
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        Ok(())
     }
     .await;
 
     let elapsed = start.elapsed();
 
     match result {
-        Ok(_) => Check::pass(
-            "Provider ping",
+        Ok(()) => Check::pass(
+            check_label,
             format!(
                 "{provider_str} → ok ({:.0}ms)",
                 elapsed.as_secs_f64() * 1000.0
             ),
         ),
         Err(e) => {
+            let display =
+                if copilot_agent_probe::is_copilot_model_not_supported_error(&e.to_string()) {
+                    format!(
+                        "{provider_str} → {e} {}",
+                        copilot_agent_probe::MODEL_NOT_SUPPORTED_HINT
+                    )
+                } else {
+                    format!("{provider_str} → {e}")
+                };
             if is_configuration_gap(&e) {
-                Check::warn(
-                    "Provider ping",
-                    format!("{provider_str} → not tested ({e})"),
-                )
+                Check::warn(check_label, format!("{provider_str} → not tested ({e})"))
             } else {
-                Check::fail("Provider ping", format!("{provider_str} → {e}"))
+                Check::fail(check_label, display)
             }
         }
     }
@@ -880,6 +943,23 @@ mod tests {
         std::fs::write(home.join("config.yaml"), "model:\n  default_model: test\n").expect("write");
         let check = check_config_file(&home);
         assert_eq!(check.status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn ha25_doctor_harness_reports_spill_gap() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join("logs")).expect("logs dir");
+        std::fs::write(
+            tmp.path()
+                .join("logs")
+                .join(edgecrab_core::HARNESS_JSON_LOG_NAME),
+            "INFO tool_name=read_file harness: tool start\nINFO tool result spilled to artifact\n",
+        )
+        .expect("write harness");
+        let report =
+            edgecrab_core::analyze_harness_file(&tmp.path().join("logs")).expect("analyze");
+        assert!(report.spill_events >= 1);
+        assert_eq!(report.spill_without_read, 1);
     }
 
     #[test]

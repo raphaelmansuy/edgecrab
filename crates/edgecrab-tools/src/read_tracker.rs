@@ -334,7 +334,7 @@ mod tests {
 
         let err = guard_file_freshness(session, "write_file", "freshness.txt", &path)
             .expect_err("stale guard should fire");
-        assert!(err.to_string().contains("modified since you last read it"));
+        assert!(err.to_string().contains("changed since it was last read"));
     }
 
     #[test]

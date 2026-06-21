@@ -132,9 +132,7 @@ fn init_meter_provider(endpoint: &str, service_name: &str) -> Option<SdkMeterPro
             Some(provider)
         }
         Err(err) => {
-            eprintln!(
-                "warning: failed to build OTLP metrics exporter for {endpoint}: {err}"
-            );
+            eprintln!("warning: failed to build OTLP metrics exporter for {endpoint}: {err}");
             None
         }
     }
@@ -144,9 +142,7 @@ fn init_trace_provider(endpoint: &str) -> Option<TracerProvider> {
     match build_trace_provider(endpoint) {
         Ok(provider) => Some(provider),
         Err(err) => {
-            eprintln!(
-                "warning: failed to build OTLP trace exporter for {endpoint}: {err}"
-            );
+            eprintln!("warning: failed to build OTLP trace exporter for {endpoint}: {err}");
             None
         }
     }
@@ -167,9 +163,7 @@ where
     }
 
     if tokio::runtime::Handle::try_current().is_err() {
-        eprintln!(
-            "warning: OpenTelemetry OTLP export requires an active Tokio runtime; skipping"
-        );
+        eprintln!("warning: OpenTelemetry OTLP export requires an active Tokio runtime; skipping");
         return (None, OtelGuard::empty());
     }
 
@@ -179,6 +173,13 @@ where
 
     let endpoint = otlp_endpoint();
     let service_name = otlp_service_name();
+
+    if !collector_reachable_sync(&endpoint) {
+        eprintln!(
+            "warning: OpenTelemetry collector unreachable at {endpoint}; skipping OTLP export"
+        );
+        return (None, OtelGuard::empty());
+    }
 
     let trace_provider = if otel_traces_enabled() {
         init_trace_provider(&endpoint)
@@ -224,6 +225,23 @@ pub async fn collector_reachable(endpoint: &str) -> bool {
     )
     .await
     .is_ok_and(|result| result.is_ok())
+}
+
+fn collector_reachable_sync(endpoint: &str) -> bool {
+    use std::net::ToSocketAddrs;
+    let host_port = endpoint
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .split('/')
+        .next()
+        .unwrap_or("localhost:4317");
+    if let Ok(mut addrs) = host_port.to_socket_addrs()
+        && let Some(addr) = addrs.next()
+    {
+        return std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(250))
+            .is_ok();
+    }
+    false
 }
 
 #[cfg(test)]

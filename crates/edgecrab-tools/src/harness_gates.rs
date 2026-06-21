@@ -12,7 +12,16 @@ use std::process::Command;
 
 use edgecrab_types::{Message, Role, parse_tool_error_payload};
 
-use crate::mutations::{FILE_MUTATING_TOOLS, MutationRecord, MutationTurnState, file_mutation_result_landed};
+use crate::mutations::{
+    FILE_MUTATING_TOOLS, MutationRecord, MutationTurnState, file_mutation_result_landed,
+};
+
+/// Per-turn advisory signals merged into [`HarnessSnapshot`] (HA-48 / HA-46).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HarnessAdvisorySignals {
+    pub visual_act_storm: bool,
+    pub guardrail_halt: bool,
+}
 
 /// Immutable gate state consumed by completion policy (pure assessment).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -23,6 +32,14 @@ pub struct HarnessSnapshot {
     pub terminal_mutation_tool_error: Option<TerminalMutationToolError>,
     /// Post-mutation oracle failures (exit code ≠ 0).
     pub oracle_failures: Vec<OracleGateFailure>,
+    /// Act-without-perceive storm (HA-48).
+    pub visual_act_storm: bool,
+    /// Tool-loop guardrail halt fired this turn (HA-46).
+    pub guardrail_halt: bool,
+    /// Spill stub never followed by `read_file` on artifact (HA-23).
+    pub spill_without_read: bool,
+    /// Assistant tool_calls missing matching tool results.
+    pub unanswered_tool_calls: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +71,8 @@ pub struct HarnessBuildInput<'a> {
     pub mutation_turn: &'a MutationTurnState,
     pub cwd: &'a Path,
     pub post_mutation_oracles: bool,
+    pub advisory: HarnessAdvisorySignals,
+    pub unanswered_tool_calls: usize,
 }
 
 /// Collect deterministic gate facts at end-of-turn (may run subprocess oracles).
@@ -82,6 +101,10 @@ pub fn build_harness_snapshot(input: HarnessBuildInput<'_>) -> HarnessSnapshot {
         unresolved_mutation_failures,
         terminal_mutation_tool_error,
         oracle_failures,
+        visual_act_storm: input.advisory.visual_act_storm,
+        guardrail_halt: input.advisory.guardrail_halt,
+        spill_without_read: crate::artifact_spill::detect_spill_without_read(input.messages),
+        unanswered_tool_calls: input.unanswered_tool_calls,
     }
 }
 
@@ -91,6 +114,10 @@ impl HarnessSnapshot {
         !self.unresolved_mutation_failures.is_empty()
             || self.terminal_mutation_tool_error.is_some()
             || !self.oracle_failures.is_empty()
+            || self.visual_act_storm
+            || self.guardrail_halt
+            || self.spill_without_read
+            || self.unanswered_tool_calls > 0
     }
 
     /// User-facing completion denial (no LLM judgment).
@@ -113,6 +140,29 @@ impl HarnessSnapshot {
                 oracle.path, oracle.command
             ));
         }
+        if self.guardrail_halt {
+            return Some(
+                "Incomplete — tool loop halted by harness guardrails; change strategy.".into(),
+            );
+        }
+        if self.visual_act_storm {
+            return Some(
+                "Incomplete — act tools fired without browser/vision evidence (visual storm)."
+                    .into(),
+            );
+        }
+        if self.spill_without_read {
+            return Some(
+                "Incomplete — spilled tool output was not read via read_file before continuing."
+                    .into(),
+            );
+        }
+        if self.unanswered_tool_calls > 0 {
+            return Some(format!(
+                "Incomplete — {n} tool call(s) ended without results.",
+                n = self.unanswered_tool_calls
+            ));
+        }
         None
     }
 
@@ -121,9 +171,7 @@ impl HarnessSnapshot {
         if !self.blocks_completion() {
             return None;
         }
-        let mut lines = vec![
-            "─── harness-gates (deterministic) ─────────────────".to_string(),
-        ];
+        let mut lines = vec!["─── harness-gates (deterministic) ─────────────────".to_string()];
         if let Some(err) = &self.terminal_mutation_tool_error {
             lines.push(format!(
                 "  ✗ last mutation tool `{}` → {} ({})",
@@ -139,9 +187,7 @@ impl HarnessSnapshot {
         for oracle in &self.oracle_failures {
             lines.push(format!(
                 "  ✗ oracle `{}` exit {:?} — {}",
-                oracle.command,
-                oracle.exit_code,
-                oracle.stderr_preview
+                oracle.command, oracle.exit_code, oracle.stderr_preview
             ));
         }
         lines.push("───────────────────────────────────────────────────".to_string());
@@ -313,8 +359,34 @@ mod tests {
             mutation_turn: &turn,
             cwd: dir.path(),
             post_mutation_oracles: true,
+            advisory: HarnessAdvisorySignals::default(),
+            unanswered_tool_calls: 0,
         });
         assert_eq!(snapshot.oracle_failures.len(), 1);
+        assert!(snapshot.blocks_completion());
+    }
+
+    #[test]
+    fn ha48_visual_storm_blocks_completion() {
+        let snapshot = HarnessSnapshot {
+            visual_act_storm: true,
+            ..HarnessSnapshot::default()
+        };
+        assert!(snapshot.blocks_completion());
+        assert!(
+            snapshot
+                .completion_block_reason()
+                .unwrap()
+                .contains("visual storm")
+        );
+    }
+
+    #[test]
+    fn ha46_guardrail_halt_blocks_completion() {
+        let snapshot = HarnessSnapshot {
+            guardrail_halt: true,
+            ..HarnessSnapshot::default()
+        };
         assert!(snapshot.blocks_completion());
     }
 
@@ -334,6 +406,8 @@ mod tests {
             mutation_turn: &turn,
             cwd: dir.path(),
             post_mutation_oracles: true,
+            advisory: HarnessAdvisorySignals::default(),
+            unanswered_tool_calls: 0,
         });
         assert!(snapshot.oracle_failures.is_empty());
         assert!(!snapshot.blocks_completion());

@@ -210,20 +210,9 @@ pub(crate) fn guard_terminal_command(
 ) -> Result<CommandInteractionAssessment, ToolError> {
     let assessment = assess_command(command);
     if command_contains_heredoc(command) {
-        return Err(
-            ToolError::capability_denied(
-                "terminal",
-                "shell_heredoc_unsupported",
-                format!(
-                    "Shell heredocs are not supported in `terminal`. A heredoc embeds multi-line input directly inside the tool-call command string, which is a second content-transport path and is unreliable for edits or large stdin payloads.\nCommand: `{}`",
-                    command_preview(command)
-                ),
-            )
-            .with_suggested_action(
-                "Use `write_file`, `patch`, or `apply_patch` for file content. If a command genuinely needs stdin, write the input to a file first and redirect it with `< file`."
-                    .to_string(),
-            ),
-        );
+        return Err(crate::recovery_catalog::terminal_heredoc_unsupported(
+            command,
+        ));
     }
     if let Some(reason) = assessment.tty_reason {
         let (code, message, action) = if pty {
@@ -551,12 +540,12 @@ mod tests {
         let command = "cat >> src/app.rs <<'EOF'\nfn main() {}\nEOF";
         let err = guard_terminal_command(command, &BackendKind::Local, false)
             .expect_err("heredoc should fail fast");
-        let ToolError::CapabilityDenied { message, code, .. } = err else {
-            panic!("expected capability denied");
-        };
-        assert_eq!(code, "shell_heredoc_unsupported");
-        assert!(message.contains("Shell heredocs are not supported"));
-        assert!(message.contains("second content-transport path"));
+        let payload = err.to_llm_payload();
+        assert_eq!(payload.code, "shell_heredoc_unsupported");
+        assert!(payload.error.contains("Shell heredocs are not supported"));
+        let recovery = payload.recovery_feedback.expect("recovery");
+        let blob = serde_json::to_string(&recovery.suggestions).expect("json");
+        assert!(blob.contains("write_file"));
     }
 
     #[test]

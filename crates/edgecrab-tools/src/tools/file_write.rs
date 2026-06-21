@@ -567,10 +567,7 @@ mod tests {
             .await;
 
         let err = result.expect_err("oversized write must be rejected");
-        assert!(
-            err.to_string()
-                .contains("Large single-call mutation payloads are unreliable")
-        );
+        assert!(err.to_string().contains("Refusing write_file"));
     }
 
     #[tokio::test]
@@ -592,10 +589,7 @@ mod tests {
             .await;
 
         let err = result.expect_err("oversized overwrite must be rejected");
-        assert!(
-            err.to_string()
-                .contains("Refusing overwrite via write_file")
-        );
+        assert!(err.to_string().contains("Refusing write_file"));
     }
 
     #[tokio::test]
@@ -621,7 +615,7 @@ mod tests {
             .await
             .expect_err("stale overwrite should be rejected");
 
-        assert!(err.to_string().contains("modified since you last read it"));
+        assert!(err.to_string().contains("changed since it was last read"));
         let content = std::fs::read_to_string(dir.path().join("stale.txt")).expect("read current");
         assert_eq!(content, "external change\n");
     }
@@ -643,18 +637,22 @@ mod tests {
             .expect_err("blind overwrite should be rejected");
 
         // FP55: rejection text must teach the model the retry protocol.
-        let msg = err.to_string();
+        let payload = err.to_llm_payload();
         assert!(
-            msg.contains("already exists"),
-            "expected existence message; got: {msg}"
+            payload.error.contains("already exists"),
+            "expected existence message; got: {}",
+            payload.error
         );
         assert!(
-            msg.contains("Snapshot recorded"),
-            "expected snapshot-recorded directive; got: {msg}"
+            payload.error.contains("Snapshot recorded"),
+            "expected snapshot-recorded directive; got: {}",
+            payload.error
         );
+        let recovery = payload.recovery_feedback.expect("recovery");
+        let blob = serde_json::to_string(&recovery.suggestions).expect("json");
         assert!(
-            msg.contains("retry the SAME write_file call"),
-            "expected explicit retry directive; got: {msg}"
+            blob.contains("retry") || blob.contains("overwrite"),
+            "expected retry guidance in recovery; got: {blob}"
         );
         // File must NOT be touched on rejection.
         let content = std::fs::read_to_string(dir.path().join("blind.txt")).expect("read current");
@@ -710,7 +708,7 @@ mod tests {
             .await
             .expect_err("first call should be rejected");
         assert!(err.to_string().contains("Snapshot recorded"));
-        assert!(err.to_string().contains("Current file content (preview)"));
+        assert!(err.to_string().contains("--- preview ---"));
         // File must NOT be modified by the rejection.
         assert_eq!(
             std::fs::read_to_string(dir.path().join("doc.md")).expect("read"),
@@ -883,7 +881,7 @@ mod tests {
             )
             .await
             .expect_err("retry must fail because file changed externally");
-        assert!(err.to_string().contains("modified since you last read it"));
+        assert!(err.to_string().contains("changed since it was last read"));
     }
 
     #[test]

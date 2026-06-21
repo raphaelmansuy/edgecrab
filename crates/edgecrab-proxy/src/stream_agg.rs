@@ -1,28 +1,29 @@
 //! Accumulate [`edgequake_llm::StreamChunk`] into a final [`edgequake_llm::LLMResponse`].
 //!
-//! Mirrors `edgecrab-core` `conversation.rs` streaming aggregation (DRY within proxy;
-//! future: extract to shared crate).
+//! Delegates tool-call finalization to [`edgequake_llm::stream_tool_calls`] (DRY with edgecrab-core).
 
-use std::collections::BTreeMap;
-
+use edgequake_llm::LLMResponse;
+use edgequake_llm::stream_tool_calls::{FinalizeStreamToolCallsOptions, StreamToolCallAccumulator};
 use edgequake_llm::traits::{StreamChunk, StreamUsage};
-use edgequake_llm::{LLMResponse, ToolCall};
 
-#[derive(Default)]
-struct PartialToolCall {
-    id: Option<String>,
-    function_name: Option<String>,
-    arguments: String,
-    thought_signature: Option<String>,
-}
-
-#[derive(Default)]
 pub struct StreamAccumulator {
     content: String,
     thinking: String,
-    tool_calls: BTreeMap<usize, PartialToolCall>,
+    tool_calls: StreamToolCallAccumulator,
     finish_reason: Option<String>,
     usage: Option<StreamUsage>,
+}
+
+impl Default for StreamAccumulator {
+    fn default() -> Self {
+        Self {
+            content: String::new(),
+            thinking: String::new(),
+            tool_calls: StreamToolCallAccumulator::new(),
+            finish_reason: None,
+            usage: None,
+        }
+    }
 }
 
 impl StreamAccumulator {
@@ -37,21 +38,16 @@ impl StreamAccumulator {
                 function_arguments,
                 thought_signature,
             } => {
-                let entry = self.tool_calls.entry(index).or_default();
-                if let Some(id) = id {
-                    entry.id = Some(id);
-                }
-                if let Some(name) = function_name {
-                    entry.function_name = Some(name);
-                }
-                if let Some(args) = function_arguments {
-                    entry.arguments.push_str(&args);
-                }
-                if thought_signature.is_some() {
-                    entry.thought_signature = thought_signature;
-                }
+                self.tool_calls.apply_delta(
+                    index,
+                    id,
+                    function_name,
+                    function_arguments,
+                    thought_signature,
+                );
             }
             StreamChunk::PrefillProgress { .. } => {}
+            StreamChunk::Connected { .. } => {}
             StreamChunk::Finished { reason, usage, .. } => {
                 self.finish_reason = Some(reason);
                 if usage.is_some() {
@@ -63,7 +59,9 @@ impl StreamAccumulator {
     }
 
     pub fn into_response(self, model: &str) -> edgequake_llm::Result<LLMResponse> {
-        let tool_calls = finalize_streamed_tool_calls(self.tool_calls)?;
+        let tool_calls = self
+            .tool_calls
+            .finalize(FinalizeStreamToolCallsOptions::default())?;
         let prompt_tokens = self.usage.as_ref().map(|u| u.prompt_tokens).unwrap_or(0);
         let completion_tokens = self
             .usage
@@ -81,47 +79,6 @@ impl StreamAccumulator {
         }
         Ok(resp)
     }
-}
-
-fn finalize_streamed_tool_calls(
-    partials: BTreeMap<usize, PartialToolCall>,
-) -> edgequake_llm::Result<Vec<ToolCall>> {
-    partials
-        .into_iter()
-        .map(|(index, partial)| {
-            let id = partial.id.unwrap_or_else(|| format!("stream_call_{index}"));
-            let function_name = partial.function_name.ok_or_else(|| {
-                edgequake_llm::LlmError::ApiError(format!(
-                    "streamed tool call {id} finished without a function name"
-                ))
-            })?;
-            let arguments = partial.arguments.trim();
-            if arguments.is_empty() {
-                return Err(edgequake_llm::LlmError::ApiError(format!(
-                    "streamed tool call {id} ({function_name}) finished without arguments"
-                )));
-            }
-            let parsed: serde_json::Value = serde_json::from_str(arguments).map_err(|err| {
-                edgequake_llm::LlmError::ApiError(format!(
-                    "streamed tool call {id} ({function_name}) invalid JSON arguments: {err}"
-                ))
-            })?;
-            if !parsed.is_object() {
-                return Err(edgequake_llm::LlmError::ApiError(format!(
-                    "streamed tool call {id} ({function_name}) arguments must be a JSON object"
-                )));
-            }
-            Ok(ToolCall {
-                id,
-                call_type: "function".to_string(),
-                function: edgequake_llm::FunctionCall {
-                    name: function_name,
-                    arguments: arguments.to_string(),
-                },
-                thought_signature: partial.thought_signature,
-            })
-        })
-        .collect()
 }
 
 #[cfg(test)]

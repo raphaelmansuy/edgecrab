@@ -187,6 +187,62 @@ fn tool_turn_budget_hint(
     }
 }
 
+/// Centralized continuation recovery branches (spec 015 HA-20b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContinuationFailureClass {
+    /// `finish_reason=length` with no tool_calls delivered.
+    LengthWithoutTools,
+    /// Stream interrupted before any tool call was delivered.
+    StreamInterruptedNoTools,
+    /// Stream interrupted after partial assistant text was shown.
+    StreamInterruptedAfterPartial,
+    /// Malformed or incomplete tool-call JSON blocked by guardrails (HA-20b extension).
+    InvalidToolArguments,
+}
+
+/// Single entry point for harness continuation user messages (DRY HA-20b).
+pub fn continuation_user_message(
+    class: ContinuationFailureClass,
+    tool_names: &[String],
+    max_mutation_payload_bytes: usize,
+    provider: Option<&dyn LLMProvider>,
+) -> String {
+    match class {
+        ContinuationFailureClass::LengthWithoutTools => {
+            length_without_tools_recovery_message(max_mutation_payload_bytes, provider)
+        }
+        ContinuationFailureClass::StreamInterruptedNoTools
+        | ContinuationFailureClass::StreamInterruptedAfterPartial => {
+            stream_interrupted_recovery_message(tool_names, max_mutation_payload_bytes, provider)
+        }
+        ContinuationFailureClass::InvalidToolArguments => {
+            invalid_tool_arguments_recovery_message(tool_names)
+        }
+    }
+}
+
+/// User-role recovery when tool-call JSON is malformed or missing required fields.
+pub fn invalid_tool_arguments_recovery_message(tool_names: &[String]) -> String {
+    let tool_hint = if tool_names.is_empty() {
+        "the previous tool call".into()
+    } else {
+        format!(
+            "tool call(s): {}",
+            tool_names
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    format!(
+        "[System: {tool_hint} had invalid or incomplete JSON arguments and was blocked. \
+         Do NOT retry the same payload. Read the tool error `required_fields` / `usage_hint`, \
+         re-emit with all required fields, or ask the user for missing values before calling tools again.]"
+    )
+}
+
 /// User-role recovery after `finish_reason=length` with no tool_calls on a tool turn.
 pub fn length_without_tools_recovery_message(
     max_mutation_payload_bytes: usize,
@@ -470,6 +526,29 @@ mod tests {
         assert!(msg.contains("write_file"));
         assert!(msg.contains("KiB"));
         assert!(msg.contains("scaffold"));
+    }
+
+    #[test]
+    fn ha20b_continuation_user_message_delegates_length() {
+        let msg = continuation_user_message(
+            ContinuationFailureClass::LengthWithoutTools,
+            &[],
+            32 * 1024,
+            None,
+        );
+        assert!(msg.contains("finish_reason=length"));
+    }
+
+    #[test]
+    fn ha20b_invalid_tool_arguments_recovery() {
+        let msg = continuation_user_message(
+            ContinuationFailureClass::InvalidToolArguments,
+            &["write_file".into()],
+            32 * 1024,
+            None,
+        );
+        assert!(msg.contains("invalid or incomplete JSON"));
+        assert!(msg.contains("write_file"));
     }
 
     #[test]

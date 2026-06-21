@@ -164,4 +164,28 @@ mod tests {
         assert!(second.created.is_empty());
         assert!(second.skipped_existing.iter().any(|name| name == "work"));
     }
+
+    #[test]
+    fn homelab_bundled_profile_enables_security_preview() {
+        let homelab = BUNDLED_PROFILES
+            .iter()
+            .find(|p| p.name == "homelab")
+            .expect("homelab profile");
+        let config = homelab
+            .files
+            .iter()
+            .find(|f| f.relative_path == "config.yaml")
+            .expect("config.yaml")
+            .content;
+        assert!(
+            config.contains("security:")
+                && config.contains("preview:")
+                && config.contains("enabled: true"),
+            "homelab starter must enable security.preview for games003 visual dogfood"
+        );
+        assert!(
+            config.contains("8000"),
+            "homelab preview must allow http.server default port"
+        );
+    }
 }

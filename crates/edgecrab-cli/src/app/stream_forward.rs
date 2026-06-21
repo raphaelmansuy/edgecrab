@@ -313,11 +313,14 @@ async fn forward_stream_event_to_tui(
             prompt_tokens_estimated,
             context_length,
             prefill_pct,
+            api_iteration,
+            native_streaming,
         } => {
             tracing::info!(
                 provider = %provider,
                 elapsed_secs,
                 has_tools,
+                native_streaming,
                 "TUI→agent: forwarding LLM wait progress"
             );
             let _ = tx.send(AgentResponse::LlmWaitProgress {
@@ -327,6 +330,8 @@ async fn forward_stream_event_to_tui(
                 prompt_tokens_estimated,
                 context_length,
                 prefill_pct,
+                api_iteration,
+                native_streaming,
             });
         }
         StreamEvent::BackgroundProcessTail {

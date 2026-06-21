@@ -182,6 +182,8 @@ pub(crate) async fn start_background_process(
         table.set_watch_patterns(&process_id, watch_patterns).await;
     }
 
+    crate::dev_server::record_session_http_server(&ctx.session_id, command);
+
     if ctx.config.terminal_backend == BackendKind::Local {
         spawn_local_process(tool_name, command, &cwd, pty, table, process_id).await
     } else {
@@ -381,12 +383,15 @@ async fn spawn_local_process(
         }
     });
 
-    Ok(serde_json::to_string(&json!({
-        "ok": true,
-        "process_id": process_id,
-        "command": command
-    }))
-    .expect("infallible"))
+    Ok(crate::dev_server::append_spawn_hint(
+        command,
+        &serde_json::to_string(&json!({
+            "ok": true,
+            "process_id": process_id,
+            "command": command
+        }))
+        .expect("infallible"),
+    ))
 }
 
 async fn spawn_remote_process(

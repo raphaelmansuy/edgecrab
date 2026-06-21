@@ -1124,7 +1124,7 @@ mod tests {
         .await
         .expect_err("stale patch should be rejected");
 
-        assert!(err.to_string().contains("modified since you last read it"));
+        assert!(err.to_string().contains("changed since it was last read"));
     }
 
     #[test]
@@ -1238,10 +1238,7 @@ mod tests {
             .await;
 
         let err = result.expect_err("oversized patch must be rejected");
-        assert!(
-            err.to_string()
-                .contains("Large single-call edit payloads are unreliable")
-        );
+        assert!(err.to_string().contains("Refusing"));
     }
 
     #[tokio::test]
@@ -1605,10 +1602,11 @@ mod tests {
             .await;
 
         let err = result.expect_err("oversized apply_patch must be rejected");
-        assert!(
-            err.to_string()
-                .contains("Split the refactor into multiple focused apply_patch calls")
-        );
+        let payload = err.to_llm_payload();
+        assert!(payload.error.contains("Refusing apply_patch"));
+        let recovery = payload.recovery_feedback.expect("recovery");
+        let blob = serde_json::to_string(&recovery.suggestions).expect("json");
+        assert!(blob.contains("patch") || blob.contains("scaffold"));
         assert!(!dir.path().join("huge.txt").exists());
     }
 

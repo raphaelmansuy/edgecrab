@@ -574,6 +574,8 @@ impl GatewayEventProcessor {
                     prompt_tokens_estimated,
                     context_length,
                     prefill_pct,
+                    api_iteration,
+                    native_streaming,
                 } => {
                     let text = edgecrab_tools::tool_progress_tail::llm_wait_progress_label(
                         &provider,
@@ -583,6 +585,8 @@ impl GatewayEventProcessor {
                             prompt_tokens_estimated,
                             context_length,
                             prefill_pct,
+                            api_iteration,
+                            native_streaming,
                         },
                     );
                     self.send_status(&text).await;

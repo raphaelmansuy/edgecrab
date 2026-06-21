@@ -287,7 +287,12 @@ pub enum Command {
     /// Check configuration, API keys, and provider connectivity
     ///
     /// Equivalent to `hermes doctor`. Prints a colored status report.
-    Doctor,
+    /// Use `edgecrab doctor harness` to analyze harness.jsonl metrics.
+    Doctor {
+        /// Optional scope: `harness` analyzes spill/perception metrics in harness.jsonl
+        #[arg(value_name = "SCOPE")]
+        scope: Option<String>,
+    },
 
     /// Inspect and maintain the filesystem checkpoint store
     ///
@@ -1460,7 +1465,7 @@ mod tests {
     #[test]
     fn parse_doctor_subcommand() {
         let args = CliArgs::parse_from(["edgecrab", "doctor"]);
-        assert!(matches!(args.command, Some(Command::Doctor)));
+        assert!(matches!(args.command, Some(Command::Doctor { .. })));
     }
 
     #[test]

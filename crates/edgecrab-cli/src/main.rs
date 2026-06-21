@@ -947,10 +947,14 @@ async fn run_subcommand(cmd: Command, args: &CliArgs) -> anyhow::Result<()> {
             setup::run_with_options(section.as_deref(), force)?;
         }
 
-        Command::Doctor => {
-            let all_ok = doctor::run(args.config.as_deref()).await?;
-            if !all_ok {
-                std::process::exit(1);
+        Command::Doctor { scope } => {
+            if scope.as_deref() == Some("harness") {
+                doctor::run_harness(args.config.as_deref())?;
+            } else {
+                let all_ok = doctor::run(args.config.as_deref()).await?;
+                if !all_ok {
+                    std::process::exit(1);
+                }
             }
         }
 

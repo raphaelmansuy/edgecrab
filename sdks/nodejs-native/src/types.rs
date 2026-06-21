@@ -96,10 +96,12 @@ impl From<edgecrab_sdk_core::StreamEvent> for JsStreamEvent {
                 prompt_tokens_estimated,
                 context_length,
                 prefill_pct,
+                api_iteration,
+                native_streaming,
             } => Self {
                 event_type: "llm_wait_progress".into(),
                 data: format!(
-                    "{provider}:{elapsed_secs}:tools={has_tools}:prompt={prompt_tokens_estimated:?}:ctx={context_length:?}:prefill={prefill_pct:?}"
+                    "{provider}:{elapsed_secs}:tools={has_tools}:prompt={prompt_tokens_estimated:?}:ctx={context_length:?}:prefill={prefill_pct:?}:iter={api_iteration:?}:stream={native_streaming}"
                 ),
             },
             edgecrab_sdk_core::StreamEvent::BackgroundProcessTail {

@@ -5,6 +5,12 @@
 
 use edgequake_llm::CopilotModel;
 
+/// Whether a user-facing model spec targets GitHub Copilot.
+pub fn is_copilot_model_spec(spec: &str) -> bool {
+    let lower = spec.trim().to_ascii_lowercase();
+    lower.starts_with("copilot/") || lower.starts_with("vscode-copilot/")
+}
+
 /// Fast local check — no network. Returns a user-facing reason when the model id
 /// is obviously not a direct agent chat target.
 pub fn copilot_model_id_reject_reason(model_id: &str) -> Option<&'static str> {
@@ -53,6 +59,13 @@ pub fn copilot_model_is_agent_selectable(model: &CopilotModel) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detects_copilot_model_specs() {
+        assert!(is_copilot_model_spec("copilot/gpt-4.1"));
+        assert!(is_copilot_model_spec("vscode-copilot/claude-haiku-4.5"));
+        assert!(!is_copilot_model_spec("anthropic/claude-opus-4.6"));
+    }
 
     #[test]
     fn rejects_picker_suffix_ids() {

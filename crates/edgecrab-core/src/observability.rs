@@ -102,7 +102,10 @@ pub struct LlmRequestStart<'a> {
 }
 
 /// Parent span for one user turn (wraps `execute_loop` / streaming entry).
-pub fn agent_conversation_span(session_id: &str, platform: edgecrab_types::Platform) -> tracing::Span {
+pub fn agent_conversation_span(
+    session_id: &str,
+    platform: edgecrab_types::Platform,
+) -> tracing::Span {
     tracing::info_span!(
         target: TARGET_HARNESS,
         "agent_conversation",
@@ -418,13 +421,22 @@ mod tests {
             },
             "edgecrab-gateway",
         );
-        assert_eq!(std::env::var("EDGECRAB_TRACE_LLM").ok().as_deref(), Some("0"));
+        assert_eq!(
+            std::env::var("EDGECRAB_TRACE_LLM").ok().as_deref(),
+            Some("0")
+        );
         assert_eq!(
             std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok().as_deref(),
             Some("http://collector:4317")
         );
-        assert_eq!(std::env::var("OTEL_SERVICE_NAME").ok().as_deref(), Some("edgecrab-gateway"));
-        assert_eq!(std::env::var("EDGECODE_CAPTURE_CONTENT").ok().as_deref(), Some("1"));
+        assert_eq!(
+            std::env::var("OTEL_SERVICE_NAME").ok().as_deref(),
+            Some("edgecrab-gateway")
+        );
+        assert_eq!(
+            std::env::var("EDGECODE_CAPTURE_CONTENT").ok().as_deref(),
+            Some("1")
+        );
 
         unsafe {
             std::env::set_var("OTEL_SERVICE_NAME", "custom-service");

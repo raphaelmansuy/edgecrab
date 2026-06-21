@@ -44,6 +44,21 @@ pub fn load_runtime(
     if !profile_report.created.is_empty() {
         tracing::info!(profiles_sync = %profile_report.summary(), "bundled profiles synced");
     }
+    // Migrate preview keys from install-global into existing profiles (spec 015 HA-41).
+    let profiles_dir = edgecrab_core::install_edgecrab_home().join("profiles");
+    if profiles_dir.is_dir()
+        && let Ok(entries) = std::fs::read_dir(&profiles_dir)
+    {
+        for entry in entries.flatten() {
+            let cfg = entry.path().join("config.yaml");
+            if let Ok(true) = AppConfig::migrate_profile_preview_from_global(&cfg) {
+                tracing::info!(
+                    profile = %entry.file_name().to_string_lossy(),
+                    "migrated security.preview from global config"
+                );
+            }
+        }
+    }
 
     // Load secrets from ~/.edgecrab/.env into the process environment BEFORE
     // config parsing so that tokens saved by `edgecrab gateway configure`
@@ -59,9 +74,14 @@ pub fn load_runtime(
         .unwrap_or_else(|| home.join("config.yaml"));
 
     let mut config = if config_path.is_file() {
-        AppConfig::load_from(&config_path).context("failed to load config")?
+        AppConfig::load_from_with_global_inheritance(&config_path)
+            .context("failed to load config")?
     } else {
-        AppConfig::default()
+        let mut config = AppConfig::default();
+        if let Ok(global) = AppConfig::load_install_global_config() {
+            edgecrab_core::config::merge_global_inherited(&mut config, &global, "");
+        }
+        config
     };
 
     if let Some(model) = model_override {
@@ -70,6 +90,9 @@ pub fn load_runtime(
     if let Some(toolsets) = toolsets_override {
         config.tools.enabled_toolsets = Some(toolsets.to_vec());
     }
+    // Model/toolset overrides can reload config without re-parsing yaml — re-apply
+    // preview SSRF allowlist so browser_navigate stays consistent for the process.
+    config.apply_security_runtime();
 
     Ok(RuntimeContext {
         state_db_path: home.join("state.db"),

@@ -317,7 +317,7 @@ pub fn load_config_for_profile(
     let home = profile_effective_home(install_root, profile_name);
     let path = home.join("config.yaml");
     if path.is_file() {
-        AppConfig::load_from(&path)
+        AppConfig::load_from_with_global_inheritance(&path)
     } else {
         Ok(AppConfig::default())
     }

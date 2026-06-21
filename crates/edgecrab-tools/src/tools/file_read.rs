@@ -15,6 +15,8 @@ use serde_json::json;
 
 use edgecrab_types::{ToolError, ToolSchema};
 
+use crate::artifact_spill::{SpillConfig, SpillContext, SpillOutcome, SpillSequence, maybe_spill};
+use crate::budget_config::is_artifact_spill_path;
 use crate::path_utils::jail_read_path;
 use crate::read_tracker;
 use crate::registry::{ToolContext, ToolHandler};
@@ -47,7 +49,38 @@ fn default_line_numbers() -> bool {
 
 fn normalize_line_range(args: &Args) -> Result<(Option<usize>, Option<usize>), ToolError> {
     if args.line_start.is_some() || args.line_end.is_some() {
-        return Ok((args.line_start, args.line_end));
+        let (start, end) = (args.line_start, args.line_end);
+        if let (Some(s), Some(e)) = (start, end) {
+            if s == 0 || e == 0 {
+                return Err(ToolError::InvalidArgs {
+                    tool: "read_file".into(),
+                    message: "line_start and line_end must be >= 1".into(),
+                });
+            }
+            if s > e {
+                return Err(ToolError::InvalidArgs {
+                    tool: "read_file".into(),
+                    message: format!(
+                        "line_start ({s}) must be <= line_end ({e}); swap them or omit line_end"
+                    ),
+                });
+            }
+        } else if let Some(s) = start
+            && s == 0
+        {
+            return Err(ToolError::InvalidArgs {
+                tool: "read_file".into(),
+                message: "line_start must be >= 1".into(),
+            });
+        } else if let Some(e) = end
+            && e == 0
+        {
+            return Err(ToolError::InvalidArgs {
+                tool: "read_file".into(),
+                message: "line_end must be >= 1".into(),
+            });
+        }
+        return Ok((start, end));
     }
 
     let Some(offset) = args.offset.or_else(|| args.limit.map(|_| 1)) else {
@@ -324,6 +357,12 @@ impl ToolHandler for ReadFileTool {
                 if start_idx >= lines.len() {
                     return Ok(format!("(empty — file has {} lines)", lines.len()));
                 }
+                if start_idx >= end_idx {
+                    return Ok(format!(
+                        "(empty — invalid range {start}–{end}; file has {} lines)",
+                        lines.len()
+                    ));
+                }
                 (lines[start_idx..end_idx].join("\n"), start)
             }
             (Some(start), None) => {
@@ -360,7 +399,38 @@ impl ToolHandler for ReadFileTool {
             return Ok(format!("{warning}{output}"));
         }
 
-        Ok(output)
+        read_file_maybe_spill_large(&args.path, &output, ctx)
+    }
+}
+
+fn read_file_maybe_spill_large(
+    path: &str,
+    output: &str,
+    ctx: &ToolContext,
+) -> Result<String, ToolError> {
+    if is_artifact_spill_path(path) {
+        return Ok(output.to_string());
+    }
+    let spill_config = SpillConfig::from(&ctx.config);
+    if !spill_config.enabled || output.len() <= spill_config.threshold {
+        return Ok(output.to_string());
+    }
+    let spill_ctx = SpillContext {
+        source_path: Some(path.to_string()),
+    };
+    let seq = SpillSequence::new();
+    match maybe_spill(
+        "read_file",
+        ctx.current_tool_call_id.as_deref().unwrap_or("read"),
+        output.to_string(),
+        &ctx.session_id,
+        &ctx.cwd,
+        &spill_config,
+        &seq,
+        Some(&spill_ctx),
+    ) {
+        SpillOutcome::Spilled { stub, .. } => Ok(stub),
+        SpillOutcome::Inline(s) => Ok(s),
     }
 }
 
@@ -391,6 +461,24 @@ mod tests {
 
         assert!(result.contains("line1"));
         assert!(result.contains("line3"));
+    }
+
+    #[tokio::test]
+    async fn read_file_rejects_inverted_line_range() {
+        let dir = TempDir::new().expect("tmpdir");
+        std::fs::write(dir.path().join("test.txt"), "a\nb\nc\n").expect("write");
+        let ctx = ctx_in(dir.path());
+        let err = ReadFileTool
+            .execute(
+                json!({"path": "test.txt", "line_start": 3, "line_end": 1}),
+                &ctx,
+            )
+            .await
+            .expect_err("inverted range");
+        let ToolError::InvalidArgs { message, .. } = err else {
+            panic!("expected InvalidArgs, got {err:?}");
+        };
+        assert!(message.contains("line_start"));
     }
 
     #[tokio::test]
@@ -677,5 +765,27 @@ mod tests {
             .expect("read virtual tmp");
 
         assert_eq!(result, "tmp contents");
+    }
+
+    #[tokio::test]
+    async fn ha23_large_read_spills_with_inline_preview() {
+        let dir = TempDir::new().expect("tmpdir");
+        let lines: Vec<String> = (1..=150).map(|i| format!("content line {i}")).collect();
+        std::fs::write(dir.path().join("big.txt"), lines.join("\n")).expect("write");
+
+        let mut ctx = ctx_in(dir.path());
+        ctx.config.result_spill = true;
+        ctx.config.result_spill_threshold = 500;
+        ctx.config.result_spill_preview_lines = 20;
+
+        let result = ReadFileTool
+            .execute(json!({"path": "big.txt", "line_numbers": false}), &ctx)
+            .await
+            .expect("read");
+
+        assert!(result.contains("[tool_result_spill]"));
+        assert!(result.contains("BEGIN PREVIEW"));
+        assert!(result.contains("next: read_file"));
+        assert!(result.contains("big.txt"));
     }
 }

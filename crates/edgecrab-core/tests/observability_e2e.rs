@@ -3,10 +3,12 @@
 //! Deterministic — no live provider or subscriber init required.
 
 use edgecrab_core::{
-    OBSERVABILITY_FILTER_DIRECTIVES, TARGET_GENAI_SPANS, TARGET_HARNESS, TARGET_LOCAL_LLM,
-    TARGET_PROVIDER_LLM,
-    observability::{LlmCorrelation, LlmRequestStart, agent_conversation_span, apply_runtime_from_config, llm_post_hook_json, llm_pre_hook_json},
-    ObservabilityConfig,
+    OBSERVABILITY_FILTER_DIRECTIVES, ObservabilityConfig, TARGET_GENAI_SPANS, TARGET_HARNESS,
+    TARGET_LOCAL_LLM, TARGET_PROVIDER_LLM,
+    observability::{
+        LlmCorrelation, LlmRequestStart, agent_conversation_span, apply_runtime_from_config,
+        llm_post_hook_json, llm_pre_hook_json,
+    },
 };
 use edgecrab_types::Platform;
 use edgequake_llm::LLMResponse;
@@ -95,7 +97,10 @@ fn apply_runtime_from_config_sets_trace_llm_off() {
         },
         "edgecrab",
     );
-    assert_eq!(std::env::var("EDGECRAB_TRACE_LLM").ok().as_deref(), Some("0"));
+    assert_eq!(
+        std::env::var("EDGECRAB_TRACE_LLM").ok().as_deref(),
+        Some("0")
+    );
     unsafe {
         std::env::remove_var("EDGECRAB_TRACE_LLM");
     }

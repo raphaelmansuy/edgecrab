@@ -26,7 +26,9 @@ pub mod trajectory;
 pub mod usage;
 
 pub use config::{ApiMode, DEFAULT_MODEL, OPENROUTER_BASE_URL, OriginChat, Platform};
-pub use error::{AgentError, ToolError, ToolErrorRecord, ToolErrorResponse, parse_tool_error_payload};
+pub use error::{
+    AgentError, ToolError, ToolErrorRecord, ToolErrorResponse, parse_tool_error_payload,
+};
 pub use harness::{
     CompletionDecision, ExitReason, ReportedTaskStatus, RunOutcome, TaskStatusKind,
     VerificationSummary,

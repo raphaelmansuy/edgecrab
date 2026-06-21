@@ -342,6 +342,11 @@ fn append_thinking_lines(
 }
 
 fn thinking_content(state: &TurnActivityState, details: &ShelfDetailsState) -> Option<String> {
+    if (state.generating_tool.is_some() || state.tools.values().any(|t| !t.finished))
+        && let Some(caption) = state.live_caption()
+    {
+        return Some(caption);
+    }
     if let Some(label) = state.llm_wait_label() {
         let elapsed = state.phase_started.elapsed().as_secs();
         return Some(format!(
@@ -386,8 +391,9 @@ fn append_activity_lines(
             SectionRender::Summary => "▸ ",
             _ => "  ↳ ",
         };
+        let text = notice.text.trim_start_matches('↳').trim_start();
         lines.push(Line::from(vec![Span::styled(
-            format!("{prefix}{}", notice.text),
+            format!("{prefix}{text}"),
             style,
         )]));
         if matches!(render, SectionRender::Summary) {

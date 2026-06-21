@@ -104,6 +104,7 @@ pub enum ExitReason {
     VerificationPending,
     ToolFailure,
     ModelError,
+    GuardrailHalt,
 }
 
 impl ExitReason {
@@ -119,6 +120,7 @@ impl ExitReason {
             Self::VerificationPending => "verification_pending",
             Self::ToolFailure => "tool_failure",
             Self::ModelError => "model_error",
+            Self::GuardrailHalt => "guardrail_halt",
         }
     }
 }
