@@ -5,9 +5,9 @@ use std::time::Instant;
 use edgecrab_core::StreamEvent;
 
 use crate::stream_bridge::{
-    apply_activity_notice, apply_reasoning_delta, apply_subagent_detail, apply_subagent_finish,
-    apply_subagent_start, apply_subagent_tool, apply_tool_done, apply_tool_exec,
-    apply_tool_generating, apply_tool_progress, maybe_agents_nudge,
+    apply_activity_notice, apply_llm_wait_progress, apply_reasoning_delta, apply_subagent_detail,
+    apply_subagent_finish, apply_subagent_start, apply_subagent_tool, apply_tool_done,
+    apply_tool_exec, apply_tool_generating, apply_tool_progress, maybe_agents_nudge,
 };
 use crate::tool_display::extract_tool_preview;
 use crate::turn_activity::{ActivityTone, TurnActivityState};
@@ -126,6 +126,26 @@ impl TurnStreamHarness {
             StreamEvent::ActivityNotice(text) => {
                 apply_activity_notice(&mut self.activity, text, ActivityTone::Info);
             }
+            StreamEvent::LlmWaitProgress {
+                provider,
+                elapsed_secs,
+                has_tools,
+                prompt_tokens_estimated,
+                context_length,
+                prefill_pct,
+            } => {
+                apply_llm_wait_progress(
+                    &mut self.activity,
+                    &provider,
+                    elapsed_secs,
+                    has_tools,
+                    edgecrab_tools::tool_progress_tail::LlmWaitContext {
+                        prompt_tokens_estimated,
+                        context_length,
+                        prefill_pct,
+                    },
+                );
+            }
             StreamEvent::BackgroundProcessTail {
                 process_id,
                 command_preview,
@@ -201,7 +221,7 @@ mod tests {
             now,
         );
         assert!(!h.activity.contains_tool("tc1"));
-        assert!(matches!(h.activity.phase, ShelfPhase::AnalyzingOutput));
+        assert!(matches!(h.activity.phase, ShelfPhase::AwaitingFirstToken));
     }
 
     #[test]

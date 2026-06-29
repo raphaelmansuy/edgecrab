@@ -98,7 +98,18 @@ impl ApprovalPolicy {
         args: &serde_json::Value,
         session_id: &str,
     ) -> ApprovalCheck {
-        if self.mode == ApprovalMode::Off {
+        self.check_with_mode(self.mode, tool_name, args, session_id)
+    }
+
+    /// Like [`check`](Self::check) but uses an explicit mode (e.g. from session config).
+    pub fn check_with_mode(
+        &self,
+        mode: ApprovalMode,
+        tool_name: &str,
+        args: &serde_json::Value,
+        session_id: &str,
+    ) -> ApprovalCheck {
+        if mode == ApprovalMode::Off {
             return ApprovalCheck {
                 needs_approval: false,
                 reasons: Vec::new(),
@@ -109,12 +120,10 @@ impl ApprovalPolicy {
         let mut reasons = Vec::new();
         let mut scan_result = None;
 
-        // Check 1: Tool-level approval requirement
         if self.approval_required_tools.contains(tool_name) {
             reasons.push(format!("tool '{tool_name}' requires approval per config"));
         }
 
-        // Check 2: Terminal command scanning
         if (tool_name == "terminal" || tool_name == "shell")
             && let Some(cmd) = args.get("command").and_then(|v| v.as_str())
         {
@@ -123,7 +132,6 @@ impl ApprovalPolicy {
                 for m in &result.matched_patterns {
                     reasons.push(format!("{}: {}", m.category_label(), m.description));
                 }
-                // Check if already approved — clear reasons if so
                 if self.is_approved(cmd, session_id) {
                     reasons.clear();
                 }

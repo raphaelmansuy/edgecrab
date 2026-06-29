@@ -1556,6 +1556,7 @@ async fn execute_remote(
                 watch_notification_tx: None,
                 mutation_turn: None,
                 lsp_gate: None,
+                kanban_task_id: None,
             };
             let rpc_dir = format!("{sandbox_dir}/rpc");
             let allowed = Arc::new(sandbox_tools.iter().map(|tool| tool.to_string()).collect());
@@ -1823,6 +1824,7 @@ impl ToolHandler for ExecuteCodeToolReal {
                     watch_notification_tx: None,
                     mutation_turn: None,
                     lsp_gate: None,
+                kanban_task_id: None,
                 };
                 let counter = tool_call_counter.clone();
                 let allowed: Arc<Vec<String>> =

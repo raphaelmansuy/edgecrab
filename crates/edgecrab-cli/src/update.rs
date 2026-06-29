@@ -532,9 +532,36 @@ pub fn execute_update_plan(plan: &UpdatePlan) -> anyhow::Result<()> {
     }
 }
 
+pub fn maybe_pre_update_snapshot(
+    config: &edgecrab_core::AppConfig,
+    skip: bool,
+    out: &mut dyn Write,
+) {
+    if skip || !config.updates.pre_update_snapshot {
+        return;
+    }
+    let keep = config.updates.pre_update_snapshot_keep.max(1) as usize;
+    match edgecrab_core::create_pre_update_snapshot(keep, None) {
+        Ok(Some(id)) => {
+            let _ = writeln!(
+                out,
+                "Pre-update snapshot: {id}  (restore: /snapshot restore {id})"
+            );
+        }
+        Ok(None) => {}
+        Err(err) => {
+            let _ = writeln!(
+                out,
+                "Warning: pre-update snapshot failed ({err}); continuing update."
+            );
+        }
+    }
+}
+
 pub async fn run_update_command(
     config: &edgecrab_core::AppConfig,
     check_only: bool,
+    skip_snapshot: bool,
     out: &mut dyn Write,
 ) -> anyhow::Result<()> {
     let status = resolve_update_status(config, true).await?;
@@ -547,6 +574,7 @@ pub async fn run_update_command(
     let plan = build_update_plan(&status);
     match &plan {
         UpdatePlan::Managed { .. } => {
+            maybe_pre_update_snapshot(config, skip_snapshot, out);
             writeln!(out)?;
             writeln!(out, "Applying update...")?;
             execute_update_plan(&plan)?;

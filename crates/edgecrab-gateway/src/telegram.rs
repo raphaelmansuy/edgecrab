@@ -72,6 +72,19 @@ fn is_thread_not_found(description: &str) -> bool {
 struct Update {
     update_id: i64,
     message: Option<TelegramMessage>,
+    #[serde(default)]
+    callback_query: Option<TelegramCallbackQuery>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramCallbackQuery {
+    id: String,
+    #[allow(dead_code)]
+    from: TelegramUser,
+    #[serde(default)]
+    message: Option<TelegramMessage>,
+    #[serde(default)]
+    data: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -167,6 +180,14 @@ struct SendMessageRequest<'a> {
     reply_to_message_id: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     message_thread_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reply_markup: Option<serde_json::Value>,
+}
+
+fn escape_html(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 // ---------------------------------------------------------------------------
@@ -336,6 +357,7 @@ impl TelegramAdapter {
                 },
                 reply_to_message_id: reply_to,
                 message_thread_id: candidate_thread_id,
+                reply_markup: None,
             };
 
             let resp: TelegramResponse<serde_json::Value> = self
@@ -368,6 +390,7 @@ impl TelegramAdapter {
                     parse_mode: None,
                     reply_to_message_id: reply_to,
                     message_thread_id: candidate_thread_id,
+                    reply_markup: None,
                 };
                 let retry: TelegramResponse<serde_json::Value> = self
                     .client
@@ -428,6 +451,7 @@ impl TelegramAdapter {
                 },
                 reply_to_message_id: reply_to,
                 message_thread_id: candidate_thread_id,
+                reply_markup: None,
             };
 
             let resp: TelegramResponse<TelegramMessage> = self
@@ -462,6 +486,7 @@ impl TelegramAdapter {
                     parse_mode: None,
                     reply_to_message_id: reply_to,
                     message_thread_id: candidate_thread_id,
+                    reply_markup: None,
                 };
                 let retry: TelegramResponse<TelegramMessage> = self
                     .client
@@ -827,6 +852,147 @@ impl TelegramAdapter {
 
         attachments
     }
+
+    fn build_clarify_keyboard(interaction_id: u64, choice_count: usize) -> serde_json::Value {
+        let mut rows = Vec::new();
+        for idx in 0..choice_count {
+            rows.push(vec![serde_json::json!({
+                "text": (idx + 1).to_string(),
+                "callback_data": format!("cl:{interaction_id}:{idx}"),
+            })]);
+        }
+        rows.push(vec![serde_json::json!({
+            "text": "✏️ Other (type answer)",
+            "callback_data": format!("cl:{interaction_id}:other"),
+        })]);
+        serde_json::json!({ "inline_keyboard": rows })
+    }
+
+    async fn send_clarify_prompt(
+        &self,
+        chat_id: &str,
+        text: &str,
+        thread_id: Option<i64>,
+        reply_markup: Option<serde_json::Value>,
+    ) -> anyhow::Result<()> {
+        let url = self.api_url("sendMessage");
+        let body = SendMessageRequest {
+            chat_id,
+            text,
+            parse_mode: Some("HTML"),
+            reply_to_message_id: None,
+            message_thread_id: thread_id,
+            reply_markup,
+        };
+        let resp: TelegramResponse<serde_json::Value> = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await?
+            .json()
+            .await?;
+        if resp.ok {
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "Telegram clarify sendMessage failed: {}",
+                resp.description.unwrap_or_default()
+            )
+        }
+    }
+
+    async fn answer_callback_query(&self, callback_id: &str, text: Option<&str>) -> anyhow::Result<()> {
+        let url = self.api_url("answerCallbackQuery");
+        #[derive(Serialize)]
+        struct Body<'a> {
+            callback_query_id: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            text: Option<&'a str>,
+        }
+        let resp: TelegramResponse<serde_json::Value> = self
+            .client
+            .post(&url)
+            .json(&Body {
+                callback_query_id: callback_id,
+                text,
+            })
+            .send()
+            .await?
+            .json()
+            .await?;
+        if resp.ok {
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "answerCallbackQuery failed: {}",
+                resp.description.unwrap_or_default()
+            )
+        }
+    }
+
+    async fn handle_clarify_callback(&self, cb: &TelegramCallbackQuery) {
+        let Some(data) = cb.data.as_deref() else {
+            return;
+        };
+        let Some(rest) = data.strip_prefix("cl:") else {
+            return;
+        };
+        let mut parts = rest.split(':');
+        let Some(id_str) = parts.next() else {
+            return;
+        };
+        let Ok(interaction_id) = id_str.parse::<u64>() else {
+            return;
+        };
+        let Some(choice_key) = parts.next() else {
+            return;
+        };
+
+        let _ = self
+            .answer_callback_query(&cb.id, Some("Got it"))
+            .await;
+
+        if choice_key == "other" {
+            if let Some(msg) = &cb.message {
+                let chat_id = msg.chat.id.to_string();
+                let thread_id = msg.message_thread_id;
+                let _ = self
+                    .send_clarify_prompt(
+                        &chat_id,
+                        "✏️ Type your answer:",
+                        thread_id,
+                        None,
+                    )
+                    .await;
+            }
+            return;
+        }
+
+        let Ok(idx) = choice_key.parse::<usize>() else {
+            return;
+        };
+        let answer = crate::clarify_wiring::peek_clarify(interaction_id)
+            .await
+            .and_then(|(_, choices)| choices)
+            .and_then(|choices| choices.get(idx).cloned())
+            .unwrap_or_else(|| choice_key.to_string());
+
+        if crate::clarify_wiring::resolve_clarify_button(interaction_id, answer).await
+            && let Some(msg) = &cb.message
+        {
+            let chat_id = msg.chat.id.to_string();
+            let thread_id = msg.message_thread_id;
+            let _ = self
+                .send_clarify_prompt(
+                    &chat_id,
+                    "✅ Answer received. Continuing…",
+                    thread_id,
+                    None,
+                )
+                .await;
+        }
+    }
 }
 
 fn render_telegram_incoming_text(
@@ -901,6 +1067,11 @@ impl PlatformAdapter for TelegramAdapter {
                 Ok(updates) => {
                     for update in updates {
                         offset = update.update_id + 1;
+
+                        if let Some(cb) = update.callback_query {
+                            self.handle_clarify_callback(&cb).await;
+                            continue;
+                        }
 
                         let Some(msg) = update.message else {
                             continue;
@@ -1049,6 +1220,40 @@ impl PlatformAdapter for TelegramAdapter {
             .as_deref()
             .and_then(|id| id.parse::<i64>().ok());
         self.send_chat_action(chat_id, thread_id).await
+    }
+
+    async fn send_clarify(
+        &self,
+        prompt: &crate::platform::ClarifyPrompt,
+        metadata: &MessageMetadata,
+    ) -> anyhow::Result<bool> {
+        let chat_id = metadata
+            .channel_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Telegram clarify requires channel_id"))?;
+        let thread_id = metadata
+            .thread_id
+            .as_deref()
+            .and_then(|id| id.parse::<i64>().ok());
+
+        let mut text = format!("❓ {}", escape_html(&prompt.question));
+        let markup = if let Some(choices) = prompt.choices.as_ref().filter(|c| !c.is_empty()) {
+            let option_lines = choices
+                .iter()
+                .enumerate()
+                .map(|(i, c)| format!("{}. {}", i + 1, escape_html(c)))
+                .collect::<Vec<_>>()
+                .join("\n");
+            text.push_str("\n\n");
+            text.push_str(&option_lines);
+            Some(Self::build_clarify_keyboard(prompt.interaction_id, choices.len()))
+        } else {
+            None
+        };
+
+        self.send_clarify_prompt(chat_id, &text, thread_id, markup)
+            .await?;
+        Ok(true)
     }
 
     async fn send_and_get_id(&self, msg: OutgoingMessage) -> anyhow::Result<Option<String>> {

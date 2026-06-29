@@ -71,6 +71,7 @@ mod secret_capture_overlay;
 mod setup;
 mod shelf_details;
 mod shelf_visual;
+mod skill_trust_overlay;
 mod skin_engine;
 mod spawn_diff;
 mod spawn_history;
@@ -202,7 +203,13 @@ fn explicit_provider_request(model: &str) -> Option<(&str, &str)> {
 }
 
 async fn prepare_super_grok_oauth_env() -> anyhow::Result<()> {
-    let auth_path = edgecrab_proxy::default_auth_path();
+    if std::env::var("XAI_API_KEY")
+        .ok()
+        .is_some_and(|v| !v.trim().is_empty())
+    {
+        return Ok(());
+    }
+    let auth_path = edgecrab_proxy::auth_path_for_provider(edgecrab_proxy::XAI_OAUTH_PROVIDER);
     let (bearer, base_url) = edgecrab_proxy::resolve_xai_credentials_async(
         &auth_path,
         edgecrab_proxy::XAI_OAUTH_PROVIDER,
@@ -211,7 +218,15 @@ async fn prepare_super_grok_oauth_env() -> anyhow::Result<()> {
         false,
     )
     .await
-    .map_err(|e| anyhow!("SuperGrok OAuth unavailable: {e}"))?;
+    .map_err(|e| {
+        anyhow!(
+            "SuperGrok OAuth unavailable: {e}\n\
+             Active profile likely uses super-grok. Fix one of:\n\
+               edgecrab auth add grok     # browser OAuth → ~/.edgecrab/auth.json\n\
+               /profile use default       # switch to ollama (or another profile)\n\
+               export XAI_API_KEY=...     # static xAI API key"
+        )
+    })?;
 
     // SAFETY: Provider construction intentionally updates process-wide env credentials.
     unsafe {
@@ -948,9 +963,9 @@ async fn run_subcommand(cmd: Command, args: &CliArgs) -> anyhow::Result<()> {
             run_version();
         }
 
-        Command::Update { check } => {
+        Command::Update { check, no_snapshot } => {
             let config = edgecrab_core::AppConfig::load()?;
-            update::run_update_command(&config, check, &mut std::io::stdout()).await?;
+            update::run_update_command(&config, check, no_snapshot, &mut std::io::stdout()).await?;
         }
 
         Command::Whatsapp => {
@@ -2037,8 +2052,16 @@ async fn run_skills(command: SkillsCommand) -> anyhow::Result<()> {
                 .unwrap_or_else(|| edgecrab_core::edgecrab_home().join("optional-skills"));
             let official_matches =
                 edgecrab_tools::tools::skills_hub::search_optional_skills(&optional_root, &query);
-            let remote_report =
-                edgecrab_tools::tools::skills_hub::search_hub(&query, None, 8).await;
+            let remote_report = edgecrab_tools::tools::skills_hub::search_hub(
+                &query,
+                None,
+                8,
+                edgecrab_core::AppConfig::load()
+                    .ok()
+                    .and_then(|c| c.skills.hub_url)
+                    .as_deref(),
+            )
+            .await;
             let has_remote_matches = remote_report
                 .groups
                 .iter()
@@ -2080,9 +2103,12 @@ async fn run_skills(command: SkillsCommand) -> anyhow::Result<()> {
             if source_path.exists() {
                 let bundle = build_local_skill_bundle(source_path, name.as_deref())?;
                 let skill_name = bundle.name.clone();
-                let message =
-                    edgecrab_tools::tools::skills_hub::install_skill(&bundle, &skills_dir, false)
-                        .map_err(|e| anyhow::anyhow!(e))?;
+                let message = edgecrab_tools::tools::skills_hub::install_skill(
+                    &bundle,
+                    &skills_dir,
+                    edgecrab_tools::tools::skills_hub::InstallGate::default(),
+                )
+                .map_err(|e| anyhow::anyhow!(e))?;
                 println!("{message}");
                 println!("Activate with: edgecrab skills view {skill_name}");
                 return Ok(());
@@ -2092,7 +2118,7 @@ async fn run_skills(command: SkillsCommand) -> anyhow::Result<()> {
                 &source,
                 &skills_dir,
                 edgecrab_tools::tools::skills_sync::optional_skills_dir().as_deref(),
-                false,
+                edgecrab_tools::tools::skills_hub::InstallGate::default(),
             )
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
@@ -2107,7 +2133,7 @@ async fn run_skills(command: SkillsCommand) -> anyhow::Result<()> {
                     &name,
                     &skills_dir,
                     optional_dir.as_deref(),
-                    false,
+                    edgecrab_tools::tools::skills_hub::InstallGate::default(),
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!(e))?;
@@ -2117,7 +2143,7 @@ async fn run_skills(command: SkillsCommand) -> anyhow::Result<()> {
                 let outcomes = edgecrab_tools::tools::skills_hub::update_all_installed_skills(
                     &skills_dir,
                     optional_dir.as_deref(),
-                    false,
+                    edgecrab_tools::tools::skills_hub::InstallGate::default(),
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!(e))?;

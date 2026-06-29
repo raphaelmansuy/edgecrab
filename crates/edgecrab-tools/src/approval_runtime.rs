@@ -13,6 +13,7 @@ use edgecrab_types::ToolError;
 use serde_json::json;
 
 use crate::registry::{ApprovalRequest, ApprovalResponse, ToolContext};
+use crate::smart_approval::{SmartVerdict, assess_smart_approval};
 
 fn approval_policy() -> &'static ApprovalPolicy {
     static POLICY: OnceLock<ApprovalPolicy> = OnceLock::new();
@@ -128,11 +129,21 @@ pub(crate) fn command_approval_reasons(ctx: &ToolContext, command: &str) -> Opti
         return None;
     }
 
+    let mode = ctx.config.approval_mode;
+    if mode == ApprovalMode::Off {
+        return None;
+    }
+
     let policy = approval_policy();
     policy.load_permanent_allowlist(&load_persistent_allowlist(&ctx.config.edgecrab_home));
 
     let session_id = session_key(ctx);
-    let check = policy.check("terminal", &json!({ "command": command }), &session_id);
+    let check = policy.check_with_mode(
+        mode,
+        "terminal",
+        &json!({ "command": command }),
+        &session_id,
+    );
     if check.needs_approval {
         Some(check.reasons)
     } else {
@@ -149,13 +160,36 @@ pub(crate) async fn request_command_approval(
         return Ok(());
     }
 
+    let mode = ctx.config.approval_mode;
+    if mode == ApprovalMode::Off {
+        return Ok(());
+    }
+
     let policy = approval_policy();
     policy.load_permanent_allowlist(&load_persistent_allowlist(&ctx.config.edgecrab_home));
 
     let session_id = session_key(ctx);
-    let check = policy.check("terminal", &json!({ "command": command }), &session_id);
+    let check = policy.check_with_mode(
+        mode,
+        "terminal",
+        &json!({ "command": command }),
+        &session_id,
+    );
     if !check.needs_approval {
         return Ok(());
+    }
+
+    if mode == ApprovalMode::Smart {
+        let description = reasons.join("; ");
+        match assess_smart_approval(command, &description, ctx).await {
+            SmartVerdict::Approve => return Ok(()),
+            SmartVerdict::Deny => {
+                return Err(ToolError::PermissionDenied(
+                    "Command denied by smart approval policy.".into(),
+                ));
+            }
+            SmartVerdict::Escalate => {}
+        }
     }
 
     let Some(tx) = &ctx.approval_tx else {

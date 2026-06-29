@@ -123,6 +123,8 @@ pub struct TranscriptRenderParams<'a> {
     pub terminal_glyph_profile: TerminalGlyphProfile,
     pub show_output_scrollbar: bool,
     pub paging_key_hint: &'a str,
+    /// Optional detail for blocking non-streaming LLM waits (LM Studio shelf notice).
+    pub llm_wait_label: Option<&'a str>,
 }
 
 pub fn render_transcript_rich(
@@ -227,12 +229,29 @@ pub fn render_transcript_rich(
             DisplayState::AwaitingFirstToken { frame, started } => {
                 let spinner = compact_spinner_frame(*frame, params.terminal_glyph_profile);
                 let elapsed = started.elapsed().as_secs();
-                let ghost_text: String = if elapsed > 10 {
-                    format!("  {spinner}  awaiting response\u{2026}  {elapsed}s  (^C to stop)")
+                let ghost_text: String = if let Some(label) = params.llm_wait_label {
+                    if elapsed > 10 {
+                        format!(
+                            "  {spinner}  {}  {elapsed}s  (^C to stop)",
+                            edgecrab_core::safe_truncate(label, 64)
+                        )
+                    } else if elapsed > 3 {
+                        format!(
+                            "  {spinner}  {}  {elapsed}s",
+                            edgecrab_core::safe_truncate(label, 64)
+                        )
+                    } else {
+                        format!(
+                            "  {spinner}  {}",
+                            edgecrab_core::safe_truncate(label, 64)
+                        )
+                    }
+                } else if elapsed > 10 {
+                    format!("  {spinner}  awaiting model response\u{2026}  {elapsed}s  (^C to stop)")
                 } else if elapsed > 3 {
-                    format!("  {spinner}  awaiting response\u{2026}  {elapsed}s")
+                    format!("  {spinner}  awaiting model response\u{2026}  {elapsed}s")
                 } else {
-                    format!("  {spinner}  awaiting response\u{2026}")
+                    format!("  {spinner}  awaiting model response\u{2026}")
                 };
                 lines.push(Line::from(vec![
                     Span::styled(
@@ -463,7 +482,12 @@ pub fn render_transcript_compact(
         DisplayState::AwaitingFirstToken { frame, started } => {
             let spinner = compact_spinner_frame(*frame, glyphs);
             let elapsed = started.elapsed().as_secs();
-            let ghost: String = if elapsed > 3 {
+            let ghost: String = if let Some(label) = params.llm_wait_label {
+                format!(
+                    "  {spinner}  {}  {elapsed}s",
+                    edgecrab_core::safe_truncate(label, 48)
+                )
+            } else if elapsed > 3 {
                 format!("  {spinner}  awaiting\u{2026}  {elapsed}s")
             } else {
                 format!("  {spinner}  awaiting\u{2026}")

@@ -41,6 +41,7 @@ fn ctx_in(workspace: &std::path::Path, edgecrab_home: &std::path::Path) -> ToolC
         watch_notification_tx: None,
         mutation_turn: None,
         lsp_gate: None,
+        kanban_task_id: None,
     }
 }
 

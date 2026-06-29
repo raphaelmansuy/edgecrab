@@ -151,6 +151,7 @@ async fn browser_advantage_tools_dispatch_through_registry_with_edge_case_valida
         watch_notification_tx: None,
         mutation_turn: None,
         lsp_gate: None,
+        kanban_task_id: None,
     };
 
     let wait_for_err = registry

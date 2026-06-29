@@ -144,6 +144,13 @@ pub enum ToolError {
 
     #[error("{0}")]
     Other(String),
+
+    /// Wraps a tool error with structured recovery guidance (Self-Reflective API pattern).
+    #[error("{inner}")]
+    WithRecovery {
+        inner: Box<ToolError>,
+        recovery: crate::RecoveryFeedback,
+    },
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -184,9 +191,35 @@ pub struct ToolErrorResponse {
     /// One-line corrective hint — e.g. "content must be a non-null string".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage_hint: Option<String>,
+    /// Machine-readable repair steps (diagnosis stays in `error` only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_feedback: Option<crate::RecoveryFeedback>,
 }
 
 impl ToolError {
+    /// Unwrap [`Self::WithRecovery`] to the underlying error.
+    pub fn core_error(&self) -> &ToolError {
+        match self {
+            Self::WithRecovery { inner, .. } => inner,
+            other => other,
+        }
+    }
+
+    pub fn recovery_feedback(&self) -> Option<&crate::RecoveryFeedback> {
+        match self {
+            Self::WithRecovery { recovery, .. } => Some(recovery),
+            _ => None,
+        }
+    }
+
+    /// Attach structured recovery guidance without duplicating diagnosis prose.
+    pub fn with_recovery(self, recovery: crate::RecoveryFeedback) -> Self {
+        Self::WithRecovery {
+            inner: Box::new(self),
+            recovery,
+        }
+    }
+
     pub fn capability_denied(
         tool: impl Into<String>,
         code: impl Into<String>,
@@ -266,20 +299,28 @@ impl ToolError {
     }
 
     pub fn to_llm_payload(&self) -> ToolErrorResponse {
-        ToolErrorResponse {
-            response_type: "tool_error".into(),
-            category: self.category().into(),
-            code: self.code().into(),
-            code_num: self.code_num(),
-            error: self.to_string(),
-            retryable: self.is_retryable(),
-            suppress_retry: self.should_suppress_retry(),
-            suppression_key: self.suppression_key(),
-            tool: self.tool_name().map(str::to_string),
-            suggested_tool: self.suggested_tool().map(str::to_string),
-            suggested_action: self.suggested_action().map(str::to_string),
-            required_fields: None,
-            usage_hint: None,
+        match self {
+            Self::WithRecovery { inner, recovery } => {
+                let mut payload = inner.to_llm_payload();
+                payload.recovery_feedback = Some(recovery.clone());
+                payload
+            }
+            other => ToolErrorResponse {
+                response_type: "tool_error".into(),
+                category: other.category().into(),
+                code: other.code().into(),
+                code_num: other.code_num(),
+                error: other.to_string(),
+                retryable: other.is_retryable(),
+                suppress_retry: other.should_suppress_retry(),
+                suppression_key: other.suppression_key(),
+                tool: other.tool_name().map(str::to_string),
+                suggested_tool: other.suggested_tool().map(str::to_string),
+                suggested_action: other.suggested_action().map(str::to_string),
+                required_fields: None,
+                usage_hint: None,
+                recovery_feedback: None,
+            },
         }
     }
 
@@ -309,14 +350,14 @@ impl ToolError {
     /// Whether the LLM should retry with different parameters.
     pub fn is_retryable(&self) -> bool {
         matches!(
-            self,
+            self.core_error(),
             ToolError::Timeout { .. } | ToolError::Unavailable { .. }
         )
     }
 
     pub fn should_suppress_retry(&self) -> bool {
         matches!(
-            self,
+            self.core_error(),
             ToolError::InvalidArgs { .. }
                 | ToolError::Unavailable { .. }
                 | ToolError::PermissionDenied(_)
@@ -326,7 +367,7 @@ impl ToolError {
     }
 
     pub fn category(&self) -> &'static str {
-        match self {
+        match self.core_error() {
             ToolError::NotFound(_) => "resolution",
             ToolError::InvalidArgs { .. } => "arguments",
             ToolError::Unavailable { .. } => "availability",
@@ -336,11 +377,12 @@ impl ToolError {
             ToolError::CapabilityDenied { .. } => "capability",
             ToolError::ContentMismatch { .. } => "content",
             ToolError::Other(_) => "other",
+            ToolError::WithRecovery { .. } => unreachable!("core_error unwraps WithRecovery"),
         }
     }
 
     pub fn code(&self) -> &str {
-        match self {
+        match self.core_error() {
             ToolError::NotFound(_) => "tool_not_found",
             ToolError::InvalidArgs { .. } => "invalid_arguments",
             ToolError::Unavailable { .. } => "tool_unavailable",
@@ -350,6 +392,7 @@ impl ToolError {
             ToolError::CapabilityDenied { code, .. } => code,
             ToolError::ContentMismatch { .. } => "content_mismatch",
             ToolError::Other(_) => "tool_error",
+            ToolError::WithRecovery { .. } => unreachable!("core_error unwraps WithRecovery"),
         }
     }
 
@@ -359,7 +402,7 @@ impl ToolError {
     /// string code. The conversation loop can branch on `code_num` instead of
     /// `code.as_str()` comparisons for better performance and clarity.
     pub fn code_num(&self) -> u16 {
-        match self {
+        match self.core_error() {
             ToolError::NotFound(_) => 1001,
             ToolError::InvalidArgs { .. } => 1002,
             ToolError::Unavailable { .. } => 1003,
@@ -369,11 +412,12 @@ impl ToolError {
             ToolError::CapabilityDenied { .. } => 1007,
             ToolError::ContentMismatch { .. } => 1008,
             ToolError::Other(_) => 1099,
+            ToolError::WithRecovery { .. } => unreachable!("core_error unwraps WithRecovery"),
         }
     }
 
     pub fn tool_name(&self) -> Option<&str> {
-        match self {
+        match self.core_error() {
             ToolError::InvalidArgs { tool, .. }
             | ToolError::Unavailable { tool, .. }
             | ToolError::Timeout { tool, .. }
@@ -381,18 +425,19 @@ impl ToolError {
             | ToolError::CapabilityDenied { tool, .. }
             | ToolError::ContentMismatch { tool, .. } => Some(tool),
             ToolError::NotFound(_) | ToolError::PermissionDenied(_) | ToolError::Other(_) => None,
+            ToolError::WithRecovery { .. } => unreachable!("core_error unwraps WithRecovery"),
         }
     }
 
     pub fn suggested_tool(&self) -> Option<&str> {
-        match self {
+        match self.core_error() {
             ToolError::CapabilityDenied { suggested_tool, .. } => suggested_tool.as_deref(),
             _ => None,
         }
     }
 
     pub fn suppression_key(&self) -> Option<String> {
-        match self {
+        match self.core_error() {
             ToolError::Unavailable { tool, .. } => Some(format!("{tool}:{}", self.code())),
             ToolError::PermissionDenied(_) => Some(self.code().to_string()),
             ToolError::CapabilityDenied {
@@ -413,7 +458,7 @@ impl ToolError {
     }
 
     pub fn suggested_action(&self) -> Option<&str> {
-        match self {
+        match self.core_error() {
             ToolError::CapabilityDenied {
                 suggested_action, ..
             } => suggested_action.as_deref(),
@@ -430,6 +475,34 @@ mod tests {
     fn agent_error_display() {
         let err = AgentError::BudgetExhausted { used: 90, max: 90 };
         assert_eq!(err.to_string(), "Budget exhausted: 90/90 iterations");
+    }
+
+    #[test]
+    fn tool_error_with_recovery_serializes_feedback_block() {
+        use crate::RecoveryFeedbackBuilder;
+        use crate::RecoveryAction;
+        use serde_json::json;
+
+        let err = ToolError::InvalidArgs {
+            tool: "write_file".into(),
+            message: "path occupied".into(),
+        }
+        .with_recovery(
+            RecoveryFeedbackBuilder::new("recovery_guidance")
+                .suggestion(
+                    RecoveryAction::SetParameter,
+                    json!({ "tool": "write_file", "if_exists": "overwrite" }),
+                )
+                .build(),
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&err.to_llm_response()).expect("valid json");
+        assert_eq!(json["code"], "invalid_arguments");
+        assert!(json["recovery_feedback"]["suggestions"].is_array());
+        assert_eq!(
+            json["recovery_feedback"]["suggestions"][0]["action"],
+            "SET_PARAMETER"
+        );
     }
 
     #[test]

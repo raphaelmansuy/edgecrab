@@ -106,6 +106,14 @@ const STREAM_INTER_CHUNK_TIMEOUT: Duration = Duration::from_millis(50);
 #[cfg(not(test))]
 const STREAM_INTER_CHUNK_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Emit a shelf notice when a provider names a tool but stops sending arg deltas.
+const TOOL_ARGS_STALL_NOTICE_SECS: u64 =
+    edgecrab_tools::tool_progress_tail::TOOL_ARGS_STALL_NOTICE_SECS;
+
+/// Abort streamed tool drafting when args stall — independent of thinking keepalive.
+const TOOL_ARGS_STALL_BREAK_SECS: u64 =
+    edgecrab_tools::tool_progress_tail::TOOL_ARGS_STALL_BREAK_SECS;
+
 /// Minimum tool-call count in a session before the end-of-session
 /// learning reflection fires. Mirrors hermes-agent's "5+ tool calls" rule.
 const SKILL_REFLECTION_THRESHOLD: u32 = 5;
@@ -289,7 +297,7 @@ fn completion_options_for(config: &crate::agent::AgentConfig) -> edgequake_llm::
 }
 
 fn provider_prefers_nonstreaming_tool_turns(provider: &dyn LLMProvider) -> bool {
-    matches!(provider.name(), "vscode-copilot")
+    crate::local_provider_policy::prefers_nonstreaming_tool_turns(provider)
 }
 
 pub(crate) fn should_use_native_streaming(
@@ -384,6 +392,7 @@ fn build_tool_context(
     mutation_turn: Option<Arc<edgecrab_tools::MutationTurnState>>,
     lsp_gate: Option<Arc<dyn edgecrab_tools::LspGate>>,
     delegate_ctx: Option<ExecuteLoopDelegateCtx>,
+    kanban_task_id: Option<String>,
 ) -> ToolContext {
     let (delegate_depth, delegate_agent_id, delegate_parent_id) = match &delegate_ctx {
         Some(d) => (d.depth, Some(d.agent_id.clone()), d.parent_id.clone()),
@@ -435,6 +444,7 @@ fn build_tool_context(
         watch_notification_tx,
         mutation_turn,
         lsp_gate,
+        kanban_task_id,
     }
 }
 
@@ -444,6 +454,8 @@ enum LoopAction {
     Continue,
     /// LLM produced a final text response — exit the loop.
     Done(String),
+    /// Model exceeded invalid-tool retry budget (Hermes 3-strike partial abort).
+    PartialAbort { reason: String },
 }
 
 const MAX_DELEGATE_TASK_CALLS_PER_TURN: usize = 3;
@@ -622,6 +634,7 @@ struct DispatchContext {
         Option<tokio::sync::mpsc::UnboundedSender<edgecrab_tools::process_table::WatchEvent>>,
     /// Child delegation identity when this loop runs inside a sub-agent.
     delegate_ctx: Option<ExecuteLoopDelegateCtx>,
+    kanban_task_id: Option<String>,
 }
 
 fn post_write_lsp_gate(
@@ -734,7 +747,7 @@ impl Agent {
         let tool_policy = resolve_tool_policy(&config);
         let expanded_enabled = tool_policy.expanded_enabled.clone();
         let expanded_disabled = tool_policy.expanded_disabled.clone();
-        let app_config_ref = config.to_app_config_ref(gateway_running, &tool_policy);
+        let mut app_config_ref = config.to_app_config_ref(gateway_running, &tool_policy);
         let lsp_gate = post_write_lsp_gate(&app_config_ref);
 
         // Apply config-based env passthrough so it is available to every
@@ -780,6 +793,7 @@ impl Agent {
                     None, // mutation_turn not needed for schema resolution
                     None, // lsp_gate not needed for schema resolution
                     delegate_ctx.clone(),
+                    config.kanban_task_id.clone(),
                 );
 
                 // "all" sentinel / genuinely empty → pass None (no filtering).
@@ -1171,6 +1185,23 @@ impl Agent {
             (provider.clone(), false)
         };
 
+        app_config_ref.local_write_create_dirs =
+            crate::local_provider_policy::effective_local_write_create_dirs(
+                app_config_ref.local_write_create_dirs,
+                effective_provider.name(),
+            );
+        crate::local_provider_policy::log_local_harness_activated(
+            effective_provider.name(),
+            !active_tool_defs.is_empty(),
+            app_config_ref.local_write_create_dirs,
+        );
+        if crate::local_provider_policy::local_tool_harness_active(
+            effective_provider.name(),
+            !active_tool_defs.is_empty(),
+        ) {
+            edgecrab_tools::tool_call_pipeline::log_pipeline_activated();
+        }
+
         // Scan user input for prompt injection attempts.
         let injection_threats = crate::prompt_builder::scan_for_injection(&expansion.expanded);
         if !injection_threats.is_empty() {
@@ -1466,6 +1497,7 @@ impl Agent {
                         None,
                         None,
                         delegate_ctx.clone(),
+                        config.kanban_task_id.clone(),
                     );
                     let enabled_filter = if config.enabled_toolsets.is_empty()
                         || edgecrab_tools::toolsets::contains_all_sentinel(&config.enabled_toolsets)
@@ -1509,6 +1541,12 @@ impl Agent {
             // Sanitize orphaned tool results before estimating prompt pressure or
             // building the next provider payload.
             sanitize_orphaned_tool_results(&mut session.messages);
+            if let Some(ref reg) = tool_registry {
+                edgecrab_tools::tool_call_pipeline::sanitize_assistant_tool_calls_for_api(
+                    &mut session.messages,
+                    reg,
+                );
+            }
 
             // FP21: Strip stale budget-warning annotations from prior turns.
             //
@@ -1542,8 +1580,19 @@ impl Agent {
             //
             // WHY check_compression_status: Unlike the old boolean needs_compression(),
             // this returns a 3-way enum so we can emit a UI warning before firing.
-            let compression_params =
+            if crate::local_provider_policy::is_local_inference_provider(effective_provider.name())
+            {
+                let _ = effective_provider.refresh_model_metadata().await;
+            }
+            let mut compression_params =
                 CompressionParams::from_model_config(&config.model, &config.compression);
+            if crate::local_provider_policy::is_local_inference_provider(effective_provider.name())
+            {
+                let live_context = effective_provider.max_context_length();
+                if live_context > 0 && live_context < compression_params.context_window {
+                    compression_params.context_window = live_context;
+                }
+            }
             let estimated_prompt_tokens = estimate_request_prompt_tokens(
                 session.cached_system_prompt.as_deref(),
                 &session.messages,
@@ -1697,6 +1746,101 @@ impl Agent {
                 _ => {}
             }
 
+            // Local mid-band structural compress (~22% ctx): stat summary without LLM call.
+            if crate::local_provider_policy::local_tool_harness_active(
+                effective_provider.name(),
+                !active_tool_defs.is_empty(),
+            )
+            {
+                let spill_config = local_prune_spill_config(&app_config_ref);
+                let spill_ctx = build_prune_spill_context(
+                    &conversation_session_id,
+                    &cwd,
+                    &spill_config,
+                    &spill_seq,
+                );
+                let prompt_for_compress = estimate_request_prompt_tokens(
+                    session.cached_system_prompt.as_deref(),
+                    &session.messages,
+                    &active_tool_defs,
+                );
+                if let Some((compressed, tokens_before, tokens_after)) =
+                    crate::local_provider_policy::try_local_midband_structural_compress(
+                        &session.messages,
+                        &compression_params,
+                        effective_provider.max_context_length(),
+                        prompt_for_compress,
+                        Some(&spill_ctx),
+                    )
+                {
+                    crate::local_provider_policy::log_local_structural_compress(
+                        effective_provider.as_ref(),
+                        tokens_before,
+                        tokens_after,
+                    );
+                    session.messages = compressed;
+                    edgecrab_tools::read_tracker::reset_read_dedup(&conversation_session_id);
+                    if let Some(tx) = event_tx {
+                        let _ = tx.send(crate::StreamEvent::ActivityNotice(
+                            edgecrab_tools::tool_progress_tail::format_local_structural_compress_notice(
+                                effective_provider.name(),
+                                tokens_before,
+                                tokens_after,
+                            ),
+                        ));
+                    }
+                    self.publish_session_state(&session).await;
+                }
+            }
+
+            // Local prefill prune: deterministic threshold below LLM compression (50% ctx).
+            // Reclaims tool-output tokens before slow local tool-turn prefill — no LLM call.
+            if crate::local_provider_policy::local_tool_harness_active(
+                effective_provider.name(),
+                !active_tool_defs.is_empty(),
+            )
+            {
+                let spill_config = local_prune_spill_config(&app_config_ref);
+                let spill_ctx = build_prune_spill_context(
+                    &conversation_session_id,
+                    &cwd,
+                    &spill_config,
+                    &spill_seq,
+                );
+                if let Some((pruned_messages, tools_pruned, prompt_before, prompt_after)) =
+                    try_local_structural_prune_request(
+                        crate::local_provider_policy::LocalStructuralPrunePhase::Preflight,
+                        session.cached_system_prompt.as_deref(),
+                        &session.messages,
+                        &active_tool_defs,
+                        &spill_ctx,
+                        effective_provider.max_context_length(),
+                    )
+                {
+                    crate::local_provider_policy::log_local_prefill_prune(
+                        effective_provider.as_ref(),
+                        prompt_before,
+                        prompt_after,
+                        tools_pruned,
+                        "preflight",
+                    );
+                    session.messages = pruned_messages;
+                    edgecrab_tools::read_tracker::reset_read_dedup(&conversation_session_id);
+                    if let Some(tx) = event_tx {
+                        let _ = tx.send(crate::StreamEvent::ActivityNotice(
+                            edgecrab_tools::tool_progress_tail::format_local_prefill_prune_notice(
+                                effective_provider.name(),
+                                prompt_before,
+                                prompt_after,
+                                tools_pruned,
+                                "preflight",
+                            ),
+                        ));
+                    }
+                    self.publish_session_state(&session).await;
+                }
+            }
+
             // Build edgequake-llm messages from our message history
             //
             // WHY cache config here: Anthropic prompt caching requires stable
@@ -1712,14 +1856,52 @@ impl Agent {
             // stable zone (8K-12K tokens of binary constants) is cached across
             // sessions.  The combined prompt keeps the stable zone as a prefix so
             // split_dynamic_from_stable() can safely extract the dynamic suffix.
-            // Build API messages, optionally appending ephemeral goal context as a
-            // user-role message (cache-safe — never mutates cached_system_prompt).
+            // Build API messages, optionally appending ephemeral goal context and local
+            // tool-turn geometry nudges as user-role messages (cache-safe).
             let goal_block = crate::goals::render_goal_block(
                 &self
                     .goal_store
                     .active(&conversation_session_id)
                     .unwrap_or_default(),
             );
+            let base_completion_options = completion_options_for(&config);
+            let max_mutation_payload_bytes = app_config_ref.max_write_payload_bytes();
+            let local_abs_max = app_config_ref.local_max_tool_turn_tokens;
+            let completion_options = crate::local_provider_policy::effective_completion_options(
+                &base_completion_options,
+                effective_provider.as_ref(),
+                !active_tool_defs.is_empty(),
+                max_mutation_payload_bytes,
+                local_abs_max,
+            );
+            let prompt_tokens_for_plan = estimate_request_prompt_tokens(
+                session.cached_system_prompt.as_deref(),
+                &session.messages,
+                &active_tool_defs,
+            );
+            let local_tool_turn_plan = if active_tool_defs.is_empty() {
+                None
+            } else {
+                crate::local_provider_policy::local_tool_turn_plan(
+                    effective_provider.as_ref(),
+                    &completion_options,
+                    prompt_tokens_for_plan,
+                    max_mutation_payload_bytes,
+                    base_completion_options.reasoning_effort.as_deref(),
+                    local_abs_max,
+                )
+            };
+            if let Some(ref plan) = local_tool_turn_plan {
+                crate::local_provider_policy::log_local_tool_turn_plan(plan);
+                if let Some(tx) = event_tx {
+                    let _ = tx.send(crate::StreamEvent::ActivityNotice(
+                        edgecrab_tools::tool_progress_tail::format_local_tool_turn_preflight(
+                            &plan.log_line(),
+                        ),
+                    ));
+                }
+            }
+
             let messages_for_api = if goal_block.is_empty() {
                 session.messages.clone()
             } else {
@@ -1735,7 +1917,6 @@ impl Agent {
                 effective_provider.as_ref(),
                 &app_config_ref,
             );
-            let completion_options = completion_options_for(&config);
 
             // API call with retry — sends tool definitions so LLM can request tool calls.
             // On failure, attempt the fallback provider if configured.
@@ -1755,10 +1936,19 @@ impl Agent {
                 event_tx.is_some(),
             ) && (!session.native_tool_streaming_disabled
                 || active_tool_defs.is_empty());
+            let local_turn_budget = local_tool_turn_plan
+                .as_ref()
+                .map(|plan| (plan.max_tool_argument_bytes, plan.max_tokens));
+            let api_tool_defs = edgecrab_tools::registry::annotate_llm_definitions_for_local_turn(
+                active_tool_defs.clone(),
+                effective_provider.name(),
+                local_turn_budget,
+            );
+
             let api_outcome = match api_call_with_retry(
                 &effective_provider,
                 &chat_messages,
-                &active_tool_defs,
+                &api_tool_defs,
                 MAX_RETRIES,
                 ApiCallContext {
                     options: Some(&completion_options),
@@ -1936,13 +2126,27 @@ impl Agent {
                                     config.streaming,
                                     event_tx.is_some(),
                                 );
+                                let fb_completion_options =
+                                    crate::local_provider_policy::effective_completion_options(
+                                        &completion_options_for(&config),
+                                        fb_prov.as_ref(),
+                                        !active_tool_defs.is_empty(),
+                                        max_mutation_payload_bytes,
+                                        local_abs_max,
+                                    );
+                                let fb_tool_defs =
+                                    edgecrab_tools::registry::annotate_llm_definitions_for_local_turn(
+                                        active_tool_defs.clone(),
+                                        fb_prov.name(),
+                                        local_turn_budget,
+                                    );
                                 match api_call_with_retry(
                                     &fb_prov,
                                     &chat_messages,
-                                    &active_tool_defs,
+                                    &fb_tool_defs,
                                     1,
                                     ApiCallContext {
-                                        options: Some(&completion_options),
+                                        options: Some(&fb_completion_options),
                                         cancel: &cancel,
                                         event_tx,
                                         use_native_streaming: fallback_native_streaming,
@@ -2033,6 +2237,116 @@ impl Agent {
                 }
             }
 
+            // Local tool turn exhausted max_tokens without emitting tool calls (reasoning
+            // often consumes the budget on Qwen3 / DeepSeek when reasoning_effort is omitted).
+            if !active_tool_defs.is_empty()
+                && response.finish_reason.as_deref() == Some("length")
+                && !response.has_tool_calls()
+            {
+                let max_tokens = completion_options.max_tokens.unwrap_or(0);
+                let thinking_tokens = response.thinking_tokens.unwrap_or(0);
+                let length_metrics = crate::local_provider_policy::LocalLlmResponseMetrics {
+                    elapsed_ms: 0,
+                    finish_reason: Some("length".to_string()),
+                    prompt_tokens: response.prompt_tokens,
+                    completion_tokens: response.completion_tokens,
+                    thinking_tokens: Some(thinking_tokens),
+                    tool_call_count: 0,
+                    content_len: response.content.len(),
+                    has_reasoning_content: response.thinking_content.is_some(),
+                    max_tokens: Some(max_tokens),
+                    tool_choice_required: true,
+                };
+                crate::local_provider_policy::log_local_tool_length_failure(
+                    provider.as_ref(),
+                    &length_metrics,
+                );
+                if crate::local_provider_policy::is_local_inference_provider(provider.name())
+                    && let Some(tx) = event_tx.as_ref()
+                {
+                    let _ = tx.send(crate::StreamEvent::ActivityNotice(
+                        edgecrab_tools::tool_progress_tail::format_local_length_without_tools_notice(
+                            provider.name(),
+                            response.completion_tokens,
+                            thinking_tokens,
+                            max_tokens,
+                        ),
+                    ));
+                }
+                if crate::local_provider_policy::is_local_inference_provider(provider.name()) {
+                    let spill_config = local_prune_spill_config(&app_config_ref);
+                    let spill_ctx = build_prune_spill_context(
+                        &conversation_session_id,
+                        &cwd,
+                        &spill_config,
+                        &spill_seq,
+                    );
+                    if let Some((pruned_messages, tools_pruned, prompt_before, prompt_after)) =
+                        try_local_structural_prune_request(
+                            crate::local_provider_policy::LocalStructuralPrunePhase::LengthRecovery,
+                            session.cached_system_prompt.as_deref(),
+                            &session.messages,
+                            &active_tool_defs,
+                            &spill_ctx,
+                            provider.max_context_length(),
+                        )
+                    {
+                        crate::local_provider_policy::log_local_prefill_prune(
+                            provider.as_ref(),
+                            prompt_before,
+                            prompt_after,
+                            tools_pruned,
+                            "length_recovery",
+                        );
+                        session.messages = pruned_messages;
+                        edgecrab_tools::read_tracker::reset_read_dedup(&conversation_session_id);
+                        if let Some(tx) = event_tx.as_ref() {
+                            let _ = tx.send(crate::StreamEvent::ActivityNotice(
+                                edgecrab_tools::tool_progress_tail::format_local_prefill_prune_notice(
+                                    provider.name(),
+                                    prompt_before,
+                                    prompt_after,
+                                    tools_pruned,
+                                    "length_recovery",
+                                ),
+                            ));
+                        }
+                    }
+                }
+                let recovery =
+                    edgecrab_tools::mutation_turn_policy::length_without_tools_recovery_message(
+                        app_config_ref.max_write_payload_bytes(),
+                        Some(provider.as_ref()),
+                    );
+                session.messages.push(Message::user(&recovery));
+                self.publish_session_state(&session).await;
+                // API geometry failure — not a tool dispatch streak.
+                failure_tracker.record_success();
+                continue;
+            }
+
+            // Stream-interrupted with no delivered tool call (stall / timeout mid-draft).
+            if response.finish_reason.as_deref() == Some(FINISH_REASON_STREAM_INTERRUPTED)
+                && !response.has_tool_calls()
+            {
+                tracing::warn!(
+                    "tool-call draft interrupted before delivery — injecting incremental-edit recovery"
+                );
+                if let Some(tx) = event_tx.as_ref() {
+                    let _ = tx.send(crate::StreamEvent::ActivityNotice(
+                        "↻ Tool draft interrupted — use scaffold + patch steps (see recovery message)"
+                            .into(),
+                    ));
+                }
+                let recovery = edgecrab_tools::mutation_turn_policy::stream_interrupted_recovery_message(
+                    &[],
+                    app_config_ref.max_write_payload_bytes(),
+                    Some(provider.as_ref()),
+                );
+                session.messages.push(Message::user(&recovery));
+                continue;
+            }
+
             // Empty response nudge: if the LLM returned no content and no
             // tool calls, inject a "please continue" prompt and retry.
             if response.content.trim().is_empty()
@@ -2075,6 +2389,7 @@ impl Agent {
                 tool_progress_tx: turn_tool_progress_tx.clone(),
                 watch_notification_tx: watch_notification_tx.clone(),
                 delegate_ctx: delegate_ctx.clone(),
+                kanban_task_id: config.kanban_task_id.clone(),
             };
             let action = match process_response(
                 &response,
@@ -2101,9 +2416,18 @@ impl Agent {
                             partial_len = text.len(),
                             "streamed tool call was interrupted after visible output; continuing via a safe non-streaming recovery turn"
                         );
-                        session.messages.push(Message::user(
-                            "[system: your previous response was interrupted while emitting a tool call. Continue from where you left off using the information already gathered. If a tool call is still needed, emit it again now.]",
-                        ));
+                        if let Some(tx) = event_tx.as_ref() {
+                            let _ = tx.send(crate::StreamEvent::ActivityNotice(
+                                "↻ Retrying tool call via non-streaming completion — split large payloads into patch steps.".into(),
+                            ));
+                        }
+                        let recovery =
+                            edgecrab_tools::mutation_turn_policy::stream_interrupted_recovery_message(
+                                &[],
+                                app_config_ref.max_write_payload_bytes(),
+                                Some(provider.as_ref()),
+                            );
+                        session.messages.push(Message::user(&recovery));
                         self.publish_session_state(&session).await;
                         continue;
                     }
@@ -2111,7 +2435,18 @@ impl Agent {
                     // Length truncation continuation: if finish_reason is "length",
                     // the model was cut off mid-response. Auto-continue by appending
                     // the partial text and asking for more.
+                    //
+                    // Tool turns without tool_calls are handled above (incremental-edit
+                    // recovery) — do not generic-continue or we burn another full HTTP window.
                     if response.finish_reason.as_deref() == Some("length") {
+                        if !active_tool_defs.is_empty() && !response.has_tool_calls() {
+                            tracing::warn!(
+                                target: "edgecrab::local_llm",
+                                "finish_reason=length without tool_calls on tool turn — recovery already handled"
+                            );
+                            self.publish_session_state(&session).await;
+                            continue;
+                        }
                         tracing::info!(
                             partial_len = text.len(),
                             "response truncated (finish_reason=length), auto-continuing"
@@ -2229,6 +2564,18 @@ impl Agent {
                     }
 
                     final_response = text;
+                    break;
+                }
+                LoopAction::PartialAbort { reason } => {
+                    tracing::warn!(%reason, "invalid tool retry budget exhausted — partial abort");
+                    if let Some(tx) = event_tx.as_ref() {
+                        let _ = tx.send(crate::StreamEvent::ActivityNotice(format!(
+                            "⚠️ {reason} (max {} invalid-tool retries)",
+                            edgecrab_tools::MAX_INVALID_TOOL_RETRIES
+                        )));
+                    }
+                    session.invalid_tool_call_retries = 0;
+                    final_response = reason;
                     break;
                 }
                 LoopAction::Continue => {
@@ -2917,6 +3264,30 @@ fn invalid_args_semantic_key(
     invalid_args_missing_fields_suppression_key(name, args_json, &required)
 }
 
+/// Format pre-dispatch validation failures with the same enrichment as registry dispatch.
+fn format_preflight_tool_error(
+    reg: &ToolRegistry,
+    name: &str,
+    args_json: &str,
+    err: &ToolError,
+) -> String {
+    if matches!(err.core_error(), ToolError::InvalidArgs { .. })
+        && let Some(mut enriched) = reg.enrich_invalid_args_error(name, err, Some(args_json))
+    {
+        if enriched.suppression_key.is_none() {
+            enriched.suppression_key = enriched
+                .required_fields
+                .as_ref()
+                .and_then(|fields| {
+                    invalid_args_missing_fields_suppression_key(name, args_json, fields)
+                })
+                .or_else(|| invalid_args_semantic_key(reg, name, args_json));
+        }
+        return serde_json::to_string(&enriched).expect("preflight enriched error serializes");
+    }
+    err.to_llm_response()
+}
+
 #[inline]
 fn is_suppressed_argument_retry(payload: &ToolErrorResponse) -> bool {
     payload.category == "arguments" && payload.code == "suppressed_repeated_tool_error"
@@ -2973,6 +3344,7 @@ fn suppressed_retry_response(
         suggested_action,
         required_fields: prior.required_fields.clone(),
         usage_hint: prior.usage_hint.clone(),
+        recovery_feedback: prior.recovery_feedback.clone(),
     }
 }
 
@@ -3356,6 +3728,11 @@ struct PartialToolCall {
     arguments: String,
     thought_signature: Option<String>,
     last_generating_emit: Option<std::time::Instant>,
+    /// When the provider first sent the tool name (args may still be empty).
+    name_received_at: Option<std::time::Instant>,
+    /// Last time a non-empty arg delta arrived.
+    last_arg_at: Option<std::time::Instant>,
+    stall_notice_sent: bool,
 }
 
 fn finalize_streamed_tool_calls(
@@ -3370,14 +3747,16 @@ fn finalize_streamed_tool_calls(
                     "streamed tool call {id} finished without a function name"
                 ))
             })?;
-            let arguments = partial.arguments.trim();
-            if arguments.is_empty() {
+            let arguments_raw = partial.arguments.trim();
+            if arguments_raw.is_empty() {
                 return Err(edgequake_llm::LlmError::ApiError(format!(
                     "streamed tool call {id} ({function_name}) finished without arguments"
                 )));
             }
 
-            let parsed: serde_json::Value = serde_json::from_str(arguments).map_err(|err| {
+            let repaired =
+                edgecrab_tools::tool_argument_pipeline::repair_stream_tool_arguments(arguments_raw);
+            let parsed: serde_json::Value = serde_json::from_str(&repaired).map_err(|err| {
                 edgequake_llm::LlmError::ApiError(format!(
                     "streamed tool call {id} ({function_name}) produced invalid JSON arguments: \
                      {err}"
@@ -3388,18 +3767,64 @@ fn finalize_streamed_tool_calls(
                     "streamed tool call {id} ({function_name}) arguments must be a JSON object"
                 )));
             }
-
+            let arguments =
+                edgecrab_tools::tool_argument_pipeline::canonical_tool_args_json(&parsed);
             Ok(edgequake_llm::ToolCall {
                 id,
                 call_type: "function".to_string(),
                 function: edgequake_llm::FunctionCall {
                     name: function_name,
-                    arguments: arguments.to_string(),
+                    arguments,
                 },
                 thought_signature: partial.thought_signature,
             })
         })
         .collect()
+}
+
+fn emit_tool_generating_progress(
+    tool_calls: &mut BTreeMap<usize, PartialToolCall>,
+    event_tx: &tokio::sync::mpsc::UnboundedSender<crate::StreamEvent>,
+) {
+    let now = std::time::Instant::now();
+    for (index, entry) in tool_calls.iter_mut() {
+        let Some(name) = entry.function_name.clone() else {
+            continue;
+        };
+        if !edgecrab_tools::tool_progress_tail::should_emit_progress(entry.last_generating_emit, now)
+        {
+            continue;
+        }
+        entry.last_generating_emit = Some(now);
+        let tool_id = entry
+            .id
+            .clone()
+            .unwrap_or_else(|| format!("stream-tool-{index}"));
+        let _ = event_tx.send(crate::StreamEvent::ToolGenerating {
+            tool_call_id: tool_id,
+            name,
+            partial_args: entry.arguments.clone(),
+        });
+    }
+}
+
+fn tool_arg_stall_break(
+    tool_calls: &BTreeMap<usize, PartialToolCall>,
+) -> Option<(String, usize)> {
+    for entry in tool_calls.values() {
+        let Some(name) = entry.function_name.as_ref() else {
+            continue;
+        };
+        let Some(name_at) = entry.name_received_at else {
+            continue;
+        };
+        let stall_from = entry.last_arg_at.unwrap_or(name_at);
+        if stall_from.elapsed() < Duration::from_secs(TOOL_ARGS_STALL_BREAK_SECS) {
+            continue;
+        }
+        return Some((name.clone(), entry.arguments.len()));
+    }
+    None
 }
 
 /// Native provider-streaming path used by the TUI.
@@ -3412,6 +3837,7 @@ async fn api_call_streaming(
     provider: &Arc<dyn LLMProvider>,
     messages: &[edgequake_llm::ChatMessage],
     tool_defs: &[edgequake_llm::ToolDefinition],
+    tool_choice: Option<edgequake_llm::ToolChoice>,
     options: Option<&edgequake_llm::CompletionOptions>,
     event_tx: &tokio::sync::mpsc::UnboundedSender<crate::StreamEvent>,
     any_tokens_sent: &std::sync::atomic::AtomicBool,
@@ -3421,7 +3847,7 @@ async fn api_call_streaming(
         "api_call_streaming: opening SSE stream"
     );
     let mut stream = provider
-        .chat_with_tools_stream(messages, tool_defs, None, options)
+        .chat_with_tools_stream(messages, tool_defs, tool_choice, options)
         .await?;
     tracing::info!("api_call_streaming: SSE stream opened, waiting for first chunk");
 
@@ -3433,6 +3859,12 @@ async fn api_call_streaming(
     let mut tool_calls: BTreeMap<usize, PartialToolCall> = BTreeMap::new();
     let first_chunk_deadline = tokio::time::Instant::now() + STREAM_FIRST_CHUNK_TIMEOUT;
     let mut saw_meaningful_chunk = false;
+    let stream_started = std::time::Instant::now();
+    let wait_ctx_base = edgecrab_tools::tool_progress_tail::LlmWaitContext {
+        prompt_tokens_estimated: Some(estimate_stream_prompt_tokens(messages, tool_defs) as u64),
+        context_length: Some(provider.max_context_length() as u64),
+        prefill_pct: None,
+    };
 
     loop {
         let next_chunk = if saw_meaningful_chunk {
@@ -3440,6 +3872,21 @@ async fn api_call_streaming(
             match tokio::time::timeout(STREAM_INTER_CHUNK_TIMEOUT, stream.next()).await {
                 Ok(chunk) => chunk,
                 Err(_) => {
+                    for entry in tool_calls.values() {
+                        if entry.function_name.is_some() {
+                            let name = entry
+                                .function_name
+                                .as_deref()
+                                .unwrap_or("tool");
+                            let _ = event_tx.send(crate::StreamEvent::ActivityNotice(
+                                edgecrab_tools::tool_progress_tail::format_tool_args_stream_stall(
+                                    name,
+                                    entry.arguments.len(),
+                                    STREAM_INTER_CHUNK_TIMEOUT.as_secs(),
+                                ),
+                            ));
+                        }
+                    }
                     tracing::warn!(
                         "api_call_streaming: inter-chunk timeout ({:?}) elapsed — \
                          stream stale, returning partial content",
@@ -3462,6 +3909,18 @@ async fn api_call_streaming(
             break;
         };
         match chunk? {
+            StreamChunk::PrefillProgress { progress } => {
+                let prefill_pct =
+                    Some((progress.clamp(0.0, 1.0) * 100.0) as f32);
+                let _ = event_tx.send(crate::StreamEvent::LlmWaitProgress {
+                    provider: provider.name().to_string(),
+                    elapsed_secs: stream_started.elapsed().as_secs(),
+                    has_tools: !tool_defs.is_empty(),
+                    prompt_tokens_estimated: wait_ctx_base.prompt_tokens_estimated,
+                    context_length: wait_ctx_base.context_length,
+                    prefill_pct,
+                });
+            }
             StreamChunk::Content(delta) => {
                 if !delta.is_empty() {
                     saw_meaningful_chunk = true;
@@ -3494,7 +3953,11 @@ async fn api_call_streaming(
                 if let Some(id) = id {
                     entry.id = Some(id);
                 }
+                let args_just_arrived = function_arguments.is_some();
                 if let Some(args) = function_arguments {
+                    if !args.is_empty() {
+                        entry.last_arg_at = Some(std::time::Instant::now());
+                    }
                     entry.arguments.push_str(&args);
                 }
                 if thought_signature.is_some() {
@@ -3508,20 +3971,43 @@ async fn api_call_streaming(
                     .unwrap_or_else(|| format!("stream-tool-{index}"));
                 if let Some(name) = function_name {
                     entry.function_name = Some(name.clone());
-                    let now = std::time::Instant::now();
-                    if name_just_arrived
-                        || edgecrab_tools::tool_progress_tail::should_emit_progress(
+                    if entry.name_received_at.is_none() {
+                        entry.name_received_at = Some(std::time::Instant::now());
+                    }
+                }
+                let emit_name = entry
+                    .function_name
+                    .clone()
+                    .unwrap_or_else(|| "tool".to_string());
+                let now = std::time::Instant::now();
+                if name_just_arrived
+                    || (args_just_arrived
+                        && edgecrab_tools::tool_progress_tail::should_emit_progress(
                             entry.last_generating_emit,
                             now,
-                        )
-                    {
-                        entry.last_generating_emit = Some(now);
-                        let _ = event_tx.send(crate::StreamEvent::ToolGenerating {
-                            tool_call_id: tool_id,
-                            name,
-                            partial_args: entry.arguments.clone(),
-                        });
-                    }
+                        ))
+                {
+                    entry.last_generating_emit = Some(now);
+                    let _ = event_tx.send(crate::StreamEvent::ToolGenerating {
+                        tool_call_id: tool_id,
+                        name: emit_name.clone(),
+                        partial_args: entry.arguments.clone(),
+                    });
+                }
+                if !entry.stall_notice_sent
+                    && entry.arguments.is_empty()
+                    && entry.name_received_at.is_some_and(|at| {
+                        at.elapsed() >= Duration::from_secs(TOOL_ARGS_STALL_NOTICE_SECS)
+                    })
+                {
+                    entry.stall_notice_sent = true;
+                    let _ = event_tx.send(crate::StreamEvent::ActivityNotice(
+                        edgecrab_tools::tool_progress_tail::format_tool_args_stream_stall(
+                            &emit_name,
+                            0,
+                            TOOL_ARGS_STALL_NOTICE_SECS,
+                        ),
+                    ));
                 }
             }
             StreamChunk::Finished { reason, usage, .. } => {
@@ -3531,6 +4017,26 @@ async fn api_call_streaming(
                     final_usage = usage;
                 }
             }
+        }
+
+        emit_tool_generating_progress(&mut tool_calls, event_tx);
+
+        if let Some((stalled_name, arg_bytes)) = tool_arg_stall_break(&tool_calls) {
+            let notice = edgecrab_tools::mutation_turn_policy::tool_draft_stall_recovery_notice(
+                &stalled_name,
+                arg_bytes,
+                edgecrab_tools::edit_contract::DEFAULT_MAX_MUTATION_PAYLOAD_BYTES,
+                Some(provider.as_ref()),
+            );
+            let _ = event_tx.send(crate::StreamEvent::ActivityNotice(notice));
+            tracing::warn!(
+                tool = %stalled_name,
+                arg_bytes,
+                stall_secs = TOOL_ARGS_STALL_BREAK_SECS,
+                "api_call_streaming: tool-arg stall — aborting streamed draft"
+            );
+            finish_reason = Some(FINISH_REASON_STREAM_INTERRUPTED.to_string());
+            break;
         }
     }
 
@@ -3621,6 +4127,57 @@ fn estimate_request_prompt_tokens(
         total += estimate_tokens_from_text(sp);
     }
     total + crate::compression::estimate_tokens(messages)
+}
+
+fn build_prune_spill_context<'a>(
+    conversation_session_id: &'a str,
+    cwd: &'a std::path::Path,
+    spill_config: &'a crate::tool_result_spill::SpillConfig,
+    spill_seq: &'a crate::tool_result_spill::SpillSequence,
+) -> crate::compression::PruneSpillContext<'a> {
+    crate::compression::PruneSpillContext::new(
+        conversation_session_id,
+        cwd,
+        spill_config,
+        spill_seq,
+    )
+}
+
+fn local_prune_spill_config(
+    app_config_ref: &edgecrab_tools::config_ref::AppConfigRef,
+) -> crate::tool_result_spill::SpillConfig {
+    crate::tool_result_spill::SpillConfig {
+        enabled: app_config_ref.result_spill,
+        threshold: app_config_ref.result_spill_threshold,
+        preview_lines: app_config_ref.result_spill_preview_lines,
+    }
+}
+
+/// Gate + apply local structural prune; returns full-request token estimates for logging.
+fn try_local_structural_prune_request(
+    phase: crate::local_provider_policy::LocalStructuralPrunePhase,
+    system_prompt: Option<&str>,
+    messages: &[Message],
+    tool_defs: &[edgequake_llm::ToolDefinition],
+    spill_ctx: &crate::compression::PruneSpillContext<'_>,
+    active_context_length: usize,
+) -> Option<(Vec<Message>, usize, usize, usize)> {
+    let prompt_before = estimate_request_prompt_tokens(system_prompt, messages, tool_defs);
+    let (pruned_messages, outcome) = crate::local_provider_policy::try_apply_structural_tool_output_prune(
+        phase,
+        prompt_before,
+        active_context_length,
+        messages,
+        Some(spill_ctx),
+    )?;
+    let prompt_after =
+        estimate_request_prompt_tokens(system_prompt, &pruned_messages, tool_defs);
+    Some((
+        pruned_messages,
+        outcome.tools_pruned,
+        prompt_before,
+        prompt_after,
+    ))
 }
 
 async fn invoke_pre_api_request_hooks(
@@ -3769,6 +4326,83 @@ fn estimate_tokens_from_text(text: &str) -> usize {
     trimmed.chars().count().div_ceil(4)
 }
 
+/// Emit periodic shelf notices while a non-streaming LLM request blocks (local servers, Copilot, etc.).
+fn spawn_nonstreaming_wait_heartbeat(
+    event_tx: Option<&tokio::sync::mpsc::UnboundedSender<crate::StreamEvent>>,
+    cancel: &tokio_util::sync::CancellationToken,
+    provider: &dyn LLMProvider,
+    has_tools: bool,
+    wait_ctx: edgecrab_tools::tool_progress_tail::LlmWaitContext,
+    http_timeout_secs: u64,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let tx = event_tx.cloned()?;
+    let provider_name = provider.name().to_string();
+    let cancel = cancel.clone();
+    let timeout_warn_at =
+        ((http_timeout_secs as f64) * crate::local_provider_policy::LOCAL_HTTP_TIMEOUT_WARN_RATIO)
+            as u64;
+    Some(tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        let mut pulses = 0u32;
+        let mut timeout_warned = false;
+        loop {
+            let elapsed = started.elapsed().as_secs();
+            if has_tools
+                && !timeout_warned
+                && http_timeout_secs > 0
+                && elapsed >= timeout_warn_at
+            {
+                timeout_warned = true;
+                tracing::warn!(
+                    target: "edgecrab::local_llm",
+                    provider = %provider_name,
+                    elapsed_secs = elapsed,
+                    http_timeout_secs,
+                    prompt_tokens_estimated = ?wait_ctx.prompt_tokens_estimated,
+                    context_length = ?wait_ctx.context_length,
+                    "local_llm: approaching HTTP timeout while composing tool call"
+                );
+                let notice =
+                    edgecrab_tools::tool_progress_tail::format_local_timeout_proximity_notice(
+                        &provider_name,
+                        elapsed,
+                        http_timeout_secs,
+                    );
+                let _ = tx.send(crate::StreamEvent::ActivityNotice(notice));
+            }
+            let _ = tx.send(crate::StreamEvent::LlmWaitProgress {
+                provider: provider_name.clone(),
+                elapsed_secs: elapsed,
+                has_tools,
+                prompt_tokens_estimated: wait_ctx.prompt_tokens_estimated,
+                context_length: wait_ctx.context_length,
+                prefill_pct: wait_ctx.prefill_pct,
+            });
+            pulses += 1;
+            let delay = if pulses == 1 {
+                Duration::from_secs(12)
+            } else {
+                Duration::from_secs(15)
+            };
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = tokio::time::sleep(delay) => {}
+            }
+        }
+    }))
+}
+
+fn emit_local_transport_stall_notice(
+    event_tx: Option<&tokio::sync::mpsc::UnboundedSender<crate::StreamEvent>>,
+    provider: &dyn LLMProvider,
+) {
+    if let Some(tx) = event_tx {
+        let _ = tx.send(crate::StreamEvent::ActivityNotice(
+            crate::local_provider_policy::transport_stall_user_notice(provider),
+        ));
+    }
+}
+
 /// API call with exponential backoff retry.
 ///
 /// WHY application-level retry: edgequake-llm doesn't retry internally.
@@ -3860,6 +4494,31 @@ async fn api_call_with_retry(
             let tokens_sent = std::sync::atomic::AtomicBool::new(false);
             invoke_pre_api_request_hooks(&ctx, provider, messages, tool_defs, attempt).await;
             let request_started_at = std::time::Instant::now();
+            let prompt_tokens_est = estimate_stream_prompt_tokens(messages, tool_defs);
+            let http_timeout_secs =
+                crate::local_provider_policy::local_http_timeout_secs(provider.name());
+            let tool_choice = crate::local_provider_policy::local_tool_choice(
+                provider.as_ref(),
+                !tool_defs.is_empty(),
+            );
+            let tool_choice_required = tool_choice.is_some();
+            if crate::local_provider_policy::is_local_inference_provider(provider.name()) {
+                tracing::info!(
+                    target: "edgecrab::local_llm",
+                    attempt,
+                    streaming = use_native_streaming_this_attempt,
+                    provider = provider.name(),
+                    model = provider.model(),
+                    has_tools = !tool_defs.is_empty(),
+                    max_tokens = ctx.options.and_then(|o| o.max_tokens),
+                    reasoning_effort = ctx.options.and_then(|o| o.reasoning_effort.as_deref()),
+                    tool_choice_required,
+                    prompt_tokens_estimated = prompt_tokens_est,
+                    context_length = provider.max_context_length(),
+                    http_timeout_secs,
+                    "local_llm: request start"
+                );
+            }
             tracing::info!(
                 attempt,
                 streaming = use_native_streaming_this_attempt,
@@ -3890,15 +4549,41 @@ async fn api_call_with_retry(
                     let tx = ctx
                         .event_tx
                         .expect("native streaming requires event channel");
-                    api_call_streaming(provider, messages, tool_defs, ctx.options, tx, &tokens_sent)
-                        .await
+                    api_call_streaming(
+                        provider,
+                        messages,
+                        tool_defs,
+                        tool_choice.clone(),
+                        ctx.options,
+                        tx,
+                        &tokens_sent,
+                    )
+                    .await
                 } else if tool_defs.is_empty() {
                     provider.chat(messages, ctx.options).await
                 } else {
                     provider
-                        .chat_with_tools(messages, tool_defs, None, ctx.options)
+                        .chat_with_tools(messages, tool_defs, tool_choice, ctx.options)
                         .await
                 }
+            };
+
+            let heartbeat = if !use_native_streaming_this_attempt {
+                let wait_ctx = edgecrab_tools::tool_progress_tail::LlmWaitContext {
+                    prompt_tokens_estimated: Some(prompt_tokens_est as u64),
+                    context_length: Some(provider.max_context_length() as u64),
+                    prefill_pct: None,
+                };
+                spawn_nonstreaming_wait_heartbeat(
+                    ctx.event_tx,
+                    ctx.cancel,
+                    provider.as_ref(),
+                    !tool_defs.is_empty(),
+                    wait_ctx,
+                    http_timeout_secs,
+                )
+            } else {
+                None
             };
 
             let result = tokio::select! {
@@ -3910,8 +4595,29 @@ async fn api_call_with_retry(
                 r = call_fut => r,
             };
 
+            if let Some(handle) = heartbeat {
+                handle.abort();
+            }
+
             match result {
                 Ok(response) => {
+                    let elapsed_ms = request_started_at.elapsed().as_millis() as u64;
+                    let response_metrics = crate::local_provider_policy::LocalLlmResponseMetrics {
+                        elapsed_ms,
+                        finish_reason: response.finish_reason.clone(),
+                        prompt_tokens: response.prompt_tokens,
+                        completion_tokens: response.completion_tokens,
+                        thinking_tokens: response.thinking_tokens,
+                        tool_call_count: response.tool_calls.len(),
+                        content_len: response.content.len(),
+                        has_reasoning_content: response.thinking_content.is_some(),
+                        max_tokens: ctx.options.and_then(|o| o.max_tokens),
+                        tool_choice_required,
+                    };
+                    crate::local_provider_policy::log_local_llm_response(
+                        provider.as_ref(),
+                        &response_metrics,
+                    );
                     invoke_post_api_request_hooks(
                         &ctx,
                         provider,
@@ -3945,7 +4651,26 @@ async fn api_call_with_retry(
                     });
                 }
                 Err(e) => {
+                    let elapsed_ms = request_started_at.elapsed().as_millis() as u64;
+                    if crate::local_provider_policy::blocks_transport_retry(provider.as_ref(), &e)
+                    {
+                        crate::local_provider_policy::log_local_llm_transport_failure(
+                            provider.as_ref(),
+                            elapsed_ms,
+                            attempt,
+                            &e.to_string(),
+                        );
+                    }
                     tracing::warn!(attempt, error = %e, "API call failed");
+
+                    if crate::local_provider_policy::blocks_transport_retry(
+                        provider.as_ref(),
+                        &e,
+                    ) {
+                        emit_local_transport_stall_notice(ctx.event_tx, provider.as_ref());
+                        last_err = Some(e.to_string());
+                        break 'attempt_loop;
+                    }
 
                     let provider_handles_error =
                         provider_manages_transport_retries(provider.as_ref())
@@ -4048,9 +4773,25 @@ async fn api_call_with_retry(
         |e| augment_provider_error(provider, e),
     );
 
+    let transport_stall = crate::local_provider_policy::is_local_inference_provider(provider.name())
+        && crate::local_provider_policy::transport_stall_error_suffix(provider.name()).is_some()
+        && {
+            let lower = raw_err.to_ascii_lowercase();
+            lower.contains("timeout")
+                || lower.contains("timed out")
+                || lower.contains("network")
+        };
+
     // FP18: For rate-limit errors, produce a clear message that names the model
     // and suggests the user wait before retrying — mirrors hermes-agent guidance.
-    let final_err_msg = if raw_err.to_ascii_lowercase().contains("rate limit")
+    let final_err_msg = if transport_stall {
+        format!(
+            "{} Provider error: {}",
+            crate::local_provider_policy::transport_stall_error_suffix(provider.name())
+                .expect("checked above"),
+            raw_err
+        )
+    } else if raw_err.to_ascii_lowercase().contains("rate limit")
         || raw_err.to_ascii_lowercase().contains("rate_limit")
         || raw_err.to_ascii_lowercase().contains("429")
         || raw_err.to_ascii_lowercase().contains("too many requests")
@@ -4419,17 +5160,84 @@ async fn process_response(
         // the assistant_with_tools ChatMessage later.
         let our_tool_calls: Vec<edgecrab_types::ToolCall> = effective_tool_calls
             .iter()
-            .map(edgecrab_types::ToolCall::from_llm)
+            .map(|tc| {
+                dctx.registry.as_ref().map_or_else(
+                    || edgecrab_types::ToolCall::from_llm(tc),
+                    |reg| edgecrab_tools::tool_call_pipeline::normalize_incoming_tool_call(reg, tc),
+                )
+            })
             .collect();
 
         let assistant_text = response.content.clone();
-        let mut assistant_msg = Message::assistant_with_tool_calls(&assistant_text, our_tool_calls);
+        let mut assistant_msg = Message::assistant_with_tool_calls(&assistant_text, our_tool_calls.clone());
         if let Some(ref thinking) = response.thinking_content {
             assistant_msg.reasoning = Some(thinking.clone());
         }
         session.messages.push(assistant_msg);
         session.session_tool_call_count += effective_tool_calls.len() as u32;
+
+        if let Some(reg) = dctx.registry.as_ref() {
+            let batch = edgecrab_tools::tool_call_pipeline::classify_unknown_tool_batch(
+                reg,
+                &dctx.engine_tool_names,
+                &our_tool_calls,
+                session.invalid_tool_call_retries,
+            );
+            if !batch.unknown_names.is_empty() {
+                session.invalid_tool_call_retries = batch.retry_count;
+                let invalid_preview = batch.unknown_names[0].chars().take(80).collect::<String>();
+                tracing::warn!(
+                    invalid = %invalid_preview,
+                    retry = batch.retry_count,
+                    max = edgecrab_tools::MAX_INVALID_TOOL_RETRIES,
+                    "unknown tool name after repair — sending structured error to model"
+                );
+                if batch.should_abort {
+                    return Ok(LoopAction::PartialAbort {
+                        reason: format!("Model generated invalid tool call: {invalid_preview}"),
+                    });
+                }
+                let unknown_set: std::collections::HashSet<String> =
+                    batch.unknown_names.into_iter().collect();
+                for tc in &our_tool_calls {
+                    let tool_result = if unknown_set.contains(&tc.function.name) {
+                        edgecrab_tools::tool_call_pipeline::unknown_tool_error_response(
+                            reg,
+                            &tc.function.name,
+                        )
+                    } else {
+                        "Skipped: another tool call in this turn used an invalid name. \
+                         Please retry with a registered tool name."
+                            .to_string()
+                    };
+                    append_tool_result_to_session(
+                        session,
+                        dctx,
+                        &tc.id,
+                        &tc.function.name,
+                        &tool_result,
+                    );
+                }
+                dedup_tracker.end_turn();
+                return Ok(LoopAction::Continue);
+            }
+            session.invalid_tool_call_retries = 0;
+        }
+
         let tool_turn_start = session.messages.len();
+        let dispatch_calls: Vec<edgequake_llm::ToolCall> = effective_tool_calls
+            .iter()
+            .zip(our_tool_calls.iter())
+            .map(|(raw, normalized)| edgequake_llm::ToolCall {
+                id: raw.id.clone(),
+                call_type: raw.call_type.clone(),
+                function: edgequake_llm::FunctionCall {
+                    name: normalized.function.name.clone(),
+                    arguments: normalized.function.arguments.clone(),
+                },
+                thought_signature: raw.thought_signature.clone(),
+            })
+            .collect();
 
         // Partition tools into parallel-safe and sequential
         let mut parallel_tasks = tokio::task::JoinSet::new();
@@ -4443,7 +5251,49 @@ async fn process_response(
         // in parallel if they target different files. (FP9: Parallel Safety)
         let mut claimed_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-        for tc in &effective_tool_calls {
+        for tc in &dispatch_calls {
+            if let Err(violation) = edgecrab_tools::mutation_turn_policy::check_tool_argument_budget(
+                &tc.function.name,
+                &tc.function.arguments,
+                dctx.app_config_ref.max_write_payload_bytes(),
+                dctx.provider.as_deref(),
+            ) {
+                tracing::warn!(
+                    tool = %violation.tool_name,
+                    argument_bytes = violation.argument_bytes,
+                    max_bytes = violation.max_bytes,
+                    "rejecting tool call before dispatch — argument exceeds one-completion budget"
+                );
+                let tool_err = edgecrab_tools::recovery_catalog::tool_argument_budget_exceeded(
+                    &violation.tool_name,
+                    violation.argument_bytes,
+                    violation.max_bytes,
+                    violation.estimated_tokens,
+                );
+                let tool_result = tool_err.to_llm_response();
+                if should_count_failure_for_escalation(&tool_result) {
+                    failure_tracker.record_failure(&extract_tool_error_text(&tool_result));
+                } else {
+                    failure_tracker.record_success();
+                }
+                dedup_tracker.record(&tc.function.name, &tc.function.arguments, &tool_result);
+                tool_errors.push(edgecrab_types::ToolErrorRecord {
+                    turn: session.api_call_count,
+                    tool_name: tc.function.name.clone(),
+                    arguments: tc.function.arguments.clone(),
+                    error: extract_tool_error_text(&tool_result),
+                    tool_result: tool_result.clone(),
+                });
+                append_tool_result_to_session(
+                    session,
+                    dctx,
+                    &tc.id,
+                    &tc.function.name,
+                    &tool_result,
+                );
+                continue;
+            }
+
             let is_parallel = dctx
                 .registry
                 .as_ref()
@@ -4504,6 +5354,7 @@ async fn process_response(
                 let tool_progress_tx = dctx.tool_progress_tx.clone();
                 let watch_notification_tx = dctx.watch_notification_tx.clone();
                 let delegate_ctx = dctx.delegate_ctx.clone();
+                let kanban_task_id = dctx.kanban_task_id.clone();
 
                 parallel_tasks.spawn(async move {
                     let started = std::time::Instant::now();
@@ -4535,6 +5386,7 @@ async fn process_response(
                         tool_progress_tx,
                         watch_notification_tx,
                         delegate_ctx,
+                        kanban_task_id,
                     };
                     let result = dispatch_single_tool(&tc_id, &tc_name, &tc_args, &inner).await;
                     let duration_ms = started.elapsed().as_millis() as u64;
@@ -4580,7 +5432,12 @@ async fn process_response(
                         {
                             argument_loop_blocked = true;
                         }
-                        failure_tracker.record_failure(&extract_tool_error_text(&tool_result));
+                        if should_count_failure_for_escalation(&tool_result) {
+                            failure_tracker
+                                .record_failure(&extract_tool_error_text(&tool_result));
+                        } else {
+                            failure_tracker.record_success();
+                        }
                     } else {
                         failure_tracker.record_success();
                     }
@@ -4690,7 +5547,11 @@ async fn process_response(
                 {
                     argument_loop_blocked = true;
                 }
-                failure_tracker.record_failure(&extract_tool_error_text(&tool_result));
+                if should_count_failure_for_escalation(&tool_result) {
+                    failure_tracker.record_failure(&extract_tool_error_text(&tool_result));
+                } else {
+                    failure_tracker.record_success();
+                }
             } else {
                 failure_tracker.record_success();
             }
@@ -4825,144 +5686,25 @@ fn cap_delegate_task_calls(
     truncated
 }
 
-/// Dispatch a single tool call through the registry.
-// ── Tool call argument repair ────────────────────────────────────────
-// Self-heal common LLM JSON errors locally instead of wasting an API turn.
-// Inspired by hermes-agent `_repair_tool_call_arguments()`.
-//
-// FP7: Self-Heal Before Failing — the cheapest fix never reaches the LLM.
-fn repair_tool_call_arguments(raw: &str) -> String {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() || trimmed == "null" || trimmed == "None" {
-        return "{}".to_string();
-    }
-    let mut s = trimmed.to_string();
-
-    // Python-style booleans / None (whole-value tokens after a colon)
-    s = s
-        .replace(": True", ": true")
-        .replace(":True", ":true")
-        .replace(": False", ": false")
-        .replace(":False", ":false")
-        .replace(": None", ": null")
-        .replace(":None", ":null");
-
-    // Trailing commas: `,<whitespace>}` or `,<whitespace>]`
-    // Walk backwards from each closing bracket to strip the preceding comma.
-    let mut out = String::with_capacity(s.len());
-    let chars: Vec<char> = s.chars().collect();
-    let len = chars.len();
-    let mut i = 0;
-    while i < len {
-        if chars[i] == '}' || chars[i] == ']' {
-            // Look backwards in `out` for a trailing comma (skip whitespace)
-            let trimmed_end = out.trim_end_matches(|c: char| c.is_ascii_whitespace());
-            if trimmed_end.ends_with(',') {
-                let comma_pos = trimmed_end.len() - 1;
-                out.truncate(comma_pos);
-                // Re-add the whitespace that was between comma and bracket
-                // (just a newline/space for readability)
-            }
-            out.push(chars[i]);
-        } else {
-            out.push(chars[i]);
-        }
-        i += 1;
-    }
-    s = out;
-
-    // Unclosed braces
-    let opens = s.chars().filter(|c| *c == '{').count();
-    let closes = s.chars().filter(|c| *c == '}').count();
-    for _ in 0..opens.saturating_sub(closes) {
-        s.push('}');
-    }
-    // Unclosed brackets
-    let opens_sq = s.chars().filter(|c| *c == '[').count();
-    let closes_sq = s.chars().filter(|c| *c == ']').count();
-    for _ in 0..opens_sq.saturating_sub(closes_sq) {
-        s.push(']');
-    }
-
-    s
-}
-
-/// Sanitize a tool call name that arrived from an LLM response.
-///
-/// WHY: Some models — particularly NousResearch Hermes 3 family on OpenRouter —
-/// bleed chatml special tokens such as `<|channel|>commentary` into the function
-/// name field.  Others output `"read file"` (spaces) or `"web-extract"` (hyphens)
-/// instead of the snake_case names published in the tool schema.
-///
-/// This is a **trust-boundary sanitizer** applied at the single point where all
-/// tool calls from all code paths enter `dispatch_single_tool`.  One fix covers
-/// every execution path.
-///
-/// # What it strips
-/// 1. `<|…|>` special tokens: truncates at the first `<|` (covers ALL chatml
-///    channel annotations regardless of token content).
-/// 2. Space → underscore normalization (`"read file"` → `"read_file"`).
-/// 3. Hyphen → underscore normalization (`"web-extract"` → `"web_extract"`).
-/// 4. Leading/trailing whitespace.
-///
-/// # What it does NOT do
-/// - Does not rewrite unknown tool names to their closest match (the registry's
-///   fuzzy match layer is responsible for that and must remain visible).
-/// - Does not lowercase (tool names are already lowercase in edgecrab; third-party
-///   engine schemas should not be silently recased).
-/// - Does not touch the argument JSON.
-///
-/// # Performance
-/// The fast path is a single `contains` check — no allocation for already-clean
-/// names.  Returns `Cow::Borrowed` in that case.
-fn sanitize_tool_name(name: &str) -> std::borrow::Cow<'_, str> {
-    let trimmed = name.trim();
-
-    // Fast path: the name is already well-formed.
-    // Valid tool names contain only ASCII alphanumeric chars and underscores.
-    let needs_clean = trimmed.contains("<|") || trimmed.contains(' ') || trimmed.contains('-');
-    if !needs_clean {
-        return std::borrow::Cow::Borrowed(trimmed);
-    }
-
-    // Strip special-token suffix — keep only the base name before `<|`.
-    let base = if let Some(pos) = trimmed.find("<|") {
-        trimmed[..pos].trim_end()
-    } else {
-        trimmed
+#[inline]
+fn should_count_failure_for_escalation(tool_result: &str) -> bool {
+    let Some(payload) = parse_tool_error_response(tool_result) else {
+        return true;
     };
-
-    // Normalize word separators to underscore (snake_case).
-    let cleaned = base.replace([' ', '-'], "_");
-    std::borrow::Cow::Owned(cleaned)
+    if is_suppressed_argument_retry(&payload) {
+        return false;
+    }
+    // Schema/wire mistakes already carry required_fields — escalation adds noise.
+    payload.category == "execution" || payload.category == "permission"
 }
 
+/// Dispatch a single tool call — name normalization via [`ToolRegistry::resolve_tool_call_name`].
 async fn dispatch_single_tool(
     tool_call_id: &str,
     name: &str,
     args_json: &str,
     dctx: &DispatchContext,
 ) -> (String, Vec<Message>) {
-    // FP54: Sanitize the tool name before anything else.
-    //
-    // Some models (e.g. Hermes 3 / NousResearch on OpenRouter) bleed chatml
-    // special tokens like `<|channel|>commentary` into the function name field,
-    // and some weaker models output spaces instead of underscores.
-    //
-    // Keep `original_name` for diagnostics, then shadow `name` with the clean
-    // form so all downstream code — fingerprinting, hook dispatch, engine routing,
-    // registry lookup — sees the canonical name.
-    let original_name = name;
-    let sanitized_name = sanitize_tool_name(name);
-    let name: &str = sanitized_name.as_ref();
-    if original_name != name {
-        tracing::info!(
-            original = %original_name,
-            clean = %name,
-            "tool call name sanitized (special tokens or non-underscore separators stripped)"
-        );
-    }
-
     let Some(reg) = dctx.registry.as_ref() else {
         return (
             format!(
@@ -4973,12 +5715,15 @@ async fn dispatch_single_tool(
         );
     };
 
-    let attempt_key = tool_attempt_fingerprint(name, args_json);
-    let semantic_key = dctx
-        .registry
-        .as_ref()
-        .and_then(|reg| invalid_args_semantic_key(reg, name, args_json));
+    let resolved = reg.resolve_tool_call_name(name);
+    let lookup_name = if resolved.canonical.is_empty() {
+        name.to_string()
+    } else {
+        resolved.canonical
+    };
 
+    let attempt_key = tool_attempt_fingerprint(&lookup_name, args_json);
+    let semantic_key = invalid_args_semantic_key(reg, &lookup_name, args_json);
     let prior = {
         let guard = dctx
             .capability_suppressions
@@ -4992,18 +5737,36 @@ async fn dispatch_single_tool(
     };
     if let Some(prior) = prior {
         return (
-            serde_json::to_string(&suppressed_retry_response(name, args_json, &prior))
+            serde_json::to_string(&suppressed_retry_response(&lookup_name, args_json, &prior))
                 .expect("suppressed retry payload serializes"),
             Vec::new(),
         );
     }
+
+    let prepared = match edgecrab_tools::tool_call_pipeline::prepare_tool_call(reg, name, args_json) {
+        Ok(prepared) => {
+            if prepared.name_repaired || prepared.original_name.trim() != prepared.name {
+                tracing::info!(
+                    original = %prepared.original_name,
+                    canonical = %prepared.name,
+                    repaired = prepared.name_repaired,
+                    "tool call normalized via tool_call_pipeline"
+                );
+            }
+            prepared
+        }
+        Err(e) => return (format_preflight_tool_error(reg, &lookup_name, args_json, &e), Vec::new()),
+    };
+    let name = prepared.name.as_str();
+    let normalized_args_json = prepared.args_json;
+    let prepared_args = prepared.args;
 
     // Emit tool:pre hook event — informational (fire-and-forget, no cancellation)
     if let Some(tx) = dctx.event_tx.as_ref() {
         let ctx_json = serde_json::json!({
             "event": "tool:pre",
             "tool_name": name,
-            "args_json": args_json,
+            "args_json": normalized_args_json,
             "session_id": &dctx.conversation_session_id,
         })
         .to_string();
@@ -5023,7 +5786,7 @@ async fn dispatch_single_tool(
                 "pre_tool_call",
                 serde_json::json!({
                     "tool_name": name,
-                    "args": serde_json::from_str::<serde_json::Value>(args_json).unwrap_or_else(|_| serde_json::json!({})),
+                    "args": prepared_args.clone(),
                     "task_id": &dctx.conversation_session_id,
                 }),
             )
@@ -5041,8 +5804,7 @@ async fn dispatch_single_tool(
     if dctx.engine_tool_names.contains(name)
         && let Some(ref engine) = dctx.context_engine
     {
-        let args: serde_json::Value = serde_json::from_str(args_json)
-            .unwrap_or(serde_json::Value::Object(Default::default()));
+        let args = prepared_args.clone();
         match engine.handle_tool_call(name, args).await {
             Some(Ok(output)) => return (output, Vec::new()),
             Some(Err(e)) => {
@@ -5085,48 +5847,22 @@ async fn dispatch_single_tool(
         Some(Arc::clone(&dctx.mutation_turn)),
         dctx.lsp_gate.clone(),
         dctx.delegate_ctx.clone(),
+        dctx.kanban_task_id.clone(),
     );
 
-    let args: serde_json::Value = match serde_json::from_str(args_json) {
-        Ok(v) => v,
-        Err(_first_err) => {
-            // Attempt self-healing repair before giving up (FP7).
-            let repaired = repair_tool_call_arguments(args_json);
-            match serde_json::from_str(&repaired) {
-                Ok(v) => {
-                    tracing::info!(tool_name = %name, "repaired malformed tool arguments JSON");
-                    v
-                }
-                Err(e) => {
-                    // Repair failed too — report as a tool error so the LLM
-                    // can self-correct.
-                    tracing::warn!(tool_name = %name, error = %e, args_json = %args_json, "malformed tool arguments JSON (repair also failed)");
-                    return (
-                        ToolError::InvalidArgs {
-                            tool: name.to_string(),
-                            message: format!("invalid JSON arguments: {e}"),
-                        }
-                        .to_llm_response(),
-                        Vec::new(),
-                    );
-                }
-            }
-        }
-    };
-
-    let args_for_mutation = args.clone();
-    let result = match reg.dispatch(name, args, &ctx).await {
+    let args_for_mutation = prepared_args.clone();
+    let result = match reg.dispatch(name, prepared_args, &ctx).await {
         Ok(output) => output,
-        Err(ref e @ ToolError::InvalidArgs { .. }) => {
+        Err(ref e) if matches!(e.core_error(), ToolError::InvalidArgs { .. }) => {
             // Enrich InvalidArgs with required_fields + usage_hint from schema.
             // This gives the LLM a precise corrective checklist on the next turn.
-            if let Some(mut enriched) = reg.enrich_invalid_args_error(name, e) {
+            if let Some(mut enriched) = reg.enrich_invalid_args_error(name, e, Some(&normalized_args_json)) {
                 if enriched.suppression_key.is_none()
                     && let Some(ref required_fields) = enriched.required_fields
                 {
                     enriched.suppression_key = invalid_args_missing_fields_suppression_key(
                         name,
-                        args_json,
+                        &normalized_args_json,
                         required_fields,
                     );
                 }
@@ -5171,7 +5907,7 @@ async fn dispatch_single_tool(
                 "post_tool_call",
                 serde_json::json!({
                     "tool_name": name,
-                    "args": serde_json::from_str::<serde_json::Value>(args_json).unwrap_or_else(|_| serde_json::json!({})),
+                    "args": &args_for_mutation,
                     "result": &result,
                     "task_id": &dctx.conversation_session_id,
                 }),
@@ -5348,6 +6084,7 @@ async fn run_learning_reflection_bg(ctx: BackgroundReflectionCtx) {
         tool_progress_tx: None,
         watch_notification_tx: None,
         delegate_ctx: None,
+        kanban_task_id: None,
     };
 
     // Work on local session clone — we don't need results propagated back.
@@ -6118,6 +6855,7 @@ def register(ctx):
             &provider,
             &[ChatMessage::user("hello")],
             &[],
+            None,
             Some(&CompletionOptions {
                 max_tokens: Some(256),
                 ..Default::default()
@@ -6174,6 +6912,7 @@ def register(ctx):
                 ChatMessage::user("hello world"),
             ],
             &tool_defs,
+            None,
             Some(&CompletionOptions {
                 max_tokens: Some(512),
                 ..Default::default()
@@ -6221,6 +6960,7 @@ def register(ctx):
             &provider,
             &[ChatMessage::user("hello")],
             &[],
+            None,
             None,
             &tx,
             &tokens_sent,
@@ -6300,6 +7040,56 @@ def register(ctx):
         );
         assert!(outcome.response.tool_calls.is_empty());
         assert!(outcome.response.content.contains("sufficient information"));
+    }
+
+    #[tokio::test]
+    async fn api_call_with_retry_does_not_double_retry_local_inference_transport_errors() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider: Arc<dyn LLMProvider> = Arc::new(RetryCountingProvider {
+            provider_name: "lmstudio",
+            attempts: attempts.clone(),
+            last_options: Arc::new(Mutex::new(None)),
+        });
+        let cancel = CancellationToken::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let err = api_call_with_retry(
+            &provider,
+            &[ChatMessage::user("hello")],
+            &[],
+            3,
+            ApiCallContext {
+                options: None,
+                cancel: &cancel,
+                event_tx: Some(&tx),
+                use_native_streaming: false,
+                discovered_plugins: None,
+                conversation_session_id: "test-session",
+                platform: edgecrab_types::Platform::Cli,
+                api_call_count: 0,
+            },
+        )
+        .await
+        .expect_err("local transport failure should fail fast");
+
+        assert!(matches!(err, AgentError::Llm(_)));
+        assert!(
+            err.to_string().contains("did not start a duplicate request"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "local inference transport errors must not trigger outer retries"
+        );
+        let mut saw_notice = false;
+        while let Ok(event) = rx.try_recv() {
+            if let crate::StreamEvent::ActivityNotice(ref msg) = event {
+                assert!(msg.contains("lmstudio"));
+                saw_notice = true;
+            }
+        }
+        assert!(saw_notice, "expected local transport stall ActivityNotice");
     }
 
     #[tokio::test]
@@ -6584,9 +7374,14 @@ def register(ctx):
     }
 
     #[test]
-    fn native_streaming_policy_disables_copilot_for_tool_turns() {
+    fn native_streaming_policy_disables_copilot_and_local_for_tool_turns() {
         let copilot_provider: Arc<dyn LLMProvider> = Arc::new(RetryCountingProvider {
             provider_name: "vscode-copilot",
+            attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            last_options: Arc::new(Mutex::new(None)),
+        });
+        let lmstudio_provider: Arc<dyn LLMProvider> = Arc::new(RetryCountingProvider {
+            provider_name: "lmstudio",
             attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             last_options: Arc::new(Mutex::new(None)),
         });
@@ -6609,6 +7404,10 @@ def register(ctx):
         assert!(
             !should_use_native_streaming(copilot_provider.as_ref(), &tool_defs, true, true),
             "Copilot tool turns should use the safer non-native path"
+        );
+        assert!(
+            !should_use_native_streaming(lmstudio_provider.as_ref(), &tool_defs, true, true),
+            "LM Studio tool turns should use non-streaming to avoid buffered arg stalls"
         );
         assert!(
             should_use_native_streaming(streaming_provider.as_ref(), &[], true, true),
@@ -7746,6 +8545,7 @@ def register(ctx):
             tool_progress_tx: None,
             watch_notification_tx: None,
             delegate_ctx: None,
+            kanban_task_id: None,
         }
     }
 
@@ -7870,6 +8670,33 @@ def register(ctx):
         assert_eq!(second_payload.code, "suppressed_repeated_tool_error");
         assert_eq!(second_payload.category, "arguments");
         assert!(second_payload.error.contains("same `write_file` call fail"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_single_tool_accepts_write_file_file_path_alias() {
+        let registry = Arc::new(ToolRegistry::new());
+        let cancel = CancellationToken::new();
+        let state_db = None;
+        let process_table = Arc::new(ProcessTable::new());
+        let capability_suppressions = Arc::new(Mutex::new(HashMap::new()));
+        let mut dctx = make_dispatch_context_for_test(
+            &registry,
+            &cancel,
+            &state_db,
+            &process_table,
+            capability_suppressions,
+        );
+
+        let workspace = TempDir::new().expect("workspace");
+        dctx.cwd = workspace.path().to_path_buf();
+        let args_json = r#"{"file_path":"build_ppt.py","content":"print('ppt')\n"}"#;
+
+        let (result, injected) =
+            dispatch_single_tool("call-write-alias", "write_file", args_json, &dctx).await;
+        assert!(injected.is_empty());
+        let payload: serde_json::Value = serde_json::from_str(&result).expect("json");
+        assert_eq!(payload.get("ok"), Some(&serde_json::json!(true)));
+        assert!(workspace.path().join("build_ppt.py").exists());
     }
 
     #[tokio::test]
@@ -8065,6 +8892,7 @@ def register(ctx):
             suggested_action: None,
             required_fields: Some(vec!["path".into()]),
             usage_hint: Some("Required: path: string".into()),
+            recovery_feedback: None,
         };
 
         let resp = suppressed_retry_response("read_file", r#"{"wrong":"args"}"#, &prior);
@@ -8097,74 +8925,6 @@ def register(ctx):
         )
         .expect("missing path should generate a semantic suppression key");
         assert_eq!(key, "invalid_args:write_file:missing:path");
-    }
-
-    // ── repair_tool_call_arguments tests ─────────────────────────────
-    #[test]
-    fn repair_empty_string() {
-        assert_eq!(repair_tool_call_arguments(""), "{}");
-        assert_eq!(repair_tool_call_arguments("   "), "{}");
-    }
-
-    #[test]
-    fn repair_null_and_none() {
-        assert_eq!(repair_tool_call_arguments("null"), "{}");
-        assert_eq!(repair_tool_call_arguments("None"), "{}");
-    }
-
-    #[test]
-    fn repair_python_booleans() {
-        let input = r#"{"flag": True, "other": False, "val": None}"#;
-        let repaired = repair_tool_call_arguments(input);
-        let v: serde_json::Value =
-            serde_json::from_str(&repaired).expect("repaired python booleans should parse");
-        assert_eq!(v["flag"], serde_json::Value::Bool(true));
-        assert_eq!(v["other"], serde_json::Value::Bool(false));
-        assert!(v["val"].is_null());
-    }
-
-    #[test]
-    fn repair_trailing_comma() {
-        let input = r#"{"a": 1, "b": 2, }"#;
-        let repaired = repair_tool_call_arguments(input);
-        let v: serde_json::Value =
-            serde_json::from_str(&repaired).expect("repaired object should parse");
-        assert_eq!(v["a"], 1);
-        assert_eq!(v["b"], 2);
-    }
-
-    #[test]
-    fn repair_trailing_comma_in_array() {
-        let input = r#"{"items": [1, 2, 3, ]}"#;
-        let repaired = repair_tool_call_arguments(input);
-        let v: serde_json::Value =
-            serde_json::from_str(&repaired).expect("repaired array should parse");
-        assert_eq!(
-            v["items"]
-                .as_array()
-                .expect("items should be repaired into an array")
-                .len(),
-            3
-        );
-    }
-
-    #[test]
-    fn repair_unclosed_braces() {
-        let input = r#"{"a": {"b": 1}"#;
-        let repaired = repair_tool_call_arguments(input);
-        let v: serde_json::Value =
-            serde_json::from_str(&repaired).expect("repaired nested object should parse");
-        assert_eq!(v["a"]["b"], 1);
-    }
-
-    #[test]
-    fn repair_valid_json_passthrough() {
-        let input = r#"{"path": "foo.rs", "line": 42}"#;
-        let repaired = repair_tool_call_arguments(input);
-        assert_eq!(repaired, input); // no changes
-        let v: serde_json::Value =
-            serde_json::from_str(&repaired).expect("valid json should still parse");
-        assert_eq!(v["path"], "foo.rs");
     }
 
     // ── FP19: parse_retry_after tests ──────────────────────────────────────
@@ -8221,65 +8981,72 @@ def register(ctx):
         );
     }
 
-    // ─── FP54: sanitize_tool_name unit tests ─────────────────────────────────
+    // ─── FP54: tool name normalization (see edgecrab-tools::tool_name_repair) ─
 
     #[test]
-    fn sanitize_tool_name_clean_is_borrowed() {
-        // Clean names must not allocate — fast path returns Borrowed.
-        let result = sanitize_tool_name("web_extract");
-        assert!(
-            matches!(result, std::borrow::Cow::Borrowed(_)),
-            "clean name should be Borrowed (zero allocation)"
+    fn dispatch_tool_name_normalization_clean() {
+        let reg = edgecrab_tools::ToolRegistry::new();
+        let resolved = reg.resolve_tool_call_name("web_extract");
+        assert_eq!(resolved.canonical, "web_extract");
+        assert!(!resolved.repaired);
+    }
+
+    #[test]
+    fn dispatch_tool_name_normalization_strips_channel_token() {
+        let reg = edgecrab_tools::ToolRegistry::new();
+        let resolved = reg.resolve_tool_call_name("web_extract<|channel|>commentary");
+        assert_eq!(resolved.canonical, "web_extract");
+    }
+
+    #[test]
+    fn dispatch_tool_name_normalization_strips_im_end_token() {
+        let reg = edgecrab_tools::ToolRegistry::new();
+        let resolved = reg.resolve_tool_call_name("read_file<|im_end|>");
+        assert_eq!(resolved.canonical, "read_file");
+    }
+
+    #[test]
+    fn dispatch_tool_name_normalization_spaces() {
+        let reg = edgecrab_tools::ToolRegistry::new();
+        assert_eq!(
+            reg.resolve_tool_call_name("read file").canonical,
+            "read_file"
         );
-        assert_eq!(result, "web_extract");
     }
 
     #[test]
-    fn sanitize_tool_name_strips_channel_token() {
-        // NousResearch Hermes 3: `<|channel|>commentary` suffix
-        let result = sanitize_tool_name("web_extract<|channel|>commentary");
-        assert_eq!(result, "web_extract");
+    fn dispatch_tool_name_normalization_hyphens() {
+        let reg = edgecrab_tools::ToolRegistry::new();
+        assert_eq!(
+            reg.resolve_tool_call_name("web-extract").canonical,
+            "web_extract"
+        );
     }
 
     #[test]
-    fn sanitize_tool_name_strips_im_end_token() {
-        // Generic chatml end token
-        let result = sanitize_tool_name("read_file<|im_end|>");
-        assert_eq!(result, "read_file");
+    fn dispatch_tool_name_normalization_combined() {
+        let reg = edgecrab_tools::ToolRegistry::new();
+        assert_eq!(
+            reg.resolve_tool_call_name("apply patch<|channel|>action").canonical,
+            "apply_patch"
+        );
     }
 
     #[test]
-    fn sanitize_tool_name_normalizes_spaces() {
-        // Some models output "read file" instead of "read_file"
-        let result = sanitize_tool_name("read file");
-        assert_eq!(result, "read_file");
+    fn dispatch_tool_name_normalization_trims_whitespace() {
+        let reg = edgecrab_tools::ToolRegistry::new();
+        assert_eq!(
+            reg.resolve_tool_call_name("  write_file  ").canonical,
+            "write_file"
+        );
     }
 
     #[test]
-    fn sanitize_tool_name_normalizes_hyphens() {
-        // Some models output "web-extract" instead of "web_extract"
-        let result = sanitize_tool_name("web-extract");
-        assert_eq!(result, "web_extract");
-    }
-
-    #[test]
-    fn sanitize_tool_name_combined() {
-        // Spaces + channel token (worst case)
-        let result = sanitize_tool_name("apply patch<|channel|>action");
-        assert_eq!(result, "apply_patch");
-    }
-
-    #[test]
-    fn sanitize_tool_name_trims_whitespace() {
-        let result = sanitize_tool_name("  file_write  ");
-        assert_eq!(result, "file_write");
-    }
-
-    #[test]
-    fn sanitize_tool_name_only_token_yields_empty() {
-        // If the entire name is a special token, result is empty — registry
-        // will return a NotFound error (correct; we don't invent a name).
-        let result = sanitize_tool_name("<|channel|>commentary");
-        assert_eq!(result, "");
+    fn dispatch_tool_name_only_token_yields_empty() {
+        let reg = edgecrab_tools::ToolRegistry::new();
+        assert_eq!(
+            reg.resolve_tool_call_name("<|channel|>commentary").canonical,
+            ""
+        );
     }
 }

@@ -118,6 +118,22 @@ pub struct PruneSpillContext<'a> {
     pub seq: &'a SpillSequence,
 }
 
+impl<'a> PruneSpillContext<'a> {
+    pub fn new(
+        session_id: &'a str,
+        cwd: &'a Path,
+        config: &'a SpillConfig,
+        seq: &'a SpillSequence,
+    ) -> Self {
+        Self {
+            session_id,
+            cwd,
+            config,
+            seq,
+        }
+    }
+}
+
 /// Number of head messages (system prompt + first exchange) always preserved.
 /// Matches hermes-agent's `protect_first_n = 3` constant.
 const PROTECT_FIRST_N: usize = 3;
@@ -523,6 +539,62 @@ pub fn compress_structural_only(
     result.push(Message::system_summary(prefixed));
     result.extend_from_slice(&pruned[tail_start..]);
     sanitize_orphan_pairs(result)
+}
+
+/// Count tool results that [`prune_tool_outputs`] would replace (>200 chars).
+pub fn count_long_tool_outputs(messages: &[Message]) -> usize {
+    messages
+        .iter()
+        .filter(|m| m.role == edgecrab_types::Role::Tool && m.text_content().len() > 200)
+        .count()
+}
+
+/// Cheap structural prefill prune for local inference — prune/spill oversized tool results only.
+///
+/// Returns `(pruned_messages, long_tool_outputs_replaced)`.
+pub fn structural_prefill_prune(
+    messages: &[Message],
+    spill_ctx: Option<&PruneSpillContext<'_>>,
+) -> (Vec<Message>, usize) {
+    let before = count_long_tool_outputs(messages);
+    let pruned = prune_tool_outputs(messages, spill_ctx);
+    let after = count_long_tool_outputs(&pruned);
+    (pruned, before.saturating_sub(after))
+}
+
+/// Metrics from a successful structural tool-output prune (message tokens only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StructuralPruneOutcome {
+    pub tools_pruned: usize,
+    pub message_tokens_before: usize,
+    pub message_tokens_after: usize,
+    pub long_tool_outputs_remaining: usize,
+}
+
+/// Prune oversized tool results when any exist; returns `None` if nothing would change.
+pub fn apply_structural_tool_output_prune(
+    messages: &[Message],
+    spill_ctx: Option<&PruneSpillContext<'_>>,
+) -> Option<(Vec<Message>, StructuralPruneOutcome)> {
+    if count_long_tool_outputs(messages) == 0 {
+        return None;
+    }
+    let message_tokens_before = estimate_tokens(messages);
+    let (pruned, tools_pruned) = structural_prefill_prune(messages, spill_ctx);
+    if tools_pruned == 0 {
+        return None;
+    }
+    let message_tokens_after = estimate_tokens(&pruned);
+    let long_tool_outputs_remaining = count_long_tool_outputs(&pruned);
+    Some((
+        pruned,
+        StructuralPruneOutcome {
+            tools_pruned,
+            message_tokens_before,
+            message_tokens_after,
+            long_tool_outputs_remaining,
+        },
+    ))
 }
 
 /// Replace large tool-result messages with a placeholder, or spill to disk.
@@ -1438,6 +1510,47 @@ mod tests {
         assert_eq!(pruned[0].text_content(), "run a command");
         // Tool result replaced with placeholder
         assert_eq!(pruned[1].text_content(), PRUNED_TOOL_PLACEHOLDER);
+    }
+
+    #[test]
+    fn structural_prefill_prune_reclaims_tool_output_tokens() {
+        let messages: Vec<Message> = (0..8)
+            .map(|i| {
+                Message::tool_result(
+                    &format!("id{i}"),
+                    "web_extract",
+                    &format!("page body {}\n", "x".repeat(8_000)),
+                )
+            })
+            .collect();
+        let tokens_before = estimate_tokens(&messages);
+        assert_eq!(count_long_tool_outputs(&messages), 8);
+
+        let (pruned, replaced) = structural_prefill_prune(&messages, None);
+        assert_eq!(replaced, 8);
+        assert_eq!(count_long_tool_outputs(&pruned), 0);
+        let tokens_after = estimate_tokens(&pruned);
+        assert!(
+            tokens_after < tokens_before / 4,
+            "expected large token drop: before={tokens_before} after={tokens_after}"
+        );
+    }
+
+    #[test]
+    fn apply_structural_tool_output_prune_returns_none_when_nothing_long() {
+        let messages = vec![Message::tool_result("id", "shell_exec", "ok")];
+        assert!(apply_structural_tool_output_prune(&messages, None).is_none());
+    }
+
+    #[test]
+    fn apply_structural_tool_output_prune_reports_outcome() {
+        let messages = vec![Message::tool_result("id", "web_extract", &"x".repeat(500))];
+        let (pruned, outcome) = apply_structural_tool_output_prune(&messages, None)
+            .expect("long tool output should prune");
+        assert_eq!(outcome.tools_pruned, 1);
+        assert_eq!(outcome.long_tool_outputs_remaining, 0);
+        assert!(outcome.message_tokens_after < outcome.message_tokens_before);
+        assert_eq!(count_long_tool_outputs(&pruned), 0);
     }
 
     #[test]

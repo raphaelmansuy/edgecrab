@@ -56,6 +56,7 @@ fn make_ctx(workspace: &TempDir, home: &TempDir) -> ToolContext {
         watch_notification_tx: None,
         mutation_turn: None,
         lsp_gate: None,
+        kanban_task_id: None,
     };
     ctx.config.edgecrab_home = home.path().to_path_buf();
     ctx.config.lsp_servers = HashMap::from([(

@@ -25,6 +25,7 @@ pub mod execution_fs;
 pub mod execution_tmp;
 pub mod fuzzy_match;
 mod local_pty;
+pub mod kanban_gating;
 pub mod lsp_gate;
 #[cfg(target_os = "macos")]
 pub mod macos_permissions;
@@ -32,13 +33,20 @@ pub mod macos_permissions;
 #[path = "macos_permissions_stub.rs"]
 pub mod macos_permissions;
 pub mod mutations;
+pub mod mutation_turn_policy;
 pub mod path_utils;
 pub mod process_table;
 pub mod provider_factory;
 pub mod read_tracker;
+pub mod recovery_catalog;
 pub mod registry;
 mod shell_syntax;
+pub mod skills;
+pub mod smart_approval;
 pub mod subagent_ids;
+pub mod tool_call_pipeline;
+pub mod tool_argument_pipeline;
+pub mod tool_name_repair;
 pub mod tool_progress_tail;
 pub mod tools;
 pub mod toolsets;
@@ -78,6 +86,19 @@ pub use registry::{
     SubAgentResult, SubAgentRunner, ToolContext, ToolHandler, ToolProgressUpdate, ToolRegistry,
     to_llm_definitions,
 };
+pub use tool_argument_pipeline::{
+    canonical_tool_args_json, parse_tool_arguments_json, prepare_parsed_tool_arguments,
+    repair_stream_tool_arguments, repair_tool_arguments,
+};
+pub use tool_call_pipeline::{
+    PreparedToolCall, MAX_INVALID_TOOL_RETRIES, classify_unknown_tool_batch,
+    is_tool_registered, normalize_incoming_tool_call, prepare_tool_call,
+    repair_tool_call_arguments_for_api, sanitize_assistant_tool_calls_for_api,
+    unknown_tool_error_response, unknown_tool_names,
+};
+pub use tool_name_repair::{ResolvedToolName, fuzzy_match_tool_name, repair_tool_name, resolve_tool_call_name};
+pub use smart_approval::handle_approvals_slash;
+pub use edgecrab_security::approval::ApprovalMode;
 pub use tools::checkpoint::{
     AutoPruneResult, CheckpointConfig, CheckpointManager, PruneCounts, RollbackOutcome,
     checkpoint_new_turn, clear_all, clear_legacy, format_checkpoint_list, format_store_status,

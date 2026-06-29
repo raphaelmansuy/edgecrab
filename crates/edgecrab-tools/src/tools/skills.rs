@@ -82,14 +82,53 @@ fn resolve_skill_directories(
 ///      and contains a `SKILL.md`.
 ///
 /// Returns the first matching skill directory, or None.
+fn parse_frontmatter_name_from_file(skill_md: &Path, fallback: &str) -> String {
+    let Ok(content) = std::fs::read_to_string(skill_md) else {
+        return fallback.to_string();
+    };
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with("---") {
+        return fallback.to_string();
+    }
+    let after = &trimmed[3..];
+    let Some(end) = after.find("\n---") else {
+        return fallback.to_string();
+    };
+    for line in after[..end].lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("name:") {
+            let name = rest.trim().trim_matches(['\'', '"']);
+            if !name.is_empty() {
+                return name.to_string();
+            }
+        }
+    }
+    fallback.to_string()
+}
+
+fn skill_dir_matches_name(path: &Path, name: &str) -> bool {
+    if !path.join("SKILL.md").is_file() {
+        return false;
+    }
+    let leaf = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    if leaf.eq_ignore_ascii_case(name) {
+        return true;
+    }
+    let fm_name = parse_frontmatter_name_from_file(&path.join("SKILL.md"), leaf);
+    fm_name.eq_ignore_ascii_case(name)
+}
+
 fn find_skill_dir(skills_base: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
     // 1. Direct flat lookup
     let direct = skills_base.join(name);
-    if direct.join("SKILL.md").is_file() {
+    if skill_dir_matches_name(&direct, name) {
         return Some(direct);
     }
 
-    // 2. Recursive search by leaf directory name
+    // 2. Recursive search by directory leaf or frontmatter name
     let mut stack = vec![skills_base.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let entries = match std::fs::read_dir(&dir) {
@@ -99,10 +138,14 @@ fn find_skill_dir(skills_base: &std::path::Path, name: &str) -> Option<std::path
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                if let Some(leaf) = path.file_name().and_then(|n| n.to_str())
-                    && leaf == name
-                    && path.join("SKILL.md").is_file()
-                {
+                let leaf = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default();
+                if leaf.starts_with('.') {
+                    continue;
+                }
+                if skill_dir_matches_name(&path, name) {
                     return Some(path);
                 }
                 stack.push(path);
@@ -167,7 +210,49 @@ fn collect_available_skill_names(roots: &[std::path::PathBuf], limit: usize) -> 
     names
 }
 
-// ─── Frontmatter parsing ───────────────────────────────────────
+/// Public wrapper for skill discovery (slash commands, write approval).
+pub fn find_skill_dir_public(skills_base: &Path, name: &str) -> Option<PathBuf> {
+    find_skill_dir(skills_base, name)
+}
+
+/// Missing required env var declared in SKILL.md frontmatter.
+#[derive(Debug, Clone)]
+pub struct SkillEnvRequirement {
+    pub name: String,
+    pub prompt: Option<String>,
+}
+
+/// Re-export for callers that import from `tools::skills`.
+pub use crate::skills::SkillCredentialRequirement;
+
+/// Env vars declared by the skill but unset in the current process.
+pub fn skill_missing_env_specs(skill_dir: &Path) -> Vec<SkillEnvRequirement> {
+    let skill_path = skill_dir.join("SKILL.md");
+    let content = match std::fs::read_to_string(&skill_path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let meta = parse_skill_frontmatter(&content);
+    check_missing_env_vars(&meta)
+        .into_iter()
+        .map(|spec| SkillEnvRequirement {
+            name: spec.name.clone(),
+            prompt: spec.prompt.clone(),
+        })
+        .collect()
+}
+
+/// Credential files declared by the skill but missing under `~/.edgecrab/`.
+pub fn skill_missing_credential_files(skill_dir: &Path) -> Vec<SkillCredentialRequirement> {
+    let skill_path = skill_dir.join("SKILL.md");
+    let content = match std::fs::read_to_string(&skill_path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let meta = parse_skill_frontmatter(&content);
+    let home = crate::config_ref::resolve_edgecrab_home();
+    crate::skills::missing_credential_files(&home, &meta.required_credential_files)
+}
 
 /// Required environment variable spec for a skill.
 #[derive(Debug, Clone, Default)]
@@ -195,9 +280,11 @@ struct SkillMeta {
     category: Option<String>,
     version: Option<String>,
     license: Option<String>,
-    platforms: Vec<String>,  // Restrict to [macos, linux, windows]
-    read_files: Vec<String>, // Progressive disclosure: linked files to load
+    platforms: Vec<String>,    // Restrict to [macos, linux, windows]
+    environments: Vec<String>, // Offer-time: [kanban, docker, s6]
+    read_files: Vec<String>,   // Progressive disclosure: linked files to load
     required_environment_variables: Vec<EnvVarSpec>, // Secure setup on load
+    required_credential_files: Vec<crate::skills::CredentialFileSpec>,
     conditional_activation: ConditionalActivation, // Fallback/requires rules
     when_to_use: Option<String>,
     argument_hint: Option<String>,
@@ -218,8 +305,10 @@ impl Default for SkillMeta {
             version: None,
             license: None,
             platforms: Vec::new(),
+            environments: Vec::new(),
             read_files: Vec::new(),
             required_environment_variables: Vec::new(),
+            required_credential_files: Vec::new(),
             conditional_activation: ConditionalActivation::default(),
             when_to_use: None,
             argument_hint: None,
@@ -266,6 +355,7 @@ fn parse_inline_frontmatter_list(value: &str) -> Vec<String> {
 fn apply_list_to_meta(meta: &mut SkillMeta, key: &str, items: Vec<String>) {
     match key {
         "platforms" => meta.platforms = items,
+        "environments" => meta.environments = items,
         "read_files" => meta.read_files = items,
         "fallback_for_toolsets" => meta.conditional_activation.fallback_for_toolsets = items,
         "requires_toolsets" => meta.conditional_activation.requires_toolsets = items,
@@ -304,6 +394,12 @@ fn parse_skill_frontmatter(content: &str) -> SkillMeta {
     let mut current_list_context: Vec<String> = Vec::new();
     let mut in_env_var_list = false;
     let mut current_env_var: EnvVarSpec = EnvVarSpec::default();
+    let mut in_cred_file_list = false;
+    let mut current_cred_file: crate::skills::CredentialFileSpec =
+        crate::skills::CredentialFileSpec {
+            path: String::new(),
+            description: None,
+        };
 
     for line in frontmatter.lines() {
         let trimmed_line = line.trim();
@@ -345,6 +441,53 @@ fn parse_skill_frontmatter(content: &str) -> SkillMeta {
                     meta.required_environment_variables
                         .push(current_env_var.clone());
                     current_env_var = EnvVarSpec::default();
+                }
+            } else {
+                continue;
+            }
+        }
+
+        // Handle credential file list items ({path: ...} or plain `- file.json`)
+        if in_cred_file_list {
+            if let Some(stripped) = trimmed_line.strip_prefix("- ") {
+                if !current_cred_file.path.is_empty() {
+                    meta.required_credential_files
+                        .push(current_cred_file.clone());
+                    current_cred_file = crate::skills::CredentialFileSpec {
+                        path: String::new(),
+                        description: None,
+                    };
+                }
+                if let Some(rest) = stripped.strip_prefix("path:") {
+                    current_cred_file.path =
+                        rest.trim().trim_matches('"').trim_matches('\'').to_string();
+                } else {
+                    current_cred_file.path = stripped
+                        .trim()
+                        .trim_matches('"')
+                        .trim_matches('\'')
+                        .to_string();
+                }
+                continue;
+            } else if trimmed_line.starts_with("path:") && current_cred_file.path.is_empty() {
+                let val = trimmed_line.trim_start_matches("path:").trim();
+                current_cred_file.path = val.trim_matches('"').trim_matches('\'').to_string();
+                continue;
+            } else if trimmed_line.starts_with("description:") && !current_cred_file.path.is_empty()
+            {
+                let val = trimmed_line.trim_start_matches("description:").trim();
+                current_cred_file.description =
+                    Some(val.trim_matches('"').trim_matches('\'').to_string());
+                continue;
+            } else if !trimmed_line.starts_with('-') && trimmed_line.contains(':') {
+                in_cred_file_list = false;
+                if !current_cred_file.path.is_empty() {
+                    meta.required_credential_files
+                        .push(current_cred_file.clone());
+                    current_cred_file = crate::skills::CredentialFileSpec {
+                        path: String::new(),
+                        description: None,
+                    };
                 }
             } else {
                 continue;
@@ -400,6 +543,14 @@ fn parse_skill_frontmatter(content: &str) -> SkillMeta {
                         current_list_context.clear();
                     } else {
                         meta.platforms = parse_inline_frontmatter_list(val);
+                    }
+                }
+                "environments" => {
+                    if val.is_empty() {
+                        current_list_key = Some("environments");
+                        current_list_context.clear();
+                    } else {
+                        meta.environments = parse_inline_frontmatter_list(val);
                     }
                 }
                 "read_files" => {
@@ -484,6 +635,9 @@ fn parse_skill_frontmatter(content: &str) -> SkillMeta {
                 "required_environment_variables" if val.is_empty() => {
                     in_env_var_list = true;
                 }
+                "required_credential_files" if val.is_empty() => {
+                    in_cred_file_list = true;
+                }
                 _ => {}
             }
         }
@@ -496,6 +650,10 @@ fn parse_skill_frontmatter(content: &str) -> SkillMeta {
 
     if !current_env_var.name.is_empty() {
         meta.required_environment_variables.push(current_env_var);
+    }
+
+    if !current_cred_file.path.is_empty() {
+        meta.required_credential_files.push(current_cred_file);
     }
 
     meta
@@ -526,28 +684,11 @@ fn normalize_skill_dir_for_prompt(skill_dir: &Path) -> String {
 }
 
 fn discover_supporting_files(skill_dir: &Path) -> Vec<String> {
-    let mut supporting_files = Vec::new();
-    for subdir in &["references", "templates", "scripts", "assets"] {
-        let sub_path = skill_dir.join(subdir);
-        let entries = match std::fs::read_dir(&sub_path) {
-            Ok(entries) => entries,
-            Err(_) => continue,
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
-                supporting_files.push(format!("{subdir}/{name}"));
-            }
-        }
-    }
-    supporting_files.sort();
-    supporting_files
+    crate::skills::list_supporting_files(skill_dir)
 }
 
 fn render_skill_bundle(
+    edgecrab_home: &Path,
     skill_dir: &Path,
     skill_name: &str,
     session_id: Option<&str>,
@@ -557,14 +698,13 @@ fn render_skill_bundle(
     let meta = parse_skill_frontmatter(&content);
     let normalized_dir = normalize_skill_dir_for_prompt(skill_dir);
 
-    let mut output = format!(
-        "Base directory for this skill: {normalized_dir}\n\n{}",
-        strip_frontmatter(&content).trim()
-    );
-    output = output.replace("${CLAUDE_SKILL_DIR}", &normalized_dir);
-    if let Some(session_id) = session_id {
-        output = output.replace("${CLAUDE_SESSION_ID}", session_id);
-    }
+    let preprocess_opts =
+        crate::skills::preprocess_options_from_config(&edgecrab_home.join("config.yaml"));
+    let body = strip_frontmatter(&content).trim();
+    let body =
+        crate::skills::preprocess_skill_content(body, skill_dir, session_id, preprocess_opts);
+
+    let mut output = format!("Base directory for this skill: {normalized_dir}\n\n{body}");
 
     for linked_file in &meta.read_files {
         if linked_file.contains("..") || (linked_file.contains('/') && linked_file.starts_with('/'))
@@ -573,11 +713,13 @@ fn render_skill_bundle(
         }
         let linked_path = skill_dir.join(linked_file);
         if let Ok(linked_content) = std::fs::read_to_string(&linked_path) {
-            output.push_str(&format!(
-                "\n\n--- {} ---\n{}",
-                linked_file,
-                linked_content.trim()
-            ));
+            let linked = crate::skills::preprocess_skill_content(
+                linked_content.trim(),
+                skill_dir,
+                session_id,
+                preprocess_opts,
+            );
+            output.push_str(&format!("\n\n--- {} ---\n{}", linked_file, linked));
         }
     }
 
@@ -624,14 +766,20 @@ Use them via normal file or terminal tools when the workflow requires them:\n",
     if !claude_fields.is_empty() {
         output.push_str("\n\n### Claude-Compatible Metadata\n\n");
         output.push_str(
-            "EdgeCrab parses these metadata fields for compatibility. Claude-specific runtime \
-semantics such as inline prompt-shell execution and forked skill-agent invocation are not \
-executed automatically by EdgeCrab.\n",
+            "EdgeCrab parses these metadata fields for compatibility. Inline `!`cmd`` expansion \
+runs only when `skills.inline_shell` is enabled (command-scanned; default off).\n",
         );
         for field in &claude_fields {
             output.push_str(field);
             output.push('\n');
         }
+    }
+
+    if let Some(config_block) =
+        crate::skills::format_skill_config_block(&content, &edgecrab_home.join("config.yaml"))
+    {
+        output.push_str("\n\n");
+        output.push_str(&config_block);
     }
 
     let heading = if output.starts_with("## Skill:") {
@@ -651,30 +799,7 @@ pub fn load_skill_prompt_bundle(
     let skills_base = edgecrab_home.join("skills");
     let roots = resolve_skill_directories(&skills_base, external_dirs);
     let skill_dir = find_skill_dir_in_roots(&roots, name)?;
-    render_skill_bundle(&skill_dir, name, session_id).map(|(rendered, _)| rendered)
-}
-
-/// Determine the current platform string for filtering.
-/// Maps Platform enum to ["darwin", "linux", "windows"] as per agentskills.io spec.
-fn get_current_platform_filter() -> String {
-    #[cfg(target_os = "macos")]
-    return "darwin".to_string();
-    #[cfg(target_os = "linux")]
-    return "linux".to_string();
-    #[cfg(target_os = "windows")]
-    return "windows".to_string();
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    return "unknown".to_string();
-}
-
-/// Check if a skill should be visible on the current platform.
-/// If platforms list is empty, the skill is available on all platforms.
-fn should_show_on_platform(platforms: &[String]) -> bool {
-    if platforms.is_empty() {
-        return true; // No restrictions
-    }
-    let current = get_current_platform_filter();
-    platforms.iter().any(|p| p.to_lowercase() == current)
+    render_skill_bundle(edgecrab_home, &skill_dir, name, session_id).map(|(rendered, _)| rendered)
 }
 
 /// Check conditional activation rules given available toolsets and tools.
@@ -859,8 +984,11 @@ impl ToolHandler for SkillsListTool {
                         continue;
                     }
 
-                    // Filter by platform compatibility (always check current OS)
-                    if !should_show_on_platform(&meta.platforms) {
+                    // Filter by platform / environment compatibility (offer-time only)
+                    if !crate::skills::skill_matches_platform(&meta.platforms) {
+                        continue;
+                    }
+                    if !crate::skills::skill_matches_environment(&meta.environments) {
                         continue;
                     }
 
@@ -991,7 +1119,10 @@ impl ToolHandler for SkillsCategoriesList {
                         if !m.user_invocable {
                             continue;
                         }
-                        if !m.platforms.is_empty() && !should_show_on_platform(&m.platforms) {
+                        if !crate::skills::skill_matches_platform(&m.platforms) {
+                            continue;
+                        }
+                        if !crate::skills::skill_matches_environment(&m.environments) {
                             continue;
                         }
                     }
@@ -1154,8 +1285,16 @@ impl ToolHandler for SkillViewTool {
             )));
         }
 
-        let (mut output, meta) = render_skill_bundle(&skill_dir, &args.name, Some(&ctx.session_id))
-            .ok_or_else(|| ToolError::Other("Cannot read skill".into()))?;
+        let (mut output, meta) = render_skill_bundle(
+            &ctx.config.edgecrab_home,
+            &skill_dir,
+            &args.name,
+            Some(&ctx.session_id),
+        )
+        .ok_or_else(|| ToolError::Other("Cannot read skill".into()))?;
+
+        crate::skills::bump_view(&ctx.config.edgecrab_home, &args.name);
+        crate::skills::bump_use(&ctx.config.edgecrab_home, &args.name);
 
         // Register required_environment_variables declared by this skill as
         // passthrough so they survive the `safe_env()` blocklist filter.
@@ -1174,6 +1313,14 @@ impl ToolHandler for SkillViewTool {
         let missing_vars = check_missing_env_vars(&meta);
         if !missing_vars.is_empty() {
             output.push_str(&format_env_var_guidance(&missing_vars));
+        }
+
+        let missing_cred = crate::skills::missing_credential_files(
+            &ctx.config.edgecrab_home,
+            &meta.required_credential_files,
+        );
+        if !missing_cred.is_empty() {
+            output.push_str(&format_credential_file_guidance(&missing_cred));
         }
 
         Ok(output)
@@ -1452,7 +1599,7 @@ mod tests {
 /// is blocked by path-traversal checks.
 pub struct SkillManageTool;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, serde::Serialize)]
 struct ManageArgs {
     /// One of: "create", "edit", "delete", "patch", "write_file", "remove_file"
     action: String,
@@ -1578,261 +1725,75 @@ impl ToolHandler for SkillManageTool {
             ));
         }
 
-        let skills_base = ctx.config.edgecrab_home.join("skills");
-
-        // For create: use explicit category path or flat.
-        // For all other actions: search recursively to find the existing skill.
-        let skill_dir = if args.action == "create" {
-            if let Some(ref cat) = args.category {
-                // Validate category: no traversal, alphanumeric + hyphens + slashes
-                if cat.contains("..") || cat.starts_with('/') {
-                    return Err(ToolError::PermissionDenied(
-                        "Category must not contain '..' or start with '/'".into(),
-                    ));
-                }
-                skills_base.join(cat).join(&args.name)
-            } else {
-                skills_base.join(&args.name)
-            }
-        } else {
-            // Try recursive search first, fall back to flat path
-            find_skill_dir(&skills_base, &args.name).unwrap_or_else(|| skills_base.join(&args.name))
-        };
-
-        match args.action.as_str() {
-            "create" | "edit" => {
-                let content = args
-                    .content
-                    .as_deref()
-                    .ok_or_else(|| ToolError::InvalidArgs {
-                        tool: "skill_manage".into(),
-                        message: "content is required for create/edit".into(),
-                    })?;
-
-                tokio::fs::create_dir_all(&skill_dir)
-                    .await
-                    .map_err(|e| ToolError::Other(format!("Cannot create skill dir: {e}")))?;
-
-                let skill_path = skill_dir.join("SKILL.md");
-                tokio::fs::write(&skill_path, content)
-                    .await
-                    .map_err(|e| ToolError::Other(format!("Cannot write SKILL.md: {e}")))?;
-
-                // Invalidate the skills prompt cache so the updated skill is
-                // picked up by the next system-prompt rebuild.
-                if let Some(ref f) = ctx.on_skills_changed {
-                    f();
-                }
-
-                Ok(format!(
-                    "Skill '{}' {}d at {}",
-                    args.name,
-                    args.action,
-                    skill_path.display()
-                ))
-            }
-            "delete" => {
-                if !skill_dir.exists() {
-                    return Err(ToolError::NotFound(format!(
-                        "Skill '{}' does not exist",
-                        args.name
-                    )));
-                }
-                tokio::fs::remove_dir_all(&skill_dir)
-                    .await
-                    .map_err(|e| ToolError::Other(format!("Cannot delete skill: {e}")))?;
-
-                // Invalidate the skills prompt cache.
-                if let Some(ref f) = ctx.on_skills_changed {
-                    f();
-                }
-
-                Ok(format!("Skill '{}' deleted.", args.name))
-            }
-            "patch" => {
-                let old = args
-                    .old_string
-                    .as_deref()
-                    .ok_or_else(|| ToolError::InvalidArgs {
-                        tool: "skill_manage".into(),
-                        message: "old_string is required for patch".into(),
-                    })?;
-                let new = args
-                    .new_string
-                    .as_deref()
-                    .ok_or_else(|| ToolError::InvalidArgs {
-                        tool: "skill_manage".into(),
-                        message: "new_string is required for patch".into(),
-                    })?;
-
-                let skill_path = skill_dir.join("SKILL.md");
-                if !skill_path.is_file() {
-                    return Err(ToolError::NotFound(format!(
-                        "Skill '{}' does not exist",
-                        args.name
-                    )));
-                }
-
-                let current = tokio::fs::read_to_string(&skill_path)
-                    .await
-                    .map_err(|e| ToolError::Other(format!("Cannot read SKILL.md: {e}")))?;
-
-                // Require exactly one match unless replace_all is set
-                let count = current.matches(old).count();
-                if count == 0 {
-                    return Err(ToolError::InvalidArgs {
-                        tool: "skill_manage".into(),
-                        message: format!(
-                            "old_string not found in skill '{}'. \
-                             Verify the exact text including whitespace.",
-                            args.name
-                        ),
-                    });
-                }
-                if count > 1 && !args.replace_all {
-                    return Err(ToolError::InvalidArgs {
-                        tool: "skill_manage".into(),
-                        message: format!(
-                            "old_string matches {} times in skill '{}'. \
-                             Use replace_all=true to replace all, or provide more context.",
-                            count, args.name
-                        ),
-                    });
-                }
-
-                let updated = if args.replace_all {
-                    current.replace(old, new)
-                } else {
-                    current.replacen(old, new, 1)
-                };
-                tokio::fs::write(&skill_path, &updated)
-                    .await
-                    .map_err(|e| ToolError::Other(format!("Cannot write SKILL.md: {e}")))?;
-
-                // Invalidate the skills prompt cache.
-                if let Some(ref f) = ctx.on_skills_changed {
-                    f();
-                }
-
-                Ok(format!(
-                    "Skill '{}' patched: replaced {} occurrence(s).",
-                    args.name,
-                    if args.replace_all { count } else { 1 }
-                ))
-            }
-            "write_file" => {
-                // Write a supporting file (references/, templates/, scripts/, assets/)
-                let fp = args
-                    .file_path
-                    .as_deref()
-                    .ok_or_else(|| ToolError::InvalidArgs {
-                        tool: "skill_manage".into(),
-                        message: "file_path is required for write_file".into(),
-                    })?;
-                let fc = args
-                    .file_content
-                    .as_deref()
-                    .ok_or_else(|| ToolError::InvalidArgs {
-                        tool: "skill_manage".into(),
-                        message: "file_content is required for write_file".into(),
-                    })?;
-
-                // Validate file_path: must be under an allowed subdirectory
-                if fp.contains("..") {
-                    return Err(ToolError::PermissionDenied(
-                        "Path traversal ('..') is not allowed".into(),
-                    ));
-                }
-                let allowed_subdirs = ["references", "templates", "scripts", "assets"];
-                let first_component = fp.split('/').next().unwrap_or("");
-                if !allowed_subdirs.contains(&first_component) {
-                    return Err(ToolError::InvalidArgs {
-                        tool: "skill_manage".into(),
-                        message: format!(
-                            "file_path must be under one of: {}. Got: '{}'",
-                            allowed_subdirs.join(", "),
-                            fp
-                        ),
-                    });
-                }
-
-                if !skill_dir.exists() {
-                    return Err(ToolError::NotFound(format!(
-                        "Skill '{}' does not exist. Create it first.",
-                        args.name
-                    )));
-                }
-
-                let target = skill_dir.join(fp);
-                if let Some(parent) = target.parent() {
-                    tokio::fs::create_dir_all(parent)
-                        .await
-                        .map_err(|e| ToolError::Other(format!("Cannot create dir: {e}")))?;
-                }
-                tokio::fs::write(&target, fc)
-                    .await
-                    .map_err(|e| ToolError::Other(format!("Cannot write file: {e}")))?;
-
-                if let Some(ref f) = ctx.on_skills_changed {
-                    f();
-                }
-
-                Ok(format!("Wrote '{}' in skill '{}'.", fp, args.name))
-            }
-            "remove_file" => {
-                // Remove a supporting file
-                let fp = args
-                    .file_path
-                    .as_deref()
-                    .ok_or_else(|| ToolError::InvalidArgs {
-                        tool: "skill_manage".into(),
-                        message: "file_path is required for remove_file".into(),
-                    })?;
-
-                if fp.contains("..") {
-                    return Err(ToolError::PermissionDenied(
-                        "Path traversal ('..') is not allowed".into(),
-                    ));
-                }
-                let allowed_subdirs = ["references", "templates", "scripts", "assets"];
-                let first_component = fp.split('/').next().unwrap_or("");
-                if !allowed_subdirs.contains(&first_component) {
-                    return Err(ToolError::InvalidArgs {
-                        tool: "skill_manage".into(),
-                        message: format!(
-                            "file_path must be under one of: {}. Got: '{}'",
-                            allowed_subdirs.join(", "),
-                            fp
-                        ),
-                    });
-                }
-
-                let target = skill_dir.join(fp);
-                if !target.is_file() {
-                    return Err(ToolError::NotFound(format!(
-                        "File '{}' not found in skill '{}'",
-                        fp, args.name
-                    )));
-                }
-
-                tokio::fs::remove_file(&target)
-                    .await
-                    .map_err(|e| ToolError::Other(format!("Cannot remove file: {e}")))?;
-
-                if let Some(ref f) = ctx.on_skills_changed {
-                    f();
-                }
-
-                Ok(format!("Removed '{}' from skill '{}'.", fp, args.name))
-            }
-            other => Err(ToolError::InvalidArgs {
-                tool: "skill_manage".into(),
-                message: format!(
-                    "Unknown action '{}'. Use: create, edit, patch, delete, write_file, remove_file",
-                    other
-                ),
-            }),
+        if let Some(ref cat) = args.category
+            && (cat.contains("..") || cat.starts_with('/'))
+        {
+            return Err(ToolError::PermissionDenied(
+                "Category must not contain '..' or start with '/'".into(),
+            ));
         }
+
+        // Validate required fields before staging (gate must see complete payloads).
+        match args.action.as_str() {
+            "create" | "edit" if args.content.is_none() => {
+                return Err(ToolError::InvalidArgs {
+                    tool: "skill_manage".into(),
+                    message: "content is required for create/edit".into(),
+                });
+            }
+            "patch" if args.old_string.is_none() || args.new_string.is_none() => {
+                return Err(ToolError::InvalidArgs {
+                    tool: "skill_manage".into(),
+                    message: "old_string and new_string are required for patch".into(),
+                });
+            }
+            "write_file" if args.file_path.is_none() || args.file_content.is_none() => {
+                return Err(ToolError::InvalidArgs {
+                    tool: "skill_manage".into(),
+                    message: "file_path and file_content are required for write_file".into(),
+                });
+            }
+            "remove_file" if args.file_path.is_none() => {
+                return Err(ToolError::InvalidArgs {
+                    tool: "skill_manage".into(),
+                    message: "file_path is required for remove_file".into(),
+                });
+            }
+            other
+                if !matches!(
+                    other,
+                    "create" | "edit" | "patch" | "delete" | "write_file" | "remove_file"
+                ) =>
+            {
+                return Err(ToolError::InvalidArgs {
+                    tool: "skill_manage".into(),
+                    message: format!(
+                        "Unknown action '{other}'. Use: create, edit, patch, delete, write_file, remove_file"
+                    ),
+                });
+            }
+            _ => {}
+        }
+
+        let payload = serde_json::to_value(&args).map_err(|e| ToolError::Other(e.to_string()))?;
+        match crate::skills::maybe_gate_skill_manage(
+            &ctx.config.edgecrab_home,
+            payload.clone(),
+            ctx.config.skills_write_approval,
+        ) {
+            crate::skills::SkillManageGate::Staged(msg) => return Ok(msg),
+            crate::skills::SkillManageGate::Allow => {}
+        }
+
+        let result = crate::skills::apply_skill_manage_payload(
+            &ctx.config.edgecrab_home,
+            &payload,
+        )
+        .await?;
+        if let Some(ref f) = ctx.on_skills_changed {
+            f();
+        }
+        Ok(result)
     }
 }
 
@@ -2387,7 +2348,7 @@ shell: powershell\n\
         assert!(result.contains("Disable model invocation: true"));
         assert!(result.contains("Execution context: fork"));
         assert!(result.contains("Shell: powershell"));
-        assert!(result.contains("not executed automatically by EdgeCrab"));
+        assert!(result.contains("skills.inline_shell"));
     }
 
     #[test]
@@ -2444,6 +2405,28 @@ shell: bash\n\
         assert_eq!(meta.execution_context.as_deref(), Some("fork"));
         assert_eq!(meta.shell.as_deref(), Some("bash"));
     }
+
+    #[test]
+    fn parse_skill_frontmatter_parses_required_credential_files() {
+        let meta = parse_skill_frontmatter(
+            "---\n\
+name: google-workspace\n\
+required_credential_files:\n\
+  - path: google_token.json\n\
+    description: OAuth token\n\
+  - oauth_backup.json\n\
+---\n\
+# Skill\n",
+        );
+
+        assert_eq!(meta.required_credential_files.len(), 2);
+        assert_eq!(meta.required_credential_files[0].path, "google_token.json");
+        assert_eq!(
+            meta.required_credential_files[0].description.as_deref(),
+            Some("OAuth token")
+        );
+        assert_eq!(meta.required_credential_files[1].path, "oauth_backup.json");
+    }
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -2488,6 +2471,40 @@ fn format_env_var_guidance(missing_vars: &[&EnvVarSpec]) -> String {
     }
 
     output.push_str("\n_To skip these warnings, set the variables or use skill_setup_env._\n");
+    output
+}
+
+/// Format credential file guidance for skill_view.
+fn format_credential_file_guidance(
+    missing: &[crate::skills::SkillCredentialRequirement],
+) -> String {
+    if missing.is_empty() {
+        return String::new();
+    }
+
+    let home = crate::config_ref::resolve_edgecrab_home();
+    let home_display = home.display();
+
+    let mut output = String::from("\n### ⚠️ Required Credential Files\n\n");
+    output.push_str(
+        "The following credential files are **NOT PRESENT** under your EdgeCrab home but may be needed:\n\n",
+    );
+
+    for spec in missing {
+        output.push_str(&format!("- **`{}`**", spec.path));
+        if let Some(desc) = &spec.description {
+            output.push_str(&format!(" — {}", desc));
+        }
+        output.push('\n');
+        output.push_str(&format!(
+            "  - Expected at: `{home_display}/{path}`\n",
+            path = spec.path
+        ));
+    }
+
+    output.push_str(
+        "\n_Run the skill setup script or copy credentials into place before using remote execution backends._\n",
+    );
     output
 }
 
@@ -2689,7 +2706,9 @@ struct HubArgs {
     query: Option<String>,
     source: Option<String>, // "skills.sh", "well-known", "github-tap"
     #[serde(default)]
-    force: bool, // Override trust policy
+    force: bool, // Override caution verdict (not dangerous)
+    #[serde(default)]
+    trust: bool, // Explicit approval for dangerous verdict
 }
 
 #[async_trait]
@@ -2715,8 +2734,8 @@ impl ToolHandler for SkillsHubTool {
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["search", "browse", "inspect", "install", "update", "uninstall"],
-                        "description": "Hub action: search, browse, inspect, install, update, or uninstall"
+                        "enum": ["search", "browse", "inspect", "scan", "install", "update", "uninstall", "audit", "check", "trust"],
+                        "description": "Hub action: search, browse, inspect, scan (guard + files), install, update, check, trust, uninstall, or audit"
                     },
                     "query": {
                         "type": "string",
@@ -2724,11 +2743,15 @@ impl ToolHandler for SkillsHubTool {
                     },
                     "source": {
                         "type": "string",
-                        "description": "Optional source filter: all, edgecrab, hermes-agent, openai, anthropics, skills.sh, well-known, github, or curated"
+                        "description": "Optional source filter: all, edgecrab, hermes-agent, openai, anthropics, skills.sh, clawhub, browse-sh, agentskills.io, well-known, github, or curated"
                     },
                     "force": {
                         "type": "boolean",
-                        "description": "Override install policy for community/untrusted skills (requires explicit confirmation)"
+                        "description": "Override caution verdict for community skills (--force does not override dangerous)"
+                    },
+                    "trust": {
+                        "type": "boolean",
+                        "description": "Install despite dangerous verdict after explicit review (or use action=trust first)"
                     }
                 },
                 "required": ["action"]
@@ -2754,7 +2777,13 @@ impl ToolHandler for SkillsHubTool {
                     message: "search requires 'query' parameter".into(),
                 })?;
 
-                let report = super::skills_hub::search_hub(&query, args.source.as_deref(), 8).await;
+                let report = super::skills_hub::search_hub(
+                    &query,
+                    args.source.as_deref(),
+                    8,
+                    ctx.config.skills_hub_url.as_deref(),
+                )
+                .await;
                 Ok(format!(
                     "{}\nUse `skills_hub install <identifier>` to install a result.",
                     super::skills_hub::render_search_report(&query, &report)
@@ -2793,11 +2822,25 @@ impl ToolHandler for SkillsHubTool {
                     message: "inspect requires 'query' (skill identifier)".into(),
                 })?;
 
-                let output = format!(
-                    "📋 Skill Details for: {}\n\nUse `skills_hub install {}` to install, or `skills_hub search {}` to find matching sources.",
-                    identifier, identifier, identifier
-                );
-                Ok(output)
+                super::skills_hub::inspect_hub_skill(&identifier)
+                    .await
+                    .map_err(ToolError::Other)
+            }
+
+            "scan" => {
+                let identifier = args.query.ok_or_else(|| ToolError::InvalidArgs {
+                    tool: "skills_hub".into(),
+                    message: "scan requires 'query' (skill identifier)".into(),
+                })?;
+                let skills_dir = ctx.config.edgecrab_home.join("skills");
+                let optional_dir = super::skills_sync::optional_skills_dir();
+                super::skills_hub::inspect_identifier_scan(
+                    &identifier,
+                    &skills_dir,
+                    optional_dir.as_deref(),
+                )
+                .await
+                .map_err(ToolError::Other)
             }
 
             "install" => {
@@ -2808,14 +2851,22 @@ impl ToolHandler for SkillsHubTool {
 
                 let skills_dir = ctx.config.edgecrab_home.join("skills");
                 let optional_dir = super::skills_sync::optional_skills_dir();
+                let gate = super::skills_hub::InstallGate {
+                    force: args.force,
+                    trust: args.trust,
+                };
                 super::skills_hub::install_identifier(
                     &identifier,
                     &skills_dir,
                     optional_dir.as_deref(),
-                    args.force,
+                    gate,
                 )
                 .await
                 .map(|outcome| {
+                    super::skills_hub::notify_hub_skills_mutated();
+                    if let Some(ref f) = ctx.on_skills_changed {
+                        f();
+                    }
                     format!(
                         "{}\n\nActivate with skill_view {}",
                         outcome.message, outcome.skill_name
@@ -2827,29 +2878,41 @@ impl ToolHandler for SkillsHubTool {
             "update" => {
                 let skills_dir = ctx.config.edgecrab_home.join("skills");
                 let optional_dir = super::skills_sync::optional_skills_dir();
-                if let Some(name) = args.query {
-                    let outcome = super::skills_hub::update_installed_skill(
+                let gate = super::skills_hub::InstallGate {
+                    force: args.force,
+                    trust: args.trust,
+                };
+                let result = if let Some(name) = args.query {
+                    super::skills_hub::update_installed_skill(
                         &name,
                         &skills_dir,
                         optional_dir.as_deref(),
-                        args.force,
+                        gate,
                     )
                     .await
-                    .map_err(ToolError::Other)?;
-                    Ok(format!(
-                        "{}\n\nActivate with skill_view {}",
-                        outcome.message, outcome.skill_name
-                    ))
+                    .map(|outcome| {
+                        format!(
+                            "{}\n\nActivate with skill_view {}",
+                            outcome.message, outcome.skill_name
+                        )
+                    })
                 } else {
-                    let outcomes = super::skills_hub::update_all_installed_skills(
+                    super::skills_hub::update_all_installed_skills(
                         &skills_dir,
                         optional_dir.as_deref(),
-                        args.force,
+                        gate,
                     )
                     .await
-                    .map_err(ToolError::Other)?;
-                    Ok(super::skills_hub::render_update_outcomes(&outcomes))
-                }
+                    .map(|outcomes| super::skills_hub::render_update_outcomes(&outcomes))
+                };
+                result
+                    .inspect(|_msg| {
+                        super::skills_hub::notify_hub_skills_mutated();
+                        if let Some(ref f) = ctx.on_skills_changed {
+                            f();
+                        }
+                    })
+                    .map_err(ToolError::Other)
             }
 
             "uninstall" => {
@@ -2859,13 +2922,48 @@ impl ToolHandler for SkillsHubTool {
                 })?;
                 let skills_dir = ctx.config.edgecrab_home.join("skills");
                 super::skills_hub::uninstall_skill(&identifier, &skills_dir)
+                    .inspect(|_msg| {
+                        super::skills_hub::notify_hub_skills_mutated();
+                        if let Some(ref f) = ctx.on_skills_changed {
+                            f();
+                        }
+                    })
+                    .map_err(ToolError::Other)
+            }
+
+            "audit" => {
+                let skills_dir = ctx.config.edgecrab_home.join("skills");
+                let name = args.query.as_deref();
+                Ok(super::skills_hub::audit_installed_hub_skills(
+                    &skills_dir,
+                    name,
+                    false,
+                ))
+            }
+
+            "check" => {
+                let optional_dir = super::skills_sync::optional_skills_dir();
+                let name = args.query.as_deref();
+                let results =
+                    super::skills_hub::check_for_skill_updates(optional_dir.as_deref(), name).await;
+                Ok(super::skills_hub::format_check_report(&results))
+            }
+
+            "trust" => {
+                let identifier = args.query.ok_or_else(|| ToolError::InvalidArgs {
+                    tool: "skills_hub".into(),
+                    message: "trust requires 'query' (skill identifier)".into(),
+                })?;
+                let optional_dir = super::skills_sync::optional_skills_dir();
+                super::skills_hub::trust_identifier(&identifier, optional_dir.as_deref())
+                    .await
                     .map_err(ToolError::Other)
             }
 
             other => Err(ToolError::InvalidArgs {
                 tool: "skills_hub".into(),
                 message: format!(
-                    "Unknown action '{}'. Use: search, browse, inspect, install, update, uninstall",
+                    "Unknown action '{}'. Use: search, browse, inspect, scan, install, update, check, trust, uninstall, audit",
                     other
                 ),
             }),

@@ -20,12 +20,16 @@ pub mod error;
 pub mod harness;
 pub mod message;
 pub mod multimodal;
+pub mod recovery_feedback;
 pub mod tool;
 pub mod trajectory;
 pub mod usage;
 
 pub use config::{ApiMode, DEFAULT_MODEL, OPENROUTER_BASE_URL, OriginChat, Platform};
 pub use error::{AgentError, ToolError, ToolErrorRecord, ToolErrorResponse};
+pub use recovery_feedback::{
+    RecoveryAction, RecoveryFeedback, RecoveryFeedbackBuilder, RecoverySuggestion,
+};
 pub use harness::{
     CompletionDecision, ExitReason, ReportedTaskStatus, RunOutcome, TaskStatusKind,
     VerificationSummary,

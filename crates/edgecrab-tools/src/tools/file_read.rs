@@ -23,6 +23,7 @@ pub struct ReadFileTool;
 
 #[derive(Deserialize)]
 struct Args {
+    #[serde(alias = "file_path")]
     path: String,
     #[serde(default)]
     line_start: Option<usize>,

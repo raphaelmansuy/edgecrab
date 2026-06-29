@@ -147,6 +147,21 @@ pub const MCP_EXTENDED_TOOLS: &[&str] = &[
 /// On-demand Mixture-of-Agents tool — loaded via `enabled_toolsets: ["core", "moa"]`.
 pub const MOA_TOOLS: &[&str] = &["moa"];
 
+/// Multi-agent kanban board — opt-in via `kanban.enabled` + `enabled_toolsets: ["kanban"]`.
+pub const KANBAN_TOOLS: &[&str] = &[
+    "kanban_create",
+    "kanban_list",
+    "kanban_show",
+    "kanban_claim",
+    "kanban_complete",
+    "kanban_release",
+    "kanban_block",
+    "kanban_unblock",
+    "kanban_comment",
+    "kanban_link",
+    "kanban_heartbeat",
+];
+
 /// macOS desktop control via cua-driver — opt-in via `enabled_toolsets: ["computer_use"]`.
 pub const COMPUTER_USE_TOOLS: &[&str] = &["computer_use"];
 

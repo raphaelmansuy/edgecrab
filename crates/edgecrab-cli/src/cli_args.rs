@@ -328,6 +328,9 @@ pub enum Command {
         /// Check only; print the update report without executing any upgrade command
         #[arg(long)]
         check: bool,
+        /// Skip the pre-update state snapshot for this run
+        #[arg(long)]
+        no_snapshot: bool,
     },
 
     /// Pair and configure the WhatsApp bridge

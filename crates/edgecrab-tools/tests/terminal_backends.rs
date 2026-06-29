@@ -583,6 +583,7 @@ fn make_ctx(dir: &Path) -> ToolContext {
         watch_notification_tx: None,
         mutation_turn: None,
         lsp_gate: None,
+        kanban_task_id: None,
     }
 }
 

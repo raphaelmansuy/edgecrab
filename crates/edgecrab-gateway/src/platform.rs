@@ -158,6 +158,14 @@ impl IncomingMessage {
     }
 }
 
+/// Clarify prompt payload for platforms that support native choice buttons.
+#[derive(Debug, Clone)]
+pub struct ClarifyPrompt {
+    pub interaction_id: u64,
+    pub question: String,
+    pub choices: Option<Vec<String>>,
+}
+
 /// An outgoing response to deliver back to a platform.
 #[derive(Debug, Clone)]
 pub struct OutgoingMessage {
@@ -274,6 +282,19 @@ pub trait PlatformAdapter: Send + Sync + 'static {
             metadata: metadata.clone(),
         })
         .await
+    }
+
+    /// Send a clarify prompt with native choice buttons when supported.
+    ///
+    /// Returns `Ok(true)` when the platform rendered buttons; `Ok(false)` means
+    /// the caller should fall back to plain-text numbered choices.
+    async fn send_clarify(
+        &self,
+        prompt: &ClarifyPrompt,
+        metadata: &MessageMetadata,
+    ) -> anyhow::Result<bool> {
+        let _ = (prompt, metadata);
+        Ok(false)
     }
 
     /// Send a typing indicator to signal that the agent is working.

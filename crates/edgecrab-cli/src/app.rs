@@ -114,6 +114,7 @@ use crate::tool_display::{
     DisplayWidths, build_subagent_done_line_width, build_subagent_running_line_width,
     build_tool_done_line_width, build_tool_running_line_width,
     build_tool_running_line_width_elapsed, build_tool_verbose_lines_width, extract_tool_preview,
+    extract_streaming_tool_preview,
     tool_signature, tool_status_preview,
 };
 use crate::transcript::{
@@ -151,10 +152,12 @@ mod log_session_browsers;
 mod mode_selectors;
 mod model_selectors;
 mod queue_edit;
+mod remote_skill_guard;
 mod replay_command;
 mod response_dispatch;
 mod secret_capture_overlay;
 mod setup_overlays;
+mod skill_trust_overlay;
 mod steering_overlay;
 mod stream_forward;
 mod value_capture_overlay;
@@ -2423,6 +2426,20 @@ impl RemoteSkillAction {
 }
 
 #[derive(Clone)]
+struct SkillTrustPromptState {
+    entry: RemoteSkillEntry,
+    preview: edgecrab_tools::tools::skills_hub::InstallScanPreview,
+    review_only: bool,
+    pane: crate::skill_trust_overlay::SkillTrustPane,
+    files_focus: crate::skill_trust_overlay::SkillTrustFilesFocus,
+    selected_action: usize,
+    findings_scroll: usize,
+    selected_file: usize,
+    file_content_scroll: usize,
+    jump_line: Option<usize>,
+}
+
+#[derive(Clone)]
 struct RemoteSkillEntry {
     name: String,
     identifier: String,
@@ -3953,6 +3970,9 @@ pub struct App {
     remote_plugin_browser: RemotePluginBrowser,
     /// Remote skill browser overlay (activated by `/skills search` or `/skills hub`)
     remote_skill_browser: RemoteSkillBrowser,
+    remote_skill_guard: remote_skill_guard::RemoteSkillGuardCache,
+    /// Guard scan trust prompt (dangerous / caution skills from remote browser).
+    skill_trust_prompt: Option<SkillTrustPromptState>,
     /// Session browser overlay (activated by F5 or `/session` with no args)
     session_browser: FuzzySelector<SessionBrowserEntry>,
     /// Last non-error status note shown in the session browser footer.
@@ -4267,6 +4287,15 @@ enum AgentResponse {
     Notice(String),
     /// Ephemeral shelf activity feed (compression, approval, bg process) — not duplicated in transcript.
     ActivityFeed(String),
+    /// Blocking non-streaming LLM wait tick (LM Studio / Ollama).
+    LlmWaitProgress {
+        provider: String,
+        elapsed_secs: u64,
+        has_tools: bool,
+        prompt_tokens_estimated: Option<u64>,
+        context_length: Option<u64>,
+        prefill_pct: Option<f32>,
+    },
     /// Agent-reported count of steering events waiting for injection.
     SteerPending {
         count: usize,
@@ -4398,6 +4427,22 @@ enum AgentResponse {
     /// A remote plugin install/update action failed.
     RemotePluginActionFailed {
         action_label: String,
+        identifier: String,
+        error: String,
+    },
+    /// A remote skill install/update needs guard review before proceeding.
+    RemoteSkillGuardPrompt {
+        entry: RemoteSkillEntry,
+        preview: Box<edgecrab_tools::tools::skills_hub::InstallScanPreview>,
+        review_only: bool,
+    },
+    /// Proactive guard scan completed for the selected remote skill.
+    RemoteSkillGuardPreviewReady {
+        identifier: String,
+        preview: Box<edgecrab_tools::tools::skills_hub::InstallScanPreview>,
+    },
+    /// Proactive guard scan failed for the selected remote skill.
+    RemoteSkillGuardPreviewFailed {
         identifier: String,
         error: String,
     },
@@ -4982,6 +5027,8 @@ impl App {
             plugin_toggle_status_note: None,
             remote_plugin_browser: RemotePluginBrowser::new(),
             remote_skill_browser: RemoteSkillBrowser::new(),
+            remote_skill_guard: remote_skill_guard::RemoteSkillGuardCache::default(),
+            skill_trust_prompt: None,
             session_browser: FuzzySelector::new(),
             session_browser_status_note: None,
             session_browser_pane: DetailPaneState::default(),
@@ -6081,6 +6128,43 @@ impl App {
         edgecrab_core::edgecrab_home().join("skills")
     }
 
+    fn persist_skills_write_approval(enabled: bool) -> Result<(), String> {
+        edgecrab_core::AppConfig::persist_skills_write_approval(enabled).map_err(|e| e.to_string())
+    }
+
+    fn persist_memory_write_approval(enabled: bool) -> Result<(), String> {
+        edgecrab_core::AppConfig::persist_memory_write_approval(enabled).map_err(|e| e.to_string())
+    }
+
+    fn persist_approvals_mode(mode: edgecrab_tools::ApprovalMode) -> Result<(), String> {
+        edgecrab_core::AppConfig::persist_approvals_mode(mode).map_err(|e| e.to_string())
+    }
+
+    fn apply_approvals_mode_live(&mut self, mode: edgecrab_tools::ApprovalMode) {
+        if let Some(agent) = self.agent.clone() {
+            let mut cfg = edgecrab_core::AppConfig::load().unwrap_or_default();
+            cfg.approvals.mode = mode;
+            self.rt_handle.block_on(async move {
+                agent.set_approvals_config(cfg.approvals.clone()).await;
+            });
+        }
+    }
+
+    fn persist_skills_inline_shell(enabled: bool) -> Result<(), String> {
+        edgecrab_core::AppConfig::persist_skills_inline_shell(enabled).map_err(|e| e.to_string())
+    }
+
+    fn skills_scan_context() -> edgecrab_tools::skills::SkillsScanContext {
+        let config = edgecrab_core::AppConfig::load().unwrap_or_default();
+        edgecrab_tools::skills::SkillsScanContext::from_config(
+            &edgecrab_core::edgecrab_home(),
+            &config.skills.external_dirs,
+            &config.skills.disabled,
+            &config.skills.platform_disabled,
+            Some("cli"),
+        )
+    }
+
     /// Find a skill's SKILL.md by name, searching recursively through category
     /// subdirectories.  Returns the path to SKILL.md, or None.
     ///
@@ -6378,10 +6462,21 @@ impl App {
                 .then_with(|| left.name.cmp(&right.name))
         });
 
-        // Update completion names cache (plain names, no slash prefix)
-        self.skills_completion_names = entries.iter().map(|e| e.name.clone()).collect();
-
+        // Update completion names cache (slash slugs + bundle slugs)
+        self.refresh_skills_completion_names();
         self.skill_selector.replace_items_preserving_state(entries);
+    }
+
+    /// Rescan skill/bundle slash commands for tab completion and `/commands`.
+    fn refresh_skills_completion_names(&mut self) {
+        let ctx = Self::skills_scan_context();
+        let mut names: Vec<String> = edgecrab_tools::skills::scan_skill_commands(&ctx)
+            .into_keys()
+            .collect();
+        names.extend(edgecrab_tools::skills::get_skill_bundles(&ctx).into_keys());
+        names.sort();
+        names.dedup();
+        self.skills_completion_names = names;
     }
 
     fn open_skill_selector(&mut self) {
@@ -7078,7 +7173,14 @@ impl App {
         self.remote_skill_browser.loading_query = Some(query.clone());
         let tx = self.response_tx.clone();
         self.rt_handle.spawn(async move {
-            let report = edgecrab_tools::tools::skills_hub::search_hub(&query, None, 12).await;
+            let config = edgecrab_core::AppConfig::load().unwrap_or_default();
+            let report = edgecrab_tools::tools::skills_hub::search_hub(
+                &query,
+                None,
+                12,
+                config.skills.hub_url.as_deref(),
+            )
+            .await;
             let _ = tx.send(AgentResponse::RemoteSkillSearchReady {
                 request_id,
                 query,
@@ -7273,6 +7375,8 @@ impl App {
         self.remote_skill_browser.selector.set_items(entries);
         self.remote_skill_browser.selector.selected = 0;
         self.reset_split_detail_scroll(DetailSurface::RemoteSkillBrowser);
+        self.clear_remote_skill_guard_cache();
+        self.schedule_remote_skill_guard_preview();
         self.needs_redraw = true;
     }
 
@@ -7285,43 +7389,96 @@ impl App {
             return;
         }
 
+        if self.remote_skill_guard.for_identifier.as_deref() == Some(entry.identifier.as_str())
+            && let Some(preview) = self.remote_skill_guard.preview.clone()
+        {
+            if preview.allowed {
+                self.begin_remote_skill_install(entry, preview.recommended_gate());
+            } else {
+                self.skill_trust_prompt =
+                    Some(Self::build_skill_trust_prompt_state(entry, preview, false));
+                self.needs_redraw = true;
+            }
+            return;
+        }
+
         let action_label = entry.action.label().to_string();
         self.remote_skill_browser.action_in_flight =
             Some(format!("{} {}", action_label, entry.identifier));
         self.needs_redraw = true;
 
         let tx = self.response_tx.clone();
+        let entry_for_task = entry.clone();
         self.rt_handle.spawn(async move {
             let skills_dir = edgecrab_core::edgecrab_home().join("skills");
             let optional_dir = edgecrab_tools::tools::skills_sync::optional_skills_dir();
-            let result = match entry.action {
-                RemoteSkillAction::Install | RemoteSkillAction::Replace => {
-                    edgecrab_tools::tools::skills_hub::install_identifier(
-                        &entry.identifier,
+
+            let preview_result = edgecrab_tools::tools::skills_hub::preview_install_scan(
+                &entry_for_task.identifier,
+                optional_dir.as_deref(),
+            )
+            .await;
+
+            let result = match preview_result {
+                Ok(preview) if preview.allowed => {
+                    App::finish_remote_skill_install_async(
+                        &entry_for_task,
                         &skills_dir,
                         optional_dir.as_deref(),
-                        false,
+                        preview.recommended_gate(),
                     )
                     .await
-                    .map(|outcome| (outcome.message, outcome.skill_name))
                 }
-                RemoteSkillAction::Update => {
-                    let skill_name = entry
-                        .installed_name
-                        .clone()
-                        .unwrap_or_else(|| entry.name.clone());
-                    edgecrab_tools::tools::skills_hub::update_installed_skill(
-                        &skill_name,
-                        &skills_dir,
-                        optional_dir.as_deref(),
-                        false,
-                    )
-                    .await
-                    .map(|outcome| (outcome.message, outcome.skill_name))
+                Ok(preview) => {
+                    let _ = tx.send(AgentResponse::RemoteSkillGuardPrompt {
+                        entry: entry_for_task,
+                        preview: Box::new(preview),
+                        review_only: false,
+                    });
+                    return;
                 }
+                Err(e) => Err(e),
             };
 
             match result {
+                Ok((message, skill_name)) => {
+                    let _ = tx.send(AgentResponse::RemoteSkillActionComplete {
+                        message,
+                        skill_name,
+                    });
+                }
+                Err(error) => {
+                    let _ = tx.send(AgentResponse::RemoteSkillActionFailed {
+                        action_label,
+                        identifier: entry_for_task.identifier,
+                        error,
+                    });
+                }
+            }
+        });
+    }
+
+    fn begin_remote_skill_install(
+        &mut self,
+        entry: RemoteSkillEntry,
+        gate: edgecrab_tools::tools::skills_hub::InstallGate,
+    ) {
+        let action_label = entry.action.label().to_string();
+        self.remote_skill_browser.action_in_flight =
+            Some(format!("{} {}", action_label, entry.identifier));
+        self.needs_redraw = true;
+        let tx = self.response_tx.clone();
+        self.rt_handle.spawn(async move {
+            let skills_dir = edgecrab_core::edgecrab_home().join("skills");
+            let optional_dir = edgecrab_tools::tools::skills_sync::optional_skills_dir();
+            match App::finish_remote_skill_install_async(
+                &entry,
+                &skills_dir,
+                optional_dir.as_deref(),
+                gate,
+            )
+            .await
+            {
                 Ok((message, skill_name)) => {
                     let _ = tx.send(AgentResponse::RemoteSkillActionComplete {
                         message,
@@ -7337,6 +7494,59 @@ impl App {
                 }
             }
         });
+    }
+
+    async fn finish_remote_skill_install_async(
+        entry: &RemoteSkillEntry,
+        skills_dir: &std::path::Path,
+        optional_dir: Option<&std::path::Path>,
+        gate: edgecrab_tools::tools::skills_hub::InstallGate,
+    ) -> Result<(String, String), String> {
+        match entry.action {
+            RemoteSkillAction::Install | RemoteSkillAction::Replace => {
+                edgecrab_tools::tools::skills_hub::install_identifier(
+                    &entry.identifier,
+                    skills_dir,
+                    optional_dir,
+                    gate,
+                )
+                .await
+                .map(|o| (o.message, o.skill_name))
+            }
+            RemoteSkillAction::Update => {
+                let skill_name = entry
+                    .installed_name
+                    .clone()
+                    .unwrap_or_else(|| entry.name.clone());
+                edgecrab_tools::tools::skills_hub::update_installed_skill(
+                    &skill_name,
+                    skills_dir,
+                    optional_dir,
+                    gate,
+                )
+                .await
+                .map(|o| (o.message, o.skill_name))
+            }
+        }
+    }
+
+    fn build_skill_trust_prompt_state(
+        entry: RemoteSkillEntry,
+        preview: edgecrab_tools::tools::skills_hub::InstallScanPreview,
+        review_only: bool,
+    ) -> SkillTrustPromptState {
+        SkillTrustPromptState {
+            entry,
+            preview,
+            review_only,
+            pane: crate::skill_trust_overlay::SkillTrustPane::Findings,
+            files_focus: crate::skill_trust_overlay::SkillTrustFilesFocus::List,
+            selected_action: 0,
+            findings_scroll: 0,
+            selected_file: 0,
+            file_content_scroll: 0,
+            jump_line: None,
+        }
     }
 
     // ─── Tab Completion ─────────────────────────────────────────────
@@ -7601,6 +7811,31 @@ impl App {
                 ("reset", "Restore the built-in MoA roster"),
                 ("add", "Add one expert to the MoA roster"),
                 ("remove", "Remove one expert from the MoA roster"),
+            ],
+            // ── Skills hub & guard ────────────────────────────────────────────
+            "skills" | "skill" => &[
+                ("list", "List installed skills"),
+                ("hub", "Open remote skill browser (TUI)"),
+                ("search", "Search hub registries: search <query>"),
+                ("review", "TUI guard review + file inspector: review <id>"),
+                ("inspect --scan", "Guard scan report: inspect --scan <id>"),
+                ("inspect", "Hub metadata: inspect <id>"),
+                ("install", "Install from hub or local path"),
+                ("trust", "Approve dangerous skill (TUI review in CLI)"),
+                ("trusted", "List hash-bound dangerous-skill approvals"),
+                ("untrust", "Revoke trust: untrust <identifier>"),
+                ("check", "Dry-run upstream update check"),
+                ("update", "Update installed hub skills"),
+                ("remove", "Uninstall a hub skill"),
+                ("audit", "Audit installed hub skills (+ audit log)"),
+                ("audit --deep", "Guard audit + Python AST hints"),
+                ("lock", "Show hub lock file"),
+                ("index refresh", "Refresh unified offline search index"),
+                ("catalog", "List hub sources and taps"),
+                ("tap list", "List custom GitHub taps"),
+                ("snapshot export", "Export hub snapshot JSON"),
+                ("config", "Skill config migrate/set"),
+                ("pending", "Write-approval queue"),
             ],
             // All other commands accept free-form arguments; fall through.
             _ => &[],
@@ -8300,16 +8535,6 @@ impl App {
         self.needs_redraw = true;
     }
 
-    /// Activate or deactivate a skill by name.
-    ///
-    /// Typing `/skill_name` a second time toggles the skill off. Active skills
-    /// are stored as session-scoped preloaded skills on the agent config,
-    /// mirroring Hermes-style preloaded skill semantics.
-    fn activate_skill(&mut self, name: &str) {
-        let next_state = !self.active_skills.iter().any(|skill| skill == name);
-        self.set_skill_activation(name, next_state);
-    }
-
     // ─── Tab Completion ─────────────────────────────────────────────
 
     // Update completion candidates based on current input.
@@ -8865,35 +9090,22 @@ impl App {
             return;
         }
 
-        // Unrecognised '/token' — check whether it names a known skill.
-        // Skills are activated/deactivated by typing their name with a leading
-        // slash, e.g. `/arxiv-impact-ranking`.  This keeps the command registry
-        // (Single Responsibility) free of skill-discovery logic.
-        //
-        // Supports an optional inline query:  `/skill_name question here`
-        // — the skill is activated first, then the inline text is submitted to
-        // the agent immediately (with skill context injected).  This lets users
-        // write both activation and question in a single Enter-press.
+        // Unrecognised '/token' — bundles first, then skills (Hermes order).
         if input.starts_with('/') {
+            let ctx = Self::skills_scan_context();
+            if let Some(invocation) = edgecrab_tools::skills::resolve_slash_line(&ctx, input, None)
+            {
+                self.push_output(format!("> {}", input.trim()), OutputRole::User);
+                self.submit_agent_prompt(&invocation.message);
+                return;
+            }
+
             let cmd_name = input
                 .strip_prefix('/')
                 .unwrap_or("")
                 .split_whitespace()
                 .next()
                 .unwrap_or("");
-            if !cmd_name.is_empty() && self.skills_completion_names.contains(&cmd_name.to_string())
-            {
-                // Text after `/skill_name` (may be empty)
-                let inline_query = input[1 + cmd_name.len()..].trim().to_string();
-                self.activate_skill(cmd_name);
-                if !inline_query.is_empty() {
-                    // Re-enter process_input with just the query text so the
-                    // full agent-dispatch path runs (output, is_processing check,
-                    // build_prompt_with_skills, streaming) without duplication.
-                    self.process_input(&inline_query);
-                }
-                return;
-            }
             self.push_output(
                 format!("Unknown command: /{cmd_name}. Type /help for commands or /skills to browse skills."),
                 OutputRole::System,
@@ -8902,8 +9114,6 @@ impl App {
         }
 
         // Regular prompt — show it in output and dispatch to agent.
-        // Internally generated stop-hook follow-ups are hidden from the visible
-        // transcript so the TUI stays focused on real user input.
         let auto_stop_prompt = input.strip_prefix(STOP_HOOK_AUTO_PREFIX).map(str::trim);
         let goal_continuation = edgecrab_core::is_goal_continuation_text(input);
         if goal_continuation {
@@ -8919,7 +9129,11 @@ impl App {
                 OutputRole::System,
             );
         }
+        self.submit_agent_prompt(auto_stop_prompt.unwrap_or(input));
+    }
 
+    /// Dispatch a prompt to the agent without echoing it in the transcript (caller may echo).
+    fn submit_agent_prompt(&mut self, input: &str) {
         let agent = match self.agent.clone() {
             Some(a) => a,
             None => {
@@ -8972,7 +9186,7 @@ impl App {
         //
         // If clipboard images are pending, append vision_analyze instructions
         // so the agent automatically processes the attached image(s).
-        let mut effective_input = auto_stop_prompt.unwrap_or(input).to_string();
+        let mut effective_input = input.to_string();
         if !self.pending_images.is_empty() {
             let image_paths: Vec<String> = self
                 .pending_images
@@ -9301,6 +9515,68 @@ impl App {
             }
             CommandResult::ShowSkills(args) => {
                 self.handle_show_skills(args);
+            }
+            CommandResult::ShowMemory(args) => {
+                self.handle_show_memory(args);
+            }
+            CommandResult::ShowSnapshot(args) => {
+                self.push_output(
+                    edgecrab_core::handle_snapshot_slash(&args, None),
+                    OutputRole::System,
+                );
+            }
+            CommandResult::ShowApprovals(args) => {
+                self.handle_show_approvals(args);
+            }
+            CommandResult::ShowKanban(args) => {
+                self.push_output(
+                    edgecrab_core::handle_kanban_slash(&args, None, None),
+                    OutputRole::System,
+                );
+            }
+            CommandResult::ShowBundles(args) => {
+                let ctx = Self::skills_scan_context();
+                if let Some(reply) = edgecrab_tools::skills::handle_bundles_subcommand(&ctx, &args)
+                {
+                    self.push_output(reply, OutputRole::System);
+                } else {
+                    let text = edgecrab_tools::skills::format_bundles_list(&ctx);
+                    self.open_report_overlay("Skill Bundles", "Bundle slash commands", text);
+                }
+                self.refresh_skills_completion_names();
+            }
+            CommandResult::ReloadSkills => {
+                let ctx = Self::skills_scan_context();
+                let before = edgecrab_tools::skills::scan_skill_commands(&ctx);
+                let (_, diff) = edgecrab_tools::skills::reload_skills(&before, &ctx);
+                edgecrab_tools::skills::invalidate_discovery_caches();
+                edgecrab_core::prompt_builder::invalidate_skills_cache();
+                self.refresh_skills_completion_names();
+                self.push_output(
+                    edgecrab_tools::skills::format_reload_diff(&diff),
+                    OutputRole::System,
+                );
+            }
+            CommandResult::ShowCurator(args) => {
+                let config = edgecrab_core::AppConfig::load().unwrap_or_default();
+                let ctx = Self::skills_scan_context();
+                let text = edgecrab_tools::skills::handle_curator_subcommand(
+                    &ctx,
+                    &edgecrab_core::edgecrab_home(),
+                    &args,
+                    edgecrab_tools::skills::CuratorSettings {
+                        stale_after_days: config.curator.stale_after_days,
+                        archive_after_days: config.curator.archive_after_days,
+                        prune_builtins: config.curator.prune_builtins,
+                        backup_enabled: config.curator.backup.enabled,
+                        backup_keep: config.curator.backup.keep,
+                    },
+                );
+                self.open_report_overlay(
+                    "Skill Curator",
+                    "Stale detection from usage telemetry",
+                    text,
+                );
             }
             CommandResult::ShowProfiles(args) => {
                 self.handle_show_profiles(args);
@@ -14736,9 +15012,139 @@ impl App {
         }
     }
 
+    fn handle_show_memory(&mut self, args: String) {
+        let home = edgecrab_core::edgecrab_home();
+        let config = edgecrab_core::AppConfig::load().unwrap_or_default();
+        if let Some(reply) = edgecrab_tools::skills::handle_memory_pending_subcommand(
+            &home,
+            args.trim(),
+            &edgecrab_tools::skills::MemorySubcommandContext {
+                write_approval: config.memory.write_approval,
+                set_write_approval: Some(&Self::persist_memory_write_approval),
+            },
+        ) {
+            self.push_output(reply, OutputRole::System);
+        }
+    }
+
+    fn handle_show_approvals(&mut self, args: String) {
+        let config = edgecrab_core::AppConfig::load().unwrap_or_default();
+        let before_mode = config.approvals.mode;
+        let reply = edgecrab_tools::handle_approvals_slash(
+            args.trim(),
+            before_mode,
+            config.approvals.smart_model.as_deref(),
+            Some(&Self::persist_approvals_mode),
+        );
+        if args.trim().contains("mode")
+            && let Ok(fresh) = edgecrab_core::AppConfig::load()
+            && fresh.approvals.mode != before_mode
+        {
+            self.apply_approvals_mode_live(fresh.approvals.mode);
+        }
+        self.push_output(reply, OutputRole::System);
+    }
+
     fn handle_show_skills(&mut self, args: String) {
+        let home = edgecrab_core::edgecrab_home();
+        let config = edgecrab_core::AppConfig::load().unwrap_or_default();
+        let ctx = Self::skills_scan_context();
+        let config_path = home.join("config.yaml");
+        if let Some(reply) =
+            edgecrab_tools::skills::handle_skills_config_subcommand(&ctx, &config_path, args.trim())
+        {
+            self.push_output(reply, OutputRole::System);
+            return;
+        }
+        if let Some(reply) = edgecrab_tools::skills::handle_skills_pending_subcommand(
+            &home,
+            args.trim(),
+            &edgecrab_tools::skills::SkillsSubcommandContext {
+                write_approval: config.skills.write_approval,
+                inline_shell: config.skills.inline_shell,
+                set_write_approval: Some(&Self::persist_skills_write_approval),
+                set_inline_shell: Some(&Self::persist_skills_inline_shell),
+            },
+        ) {
+            self.push_output(reply, OutputRole::System);
+            return;
+        }
+
+        let skills_dir = home.join("skills");
+        let trimmed = args.trim();
+
+        // TUI-only: interactive guard review with file inspector
+        if trimmed.starts_with("review ") {
+            let identifier = trimmed.trim_start_matches("review ").trim();
+            self.open_skill_guard_review(identifier);
+            return;
+        }
+        if trimmed.starts_with("trust ") {
+            let identifier = trimmed.trim_start_matches("trust ").trim();
+            if !identifier.is_empty() {
+                self.open_skill_guard_review(identifier);
+                return;
+            }
+        }
+        if trimmed.starts_with("inspect ") {
+            let operand = trimmed.trim_start_matches("inspect ").trim();
+            let (identifier, scan) =
+                edgecrab_tools::tools::skills_hub::parse_inspect_operand(operand);
+            if scan && !identifier.is_empty() {
+                self.open_skill_guard_review(identifier);
+                return;
+            }
+        }
+
+        // Hub slash commands — remote ops + index (keep hub/search TUI in match below)
+        if (trimmed.starts_with("index ")
+            || trimmed.starts_with("inspect ")
+            || trimmed == "catalog"
+            || trimmed == "sources"
+            || trimmed.starts_with("tap")
+            || trimmed.starts_with("audit")
+            || trimmed == "lock"
+            || trimmed == "installed"
+            || trimmed.starts_with("install ")
+            || trimmed.starts_with("trust ")
+            || trimmed == "trusted"
+            || trimmed == "trusts"
+            || trimmed.starts_with("untrust ")
+            || trimmed == "check"
+            || trimmed.starts_with("check ")
+            || trimmed.starts_with("reset ")
+            || trimmed.starts_with("opt-out")
+            || trimmed.starts_with("opt-out ")
+            || trimmed.starts_with("optout")
+            || trimmed.starts_with("opt-in")
+            || trimmed.starts_with("opt-in ")
+            || trimmed.starts_with("optin")
+            || trimmed.starts_with("snapshot ")
+            || trimmed.starts_with("update")
+            || trimmed.starts_with("remove ")
+            || trimmed.starts_with("uninstall ")
+            || trimmed.starts_with("rm "))
+            && let Some(reply) = {
+                let config = edgecrab_core::AppConfig::load().unwrap_or_default();
+                self.rt_handle.block_on(
+                    edgecrab_tools::tools::skills_hub::handle_skills_hub_slash(
+                        trimmed,
+                        &skills_dir,
+                        config.skills.hub_url.as_deref(),
+                    ),
+                )
+            }
+        {
+            if edgecrab_tools::tools::skills_hub::hub_slash_mutates_skills(trimmed) {
+                edgecrab_tools::skills::invalidate_discovery_caches();
+                edgecrab_core::prompt_builder::invalidate_skills_cache();
+                self.refresh_skills_completion_names();
+            }
+            self.push_output(reply, OutputRole::System);
+            return;
+        }
+
         // Use ~/.edgecrab/skills/ — mirrors skills tool (edgecrab_home-based)
-        let skills_dir = edgecrab_core::edgecrab_home().join("skills");
 
         let mut parts = args.trim().splitn(2, ' ');
         let subcommand = parts.next().unwrap_or("").trim();
@@ -14779,7 +15185,10 @@ impl App {
                                 text.push_str(&format!("  {skill_type} {name}\n"));
                             }
                             text.push_str(
-                                "\nUsage: /skills view <name.md>  /skills search  /skills install <path>",
+                                "\nUsage: /skills view <name.md>  /skills search  /skills install <path>\n\
+                                 Write approval: /skills pending  /skills approve <id>  /skills diff <id>\n\
+                                 Usage stats: /skills usage  /skills pin|unpin <name>\n\
+                                 Skill config: /skills config  /skills config set <key> <value>",
                             );
                             self.open_report_overlay(
                                 "Installed Skills",
@@ -14842,79 +15251,14 @@ impl App {
                     return;
                 }
 
-                // Detect GitHub-style operand: at least 2 slashes, not an absolute path
-                let looks_like_github = !operand.starts_with('/')
-                    && !operand.starts_with('.')
-                    && !operand.starts_with('~')
-                    && operand.matches('/').count() >= 2
-                    && !std::path::Path::new(operand).exists();
-
-                if looks_like_github {
-                    let skills_dir_c = skills_dir.clone();
-                    let optional_dir = edgecrab_tools::tools::skills_sync::optional_skills_dir();
-                    let remote_id = operand.to_string();
-
-                    self.push_output(
-                        format!("Fetching remote skill bundle '{remote_id}' …"),
-                        OutputRole::System,
-                    );
-
-                    let result = self.rt_handle.block_on(async {
-                        edgecrab_tools::tools::skills_hub::install_identifier(
-                            &remote_id,
-                            &skills_dir_c,
-                            optional_dir.as_deref(),
-                            false,
-                        )
-                        .await
-                    });
-
-                    match result {
-                        Ok(outcome) => self.push_output(
-                            format!(
-                                "{}\nActivate with: /skills view {}",
-                                outcome.message, outcome.skill_name
-                            ),
-                            OutputRole::System,
-                        ),
-                        Err(e)  => self.push_output(format!("Remote install failed: {e}"), OutputRole::Error),
-                    }
-                    return;
-                }
-
                 let src = std::path::Path::new(operand);
                 if !src.exists() {
-                    let skills_dir_c = skills_dir.clone();
-                    let optional_dir = edgecrab_tools::tools::skills_sync::optional_skills_dir();
-                    let remote_id = operand.to_string();
                     self.push_output(
-                        format!("Fetching remote skill bundle '{remote_id}' …"),
-                        OutputRole::System,
+                        format!("Path not found: {operand}. For remote installs use a hub identifier (e.g. clawhub:slug, owner/repo/path)."),
+                        OutputRole::Error,
                     );
-                    let result = self.rt_handle.block_on(async {
-                        edgecrab_tools::tools::skills_hub::install_identifier(
-                            &remote_id,
-                            &skills_dir_c,
-                            optional_dir.as_deref(),
-                            false,
-                        )
-                        .await
-                    });
-                    match result {
-                        Ok(outcome) => self.push_output(
-                            format!(
-                                "{}\nActivate with: /skills view {}",
-                                outcome.message, outcome.skill_name
-                            ),
-                            OutputRole::System,
-                        ),
-                        Err(e) => {
-                            self.push_output(format!("Remote install failed: {e}"), OutputRole::Error)
-                        }
-                    }
                     return;
                 }
-                // Create skills dir if needed
                 if let Err(e) = std::fs::create_dir_all(&skills_dir) {
                     self.push_output(format!("Cannot create skills dir: {e}"), OutputRole::Error);
                     return;
@@ -14922,74 +15266,39 @@ impl App {
                 if src.is_file() {
                     let dest = skills_dir.join(src.file_name().unwrap_or_default());
                     match std::fs::copy(src, &dest) {
-                        Ok(_) => self.push_output(
-                            format!("Skill installed: {}", dest.file_name().unwrap_or_default().to_string_lossy()),
-                            OutputRole::System,
-                        ),
+                        Ok(_) => {
+                            edgecrab_tools::skills::invalidate_discovery_caches();
+                            edgecrab_core::prompt_builder::invalidate_skills_cache();
+                            self.push_output(
+                                format!("Skill installed: {}", dest.file_name().unwrap_or_default().to_string_lossy()),
+                                OutputRole::System,
+                            );
+                        }
                         Err(e) => self.push_output(format!("Install failed: {e}"), OutputRole::Error),
                     }
                 } else if src.is_dir() {
                     let dir_name = src.file_name().unwrap_or_default();
                     let dest = skills_dir.join(dir_name);
                     match copy_dir_recursive(src, &dest) {
-                        Ok(n) => self.push_output(
-                            format!("Skill directory '{}' installed ({n} files).", dir_name.to_string_lossy()),
-                            OutputRole::System,
-                        ),
+                        Ok(n) => {
+                            edgecrab_tools::skills::invalidate_discovery_caches();
+                            edgecrab_core::prompt_builder::invalidate_skills_cache();
+                            self.push_output(
+                                format!("Skill directory '{}' installed ({n} files).", dir_name.to_string_lossy()),
+                                OutputRole::System,
+                            );
+                        }
                         Err(e) => self.push_output(format!("Install failed: {e}"), OutputRole::Error),
                     }
                 }
             }
 
-            "update" => {
-                let skills_dir_c = skills_dir.clone();
-                let optional_dir = edgecrab_tools::tools::skills_sync::optional_skills_dir();
-                if operand.is_empty() {
-                    self.push_output(
-                        "Updating all hub-installed remote skills …",
-                        OutputRole::System,
-                    );
-                    let result = self.rt_handle.block_on(async {
-                        edgecrab_tools::tools::skills_hub::update_all_installed_skills(
-                            &skills_dir_c,
-                            optional_dir.as_deref(),
-                            false,
-                        )
-                        .await
-                    });
-                    match result {
-                        Ok(outcomes) => self.push_output(
-                            edgecrab_tools::tools::skills_hub::render_update_outcomes(&outcomes),
-                            OutputRole::System,
-                        ),
-                        Err(e) => self.push_output(format!("Remote update failed: {e}"), OutputRole::Error),
-                    }
-                } else {
-                    let skill_name = operand.to_string();
-                    self.push_output(
-                        format!("Updating remote skill '{skill_name}' …"),
-                        OutputRole::System,
-                    );
-                    let result = self.rt_handle.block_on(async {
-                        edgecrab_tools::tools::skills_hub::update_installed_skill(
-                            &skill_name,
-                            &skills_dir_c,
-                            optional_dir.as_deref(),
-                            false,
-                        )
-                        .await
-                    });
-                    match result {
-                        Ok(outcome) => self.push_output(
-                            format!(
-                                "{}\nActivate with: /skills view {}",
-                                outcome.message, outcome.skill_name
-                            ),
-                            OutputRole::System,
-                        ),
-                        Err(e) => self.push_output(format!("Remote update failed: {e}"), OutputRole::Error),
-                    }
-                }
+            "update" | "remove" | "uninstall" | "rm" => {
+                // Remote update/remove handled by hub_slash dispatch above.
+                self.push_output(
+                    format!("Could not {subcommand} '{operand}'. Check the skill name or hub lock file."),
+                    OutputRole::Error,
+                );
             }
 
             "hub" | "search" => {
@@ -14997,35 +15306,8 @@ impl App {
                 self.open_remote_skill_selector((!query.is_empty()).then_some(query));
             }
 
-            "remove" | "uninstall" | "rm" => {
-                if operand.is_empty() {
-                    self.push_output("Usage: /skills remove <skill-name>", OutputRole::System);
-                    return;
-                }
-                let candidates = vec![
-                    skills_dir.join(operand),
-                    skills_dir.join(format!("{operand}.md")),
-                ];
-                let target = candidates.into_iter().find(|p| p.exists());
-                match target {
-                    Some(path) if path.is_file() => {
-                        match std::fs::remove_file(&path) {
-                            Ok(_) => self.push_output(format!("Skill '{}' removed.", operand), OutputRole::System),
-                            Err(e) => self.push_output(format!("Remove failed: {e}"), OutputRole::Error),
-                        }
-                    }
-                    Some(path) if path.is_dir() => {
-                        match std::fs::remove_dir_all(&path) {
-                            Ok(_) => self.push_output(format!("Skill directory '{}' removed.", operand), OutputRole::System),
-                            Err(e) => self.push_output(format!("Remove failed: {e}"), OutputRole::Error),
-                        }
-                    }
-                    _ => self.push_output(format!("Skill '{}' not found.", operand), OutputRole::Error),
-                }
-            }
-
             _ => self.push_output(
-                "Usage: /skills [list | view <name> | install <path-or-source-or-owner/repo/path> | update [name] | remove <name> | hub [query] | search [query]]",
+                "Usage: /skills [list | view <name> | hub [query] | search [query] | review <id> | inspect [--scan] <id> | install <id> | trust <id> | check | update | remove | audit | lock | index refresh | catalog | tap list|add|remove]",
                 OutputRole::System,
             ),
         }
@@ -16351,6 +16633,7 @@ impl App {
             watch_notification_tx: None,
             mutation_turn: None,
             lsp_gate: None,
+            kanban_task_id: None,
         }
     }
 
@@ -21154,7 +21437,7 @@ kind = "skill"
         .expect("write flat skill");
 
         let mut app = App::new();
-        app.activate_skill("quickstart");
+        app.set_skill_activation("quickstart", true);
 
         assert!(app.active_skills.iter().any(|entry| entry == "quickstart"));
         assert!(
@@ -21190,14 +21473,14 @@ kind = "skill"
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         let (mut app, agent) = rt.block_on(async { (App::new(), mock_agent()) });
         app.set_agent(agent.clone());
-        app.activate_skill("quickstart");
+        app.set_skill_activation("quickstart", true);
 
         assert_eq!(
             app.rt_handle.block_on(agent.preloaded_skills()),
             vec!["quickstart"]
         );
 
-        app.activate_skill("quickstart");
+        app.set_skill_activation("quickstart", false);
         assert!(app.rt_handle.block_on(agent.preloaded_skills()).is_empty());
 
         unsafe {
@@ -21340,6 +21623,7 @@ kind = "skill"
             0,
             0,
             2,
+            "waiting for first token",
         );
         let long = format_waiting_first_token_status(
             &theme,
@@ -21349,6 +21633,7 @@ kind = "skill"
             0,
             0,
             12,
+            "waiting for first token",
         );
         assert!(early.contains("first token"));
         assert!(long.contains("waiting for first token"));
@@ -21366,6 +21651,7 @@ kind = "skill"
             0,
             0,
             2,
+            "waiting for first token",
         );
         assert!(status.starts_with("| "));
     }
@@ -23738,6 +24024,17 @@ kind = "skill"
         assert!(names.contains(&"permissions"));
         assert!(names.contains(&"open"));
         assert_eq!(hints, App::command_arg_hints("cu"));
+    }
+
+    #[test]
+    fn command_arg_hints_skills_includes_guard_review_and_scan() {
+        let hints = App::command_arg_hints("skills");
+        assert!(!hints.is_empty());
+        let names: Vec<&str> = hints.iter().map(|(name, _)| *name).collect();
+        assert!(names.contains(&"review"));
+        assert!(names.contains(&"inspect --scan"));
+        assert!(names.contains(&"trust"));
+        assert_eq!(hints, App::command_arg_hints("skill"));
     }
 
     /// After typing "/sessions " (with trailing space) update_completion should

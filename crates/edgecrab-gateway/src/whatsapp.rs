@@ -117,6 +117,10 @@ impl WhatsappAdapterConfig {
     pub fn send_media_url(&self) -> String {
         format!("{}/send-media", self.bridge_url())
     }
+
+    pub fn send_clarify_url(&self) -> String {
+        format!("{}/send-clarify", self.bridge_url())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -165,6 +169,29 @@ struct SendMediaRequest<'a> {
     caption: Option<&'a str>,
     #[serde(rename = "fileName", skip_serializing_if = "Option::is_none")]
     file_name: Option<&'a str>,
+}
+
+#[derive(Debug, Serialize)]
+struct SendClarifyRequest<'a> {
+    #[serde(rename = "chatId")]
+    chat_id: &'a str,
+    question: &'a str,
+    #[serde(rename = "interactionId")]
+    interaction_id: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    choices: Option<&'a [String]>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SendClarifyResponse {
+    #[serde(default)]
+    success: bool,
+    #[serde(default)]
+    used_buttons: bool,
+    #[serde(default)]
+    used_list: bool,
+    #[serde(default)]
+    error: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -411,6 +438,100 @@ impl WhatsAppAdapter {
                 attachments,
                 ..Default::default()
             },
+        }
+    }
+
+    async fn send_bridge_clarify(
+        &self,
+        chat_id: &str,
+        question: &str,
+        interaction_id: u64,
+        choices: Option<&[String]>,
+    ) -> Result<(bool, bool), BridgeSendFailure> {
+        let body = SendClarifyRequest {
+            chat_id,
+            question,
+            interaction_id,
+            choices,
+        };
+        let response = self
+            .client
+            .post(self.config.send_clarify_url())
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| BridgeSendFailure {
+                detail: format!(
+                    "failed to contact the local clarify relay ({}): {error}",
+                    self.config.send_clarify_url()
+                ),
+            })?;
+
+        let status = response.status();
+        let raw_body = response.text().await.map_err(|error| BridgeSendFailure {
+            detail: format!(
+                "failed to read the local clarify relay response ({}): {error}",
+                self.config.send_clarify_url()
+            ),
+        })?;
+
+        if !status.is_success() {
+            return Err(BridgeSendFailure {
+                detail: parse_bridge_error(&raw_body).unwrap_or_else(|| {
+                    format!("clarify relay returned HTTP {status}: {raw_body}")
+                }),
+            });
+        }
+
+        let payload: SendClarifyResponse = serde_json::from_str(&raw_body).map_err(|error| {
+            BridgeSendFailure {
+                detail: format!("invalid clarify relay response: {error}; body={raw_body}"),
+            }
+        })?;
+        if !payload.success {
+            return Err(BridgeSendFailure {
+                detail: payload
+                    .error
+                    .unwrap_or_else(|| "clarify relay reported failure".into()),
+            });
+        }
+        Ok((payload.used_buttons, payload.used_list))
+    }
+
+    async fn handle_clarify_tap(&self, event: &WhatsAppInboundEvent) {
+        let Some(rest) = event.body.strip_prefix("cl:") else {
+            return;
+        };
+        let mut parts = rest.split(':');
+        let Some(id_str) = parts.next() else {
+            return;
+        };
+        let Ok(interaction_id) = id_str.parse::<u64>() else {
+            return;
+        };
+        let Some(choice_key) = parts.next() else {
+            return;
+        };
+
+        let chat_id = normalize_outbound_chat_id(&event.chat_id);
+        if choice_key == "other" {
+            let _ = self
+                .send_bridge_message(&chat_id, "✏️ Type your answer:")
+                .await;
+            return;
+        }
+
+        let Ok(idx) = choice_key.parse::<usize>() else {
+            return;
+        };
+        let answer = crate::clarify_wiring::peek_clarify(interaction_id)
+            .await
+            .and_then(|(_, choices)| choices)
+            .and_then(|choices| choices.get(idx).cloned())
+            .unwrap_or_else(|| choice_key.to_string());
+
+        if crate::clarify_wiring::resolve_clarify_button(interaction_id, answer).await {
+            debug!(interaction_id, "WhatsApp clarify button resolved");
         }
     }
 
@@ -718,6 +839,11 @@ impl PlatformAdapter for WhatsAppAdapter {
                             }
                         }
 
+                        if event.body.starts_with("cl:") {
+                            self.handle_clarify_tap(&event).await;
+                            continue;
+                        }
+
                         let message = Self::event_to_message(event);
                         tx.send(message)
                             .await
@@ -773,6 +899,42 @@ impl PlatformAdapter for WhatsAppAdapter {
 
     fn supports_files(&self) -> bool {
         true
+    }
+
+    async fn send_clarify(
+        &self,
+        prompt: &crate::platform::ClarifyPrompt,
+        metadata: &MessageMetadata,
+    ) -> anyhow::Result<bool> {
+        let original_chat_id = metadata
+            .channel_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("WhatsApp clarify requires channel_id"))?;
+        let normalized_chat_id = normalize_outbound_chat_id(original_chat_id);
+        if normalized_chat_id.is_empty() {
+            anyhow::bail!("WhatsApp clarify requires a non-empty channel_id");
+        }
+
+        let choices = prompt.choices.as_ref().filter(|c| !c.is_empty());
+        if choices.is_some_and(|c| c.len() > 10) {
+            return Ok(false);
+        }
+
+        match self
+            .send_bridge_clarify(
+                &normalized_chat_id,
+                &prompt.question,
+                prompt.interaction_id,
+                choices.map(|c| c.as_slice()),
+            )
+            .await
+        {
+            Ok((used_buttons, used_list)) => Ok(used_buttons || used_list),
+            Err(error) => {
+                warn!(%error, "WhatsApp clarify buttons failed; falling back to text");
+                Ok(false)
+            }
+        }
     }
 
     async fn send_photo(

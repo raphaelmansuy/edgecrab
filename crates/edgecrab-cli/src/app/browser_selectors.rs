@@ -1126,14 +1126,40 @@ impl App {
                     } else {
                         Style::default().fg(Color::Rgb(120, 140, 140))
                     };
-                    ListItem::new(Line::from(vec![
+                    let mut spans = vec![
                         selector_marker(is_selected, Color::Rgb(110, 220, 210), Some(bg)),
                         Span::styled(format!("  {:<11}", entry.source_label), source_style),
                         Span::styled(format!("{:<8}", entry.action.label()), action_style),
-                        Span::styled(unicode_trunc(&entry.identifier, 44), main_style),
-                        Span::raw("  "),
-                        Span::styled(unicode_trunc(&entry.description, 36), desc_style),
-                    ]))
+                    ];
+                    if is_selected && let Some(guard) = &self.remote_skill_guard.preview {
+                        if self.remote_skill_guard.for_identifier.as_deref()
+                            == Some(entry.identifier.as_str())
+                        {
+                            let (chip, chip_color) =
+                                super::remote_skill_guard::guard_verdict_chip(&guard.verdict);
+                            spans.push(Span::styled(
+                                format!("{chip} "),
+                                Style::default().bg(bg).fg(chip_color),
+                            ));
+                        } else if self.remote_skill_guard.inflight.as_deref()
+                            == Some(entry.identifier.as_str())
+                        {
+                            spans.push(Span::styled(
+                                "… ",
+                                Style::default().bg(bg).fg(Color::Rgb(110, 220, 210)),
+                            ));
+                        }
+                    }
+                    spans.push(Span::styled(
+                        unicode_trunc(&entry.identifier, 40),
+                        main_style,
+                    ));
+                    spans.push(Span::raw("  "));
+                    spans.push(Span::styled(
+                        unicode_trunc(&entry.description, 32),
+                        desc_style,
+                    ));
+                    ListItem::new(Line::from(spans))
                 })
                 .collect()
         };
@@ -1192,6 +1218,7 @@ impl App {
                     Style::default().fg(Color::Rgb(255, 180, 120)),
                 )));
             }
+            self.append_remote_skill_guard_detail(&mut detail_lines);
         } else if query.is_empty() {
             detail_lines.push(Line::from(Span::styled(
                 "Curated Sources",
@@ -1319,6 +1346,8 @@ impl App {
             Span::styled("detail  ", Style::default().fg(Color::DarkGray)),
             Span::styled("R ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("refresh  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("S ", Style::default().fg(Color::Rgb(110, 220, 210))),
+            Span::styled("guard scan  ", Style::default().fg(Color::DarkGray)),
             Span::styled("L ", Style::default().fg(Color::Rgb(110, 220, 210))),
             Span::styled("local browser  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Esc ", Style::default().fg(Color::Rgb(110, 220, 210))),

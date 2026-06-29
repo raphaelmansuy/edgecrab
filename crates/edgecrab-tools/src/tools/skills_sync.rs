@@ -125,7 +125,11 @@ pub fn optional_skills_dir() -> Option<PathBuf> {
 ///
 /// Discovers bundled skills from the repo, syncs them to `~/.edgecrab/skills/`,
 /// and returns a summary string.  Safe to call multiple times — idempotent.
+/// Returns `None` when the profile opted out via `/skills opt-out`.
 pub fn sync_on_startup() -> Option<SyncReport> {
+    if is_bundled_skills_opt_out() {
+        return None;
+    }
     if let Some(bundled_dir) = bundled_skills_dir() {
         return Some(sync_bundled_skills(&bundled_dir));
     }
@@ -138,6 +142,161 @@ pub fn sync_on_startup() -> Option<SyncReport> {
     None
 }
 
+/// Marker file: when present, bundled skill seeding is disabled for this profile.
+pub const NO_BUNDLED_SKILLS_MARKER: &str = ".no-bundled-skills";
+
+/// Path to the bundled-skills opt-out marker for a given EdgeCrab home.
+pub fn bundled_skills_opt_out_marker(home: &Path) -> PathBuf {
+    home.join(NO_BUNDLED_SKILLS_MARKER)
+}
+
+/// True when bundled skill sync is disabled for the active profile.
+pub fn is_bundled_skills_opt_out() -> bool {
+    bundled_skills_opt_out_marker(&resolve_edgecrab_home()).is_file()
+}
+
+#[derive(Debug, Clone)]
+pub struct BundledOptOutResult {
+    pub ok: bool,
+    pub changed: bool,
+    pub message: String,
+}
+
+/// Toggle the `.no-bundled-skills` marker (Hermes `set_bundled_skills_opt_out` parity).
+pub fn set_bundled_skills_opt_out(enabled: bool) -> BundledOptOutResult {
+    let home = resolve_edgecrab_home();
+    let marker = bundled_skills_opt_out_marker(&home);
+    let existed = marker.is_file();
+
+    if enabled {
+        if let Err(e) = std::fs::create_dir_all(&home) {
+            return BundledOptOutResult {
+                ok: false,
+                changed: false,
+                message: format!("Could not create home dir: {e}"),
+            };
+        }
+        match std::fs::write(
+            &marker,
+            "This profile opted out of bundled-skill seeding (`/skills opt-out`).\n\
+             Delete this file or run `/skills opt-in` to re-enable sync.\n",
+        ) {
+            Ok(()) => BundledOptOutResult {
+                ok: true,
+                changed: !existed,
+                message: if existed {
+                    "Already opted out — marker was already present.".into()
+                } else {
+                    "Opted out of bundled skills. Future sync runs will not seed bundled skills."
+                        .into()
+                },
+            },
+            Err(e) => BundledOptOutResult {
+                ok: false,
+                changed: false,
+                message: format!(
+                    "Could not write opt-out marker at {}: {e}",
+                    marker.display()
+                ),
+            },
+        }
+    } else {
+        let changed = existed;
+        if existed && let Err(e) = std::fs::remove_file(&marker) {
+            return BundledOptOutResult {
+                ok: false,
+                changed: false,
+                message: format!("Could not remove opt-out marker: {e}"),
+            };
+        }
+        BundledOptOutResult {
+            ok: true,
+            changed,
+            message: if changed {
+                "Opted back in. Run `/skills opt-in --sync` or restart to re-seed bundled skills."
+                    .into()
+            } else {
+                "Not opted out — no marker to remove.".into()
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RemovePristineResult {
+    pub ok: bool,
+    pub removed: Vec<String>,
+    pub skipped: Vec<(String, String)>,
+    pub dry_run: bool,
+    pub message: String,
+}
+
+/// Delete manifest-tracked bundled skills that are byte-identical to their sync baseline.
+pub fn remove_pristine_bundled_skills(dry_run: bool) -> RemovePristineResult {
+    let mut manifest = read_manifest();
+    let user_skills = skills_dir();
+    let snapshots = load_bundled_snapshots();
+    let bundled_by_key: HashMap<String, &SkillSnapshot> =
+        snapshots.iter().map(|s| (s.name.clone(), s)).collect();
+
+    let mut removed = Vec::new();
+    let mut skipped = Vec::new();
+
+    for (name, origin_hash) in manifest.clone() {
+        let Some(_snapshot) = bundled_by_key.get(&name) else {
+            skipped.push((name.clone(), "no bundled source (removed upstream)".into()));
+            continue;
+        };
+        let dest = user_skills.join(&name);
+        if !dest.is_dir() {
+            if !dry_run {
+                manifest.remove(&name);
+            }
+            continue;
+        }
+        if origin_hash.is_empty() {
+            skipped.push((name.clone(), "missing origin hash (kept)".into()));
+            continue;
+        }
+        let on_disk = dir_hash(&dest);
+        if on_disk != origin_hash {
+            skipped.push((name.clone(), "user-modified (kept)".into()));
+            continue;
+        }
+        if dry_run {
+            removed.push(name);
+            continue;
+        }
+        match remove_dir_all_writable(&dest) {
+            Ok(()) => {
+                manifest.remove(&name);
+                removed.push(name);
+            }
+            Err(e) => skipped.push((name, format!("delete failed: {e}"))),
+        }
+    }
+
+    if !dry_run && !removed.is_empty() {
+        write_manifest(&manifest);
+    }
+
+    let message = if dry_run {
+        format!("Would remove {} pristine bundled skill(s).", removed.len())
+    } else if removed.is_empty() {
+        "No pristine bundled skills to remove.".into()
+    } else {
+        format!("Removed {} pristine bundled skill(s).", removed.len())
+    };
+
+    RemovePristineResult {
+        ok: true,
+        removed,
+        skipped,
+        dry_run,
+        message,
+    }
+}
+
 /// Get the user's skills directory.
 fn skills_dir() -> PathBuf {
     resolve_edgecrab_home().join("skills")
@@ -148,9 +307,9 @@ fn manifest_path() -> PathBuf {
     skills_dir().join(".bundled_manifest")
 }
 
-/// Read the manifest as `{skill_name: origin_hash}`.
-fn read_manifest() -> HashMap<String, String> {
-    let path = manifest_path();
+/// Read the manifest as `{skill_name: origin_hash}` for a given EdgeCrab home.
+pub fn read_bundled_manifest(home: &Path) -> HashMap<String, String> {
+    let path = home.join("skills").join(".bundled_manifest");
     match std::fs::read_to_string(&path) {
         Ok(content) => {
             let mut map = HashMap::new();
@@ -162,7 +321,6 @@ fn read_manifest() -> HashMap<String, String> {
                 if let Some((name, hash)) = line.split_once(':') {
                     map.insert(name.trim().to_string(), hash.trim().to_string());
                 } else {
-                    // v1 format: plain name, empty hash triggers migration
                     map.insert(line.to_string(), String::new());
                 }
             }
@@ -170,6 +328,16 @@ fn read_manifest() -> HashMap<String, String> {
         }
         Err(_) => HashMap::new(),
     }
+}
+
+/// Whether `name` is tracked as a bundled/synced skill (not user-created).
+pub fn is_bundled_skill(home: &Path, name: &str) -> bool {
+    read_bundled_manifest(home).contains_key(name)
+}
+
+/// Read the manifest as `{skill_name: origin_hash}`.
+fn read_manifest() -> HashMap<String, String> {
+    read_bundled_manifest(&resolve_edgecrab_home())
 }
 
 /// Write the manifest file.
@@ -323,6 +491,9 @@ impl Default for SyncReport {
 ///
 /// Returns a report of what was added, updated, or skipped.
 pub fn sync_bundled_skills(bundled_dir: &Path) -> SyncReport {
+    if is_bundled_skills_opt_out() {
+        return SyncReport::default();
+    }
     sync_skill_snapshots(discover_bundled_skills(bundled_dir), SyncSource::Filesystem)
 }
 
@@ -481,6 +652,259 @@ fn safe_relative_join(base: &Path, rel_path: &str) -> Option<PathBuf> {
 
 pub(crate) fn embedded_optional_skills() -> &'static [EmbeddedSkill] {
     EMBEDDED_OPTIONAL_SKILLS
+}
+
+pub(crate) fn embedded_bundled_skills() -> &'static [EmbeddedSkill] {
+    EMBEDDED_BUNDLED_SKILLS
+}
+
+/// Read the `name` field from SKILL.md YAML frontmatter (Hermes `_read_skill_name` parity).
+pub fn read_skill_frontmatter_name(content: &str, fallback: &str) -> String {
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with("---") {
+        return fallback.to_string();
+    }
+    let after = &trimmed[3..];
+    let Some(end) = after.find("\n---") else {
+        return fallback.to_string();
+    };
+    for line in after[..end].lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("name:") {
+            let name = rest.trim().trim_matches(['\'', '"']);
+            if !name.is_empty() {
+                return name.to_string();
+            }
+        }
+    }
+    fallback.to_string()
+}
+
+fn snapshot_frontmatter_name(snapshot: &SkillSnapshot) -> String {
+    for file in &snapshot.files {
+        if file.relative_path == "SKILL.md" {
+            return read_skill_frontmatter_name(&file.content, &snapshot.name);
+        }
+    }
+    snapshot.name.clone()
+}
+
+fn load_bundled_snapshots() -> Vec<SkillSnapshot> {
+    if let Some(dir) = bundled_skills_dir() {
+        discover_bundled_skills(&dir)
+    } else if !EMBEDDED_BUNDLED_SKILLS.is_empty() {
+        embedded_skill_snapshots(EMBEDDED_BUNDLED_SKILLS)
+    } else {
+        Vec::new()
+    }
+}
+
+/// Resolve manifest path key, frontmatter name, or trailing path segment to a bundled snapshot.
+fn resolve_bundled_skill_query<'a>(
+    query: &str,
+    snapshots: &'a [SkillSnapshot],
+) -> Option<&'a SkillSnapshot> {
+    if query.is_empty() {
+        return None;
+    }
+    if let Some(s) = snapshots.iter().find(|s| s.name == query) {
+        return Some(s);
+    }
+    if let Some(s) = snapshots
+        .iter()
+        .find(|s| snapshot_frontmatter_name(s) == query)
+    {
+        return Some(s);
+    }
+    snapshots.iter().find(|s| {
+        s.name.ends_with(&format!("/{query}")) || s.name.rsplit('/').next() == Some(query)
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResetAction {
+    ManifestCleared,
+    Restored,
+    NotInManifest,
+    BundledMissing,
+    NotReset,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResetResult {
+    pub ok: bool,
+    pub action: ResetAction,
+    pub message: String,
+    pub sync_summary: Option<String>,
+}
+
+/// Reset bundled-skill manifest tracking (Hermes `reset_bundled_skill` parity).
+///
+/// Clears the stuck `user_modified` loop when a user re-copies bundled content but the
+/// manifest still holds a stale origin hash. With `restore`, deletes the user copy first
+/// so the next sync re-copies from bundled source.
+pub fn reset_bundled_skill(name: &str, restore: bool) -> ResetResult {
+    let snapshots = load_bundled_snapshots();
+    let mut manifest = read_manifest();
+    let user_skills = skills_dir();
+
+    let bundled = resolve_bundled_skill_query(name, &snapshots);
+    let manifest_keys: Vec<String> = manifest
+        .keys()
+        .filter(|k| k.as_str() == name || k.ends_with(&format!("/{name}")))
+        .cloned()
+        .collect();
+
+    let in_manifest = !manifest_keys.is_empty() || manifest.contains_key(name);
+    let is_bundled = bundled.is_some();
+
+    if !in_manifest && !is_bundled {
+        return ResetResult {
+            ok: false,
+            action: ResetAction::NotInManifest,
+            message: format!(
+                "'{name}' is not a tracked bundled skill. Nothing to reset. \
+                 (Hub-installed skills: /skills remove <name>.)"
+            ),
+            sync_summary: None,
+        };
+    }
+
+    if restore && bundled.is_none() {
+        return ResetResult {
+            ok: false,
+            action: ResetAction::BundledMissing,
+            message: format!(
+                "'{name}' has no bundled source — manifest preserved but cannot restore \
+                 (skill was removed upstream)."
+            ),
+            sync_summary: None,
+        };
+    }
+
+    let manifest_key = bundled
+        .map(|s| s.name.clone())
+        .or_else(|| manifest_keys.first().cloned())
+        .unwrap_or_else(|| name.to_string());
+
+    let user_path = user_skills.join(&manifest_key);
+    let mut deleted_user_copy = false;
+
+    if restore && user_path.is_dir() {
+        match remove_dir_all_writable(&user_path) {
+            Ok(()) => deleted_user_copy = true,
+            Err(e) => {
+                return ResetResult {
+                    ok: false,
+                    action: ResetAction::NotReset,
+                    message: format!(
+                        "Could not delete user copy at {}: {e}. \
+                             Manifest entry preserved — nothing was changed.",
+                        user_path.display()
+                    ),
+                    sync_summary: None,
+                };
+            }
+        }
+    }
+
+    let mut cleared = false;
+    if manifest.remove(&manifest_key).is_some() {
+        cleared = true;
+    }
+    for key in &manifest_keys {
+        if manifest.remove(key).is_some() {
+            cleared = true;
+        }
+    }
+    if manifest.remove(name).is_some() {
+        cleared = true;
+    }
+    if cleared || restore {
+        write_manifest(&manifest);
+    }
+
+    let sync_report = if let Some(dir) = bundled_skills_dir() {
+        Some(sync_bundled_skills(&dir))
+    } else if !EMBEDDED_BUNDLED_SKILLS.is_empty() {
+        Some(sync_skill_snapshots(
+            embedded_skill_snapshots(EMBEDDED_BUNDLED_SKILLS),
+            SyncSource::Embedded,
+        ))
+    } else {
+        None
+    };
+
+    let sync_summary = sync_report.as_ref().map(|r| r.summary());
+
+    let (ok, action, message) = if restore && deleted_user_copy {
+        (
+            true,
+            ResetAction::Restored,
+            format!("Restored '{name}' from bundled source."),
+        )
+    } else if restore {
+        (
+            true,
+            ResetAction::Restored,
+            format!("Restored '{name}' (no prior user copy, re-copied from bundled)."),
+        )
+    } else {
+        (
+            true,
+            ResetAction::ManifestCleared,
+            format!(
+                "Cleared manifest entry for '{name}'. Future sync runs will re-baseline \
+                 against your current copy and accept upstream changes."
+            ),
+        )
+    };
+
+    ResetResult {
+        ok,
+        action,
+        message,
+        sync_summary,
+    }
+}
+
+fn remove_dir_all_writable(path: &Path) -> std::io::Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_e) => {
+            #[cfg(unix)]
+            {
+                make_tree_writable(path);
+                std::fs::remove_dir_all(path)
+            }
+            #[cfg(not(unix))]
+            {
+                Err(e)
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn make_tree_writable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _ = (|| -> std::io::Result<()> {
+        if path.is_dir() {
+            for entry in std::fs::read_dir(path)? {
+                let entry = entry?;
+                make_tree_writable(&entry.path());
+            }
+        }
+        let mut perms = std::fs::metadata(path)?.permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(path, perms)?;
+        Ok(())
+    })();
 }
 
 // ─── MD5 context (minimal implementation using standard lib) ───
@@ -666,5 +1090,149 @@ mod tests {
             report.added.push(snapshot.name.clone());
         }
         report
+    }
+
+    fn setup_bundled_google_workspace(bundled: &TempDir) -> PathBuf {
+        let skill_dir = bundled.path().join("productivity").join("google-workspace");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: google-workspace\n---\n# GW v2 (upstream)\n",
+        )
+        .unwrap();
+        skill_dir
+    }
+
+    #[test]
+    fn reset_clears_stuck_user_modified_via_frontmatter_name() {
+        let home = TestEdgecrabHome::new();
+        let bundled = TempDir::new().unwrap();
+        setup_bundled_google_workspace(&bundled);
+        unsafe { std::env::set_var("EDGECRAB_BUNDLED_SKILLS", bundled.path()) };
+
+        let user_dest = home.path().join("skills/productivity/google-workspace");
+        std::fs::create_dir_all(&user_dest).unwrap();
+        std::fs::write(
+            user_dest.join("SKILL.md"),
+            "---\nname: google-workspace\n---\n# GW v2 (upstream)\n",
+        )
+        .unwrap();
+        std::fs::write(
+            home.path().join("skills/.bundled_manifest"),
+            "productivity/google-workspace:STALEHASH000000000000000000000000\n",
+        )
+        .unwrap();
+
+        let pre = sync_bundled_skills(bundled.path());
+        assert!(
+            pre.skipped_user_modified
+                .contains(&"productivity/google-workspace".to_string())
+        );
+
+        let result = reset_bundled_skill("google-workspace", false);
+        assert!(result.ok);
+        assert_eq!(result.action, ResetAction::ManifestCleared);
+        assert!(user_dest.is_dir());
+
+        let post = sync_bundled_skills(bundled.path());
+        assert!(
+            !post
+                .skipped_user_modified
+                .contains(&"productivity/google-workspace".to_string())
+        );
+
+        unsafe { std::env::remove_var("EDGECRAB_BUNDLED_SKILLS") };
+    }
+
+    #[test]
+    fn reset_restore_replaces_user_copy() {
+        let home = TestEdgecrabHome::new();
+        let bundled = TempDir::new().unwrap();
+        setup_bundled_google_workspace(&bundled);
+        unsafe { std::env::set_var("EDGECRAB_BUNDLED_SKILLS", bundled.path()) };
+
+        let user_dest = home.path().join("skills/productivity/google-workspace");
+        std::fs::create_dir_all(&user_dest).unwrap();
+        std::fs::write(user_dest.join("SKILL.md"), "# heavily edited\n").unwrap();
+        std::fs::write(user_dest.join("custom.py"), "print('user')\n").unwrap();
+        std::fs::write(
+            home.path().join("skills/.bundled_manifest"),
+            "productivity/google-workspace:STALEHASH\n",
+        )
+        .unwrap();
+
+        let result = reset_bundled_skill("google-workspace", true);
+        assert!(result.ok);
+        assert_eq!(result.action, ResetAction::Restored);
+        assert!(!user_dest.join("custom.py").exists());
+        let content = std::fs::read_to_string(user_dest.join("SKILL.md")).unwrap();
+        assert!(content.contains("GW v2 (upstream)"));
+
+        unsafe { std::env::remove_var("EDGECRAB_BUNDLED_SKILLS") };
+    }
+
+    #[test]
+    fn reset_unknown_skill_errors() {
+        let home = TestEdgecrabHome::new();
+        let bundled = TempDir::new().unwrap();
+        setup_bundled_google_workspace(&bundled);
+        unsafe { std::env::set_var("EDGECRAB_BUNDLED_SKILLS", bundled.path()) };
+        let _ = home;
+
+        let result = reset_bundled_skill("some-hub-skill", false);
+        assert!(!result.ok);
+        assert_eq!(result.action, ResetAction::NotInManifest);
+
+        unsafe { std::env::remove_var("EDGECRAB_BUNDLED_SKILLS") };
+    }
+
+    #[test]
+    fn bundled_opt_out_blocks_sync_on_startup() {
+        let home = TestEdgecrabHome::new();
+        let bundled = TempDir::new().unwrap();
+        setup_bundled_google_workspace(&bundled);
+        unsafe { std::env::set_var("EDGECRAB_BUNDLED_SKILLS", bundled.path()) };
+
+        let opt = set_bundled_skills_opt_out(true);
+        assert!(opt.ok);
+        assert!(is_bundled_skills_opt_out());
+        assert!(sync_on_startup().is_none());
+
+        let opt_in = set_bundled_skills_opt_out(false);
+        assert!(opt_in.ok);
+        assert!(!is_bundled_skills_opt_out());
+        assert!(sync_on_startup().is_some());
+
+        unsafe { std::env::remove_var("EDGECRAB_BUNDLED_SKILLS") };
+        let _ = home;
+    }
+
+    #[test]
+    fn remove_pristine_skips_user_modified() {
+        let home = TestEdgecrabHome::new();
+        let bundled = TempDir::new().unwrap();
+        setup_bundled_google_workspace(&bundled);
+        unsafe { std::env::set_var("EDGECRAB_BUNDLED_SKILLS", bundled.path()) };
+
+        let user_dest = home.path().join("skills/productivity/google-workspace");
+        std::fs::create_dir_all(&user_dest).unwrap();
+        std::fs::write(user_dest.join("SKILL.md"), "# user edited\n").unwrap();
+        let bundled_hash = dir_hash(&bundled.path().join("productivity/google-workspace"));
+        std::fs::write(
+            home.path().join("skills/.bundled_manifest"),
+            format!("productivity/google-workspace:{bundled_hash}\n"),
+        )
+        .unwrap();
+
+        let preview = remove_pristine_bundled_skills(true);
+        assert!(preview.removed.is_empty());
+        assert!(
+            preview
+                .skipped
+                .iter()
+                .any(|(n, _)| n.contains("google-workspace"))
+        );
+
+        unsafe { std::env::remove_var("EDGECRAB_BUNDLED_SKILLS") };
     }
 }

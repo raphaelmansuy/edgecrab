@@ -204,6 +204,55 @@ impl InteractionBroker {
         }
     }
 
+    /// Resolve a clarify interaction by broker id (inline button callbacks).
+    pub async fn resolve_clarify_by_id(&self, id: u64, answer: String) -> bool {
+        let target = {
+            let mut queues = self.queues.lock().await;
+            let mut found: Option<PendingInteraction> = None;
+            let mut empty_key: Option<String> = None;
+            'outer: for (session_key, queue) in queues.iter_mut() {
+                if let Some(pos) = queue.iter().position(|item| {
+                    item.id == id && matches!(item.kind, PendingInteractionKind::Clarify { .. })
+                }) {
+                    found = Some(queue.remove(pos).expect("position verified"));
+                    if queue.is_empty() {
+                        empty_key = Some(session_key.clone());
+                    }
+                    break 'outer;
+                }
+            }
+            if let Some(key) = empty_key {
+                queues.remove(&key);
+            }
+            found
+        };
+
+        match target {
+            Some(PendingInteraction {
+                responder: PendingResponder::Clarify(tx),
+                ..
+            }) => {
+                let _ = tx.send(answer);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub async fn peek_clarify_by_id(&self, id: u64) -> Option<(String, Option<Vec<String>>)> {
+        let queues = self.queues.lock().await;
+        for queue in queues.values() {
+            for item in queue {
+                if item.id == id
+                    && let PendingInteractionKind::Clarify { question, choices } = &item.kind
+                {
+                    return Some((question.clone(), choices.clone()));
+                }
+            }
+        }
+        None
+    }
+
     pub async fn cancel_session(&self, session_key: &str) -> usize {
         let pending = {
             let mut queues = self.queues.lock().await;
@@ -286,6 +335,22 @@ mod tests {
             1
         );
         assert_eq!(rx2.await.expect("second resolution"), ApprovalChoice::Deny);
+    }
+
+    #[tokio::test]
+    async fn resolve_clarify_by_id_across_sessions() {
+        let broker = InteractionBroker::new();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let view = broker
+            .enqueue_clarify(
+                "telegram:99",
+                "Pick color".into(),
+                Some(vec!["red".into(), "blue".into()]),
+                tx,
+            )
+            .await;
+        assert!(broker.resolve_clarify_by_id(view.id, "blue".into()).await);
+        assert_eq!(rx.await.expect("answer"), "blue");
     }
 
     #[tokio::test]

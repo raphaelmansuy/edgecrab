@@ -47,6 +47,7 @@ pub struct AppConfig {
     pub mcp_servers: HashMap<String, McpServerConfig>,
     pub memory: MemoryConfig,
     pub skills: SkillsConfig,
+    pub curator: CuratorConfig,
     pub plugins: PluginsConfig,
     pub security: SecurityConfig,
     pub terminal: TerminalConfig,
@@ -63,6 +64,10 @@ pub struct AppConfig {
     pub image_generation: ImageGenerationConfig,
     pub voice: VoiceConfig,
     pub honcho: HonchoConfig,
+    pub approvals: ApprovalsConfig,
+    /// Update safety and check settings (Hermes `updates:` section).
+    pub updates: UpdatesConfig,
+    pub kanban: KanbanConfig,
     pub auxiliary: AuxiliaryConfig,
     pub shadow_judge: ShadowJudgeConfig,
     pub goals: GoalsConfig,
@@ -73,6 +78,29 @@ pub struct AppConfig {
     pub web_search: WebSearchConfig,
     /// Hermes-aligned per-capability backend overrides (`web:` in config.yaml).
     pub web: WebToolsConfig,
+    /// LM Studio / Ollama harness tuning (prefill prune lives in code; see spec 014).
+    pub local_inference: LocalInferenceConfig,
+}
+
+/// Local inference provider harness options (deterministic; active by default on lmstudio/ollama).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct LocalInferenceConfig {
+    /// When true, `write_file` treats omitted `create_dirs` as true (nested homelab paths).
+    /// Default **true**; auto-enabled on lmstudio/ollama even when set false in yaml.
+    pub write_create_dirs: bool,
+    /// Absolute completion cap for local tool turns (`max_tokens` on lmstudio/ollama).
+    /// Override precedence: `EDGECRAB_LOCAL_TOOL_MAX_TOKENS` env > this field > compile-time default.
+    pub max_tool_turn_tokens: usize,
+}
+
+impl Default for LocalInferenceConfig {
+    fn default() -> Self {
+        Self {
+            write_create_dirs: true,
+            max_tool_turn_tokens: edgecrab_tools::mutation_turn_policy::LOCAL_TOOL_TURN_ABS_MAX_TOKENS,
+        }
+    }
 }
 
 /// Cross-session Anthropic prompt prefix cache (stable/dynamic system split).
@@ -277,6 +305,34 @@ impl AppConfig {
             lsp.timeout_ms,
             lsp.servers.len()
         )
+    }
+
+    /// Update `skills.write_approval` and persist to `~/.edgecrab/config.yaml`.
+    pub fn persist_skills_write_approval(enabled: bool) -> Result<(), AgentError> {
+        let mut config = Self::load()?;
+        config.skills.write_approval = enabled;
+        config.save()
+    }
+
+    /// Update `memory.write_approval` and persist to `~/.edgecrab/config.yaml`.
+    pub fn persist_memory_write_approval(enabled: bool) -> Result<(), AgentError> {
+        let mut config = Self::load()?;
+        config.memory.write_approval = enabled;
+        config.save()
+    }
+
+    /// Update `approvals.mode` and persist to `~/.edgecrab/config.yaml`.
+    pub fn persist_approvals_mode(mode: edgecrab_security::approval::ApprovalMode) -> Result<(), AgentError> {
+        let mut config = Self::load()?;
+        config.approvals.mode = mode;
+        config.save()
+    }
+
+    /// Update `skills.inline_shell` and persist to `~/.edgecrab/config.yaml`.
+    pub fn persist_skills_inline_shell(enabled: bool) -> Result<(), AgentError> {
+        let mut config = Self::load()?;
+        config.skills.inline_shell = enabled;
+        config.save()
     }
 
     /// Persist the current config to the default config path.
@@ -1582,6 +1638,10 @@ impl Default for McpServerConfig {
 pub struct MemoryConfig {
     pub enabled: bool,
     pub auto_flush: bool,
+    /// When true, `memory_write` stages under `pending/memory/` until approved
+    /// via `/memory approve <id>` (Hermes parity).
+    #[serde(default)]
+    pub write_approval: bool,
 }
 
 impl Default for MemoryConfig {
@@ -1589,6 +1649,7 @@ impl Default for MemoryConfig {
         Self {
             enabled: true,
             auto_flush: true,
+            write_approval: false,
         }
     }
 }
@@ -1616,6 +1677,27 @@ pub struct SkillsConfig {
     /// Equivalent to `hermes -s skill1,skill2`.
     #[serde(default)]
     pub preloaded: Vec<String>,
+    /// When true, `skill_manage` writes are staged under `pending/skills/`
+    /// until approved via `/skills approve <id>` (Hermes parity).
+    #[serde(default)]
+    pub write_approval: bool,
+    /// Substitute `${HERMES,EDGECRAB,CLAUDE}_*` tokens when loading skills (default on).
+    #[serde(default = "default_true")]
+    pub template_vars: bool,
+    /// Expand `!`cmd`` inline shell snippets in SKILL.md (default off — opt-in).
+    #[serde(default)]
+    pub inline_shell: bool,
+    /// Timeout seconds for each inline shell snippet (default 10).
+    #[serde(default = "default_inline_shell_timeout")]
+    pub inline_shell_timeout: u32,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_inline_shell_timeout() -> u32 {
+    10
 }
 
 impl Default for SkillsConfig {
@@ -1627,6 +1709,58 @@ impl Default for SkillsConfig {
             platform_disabled: std::collections::HashMap::new(),
             external_dirs: Vec::new(),
             preloaded: Vec::new(),
+            write_approval: false,
+            template_vars: true,
+            inline_shell: false,
+            inline_shell_timeout: 10,
+        }
+    }
+}
+
+/// Skill hygiene — stale detection, archival, optional scheduled prune.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct CuratorConfig {
+    /// Enable background deterministic prune on gateway tick (default off — opt-in).
+    pub enabled: bool,
+    /// Minimum hours between scheduled curator passes (default 7 days).
+    pub interval_hours: u32,
+    /// Skills not used in this many days are reported as stale by `/curator stale`.
+    pub stale_after_days: u32,
+    /// Skills idle longer than this may be archived by `/curator prune` (never auto-deletes).
+    pub archive_after_days: u32,
+    /// When true, bundled/synced skills may be archived after idle threshold (hub skills never).
+    pub prune_builtins: bool,
+    /// Pre-run tar.gz snapshots before mutating curator passes.
+    #[serde(default)]
+    pub backup: CuratorBackupConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct CuratorBackupConfig {
+    pub enabled: bool,
+    pub keep: u32,
+}
+
+impl Default for CuratorBackupConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            keep: 5,
+        }
+    }
+}
+
+impl Default for CuratorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_hours: 168,
+            stale_after_days: 30,
+            archive_after_days: 90,
+            prune_builtins: false,
+            backup: CuratorBackupConfig::default(),
         }
     }
 }
@@ -2361,6 +2495,154 @@ impl Default for HonchoConfig {
     }
 }
 
+/// Dangerous-command approval policy (Hermes `approvals` in config.yaml).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ApprovalsConfig {
+    /// `manual` (default), `smart` (aux LLM pre-screens), or `off`.
+    pub mode: edgecrab_security::approval::ApprovalMode,
+    /// Seconds to wait for user approval in gateway (default 60).
+    pub timeout: u32,
+    /// Cron headless mode: `deny` (default) or `approve`.
+    pub cron_mode: String,
+    /// Optional model for smart approval (`provider/model`); falls back to `auxiliary.model`.
+    pub smart_model: Option<String>,
+}
+
+impl Default for ApprovalsConfig {
+    fn default() -> Self {
+        Self {
+            mode: edgecrab_security::approval::ApprovalMode::Manual,
+            timeout: 60,
+            cron_mode: "deny".into(),
+            smart_model: None,
+        }
+    }
+}
+
+/// Update command safety (`updates:` in config.yaml).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct UpdatesConfig {
+    /// Lightweight state snapshot before applying an update (Hermes always-on quick snapshot).
+    pub pre_update_snapshot: bool,
+    /// How many labeled pre-update snapshots to retain.
+    pub pre_update_snapshot_keep: u32,
+}
+
+impl Default for UpdatesConfig {
+    fn default() -> Self {
+        Self {
+            pre_update_snapshot: true,
+            pre_update_snapshot_keep: 1,
+        }
+    }
+}
+
+/// Multi-agent kanban board (`kanban:` in config.yaml).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct KanbanConfig {
+    /// Enable kanban tools and `/kanban` slash command.
+    pub enabled: bool,
+    /// Claim lease TTL in seconds (default 900 = 15 min, Hermes parity).
+    pub claim_ttl_secs: u32,
+    /// Soft cap on concurrent workers (enforced by orchestrator in later phases).
+    pub max_workers: u32,
+    /// Per-profile cap on concurrent `doing` tasks (unset = unlimited). Hermes #21582.
+    pub max_in_progress_per_profile: Option<u32>,
+    /// Run stale-claim reaper inside the gateway (Hermes `dispatch_in_gateway`).
+    pub dispatch_in_gateway: bool,
+    /// Reaper tick interval in seconds when `dispatch_in_gateway` is true.
+    pub reclaim_interval_secs: u32,
+    /// Auto-block after N consecutive non-success attempts (Hermes default: 2).
+    pub failure_limit: u32,
+    /// Default per-task max runtime in seconds (0 = disabled). Applied on create when unset.
+    pub default_max_runtime_secs: u32,
+    /// Auto-run decomposer on triage tasks each dispatcher tick (Hermes default: true).
+    pub auto_decompose: bool,
+    /// Max decompositions per tick (Hermes default: 3).
+    pub auto_decompose_per_tick: u32,
+    /// Require Bearer/`X-Kanban-Token` for `/api/kanban/*` and `/kanban` (default true).
+    pub require_api_auth: bool,
+    /// Token file path (default `~/.edgecrab/kanban-token`).
+    pub api_token_path: Option<PathBuf>,
+    /// Skip auth when gateway binds loopback (default true — Hermes loopback mode).
+    pub allow_localhost_without_auth: bool,
+    /// Profile that owns the root task after decompose fan-out (orchestrator).
+    pub orchestrator_profile: Option<String>,
+    /// Fallback assignee when decomposer picks unknown profile or task is unassigned.
+    pub default_assignee: Option<String>,
+    /// Promote parent-free children to claimable immediately after decompose (Hermes default).
+    pub auto_promote_children: bool,
+    /// Cooldown after rate-limited requeue before respawn (seconds, default 300).
+    pub rate_limit_cooldown_secs: u32,
+    /// Window where a completed run blocks respawn (seconds, default 3600).
+    pub respawn_guard_success_window_secs: u32,
+    /// Window where a GitHub PR comment blocks respawn (seconds, default 86400).
+    pub respawn_guard_pr_window_secs: u32,
+}
+
+impl Default for KanbanConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            claim_ttl_secs: 900,
+            max_workers: 3,
+            max_in_progress_per_profile: None,
+            dispatch_in_gateway: true,
+            reclaim_interval_secs: 60,
+            failure_limit: 2,
+            default_max_runtime_secs: 0,
+            auto_decompose: true,
+            auto_decompose_per_tick: 3,
+            require_api_auth: true,
+            api_token_path: None,
+            allow_localhost_without_auth: true,
+            orchestrator_profile: None,
+            default_assignee: None,
+            auto_promote_children: true,
+            rate_limit_cooldown_secs: 300,
+            respawn_guard_success_window_secs: 3600,
+            respawn_guard_pr_window_secs: 86_400,
+        }
+    }
+}
+
+/// Kanban decomposer auxiliary model (`auxiliary.kanban_decomposer`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct KanbanDecomposerConfig {
+    pub model: Option<String>,
+    pub max_tokens: u32,
+}
+
+impl Default for KanbanDecomposerConfig {
+    fn default() -> Self {
+        Self {
+            model: None,
+            max_tokens: 4096,
+        }
+    }
+}
+
+/// Profile describer auxiliary model (`auxiliary.profile_describer`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ProfileDescriberConfig {
+    pub model: Option<String>,
+    pub max_tokens: u32,
+}
+
+impl Default for ProfileDescriberConfig {
+    fn default() -> Self {
+        Self {
+            model: None,
+            max_tokens: 512,
+        }
+    }
+}
+
 /// Auxiliary model configuration.
 ///
 /// Mirrors hermes-agent's support for a secondary cheap model used
@@ -2379,6 +2661,10 @@ pub struct AuxiliaryConfig {
     pub api_key_env: Option<String>,
     /// Goal judge overrides (`auxiliary.goal_judge` in config.yaml).
     pub goal_judge: GoalJudgeConfig,
+    /// Kanban decomposer overrides (`auxiliary.kanban_decomposer`).
+    pub kanban_decomposer: KanbanDecomposerConfig,
+    /// Profile describer overrides (`auxiliary.profile_describer`).
+    pub profile_describer: ProfileDescriberConfig,
 }
 
 /// Goal judge auxiliary task configuration.

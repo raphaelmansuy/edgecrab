@@ -59,8 +59,6 @@ pub enum ShelfPhase {
     Thinking,
     GeneratingTool,
     ToolExec,
-    /// Brief bridge after tools finish, before the next model token (Hermes transient trail).
-    AnalyzingOutput,
     Streaming,
     WaitingForApproval,
     WaitingForClarify,
@@ -132,12 +130,18 @@ pub struct TurnActivityState {
     pub subagents: HashMap<usize, ShelfSubagentRow>,
     pub generating_tool: Option<(String, String)>,
     pub generating_preview: Option<String>,
+    /// Bytes accumulated in the in-flight tool-call JSON stream.
+    pub generating_args_bytes: usize,
     pub reasoning_snippet: Option<String>,
     /// Live rough estimate for thinking shelf header (Hermes `thinkingTokens`).
     pub thinking_token_est: u32,
     /// Accumulated rough estimate for tool args this turn (Hermes `toolTokenAcc`).
     pub tool_token_acc: u32,
     pub hint: Option<String>,
+    /// Human-readable detail for blocking non-streaming LLM waits (LM Studio, Ollama).
+    pub llm_wait_detail: Option<String>,
+    /// Short status-bar label for the same wait (no mid-word truncation).
+    pub llm_wait_compact: Option<String>,
     /// Short rolling notices (long-run charms, onboarding) — Hermes Activity feed.
     pub activity_feed: Vec<ActivityNotice>,
     long_run_hints_per_tool: HashMap<String, usize>,
@@ -163,10 +167,13 @@ impl TurnActivityState {
             subagents: HashMap::new(),
             generating_tool: None,
             generating_preview: None,
+            generating_args_bytes: 0,
             reasoning_snippet: None,
             thinking_token_est: 0,
             tool_token_acc: 0,
             hint: None,
+            llm_wait_detail: None,
+            llm_wait_compact: None,
             activity_feed: Vec::new(),
             long_run_hints_per_tool: HashMap::new(),
             long_run_last_at: HashMap::new(),
@@ -192,10 +199,13 @@ impl TurnActivityState {
         self.subagents.clear();
         self.generating_tool = None;
         self.generating_preview = None;
+        self.generating_args_bytes = 0;
         self.reasoning_snippet = None;
         self.thinking_token_est = 0;
         self.tool_token_acc = 0;
         self.hint = None;
+        self.llm_wait_detail = None;
+        self.llm_wait_compact = None;
         self.activity_feed.clear();
         self.long_run_hints_per_tool.clear();
         self.long_run_last_at.clear();
@@ -204,9 +214,61 @@ impl TurnActivityState {
 
     /// Hermes `pruneTransient()` — clear bridge phases when the model resumes.
     pub fn on_model_resuming(&mut self) {
-        if matches!(self.phase, ShelfPhase::AnalyzingOutput) {
+        if matches!(
+            self.phase,
+            ShelfPhase::AwaitingFirstToken
+        ) {
             self.set_phase(ShelfPhase::Streaming);
         }
+        self.llm_wait_detail = None;
+        self.llm_wait_compact = None;
+    }
+
+    /// Clear in-flight streamed tool draft UI (non-streaming retry / stall abort).
+    pub fn clear_tool_generating(&mut self) {
+        self.generating_tool = None;
+        self.generating_preview = None;
+        self.generating_args_bytes = 0;
+        if matches!(self.phase, ShelfPhase::GeneratingTool) {
+            self.set_phase(ShelfPhase::AwaitingFirstToken);
+        }
+    }
+
+    pub fn on_llm_wait_progress(
+        &mut self,
+        provider: &str,
+        elapsed_secs: u64,
+        has_tools: bool,
+        ctx: edgecrab_tools::tool_progress_tail::LlmWaitContext,
+    ) {
+        let detail = edgecrab_tools::tool_progress_tail::llm_wait_progress_label(
+            provider, elapsed_secs, has_tools, ctx,
+        );
+        self.llm_wait_compact = Some(edgecrab_tools::tool_progress_tail::llm_wait_status_compact(
+            provider, has_tools, ctx,
+        ));
+        self.llm_wait_detail = Some(detail.clone());
+        self.set_phase(ShelfPhase::AwaitingFirstToken);
+        let tone = if elapsed_secs >= 45 {
+            ActivityTone::Warn
+        } else {
+            ActivityTone::Info
+        };
+        if self
+            .activity_feed
+            .last()
+            .is_some_and(|last| last.text == detail)
+        {
+            return;
+        }
+        if self.activity_feed.len() >= SHELF_ACTIVITY_FEED_MAX {
+            self.activity_feed.remove(0);
+        }
+        self.activity_feed.push(ActivityNotice {
+            text: detail,
+            tone,
+        });
+        self.hint = self.llm_wait_detail.clone();
     }
 
     pub fn push_activity(&mut self, text: String, tone: ActivityTone) {
@@ -225,7 +287,26 @@ impl TurnActivityState {
             self.activity_feed.remove(0);
         }
         self.activity_feed.push(notice.clone());
-        self.hint = Some(notice.text);
+        self.hint = Some(notice.text.clone());
+    }
+
+    /// Short label for status bar / ghost line during blocking LLM waits.
+    pub fn llm_wait_compact_label(&self) -> Option<&str> {
+        self.llm_wait_compact.as_deref()
+    }
+
+    /// Full shelf line during blocking LLM waits (activity feed).
+    pub fn llm_wait_label(&self) -> Option<&str> {
+        self.llm_wait_detail.as_deref().or_else(|| {
+            self.activity_feed.iter().rev().find_map(|n| {
+                let t = n.text.as_str();
+                if t.contains("composing") || t.contains("non-streaming") || t.contains("Bedrock") {
+                    Some(t)
+                } else {
+                    None
+                }
+            })
+        })
     }
 
     pub fn set_phase(&mut self, phase: ShelfPhase) {
@@ -237,14 +318,13 @@ impl TurnActivityState {
 
     pub fn on_generating(&mut self, tool_call_id: String, name: String, partial_args: String) {
         self.on_model_resuming();
-        self.generating_tool = Some((tool_call_id, name));
-        let live = crate::transcript_heights::bounded_live_render_text(
-            partial_args.trim(),
+        self.generating_tool = Some((tool_call_id, name.clone()));
+        self.generating_args_bytes = partial_args.len();
+        let preview = crate::tool_display::extract_streaming_tool_preview(&name, &partial_args);
+        self.generating_preview = Some(crate::transcript_heights::bounded_live_render_text(
+            preview.trim(),
             crate::transcript_heights::LIVE_RENDER_MAX_CHARS,
-        );
-        if !live.is_empty() {
-            self.generating_preview = Some(live);
-        }
+        ));
         self.set_phase(ShelfPhase::GeneratingTool);
     }
 
@@ -259,6 +339,7 @@ impl TurnActivityState {
         self.on_model_resuming();
         self.generating_tool = None;
         self.generating_preview = None;
+        self.generating_args_bytes = 0;
         let rough = crate::shelf_visual::estimate_tokens_rough(&format!("{name} {preview}"));
         self.tool_token_acc = self.tool_token_acc.saturating_add(rough);
         self.tools.insert(
@@ -334,7 +415,7 @@ impl TurnActivityState {
         self.long_run_hints_per_tool.remove(tool_call_id);
         self.long_run_last_at.remove(tool_call_id);
         if self.tools.is_empty() {
-            self.set_phase(ShelfPhase::AnalyzingOutput);
+            self.set_phase(ShelfPhase::AwaitingFirstToken);
         } else {
             self.set_phase(ShelfPhase::ToolExec);
         }
@@ -372,7 +453,7 @@ impl TurnActivityState {
                 .saturating_add(crate::shelf_visual::estimate_tokens_rough(text));
             if matches!(
                 self.phase,
-                ShelfPhase::Idle | ShelfPhase::AwaitingFirstToken | ShelfPhase::AnalyzingOutput
+                ShelfPhase::Idle | ShelfPhase::AwaitingFirstToken
             ) {
                 self.set_phase(ShelfPhase::Thinking);
             }
@@ -457,7 +538,16 @@ impl TurnActivityState {
         let elapsed = self.phase_started.elapsed().as_secs();
         match self.phase {
             ShelfPhase::Idle => None,
-            ShelfPhase::AwaitingFirstToken => Some(format!("awaiting response ({elapsed}s)")),
+            ShelfPhase::AwaitingFirstToken => {
+                if let Some(detail) = self.llm_wait_label() {
+                    Some(format!(
+                        "{} ({elapsed}s)",
+                        edgecrab_core::safe_truncate(detail, 72)
+                    ))
+                } else {
+                    Some(format!("awaiting model response ({elapsed}s)"))
+                }
+            }
             ShelfPhase::Thinking => self
                 .reasoning_snippet
                 .clone()
@@ -466,7 +556,6 @@ impl TurnActivityState {
             ShelfPhase::GeneratingTool => self.generating_caption(),
             ShelfPhase::Streaming => Some(format!("streaming ({elapsed}s)")),
             ShelfPhase::ToolExec => self.active_tool_caption(),
-            ShelfPhase::AnalyzingOutput => Some("analyzing tool output…".into()),
             ShelfPhase::WaitingForApproval => Some("waiting for approval".into()),
             ShelfPhase::WaitingForClarify => Some("waiting for clarification".into()),
             ShelfPhase::BgOp => Some("background operation…".into()),
@@ -475,6 +564,13 @@ impl TurnActivityState {
 
     /// Single-line caption for shelf compact mode, input title, and status hints.
     pub fn live_caption(&self) -> Option<String> {
+        if let Some(detail) = self.llm_wait_label() {
+            let elapsed = self.phase_started.elapsed().as_secs();
+            return Some(format!(
+                "{} ({elapsed}s)",
+                edgecrab_core::safe_truncate(detail, 72)
+            ));
+        }
         if let Some(text) = self.generating_caption() {
             return Some(text);
         }
@@ -514,13 +610,24 @@ impl TurnActivityState {
     fn generating_caption(&self) -> Option<String> {
         let (_, name) = self.generating_tool.as_ref()?;
         let label = name.replace('_', " ");
+        let elapsed = self.phase_started.elapsed().as_secs();
+        let elapsed_suffix = if elapsed > 0 {
+            format!(" · {elapsed}s")
+        } else {
+            String::new()
+        };
         let preview = self
             .generating_preview
             .as_deref()
             .filter(|p| !p.trim().is_empty());
         Some(match preview {
-            Some(p) => format!("preparing {label} · {p}"),
-            None => format!("preparing {label}"),
+            Some(p) => format!("preparing {label} · {p}{elapsed_suffix}"),
+            None => format!(
+                "preparing {label} · {}{elapsed_suffix}",
+                edgecrab_tools::tool_progress_tail::format_streaming_args_progress(
+                    self.generating_args_bytes
+                )
+            ),
         })
     }
 
@@ -558,7 +665,14 @@ impl TurnActivityState {
             let (_, name) = self.generating_tool.as_ref()?;
             return Some(TurnToolSummary {
                 primary_name: name.clone(),
-                detail: self.generating_preview.clone().unwrap_or_default(),
+                detail: self
+                    .generating_preview
+                    .clone()
+                    .unwrap_or_else(|| {
+                        edgecrab_tools::tool_progress_tail::format_streaming_args_progress(
+                            self.generating_args_bytes,
+                        )
+                    }),
                 active_count: 0,
                 elapsed_secs: self.phase_started.elapsed().as_secs(),
                 preparing: true,
@@ -625,6 +739,11 @@ impl TurnActivityState {
     }
 
     pub fn tick_long_run_hints(&mut self, now: Instant) {
+        if matches!(self.phase, ShelfPhase::GeneratingTool)
+            && let Some((id, _)) = self.generating_tool.clone()
+        {
+            self.maybe_generating_long_run_hint(&id, now);
+        }
         let active: Vec<(String, Instant)> = self
             .tools
             .iter()
@@ -637,6 +756,51 @@ impl TurnActivityState {
                 break;
             }
         }
+    }
+
+    fn maybe_generating_long_run_hint(&mut self, tool_call_id: &str, now: Instant) {
+        if self.long_run_hint_count >= MAX_LONG_RUN_HINTS_PER_TURN {
+            return;
+        }
+        let per_tool = self
+            .long_run_hints_per_tool
+            .get(tool_call_id)
+            .copied()
+            .unwrap_or(0);
+        if per_tool >= MAX_LONG_RUN_HINTS_PER_TOOL {
+            return;
+        }
+        if now.duration_since(self.phase_started) < Duration::from_secs(LONG_RUN_HINT_SECS) {
+            return;
+        }
+        if let Some(last) = self.long_run_last_at.get(tool_call_id)
+            && now.duration_since(*last) < Duration::from_secs(LONG_RUN_HINT_INTERVAL_SECS)
+        {
+            return;
+        }
+        let Some((_, name)) = self.generating_tool.as_ref() else {
+            return;
+        };
+        let charm = self
+            .long_run_charms
+            .get(per_tool % self.long_run_charms.len())
+            .map(String::as_str)
+            .unwrap_or("still drafting");
+        let detail = self
+            .generating_preview
+            .as_deref()
+            .filter(|d| !d.trim().is_empty())
+            .unwrap_or("tool args");
+        let line = format!(
+            "{charm} — model drafting {} · {detail}",
+            name.replace('_', " ")
+        );
+        self.push_activity(line, ActivityTone::Warn);
+        self.long_run_hints_per_tool
+            .insert(tool_call_id.to_string(), per_tool + 1);
+        self.long_run_last_at
+            .insert(tool_call_id.to_string(), now);
+        self.long_run_hint_count += 1;
     }
 }
 

@@ -35,7 +35,6 @@ pub fn spinner_kind_for_state(state: &TurnActivityState) -> SpinnerKind {
         ShelfPhase::ToolExec | ShelfPhase::GeneratingTool | ShelfPhase::BgOp => SpinnerKind::Tool,
         ShelfPhase::Thinking
         | ShelfPhase::AwaitingFirstToken
-        | ShelfPhase::AnalyzingOutput
         | ShelfPhase::Streaming => SpinnerKind::Thinking,
         _ => SpinnerKind::Default,
     }

@@ -342,6 +342,13 @@ fn append_thinking_lines(
 }
 
 fn thinking_content(state: &TurnActivityState, details: &ShelfDetailsState) -> Option<String> {
+    if let Some(label) = state.llm_wait_label() {
+        let elapsed = state.phase_started.elapsed().as_secs();
+        return Some(format!(
+            "{} ({elapsed}s)",
+            edgecrab_core::safe_truncate(label, 72)
+        ));
+    }
     let render = thinking_render_mode(state, details);
     if render != SectionRender::Skip
         && let Some(snippet) = state

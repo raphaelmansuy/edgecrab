@@ -133,17 +133,32 @@ Use this when users report “the agent is stuck.”
 
 ---
 
+## S14 — LM Studio / Ollama “composing tool call” — ⚠️ (often normal)
+
+| | |
+|---|---|
+| **User report** | “Stuck 30–180s after tools finished”; status `(¬_¬) negotiating` / `awaiting` |
+| **Visible now** | Shelf `lmstudio: still composing tool call ~Nk/262k ctx`; preflight `max_tokens=2048 reasoning=none tool_choice=required`; LM Studio **GEN/tok** climbing |
+| **Root cause** | **Not tool dispatch** — blocked on non-streaming `chat/completions` while server prefills prompt + generates tool-call JSON ([first principles](../014-improve-local-harness/002-first-principles-why.md)) |
+| **Code** | [local_provider_policy.rs](../../crates/edgecrab-core/src/local_provider_policy.rs), [conversation.rs non-streaming heartbeat](../../crates/edgecrab-core/src/conversation.rs), [mutation_turn_policy.rs](../../crates/edgecrab-tools/src/mutation_turn_policy.rs) |
+| **If GEN → ~2048 then loops** | `finish_reason=length` + empty `tool_calls` — output budget exhausted; steer incremental mutation or rebuild with [014 prefill/length prune](../014-improve-local-harness/006-solution-plan.md) |
+| **If benign** | GEN increasing, tools already fast — wait; watch LM Studio UI |
+
+---
+
 ## Diagnostic checklist
 
 1. **`display_state`** — ToolExec vs AwaitingFirstToken vs WaitingForApproval
 2. **`/verbose` mode** — Off still shows minimal `⏳` line when progress wired
 3. **Last tool** — `terminal`, `wait_for_process`, `web_*`, `browser_*` = long-blocking
-4. **Logs** — compression ActivityNotice, tool progress throttling
+4. **Logs** — compression ActivityNotice, tool progress throttling, `edgecrab::local_llm` length/prune events
 5. **`in_flight_tool_count`** — parallel tools
 6. **Approval/clarify modal** — input rerouted
+7. **Local provider** — if tools done but shelf says “composing”, see **S14** (not S1 terminal stall)
 
 ## Cross-references
 
 - Assessment → [005-honest-assessment.md](005-honest-assessment.md)
 - Stream events → [004-stream-event-contract.md](004-stream-event-contract.md)
 - Roadmap → [007-implementation-roadmap.md](007-implementation-roadmap.md)
+- Local inference harness → [014-improve-local-harness](../014-improve-local-harness/README.md)

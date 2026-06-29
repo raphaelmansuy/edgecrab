@@ -306,6 +306,29 @@ async fn forward_stream_event_to_tui(
             tracing::info!(len = text.len(), "TUI→agent: forwarding activity notice");
             let _ = tx.send(AgentResponse::ActivityFeed(text));
         }
+        StreamEvent::LlmWaitProgress {
+            provider,
+            elapsed_secs,
+            has_tools,
+            prompt_tokens_estimated,
+            context_length,
+            prefill_pct,
+        } => {
+            tracing::info!(
+                provider = %provider,
+                elapsed_secs,
+                has_tools,
+                "TUI→agent: forwarding LLM wait progress"
+            );
+            let _ = tx.send(AgentResponse::LlmWaitProgress {
+                provider,
+                elapsed_secs,
+                has_tools,
+                prompt_tokens_estimated,
+                context_length,
+                prefill_pct,
+            });
+        }
         StreamEvent::BackgroundProcessTail {
             process_id,
             command_preview,

@@ -224,6 +224,11 @@ impl App {
             self.render_steering_overlay(frame, frame.area());
         }
 
+        // Skill guard trust overlay (high precedence)
+        if self.skill_trust_prompt.is_some() {
+            self.render_skill_trust_overlay(frame, frame.area());
+        }
+
         // Approval overlay (full screen, highest precedence)
         if matches!(self.display_state, DisplayState::WaitingForApproval { .. }) {
             self.render_approval_overlay(frame, frame.area());
@@ -256,6 +261,7 @@ impl App {
             terminal_glyph_profile: self.terminal_glyph_profile,
             show_output_scrollbar: self.show_output_scrollbar,
             paging_key_hint,
+            llm_wait_label: self.turn_activity.llm_wait_label(),
         };
         if self.rich_transcript {
             render_transcript_rich(frame, area, &mut params, &mut metrics);

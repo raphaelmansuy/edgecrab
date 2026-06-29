@@ -20,9 +20,6 @@ use std::sync::{Mutex, OnceLock};
 
 use regex::Regex;
 
-use edgecrab_tools::edit_contract::{
-    DEFAULT_MAX_MUTATION_PAYLOAD_BYTES, DEFAULT_MAX_MUTATION_PAYLOAD_KIB,
-};
 use edgecrab_tools::tools::skills::load_skill_prompt_bundle;
 use edgecrab_types::Platform;
 
@@ -631,26 +628,24 @@ Operational rules:
 EdgeCrab's LSP surface exceeds the common 9-operation baseline: it includes navigation plus code actions, rename, formatting, inlay hints, semantic tokens, signature help, type hierarchy, diagnostics pull, linked editing, LLM-enriched diagnostics, guided action selection, and workspace-wide type-error scans.";
 
 fn code_editing_guidance() -> String {
-    format!(
-        "\
-## Code Editing Execution
+    edgecrab_tools::mutation_turn_policy::default_code_editing_guidance()
+}
 
-When the user asks for a concrete code or file change and the necessary tools are available, inspect the relevant files and apply the edit in the same turn.
+fn code_editing_guidance_for_model(model_str: &str) -> String {
+    let provider = model_str.split('/').next().unwrap_or(model_str);
+    if matches!(provider, "lmstudio" | "ollama") {
+        let max_bytes = edgecrab_tools::mutation_turn_policy::local_default_max_tool_argument_bytes();
+        let max_kib = max_bytes.div_ceil(1024);
+        edgecrab_tools::mutation_turn_policy::code_editing_guidance(max_bytes, max_kib)
+    } else {
+        code_editing_guidance()
+    }
+}
 
-Rules:
-  - Do not stop at a plan, draft diff, or 'ready for a patch?' unless the user explicitly asked for a plan/options or the requirements are materially ambiguous.
-  - Use read/search/LSP tools to gather the minimum context needed, then mutate files with apply_patch or write_file.
-  - Create new files directly when the request requires them, but keep the first write small when the file will be substantial.
-        - `write_file` has no touch-only overwrite mode: include `content` when replacing an existing non-empty file. If you already know the full content and it fits within the payload limit, write it in the first call instead of creating an empty scaffold.
-        - Omit `content` only for a genuinely minimal scaffold that you will extend immediately with patch/apply_patch, or when the final artifact is too large for a single write_file call.
-        - For an existing non-empty file, call `read_file` in the current session before using `write_file`. Blind full-file overwrites are rejected because they are too risky under LLM cached context.
-    - If a file may have changed after your last read, call `read_file` again before `write_file`, `patch`, or `apply_patch`. Cached context can be stale even when your reasoning is otherwise correct.
-  - The file-mutation contract is hard-bounded: each write_file content payload and each apply_patch patch payload must stay at or under {DEFAULT_MAX_MUTATION_PAYLOAD_BYTES} bytes ({DEFAULT_MAX_MUTATION_PAYLOAD_KIB} KiB) per call.
-  - For large files, full game engines, long scripts, or other substantial code artifacts, do NOT attempt a single giant write_file or execute_code payload. Create a minimal scaffold first, then add the implementation with focused patch/apply_patch steps.
-  - Do not call execute_code as a placeholder plan. Only call it when you already have a concrete code payload to run.
-  - Once the requested edit or artifact is complete, stop expanding scope. Do not add bonus summary files, quick-reference docs, start-here files, or repeated verification passes unless the user explicitly asked for them.
-  - After editing, report what changed and any verification you ran.
-  - Ask before destructive changes outside the user's stated scope."
+fn is_local_inference_model(model_str: &str) -> bool {
+    matches!(
+        model_str.split('/').next().unwrap_or(model_str),
+        "lmstudio" | "ollama"
     )
 }
 
@@ -1272,7 +1267,7 @@ impl PromptBuilder {
 
         // 14. Direct code-editing guidance — only when file-mutation tools are present.
         if self.has_any_tool(&["apply_patch", "write_file"]) {
-            stable.push(Cow::Owned(code_editing_guidance()));
+            stable.push(Cow::Owned(code_editing_guidance_for_model(model_str)));
         }
 
         // 15a. File-output enforcement guidance (FP34) — injected whenever write_file
@@ -1327,6 +1322,22 @@ impl PromptBuilder {
                 }
             }
             dynamic.push(Cow::Owned(ts));
+        }
+
+        // D1b. Local inference output geometry — dynamic because model/provider is session config.
+        if is_local_inference_model(model_str)
+            && self.has_any_tool(&["write_file", "patch", "apply_patch", "execute_code"])
+        {
+            let max_tokens = crate::local_provider_policy::local_tool_turn_absolute_max_tokens_default();
+            let max_arg =
+                edgecrab_tools::mutation_turn_policy::local_max_tool_argument_bytes_for_output_tokens(
+                    max_tokens,
+                );
+            dynamic.push(Cow::Owned(
+                edgecrab_tools::mutation_turn_policy::local_inference_geometry_guidance(
+                    max_arg, max_tokens,
+                ),
+            ));
         }
 
         // D2. Execution environment guidance (cwd, allowed paths, etc.)
@@ -3297,16 +3308,16 @@ Run `${CLAUDE_SKILL_DIR}/scripts/helper.py --session ${CLAUDE_SESSION_ID}`.\n",
             "guidance must explicitly prohibit waiting for patch approval when not requested"
         );
         assert!(
-            prompt.contains("Do not add bonus summary files"),
+            prompt.contains("stop expanding scope"),
             "guidance must explicitly forbid scope creep after the requested artifact is complete"
         );
         assert!(
-            prompt.contains("do NOT attempt a single giant write_file or execute_code payload"),
+            prompt.contains("NEVER emit one giant write_file or execute_code payload"),
             "guidance must forbid monolithic payload writes for large artifacts"
         );
         assert!(
-            prompt.contains("If you already know the full content and it fits within the payload limit, write it in the first call"),
-            "guidance must tell the model to avoid unnecessary empty scaffolds"
+            prompt.contains("keep the first write small"),
+            "guidance must tell the model to avoid unnecessary large first writes"
         );
         assert!(
             prompt.contains("For an existing non-empty file, call `read_file` in the current session before using `write_file`"),
@@ -3327,6 +3338,36 @@ Run `${CLAUDE_SKILL_DIR}/scripts/helper.py --session ${CLAUDE_SESSION_ID}`.\n",
         assert!(
             !prompt.contains("## Code Editing Execution"),
             "code-editing guidance must not appear without mutation tools"
+        );
+    }
+
+    #[test]
+    fn lh55_local_model_code_editing_guidance_uses_output_geometry_not_config_kib() {
+        let builder = PromptBuilder::new(Platform::Cli)
+            .skip_context_files(true)
+            .model_name(Some("lmstudio/qwen/qwen3.6-35b-a3b".into()))
+            .available_tools(vec![
+                "write_file".to_string(),
+                "patch".to_string(),
+                "execute_code".to_string(),
+            ]);
+        let blocks = builder.build_blocks(None, None, &[], None);
+        let combined = blocks.combined();
+        assert!(
+            combined.contains("27852 bytes"),
+            "local model must cite output-geometry arg cap, not 32 KiB config limit"
+        );
+        assert!(
+            !combined.contains("32768 bytes (32 KiB)"),
+            "local model must not cite cloud config cap in code-editing guidance"
+        );
+        assert!(
+            combined.contains("## Local Inference Tool Geometry"),
+            "local model must include dynamic geometry block"
+        );
+        assert!(
+            combined.contains("max completion tokens: 8192"),
+            "geometry block must cite local max_tokens default"
         );
     }
 

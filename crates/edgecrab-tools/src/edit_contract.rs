@@ -64,14 +64,14 @@ pub fn enforce_write_payload_limit_with_max(
     } else {
         "creation"
     };
-
-    let max_kib = max_bytes / 1024;
-    Err(ToolError::Other(format!(
-        "Refusing {target_kind} via {tool_name} for '{path}' ({bytes} bytes > {max_bytes} bytes / {max_kib} KiB). \
-         Large single-call mutation payloads are unreliable because the model must emit \
-         the entire payload in one tool call. Create a small scaffold first, then grow \
-         it with focused patch/apply_patch steps."
-    )))
+    let _ = target_kind;
+    Err(crate::recovery_catalog::mutation_payload_too_large(
+        tool_name,
+        path,
+        bytes,
+        max_bytes,
+        !resolved.exists(),
+    ))
 }
 
 pub fn enforce_patch_payload_limit(
@@ -97,12 +97,13 @@ pub fn enforce_patch_payload_limit_with_max(
         return Ok(());
     }
 
-    let max_kib = max_bytes / 1024;
-    Err(ToolError::Other(format!(
-        "Refusing {tool_name} for '{path}' ({payload_bytes} bytes > {max_bytes} bytes / {max_kib} KiB). \
-         Large single-call edit payloads are unreliable. Split the change into \
-         smaller focused patches."
-    )))
+    Err(crate::recovery_catalog::mutation_payload_too_large(
+        tool_name,
+        path,
+        payload_bytes,
+        max_bytes,
+        false,
+    ))
 }
 
 pub fn enforce_apply_patch_payload_limit(patch_text: &str) -> Result<(), ToolError> {
@@ -118,12 +119,13 @@ pub fn enforce_apply_patch_payload_limit_with_max(
         return Ok(());
     }
 
-    let max_kib = max_bytes / 1024;
-    Err(ToolError::Other(format!(
-        "Refusing apply_patch payload ({bytes} bytes > {max_bytes} bytes / {max_kib} KiB). \
-         Split the refactor into multiple focused apply_patch calls so each tool \
-         argument stays within the mutation contract."
-    )))
+    Err(crate::recovery_catalog::mutation_payload_too_large(
+        "apply_patch",
+        "(multi-file patch)",
+        bytes,
+        max_bytes,
+        false,
+    ))
 }
 
 #[cfg(test)]

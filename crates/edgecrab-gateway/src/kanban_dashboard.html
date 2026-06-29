@@ -1,0 +1,505 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>EdgeCrab Kanban</title>
+  <style>
+    :root { --bg:#0f1117; --card:#1a1d27; --text:#e6e8ef; --muted:#8b90a0; --accent:#5b9fd4; --ok:#6bcf7f; --err:#e07070; }
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 1rem; }
+    header { display: flex; gap: 1rem; align-items: center; flex-wrap: wrap; margin-bottom: 1rem; }
+    h1 { font-size: 1.25rem; margin: 0; }
+    .meta { color: var(--muted); font-size: 0.85rem; }
+    .board { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 0.75rem; }
+    .col { background: var(--card); border-radius: 8px; padding: 0.5rem; min-height: 120px; }
+    .col h2 { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin: 0 0 0.5rem; }
+    .card { background: #252836; border-radius: 6px; padding: 0.5rem 0.6rem; margin-bottom: 0.4rem; font-size: 0.85rem; cursor: pointer; }
+    .card:hover { outline: 1px solid var(--accent); }
+    .card.dragging { opacity: 0.45; }
+    .col.drop-target { outline: 2px dashed var(--accent); outline-offset: -2px; }
+    .card-id { color: var(--muted); font-size: 0.7rem; }
+    #detail, #settings { margin-top: 1rem; background: var(--card); border-radius: 8px; padding: 1rem; font-size: 0.85rem; display: none; }
+    #detail pre { white-space: pre-wrap; margin: 0.5rem 0 0; }
+    .live { color: var(--ok); }
+    .actions { margin-top: 0.75rem; display: flex; gap: 0.5rem; flex-wrap: wrap; }
+    button, .btn { background: var(--accent); color: #fff; border: none; border-radius: 6px; padding: 0.4rem 0.75rem; cursor: pointer; font-size: 0.85rem; }
+    button:disabled { opacity: 0.5; cursor: wait; }
+    .btn.secondary { background: #3a4054; }
+    .msg { margin-top: 0.5rem; font-size: 0.85rem; }
+    .msg.ok { color: var(--ok); }
+    .msg.err { color: var(--err); }
+    label { display: block; margin: 0.5rem 0 0.25rem; color: var(--muted); font-size: 0.75rem; }
+    select, input[type=text], textarea { width: 100%; background: #252836; color: var(--text); border: 1px solid #3a4054; border-radius: 6px; padding: 0.35rem 0.5rem; font-size: 0.85rem; }
+    textarea { min-height: 3rem; resize: vertical; }
+    .profile-row { margin-top: 0.75rem; padding-top: 0.75rem; border-top: 1px solid #3a4054; }
+    .toggle { display: flex; align-items: center; gap: 0.5rem; margin-top: 0.5rem; }
+    .runs { list-style: none; padding: 0; margin: 0.5rem 0 0; }
+    .runs li { padding: 0.35rem 0; border-bottom: 1px solid #3a4054; font-size: 0.8rem; }
+    .runs li.ok { color: var(--ok); }
+    .runs li.err { color: var(--err); }
+    .comments { margin-top: 0.75rem; font-size: 0.8rem; color: var(--muted); }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>EdgeCrab Kanban</h1>
+    <span class="meta" id="board-name">loading…</span>
+    <span class="meta live" id="live">● live</span>
+    <button type="button" class="btn secondary" id="settings-toggle">⚙ Settings</button>
+  </header>
+  <div id="settings"></div>
+  <div class="board" id="board"></div>
+  <div id="detail"></div>
+  <script>
+    const KANBAN_TOKEN = __KANBAN_TOKEN__;
+    const COLS = ['triage','todo','doing','blocked','done'];
+    const DESTRUCTIVE_STATUS = ['done', 'blocked'];
+    let cursor = 0;
+    let ws;
+    let selectedTask = null;
+    let selectedStatus = null;
+    let settingsOpen = false;
+    let orchestration = null;
+    let profiles = [];
+    let lastTaskScheduledAt = null;
+
+    function authHeaders(json) {
+      const h = {};
+      if (KANBAN_TOKEN) h['Authorization'] = 'Bearer ' + KANBAN_TOKEN;
+      if (json) h['Content-Type'] = 'application/json';
+      return h;
+    }
+
+    function apiUrl(path) {
+      if (KANBAN_TOKEN && path.indexOf('token=') === -1) {
+        const sep = path.indexOf('?') >= 0 ? '&' : '?';
+        return path + sep + 'token=' + encodeURIComponent(KANBAN_TOKEN);
+      }
+      return path;
+    }
+
+    function colEl(name, tasks) {
+      const el = document.createElement('div');
+      el.className = 'col';
+      el.dataset.column = name;
+      el.innerHTML = '<h2>' + name + ' (' + tasks.length + ')</h2>';
+      tasks.forEach(t => {
+        const c = document.createElement('div');
+        c.className = 'card';
+        c.draggable = true;
+        c.dataset.taskId = t.id;
+        c.dataset.status = t.status;
+        const assignee = t.assignee ? ' · ' + t.assignee : '';
+        c.innerHTML = '<div class="card-id">' + t.id + assignee + '</div><div>' + escapeHtml(t.title) + '</div>';
+        c.onclick = () => showTask(t.id, t.status);
+        c.ondragstart = (e) => {
+          e.dataTransfer.setData('text/plain', t.id);
+          e.dataTransfer.setData('application/x-kanban-status', t.status);
+          c.classList.add('dragging');
+        };
+        c.ondragend = () => c.classList.remove('dragging');
+        el.appendChild(c);
+      });
+      el.ondragover = (e) => { e.preventDefault(); el.classList.add('drop-target'); };
+      el.ondragleave = (e) => { if (e.currentTarget === el) el.classList.remove('drop-target'); };
+      el.ondrop = (e) => {
+        e.preventDefault();
+        el.classList.remove('drop-target');
+        const id = e.dataTransfer.getData('text/plain');
+        const from = e.dataTransfer.getData('application/x-kanban-status');
+        if (!id || from === name) return;
+        moveTaskColumn(id, from, name);
+      };
+      return el;
+    }
+
+    async function moveTaskColumn(id, fromStatus, toStatus) {
+      if (toStatus === 'doing') {
+        alert('Cannot drag to doing — dispatcher claims tasks from todo.');
+        return;
+      }
+      let body = { status: toStatus };
+      if (DESTRUCTIVE_STATUS.includes(toStatus)) {
+        if (!confirm('Move task to "' + toStatus + '"?')) return;
+        if (toStatus === 'blocked') {
+          const reason = prompt('Block reason (optional):') || '';
+          if (reason) body.block_reason = reason;
+        }
+        if (toStatus === 'done') {
+          const summary = prompt('Completion summary (optional):') || '';
+          if (summary) body.summary = summary;
+        }
+      }
+      try {
+        await patchTaskStatus(id, body);
+      } catch (e) {
+        alert(String(e));
+      }
+    }
+
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+    }
+
+    async function refreshBoard() {
+      const r = await fetch(apiUrl('/api/kanban/board'), { headers: authHeaders() });
+      if (!r.ok) { document.getElementById('board-name').textContent = 'kanban disabled or unauthorized'; return; }
+      const data = await r.json();
+      document.getElementById('board-name').textContent = 'board: ' + data.board;
+      const root = document.getElementById('board');
+      root.innerHTML = '';
+      COLS.forEach(col => {
+        const tasks = (data.columns && data.columns[col]) || [];
+        root.appendChild(colEl(col, tasks));
+      });
+      if (selectedTask) showTask(selectedTask, selectedStatus);
+    }
+
+    async function loadSettingsData() {
+      const [orchR, profR] = await Promise.all([
+        fetch(apiUrl('/api/kanban/orchestration'), { headers: authHeaders() }),
+        fetch(apiUrl('/api/kanban/profiles'), { headers: authHeaders() }),
+      ]);
+      if (orchR.ok) orchestration = await orchR.json();
+      if (profR.ok) {
+        const body = await profR.json();
+        profiles = body.profiles || [];
+      }
+    }
+
+    function profileOptions(selected) {
+      return profiles.map(p =>
+        '<option value="' + escapeHtml(p.name) + '"' + (p.name === selected ? ' selected' : '') + '>' +
+        escapeHtml(p.name) + '</option>'
+      ).join('');
+    }
+
+    function renderSettingsPanel() {
+      const box = document.getElementById('settings');
+      if (!settingsOpen) { box.style.display = 'none'; return; }
+      box.style.display = 'block';
+      if (!orchestration) {
+        box.innerHTML = '<div class="msg">Loading settings…</div>';
+        return;
+      }
+      const orch = orchestration.orchestrator_profile || '';
+      const def = orchestration.default_assignee || '';
+      let html = '<h2>Orchestration</h2>';
+      html += '<label>Orchestrator profile</label><select id="orch-select">' +
+        '<option value="">(active: ' + escapeHtml(orchestration.resolved_orchestrator_profile) + ')</option>' +
+        profileOptions(orch) + '</select>';
+      html += '<label>Default assignee</label><select id="default-select">' +
+        '<option value="">(active: ' + escapeHtml(orchestration.resolved_default_assignee) + ')</option>' +
+        profileOptions(def) + '</select>';
+      html += '<div class="toggle"><input type="checkbox" id="auto-decompose"' +
+        (orchestration.auto_decompose ? ' checked' : '') + '><label for="auto-decompose">Auto-decompose triage tasks</label></div>';
+      html += '<label>Per-profile concurrency cap (0 = unlimited)</label>' +
+        '<input type="number" id="per-profile-cap" min="0" max="99" value="' +
+        (orchestration.max_in_progress_per_profile != null ? orchestration.max_in_progress_per_profile : 0) + '">';
+      html += '<div class="actions"><button type="button" id="save-settings">Save settings</button></div>';
+      html += '<div id="settings-msg" class="msg"></div>';
+      html += '<h2 style="margin-top:1rem">Profile descriptions</h2>';
+      profiles.forEach(p => {
+        const autoBadge = p.description_auto
+          ? ' <span class="meta">(auto — review)</span>' : '';
+        html += '<div class="profile-row"><strong>' + escapeHtml(p.name) + '</strong>' +
+          autoBadge +
+          (p.model ? ' <span class="meta">(' + escapeHtml(p.model) + ')</span>' : '') +
+          '<textarea id="desc-' + escapeHtml(p.name) + '">' + escapeHtml(p.description || '') + '</textarea>' +
+          '<div class="actions"><button type="button" class="btn secondary save-desc" data-profile="' +
+          escapeHtml(p.name) + '">Save description</button>' +
+          '<button type="button" class="btn secondary auto-desc" data-profile="' +
+          escapeHtml(p.name) + '">⚗ Auto-generate</button>' +
+          '<span id="auto-msg-' + escapeHtml(p.name) + '" class="msg"></span></div></div>';
+      });
+      box.innerHTML = html;
+      document.getElementById('save-settings').onclick = saveSettings;
+      box.querySelectorAll('.save-desc').forEach(btn => {
+        btn.onclick = () => saveProfileDescription(btn.getAttribute('data-profile'));
+      });
+      box.querySelectorAll('.auto-desc').forEach(btn => {
+        btn.onclick = () => autoDescribeProfile(btn.getAttribute('data-profile'));
+      });
+    }
+
+    async function autoDescribeProfile(name) {
+      const msg = document.getElementById('auto-msg-' + name);
+      const ta = document.getElementById('desc-' + name);
+      if (msg) { msg.textContent = 'Generating…'; msg.className = 'msg'; }
+      try {
+        const r = await fetch(apiUrl('/api/kanban/profiles/' + encodeURIComponent(name) + '/describe-auto'), {
+          method: 'POST',
+          headers: authHeaders(true),
+          body: JSON.stringify({ overwrite: false }),
+        });
+        const data = await r.json();
+        if (msg) {
+          msg.textContent = data.reason || (data.ok ? 'Done' : 'Failed');
+          msg.className = 'msg ' + (data.ok ? 'ok' : 'err');
+        }
+        if (data.ok && data.description && ta) {
+          ta.value = data.description;
+          await loadSettingsData();
+        }
+      } catch (e) {
+        if (msg) { msg.textContent = String(e); msg.className = 'msg err'; }
+      }
+    }
+
+    async function saveSettings() {
+      const msg = document.getElementById('settings-msg');
+      const body = {
+        orchestrator_profile: document.getElementById('orch-select').value,
+        default_assignee: document.getElementById('default-select').value,
+        auto_decompose: document.getElementById('auto-decompose').checked,
+        max_in_progress_per_profile: parseInt(document.getElementById('per-profile-cap').value, 10) || 0,
+      };
+      try {
+        const r = await fetch(apiUrl('/api/kanban/orchestration'), {
+          method: 'PUT',
+          headers: authHeaders(true),
+          body: JSON.stringify(body),
+        });
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.error || 'save failed');
+        orchestration = data;
+        msg.textContent = 'Settings saved';
+        msg.className = 'msg ok';
+        renderSettingsPanel();
+      } catch (e) {
+        msg.textContent = String(e);
+        msg.className = 'msg err';
+      }
+    }
+
+    async function saveProfileDescription(name) {
+      const ta = document.getElementById('desc-' + name);
+      if (!ta) return;
+      try {
+        const r = await fetch(apiUrl('/api/kanban/profiles/' + encodeURIComponent(name)), {
+          method: 'PATCH',
+          headers: authHeaders(true),
+          body: JSON.stringify({ description: ta.value }),
+        });
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.error || 'save failed');
+        await loadSettingsData();
+        renderSettingsPanel();
+      } catch (e) {
+        alert(String(e));
+      }
+    }
+
+    document.getElementById('settings-toggle').onclick = async () => {
+      settingsOpen = !settingsOpen;
+      if (settingsOpen) {
+        await loadSettingsData();
+        renderSettingsPanel();
+      } else {
+        renderSettingsPanel();
+      }
+    };
+
+    async function showTask(id, status) {
+      selectedTask = id;
+      selectedStatus = status;
+      if (!profiles.length) await loadSettingsData();
+      const r = await fetch(apiUrl('/api/kanban/tasks/' + encodeURIComponent(id)), { headers: authHeaders() });
+      const box = document.getElementById('detail');
+      box.style.display = 'block';
+      if (!r.ok) { box.innerHTML = '<div class="msg err">Task not found</div>'; return; }
+      const data = await r.json();
+      const t = data.task;
+      lastTaskScheduledAt = t.scheduled_at || null;
+      const runs = data.runs || [];
+      const comments = data.comments || [];
+      const runsHtml = runs.length
+        ? '<h3 style="margin-top:1rem;font-size:0.85rem">Run history</h3><ul class="runs">' +
+          runs.map(r => {
+            const outcome = r.outcome || r.status || '?';
+            const cls = (outcome === 'done' || outcome === 'completed') ? 'ok'
+              : (outcome === 'failed' || outcome === 'blocked') ? 'err' : '';
+            const detail = r.summary || r.error || '';
+            const worker = r.worker_id ? ' · ' + escapeHtml(r.worker_id) : '';
+            return '<li class="' + cls + '"><strong>' + escapeHtml(outcome) + '</strong>' +
+              worker + (detail ? ' — ' + escapeHtml(detail) : '') + '</li>';
+          }).join('') + '</ul>'
+        : '';
+      const commentsHtml = comments.length
+        ? '<div class="comments"><strong>Comments</strong><ul>' +
+          comments.map(c => '<li>' + escapeHtml(c.author) + ': ' + escapeHtml(c.body) + '</li>').join('') +
+          '</ul></div>' : '';
+      const lines = [
+        t.id, t.title, 'status: ' + t.status,
+        t.assignee ? 'assignee: ' + t.assignee : '',
+        t.scheduled_at ? 'scheduled_at: ' + new Date(t.scheduled_at * 1000).toISOString() : '',
+        t.body || '', t.result ? 'result: ' + t.result : '',
+      ].filter(Boolean).join('\n');
+      const decomposeBtn = (t.status === 'triage')
+        ? '<div class="actions"><button id="decompose-btn" type="button">⚗ Decompose</button></div><div id="decompose-msg" class="msg"></div>'
+        : '';
+      const editHtml = '<div class="actions" style="margin-top:0.75rem">' +
+        '<label style="display:inline;margin-right:0.5rem">Status</label>' +
+        '<select id="task-status">' +
+        ['triage','todo','doing','blocked','done','archived'].map(s =>
+          '<option value="' + s + '"' + (t.status === s ? ' selected' : '') + '>' + s + '</option>'
+        ).join('') +
+        '</select>' +
+        '<label style="display:inline;margin:0 0.5rem 0 1rem">Assignee</label>' +
+        '<select id="task-assignee"><option value="">(none)</option>' +
+        profileOptions(t.assignee || '') +
+        '</select>' +
+        '<button type="button" id="save-task-btn">Save changes</button>' +
+        '<button type="button" class="btn secondary" id="archive-task-btn">Archive</button>' +
+        '<button type="button" class="btn secondary" id="delete-task-btn">Delete</button>' +
+        '</div>' +
+        '<div id="done-fields" style="display:none;margin-top:0.5rem">' +
+        '<label>Completion summary</label><textarea id="task-summary" placeholder="Optional handoff summary"></textarea>' +
+        '</div>' +
+        '<div id="block-fields" style="display:none;margin-top:0.5rem">' +
+        '<label>Block reason</label><input type="text" id="task-block-reason" placeholder="Why blocked?" />' +
+        '</div>' +
+        '<label style="margin-top:0.5rem">Schedule dispatch (UTC ISO, empty = immediate)</label>' +
+        '<input type="datetime-local" id="task-scheduled-at" />' +
+        '<div id="task-patch-msg" class="msg"></div>';
+      box.innerHTML = '<strong>' + escapeHtml(t.title) + '</strong><pre>' + escapeHtml(lines) + '</pre>' +
+        runsHtml + commentsHtml + editHtml + decomposeBtn;
+      const statusSel = document.getElementById('task-status');
+      const doneFields = document.getElementById('done-fields');
+      const blockFields = document.getElementById('block-fields');
+      function syncStatusFields() {
+        const s = statusSel.value;
+        doneFields.style.display = s === 'done' ? 'block' : 'none';
+        blockFields.style.display = s === 'blocked' ? 'block' : 'none';
+      }
+      statusSel.onchange = syncStatusFields;
+      syncStatusFields();
+      const schedEl = document.getElementById('task-scheduled-at');
+      if (schedEl && t.scheduled_at) {
+        const d = new Date(t.scheduled_at * 1000);
+        schedEl.value = d.toISOString().slice(0, 16);
+      }
+      document.getElementById('save-task-btn').onclick = () => patchTask(id);
+      document.getElementById('archive-task-btn').onclick = () => archiveTask(id);
+      document.getElementById('delete-task-btn').onclick = () => deleteTask(id);
+      const btn = document.getElementById('decompose-btn');
+      if (btn) btn.onclick = () => decomposeTask(id);
+    }
+
+    async function archiveTask(id) {
+      if (!confirm('Archive this task?')) return;
+      await patchTaskStatus(id, { status: 'archived' });
+    }
+
+    async function deleteTask(id) {
+      if (!confirm('Permanently delete this task and all runs/comments?')) return;
+      try {
+        const r = await fetch(apiUrl('/api/kanban/tasks/' + encodeURIComponent(id)), {
+          method: 'DELETE',
+          headers: authHeaders(),
+        });
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.error || 'delete failed');
+        selectedTask = null;
+        document.getElementById('detail').style.display = 'none';
+        refreshBoard();
+      } catch (e) {
+        alert(String(e));
+      }
+    }
+
+    async function patchTaskStatus(id, body) {
+      const r = await fetch(apiUrl('/api/kanban/tasks/' + encodeURIComponent(id)), {
+        method: 'PATCH',
+        headers: authHeaders(true),
+        body: JSON.stringify(body),
+      });
+      const data = await r.json();
+      if (r.status === 409 && data.blockers) {
+        const names = data.blockers.map(b => b.title + ' (' + b.status + ')').join(', ');
+        throw new Error((data.error || 'blocked') + ': ' + names);
+      }
+      if (!r.ok) throw new Error(data.error || 'patch failed');
+      refreshBoard();
+    }
+
+    async function patchTask(id) {
+      const msg = document.getElementById('task-patch-msg');
+      const btn = document.getElementById('save-task-btn');
+      const status = document.getElementById('task-status').value;
+      const assignee = document.getElementById('task-assignee').value;
+      const body = { status: status, assignee: assignee };
+      const summaryEl = document.getElementById('task-summary');
+      const blockEl = document.getElementById('task-block-reason');
+      if (status === 'done' && summaryEl && summaryEl.value.trim()) {
+        body.summary = summaryEl.value.trim();
+      }
+      if (status === 'blocked' && blockEl && blockEl.value.trim()) {
+        body.block_reason = blockEl.value.trim();
+      }
+      const schedEl = document.getElementById('task-scheduled-at');
+      if (schedEl) {
+        if (schedEl.value) {
+          body.scheduled_at = Math.floor(new Date(schedEl.value).getTime() / 1000);
+        } else if (lastTaskScheduledAt) {
+          body.scheduled_at = null;
+        }
+      }
+      if (btn) btn.disabled = true;
+      if (msg) { msg.textContent = 'Saving…'; msg.className = 'msg'; }
+      try {
+        await patchTaskStatus(id, body);
+        if (msg) { msg.textContent = 'Saved'; msg.className = 'msg ok'; }
+      } catch (e) {
+        if (msg) { msg.textContent = String(e); msg.className = 'msg err'; }
+      } finally {
+        if (btn) btn.disabled = false;
+      }
+    }
+
+    async function decomposeTask(id) {
+      const btn = document.getElementById('decompose-btn');
+      const msg = document.getElementById('decompose-msg');
+      if (btn) btn.disabled = true;
+      if (msg) { msg.textContent = 'Decomposing…'; msg.className = 'msg'; }
+      try {
+        const r = await fetch(apiUrl('/api/kanban/tasks/' + encodeURIComponent(id) + '/decompose'), {
+          method: 'POST',
+          headers: authHeaders(),
+        });
+        const data = await r.json();
+        if (msg) {
+          msg.textContent = data.reason || (data.ok ? 'Done' : 'Failed');
+          msg.className = 'msg ' + (data.ok ? 'ok' : 'err');
+        }
+        if (data.ok) refreshBoard();
+      } catch (e) {
+        if (msg) { msg.textContent = String(e); msg.className = 'msg err'; }
+      } finally {
+        if (btn) btn.disabled = false;
+      }
+    }
+
+    function connectWs() {
+      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const qs = 'since=' + cursor + (KANBAN_TOKEN ? '&token=' + encodeURIComponent(KANBAN_TOKEN) : '');
+      ws = new WebSocket(proto + '//' + location.host + '/api/kanban/events/ws?' + qs);
+      ws.onmessage = (ev) => {
+        try {
+          const msg = JSON.parse(ev.data);
+          if (msg.cursor) cursor = msg.cursor;
+          if (msg.events && msg.events.length) refreshBoard();
+        } catch (_) {}
+      };
+      ws.onclose = () => { document.getElementById('live').textContent = '○ reconnecting'; setTimeout(connectWs, 2000); };
+      ws.onopen = () => { document.getElementById('live').textContent = '● live'; };
+    }
+
+    refreshBoard();
+    loadSettingsData();
+    connectWs();
+    setInterval(refreshBoard, 30000);
+  </script>
+</body>
+</html>

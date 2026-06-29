@@ -17,8 +17,28 @@ use super::skills_guard;
 use super::skills_sync;
 use crate::config_ref::resolve_edgecrab_home;
 
+mod guard_approvals;
+mod hub_slash;
+mod index;
+mod install_preview;
+mod snapshot;
+mod sources;
+
+pub use guard_approvals::{
+    format_guard_approvals_list, record_guard_approval, revoke_guard_approval,
+};
+pub use hub_slash::{
+    handle_skills_hub_slash, hub_slash_mutates_skills, is_remote_skill_identifier,
+    parse_inspect_operand,
+};
+pub use install_preview::{
+    BundleFilePreview, InstallScanPreview, ScanFindingPreview, format_preview_text_report,
+    inspect_identifier_scan, preview_install_scan, preview_installed_skill, preview_skill_scan,
+};
+pub use snapshot::{export_hub_snapshot, import_hub_snapshot};
+
 const CACHE_TTL_SECS: i64 = 15 * 60;
-const SOURCE_TIMEOUT_SECS: u64 = 12;
+pub(crate) const SOURCE_TIMEOUT_SECS: u64 = 12;
 #[derive(Debug, Clone, Copy)]
 enum SourceKind {
     GitHubRepo {
@@ -270,6 +290,148 @@ pub fn read_lock() -> HashMap<String, LockEntry> {
     }
 }
 
+/// Skill names installed via Skills Hub (lock file keys).
+pub fn hub_installed_skill_names(home: &Path) -> std::collections::HashSet<String> {
+    let path = home.join("skills").join(".hub").join("lock.json");
+    match std::fs::read_to_string(&path) {
+        Ok(content) => serde_json::from_str::<HashMap<String, LockEntry>>(&content)
+            .unwrap_or_default()
+            .into_keys()
+            .collect(),
+        Err(_) => std::collections::HashSet::new(),
+    }
+}
+
+/// Re-run skills_guard on hub-installed skills (Hermes `/skills audit` parity).
+pub fn audit_installed_hub_skills(
+    skills_dir: &Path,
+    skill_name: Option<&str>,
+    deep: bool,
+) -> String {
+    let lock = read_lock();
+    if lock.is_empty() {
+        return "No hub-installed skills to audit.".into();
+    }
+
+    let mut entries: Vec<_> = lock.iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+
+    if let Some(name) = skill_name.filter(|n| !n.is_empty()) {
+        entries.retain(|(k, _)| k.as_str() == name);
+        if entries.is_empty() {
+            return format!("'{name}' is not a hub-installed skill.");
+        }
+    }
+
+    let scanned = entries.len();
+    let mut out = format!("Auditing {scanned} hub skill(s)…\n\n");
+    let mut blocking = 0usize;
+
+    for (name, entry) in entries {
+        let skill_path = skills_dir.join(name);
+        if !skill_path.exists() {
+            out.push_str(&format!(
+                "⚠️  {name} — directory missing (stale lock entry)\n\n"
+            ));
+            blocking += 1;
+            continue;
+        }
+        let trust = infer_trust_level(&entry.source);
+        let scan = skills_guard::scan_skill(&skill_path, &entry.source, trust);
+        let (allowed, reason) = skills_guard::should_allow_install(&scan);
+        out.push_str(&format!("── {name} ──\nSource: {}\n", entry.identifier));
+        out.push_str(&skills_guard::format_scan_report(&scan));
+        if allowed {
+            out.push_str("✅ Passes install gate\n");
+        } else {
+            blocking += 1;
+            out.push_str(&format!("❌ Would block fresh install: {reason}\n"));
+        }
+        if deep {
+            let ast_findings = crate::tools::skills_ast_audit::ast_scan_path(&skill_path);
+            out.push_str(&crate::tools::skills_ast_audit::format_ast_report(
+                &ast_findings,
+                name,
+            ));
+        }
+        out.push('\n');
+    }
+
+    out.push_str(&format!(
+        "Summary: {scanned} scanned, {blocking} with blocking findings.\nInstall audit trail: ~/.edgecrab/skills/.hub/audit.log\n",
+    ));
+    out
+}
+
+pub(crate) fn infer_trust_level(source: &str) -> &'static str {
+    let lower = source.to_lowercase();
+    if lower.contains("edgecrab")
+        || lower.contains("hermes")
+        || lower.contains("openai")
+        || lower.contains("anthropic")
+        || lower.contains("official")
+    {
+        "trusted"
+    } else {
+        "community"
+    }
+}
+
+/// List hub lock file entries (`/skills lock`).
+pub fn format_installed_lock() -> String {
+    let lock = read_lock();
+    if lock.is_empty() {
+        return "No hub-installed skills (lock file empty).\n\
+             Install: /skills install <identifier>"
+            .into();
+    }
+    let mut names: Vec<_> = lock.keys().cloned().collect();
+    names.sort();
+    let mut out = format!("Hub-installed skills ({}):\n", names.len());
+    for name in names {
+        if let Some(entry) = lock.get(&name) {
+            out.push_str(&format!(
+                "  {name}\n    source: {}\n    installed: {}\n",
+                entry.identifier, entry.installed_at
+            ));
+        }
+    }
+    out.push_str("\nUpdate all: /skills update\nAudit: /skills audit\n");
+    out
+}
+
+/// Tail of the install/uninstall audit log.
+pub fn format_audit_log_tail(max_lines: usize) -> String {
+    let path = audit_log_path();
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return "Audit log empty. Installs/uninstalls append to ~/.edgecrab/skills/.hub/audit.log"
+            .into();
+    };
+    let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+    if lines.is_empty() {
+        return "Audit log empty.".into();
+    }
+    let start = lines.len().saturating_sub(max_lines);
+    let mut out = format!(
+        "Recent hub audit log (last {} entries):\n\n",
+        lines.len() - start
+    );
+    for line in &lines[start..] {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+            out.push_str(&format!(
+                "  {} {} {} [{}]\n",
+                v.get("timestamp").and_then(|t| t.as_str()).unwrap_or("?"),
+                v.get("action").and_then(|t| t.as_str()).unwrap_or("?"),
+                v.get("skill").and_then(|t| t.as_str()).unwrap_or("?"),
+                v.get("source").and_then(|t| t.as_str()).unwrap_or("?"),
+            ));
+        } else {
+            out.push_str(&format!("  {line}\n"));
+        }
+    }
+    out
+}
+
 fn write_lock(lock: &HashMap<String, LockEntry>) {
     let path = lock_file_path();
     if let Some(parent) = path.parent() {
@@ -307,11 +469,41 @@ pub fn add_tap(name: &str, url: &str, trust_level: &str) {
     }
 }
 
+/// Add tap only when not already present. Returns true when a new tap was added.
+pub fn add_tap_if_missing(tap: &Tap) -> bool {
+    let taps = read_taps();
+    if taps.iter().any(|t| t.name == tap.name || t.url == tap.url) {
+        return false;
+    }
+    add_tap(&tap.name, &tap.url, &tap.trust_level);
+    true
+}
+
+/// Parse a tap entry from EdgeCrab or Hermes snapshot JSON.
+pub fn tap_from_snapshot_value(raw: &serde_json::Value) -> Option<Tap> {
+    if let Ok(tap) = serde_json::from_value::<Tap>(raw.clone())
+        && !tap.url.is_empty()
+    {
+        return Some(tap);
+    }
+    let repo = raw.get("repo").and_then(|v| v.as_str())?;
+    let path = raw
+        .get("path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("skills/");
+    let name = repo.replace('/', "-");
+    Some(Tap {
+        name: name.clone(),
+        url: format!("https://github.com/{repo}/{path}"),
+        trust_level: "community".into(),
+    })
+}
+
 pub fn remove_tap(name: &str) -> bool {
     let path = taps_file_path();
     let mut taps = read_taps();
     let before = taps.len();
-    taps.retain(|t| t.name != name);
+    taps.retain(|t| t.name != name && t.url != name);
     if taps.len() != before {
         if let Ok(json) = serde_json::to_string_pretty(&taps) {
             let _ = std::fs::write(&path, json);
@@ -320,6 +512,45 @@ pub fn remove_tap(name: &str) -> bool {
     } else {
         false
     }
+}
+
+/// Parse tap URL into `(owner/repo, skills-root-path)`.
+pub fn parse_tap_repo(tap: &Tap) -> Option<(String, String)> {
+    let url = tap.url.trim().trim_end_matches('/');
+    let stripped = url
+        .strip_prefix("https://github.com/")
+        .or_else(|| url.strip_prefix("http://github.com/"))
+        .unwrap_or(url);
+    let parts: Vec<&str> = stripped.split('/').filter(|p| !p.is_empty()).collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let repo = format!("{}/{}", parts[0], parts[1]);
+    let root = if parts.len() > 2 {
+        parts[2..].join("/")
+    } else {
+        "skills".into()
+    };
+    Some((repo, root))
+}
+
+pub fn format_taps_list() -> String {
+    let taps = read_taps();
+    if taps.is_empty() {
+        return "Custom taps: none configured.\n\
+             Built-in curated sources: edgecrab, hermes-agent, openai, anthropics.\n\
+             Add: /skills tap add owner/repo [root-path]"
+            .into();
+    }
+    let mut out = format!("Custom taps ({}):\n", taps.len());
+    for tap in &taps {
+        out.push_str(&format!(
+            "  {} -> {} [{}]\n",
+            tap.name, tap.url, tap.trust_level
+        ));
+    }
+    out.push_str("\nAdd: /skills tap add owner/repo [path]\nRemove: /skills tap remove <name>\n");
+    out
 }
 
 // ─── Search ────────────────────────────────────────────────────
@@ -345,7 +576,17 @@ pub fn render_sources_catalog() -> String {
         ));
     }
     out.push_str(
-        "\nInstall identifiers use the source prefix:\n  edgecrab:<path>\n  hermes-agent:<path>\n  openai:<path>\n  anthropics:<path>\n\nYou can also install directly from GitHub with owner/repo/path.\n",
+        "\nInstall identifiers use the source prefix:\n  edgecrab:<path>\n  hermes-agent:<path>\n  openai:<path>\n  anthropics:<path>\n  skills.sh:<owner/repo/skill>\n  clawhub:<slug>\n  browse-sh:<slug>\n  claude-marketplace:<owner/repo/path>\n  lobehub:<agent>\n  agentskills.io:<name>\n\nYou can also install directly from GitHub with owner/repo/path.\n",
+    );
+    out.push_str("\nRegistry sources (parallel search):\n");
+    for source in sources::registry_source_summaries() {
+        out.push_str(&format!(
+            "- {} ({}) [{}]\n",
+            source.label, source.origin, source.trust_level
+        ));
+    }
+    out.push_str(
+        "\nUnified index: ~/.edgecrab/skills/.hub/unified-index.json (instant search; self-improving merge).\n",
     );
     out
 }
@@ -391,6 +632,7 @@ pub async fn search_hub(
     query: &str,
     source_filter: Option<&str>,
     limit_per_source: usize,
+    configured_hub_url: Option<&str>,
 ) -> SearchReport {
     let query = query.trim();
     if query.is_empty() {
@@ -398,31 +640,65 @@ pub async fn search_hub(
     }
 
     let limit = limit_per_source.clamp(1, 20);
+    let filter = source_filter.unwrap_or("all");
+
+    if filter == "all" && !index::unified_index_available() {
+        index::bootstrap_index_from_local_caches();
+        if let Ok(client) = hub_client() {
+            let _ = index::refresh_unified_index_from_remote(&client).await;
+        }
+    }
+
+    let mut groups: Vec<SearchGroup> = Vec::new();
+
+    if filter == "all" || filter == "index" || filter == "unified-index" {
+        groups.push(index::search_unified_index(query, limit));
+    }
+
+    if filter == "index" || filter == "unified-index" {
+        let report = SearchReport { groups };
+        index::merge_search_report_into_index(&report);
+        return report;
+    }
+
+    let index_has_hits = groups
+        .first()
+        .map(|g| !g.results.is_empty())
+        .unwrap_or(false);
+    let skip_live_registries =
+        filter == "all" && index_has_hits && index::unified_index_available();
+
+    if skip_live_registries {
+        let report = SearchReport { groups };
+        index::merge_search_report_into_index(&report);
+        return report;
+    }
+
     let client = match hub_client() {
         Ok(client) => client,
         Err(error) => {
-            return SearchReport {
-                groups: vec![SearchGroup {
-                    source: HubSourceInfo {
-                        id: "hub".into(),
-                        label: "Skills Hub".into(),
-                        origin: "local".into(),
-                        trust_level: "n/a".into(),
-                    },
-                    results: Vec::new(),
-                    notice: Some(error),
-                }],
-            };
+            groups.push(SearchGroup {
+                source: HubSourceInfo {
+                    id: "hub".into(),
+                    label: "Skills Hub".into(),
+                    origin: "local".into(),
+                    trust_level: "n/a".into(),
+                },
+                results: Vec::new(),
+                notice: Some(error),
+            });
+            let report = SearchReport { groups };
+            index::merge_search_report_into_index(&report);
+            return report;
         }
     };
 
-    let filter = source_filter.unwrap_or("all");
     let futures = CURATED_SOURCES
         .iter()
         .filter(|source| source_matches_filter(source, filter))
         .map(|source| search_source(&client, source, query, limit));
 
-    let mut groups: Vec<SearchGroup> = join_all(futures).await;
+    groups.extend(join_all(futures).await);
 
     if (filter == "all" || filter == "well-known")
         && (query.starts_with("https://") || query.starts_with("http://"))
@@ -430,7 +706,101 @@ pub async fn search_hub(
         groups.push(search_well_known_source(&client, query, limit).await);
     }
 
-    SearchReport { groups }
+    if let Some(url) = configured_hub_url.map(str::trim).filter(|u| !u.is_empty())
+        && (filter == "all" || filter == "well-known" || filter == "hub")
+    {
+        groups.push(search_well_known_source(&client, url, limit).await);
+    }
+
+    if filter == "all" || sources::registry_filter_includes_any(filter) {
+        groups.extend(sources::search_registry_sources(query, filter, limit).await);
+    }
+
+    if filter == "all" || filter == "tap" || filter == "taps" {
+        groups.extend(search_custom_taps(&client, query, limit).await);
+    }
+
+    let report = SearchReport { groups };
+    index::merge_search_report_into_index(&report);
+    report
+}
+
+/// Refresh the unified index from the public remote catalog.
+pub async fn refresh_unified_index() -> Result<String, String> {
+    let client = hub_client()?;
+    let count = index::refresh_unified_index_from_remote(&client).await?;
+    Ok(format!(
+        "Unified index refreshed: {count} skills cached locally."
+    ))
+}
+
+/// Inspect a hub skill without installing (registry + curated GitHub).
+pub async fn inspect_hub_skill(identifier: &str) -> Result<String, String> {
+    if let Some(meta) = index::inspect_index_identifier(identifier) {
+        return Ok(format_inspect_report(&meta, None));
+    }
+
+    if let Some(meta) = sources::inspect_registry_skill(identifier).await {
+        return Ok(format_inspect_report(&meta, None));
+    }
+
+    let normalized = normalize_source_identifier(identifier);
+    if let Some(resolved) = resolve_curated_identifier(&normalized)
+        && let Ok(client) = hub_client()
+        && let Some((repo, path)) = parse_github_identifier(&resolved)
+        && let Ok(bundle) = fetch_github_bundle(&client, &repo, &path, &normalized).await
+    {
+        let meta = SkillMeta {
+            name: bundle.name.clone(),
+            description: extract_description(
+                bundle
+                    .files
+                    .get("SKILL.md")
+                    .map(String::as_str)
+                    .unwrap_or(""),
+            ),
+            source: bundle.source.clone(),
+            origin: format!("https://github.com/{repo}"),
+            identifier: normalized.clone(),
+            trust_level: bundle.trust_level.clone(),
+            repo: Some(repo.clone()),
+            path: Some(path.clone()),
+            url: Some(format!("https://github.com/{repo}/tree/HEAD/{path}")),
+            tags: Vec::new(),
+        };
+        return Ok(format_inspect_report(&meta, Some(&bundle)));
+    }
+
+    Err(format!("No hub metadata found for '{identifier}'"))
+}
+
+fn format_inspect_report(meta: &SkillMeta, bundle: Option<&SkillBundle>) -> String {
+    let mut out = format!(
+        "📋 {}\n\nSource: {} [{}]\nIdentifier: {}\nTrust: {}\n",
+        meta.name, meta.source, meta.origin, meta.identifier, meta.trust_level
+    );
+    if !meta.description.is_empty() {
+        out.push_str(&format!("\n{}\n", meta.description));
+    }
+    if let Some(url) = &meta.url {
+        out.push_str(&format!("\nURL: {url}\n"));
+    }
+    if !meta.tags.is_empty() {
+        out.push_str(&format!("\nTags: {}\n", meta.tags.join(", ")));
+    }
+    if let Some(bundle) = bundle {
+        out.push_str(&format!(
+            "\nFiles: {} (includes SKILL.md)\n",
+            bundle.files.len()
+        ));
+        if bundle.trust_level == "community" {
+            out.push_str("\n⚠️ Community skill — review content before trusting in production.\n");
+        }
+    }
+    out.push_str("\nInstall: `skills_hub install ");
+    out.push_str(&meta.identifier);
+    out.push_str("`\n");
+    out
 }
 
 async fn search_source(
@@ -831,7 +1201,14 @@ fn extract_description(content: &str) -> String {
 
 // ─── Install flow ──────────────────────────────────────────────
 
-fn bundle_content_hash(bundle: &SkillBundle) -> String {
+/// Install policy flags (`--force` = caution override; `--trust` = dangerous approval).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct InstallGate {
+    pub force: bool,
+    pub trust: bool,
+}
+
+pub(crate) fn bundle_content_hash(bundle: &SkillBundle) -> String {
     let mut hasher = Sha256::new();
     let mut keys: Vec<&String> = bundle.files.keys().collect();
     keys.sort();
@@ -846,11 +1223,7 @@ fn bundle_content_hash(bundle: &SkillBundle) -> String {
     format!("sha256:{:x}", hasher.finalize())
 }
 
-pub fn install_skill(
-    bundle: &SkillBundle,
-    skills_dir: &Path,
-    force: bool,
-) -> Result<String, String> {
+pub(crate) fn stage_bundle_in_quarantine(bundle: &SkillBundle) -> Result<PathBuf, String> {
     validate_bundle(bundle)?;
 
     let qdir = quarantine_dir();
@@ -870,14 +1243,55 @@ pub fn install_skill(
         std::fs::write(&file_path, content)
             .map_err(|e| format!("Failed to write quarantine file: {e}"))?;
     }
+    Ok(q_skill_dir)
+}
 
-    let scan_result = skills_guard::scan_skill(&q_skill_dir, &bundle.source, &bundle.trust_level);
-    let (allowed, reason) = skills_guard::should_allow_install(&scan_result);
+pub(crate) fn scan_quarantined_dir(
+    bundle: &SkillBundle,
+    q_skill_dir: &Path,
+) -> skills_guard::ScanResult {
+    skills_guard::scan_skill(q_skill_dir, &bundle.source, &bundle.trust_level)
+}
 
-    if !allowed && !force {
+pub fn install_skill(
+    bundle: &SkillBundle,
+    skills_dir: &Path,
+    gate: InstallGate,
+) -> Result<String, String> {
+    let q_skill_dir = stage_bundle_in_quarantine(bundle)?;
+    let scan_result = scan_quarantined_dir(bundle, &q_skill_dir);
+    let hash = bundle_content_hash(bundle);
+    let pre_approved = guard_approvals::is_dangerous_approved(&bundle.identifier, &hash);
+    let trusted_dangerous = gate.trust || pre_approved;
+
+    let ctx = skills_guard::InstallPolicyContext {
+        force: gate.force,
+        trusted_dangerous,
+    };
+    let (allowed, reason) = skills_guard::should_allow_install_with(&scan_result, ctx);
+
+    if !allowed {
         let _ = std::fs::remove_dir_all(&q_skill_dir);
         let report = skills_guard::format_scan_report(&scan_result);
-        return Err(format!("{}\n\n{}", reason, report));
+        return Err(format!("{reason}\n\n{report}"));
+    }
+
+    if scan_result.verdict == skills_guard::Verdict::Dangerous && gate.trust {
+        guard_approvals::record_guard_approval(
+            &bundle.identifier,
+            &bundle.name,
+            &hash,
+            "dangerous",
+            scan_result.findings.len(),
+        )?;
+        append_audit_log(
+            "trust",
+            &bundle.name,
+            &bundle.identifier,
+            &bundle.trust_level,
+            &hash,
+            false,
+        );
     }
 
     std::fs::create_dir_all(skills_dir)
@@ -890,7 +1304,6 @@ pub fn install_skill(
     std::fs::rename(&q_skill_dir, &target_dir)
         .map_err(|e| format!("Failed to move skill into place: {e}"))?;
 
-    let hash = bundle_content_hash(bundle);
     let mut lock = read_lock();
     lock.insert(
         bundle.name.clone(),
@@ -903,18 +1316,31 @@ pub fn install_skill(
     );
     write_lock(&lock);
 
+    let forced = gate.force && scan_result.verdict == skills_guard::Verdict::Caution;
+    let trusted = trusted_dangerous && scan_result.verdict == skills_guard::Verdict::Dangerous;
     append_audit_log(
-        "install",
+        if trusted {
+            "install_trusted"
+        } else {
+            "install"
+        },
         &bundle.name,
         &bundle.source,
         &bundle.trust_level,
         &hash,
-        force && !allowed,
+        forced,
     );
 
-    if !allowed && force {
+    notify_hub_skills_mutated();
+
+    if trusted {
         Ok(format!(
-            "Skill '{}' installed (forced, guard warnings ignored)",
+            "Skill '{}' installed (dangerous verdict — explicit trust recorded)",
+            bundle.name
+        ))
+    } else if forced {
+        Ok(format!(
+            "Skill '{}' installed (forced, caution warnings ignored)",
             bundle.name
         ))
     } else {
@@ -922,16 +1348,58 @@ pub fn install_skill(
     }
 }
 
+/// Review scan + record hash-bound trust for a dangerous skill (no install).
+pub async fn trust_identifier(
+    identifier: &str,
+    optional_dir: Option<&Path>,
+) -> Result<String, String> {
+    let preview = preview_install_scan(identifier, optional_dir).await?;
+    let normalized_identifier = preview.identifier.clone();
+
+    if preview.verdict == "dangerous" && !preview.already_trusted {
+        guard_approvals::record_guard_approval(
+            &normalized_identifier,
+            &preview.skill_name,
+            &preview.content_hash,
+            "dangerous",
+            preview.finding_count,
+        )?;
+        append_audit_log(
+            "trust",
+            &preview.skill_name,
+            &normalized_identifier,
+            &preview.trust_level,
+            &preview.content_hash,
+            false,
+        );
+        return Ok(format!(
+            "Trust recorded for `{normalized_identifier}`.\n\
+             Install: /skills install {normalized_identifier}\n\
+             (Re-trust required if upstream content changes.)\n\n{}",
+            format_preview_text_report(&preview)
+        ));
+    }
+
+    if preview.verdict == "dangerous" && preview.already_trusted {
+        return Ok(format!(
+            "Already trusted for `{normalized_identifier}`.\n\n{}",
+            format_preview_text_report(&preview)
+        ));
+    }
+
+    Ok(format_preview_text_report(&preview))
+}
+
 pub async fn install_identifier(
     identifier: &str,
     skills_dir: &Path,
     optional_dir: Option<&Path>,
-    force: bool,
+    gate: InstallGate,
 ) -> Result<InstallOutcome, String> {
     let normalized_identifier = normalize_source_identifier(identifier);
     let bundle = fetch_bundle_for_identifier(&normalized_identifier, optional_dir).await?;
     let skill_name = bundle.name.clone();
-    let message = install_skill(&bundle, skills_dir, force)?;
+    let message = install_skill(&bundle, skills_dir, gate)?;
     Ok(InstallOutcome {
         message,
         skill_name,
@@ -941,7 +1409,7 @@ pub async fn install_identifier(
 pub async fn install_github_skill(
     identifier: &str,
     skills_dir: &Path,
-    force: bool,
+    gate: InstallGate,
 ) -> Result<InstallOutcome, String> {
     let normalized_identifier = normalize_source_identifier(identifier);
     let Some((repo, path)) = parse_github_identifier(&normalized_identifier) else {
@@ -950,7 +1418,7 @@ pub async fn install_github_skill(
     let client = hub_client()?;
     let bundle = fetch_github_bundle(&client, &repo, &path, &normalized_identifier).await?;
     let skill_name = bundle.name.clone();
-    let message = install_skill(&bundle, skills_dir, force)?;
+    let message = install_skill(&bundle, skills_dir, gate)?;
     Ok(InstallOutcome {
         message,
         skill_name,
@@ -961,7 +1429,7 @@ pub async fn update_installed_skill(
     name: &str,
     skills_dir: &Path,
     optional_dir: Option<&Path>,
-    force: bool,
+    gate: InstallGate,
 ) -> Result<InstallOutcome, String> {
     let lock = read_lock();
     let Some(entry) = lock.get(name) else {
@@ -970,7 +1438,7 @@ pub async fn update_installed_skill(
 
     let mut bundle = fetch_bundle_for_identifier(&entry.identifier, optional_dir).await?;
     bundle.name = name.to_string();
-    let install_message = install_skill(&bundle, skills_dir, force)?;
+    let install_message = install_skill(&bundle, skills_dir, gate)?;
     Ok(InstallOutcome {
         message: format!("{} (source: {})", install_message, entry.identifier),
         skill_name: name.to_string(),
@@ -980,7 +1448,7 @@ pub async fn update_installed_skill(
 pub async fn update_all_installed_skills(
     skills_dir: &Path,
     optional_dir: Option<&Path>,
-    force: bool,
+    gate: InstallGate,
 ) -> Result<Vec<InstallOutcome>, String> {
     let lock = read_lock();
     if lock.is_empty() {
@@ -991,7 +1459,7 @@ pub async fn update_all_installed_skills(
     names.sort();
     let mut outcomes = Vec::with_capacity(names.len());
     for name in names {
-        outcomes.push(update_installed_skill(&name, skills_dir, optional_dir, force).await?);
+        outcomes.push(update_installed_skill(&name, skills_dir, optional_dir, gate).await?);
     }
     Ok(outcomes)
 }
@@ -1008,11 +1476,109 @@ pub fn render_update_outcomes(outcomes: &[InstallOutcome]) -> String {
     output
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillUpdateCheck {
+    pub name: String,
+    pub identifier: String,
+    pub source: String,
+    pub status: SkillUpdateStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillUpdateStatus {
+    UpToDate,
+    UpdateAvailable,
+    Unavailable,
+}
+
+/// Check hub lock entries against upstream bundles (Hermes `skills check` parity).
+pub async fn check_for_skill_updates(
+    optional_dir: Option<&Path>,
+    name: Option<&str>,
+) -> Vec<SkillUpdateCheck> {
+    let lock = read_lock();
+    let mut entries: Vec<_> = lock.iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+
+    if let Some(filter) = name.filter(|n| !n.is_empty()) {
+        entries.retain(|(k, _)| k.as_str() == filter);
+    }
+
+    let mut results = Vec::with_capacity(entries.len());
+    for (skill_name, entry) in entries {
+        match fetch_bundle_for_identifier(&entry.identifier, optional_dir).await {
+            Ok(bundle) => {
+                let latest_hash = bundle_content_hash(&bundle);
+                let status = if entry.content_hash == latest_hash {
+                    SkillUpdateStatus::UpToDate
+                } else {
+                    SkillUpdateStatus::UpdateAvailable
+                };
+                results.push(SkillUpdateCheck {
+                    name: skill_name.clone(),
+                    identifier: entry.identifier.clone(),
+                    source: entry.source.clone(),
+                    status,
+                });
+            }
+            Err(_) => results.push(SkillUpdateCheck {
+                name: skill_name.clone(),
+                identifier: entry.identifier.clone(),
+                source: entry.source.clone(),
+                status: SkillUpdateStatus::Unavailable,
+            }),
+        }
+    }
+    results
+}
+
+pub fn format_check_report(results: &[SkillUpdateCheck]) -> String {
+    if results.is_empty() {
+        return "No hub-installed skills to check.".into();
+    }
+
+    let mut out = format!("Hub skill update check ({}):\n\n", results.len());
+    for entry in results {
+        let status = match entry.status {
+            SkillUpdateStatus::UpToDate => "up to date",
+            SkillUpdateStatus::UpdateAvailable => "update available",
+            SkillUpdateStatus::Unavailable => "upstream unavailable",
+        };
+        out.push_str(&format!(
+            "  {} — {} [{status}]\n    {}\n",
+            entry.name, entry.source, entry.identifier
+        ));
+    }
+    let updates = results
+        .iter()
+        .filter(|e| e.status == SkillUpdateStatus::UpdateAvailable)
+        .count();
+    out.push_str(&format!(
+        "\n{updates} update(s) available. Apply: /skills update\n"
+    ));
+    out
+}
+
 async fn fetch_bundle_for_identifier(
     identifier: &str,
     optional_dir: Option<&Path>,
 ) -> Result<SkillBundle, String> {
     let normalized_identifier = normalize_source_identifier(identifier);
+
+    if normalized_identifier.starts_with("http://") || normalized_identifier.starts_with("https://")
+    {
+        let client = hub_client()?;
+        return sources::fetch_url_skill_bundle(&client, &normalized_identifier).await;
+    }
+
+    if let Some(bundle) = index::try_fetch_from_index(&normalized_identifier).await {
+        return Ok(bundle);
+    }
+
+    if is_registry_identifier(&normalized_identifier) {
+        return sources::fetch_registry_bundle(&normalized_identifier).await;
+    }
+
     if normalized_identifier.starts_with("official/") {
         return load_official_skill_bundle(&normalized_identifier, optional_dir);
     }
@@ -1036,9 +1602,40 @@ async fn fetch_bundle_for_identifier(
     }
 
     Err(format!(
-        "Skill source '{}' not found. Use official/<category>/<skill>, a source alias like edgecrab:<path>, or owner/repo/path",
+        "Skill source '{}' not found. Use official/<category>/<skill>, a source alias like edgecrab:<path>, clawhub:<slug>, skills.sh:<owner/repo/skill>, or owner/repo/path",
         identifier
     ))
+}
+
+fn is_registry_identifier(identifier: &str) -> bool {
+    let lower = identifier.to_lowercase();
+    for prefix in [
+        "clawhub:",
+        "clawhub/",
+        "skills.sh:",
+        "skills-sh:",
+        "skills.sh/",
+        "skills-sh/",
+        "browse-sh:",
+        "browse.sh:",
+        "browse-sh/",
+        "browse.sh/",
+        "lobehub:",
+        "lobehub/",
+        "claude-marketplace:",
+        "claude-marketplace/",
+        "claude_marketplace:",
+        "claude_marketplace/",
+        "agentskills.io:",
+        "agentskills:",
+        "agentskills.io/",
+        "agentskills/",
+    ] {
+        if lower.starts_with(prefix) {
+            return true;
+        }
+    }
+    false
 }
 
 fn validate_bundle(bundle: &SkillBundle) -> Result<(), String> {
@@ -1154,12 +1751,14 @@ pub fn uninstall_skill(name: &str, skills_dir: &Path) -> Result<String, String> 
 
     append_audit_log("uninstall", name, "local", "unknown", "", false);
 
+    notify_hub_skills_mutated();
+
     Ok(format!("Skill '{}' uninstalled", name))
 }
 
 // ─── Remote helpers ────────────────────────────────────────────
 
-fn hub_client() -> Result<reqwest::Client, String> {
+pub(crate) fn hub_client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .user_agent("edgecrab-skills-hub/0.1")
         .timeout(Duration::from_secs(SOURCE_TIMEOUT_SECS))
@@ -1167,7 +1766,7 @@ fn hub_client() -> Result<reqwest::Client, String> {
         .map_err(|e| format!("failed to build HTTP client: {e}"))
 }
 
-fn ensure_safe_url(url: &str) -> Result<(), String> {
+pub(crate) fn ensure_safe_url(url: &str) -> Result<(), String> {
     edgecrab_security::url_validation::validate_outbound_url(url).map_err(|e| e.to_string())
 }
 
@@ -1200,17 +1799,185 @@ async fn refresh_github_cache(
         SourceKind::GitHubRepo { repo, root } => (repo, root),
         SourceKind::SkillsSh => return Err("skills.sh does not use the GitHub cache".into()),
     };
+    refresh_repo_skill_cache(client, source.id, repo, root).await
+}
+
+async fn refresh_repo_skill_cache(
+    client: &reqwest::Client,
+    cache_id: &str,
+    repo: &str,
+    root: &str,
+) -> Result<SourceCache, String> {
     let tree = fetch_github_tree(client, repo).await?;
     let entries = tree
         .iter()
         .filter(|entry| entry.kind == "blob" && is_skill_md_under_root(&entry.path, root))
-        .filter_map(|entry| build_cached_skill_entry(source.id, root, &entry.path))
+        .filter_map(|entry| build_cached_skill_entry(cache_id, root, &entry.path))
         .collect();
 
     Ok(SourceCache {
         fetched_at: chrono::Utc::now().timestamp(),
         entries,
     })
+}
+
+async fn search_custom_taps(
+    client: &reqwest::Client,
+    query: &str,
+    limit: usize,
+) -> Vec<SearchGroup> {
+    let taps = read_taps();
+    let futures = taps
+        .iter()
+        .map(|tap| search_custom_tap(client, tap, query, limit));
+    join_all(futures).await
+}
+
+async fn search_custom_tap(
+    client: &reqwest::Client,
+    tap: &Tap,
+    query: &str,
+    limit: usize,
+) -> SearchGroup {
+    let Some((repo, root)) = parse_tap_repo(tap) else {
+        return SearchGroup {
+            source: HubSourceInfo {
+                id: format!("tap:{}", tap.name),
+                label: format!("Tap: {}", tap.name),
+                origin: tap.url.clone(),
+                trust_level: tap.trust_level.clone(),
+            },
+            results: Vec::new(),
+            notice: Some(format!("Invalid tap URL '{}'", tap.url)),
+        };
+    };
+    let cache_id = format!("tap-{}", tap.name.replace('/', "_"));
+    let summary = HubSourceInfo {
+        id: cache_id.clone(),
+        label: format!("Tap: {}", tap.name),
+        origin: format!("https://github.com/{repo}"),
+        trust_level: tap.trust_level.clone(),
+    };
+    search_repo_cached_index(
+        client, &cache_id, &repo, &root, &tap.name, summary, query, limit,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn search_repo_cached_index(
+    client: &reqwest::Client,
+    cache_id: &str,
+    repo: &str,
+    root: &str,
+    source_id: &str,
+    summary: HubSourceInfo,
+    query: &str,
+    limit: usize,
+) -> SearchGroup {
+    let cached = read_source_cache(cache_id);
+    let fresh_cached = cached
+        .as_ref()
+        .filter(|cache| is_cache_fresh(cache))
+        .cloned();
+
+    let mut notice = None;
+    let cache = if let Some(cache) = fresh_cached {
+        cache
+    } else {
+        match tokio::time::timeout(
+            Duration::from_secs(SOURCE_TIMEOUT_SECS),
+            refresh_repo_skill_cache(client, cache_id, repo, root),
+        )
+        .await
+        {
+            Ok(Ok(cache)) => {
+                write_source_cache(cache_id, &cache);
+                cache
+            }
+            Ok(Err(error)) => match cached {
+                Some(cache) => {
+                    notice = Some(format!(
+                        "using cached tap index after refresh failed: {error}"
+                    ));
+                    cache
+                }
+                None => {
+                    return SearchGroup {
+                        source: summary,
+                        results: Vec::new(),
+                        notice: Some(error),
+                    };
+                }
+            },
+            Err(_) => match cached {
+                Some(cache) => {
+                    notice = Some("using cached tap index after timeout".into());
+                    cache
+                }
+                None => {
+                    return SearchGroup {
+                        source: summary,
+                        results: Vec::new(),
+                        notice: Some("tap source timed out".into()),
+                    };
+                }
+            },
+        }
+    };
+
+    let mut ranked: Vec<CachedSkillEntry> = cache
+        .entries
+        .iter()
+        .filter(|entry| cache_entry_matches(entry, query))
+        .cloned()
+        .collect();
+    ranked.sort_by(|left, right| {
+        cache_entry_score(left, query)
+            .cmp(&cache_entry_score(right, query))
+            .then_with(|| left.identifier.cmp(&right.identifier))
+    });
+    ranked.truncate(limit);
+
+    let results: Vec<SkillMeta> = ranked
+        .into_iter()
+        .map(|entry| cached_entry_to_meta(&entry, source_id, repo, root, &summary.trust_level))
+        .collect();
+
+    SearchGroup {
+        source: summary,
+        results,
+        notice,
+    }
+}
+
+fn cached_entry_to_meta(
+    entry: &CachedSkillEntry,
+    source_id: &str,
+    repo: &str,
+    root: &str,
+    trust: &str,
+) -> SkillMeta {
+    let github_path = format!("{root}/{}", entry.relative_path);
+    SkillMeta {
+        name: entry.name.clone(),
+        description: entry.description.clone(),
+        source: source_id.into(),
+        origin: format!("https://github.com/{repo}"),
+        identifier: entry.identifier.clone(),
+        trust_level: trust.into(),
+        repo: Some(repo.into()),
+        path: Some(github_path.clone()),
+        url: Some(format!(
+            "https://github.com/{repo}/tree/HEAD/{github_path}/SKILL.md"
+        )),
+        tags: entry.tags.clone(),
+    }
+}
+
+/// Invalidate bundle cache after hub install/update/uninstall.
+pub fn notify_hub_skills_mutated() {
+    crate::skills::invalidate_discovery_caches();
 }
 
 async fn fetch_github_tree(
@@ -1264,7 +2031,7 @@ async fn hydrate_cache_entry(
     Some(updated)
 }
 
-async fn fetch_github_bundle(
+pub(crate) async fn fetch_github_bundle(
     client: &reqwest::Client,
     repo: &str,
     path: &str,
@@ -1401,7 +2168,7 @@ async fn fetch_github_text_file(
         .map_err(|e| format!("Failed to read GitHub content: {e}"))
 }
 
-async fn search_skills_sh_registry(
+pub(crate) async fn search_skills_sh_registry(
     client: &reqwest::Client,
     query: &str,
     limit: usize,
@@ -1530,11 +2297,16 @@ fn source_matches_filter(source: &SourceDefinition, filter: &str) -> bool {
     if filter.is_empty() || filter == "all" {
         return true;
     }
+    if sources::registry_filter_includes_any(&filter) && filter != "registry" {
+        return false;
+    }
     filter == source.id
         || filter == source.label.to_lowercase()
         || (filter == "github" && matches!(source.kind, SourceKind::GitHubRepo { .. }))
         || (filter == "curated" && matches!(source.kind, SourceKind::GitHubRepo { .. }))
         || (filter == "registry" && matches!(source.kind, SourceKind::SkillsSh))
+        || (filter == "skills.sh" && matches!(source.kind, SourceKind::SkillsSh))
+        || (filter == "skills-sh" && matches!(source.kind, SourceKind::SkillsSh))
 }
 
 fn is_skill_md_under_root(path: &str, root: &str) -> bool {
@@ -1633,7 +2405,7 @@ fn resolve_curated_identifier(identifier: &str) -> Option<String> {
     })
 }
 
-fn parse_github_identifier(identifier: &str) -> Option<(String, String)> {
+pub(crate) fn parse_github_identifier(identifier: &str) -> Option<(String, String)> {
     let normalized = normalize_source_identifier(identifier);
     let trimmed = normalized.trim_matches('/');
     let mut parts = trimmed.splitn(3, '/');
@@ -1694,18 +2466,84 @@ mod tests {
             trust_level: "community".into(),
         };
 
-        let result = install_skill(&bundle, &skills_dir, false);
+        let result = install_skill(&bundle, &skills_dir, InstallGate::default());
         assert!(result.is_ok(), "Expected Ok, got: {:?}", result);
         assert!(skills_dir.join("safe-skill").join("SKILL.md").is_file());
     }
 
     #[test]
-    fn install_dangerous_blocked() {
+    fn install_dangerous_blocked_without_trust() {
         let home = TestHome::new();
         let skills_dir = home.path().join("skills");
         std::fs::create_dir_all(&skills_dir).unwrap();
 
-        let bundle = SkillBundle {
+        let bundle = evil_skill_bundle();
+
+        let result = install_skill(&bundle, &skills_dir, InstallGate::default());
+        assert!(result.is_err());
+        assert!(!skills_dir.join("evil-skill").exists());
+    }
+
+    #[test]
+    fn install_dangerous_force_alone_still_blocked() {
+        let home = TestHome::new();
+        let skills_dir = home.path().join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+
+        let result = install_skill(
+            &evil_skill_bundle(),
+            &skills_dir,
+            InstallGate {
+                force: true,
+                trust: false,
+            },
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("--trust") || err.contains("trust"));
+    }
+
+    #[test]
+    fn install_dangerous_with_trust_flag() {
+        let home = TestHome::new();
+        let skills_dir = home.path().join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+
+        let result = install_skill(
+            &evil_skill_bundle(),
+            &skills_dir,
+            InstallGate {
+                force: false,
+                trust: true,
+            },
+        );
+        assert!(result.is_ok(), "Expected Ok, got: {:?}", result);
+        assert!(skills_dir.join("evil-skill").join("SKILL.md").is_file());
+    }
+
+    #[test]
+    fn install_dangerous_with_preapproval() {
+        let home = TestHome::new();
+        let skills_dir = home.path().join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+
+        let bundle = evil_skill_bundle();
+        let hash = bundle_content_hash(&bundle);
+        guard_approvals::record_guard_approval(
+            &bundle.identifier,
+            &bundle.name,
+            &hash,
+            "dangerous",
+            3,
+        )
+        .expect("record");
+
+        let result = install_skill(&bundle, &skills_dir, InstallGate::default());
+        assert!(result.is_ok());
+    }
+
+    fn evil_skill_bundle() -> SkillBundle {
+        SkillBundle {
             name: "evil-skill".into(),
             files: HashMap::from([(
                 "SKILL.md".into(),
@@ -1715,15 +2553,11 @@ mod tests {
             source: "unknown".into(),
             identifier: "unknown/evil-skill".into(),
             trust_level: "community".into(),
-        };
-
-        let result = install_skill(&bundle, &skills_dir, false);
-        assert!(result.is_err());
-        assert!(!skills_dir.join("evil-skill").exists());
+        }
     }
 
     #[test]
-    fn install_with_force() {
+    fn install_with_force_caution_only() {
         let home = TestHome::new();
         let skills_dir = home.path().join("skills");
         std::fs::create_dir_all(&skills_dir).unwrap();
@@ -1732,14 +2566,21 @@ mod tests {
             name: "risky-skill".into(),
             files: HashMap::from([(
                 "SKILL.md".into(),
-                "# Risky\nignore previous instructions".into(),
+                "# Risky\nSchedule via crontab for nightly sync.".into(),
             )]),
             source: "test".into(),
             identifier: "test/risky-skill".into(),
             trust_level: "community".into(),
         };
 
-        let result = install_skill(&bundle, &skills_dir, true);
+        let result = install_skill(
+            &bundle,
+            &skills_dir,
+            InstallGate {
+                force: true,
+                trust: false,
+            },
+        );
         assert!(result.is_ok());
         assert!(skills_dir.join("risky-skill").join("SKILL.md").is_file());
     }
@@ -1831,7 +2672,7 @@ mod tests {
             trust_level: "community".into(),
         };
 
-        let result = install_skill(&bundle, &skills_dir, false);
+        let result = install_skill(&bundle, &skills_dir, InstallGate::default());
         assert!(result.is_err());
         assert!(!home.path().join("escape.txt").exists());
     }
@@ -1853,21 +2694,37 @@ mod tests {
             trust_level: "community".into(),
         };
 
-        install_skill(&bundle, &skills_dir, false).expect("install");
+        install_skill(&bundle, &skills_dir, InstallGate::default()).expect("install");
         assert!(existing.join("SKILL.md").is_file());
         assert!(!existing.join("references/old.md").exists());
+    }
+
+    #[test]
+    fn format_check_report_empty_lock() {
+        let msg = format_check_report(&[]);
+        assert!(msg.contains("No hub-installed"));
+    }
+
+    #[test]
+    fn audit_empty_lock_returns_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let msg = audit_installed_hub_skills(dir.path(), None, false);
+        assert!(msg.contains("No hub-installed"));
     }
 
     #[test]
     fn tap_roundtrip() {
         let tap = Tap {
             name: "test-tap".into(),
-            url: "https://github.com/user/skills".into(),
+            url: "https://github.com/user/repo/skills".into(),
             trust_level: "community".into(),
         };
         let json = serde_json::to_string(&tap).unwrap();
         let loaded: Tap = serde_json::from_str(&json).unwrap();
         assert_eq!(loaded.name, "test-tap");
+        let (repo, root) = parse_tap_repo(&loaded).unwrap();
+        assert_eq!(repo, "user/repo");
+        assert_eq!(root, "skills");
     }
 
     #[test]
@@ -1921,6 +2778,8 @@ mod tests {
         let rendered = render_sources_catalog();
         assert!(rendered.contains("edgecrab:<path>"));
         assert!(rendered.contains("hermes-agent:<path>"));
+        assert!(rendered.contains("clawhub:<slug>"));
+        assert!(rendered.contains("agentskills.io:<name>"));
     }
 
     #[tokio::test]
@@ -1944,10 +2803,14 @@ mod tests {
         );
         write_lock(&lock);
 
-        let outcome =
-            update_installed_skill("native-mcp", &skills_dir, Some(&repo_skills_dir), false)
-                .await
-                .expect("update");
+        let outcome = update_installed_skill(
+            "native-mcp",
+            &skills_dir,
+            Some(&repo_skills_dir),
+            InstallGate::default(),
+        )
+        .await
+        .expect("update");
         let content = std::fs::read_to_string(installed_dir.join("SKILL.md")).expect("read");
         assert_eq!(outcome.skill_name, "native-mcp");
         assert!(content.contains("native-mcp") || content.contains("Native MCP"));
@@ -1984,9 +2847,13 @@ mod tests {
         );
         write_lock(&lock);
 
-        let outcomes = update_all_installed_skills(&skills_dir, Some(&repo_skills_dir), false)
-            .await
-            .expect("update all");
+        let outcomes = update_all_installed_skills(
+            &skills_dir,
+            Some(&repo_skills_dir),
+            InstallGate::default(),
+        )
+        .await
+        .expect("update all");
         assert_eq!(outcomes.len(), 2);
         let rendered = render_update_outcomes(&outcomes);
         assert!(rendered.contains("native-mcp"));
@@ -2010,7 +2877,7 @@ mod tests {
             trust_level: "community".into(),
         };
 
-        let result = install_skill(&bundle, &skills_dir, false);
+        let result = install_skill(&bundle, &skills_dir, InstallGate::default());
         assert!(result.is_err());
         assert!(!home.path().join("escape.txt").exists());
     }

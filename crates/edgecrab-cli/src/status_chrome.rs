@@ -128,6 +128,7 @@ pub fn wait_urgency_color(elapsed_secs: u64) -> Color {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn format_waiting_first_token_status(
     theme: &Theme,
     indicator_style: StatusIndicatorStyle,
@@ -136,6 +137,7 @@ pub fn format_waiting_first_token_status(
     verb_idx: usize,
     face_idx: usize,
     elapsed_secs: u64,
+    long_label: &str,
 ) -> String {
     let verb = if theme.waiting_verbs.is_empty() {
         "awaiting"
@@ -151,7 +153,7 @@ pub fn format_waiting_first_token_status(
         verb,
         elapsed_secs,
         "first token",
-        "waiting for first token",
+        long_label,
     )
 }
 
@@ -193,11 +195,15 @@ pub struct ActiveToolSummary {
 pub fn summarize_tools_for_status(turn_activity: &TurnActivityState) -> Option<ActiveToolSummary> {
     turn_activity.tool_summary().map(|s| {
         let detail = if s.preparing {
-            let preview = edgecrab_core::safe_truncate(s.detail.trim(), 52);
-            if preview.is_empty() {
+            let preview = if s.detail.trim().is_empty() {
                 s.primary_name.replace('_', " ")
             } else {
-                format!("{} · {preview}", s.primary_name.replace('_', " "))
+                edgecrab_core::safe_truncate(s.detail.trim(), 52).to_string()
+            };
+            if s.elapsed_secs > 0 {
+                format!("{preview} · {}s", s.elapsed_secs)
+            } else {
+                preview
             }
         } else if s.active_count > 1 {
             format!(
@@ -288,6 +294,7 @@ mod tests {
             0,
             0,
             25,
+            "waiting for first token",
         );
         assert!(msg.contains("^C=stop"));
     }

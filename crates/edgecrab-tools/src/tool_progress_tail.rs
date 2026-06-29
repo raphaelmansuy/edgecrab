@@ -666,6 +666,385 @@ pub fn should_emit_progress(last: Option<Instant>, now: Instant) -> bool {
     last.is_none_or(|prev| now.duration_since(prev) >= PROGRESS_EMIT_INTERVAL)
 }
 
+/// Human-readable size for in-flight streamed tool-call JSON (TUI + gateway).
+pub fn format_streaming_args_progress(arg_bytes: usize) -> String {
+    if arg_bytes == 0 {
+        "waiting for args".into()
+    } else if arg_bytes >= 1024 * 1024 {
+        format!("~{:.1} MB args", arg_bytes as f64 / (1024.0 * 1024.0))
+    } else if arg_bytes >= 1024 {
+        format!("~{} KB args", arg_bytes / 1024)
+    } else {
+        format!("~{arg_bytes} B args")
+    }
+}
+
+/// Best-effort preview while tool-call JSON is still streaming (invalid / partial JSON).
+pub fn extract_partial_json_string_field(partial: &str, field: &str) -> Option<String> {
+    let needle = format!("\"{field}\"");
+    let start = partial.find(&needle)?;
+    let mut rest = partial[start + needle.len()..].trim_start();
+    if !rest.starts_with(':') {
+        return None;
+    }
+    rest = rest[1..].trim_start();
+    if !rest.starts_with('"') {
+        return None;
+    }
+    let mut out = String::new();
+    let mut escaped = false;
+    for ch in rest[1..].chars() {
+        if escaped {
+            out.push(match ch {
+                'n' => '\n',
+                't' => '\t',
+                'r' => '\r',
+                other => other,
+            });
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == '"' {
+            return Some(out);
+        }
+        out.push(ch);
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(format!("{out}…"))
+    }
+}
+
+/// Compact gateway/TUI status while the model drafts a tool call.
+pub fn format_tool_generating_status(name: &str, partial_args: &str) -> String {
+    let preview = streaming_tool_field_preview(name, partial_args);
+    if preview.is_empty() {
+        format!("📝 preparing {name} · {}", format_streaming_args_progress(partial_args.len()))
+    } else {
+        format!(
+            "📝 preparing {name} · {}",
+            truncate_command_preview(&preview, 72)
+        )
+    }
+}
+
+/// Extract a single high-signal field from partial tool-call JSON.
+pub fn streaming_tool_field_preview(tool_name: &str, partial_args: &str) -> String {
+    let field = match tool_name {
+        "write_file" | "read_file" | "patch" => "path",
+        "terminal" => "command",
+        "web_search" => "query",
+        "web_extract" | "web_crawl" | "browser_navigate" => "url",
+        _ => return String::new(),
+    };
+    extract_partial_json_string_field(partial_args, field).unwrap_or_default()
+}
+
+/// Emit a shelf notice when a provider names a tool but stops sending arg deltas.
+pub const TOOL_ARGS_STALL_NOTICE_SECS: u64 = 12;
+
+/// Force-abort streamed tool drafting if args never arrive (ignores thinking keepalive).
+pub const TOOL_ARGS_STALL_BREAK_SECS: u64 = 45;
+
+pub fn format_tool_args_stream_stall(name: &str, arg_bytes: usize, timeout_secs: u64) -> String {
+    format!(
+        "⚠ Provider stalled drafting {name} ({}) after {timeout_secs}s — \
+         local models may buffer large write_file payloads; waiting or recovering…",
+        format_streaming_args_progress(arg_bytes)
+    )
+}
+
+/// Activity line when EdgeCrab aborts a streamed tool draft and retries.
+pub fn format_tool_draft_aborted(
+    provider: &str,
+    name: &str,
+    arg_bytes: usize,
+    non_streaming: bool,
+) -> String {
+    let mode = if non_streaming {
+        "non-streaming retry"
+    } else {
+        "stream recovery"
+    };
+    let server_hint = match provider {
+        "lmstudio" => " LM Studio may show a new GEN counter.",
+        "ollama" => " Ollama may still be processing the prior request.",
+        _ => "",
+    };
+    format!(
+        "↻ Tool draft aborted ({name}, {}) — {mode}.{server_hint}",
+        format_streaming_args_progress(arg_bytes)
+    )
+}
+
+/// Optional context metrics for blocking LLM wait heartbeats.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct LlmWaitContext {
+    pub prompt_tokens_estimated: Option<u64>,
+    pub context_length: Option<u64>,
+    /// Prefill progress 0–100 when the provider streams `prompt_processing.progress`.
+    pub prefill_pct: Option<f32>,
+}
+
+fn format_token_k(n: u64) -> String {
+    if n >= 1_000 {
+        format!("{}k", n / 1_000)
+    } else {
+        n.to_string()
+    }
+}
+
+fn format_ctx_hint(prompt: Option<u64>, ctx: Option<u64>) -> Option<String> {
+    match (prompt, ctx) {
+        (Some(p), Some(c)) if c > 0 => Some(format!(
+            "~{}/{} ctx",
+            format_token_k(p),
+            format_token_k(c)
+        )),
+        (Some(p), None) => Some(format!("~{} prompt tok", format_token_k(p))),
+        (None, Some(c)) => Some(format!("{} ctx window", format_token_k(c))),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NonStreamingWaitPhase {
+    Start,
+    Heartbeat,
+}
+
+/// Provider-accurate liveness hint for blocking non-streaming HTTP waits.
+///
+/// First principle: EdgeCrab hides the token stream on non-streaming turns; the shelf must
+/// tell the user where *their* backend exposes progress. Only LM Studio has a GEN/tok counter.
+fn nonstreaming_wait_liveness(provider: &str, phase: NonStreamingWaitPhase) -> &'static str {
+    match provider {
+        "lmstudio" => match phase {
+            NonStreamingWaitPhase::Start => {
+                "non-streaming — watch LM Studio GEN/tok for live progress"
+            }
+            NonStreamingWaitPhase::Heartbeat => {
+                "non-streaming — LM Studio may show GEN/tok climbing"
+            }
+        },
+        "ollama" => match phase {
+            NonStreamingWaitPhase::Start => {
+                "non-streaming — Ollama generates server-side until complete"
+            }
+            NonStreamingWaitPhase::Heartbeat => {
+                "non-streaming — Ollama may still be generating"
+            }
+        },
+        "vscode-copilot" => match phase {
+            NonStreamingWaitPhase::Start => {
+                "non-streaming — waiting on Copilot API until complete"
+            }
+            NonStreamingWaitPhase::Heartbeat => {
+                "non-streaming — still waiting on Copilot API"
+            }
+        },
+        "bedrock" => match phase {
+            NonStreamingWaitPhase::Start => {
+                "Bedrock Converse — tool JSON arrives when complete (no tool stream yet)"
+            }
+            NonStreamingWaitPhase::Heartbeat => {
+                "Bedrock Converse — still generating tool call"
+            }
+        },
+        _ => match phase {
+            NonStreamingWaitPhase::Start => {
+                "buffered API — response arrives when complete"
+            }
+            NonStreamingWaitPhase::Heartbeat => {
+                "buffered API — provider may still be working"
+            }
+        },
+    }
+}
+
+fn timeout_env_hint(provider: &str) -> &'static str {
+    match provider {
+        "lmstudio" => "LMSTUDIO_TIMEOUT_SECONDS",
+        "ollama" => "OLLAMA_TIMEOUT_SECONDS",
+        _ => "HTTP timeout settings",
+    }
+}
+
+/// Shelf notice when a non-streaming LLM request starts (buffered server-side or cloud API).
+pub fn format_nonstreaming_llm_start(
+    provider: &str,
+    has_tools: bool,
+    ctx: LlmWaitContext,
+) -> String {
+    let task = if has_tools {
+        "next tool call"
+    } else {
+        "response"
+    };
+    let liveness = nonstreaming_wait_liveness(provider, NonStreamingWaitPhase::Start);
+    let mut hints: Vec<String> = Vec::new();
+    if let Some(pct) = ctx.prefill_pct {
+        hints.push(format!("prefill {pct:.0}%"));
+    }
+    if let Some(ctx_hint) = format_ctx_hint(ctx.prompt_tokens_estimated, ctx.context_length) {
+        hints.push(ctx_hint);
+    }
+    if hints.is_empty() {
+        return format!("↳ {provider}: composing {task} — {liveness}");
+    }
+    format!(
+        "↳ {provider}: {} · composing {task} — {liveness}",
+        hints.join(" · ")
+    )
+}
+
+/// Periodic heartbeat while a non-streaming LLM request is in flight.
+pub fn format_nonstreaming_llm_wait(
+    provider: &str,
+    elapsed_secs: u64,
+    has_tools: bool,
+    ctx: LlmWaitContext,
+) -> String {
+    let task = if has_tools {
+        "tool call"
+    } else {
+        "response"
+    };
+    let liveness = nonstreaming_wait_liveness(provider, NonStreamingWaitPhase::Heartbeat);
+    let mut hints: Vec<String> = Vec::new();
+    if let Some(pct) = ctx.prefill_pct {
+        hints.push(format!("prefill {pct:.0}%"));
+    }
+    if let Some(ctx_hint) = format_ctx_hint(ctx.prompt_tokens_estimated, ctx.context_length) {
+        hints.push(ctx_hint);
+    }
+    hints.push(format!("{elapsed_secs}s"));
+    format!(
+        "↳ {provider}: still composing {task} · {} ({liveness})",
+        hints.join(" · ")
+    )
+}
+
+/// Shelf warning when a local HTTP call approaches its timeout (prefill + tool JSON still running).
+pub fn format_local_timeout_proximity_notice(
+    provider: &str,
+    elapsed_secs: u64,
+    http_timeout_secs: u64,
+) -> String {
+    format!(
+        "⚠ {provider}: {elapsed_secs}s / {http_timeout_secs}s HTTP budget — large tool JSON may \
+         abort soon (EdgeCrab will not retry). Use smaller incremental steps or raise \
+         {}.",
+        timeout_env_hint(provider)
+    )
+}
+
+/// Shelf notice when output budget was exhausted without a tool call (reasoning ate max_tokens).
+pub fn format_local_length_without_tools_notice(
+    provider: &str,
+    completion_tokens: usize,
+    thinking_tokens: usize,
+    max_tokens: usize,
+) -> String {
+    format!(
+        "⚠ {provider}: hit max_tokens ({max_tokens}) without tool_calls \
+         (completion={completion_tokens}, reasoning={thinking_tokens}) — retrying with \
+         incremental-edit guidance (reasoning=none, smaller payload)"
+    )
+}
+
+/// Shelf notice when local mid-band structural compress runs (no LLM call).
+pub fn format_local_structural_compress_notice(
+    provider: &str,
+    tokens_before: usize,
+    tokens_after: usize,
+) -> String {
+    format!(
+        "📦 {provider}: mid-band structural compress — ~{}k→~{}k prompt est. \
+         (stat summary, no LLM compress)",
+        tokens_before / 1000,
+        tokens_after / 1000,
+    )
+}
+
+/// Preflight shelf line when a local tool turn starts with policy caps applied.
+pub fn format_local_tool_turn_preflight(plan_line: &str) -> String {
+    format!("⚙ {plan_line}")
+}
+
+/// Shelf notice when structural prefill prune reclaims tool-output context (no LLM call).
+pub fn format_local_prefill_prune_notice(
+    provider: &str,
+    tokens_before: usize,
+    tokens_after: usize,
+    tools_pruned: usize,
+    reason: &str,
+) -> String {
+    let phase = match reason {
+        "length_recovery" => "after max_tokens stall",
+        _ => "before tool turn",
+    };
+    format!(
+        "✂ {provider}: structural prefill prune {phase} — ~{}k→~{}k prompt est., \
+         {tools_pruned} tool output(s) pruned/spilled (deterministic, no LLM compress)",
+        tokens_before / 1000,
+        tokens_after / 1000,
+    )
+}
+
+/// Shelf notice when a local provider HTTP call times out or the network drops.
+pub fn format_local_transport_stall_notice(provider: &str) -> String {
+    match provider {
+        "lmstudio" => format!(
+            "⚠ {provider}: request timed out or lost connection — LM Studio may still be \
+             generating (watch GEN/tok). EdgeCrab did not retry to avoid a duplicate generation. \
+             Wait for the current job to finish or restart LM Studio, then retry with a smaller step."
+        ),
+        "ollama" => format!(
+            "⚠ {provider}: request timed out or lost connection — Ollama may still be generating. \
+             EdgeCrab did not retry to avoid a duplicate request. Wait for the server or restart \
+             Ollama, then retry with a smaller step."
+        ),
+        _ => format!(
+            "⚠ {provider}: request timed out or lost connection. EdgeCrab did not retry. \
+             Wait and retry with a smaller step."
+        ),
+    }
+}
+
+/// Single shelf/status label for [`StreamEvent::LlmWaitProgress`] (DRY entry point).
+pub fn llm_wait_progress_label(
+    provider: &str,
+    elapsed_secs: u64,
+    has_tools: bool,
+    ctx: LlmWaitContext,
+) -> String {
+    if elapsed_secs == 0 {
+        format_nonstreaming_llm_start(provider, has_tools, ctx)
+    } else {
+        format_nonstreaming_llm_wait(provider, elapsed_secs, has_tools, ctx)
+    }
+}
+
+/// Compact status-bar label — avoids truncating the full shelf line mid-word.
+pub fn llm_wait_status_compact(
+    provider: &str,
+    has_tools: bool,
+    ctx: LlmWaitContext,
+) -> String {
+    let task = if has_tools { "tool turn" } else { "reply" };
+    if let Some(hint) = format_ctx_hint(ctx.prompt_tokens_estimated, ctx.context_length) {
+        format!("{provider} {task} · {hint}")
+    } else {
+        format!("{provider} {task}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -695,6 +1074,127 @@ mod tests {
     #[test]
     fn sanitize_strips_ansi() {
         assert_eq!(sanitize_output_line("\x1b[31merror\x1b[0m"), "error");
+    }
+
+    #[test]
+    fn local_transport_stall_notice_is_actionable() {
+        let msg = format_local_transport_stall_notice("lmstudio");
+        assert!(msg.contains("lmstudio"));
+        assert!(msg.contains("did not retry"));
+        assert!(msg.contains("GEN"));
+    }
+
+    #[test]
+    fn llm_wait_label_includes_context_hint() {
+        let ctx = LlmWaitContext {
+            prompt_tokens_estimated: Some(56_000),
+            context_length: Some(64_000),
+            prefill_pct: None,
+        };
+        let msg = llm_wait_progress_label("lmstudio", 120, true, ctx);
+        assert!(msg.contains("56k/64k"));
+        assert!(msg.contains("120s"));
+        assert!(msg.contains("LM Studio"));
+    }
+
+    #[test]
+    fn llm_wait_label_copilot_never_mentions_lm_studio() {
+        let ctx = LlmWaitContext {
+            prompt_tokens_estimated: Some(33_000),
+            context_length: Some(128_000),
+            prefill_pct: None,
+        };
+        let start = llm_wait_progress_label("vscode-copilot", 0, true, ctx);
+        let wait = llm_wait_progress_label("vscode-copilot", 27, true, ctx);
+        assert!(start.contains("Copilot API"));
+        assert!(!start.to_lowercase().contains("lm studio"));
+        assert!(wait.contains("Copilot API"));
+        assert!(!wait.to_lowercase().contains("lm studio"));
+        assert!(!wait.contains("GEN/tok"));
+    }
+
+    #[test]
+    fn llm_wait_label_bedrock_uses_converse_not_local_nonstreaming() {
+        let ctx = LlmWaitContext {
+            prompt_tokens_estimated: Some(33_000),
+            context_length: Some(300_000),
+            prefill_pct: None,
+        };
+        let start = llm_wait_progress_label("bedrock", 0, true, ctx);
+        let wait = llm_wait_progress_label("bedrock", 31, true, ctx);
+        assert!(start.contains("Bedrock Converse"));
+        assert!(!start.contains("LM Studio"));
+        assert!(!start.contains("GEN/tok"));
+        assert!(wait.contains("Bedrock Converse"));
+        let compact = llm_wait_status_compact("bedrock", true, ctx);
+        assert!(compact.contains("bedrock tool turn"));
+        assert!(compact.contains("33k/300k"));
+        assert!(compact.len() < 48, "compact label must fit status bar: {compact}");
+    }
+
+    #[test]
+    fn llm_wait_label_ollama_never_mentions_lm_studio() {
+        let ctx = LlmWaitContext {
+            prompt_tokens_estimated: Some(40_000),
+            context_length: Some(64_000),
+            prefill_pct: None,
+        };
+        let msg = llm_wait_progress_label("ollama", 15, true, ctx);
+        assert!(msg.contains("Ollama"));
+        assert!(!msg.to_lowercase().contains("lm studio"));
+    }
+
+    #[test]
+    fn llm_wait_label_includes_prefill_pct() {
+        let ctx = LlmWaitContext {
+            prompt_tokens_estimated: Some(40_000),
+            context_length: Some(64_000),
+            prefill_pct: Some(73.0),
+        };
+        let msg = llm_wait_progress_label("lmstudio", 0, false, ctx);
+        assert!(msg.contains("prefill 73%"));
+        assert!(msg.contains("40k/64k"));
+    }
+
+    #[test]
+    fn local_timeout_proximity_notice_is_actionable() {
+        let msg = format_local_timeout_proximity_notice("lmstudio", 480, 600);
+        assert!(msg.contains("480s / 600s"));
+        assert!(msg.contains("LMSTUDIO_TIMEOUT_SECONDS"));
+    }
+
+    #[test]
+    fn local_length_without_tools_notice_mentions_reasoning() {
+        let msg = format_local_length_without_tools_notice("lmstudio", 2048, 1800, 2048);
+        assert!(msg.contains("without tool_calls"));
+        assert!(msg.contains("reasoning=1800"));
+    }
+
+    #[test]
+    fn local_prefill_prune_notice_mentions_token_drop() {
+        let preflight = format_local_prefill_prune_notice("lmstudio", 52_000, 18_000, 6, "preflight");
+        assert!(preflight.contains("~52k→~18k"));
+        assert!(preflight.contains("6 tool output"));
+        assert!(preflight.contains("before tool turn"));
+
+        let recovery =
+            format_local_prefill_prune_notice("lmstudio", 46_000, 12_000, 8, "length_recovery");
+        assert!(recovery.contains("after max_tokens stall"));
+    }
+
+    #[test]
+    fn lh50_local_structural_compress_notice_mentions_token_drop() {
+        let line = format_local_structural_compress_notice("lmstudio", 58_000, 22_000);
+        assert!(line.contains("~58k→~22k"));
+        assert!(line.contains("mid-band"));
+    }
+
+    #[test]
+    fn lh51_local_tool_turn_preflight_passes_through_max_arg_plan_line() {
+        let plan_line =
+            "local tool turn: lmstudio / qwen · max_tokens=8192 · max_arg=27852B · reasoning=none";
+        let shelf = format_local_tool_turn_preflight(plan_line);
+        assert!(shelf.contains("max_arg=27852B"));
     }
 
     #[test]
@@ -799,6 +1299,33 @@ mod tests {
     fn format_browser_milestone_omits_empty_detail() {
         let msg = format_browser_milestone("connecting", "   ");
         assert_eq!(msg, "browser: connecting…");
+    }
+
+    #[test]
+    fn format_streaming_args_progress_scales_units() {
+        assert_eq!(
+            format_streaming_args_progress(0),
+            "waiting for args".to_string()
+        );
+        assert!(format_streaming_args_progress(512).contains("512"));
+        assert!(format_streaming_args_progress(4096).contains("KB"));
+    }
+
+    #[test]
+    fn extract_partial_json_string_field_reads_incomplete_path() {
+        let partial = r#"{"path":"demo/slides.js","content":"const ppt"#;
+        let path = extract_partial_json_string_field(partial, "path").expect("path");
+        assert_eq!(path, "demo/slides.js");
+    }
+
+    #[test]
+    fn format_tool_generating_status_uses_partial_path() {
+        let msg = format_tool_generating_status(
+            "write_file",
+            r##"{"path":"report.md","content":"# Title"}"##,
+        );
+        assert!(msg.contains("write_file"));
+        assert!(msg.contains("report.md"));
     }
 
     #[test]

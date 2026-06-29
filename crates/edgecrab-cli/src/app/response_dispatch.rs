@@ -84,7 +84,7 @@ impl App {
                         || !self.turn_activity.tools.is_empty()
                         || matches!(
                             self.turn_activity.phase,
-                            ShelfPhase::AnalyzingOutput | ShelfPhase::AwaitingFirstToken
+                            ShelfPhase::AwaitingFirstToken
                         )
                     {
                         self.turn_activity.set_phase(ShelfPhase::Streaming);
@@ -109,11 +109,60 @@ impl App {
                     self.needs_redraw = true;
                 }
                 AgentResponse::ActivityFeed(text) => {
+                    if text.contains("Tool draft aborted")
+                        || text.contains("non-streaming")
+                        || text.contains("Stream interrupted")
+                        || text.contains("stalled drafting")
+                    {
+                        stream_bridge::clear_tool_generating(&mut self.turn_activity);
+                        self.display_state = DisplayState::AwaitingFirstToken {
+                            frame: 0,
+                            started: Instant::now(),
+                        };
+                    }
                     stream_bridge::apply_activity_notice(
                         &mut self.turn_activity,
                         text,
                         crate::turn_activity::ActivityTone::Info,
                     );
+                    self.note_shelf_activity();
+                    self.needs_redraw = true;
+                }
+                AgentResponse::LlmWaitProgress {
+                    provider,
+                    elapsed_secs,
+                    has_tools,
+                    prompt_tokens_estimated,
+                    context_length,
+                    prefill_pct,
+                } => {
+                    stream_bridge::apply_llm_wait_progress(
+                        &mut self.turn_activity,
+                        &provider,
+                        elapsed_secs,
+                        has_tools,
+                        edgecrab_tools::tool_progress_tail::LlmWaitContext {
+                            prompt_tokens_estimated,
+                            context_length,
+                            prefill_pct,
+                        },
+                    );
+                    if !matches!(
+                        self.display_state,
+                        DisplayState::Streaming { .. } | DisplayState::Thinking { .. }
+                    ) {
+                        match &mut self.display_state {
+                            DisplayState::AwaitingFirstToken { started: _, .. } => {
+                                // Keep wall-clock anchor — heartbeats must not reset elapsed.
+                            }
+                            _ => {
+                                self.display_state = DisplayState::AwaitingFirstToken {
+                                    frame: 0,
+                                    started: Instant::now(),
+                                };
+                            }
+                        }
+                    }
                     self.note_shelf_activity();
                     self.needs_redraw = true;
                 }
@@ -187,7 +236,7 @@ impl App {
                     name,
                     partial_args,
                 } => {
-                    let preview = extract_tool_preview(&name, &partial_args);
+                    let preview = extract_streaming_tool_preview(&name, &partial_args);
                     stream_bridge::apply_tool_generating(
                         &mut self.turn_activity,
                         tool_call_id.clone(),
@@ -546,6 +595,8 @@ impl App {
                             frame: 0,
                             started: Instant::now(),
                         };
+                        self.turn_activity
+                            .set_phase(crate::turn_activity::ShelfPhase::AwaitingFirstToken);
                     } else if let Some((active_tool_call_id, row)) =
                         self.turn_activity.latest_active_tool()
                     {
@@ -1049,6 +1100,28 @@ impl App {
                         OutputRole::Error,
                     );
                     self.needs_redraw = true;
+                }
+                AgentResponse::RemoteSkillGuardPrompt {
+                    entry,
+                    preview,
+                    review_only,
+                } => {
+                    self.remote_skill_browser.action_in_flight = None;
+                    self.skill_trust_prompt = Some(App::build_skill_trust_prompt_state(
+                        entry,
+                        *preview,
+                        review_only,
+                    ));
+                    self.needs_redraw = true;
+                }
+                AgentResponse::RemoteSkillGuardPreviewReady {
+                    identifier,
+                    preview,
+                } => {
+                    self.apply_remote_skill_guard_preview_ready(identifier, *preview);
+                }
+                AgentResponse::RemoteSkillGuardPreviewFailed { identifier, error } => {
+                    self.apply_remote_skill_guard_preview_failed(identifier, error);
                 }
                 AgentResponse::RemoteSkillActionComplete {
                     message,

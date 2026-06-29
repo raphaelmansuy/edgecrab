@@ -39,7 +39,9 @@ pub(crate) enum IfExists {
 
 #[derive(Deserialize)]
 struct Args {
+    #[serde(alias = "file_path")]
     path: String,
+    #[serde(alias = "file_content", alias = "text", alias = "body")]
     content: String,
     #[serde(default)]
     create_dirs: bool,
@@ -124,7 +126,8 @@ impl ToolHandler for WriteFileTool {
 
         // Path jail check — delegates security concern to path_utils (SRP).
         // For create_dirs=true the helper also creates parent directories.
-        let resolved = if args.create_dirs {
+        let create_dirs = args.create_dirs || ctx.config.local_write_create_dirs;
+        let resolved = if create_dirs {
             jail_write_path_create_dirs(&args.path, &path_policy)?
         } else {
             jail_write_path(&args.path, &path_policy)?
@@ -141,19 +144,11 @@ impl ToolHandler for WriteFileTool {
         {
             match args.if_exists {
                 IfExists::Abort => {
-                    // FP55 cheap path: model declared intent to create a NEW file.
-                    // Return stat-only — no preview, no snapshot — so the model
-                    // can quickly choose a different path.
                     let size = std::fs::metadata(&resolved).map(|m| m.len()).unwrap_or(0);
-                    return Err(ToolError::InvalidArgs {
-                        tool: "write_file".into(),
-                        message: format!(
-                            "'{path}' already exists ({size} bytes). \
-                             Pick a different path, or call write_file again with \
-                             if_exists=\"overwrite\" (the default) to replace it.",
-                            path = args.path
-                        ),
-                    });
+                    return Err(crate::recovery_catalog::write_file_path_exists_abort(
+                        args.path.clone(),
+                        size,
+                    ));
                 }
                 IfExists::Overwrite => {
                     // FP51 + FP55: include the current file content so the model
@@ -170,15 +165,6 @@ impl ToolHandler for WriteFileTool {
                     let current_content = std::fs::read_to_string(&resolved).unwrap_or_default();
                     let preview = crate::safe_truncate(&current_content, PREVIEW_LIMIT);
                     let truncated = preview.len() < current_content.len();
-                    let trunc_note = if truncated {
-                        format!(
-                            "\n[...truncated — file has {} total bytes; \
-                             read_file gives full content if needed.]",
-                            current_content.len()
-                        )
-                    } else {
-                        String::new()
-                    };
 
                     // Record snapshot BEFORE returning the error so the
                     // immediate retry passes the freshness guard. Failure
@@ -186,21 +172,11 @@ impl ToolHandler for WriteFileTool {
                     // and learn to read_file. Logging would be noise.
                     let _ = crate::read_tracker::record_file_snapshot(&ctx.session_id, &resolved);
 
-                    return Err(ToolError::InvalidArgs {
-                        tool: "write_file".into(),
-                        message: format!(
-                            "'{path}' already exists. \
-                             Snapshot recorded — retry the SAME write_file call to overwrite \
-                             (no extra read_file needed). \
-                             For targeted edits prefer patch/apply_patch — far more token-efficient.\n\
-                             \n\
-                             Current file content (preview):\n\
-                             ---\n\
-                             {preview}{trunc_note}\n\
-                             ---",
-                            path = args.path
-                        ),
-                    });
+                    return Err(crate::recovery_catalog::write_file_overwrite_guard(
+                        args.path.clone(),
+                        preview.to_string(),
+                        truncated,
+                    ));
                 }
             }
         }
@@ -244,15 +220,9 @@ impl ToolHandler for WriteFileTool {
         {
             let changed = current.len() != size_snap || current.modified().ok() != mtime_snap;
             if changed {
-                return Err(ToolError::ContentMismatch {
-                    tool: "write_file".into(),
-                    path: args.path.clone(),
-                    message: format!(
-                        "'{}' was modified by another process between freshness check and \
-                             write (TOCTOU). Re-read with read_file and retry.",
-                        args.path
-                    ),
-                });
+                return Err(crate::recovery_catalog::write_file_content_mismatch(
+                    args.path.clone(),
+                ));
             }
         }
 
@@ -440,6 +410,29 @@ mod tests {
         assert!(result.contains("Created empty scaffold"));
         let content = std::fs::read_to_string(dir.path().join("audit.md")).expect("read");
         assert_eq!(content, "");
+    }
+
+    #[tokio::test]
+    async fn lh40_local_write_create_dirs_default_writes_nested_path() {
+        let dir = TempDir::new().expect("tmpdir");
+        let mut ctx = ctx_in(dir.path());
+        ctx.config.local_write_create_dirs = true;
+
+        let result = WriteFileTool
+            .execute(
+                json!({"path": "tmp/pptx_builder/script.py", "content": "print('ok')\n"}),
+                &ctx,
+            )
+            .await
+            .expect("nested write with local_write_create_dirs");
+
+        let v: serde_json::Value = serde_json::from_str(&result).expect("JSON");
+        assert_eq!(v["ok"], true);
+        assert!(
+            dir.path()
+                .join("tmp/pptx_builder/script.py")
+                .exists()
+        );
     }
 
     #[tokio::test]

@@ -161,6 +161,10 @@ pub fn render_status_bar(frame: &mut Frame, area: Rect, params: &StatusBarRender
         match params.display_state {
             DisplayState::AwaitingFirstToken { frame: f, started } => {
                 let elapsed_secs = started.elapsed().as_secs();
+                let long_label = params
+                    .turn_activity
+                    .llm_wait_compact_label()
+                    .unwrap_or("waiting for first token");
                 let msg = format_waiting_first_token_status(
                     params.theme,
                     params.status_indicator,
@@ -169,6 +173,7 @@ pub fn render_status_bar(frame: &mut Frame, area: Rect, params: &StatusBarRender
                     params.thinking_verb_idx,
                     params.kaomoji_frame_idx,
                     elapsed_secs,
+                    &long_label,
                 );
                 // FP46: urgency color ramp — amber (normal) → orange (slow) → red (stall)
                 let color = wait_urgency_color(elapsed_secs);

@@ -14,7 +14,7 @@
 //!   │      │                                                  │
 //!   │      ├── exact match? → handler.execute(args, ctx)      │
 //!   │      │                                                  │
-//!   │      └── no match? → fuzzy_match (strsim) → suggestion  │
+//!   │      └── no match? → fuzzy_match_tool_name (Jaro ≥0.7) → suggestion │
 //!   │                                                         │
 //!   │  get_definitions(enabled, disabled)                     │
 //!   │      → filter by toolset + availability                 │
@@ -350,6 +350,8 @@ pub struct ToolContext {
     pub mutation_turn: Option<Arc<crate::mutations::MutationTurnState>>,
     /// Post-write LSP diagnostic gate (injected when `lsp.enabled`).
     pub lsp_gate: Option<Arc<dyn crate::lsp_gate::LspGate>>,
+    /// Kanban worker task scope (dispatcher-spawned agents).
+    pub kanban_task_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -437,6 +439,7 @@ impl ToolContext {
             watch_notification_tx: None,
             mutation_turn: None,
             lsp_gate: None,
+            kanban_task_id: None,
         }
     }
 
@@ -465,6 +468,125 @@ pub struct ToolRegistry {
     dynamic_tool_aliases: HashMap<String, String>,
 }
 
+// ── Schema-aware argument normalization ───────────────────────────────
+// Local models (LM Studio / Qwen) often emit Hermes/OpenAI-inconsistent
+// field names (`file_path` vs `path`). Rename at the harness boundary —
+// deterministic, schema-driven, not failure-count adaptive.
+
+const PATH_FIELD_ALIASES: &[&str] = &["file_path", "filepath", "filename"];
+const CONTENT_FIELD_ALIASES: &[&str] = &["file_content", "text", "body"];
+
+fn rename_missing_canonical_field(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    canonical: &str,
+    aliases: &[&str],
+) {
+    if map.contains_key(canonical) {
+        return;
+    }
+    for alias in aliases {
+        if let Some(value) = map.remove(*alias) {
+            map.insert(canonical.to_string(), value);
+            return;
+        }
+    }
+}
+
+fn normalize_schema_field_aliases(args: &mut serde_json::Value, schema: &serde_json::Value) {
+    let Some(properties) = schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return;
+    };
+    let serde_json::Value::Object(map) = args else {
+        return;
+    };
+    if properties.contains_key("path") {
+        rename_missing_canonical_field(map, "path", PATH_FIELD_ALIASES);
+    }
+    if properties.contains_key("content") {
+        rename_missing_canonical_field(map, "content", CONTENT_FIELD_ALIASES);
+    }
+}
+
+fn schema_allows_null(prop_schema: &serde_json::Value) -> bool {
+    match prop_schema.get("type") {
+        Some(serde_json::Value::String(t)) if t == "null" => true,
+        Some(serde_json::Value::Array(types)) if types.iter().any(|t| t.as_str() == Some("null")) => {
+            true
+        }
+        _ => prop_schema.get("nullable").and_then(|v| v.as_bool()) == Some(true),
+    }
+}
+
+fn coerce_string_value(value: &str, expected_type: &str, prop_schema: &serde_json::Value) -> Option<serde_json::Value> {
+    if schema_allows_null(prop_schema) && value.trim().eq_ignore_ascii_case("null") {
+        return Some(serde_json::Value::Null);
+    }
+    match expected_type {
+        "integer" => value
+            .parse::<i64>()
+            .ok()
+            .map(|n| serde_json::Value::Number(n.into())),
+        "number" => value
+            .parse::<f64>()
+            .ok()
+            .and_then(serde_json::Number::from_f64)
+            .map(serde_json::Value::Number),
+        "boolean" => match value {
+            "true" | "1" | "True" => Some(serde_json::Value::Bool(true)),
+            "false" | "0" | "False" => Some(serde_json::Value::Bool(false)),
+            _ => None,
+        },
+        "array" => serde_json::from_str::<Vec<serde_json::Value>>(value)
+            .ok()
+            .map(serde_json::Value::Array),
+        "object" => serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(value)
+            .ok()
+            .map(serde_json::Value::Object),
+        _ => None,
+    }
+}
+
+fn coerce_value_for_schema(value: &mut serde_json::Value, prop_schema: &serde_json::Value) {
+    if let Some(serde_json::Value::Array(types)) = prop_schema.get("type")
+        && let Some(s) = value.as_str()
+    {
+        for t in types {
+            if let Some(t) = t.as_str()
+                && let Some(coerced) = coerce_string_value(s, t, prop_schema)
+            {
+                *value = coerced;
+                return;
+            }
+        }
+        return;
+    }
+
+    let Some(expected_type) = prop_schema.get("type").and_then(|t| t.as_str()) else {
+        return;
+    };
+
+    if let Some(s) = value.as_str()
+        && let Some(coerced) = coerce_string_value(s, expected_type, prop_schema)
+    {
+        *value = coerced;
+        return;
+    }
+
+    match expected_type {
+        "string" if !value.is_string() => {
+            *value = serde_json::Value::String(value.to_string());
+        }
+        "array" if !value.is_array() && value.as_str().is_none() => {
+            let v = value.take();
+            *value = serde_json::Value::Array(vec![v]);
+        }
+        _ => {}
+    }
+}
+
 // ── Schema-aware type coercion ──────────────────────────────────────
 // Silently coerce string↔integer, string↔boolean, etc. when the LLM
 // sends a value in the wrong JSON type but the right semantic value.
@@ -472,6 +594,7 @@ pub struct ToolRegistry {
 //
 // FP2: Make The Right Thing Easy — "42" for an integer field IS the right value.
 fn coerce_tool_args(args: &mut serde_json::Value, schema: &serde_json::Value) {
+    normalize_schema_field_aliases(args, schema);
     let Some(properties) = schema
         .get("properties")
         .and_then(serde_json::Value::as_object)
@@ -485,40 +608,7 @@ fn coerce_tool_args(args: &mut serde_json::Value, schema: &serde_json::Value) {
         let Some(value) = map.get_mut(key) else {
             continue;
         };
-        let Some(expected_type) = prop_schema.get("type").and_then(serde_json::Value::as_str)
-        else {
-            continue;
-        };
-        match expected_type {
-            "integer" if value.is_string() => {
-                if let Some(s) = value.as_str()
-                    && let Ok(n) = s.parse::<i64>()
-                {
-                    *value = serde_json::Value::Number(n.into());
-                }
-            }
-            "number" if value.is_string() => {
-                if let Some(s) = value.as_str()
-                    && let Ok(n) = s.parse::<f64>()
-                    && let Some(n) = serde_json::Number::from_f64(n)
-                {
-                    *value = serde_json::Value::Number(n);
-                }
-            }
-            "boolean" if value.is_string() => match value.as_str() {
-                Some("true" | "1") => *value = serde_json::Value::Bool(true),
-                Some("false" | "0") => *value = serde_json::Value::Bool(false),
-                _ => {}
-            },
-            "string" if !value.is_string() => {
-                *value = serde_json::Value::String(value.to_string());
-            }
-            "array" if !value.is_array() => {
-                let v = value.take();
-                *value = serde_json::Value::Array(vec![v]);
-            }
-            _ => {}
-        }
+        coerce_value_for_schema(value, prop_schema);
     }
 }
 
@@ -723,6 +813,25 @@ impl ToolRegistry {
         schemas
     }
 
+    /// Normalize schema field aliases and coerce JSON types before dispatch.
+    ///
+    /// Call this on parsed tool arguments before suppression keys or `dispatch`.
+    pub fn prepare_tool_arguments(&self, name: &str, args: &mut serde_json::Value) {
+        let static_name = self.tool_aliases.get(name).copied().unwrap_or(name);
+        if let Some(handler) = self.tools.get(static_name) {
+            coerce_tool_args(args, &handler.schema().parameters);
+            return;
+        }
+        let dynamic_name = self
+            .dynamic_tool_aliases
+            .get(name)
+            .map(String::as_str)
+            .unwrap_or(name);
+        if let Some(handler) = self.dynamic_tools.get(dynamic_name) {
+            coerce_tool_args(args, &handler.schema().parameters);
+        }
+    }
+
     /// Dispatch a tool call by name.
     ///
     /// On name mismatch, uses fuzzy matching (Levenshtein distance via strsim)
@@ -737,6 +846,13 @@ impl ToolRegistry {
         mut args: serde_json::Value,
         ctx: &ToolContext,
     ) -> Result<String, ToolError> {
+        let resolved = self.resolve_tool_call_name(name);
+        let name = if resolved.canonical.is_empty() {
+            name
+        } else {
+            resolved.canonical.as_str()
+        };
+
         // Any tool other than read_file / search_files resets the consecutive
         // re-read counter so only truly back-to-back identical reads trigger
         // the loop guard. Mirrors hermes-agent's notify_other_tool_call().
@@ -793,8 +909,8 @@ impl ToolRegistry {
             return handler.execute(args, ctx).await;
         }
 
-        // Fuzzy fallback
-        if let Some(suggestion) = self.fuzzy_match(name) {
+        // Fuzzy fallback — suggest closest registered tool (Hermes difflib parity).
+        if let Some(suggestion) = crate::tool_name_repair::fuzzy_match_tool_name(self, name) {
             Err(ToolError::NotFound(format!(
                 "Unknown tool '{}'. Did you mean '{}'?",
                 name, suggestion
@@ -813,8 +929,9 @@ impl ToolRegistry {
         &self,
         tool_name: &str,
         error: &ToolError,
+        args_json: Option<&str>,
     ) -> Option<edgecrab_types::ToolErrorResponse> {
-        if !matches!(error, ToolError::InvalidArgs { .. }) {
+        if !matches!(error.core_error(), ToolError::InvalidArgs { .. }) {
             return None;
         }
         let handler: &dyn ToolHandler = if let Some(h) = self.tools.get(tool_name) {
@@ -826,15 +943,8 @@ impl ToolRegistry {
         };
 
         let schema = handler.schema();
-        let required_fields = schema
-            .parameters
-            .get("required")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect::<Vec<_>>()
-            });
+        let required_fields =
+            required_fields_from_parameters(&schema.parameters, args_json);
 
         let usage_hint = Self::build_usage_hint(&schema);
 
@@ -893,6 +1003,27 @@ impl ToolRegistry {
         names
     }
 
+    /// Resolve a wire name to a registered canonical tool name, if known.
+    pub fn lookup_tool_name(&self, name: &str) -> Option<String> {
+        if self.tools.contains_key(name) {
+            return Some(name.to_string());
+        }
+        if let Some(&canonical) = self.tool_aliases.get(name) {
+            return Some(canonical.to_string());
+        }
+        if self.dynamic_tools.contains_key(name) {
+            return Some(name.to_string());
+        }
+        self.dynamic_tool_aliases
+            .get(name)
+            .cloned()
+    }
+
+    /// Normalize a raw model-emitted tool name (pollution strip + Hermes repair).
+    pub fn resolve_tool_call_name(&self, raw: &str) -> crate::tool_name_repair::ResolvedToolName {
+        crate::tool_name_repair::resolve_tool_call_name(self, raw)
+    }
+
     /// All toolset names
     pub fn toolset_names(&self) -> Vec<&str> {
         let mut names: Vec<&str> = self.toolset_index.keys().copied().collect();
@@ -940,16 +1071,7 @@ impl ToolRegistry {
         };
 
         Some(
-            schema
-                .parameters
-                .get("required")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default(),
+            required_fields_from_parameters(&schema.parameters, None).unwrap_or_default(),
         )
     }
 
@@ -1111,51 +1233,6 @@ impl ToolRegistry {
             })
             .collect()
     }
-
-    /// Fuzzy match tool name using Levenshtein distance.
-    /// Returns the closest match if distance ≤ 3 (catches common typos).
-    fn fuzzy_match(&self, name: &str) -> Option<&str> {
-        let threshold = 3;
-        let mut best: Option<(&str, usize)> = None;
-
-        for &tool_name in self.tools.keys() {
-            let dist = strsim::levenshtein(name, tool_name);
-            if dist <= threshold
-                && (best.is_none() || dist < best.as_ref().map_or(usize::MAX, |b| b.1))
-            {
-                best = Some((tool_name, dist));
-            }
-        }
-
-        for (&alias, &canonical) in &self.tool_aliases {
-            let dist = strsim::levenshtein(name, alias);
-            if dist <= threshold
-                && (best.is_none() || dist < best.as_ref().map_or(usize::MAX, |b| b.1))
-            {
-                best = Some((canonical, dist));
-            }
-        }
-
-        for tool_name in self.dynamic_tools.keys() {
-            let dist = strsim::levenshtein(name, tool_name);
-            if dist <= threshold
-                && (best.is_none() || dist < best.as_ref().map_or(usize::MAX, |b| b.1))
-            {
-                best = Some((tool_name.as_str(), dist));
-            }
-        }
-
-        for (alias, canonical) in &self.dynamic_tool_aliases {
-            let dist = strsim::levenshtein(name, alias);
-            if dist <= threshold
-                && (best.is_none() || dist < best.as_ref().map_or(usize::MAX, |b| b.1))
-            {
-                best = Some((canonical.as_str(), dist));
-            }
-        }
-
-        best.map(|(name, _)| name)
-    }
 }
 
 impl Default for ToolRegistry {
@@ -1174,10 +1251,150 @@ pub fn to_llm_definitions(schemas: &[ToolSchema]) -> Vec<edgequake_llm::ToolDefi
             edgequake_llm::ToolDefinition::function(
                 &s.name,
                 &s.description,
-                normalize_json_schema(&s.parameters),
+                openai_compatible_tool_parameters(&s.parameters),
             )
         })
         .collect()
+}
+
+/// OpenAI-compatible wire shape: top-level `type: "object"` only (LM Studio rejects `oneOf`).
+pub fn openai_compatible_tool_parameters(schema: &Value) -> Value {
+    if let Some(one_of) = schema.get("oneOf").and_then(Value::as_array) {
+        return flatten_oneof_object_schema(one_of);
+    }
+    normalize_json_schema(schema)
+}
+
+fn flatten_oneof_object_schema(branches: &[Value]) -> Value {
+    let mut properties = Map::new();
+    for branch in branches {
+        if let Some(props) = branch.get("properties").and_then(Value::as_object) {
+            for (key, value) in props {
+                properties.entry(key.clone()).or_insert_with(|| value.clone());
+            }
+        }
+    }
+    Value::Object(Map::from_iter([
+        ("type".into(), Value::String("object".into())),
+        ("additionalProperties".into(), Value::Bool(false)),
+        ("properties".into(), Value::Object(properties)),
+        (
+            "required".into(),
+            Value::Array(vec![Value::String("mode".into())]),
+        ),
+    ]))
+}
+
+/// Append live output-geometry limits to mutation-tool descriptions (local providers only).
+pub fn annotate_llm_definitions_for_local_turn(
+    defs: Vec<edgequake_llm::ToolDefinition>,
+    provider_name: &str,
+    local_turn_budget: Option<(usize, usize)>,
+) -> Vec<edgequake_llm::ToolDefinition> {
+    let Some((max_arg_bytes, max_output_tokens)) = local_turn_budget else {
+        return defs;
+    };
+    if !matches!(provider_name, "lmstudio" | "ollama") {
+        return defs;
+    }
+    let suffix =
+        crate::mutation_turn_policy::local_tool_budget_schema_suffix(max_arg_bytes, max_output_tokens);
+    defs.into_iter()
+        .map(|mut def| {
+            if crate::mutation_turn_policy::is_large_payload_tool(&def.function.name) {
+                def.function.description.push_str(&suffix);
+            }
+            def
+        })
+        .collect()
+}
+
+fn patch_mode_required_fields(mode: &str) -> Vec<String> {
+    match mode {
+        "patch" => vec![
+            "mode".into(),
+            "patch".into(),
+        ],
+        _ => vec![
+            "mode".into(),
+            "path".into(),
+            "old_string".into(),
+            "new_string".into(),
+        ],
+    }
+}
+
+fn is_patch_flat_schema(parameters: &Value) -> bool {
+    parameters.get("type").and_then(Value::as_str) == Some("object")
+        && parameters
+            .get("properties")
+            .and_then(|p| p.get("mode"))
+            .and_then(|m| m.get("enum"))
+            .is_some()
+        && parameters
+            .get("properties")
+            .and_then(|p| p.get("patch"))
+            .is_some()
+        && parameters
+            .get("properties")
+            .and_then(|p| p.get("old_string"))
+            .is_some()
+}
+
+fn required_fields_from_parameters(
+    parameters: &Value,
+    args_json: Option<&str>,
+) -> Option<Vec<String>> {
+    if let Some(one_of) = parameters.get("oneOf").and_then(Value::as_array) {
+        let mode = args_json
+            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+            .and_then(|v| v.get("mode").and_then(Value::as_str).map(String::from))
+            .unwrap_or_else(|| "replace".to_string());
+        for branch in one_of {
+            let branch_mode = branch
+                .get("properties")
+                .and_then(|p| p.get("mode"))
+                .and_then(|m| m.get("const"))
+                .and_then(Value::as_str);
+            if branch_mode == Some(mode.as_str()) {
+                return branch
+                    .get("required")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    });
+            }
+        }
+        return one_of.first().and_then(|branch| {
+            branch
+                .get("required")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+        });
+    }
+
+    if is_patch_flat_schema(parameters) {
+        let mode = args_json
+            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+            .and_then(|v| v.get("mode").and_then(Value::as_str).map(String::from))
+            .unwrap_or_else(|| "replace".to_string());
+        return Some(patch_mode_required_fields(&mode));
+    }
+
+    parameters
+        .get("required")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
 }
 
 /// Normalize JSON Schema into a provider-safe shape.
@@ -1447,18 +1664,13 @@ mod tests {
         let registry = make_registry_with_tools();
         let ctx = ToolContext::test_context();
 
-        let err = registry
-            .dispatch("test_tol", json!({}), &ctx) // typo: "tol" vs "tool"
+        // Typo auto-repaired at dispatch boundary (Hermes repair_tool_call parity).
+        let result = registry
+            .dispatch("test_tol", json!({"input": "hello"}), &ctx)
             .await
-            .expect_err("should suggest similar tool name");
+            .expect("fuzzy name repair should dispatch");
 
-        match err {
-            ToolError::NotFound(msg) => {
-                assert!(msg.contains("Did you mean"), "Got: {}", msg);
-                assert!(msg.contains("test_tool"), "Got: {}", msg);
-            }
-            other => panic!("Expected NotFound, got: {:?}", other),
-        }
+        assert_eq!(result, "echo: hello");
     }
 
     #[tokio::test]
@@ -1610,14 +1822,23 @@ mod tests {
     #[test]
     fn fuzzy_match_close_typo() {
         let registry = make_registry_with_tools();
-        assert_eq!(registry.fuzzy_match("test_tol"), Some("test_tool"));
-        assert_eq!(registry.fuzzy_match("tset_tool"), Some("test_tool"));
+        assert_eq!(
+            crate::tool_name_repair::fuzzy_match_tool_name(&registry, "test_tol"),
+            Some("test_tool".into())
+        );
+        assert_eq!(
+            crate::tool_name_repair::fuzzy_match_tool_name(&registry, "tset_tool"),
+            Some("test_tool".into())
+        );
     }
 
     #[test]
     fn fuzzy_match_too_far() {
         let registry = make_registry_with_tools();
-        assert_eq!(registry.fuzzy_match("completely_different"), None);
+        assert_eq!(
+            crate::tool_name_repair::fuzzy_match_tool_name(&registry, "completely_different"),
+            None
+        );
     }
 
     #[test]
@@ -1747,7 +1968,7 @@ mod tests {
             message: "missing field `path`".into(),
         };
 
-        let enriched = registry.enrich_invalid_args_error("read_file", &err);
+        let enriched = registry.enrich_invalid_args_error("read_file", &err, None);
         assert!(
             enriched.is_some(),
             "should return enriched error for InvalidArgs"
@@ -1772,9 +1993,86 @@ mod tests {
         let err = ToolError::NotFound("read_file".into());
         assert!(
             registry
-                .enrich_invalid_args_error("read_file", &err)
+                .enrich_invalid_args_error("read_file", &err, None)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn lh61_annotate_llm_definitions_appends_budget_suffix_for_local_mutation_tools() {
+        let defs = vec![edgequake_llm::ToolDefinition::function(
+            "write_file",
+            "Write a file.",
+            serde_json::json!({}),
+        )];
+        let out = annotate_llm_definitions_for_local_turn(defs, "lmstudio", Some((27_852, 8192)));
+        assert!(out[0].function.description.contains("27852"));
+        assert!(out[0].function.description.contains("8192"));
+
+        let unchanged =
+            annotate_llm_definitions_for_local_turn(out.clone(), "anthropic", Some((27_852, 8192)));
+        assert_eq!(unchanged[0].function.description, out[0].function.description);
+
+        let no_budget = annotate_llm_definitions_for_local_turn(
+            vec![edgequake_llm::ToolDefinition::function(
+                "write_file",
+                "Write a file.",
+                serde_json::json!({}),
+            )],
+            "lmstudio",
+            None,
+        );
+        assert!(!no_budget[0].function.description.contains("Local turn limit"));
+    }
+
+    #[test]
+    fn lh62_required_fields_from_patch_flat_schema_respects_mode() {
+        let params = crate::tools::file_patch::patch_tool_parameters_json();
+        let replace_args = r#"{"mode":"replace","path":"a.md"}"#;
+        let fields =
+            required_fields_from_parameters(&params, Some(replace_args)).expect("fields");
+        assert!(fields.contains(&"path".to_string()));
+        assert!(fields.contains(&"old_string".to_string()));
+        assert!(!fields.contains(&"patch".to_string()));
+
+        let patch_args = r#"{"mode":"patch"}"#;
+        let patch_fields =
+            required_fields_from_parameters(&params, Some(patch_args)).expect("patch fields");
+        assert_eq!(patch_fields, vec!["mode".to_string(), "patch".to_string()]);
+    }
+
+    #[test]
+    fn lh64_patch_schema_passes_openai_compatible_provider_safe_gate() {
+        let params = crate::tools::file_patch::patch_tool_parameters_json();
+        let wire = openai_compatible_tool_parameters(&params);
+        assert_provider_safe_top_level_schema("patch", &wire);
+    }
+
+    #[test]
+    fn openai_compatible_tool_parameters_flattens_top_level_oneof() {
+        let oneof = json!({
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "mode": { "const": "a" },
+                        "foo": { "type": "string" }
+                    }
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "mode": { "const": "b" },
+                        "bar": { "type": "string" }
+                    }
+                }
+            ]
+        });
+        let flat = openai_compatible_tool_parameters(&oneof);
+        assert_eq!(flat["type"], "object");
+        assert!(flat.get("oneOf").is_none());
+        assert!(flat["properties"].get("foo").is_some());
+        assert!(flat["properties"].get("bar").is_some());
     }
 
     // ── coerce_tool_args tests ───────────────────────────────────────
@@ -1786,6 +2084,38 @@ mod tests {
         let mut args = serde_json::json!({"line": "42"});
         coerce_tool_args(&mut args, &schema);
         assert_eq!(args["line"], 42);
+    }
+
+    #[test]
+    fn coerce_union_integer_from_string() {
+        let schema = serde_json::json!({
+            "properties": { "line": { "type": ["integer", "string"] } }
+        });
+        let mut args = serde_json::json!({"line": "42"});
+        coerce_tool_args(&mut args, &schema);
+        assert_eq!(args["line"], 42);
+    }
+
+    #[test]
+    fn coerce_null_string_when_nullable() {
+        let schema = serde_json::json!({
+            "properties": { "limit": { "type": ["integer", "null"], "nullable": true } }
+        });
+        let mut args = serde_json::json!({"limit": "null"});
+        coerce_tool_args(&mut args, &schema);
+        assert!(args["limit"].is_null());
+    }
+
+    #[test]
+    fn prepare_tool_arguments_renames_file_path_before_dispatch() {
+        let registry = ToolRegistry::new();
+        let mut args = serde_json::json!({
+            "file_path": "notes.md",
+            "text": "hello"
+        });
+        registry.prepare_tool_arguments("write_file", &mut args);
+        assert_eq!(args["path"], "notes.md");
+        assert_eq!(args["content"], "hello");
     }
 
     #[test]

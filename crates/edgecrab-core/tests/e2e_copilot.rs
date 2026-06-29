@@ -345,6 +345,7 @@ async fn e2e_agent_streaming_with_copilot() {
             StreamEvent::SteerPending { .. } => {} // steering notification — not relevant in this test
             StreamEvent::SteerApplied { .. } => {} // steering applied — not relevant in this test
             StreamEvent::ActivityNotice { .. } => {} // compression / process notices — ignore
+            StreamEvent::LlmWaitProgress { .. } => {} // local LLM wait heartbeat — ignore
             StreamEvent::BackgroundProcessTail { .. } => {} // bg process tail — ignore
             StreamEvent::BackgroundProcessFinished { .. } => {} // bg process exit — ignore
             StreamEvent::ModelTransferComplete { .. } => {} // handoff — not relevant in this test

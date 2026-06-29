@@ -10,15 +10,40 @@ use crate::error::ProxyError;
 use super::auth_lock::with_auth_store_lock;
 use super::auth_store::provider_state_from_doc;
 
-/// Default auth store: `~/.edgecrab/auth.json`, else `~/.hermes/auth.json`.
+/// Default auth store: `~/.edgecrab/auth.json` (created by `edgecrab auth add`).
 pub fn default_auth_path() -> PathBuf {
-    let edgecrab = edgecrab_home().join("auth.json");
-    if edgecrab.exists() {
+    edgecrab_home().join("auth.json")
+}
+
+fn hermes_auth_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".hermes").join("auth.json"))
+}
+
+fn doc_has_provider(doc: &Value, provider: &str) -> bool {
+    if super::auth_store::provider_state_from_doc(doc, provider).is_some() {
+        return true;
+    }
+    !read_credential_pool_entries(doc, provider).is_empty()
+}
+
+/// Resolve which auth.json holds `provider` — EdgeCrab first, Hermes only when populated.
+pub fn auth_path_for_provider(provider: &str) -> PathBuf {
+    let edgecrab = default_auth_path();
+    if edgecrab.is_file()
+        && load_auth_doc(&edgecrab)
+            .ok()
+            .is_some_and(|doc| doc_has_provider(&doc, provider))
+    {
         return edgecrab;
     }
-    dirs::home_dir()
-        .map(|h| h.join(".hermes").join("auth.json"))
-        .unwrap_or(edgecrab)
+    if let Some(hermes) = hermes_auth_path().filter(|p| p.is_file())
+        && load_auth_doc(&hermes)
+            .ok()
+            .is_some_and(|doc| doc_has_provider(&doc, provider))
+    {
+        return hermes;
+    }
+    edgecrab
 }
 
 pub fn load_auth_doc(path: &Path) -> Result<Value, ProxyError> {
@@ -174,5 +199,49 @@ mod tests {
         let (b2, _) =
             bearer_and_base_from_entry(&state, "https://fallback/v1").expect("state bearer");
         assert_eq!(b2, "singleton-tok");
+    }
+
+    #[test]
+    fn auth_path_for_provider_prefers_edgecrab_when_both_have_provider() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ec = dir.path().join("edgecrab");
+        let hermes_dir = dir.path().join(".hermes");
+        std::fs::create_dir_all(&ec).expect("mkdir ec");
+        std::fs::create_dir_all(&hermes_dir).expect("mkdir hermes");
+        let doc = serde_json::json!({
+            "providers": {
+                "xai-oauth": { "tokens": { "access_token": "tok" } }
+            }
+        });
+        std::fs::write(ec.join("auth.json"), doc.to_string()).expect("write ec");
+        std::fs::write(hermes_dir.join("auth.json"), doc.to_string()).expect("write hm");
+        // SAFETY: test-only env isolation.
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", ec.to_str().expect("utf8"));
+            std::env::set_var("HOME", dir.path().to_str().expect("utf8"));
+        }
+        assert_eq!(
+            auth_path_for_provider("xai-oauth"),
+            ec.join("auth.json")
+        );
+    }
+
+    #[test]
+    fn auth_path_for_provider_returns_edgecrab_when_neither_has_provider() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ec = dir.path().join("edgecrab");
+        let hermes_dir = dir.path().join(".hermes");
+        std::fs::create_dir_all(&ec).expect("mkdir ec");
+        std::fs::create_dir_all(&hermes_dir).expect("mkdir hermes");
+        std::fs::write(hermes_dir.join("auth.json"), r#"{"providers":{}}"#).expect("write hm");
+        // SAFETY: test-only env isolation.
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", ec.to_str().expect("utf8"));
+            std::env::set_var("HOME", dir.path().to_str().expect("utf8"));
+        }
+        assert_eq!(
+            auth_path_for_provider("xai-oauth"),
+            ec.join("auth.json")
+        );
     }
 }

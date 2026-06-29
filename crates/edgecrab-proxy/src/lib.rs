@@ -32,7 +32,7 @@ pub mod e2e_harness;
 
 pub use auth::{ensure_proxy_token, load_proxy_token, write_proxy_token};
 pub use backend::adapter::describe_adapter;
-pub use backend::auth_file::{default_auth_path, remove_provider_state};
+pub use backend::auth_file::{auth_path_for_provider, default_auth_path, remove_provider_state};
 pub use backend::nous::state_requires_relogin;
 pub use backend::nous::{
     DEFAULT_NOUS_INFERENCE, NousDeviceLoginOptions, login_nous_portal, persist_nous_oauth,

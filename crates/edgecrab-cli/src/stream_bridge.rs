@@ -46,6 +46,10 @@ pub fn apply_tool_generating(
     state.on_generating(tool_call_id, name, partial_args);
 }
 
+pub fn clear_tool_generating(state: &mut TurnActivityState) {
+    state.clear_tool_generating();
+}
+
 pub fn apply_tool_exec(
     state: &mut TurnActivityState,
     tool_call_id: String,
@@ -69,6 +73,16 @@ pub fn apply_tool_progress(
 
 pub fn apply_tool_done(state: &mut TurnActivityState, tool_call_id: &str) {
     state.on_tool_done(tool_call_id);
+}
+
+pub fn apply_llm_wait_progress(
+    state: &mut TurnActivityState,
+    provider: &str,
+    elapsed_secs: u64,
+    has_tools: bool,
+    ctx: edgecrab_tools::tool_progress_tail::LlmWaitContext,
+) {
+    state.on_llm_wait_progress(provider, elapsed_secs, has_tools, ctx);
 }
 
 pub fn apply_reasoning_delta(state: &mut TurnActivityState, text: &str) {
@@ -184,7 +198,7 @@ mod tests {
 
         apply_tool_done(&mut state, "tc1");
         assert!(!state.contains_tool("tc1"));
-        assert!(matches!(state.phase, ShelfPhase::AnalyzingOutput));
+        assert!(matches!(state.phase, ShelfPhase::AwaitingFirstToken));
     }
 
     #[test]

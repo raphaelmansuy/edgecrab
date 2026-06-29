@@ -992,6 +992,7 @@ mod tests {
             watch_notification_tx: None,
             mutation_turn: None,
             lsp_gate: None,
+            kanban_task_id: None,
         };
 
         let target = resolve_explicit_target(&ctx, "openai", "gpt-4o", Some(&models))

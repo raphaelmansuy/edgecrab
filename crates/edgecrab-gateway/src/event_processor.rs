@@ -272,9 +272,12 @@ impl GatewayEventProcessor {
                     }
                 }
 
-                StreamEvent::ToolGenerating { name, .. } => {
+                StreamEvent::ToolGenerating { name, partial_args, .. } => {
                     if self.cfg.tool_progress {
-                        let status = format!("📝 preparing {name}…");
+                        let status = edgecrab_tools::tool_progress_tail::format_tool_generating_status(
+                            &name,
+                            &partial_args,
+                        );
                         self.send_status(&status).await;
                     }
                 }
@@ -501,7 +504,23 @@ impl GatewayEventProcessor {
                         .interaction_broker
                         .enqueue_clarify(&self.session_key, question, choices, response_tx)
                         .await;
-                    self.send_status(&format_pending_interaction(&view)).await;
+                    let prompt = crate::platform::ClarifyPrompt {
+                        interaction_id: view.id,
+                        question: match &view.kind {
+                            PendingInteractionKind::Clarify { question, .. } => question.clone(),
+                            _ => String::new(),
+                        },
+                        choices: match &view.kind {
+                            PendingInteractionKind::Clarify { choices, .. } => choices.clone(),
+                            _ => None,
+                        },
+                    };
+                    match self.adapter.send_clarify(&prompt, &self.metadata).await {
+                        Ok(true) => {}
+                        _ => {
+                            self.send_status(&format_pending_interaction(&view)).await;
+                        }
+                    }
                 }
 
                 StreamEvent::HookEvent {
@@ -542,6 +561,27 @@ impl GatewayEventProcessor {
                 }
 
                 StreamEvent::ActivityNotice(text) => {
+                    self.send_status(&text).await;
+                }
+
+                StreamEvent::LlmWaitProgress {
+                    provider,
+                    elapsed_secs,
+                    has_tools,
+                    prompt_tokens_estimated,
+                    context_length,
+                    prefill_pct,
+                } => {
+                    let text = edgecrab_tools::tool_progress_tail::llm_wait_progress_label(
+                        &provider,
+                        elapsed_secs,
+                        has_tools,
+                        edgecrab_tools::tool_progress_tail::LlmWaitContext {
+                            prompt_tokens_estimated,
+                            context_length,
+                            prefill_pct,
+                        },
+                    );
                     self.send_status(&text).await;
                 }
 

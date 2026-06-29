@@ -51,6 +51,7 @@ impl StreamAccumulator {
                     entry.thought_signature = thought_signature;
                 }
             }
+            StreamChunk::PrefillProgress { .. } => {}
             StreamChunk::Finished { reason, usage, .. } => {
                 self.finish_reason = Some(reason);
                 if usage.is_some() {

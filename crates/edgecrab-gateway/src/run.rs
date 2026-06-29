@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use axum::body::Bytes;
 use axum::extract::{Path as AxumPath, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use edgecrab_command_catalog::{SlashSurface, slash_commands_for_surface};
 use edgecrab_tools::tools::transcribe::TranscribeAudioTool;
@@ -177,38 +177,87 @@ fn gateway_builtin_commands() -> Vec<(String, String)> {
     commands
 }
 
-fn installed_skill_commands() -> Vec<String> {
-    let skills_dir = edgecrab_core::edgecrab_home().join("skills");
-    let Ok(entries) = std::fs::read_dir(skills_dir) else {
-        return Vec::new();
-    };
+fn skills_scan_context(platform: Option<&str>) -> edgecrab_tools::skills::SkillsScanContext {
+    let config = edgecrab_core::AppConfig::load().unwrap_or_default();
+    edgecrab_tools::skills::SkillsScanContext::from_config(
+        &edgecrab_core::edgecrab_home(),
+        &config.skills.external_dirs,
+        &config.skills.disabled,
+        &config.skills.platform_disabled,
+        platform,
+    )
+    .with_interactive(false)
+}
 
-    let mut names = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Some(raw_name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        if path.is_dir() {
-            names.push(raw_name.to_string());
-        } else if path.extension().is_some_and(|ext| ext == "md") {
-            names.push(raw_name.trim_end_matches(".md").to_string());
-        }
+fn kanban_notify_platform(name: &str) -> Option<edgecrab_types::Platform> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "telegram" => Some(edgecrab_types::Platform::Telegram),
+        "discord" => Some(edgecrab_types::Platform::Discord),
+        "slack" => Some(edgecrab_types::Platform::Slack),
+        "whatsapp" => Some(edgecrab_types::Platform::Whatsapp),
+        "signal" => Some(edgecrab_types::Platform::Signal),
+        "matrix" => Some(edgecrab_types::Platform::Matrix),
+        "mattermost" => Some(edgecrab_types::Platform::Mattermost),
+        "dingtalk" => Some(edgecrab_types::Platform::DingTalk),
+        "sms" => Some(edgecrab_types::Platform::Sms),
+        "email" => Some(edgecrab_types::Platform::Email),
+        "feishu" => Some(edgecrab_types::Platform::Feishu),
+        "wecom" => Some(edgecrab_types::Platform::Wecom),
+        "bluebubbles" => Some(edgecrab_types::Platform::BlueBubbles),
+        "weixin" => Some(edgecrab_types::Platform::Weixin),
+        _ => None,
     }
-    names.sort();
-    names.dedup();
-    names
+}
+
+fn persist_skills_write_approval(enabled: bool) -> Result<(), String> {
+    edgecrab_core::AppConfig::persist_skills_write_approval(enabled).map_err(|e| e.to_string())
+}
+
+fn persist_memory_write_approval(enabled: bool) -> Result<(), String> {
+    edgecrab_core::AppConfig::persist_memory_write_approval(enabled).map_err(|e| e.to_string())
+}
+
+fn persist_approvals_mode(mode: edgecrab_security::approval::ApprovalMode) -> Result<(), String> {
+    edgecrab_core::AppConfig::persist_approvals_mode(mode).map_err(|e| e.to_string())
+}
+
+fn persist_skills_inline_shell(enabled: bool) -> Result<(), String> {
+    edgecrab_core::AppConfig::persist_skills_inline_shell(enabled).map_err(|e| e.to_string())
+}
+
+fn installed_skill_commands() -> Vec<(String, String)> {
+    let ctx = skills_scan_context(None);
+    let mut entries = Vec::new();
+    for (slug, info) in edgecrab_tools::skills::scan_skill_commands(&ctx) {
+        entries.push((format!("/{slug}"), info.description));
+    }
+    for (slug, bundle) in edgecrab_tools::skills::get_skill_bundles(&ctx) {
+        entries.push((
+            format!("/{slug}"),
+            format!("Bundle: {}", bundle.description),
+        ));
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    entries
+}
+
+fn enrich_text_for_skill_slash(
+    text: &str,
+    session_id: Option<&str>,
+    platform: Option<&str>,
+) -> String {
+    if !text.trim_start().starts_with('/') {
+        return text.to_string();
+    }
+    let ctx = skills_scan_context(platform);
+    edgecrab_tools::skills::enrich_message_for_skill_slash(&ctx, text, session_id)
 }
 
 fn gateway_commands_page(page: usize) -> String {
     const PAGE_SIZE: usize = 12;
 
     let mut entries = gateway_builtin_commands();
-    entries.extend(
-        installed_skill_commands()
-            .into_iter()
-            .map(|name| (format!("/{name}"), "Installed skill command".to_string())),
-    );
+    entries.extend(installed_skill_commands());
     entries.sort_by(|a, b| a.0.cmp(&b.0));
 
     let total_pages = entries.len().max(1).div_ceil(PAGE_SIZE);
@@ -503,10 +552,13 @@ fn render_gateway_image_context(
 }
 
 async fn build_effective_text(agent: &Agent, msg: &IncomingMessage) -> String {
+    let session_key = format!("gateway-{}", message_origin_recipient(msg));
+    let platform_key = msg.platform.to_string();
+    let base_text = enrich_text_for_skill_slash(&msg.text, Some(&session_key), Some(&platform_key));
     let image_sources = image_attachment_sources(msg);
     let audio_sources = audio_attachment_sources(msg);
     if image_sources.is_empty() && audio_sources.is_empty() {
-        return msg.text.clone();
+        return base_text;
     }
 
     let provider = agent.provider_handle().await;
@@ -528,7 +580,7 @@ async fn build_effective_text(agent: &Agent, msg: &IncomingMessage) -> String {
         ..Default::default()
     };
 
-    let mut effective_text = msg.text.clone();
+    let mut effective_text = base_text;
     let mut analyses = Vec::new();
     let mut failures = Vec::new();
     for (idx, source) in image_sources
@@ -567,6 +619,7 @@ async fn build_effective_text(agent: &Agent, msg: &IncomingMessage) -> String {
             watch_notification_tx: None,
             mutation_turn: None,
             lsp_gate: None,
+            kanban_task_id: None,
         };
 
         match VisionAnalyzeTool
@@ -635,6 +688,7 @@ async fn build_effective_text(agent: &Agent, msg: &IncomingMessage) -> String {
             watch_notification_tx: None,
             mutation_turn: None,
             lsp_gate: None,
+            kanban_task_id: None,
         };
 
         match TranscribeAudioTool
@@ -962,6 +1016,7 @@ async fn maybe_send_voice_reply(
         watch_notification_tx: None,
         mutation_turn: None,
         lsp_gate: None,
+        kanban_task_id: None,
     };
 
     let result = match TextToSpeechTool
@@ -1052,6 +1107,8 @@ pub struct GatewayState {
     pub hook_registry: Arc<HookRegistry>,
     pub message_tx: mpsc::Sender<IncomingMessage>,
     pub cancel: CancellationToken,
+    pub agent: Option<Arc<Agent>>,
+    pub gateway_host: String,
     webhook_ingress: Arc<tokio::sync::Mutex<WebhookIngressState>>,
 }
 
@@ -1688,6 +1745,7 @@ impl Gateway {
     /// This starts the HTTP server, boots all platform adapters, and
     /// enters the message dispatch loop.
     pub async fn run(&self) -> anyhow::Result<()> {
+        crate::clarify_wiring::install_interaction_broker(self.interaction_broker.clone());
         let (tx, mut rx) = mpsc::channel::<IncomingMessage>(256);
         let mut delivery_router = DeliveryRouter::new();
 
@@ -1762,6 +1820,140 @@ impl Gateway {
             });
         }
 
+        let ec_config = edgecrab_core::AppConfig::load().unwrap_or_default();
+        if ec_config.kanban.enabled && ec_config.kanban.dispatch_in_gateway {
+            let home = edgecrab_core::edgecrab_home();
+            let interval = ec_config.kanban.reclaim_interval_secs as u64;
+            let dispatch_cfg =
+                edgecrab_core::KanbanDispatchConfig::from_kanban_config(&ec_config.kanban);
+            if let Some(agent) = self.agent.clone() {
+                let failure_limit = ec_config.kanban.failure_limit;
+                let kanban_home = home.clone();
+                let spawn_agent = agent.clone();
+                let install_root = edgecrab_core::install_root();
+                let spawn_fn: edgecrab_core::KanbanSpawnFn = Arc::new(move |req| {
+                    let agent = spawn_agent.clone();
+                    let kanban_home = kanban_home.clone();
+                    let install_root = install_root.clone();
+                    let worker_id = req.worker_id.clone();
+                    let task_id = req.task_id.clone();
+                    let assignee = req.assignee.clone();
+                    tokio::spawn(async move {
+                        let Ok(child) = agent
+                            .fork_isolated(IsolatedAgentOptions {
+                                session_id: Some(format!("kb-{}", req.task_id)),
+                                kanban_task_id: Some(req.task_id.clone()),
+                                profile: Some(assignee),
+                                install_root: Some(install_root),
+                                quiet_mode: Some(true),
+                                ..Default::default()
+                            })
+                            .await
+                        else {
+                            let _ = tokio::task::spawn_blocking({
+                                let kanban_home = kanban_home.clone();
+                                let task_id = task_id.clone();
+                                let worker_id = worker_id.clone();
+                                move || {
+                                    if let Ok(db) =
+                                        edgecrab_state::KanbanDb::open_default(Some(&kanban_home))
+                                    {
+                                        let _ = db.handle_worker_failure(
+                                            &task_id,
+                                            &worker_id,
+                                            "fork_isolated failed",
+                                            failure_limit,
+                                        );
+                                    }
+                                }
+                            })
+                            .await;
+                            return;
+                        };
+                        let child = Arc::new(child);
+                        edgecrab_core::kanban_workers::register_worker(&task_id, &child);
+                        let body = req.body.as_deref().unwrap_or("");
+                        let prompt = if req.worker_context.trim().is_empty() {
+                            format!(
+                                "[KANBAN WORKER] Task `{}` — {}\n{body}\n\n\
+                                 Use kanban_show for context. Call kanban_complete when done \
+                                 or kanban_block if you need human input.",
+                                req.task_id, req.title
+                            )
+                        } else {
+                            format!(
+                                "{}\n\n---\n\n\
+                                 Call kanban_complete when done or kanban_block if you need human input.",
+                                req.worker_context.trim()
+                            )
+                        };
+                        let chat_err = child.chat(&prompt).await.is_err();
+                        edgecrab_core::kanban_workers::unregister_worker(&task_id);
+                        if chat_err {
+                            let _ = tokio::task::spawn_blocking({
+                                let kanban_home = kanban_home.clone();
+                                let task_id = task_id.clone();
+                                let worker_id = worker_id.clone();
+                                move || {
+                                    if let Ok(db) =
+                                        edgecrab_state::KanbanDb::open_default(Some(&kanban_home))
+                                    {
+                                        let _ = db.handle_worker_failure(
+                                            &task_id,
+                                            &worker_id,
+                                            "worker chat failed",
+                                            failure_limit,
+                                        );
+                                    }
+                                }
+                            })
+                            .await;
+                        }
+                    });
+                    true
+                });
+                let _kanban_watcher = edgecrab_core::spawn_kanban_watcher(
+                    home.clone(),
+                    interval,
+                    dispatch_cfg,
+                    Some(spawn_fn),
+                );
+                if ec_config.kanban.auto_decompose {
+                    let agent = agent.clone();
+                    let kanban_home = home;
+                    tokio::spawn(async move {
+                        let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval.max(15)));
+                        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                        loop {
+                            tick.tick().await;
+                            let cfg = edgecrab_core::AppConfig::load().unwrap_or_default();
+                            if !cfg.kanban.enabled || !cfg.kanban.auto_decompose {
+                                continue;
+                            }
+                            let provider = agent.provider_handle().await;
+                            let model = agent.model().await;
+                            let n = edgecrab_core::run_auto_decompose_tick(
+                                &kanban_home,
+                                provider,
+                                &model,
+                                &cfg,
+                            )
+                            .await;
+                            if n > 0 {
+                                tracing::info!(decomposed = n, "kanban: auto-decompose tick");
+                            }
+                        }
+                    });
+                }
+            } else {
+                let _kanban_watcher = edgecrab_core::spawn_kanban_reaper(home, interval);
+            }
+            tracing::info!(
+                interval_secs = interval,
+                "kanban dispatcher watcher started"
+            );
+        }
+
         if let Some(agent) = self.agent.as_ref()
             && let Some(db) = agent.state_db().await
         {
@@ -1774,8 +1966,11 @@ impl Gateway {
             hook_registry: self.hook_registry.clone(),
             message_tx: tx.clone(),
             cancel: self.cancel.clone(),
+            agent: self.agent.clone(),
+            gateway_host: self.config.host.clone(),
             webhook_ingress: Arc::new(tokio::sync::Mutex::new(WebhookIngressState::default())),
         };
+        crate::kanban_routes::init_kanban_api_auth(&ec_config);
         let app = build_router(state);
 
         // Start HTTP server
@@ -1877,6 +2072,48 @@ impl Gateway {
         // the spawned dispatch tasks can share it without cloning the entire map.
         let delivery_router = Arc::new(delivery_router);
 
+        if ec_config.kanban.enabled && ec_config.kanban.dispatch_in_gateway {
+            let home = edgecrab_core::edgecrab_home();
+            let notifier_interval = ec_config.kanban.reclaim_interval_secs.max(5) as u64;
+            let router_for_platforms = delivery_router.clone();
+            let active_fn: edgecrab_core::KanbanActivePlatformsFn = Arc::new(move || {
+                router_for_platforms
+                    .list_platforms()
+                    .into_iter()
+                    .map(|p| p.to_string())
+                    .collect()
+            });
+            let router_for_deliver = delivery_router.clone();
+            let deliver_fn: edgecrab_core::KanbanNotifyDeliverFn = Arc::new(move |out| {
+                let router = router_for_deliver.clone();
+                Box::pin(async move {
+                    let platform = kanban_notify_platform(&out.sub.platform)
+                        .ok_or_else(|| format!("unknown platform {}", out.sub.platform))?;
+                    let mut metadata = crate::platform::MessageMetadata {
+                        channel_id: Some(out.sub.chat_id.clone()),
+                        ..Default::default()
+                    };
+                    if !out.sub.thread_id.is_empty() {
+                        metadata.thread_id = Some(out.sub.thread_id.clone());
+                    }
+                    router
+                        .deliver(&out.message, platform, &metadata)
+                        .await
+                        .map_err(|e| e.to_string())
+                })
+            });
+            let _kanban_notifier = edgecrab_core::spawn_kanban_notifier(
+                home,
+                notifier_interval,
+                active_fn,
+                deliver_fn,
+            );
+            tracing::info!(
+                interval_secs = notifier_interval,
+                "kanban notifier watcher started"
+            );
+        }
+
         // Start session cleanup task
         let sm = self.session_manager.clone();
         let interval = self.config.cleanup_interval();
@@ -1889,6 +2126,49 @@ impl Gateway {
                         sm.cleanup_expired().await;
                     }
                     _ = cancel_cleanup.cancelled() => break,
+                }
+            }
+        });
+
+        // Scheduled skill curator — hourly poll, gated by curator.interval_hours (opt-in).
+        if let Ok(app_cfg) = edgecrab_core::AppConfig::load()
+            && app_cfg.curator.enabled
+        {
+            let _ = edgecrab_tools::skills::seed_curator_deferred_if_needed(
+                &edgecrab_core::edgecrab_home(),
+                true,
+            );
+        }
+        let cancel_curator = self.cancel.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3600));
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        let Ok(config) = edgecrab_core::AppConfig::load() else { continue };
+                        if !config.curator.enabled {
+                            continue;
+                        }
+                        let home = edgecrab_core::edgecrab_home();
+                        let ctx = skills_scan_context(None);
+                        let settings = edgecrab_tools::skills::CuratorSettings {
+                            stale_after_days: config.curator.stale_after_days,
+                            archive_after_days: config.curator.archive_after_days,
+                            prune_builtins: config.curator.prune_builtins,
+                            backup_enabled: config.curator.backup.enabled,
+                            backup_keep: config.curator.backup.keep,
+                        };
+                        if let Some(summary) = edgecrab_tools::skills::maybe_run_scheduled_curator(
+                            &home,
+                            &ctx,
+                            settings,
+                            config.curator.enabled,
+                            config.curator.interval_hours,
+                        ) {
+                            tracing::info!("curator scheduled pass: {summary}");
+                        }
+                    }
+                    _ = cancel_curator.cancelled() => break,
                 }
             }
         });
@@ -2593,10 +2873,12 @@ impl Gateway {
                                                 session_id: Some(task_id_for_spawn.clone()),
                                                 platform: Some(platform),
                                                 quiet_mode: Some(true),
+                                                kanban_task_id: None,
                                                 origin_chat: Some(OriginChat::new(
                                                     platform_name.clone(),
                                                     origin_chat_id_clone.clone(),
                                                 )),
+                                                ..Default::default()
                                             })
                                             .await
                                         {
@@ -2941,6 +3223,184 @@ impl Gateway {
                                     }
                                     Some(lines)
                                 }
+                            }
+                            "skills" | "skill" => {
+                                let args = msg.get_command_args().trim();
+                                let config =
+                                    edgecrab_core::AppConfig::load().unwrap_or_default();
+                                let home = edgecrab_core::edgecrab_home();
+                                let ctx = skills_scan_context(Some(&msg.platform.to_string()));
+                                let config_path = home.join("config.yaml");
+                                if let Some(reply) =
+                                    edgecrab_tools::skills::handle_skills_config_subcommand(
+                                        &ctx,
+                                        &config_path,
+                                        args,
+                                    )
+                                {
+                                    Some(reply)
+                                } else if let Some(reply) =
+                                    edgecrab_tools::skills::handle_skills_pending_subcommand(
+                                        &home,
+                                        args,
+                                        &edgecrab_tools::skills::SkillsSubcommandContext {
+                                            write_approval: config.skills.write_approval,
+                                            inline_shell: config.skills.inline_shell,
+                                            set_write_approval: Some(&persist_skills_write_approval),
+                                            set_inline_shell: Some(&persist_skills_inline_shell),
+                                        },
+                                    )
+                                {
+                                    Some(reply)
+                                } else if let Some(reply) = {
+                                    let hub_url = config.skills.hub_url.clone();
+                                    edgecrab_tools::tools::skills_hub::handle_skills_hub_slash(
+                                        args,
+                                        &home.join("skills"),
+                                        hub_url.as_deref(),
+                                    )
+                                    .await
+                                } {
+                                    if edgecrab_tools::tools::skills_hub::hub_slash_mutates_skills(args)
+                                    {
+                                        edgecrab_tools::skills::invalidate_discovery_caches();
+                                        edgecrab_core::prompt_builder::invalidate_skills_cache();
+                                    }
+                                    Some(reply)
+                                } else if args.is_empty() || args.eq_ignore_ascii_case("list") {
+                                    let cmds = edgecrab_tools::skills::scan_skill_commands(&ctx);
+                                    if cmds.is_empty() {
+                                        Some(
+                                            "No skills installed. Add SKILL.md directories under ~/.edgecrab/skills/."
+                                                .into(),
+                                        )
+                                    } else {
+                                        let mut lines =
+                                            format!("*Installed skills ({}):*\n", cmds.len());
+                                        let mut sorted: Vec<_> = cmds.iter().collect();
+                                        sorted.sort_by(|a, b| a.0.cmp(b.0));
+                                        for (slug, info) in sorted {
+                                            lines.push_str(&format!(
+                                                "• /{slug} — {}\n",
+                                                info.description
+                                            ));
+                                        }
+                                        Some(lines)
+                                    }
+                                } else {
+                                    Some(
+                                        "Unknown /skills subcommand. Try: /skills list, /skills search <q>, /skills review <id>, /skills inspect --scan <id>, /skills install <id>, /skills trust <id>, /skills check, /skills update, /skills reset, /skills opt-out, /skills snapshot export, /skills audit, /skills lock, /skills index refresh, /skills config, /skills pending."
+                                            .into(),
+                                    )
+                                }
+                            }
+                            "bundles" | "bundle" => {
+                                let args = msg.get_command_args().trim();
+                                let ctx = skills_scan_context(Some(&msg.platform.to_string()));
+                                if let Some(reply) =
+                                    edgecrab_tools::skills::handle_bundles_subcommand(&ctx, args)
+                                {
+                                    Some(reply)
+                                } else {
+                                    Some(edgecrab_tools::skills::format_bundles_list(&ctx))
+                                }
+                            }
+                            "reload-skills" | "reload_skills" | "reloadskills" => {
+                                let ctx = skills_scan_context(Some(&msg.platform.to_string()));
+                                let before = edgecrab_tools::skills::scan_skill_commands(&ctx);
+                                let (_, diff) =
+                                    edgecrab_tools::skills::reload_skills(&before, &ctx);
+                                edgecrab_tools::skills::invalidate_discovery_caches();
+                                edgecrab_core::prompt_builder::invalidate_skills_cache();
+                                Some(edgecrab_tools::skills::format_reload_diff(&diff))
+                            }
+                            "curator" => {
+                                let args = msg.get_command_args().trim();
+                                let config =
+                                    edgecrab_core::AppConfig::load().unwrap_or_default();
+                                let ctx = skills_scan_context(Some(&msg.platform.to_string()));
+                                Some(edgecrab_tools::skills::handle_curator_subcommand(
+                                    &ctx,
+                                    &edgecrab_core::edgecrab_home(),
+                                    args,
+                                    edgecrab_tools::skills::CuratorSettings {
+                                        stale_after_days: config.curator.stale_after_days,
+                                        archive_after_days: config.curator.archive_after_days,
+                                        prune_builtins: config.curator.prune_builtins,
+                                        backup_enabled: config.curator.backup.enabled,
+                                        backup_keep: config.curator.backup.keep,
+                                    },
+                                ))
+                            }
+                            "memory" | "mem" => {
+                                let args = msg.get_command_args().trim();
+                                let config =
+                                    edgecrab_core::AppConfig::load().unwrap_or_default();
+                                let home = edgecrab_core::edgecrab_home();
+                                edgecrab_tools::skills::handle_memory_pending_subcommand(
+                                    &home,
+                                    args,
+                                    &edgecrab_tools::skills::MemorySubcommandContext {
+                                        write_approval: config.memory.write_approval,
+                                        set_write_approval: Some(&persist_memory_write_approval),
+                                    },
+                                )
+                                .or_else(|| {
+                                    Some(format!(
+                                        "Memory store: {}/memories/\n\
+                                         Governance: /memory pending | /memory approval on|off",
+                                        home.display()
+                                    ))
+                                })
+                            }
+                            "snapshot" | "snap" => {
+                                let args = msg.get_command_args().trim();
+                                Some(edgecrab_core::handle_snapshot_slash(args, None))
+                            }
+                            "approvals" => {
+                                let args = msg.get_command_args().trim();
+                                let config =
+                                    edgecrab_core::AppConfig::load().unwrap_or_default();
+                                Some(edgecrab_tools::handle_approvals_slash(
+                                    args,
+                                    config.approvals.mode,
+                                    config.approvals.smart_model.as_deref(),
+                                    Some(&persist_approvals_mode),
+                                ))
+                            }
+                            "kanban" | "kb" => {
+                                let args = msg.get_command_args().trim();
+                                let notify = {
+                                    let sub = args.split_whitespace().next().unwrap_or("");
+                                    if sub.eq_ignore_ascii_case("create")
+                                        || sub.eq_ignore_ascii_case("add")
+                                        || sub.eq_ignore_ascii_case("subscribe")
+                                        || sub.eq_ignore_ascii_case("notify")
+                                    {
+                                        let chat_id = msg
+                                            .metadata
+                                            .channel_id
+                                            .clone()
+                                            .unwrap_or_else(|| msg.user_id.clone());
+                                        Some(edgecrab_core::KanbanNotifyOrigin {
+                                            platform: msg.platform.to_string(),
+                                            chat_id,
+                                            thread_id: msg.metadata.thread_id.clone(),
+                                            user_id: Some(msg.user_id.clone()),
+                                        })
+                                    } else {
+                                        None
+                                    }
+                                };
+                                Some(
+                                    edgecrab_core::handle_kanban_slash_gateway(
+                                        args,
+                                        None,
+                                        notify.as_ref(),
+                                        self.agent.clone(),
+                                    )
+                                    .await,
+                                )
                             }
                             _ => {
                                 // Unknown command — fall through to agent dispatch
@@ -3638,6 +4098,44 @@ async fn dispatch_streaming_arc(
 fn build_router(state: GatewayState) -> Router {
     Router::new()
         .route("/health", get(health_handler))
+        .route("/kanban", get(crate::kanban_routes::kanban_dashboard))
+        .route("/api/kanban/board", get(crate::kanban_routes::kanban_board))
+        .route("/api/kanban/boards", get(crate::kanban_routes::kanban_boards))
+        .route(
+            "/api/kanban/tasks/:id",
+            get(crate::kanban_routes::kanban_task_detail)
+                .patch(crate::kanban_routes::kanban_task_patch)
+                .delete(crate::kanban_routes::kanban_task_delete),
+        )
+        .route(
+            "/api/kanban/orchestration",
+            get(crate::kanban_routes::kanban_orchestration_get)
+                .put(crate::kanban_routes::kanban_orchestration_put),
+        )
+        .route(
+            "/api/kanban/profiles",
+            get(crate::kanban_routes::kanban_profiles_list),
+        )
+        .route(
+            "/api/kanban/profiles/:name",
+            patch(crate::kanban_routes::kanban_profile_patch),
+        )
+        .route(
+            "/api/kanban/profiles/:name/describe-auto",
+            post(crate::kanban_routes::kanban_profile_describe_auto),
+        )
+        .route(
+            "/api/kanban/tasks/:id/decompose",
+            post(crate::kanban_routes::kanban_decompose_task),
+        )
+        .route(
+            "/api/kanban/events",
+            get(crate::kanban_routes::kanban_events_poll),
+        )
+        .route(
+            "/api/kanban/events/ws",
+            get(crate::kanban_routes::kanban_events_ws),
+        )
         .route("/webhook/incoming", post(webhook_incoming))
         .route("/webhooks/:name", post(webhook_subscription_incoming))
         .with_state(state)
@@ -4497,6 +4995,8 @@ def register(ctx):
             hook_registry: Arc::new(HookRegistry::new()),
             message_tx: tx,
             cancel: CancellationToken::new(),
+            agent: None,
+            gateway_host: "127.0.0.1".into(),
             webhook_ingress: Arc::new(tokio::sync::Mutex::new(WebhookIngressState::default())),
         };
         let app = build_router(state);
@@ -4522,6 +5022,8 @@ def register(ctx):
             hook_registry: Arc::new(HookRegistry::new()),
             message_tx: tx,
             cancel: CancellationToken::new(),
+            agent: None,
+            gateway_host: "127.0.0.1".into(),
             webhook_ingress: Arc::new(tokio::sync::Mutex::new(WebhookIngressState::default())),
         };
         let app = build_router(state);
@@ -4586,6 +5088,8 @@ def register(ctx):
             hook_registry: Arc::new(HookRegistry::new()),
             message_tx: tx,
             cancel: CancellationToken::new(),
+            agent: None,
+            gateway_host: "127.0.0.1".into(),
             webhook_ingress: Arc::new(tokio::sync::Mutex::new(WebhookIngressState::default())),
         };
         let app = build_router(state);
@@ -4661,6 +5165,8 @@ def register(ctx):
             hook_registry: Arc::new(HookRegistry::new()),
             message_tx: tx,
             cancel: CancellationToken::new(),
+            agent: None,
+            gateway_host: "127.0.0.1".into(),
             webhook_ingress: Arc::new(tokio::sync::Mutex::new(WebhookIngressState::default())),
         };
         let app = build_router(state);
@@ -4784,6 +5290,8 @@ def register(ctx):
             hook_registry: Arc::new(HookRegistry::new()),
             message_tx: tx,
             cancel: CancellationToken::new(),
+            agent: None,
+            gateway_host: "127.0.0.1".into(),
             webhook_ingress: Arc::new(tokio::sync::Mutex::new(WebhookIngressState::default())),
         };
         let app = build_router(state);

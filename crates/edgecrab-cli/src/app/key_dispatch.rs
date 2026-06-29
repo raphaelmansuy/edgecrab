@@ -1399,6 +1399,12 @@ impl App {
             return;
         }
 
+        // Skill guard trust overlay (full screen — before remote browser)
+        if self.skill_trust_prompt.is_some() {
+            self.handle_skill_trust_key(key);
+            return;
+        }
+
         if self.remote_skill_browser.selector.active {
             match key.code {
                 KeyCode::Esc
@@ -1406,6 +1412,7 @@ impl App {
                 {
                     self.remote_skill_browser.selector.active = false;
                     self.remote_skill_browser.action_in_flight = None;
+                    self.clear_remote_skill_guard_cache();
                     self.needs_redraw = true;
                 }
                 _ if selector_action_key(&key, 'z') => {
@@ -1452,6 +1459,10 @@ impl App {
                     self.open_skill_selector();
                     self.needs_redraw = true;
                 }
+                _ if selector_action_key(&key, 's') => {
+                    self.clear_remote_skill_guard_cache();
+                    self.schedule_remote_skill_guard_preview();
+                }
                 KeyCode::Up => {
                     if self.simple_split_detail_focused(DetailSurface::RemoteSkillBrowser) {
                         self.scroll_split_detail_lines(DetailSurface::RemoteSkillBrowser, -1);
@@ -1459,6 +1470,7 @@ impl App {
                         self.remote_skill_browser.selector.move_up();
                         self.reset_split_detail_scroll(DetailSurface::RemoteSkillBrowser);
                         self.reset_detail_fullscreen_scroll(DetailSurface::RemoteSkillBrowser);
+                        self.schedule_remote_skill_guard_preview();
                     }
                 }
                 KeyCode::Down => {
@@ -1468,6 +1480,7 @@ impl App {
                         self.remote_skill_browser.selector.move_down();
                         self.reset_split_detail_scroll(DetailSurface::RemoteSkillBrowser);
                         self.reset_detail_fullscreen_scroll(DetailSurface::RemoteSkillBrowser);
+                        self.schedule_remote_skill_guard_preview();
                     }
                 }
                 KeyCode::PageUp
@@ -1498,6 +1511,7 @@ impl App {
                         self.remote_skill_browser.selector.selected = 0;
                         self.reset_split_detail_scroll(DetailSurface::RemoteSkillBrowser);
                         self.reset_detail_fullscreen_scroll(DetailSurface::RemoteSkillBrowser);
+                        self.schedule_remote_skill_guard_preview();
                     }
                 }
                 KeyCode::End => {
@@ -1515,6 +1529,7 @@ impl App {
                             .saturating_sub(1);
                         self.reset_split_detail_scroll(DetailSurface::RemoteSkillBrowser);
                         self.reset_detail_fullscreen_scroll(DetailSurface::RemoteSkillBrowser);
+                        self.schedule_remote_skill_guard_preview();
                     }
                 }
                 KeyCode::Backspace => {

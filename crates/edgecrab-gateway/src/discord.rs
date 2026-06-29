@@ -357,6 +357,188 @@ impl DiscordAdapter {
             .map(|_| ())
     }
 
+    fn build_clarify_components(interaction_id: u64, choices: &[String]) -> Vec<serde_json::Value> {
+        let mut buttons = Vec::new();
+        for (idx, choice) in choices.iter().take(24).enumerate() {
+            let label = if choice.len() > 75 {
+                format!("{}. {}...", idx + 1, choice.chars().take(72).collect::<String>())
+            } else {
+                format!("{}. {choice}", idx + 1)
+            };
+            buttons.push(serde_json::json!({
+                "type": 2,
+                "style": 1,
+                "label": label.chars().take(80).collect::<String>(),
+                "custom_id": format!("cl:{interaction_id}:{idx}"),
+            }));
+        }
+        buttons.push(serde_json::json!({
+            "type": 2,
+            "style": 2,
+            "label": "✏️ Other (type answer)",
+            "custom_id": format!("cl:{interaction_id}:other"),
+        }));
+        let mut rows = Vec::new();
+        for chunk in buttons.chunks(5) {
+            rows.push(serde_json::json!({
+                "type": 1,
+                "components": chunk,
+            }));
+        }
+        rows
+    }
+
+    async fn send_clarify_message(
+        &self,
+        channel_id: &str,
+        question: &str,
+        interaction_id: u64,
+        choices: Option<&[String]>,
+    ) -> anyhow::Result<()> {
+        let body = question.trim();
+        let description = if body.len() > 4088 {
+            format!("{}...", body.chars().take(4085).collect::<String>())
+        } else {
+            body.to_string()
+        };
+        let mut payload = serde_json::json!({
+            "embeds": [{
+                "title": "❓ EdgeCrab needs your input",
+                "description": description,
+                "color": 0xFFA500,
+            }],
+        });
+        if let Some(choices) = choices.filter(|c| !c.is_empty()) {
+            payload["embeds"][0]["fields"] = serde_json::json!([{
+                "name": "Choices",
+                "value": "Pick one below, or click ✏️ Other to type a custom answer.",
+                "inline": false,
+            }]);
+            payload["components"] = serde_json::Value::Array(Self::build_clarify_components(
+                interaction_id,
+                choices,
+            ));
+        } else {
+            payload["embeds"][0]["fields"] = serde_json::json!([{
+                "name": "Reply",
+                "value": "Reply in this channel with your answer.",
+                "inline": false,
+            }]);
+        }
+        let url = format!("{}/channels/{}/messages", self.api_base, channel_id);
+        let resp = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bot {}", self.token))
+            .json(&payload)
+            .send()
+            .await?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            let status = resp.status();
+            let body_text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Discord clarify send failed ({status}): {body_text}")
+        }
+    }
+
+    async fn respond_interaction_ephemeral_v10(
+        &self,
+        interaction_id: &str,
+        interaction_token: &str,
+        content: &str,
+    ) -> anyhow::Result<()> {
+        let url = format!(
+            "{}/interactions/{interaction_id}/{interaction_token}/callback",
+            self.api_base
+        );
+        let payload = serde_json::json!({
+            "type": 4,
+            "data": {
+                "content": content,
+                "flags": 64,
+            },
+        });
+        let resp = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bot {}", self.token))
+            .json(&payload)
+            .send()
+            .await?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            let status = resp.status();
+            let body_text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Discord interaction response failed ({status}): {body_text}")
+        }
+    }
+
+    async fn handle_clarify_interaction(&self, d: &serde_json::Value) {
+        if d["type"].as_u64() != Some(3) {
+            return;
+        }
+        let Some(custom_id) = d["data"]["custom_id"].as_str() else {
+            return;
+        };
+        let Some(rest) = custom_id.strip_prefix("cl:") else {
+            return;
+        };
+        let mut parts = rest.split(':');
+        let Some(id_str) = parts.next() else {
+            return;
+        };
+        let Ok(interaction_id) = id_str.parse::<u64>() else {
+            return;
+        };
+        let Some(choice_key) = parts.next() else {
+            return;
+        };
+        let interaction_id_str = d["id"].as_str().unwrap_or("");
+        let token = d["token"].as_str().unwrap_or("");
+        let user_id = d["member"]["user"]["id"]
+            .as_str()
+            .or_else(|| d["user"]["id"].as_str())
+            .unwrap_or("");
+        if !self.allowed_users.is_empty()
+            && !self.allowed_users.iter().any(|u| u == user_id)
+        {
+            let _ = self
+                .respond_interaction_ephemeral_v10(interaction_id_str, token, "Not authorized.")
+                .await;
+            return;
+        }
+
+        if choice_key == "other" {
+            let _ = self
+                .respond_interaction_ephemeral_v10(
+                    interaction_id_str,
+                    token,
+                    "✏️ Type your answer in this channel.",
+                )
+                .await;
+            return;
+        }
+
+        let Ok(idx) = choice_key.parse::<usize>() else {
+            return;
+        };
+        let answer = crate::clarify_wiring::peek_clarify(interaction_id)
+            .await
+            .and_then(|(_, choices)| choices)
+            .and_then(|choices| choices.get(idx).cloned())
+            .unwrap_or_else(|| choice_key.to_string());
+
+        let _ = self
+            .respond_interaction_ephemeral_v10(interaction_id_str, token, "Got it")
+            .await;
+
+        if crate::clarify_wiring::resolve_clarify_button(interaction_id, answer).await {
+            debug!(interaction_id, "Discord clarify button resolved");
+        }
+    }
+
     async fn edit_rest_message(
         &self,
         channel_id: &str,
@@ -745,6 +927,9 @@ impl DiscordAdapter {
                                 return Ok(());
                             }
                         }
+                        "INTERACTION_CREATE" => {
+                            self.handle_clarify_interaction(&event["d"]).await;
+                        }
                         _ => {}
                     }
                 }
@@ -953,6 +1138,26 @@ impl PlatformAdapter for DiscordAdapter {
     async fn send_typing(&self, metadata: &MessageMetadata) -> anyhow::Result<()> {
         let channel_id = Self::resolve_delivery_channel(metadata)?;
         self.trigger_typing(channel_id).await
+    }
+
+    async fn send_clarify(
+        &self,
+        prompt: &crate::platform::ClarifyPrompt,
+        metadata: &MessageMetadata,
+    ) -> anyhow::Result<bool> {
+        let channel_id = metadata
+            .thread_id
+            .as_deref()
+            .or(metadata.channel_id.as_deref())
+            .ok_or_else(|| anyhow::anyhow!("Discord clarify requires channel_id"))?;
+        self.send_clarify_message(
+            channel_id,
+            &prompt.question,
+            prompt.interaction_id,
+            prompt.choices.as_deref(),
+        )
+        .await?;
+        Ok(true)
     }
 
     async fn send_and_get_id(&self, msg: OutgoingMessage) -> anyhow::Result<Option<String>> {

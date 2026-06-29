@@ -123,6 +123,19 @@ impl From<edgecrab_sdk_core::StreamEvent> for PyStreamEvent {
                 event_type: "activity_notice".into(),
                 data: text,
             },
+            edgecrab_sdk_core::StreamEvent::LlmWaitProgress {
+                provider,
+                elapsed_secs,
+                has_tools,
+                prompt_tokens_estimated,
+                context_length,
+                prefill_pct,
+            } => Self {
+                event_type: "llm_wait_progress".into(),
+                data: format!(
+                    "{provider}:{elapsed_secs}:tools={has_tools}:prompt={prompt_tokens_estimated:?}:ctx={context_length:?}:prefill={prefill_pct:?}"
+                ),
+            },
             edgecrab_sdk_core::StreamEvent::BackgroundProcessTail {
                 process_id,
                 command_preview,

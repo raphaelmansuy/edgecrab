@@ -28,6 +28,10 @@ const USER_MAX_CHARS: usize = 1375;
 ///
 /// WHY extracted: Both `memory_read` and `memory_write` need this mapping.
 /// Centralising avoids duplicated match arms.
+pub fn resolve_memory_target_public(target: &str) -> (&'static str, usize) {
+    resolve_memory_target(target)
+}
+
 fn resolve_memory_target(target: &str) -> (&'static str, usize) {
     match target {
         "user" => ("USER.md", USER_MAX_CHARS),
@@ -217,7 +221,6 @@ impl ToolHandler for MemoryWriteTool {
             tool: "memory_write".into(),
             message: e.to_string(),
         })?;
-        let action = args.action.clone().unwrap_or_else(default_action);
         let old_content = args.old_content.clone().or(args.old_text.clone());
 
         if args.action.is_none() && args.content.is_none() && old_content.is_none() {
@@ -226,19 +229,53 @@ impl ToolHandler for MemoryWriteTool {
                 .await;
         }
 
-        let (filename, max_chars) = resolve_memory_target(&args.target);
+        let payload = crate::skills::MemoryWritePayload {
+            action: args.action.clone().unwrap_or_else(default_action),
+            content: args.content.clone(),
+            old_content: args.old_content.clone(),
+            old_text: args.old_text.clone(),
+            target: args.target.clone(),
+        };
 
-        let mem_dir = memory_dir(&ctx.config.edgecrab_home);
-        tokio::fs::create_dir_all(&mem_dir)
-            .await
-            .map_err(|e| ToolError::Other(format!("Cannot create memories dir: {}", e)))?;
-        let path = mem_dir.join(filename);
+        match crate::skills::maybe_gate_memory_write(
+            &ctx.config.edgecrab_home,
+            payload.clone(),
+            ctx.config.memory_write_approval,
+        ) {
+            crate::skills::MemoryWriteGate::Staged(msg) => return Ok(msg),
+            crate::skills::MemoryWriteGate::Allow => {}
+        }
 
-        let existing = tokio::fs::read_to_string(&path).await.unwrap_or_default();
+        apply_memory_write_public(&ctx.config.edgecrab_home, &payload).await
+    }
+}
 
-        let new_content = match action.as_str() {
+inventory::submit!(&MemoryWriteTool as &dyn ToolHandler);
+
+/// Apply a memory write payload (used by tool dispatch and pending approval).
+pub async fn apply_memory_write_public(
+    edgecrab_home: &std::path::Path,
+    payload: &crate::skills::MemoryWritePayload,
+) -> Result<String, ToolError> {
+    let action = payload.action.as_str();
+    let old_content = payload
+        .old_content
+        .as_deref()
+        .or(payload.old_text.as_deref());
+
+    let (filename, max_chars) = resolve_memory_target(&payload.target);
+
+    let mem_dir = memory_dir(edgecrab_home);
+    tokio::fs::create_dir_all(&mem_dir)
+        .await
+        .map_err(|e| ToolError::Other(format!("Cannot create memories dir: {}", e)))?;
+    let path = mem_dir.join(filename);
+
+    let existing = tokio::fs::read_to_string(&path).await.unwrap_or_default();
+
+    let new_content = match action {
             "add" => {
-                let content = args.content.as_deref().unwrap_or("").trim();
+                let content = payload.content.as_deref().unwrap_or("").trim();
                 if content.is_empty() {
                     return Err(ToolError::InvalidArgs {
                         tool: "memory_write".into(),
@@ -289,8 +326,8 @@ impl ToolHandler for MemoryWriteTool {
                 result
             }
             "replace" => {
-                let old = old_content.as_deref().unwrap_or("").trim();
-                let new = args.content.as_deref().unwrap_or("").trim();
+                let old = old_content.unwrap_or("").trim();
+                let new = payload.content.as_deref().unwrap_or("").trim();
                 if old.is_empty() {
                     return Err(ToolError::InvalidArgs {
                         tool: "memory_write".into(),
@@ -359,7 +396,7 @@ impl ToolHandler for MemoryWriteTool {
                 result
             }
             "remove" => {
-                let old = old_content.as_deref().unwrap_or("").trim();
+                let old = old_content.unwrap_or("").trim();
                 if old.is_empty() {
                     return Err(ToolError::InvalidArgs {
                         tool: "memory_write".into(),
@@ -440,17 +477,14 @@ impl ToolHandler for MemoryWriteTool {
         let pct = (new_content.len() * 100) / max_chars;
         Ok(serde_json::to_string(&json!({
             "ok": true,
-            "action": action.as_str(),
+            "action": action,
             "file": filename,
             "used_chars": new_content.len(),
             "max_chars": max_chars,
             "used_pct": pct
         }))
         .expect("infallible"))
-    }
 }
-
-inventory::submit!(&MemoryWriteTool as &dyn ToolHandler);
 
 /// Resolve the memories directory relative to workspace root
 fn memory_dir(edgecrab_home: &std::path::Path) -> std::path::PathBuf {

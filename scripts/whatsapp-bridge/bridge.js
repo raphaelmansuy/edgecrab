@@ -343,6 +343,10 @@ async function startSocket() {
         } catch (err) {
           console.error('[bridge] Failed to download audio:', err.message);
         }
+      } else if (msg.message.buttonsResponseMessage) {
+        body = msg.message.buttonsResponseMessage.selectedButtonId || '';
+      } else if (msg.message.listResponseMessage) {
+        body = msg.message.listResponseMessage.singleSelectReply?.selectedRowId || '';
       } else if (msg.message.documentMessage) {
         body = msg.message.documentMessage.caption || '';
         hasMedia = true;
@@ -449,6 +453,95 @@ app.post('/send', async (req, res) => {
     }
 
     res.json({ success: true, messageId: sent?.key?.id });
+  } catch (err) {
+    const error = err?.message || String(err);
+    const status = error.includes('Connection Closed') ? 503 : 500;
+    res.status(status).json({ error, originalChatId, normalizedChatId });
+  }
+});
+
+// Send a clarify prompt with native quick-reply buttons (Baileys).
+app.post('/send-clarify', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+
+  const { chatId, question, interactionId, choices } = req.body;
+  if (!chatId || !question || interactionId === undefined) {
+    return res.status(400).json({ error: 'chatId, question, and interactionId are required' });
+  }
+
+  const resolvedTarget = resolveOutboundChatId(chatId);
+  if (resolvedTarget.error) {
+    return res.status(400).json(resolvedTarget);
+  }
+  const { originalChatId, normalizedChatId } = resolvedTarget;
+
+  const cleanChoices = Array.isArray(choices)
+    ? choices.map(c => String(c || '').trim()).filter(Boolean)
+    : [];
+  const buttonChoices = cleanChoices.slice(0, 3);
+  const listChoices = cleanChoices.length > 3 ? cleanChoices.slice(0, 10) : [];
+
+  try {
+    let bodyText = String(question || '').trim();
+    if (cleanChoices.length > 0) {
+      const optionLines = cleanChoices.map((c, i) => `${i + 1}. ${c}`).join('\n');
+      bodyText = `❓ ${bodyText}\n\n${optionLines}`;
+    } else {
+      bodyText = `❓ ${bodyText}`;
+    }
+
+    let payload;
+    if (listChoices.length > 0) {
+      const rows = listChoices.map((choice, idx) => ({
+        title: choice.length > 24 ? `${choice.slice(0, 21)}…` : choice,
+        description: choice.length > 24 ? choice : '',
+        rowId: `cl:${interactionId}:${idx}`,
+      }));
+      rows.push({
+        title: '✏️ Other',
+        description: 'Type a custom answer',
+        rowId: `cl:${interactionId}:other`,
+      });
+      payload = {
+        text: formatOutgoingMessage(bodyText),
+        title: 'Clarify',
+        buttonText: 'Choose',
+        footer: 'Pick one option from the list.',
+        sections: [{ title: 'Options', rows }],
+      };
+    } else if (buttonChoices.length > 0) {
+      const buttons = buttonChoices.map((choice, idx) => ({
+        buttonId: `cl:${interactionId}:${idx}`,
+        buttonText: { displayText: String(idx + 1) },
+        type: 1,
+      }));
+      buttons.push({
+        buttonId: `cl:${interactionId}:other`,
+        buttonText: { displayText: '✏️ Other' },
+        type: 1,
+      });
+      payload = {
+        text: formatOutgoingMessage(bodyText),
+        footer: 'Pick one or tap ✏️ Other to type a custom answer.',
+        buttons,
+        headerType: 1,
+      };
+    } else {
+      payload = { text: formatOutgoingMessage(`${bodyText}\n\nReply with your answer.`) };
+    }
+
+    const sent = await sock.sendMessage(normalizedChatId, payload);
+    if (sent?.key?.id) {
+      recentlySentIds.add(sent.key.id);
+      if (recentlySentIds.size > MAX_RECENT_IDS) {
+        recentlySentIds.delete(recentlySentIds.values().next().value);
+      }
+    }
+    const usedButtons = buttonChoices.length > 0;
+    const usedList = listChoices.length > 0;
+    res.json({ success: true, messageId: sent?.key?.id, usedButtons, usedList });
   } catch (err) {
     const error = err?.message || String(err);
     const status = error.includes('Connection Closed') ? 503 : 500;

@@ -69,8 +69,8 @@ lsp-types = { version = "0.97.0", features = ["proposed"] }
 regex = "1"
 url = "2"
 
-# LLM backend — crates.io pin (git tag stripped on `cargo publish`; v0.9.0 used version-only).
-edgequake-llm = { version = "0.6.24", features = ["bedrock"] }
+# LLM backend — crates.io pin (v0.6.25: LM Studio metadata + tool-turn reasoning_effort).
+edgequake-llm = { version = "0.6.25", features = ["bedrock"] }
 
 # Image processing (vision tool: resize/compress before base64 encoding)
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
@@ -93,7 +93,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # Apache-2.0 only — Chrome TLS config set manually inline (no wreq-util GPL-3.0 dep).
 # NOTE: incompatible with openssl-sys; safe here because reqwest uses rustls-tls.
 wreq = { version = "5", default-features = false, features = ["json", "gzip", "brotli", "deflate", "socks", "cookies"] }
-axum = "0.7"
+axum = { version = "0.7", features = ["ws"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 
 # Security

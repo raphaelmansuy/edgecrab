@@ -178,12 +178,7 @@ pub fn guard_file_freshness(
         return Ok(());
     }
 
-    Err(ToolError::InvalidArgs {
-        tool: tool.into(),
-        message: format!(
-            "'{display_path}' was modified since you last read it in this session. Re-run read_file on the current file before using {tool} so the model does not act on stale cached context."
-        ),
-    })
+    Err(crate::recovery_catalog::stale_file_context(tool, display_path))
 }
 
 // ─── FP13: mtime-based read dedup cache ────────────────────────────────────
