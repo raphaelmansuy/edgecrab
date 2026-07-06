@@ -19,7 +19,7 @@ edgecrab-tools = { workspace = true }
 edgecrab-state = { workspace = true }
 edgecrab-core = { workspace = true }
 
-pyo3 = { version = "0.24.1", features = ["abi3-py310"] }
+pyo3 = { version = "0.29.0", features = ["abi3-py310"] }
 serde_json = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
