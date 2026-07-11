@@ -157,7 +157,7 @@ fn completion_json(
     ChatCompletionResponse {
         id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
         object: "chat.completion",
-        created: unix_now(),
+        created: Some(unix_now()),
         model: backend.display_model.clone(),
         choices: vec![ChatChoiceOut {
             index: 0,

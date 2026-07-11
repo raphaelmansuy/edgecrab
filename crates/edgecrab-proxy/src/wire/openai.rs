@@ -106,7 +106,7 @@ pub struct FunctionCallIn {
 pub struct ChatCompletionResponse {
     pub id: String,
     pub object: &'static str,
-    pub created: u64,
+    pub created: Option<u64>,
     pub model: String,
     pub choices: Vec<ChatChoiceOut>,
     pub usage: UsageOut,
@@ -159,7 +159,7 @@ pub struct ModelsListResponse {
 pub struct ModelObject {
     pub id: String,
     pub object: &'static str,
-    pub created: u64,
+    pub created: Option<u64>,
     pub owned_by: String,
 }
 
