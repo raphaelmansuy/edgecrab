@@ -173,7 +173,7 @@ pub fn render_status_bar(frame: &mut Frame, area: Rect, params: &StatusBarRender
                     params.thinking_verb_idx,
                     params.kaomoji_frame_idx,
                     elapsed_secs,
-                    &long_label,
+                    long_label,
                 );
                 // FP46: urgency color ramp — amber (normal) → orange (slow) → red (stall)
                 let color = wait_urgency_color(elapsed_secs);

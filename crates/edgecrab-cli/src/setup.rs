@@ -257,6 +257,8 @@ fn run_fresh_setup(home: &Path, config_path: &Path) -> anyhow::Result<()> {
     let mut config = CurrentConfig {
         model: Some(model.clone()),
         provider: Some(chosen_provider.clone()),
+        base_url: None,
+        api_key_env: None,
         max_iterations: 90,
         streaming: true,
         toolsets: vec![
@@ -489,6 +491,32 @@ fn setup_model_section(config: &mut CurrentConfig) -> anyhow::Result<()> {
         let trimmed = input.trim();
         if !trimmed.is_empty() {
             config.model = Some(trimmed.to_string());
+        }
+    }
+
+    // Configure custom base URL for OpenAI-compatible endpoints
+    let current_base_url = config.base_url.as_deref().unwrap_or("(default)");
+    let change_base_url = prompt_yes_no(&format!("Configure custom base URL? (current: {current_base_url})"), false)?;
+    if change_base_url {
+        let input = prompt_line("  Base URL [https://api.openai.com/v1]: ")?;
+        let trimmed = input.trim();
+        if !trimmed.is_empty() {
+            config.base_url = Some(trimmed.to_string());
+        } else {
+            config.base_url = None;
+        }
+    }
+
+    // Configure custom API key environment variable
+    let current_api_key_env = config.api_key_env.as_deref().unwrap_or("(default)");
+    let change_api_key_env = prompt_yes_no(&format!("Configure custom API key env var? (current: {current_api_key_env})"), false)?;
+    if change_api_key_env {
+        let input = prompt_line("  API key env var [OPENAI_API_KEY]: ")?;
+        let trimmed = input.trim();
+        if !trimmed.is_empty() {
+            config.api_key_env = Some(trimmed.to_string());
+        } else {
+            config.api_key_env = None;
         }
     }
 
@@ -803,6 +831,8 @@ fn setup_agent_section(config: &mut CurrentConfig) -> anyhow::Result<()> {
 struct CurrentConfig {
     model: Option<String>,
     provider: Option<String>,
+    base_url: Option<String>,
+    api_key_env: Option<String>,
     max_iterations: u32,
     streaming: bool,
     toolsets: Vec<String>,
@@ -836,6 +866,18 @@ fn load_current_config(config_path: &Path) -> CurrentConfig {
 
     let provider = raw
         .get("provider")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    let base_url = raw
+        .get("model")
+        .and_then(|m| m.get("base_url"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    let api_key_env = raw
+        .get("model")
+        .and_then(|m| m.get("api_key_env"))
         .and_then(|v| v.as_str())
         .map(String::from);
 
@@ -939,6 +981,8 @@ fn load_current_config(config_path: &Path) -> CurrentConfig {
     CurrentConfig {
         model,
         provider,
+        base_url,
+        api_key_env,
         max_iterations,
         streaming,
         toolsets,
@@ -980,7 +1024,7 @@ fn save_current_config(
 
     if let Some(ref m) = config.model {
         model_map.insert(
-            serde_yml::Value::String("default_model".into()),
+            serde_yml::Value::String("default".into()),
             serde_yml::Value::String(m.clone()),
         );
     }
@@ -992,6 +1036,18 @@ fn save_current_config(
         serde_yml::Value::String("streaming".into()),
         serde_yml::Value::Bool(config.streaming),
     );
+    if let Some(ref base_url) = config.base_url {
+        model_map.insert(
+            serde_yml::Value::String("base_url".into()),
+            serde_yml::Value::String(base_url.clone()),
+        );
+    }
+    if let Some(ref api_key_env) = config.api_key_env {
+        model_map.insert(
+            serde_yml::Value::String("api_key_env".into()),
+            serde_yml::Value::String(api_key_env.clone()),
+        );
+    }
     root.insert(
         serde_yml::Value::String("model".into()),
         serde_yml::Value::Mapping(model_map),
@@ -1169,6 +1225,7 @@ fn choose_provider_interactively() -> anyhow::Result<String> {
     for (_id, name) in LOCAL_PROVIDERS {
         items.push(format!("{name}  [no key needed]"));
     }
+    items.push("Custom OpenAI-compatible endpoint".to_string());
 
     println!();
     println!("  Nous Hermes 3 (NousResearch) is available via OpenRouter.");
@@ -1209,12 +1266,17 @@ fn choose_provider_interactively() -> anyhow::Result<String> {
             }
         }
         Ok(provider_id.to_string())
-    } else {
+    } else if choice < PROVIDER_ENV_MAP.len() + LOCAL_PROVIDERS.len() {
         let local_idx = choice - PROVIDER_ENV_MAP.len();
         let (provider_id, name) = LOCAL_PROVIDERS[local_idx];
         println!("  Selected: {name}");
         println!("  Make sure the service is running locally.");
         Ok(provider_id.to_string())
+    } else {
+        // Custom OpenAI-compatible endpoint
+        println!("  Selected: Custom OpenAI-compatible endpoint");
+        println!("  You can configure the base URL and API key in the model settings.");
+        Ok("openai".to_string())
     }
 }
 
@@ -1312,7 +1374,7 @@ fn write_config(
 # Run `edgecrab doctor` to validate.
 
 model:
-  default_model: "{model}"
+  default: "{model}"
   max_iterations: 90
   streaming: true
 
@@ -1365,7 +1427,7 @@ mod tests {
 
         let content = std::fs::read_to_string(&config_path).expect("read config");
         assert!(content.contains("copilot/gpt-4.1-mini"));
-        assert!(content.contains("default_model"));
+        assert!(content.contains("default:"));
         assert!(tmp.path().join("memories").exists());
         assert!(tmp.path().join("skills").exists());
     }
@@ -1414,6 +1476,8 @@ mod tests {
         let config = CurrentConfig {
             model: Some("anthropic/claude-sonnet-4-20250514".into()),
             provider: Some("anthropic".into()),
+            base_url: None,
+            api_key_env: None,
             max_iterations: 50,
             streaming: false,
             toolsets: vec!["core".into(), "web".into()],
@@ -1459,7 +1523,7 @@ mod tests {
             r#"
 provider: openai
 model:
-  default_model: openai/gpt-4.1-mini
+  default: openai/gpt-4.1-mini
 auxiliary:
   provider: copilot
   model: gpt-5.4
@@ -1478,7 +1542,7 @@ auxiliary:
         let config_path = tmp.path().join("config.yaml");
 
         // Write initial config with an extra key
-        let yaml = "model:\n  default_model: \"test\"\ncustom_key: preserved\n";
+        let yaml = "model:\n  default: \"test\"\ncustom_key: preserved\n";
         std::fs::write(&config_path, yaml).unwrap();
 
         let mut config = load_current_config(&config_path);
