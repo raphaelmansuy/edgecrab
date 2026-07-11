@@ -968,7 +968,11 @@ async fn execute_job(job: &CronJob, args: &CliArgs) -> anyhow::Result<String> {
         model_override,
         args.toolset.as_deref(),
     )?;
-    let provider = crate::create_provider_async(&runtime.config.model.default_model).await?;
+    let provider = crate::create_provider_with_config_async(
+        &runtime.config.model.default_model,
+        runtime.config.model.base_url.as_deref(),
+        Some(&runtime.config.model.api_key_env),
+    ).await?;
     let state_db = open_state_db(&runtime.state_db_path)?;
     let tool_registry = build_tool_registry_with_mcp_discovery(&runtime.config).await;
 

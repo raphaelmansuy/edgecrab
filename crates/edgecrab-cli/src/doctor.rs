@@ -23,6 +23,7 @@ use edgecrab_core::{AppConfig, edgecrab_home};
 use edgequake_llm::{ProviderFactory, ProviderType};
 
 use crate::runtime::load_dot_env;
+use crate::apply_provider_config_env;
 
 fn copilot_auth_available() -> bool {
     if std::env::var("GITHUB_TOKEN")
@@ -653,6 +654,14 @@ async fn check_provider_ping(context: &DoctorContext) -> Check {
             format!("{provider_str} → unsupported configured provider"),
         );
     };
+
+    if let Ok(config) = AppConfig::load_from(&context.config_path) {
+        apply_provider_config_env(
+            &model,
+            config.model.base_url.as_deref(),
+            Some(&config.model.api_key_env),
+        );
+    }
 
     let start = Instant::now();
     let result: anyhow::Result<String> = async {
