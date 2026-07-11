@@ -16,6 +16,27 @@ model:
   max_tokens: 4096
 ```
 
+### 1.5. 自定义 OpenAI 兼容端点 (openai-compatible)
+
+对于支持 OpenAI 兼容 API 的自定义端点（如讯飞 MaaS API、Groq、DeepSeek），使用 `openai-compatible` provider：
+
+```yaml
+provider: openai-compatible
+model:
+  default: xopkimik26
+  base_url: https://maas-coding-api.cn-huabei-1.xf-yun.com/v2
+  api_key_env: xfyun_API_KEY
+  streaming: false
+```
+
+**配置流程**：
+1. `setup.rs` — CLI 安装向导提示输入自定义 base_url 和 api_key_env
+2. `config.rs` — 将 `provider` 和 `model.default` 合并为 `openai-compatible/model_name` 格式
+3. `main.rs` — `apply_provider_config_env` 读取配置并设置环境变量 (`OPENAI_COMPATIBLE_BASE_URL`, `OPENAI_COMPATIBLE_API_KEY`)
+4. `edgequake_llm` — `OpenAICompatibleProvider` 读取环境变量连接到自定义端点
+
+**Provider 规范化**：`openai-compatible` 和 `openai_compatible` 都被规范化为 `openai-compatible`。
+
 ### 2. Anthropic
 
 ```yaml
