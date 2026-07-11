@@ -29,6 +29,7 @@ pub fn normalize_provider_name(provider: &str) -> String {
         "vertex" | "vertex-ai" => "vertexai".to_string(),
         "azure-openai" | "azure_openai" | "azureopenai" => "azure".to_string(),
         "aws-bedrock" | "aws_bedrock" | "aws bedrock" => "bedrock".to_string(),
+        "openai-compatible" | "openai_compatible" => "openai-compatible".to_string(),
         other => other.to_string(),
     }
 }
