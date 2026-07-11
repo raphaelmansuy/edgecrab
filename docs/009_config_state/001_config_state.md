@@ -181,6 +181,29 @@ edgecrab --profile personal "summarise my notes"
 
 ---
 
+## OpenAI-Compatible Provider Configuration
+
+For providers that support the OpenAI-compatible API (e.g., 讯飞 MaaS API, Groq, DeepSeek), use the `openai-compatible` provider type:
+
+```yaml
+provider: openai-compatible
+model:
+  default: xopkimik26
+  base_url: https://maas-coding-api.cn-huabei-1.xf-yun.com/v2
+  api_key_env: xfyun_API_KEY
+  streaming: false
+```
+
+- **`provider`**: Set to `openai-compatible` for OpenAI-compatible APIs
+- **`model.default`**: The model name (without provider prefix)
+- **`model.base_url`**: The API endpoint URL
+- **`model.api_key_env`**: The name of the environment variable containing the API key
+- **`model.streaming`**: Set to `false` if the provider doesn't support streaming
+
+The `provider` and `model.default` values are automatically merged into `openai-compatible/model_name` format at runtime.
+
+---
+
 ## Minimal `config.yaml` Example
 
 ```yaml
