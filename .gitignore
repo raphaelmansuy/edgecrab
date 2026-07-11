@@ -12,6 +12,7 @@ Thumbs.db
 .idea/
 .vscode/settings.json
 .vscode/*.log
+.vscode/
 
 # ── Local secrets — NEVER commit ─────────────────────────────────────────────
 .env
@@ -103,3 +104,4 @@ demo/*
 demo/.edgecrab-home/
 demo/**/*.db
 .edgecrab-artifacts/
+.aider*

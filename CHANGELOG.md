@@ -7,6 +7,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **OpenAI-compatible provider configuration** — `provider: openai-compatible` and `model.default` are now correctly merged into `openai-compatible/model` format.
+- **API key environment variable resolution** — `api_key_env` now correctly reads the value from the specified environment variable instead of using the variable name as the key.
+- **`edgequake-llm` local directory removal** — removed accidentally committed local copy of the dependency crate (still used from crates.io).
+
 ## [0.10.0] — 2026-06-13
 
 ### Added
