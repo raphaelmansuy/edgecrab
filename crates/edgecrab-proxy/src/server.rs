@@ -185,7 +185,7 @@ pub async fn list_models(
         .map(|id| ModelObject {
             id: id.clone(),
             object: "model",
-            created: now,
+            created: Some(now),
             owned_by: "edgecrab".to_string(),
         })
         .collect();
@@ -203,7 +203,7 @@ pub async fn list_models(
             data.push(ModelObject {
                 id,
                 object: "model",
-                created: now,
+                created: Some(now),
                 owned_by: "edgecrab".to_string(),
             });
         }
@@ -213,7 +213,7 @@ pub async fn list_models(
         data.push(ModelObject {
             id: "mock/test".into(),
             object: "model",
-            created: now,
+            created: Some(now),
             owned_by: "edgecrab".to_string(),
         });
     }

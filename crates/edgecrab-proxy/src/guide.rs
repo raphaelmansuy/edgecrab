@@ -49,7 +49,7 @@ pub fn resolve_recipe(name: &str) -> Option<&'static BuiltinRecipe> {
 
 /// Apply recipe to config (idempotent merge).
 pub fn apply_recipe(cfg: &mut ProxyConfig, recipe: &BuiltinRecipe) {
-    cfg.forward_upstreams
+    let upstream = cfg.forward_upstreams
         .entry(recipe.key.to_string())
         .or_insert_with(|| ForwardUpstreamConfig {
             base_url: recipe.base_url.into(),
@@ -58,6 +58,9 @@ pub fn apply_recipe(cfg: &mut ProxyConfig, recipe: &BuiltinRecipe) {
             auth_hint: Some(recipe.hermes_auth_cmd.into()),
             ..Default::default()
         });
+    if upstream.base_url.is_empty() {
+        upstream.base_url = recipe.base_url.into();
+    }
     cfg.model_aliases.insert(
         recipe.default_alias.to_string(),
         format!("forward:{}", recipe.key),

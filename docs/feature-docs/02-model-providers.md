@@ -17,6 +17,7 @@ EdgeCrab supports multi-provider LLM selection via a single source-of-truth mode
 - **DeepSeek**: DeepSeek V3, R1
 - **HuggingFace**: Inference API
 - **Z.AI**: GLM 4.5-5
+- **OpenAI-Compatible**: Custom OpenAI-compatible API endpoints (e.g., 讯飞 MaaS API, Groq, DeepSeek)
 
 See [`model_catalog_default.yaml`](../../crates/edgecrab-core/src/model_catalog_default.yaml) for the full, up-to-date list.
 
@@ -35,6 +36,27 @@ See [`model_catalog_default.yaml`](../../crates/edgecrab-core/src/model_catalog_
 - [`model_router.rs`](../../crates/edgecrab-core/src/model_router.rs): Smart routing (simple vs complex messages), fallback on error, tier-based selection.
 - **API mode**: Supports OpenAI-compatible, Copilot, Anthropic, Gemini, Bedrock, etc. (see `ApiMode` enum).
 - **Extensibility**: Adding a new provider = add to catalog YAML, implement API mode if needed, add CLI setup prompt.
+
+## OpenAI-Compatible Provider Configuration
+
+The `openai-compatible` provider allows connecting to any custom OpenAI-compatible API endpoint:
+
+```yaml
+provider: openai-compatible
+model:
+  default: xopkimik26
+  base_url: https://maas-coding-api.cn-huabei-1.xf-yun.com/v2
+  api_key_env: xfyun_API_KEY
+  streaming: false
+```
+
+**Configuration flow**:
+1. `setup.rs` — CLI setup wizard prompts for custom base_url and api_key_env
+2. `config.rs` — Merges `provider` and `model.default` into `openai-compatible/model_name` format
+3. `main.rs` — `apply_provider_config_env` reads config and sets environment variables (`OPENAI_COMPATIBLE_BASE_URL`, `OPENAI_COMPATIBLE_API_KEY`)
+4. `edgequake_llm` — `OpenAICompatibleProvider` reads environment variables to connect to the custom endpoint
+
+**Provider normalization**: `openai-compatible` and `openai_compatible` are both normalized to `openai-compatible`.
 
 ## Design Patterns & Extensibility
 

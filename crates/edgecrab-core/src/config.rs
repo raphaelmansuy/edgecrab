@@ -738,6 +738,14 @@ fn normalize_model_keys(root: &mut serde_yml::Value) {
         return;
     }
 
+    let provider_key = serde_yml::Value::String("provider".into());
+    let provider = root_map
+        .get(&provider_key)
+        .and_then(serde_yml::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
     let serde_yml::Value::Mapping(model_map) = root_map
         .get_mut(serde_yml::Value::String("model".into()))
         .expect("model key exists after clone")
@@ -756,9 +764,23 @@ fn normalize_model_keys(root: &mut serde_yml::Value) {
         };
 
         if should_promote {
-            model_map.insert(default_key, legacy_val);
+            if let (Some(provider), serde_yml::Value::String(model_name)) = (&provider, &legacy_val) {
+                if !has_explicit_provider_prefix(model_name.trim()) {
+                    let normalized = format!("{provider}/{}", model_name.trim());
+                    model_map.insert(default_key, serde_yml::Value::String(normalized));
+                } else {
+                    model_map.insert(default_key, legacy_val);
+                }
+            } else {
+                model_map.insert(default_key, legacy_val);
+            }
         }
         model_map.remove(&legacy_key);
+    } else if let Some((provider, serde_yml::Value::String(model_name))) = provider.zip(model_map.get(&default_key).cloned()) {
+        if !has_explicit_provider_prefix(model_name.trim()) {
+            let normalized = format!("{provider}/{}", model_name.trim());
+            model_map.insert(default_key, serde_yml::Value::String(normalized));
+        }
     }
 }
 
@@ -842,6 +864,8 @@ fn has_explicit_provider_prefix(model_name: &str) -> bool {
             | "bedrock"
             | "aws-bedrock"
             | "aws_bedrock"
+            | "openai-compatible"
+            | "openai_compatible"
     )
 }
 
@@ -3077,6 +3101,22 @@ tools:
             cfg.tools.file.allowed_roots,
             vec![PathBuf::from("/tmp/project")]
         );
+    }
+
+    #[test]
+    fn parse_compat_accepts_provider_with_nested_model() {
+        let yaml = r#"
+provider: openai
+model:
+  default_model: xopglm
+  base_url: https://maas-coding-api.cn-huabei-1.xf-yun.com/v2
+  api_key_env: xfyun_API_KEY
+"#;
+        let cfg = AppConfig::parse_compat_yaml(yaml, Path::new("/tmp/test-config.yaml"))
+            .expect("parse compat");
+        assert_eq!(cfg.model.default_model, "openai/xopglm");
+        assert_eq!(cfg.model.base_url, Some("https://maas-coding-api.cn-huabei-1.xf-yun.com/v2".to_string()));
+        assert_eq!(cfg.model.api_key_env, "xfyun_API_KEY");
     }
 
     #[test]

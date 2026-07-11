@@ -177,6 +177,47 @@ pub(crate) async fn create_provider_async(
     create_provider_inner(model)
 }
 
+pub(crate) fn apply_provider_config_env(
+    model: &str,
+    base_url: Option<&str>,
+    api_key_env: Option<&str>,
+) {
+    if let Some((provider_name, _model_name)) = explicit_provider_request(model) {
+        let canonical = normalize_provider_name(provider_name);
+        
+        let canonical_upper = canonical.to_uppercase().replace('-', "_");
+        let base_url_env_name = format!("{}_BASE_URL", canonical_upper);
+        if let Some(url) = base_url {
+            unsafe { std::env::set_var(&base_url_env_name, url); }
+            tracing::info!(provider = canonical, env_name = base_url_env_name, base_url = url, "setting base URL from config");
+        }
+        
+        let api_key_env_name = format!("{}_API_KEY", canonical_upper);
+        if let Some(key_env_name) = api_key_env {
+            if std::env::var(&api_key_env_name).is_err() {
+                if let Ok(api_key_value) = std::env::var(key_env_name) {
+                    unsafe { std::env::set_var(&api_key_env_name, api_key_value); }
+                    tracing::info!(provider = canonical, env_name = api_key_env_name, source_env = key_env_name, "setting API key env from config");
+                } else {
+                    tracing::warn!(provider = canonical, source_env = key_env_name, "source API key env not found");
+                }
+            }
+        }
+    }
+}
+
+pub(crate) async fn create_provider_with_config_async(
+    model: &str,
+    base_url: Option<&str>,
+    api_key_env: Option<&str>,
+) -> anyhow::Result<Arc<dyn edgequake_llm::LLMProvider>> {
+    tracing::debug!(model = model, base_url = ?base_url, api_key_env = ?api_key_env, "create_provider_with_config_async called");
+    
+    apply_provider_config_env(model, base_url, api_key_env);
+    
+    create_provider_async(model).await
+}
+
 fn create_provider_inner(model: &str) -> anyhow::Result<Arc<dyn edgequake_llm::LLMProvider>> {
     let normalized_model = model.trim().to_ascii_lowercase();
     if normalized_model == "mock" || normalized_model.starts_with("mock/") {
@@ -577,7 +618,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let model = runtime.config.model.default_model.clone();
-    let provider = create_provider_async(&model).await?;
+    let provider = create_provider_with_config_async(
+        &model,
+        runtime.config.model.base_url.as_deref(),
+        Some(&runtime.config.model.api_key_env),
+    ).await?;
     let state_db = open_state_db(&runtime.state_db_path)?;
     let tool_registry = build_tool_registry_with_mcp_discovery(&runtime.config).await;
 
