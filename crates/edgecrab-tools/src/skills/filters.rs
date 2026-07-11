@@ -29,11 +29,11 @@ pub fn current_os_platform_prefix() -> &'static str {
     }
     #[cfg(target_os = "linux")]
     {
-        return "linux";
+        "linux"
     }
     #[cfg(target_os = "windows")]
     {
-        return "win32";
+        "win32"
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
