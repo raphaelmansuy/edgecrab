@@ -28,6 +28,7 @@ pub mod execution_fs;
 pub mod execution_tmp;
 pub mod fuzzy_match;
 pub mod harness_gates;
+pub mod isolated_worktree;
 pub mod kanban_gating;
 mod local_pty;
 pub mod lsp_gate;
@@ -118,8 +119,9 @@ pub use tool_name_repair::{
     ResolvedToolName, fuzzy_match_tool_name, repair_tool_name, resolve_tool_call_name,
 };
 pub use tool_schema_index::{
-    TOOL_SEARCH_NAME, deferred_tool_error_response, format_deferred_index, is_deferred_not_on_wire,
-    partition_schemas, read_materialized_set, wire_partition_counts,
+    DEFAULT_MAX_MATERIALIZED_TOOLS, MaterializedToolSet, TOOL_SEARCH_NAME,
+    deferred_tool_error_response, format_deferred_index, is_deferred_not_on_wire, partition_schemas,
+    read_materialized_set, wire_partition_counts,
 };
 pub use tools::checkpoint::{
     AutoPruneResult, CheckpointConfig, CheckpointManager, PruneCounts, RollbackOutcome,

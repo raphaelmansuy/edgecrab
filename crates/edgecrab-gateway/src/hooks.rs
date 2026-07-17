@@ -688,13 +688,9 @@ impl Default for HookRegistry {
 
 // ─── Helpers ───────────────────────────────────────────────────────────
 
-/// Resolve `~/.edgecrab/hooks/` directory.
+/// Resolve `~/.edgecrab/hooks/` directory (delegates to core — single SoT).
 fn edgecrab_hooks_dir() -> Option<PathBuf> {
-    std::env::var("EDGECRAB_HOME")
-        .ok()
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|h| h.join(".edgecrab")))
-        .map(|home| home.join("hooks"))
+    edgecrab_core::lifecycle_hooks::hooks_home()
 }
 
 /// Find the handler script in a hook directory.

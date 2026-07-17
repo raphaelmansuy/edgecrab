@@ -346,6 +346,30 @@ impl DiscordAdapter {
         anyhow::bail!("Discord sendMessage failed ({}): {}", status, body_text)
     }
 
+    /// Fetch recent channel messages for first-seen backfill (gap 016).
+    pub async fn fetch_channel_history(
+        &self,
+        channel_id: &str,
+        limit: u32,
+    ) -> anyhow::Result<Vec<crate::backfill::BackfillMessage>> {
+        let limit = limit.clamp(1, 100);
+        let url = format!(
+            "{}/channels/{}/messages?limit={}",
+            self.api_base, channel_id, limit
+        );
+        let resp = self
+            .client
+            .get(&url)
+            .header("Authorization", format!("Bot {}", self.token))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("discord history HTTP {}", resp.status());
+        }
+        let body: serde_json::Value = resp.json().await?;
+        Ok(crate::backfill::discord_messages_from_json(&body))
+    }
+
     async fn send_rest_message(
         &self,
         channel_id: &str,
@@ -1067,6 +1091,14 @@ impl PlatformAdapter for DiscordAdapter {
         Platform::Discord
     }
 
+    async fn fetch_channel_history(
+        &self,
+        channel_id: &str,
+        limit: u32,
+    ) -> anyhow::Result<Vec<crate::backfill::BackfillMessage>> {
+        DiscordAdapter::fetch_channel_history(self, channel_id, limit).await
+    }
+
     async fn start(&self, tx: mpsc::Sender<IncomingMessage>) -> anyhow::Result<()> {
         info!("Discord adapter starting (Gateway WebSocket mode)");
 
@@ -1531,6 +1563,57 @@ mod tests {
         assert!(paths.contains(&"POST /channels/chan_1/messages".to_string()));
         assert!(paths.contains(&"PATCH /channels/chan_1/messages/msg_123".to_string()));
         assert!(paths.contains(&"POST /channels/chan_1/typing".to_string()));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn fetch_channel_history_parses_and_orders_oldest_first() {
+        use axum::{Json, Router, routing::get};
+
+        async fn history() -> Json<serde_json::Value> {
+            Json(serde_json::json!([
+                {
+                    "id": "2",
+                    "content": "newer",
+                    "author": { "username": "bob", "bot": false },
+                    "timestamp": "2024-01-02T00:00:00Z"
+                },
+                {
+                    "id": "1",
+                    "content": "older",
+                    "author": { "username": "alice", "bot": false },
+                    "timestamp": "2024-01-01T00:00:00Z"
+                }
+            ]))
+        }
+
+        let app = Router::new().route("/channels/chan_1/messages", get(history));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+
+        let adapter = DiscordAdapter {
+            token: "test".into(),
+            client: reqwest::Client::new(),
+            api_base: format!("http://{addr}"),
+            allowed_users: Vec::new(),
+        };
+        let msgs = adapter
+            .fetch_channel_history("chan_1", 50)
+            .await
+            .expect("history");
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].content, "older");
+        assert_eq!(msgs[1].content, "newer");
+
+        let seed = crate::backfill::prepare_seed(&msgs, None, 8000);
+        assert_eq!(seed.len(), 2);
+        assert!(seed[0].text_content().contains("alice"));
 
         server.abort();
     }

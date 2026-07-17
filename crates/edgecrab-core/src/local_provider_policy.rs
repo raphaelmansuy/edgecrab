@@ -49,7 +49,7 @@ pub fn local_structural_compress_threshold_ratio() -> f32 {
 
 /// Providers that run on localhost and queue generations server-side.
 pub fn is_local_inference_provider(provider_name: &str) -> bool {
-    matches!(provider_name, "lmstudio" | "ollama")
+    matches!(provider_name, "lmstudio" | "ollama" | "vllm" | "llamacpp")
 }
 
 /// First segment of `provider/model` or bare provider name.
@@ -1001,18 +1001,32 @@ mod tests {
 
 /// Whether to canonicalize API message text + tool-call JSON before send.
 ///
-/// Local servers (llama.cpp, Ollama) reuse KV on byte-identical prefixes.
+/// Local servers (llama.cpp, Ollama, vLLM) reuse KV on byte-identical prefixes.
 /// Hermes parity: `conversation_loop.py` pre-API normalization pass.
 pub fn should_normalize_api_messages_for_kv(provider_name: &str) -> bool {
     is_local_inference_provider(provider_name)
 }
 
 /// Strip string content and canonicalize assistant tool-call argument JSON.
+///
+/// Full Hermes-parity prefix pass for local KV reuse:
+/// 1. Trim whitespace on every string `content` field
+/// 2. Re-serialize tool-call arguments with sorted keys + compact separators
+/// 3. Collapse runs of internal whitespace in tool `name` (defensive)
 pub fn normalize_api_messages_for_kv(messages: &mut [edgequake_llm::ChatMessage]) {
     for msg in messages.iter_mut() {
-        msg.content = msg.content.trim().to_string();
+        if !msg.content.is_empty() {
+            msg.content = msg.content.trim().to_string();
+        }
+        if let Some(name) = msg.name.as_mut() {
+            let trimmed = name.trim();
+            if trimmed != name.as_str() {
+                *name = trimmed.to_string();
+            }
+        }
         if let Some(tool_calls) = msg.tool_calls.as_mut() {
             for tc in tool_calls.iter_mut() {
+                tc.function.name = tc.function.name.trim().to_string();
                 tc.function.arguments =
                     edgecrab_tools::tool_call_pipeline::repair_tool_call_arguments_for_api(
                         &tc.function.arguments,

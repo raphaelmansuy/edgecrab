@@ -1,6 +1,8 @@
 # 012 — Master Gap Matrix
 
-Single cross-reference table. Status from code inspection + [001-gap-analysis-v14/999-roadmap.md](../001-gap-analysis-v14/999-roadmap.md).
+Single cross-reference table.
+
+**Last resync:** 2026-07-17 — against edgequake-llm 0.10.1 (latest) + EdgeCrab path dep. Verified: proxy/OAuth/video/x_search/Discord backfill/mcp serve/secrets/skill bundles/plugin host. See [001-gap-analysis-v14/999-roadmap.md](../001-gap-analysis-v14/999-roadmap.md).
 
 **Legend:** ✅ parity/shipped · 🟡 partial · ❌ missing · ≠ different design
 
@@ -35,8 +37,8 @@ Single cross-reference table. Status from code inspection + [001-gap-analysis-v1
 | File/terminal/web/browser core | ✅ | ✅ | Parity | — |
 | web_crawl | ❌ | ✅ | EC only | EC |
 | LSP 25 tools + write gate | 🟡 | ✅ | EC ahead | EC |
-| video_analyze/generate | ✅ | ❌ gap 012 | Hermes | Hermes |
-| x_search | ✅ | ❌ gap 027 | Hermes | Hermes |
+| video_analyze/generate | ✅ | ✅ opt-in `video` | Parity | — |
+| x_search | ✅ | ✅ opt-in `x_search` | Parity | — |
 | computer_use | ✅ | ✅ | Parity | — |
 | mixture_of_agents | ✅ | ✅ opt-in | Parity | — |
 | Spotify (7 tools) | ✅ plugin | ❌ | Hermes | Hermes |
@@ -61,7 +63,7 @@ Single cross-reference table. Status from code inspection + [001-gap-analysis-v1
 | MEDIA:// delivery | ✅ | ✅ | Parity | — |
 | DM pairing | ✅ | ✅ | Parity | — |
 | Platform circuit breaker | ✅ | 🟡 | Hermes | Hermes |
-| Discord history backfill | ✅ | ❌ gap 016 | Hermes | Hermes |
+| Discord history backfill | ✅ | ✅ first-seen seed + markers | Parity | — |
 | Native clarify buttons | 🟡 | 🟡 Telegram + Discord + WhatsApp (buttons ≤3, list 4–10) | EC ahead (3 platforms) |
 
 ---
@@ -90,8 +92,8 @@ Single cross-reference table. Status from code inspection + [001-gap-analysis-v1
 | Memory write approval | ✅ | ✅ | Parity | — |
 | 8 memory provider plugins | ✅ | Honcho only | Hermes | Hermes |
 | Skills hub + guard | ✅ | ✅ | Parity | — |
-| Curator subsystem | ✅ | ❌ gap 021 | Hermes | Hermes |
-| Skill bundles | ✅ | 🟡 | Hermes | Hermes |
+| Curator subsystem | ✅ | 🟡 deterministic + `/curator` (LLM review thinner) | Partial | Hermes |
+| Skill bundles | ✅ | ✅ `/bundles` + `/<name>` | Parity | — |
 | Profiles | ✅ | ✅ | Parity | — |
 
 ---
@@ -104,7 +106,7 @@ Single cross-reference table. Status from code inspection + [001-gap-analysis-v1
 | Smart approval (LLM) | ✅ | ✅ | Parity | — |
 | Skills guard | ✅ | ✅ | Parity | — |
 | OSV supply-chain audit | ✅ | 🟡 | Hermes | Hermes |
-| Bitwarden secrets | ✅ | ❌ gap 032 | Hermes | Hermes |
+| Secrets resolver | ✅ vault/keychain | ✅ env+file (`edgecrab secret`) | Partial | Hermes depth / EC seam |
 | LSP write gate | ✅ | ✅ | Parity | — |
 
 ---
@@ -129,9 +131,9 @@ Single cross-reference table. Status from code inspection + [001-gap-analysis-v1
 | Feature | Hermes | EdgeCrab | Status | Leader |
 |---------|--------|----------|--------|--------|
 | Python plugins | ✅ 100+ | ❌ | Hermes | Hermes |
-| Provider plugins | ✅ | ❌ gap 009 | Hermes | Hermes |
+| Provider plugins | ✅ | 🟡 `EdgecrabPlugin` + `PluginHost` | Partial | Hermes |
 | MCP client | ✅ | ✅ | Parity | — |
-| Hermes as MCP server | ✅ | ❌ | Hermes | Hermes |
+| Hermes as MCP server | ✅ | ✅ `edgecrab mcp serve` | Parity | — |
 | ACP | ✅ | ✅ | Parity | — |
 | SDK Python/Node | 🟡 | ✅ | EC ahead | EC |
 | WASM plugins | ❌ | deferred | Both weak | — |
@@ -142,7 +144,7 @@ Single cross-reference table. Status from code inspection + [001-gap-analysis-v1
 
 | Feature | Hermes | EdgeCrab | Status | Leader |
 |---------|--------|----------|--------|--------|
-| Test count | ~25k | ~650+ | Hermes | Hermes |
+| Test count | ~2k+ py files | ~3.9k `#[test]` attrs | Hermes CI culture | Hermes |
 | Clippy/type safety | N/A | ✅ strict | EC | EC |
 | `edgecrab migrate` | N/A | ✅ | EC | EC |
 | Monolith hotspot | tui_gateway | app.rs | Both debt | — |
@@ -174,14 +176,14 @@ Priority items still **not** at Hermes parity:
 | ID | Feature | Tier |
 |----|---------|------|
 | 007 | Multi-agent kanban (React dashboard) | A 🟡 partial — orchestration API + profile routing + static settings UI |
-| 009 | Pluggable providers/plugins | A |
-| 012 | Video tools | A |
+| 009 | Pluggable providers/plugins | A 🟡 |
+| 012 | Video tools | A ✅ |
 | 015 | Native clarify buttons (WhatsApp Cloud list mode) | B 🟡 partial — Baileys list 4–10 shipped |
-| 016 | Discord history backfill | B |
+| 016 | Discord history backfill | B ✅ |
 | 021 | Curator subsystem | C |
 | 025 | i18n | C |
-| 027 | x-search tool | C |
+| 027 | x-search tool | C ✅ |
 | 029 | Pareto code router | C |
-| 032 | Secrets manager | C |
+| 032 | Secrets manager | C ✅ seam |
 
 Shipped notable gaps: 001 goals, 002 mutation verifier, 003 LSP diagnostics, 004 cache, 005 handoff, 006 checkpoints, 010 MCP OAuth, 011 computer use, 024 OAuth providers, **memory write approval**, **config `/snapshot`**, **pre-update auto-snapshot**, **smart approval**, **kanban Phase 2–6** (comments, block/unblock, deps, dispatch, task_runs, failure_limit, multi-board, gateway notifier, max_runtime, worker interrupt, `/kanban subscribe`, read API + events WS, **decomposer + triage + static UI + API auth + orchestration settings + profile routing + PATCH/DELETE tasks + describe-auto + drag-drop + parent blockers 409 + archive + per-profile cap + scheduled_at + respawn guard + rate-limit requeue + `/kanban schedule|archive|delete` + build_worker_context handoff**), **clarify buttons (Telegram + Discord + WhatsApp buttons/list)**, **kanban_create max_runtime wired**.

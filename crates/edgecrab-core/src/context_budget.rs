@@ -34,6 +34,12 @@ pub struct ContextBudgetBreakdown {
     pub history_tokens: usize,
     pub total_tokens: usize,
     pub context_window: usize,
+    /// Session-cumulative Anthropic/OpenRouter cache read tokens.
+    pub cache_read_tokens: u64,
+    /// Session-cumulative cache write tokens.
+    pub cache_write_tokens: u64,
+    /// Last-turn prompt mass (for hit-rate denominator when available).
+    pub last_prompt_tokens: u64,
 }
 
 impl ContextBudgetBreakdown {
@@ -44,8 +50,31 @@ impl ContextBudgetBreakdown {
         (self.total_tokens as f64 / self.context_window as f64) * 100.0
     }
 
+    /// Session cumulative cache hit rate: `cache_read / (input-ish + cache)`.
+    pub fn cache_hit_rate_pct(&self) -> Option<f64> {
+        let denom = self
+            .last_prompt_tokens
+            .max(self.cache_read_tokens.saturating_add(self.cache_write_tokens));
+        if denom == 0 || self.cache_read_tokens == 0 {
+            return None;
+        }
+        Some((self.cache_read_tokens as f64 / denom as f64) * 100.0)
+    }
+
     pub fn with_deferred_tools(mut self, deferred: Option<usize>) -> Self {
         self.tools_deferred_count = deferred;
+        self
+    }
+
+    pub fn with_cache_telemetry(
+        mut self,
+        cache_read_tokens: u64,
+        cache_write_tokens: u64,
+        last_prompt_tokens: u64,
+    ) -> Self {
+        self.cache_read_tokens = cache_read_tokens;
+        self.cache_write_tokens = cache_write_tokens;
+        self.last_prompt_tokens = last_prompt_tokens;
         self
     }
 
@@ -65,6 +94,18 @@ impl ContextBudgetBreakdown {
                 self.tools_tokens, self.tool_count
             ),
         };
+        let cache_line = if self.cache_read_tokens > 0 || self.cache_write_tokens > 0 {
+            let hit = self
+                .cache_hit_rate_pct()
+                .map(|p| format!(" ({p:.0}% hit)"))
+                .unwrap_or_default();
+            format!(
+                "cache:     read {:>6}  write {:>6}{hit}\n",
+                self.cache_read_tokens, self.cache_write_tokens
+            )
+        } else {
+            String::new()
+        };
         format!(
             "Context budget (estimated):\n\
              \n\
@@ -73,6 +114,7 @@ impl ContextBudgetBreakdown {
              dynamic:   {:>6} tok\n\
              {tools_line}\
              history:   {:>6} tok\n\
+             {cache_line}\
              ─────────────────────\n\
              total:     {:>6} tok ({:.1}% of {}K)",
             self.stable_tokens,
@@ -124,6 +166,9 @@ pub fn estimate_context_budget(
         history_tokens,
         total_tokens,
         context_window,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+        last_prompt_tokens: 0,
     }
 }
 
@@ -309,6 +354,9 @@ mod tests {
             history_tokens: 500,
             total_tokens: 19542,
             context_window: 128_000,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            last_prompt_tokens: 0,
         };
         let text = breakdown.format_report();
         assert!(text.contains("stable:"));
@@ -328,6 +376,9 @@ mod tests {
             history_tokens: 0,
             total_tokens: 7300,
             context_window: 128_000,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            last_prompt_tokens: 0,
         };
         let text = breakdown.format_report();
         assert!(text.contains("13 on wire, 31 deferred"));
@@ -345,8 +396,32 @@ mod tests {
             history_tokens: 0,
             total_tokens: 7300,
             context_window: 128_000,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            last_prompt_tokens: 0,
         };
         let text = breakdown.format_report();
         assert!(text.contains("44 on wire, 0 deferred"));
+    }
+
+    #[test]
+    fn format_report_shows_cache_hit_rate() {
+        let breakdown = ContextBudgetBreakdown {
+            stable_tokens: 2000,
+            semi_stable_tokens: 0,
+            dynamic_tokens: 800,
+            tools_tokens: 4500,
+            tool_count: 13,
+            tools_deferred_count: None,
+            history_tokens: 0,
+            total_tokens: 7300,
+            context_window: 128_000,
+            cache_read_tokens: 90_000,
+            cache_write_tokens: 10_000,
+            last_prompt_tokens: 100_000,
+        };
+        let text = breakdown.format_report();
+        assert!(text.contains("cache:"));
+        assert!(text.contains("90% hit"), "got: {text}");
     }
 }

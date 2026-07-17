@@ -1074,6 +1074,86 @@ fn message_origin_recipient(msg: &IncomingMessage) -> String {
     delivery_recipient(chat_id, thread_id)
 }
 
+/// First-seen Discord channel history backfill (gap 016).
+///
+/// When `gateway.discord.backfill_on_join` is enabled and the channel has no
+/// persisted marker, fetch recent history, prune to the token budget, and seed
+/// the fresh session — excluding the triggering message to avoid duplication.
+async fn maybe_discord_channel_backfill(
+    adapter: Option<&Arc<dyn PlatformAdapter>>,
+    agent: &Agent,
+    msg: &IncomingMessage,
+) {
+    if msg.platform != edgecrab_types::Platform::Discord {
+        return;
+    }
+    let Some(adapter) = adapter else {
+        return;
+    };
+    let Some(channel_id) = msg
+        .channel_id
+        .as_deref()
+        .or(msg.metadata.channel_id.as_deref())
+        .filter(|id| !id.is_empty())
+    else {
+        return;
+    };
+
+    let discord_cfg = edgecrab_core::AppConfig::load()
+        .unwrap_or_default()
+        .gateway
+        .discord;
+    if !discord_cfg.backfill_on_join {
+        return;
+    }
+    if !crate::backfill::try_begin_backfill("discord", channel_id) {
+        return;
+    }
+
+    // Skip if the session already has transcript (e.g. restored / prior turns).
+    if !agent.messages().await.is_empty() {
+        crate::backfill::mark_channel_backfilled("discord", channel_id, "");
+        crate::backfill::end_backfill("discord", channel_id);
+        return;
+    }
+
+    let limit = discord_cfg.backfill_limit.max(1);
+    let history = match adapter.fetch_channel_history(channel_id, limit).await {
+        Ok(msgs) => msgs,
+        Err(err) => {
+            tracing::warn!(
+                channel_id,
+                error = %err,
+                "discord backfill: history fetch failed"
+            );
+            crate::backfill::end_backfill("discord", channel_id);
+            return;
+        }
+    };
+
+    let exclude = msg.metadata.message_id.as_deref();
+    let seed = crate::backfill::prepare_seed(
+        &history,
+        exclude,
+        discord_cfg.backfill_max_tokens as usize,
+    );
+    let last_id = history
+        .last()
+        .map(|m| m.id.as_str())
+        .unwrap_or_default();
+    if !seed.is_empty() {
+        let seeded = seed.len();
+        agent.seed_history(seed).await;
+        tracing::info!(
+            channel_id,
+            seeded,
+            "discord backfill: seeded session history"
+        );
+    }
+    crate::backfill::mark_channel_backfilled("discord", channel_id, last_id);
+    crate::backfill::end_backfill("discord", channel_id);
+}
+
 fn extract_stream_fallback_response(
     messages: &[edgecrab_types::Message],
     baseline_len: usize,
@@ -3269,6 +3349,12 @@ impl Gateway {
                                     {
                                         edgecrab_tools::skills::invalidate_discovery_caches();
                                         edgecrab_core::prompt_builder::invalidate_skills_cache();
+                                        if let Ok(agent) = self
+                                            .resolve_command_session_agent(&msg, &origin_chat_id)
+                                            .await
+                                        {
+                                            agent.invalidate_skills_zone().await;
+                                        }
                                     }
                                     Some(reply)
                                 } else if args.is_empty() || args.eq_ignore_ascii_case("list") {
@@ -3685,6 +3771,31 @@ impl Gateway {
                             guard.touch();
                             guard.agent.clone()
                         };
+
+                        maybe_discord_channel_backfill(
+                            origin_adapter.as_ref(),
+                            session_agent.as_ref(),
+                            &msg,
+                        )
+                        .await;
+
+                        // Hermes-parity session hygiene: compress oversized
+                        // transcripts before the agent turn (85% of context).
+                        match session_agent.maybe_session_hygiene().await {
+                            edgecrab_core::compression::SessionHygieneOutcome::Compressed {
+                                before_msgs,
+                                after_msgs,
+                                approx_tokens_before,
+                            } => {
+                                tracing::info!(
+                                    before_msgs,
+                                    after_msgs,
+                                    approx_tokens_before,
+                                    "Gateway session hygiene compressed transcript"
+                                );
+                            }
+                            edgecrab_core::compression::SessionHygieneOutcome::Skipped => {}
+                        }
 
                         let running_sessions = self.running_sessions.clone();
                         let pending_messages = self.pending_messages.clone();

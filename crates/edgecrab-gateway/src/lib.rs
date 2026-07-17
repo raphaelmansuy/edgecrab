@@ -26,8 +26,10 @@
 pub mod api_server;
 pub mod attachment_cache;
 pub mod auth;
+pub mod backfill;
 pub mod bluebubbles;
 pub mod channel_directory;
+pub mod circuit_breaker;
 pub mod clarify_wiring;
 pub mod config;
 pub mod delivery;

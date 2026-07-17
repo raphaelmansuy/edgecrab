@@ -208,9 +208,11 @@ impl ToolHandler for TerminalTool {
         let antipattern_warning = detect_file_io_antipattern(&args.command);
 
         if args.background {
+            // Apply the same OS sandbox as foreground local execution (SOLID: one policy).
+            let bg_command = apply_os_sandbox_if_local(ctx, &args.command, args.workdir.as_deref());
             let started = crate::tools::process::start_background_process(
                 "terminal",
-                &args.command,
+                &bg_command,
                 args.workdir.as_deref(),
                 args.pty,
                 Vec::new(), // terminal tool doesn't support watch_patterns
@@ -299,6 +301,12 @@ impl ToolHandler for TerminalTool {
         } else {
             effective_command
         };
+
+        let final_command = apply_os_sandbox_to_command(
+            ctx,
+            &final_command,
+            std::path::Path::new(&cwd),
+        );
 
         // Execute via backend with up to 3 retries on transient infrastructure
         // errors. This matches the existing exponential-backoff retry logic: wait
@@ -419,6 +427,34 @@ impl ToolHandler for TerminalTool {
 }
 
 /// Returns true if the command is likely to mutate files or history.
+/// Apply `security.os_sandbox.mode` for local backend commands (foreground + background).
+fn apply_os_sandbox_to_command(ctx: &ToolContext, command: &str, cwd: &std::path::Path) -> String {
+    if ctx.config.terminal_backend != crate::tools::backends::BackendKind::Local
+        || ctx.config.os_sandbox_mode.eq_ignore_ascii_case("off")
+    {
+        return command.to_string();
+    }
+    let mode = edgecrab_security::OsSandboxMode::parse(&ctx.config.os_sandbox_mode);
+    let wrapped = edgecrab_security::wrap_command(mode, command, cwd, true);
+    if let Some(ref warning) = wrapped.warning {
+        tracing::warn!(%warning, "OS sandbox passthrough");
+    }
+    if wrapped.passthrough {
+        command.to_string()
+    } else {
+        edgecrab_security::wrapped_to_shell_line(&wrapped)
+    }
+}
+
+fn apply_os_sandbox_if_local(
+    ctx: &ToolContext,
+    command: &str,
+    workdir: Option<&str>,
+) -> String {
+    let cwd = resolve_workdir(ctx, workdir);
+    apply_os_sandbox_to_command(ctx, command, std::path::Path::new(&cwd))
+}
+
 /// These commands get an auto-checkpoint before execution.
 fn is_destructive_command(cmd: &str) -> bool {
     const DESTRUCTIVE_PREFIXES: &[&str] = &[

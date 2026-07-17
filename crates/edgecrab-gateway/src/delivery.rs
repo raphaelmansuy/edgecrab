@@ -58,6 +58,11 @@ impl DeliveryRouter {
         platform: Platform,
         metadata: &MessageMetadata,
     ) -> anyhow::Result<()> {
+        let platform_key = format!("{platform:?}");
+        if crate::circuit_breaker::PlatformCircuitBreaker::global().is_open(&platform_key) {
+            anyhow::bail!("platform circuit breaker open for {platform:?}");
+        }
+
         let adapter = self
             .adapters
             .get(&platform)

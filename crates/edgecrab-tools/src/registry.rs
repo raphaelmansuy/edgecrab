@@ -159,6 +159,8 @@ pub struct SubAgentRunRequest {
     pub parent_id: Option<String>,
     /// Delegation depth (1 = direct child of root agent).
     pub depth: u32,
+    /// When true, run the child in an isolated git worktree under `.edgecrab/worktrees/`.
+    pub isolated_worktree: bool,
 }
 
 /// Trait for running sub-agent tasks with full tool execution.
@@ -353,7 +355,8 @@ pub struct ToolContext {
     /// Kanban worker task scope (dispatcher-spawned agents).
     pub kanban_task_id: Option<String>,
     /// Session-scoped deferred tools materialized via `tool_search` (indexed schema mode).
-    pub materialized_tools: Option<Arc<std::sync::RwLock<std::collections::HashSet<String>>>>,
+    pub materialized_tools:
+        Option<Arc<std::sync::RwLock<crate::tool_schema_index::MaterializedToolSet>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -406,14 +409,13 @@ impl ToolContext {
         }
     }
 
-    /// Create a minimal context for testing
-    #[cfg(test)]
-    pub fn test_context() -> Self {
+    /// Minimal context for tests and MCP server mode (`edgecrab mcp serve`).
+    pub fn minimal() -> Self {
         crate::delegation_state::set_spawn_paused(false);
         Self {
             task_id: "test-task".into(),
-            cwd: std::env::temp_dir(),
-            session_id: "test-session".into(),
+            cwd: std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir()),
+            session_id: "mcp-serve".into(),
             user_task: None,
             cancel: CancellationToken::new(),
             config: AppConfigRef::default(),
@@ -444,6 +446,12 @@ impl ToolContext {
             kanban_task_id: None,
             materialized_tools: None,
         }
+    }
+
+    /// Create a minimal context for testing
+    #[cfg(test)]
+    pub fn test_context() -> Self {
+        Self::minimal()
     }
 
     pub fn emit_progress(&self, message: impl AsRef<str>) {

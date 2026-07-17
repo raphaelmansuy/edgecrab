@@ -249,7 +249,7 @@ These agent flags are top-level `config.yaml` keys and also support env override
 1. **Identity** — `DEFAULT_IDENTITY` (or `override_identity` from SOUL.md/config)
 2. **Platform hint** — concise formatting/behavior guidance per platform
 3. **Date/time stamp** — current local time injected fresh each session
-4. **Context files** — SOUL.md (walk up), AGENTS.md, .cursorrules, CLAUDE.md, .edgecrab.md, .hermes.md, .cursor/rules/*.mdc (all scanned for prompt injection)
+4. **Context files** — SOUL.md (walk up), AGENTS.md (recursive walk capped at 8 files / 48KB / depth 6; each file truncated at 20K chars), .cursorrules, CLAUDE.md, .edgecrab.md, .hermes.md, .cursor/rules/*.mdc (all scanned for prompt injection)
 5. **Memory guidance** — `MEMORY_GUIDANCE` constant
 6. **Memory sections** — MEMORY.md + USER.md from `~/.edgecrab/memories/`
 7. **Session search guidance** — `SESSION_SEARCH_GUIDANCE` constant

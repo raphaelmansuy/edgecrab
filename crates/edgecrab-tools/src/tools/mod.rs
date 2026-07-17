@@ -57,5 +57,7 @@ pub mod todo;
 pub mod tool_search;
 pub mod transcribe;
 pub mod tts;
+pub mod video;
 pub mod vision;
 pub mod web;
+pub mod x_search;

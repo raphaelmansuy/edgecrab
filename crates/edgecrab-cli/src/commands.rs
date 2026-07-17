@@ -103,12 +103,14 @@ pub enum CommandResult {
     Retry,
     /// Remove last user + assistant message pair from history
     Undo,
-    /// Trigger manual context compression
-    Compress,
+    /// Trigger manual context compression (`/compress [focus topic]`)
+    Compress { focus: Option<String> },
 
     // ── Phase 8.1: stateful commands (app handles via Agent) ─────
     /// Show live session stats (token counts, model, budget)
     ShowStatus,
+    /// In-session diagnostics including cache hit-rate SLO
+    ShowDoctor,
     /// Show cost breakdown (tokens × pricing → estimated USD)
     ShowCost,
     /// Show estimated context token budget breakdown.
@@ -596,6 +598,25 @@ impl CommandRegistry {
         });
 
         self.register(Command {
+            name: "fast",
+            aliases: &["priority", "fast-tier"],
+            description: "Hermes /fast parity — route simple turns via smart cheap model (/fast, /fast status, /fast off, /fast <model>)",
+            handler: |args| {
+                let trimmed = args.trim();
+                if trimmed.is_empty()
+                    || trimmed.eq_ignore_ascii_case("open")
+                    || trimmed.eq_ignore_ascii_case("list")
+                {
+                    CommandResult::CheapModelSelector
+                } else if trimmed.eq_ignore_ascii_case("status") {
+                    CommandResult::ShowCheapModel
+                } else {
+                    CommandResult::SetCheapModel(trimmed.to_string())
+                }
+            },
+        });
+
+        self.register(Command {
             name: "cheap_model",
             aliases: &["cheap-model"],
             description: "Open, show, or set the smart-routing cheap model (/cheap_model, /cheap_model status, /cheap_model off)",
@@ -977,8 +998,13 @@ impl CommandRegistry {
         self.register(Command {
             name: "compress",
             aliases: &["compact"],
-            description: "Manually trigger context compression",
-            handler: |_| CommandResult::Compress,
+            description: "Manually trigger context compression (/compress [focus topic])",
+            handler: |args| {
+                let focus = args.trim();
+                CommandResult::Compress {
+                    focus: (!focus.is_empty()).then(|| focus.to_string()),
+                }
+            },
         });
 
         self.register(Command {
@@ -1026,36 +1052,7 @@ impl CommandRegistry {
             name: "doctor",
             aliases: &["diag"],
             description: "Run diagnostics",
-            handler: |_| {
-                let api_key_status = if std::env::var("OPENAI_API_KEY").is_ok()
-                    || std::env::var("ANTHROPIC_API_KEY")
-                        .ok()
-                        .is_some_and(|value| !value.trim().is_empty())
-                    || std::env::var("ANTHROPIC_AUTH_TOKEN")
-                        .ok()
-                        .is_some_and(|value| !value.trim().is_empty())
-                    || std::env::var("GEMINI_API_KEY").is_ok()
-                    || std::env::var("GITHUB_COPILOT_TOKEN").is_ok()
-                {
-                    "✓ API key: detected"
-                } else {
-                    "⚠ API key: none detected (run `edgecrab setup` to configure)"
-                };
-
-                let home =
-                    std::env::var("EDGECRAB_HOME").unwrap_or_else(|_| "~/.edgecrab".to_string());
-
-                CommandResult::Output(format!(
-                    "EdgeCrab in-session diagnostics:\n\
-                     ✓ Agent: running\n\
-                     ✓ SQLite state: ok\n\
-                     ✓ Tool registry: loaded\n\
-                     {api_key_status}\n\
-                     ✓ Config dir: {home}\n\
-                     Skin: {home}/skin.yaml (use /skin reload to refresh)\n\
-                     \nFor full diagnostics run: edgecrab doctor"
-                ))
-            },
+            handler: |_| CommandResult::ShowDoctor,
         });
 
         self.register(Command {
@@ -2094,7 +2091,7 @@ mod tests {
         let reg = CommandRegistry::new();
         assert!(matches!(
             reg.dispatch("/compress"),
-            Some(CommandResult::Compress)
+            Some(CommandResult::Compress { focus: None })
         ));
     }
 

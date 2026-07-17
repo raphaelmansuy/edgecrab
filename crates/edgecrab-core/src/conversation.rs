@@ -55,7 +55,7 @@ use edgecrab_types::{
     AgentError, Content, Cost, Message, Role, ToolError, ToolErrorResponse, Trajectory, Usage,
 };
 use edgequake_llm::traits::CacheControl;
-use edgequake_llm::{CachePromptConfig, LLMProvider, apply_cache_control};
+use edgequake_llm::{LLMProvider, CachePromptConfig};
 use std::collections::HashMap;
 use std::sync::{
     Arc, Mutex,
@@ -66,7 +66,7 @@ use tracing::Instrument;
 
 use crate::agent::{Agent, ConversationResult, SessionState, resolve_tool_policy};
 use crate::compression::{
-    CompressionParams, CompressionStatus, check_compression_status_for_estimate, compress_with_llm,
+    CompressionParams, CompressionStatus, check_compression_status_for_estimate,
 };
 use crate::config::edgecrab_home;
 use crate::context_references::expand_context_refs_with_policy;
@@ -207,12 +207,20 @@ fn build_tool_context(
     lsp_gate: Option<Arc<dyn edgecrab_tools::LspGate>>,
     delegate_ctx: Option<ExecuteLoopDelegateCtx>,
     kanban_task_id: Option<String>,
-    materialized_tools: Option<Arc<std::sync::RwLock<std::collections::HashSet<String>>>>,
+    materialized_tools: Option<Arc<std::sync::RwLock<edgecrab_tools::MaterializedToolSet>>>,
+    skills_zone_dirty: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> ToolContext {
     let (delegate_depth, delegate_agent_id, delegate_parent_id) = match &delegate_ctx {
         Some(d) => (d.depth, Some(d.agent_id.clone()), d.parent_id.clone()),
         None => (0, None, None),
     };
+    let on_skills_changed: Option<Arc<dyn Fn() + Send + Sync>> =
+        skills_zone_dirty.map(|flag| {
+            Arc::new(move || {
+                crate::prompt_builder::invalidate_skills_cache();
+                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            }) as Arc<dyn Fn() + Send + Sync>
+        });
     ToolContext {
         task_id: uuid::Uuid::new_v4().to_string(),
         cwd: cwd.to_path_buf(),
@@ -232,14 +240,8 @@ fn build_tool_context(
         delegation_event_tx,
         clarify_tx,
         approval_tx,
-        // Wires the skills prompt-cache invalidation hook into every
-        // SkillManageTool mutation (create/edit/patch/delete) without
-        // creating a circular crate dependency from edgecrab-tools →
-        // edgecrab-core.  The closure captures nothing — zero allocation
-        // overhead per invocation.
-        on_skills_changed: Some(std::sync::Arc::new(
-            crate::prompt_builder::invalidate_skills_cache,
-        )),
+        // Disk skills cache + session semi-stable dirty flag (drained in loop).
+        on_skills_changed,
         gateway_sender,
         origin_chat: origin_chat.clone(),
         // Build the session key from origin_chat (gateway mode) or fall back
@@ -335,7 +337,11 @@ struct DispatchContext {
     /// Child delegation identity when this loop runs inside a sub-agent.
     delegate_ctx: Option<ExecuteLoopDelegateCtx>,
     kanban_task_id: Option<String>,
-    materialized_tools: Option<Arc<std::sync::RwLock<std::collections::HashSet<String>>>>,
+    materialized_tools: Option<Arc<std::sync::RwLock<edgecrab_tools::MaterializedToolSet>>>,
+    /// Progressive AGENTS.md discovery for subdirectories (Hermes parity).
+    subdirectory_hints: Option<Arc<tokio::sync::Mutex<crate::subdirectory_hints::SubdirectoryHintTracker>>>,
+    /// Shared dirty flag for skills-zone invalidation from tool callbacks.
+    skills_zone_dirty: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 fn post_write_lsp_gate(
@@ -442,7 +448,14 @@ impl Agent {
                 std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
             });
 
-        let materialized_tools = Arc::new(std::sync::RwLock::new(std::collections::HashSet::new()));
+        let materialized_tools = Arc::new(std::sync::RwLock::new(edgecrab_tools::MaterializedToolSet::new()));
+        let subdirectory_hints = if config.skip_context_files {
+            None
+        } else {
+            Some(Arc::new(tokio::sync::Mutex::new(
+                crate::subdirectory_hints::SubdirectoryHintTracker::new(cwd.clone()),
+            )))
+        };
 
         // Expand parent toolset configuration once and reuse for schema filtering,
         // ToolContext propagation, and child delegation restrictions.
@@ -498,6 +511,7 @@ impl Agent {
                     delegate_ctx.clone(),
                     config.kanban_task_id.clone(),
                     Some(materialized_tools.clone()),
+                    Some(self.skills_zone_dirty.clone()),
                 );
 
                 // "all" sentinel / genuinely empty → pass None (no filtering).
@@ -725,6 +739,17 @@ impl Agent {
             }
         }
 
+        if is_first_turn {
+            crate::lifecycle_hooks::emit_global(
+                crate::lifecycle_hooks::LifecycleEvent::SessionStart,
+                serde_json::json!({
+                    "session_id": &conversation_session_id,
+                    "model": &config.model,
+                    "platform": config.platform.to_string(),
+                }),
+            );
+        }
+
         // Expand @context references in the user message before appending.
         //
         // WHY before append: @file, @diff etc. inject raw content into the
@@ -838,6 +863,11 @@ impl Agent {
             thresholds: RoutingThresholds::default(),
         };
         let route = resolve_turn_route(&expansion.expanded, &config.model_config, &smart_routing);
+        if route.is_primary {
+            session.smart_routing_strong_turns = session.smart_routing_strong_turns.saturating_add(1);
+        } else {
+            session.smart_routing_cheap_turns = session.smart_routing_cheap_turns.saturating_add(1);
+        }
         if let Some(ref label) = route.label {
             tracing::info!(route = %label, "model routing decision");
         }
@@ -1237,6 +1267,7 @@ impl Agent {
                         delegate_ctx.clone(),
                         config.kanban_task_id.clone(),
                         Some(materialized_tools.clone()),
+                        Some(self.skills_zone_dirty.clone()),
                     );
                     let enabled_filter = if config.enabled_toolsets.is_empty()
                         || edgecrab_tools::toolsets::contains_all_sentinel(&config.enabled_toolsets)
@@ -1336,6 +1367,7 @@ impl Agent {
                 let live_context = effective_provider.max_context_length();
                 if live_context > 0 && live_context < compression_params.context_window {
                     compression_params.context_window = live_context;
+                    compression_params.reapply_threshold_floor(config.compression.threshold);
                 }
             }
             let estimated_prompt_tokens = estimate_request_prompt_tokens(
@@ -1343,10 +1375,36 @@ impl Agent {
                 &session.messages,
                 &active_tool_defs,
             );
+            let threshold_tokens = compression_params.threshold_tokens();
+            let defer_preflight = crate::compression::should_defer_preflight_to_real_usage(
+                &session.compression_runtime,
+                estimated_prompt_tokens,
+                threshold_tokens,
+            );
+            if defer_preflight {
+                tracing::debug!(
+                    estimated_prompt_tokens,
+                    threshold_tokens,
+                    "deferring rough-estimate preflight compression to real usage"
+                );
+            }
+            let blocked = crate::compression::automatic_compression_blocked(
+                &session.compression_runtime,
+            );
             match check_compression_status_for_estimate(
                 estimated_prompt_tokens,
                 &compression_params,
             ) {
+                CompressionStatus::NeedsCompression if blocked => {
+                    tracing::warn!(
+                        ineffective = session.compression_runtime.ineffective_compression_count,
+                        fallback = session.compression_runtime.fallback_compression_streak,
+                        "compression skipped — anti-thrashing cooldown active"
+                    );
+                }
+                CompressionStatus::NeedsCompression if defer_preflight => {
+                    // Rough estimate deferred — debug already emitted above.
+                }
                 CompressionStatus::NeedsCompression => {
                     emit_activity(
                         event_tx,
@@ -1367,6 +1425,8 @@ impl Agent {
                         },
                         seq: &spill_seq,
                     };
+                    let compression_count = session.compression_runtime.compression_count;
+                    let mut used_fallback = false;
                     // FP12: Compression circuit breaker — if LLM compression has
                     // failed 3 times consecutively, skip the LLM call and use
                     // structural-only compression (cheap, never fails).
@@ -1381,58 +1441,67 @@ impl Agent {
                             failures = compression_llm_failures,
                             "compression circuit breaker active — using structural fallback only"
                         );
-                        session.messages = crate::compression::compress_structural_only(
+                        session.messages = crate::compression::compress_structural_only_counted(
                             &session.messages,
                             &compression_params,
                             Some(&spill_ctx),
+                            compression_count,
                         );
+                        used_fallback = true;
                     } else {
                         // FP29: Return (messages, llm_succeeded) — use the bool to drive
                         // the circuit breaker instead of the unreliable length comparison.
                         // Structural fallback also reduces message count, so length comparison
                         // never tripped the counter; the bool is the correct signal.
-                        let (compressed, llm_succeeded) = compress_with_llm(
-                            &session.messages,
-                            &compression_params,
-                            &provider,
-                            Some(&spill_ctx),
-                        )
-                        .await;
+                        let (compressed, llm_succeeded) =
+                            crate::compression::compress_with_llm_counted(
+                                &session.messages,
+                                &compression_params,
+                                &provider,
+                                Some(&spill_ctx),
+                                compression_count,
+                                None,
+                            )
+                            .await;
                         session.messages = compressed;
                         if llm_succeeded {
                             // Successful LLM compression — reset failure count.
                             compression_llm_failures = 0;
                         } else {
                             compression_llm_failures += 1;
+                            used_fallback = true;
                             tracing::warn!(
                                 failures = compression_llm_failures,
                                 "LLM compression fell back to structural, tracking for circuit breaker (FP29)"
                             );
                         }
                     }
-                    // FP33 + HA-19 + FP17 — shared post-compress hooks (all compression paths).
-                    {
-                        let first_compression_done = &mut session.first_compression_done;
-                        let cached_system_prompt = &mut session.cached_system_prompt;
-                        crate::compression::apply_first_compression_system_note(
-                            crate::compression::FirstCompressionNoteState {
-                                first_compression_done,
-                                cached_system_prompt,
-                            },
-                        );
-                    }
-                    crate::compression::apply_post_compress_message_hooks(
-                        &mut session.messages,
-                        self.todo_store.as_ref(),
-                        &conversation_session_id,
-                    );
+                    // FP33 + HA-19 + FP17 — one post-compress path (`SessionState::finish_compression`).
                     crate::progress_sink::emit_activity(
                         event_tx,
                         edgecrab_tools::tool_progress_tail::format_compression_done(
                             session.messages.len(),
                         ),
                     );
-                    // Re-check: if compression succeeded, clear the pressure flag.
+                    let rough_after = estimate_request_prompt_tokens(
+                        session.cached_system_prompt.as_deref(),
+                        &session.messages,
+                        &active_tool_defs,
+                    );
+                    session.finish_compression(
+                        self.todo_store.as_ref(),
+                        rough_after,
+                        used_fallback,
+                    );
+                    crate::lifecycle_hooks::emit_global(
+                        crate::lifecycle_hooks::LifecycleEvent::CompressAfter,
+                        serde_json::json!({
+                            "session_id": &conversation_session_id,
+                            "message_count": session.messages.len(),
+                            "used_fallback": used_fallback,
+                        }),
+                    );
+                    // Re-check after note/hooks: if compression succeeded, clear pressure.
                     let recomputed_prompt_tokens = estimate_request_prompt_tokens(
                         session.cached_system_prompt.as_deref(),
                         &session.messages,
@@ -1448,9 +1517,6 @@ impl Agent {
                     self.publish_session_state(&session).await;
                 }
                 CompressionStatus::PressureWarning if !pressure_warned => {
-                    let threshold_tokens = (compression_params.context_window as f32
-                        * compression_params.threshold)
-                        as usize;
                     tracing::warn!(
                         estimated_tokens = estimated_prompt_tokens,
                         threshold_tokens,
@@ -1499,20 +1565,10 @@ impl Agent {
                         tokens_after,
                     );
                     session.messages = compressed;
-                    {
-                        let first_compression_done = &mut session.first_compression_done;
-                        let cached_system_prompt = &mut session.cached_system_prompt;
-                        crate::compression::apply_first_compression_system_note(
-                            crate::compression::FirstCompressionNoteState {
-                                first_compression_done,
-                                cached_system_prompt,
-                            },
-                        );
-                    }
-                    crate::compression::apply_post_compress_message_hooks(
-                        &mut session.messages,
+                    session.finish_compression(
                         self.todo_store.as_ref(),
-                        &conversation_session_id,
+                        tokens_after,
+                        true, // structural-only midband path
                     );
                     crate::progress_sink::emit_activity(
                         event_tx,
@@ -1663,6 +1719,14 @@ impl Agent {
                 active_tool_defs.len(),
                 chat_messages.len(),
             );
+            crate::lifecycle_hooks::emit_global(
+                crate::lifecycle_hooks::LifecycleEvent::TurnBefore,
+                serde_json::json!({
+                    "session_id": &conversation_session_id,
+                    "iteration": session.api_call_count,
+                    "model": effective_provider.model(),
+                }),
+            );
             let native_streaming_active = should_use_native_streaming(
                 effective_provider.as_ref(),
                 &active_tool_defs,
@@ -1781,7 +1845,17 @@ impl Agent {
             };
 
             let api_outcome = match api_outcome {
-                Ok(outcome) => outcome,
+                Ok(outcome) => {
+                    crate::lifecycle_hooks::emit_global(
+                        crate::lifecycle_hooks::LifecycleEvent::TurnAfter,
+                        serde_json::json!({
+                            "session_id": &conversation_session_id,
+                            "iteration": session.api_call_count,
+                            "has_tool_calls": outcome.response.has_tool_calls(),
+                        }),
+                    );
+                    outcome
+                }
                 Err(primary_err) => 'recover: {
                     // In native streaming mode, partial output may already have
                     // been shown to the user. Retrying or swapping to a fallback
@@ -1984,6 +2058,26 @@ impl Agent {
                 }
             }
 
+            // Hermes defer-preflight / anti-thrashing: update from real usage.
+            {
+                let rough_now = estimate_request_prompt_tokens(
+                    session.cached_system_prompt.as_deref(),
+                    &session.messages,
+                    &active_tool_defs,
+                );
+                let threshold_now = CompressionParams::from_model_config(
+                    &config.model,
+                    &config.compression,
+                )
+                .threshold_tokens();
+                crate::compression::update_compression_from_response(
+                    &mut session.compression_runtime,
+                    session.last_prompt_tokens,
+                    threshold_now,
+                    rough_now,
+                );
+            }
+
             // Local tool turn exhausted max_tokens without emitting tool calls (reasoning
             // often consumes the budget on Qwen3 / DeepSeek when reasoning_effort is omitted).
             if !active_tool_defs.is_empty()
@@ -2137,6 +2231,8 @@ impl Agent {
                 delegate_ctx: delegate_ctx.clone(),
                 kanban_task_id: config.kanban_task_id.clone(),
                 materialized_tools: Some(materialized_tools.clone()),
+                subdirectory_hints: subdirectory_hints.clone(),
+                skills_zone_dirty: Some(self.skills_zone_dirty.clone()),
             };
             let action = match process_response(
                 &response,
@@ -2359,6 +2455,11 @@ impl Agent {
                     break;
                 }
                 LoopAction::Continue => {
+                    // Skills mutated mid-turn → clear 3-tier prompt so next
+                    // iteration rebuilds semi-stable skills index (FP cache law).
+                    if self.take_skills_zone_dirty() {
+                        session.invalidate_skills_zone();
+                    }
                     // ── Steering injection point ─────────────────────────────
                     // Check for pending steers AFTER all tool results are appended.
                     // This is the only safe injection point — it maintains strict
@@ -2663,6 +2764,8 @@ impl Agent {
                 user_id: routing_key,
                 model: Some(config.model.clone()),
                 system_prompt: session.cached_system_prompt.clone(),
+                stable_system_prompt: session.cached_stable_prompt.clone(),
+                semi_stable_system_prompt: session.cached_semi_stable_prompt.clone(),
                 parent_session_id: None,
                 started_at: now,
                 ended_at: Some(now),
@@ -2674,6 +2777,7 @@ impl Agent {
                 cache_read_tokens: session.session_cache_read_tokens as i64,
                 cache_write_tokens: session.session_cache_write_tokens as i64,
                 reasoning_tokens: session.session_reasoning_tokens as i64,
+                last_prompt_tokens: session.last_prompt_tokens as i64,
                 estimated_cost_usd: cost_result.amount_usd,
                 title: Some(title),
             };
@@ -2807,23 +2911,29 @@ fn build_api_chat_messages(
         app_cfg,
         &session.tool_result_image_downgrades,
     );
-    let cache_cfg = cache.map(|resolved| &resolved.config);
     let native_inner_layout = cache.is_some_and(|resolved| resolved.decision.native_inner_layout);
     let mut out = match (
         session.cached_stable_prompt.as_deref(),
-        cache_cfg,
+        cache,
         native_inner_layout,
     ) {
-        (Some(stable), Some(cfg), true) => {
+        (Some(stable), Some(resolved), true) => {
             let combined = session.cached_system_prompt.as_deref().unwrap_or("");
             let semi = session.cached_semi_stable_prompt.as_deref().unwrap_or("");
             let dynamic = split_dynamic_after_cache_prefixes(combined, stable, semi);
-            build_chat_messages_blocks(stable, semi, dynamic, messages_for_api, Some(cfg), attach)
+            build_chat_messages_blocks(
+                stable,
+                semi,
+                dynamic,
+                messages_for_api,
+                Some(resolved),
+                attach,
+            )
         }
         _ => build_chat_messages(
             session.cached_system_prompt.as_deref(),
             messages_for_api,
-            cache_cfg,
+            cache,
             attach,
         ),
     };
@@ -2921,7 +3031,8 @@ fn stable_cache_control(cache_config: Option<&CachePromptConfig>) -> Option<Cach
 /// - `stable` block → `cache_control` with configured TTL (default 1h).
 /// - `semi_stable` block → `cache_control` with 5m TTL (skills index churn).
 /// - `dynamic` block → no cache_control (datetime, context files, memory).
-/// - User messages → `apply_cache_control` marks the last N with ephemeral.
+/// - Conversation → [`crate::prompt_cache_policy::apply_prompt_cache_breakpoints`]
+///   (native: last-N users; envelope never used on this path — native_inner only).
 ///
 /// When `stable` is empty, falls back to single-block behaviour for the
 /// remaining zones (without cache_control on dynamic-only paths).
@@ -2930,10 +3041,11 @@ pub fn build_chat_messages_blocks(
     semi_stable: &str,
     dynamic: &str,
     messages: &[Message],
-    cache_config: Option<&CachePromptConfig>,
+    cache: Option<&crate::prompt_cache_policy::ResolvedPromptCache>,
     attach_computer_use_images: bool,
 ) -> Vec<edgequake_llm::ChatMessage> {
     let mut out = Vec::with_capacity(messages.len() + 3);
+    let cache_config = cache.map(|r| &r.config);
 
     if !stable.is_empty() {
         let mut sys = edgequake_llm::ChatMessage::system(stable);
@@ -2953,14 +3065,14 @@ pub fn build_chat_messages_blocks(
 
     append_conversation_messages(&mut out, messages, attach_computer_use_images);
 
-    // Cache breakpoints on last N user messages.
-    // cache_system_prompt: false → system messages already handled above.
-    if let Some(cfg) = cache_config {
-        let user_cfg = CachePromptConfig {
-            cache_system_prompt: false,
-            ..cfg.clone()
-        };
-        apply_cache_control(&mut out, &user_cfg);
+    // System markers already set; planner adds last-N user breakpoints.
+    if let Some(resolved) = cache {
+        crate::prompt_cache_policy::apply_prompt_cache_breakpoints(
+            &mut out,
+            resolved.decision,
+            &resolved.config,
+            true, // system_already_marked
+        );
     }
 
     out
@@ -2984,15 +3096,13 @@ pub fn build_chat_messages_blocks(
 ///
 /// Public so agent.rs streaming path can reuse it.
 ///
-/// WHY cache_config param: Anthropic prompt caching requires
-/// `cache_control: ephemeral` breakpoints on the system message
-/// and last N user messages. edgequake-llm's `apply_cache_control()`
-/// injects these markers. We call it here so both the conversation
-/// loop and streaming path get consistent cache annotations.
+/// WHY cache param: Anthropic prompt caching requires `cache_control`
+/// breakpoints. Placement is owned by [`crate::prompt_cache_policy`] —
+/// native last-N users, or envelope `system_and_3` with `_can_carry_marker`.
 pub fn build_chat_messages(
     system_prompt: Option<&str>,
     messages: &[Message],
-    cache_config: Option<&CachePromptConfig>,
+    cache: Option<&crate::prompt_cache_policy::ResolvedPromptCache>,
     attach_computer_use_images: bool,
 ) -> Vec<edgequake_llm::ChatMessage> {
     let mut out = Vec::with_capacity(messages.len() + 1);
@@ -3004,10 +3114,13 @@ pub fn build_chat_messages(
 
     append_conversation_messages(&mut out, messages, attach_computer_use_images);
 
-    // Inject Anthropic cache_control breakpoints when prompt caching is enabled.
-    // System message → always cacheable; last N user messages → breakpoints.
-    if let Some(cfg) = cache_config {
-        apply_cache_control(&mut out, cfg);
+    if let Some(resolved) = cache {
+        crate::prompt_cache_policy::apply_prompt_cache_breakpoints(
+            &mut out,
+            resolved.decision,
+            &resolved.config,
+            false,
+        );
     }
 
     out
@@ -3580,12 +3693,28 @@ fn append_tool_result_to_session(
         &dctx.app_config_ref,
         &session.tool_result_image_downgrades,
     );
+    // Gap 031: scan + delimit so forged framing cannot break out of the block.
+    let delimit = edgecrab_security::tool_output_delimiters_enabled();
+    let (body, scan) =
+        edgecrab_security::prepare_tool_result_body(tool_call_id, tool_result, delimit);
+    if !matches!(
+        scan.verdict,
+        edgecrab_security::ThreatVerdict::Allow
+    ) {
+        let kinds: Vec<&str> = scan.findings.iter().map(|f| f.pattern_id).collect();
+        tracing::warn!(
+            tool = tool_name,
+            tool_call_id,
+            threats = ?kinds,
+            "tool output matched promptware patterns — delimited but not suppressed"
+        );
+    }
     session
         .messages
         .push(Message::tool_result_for_session_policy(
             tool_call_id,
             tool_name,
-            tool_result,
+            &body,
             store_images,
         ));
 }
@@ -3846,6 +3975,8 @@ async fn process_response(
                 let delegate_ctx = dctx.delegate_ctx.clone();
                 let kanban_task_id = dctx.kanban_task_id.clone();
                 let materialized_tools = dctx.materialized_tools.clone();
+                let subdirectory_hints = dctx.subdirectory_hints.clone();
+                let skills_zone_dirty = dctx.skills_zone_dirty.clone();
 
                 parallel_tasks.spawn(async move {
                     let started = std::time::Instant::now();
@@ -3879,6 +4010,8 @@ async fn process_response(
                         delegate_ctx,
                         kanban_task_id,
                         materialized_tools,
+                        subdirectory_hints,
+                        skills_zone_dirty,
                     };
                     let result = dispatch_single_tool(&tc_id, &tc_name, &tc_args, &inner).await;
                     let duration_ms = started.elapsed().as_millis() as u64;
@@ -4339,6 +4472,15 @@ async fn dispatch_single_tool_impl(
     let normalized_args_json = prepared.args_json;
     let prepared_args = prepared.args;
 
+    crate::lifecycle_hooks::emit_global(
+        crate::lifecycle_hooks::LifecycleEvent::ToolBefore,
+        serde_json::json!({
+            "session_id": &dctx.conversation_session_id,
+            "tool_name": name,
+            "args": &prepared_args,
+        }),
+    );
+
     // Emit tool:pre hook event — informational (fire-and-forget, no cancellation)
     if let Some(tx) = dctx.event_tx.as_ref() {
         let ctx_json = serde_json::json!({
@@ -4427,6 +4569,7 @@ async fn dispatch_single_tool_impl(
         dctx.delegate_ctx.clone(),
         dctx.kanban_task_id.clone(),
         dctx.materialized_tools.clone(),
+        dctx.skills_zone_dirty.clone(),
     );
 
     let args_for_mutation = prepared_args.clone();
@@ -4455,14 +4598,43 @@ async fn dispatch_single_tool_impl(
         Err(e) => e.to_llm_response(),
     };
 
+    let mut result = result;
+    let tool_failed = is_tool_error(&result);
+
+    // Touch LRU for successfully dispatched materialized tools.
+    if !tool_failed
+        && let Some(set) = dctx.materialized_tools.as_ref()
+        && let Ok(mut guard) = set.write()
+    {
+        guard.touch(name);
+    }
+
+    // Hermes subdirectory AGENTS.md hints — append to tool result (cache-safe).
+    if !tool_failed
+        && let Some(tracker) = dctx.subdirectory_hints.as_ref()
+    {
+        let mut guard = tracker.lock().await;
+        if let Some(hint) = guard.check_tool_call(name, &args_for_mutation) {
+            result.push_str(&hint);
+        }
+    }
+
     dctx.mutation_turn.record_tool_outcome(
         name,
         &args_for_mutation,
         &result,
-        is_tool_error(&result),
+        tool_failed,
     );
 
     // Emit tool:post hook event
+    crate::lifecycle_hooks::emit_global(
+        crate::lifecycle_hooks::LifecycleEvent::ToolAfter,
+        serde_json::json!({
+            "session_id": &dctx.conversation_session_id,
+            "tool_name": name,
+            "is_error": is_tool_error(&result),
+        }),
+    );
     if let Some(tx) = dctx.event_tx.as_ref() {
         let is_error = is_tool_error(&result);
         let ctx_json = serde_json::json!({
@@ -4670,6 +4842,8 @@ async fn run_learning_reflection_bg(ctx: BackgroundReflectionCtx) {
         delegate_ctx: None,
         kanban_task_id: None,
         materialized_tools: None,
+        subdirectory_hints: None,
+        skills_zone_dirty: None,
     };
 
     // Work on local session clone — we don't need results propagated back.
@@ -6353,6 +6527,20 @@ def register(ctx):
         assert!(tool.images.as_ref().is_some_and(|imgs| !imgs.is_empty()));
     }
 
+    fn test_resolved_cache(native_inner: bool) -> crate::prompt_cache_policy::ResolvedPromptCache {
+        crate::prompt_cache_policy::ResolvedPromptCache {
+            decision: crate::prompt_cache_policy::PromptCacheDecision {
+                should_cache: true,
+                native_inner_layout: native_inner,
+            },
+            config: CachePromptConfig {
+                enabled: true,
+                cache_ttl: Some("1h".into()),
+                ..Default::default()
+            },
+        }
+    }
+
     #[test]
     fn build_chat_messages_with_cache_config() {
         let messages = vec![Message::user(
@@ -6360,8 +6548,9 @@ def register(ctx):
                 .repeat(20)
                 .as_str(),
         )];
-        let cfg = CachePromptConfig::default();
-        let chat_msgs = build_chat_messages(Some("system prompt"), &messages, Some(&cfg), true);
+        let resolved = test_resolved_cache(true);
+        let chat_msgs =
+            build_chat_messages(Some("system prompt"), &messages, Some(&resolved), true);
         // System + user = 2 messages; cache breakpoints should be set
         assert_eq!(chat_msgs.len(), 2);
         // System message should have cache_control set
@@ -6433,8 +6622,9 @@ def register(ctx):
     #[test]
     fn build_chat_messages_blocks_with_cache_config_does_not_double_mark_system() {
         let msgs = vec![Message::user("hi")];
-        let cfg = CachePromptConfig::default();
-        let out = build_chat_messages_blocks("STABLE", "", "DYNAMIC", &msgs, Some(&cfg), true);
+        let resolved = test_resolved_cache(true);
+        let out =
+            build_chat_messages_blocks("STABLE", "", "DYNAMIC", &msgs, Some(&resolved), true);
         // stable[0] already has cache_control set by us, not apply_cache_control
         assert!(out[0].cache_control.is_some());
         // dynamic[1] must NOT get cache_control even with cache config active
@@ -7190,13 +7380,14 @@ def register(ctx):
             delegate_ctx: None,
             kanban_task_id: None,
             materialized_tools: None,
+            subdirectory_hints: None,
+            skills_zone_dirty: None,
         }
     }
 
     #[tokio::test]
     async fn dispatch_single_tool_blocks_deferred_until_materialized() {
         use edgecrab_tools::ToolSchemaMode;
-        use std::collections::HashSet;
         use std::sync::{Arc, RwLock};
 
         let registry = Arc::new(ToolRegistry::new());
@@ -7225,9 +7416,9 @@ def register(ctx):
             "deferred tool should require materialization: {blocked}"
         );
 
-        dctx.materialized_tools = Some(Arc::new(RwLock::new(HashSet::from([
-            "browser_navigate".into()
-        ]))));
+        let mut set = edgecrab_tools::MaterializedToolSet::new();
+        set.insert("browser_navigate", 0);
+        dctx.materialized_tools = Some(Arc::new(RwLock::new(set)));
         let (allowed, _) = dispatch_single_tool(
             "call-browser-2",
             "browser_navigate",

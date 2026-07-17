@@ -47,6 +47,7 @@ mod logs_cmd;
 mod markdown_render;
 mod mcp_catalog;
 mod mcp_oauth;
+mod mcp_serve;
 mod mcp_support;
 mod memory_cmd;
 mod model_catalog_ui;
@@ -68,6 +69,7 @@ mod proxy_setup_tui;
 mod queued_messages;
 mod runtime;
 mod secret_capture_overlay;
+mod secret_cmd;
 mod setup;
 mod shelf_details;
 mod shelf_visual;
@@ -120,9 +122,9 @@ use crate::logging::{LoggingMode, StderrMode, init_logging};
 use app::App;
 use cli_args::{
     AcpCommand, AuthCommand, ClawCommand, CliArgs, Command, ConfigCommand, CronCommand,
-    GatewayCommand, HonchoCommand, LogsCommand, McpCommand, MemoryCommand, OpenClawPresetArg,
-    PairingCommand, PluginsCommand, ProfileCommand, SessionCommand, SkillConflictModeArg,
-    SkillsCommand, ToolsCommand, WebhookCommand,
+    GatewayCommand, HonchoCommand, KanbanCommand, LogsCommand, McpCommand, MemoryCommand,
+    OpenClawPresetArg, PairingCommand, PluginsCommand, ProfileCommand, SessionCommand,
+    SkillConflictModeArg, SkillsCommand, ToolsCommand, WebhookCommand,
 };
 use edgecrab_core::config::McpServerConfig;
 use edgecrab_state::SessionDb;
@@ -625,8 +627,21 @@ async fn main() -> anyhow::Result<()> {
     // Quiet mode: send prompt, print response, exit
     if args.quiet {
         if let Some(prompt) = args.prompt_text() {
-            let response = agent.chat(&prompt).await?;
-            println!("{}", response);
+            if args.json_stream {
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+                let printer = tokio::spawn(async move {
+                    while let Some(event) = rx.recv().await {
+                        if let Some(line) = stream_event_ndjson_line(&event) {
+                            println!("{line}");
+                        }
+                    }
+                });
+                agent.chat_streaming(&prompt, tx).await?;
+                let _ = printer.await;
+            } else {
+                let response = agent.chat(&prompt).await?;
+                println!("{}", response);
+            }
         } else {
             eprintln!("edgecrab: no prompt provided in quiet mode. Use -q \"your prompt\"");
             std::process::exit(1);
@@ -1055,6 +1070,10 @@ async fn run_subcommand(cmd: Command, args: &CliArgs) -> anyhow::Result<()> {
             run_config(command, args)?;
         }
 
+        Command::Secret { command } => {
+            secret_cmd::run_secret(command)?;
+        }
+
         Command::Tools { command } => {
             run_tools(command, args)?;
         }
@@ -1077,6 +1096,14 @@ async fn run_subcommand(cmd: Command, args: &CliArgs) -> anyhow::Result<()> {
 
         Command::Gateway { command } => {
             run_gateway(command, args).await?;
+        }
+
+        Command::Install { spec } => {
+            run_install(&spec).await?;
+        }
+
+        Command::Kanban { command } => {
+            run_kanban(command)?;
         }
 
         Command::Skills { command } => {
@@ -1934,6 +1961,10 @@ async fn run_mcp(command: McpCommand, args: &CliArgs) -> anyhow::Result<()> {
                 anyhow::bail!("unknown MCP server '{}'", name);
             }
         }
+        McpCommand::Serve => {
+            let registry = build_tool_registry();
+            mcp_serve::run_mcp_serve(registry).await?;
+        }
     }
     Ok(())
 }
@@ -2011,6 +2042,70 @@ async fn run_gateway(command: GatewayCommand, args: &CliArgs) -> anyhow::Result<
             gateway_cmd::run(action, args).await
         }
     }
+}
+
+/// Simplified NDJSON line for headless `--json-stream` mode.
+fn stream_event_ndjson_line(event: &edgecrab_core::StreamEvent) -> Option<String> {
+    use edgecrab_core::StreamEvent;
+    let value = match event {
+        StreamEvent::Token(text) => serde_json::json!({"kind": "token", "text": text}),
+        StreamEvent::Reasoning(text) => serde_json::json!({"kind": "reasoning", "text": text}),
+        StreamEvent::ToolExec { name, .. } => serde_json::json!({"kind": "tool_exec", "name": name}),
+        StreamEvent::ToolDone { name, is_error, .. } => {
+            serde_json::json!({"kind": "tool_done", "name": name, "is_error": is_error})
+        }
+        StreamEvent::Done => serde_json::json!({"kind": "done"}),
+        StreamEvent::Error(message) => serde_json::json!({"kind": "error", "message": message}),
+        _ => return None,
+    };
+    serde_json::to_string(&value).ok()
+}
+
+/// Pi-class skill pack install: `edgecrab install <spec>`.
+async fn run_install(spec: &str) -> anyhow::Result<()> {
+    let skills_dir = edgecrab_core::edgecrab_home().join("skills");
+    std::fs::create_dir_all(&skills_dir)?;
+    let outcome = edgecrab_tools::tools::skills_hub::install_identifier(
+        spec,
+        &skills_dir,
+        None,
+        edgecrab_tools::tools::skills_hub::InstallGate::default(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!(e))?;
+    println!("{}", outcome.message);
+    Ok(())
+}
+
+fn run_kanban(command: KanbanCommand) -> anyhow::Result<()> {
+    use edgecrab_state::kanban_board::{kanban_db_path_for_board, kanban_home};
+    use edgecrab_state::kanban_db::KanbanDb;
+
+    match command {
+        KanbanCommand::List => {
+            let home = kanban_home(None);
+            let db_path = kanban_db_path_for_board(&home, None);
+            if !db_path.exists() {
+                println!("No kanban database at {}.", db_path.display());
+                println!("Enable kanban in config.yaml and create tasks via /kanban.");
+                return Ok(());
+            }
+            let db = KanbanDb::open(&db_path)?;
+            let tasks = db.list_tasks(None, 50)?;
+            if tasks.is_empty() {
+                println!("Kanban board is empty.");
+                return Ok(());
+            }
+            println!("Kanban tasks ({}):", tasks.len());
+            for t in tasks {
+                println!(
+                    "  [{}] {} — {} (priority {})",
+                    t.id, t.title, t.status, t.priority
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Manage skills from the CLI (`edgecrab skills list/view/search/install/remove`).
@@ -2648,6 +2743,8 @@ fn set_config_value(
         "gateway.whatsapp.bridge_port" => config.gateway.whatsapp.bridge_port = value.parse()?,
         "tools.enabled_toolsets" => config.tools.enabled_toolsets = Some(parse_csv(value)),
         "tools.disabled_toolsets" => config.tools.disabled_toolsets = Some(parse_csv(value)),
+        "security.preview.enabled" => config.security.preview.enabled = parse_bool(value)?,
+        "harness.verification_strict" => config.harness.verification_strict = parse_bool(value)?,
         _ => anyhow::bail!("unsupported config key '{}'", key),
     }
     Ok(())
@@ -2711,7 +2808,7 @@ mod tests {
         activate_runtime_home_from_config, builtin_cli_command_names, create_provider,
         detect_plugin_cli_candidate, explicit_provider_request, forwarded_interactive_slash,
         parse_editor_command, render_version_report, runtime_home_for_config_override,
-        set_config_value,
+        set_config_value, stream_event_ndjson_line,
     };
     use crate::cli_args::Command;
 
@@ -2907,5 +3004,15 @@ mod tests {
     fn explicit_provider_request_ignores_implicit_model_names() {
         assert_eq!(explicit_provider_request("gpt-5-nano"), None);
         assert_eq!(explicit_provider_request(""), None);
+    }
+
+    #[test]
+    fn json_stream_emits_done_and_token_kinds() {
+        let done = stream_event_ndjson_line(&edgecrab_core::StreamEvent::Done).expect("done");
+        assert!(done.contains(r#""kind":"done"#));
+        let token =
+            stream_event_ndjson_line(&edgecrab_core::StreamEvent::Token("hi".into())).expect("tok");
+        assert!(token.contains(r#""kind":"token"#));
+        assert!(token.contains("hi"));
     }
 }

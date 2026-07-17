@@ -217,6 +217,18 @@ pub trait PlatformAdapter: Send + Sync + 'static {
     /// shutdown. Called inside a tokio::spawn, so it runs concurrently.
     async fn start(&self, tx: mpsc::Sender<IncomingMessage>) -> anyhow::Result<()>;
 
+    /// Fetch recent channel history for first-seen backfill (gap 016).
+    ///
+    /// Default: unsupported (empty). Discord overrides this.
+    async fn fetch_channel_history(
+        &self,
+        channel_id: &str,
+        limit: u32,
+    ) -> anyhow::Result<Vec<crate::backfill::BackfillMessage>> {
+        let _ = (channel_id, limit);
+        Ok(Vec::new())
+    }
+
     /// Send a response back to the platform.
     async fn send(&self, msg: OutgoingMessage) -> anyhow::Result<()>;
 

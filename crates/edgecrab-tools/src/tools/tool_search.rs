@@ -127,8 +127,10 @@ impl ToolHandler for ToolSearchTool {
         let mut already_wire = Vec::new();
         let mut not_found = Vec::new();
         let mut schemas_out = Vec::new();
+        let mut evicted = Vec::new();
 
         let materialized = ctx.materialized_tools.as_ref();
+        let max = ctx.config.max_materialized_tools;
 
         for name in names_to_activate {
             let trimmed = name.trim();
@@ -146,7 +148,7 @@ impl ToolHandler for ToolSearchTool {
             if let Some(set) = materialized
                 && let Ok(mut guard) = set.write()
             {
-                guard.insert(trimmed.to_string());
+                evicted.extend(guard.insert(trimmed.to_string(), max));
             }
             if let Some(schema) = all_schemas.iter().find(|s| s.name == trimmed) {
                 schemas_out.push(compact_tool_schema(schema));
@@ -158,8 +160,10 @@ impl ToolHandler for ToolSearchTool {
             "activated": activated,
             "already_on_wire": already_wire,
             "not_found": not_found,
+            "evicted": evicted,
             "schemas": schemas_out,
             "query": args.query,
+            "max_materialized_tools": max,
             "hint": "Deferred tools are now on your tool list for subsequent turns."
         })
         .to_string())
@@ -182,7 +186,7 @@ mod tests {
     #[tokio::test]
     async fn bm25_query_materializes_deferred_tool() {
         let registry = Arc::new(ToolRegistry::new());
-        let materialized = Arc::new(RwLock::new(HashSet::new()));
+        let materialized = Arc::new(RwLock::new(crate::MaterializedToolSet::new()));
         let ctx = ToolContext {
             task_id: "t".into(),
             cwd: std::env::temp_dir(),
@@ -235,7 +239,7 @@ mod tests {
     #[tokio::test]
     async fn materializes_deferred_tool() {
         let registry = Arc::new(ToolRegistry::new());
-        let materialized = Arc::new(RwLock::new(HashSet::new()));
+        let materialized = Arc::new(RwLock::new(crate::MaterializedToolSet::new()));
         let ctx = ToolContext {
             task_id: "t".into(),
             cwd: std::env::temp_dir(),

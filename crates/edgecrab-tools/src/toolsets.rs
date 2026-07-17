@@ -19,7 +19,8 @@
 /// registered tool in the binary.
 ///
 /// Opt-in surfaces (not listed here): `LSP_TOOLS`, `MOA_TOOLS`, `HONCHO_TOOLS`,
-/// `RESEARCH_EXTRA_TOOLS`, `MCP_EXTENDED_TOOLS`, `kanban`, `computer_use`.
+/// `RESEARCH_EXTRA_TOOLS`, `MCP_EXTENDED_TOOLS`, `kanban`, `computer_use`,
+/// `video`, `x_search`.
 pub const CORE_TOOLS: &[&str] = &[
     // Web (2) — web_crawl is `research` toolset only (heavy schema)
     "web_search",
@@ -188,6 +189,12 @@ pub const KANBAN_TOOLS: &[&str] = &[
 
 /// macOS desktop control via cua-driver — opt-in via `enabled_toolsets: ["computer_use"]`.
 pub const COMPUTER_USE_TOOLS: &[&str] = &["computer_use"];
+
+/// Video analyze / generate — opt-in via `enabled_toolsets: ["video"]` (gap 012).
+pub const VIDEO_TOOLS: &[&str] = &["video_analyze", "video_generate", "video_status"];
+
+/// X (Twitter) search via xAI — opt-in via `enabled_toolsets: ["x_search"]` (gap 027).
+pub const X_SEARCH_TOOLS: &[&str] = &["x_search"];
 
 /// Tools EXCLUDED from ACP (editor integration) mode.
 ///

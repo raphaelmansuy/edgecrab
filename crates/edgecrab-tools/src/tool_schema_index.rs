@@ -4,7 +4,7 @@
 //! as a compact name index in the system prompt. `tool_search` materializes full
 //! schemas on demand and adds them to the session wire set.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 
 use edgecrab_types::ToolSchema;
 
@@ -12,6 +12,75 @@ use crate::schema_mode::compact_tool_description;
 use crate::toolsets::INDEXED_HOT_TOOLS;
 
 pub const TOOL_SEARCH_NAME: &str = "tool_search";
+
+/// Default cap on non-hot tools materialized onto the wire (`0` = unlimited).
+pub const DEFAULT_MAX_MATERIALIZED_TOOLS: usize = 12;
+
+/// Session-scoped materialized wire set with optional LRU eviction.
+#[derive(Debug, Clone, Default)]
+pub struct MaterializedToolSet {
+    set: HashSet<String>,
+    /// LRU order: front = coldest, back = hottest.
+    order: VecDeque<String>,
+}
+
+impl MaterializedToolSet {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        self.set.contains(name)
+    }
+
+    pub fn len(&self) -> usize {
+        self.set.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.set.is_empty()
+    }
+
+    pub fn names(&self) -> HashSet<String> {
+        self.set.clone()
+    }
+
+    /// Insert `name` (non-hot). When `max > 0` and over capacity, evict coldest.
+    /// Returns names that were evicted.
+    pub fn insert(&mut self, name: impl Into<String>, max: usize) -> Vec<String> {
+        let name = name.into();
+        if is_hot_tool(&name) {
+            return Vec::new();
+        }
+        if self.set.contains(&name) {
+            self.order.retain(|n| n != &name);
+            self.order.push_back(name);
+            return Vec::new();
+        }
+        self.set.insert(name.clone());
+        self.order.push_back(name);
+        let mut evicted = Vec::new();
+        if max > 0 {
+            while self.set.len() > max {
+                let Some(cold) = self.order.pop_front() else {
+                    break;
+                };
+                self.set.remove(&cold);
+                evicted.push(cold);
+            }
+        }
+        evicted
+    }
+
+    /// Mark a materialized tool as most-recently used (on successful dispatch).
+    pub fn touch(&mut self, name: &str) {
+        if !self.set.contains(name) {
+            return;
+        }
+        self.order.retain(|n| n != name);
+        self.order.push_back(name.to_string());
+    }
+}
 
 /// Whether `name` is on the LLM wire in indexed mode.
 pub fn is_on_wire(name: &str, materialized: &HashSet<String>) -> bool {
@@ -33,11 +102,11 @@ pub fn deferred_tool_error_response(tool_name: &str) -> String {
 
 /// Read the session materialized set (empty when unset or lock poisoned).
 pub fn read_materialized_set(
-    materialized: Option<&std::sync::Arc<std::sync::RwLock<HashSet<String>>>>,
+    materialized: Option<&std::sync::Arc<std::sync::RwLock<MaterializedToolSet>>>,
 ) -> HashSet<String> {
     materialized
         .and_then(|set| set.read().ok())
-        .map(|guard| guard.clone())
+        .map(|guard| guard.names())
         .unwrap_or_default()
 }
 
@@ -156,5 +225,28 @@ mod tests {
         let text = format_deferred_index(&[&a]);
         assert!(text.contains("browser_click"));
         assert!(text.contains("tool_search"));
+    }
+
+    #[test]
+    fn materialized_lru_evicts_coldest() {
+        let mut set = MaterializedToolSet::new();
+        assert!(set.insert("browser_navigate", 2).is_empty());
+        assert!(set.insert("browser_click", 2).is_empty());
+        let evicted = set.insert("web_crawl", 2);
+        assert_eq!(evicted, vec!["browser_navigate".to_string()]);
+        assert!(!set.contains("browser_navigate"));
+        assert!(set.contains("browser_click"));
+        assert!(set.contains("web_crawl"));
+    }
+
+    #[test]
+    fn materialized_lru_touch_keeps_hot_tools() {
+        let mut set = MaterializedToolSet::new();
+        set.insert("browser_navigate", 2);
+        set.insert("browser_click", 2);
+        set.touch("browser_navigate");
+        let evicted = set.insert("web_crawl", 2);
+        assert_eq!(evicted, vec!["browser_click".to_string()]);
+        assert!(set.contains("browser_navigate"));
     }
 }

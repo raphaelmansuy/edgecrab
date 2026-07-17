@@ -200,9 +200,18 @@ impl HarnessTurnAdvisory {
     }
 
     fn window_lacks_perception(&self, task_class: TaskClass) -> bool {
+        // Failed browser_navigate (SSRF/preview block) must not count as perception —
+        // otherwise terminal storms after a blocked preview never hard-stop (0aeef965).
         !self.window.iter().any(|(_, name)| {
-            is_verification_tool_for_class(name, task_class)
-                && PERCEPTION_TOOLS.contains(&name.as_str())
+            if !is_verification_tool_for_class(name, task_class)
+                || !PERCEPTION_TOOLS.contains(&name.as_str())
+            {
+                return false;
+            }
+            if name == "browser_navigate" {
+                return self.browser_nav_success;
+            }
+            true
         })
     }
 

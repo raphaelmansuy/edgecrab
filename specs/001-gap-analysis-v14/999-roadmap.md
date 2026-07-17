@@ -34,12 +34,12 @@ green.
 
 | # | Folder | Effort | Depends on | Status |
 |---|--------|--------|------------|--------|
-| 7 | [007-multi-agent-kanban/](007-multi-agent-kanban/) | L | — | ○ OPEN |
-| 8 | [008-openai-compat-proxy/](008-openai-compat-proxy/) | M | **024 (OAuth providers)** | ○ OPEN |
-| 9 | [009-pluggable-providers-plugins/](009-pluggable-providers-plugins/) | L | — | ○ OPEN |
+| 7 | [007-multi-agent-kanban/](007-multi-agent-kanban/) | L | — | ✅ DONE |
+| 8 | [008-openai-compat-proxy/](008-openai-compat-proxy/) | M | **024 (OAuth providers)** | ✅ DONE |
+| 9 | [009-pluggable-providers-plugins/](009-pluggable-providers-plugins/) | L | — | 🟡 PARTIAL |
 | 10 | [010-mcp-sse-oauth-parallel/](010-mcp-sse-oauth-parallel/) | L | — | ✅ DONE |
 | 11 | [011-computer-use/](011-computer-use/) | XL | — | ✅ DONE |
-| 12 | [012-video-tools/](012-video-tools/) | M | — | ○ OPEN |
+| 12 | [012-video-tools/](012-video-tools/) | M | — | ✅ DONE |
 
 **Critical dependency**: Folder 008 (proxy) cannot ship until
 Folder 024 (OAuth) is done. Pull 024 forward to early Phase 2.
@@ -59,7 +59,7 @@ Folder 024 (OAuth) is done. Pull 024 forward to early Phase 2.
 | 13 | [013-cron-no-agent/](013-cron-no-agent/) | M | — |
 | 14 | [014-web-search-backends/](014-web-search-backends/) | M | — |
 | 15 | [015-native-clarify-buttons/](015-native-clarify-buttons/) | M | — |
-| 16 | [016-discord-history-backfill/](016-discord-history-backfill/) | S | — |
+| 16 | [016-discord-history-backfill/](016-discord-history-backfill/) | S | — | ✅ DONE |
 | 17 | [017-tool-error-sanitization/](017-tool-error-sanitization/) | S | — |
 | 18 | [018-osc8-clickable-urls/](018-osc8-clickable-urls/) | S | — |
 | 19 | [019-sudo-bruteforce-defense/](019-sudo-bruteforce-defense/) | S | 015 (confirm UI) |
@@ -77,10 +77,10 @@ Folder 024 (OAuth) is done. Pull 024 forward to early Phase 2.
 | 21 | [021-curator-subsystem/](021-curator-subsystem/) | M | — |
 | 22 | [022-cold-start-perf/](022-cold-start-perf/) | M | — |
 | 23 | [023-persistent-cdp-ws/](023-persistent-cdp-ws/) | M | — |
-| 24 | [024-oauth-providers/](024-oauth-providers/) | XL | *pulled to Phase 2* |
+| 24 | [024-oauth-providers/](024-oauth-providers/) | XL | *pulled to Phase 2* ✅ |
 | 25 | [025-i18n/](025-i18n/) | L | — |
 | 26 | [026-new-platforms/](026-new-platforms/) | L | 015 |
-| 27 | [027-x-search-tool/](027-x-search-tool/) | S | — |
+| 27 | [027-x-search-tool/](027-x-search-tool/) | S | — | ✅ DONE |
 | 28 | [028-skills-hub-trusted-taps/](028-skills-hub-trusted-taps/) | M | existing skills system |
 | 29 | [029-pareto-code-router/](029-pareto-code-router/) | M | — |
 | 30 | [030-transform-llm-output-hook/](030-transform-llm-output-hook/) | M | 009 |
@@ -162,8 +162,8 @@ Each is independently shippable in 1–3 days.
 | # | Folder | Effort | Depends on | Status |
 |---|--------|--------|------------|--------|
 | 31 | [031-promptware-brainworm-defense/](031-promptware-brainworm-defense/) | M | supersedes 017 | ○ OPEN |
-| 32 | [032-secrets-manager/](032-secrets-manager/) | M | — | ○ OPEN |
-| 33 | [033-skill-bundles/](033-skill-bundles/) | S | existing skills system | ○ OPEN |
+| 32 | [032-secrets-manager/](032-secrets-manager/) | M | — | ✅ DONE |
+| 33 | [033-skill-bundles/](033-skill-bundles/) | S | existing skills system | ✅ DONE |
 
 **Priority**: 031 first — it is a security/trust item that also pays down
 the four-way threat-pattern DRY debt and absorbs Phase-3 item 017. 033 is

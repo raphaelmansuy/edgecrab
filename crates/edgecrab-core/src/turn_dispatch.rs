@@ -461,6 +461,38 @@ mod tests {
     }
 
     #[test]
+    fn spill_blind_write_block_before_dispatch() {
+        let messages = vec![
+            edgecrab_types::Message::user("read big file"),
+            edgecrab_types::Message::tool_result(
+                "r1",
+                "read_file",
+                "[tool_result_spill] artifact=.edgecrab/artifacts/s1/read_001.md next_read=read_file",
+            ),
+        ];
+        let advisory = crate::harness_advisory::HarnessTurnAdvisory::new();
+        let guardrail = edgecrab_tools::tool_loop_guardrails::ToolLoopGuardrailController::new(
+            edgecrab_tools::tool_loop_guardrails::ToolLoopGuardrailConfig::default(),
+        );
+        let trackers = TurnDispatchTrackersView {
+            harness_advisory: &advisory,
+            tool_guardrail: &guardrail,
+        };
+        let blocked = guardrail_before_dispatch_checked(
+            &trackers,
+            &messages,
+            "write_file",
+            r#"{"path":"out.rs","content":"x"}"#,
+        );
+        assert!(
+            blocked
+                .as_deref()
+                .is_some_and(|b| b.contains("spill_blind") || b.contains("spilled")),
+            "got {blocked:?}"
+        );
+    }
+
+    #[test]
     fn ha26_forward_process_watch_emits_activity_notice() {
         use edgecrab_tools::process_table::{WatchEvent, WatchEventType};
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();

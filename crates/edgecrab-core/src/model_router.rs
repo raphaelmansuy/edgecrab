@@ -583,3 +583,71 @@ mod tests {
         assert!(route.label.as_ref().is_some_and(|l| l.contains("fallback")));
     }
 }
+
+// ─── Pareto / smart-routing reporting (gap 029) ───────────────────────
+
+/// Cheap-vs-strong turn counters for session snapshots.
+#[derive(Debug, Clone, Default)]
+pub struct SmartRoutingStats {
+    pub cheap_turns: u32,
+    pub strong_turns: u32,
+}
+
+impl SmartRoutingStats {
+    pub fn routing_savings_note(&self, cheap_model: &str) -> Option<String> {
+        let total = self.cheap_turns.saturating_add(self.strong_turns);
+        if total == 0 || self.cheap_turns == 0 {
+            return None;
+        }
+        let pct = (self.cheap_turns as f64 / total as f64) * 100.0;
+        Some(format!(
+            "Smart routing: {}/{} turns used cheap model `{}` ({:.0}% savings opportunity)",
+            self.cheap_turns, total, cheap_model, pct
+        ))
+    }
+}
+
+/// Collect provider aliases contributed by discovered native plugins (gap 009).
+pub fn list_plugin_provider_aliases(
+    plugins: &[std::sync::Arc<dyn edgecrab_plugins::EdgecrabPlugin>],
+) -> Vec<String> {
+    let mut host = edgecrab_plugins::PluginHost::new();
+    for p in plugins {
+        host.register(p.clone());
+    }
+    host.provider_aliases()
+}
+
+#[cfg(test)]
+mod plugin_alias_tests {
+    use super::*;
+    use edgecrab_plugins::EdgecrabPlugin;
+
+    struct AliasPlugin;
+    impl EdgecrabPlugin for AliasPlugin {
+        fn name(&self) -> &str {
+            "alias"
+        }
+        fn provider_aliases(&self) -> Vec<String> {
+            vec!["custom/echo".into()]
+        }
+    }
+
+    #[test]
+    fn list_plugin_provider_aliases_dedupes() {
+        let p = std::sync::Arc::new(AliasPlugin);
+        let aliases = list_plugin_provider_aliases(&[p]);
+        assert_eq!(aliases, vec!["custom/echo".to_string()]);
+    }
+
+    #[test]
+    fn routing_savings_note_formats() {
+        let stats = SmartRoutingStats {
+            cheap_turns: 3,
+            strong_turns: 1,
+        };
+        let note = stats.routing_savings_note("gpt-4.1-mini").expect("note");
+        assert!(note.contains("3/4"));
+        assert!(note.contains("gpt-4.1-mini"));
+    }
+}

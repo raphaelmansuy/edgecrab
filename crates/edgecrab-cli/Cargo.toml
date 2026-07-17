@@ -23,6 +23,7 @@ edgecrab-plugins = { workspace = true }
 edgecrab-types = { workspace = true }
 edgecrab-state = { workspace = true }
 edgecrab-tools = { workspace = true }
+edgecrab-security = { workspace = true }
 edgecrab-cron = { workspace = true }
 edgecrab-acp = { workspace = true }
 edgecrab-gateway = { workspace = true }

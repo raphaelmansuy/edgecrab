@@ -237,4 +237,85 @@ fn games003_browser_recovery_cites_config_not_read_file() {
     let blob = serde_json::to_string(&err.to_llm_payload()).expect("json");
     assert!(blob.contains("/config") || blob.contains("fix_via"));
     assert!(blob.contains("do_not") || blob.contains("read_file"));
+    assert!(blob.contains("preview"));
+}
+
+/// Session `0aeef965` (race_gamey): terminal storm after browser block must not Complete.
+#[test]
+fn session_0aeef965_terminal_storm_blocks_completion_and_act() {
+    use edgecrab_core::completion_assessor::{CompletionContext, assess_completion};
+    use edgecrab_core::harness_loop_policy::visual_storm_block_result;
+    use edgecrab_core::harness_advisory::HarnessTurnAdvisory;
+    use edgecrab_tools::{
+        HarnessAdvisorySignals, HarnessBuildInput, MutationTurnState, build_harness_snapshot,
+    };
+
+    let messages = vec![
+        edgecrab_types::Message::user(
+            "Create best 3D race car demo/race_gamey with beautiful UX preview",
+        ),
+        edgecrab_types::Message::tool_result("t1", "write_file", r#"{"path":"index.html"}"#),
+        edgecrab_types::Message::tool_result("t2", "terminal", "Serving HTTP on port 8000"),
+        edgecrab_types::Message::tool_result(
+            "t3",
+            "browser_navigate",
+            "URL blocked for browser navigation",
+        ),
+        edgecrab_types::Message::tool_result("t4", "terminal", "ls"),
+        edgecrab_types::Message::tool_result("t5", "terminal", "cat"),
+        edgecrab_types::Message::tool_result("t6", "terminal", "grep"),
+        edgecrab_types::Message::tool_result("t7", "terminal", "ls again"),
+        edgecrab_types::Message::tool_result("t8", "terminal", "pwd"),
+        edgecrab_types::Message::tool_result(
+            "t9",
+            "write_file",
+            r#"{"path":"VERIFICATION.md"}"#,
+        ),
+    ];
+
+    let mut advisory = HarnessTurnAdvisory::new();
+    for name in [
+        "write_file",
+        "terminal",
+        "browser_navigate",
+        "terminal",
+        "terminal",
+        "terminal",
+        "terminal",
+        "terminal",
+    ] {
+        advisory.record_tool(name);
+    }
+    // Navigate was blocked (SSRF/preview) — must not count as perception evidence.
+    advisory.record_browser_navigate_result("URL blocked for browser navigation");
+    assert!(
+        visual_storm_block_result(&advisory, &messages, "terminal").is_some(),
+        "0aeef965-class storm must hard-block further terminal"
+    );
+
+    let harness = build_harness_snapshot(HarnessBuildInput {
+        messages: &messages,
+        mutation_turn: &MutationTurnState::new(),
+        cwd: std::path::Path::new("."),
+        post_mutation_oracles: false,
+        advisory: HarnessAdvisorySignals {
+            visual_act_storm: true,
+            guardrail_halt: false,
+        },
+        unanswered_tool_calls: 0,
+    });
+    let outcome = assess_completion(&CompletionContext {
+        final_response: "Done — see VERIFICATION.md",
+        messages: &messages,
+        interrupted: false,
+        budget_exhausted: false,
+        pending_approval: false,
+        pending_clarification: false,
+        active_todos: 0,
+        blocked_todos: 0,
+        child_runs_in_flight: 0,
+        harness,
+        verification_strict: true,
+    });
+    assert_ne!(outcome.state, edgecrab_types::CompletionDecision::Completed);
 }

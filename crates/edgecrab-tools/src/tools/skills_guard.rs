@@ -100,185 +100,7 @@ pub struct ScanResult {
     pub summary: String,
 }
 
-// ─── Threat patterns ───────────────────────────────────────────
-
-/// A threat pattern: (substring, pattern_id, severity, category, description).
-struct ThreatPattern {
-    substring: &'static str,
-    pattern_id: &'static str,
-    severity: Severity,
-    category: ThreatCategory,
-    description: &'static str,
-}
-
-const THREAT_PATTERNS: &[ThreatPattern] = &[
-    // ── Exfiltration ──
-    ThreatPattern {
-        substring: "curl",
-        pattern_id: "env_exfil_curl",
-        severity: Severity::High,
-        category: ThreatCategory::Exfiltration,
-        description: "curl command (potential data exfiltration)",
-    },
-    ThreatPattern {
-        substring: "wget",
-        pattern_id: "env_exfil_wget",
-        severity: Severity::High,
-        category: ThreatCategory::Exfiltration,
-        description: "wget command (potential data exfiltration)",
-    },
-    ThreatPattern {
-        substring: ".ssh",
-        pattern_id: "ssh_dir_access",
-        severity: Severity::High,
-        category: ThreatCategory::Exfiltration,
-        description: "references SSH directory",
-    },
-    ThreatPattern {
-        substring: ".aws",
-        pattern_id: "aws_dir_access",
-        severity: Severity::High,
-        category: ThreatCategory::Exfiltration,
-        description: "references AWS credentials directory",
-    },
-    ThreatPattern {
-        substring: ".env",
-        pattern_id: "env_file_access",
-        severity: Severity::Critical,
-        category: ThreatCategory::Exfiltration,
-        description: "references .env secrets file",
-    },
-    ThreatPattern {
-        substring: "printenv",
-        pattern_id: "dump_all_env",
-        severity: Severity::High,
-        category: ThreatCategory::Exfiltration,
-        description: "dumps all environment variables",
-    },
-    ThreatPattern {
-        substring: "os.environ",
-        pattern_id: "python_os_environ",
-        severity: Severity::High,
-        category: ThreatCategory::Exfiltration,
-        description: "accesses os.environ (potential env dump)",
-    },
-    ThreatPattern {
-        substring: "process.env",
-        pattern_id: "node_process_env",
-        severity: Severity::High,
-        category: ThreatCategory::Exfiltration,
-        description: "accesses process.env (Node.js environment)",
-    },
-    // ── Prompt Injection ──
-    ThreatPattern {
-        substring: "ignore previous",
-        pattern_id: "prompt_injection_ignore",
-        severity: Severity::Critical,
-        category: ThreatCategory::Injection,
-        description: "prompt injection: ignore previous instructions",
-    },
-    ThreatPattern {
-        substring: "ignore all instructions",
-        pattern_id: "prompt_injection_all",
-        severity: Severity::Critical,
-        category: ThreatCategory::Injection,
-        description: "prompt injection: ignore all instructions",
-    },
-    ThreatPattern {
-        substring: "you are now",
-        pattern_id: "role_hijack",
-        severity: Severity::High,
-        category: ThreatCategory::Injection,
-        description: "attempts to override the agent's role",
-    },
-    ThreatPattern {
-        substring: "system prompt override",
-        pattern_id: "sys_prompt_override",
-        severity: Severity::Critical,
-        category: ThreatCategory::Injection,
-        description: "attempts to override the system prompt",
-    },
-    ThreatPattern {
-        substring: "disregard",
-        pattern_id: "disregard_rules",
-        severity: Severity::High,
-        category: ThreatCategory::Injection,
-        description: "instructs agent to disregard rules",
-    },
-    ThreatPattern {
-        substring: "forget everything",
-        pattern_id: "forget_everything",
-        severity: Severity::Critical,
-        category: ThreatCategory::Injection,
-        description: "instructs agent to forget its training",
-    },
-    // ── Destructive ──
-    ThreatPattern {
-        substring: "rm -rf /",
-        pattern_id: "destructive_root_rm",
-        severity: Severity::Critical,
-        category: ThreatCategory::Destructive,
-        description: "recursive delete from root",
-    },
-    ThreatPattern {
-        substring: "mkfs",
-        pattern_id: "destructive_mkfs",
-        severity: Severity::Critical,
-        category: ThreatCategory::Destructive,
-        description: "filesystem format command",
-    },
-    ThreatPattern {
-        substring: "dd if=",
-        pattern_id: "destructive_dd",
-        severity: Severity::High,
-        category: ThreatCategory::Destructive,
-        description: "raw disk write command",
-    },
-    // ── Persistence ──
-    ThreatPattern {
-        substring: "crontab",
-        pattern_id: "persistence_crontab",
-        severity: Severity::Medium,
-        category: ThreatCategory::Persistence,
-        description: "crontab modification (persistence mechanism)",
-    },
-    ThreatPattern {
-        substring: ".bashrc",
-        pattern_id: "persistence_bashrc",
-        severity: Severity::Medium,
-        category: ThreatCategory::Persistence,
-        description: "shell RC file modification",
-    },
-    ThreatPattern {
-        substring: "systemctl enable",
-        pattern_id: "persistence_systemd",
-        severity: Severity::Medium,
-        category: ThreatCategory::Persistence,
-        description: "systemd service installation",
-    },
-    // ── Obfuscation ──
-    ThreatPattern {
-        substring: "base64",
-        pattern_id: "obfuscation_base64",
-        severity: Severity::Medium,
-        category: ThreatCategory::Obfuscation,
-        description: "base64 encoding (potential obfuscation)",
-    },
-    ThreatPattern {
-        substring: "eval(",
-        pattern_id: "obfuscation_eval",
-        severity: Severity::High,
-        category: ThreatCategory::Obfuscation,
-        description: "eval() call (code execution from string)",
-    },
-    ThreatPattern {
-        substring: "exec(",
-        pattern_id: "obfuscation_exec",
-        severity: Severity::High,
-        category: ThreatCategory::Obfuscation,
-        description: "exec() call (code execution from string)",
-    },
-];
+// Threat needles live in `edgecrab_security::threat_patterns` (gap 031 SoT).
 
 /// Trusted repositories — skills from these sources get elevated trust.
 pub const TRUSTED_REPOS: &[&str] = &[
@@ -552,19 +374,53 @@ fn scan_file(path: &Path, root: &Path, findings: &mut Vec<Finding>) {
         .to_string();
 
     for (line_num, line) in content.lines().enumerate() {
-        let lower = line.to_lowercase();
-        for pattern in THREAT_PATTERNS {
-            if lower.contains(pattern.substring) {
-                findings.push(Finding {
-                    pattern_id: pattern.pattern_id.to_string(),
-                    severity: pattern.severity,
-                    category: pattern.category,
-                    file: rel_path.clone(),
-                    line: line_num + 1,
-                    matched_text: line.chars().take(120).collect(),
-                    description: pattern.description.to_string(),
-                });
-            }
+        let result = edgecrab_security::threat_patterns::scan(
+            line,
+            edgecrab_security::threat_patterns::ScanContext::Install,
+        );
+        for f in result.findings {
+            findings.push(Finding {
+                pattern_id: f.pattern_id.to_string(),
+                severity: map_severity(f.severity),
+                category: map_category(f.category),
+                file: rel_path.clone(),
+                line: line_num + 1,
+                matched_text: line.chars().take(120).collect(),
+                description: f.description.to_string(),
+            });
+        }
+    }
+}
+
+fn map_severity(s: edgecrab_security::threat_patterns::ThreatSeverity) -> Severity {
+    match s {
+        edgecrab_security::threat_patterns::ThreatSeverity::Low => Severity::Low,
+        edgecrab_security::threat_patterns::ThreatSeverity::Medium => Severity::Medium,
+        edgecrab_security::threat_patterns::ThreatSeverity::High => Severity::High,
+        edgecrab_security::threat_patterns::ThreatSeverity::Critical => Severity::Critical,
+    }
+}
+
+fn map_category(c: edgecrab_security::threat_patterns::ThreatCategory) -> ThreatCategory {
+    match c {
+        edgecrab_security::threat_patterns::ThreatCategory::Exfiltration => {
+            ThreatCategory::Exfiltration
+        }
+        edgecrab_security::threat_patterns::ThreatCategory::Injection
+        | edgecrab_security::threat_patterns::ThreatCategory::Brainworm => {
+            ThreatCategory::Injection
+        }
+        edgecrab_security::threat_patterns::ThreatCategory::Destructive => {
+            ThreatCategory::Destructive
+        }
+        edgecrab_security::threat_patterns::ThreatCategory::Persistence => {
+            ThreatCategory::Persistence
+        }
+        edgecrab_security::threat_patterns::ThreatCategory::Network => ThreatCategory::Network,
+        edgecrab_security::threat_patterns::ThreatCategory::Obfuscation
+        | edgecrab_security::threat_patterns::ThreatCategory::Execution
+        | edgecrab_security::threat_patterns::ThreatCategory::Traversal => {
+            ThreatCategory::Obfuscation
         }
     }
 }

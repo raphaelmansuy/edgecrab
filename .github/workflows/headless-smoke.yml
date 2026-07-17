@@ -1,0 +1,32 @@
+name: Headless Smoke
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  headless-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release -p edgecrab-cli
+
+      - name: Headless JSON stream smoke
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ] && [ -z "$OPENAI_API_KEY" ]; then
+            echo "Skipping headless smoke — no model API key secret configured."
+            exit 0
+          fi
+          ./target/release/edgecrab -q --json-stream "Reply with exactly: ok" | tee /tmp/ndjson.log
+          grep -q '"kind":"done"' /tmp/ndjson.log || grep -q '"kind": "done"' /tmp/ndjson.log

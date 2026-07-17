@@ -569,16 +569,6 @@ pub struct InjectionThreat {
 }
 
 /// Invisible unicode codepoints used in prompt injection attacks.
-const INVISIBLE_CHARS: &[char] = &[
-    '\u{200B}', // zero-width space
-    '\u{200C}', // zero-width non-joiner
-    '\u{200D}', // zero-width joiner
-    '\u{2060}', // word joiner
-    '\u{FEFF}', // BOM / zero-width no-break space
-    '\u{2028}', // line separator
-    '\u{2029}', // paragraph separator
-];
-
 /// Homoglyph characters that look like ASCII but are different unicode codepoints.
 /// Common Cyrillic/Greek lookalikes for Latin letters.
 const HOMOGLYPH_RANGES: &[(char, char)] = &[
@@ -598,43 +588,17 @@ const HOMOGLYPH_RANGES: &[(char, char)] = &[
 /// `(?i)` flag catches all of these at the cost of one compile per pattern
 /// (amortised to zero via `OnceLock`).
 pub fn scan_for_injection(text: &str) -> Vec<InjectionThreat> {
-    // Compiled patterns — initialised once, reused for every call.
-    // (pattern_str, pattern_name, severity)
+    // Gap 031: needles live in `edgecrab_security::threat_patterns`.
+    // Additional whitespace/camelCase bypass regexes catch variants the
+    // substring catalogue would miss.
     static COMPILED: OnceLock<Vec<(Regex, &'static str, ThreatSeverity)>> = OnceLock::new();
     let compiled = COMPILED.get_or_init(|| {
-        // Patterns that must match as substrings (case-insensitive).
-        // The regex notation allows whitespace variants, camelCase, etc.
         let defs: &[(&str, &str, ThreatSeverity)] = &[
-            // Core override attacks
             (r"(?i)ignore[\s\-_]*previous", "ignore_previous", ThreatSeverity::High),
             (r"(?i)ignore[\s\-_]*all[\s\-_]*instructions", "ignore_all_instructions", ThreatSeverity::High),
             (r"(?i)dis[\s\-_]*regard", "disregard", ThreatSeverity::Medium),
-            (r"(?i)override[\s\-_]*system", "override_system", ThreatSeverity::High),
             (r"(?i)you[\s\-_]*are[\s\-_]*now", "you_are_now", ThreatSeverity::High),
             (r"(?i)forget[\s\-_]*every[\s\-_]*thing", "forget_everything", ThreatSeverity::High),
-            (r"(?i)new[\s\-_]*instructions\s*:", "new_instructions", ThreatSeverity::High),
-            (r"(?i)system[\s\-_]*prompt\s*:", "system_prompt_leak", ThreatSeverity::Medium),
-            // Data exfiltration / hidden content attacks (ported from Hermes)
-            (
-                r#"(?i)<\s*div\s+style\s*=\s*["'][^"']*display\s*:\s*none"#,
-                "hidden_div",
-                ThreatSeverity::High,
-            ),
-            (
-                r"(?i)translate\s+.{0,40}\s+into\s+.{0,40}\s+and\s+(execute|run|eval)",
-                "translate_execute",
-                ThreatSeverity::High,
-            ),
-            (
-                r"(?i)curl\s+[^\n]*\$\{?\w*(KEY|TOKEN|SECRET|PASSWORD|API)",
-                "exfil_curl",
-                ThreatSeverity::High,
-            ),
-            (
-                r"(?i)cat\s+[^\n]*(\.env|credentials|\.netrc|\.pgpass|id_rsa|id_ed25519)",
-                "read_secrets",
-                ThreatSeverity::High,
-            ),
         ];
         defs.iter()
             .filter_map(|&(pat, name, sev)| {
@@ -651,8 +615,25 @@ pub fn scan_for_injection(text: &str) -> Vec<InjectionThreat> {
 
     let mut threats = Vec::new();
 
+    let shared = edgecrab_security::threat_patterns::scan(
+        text,
+        edgecrab_security::threat_patterns::ScanContext::ContextFile,
+    );
+    for f in shared.findings {
+        let severity = match f.severity {
+            edgecrab_security::threat_patterns::ThreatSeverity::Low
+            | edgecrab_security::threat_patterns::ThreatSeverity::Medium => ThreatSeverity::Medium,
+            edgecrab_security::threat_patterns::ThreatSeverity::High
+            | edgecrab_security::threat_patterns::ThreatSeverity::Critical => ThreatSeverity::High,
+        };
+        threats.push(InjectionThreat {
+            pattern_name: f.pattern_id.to_string(),
+            severity,
+        });
+    }
+
     for (re, name, severity) in compiled {
-        if re.is_match(text) {
+        if re.is_match(text) && !threats.iter().any(|t| t.pattern_name == *name) {
             threats.push(InjectionThreat {
                 pattern_name: name.to_string(),
                 severity: *severity,
@@ -661,7 +642,11 @@ pub fn scan_for_injection(text: &str) -> Vec<InjectionThreat> {
     }
 
     // Check for invisible unicode characters
-    if text.chars().any(|c| INVISIBLE_CHARS.contains(&c)) {
+    if text
+        .chars()
+        .any(|c| edgecrab_security::threat_patterns::INVISIBLE_CHARS.contains(&c))
+        && !threats.iter().any(|t| t.pattern_name == "invisible_unicode")
+    {
         threats.push(InjectionThreat {
             pattern_name: "invisible_unicode".to_string(),
             severity: ThreatSeverity::High,
@@ -1639,18 +1624,53 @@ fn collect_agents_md_files(cwd: &Path) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Hard caps so recursive AGENTS.md discovery stays Hermes-lean (prompt weight).
+const MAX_AGENTS_MD_FILES: usize = 8;
+const MAX_AGENTS_MD_TOTAL_BYTES: usize = 48_000;
+const MAX_AGENTS_MD_DEPTH: usize = 6;
+
 /// Recursive helper: walk `dir`, collecting AGENTS.md files.
 fn collect_agents_md_recursive(
     dir: &Path,
     _cwd: &Path,
     files: &mut Vec<(std::path::PathBuf, String)>,
 ) {
+    collect_agents_md_recursive_budget(dir, files, 0, &mut 0);
+}
+
+fn collect_agents_md_recursive_budget(
+    dir: &Path,
+    files: &mut Vec<(std::path::PathBuf, String)>,
+    depth: usize,
+    total_bytes: &mut usize,
+) {
+    if files.len() >= MAX_AGENTS_MD_FILES || *total_bytes >= MAX_AGENTS_MD_TOTAL_BYTES {
+        return;
+    }
+    if depth > MAX_AGENTS_MD_DEPTH {
+        return;
+    }
+
     // Load AGENTS.md in this directory
     let agents_path = dir.join("AGENTS.md");
     if let Ok(content) = std::fs::read_to_string(&agents_path)
         && !content.trim().is_empty()
     {
-        files.push((agents_path, content));
+        let remaining = MAX_AGENTS_MD_TOTAL_BYTES.saturating_sub(*total_bytes);
+        if remaining == 0 {
+            return;
+        }
+        let clipped = if content.len() > remaining {
+            content.chars().take(remaining).collect::<String>()
+        } else {
+            content
+        };
+        *total_bytes += clipped.len();
+        files.push((agents_path, clipped));
+    }
+
+    if files.len() >= MAX_AGENTS_MD_FILES || *total_bytes >= MAX_AGENTS_MD_TOTAL_BYTES {
+        return;
     }
 
     // Recurse into subdirectories (skip hidden/system dirs)
@@ -1659,6 +1679,9 @@ fn collect_agents_md_recursive(
         Err(_) => return,
     };
     for entry in entries.flatten() {
+        if files.len() >= MAX_AGENTS_MD_FILES || *total_bytes >= MAX_AGENTS_MD_TOTAL_BYTES {
+            break;
+        }
         let path = entry.path();
         let Ok(metadata) = std::fs::symlink_metadata(&path) else {
             continue;
@@ -1681,7 +1704,7 @@ fn collect_agents_md_recursive(
         ) {
             continue;
         }
-        collect_agents_md_recursive(&path, _cwd, files);
+        collect_agents_md_recursive_budget(&path, files, depth + 1, total_bytes);
     }
 }
 
@@ -1740,11 +1763,32 @@ fn load_memory_file(
     filename: &str,
     title: &str,
     max_chars: usize,
+    scan_recalled: bool,
 ) -> Option<String> {
     let content = std::fs::read_to_string(mem_dir.join(filename)).ok()?;
     let trimmed = content.trim();
     if trimmed.is_empty() {
         return None;
+    }
+    if scan_recalled {
+        let result = edgecrab_security::threat_patterns::scan(
+            trimmed,
+            edgecrab_security::threat_patterns::ScanContext::Memory,
+        );
+        if !matches!(
+            result.verdict,
+            edgecrab_security::threat_patterns::Verdict::Allow
+        ) {
+            let kinds: Vec<&str> = result.findings.iter().map(|f| f.pattern_id).collect();
+            tracing::warn!(
+                file = filename,
+                threats = ?kinds,
+                "Recalled memory quarantined at load — content skipped for security"
+            );
+            return Some(format!(
+                "[BLOCKED: {filename} contained potential promptware ({kinds:?}). Content skipped for security.]"
+            ));
+        }
     }
     let truncated = crate::safe_truncate(trimmed, max_chars);
     let pct = (trimmed.len() * 100) / max_chars;
@@ -1828,6 +1872,11 @@ fn seed_global_soul(edgecrab_home: &Path) {
 }
 
 pub fn load_memory_sections(edgecrab_home: &Path) -> Vec<String> {
+    load_memory_sections_with_options(edgecrab_home, true)
+}
+
+/// Load MEMORY.md / USER.md with optional recalled-memory scanning (gap 031).
+pub fn load_memory_sections_with_options(edgecrab_home: &Path, scan_recalled: bool) -> Vec<String> {
     let mut sections = Vec::new();
     let mem_dir = edgecrab_home.join("memories");
 
@@ -1836,10 +1885,17 @@ pub fn load_memory_sections(edgecrab_home: &Path) -> Vec<String> {
         "MEMORY.md",
         "MEMORY (your personal notes)",
         MEMORY_MAX_CHARS,
+        scan_recalled,
     ) {
         sections.push(s);
     }
-    if let Some(s) = load_memory_file(&mem_dir, "USER.md", "USER PROFILE", USER_MAX_CHARS) {
+    if let Some(s) = load_memory_file(
+        &mem_dir,
+        "USER.md",
+        "USER PROFILE",
+        USER_MAX_CHARS,
+        scan_recalled,
+    ) {
         sections.push(s);
     }
 

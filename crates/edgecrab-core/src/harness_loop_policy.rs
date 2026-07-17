@@ -45,7 +45,7 @@ pub fn visual_storm_block_result(
             action: edgecrab_tools::tool_loop_guardrails::GuardrailAction::Block,
             code: "visual_storm_act_block",
             message: "Blocked shell/code tool — visual task needs browser evidence, not terminal debugging. \
-                       Run /config set security.preview.enabled true if needed, start a dev server, \
+                       Run /config preview on if needed, start a dev server, \
                        then browser_navigate + browser_snapshot."
                 .into(),
             tool_name: tool_name.to_string(),

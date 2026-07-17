@@ -426,6 +426,8 @@ mod tests {
             user_id: None,
             model: Some("test".into()),
             system_prompt: None,
+            stable_system_prompt: None,
+            semi_stable_system_prompt: None,
             parent_session_id: None,
             started_at: 0.0,
             ended_at: None,
@@ -437,6 +439,7 @@ mod tests {
             cache_read_tokens: 0,
             cache_write_tokens: 0,
             reasoning_tokens: 0,
+            last_prompt_tokens: 0,
             estimated_cost_usd: None,
             title: Some("demo".into()),
         })

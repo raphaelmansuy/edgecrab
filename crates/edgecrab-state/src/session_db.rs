@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use edgecrab_types::{AgentError, Message, Role};
 
 /// Schema version — incremented on breaking schema changes.
-const SCHEMA_VERSION: u32 = 10;
+const SCHEMA_VERSION: u32 = 12;
 
 // Write-contention constants
 const WRITE_MAX_RETRIES: u32 = 15;
@@ -50,6 +50,12 @@ pub struct SessionRecord {
     pub user_id: Option<String>,
     pub model: Option<String>,
     pub system_prompt: Option<String>,
+    /// Stable cache-law prefix (1h tier). Restored with [`Self::system_prompt`] for 3-tier wire.
+    #[serde(default)]
+    pub stable_system_prompt: Option<String>,
+    /// Semi-stable skills index (5m tier).
+    #[serde(default)]
+    pub semi_stable_system_prompt: Option<String>,
     pub parent_session_id: Option<String>,
     pub started_at: f64,
     pub ended_at: Option<f64>,
@@ -61,6 +67,9 @@ pub struct SessionRecord {
     pub cache_read_tokens: i64,
     pub cache_write_tokens: i64,
     pub reasoning_tokens: i64,
+    /// Last full-request prompt-side token pressure (Hermes parity for restore UI).
+    #[serde(default)]
+    pub last_prompt_tokens: i64,
     pub estimated_cost_usd: Option<f64>,
     pub title: Option<String>,
 }
@@ -310,6 +319,12 @@ impl SessionDb {
                 if v < 10 {
                     Self::migrate_to_v10(conn)?;
                 }
+                if v < 11 {
+                    Self::migrate_to_v11(conn)?;
+                }
+                if v < 12 {
+                    Self::migrate_to_v12(conn)?;
+                }
                 conn.execute(
                     "UPDATE schema_version SET version = ?1",
                     params![SCHEMA_VERSION],
@@ -377,6 +392,17 @@ impl SessionDb {
         Self::ensure_sessions_column(conn, "handoff_state", "TEXT")?;
         Self::ensure_sessions_column(conn, "handoff_platform", "TEXT")?;
         Self::ensure_sessions_column(conn, "handoff_error", "TEXT")?;
+        Ok(())
+    }
+
+    fn migrate_to_v11(conn: &Connection) -> Result<(), AgentError> {
+        Self::ensure_sessions_column(conn, "last_prompt_tokens", "INTEGER NOT NULL DEFAULT 0")?;
+        Ok(())
+    }
+
+    fn migrate_to_v12(conn: &Connection) -> Result<(), AgentError> {
+        Self::ensure_sessions_column(conn, "stable_system_prompt", "TEXT")?;
+        Self::ensure_sessions_column(conn, "semi_stable_system_prompt", "TEXT")?;
         Ok(())
     }
 
@@ -473,16 +499,19 @@ impl SessionDb {
     ) -> Result<(), rusqlite::Error> {
         conn.execute(
             "INSERT INTO sessions
-             (id, source, user_id, model, system_prompt, parent_session_id,
+             (id, source, user_id, model, system_prompt, stable_system_prompt,
+              semi_stable_system_prompt, parent_session_id,
               started_at, ended_at, end_reason, message_count, tool_call_count,
               input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-              reasoning_tokens, estimated_cost_usd, title)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)
+              reasoning_tokens, last_prompt_tokens, estimated_cost_usd, title)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)
              ON CONFLICT(id) DO UPDATE SET
               source = excluded.source,
               user_id = excluded.user_id,
               model = excluded.model,
               system_prompt = excluded.system_prompt,
+              stable_system_prompt = excluded.stable_system_prompt,
+              semi_stable_system_prompt = excluded.semi_stable_system_prompt,
               parent_session_id = excluded.parent_session_id,
               started_at = sessions.started_at,
               ended_at = excluded.ended_at,
@@ -494,6 +523,7 @@ impl SessionDb {
               cache_read_tokens = excluded.cache_read_tokens,
               cache_write_tokens = excluded.cache_write_tokens,
               reasoning_tokens = excluded.reasoning_tokens,
+              last_prompt_tokens = excluded.last_prompt_tokens,
               estimated_cost_usd = excluded.estimated_cost_usd,
               title = excluded.title",
             params![
@@ -502,6 +532,8 @@ impl SessionDb {
                 session.user_id,
                 session.model,
                 session.system_prompt,
+                session.stable_system_prompt,
+                session.semi_stable_system_prompt,
                 session.parent_session_id,
                 session.started_at,
                 session.ended_at,
@@ -513,6 +545,7 @@ impl SessionDb {
                 session.cache_read_tokens,
                 session.cache_write_tokens,
                 session.reasoning_tokens,
+                session.last_prompt_tokens,
                 session.estimated_cost_usd,
                 session.title,
             ],
@@ -571,40 +604,46 @@ impl SessionDb {
             .map_err(|e| AgentError::Database(e.to_string()))?;
         let mut stmt = conn
             .prepare(
-                "SELECT id, source, user_id, model, system_prompt, parent_session_id,
+                "SELECT id, source, user_id, model, system_prompt,
+                        stable_system_prompt, semi_stable_system_prompt, parent_session_id,
                         started_at, ended_at, end_reason, message_count, tool_call_count,
                         input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-                        reasoning_tokens, estimated_cost_usd, title
+                        reasoning_tokens, COALESCE(last_prompt_tokens, 0), estimated_cost_usd, title
                  FROM sessions WHERE id = ?1",
             )
             .map_err(|e| AgentError::Database(e.to_string()))?;
 
         let result = stmt
-            .query_row(params![id], |row| {
-                Ok(SessionRecord {
-                    id: row.get(0)?,
-                    source: row.get(1)?,
-                    user_id: row.get(2)?,
-                    model: row.get(3)?,
-                    system_prompt: row.get(4)?,
-                    parent_session_id: row.get(5)?,
-                    started_at: row.get(6)?,
-                    ended_at: row.get(7)?,
-                    end_reason: row.get(8)?,
-                    message_count: row.get(9)?,
-                    tool_call_count: row.get(10)?,
-                    input_tokens: row.get(11)?,
-                    output_tokens: row.get(12)?,
-                    cache_read_tokens: row.get(13)?,
-                    cache_write_tokens: row.get(14)?,
-                    reasoning_tokens: row.get(15)?,
-                    estimated_cost_usd: row.get(16)?,
-                    title: row.get(17)?,
-                })
-            })
+            .query_row(params![id], Self::session_record_from_row)
             .ok();
 
         Ok(result)
+    }
+
+    fn session_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
+        Ok(SessionRecord {
+            id: row.get(0)?,
+            source: row.get(1)?,
+            user_id: row.get(2)?,
+            model: row.get(3)?,
+            system_prompt: row.get(4)?,
+            stable_system_prompt: row.get(5)?,
+            semi_stable_system_prompt: row.get(6)?,
+            parent_session_id: row.get(7)?,
+            started_at: row.get(8)?,
+            ended_at: row.get(9)?,
+            end_reason: row.get(10)?,
+            message_count: row.get(11)?,
+            tool_call_count: row.get(12)?,
+            input_tokens: row.get(13)?,
+            output_tokens: row.get(14)?,
+            cache_read_tokens: row.get(15)?,
+            cache_write_tokens: row.get(16)?,
+            reasoning_tokens: row.get(17)?,
+            last_prompt_tokens: row.get(18)?,
+            estimated_cost_usd: row.get(19)?,
+            title: row.get(20)?,
+        })
     }
 
     pub fn list_sessions(&self, limit: usize) -> Result<Vec<SessionSummary>, AgentError> {
@@ -944,34 +983,14 @@ impl SessionDb {
             .map_err(|e| AgentError::Database(e.to_string()))?;
         let result = conn
             .query_row(
-                "SELECT id, source, user_id, model, system_prompt, parent_session_id,
+                "SELECT id, source, user_id, model, system_prompt,
+                        stable_system_prompt, semi_stable_system_prompt, parent_session_id,
                         started_at, ended_at, end_reason, message_count, tool_call_count,
                         input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-                        reasoning_tokens, estimated_cost_usd, title
+                        reasoning_tokens, COALESCE(last_prompt_tokens, 0), estimated_cost_usd, title
                  FROM sessions WHERE title = ?1",
                 params![title],
-                |row| {
-                    Ok(SessionRecord {
-                        id: row.get(0)?,
-                        source: row.get(1)?,
-                        user_id: row.get(2)?,
-                        model: row.get(3)?,
-                        system_prompt: row.get(4)?,
-                        parent_session_id: row.get(5)?,
-                        started_at: row.get(6)?,
-                        ended_at: row.get(7)?,
-                        end_reason: row.get(8)?,
-                        message_count: row.get(9)?,
-                        tool_call_count: row.get(10)?,
-                        input_tokens: row.get(11)?,
-                        output_tokens: row.get(12)?,
-                        cache_read_tokens: row.get(13)?,
-                        cache_write_tokens: row.get(14)?,
-                        reasoning_tokens: row.get(15)?,
-                        estimated_cost_usd: row.get(16)?,
-                        title: row.get(17)?,
-                    })
-                },
+                Self::session_record_from_row,
             )
             .ok();
         Ok(result)
@@ -2341,6 +2360,8 @@ mod tests {
             user_id: None,
             model: Some("mock/test".to_string()),
             system_prompt: None,
+            stable_system_prompt: None,
+            semi_stable_system_prompt: None,
             parent_session_id: None,
             started_at: 1720000000.0,
             ended_at: None,
@@ -2352,6 +2373,7 @@ mod tests {
             cache_read_tokens: 0,
             cache_write_tokens: 0,
             reasoning_tokens: 0,
+            last_prompt_tokens: 0,
             estimated_cost_usd: None,
             title: Some("Test session".to_string()),
         }

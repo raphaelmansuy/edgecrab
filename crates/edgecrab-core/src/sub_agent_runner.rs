@@ -71,6 +71,7 @@ impl SubAgentRunner for CoreSubAgentRunner {
             agent_id,
             parent_id,
             depth,
+            isolated_worktree,
         } = request;
         let (child_provider, child_model) =
             self.resolve_child_provider_and_model(model_override.as_deref())?;
@@ -148,9 +149,28 @@ impl SubAgentRunner for CoreSubAgentRunner {
 
         let delegate_ctx = ExecuteLoopDelegateCtx {
             depth,
-            agent_id,
+            agent_id: agent_id.clone(),
             parent_id,
         };
+
+        let worktree_cwd = if isolated_worktree {
+            let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
+            if let Some(repo_root) = edgecrab_tools::isolated_worktree::git_repo_root_from(&cwd) {
+                let task_key = format!("{task_index}-{agent_id}");
+                let info = edgecrab_tools::isolated_worktree::setup_isolated_worktree(
+                    &repo_root,
+                    &task_key,
+                )
+                .map_err(|e| format!("worktree setup: {e}"))?;
+                let report = edgecrab_tools::isolated_worktree::merge_report(&info);
+                Some((info, report))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let cwd_override = worktree_cwd.as_ref().map(|(info, _)| info.path.as_path());
 
         let result = child
             .execute_loop(
@@ -158,7 +178,7 @@ impl SubAgentRunner for CoreSubAgentRunner {
                 Some(&system_prompt),
                 None,
                 Some(&child_event_tx),
-                None,
+                cwd_override,
                 Some(delegate_ctx),
             )
             .await;
@@ -167,7 +187,11 @@ impl SubAgentRunner for CoreSubAgentRunner {
         if let Some(forwarder) = progress_forwarder {
             let _ = forwarder.await;
         }
-        let result = result.map_err(|e| format!("Child agent execution failed: {e}"))?;
+        let mut result = result.map_err(|e| format!("Child agent execution failed: {e}"))?;
+
+        if let Some((_, report)) = worktree_cwd {
+            result.final_response = format!("{}\n\n{}", result.final_response, report);
+        }
 
         Ok(SubAgentResult {
             summary: result.final_response,

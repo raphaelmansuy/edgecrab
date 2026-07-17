@@ -109,6 +109,8 @@ pub async fn run(config_override: Option<&str>) -> anyhow::Result<bool> {
     if let Ok(config) = edgecrab_core::AppConfig::load() {
         checks.push(check_toolset_policy(&config));
         checks.push(check_schema_mode(&config));
+        checks.push(check_prompt_prefix_cache(&config));
+        checks.push(check_smart_routing(&config));
     }
     checks.extend(check_mcp_servers());
     checks.extend(check_provider_keys());
@@ -187,7 +189,7 @@ pub fn run_harness(config_override: Option<&str>) -> anyhow::Result<()> {
         _ => {
             println!(
                 "  ⚠ security.preview disabled — visual tasks cannot browser_navigate localhost.\n\
-                 Fix: /config set security.preview.enabled true\n\
+                 Fix: /config preview on\n\
                  Or add to active profile config.yaml:\n\
                    security:\n\
                      preview:\n\
@@ -295,6 +297,86 @@ fn check_schema_mode(config: &edgecrab_core::AppConfig) -> Check {
             "Schema mode",
             "full — all enabled tools on wire with verbose descriptions",
         ),
+    }
+}
+
+fn check_prompt_prefix_cache(config: &edgecrab_core::AppConfig) -> Check {
+    let model = config.model.default_model.trim();
+    let (provider, model_id) = model.split_once('/').unwrap_or((model, ""));
+    let supports = edgecrab_core::prompt_cache_policy::provider_supports_prompt_caching(
+        provider, model_id, None,
+    );
+    let prefix = &config.cache.prompt_prefix;
+    match (supports, prefix.enabled) {
+        (true, true) => Check::pass(
+            "Prompt cache",
+            format!(
+                "enabled (ttl={}, warm_on_start={}); SLO ≥70% hit after 3+ turns — watch via /context budget or /cost",
+                prefix.ttl, prefix.warm_on_start
+            ),
+        ),
+        (true, false) => Check::warn(
+            "Prompt cache",
+            "provider supports caching but cache.prompt_prefix.enabled=false",
+        ),
+        (false, _) => Check::pass(
+            "Prompt cache",
+            "not applicable for configured provider (local KV normalize still applies for lmstudio/ollama)",
+        ),
+    }
+}
+
+fn check_smart_routing(config: &edgecrab_core::AppConfig) -> Check {
+    let sr = &config.model.smart_routing;
+    if sr.enabled {
+        if sr.cheap_model.trim().is_empty() {
+            Check::warn(
+                "Smart routing",
+                "model.smart_routing.enabled=true but cheap_model is empty — set via /pareto or config",
+            )
+        } else {
+            Check::pass(
+                "Smart routing",
+                format!(
+                    "enabled (cheap_model={}); simple turns route to cheap model — stats in /cost",
+                    sr.cheap_model
+                ),
+            )
+        }
+    } else {
+        Check::pass(
+            "Smart routing",
+            "disabled (set model.smart_routing.enabled: true for Pareto savings)",
+        )
+    }
+}
+
+/// Warn when a live session has enough turns but cache hit rate is below 70%.
+pub fn check_cache_hit_rate_slo(
+    caching_enabled: bool,
+    api_call_count: u32,
+    hit_rate_pct: Option<f64>,
+) -> Option<Check> {
+    if !caching_enabled || api_call_count < 3 {
+        return None;
+    }
+    match hit_rate_pct {
+        Some(rate) if rate < 70.0 => Some(Check::warn(
+            "Cache hit rate",
+            format!(
+                "{rate:.0}% after {api_call_count} API turns (SLO ≥70%) — check stable/semi prefixes and provider matrix"
+            ),
+        )),
+        Some(rate) => Some(Check::pass(
+            "Cache hit rate",
+            format!("{rate:.0}% after {api_call_count} API turns (SLO ≥70%)"),
+        )),
+        None => Some(Check::warn(
+            "Cache hit rate",
+            format!(
+                "no cache_read tokens after {api_call_count} API turns — prefix may be busting every turn"
+            ),
+        )),
     }
 }
 
@@ -1048,6 +1130,15 @@ mod tests {
         let check = permission_check("Accessibility", MacosConsentState::Denied, "fix it");
         assert_eq!(check.status, CheckStatus::Warn);
         assert!(check.detail.contains("cached TCC state"));
+    }
+
+    #[test]
+    fn cache_hit_rate_slo_warns_below_seventy() {
+        let warn = check_cache_hit_rate_slo(true, 5, Some(40.0)).expect("check");
+        assert_eq!(warn.status, CheckStatus::Warn);
+        let pass = check_cache_hit_rate_slo(true, 5, Some(85.0)).expect("check");
+        assert_eq!(pass.status, CheckStatus::Pass);
+        assert!(check_cache_hit_rate_slo(true, 2, Some(10.0)).is_none());
     }
 
     #[test]

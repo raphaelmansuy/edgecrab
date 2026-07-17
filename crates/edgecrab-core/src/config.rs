@@ -171,6 +171,10 @@ pub struct PromptPrefixCacheConfig {
     pub enabled: bool,
     /// Cache TTL tier: `"5m"` (default) or `"1h"` (cross-session, requires extended-cache beta).
     pub ttl: String,
+    /// When true, fire a `max_tokens: 0` warm request for Anthropic-class sessions
+    /// at interactive start (July 2026 best practice for cold-start TTFT).
+    #[serde(default)]
+    pub warm_on_start: bool,
 }
 
 impl Default for PromptPrefixCacheConfig {
@@ -178,6 +182,7 @@ impl Default for PromptPrefixCacheConfig {
         Self {
             enabled: true,
             ttl: "1h".into(),
+            warm_on_start: false,
         }
     }
 }
@@ -1200,10 +1205,18 @@ pub struct ToolsConfig {
     /// `0` disables per-turn budget enforcement (Hermes `enforce_turn_budget`).
     #[serde(default = "default_result_turn_budget_chars")]
     pub result_turn_budget_chars: usize,
+    /// Cap on non-hot tools materialized onto the wire in indexed mode.
+    /// `0` = unlimited. Default 12 (Hermes-inspired wire budget).
+    #[serde(default = "default_max_materialized_tools")]
+    pub max_materialized_tools: usize,
 }
 
 fn default_result_turn_budget_chars() -> usize {
     200_000
+}
+
+fn default_max_materialized_tools() -> usize {
+    edgecrab_tools::DEFAULT_MAX_MATERIALIZED_TOOLS
 }
 
 impl Default for ToolsConfig {
@@ -1223,6 +1236,7 @@ impl Default for ToolsConfig {
             result_spill_threshold: 16_384,
             result_spill_preview_lines: 80,
             result_turn_budget_chars: default_result_turn_budget_chars(),
+            max_materialized_tools: default_max_materialized_tools(),
         }
     }
 }
@@ -1606,6 +1620,12 @@ pub struct DiscordGatewayConfig {
     pub token_env: String,
     pub allowed_users: Vec<String>,
     pub home_channel: Option<String>,
+    /// Fetch recent channel history on first message (gap 016).
+    pub backfill_on_join: bool,
+    /// Max messages to fetch when backfilling (default 50).
+    pub backfill_limit: u32,
+    /// Drop oldest backfilled messages above this token estimate (default 8000).
+    pub backfill_max_tokens: u32,
 }
 
 impl Default for DiscordGatewayConfig {
@@ -1615,6 +1635,9 @@ impl Default for DiscordGatewayConfig {
             token_env: "DISCORD_BOT_TOKEN".into(),
             allowed_users: Vec::new(),
             home_channel: None,
+            backfill_on_join: true,
+            backfill_limit: 50,
+            backfill_max_tokens: 8000,
         }
     }
 }
@@ -2036,13 +2059,38 @@ pub struct SecurityConfig {
     pub blocked_commands: Vec<String>,
     pub path_restrictions: Vec<PathBuf>,
     pub injection_scanning: bool,
+    /// Wrap tool results in EdgeCrab delimiters so forged framing cannot break out (gap 031).
+    #[serde(default = "default_true")]
+    pub tool_output_delimiters: bool,
+    /// Scan MEMORY.md / USER.md at load time before prompt injection (gap 031).
+    #[serde(default = "default_true")]
+    pub scan_recalled_memory: bool,
     pub url_safety: bool,
     pub website_blocklist: WebsiteBlocklistConfig,
     /// Allow loopback HTTP preview for visual UX verification (dev profile).
     pub preview: PreviewConfig,
+    /// Optional OS-level sandbox for local terminal (`off` | `seatbelt` | `bubblewrap`).
+    #[serde(default)]
+    pub os_sandbox: OsSandboxConfig,
     /// Set by EDGECRAB_MANAGED=1 — blocks config writes.
     #[serde(skip)]
     pub managed_mode: bool,
+}
+
+/// Optional kernel/userspace sandbox for the local terminal tool (Wave 2).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct OsSandboxConfig {
+    /// `off` (default), `seatbelt` (macOS), or `bubblewrap` (Linux).
+    pub mode: String,
+}
+
+impl Default for OsSandboxConfig {
+    fn default() -> Self {
+        Self {
+            mode: "off".into(),
+        }
+    }
 }
 
 impl Default for SecurityConfig {
@@ -2052,9 +2100,12 @@ impl Default for SecurityConfig {
             blocked_commands: Vec::new(),
             path_restrictions: Vec::new(),
             injection_scanning: true,
+            tool_output_delimiters: true,
+            scan_recalled_memory: true,
             url_safety: true,
             website_blocklist: WebsiteBlocklistConfig::default(),
             preview: PreviewConfig::default(),
+            os_sandbox: OsSandboxConfig::default(),
             managed_mode: false,
         }
     }
@@ -2138,6 +2189,11 @@ pub struct CompressionConfig {
     /// Always keep the last N messages uncompressed.
     pub protect_last_n: usize,
     pub summary_model: Option<String>,
+    /// Gateway pre-agent hygiene: force compress when message count exceeds this
+    /// (Hermes `compression.hygiene_hard_message_limit` parity). Token threshold
+    /// for hygiene is fixed at 85% of the context window — intentionally higher
+    /// than [`Self::threshold`] so the in-loop compressor stays primary.
+    pub hygiene_hard_message_limit: usize,
 }
 
 impl Default for CompressionConfig {
@@ -2148,6 +2204,7 @@ impl Default for CompressionConfig {
             target_ratio: 0.20,
             protect_last_n: 20,
             summary_model: None,
+            hygiene_hard_message_limit: 5000,
         }
     }
 }
@@ -3407,6 +3464,35 @@ observability:
             ports.contains(&8000),
             "http.server default port must be allowlisted"
         );
+    }
+
+    #[test]
+    fn ha41_migrate_profile_preview_from_global_persists() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let install = tmp.path().join(".edgecrab");
+        let profile_dir = install.join("profiles").join("homelab");
+        std::fs::create_dir_all(&profile_dir).expect("mkdir");
+        std::fs::write(
+            install.join("config.yaml"),
+            "security:\n  preview:\n    enabled: true\n    allow_localhost_ports: [8000]\n",
+        )
+        .expect("global");
+        let profile_cfg = profile_dir.join("config.yaml");
+        std::fs::write(&profile_cfg, "model:\n  default: test\n").expect("profile");
+        unsafe { std::env::set_var("EDGECRAB_HOME", install.as_os_str()) };
+        let migrated =
+            AppConfig::migrate_profile_preview_from_global(&profile_cfg).expect("migrate");
+        assert!(migrated);
+        let loaded = AppConfig::load_from(&profile_cfg).expect("load profile");
+        assert!(loaded.security.preview.enabled);
+        assert!(
+            loaded
+                .security
+                .preview
+                .allow_localhost_ports
+                .contains(&8000)
+        );
+        unsafe { std::env::remove_var("EDGECRAB_HOME") };
     }
 
     #[test]

@@ -66,6 +66,12 @@ pub struct CliArgs {
     #[arg(short, long, global = true)]
     pub quiet: bool,
 
+    /// With `--quiet`, emit simplified NDJSON `StreamEvent` lines to stdout.
+    ///
+    /// Pi-class headless CI: `edgecrab -q --json-stream "prompt"`.
+    #[arg(long = "json-stream", global = true)]
+    pub json_stream: bool,
+
     /// Config file path (default: ~/.edgecrab/config.yaml)
     #[arg(short, long, global = true)]
     pub config: Option<String>,
@@ -431,6 +437,12 @@ pub enum Command {
         command: ConfigCommand,
     },
 
+    /// Secret store (file/env resolver — gap 032)
+    Secret {
+        #[command(subcommand)]
+        command: SecretCommand,
+    },
+
     /// Inspect registered tools and toolsets
     Tools {
         #[command(subcommand)]
@@ -478,6 +490,21 @@ pub enum Command {
     Gateway {
         #[command(subcommand)]
         command: GatewayCommand,
+    },
+
+    /// Install a skill pack — Pi-class `edgecrab install <spec>`
+    ///
+    /// Accepts `git:owner/repo/path`, `owner/repo/path`, `git:https://...`, or a local path.
+    /// Same installer as `/skills install` and `edgecrab skills install`.
+    Install {
+        /// Skill spec (GitHub path, git URL, or local directory)
+        spec: String,
+    },
+
+    /// Kanban board CLI (list cards, inspect workers)
+    Kanban {
+        #[command(subcommand)]
+        command: KanbanCommand,
     },
 
     /// Manage agent skills (~/.edgecrab/skills/)
@@ -897,6 +924,16 @@ pub enum AcpCommand {
 }
 
 #[derive(Subcommand, Debug, Clone)]
+pub enum SecretCommand {
+    /// List file-backed secret names
+    List,
+    /// Check whether a secret resolves (prints set|missing)
+    Get { name: String },
+    /// Store a secret in ~/.edgecrab/secrets/
+    Set { name: String, value: String },
+}
+
+#[derive(Subcommand, Debug, Clone)]
 pub enum ConfigCommand {
     /// Print the active config as YAML
     Show,
@@ -977,6 +1014,8 @@ pub enum McpCommand {
     /// Remove an MCP server
     #[command(visible_aliases = ["uninstall", "rm"])]
     Remove { name: String },
+    /// Expose EdgeCrab tools as an MCP server over stdio
+    Serve,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -1338,6 +1377,12 @@ pub enum ProfileCommand {
         #[arg(long)]
         name: Option<String>,
     },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum KanbanCommand {
+    /// List kanban task cards from the default board
+    List,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -2009,6 +2054,25 @@ mod tests {
                 command: SkillsCommand::Remove { .. }
             })
         ));
+    }
+
+    #[test]
+    fn parse_top_level_install_skill_pack() {
+        let args = CliArgs::parse_from(["edgecrab", "install", "owner/repo/path/to/skill"]);
+        match args.command {
+            Some(Command::Install { spec }) => {
+                assert_eq!(spec, "owner/repo/path/to/skill");
+            }
+            other => panic!("expected Command::Install, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_json_stream_global_flag() {
+        let args = CliArgs::parse_from(["edgecrab", "-q", "--json-stream", "hello"]);
+        assert!(args.json_stream);
+        assert!(args.quiet);
+        assert_eq!(args.prompt_text().as_deref(), Some("hello"));
     }
 
     #[test]

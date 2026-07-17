@@ -282,7 +282,8 @@ pub fn browser_navigate_blocked(url: &str, reason: &str, known_ports: &[u16]) ->
             json!({
                 "tool": "browser_navigate",
                 "url_shape": "http://127.0.0.1:PORT/path",
-                "fix_via": "/config set security.preview.enabled true",
+                "fix_via": "/config preview on",
+                "cli_alt": "edgecrab config set security.preview.enabled true",
                 "do_not": ["read_file on ~/.edgecrab/config.yaml", "terminal cat/grep on home config"],
                 "security_preview_yaml": {
                     "security": {

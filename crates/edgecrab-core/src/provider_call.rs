@@ -622,31 +622,41 @@ pub(crate) async fn api_call_streaming(
     };
 
     loop {
+        // Local KV engines (Ollama/LM Studio/vLLM) can pause for minutes during
+        // prefill — Hermes disables stale-stream kills for local endpoints.
+        let local_provider =
+            crate::local_provider_policy::is_local_inference_provider(provider.name());
+
         let next_chunk = if saw_meaningful_chunk {
-            // Inter-chunk timeout — detect stale streams (FP10).
-            match tokio::time::timeout(STREAM_INTER_CHUNK_TIMEOUT, stream.next()).await {
-                Ok(chunk) => chunk,
-                Err(_) => {
-                    for entry in tool_calls.values() {
-                        if entry.function_name.is_some() {
-                            let name = entry.function_name.as_deref().unwrap_or("tool");
-                            emit_activity(
-                                Some(event_tx),
-                                edgecrab_tools::tool_progress_tail::format_tool_args_stream_stall(
-                                    name,
-                                    entry.arguments.len(),
-                                    STREAM_INTER_CHUNK_TIMEOUT.as_secs(),
-                                ),
-                            );
+            if local_provider {
+                // No inter-chunk stale timeout — long local prefill/generation gaps are normal.
+                stream.next().await
+            } else {
+                // Inter-chunk timeout — detect stale streams (FP10).
+                match tokio::time::timeout(STREAM_INTER_CHUNK_TIMEOUT, stream.next()).await {
+                    Ok(chunk) => chunk,
+                    Err(_) => {
+                        for entry in tool_calls.values() {
+                            if entry.function_name.is_some() {
+                                let name = entry.function_name.as_deref().unwrap_or("tool");
+                                emit_activity(
+                                    Some(event_tx),
+                                    edgecrab_tools::tool_progress_tail::format_tool_args_stream_stall(
+                                        name,
+                                        entry.arguments.len(),
+                                        STREAM_INTER_CHUNK_TIMEOUT.as_secs(),
+                                    ),
+                                );
+                            }
                         }
+                        tracing::warn!(
+                            "api_call_streaming: inter-chunk timeout ({:?}) elapsed — \
+                             stream stale, returning partial content",
+                            STREAM_INTER_CHUNK_TIMEOUT,
+                        );
+                        finish_reason = Some(FINISH_REASON_STREAM_INTERRUPTED.to_string());
+                        break;
                     }
-                    tracing::warn!(
-                        "api_call_streaming: inter-chunk timeout ({:?}) elapsed — \
-                         stream stale, returning partial content",
-                        STREAM_INTER_CHUNK_TIMEOUT,
-                    );
-                    finish_reason = Some(FINISH_REASON_STREAM_INTERRUPTED.to_string());
-                    break;
                 }
             }
         } else {
@@ -1485,7 +1495,7 @@ pub async fn api_call_with_retry(
                     // retry-after duration so the next backoff sleeps the
                     // correct amount rather than a fixed BASE_BACKOFF.
                     if let edgequake_llm::LlmError::RateLimited(msg) = &e {
-                        rate_limit_delay = parse_retry_after(msg);
+                        rate_limit_delay = parse_retry_after(msg.as_str());
                         if let Some(d) = rate_limit_delay {
                             tracing::info!(
                                 provider = provider.name(),

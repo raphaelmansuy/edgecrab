@@ -40,6 +40,7 @@ pub mod kanban_respawn_guard;
 pub mod kanban_slash;
 pub mod kanban_task_patch;
 pub mod kanban_workers;
+pub mod lifecycle_hooks;
 pub mod local_provider_policy;
 pub mod logging;
 pub mod model_catalog;
@@ -65,6 +66,7 @@ pub mod steering;
 pub mod stream_observability;
 pub mod sub_agent_runner;
 pub mod subagent_registry;
+pub mod subdirectory_hints;
 pub mod task_class;
 pub mod tool_result_spill;
 pub mod tool_result_summary;
@@ -155,7 +157,8 @@ pub use model_discovery::{
     live_discovery_providers, merge_grouped_catalog_with_dynamic, normalize_discovery_provider,
 };
 pub use model_router::{
-    SmartRoutingConfig, TurnRoute, classify_message, fallback_route, resolve_turn_route,
+    SmartRoutingConfig, SmartRoutingStats, TurnRoute, classify_message, fallback_route,
+    list_plugin_provider_aliases, resolve_turn_route,
 };
 pub use model_transfer::{
     MODEL_TRANSFER_BUSY_MESSAGE, MODEL_TRANSFER_USAGE, ModelChangeOutcome, ModelSwitchOutcome,

@@ -5187,6 +5187,11 @@ impl App {
         self.pending_steer_count = 0;
         self.steer_applied_at = None;
         self.steering_overlay_active = false;
+        // Best-effort Anthropic prefix warm when configured (`cache.prompt_prefix.warm_on_start`).
+        let warm_agent = agent.clone();
+        self.rt_handle.spawn(async move {
+            warm_agent.warm_prompt_prefix_cache_if_configured().await;
+        });
         self.agent = Some(agent);
         self.refresh_goal_status_chip();
     }
@@ -9380,11 +9385,15 @@ impl App {
                     self.push_output("No agent configured.", OutputRole::Error);
                 }
             }
-            CommandResult::Compress => {
+            CommandResult::Compress { focus } => {
                 if let Some(agent) = self.agent.clone() {
                     let tx = self.response_tx.clone();
+                    let label = match focus.as_deref() {
+                        Some(topic) => format!("Compressing context (focus: {topic})…"),
+                        None => "Compressing context…".to_string(),
+                    };
                     self.display_state = DisplayState::BgOp {
-                        label: "Compressing context…".to_string(),
+                        label,
                         frame: 0,
                         started: Instant::now(),
                     };
@@ -9394,7 +9403,9 @@ impl App {
                         let before_count = before_messages.len();
                         let before_tokens =
                             edgecrab_core::compression::estimate_tokens(&before_messages);
-                        agent.force_compress().await;
+                        agent
+                            .force_compress_with_focus(focus.as_deref())
+                            .await;
                         let after_messages = agent.messages().await;
                         let after_count = after_messages.len();
                         let after_tokens =
@@ -9412,6 +9423,9 @@ impl App {
             }
             CommandResult::ShowStatus => {
                 self.handle_show_status();
+            }
+            CommandResult::ShowDoctor => {
+                self.handle_show_doctor();
             }
             CommandResult::ShowCost => {
                 self.handle_show_cost();
@@ -9557,7 +9571,12 @@ impl App {
                 let before = edgecrab_tools::skills::scan_skill_commands(&ctx);
                 let (_, diff) = edgecrab_tools::skills::reload_skills(&before, &ctx);
                 edgecrab_tools::skills::invalidate_discovery_caches();
-                edgecrab_core::prompt_builder::invalidate_skills_cache();
+                if let Some(agent) = self.agent.clone() {
+                    self.rt_handle
+                        .block_on(async { agent.invalidate_skills_zone().await });
+                } else {
+                    edgecrab_core::prompt_builder::invalidate_skills_cache();
+                }
                 self.refresh_skills_completion_names();
                 self.push_output(
                     edgecrab_tools::skills::format_reload_diff(&diff),
@@ -12165,6 +12184,68 @@ impl App {
         );
     }
 
+    fn handle_show_doctor(&mut self) {
+        let api_key_status = if std::env::var("OPENAI_API_KEY").is_ok()
+            || std::env::var("ANTHROPIC_API_KEY")
+                .ok()
+                .is_some_and(|value| !value.trim().is_empty())
+            || std::env::var("ANTHROPIC_AUTH_TOKEN")
+                .ok()
+                .is_some_and(|value| !value.trim().is_empty())
+            || std::env::var("GEMINI_API_KEY").is_ok()
+            || std::env::var("GITHUB_COPILOT_TOKEN").is_ok()
+        {
+            "✓ API key: detected"
+        } else {
+            "⚠ API key: none detected (run `edgecrab setup` to configure)"
+        };
+
+        let home = std::env::var("EDGECRAB_HOME").unwrap_or_else(|_| "~/.edgecrab".to_string());
+
+        let mut lines = vec![
+            "EdgeCrab in-session diagnostics:".to_string(),
+            "✓ Agent: running".into(),
+            "✓ SQLite state: ok".into(),
+            "✓ Tool registry: loaded".into(),
+            api_key_status.into(),
+            format!("✓ Config dir: {home}"),
+            format!("Skin: {home}/skin.yaml (use /skin reload to refresh)"),
+        ];
+
+        if let Some(agent) = self.agent.clone() {
+            let snap = self.agent_snapshot(&agent);
+            let caching_enabled = edgecrab_core::AppConfig::load()
+                .map(|c| c.cache.prompt_prefix.enabled)
+                .unwrap_or(true);
+            if let Some(check) = crate::doctor::check_cache_hit_rate_slo(
+                caching_enabled,
+                snap.api_call_count,
+                snap.cache_hit_rate_pct(),
+            ) {
+                let icon = match check.status {
+                    crate::doctor::CheckStatus::Pass => "✓",
+                    crate::doctor::CheckStatus::Warn => "⚠",
+                    crate::doctor::CheckStatus::Fail => "✗",
+                };
+                lines.push(format!("{icon} {}: {}", check.label, check.detail));
+            } else if caching_enabled {
+                lines.push(format!(
+                    "✓ Cache hit rate: waiting for ≥3 API turns (now {}) — SLO ≥70%",
+                    snap.api_call_count
+                ));
+            }
+        }
+
+        lines.push(String::new());
+        lines.push("For full diagnostics run: edgecrab doctor".into());
+
+        self.open_report_overlay(
+            "Doctor",
+            "In-session diagnostics",
+            lines.join("\n"),
+        );
+    }
+
     fn handle_show_cost(&mut self) {
         let Some(agent) = self.require_agent() else {
             return;
@@ -12182,12 +12263,16 @@ impl App {
             Some(usd) => format!("${:.6} ({})", usd, cost_result.label),
             None => cost_result.label.clone(),
         };
+        let cache_hit = snap
+            .cache_hit_rate_pct()
+            .map(|p| format!(" ({p:.0}% hit)"))
+            .unwrap_or_default();
         let text = format!(
             "Token usage & cost:\n\
              Current prompt:      {}\n\
              Input tokens:       {}\n\
              Output tokens:      {}\n\
-             Cache read tokens:  {}\n\
+             Cache read tokens:  {}{cache_hit}\n\
              Cache write tokens: {}\n\
              Reasoning tokens:   {}\n\
              Total tokens:       {}\n\
@@ -12709,8 +12794,10 @@ impl App {
     }
 
     fn handle_config_command(&mut self, args: String) {
-        let normalized = args.trim().to_ascii_lowercase();
-        match normalized.as_str() {
+        let trimmed = args.trim();
+        let mut parts = trimmed.split_whitespace();
+        let head = parts.next().unwrap_or("").to_ascii_lowercase();
+        match head.as_str() {
             "" | "open" | "browse" => self.open_config_selector(),
             "show" | "summary" | "status" => {
                 self.open_report_overlay(
@@ -12719,8 +12806,49 @@ impl App {
                     self.render_config_summary(),
                 );
             }
+            "preview" => {
+                let sub = parts.next().unwrap_or("status").to_ascii_lowercase();
+                match sub.as_str() {
+                    "on" | "enable" | "true" | "1" => {
+                        self.apply_preview_enabled(true);
+                    }
+                    "off" | "disable" | "false" | "0" => {
+                        self.apply_preview_enabled(false);
+                    }
+                    "status" | "show" | "" => {
+                        let cfg = self.load_runtime_config();
+                        self.push_output(
+                            format!(
+                                "security.preview.enabled={} ports={:?}",
+                                cfg.security.preview.enabled,
+                                cfg.security.preview.allow_localhost_ports
+                            ),
+                            OutputRole::System,
+                        );
+                    }
+                    other => self.push_output(
+                        format!("Usage: /config preview [on|off|status] (got {other})"),
+                        OutputRole::System,
+                    ),
+                }
+            }
+            "set" => {
+                let key = parts.next().unwrap_or("");
+                let value = parts.collect::<Vec<_>>().join(" ");
+                if key.is_empty() || value.is_empty() {
+                    self.push_output(
+                        "Usage: /config set <key> <value>  (e.g. /config set security.preview.enabled true)",
+                        OutputRole::System,
+                    );
+                    return;
+                }
+                match self.apply_config_set(key, &value) {
+                    Ok(msg) => self.push_output(msg, OutputRole::System),
+                    Err(e) => self.push_output(format!("config set failed: {e}"), OutputRole::System),
+                }
+            }
             "model" => self.refresh_model_selector_catalog(),
-            "cheap" | "cheap_model" | "cheap-model" | "routing" => {
+            "cheap" | "cheap_model" | "cheap-model" | "routing" | "fast" => {
                 self.open_cheap_model_selector();
             }
             "moa" => self.handle_show_moa_config(),
@@ -12749,10 +12877,50 @@ impl App {
                 );
             }
             _ => self.push_output(
-                "Usage: /config [open|show|model|cheap|moa|logs|paths|voice|gateway|update|edit]",
+                "Usage: /config [open|show|preview|set|model|cheap|fast|moa|logs|paths|voice|gateway|update|edit]",
                 OutputRole::System,
             ),
         }
+    }
+
+    fn apply_preview_enabled(&mut self, enabled: bool) {
+        match self.apply_config_set(
+            "security.preview.enabled",
+            if enabled { "true" } else { "false" },
+        ) {
+            Ok(msg) => self.push_output(msg, OutputRole::System),
+            Err(e) => self.push_output(format!("failed to set preview: {e}"), OutputRole::System),
+        }
+    }
+
+    /// Persist a small set of dotted config keys from the TUI (HA-42).
+    fn apply_config_set(&mut self, key: &str, value: &str) -> Result<String, String> {
+        let path = edgecrab_core::edgecrab_home().join("config.yaml");
+        let mut config = edgecrab_core::AppConfig::load().map_err(|e| e.to_string())?;
+        match key {
+            "security.preview.enabled" => {
+                let enabled = matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "true" | "1" | "on" | "yes" | "enable"
+                );
+                config.security.preview.enabled = enabled;
+            }
+            "harness.verification_strict" => {
+                let enabled = matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "true" | "1" | "on" | "yes"
+                );
+                config.harness.verification_strict = enabled;
+            }
+            other => {
+                return Err(format!(
+                    "unsupported key '{other}' in TUI (try `edgecrab config set` for full keys)"
+                ));
+            }
+        }
+        config.save_to(&path).map_err(|e| e.to_string())?;
+        config.apply_security_runtime();
+        Ok(format!("Set {key} = {value} ({})", path.display()))
     }
 
     fn handle_details_command(&mut self, args: String) {
@@ -14562,7 +14730,8 @@ impl App {
                     .map_err(|e| e.to_string())?,
             };
 
-            let system_prompt = agent.system_prompt().await;
+            let (system_prompt, stable_system_prompt, semi_stable_system_prompt) =
+                agent.system_prompt_tiers().await;
             let new_session_id = uuid::Uuid::new_v4().to_string();
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -14575,6 +14744,8 @@ impl App {
                 user_id: None,
                 model: Some(snapshot.model.clone()),
                 system_prompt,
+                stable_system_prompt,
+                semi_stable_system_prompt,
                 parent_session_id: Some(current_session_id.clone()),
                 started_at: now,
                 ended_at: Some(now),
@@ -14586,6 +14757,7 @@ impl App {
                 cache_read_tokens: snapshot.cache_read_tokens as i64,
                 cache_write_tokens: snapshot.cache_write_tokens as i64,
                 reasoning_tokens: snapshot.reasoning_tokens as i64,
+                last_prompt_tokens: 0,
                 estimated_cost_usd: Some(session_cost),
                 title: Some(new_title.clone()),
             };
@@ -15174,7 +15346,12 @@ impl App {
         {
             if edgecrab_tools::tools::skills_hub::hub_slash_mutates_skills(trimmed) {
                 edgecrab_tools::skills::invalidate_discovery_caches();
-                edgecrab_core::prompt_builder::invalidate_skills_cache();
+                if let Some(agent) = self.agent.clone() {
+                    self.rt_handle
+                        .block_on(async { agent.invalidate_skills_zone().await });
+                } else {
+                    edgecrab_core::prompt_builder::invalidate_skills_cache();
+                }
                 self.refresh_skills_completion_names();
             }
             self.push_output(reply, OutputRole::System);
@@ -15305,7 +15482,12 @@ impl App {
                     match std::fs::copy(src, &dest) {
                         Ok(_) => {
                             edgecrab_tools::skills::invalidate_discovery_caches();
-                            edgecrab_core::prompt_builder::invalidate_skills_cache();
+                            if let Some(agent) = self.agent.clone() {
+                                self.rt_handle
+                                    .block_on(async { agent.invalidate_skills_zone().await });
+                            } else {
+                                edgecrab_core::prompt_builder::invalidate_skills_cache();
+                            }
                             self.push_output(
                                 format!("Skill installed: {}", dest.file_name().unwrap_or_default().to_string_lossy()),
                                 OutputRole::System,
@@ -15319,7 +15501,12 @@ impl App {
                     match copy_dir_recursive(src, &dest) {
                         Ok(n) => {
                             edgecrab_tools::skills::invalidate_discovery_caches();
-                            edgecrab_core::prompt_builder::invalidate_skills_cache();
+                            if let Some(agent) = self.agent.clone() {
+                                self.rt_handle
+                                    .block_on(async { agent.invalidate_skills_zone().await });
+                            } else {
+                                edgecrab_core::prompt_builder::invalidate_skills_cache();
+                            }
                             self.push_output(
                                 format!("Skill directory '{}' installed ({n} files).", dir_name.to_string_lossy()),
                                 OutputRole::System,
@@ -19848,6 +20035,8 @@ description = "Demo plugin tool"
             user_id: None,
             model: Some(model.into()),
             system_prompt: None,
+            stable_system_prompt: None,
+            semi_stable_system_prompt: None,
             parent_session_id: None,
             started_at,
             ended_at: None,
@@ -19859,6 +20048,7 @@ description = "Demo plugin tool"
             cache_read_tokens: 0,
             cache_write_tokens: 0,
             reasoning_tokens: 0,
+            last_prompt_tokens: 0,
             estimated_cost_usd: None,
             title: Some(title.into()),
         }

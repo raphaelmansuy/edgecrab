@@ -14,17 +14,30 @@
 pub mod approval;
 pub mod command_scan;
 pub mod injection;
+pub mod threat_patterns;
 pub mod normalize;
+pub mod os_sandbox;
 pub mod path_jail;
 pub mod path_policy;
 pub mod proxy;
 pub mod redact;
+pub mod secrets;
 pub mod url_safety;
 pub mod url_validation;
 pub mod website_policy;
 
+pub use secrets::{
+    EnvSecretBackend, FileSecretBackend, SecretBackend, SecretError, SecretResolver,
+    default_resolver,
+};
+
 /// Re-export injection checks at crate root for convenience.
 pub use injection::{check_injection, check_memory_content};
+pub use os_sandbox::{OsSandboxMode, WrappedCommand, wrap_command, wrapped_to_shell_line};
+pub use threat_patterns::{
+    ScanContext, ScanResult as ThreatScanResult, Verdict as ThreatVerdict,
+    prepare_tool_result_body, scan, tool_output_delimiters_enabled, wrap_tool_result,
+};
 
 /// Check for CRLF injection in header values.
 ///

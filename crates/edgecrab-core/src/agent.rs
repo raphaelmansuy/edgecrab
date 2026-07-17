@@ -121,6 +121,9 @@ pub struct Agent {
         std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<crate::StreamEvent>>>,
     /// Count of steering events queued but not yet injected at a tool boundary.
     pub(crate) steer_pending: std::sync::atomic::AtomicUsize,
+    /// Set by `skill_manage` / skills hub tools; drained in the conversation loop
+    /// to clear the semi-stable skills zone without a circular tools→core dep.
+    pub(crate) skills_zone_dirty: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Options for cloning an agent into a fresh isolated session.
@@ -263,6 +266,8 @@ pub struct AgentConfig {
     pub harness: crate::config::HarnessConfig,
     /// Localhost preview SSRF allowlist (spec 015 P0.4 / P0.9).
     pub security_preview: crate::config::PreviewConfig,
+    /// OS sandbox mode for local terminal backend.
+    pub os_sandbox_mode: String,
     /// Cross-session Anthropic prompt prefix cache (stable/dynamic split + TTL).
     pub cache: crate::config::CacheConfig,
     /// Pluggable web search backend chain.
@@ -271,6 +276,8 @@ pub struct AgentConfig {
     pub web: crate::config::WebToolsConfig,
     /// Tool JSON schema wire shape (`full` | `compact`, spec 007 L1.2).
     pub tool_schema_mode: edgecrab_tools::ToolSchemaMode,
+    /// Cap on non-hot tools materialized onto the wire (`0` = unlimited).
+    pub max_materialized_tools: usize,
 }
 
 impl Default for AgentConfig {
@@ -347,10 +354,12 @@ impl Default for AgentConfig {
             harness_post_mutation_oracles: true,
             harness: crate::config::HarnessConfig::default(),
             security_preview: crate::config::PreviewConfig::default(),
+            os_sandbox_mode: "off".into(),
             cache: crate::config::CacheConfig::default(),
             web_search: crate::config::WebSearchConfig::default(),
             web: crate::config::WebToolsConfig::default(),
             tool_schema_mode: edgecrab_tools::ToolSchemaMode::Indexed,
+            max_materialized_tools: edgecrab_tools::DEFAULT_MAX_MATERIALIZED_TOOLS,
         }
     }
 }
@@ -543,6 +552,8 @@ impl AgentConfig {
                 backend: self.web.backend.clone(),
             },
             tool_schema_mode: self.tool_schema_mode,
+            max_materialized_tools: self.max_materialized_tools,
+            os_sandbox_mode: self.os_sandbox_mode.clone(),
             gateway_running,
             ..Default::default()
         }
@@ -609,6 +620,12 @@ pub struct SessionState {
     /// compacted.  Subsequent compressions do NOT modify the system prompt so
     /// that Anthropic's prompt cache breakpoints remain stable.
     pub first_compression_done: bool,
+    /// Defer-preflight / anti-thrashing / protect_first decay (Hermes parity).
+    pub compression_runtime: crate::compression::CompressionRuntimeState,
+    /// Turns routed to the cheap model (Pareto / smart routing stats).
+    pub smart_routing_cheap_turns: u32,
+    /// Turns routed to the primary (strong) model.
+    pub smart_routing_strong_turns: u32,
 }
 
 impl SessionState {
@@ -631,6 +648,54 @@ impl SessionState {
                 outcome.compressed,
             ),
         ));
+    }
+
+    /// One-shot first-compression note into the **dynamic** zone (FP33).
+    ///
+    /// Owns the disjoint-field mutation so callers avoid borrow-checker splits
+    /// between `first_compression_done` and `cached_system_prompt`.
+    pub(crate) fn apply_first_compression_note(&mut self) {
+        crate::compression::apply_first_compression_system_note(
+            &mut self.first_compression_done,
+            &mut self.cached_system_prompt,
+        );
+    }
+
+    /// Clear cached prompt tiers after a skills mutation (semi-stable + combined).
+    ///
+    /// Forces the next turn to rebuild via `PromptBuilder::build_blocks()` so the
+    /// 5m skills index and dynamic skill bodies stay coherent.
+    pub fn invalidate_skills_zone(&mut self) {
+        self.cached_system_prompt = None;
+        self.cached_stable_prompt = None;
+        self.cached_semi_stable_prompt = None;
+    }
+
+    /// Shared post-compress path for `/compress`, gateway hygiene, and in-loop
+    /// compaction: dynamic-zone note + todo/read-dedup hooks + defer-preflight arming.
+    pub(crate) fn finish_compression(
+        &mut self,
+        todo_store: &edgecrab_tools::TodoStore,
+        rough_tokens_after: usize,
+        used_structural_fallback: bool,
+    ) {
+        self.apply_first_compression_note();
+        let session_id = self
+            .session_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        crate::compression::apply_post_compress_message_hooks(
+            &mut self.messages,
+            todo_store,
+            &session_id,
+        );
+        crate::compression::record_completed_compaction(
+            &mut self.compression_runtime,
+            rough_tokens_after,
+            used_structural_fallback,
+        );
+        // Force next turn to re-measure; defer-preflight uses compression_runtime.
+        self.last_prompt_tokens = 0;
     }
 }
 
@@ -750,6 +815,7 @@ impl Agent {
             steer_rx: std::sync::Mutex::new(Some(steer_rx)),
             steer_event_tx: std::sync::Mutex::new(None),
             steer_pending: std::sync::atomic::AtomicUsize::new(0),
+            skills_zone_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -1384,6 +1450,11 @@ impl Agent {
             last_prompt_tokens: session.last_prompt_tokens,
             budget_remaining: self.budget.remaining(),
             budget_max: self.budget.max(),
+            routing_savings_note: crate::model_router::SmartRoutingStats {
+                cheap_turns: session.smart_routing_cheap_turns,
+                strong_turns: session.smart_routing_strong_turns,
+            }
+            .routing_savings_note(&config.model_config.smart_routing.cheap_model),
         }
     }
 
@@ -1503,6 +1574,11 @@ impl Agent {
             context_window,
         )
         .with_deferred_tools(tools_deferred_count)
+        .with_cache_telemetry(
+            session.session_cache_read_tokens,
+            session.session_cache_write_tokens,
+            session.last_prompt_tokens,
+        )
     }
 
     /// Best-effort synchronous snapshot accessor for non-async inspection paths.
@@ -1523,6 +1599,11 @@ impl Agent {
             last_prompt_tokens: session.last_prompt_tokens,
             budget_remaining: self.budget.remaining(),
             budget_max: self.budget.max(),
+            routing_savings_note: crate::model_router::SmartRoutingStats {
+                cheap_turns: session.smart_routing_cheap_turns,
+                strong_turns: session.smart_routing_strong_turns,
+            }
+            .routing_savings_note(&config.model_config.smart_routing.cheap_model),
         })
     }
 
@@ -1549,31 +1630,55 @@ impl Agent {
         *self.session.write().await = session.clone();
     }
 
-    /// Append a note to the cached system prompt.
+    /// Append a note to the cached system prompt's **dynamic** zone.
     ///
     /// Used to inject runtime context (e.g. "browser is now connected to live
     /// Chrome") without consuming a full user→model conversation turn.
     /// The note is appended once; callers should guard for idempotency.
-    /// If the system prompt hasn't been built yet it will be set as the full
-    /// prompt at first-turn assembly time and this note will be ignored — the
-    /// note is silently discarded rather than force-building the prompt early.
+    ///
+    /// Stable and semi-stable prefixes are left untouched so Anthropic's
+    /// three-tier `cache_control` split keeps matching. If the system prompt
+    /// hasn't been built yet the note is silently discarded — callers send
+    /// `/browser connect` after the first message, so the prompt is already
+    /// cached.
     pub async fn append_to_system_prompt(&self, note: &str) {
         let mut session = self.session.write().await;
-        if let Some(ref mut prompt) = session.cached_system_prompt {
-            prompt.push_str("\n\n");
-            prompt.push_str(note);
-        }
-        // If the system prompt isn't cached yet (no messages sent) we store the
-        // note in a pending field so it can be appended at build time.
-        // For simplicity we skip that path — callers send /browser connect after
-        // the first message, so the prompt is already cached.
+        crate::compression::append_to_combined_system_prompt(
+            &mut session.cached_system_prompt,
+            note,
+        );
     }
 
     pub async fn invalidate_system_prompt(&self) {
         let mut session = self.session.write().await;
-        session.cached_system_prompt = None;
-        session.cached_stable_prompt = None;
-        session.cached_semi_stable_prompt = None;
+        session.invalidate_skills_zone();
+    }
+
+    /// Invalidate disk skills cache + live session prompt tiers (CLI `/skills`, tools).
+    pub async fn invalidate_skills_zone(&self) {
+        crate::prompt_builder::invalidate_skills_cache();
+        let mut session = self.session.write().await;
+        session.invalidate_skills_zone();
+        self.skills_zone_dirty
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Combined + stable + semi-stable prompt tiers (session branch / persistence).
+    pub async fn system_prompt_tiers(
+        &self,
+    ) -> (Option<String>, Option<String>, Option<String>) {
+        let session = self.session.read().await;
+        (
+            session.cached_system_prompt.clone(),
+            session.cached_stable_prompt.clone(),
+            session.cached_semi_stable_prompt.clone(),
+        )
+    }
+
+    /// Drain skill-mutation dirty flag set by `on_skills_changed` during tool dispatch.
+    pub(crate) fn take_skills_zone_dirty(&self) -> bool {
+        self.skills_zone_dirty
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
     }
 
     pub async fn set_personality_addon(&self, addon: Option<String>) {
@@ -1626,6 +1731,21 @@ impl Agent {
         session.messages.push(Message::assistant(text));
     }
 
+    /// Seed conversation history before the first live turn (e.g. Discord backfill).
+    ///
+    /// No-op when `messages` is empty or the session already has history, so a
+    /// live user turn cannot be duplicated or overwrite an existing transcript.
+    pub async fn seed_history(&self, messages: Vec<Message>) {
+        if messages.is_empty() {
+            return;
+        }
+        let mut session = self.session.write().await;
+        if !session.messages.is_empty() {
+            return;
+        }
+        session.messages = messages;
+    }
+
     /// Get full message history for export.
     pub async fn messages(&self) -> Vec<Message> {
         self.session.read().await.messages.clone()
@@ -1654,8 +1774,65 @@ impl Agent {
         removed
     }
 
-    /// Force context compression on the next turn.
+    /// Force context compression (`/compress`).
+    /// Optional `max_tokens: 0` warm for Anthropic-class prompt prefix (July 2026).
+    ///
+    /// No-op when `cache.prompt_prefix.warm_on_start` is false or the provider
+    /// does not support prompt caching. Best-effort — warm failures are logged.
+    pub async fn warm_prompt_prefix_cache_if_configured(&self) {
+        let config = self.config.read().await.clone();
+        if !config.cache.prompt_prefix.warm_on_start || !config.cache.prompt_prefix.enabled {
+            return;
+        }
+        let (provider_name, model_id) = config
+            .model
+            .split_once('/')
+            .unwrap_or((config.model.as_str(), ""));
+        let base_url = config.model_config.base_url.as_deref();
+        let Some(resolved) = crate::prompt_cache_policy::resolve_prompt_cache(
+            provider_name,
+            model_id,
+            base_url,
+            true,
+            &config.cache.prompt_prefix,
+        ) else {
+            return;
+        };
+        let provider = self.provider.read().await.clone();
+        let session = self.session.read().await;
+        let system = session.cached_system_prompt.clone();
+        drop(session);
+        let Some(system) = system.filter(|s| !s.is_empty()) else {
+            return;
+        };
+        let mut msgs = vec![edgequake_llm::ChatMessage::system(&system)];
+        crate::prompt_cache_policy::apply_prompt_cache_breakpoints(
+            &mut msgs,
+            resolved.decision,
+            &resolved.config,
+            false,
+        );
+        // max_tokens: 0 — prefill-only warm (Anthropic returns empty content).
+        let opts = edgequake_llm::CompletionOptions {
+            max_tokens: Some(0),
+            ..Default::default()
+        };
+        match provider
+            .chat_with_tools(&msgs, &[], None, Some(&opts))
+            .await
+        {
+            Ok(_) => tracing::info!("prompt prefix cache warm completed"),
+            Err(e) => tracing::debug!(error = %e, "prompt prefix cache warm skipped"),
+        }
+    }
+
+    /// Manual `/compress` — optional `focus` weights the summary toward a topic.
     pub async fn force_compress(&self) {
+        self.force_compress_with_focus(None).await;
+    }
+
+    /// Manual `/compress [focus topic]` (Hermes parity).
+    pub async fn force_compress_with_focus(&self, focus: Option<&str>) {
         let provider = self.provider.read().await.clone();
         let config = self.config.read().await.clone();
         let mut session = self.session.write().await;
@@ -1663,28 +1840,109 @@ impl Agent {
             &config.model,
             &config.compression,
         );
-        // Pass None for spill context in force_compress — this is a manual /compress
-        // command and we don't have a cwd/session_id readily available. Tool results
-        // are still pruned with the generic placeholder, which is fine for /compress.
-        let (compressed, _llm_succeeded) =
-            crate::compression::compress_with_llm(&session.messages, &params, &provider, None)
-                .await;
+        let compression_count = session.compression_runtime.compression_count;
+        // Pass None for spill context — manual /compress has no cwd/session spill path.
+        let (compressed, llm_succeeded) = crate::compression::compress_with_llm_counted(
+            &session.messages,
+            &params,
+            &provider,
+            None,
+            compression_count,
+            focus,
+        )
+        .await;
         session.messages = compressed;
-        let session_id = session
-            .session_id
-            .clone()
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        if !session.first_compression_done {
-            session.first_compression_done = true;
-            if let Some(ref mut sys) = session.cached_system_prompt {
-                sys.push_str(crate::compression::FIRST_COMPRESSION_NOTE);
-            }
+        let rough_after = crate::compression::estimate_tokens(&session.messages);
+        session.finish_compression(&self.todo_store, rough_after, !llm_succeeded);
+    }
+
+    /// Pre-agent session hygiene (Hermes 85% gateway safety net).
+    ///
+    /// Compresses the in-memory transcript when estimated (or last-reported)
+    /// prompt tokens reach 85% of the model context window, or when the
+    /// message count exceeds `compression.hygiene_hard_message_limit`.
+    /// Threshold is intentionally higher than the in-loop 50% compressor.
+    pub async fn maybe_session_hygiene(&self) -> crate::compression::SessionHygieneOutcome {
+        use crate::compression::{
+            CompressionParams, SessionHygieneOutcome, compress_with_llm_counted, estimate_tokens,
+            should_run_session_hygiene,
+        };
+
+        let config = self.config.read().await.clone();
+        if !config.compression.enabled {
+            return SessionHygieneOutcome::Skipped;
         }
-        crate::compression::apply_post_compress_message_hooks(
-            &mut session.messages,
-            &self.todo_store,
-            &session_id,
+
+        let snapshot = {
+            let session = self.session.read().await;
+            (
+                session.messages.len(),
+                session.messages.clone(),
+                session.last_prompt_tokens,
+                session.cached_system_prompt.clone(),
+                session.compression_runtime.compression_count,
+            )
+        };
+        let (msg_count, messages, last_prompt_tokens, system_prompt, compression_count) = snapshot;
+        if msg_count < 4 {
+            return SessionHygieneOutcome::Skipped;
+        }
+
+        let params = CompressionParams::from_model_config(&config.model, &config.compression);
+        let approx_tokens = if last_prompt_tokens > 0 {
+            last_prompt_tokens as usize
+        } else {
+            estimate_tokens(&messages)
+                + system_prompt
+                    .as_deref()
+                    .map(|s| (s.len() / 4) + 4)
+                    .unwrap_or(0)
+        };
+
+        if !should_run_session_hygiene(
+            msg_count,
+            approx_tokens,
+            params.context_window,
+            config.compression.enabled,
+            config.compression.hygiene_hard_message_limit,
+        ) {
+            return SessionHygieneOutcome::Skipped;
+        }
+
+        tracing::info!(
+            msg_count,
+            approx_tokens,
+            context_window = params.context_window,
+            "Session hygiene: auto-compressing oversized gateway transcript"
         );
+
+        let provider = self.provider.read().await.clone();
+        let mut hygiene_params = params;
+        hygiene_params.threshold = crate::compression::GATEWAY_HYGIENE_THRESHOLD;
+
+        let (compressed, llm_ok) = compress_with_llm_counted(
+            &messages,
+            &hygiene_params,
+            &provider,
+            None,
+            compression_count,
+            None,
+        )
+        .await;
+        let after_msgs = compressed.len();
+        let rough_after = estimate_tokens(&compressed);
+
+        {
+            let mut session = self.session.write().await;
+            session.messages = compressed;
+            session.finish_compression(&self.todo_store, rough_after, !llm_ok);
+        }
+
+        SessionHygieneOutcome::Compressed {
+            before_msgs: msg_count,
+            after_msgs,
+            approx_tokens_before: approx_tokens,
+        }
     }
 
     /// Set the session title (persisted on next DB write).
@@ -1927,7 +2185,12 @@ impl Agent {
         {
             let mut session = self.session.write().await;
             session.session_id = Some(record.id.clone());
+            // Restore combined + stable/semi prefixes for 3-tier cache continuity.
+            // When older rows lack stable/semi columns, clear those zones so we
+            // fall back to the single-block wire path until the next rebuild.
             session.cached_system_prompt = record.system_prompt.clone();
+            session.cached_stable_prompt = record.stable_system_prompt.clone();
+            session.cached_semi_stable_prompt = record.semi_stable_system_prompt.clone();
             session.user_turn_count = messages
                 .iter()
                 .filter(|m| matches!(m.role, edgecrab_types::Role::User))
@@ -1938,7 +2201,7 @@ impl Agent {
             session.session_cache_read_tokens = record.cache_read_tokens.max(0) as u64;
             session.session_cache_write_tokens = record.cache_write_tokens.max(0) as u64;
             session.session_reasoning_tokens = record.reasoning_tokens.max(0) as u64;
-            session.last_prompt_tokens = 0;
+            session.last_prompt_tokens = record.last_prompt_tokens.max(0) as u64;
             session.messages = messages;
         }
 
@@ -2162,6 +2425,22 @@ impl Agent {
         config.model_config.smart_routing = smart_routing;
     }
 
+    /// Emit a core lifecycle hook event (e.g. after skills install/mutate).
+    pub fn emit_lifecycle(&self, event: crate::lifecycle_hooks::LifecycleEvent, context: serde_json::Value) {
+        let session_id = self
+            .session
+            .try_read()
+            .ok()
+            .and_then(|s| s.session_id.clone());
+        let mut payload = context;
+        if let Some(obj) = payload.as_object_mut()
+            && let Some(id) = session_id
+        {
+            obj.entry("session_id").or_insert(serde_json::json!(id));
+        }
+        crate::lifecycle_hooks::emit_global(event, payload);
+    }
+
     /// Update the default image generation routing for future turns.
     pub async fn set_image_generation_config(
         &self,
@@ -2278,6 +2557,8 @@ pub struct SessionSnapshot {
     pub last_prompt_tokens: u64,
     pub budget_remaining: u32,
     pub budget_max: u32,
+    /// Human-readable smart-routing savings note for `/cost` and snapshots.
+    pub routing_savings_note: Option<String>,
 }
 
 impl SessionSnapshot {
@@ -2287,6 +2568,15 @@ impl SessionSnapshot {
 
     pub fn total_tokens(&self) -> u64 {
         self.prompt_tokens() + self.output_tokens + self.reasoning_tokens
+    }
+
+    /// Session-cumulative Anthropic-style cache hit rate (`cache_read / prompt`).
+    pub fn cache_hit_rate_pct(&self) -> Option<f64> {
+        let denom = self.prompt_tokens();
+        if denom == 0 || self.cache_read_tokens == 0 {
+            return None;
+        }
+        Some((self.cache_read_tokens as f64 / denom as f64) * 100.0)
     }
 
     pub fn context_pressure_tokens(&self) -> u64 {
@@ -2813,10 +3103,12 @@ impl AgentBuilder {
                 harness_post_mutation_oracles: config.display.harness_post_mutation_oracles,
                 harness: config.harness.clone(),
                 security_preview: config.security.preview.clone(),
+                os_sandbox_mode: config.security.os_sandbox.mode.clone(),
                 cache: config.cache.clone(),
                 web_search: config.web_search.clone(),
                 web: config.web.clone(),
                 tool_schema_mode: edgecrab_tools::ToolSchemaMode::parse(&config.tools.schema_mode),
+                max_materialized_tools: config.tools.max_materialized_tools,
                 ..Default::default()
             },
             provider: None,
@@ -3680,6 +3972,7 @@ def register(ctx):
             last_prompt_tokens: 1_234,
             budget_remaining: 0,
             budget_max: 0,
+            routing_savings_note: None,
         };
 
         assert_eq!(snap.prompt_tokens(), 17_003);
@@ -3698,6 +3991,8 @@ def register(ctx):
             user_id: None,
             model: Some("mock/model".into()),
             system_prompt: Some("Persisted system prompt".into()),
+            stable_system_prompt: None,
+            semi_stable_system_prompt: None,
             parent_session_id: None,
             started_at: 1.0,
             ended_at: Some(2.0),
@@ -3709,6 +4004,7 @@ def register(ctx):
             cache_read_tokens: 0,
             cache_write_tokens: 0,
             reasoning_tokens: 0,
+            last_prompt_tokens: 0,
             estimated_cost_usd: None,
             title: Some("restore".into()),
         };
@@ -3997,5 +4293,240 @@ def register(ctx):
         assert_eq!(records[0].from_model, "anthropic/claude-opus-4.6");
         assert_eq!(records[0].to_model, "anthropic/claude-haiku-4.5");
         assert!(!records[0].brief.trim().is_empty());
+    }
+
+    // ── Context-cache efficiency: shared finish_compression + hygiene ─
+
+    #[test]
+    fn finish_compression_keeps_stable_prefix_and_arms_defer_preflight() {
+        let stable = "STABLE_LAW";
+        let semi = "SEMI_SKILLS";
+        let dynamic = "dynamic datetime + memory";
+        let combined = format!("{stable}\n\n{semi}\n\n{dynamic}");
+        let mut session = SessionState {
+            cached_stable_prompt: Some(stable.into()),
+            cached_semi_stable_prompt: Some(semi.into()),
+            cached_system_prompt: Some(combined),
+            session_id: Some("finish-compress".into()),
+            messages: vec![Message::user("hello"), Message::assistant("hi")],
+            last_prompt_tokens: 9_999,
+            ..SessionState::default()
+        };
+        let todos = edgecrab_tools::TodoStore::new();
+        session.finish_compression(&todos, 1_234, false);
+
+        assert!(session.first_compression_done);
+        assert_eq!(session.cached_stable_prompt.as_deref(), Some(stable));
+        assert_eq!(session.cached_semi_stable_prompt.as_deref(), Some(semi));
+        assert_eq!(session.last_prompt_tokens, 0);
+        assert_eq!(session.compression_runtime.compression_count, 1);
+        assert!(session.compression_runtime.awaiting_real_usage_after_compression);
+        assert!(session.compression_runtime.verify_compaction_pending);
+
+        let combined = session.cached_system_prompt.as_deref().expect("combined");
+        assert!(
+            combined.starts_with(stable),
+            "stable prefix must survive first-compression note"
+        );
+        let peeled = crate::conversation::split_dynamic_after_cache_prefixes(
+            combined, stable, semi,
+        );
+        assert!(
+            peeled.contains("Earlier conversation turns have been compacted"),
+            "note must land in dynamic zone, got: {peeled}"
+        );
+        assert!(
+            !peeled.starts_with(stable),
+            "peel must remove stable from dynamic zone"
+        );
+    }
+
+    #[tokio::test]
+    async fn maybe_session_hygiene_skips_under_thresholds() {
+        let provider: Arc<dyn LLMProvider> = Arc::new(edgequake_llm::MockProvider::new());
+        let agent = AgentBuilder::new("mock/model")
+            .provider(provider)
+            .build()
+            .expect("build");
+        {
+            let mut session = agent.session.write().await;
+            session.messages = vec![
+                Message::user("a"),
+                Message::assistant("b"),
+                Message::user("c"),
+                Message::assistant("d"),
+                Message::user("e"),
+            ];
+            session.last_prompt_tokens = 1_000; // far below 85% of default window
+        }
+        let outcome = agent.maybe_session_hygiene().await;
+        assert_eq!(outcome, crate::compression::SessionHygieneOutcome::Skipped);
+        assert_eq!(agent.session.read().await.compression_runtime.compression_count, 0);
+    }
+
+    #[tokio::test]
+    async fn maybe_session_hygiene_fires_on_hard_message_limit_and_records_compaction() {
+        let provider: Arc<dyn LLMProvider> = Arc::new(edgequake_llm::MockProvider::new());
+        let agent = AgentBuilder::new("mock/model")
+            .provider(provider)
+            .build()
+            .expect("build");
+        {
+            let mut cfg = agent.config.write().await;
+            cfg.compression.hygiene_hard_message_limit = 30;
+            cfg.compression.protect_last_n = 8;
+        }
+        {
+            let mut session = agent.session.write().await;
+            session.session_id = Some("hygiene-e2e".into());
+            session.cached_stable_prompt = Some("STABLE".into());
+            session.cached_semi_stable_prompt = Some("SEMI".into());
+            session.cached_system_prompt = Some("STABLE\n\nSEMI\n\ndynamic".into());
+            // > protect_first(3) + protect_last_n(8) so compress actually runs.
+            session.messages = (0..40)
+                .flat_map(|i| {
+                    [
+                        Message::user(&format!("user turn {i} {}", "x".repeat(80))),
+                        Message::assistant(&format!("assistant turn {i}")),
+                    ]
+                })
+                .collect();
+            session.last_prompt_tokens = 100; // under 85% token gate; hard msg limit fires
+        }
+
+        let before = agent.session.read().await.messages.len();
+        let outcome = agent.maybe_session_hygiene().await;
+        match outcome {
+            crate::compression::SessionHygieneOutcome::Compressed {
+                before_msgs,
+                after_msgs,
+                ..
+            } => {
+                assert_eq!(before_msgs, before);
+                assert!(
+                    after_msgs < before_msgs,
+                    "hygiene must shrink transcript: {before_msgs} → {after_msgs}"
+                );
+            }
+            crate::compression::SessionHygieneOutcome::Skipped => {
+                panic!("expected hygiene to fire on hard message limit");
+            }
+        }
+
+        let session = agent.session.read().await;
+        assert!(session.first_compression_done);
+        assert_eq!(session.compression_runtime.compression_count, 1);
+        assert!(session.compression_runtime.awaiting_real_usage_after_compression);
+        assert_eq!(session.cached_stable_prompt.as_deref(), Some("STABLE"));
+        let combined = session.cached_system_prompt.as_deref().expect("combined");
+        let dynamic =
+            crate::conversation::split_dynamic_after_cache_prefixes(combined, "STABLE", "SEMI");
+        assert!(dynamic.contains("Earlier conversation turns have been compacted"));
+    }
+
+    #[tokio::test]
+    async fn restore_session_rehydrates_stable_and_semi_cache_zones() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(SessionDb::open(&tmp.path().join("sessions.db")).expect("db"));
+        let provider: Arc<dyn LLMProvider> = Arc::new(edgequake_llm::MockProvider::new());
+        let record = edgecrab_state::SessionRecord {
+            id: "cache-zones".into(),
+            source: "cli".into(),
+            user_id: None,
+            model: Some("mock/model".into()),
+            system_prompt: Some("STABLE\n\nSEMI\n\ndynamic".into()),
+            stable_system_prompt: Some("STABLE".into()),
+            semi_stable_system_prompt: Some("SEMI".into()),
+            parent_session_id: None,
+            started_at: 1.0,
+            ended_at: Some(2.0),
+            end_reason: None,
+            message_count: 2,
+            tool_call_count: 0,
+            input_tokens: 10,
+            output_tokens: 4,
+            cache_read_tokens: 5,
+            cache_write_tokens: 2,
+            reasoning_tokens: 0,
+            last_prompt_tokens: 12,
+            estimated_cost_usd: None,
+            title: Some("zones".into()),
+        };
+        db.save_session(&record).expect("save");
+        db.save_message("cache-zones", &Message::user("hello"), 1.0)
+            .expect("user");
+        db.save_message("cache-zones", &Message::assistant("hi"), 2.0)
+            .expect("assistant");
+
+        let agent = AgentBuilder::new("mock/model")
+            .provider(provider)
+            .state_db(db)
+            .build()
+            .expect("build");
+        {
+            let mut session = agent.session.write().await;
+            session.cached_stable_prompt = Some("stale-stable".into());
+            session.cached_semi_stable_prompt = Some("stale-semi".into());
+        }
+
+        agent.restore_session("cache-zones").await.expect("restore");
+        let session = agent.session.read().await;
+        assert_eq!(
+            session.cached_system_prompt.as_deref(),
+            Some("STABLE\n\nSEMI\n\ndynamic")
+        );
+        assert_eq!(session.cached_stable_prompt.as_deref(), Some("STABLE"));
+        assert_eq!(session.cached_semi_stable_prompt.as_deref(), Some("SEMI"));
+    }
+
+    #[tokio::test]
+    async fn restore_session_clears_stale_tiers_when_db_lacks_prefixes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(SessionDb::open(&tmp.path().join("sessions.db")).expect("db"));
+        let provider: Arc<dyn LLMProvider> = Arc::new(edgequake_llm::MockProvider::new());
+        let record = edgecrab_state::SessionRecord {
+            id: "legacy-combined".into(),
+            source: "cli".into(),
+            user_id: None,
+            model: Some("mock/model".into()),
+            system_prompt: Some("combined only".into()),
+            stable_system_prompt: None,
+            semi_stable_system_prompt: None,
+            parent_session_id: None,
+            started_at: 1.0,
+            ended_at: None,
+            end_reason: None,
+            message_count: 1,
+            tool_call_count: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
+            last_prompt_tokens: 0,
+            estimated_cost_usd: None,
+            title: None,
+        };
+        db.save_session(&record).expect("save");
+        db.save_message("legacy-combined", &Message::user("hi"), 1.0)
+            .expect("msg");
+
+        let agent = AgentBuilder::new("mock/model")
+            .provider(provider)
+            .state_db(db)
+            .build()
+            .expect("build");
+        {
+            let mut session = agent.session.write().await;
+            session.cached_stable_prompt = Some("stale".into());
+            session.cached_semi_stable_prompt = Some("stale".into());
+        }
+        agent
+            .restore_session("legacy-combined")
+            .await
+            .expect("restore");
+        let session = agent.session.read().await;
+        assert!(session.cached_stable_prompt.is_none());
+        assert!(session.cached_semi_stable_prompt.is_none());
     }
 }

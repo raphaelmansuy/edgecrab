@@ -16,6 +16,8 @@ fn sample_session(id: &str, title: &str, started_at: f64) -> SessionRecord {
         user_id: None,
         model: Some("copilot/gpt-5-mini".into()),
         system_prompt: None,
+        stable_system_prompt: None,
+        semi_stable_system_prompt: None,
         parent_session_id: None,
         started_at,
         ended_at: None,
@@ -27,6 +29,7 @@ fn sample_session(id: &str, title: &str, started_at: f64) -> SessionRecord {
         cache_read_tokens: 0,
         cache_write_tokens: 0,
         reasoning_tokens: 0,
+        last_prompt_tokens: 0,
         estimated_cost_usd: None,
         title: Some(title.into()),
     }

@@ -1,0 +1,35 @@
+name: Harness Benchmark
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  harness-benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: harness_games003_replay
+        run: cargo test -p edgecrab-core --test harness_games003_replay
+
+      - name: local_harness_geometry_e2e
+        run: cargo test -p edgecrab-core --test local_harness_geometry_e2e
+
+      - name: context_cache_efficiency_e2e
+        run: cargo test -p edgecrab-core --test context_cache_efficiency_e2e
+
+      - name: threat_patterns unit tests
+        run: cargo test -p edgecrab-security --lib threat_patterns
+
+      - name: sota_harness_wave_e2e
+        run: cargo test -p edgecrab-core --test sota_harness_wave_e2e
+
+      - name: harness_failover_matrix
+        run: cargo test -p edgecrab-core --test harness_failover_matrix

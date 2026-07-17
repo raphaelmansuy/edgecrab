@@ -304,6 +304,10 @@ pub struct AppConfigRef {
     pub web: WebToolsConfigRef,
     /// Tool schema wire mode (`tools.schema_mode` in config.yaml).
     pub tool_schema_mode: crate::schema_mode::ToolSchemaMode,
+    /// Cap on non-hot tools materialized onto the wire (`0` = unlimited).
+    pub max_materialized_tools: usize,
+    /// OS sandbox mode for local terminal (`off` | `seatbelt` | `bubblewrap`).
+    pub os_sandbox_mode: String,
 }
 
 impl Default for AppConfigRef {
@@ -390,6 +394,8 @@ impl Default for AppConfigRef {
             web_search: WebSearchConfigRef::default(),
             web: WebToolsConfigRef::default(),
             tool_schema_mode: crate::schema_mode::ToolSchemaMode::Indexed,
+            max_materialized_tools: crate::tool_schema_index::DEFAULT_MAX_MATERIALIZED_TOOLS,
+            os_sandbox_mode: "off".into(),
         }
     }
 }

@@ -5,6 +5,7 @@ pub mod error;
 pub mod guard;
 pub mod hermes;
 pub mod host_api;
+pub mod provider_plugin;
 pub mod hub;
 pub mod manifest;
 pub mod script;
@@ -48,3 +49,5 @@ pub use manifest::{
 };
 pub use skill::sync::{BundledSyncReport, BundledSyncStatus, bundled_skills_sync};
 pub use types::{PluginKind, PluginStatus, SkillReadinessStatus, SkillSource, TrustLevel};
+
+pub use provider_plugin::{EdgecrabPlugin, LlmHandle, PluginContext, PluginEvent, PluginHost};

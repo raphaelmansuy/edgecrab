@@ -68,121 +68,7 @@ pub struct VerdictResult {
     pub forced: bool,
 }
 
-struct ThreatPattern {
-    needle: &'static str,
-    pattern_id: &'static str,
-    severity: Severity,
-    category: ThreatCategory,
-    description: &'static str,
-}
-
-const THREAT_PATTERNS: &[ThreatPattern] = &[
-    ThreatPattern {
-        needle: "~/.edgecrab/.env",
-        pattern_id: "edgecrab_env_access",
-        severity: Severity::Critical,
-        category: ThreatCategory::Exfiltration,
-        description: "references the EdgeCrab environment file",
-    },
-    ThreatPattern {
-        needle: "os.getenv(",
-        pattern_id: "python_getenv_secret",
-        severity: Severity::High,
-        category: ThreatCategory::Exfiltration,
-        description: "reads process environment variables",
-    },
-    ThreatPattern {
-        needle: "process.env",
-        pattern_id: "node_process_env",
-        severity: Severity::High,
-        category: ThreatCategory::Exfiltration,
-        description: "reads Node.js environment variables",
-    },
-    ThreatPattern {
-        needle: "ignore previous instructions",
-        pattern_id: "prompt_injection_ignore",
-        severity: Severity::Critical,
-        category: ThreatCategory::Injection,
-        description: "contains a prompt-injection override",
-    },
-    ThreatPattern {
-        needle: "system prompt override",
-        pattern_id: "sys_prompt_override",
-        severity: Severity::Critical,
-        category: ThreatCategory::Injection,
-        description: "attempts to override the system prompt",
-    },
-    ThreatPattern {
-        needle: "rm -rf /",
-        pattern_id: "destructive_root_rm",
-        severity: Severity::Critical,
-        category: ThreatCategory::Destructive,
-        description: "contains a destructive root deletion command",
-    },
-    ThreatPattern {
-        needle: "chmod 777",
-        pattern_id: "insecure_perms",
-        severity: Severity::Medium,
-        category: ThreatCategory::Destructive,
-        description: "sets world-writable permissions",
-    },
-    ThreatPattern {
-        needle: "crontab",
-        pattern_id: "persistence_cron",
-        severity: Severity::Medium,
-        category: ThreatCategory::Persistence,
-        description: "installs cron persistence",
-    },
-    ThreatPattern {
-        needle: "launchctl load",
-        pattern_id: "macos_launchd",
-        severity: Severity::Medium,
-        category: ThreatCategory::Persistence,
-        description: "loads a launchd persistence job",
-    },
-    ThreatPattern {
-        needle: "socket.connect((",
-        pattern_id: "python_socket_connect",
-        severity: Severity::High,
-        category: ThreatCategory::Network,
-        description: "opens an outbound socket connection",
-    },
-    ThreatPattern {
-        needle: "curl | bash",
-        pattern_id: "curl_pipe_shell",
-        severity: Severity::Critical,
-        category: ThreatCategory::Obfuscation,
-        description: "pipes remote content directly into a shell",
-    },
-    ThreatPattern {
-        needle: "base64 -d |",
-        pattern_id: "base64_decode_pipe",
-        severity: Severity::High,
-        category: ThreatCategory::Obfuscation,
-        description: "decodes base64 into execution",
-    },
-    ThreatPattern {
-        needle: "subprocess.run(",
-        pattern_id: "python_subprocess",
-        severity: Severity::Medium,
-        category: ThreatCategory::Execution,
-        description: "spawns a subprocess from Python",
-    },
-    ThreatPattern {
-        needle: "child_process.exec(",
-        pattern_id: "node_child_process",
-        severity: Severity::High,
-        category: ThreatCategory::Execution,
-        description: "spawns a subprocess from Node.js",
-    },
-    ThreatPattern {
-        needle: "../..",
-        pattern_id: "path_traversal",
-        severity: Severity::Medium,
-        category: ThreatCategory::Traversal,
-        description: "contains a path traversal sequence",
-    },
-];
+// Threat needles live in `edgecrab_security::threat_patterns` (gap 031 SoT).
 
 pub fn scan_plugin_bundle(
     plugin_dir: &Path,
@@ -233,23 +119,57 @@ fn scan_dir(root: &Path, dir: &Path, findings: &mut Vec<ScanFinding>) -> std::io
             .map(PathBuf::from)
             .unwrap_or_else(|_| path.clone());
         for (line_idx, line) in content.lines().enumerate() {
-            let lowered = line.to_ascii_lowercase();
-            for pattern in THREAT_PATTERNS {
-                if lowered.contains(&pattern.needle.to_ascii_lowercase()) {
-                    findings.push(ScanFinding {
-                        pattern_id: pattern.pattern_id.to_string(),
-                        severity: pattern.severity,
-                        category: pattern.category,
-                        file: relative.clone(),
-                        line: line_idx + 1,
-                        excerpt: line.trim().to_string(),
-                        description: pattern.description.to_string(),
-                    });
-                }
+            let result = edgecrab_security::threat_patterns::scan(
+                line,
+                edgecrab_security::threat_patterns::ScanContext::Install,
+            );
+            for f in result.findings {
+                findings.push(ScanFinding {
+                    pattern_id: f.pattern_id.to_string(),
+                    severity: map_severity(f.severity),
+                    category: map_category(f.category),
+                    file: relative.clone(),
+                    line: line_idx + 1,
+                    excerpt: line.trim().to_string(),
+                    description: f.description.to_string(),
+                });
             }
         }
     }
     Ok(())
+}
+
+fn map_severity(s: edgecrab_security::threat_patterns::ThreatSeverity) -> Severity {
+    match s {
+        edgecrab_security::threat_patterns::ThreatSeverity::Low => Severity::Low,
+        edgecrab_security::threat_patterns::ThreatSeverity::Medium => Severity::Medium,
+        edgecrab_security::threat_patterns::ThreatSeverity::High => Severity::High,
+        edgecrab_security::threat_patterns::ThreatSeverity::Critical => Severity::Critical,
+    }
+}
+
+fn map_category(c: edgecrab_security::threat_patterns::ThreatCategory) -> ThreatCategory {
+    match c {
+        edgecrab_security::threat_patterns::ThreatCategory::Exfiltration => {
+            ThreatCategory::Exfiltration
+        }
+        edgecrab_security::threat_patterns::ThreatCategory::Injection
+        | edgecrab_security::threat_patterns::ThreatCategory::Brainworm => {
+            ThreatCategory::Injection
+        }
+        edgecrab_security::threat_patterns::ThreatCategory::Destructive => {
+            ThreatCategory::Destructive
+        }
+        edgecrab_security::threat_patterns::ThreatCategory::Persistence => {
+            ThreatCategory::Persistence
+        }
+        edgecrab_security::threat_patterns::ThreatCategory::Network => ThreatCategory::Network,
+        edgecrab_security::threat_patterns::ThreatCategory::Obfuscation => {
+            ThreatCategory::Obfuscation
+        }
+        edgecrab_security::threat_patterns::ThreatCategory::Execution => ThreatCategory::Execution,
+        edgecrab_security::threat_patterns::ThreatCategory::Traversal => ThreatCategory::Traversal,
+    }
 }
 
 fn is_scan_candidate(path: &Path) -> bool {

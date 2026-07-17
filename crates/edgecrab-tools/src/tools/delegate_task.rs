@@ -66,6 +66,9 @@ struct DelegateTaskArgs {
     /// Iteration budget for each child agent
     #[serde(default)]
     max_iterations: Option<u32>,
+    /// Run each child in an isolated git worktree (parallel safe edits).
+    #[serde(default)]
+    isolated_worktree: bool,
 }
 
 #[derive(Deserialize, Clone)]
@@ -205,6 +208,7 @@ struct ChildTaskRequest {
     toolsets: Option<Vec<String>>,
     max_iterations: u32,
     model_override: Option<String>,
+    isolated_worktree: bool,
 }
 
 /// Run a single child task using the SubAgentRunner.
@@ -217,6 +221,7 @@ async fn run_child_task(parent_ctx: &ToolContext, request: ChildTaskRequest) -> 
         toolsets,
         max_iterations,
         model_override,
+        isolated_worktree,
     } = request;
     let start = std::time::Instant::now();
 
@@ -276,6 +281,7 @@ async fn run_child_task(parent_ctx: &ToolContext, request: ChildTaskRequest) -> 
             ),
             parent_id: parent_ctx.delegate_agent_id.clone(),
             depth: parent_ctx.delegate_depth.saturating_add(1),
+            isolated_worktree,
         })
         .await
     {
@@ -413,6 +419,10 @@ impl ToolHandler for DelegateTaskToolReal {
                     "max_iterations": {
                         "type": "integer",
                         "description": "Iteration budget per sub-agent (default: 50)"
+                    },
+                    "isolated_worktree": {
+                        "type": "boolean",
+                        "description": "Run each child in an isolated git worktree under .edgecrab/worktrees/ (default: false)"
                     }
                 }
             }),
@@ -459,6 +469,7 @@ impl ToolHandler for DelegateTaskToolReal {
             DEFAULT_CHILD_MAX_ITERATIONS
         };
         let max_iter = args.max_iterations.unwrap_or(config_default_max_iter);
+        let isolated_worktree = args.isolated_worktree;
 
         let configured_max_subagents = if ctx.config.delegation_max_subagents > 0 {
             ctx.config.delegation_max_subagents as usize
@@ -539,6 +550,7 @@ impl ToolHandler for DelegateTaskToolReal {
                     toolsets: t.toolsets.clone(),
                     max_iterations: max_iter,
                     model_override: model_override.clone(),
+                    isolated_worktree,
                 },
             )
             .await;
@@ -601,6 +613,7 @@ impl ToolHandler for DelegateTaskToolReal {
                 let context = t.context.clone();
                 let toolsets = t.toolsets.clone();
                 let model_override = model_override.clone();
+                let child_isolated = isolated_worktree;
 
                 handles.push(tokio::spawn(async move {
                     run_child_task(
@@ -613,6 +626,7 @@ impl ToolHandler for DelegateTaskToolReal {
                             toolsets,
                             max_iterations: max_iter,
                             model_override,
+                            isolated_worktree: child_isolated,
                         },
                     )
                     .await

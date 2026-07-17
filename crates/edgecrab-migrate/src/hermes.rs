@@ -753,6 +753,8 @@ mod tests {
                 user_id: None,
                 model: Some("existing/model".into()),
                 system_prompt: None,
+                stable_system_prompt: None,
+                semi_stable_system_prompt: None,
                 parent_session_id: None,
                 started_at: 1_800_000_000.0_f64,
                 ended_at: None,
@@ -764,6 +766,7 @@ mod tests {
                 cache_read_tokens: 0,
                 cache_write_tokens: 0,
                 reasoning_tokens: 0,
+                last_prompt_tokens: 0,
                 estimated_cost_usd: None,
                 title: Some("Existing".into()),
             })
@@ -891,6 +894,8 @@ mod tests {
                 user_id: None,
                 model: None,
                 system_prompt: None,
+                stable_system_prompt: None,
+                semi_stable_system_prompt: None,
                 parent_session_id: None,
                 started_at: 1_699_999_000.0_f64,
                 ended_at: None,
@@ -902,6 +907,7 @@ mod tests {
                 cache_read_tokens: 0,
                 cache_write_tokens: 0,
                 reasoning_tokens: 0,
+                last_prompt_tokens: 0,
                 estimated_cost_usd: None,
                 title: Some("Existing Parent".into()),
             })
