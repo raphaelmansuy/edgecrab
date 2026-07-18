@@ -30,8 +30,8 @@ pub use error::{
     AgentError, ToolError, ToolErrorRecord, ToolErrorResponse, parse_tool_error_payload,
 };
 pub use harness::{
-    CompletionDecision, ExitReason, ReportedTaskStatus, RunOutcome, TaskStatusKind,
-    VerificationSummary,
+    CompletionDecision, ExitReason, GoalContract, ReportedTaskStatus, RunOutcome, TaskStatusKind,
+    VerificationSummary, parse_goal_with_contract,
 };
 pub use message::{Content, ContentPart, ImageUrl, Message, Role};
 pub use multimodal::{

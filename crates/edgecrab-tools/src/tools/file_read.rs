@@ -47,6 +47,118 @@ fn default_line_numbers() -> bool {
     true
 }
 
+/// Extension / path-based media redirect before any UTF-8 decode (006).
+fn binary_media_redirect_stub(path: &str) -> Option<String> {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())?;
+    match ext.as_str() {
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tiff" | "tif" | "avif" | "ico" => {
+            Some(format!(
+                "[IMAGE FILE DETECTED] '{path}' is an image — use vision_analyze instead. \
+                 Call vision_analyze with image_source='{path}' to inspect its contents."
+            ))
+        }
+        "pptx" | "ppt" | "docx" | "doc" | "xlsx" | "xls" | "odt" | "odp" | "pdf" | "zip"
+        | "jar" | "whl" | "gz" | "tgz" | "bz2" | "7z" | "rar" | "wasm" | "so" | "dylib"
+        | "dll" | "exe" | "bin" => {
+            let mime = mime_for_office_ext(&ext);
+            Some(
+                serde_json::json!({
+                    "ok": false,
+                    "binary": true,
+                    "path": path,
+                    "mime": mime,
+                    "suggested_tools": suggested_tools_for_mime(mime),
+                    "note": "Binary/office artifact — do not read as UTF-8 text. \
+                             Verify via filesystem metadata (ls/stat) or export to PDF/JPG + vision_analyze."
+                })
+                .to_string(),
+            )
+        }
+        _ => None,
+    }
+}
+
+fn mime_for_office_ext(ext: &str) -> &'static str {
+    match ext {
+        "pptx" | "ppt" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "docx" | "doc" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xlsx" | "xls" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "pdf" => "application/pdf",
+        "zip" | "jar" | "whl" => "application/zip",
+        "gz" | "tgz" => "application/gzip",
+        _ => "application/octet-stream",
+    }
+}
+
+fn suggested_tools_for_mime(mime: &str) -> Vec<&'static str> {
+    if mime.starts_with("image/") {
+        vec!["vision_analyze"]
+    } else if mime.contains("presentation") || mime == "application/pdf" {
+        vec!["terminal", "vision_analyze"]
+    } else {
+        vec!["terminal"]
+    }
+}
+
+/// Magic-byte media router when extension is missing/misleading.
+fn binary_stub_from_magic(path: &str, bytes: &[u8]) -> Option<String> {
+    if bytes.len() < 4 {
+        return None;
+    }
+    // ZIP-based Office (PK..)
+    if bytes[0] == 0x50 && bytes[1] == 0x4B && (bytes[2] == 0x03 || bytes[2] == 0x05 || bytes[2] == 0x07)
+    {
+        let mime = "application/zip";
+        return Some(
+            serde_json::json!({
+                "ok": false,
+                "binary": true,
+                "path": path,
+                "mime": mime,
+                "magic": "PK",
+                "bytes": bytes.len(),
+                "suggested_tools": ["terminal", "vision_analyze"],
+                "note": "ZIP/Office binary detected by magic bytes — not UTF-8 text."
+            })
+            .to_string(),
+        );
+    }
+    // PDF
+    if bytes.starts_with(b"%PDF") {
+        return Some(
+            serde_json::json!({
+                "ok": false,
+                "binary": true,
+                "path": path,
+                "mime": "application/pdf",
+                "magic": "%PDF",
+                "bytes": bytes.len(),
+                "suggested_tools": ["terminal", "vision_analyze"],
+                "note": "PDF binary — verify via metadata or exported page images + vision_analyze."
+            })
+            .to_string(),
+        );
+    }
+    // PNG
+    if bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47]) {
+        return Some(format!(
+            "[IMAGE FILE DETECTED] '{path}' is an image — use vision_analyze instead. \
+             Call vision_analyze with image_source='{path}' to inspect its contents."
+        ));
+    }
+    // JPEG
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some(format!(
+            "[IMAGE FILE DETECTED] '{path}' is an image — use vision_analyze instead. \
+             Call vision_analyze with image_source='{path}' to inspect its contents."
+        ));
+    }
+    None
+}
+
 fn normalize_line_range(args: &Args) -> Result<(Option<usize>, Option<usize>), ToolError> {
     if args.line_start.is_some() || args.line_end.is_some() {
         let (start, end) = (args.line_start, args.line_end);
@@ -247,37 +359,11 @@ impl ToolHandler for ReadFileTool {
             message: e.to_string(),
         })?;
 
-        // Image redirect: if the path points to an image file, redirect to vision_analyze.
-        // This mirrors the legacy image redirect behavior — prevents the agent from
-        // trying to read binary image bytes as text, which always fails.
+        // Media router: never UTF-8-decode images/office/zip binaries (006 / Claude Code).
         let (line_start, line_end) = normalize_line_range(&args)?;
 
-        {
-            let ext = std::path::Path::new(&args.path)
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|e| e.to_lowercase());
-            if matches!(
-                ext.as_deref(),
-                Some(
-                    "png"
-                        | "jpg"
-                        | "jpeg"
-                        | "gif"
-                        | "webp"
-                        | "bmp"
-                        | "tiff"
-                        | "tif"
-                        | "avif"
-                        | "ico"
-                )
-            ) {
-                return Ok(format!(
-                    "[IMAGE FILE DETECTED] '{}' is an image — use vision_analyze instead. \
-                     Call vision_analyze with image_source='{}' to inspect its contents.",
-                    args.path, args.path
-                ));
-            }
+        if let Some(stub) = binary_media_redirect_stub(&args.path) {
+            return Ok(stub);
         }
 
         let path_policy = ctx.config.file_path_policy(&ctx.cwd);
@@ -341,9 +427,29 @@ impl ToolHandler for ReadFileTool {
             return Ok(stub);
         }
 
-        let content = tokio::fs::read_to_string(&resolved)
+        let raw = tokio::fs::read(&resolved)
             .await
             .map_err(|e| ToolError::Other(format!("Cannot read '{}': {}", args.path, e)))?;
+
+        if let Some(stub) = binary_stub_from_magic(&args.path, &raw) {
+            return Ok(stub);
+        }
+
+        let content = match String::from_utf8(raw) {
+            Ok(s) => s,
+            Err(_) => {
+                return Ok(serde_json::json!({
+                    "ok": false,
+                    "binary": true,
+                    "path": args.path,
+                    "mime": "application/octet-stream",
+                    "bytes": metadata.len(),
+                    "suggested_tools": ["terminal"],
+                    "note": "File is not valid UTF-8 — do not decode as text."
+                })
+                .to_string());
+            }
+        };
 
         // Apply line range filter.
         // `first_line` tracks the 1-based line number of the first output line
@@ -597,6 +703,25 @@ mod tests {
             .await;
 
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn read_file_pptx_returns_binary_stub_not_utf8_error() {
+        let dir = TempDir::new().expect("tmpdir");
+        // Minimal ZIP/PK magic (Office Open XML container).
+        std::fs::write(dir.path().join("deck.pptx"), b"PK\x03\x04fake-office")
+            .expect("write");
+        let ctx = ctx_in(dir.path());
+        let result = ReadFileTool
+            .execute(json!({"path": "deck.pptx"}), &ctx)
+            .await
+            .expect("binary stub ok");
+        assert!(result.contains("binary"), "got: {result}");
+        assert!(result.contains("mime") || result.contains("suggested_tools"), "got: {result}");
+        assert!(
+            !result.contains("stream did not contain valid UTF-8"),
+            "must not surface UTF-8 decode panic: {result}"
+        );
     }
 
     #[tokio::test]

@@ -144,30 +144,12 @@ async fn execute_replace_patch(args: ReplaceArgs, ctx: &ToolContext) -> Result<S
             const PREVIEW_LIMIT: usize = 600;
             let preview = crate::safe_truncate(&content, PREVIEW_LIMIT);
             let truncated = preview.len() < content.len();
-            let trunc_note = if truncated {
-                format!(
-                    "\n[...truncated — file has {} total bytes; \
-                     read_file gives full content if needed.]",
-                    content.len()
-                )
-            } else {
-                String::new()
-            };
-
-            return Err(ToolError::ContentMismatch {
-                tool: "patch".into(),
-                path: args.path.clone(),
-                message: format!(
-                    "{msg}\n\
-                     Snapshot recorded — retry patch with the corrected old_string \
-                     (no read_file needed).\n\
-                     \n\
-                     Current file content (preview):\n\
-                     ---\n\
-                     {preview}{trunc_note}\n\
-                     ---"
-                ),
-            });
+            return Err(crate::recovery_catalog::patch_content_mismatch(
+                &args.path,
+                &msg,
+                preview,
+                truncated,
+            ));
         }
     };
 

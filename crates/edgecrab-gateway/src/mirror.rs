@@ -46,6 +46,7 @@ pub fn mirror_to_session(
         name: None,
         reasoning: None,
         finish_reason: None,
+        created_at: None,
     };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

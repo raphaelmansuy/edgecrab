@@ -89,8 +89,9 @@ use crate::task_class::{
 };
 use crate::turn_dispatch::{
     ToolTurnFinalizeParams, TurnDispatchTrackers, TurnDispatchTrackersView, apply_guardrail_result,
-    finalize_tool_turn, forward_process_watch_event, guardrail_before_dispatch_checked,
+    finalize_tool_turn, forward_process_watch_event,
 };
+use crate::turn_dispatch_policy::pre_dispatch_decision;
 
 /// Maximum API retries before giving up.
 const MAX_RETRIES: u32 = 3;
@@ -532,21 +533,29 @@ impl Agent {
                 let schemas = registry.get_definitions(enabled_filter, disabled_filter, &ctx);
                 let names: Vec<String> = schemas.iter().map(|s| s.name.clone()).collect();
                 let materialized = read_materialized_set(Some(&materialized_tools));
-                (
-                    build_wire_llm_definitions(
-                        registry,
-                        &ctx,
-                        enabled_filter,
-                        disabled_filter,
-                        config.tool_schema_mode,
-                        &materialized,
-                    ),
-                    names,
-                    Some(schemas),
-                )
+                let hot_full = crate::local_provider_policy::is_local_inference_provider(
+                    provider.name(),
+                );
+                let wire = build_wire_llm_definitions(
+                    registry,
+                    &ctx,
+                    enabled_filter,
+                    disabled_filter,
+                    config.tool_schema_mode,
+                    &materialized,
+                    hot_full,
+                );
+                (wire, names, Some(schemas))
             } else {
                 (Vec::new(), Vec::new(), None)
             };
+        let effective_schema_mode = edgecrab_tools::resolve_effective_schema_mode(
+            config.tool_schema_mode,
+            tool_names_for_prompt.len(),
+        );
+        app_config_ref.tool_schema_mode = effective_schema_mode;
+        let hot_schema_full =
+            crate::local_provider_policy::is_local_inference_provider(provider.name());
 
         // Inject context engine tool schemas (if any) — added once at session start.
         // Also build engine_tool_names (O(1) lookup set) used in dispatch routing.
@@ -560,7 +569,7 @@ impl Agent {
                         .min(crate::context_engine::MAX_ENGINE_TOOLS)];
                     active_tool_defs.extend(to_llm_definitions_with_mode(
                         capped,
-                        config.tool_schema_mode,
+                        effective_schema_mode,
                     ));
                     capped.iter().map(|s| s.name.clone()).collect()
                 } else {
@@ -651,11 +660,25 @@ impl Agent {
                     edgecrab_tools::describe_execution_filesystem(&app_config_ref, &cwd)
                         .render_prompt_block()
                 });
+                let wire_for_prompt = if effective_schema_mode
+                    == edgecrab_tools::ToolSchemaMode::Indexed
+                {
+                    let mut wire: Vec<String> = edgecrab_tools::INDEXED_HOT_TOOLS
+                        .iter()
+                        .map(|s| (*s).to_string())
+                        .collect();
+                    wire.push(edgecrab_tools::TOOL_SEARCH_NAME.to_string());
+                    wire.extend(read_materialized_set(Some(&materialized_tools)));
+                    Some(wire)
+                } else {
+                    None
+                };
                 let blocks = PromptBuilder::new(config.platform)
                     .skip_context_files(config.skip_context_files)
                     .execution_environment_guidance(execution_guidance)
-                    .available_tools(tool_names_for_prompt)
-                    .tool_schema_mode(config.tool_schema_mode)
+                    .available_tools(tool_names_for_prompt.clone())
+                    .wire_tools(wire_for_prompt)
+                    .tool_schema_mode(effective_schema_mode)
                     .model_name(Some(config.model.clone()))
                     .session_id(Some(conversation_session_id.clone()))
                     .build_blocks(
@@ -680,14 +703,26 @@ impl Agent {
                     }
                     dynamic.push_str(&format!("## Personality\n\n{addon}"));
                 }
-                if config.tool_schema_mode == edgecrab_tools::ToolSchemaMode::Indexed
+                if effective_schema_mode == edgecrab_tools::ToolSchemaMode::Indexed
                     && let Some(ref schemas) = session_tool_schemas
                 {
                     let (_, deferred) = edgecrab_tools::partition_schemas(
                         schemas,
                         &std::collections::HashSet::new(),
                     );
-                    let index = edgecrab_tools::format_deferred_index(&deferred);
+                    let mut categories: Vec<String> = Vec::new();
+                    if let Some(ref registry) = tool_registry {
+                        let mut seen = std::collections::BTreeSet::new();
+                        for schema in &deferred {
+                            if let Some(toolset) = registry.toolset_for_tool(&schema.name)
+                                && seen.insert(toolset.clone())
+                            {
+                                categories.push(toolset);
+                            }
+                        }
+                    }
+                    let index =
+                        edgecrab_tools::format_deferred_index(deferred.len(), &categories);
                     if !index.is_empty() {
                         if !dynamic.is_empty() {
                             dynamic.push_str("\n\n");
@@ -982,8 +1017,63 @@ impl Agent {
         session.messages.push(Message::user(&expansion.expanded));
         session.user_turn_count += 1;
 
+        // Turn-start BM25 prefetch (Indexed only): silent materialize before first LLM call.
+        let mut tool_defs_dirty = false;
+        if effective_schema_mode == ToolSchemaMode::Indexed
+            && tool_names_for_prompt.iter().any(|n| n == "tool_search")
+            && let Some(ref schemas) = session_tool_schemas
+        {
+            let mat = read_materialized_set(Some(&materialized_tools));
+            let hits = edgecrab_tools::prefetch_tools_for_user_message(
+                &expansion.expanded,
+                schemas,
+                &mat,
+                edgecrab_tools::DEFAULT_PREFETCH_LIMIT,
+            );
+            if !hits.is_empty() {
+                let _ = edgecrab_tools::materialize_tool_names(
+                    &hits,
+                    schemas,
+                    &materialized_tools,
+                    app_config_ref.max_materialized_tools,
+                    edgecrab_tools::MaterializeSchemaStyle::Compact,
+                );
+                tool_defs_dirty = true;
+                tracing::debug!(
+                    count = hits.len(),
+                    tools = ?hits,
+                    "indexed schema: turn-start tool prefetch"
+                );
+            }
+        }
+
         if !session.task_class_advisory_sent {
             let class = classify_from_messages(&session.messages);
+            // VisualUx: materialize browser verify tools so perception does not burn
+            // iterations on tool_search (cache-safe — wire path only).
+            if matches!(class, crate::task_class::TaskClass::VisualUx)
+                && effective_schema_mode == ToolSchemaMode::Indexed
+                && let Some(ref schemas) = session_tool_schemas
+            {
+                let visual_tools = vec![
+                    "browser_navigate".to_string(),
+                    "browser_snapshot".to_string(),
+                ];
+                let outcome = edgecrab_tools::materialize_tool_names(
+                    &visual_tools,
+                    schemas,
+                    &materialized_tools,
+                    app_config_ref.max_materialized_tools,
+                    edgecrab_tools::MaterializeSchemaStyle::Compact,
+                );
+                if !outcome.activated.is_empty() {
+                    tool_defs_dirty = true;
+                    tracing::debug!(
+                        tools = ?outcome.activated,
+                        "indexed schema: VisualUx browser verify prefetch"
+                    );
+                }
+            }
             if apply_visual_ux_session_preview(class, &config.security_preview) {
                 tracing::info!(
                     ?class,
@@ -1195,6 +1285,7 @@ impl Agent {
         let mut final_response = String::new();
         let mut interrupted = false;
         let mut budget_exhausted = false;
+        let mut invalid_tool_budget_exhausted = false;
         // Accumulate per-tool-call error records — mirrors hermes AgentResult.tool_errors.
         let mut tool_errors_acc: Vec<edgecrab_types::ToolErrorRecord> = Vec::new();
         let turn = crate::turn_prologue::TurnPrologueState::begin(&config.harness);
@@ -1202,7 +1293,6 @@ impl Agent {
         let capability_suppressions: Arc<Mutex<HashMap<String, ToolErrorResponse>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let spill_seq = Arc::new(crate::tool_result_spill::SpillSequence::new());
-        let mut tool_defs_dirty = false;
         let mut pressure_warned = turn.pressure_warned;
         let mut compression_llm_failures = turn.compression_llm_failures;
         const MAX_COMPRESSION_LLM_FAILURES: u32 = 3;
@@ -1288,8 +1378,9 @@ impl Agent {
                         &schema_ctx,
                         enabled_filter,
                         disabled_filter,
-                        config.tool_schema_mode,
+                        effective_schema_mode,
                         &materialized,
+                        hot_schema_full,
                     )
                 } else {
                     Vec::new()
@@ -2314,12 +2405,19 @@ impl Agent {
                             task_class,
                         },
                     );
+                    let goal_state = self
+                        .goal_store
+                        .active(&conversation_session_id)
+                        .unwrap_or_default();
+                    let goal_contract = (!goal_state.contract.is_empty())
+                        .then_some(&goal_state.contract);
                     let provisional_outcome = crate::turn_epilogue::assess_turn_outcome(
                         crate::turn_epilogue::TurnAssessParams {
                             final_response: &text,
                             messages: &session.messages,
                             interrupted: false,
                             budget_exhausted: false,
+                            invalid_tool_budget_exhausted: false,
                             pending_approval: run_progress
                                 .pending_approvals
                                 .load(Ordering::Relaxed)
@@ -2335,10 +2433,17 @@ impl Agent {
                                 .load(Ordering::Relaxed),
                             harness: provisional_harness,
                             harness_config: &config.harness,
+                            goal_contract,
+                            // Provisional mid-loop never runs harness contract verify.
+                            harness_contract_verify: false,
+                            cwd: &cwd,
                         },
                     );
 
-                    if crate::turn_epilogue::should_reopen_loop(&provisional_outcome) {
+                    if crate::turn_epilogue::should_reopen_loop_with_messages(
+                        &provisional_outcome,
+                        &session.messages,
+                    ) {
                         tracing::info!(
                             state = provisional_outcome.state.as_str(),
                             active_tasks = todo.active,
@@ -2451,6 +2556,7 @@ impl Agent {
                         ),
                     );
                     session.invalid_tool_call_retries = 0;
+                    invalid_tool_budget_exhausted = true;
                     final_response = reason;
                     break;
                 }
@@ -2459,6 +2565,30 @@ impl Agent {
                     // iteration rebuilds semi-stable skills index (FP cache law).
                     if self.take_skills_zone_dirty() {
                         session.invalidate_skills_zone();
+                    }
+                    // ── Document Done latch (007 never-stop) ──────────────────
+                    // Artifact ready ⇒ stop mid-loop; do not wait for model silence
+                    // or burn budget on open/screencapture theater.
+                    if crate::task_class::document_done_latch_ready(&session.messages) {
+                        tracing::info!(
+                            "document done latch: artifact evidence present — ending turn"
+                        );
+                        final_response = session
+                            .messages
+                            .iter()
+                            .rev()
+                            .find(|m| m.role == Role::Assistant)
+                            .map(|m| m.text_content())
+                            .filter(|t| !t.trim().is_empty())
+                            .unwrap_or_else(|| {
+                                "Document artifact delivered and verified on disk.".into()
+                            });
+                        emit_activity(
+                            event_tx,
+                            "✓ Document artifact ready — ending turn (Done latch).",
+                        );
+                        self.publish_session_state(&session).await;
+                        break;
                     }
                     // ── Steering injection point ─────────────────────────────
                     // Check for pending steers AFTER all tool results are appended.
@@ -2654,12 +2784,19 @@ impl Agent {
         self.publish_session_state(&session).await;
 
         let todo = snapshot_todo_state(&self.todo_store);
+        let final_goal_state = self
+            .goal_store
+            .active(&conversation_session_id)
+            .unwrap_or_default();
+        let final_goal_contract = (!final_goal_state.contract.is_empty())
+            .then_some(&final_goal_state.contract);
         let mut run_outcome =
             crate::turn_epilogue::assess_turn_outcome(crate::turn_epilogue::TurnAssessParams {
                 final_response: &final_response,
                 messages: &session.messages,
                 interrupted,
                 budget_exhausted,
+                invalid_tool_budget_exhausted,
                 pending_approval: run_progress.pending_approvals.load(Ordering::Relaxed) > 0,
                 pending_clarification: run_progress.pending_clarifications.load(Ordering::Relaxed)
                     > 0,
@@ -2668,6 +2805,9 @@ impl Agent {
                 child_runs_in_flight: run_progress.child_runs_in_flight.load(Ordering::Relaxed),
                 harness: harness_snapshot.clone(),
                 harness_config: &config.harness,
+                goal_contract: final_goal_contract,
+                harness_contract_verify: true,
+                cwd: &cwd,
             });
         run_outcome = crate::turn_epilogue::enrich_turn_outcome(
             run_outcome,
@@ -2771,7 +2911,7 @@ impl Agent {
                 ended_at: Some(now),
                 end_reason: Some(run_outcome.exit_reason.as_str().to_string()),
                 message_count: session.messages.len() as i64,
-                tool_call_count: session.session_tool_call_count as i64,
+                tool_call_count: derive_tool_call_count(&session) as i64,
                 input_tokens: session.session_input_tokens as i64,
                 output_tokens: session.session_output_tokens as i64,
                 cache_read_tokens: session.session_cache_read_tokens as i64,
@@ -3775,11 +3915,8 @@ async fn process_response(
                     max = edgecrab_tools::MAX_INVALID_TOOL_RETRIES,
                     "unknown tool name after repair — sending structured error to model"
                 );
-                if batch.should_abort {
-                    return Ok(LoopAction::PartialAbort {
-                        reason: format!("Model generated invalid tool call: {invalid_preview}"),
-                    });
-                }
+                // Tool-call closure invariant: every assistant tool_call must receive a
+                // matching tool result before any loop exit — including PartialAbort.
                 let unknown_set: std::collections::HashSet<String> =
                     batch.unknown_names.into_iter().collect();
                 for tc in &our_tool_calls {
@@ -3802,6 +3939,11 @@ async fn process_response(
                     );
                 }
                 trackers.dedup.end_turn();
+                if batch.should_abort {
+                    return Ok(LoopAction::PartialAbort {
+                        reason: format!("Model generated invalid tool call: {invalid_preview}"),
+                    });
+                }
                 return Ok(LoopAction::Continue);
             }
             session.invalid_tool_call_retries = 0;
@@ -3908,11 +4050,12 @@ async fn process_response(
                     harness_advisory: &trackers.harness_advisory,
                     tool_guardrail: &trackers.tool_guardrail,
                 };
-                if let Some(blocked) = guardrail_before_dispatch_checked(
+                if let Some(blocked) = pre_dispatch_decision(
                     &trackers_view,
                     &session.messages,
                     &tc.function.name,
                     &tc.function.arguments,
+                    &dctx.conversation_session_id,
                 ) {
                     emit_tool_done(
                         dctx.event_tx.as_ref(),
@@ -4154,13 +4297,13 @@ async fn process_response(
                 harness_advisory: &trackers.harness_advisory,
                 tool_guardrail: &trackers.tool_guardrail,
             };
-            let (mut tool_result, injected_messages) = if let Some(blocked) =
-                guardrail_before_dispatch_checked(
-                    &trackers_view,
-                    &session.messages,
-                    &tc.function.name,
-                    &tc.function.arguments,
-                ) {
+            let (mut tool_result, injected_messages) = if let Some(blocked) = pre_dispatch_decision(
+                &trackers_view,
+                &session.messages,
+                &tc.function.name,
+                &tc.function.arguments,
+                &dctx.conversation_session_id,
+            ) {
                 (blocked, Vec::new())
             } else {
                 dispatch_single_tool(&tc.id, &tc.function.name, &tc.function.arguments, dctx).await
@@ -4235,7 +4378,11 @@ async fn process_response(
             .map(|m| m.text_content())
             .collect();
         let browser_refs: Vec<&str> = browser_results.iter().map(String::as_str).collect();
-        let known_dev_ports = dctx.process_table.list_running_http_server_ports().await;
+        let process_ports = dctx.process_table.list_running_http_server_ports().await;
+        let known_dev_ports = edgecrab_tools::dev_server::merge_dev_server_ports(
+            &dctx.conversation_session_id,
+            &process_ports,
+        );
         let blocked_tools: Vec<String> = if argument_loop_blocked {
             effective_tool_calls
                 .iter()
@@ -4287,6 +4434,10 @@ async fn process_response(
 
         // End-of-turn: rotate dedup tracker (FP11)
         trackers.dedup.end_turn();
+
+        // Mid-loop flush so live sessions have messages in state.db (game005
+        // forensics: 0f6fc6d6 had message_count=0 while tools were running).
+        checkpoint_session_messages_mid_turn(dctx, session);
 
         if trackers.guardrail_halt {
             return Ok(LoopAction::GuardrailHalt);
@@ -4705,6 +4856,31 @@ async fn dispatch_single_tool_impl(
         result
     };
 
+    // Recovery → wire closure (Indexed): materialize SwitchTool / CallToolFirst
+    // targets so the next LLM turn can call them without a lucky tool_search.
+    if tool_failed
+        && dctx.app_config_ref.tool_schema_mode == ToolSchemaMode::Indexed
+        && let Some(mat) = dctx.materialized_tools.as_ref()
+    {
+        let targets = edgecrab_tools::recovery_catalog::tools_to_materialize_from_error_json(&result);
+        if !targets.is_empty() {
+            let schemas = reg.get_definitions(None, None, &ctx);
+            let outcome = edgecrab_tools::materialize_tool_names(
+                &targets,
+                &schemas,
+                mat,
+                dctx.app_config_ref.max_materialized_tools,
+                edgecrab_tools::MaterializeSchemaStyle::Compact,
+            );
+            if !outcome.activated.is_empty() {
+                tracing::debug!(
+                    tools = ?outcome.activated,
+                    "indexed schema: recovery auto-materialize"
+                );
+            }
+        }
+    }
+
     (result, queued_messages)
 }
 
@@ -4932,6 +5108,100 @@ and stop — do NOT call any tools.";
     {
         tracing::debug!(error = %e, "learning reflection tool dispatch failed (non-fatal)");
     }
+}
+
+/// Persist messages mid-ReAct-loop so forensics/`/history` match the live TUI.
+///
+/// Does not set `ended_at` — the final save at turn completion owns terminal
+/// outcome fields.
+fn stamp_unset_message_timestamps(messages: &mut [Message], now: f64) {
+    let mut seq = 0u32;
+    for msg in messages.iter_mut() {
+        if msg.created_at.is_none() {
+            msg.created_at = Some(now + f64::from(seq) * 1e-6);
+            seq = seq.saturating_add(1);
+        }
+    }
+}
+
+fn checkpoint_session_messages_mid_turn(dctx: &DispatchContext, session: &mut SessionState) {
+    let Some(ref db) = dctx.state_db else {
+        return;
+    };
+    if session.messages.is_empty() {
+        return;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+    stamp_unset_message_timestamps(&mut session.messages, now);
+    let existing = db
+        .get_session(&dctx.conversation_session_id)
+        .ok()
+        .flatten();
+    let (source, user_id) = match &dctx.origin_chat {
+        Some(origin) => (origin.platform.clone(), Some(origin.chat_id.clone())),
+        None => (
+            existing
+                .as_ref()
+                .map(|s| s.source.clone())
+                .unwrap_or_else(|| "cli".to_string()),
+            existing.as_ref().and_then(|s| s.user_id.clone()),
+        ),
+    };
+    let title = existing
+        .as_ref()
+        .and_then(|s| s.title.clone())
+        .or_else(|| {
+            session.messages.iter().find(|m| m.role == Role::User).map(|m| {
+                let t = m.text_content();
+                if t.len() > 80 {
+                    format!("{}…", crate::safe_truncate(&t, 80))
+                } else {
+                    t
+                }
+            })
+        });
+    let record = edgecrab_state::SessionRecord {
+        id: dctx.conversation_session_id.clone(),
+        source,
+        user_id,
+        model: Some(dctx.app_config_ref.active_model.clone()),
+        system_prompt: session.cached_system_prompt.clone(),
+        stable_system_prompt: session.cached_stable_prompt.clone(),
+        semi_stable_system_prompt: session.cached_semi_stable_prompt.clone(),
+        parent_session_id: existing.as_ref().and_then(|s| s.parent_session_id.clone()),
+        started_at: existing.as_ref().map(|s| s.started_at).unwrap_or(now),
+        ended_at: None,
+        end_reason: None,
+        message_count: session.messages.len() as i64,
+        tool_call_count: derive_tool_call_count(session) as i64,
+        input_tokens: session.session_input_tokens as i64,
+        output_tokens: session.session_output_tokens as i64,
+        cache_read_tokens: session.session_cache_read_tokens as i64,
+        cache_write_tokens: session.session_cache_write_tokens as i64,
+        reasoning_tokens: session.session_reasoning_tokens as i64,
+        last_prompt_tokens: session.last_prompt_tokens as i64,
+        estimated_cost_usd: existing
+            .as_ref()
+            .and_then(|s| s.estimated_cost_usd)
+            .or(Some(0.0)),
+        title,
+    };
+    if let Err(e) = db.save_session_with_messages(&record, &session.messages, now) {
+        tracing::debug!(error = %e, "mid-turn session checkpoint failed (non-fatal)");
+    }
+}
+
+/// Persist / restore honesty: count `role=tool` messages (006 pptx forensics).
+fn derive_tool_call_count(session: &crate::agent::SessionState) -> u32 {
+    let from_messages = session
+        .messages
+        .iter()
+        .filter(|m| matches!(m.role, Role::Tool))
+        .count() as u32;
+    from_messages.max(session.session_tool_call_count)
 }
 
 /// Remove orphaned tool_result messages that have no matching assistant

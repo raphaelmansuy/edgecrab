@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use edgecrab_state::{SessionDb, StoredGoalState, StoredSubGoal};
-use edgecrab_types::AgentError;
+use edgecrab_types::{AgentError, GoalContract, parse_goal_with_contract};
 
 use super::{GoalState, GoalStatus, GoalStore, SubGoal};
 
@@ -26,6 +26,7 @@ fn map_state(stored: StoredGoalState) -> GoalState {
         last_verdict: stored.last_verdict,
         last_reason: stored.last_reason,
         consecutive_parse_failures: stored.consecutive_parse_failures,
+        contract: GoalContract::from_json(stored.contract_json.as_deref()),
     }
 }
 
@@ -53,7 +54,23 @@ impl GoalStore for SqliteGoalStore {
     }
 
     fn set_goal(&self, session_id: &str, text: &str, max_turns: u32) -> Result<(), AgentError> {
-        self.db.goals_set(session_id, text, max_turns)
+        let (goal_text, contract) = parse_goal_with_contract(text);
+        self.set_goal_with_contract(session_id, &goal_text, max_turns, &contract)
+    }
+
+    fn set_goal_with_contract(
+        &self,
+        session_id: &str,
+        text: &str,
+        max_turns: u32,
+        contract: &GoalContract,
+    ) -> Result<(), AgentError> {
+        self.db.goals_set_with_contract(
+            session_id,
+            text,
+            max_turns,
+            contract.to_json().as_deref(),
+        )
     }
 
     fn clear(&self, session_id: &str) -> Result<(), AgentError> {
@@ -123,6 +140,7 @@ impl GoalStore for SqliteGoalStore {
             last_verdict: state.last_verdict.clone(),
             last_reason: state.last_reason.clone(),
             consecutive_parse_failures: state.consecutive_parse_failures,
+            contract_json: state.contract.to_json(),
         };
         self.db.goals_save_loop_state(session_id, &stored)
     }

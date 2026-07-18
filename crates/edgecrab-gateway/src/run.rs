@@ -2662,10 +2662,11 @@ impl Gateway {
                                     {
                                         Ok(agent) => {
                                             let (result, kickoff) = if args.is_empty()
-                                                || lower == "show"
                                                 || lower == "status"
                                             {
                                                 (agent.goal_status().await, None)
+                                            } else if lower == "show" {
+                                                (agent.goal_show().await, None)
                                             } else if lower == "pause" {
                                                 (agent.goal_pause().await, None)
                                             } else if lower == "resume" {
@@ -2675,11 +2676,34 @@ impl Gateway {
                                                 }
                                             } else if matches!(lower.as_str(), "clear" | "stop" | "done") {
                                                 (agent.goal_clear().await, None)
+                                            } else if lower.starts_with("draft ") || lower == "draft"
+                                            {
+                                                let draft_args = args
+                                                    .strip_prefix("draft ")
+                                                    .or_else(|| args.strip_prefix("DRAFT "))
+                                                    .or_else(|| args.strip_prefix("Draft "))
+                                                    .unwrap_or("")
+                                                    .trim();
+                                                match agent.goal_draft(draft_args).await {
+                                                    Ok(msg) => {
+                                                        let kickoff = agent
+                                                            .goal_state()
+                                                            .await
+                                                            .ok()
+                                                            .and_then(|s| s.goal_text);
+                                                        (Ok(msg), kickoff)
+                                                    }
+                                                    Err(err) => (Err(err), None),
+                                                }
                                             } else {
-                                                (
-                                                    agent.goal_set(args).await,
-                                                    Some(args.to_string()),
-                                                )
+                                                let (goal_text, _) =
+                                                    edgecrab_types::parse_goal_with_contract(args);
+                                                let kickoff = if goal_text.trim().is_empty() {
+                                                    None
+                                                } else {
+                                                    Some(goal_text)
+                                                };
+                                                (agent.goal_set(args).await, kickoff)
                                             };
                                             if matches!(lower.as_str(), "pause" | "clear" | "stop" | "done") {
                                                 self.clear_pending_goal_continuation(&session_key)

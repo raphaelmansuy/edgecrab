@@ -420,7 +420,33 @@ impl ToolHandler for TerminalTool {
             result = format!("[NOTE: {warning}]\n\n{result}");
         }
 
-        crate::dev_server::record_session_http_server(&ctx.session_id, &args.command);
+        // Port-bind truth: record only after evidence of a listening server;
+        // EADDRINUSE → unrecord + structured heal recovery (game005 forensics).
+        if crate::dev_server::is_preview_server_command(&args.command) {
+            if crate::dev_server::is_address_already_in_use(&result) {
+                crate::dev_server::unrecord_session_http_server(&ctx.session_id, &args.command);
+                let Some(port) = crate::dev_server::infer_http_server_port(&args.command) else {
+                    return Err(ToolError::ExecutionFailed {
+                        tool: "terminal".into(),
+                        message: "Address already in use — preview server port unknown \
+                             (pass an explicit port, e.g. `python3 -m http.server 8000`)."
+                            .into(),
+                    });
+                };
+                let serve_dir = crate::recovery_catalog::infer_preview_serve_directory_from_text(
+                    &args.command,
+                );
+                return Err(crate::recovery_catalog::terminal_port_in_use(
+                    &args.command,
+                    port,
+                    &serve_dir,
+                ));
+            }
+            // TCP listen probe owns port trust (not English "Serving HTTP" logs).
+            if let Some(port) = crate::dev_server::infer_http_server_port(&args.command) {
+                crate::dev_server::record_session_http_port_if_listening(&ctx.session_id, port);
+            }
+        }
 
         Ok(result)
     }
@@ -435,7 +461,13 @@ fn apply_os_sandbox_to_command(ctx: &ToolContext, command: &str, cwd: &std::path
         return command.to_string();
     }
     let mode = edgecrab_security::OsSandboxMode::parse(&ctx.config.os_sandbox_mode);
-    let wrapped = edgecrab_security::wrap_command(mode, command, cwd, true);
+    let wrapped = edgecrab_security::wrap_command(
+        mode,
+        command,
+        cwd,
+        true,
+        ctx.config.os_sandbox_deny_default,
+    );
     if let Some(ref warning) = wrapped.warning {
         tracing::warn!(%warning, "OS sandbox passthrough");
     }

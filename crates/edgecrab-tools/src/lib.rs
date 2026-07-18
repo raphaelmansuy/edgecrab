@@ -19,6 +19,7 @@ pub mod approval_runtime;
 pub mod artifact_spill;
 pub mod budget_config;
 mod command_interaction;
+pub use command_interaction::{command_invokes_screencapture, command_is_inspect_only};
 pub mod config_ref;
 pub mod copilot_model_normalize;
 pub mod delegation_state;
@@ -56,9 +57,12 @@ pub mod tool_call_pipeline;
 pub mod tool_loop_guardrails;
 pub mod tool_name_repair;
 pub mod tool_progress_tail;
+pub mod tool_input_examples;
 pub mod tool_schema_index;
 pub mod tool_search_bm25;
 pub mod tools;
+pub mod structured_browser;
+pub mod terminal_result;
 pub mod toolsets;
 pub mod vision_models;
 
@@ -104,24 +108,38 @@ pub use registry::{
     build_wire_llm_definitions, to_llm_definitions, to_llm_definitions_with_materialized,
     to_llm_definitions_with_mode,
 };
-pub use schema_mode::{ToolSchemaMode, compact_tool_schema, prepare_schemas_for_mode};
+pub use schema_mode::{
+    ToolSchemaMode, compact_tool_schema, prepare_schemas_for_mode, resolve_effective_schema_mode,
+};
 pub use smart_approval::handle_approvals_slash;
 pub use tool_argument_pipeline::{
     canonical_tool_args_json, parse_tool_arguments_json, prepare_parsed_tool_arguments,
     repair_stream_tool_arguments, repair_tool_arguments,
 };
 pub use tool_call_pipeline::{
-    MAX_INVALID_TOOL_RETRIES, PreparedToolCall, classify_unknown_tool_batch, is_tool_registered,
-    normalize_incoming_tool_call, prepare_tool_call, repair_tool_call_arguments_for_api,
-    sanitize_assistant_tool_calls_for_api, unknown_tool_error_response, unknown_tool_names,
+    MAX_INVALID_TOOL_RETRIES, PreparedToolCall, UNKNOWN_TOOL_SAMPLE_LIMIT,
+    classify_unknown_tool_batch, is_tool_registered, normalize_incoming_tool_call, prepare_tool_call,
+    repair_tool_call_arguments_for_api, sanitize_assistant_tool_calls_for_api,
+    unknown_tool_error_response, unknown_tool_names, unknown_tool_recovery_sample,
+    unknown_tool_search_query,
+};
+pub use recovery_catalog::tools_to_materialize_from_error_json;
+pub use tool_search_bm25::{
+    CatalogEntry, build_deferred_catalog, build_registry_catalog, looks_like_create_file_intent,
+    prefetch_tools_for_user_message, search_deferred_catalog,
 };
 pub use tool_name_repair::{
     ResolvedToolName, fuzzy_match_tool_name, repair_tool_name, resolve_tool_call_name,
 };
+pub use tool_input_examples::{
+    MAX_INPUT_EXAMPLES_PER_TOOL, input_examples_for_names, input_examples_for_tool,
+};
 pub use tool_schema_index::{
-    DEFAULT_MAX_MATERIALIZED_TOOLS, MaterializedToolSet, TOOL_SEARCH_NAME,
-    deferred_tool_error_response, format_deferred_index, is_deferred_not_on_wire, partition_schemas,
-    read_materialized_set, wire_partition_counts,
+    AUTO_INDEXED_TOOL_COUNT_THRESHOLD, DEFAULT_MAX_MATERIALIZED_TOOLS, DEFAULT_PREFETCH_LIMIT,
+    MAX_TOOLSET_MATERIALIZE, MaterializeOutcome, MaterializeSchemaStyle, MaterializedToolSet,
+    TOOL_SEARCH_NAME, deferred_names_for_toolset, deferred_tool_error_response,
+    format_deferred_index, is_deferred_not_on_wire, materialize_tool_names, partition_schemas,
+    read_materialized_set, wire_partition_counts, wire_schemas,
 };
 pub use tools::checkpoint::{
     AutoPruneResult, CheckpointConfig, CheckpointManager, PruneCounts, RollbackOutcome,
@@ -157,9 +175,16 @@ pub use tools::web::{
     web_command_overlay, web_command_usage, web_menu_status_hint, web_provider_picker_rows,
     web_search_is_available, web_search_result_note, web_status_one_liner,
 };
+pub use structured_browser::{
+    StructuredBrowserResult, parse_structured_browser_result, structured_browser_nav_succeeded,
+    url_is_chrome_error,
+};
+pub use terminal_result::{
+    ParsedTerminalResult, parse_terminal_result, terminal_result_succeeded,
+};
 pub use toolsets::{
-    CORE_TOOLS, HONCHO_TOOLS, LSP_TOOLS, MCP_EXTENDED_TOOLS, MOA_TOOLS, RESEARCH_EXTRA_TOOLS,
-    acp_tools, is_acp_tool, resolve_active_toolsets, resolve_alias,
+    CORE_TOOLS, HONCHO_TOOLS, INDEXED_HOT_TOOLS, LSP_TOOLS, MCP_EXTENDED_TOOLS, MOA_TOOLS,
+    RESEARCH_EXTRA_TOOLS, acp_tools, is_acp_tool, resolve_active_toolsets, resolve_alias,
 };
 
 #[cfg(test)]

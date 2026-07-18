@@ -94,6 +94,7 @@ async fn eval_with_verdict(
         store,
         session_id,
         response,
+        &[],
         false,
         &GoalsConfig::default(),
         &GoalJudgeConfig::default(),
@@ -161,6 +162,7 @@ async fn evaluate_after_turn_budget_exhausted() {
         store.clone(),
         "eval-budget",
         "step 1",
+        &[],
         false,
         &cfg,
         &judge,
@@ -177,6 +179,7 @@ async fn evaluate_after_turn_budget_exhausted() {
         store.clone(),
         "eval-budget",
         "step 2",
+        &[],
         false,
         &cfg,
         &judge,
@@ -210,6 +213,7 @@ async fn evaluate_after_turn_inactive_when_paused() {
         store,
         "eval-inact",
         "anything",
+        &[],
         false,
         &GoalsConfig::default(),
         &GoalJudgeConfig::default(),
@@ -238,6 +242,7 @@ async fn auto_pause_after_three_parse_failures() {
             store.clone(),
             "parse-fail",
             &format!("step {turn}"),
+            &[],
             false,
             &cfg,
             &judge,
@@ -261,6 +266,7 @@ async fn auto_pause_after_three_parse_failures() {
         store.clone(),
         "parse-fail",
         "step 3",
+        &[],
         false,
         &cfg,
         &judge,
@@ -292,6 +298,8 @@ async fn agent_goal_commands_match_hermes_surface() {
         .expect("agent");
 
     agent.goal_set("Build API").await.expect("goal");
+    let shown = agent.goal_show().await.expect("show");
+    assert!(shown.contains("Build API"));
     agent.subgoal_push("write tests").await.expect("push");
     agent.subgoal_remove(1).await.expect("remove");
     agent.subgoal_clear().await.expect("clear");
@@ -299,6 +307,9 @@ async fn agent_goal_commands_match_hermes_surface() {
     let status = agent.goal_status().await.expect("status");
     assert!(status.contains("paused"));
     agent.goal_resume().await.expect("resume");
+    // draft fail-open (mock returns empty → free-form set)
+    let drafted = agent.goal_draft("Ship feature").await.expect("draft");
+    assert!(drafted.contains("Goal set") || drafted.contains("Draft"));
     agent.goal_clear().await.expect("clear");
 }
 
@@ -319,6 +330,45 @@ fn parse_malformed_json_is_parse_failure() {
     let v = parse_judge_response("this is not json at all");
     assert!(!v.done);
     assert!(v.parse_failed);
+}
+
+#[test]
+fn parse_judge_wait_flag() {
+    let v = parse_judge_response(r#"{"done": false, "reason": "bg server", "wait": true}"#);
+    assert!(!v.done);
+    assert!(v.wait);
+}
+
+#[tokio::test]
+async fn evaluate_after_turn_wait_parks_without_continuation() {
+    let store = Arc::new(InMemoryGoalStore::new());
+    store
+        .set_goal("eval-wait", "wait for server", 20)
+        .expect("set");
+    let provider = Arc::new(VerdictProvider {
+        content: r#"{"done": false, "reason": "process still running", "wait": true}"#.into(),
+    });
+    let decision = evaluate_goal_after_turn(
+        store.clone(),
+        "eval-wait",
+        "started server",
+        &[],
+        false,
+        &GoalsConfig::default(),
+        &GoalJudgeConfig::default(),
+        None,
+        provider,
+        "mock/test",
+    )
+    .await
+    .expect("evaluate");
+    assert_eq!(decision.verdict, "wait");
+    assert!(!decision.should_continue);
+    assert!(decision.continuation_prompt.is_none());
+    assert_eq!(
+        store.active("eval-wait").expect("s").status,
+        GoalStatus::Active
+    );
 }
 
 #[test]
@@ -405,4 +455,112 @@ async fn goal_status_includes_subgoals_when_present() {
     let status = agent.goal_status().await.expect("status");
     assert!(status.contains("write tests"));
     assert!(status.contains("[ ]"));
+}
+
+#[tokio::test]
+async fn contract_vetoes_judge_done_without_tool_evidence() {
+    let store = Arc::new(InMemoryGoalStore::new());
+    let contract = edgecrab_types::GoalContract {
+        verification: "cargo test".into(),
+        ..Default::default()
+    };
+    store
+        .set_goal_with_contract("contract-veto", "Ship feature", 20, &contract)
+        .expect("set");
+    let provider = Arc::new(VerdictProvider {
+        content: r#"{"done": true, "reason": "looks done"}"#.into(),
+    });
+    let decision = evaluate_goal_after_turn(
+        store.clone(),
+        "contract-veto",
+        "I ran cargo test and everything passed.",
+        &[],
+        false,
+        &GoalsConfig::default(),
+        &GoalJudgeConfig::default(),
+        None,
+        provider,
+        "mock/test",
+    )
+    .await
+    .expect("evaluate");
+    assert_ne!(decision.verdict, "done");
+    assert!(decision.should_continue);
+    assert_eq!(
+        store.active("contract-veto").expect("s").status,
+        GoalStatus::Active
+    );
+}
+
+#[tokio::test]
+async fn contract_allows_done_with_successful_terminal_evidence() {
+    let store = Arc::new(InMemoryGoalStore::new());
+    let contract = edgecrab_types::GoalContract {
+        verification: "cargo test".into(),
+        ..Default::default()
+    };
+    store
+        .set_goal_with_contract("contract-ok", "Ship feature", 20, &contract)
+        .expect("set");
+    let provider = Arc::new(VerdictProvider {
+        content: r#"{"done": true, "reason": "tests green"}"#.into(),
+    });
+    let messages = vec![edgecrab_types::Message::tool_result(
+        "t1",
+        "terminal",
+        "[terminal_result status=success backend=local cwd=/tmp exit_code=0]\n\
+         cargo test\nok",
+    )];
+    let decision = evaluate_goal_after_turn(
+        store.clone(),
+        "contract-ok",
+        "Tests passed.",
+        &messages,
+        false,
+        &GoalsConfig::default(),
+        &GoalJudgeConfig::default(),
+        None,
+        provider,
+        "mock/test",
+    )
+    .await
+    .expect("evaluate");
+    assert_eq!(decision.verdict, "done");
+    assert!(!decision.should_continue);
+    assert_eq!(
+        store.active("contract-ok").expect("s").status,
+        GoalStatus::Done
+    );
+}
+
+#[tokio::test]
+async fn continuation_prompt_includes_contract_reminder() {
+    let store = Arc::new(InMemoryGoalStore::new());
+    let contract = edgecrab_types::GoalContract {
+        verification: "cargo test -p edgecrab-core".into(),
+        ..Default::default()
+    };
+    store
+        .set_goal_with_contract("contract-cont", "Refactor module", 10, &contract)
+        .expect("set");
+    let provider = Arc::new(VerdictProvider {
+        content: r#"{"done": false, "reason": "more work"}"#.into(),
+    });
+    let decision = evaluate_goal_after_turn(
+        store,
+        "contract-cont",
+        "progress",
+        &[],
+        false,
+        &GoalsConfig::default(),
+        &GoalJudgeConfig::default(),
+        None,
+        provider,
+        "mock/test",
+    )
+    .await
+    .expect("evaluate");
+    let prompt = decision.continuation_prompt.expect("continuation");
+    assert!(prompt.contains("Must produce tool evidence"));
+    assert!(prompt.contains("cargo test -p edgecrab-core"));
 }

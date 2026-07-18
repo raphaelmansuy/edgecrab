@@ -64,7 +64,7 @@ pub fn skill_gist(payload: &Value) -> String {
                 .unwrap_or("SKILL.md");
             format!("patch '{name}' {target}")
         }
-        "write_file" => {
+        "write_file" | "write_skill_file" => {
             let fp = payload
                 .get("file_path")
                 .and_then(|v| v.as_str())
@@ -238,7 +238,7 @@ pub async fn apply_skill_manage_payload(home: &Path, payload: &Value) -> Result<
                 "Skill '{name}' patched: replaced {replaced} occurrence(s)."
             ))
         }
-        "write_file" => {
+        "write_file" | "write_skill_file" => {
             let fp = payload
                 .get("file_path")
                 .and_then(|v| v.as_str())

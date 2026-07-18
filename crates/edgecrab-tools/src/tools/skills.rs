@@ -1601,7 +1601,8 @@ pub struct SkillManageTool;
 
 #[derive(Deserialize, serde::Serialize)]
 struct ManageArgs {
-    /// One of: "create", "edit", "delete", "patch", "write_file", "remove_file"
+    /// One of: "create", "edit", "delete", "patch", "write_skill_file", "remove_file"
+    /// (`write_file` is accepted as a deprecated alias for `write_skill_file`).
     action: String,
     /// Skill name (directory name under skills/)
     name: String,
@@ -1620,13 +1621,70 @@ struct ManageArgs {
     /// Optional subdirectory category for create (e.g. "mlops/training")
     #[serde(default)]
     category: Option<String>,
-    /// Path within the skill dir (required for write_file / remove_file).
+    /// Path within the skill dir (required for write_skill_file / remove_file).
     /// Must be under references/, templates/, scripts/, or assets/.
     #[serde(default)]
     file_path: Option<String>,
-    /// Content for write_file action
+    /// Content for write_skill_file action
     #[serde(default)]
     file_content: Option<String>,
+}
+
+/// Normalize deprecated `write_file` action → `write_skill_file`.
+fn normalize_skill_manage_action(action: &str) -> &str {
+    if action == "write_file" {
+        "write_skill_file"
+    } else {
+        action
+    }
+}
+
+/// True when `file_path` looks like a workspace path (not a skill package relative path).
+fn looks_like_workspace_path_misuse(args: &ManageArgs) -> bool {
+    let Some(fp) = args.file_path.as_deref() else {
+        return false;
+    };
+    let lower = fp.to_ascii_lowercase();
+    lower.starts_with("./")
+        || lower.starts_with("../")
+        || lower.starts_with('/')
+        || lower.starts_with("demo/")
+        || lower.starts_with("src/")
+        || lower.starts_with("crates/")
+        || lower.contains("/demo/")
+        || (lower.ends_with(".html")
+            || lower.ends_with(".js")
+            || lower.ends_with(".css")
+            || lower.ends_with(".rs"))
+            && !(lower.starts_with("references/")
+                || lower.starts_with("templates/")
+                || lower.starts_with("scripts/")
+                || lower.starts_with("assets/"))
+}
+
+fn skill_manage_workspace_misuse_error() -> ToolError {
+    use edgecrab_types::{RecoveryAction, RecoveryFeedbackBuilder};
+    ToolError::InvalidArgs {
+        tool: "skill_manage".into(),
+        message: "skill_manage is for ~/.edgecrab/skills/ packages only — not workspace \
+                  project files. Use write_file (path + content) or patch for files under \
+                  the working directory (e.g. demo/, src/)."
+            .into(),
+    }
+    .with_recovery(
+        RecoveryFeedbackBuilder::new("recovery_guidance")
+            .message("Workspace file create/edit — use write_file, not skill_manage")
+            .suggestion(
+                RecoveryAction::SwitchTool,
+                json!({
+                    "from_tool": "skill_manage",
+                    "to_tool": "write_file",
+                    "recommended_tools": ["write_file", "patch"],
+                    "reason": "skill_manage writes skill packages; write_file writes workspace files"
+                }),
+            )
+            .build(),
+    )
 }
 
 #[async_trait]
@@ -1646,22 +1704,23 @@ impl ToolHandler for SkillManageTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "skill_manage".into(),
-            description: "Create, edit, patch, delete a skill, or write/remove supporting files in ~/.edgecrab/skills/. \
+            description: "Create, edit, patch, delete a skill package under ~/.edgecrab/skills/ \
+                           (NOT for workspace project files — use write_file / patch for those). \
                            Use action='create' or 'edit' with content to write SKILL.md. \
                            Use action='patch' with old_string and new_string for targeted replacement. \
                            Use action='delete' to remove the skill directory. \
-                           Use action='write_file' with file_path and file_content to add/overwrite a supporting file. \
-                           Use action='remove_file' with file_path to remove a supporting file. \
-                           Skills are procedural memory: save non-trivial reusable workflows, and \
-                           patch a skill when you discover missing steps or pitfalls."
+                           Use action='write_skill_file' with file_path and file_content for supporting \
+                           files under references/, templates/, scripts/, or assets/ \
+                           (alias: write_file). Use action='remove_file' with file_path to remove one. \
+                           Skills are procedural memory: save non-trivial reusable workflows."
                 .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["create", "edit", "patch", "delete", "write_file", "remove_file"],
-                        "description": "Operation to perform"
+                        "enum": ["create", "edit", "patch", "delete", "write_skill_file", "write_file", "remove_file"],
+                        "description": "Operation to perform. write_skill_file writes skill package files only (write_file is a deprecated alias). For workspace files use the write_file tool instead."
                     },
                     "name": {
                         "type": "string",
@@ -1689,11 +1748,11 @@ impl ToolHandler for SkillManageTool {
                     },
                     "file_path": {
                         "type": "string",
-                        "description": "Relative path within the skill dir for write_file/remove_file (must be under references/, templates/, scripts/, or assets/)"
+                        "description": "Relative path within the skill dir for write_skill_file/remove_file (must be under references/, templates/, scripts/, or assets/)"
                     },
                     "file_content": {
                         "type": "string",
-                        "description": "Content for write_file action"
+                        "description": "Content for write_skill_file action"
                     }
                 },
                 "required": ["action", "name"]
@@ -1707,11 +1766,20 @@ impl ToolHandler for SkillManageTool {
         args: serde_json::Value,
         ctx: &ToolContext,
     ) -> Result<String, ToolError> {
-        let args: ManageArgs =
+        let mut args: ManageArgs =
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs {
                 tool: "skill_manage".into(),
                 message: e.to_string(),
             })?;
+
+        // Normalize deprecated action alias before validation / staging.
+        if args.action == "write_file" {
+            args.action = "write_skill_file".into();
+        }
+
+        if looks_like_workspace_path_misuse(&args) {
+            return Err(skill_manage_workspace_misuse_error());
+        }
 
         // Validate name: only safe characters, no path traversal
         let valid_name = args
@@ -1734,7 +1802,8 @@ impl ToolHandler for SkillManageTool {
         }
 
         // Validate required fields before staging (gate must see complete payloads).
-        match args.action.as_str() {
+        let action = normalize_skill_manage_action(&args.action);
+        match action {
             "create" | "edit" if args.content.is_none() => {
                 return Err(ToolError::InvalidArgs {
                     tool: "skill_manage".into(),
@@ -1747,10 +1816,10 @@ impl ToolHandler for SkillManageTool {
                     message: "old_string and new_string are required for patch".into(),
                 });
             }
-            "write_file" if args.file_path.is_none() || args.file_content.is_none() => {
+            "write_skill_file" if args.file_path.is_none() || args.file_content.is_none() => {
                 return Err(ToolError::InvalidArgs {
                     tool: "skill_manage".into(),
-                    message: "file_path and file_content are required for write_file".into(),
+                    message: "file_path and file_content are required for write_skill_file".into(),
                 });
             }
             "remove_file" if args.file_path.is_none() => {
@@ -1762,18 +1831,24 @@ impl ToolHandler for SkillManageTool {
             other
                 if !matches!(
                     other,
-                    "create" | "edit" | "patch" | "delete" | "write_file" | "remove_file"
+                    "create"
+                        | "edit"
+                        | "patch"
+                        | "delete"
+                        | "write_skill_file"
+                        | "remove_file"
                 ) =>
             {
                 return Err(ToolError::InvalidArgs {
                     tool: "skill_manage".into(),
                     message: format!(
-                        "Unknown action '{other}'. Use: create, edit, patch, delete, write_file, remove_file"
+                        "Unknown action '{other}'. Use: create, edit, patch, delete, write_skill_file, remove_file"
                     ),
                 });
             }
             _ => {}
         }
+        args.action = action.to_string();
 
         let payload = serde_json::to_value(&args).map_err(|e| ToolError::Other(e.to_string()))?;
         match crate::skills::maybe_gate_skill_manage(

@@ -23,9 +23,15 @@ A goal is DONE only when:\n\
 - The response clearly shows the final deliverable was produced, OR\n\
 - The response explains the goal is unachievable / blocked / needs \
 user input (treat this as DONE with reason describing the block).\n\n\
+When a completion contract is present, DONE additionally requires \
+concrete evidence that the verification criterion was met \
+(command result, test output, file excerpt, or browser evidence) \
+— never accept vibes or generic \"looks done\" claims.\n\n\
 Otherwise the goal is NOT done — CONTINUE.\n\n\
 Reply ONLY with a single JSON object on one line:\n\
-{\"done\": <true|false>, \"reason\": \"<one-sentence rationale>\"}";
+{\"done\": <true|false>, \"reason\": \"<one-sentence rationale>\", \"wait\": <true|false>}\n\
+Set wait=true when the agent is blocked on a long-running background process \
+and should park (not busy-loop) until the next user turn.";
 
 const JUDGE_USER_PROMPT: &str = "\
 Goal:\n{goal}\n\n\
@@ -48,12 +54,27 @@ ANY criterion lacks specific evidence in the response, the goal \
 is NOT done — return CONTINUE.\n\n\
 Is the goal AND every additional criterion satisfied?";
 
+const JUDGE_USER_PROMPT_WITH_CONTRACT: &str = "\
+Goal:\n{goal}\n\n\
+Completion contract (evidence-based done):\n{contract_block}\n\n\
+{extra_criteria}\
+Agent's most recent response:\n{response}\n\n\
+Current time: {current_time}\n\n\
+Decision: Mark DONE only when the verification criterion is met \
+with concrete evidence in the response (command/test output, file \
+excerpt, or browser/screenshot evidence). Reject vibes. Respect \
+constraints and boundaries. If stop_when applies, mark DONE with \
+a block reason.\n\n\
+Is the goal satisfied under the contract?";
+
 /// Parsed judge verdict.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GoalJudgeVerdict {
     pub done: bool,
     pub reason: String,
     pub parse_failed: bool,
+    /// Park Ralph continuation (background work / wait-for-process).
+    pub wait: bool,
 }
 
 /// Run the goal judge against the last assistant response.
@@ -70,6 +91,7 @@ pub async fn run_goal_judge(
             done: false,
             reason: "empty goal".into(),
             parse_failed: false,
+            wait: false,
         };
     }
     if last_response.trim().is_empty() {
@@ -77,6 +99,7 @@ pub async fn run_goal_judge(
             done: false,
             reason: "empty response (nothing to evaluate)".into(),
             parse_failed: false,
+            wait: false,
         };
     }
 
@@ -90,7 +113,29 @@ pub async fn run_goal_judge(
         .filter(|t| !t.is_empty())
         .collect();
 
-    let user_prompt = if active_subgoals.is_empty() {
+    let user_prompt = if !state.contract.is_empty() {
+        let contract_block = format_contract_block(&state.contract);
+        let extra_criteria = if active_subgoals.is_empty() {
+            String::new()
+        } else {
+            let subgoals_block = active_subgoals
+                .iter()
+                .enumerate()
+                .map(|(i, text)| format!("- {}. {text}", i + 1))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("Additional subgoal criteria (all required):\n{subgoals_block}\n\n")
+        };
+        JUDGE_USER_PROMPT_WITH_CONTRACT
+            .replace("{goal}", &truncate(goal, 2000))
+            .replace("{contract_block}", &truncate(&contract_block, 2000))
+            .replace("{extra_criteria}", &extra_criteria)
+            .replace(
+                "{response}",
+                &truncate(last_response, JUDGE_RESPONSE_SNIPPET_CHARS),
+            )
+            .replace("{current_time}", &now)
+    } else if active_subgoals.is_empty() {
         JUDGE_USER_PROMPT
             .replace("{goal}", &truncate(goal, 2000))
             .replace(
@@ -140,6 +185,7 @@ pub async fn run_goal_judge(
                 done: false,
                 reason: format!("judge error: {err}"),
                 parse_failed: false,
+                wait: false,
             };
         }
     };
@@ -176,6 +222,123 @@ fn truncate(text: &str, limit: usize) -> String {
     format!("{}… [truncated]", &text[..end])
 }
 
+fn format_contract_block(contract: &edgecrab_types::GoalContract) -> String {
+    let mut lines = Vec::new();
+    if !contract.outcome.trim().is_empty() {
+        lines.push(format!("- outcome: {}", contract.outcome.trim()));
+    }
+    if !contract.verification.trim().is_empty() {
+        lines.push(format!("- verification: {}", contract.verification.trim()));
+    }
+    if !contract.constraints.trim().is_empty() {
+        lines.push(format!("- constraints: {}", contract.constraints.trim()));
+    }
+    if !contract.boundaries.trim().is_empty() {
+        lines.push(format!("- boundaries: {}", contract.boundaries.trim()));
+    }
+    if !contract.stop_when.trim().is_empty() {
+        lines.push(format!("- stop_when: {}", contract.stop_when.trim()));
+    }
+    if lines.is_empty() {
+        "(empty contract)".into()
+    } else {
+        lines.join("\n")
+    }
+}
+
+/// Tools whose successful results may satisfy a goal contract verification criterion.
+///
+/// `report_task_status` is intentionally excluded — model-authored status is not proof.
+const CONTRACT_EVIDENCE_TOOLS: &[&str] = &[
+    "terminal",
+    "run_process",
+    "execute_code",
+    "browser_navigate",
+    "browser_snapshot",
+    "browser_screenshot",
+    "vision_analyze",
+];
+
+/// Code-is-law evidence: scan **tool results** for structured proof.
+///
+/// - `terminal` / `run_process`: `[terminal_result … exit_code=0]`; harness backend
+///   always counts; agent runs need needle in body and must not be echo-gaming.
+/// - Browser/vision: `StructuredBrowserResult.ok` when verification names perception.
+/// - Free-text `.contains(needle)` on tool prose is never evidence (018 F2).
+/// - Cheerleading / `report_task_status` alone never satisfy.
+pub fn contract_evidence_in_messages(
+    contract: &edgecrab_types::GoalContract,
+    messages: &[edgecrab_types::Message],
+) -> bool {
+    if !contract.requires_verification_evidence() {
+        return true;
+    }
+    let needle = contract.verification.trim().to_ascii_lowercase();
+    if needle.is_empty() {
+        return true;
+    }
+    for msg in messages {
+        if msg.role != edgecrab_types::Role::Tool {
+            continue;
+        }
+        let Some(name) = msg.name.as_deref() else {
+            continue;
+        };
+        if !CONTRACT_EVIDENCE_TOOLS.contains(&name) {
+            continue;
+        }
+        let content = msg.text_content();
+        if edgecrab_types::parse_tool_error_payload(&content).is_some() {
+            continue;
+        }
+        if matches!(name, "terminal" | "run_process") {
+            let Some(parsed) = edgecrab_tools::parse_terminal_result(&content) else {
+                continue;
+            };
+            if parsed.exit_code != 0 {
+                continue;
+            }
+            // Harness-run verification already executed the contract command.
+            if parsed.backend == "harness" {
+                return true;
+            }
+            if crate::contract_verify::looks_like_echo_gaming(parsed.body, &needle) {
+                continue;
+            }
+            if parsed.body.to_ascii_lowercase().contains(&needle) {
+                return true;
+            }
+            continue;
+        }
+        if matches!(
+            name,
+            "browser_navigate"
+                | "browser_snapshot"
+                | "browser_screenshot"
+                | "browser_vision"
+                | "vision_analyze"
+        ) {
+            let structured_ok =
+                edgecrab_tools::structured_browser_nav_succeeded(&content).unwrap_or(false);
+            if !structured_ok {
+                continue;
+            }
+            // Verification must name a perception criterion — not arbitrary prose match.
+            if needle.contains("browser")
+                || needle.contains("snapshot")
+                || needle.contains("screenshot")
+                || needle.contains("vision")
+                || needle.contains(name)
+            {
+                return true;
+            }
+            continue;
+        }
+        // execute_code: never free-text needle (code contracts use terminal/harness).
+    }
+    false
+}
+
 /// Parse judge JSON. Fail-open to `(done=false, reason, parse_failed=true)`.
 pub fn parse_judge_response(raw: &str) -> GoalJudgeVerdict {
     if raw.trim().is_empty() {
@@ -183,6 +346,7 @@ pub fn parse_judge_response(raw: &str) -> GoalJudgeVerdict {
             done: false,
             reason: "judge returned empty response".into(),
             parse_failed: true,
+            wait: false,
         };
     }
 
@@ -203,6 +367,7 @@ pub fn parse_judge_response(raw: &str) -> GoalJudgeVerdict {
             done: false,
             reason: format!("judge reply was not JSON: {:?}", truncate(raw, 200)),
             parse_failed: true,
+            wait: false,
         };
     };
 
@@ -221,11 +386,13 @@ pub fn parse_judge_response(raw: &str) -> GoalJudgeVerdict {
         .filter(|s| !s.is_empty())
         .unwrap_or("no reason provided")
         .to_string();
+    let wait = data["wait"].as_bool().unwrap_or(false);
 
     GoalJudgeVerdict {
         done,
         reason,
         parse_failed: false,
+        wait,
     }
 }
 
@@ -275,5 +442,111 @@ mod tests {
         );
         assert!(!v.done);
         assert_eq!(v.reason, "needs tests");
+    }
+
+    #[test]
+    fn contract_evidence_requires_tool_result_not_prose() {
+        let contract = edgecrab_types::GoalContract {
+            verification: "cargo test -p edgecrab-core".into(),
+            ..Default::default()
+        };
+        let prose_only = vec![edgecrab_types::Message::assistant(
+            "Ran cargo test -p edgecrab-core — all green.",
+        )];
+        assert!(!contract_evidence_in_messages(&contract, &prose_only));
+        let with_tool = vec![
+            edgecrab_types::Message::assistant("running"),
+            edgecrab_types::Message::tool_result(
+                "t1",
+                "terminal",
+                "[terminal_result status=success backend=local cwd=/tmp exit_code=0]\n\
+                 cargo test -p edgecrab-core\nok",
+            ),
+        ];
+        assert!(contract_evidence_in_messages(&contract, &with_tool));
+    }
+
+    #[test]
+    fn contract_evidence_rejects_failed_terminal_even_with_needle() {
+        let contract = edgecrab_types::GoalContract {
+            verification: "cargo test".into(),
+            ..Default::default()
+        };
+        let failed = vec![edgecrab_types::Message::tool_result(
+            "t1",
+            "terminal",
+            "[terminal_result status=error backend=local cwd=/tmp exit_code=1]\n\
+             cargo test\nFAILED",
+        )];
+        assert!(!contract_evidence_in_messages(&contract, &failed));
+    }
+
+    #[test]
+    fn contract_evidence_rejects_report_task_status_alone() {
+        let contract = edgecrab_types::GoalContract {
+            verification: "cargo test".into(),
+            ..Default::default()
+        };
+        let status = vec![edgecrab_types::Message::tool_result(
+            "r1",
+            "report_task_status",
+            r#"{"status":"completed","summary":"cargo test passed","evidence":["cargo test"]}"#,
+        )];
+        assert!(!contract_evidence_in_messages(&contract, &status));
+    }
+
+    #[test]
+    fn contract_evidence_rejects_headerless_terminal_blob() {
+        let contract = edgecrab_types::GoalContract {
+            verification: "cargo test".into(),
+            ..Default::default()
+        };
+        let blob = vec![edgecrab_types::Message::tool_result(
+            "t1",
+            "terminal",
+            "cargo test\nok",
+        )];
+        assert!(!contract_evidence_in_messages(&contract, &blob));
+    }
+
+    #[test]
+    fn contract_evidence_harness_backend_counts_without_needle() {
+        let contract = edgecrab_types::GoalContract {
+            verification: "cargo test -p edgecrab-core".into(),
+            ..Default::default()
+        };
+        let msgs = vec![edgecrab_types::Message::tool_result(
+            "t1",
+            "terminal",
+            "[terminal_result status=success backend=harness cwd=/tmp exit_code=0]\nok\n",
+        )];
+        assert!(contract_evidence_in_messages(&contract, &msgs));
+    }
+
+    #[test]
+    fn contract_evidence_rejects_browser_prose_needle() {
+        let contract = edgecrab_types::GoalContract {
+            verification: "browser_snapshot shows chess board".into(),
+            ..Default::default()
+        };
+        let prose = vec![edgecrab_types::Message::tool_result(
+            "s1",
+            "browser_snapshot",
+            "browser_snapshot shows chess board with pieces",
+        )];
+        assert!(!contract_evidence_in_messages(&contract, &prose));
+
+        let structured = edgecrab_tools::StructuredBrowserResult::snapshot_ok(
+            "http://127.0.0.1:8000/",
+            "Board @e1 @e2",
+            Some(4),
+        )
+        .to_tool_result_text();
+        let ok = vec![edgecrab_types::Message::tool_result(
+            "s1",
+            "browser_snapshot",
+            &structured,
+        )];
+        assert!(contract_evidence_in_messages(&contract, &ok));
     }
 }

@@ -2054,6 +2054,14 @@ fn stream_event_ndjson_line(event: &edgecrab_core::StreamEvent) -> Option<String
         StreamEvent::ToolDone { name, is_error, .. } => {
             serde_json::json!({"kind": "tool_done", "name": name, "is_error": is_error})
         }
+        // Operator honesty: typed exit on the done path (018 W4).
+        StreamEvent::RunFinished { outcome } => serde_json::json!({
+            "kind": "done",
+            "completion_state": outcome.state.as_str(),
+            "exit_reason": outcome.exit_reason.as_str(),
+            "summary": outcome.user_summary,
+            "evidence_count": outcome.evidence.len(),
+        }),
         StreamEvent::Done => serde_json::json!({"kind": "done"}),
         StreamEvent::Error(message) => serde_json::json!({"kind": "error", "message": message}),
         _ => return None,
@@ -3014,5 +3022,21 @@ mod tests {
             stream_event_ndjson_line(&edgecrab_core::StreamEvent::Token("hi".into())).expect("tok");
         assert!(token.contains(r#""kind":"token"#));
         assert!(token.contains("hi"));
+    }
+
+    #[test]
+    fn json_stream_run_finished_includes_exit_reason() {
+        use edgecrab_types::{CompletionDecision, ExitReason, RunOutcome};
+        let outcome = RunOutcome::new(
+            CompletionDecision::NeedsVerification,
+            ExitReason::VerificationPending,
+            "Needs browser evidence.",
+        );
+        let line = stream_event_ndjson_line(&edgecrab_core::StreamEvent::RunFinished { outcome })
+            .expect("run finished");
+        assert!(line.contains(r#""kind":"done"#));
+        assert!(line.contains("needs_verification"));
+        assert!(line.contains("verification_pending"));
+        assert!(line.contains("Needs browser evidence"));
     }
 }

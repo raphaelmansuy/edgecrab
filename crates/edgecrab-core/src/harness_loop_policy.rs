@@ -28,12 +28,38 @@ pub fn resolve_guardrail_config(harness: &HarnessConfig) -> ToolLoopGuardrailCon
 const STORM_BLOCK_TOOLS: &[&str] = &["terminal", "run_process", "execute_code"];
 
 /// Block act-without-perceive storms on visual tasks (terminal, shell, sandbox code).
+///
+/// Preview-server starts (`python -m http.server`, `npx serve`, …) are exempt —
+/// browser perception requires a listening HTTP server first (game002 deadlock).
 pub fn visual_storm_block_result(
     advisory: &HarnessTurnAdvisory,
     messages: &[Message],
     tool_name: &str,
 ) -> Option<String> {
+    visual_storm_block_result_with_args(advisory, messages, tool_name, "")
+}
+
+/// Like [`visual_storm_block_result`] but inspects tool args for preview-server exemption.
+pub fn visual_storm_block_result_with_args(
+    advisory: &HarnessTurnAdvisory,
+    messages: &[Message],
+    tool_name: &str,
+    args_json: &str,
+) -> Option<String> {
     if !STORM_BLOCK_TOOLS.contains(&tool_name) {
+        return None;
+    }
+    // Capability law: serve before perceive — never block the serve step.
+    if matches!(tool_name, "terminal" | "run_process" | "execute_code")
+        && let Some(cmd) = edgecrab_tools::dev_server::command_from_tool_args_json(args_json)
+        && edgecrab_tools::dev_server::is_preview_server_command(&cmd)
+    {
+        return None;
+    }
+    // execute_code: also scan raw args for embedded http.server snippets.
+    if tool_name == "execute_code"
+        && edgecrab_tools::dev_server::is_preview_server_command(args_json)
+    {
         return None;
     }
     let class = classify_from_messages(messages);
@@ -44,9 +70,12 @@ pub fn visual_storm_block_result(
         &edgecrab_tools::tool_loop_guardrails::ToolGuardrailDecision {
             action: edgecrab_tools::tool_loop_guardrails::GuardrailAction::Block,
             code: "visual_storm_act_block",
-            message: "Blocked shell/code tool — visual task needs browser evidence, not terminal debugging. \
-                       Run /config preview on if needed, start a dev server, \
-                       then browser_navigate + browser_snapshot."
+            message: "Blocked shell/code debugging — visual task needs browser evidence. \
+                       To preview: call terminal with \
+                       `python3 -m http.server 8000 --directory <demo-dir>` \
+                       (preview-server starts are allowed), then \
+                       browser_navigate http://127.0.0.1:8000/ and browser_snapshot. \
+                       Do not try other localhost ports. Do not ls/cat/grep-storm."
                 .into(),
             tool_name: tool_name.to_string(),
             count: advisory.act_tool_count_in_window() as u32,
@@ -84,8 +113,14 @@ mod tests {
         for _ in 0..6 {
             adv.record_tool("terminal");
         }
-        let messages = vec![Message::user("make demo/games003 beautiful UX")];
-        assert!(visual_storm_block_result(&adv, &messages, "terminal").is_some());
+        let messages = vec![Message::user("make demo/games003/index.html beautiful UX")];
+        assert!(visual_storm_block_result_with_args(
+            &adv,
+            &messages,
+            "terminal",
+            r#"{"command":"ls -la"}"#
+        )
+        .is_some());
         assert!(visual_storm_block_result(&adv, &messages, "write_file").is_none());
     }
 
@@ -95,7 +130,44 @@ mod tests {
         for _ in 0..6 {
             adv.record_tool("execute_code");
         }
-        let messages = vec![Message::user("make demo/games003 beautiful UX")];
-        assert!(visual_storm_block_result(&adv, &messages, "execute_code").is_some());
+        let messages = vec![Message::user("make demo/games003/index.html beautiful UX")];
+        assert!(visual_storm_block_result_with_args(
+            &adv,
+            &messages,
+            "execute_code",
+            r#"{"code":"print('hi')"}"#
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn visual_storm_allows_http_server_after_write_storm() {
+        let mut adv = HarnessTurnAdvisory::new();
+        for _ in 0..6 {
+            adv.record_tool("write_file");
+        }
+        let messages = vec![Message::user(
+            "build a 3D html game in demo/game002/index.html",
+        )];
+        assert!(
+            visual_storm_block_result_with_args(
+                &adv,
+                &messages,
+                "terminal",
+                r#"{"command":"python3 -m http.server 8000 --directory demo/game002","background":true}"#
+            )
+            .is_none(),
+            "preview-server start must be exempt from visual storm block"
+        );
+        assert!(
+            visual_storm_block_result_with_args(
+                &adv,
+                &messages,
+                "terminal",
+                r#"{"command":"ls -la demo/game002"}"#
+            )
+            .is_some(),
+            "non-preview terminal must still block under storm"
+        );
     }
 }

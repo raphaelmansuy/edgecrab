@@ -966,11 +966,38 @@ impl ToolRegistry {
         };
 
         let schema = handler.schema();
-        let required_fields = required_fields_from_parameters(&schema.parameters, args_json);
+        let required_fields = if tool_name == "skill_manage" {
+            skill_manage_required_fields(args_json)
+        } else {
+            required_fields_from_parameters(&schema.parameters, args_json)
+        };
 
-        let usage_hint = Self::build_usage_hint(&schema);
+        let usage_hint = if tool_name == "skill_manage" {
+            skill_manage_usage_hint(args_json).or_else(|| Self::build_usage_hint(&schema))
+        } else {
+            Self::build_usage_hint(&schema)
+        };
 
-        Some(error.to_llm_payload_enriched(required_fields, usage_hint))
+        let mut payload = error.to_llm_payload_enriched(required_fields.clone(), usage_hint);
+        // Already-materialized arg mistakes: SetParameter only — never re-funnel to tool_search.
+        if payload.recovery_feedback.is_none()
+            && let Some(ref fields) = required_fields
+        {
+            payload.recovery_feedback = Some(
+                edgecrab_types::RecoveryFeedbackBuilder::new("recovery_guidance")
+                    .message("Fix missing or invalid arguments and retry the same tool")
+                    .suggestion(
+                        edgecrab_types::RecoveryAction::SetParameter,
+                        serde_json::json!({
+                            "tool": tool_name,
+                            "required": fields,
+                            "note": "Retry this tool with corrected args — it is already on your wire"
+                        }),
+                    )
+                    .build(),
+            );
+        }
+        Some(payload)
     }
 
     /// Build a one-line usage hint from the tool schema describing parameter types.
@@ -1271,7 +1298,12 @@ pub fn to_llm_definitions_with_mode(
     schemas: &[ToolSchema],
     mode: crate::schema_mode::ToolSchemaMode,
 ) -> Vec<edgequake_llm::ToolDefinition> {
-    to_llm_definitions_with_materialized(schemas, mode, &std::collections::HashSet::new())
+    to_llm_definitions_with_materialized(
+        schemas,
+        mode,
+        &std::collections::HashSet::new(),
+        false,
+    )
 }
 
 /// Convert schemas for the LLM wire, honoring indexed materialization state.
@@ -1279,10 +1311,12 @@ pub fn to_llm_definitions_with_materialized(
     schemas: &[ToolSchema],
     mode: crate::schema_mode::ToolSchemaMode,
     materialized: &std::collections::HashSet<String>,
+    hot_schema_full: bool,
 ) -> Vec<edgequake_llm::ToolDefinition> {
+    let mode = crate::schema_mode::resolve_effective_schema_mode(mode, schemas.len());
     let prepared = match mode {
         crate::schema_mode::ToolSchemaMode::Indexed => {
-            crate::tool_schema_index::wire_schemas(schemas, materialized)
+            crate::tool_schema_index::wire_schemas(schemas, materialized, hot_schema_full)
         }
         other => crate::schema_mode::prepare_schemas_for_mode(schemas, other),
     };
@@ -1306,9 +1340,10 @@ pub fn build_wire_llm_definitions(
     disabled: Option<&[String]>,
     mode: crate::schema_mode::ToolSchemaMode,
     materialized: &std::collections::HashSet<String>,
+    hot_schema_full: bool,
 ) -> Vec<edgequake_llm::ToolDefinition> {
     let schemas = registry.get_definitions(enabled, disabled, ctx);
-    to_llm_definitions_with_materialized(&schemas, mode, materialized)
+    to_llm_definitions_with_materialized(&schemas, mode, materialized, hot_schema_full)
 }
 
 /// OpenAI-compatible wire shape: top-level `type: "object"` only (LM Studio rejects `oneOf`).
@@ -1394,6 +1429,71 @@ fn is_patch_flat_schema(parameters: &Value) -> bool {
             .get("properties")
             .and_then(|p| p.get("old_string"))
             .is_some()
+}
+
+/// Action-conditional required fields for `skill_manage` (schema `required` is only action/name).
+fn skill_manage_required_fields(args_json: Option<&str>) -> Option<Vec<String>> {
+    let action = args_json
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .and_then(|v| {
+            v.get("action")
+                .and_then(Value::as_str)
+                .map(|s| {
+                    if s == "write_file" {
+                        "write_skill_file".to_string()
+                    } else {
+                        s.to_string()
+                    }
+                })
+        })
+        .unwrap_or_default();
+    let mut fields = vec!["action".into(), "name".into()];
+    match action.as_str() {
+        "create" | "edit" => fields.push("content".into()),
+        "patch" => {
+            fields.push("old_string".into());
+            fields.push("new_string".into());
+        }
+        "write_skill_file" => {
+            fields.push("file_path".into());
+            fields.push("file_content".into());
+        }
+        "remove_file" => fields.push("file_path".into()),
+        _ => {}
+    }
+    Some(fields)
+}
+
+fn skill_manage_usage_hint(args_json: Option<&str>) -> Option<String> {
+    let action = args_json
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .and_then(|v| v.get("action").and_then(Value::as_str).map(str::to_string))?;
+    let action = if action == "write_file" {
+        "write_skill_file"
+    } else {
+        action.as_str()
+    };
+    Some(match action {
+        "create" | "edit" => {
+            "skill_manage create/edit requires action, name, and content (SKILL.md markdown). \
+             For workspace files use the write_file tool (path + content)."
+                .into()
+        }
+        "patch" => {
+            "skill_manage patch requires action, name, old_string, and new_string.".into()
+        }
+        "write_skill_file" => {
+            "skill_manage write_skill_file requires action, name, file_path, and file_content \
+             (paths under references/, templates/, scripts/, or assets/). \
+             For workspace files use the write_file tool (path + content)."
+                .into()
+        }
+        "remove_file" => {
+            "skill_manage remove_file requires action, name, and file_path.".into()
+        }
+        "delete" => "skill_manage delete requires action and name.".into(),
+        _ => return None,
+    })
 }
 
 fn required_fields_from_parameters(
@@ -2040,6 +2140,46 @@ mod tests {
         );
         assert!(resp.usage_hint.is_some(), "should have a usage hint");
         assert!(resp.usage_hint.unwrap().contains("path"));
+        let recovery = resp.recovery_feedback.expect("SetParameter recovery");
+        let blob = serde_json::to_string(&recovery).expect("json");
+        assert!(blob.contains("SET_PARAMETER") || blob.contains("SetParameter") || blob.contains("required"));
+        assert!(!blob.contains("tool_search"));
+    }
+
+    #[test]
+    fn skill_manage_enrichment_is_action_conditional() {
+        let registry = ToolRegistry::new();
+        let err = ToolError::InvalidArgs {
+            tool: "skill_manage".into(),
+            message: "content is required for create/edit".into(),
+        };
+        let enriched = registry
+            .enrich_invalid_args_error(
+                "skill_manage",
+                &err,
+                Some(r#"{"action":"edit","name":"x"}"#),
+            )
+            .expect("enriched");
+        let rf = enriched.required_fields.expect("fields");
+        assert!(rf.contains(&"content".into()), "got {rf:?}");
+        assert!(
+            enriched
+                .usage_hint
+                .as_deref()
+                .is_some_and(|h| h.contains("content")),
+            "hint={:?}",
+            enriched.usage_hint
+        );
+        let recovery = enriched.recovery_feedback.expect("recovery");
+        assert_eq!(
+            recovery.suggestions[0].action,
+            edgecrab_types::RecoveryAction::SetParameter
+        );
+        let blob = serde_json::to_string(&recovery).expect("json");
+        assert!(
+            !blob.contains("\"tool\":\"tool_search\""),
+            "must not re-funnel to discovery: {blob}"
+        );
     }
 
     #[test]

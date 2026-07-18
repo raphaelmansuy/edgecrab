@@ -1717,7 +1717,8 @@ impl ToolHandler for ExecuteCodeToolReal {
             });
         }
 
-        crate::dev_server::record_session_http_from_text(&ctx.session_id, &args.code);
+        // Port-bind truth (018 P6): do NOT record ports from code text at submit.
+        // Ports are recorded only after TCP listen probe (terminal/process ready path).
 
         if ctx.cancel.is_cancelled() {
             return Err(ToolError::Other("Cancelled".into()));

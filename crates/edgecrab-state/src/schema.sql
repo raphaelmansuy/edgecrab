@@ -100,7 +100,8 @@ CREATE TABLE IF NOT EXISTS session_goals (
     paused_reason TEXT,
     last_verdict TEXT,
     last_reason TEXT,
-    consecutive_parse_failures INTEGER NOT NULL DEFAULT 0
+    consecutive_parse_failures INTEGER NOT NULL DEFAULT 0,
+    contract_json TEXT
 );
 
 CREATE TABLE IF NOT EXISTS session_subgoals (

@@ -6,9 +6,13 @@ use edgecrab_tools::{
     HarnessAdvisorySignals, HarnessBuildInput, HarnessSnapshot, MutationTurnState,
     build_harness_snapshot,
 };
-use edgecrab_types::{CompletionDecision, Message, RunOutcome};
+use edgecrab_types::{
+    CompletionDecision, ExitReason, GoalContract, Message, RunOutcome,
+};
 
-use crate::completion_assessor::{CompletionContext, assess_completion};
+use crate::completion_assessor::{
+    CompletionContext, assess_completion, enrich_verification_with_contract,
+};
 use crate::config::HarnessConfig;
 use crate::harness_advisory::HarnessTurnAdvisory;
 use crate::task_class::{TaskClass, classify_from_messages, effective_verification_strict};
@@ -57,6 +61,7 @@ pub struct TurnAssessParams<'a> {
     pub messages: &'a [Message],
     pub interrupted: bool,
     pub budget_exhausted: bool,
+    pub invalid_tool_budget_exhausted: bool,
     pub pending_approval: bool,
     pub pending_clarification: bool,
     pub active_todos: usize,
@@ -64,16 +69,43 @@ pub struct TurnAssessParams<'a> {
     pub child_runs_in_flight: usize,
     pub harness: HarnessSnapshot,
     pub harness_config: &'a HarnessConfig,
+    /// Active goal completion contract (empty = free-form assess).
+    pub goal_contract: Option<&'a GoalContract>,
+    /// Final assess only: run `GoalContract.verification` once if unmet by agent tools.
+    pub harness_contract_verify: bool,
+    /// Working directory for harness-run contract verification.
+    pub cwd: &'a std::path::Path,
 }
 
 /// Single completion assess entry (provisional + final).
 pub fn assess_turn_outcome(params: TurnAssessParams<'_>) -> RunOutcome {
+    // Blockable PreVerify (018 P6): non-zero exit forces NeedsVerification.
+    // Still cache-safe — never mutates system prompt.
+    let pre_ctx = serde_json::json!({
+        "final_response_chars": params.final_response.chars().count(),
+        "message_count": params.messages.len(),
+        "budget_exhausted": params.budget_exhausted,
+        "interrupted": params.interrupted,
+        "contract_required": params
+            .goal_contract
+            .map(|c| c.requires_verification_evidence())
+            .unwrap_or(false),
+        "harness_contract_verify": params.harness_contract_verify,
+    });
+    let pre_gate = crate::lifecycle_hooks::run_pre_verify_blocking(pre_ctx.clone());
+    // Keep fire-and-forget emit for observers that only listen.
+    crate::lifecycle_hooks::emit_global(
+        crate::lifecycle_hooks::LifecycleEvent::PreVerify,
+        pre_ctx,
+    );
+
     let verification_strict = effective_verification_strict(params.harness_config, params.messages);
-    assess_completion(&CompletionContext {
+    let mut outcome = assess_completion(&CompletionContext {
         final_response: params.final_response,
         messages: params.messages,
         interrupted: params.interrupted,
         budget_exhausted: params.budget_exhausted,
+        invalid_tool_budget_exhausted: params.invalid_tool_budget_exhausted,
         pending_approval: params.pending_approval,
         pending_clarification: params.pending_clarification,
         active_todos: params.active_todos,
@@ -81,11 +113,148 @@ pub fn assess_turn_outcome(params: TurnAssessParams<'_>) -> RunOutcome {
         child_runs_in_flight: params.child_runs_in_flight,
         harness: params.harness,
         verification_strict,
-    })
+    });
+
+    if pre_gate.denied && matches!(outcome.state, CompletionDecision::Completed) {
+        outcome.state = CompletionDecision::NeedsVerification;
+        outcome.exit_reason = ExitReason::VerificationPending;
+        outcome.user_summary = format!(
+            "Needs verification — PreVerify hook denied completion ({})",
+            pre_gate.reasons.join("; ")
+        );
+        outcome.verification.required = true;
+        outcome.verification.evidence_present = false;
+        outcome.verification.debt_reason = Some(outcome.user_summary.clone());
+    }
+
+    // Wave B: coding verify-on-stop (pre-completion checklist).
+    if params.harness_config.verify_on_stop
+        && matches!(outcome.state, CompletionDecision::Completed)
+        && coding_verify_on_stop_debt(params.messages)
+    {
+        outcome.state = CompletionDecision::NeedsVerification;
+        outcome.exit_reason = ExitReason::VerificationPending;
+        outcome.user_summary = "Needs verification — run the project's test/check command \
+             (terminal exit_code=0) after code changes."
+            .into();
+        outcome.verification.required = true;
+        outcome.verification.evidence_present = false;
+        outcome.verification.debt_reason = Some(outcome.user_summary.clone());
+    }
+
+    if let Some(contract) = params.goal_contract {
+        outcome.verification =
+            enrich_verification_with_contract(outcome.verification, contract, params.messages);
+        outcome.evidence = outcome.verification.evidence.clone();
+
+        // Wave A: harness-run verification on final assess only.
+        if params.harness_contract_verify
+            && outcome.verification.contract_required
+            && !outcome.verification.contract_satisfied
+        {
+            let cmd = contract.verification.trim();
+            if !cmd.is_empty() {
+                let result =
+                    crate::contract_verify::run_contract_verification(cmd, params.cwd);
+                if result.exit_code == 0 {
+                    outcome.verification.contract_satisfied = true;
+                    outcome.verification.evidence_present = true;
+                    outcome.verification.debt_reason = None;
+                    outcome.verification.evidence.push(format!(
+                        "contract_verify: exit_code=0 cmd={cmd}"
+                    ));
+                    outcome.evidence = outcome.verification.evidence.clone();
+                    // Harness proof can clear NeedsVerification when that was the only debt.
+                    if matches!(
+                        outcome.state,
+                        CompletionDecision::NeedsVerification | CompletionDecision::Completed
+                    ) && !coding_verify_on_stop_debt(params.messages)
+                    {
+                        outcome.state = CompletionDecision::Completed;
+                        outcome.exit_reason = ExitReason::ModelReturnedFinalText;
+                        outcome.user_summary =
+                            "Completed — harness verified goal contract.".into();
+                    }
+                } else {
+                    outcome.verification.evidence.push(format!(
+                        "contract_verify: exit_code={} cmd={cmd}",
+                        result.exit_code
+                    ));
+                    outcome.evidence = outcome.verification.evidence.clone();
+                    outcome.verification.debt_reason = Some(format!(
+                        "Goal contract verification failed (exit_code={}): {cmd}",
+                        result.exit_code
+                    ));
+                }
+            }
+        }
+
+        if outcome.verification.contract_required
+            && !outcome.verification.contract_satisfied
+            && matches!(outcome.state, CompletionDecision::Completed)
+        {
+            outcome.state = CompletionDecision::NeedsVerification;
+            outcome.exit_reason = ExitReason::VerificationPending;
+            outcome.user_summary = outcome.verification.debt_reason.clone().unwrap_or_else(|| {
+                format!(
+                    "Needs verification — goal contract requires tool evidence for: {}",
+                    contract.verification.trim()
+                )
+            });
+        }
+    }
+
+    outcome
+}
+
+/// True when mutations landed without a successful terminal/execute_code verify tool.
+fn coding_verify_on_stop_debt(messages: &[Message]) -> bool {
+    let mut mutation_ok = false;
+    let mut verify_ok = false;
+    for msg in messages {
+        if msg.role != edgecrab_types::Role::Tool {
+            continue;
+        }
+        let Some(name) = msg.name.as_deref() else {
+            continue;
+        };
+        let content = msg.text_content();
+        if matches!(name, "write_file" | "patch" | "apply_patch")
+            && edgecrab_tools::file_mutation_result_landed(name, &content)
+        {
+            mutation_ok = true;
+        }
+        if matches!(name, "terminal" | "run_process") {
+            if let Some(parsed) = edgecrab_tools::parse_terminal_result(&content)
+                && parsed.exit_code == 0
+            {
+                verify_ok = true;
+            }
+        } else if name == "execute_code"
+            && edgecrab_types::parse_tool_error_payload(&content).is_none()
+            && !content.trim().is_empty()
+        {
+            verify_ok = true;
+        }
+    }
+    mutation_ok && !verify_ok
 }
 
 /// Re-open the loop when assess rejects premature model text.
 pub fn should_reopen_loop(outcome: &RunOutcome) -> bool {
+    should_reopen_loop_with_messages(outcome, &[])
+}
+
+/// Like [`should_reopen_loop`], but never reopens when Document artifact evidence
+/// is already present (007 docx never-stop — no “do not stop yet” theater).
+pub fn should_reopen_loop_with_messages(outcome: &RunOutcome, messages: &[Message]) -> bool {
+    // Invalid-tool budget abort is terminal — do not reopen into another invent-retry cycle.
+    if outcome.exit_reason == ExitReason::InvalidToolBudget {
+        return false;
+    }
+    if !messages.is_empty() && crate::task_class::document_done_latch_ready(messages) {
+        return false;
+    }
     matches!(
         outcome.state,
         CompletionDecision::Incomplete
@@ -195,6 +364,16 @@ mod tests {
     use edgecrab_types::{CompletionDecision, ExitReason, RunOutcome};
 
     #[test]
+    fn invalid_tool_budget_does_not_reopen_loop() {
+        let outcome = RunOutcome::new(
+            CompletionDecision::Failed,
+            ExitReason::InvalidToolBudget,
+            "Model generated invalid tool call: quick_stock_quote",
+        );
+        assert!(!should_reopen_loop(&outcome));
+    }
+
+    #[test]
     fn ha45_assess_uses_built_snapshot_not_default() {
         let messages = vec![edgecrab_types::Message::assistant_with_tool_calls(
             "",
@@ -226,6 +405,7 @@ mod tests {
             messages: &messages,
             interrupted: false,
             budget_exhausted: false,
+            invalid_tool_budget_exhausted: false,
             pending_approval: false,
             pending_clarification: false,
             active_todos: 0,
@@ -233,8 +413,203 @@ mod tests {
             child_runs_in_flight: 0,
             harness,
             harness_config: &HarnessConfig::default(),
+            goal_contract: None,
+            harness_contract_verify: false,
+            cwd: std::path::Path::new("."),
         });
         assert_eq!(outcome.state, CompletionDecision::Incomplete);
+    }
+
+    fn assess_params<'a>(
+        final_response: &'a str,
+        messages: &'a [edgecrab_types::Message],
+        harness: HarnessSnapshot,
+        harness_config: &'a HarnessConfig,
+        goal_contract: Option<&'a GoalContract>,
+        harness_contract_verify: bool,
+    ) -> TurnAssessParams<'a> {
+        TurnAssessParams {
+            final_response,
+            messages,
+            interrupted: false,
+            budget_exhausted: false,
+            invalid_tool_budget_exhausted: false,
+            pending_approval: false,
+            pending_clarification: false,
+            active_todos: 0,
+            blocked_todos: 0,
+            child_runs_in_flight: 0,
+            harness,
+            harness_config,
+            goal_contract,
+            harness_contract_verify,
+            cwd: std::path::Path::new("."),
+        }
+    }
+
+    #[test]
+    fn p0_contract_blocks_completed_without_tool_evidence() {
+        let messages = vec![edgecrab_types::Message::assistant("All done, looks good.")];
+        let advisory = HarnessTurnAdvisory::new();
+        let turn = MutationTurnState::new();
+        let harness = build_turn_harness_snapshot(TurnHarnessBuildParams {
+            messages: &messages,
+            mutation_turn: &turn,
+            cwd: std::path::Path::new("."),
+            post_mutation_oracles: false,
+            harness_advisory: &advisory,
+            guardrail_halt: false,
+            task_class: TaskClass::General,
+        });
+        let contract = GoalContract {
+            verification: "cargo test -p edgecrab-core".into(),
+            ..Default::default()
+        };
+        let cfg = HarnessConfig::default();
+        let outcome = assess_turn_outcome(assess_params(
+            "Completed — cargo tests passed.",
+            &messages,
+            harness,
+            &cfg,
+            Some(&contract),
+            false, // provisional-style: no harness run
+        ));
+        assert_eq!(outcome.state, CompletionDecision::NeedsVerification);
+        assert!(outcome.verification.contract_required);
+        assert!(!outcome.verification.contract_satisfied);
+    }
+
+    #[test]
+    fn p0_contract_satisfied_by_terminal_tool_result() {
+        let messages = vec![
+            edgecrab_types::Message::assistant("Running tests."),
+            edgecrab_types::Message::tool_result(
+                "t1",
+                "terminal",
+                "[terminal_result status=success backend=local cwd=/tmp exit_code=0]\n\
+                 running 20 tests\ncargo test -p edgecrab-core\ntest result: ok. 20 passed",
+            ),
+            edgecrab_types::Message::assistant("Done."),
+        ];
+        let advisory = HarnessTurnAdvisory::new();
+        let turn = MutationTurnState::new();
+        let harness = build_turn_harness_snapshot(TurnHarnessBuildParams {
+            messages: &messages,
+            mutation_turn: &turn,
+            cwd: std::path::Path::new("."),
+            post_mutation_oracles: false,
+            harness_advisory: &advisory,
+            guardrail_halt: false,
+            task_class: TaskClass::General,
+        });
+        let contract = GoalContract {
+            verification: "cargo test -p edgecrab-core".into(),
+            ..Default::default()
+        };
+        let cfg = HarnessConfig::default();
+        let outcome = assess_turn_outcome(assess_params(
+            "Completed.",
+            &messages,
+            harness,
+            &cfg,
+            Some(&contract),
+            false,
+        ));
+        assert_eq!(outcome.state, CompletionDecision::Completed);
+        assert!(outcome.verification.contract_satisfied);
+    }
+
+    #[test]
+    fn wave_a_echo_gaming_rejected_even_with_exit_zero() {
+        let messages = vec![edgecrab_types::Message::tool_result(
+            "t1",
+            "terminal",
+            "[terminal_result status=success backend=local cwd=/tmp exit_code=0]\n\
+             echo cargo test\ncargo test\n",
+        )];
+        let contract = GoalContract {
+            verification: "cargo test".into(),
+            ..Default::default()
+        };
+        assert!(!crate::goal_judge::contract_evidence_in_messages(
+            &contract, &messages
+        ));
+    }
+
+    #[test]
+    fn wave_a_harness_run_satisfies_contract() {
+        let messages = vec![edgecrab_types::Message::assistant("Done.")];
+        let advisory = HarnessTurnAdvisory::new();
+        let turn = MutationTurnState::new();
+        let harness = build_turn_harness_snapshot(TurnHarnessBuildParams {
+            messages: &messages,
+            mutation_turn: &turn,
+            cwd: std::path::Path::new("."),
+            post_mutation_oracles: false,
+            harness_advisory: &advisory,
+            guardrail_halt: false,
+            task_class: TaskClass::General,
+        });
+        let contract = GoalContract {
+            verification: "true".into(),
+            ..Default::default()
+        };
+        let cfg = HarnessConfig {
+            verify_on_stop: false,
+            ..Default::default()
+        };
+        let outcome = assess_turn_outcome(assess_params(
+            "Completed.",
+            &messages,
+            harness,
+            &cfg,
+            Some(&contract),
+            true,
+        ));
+        assert!(
+            outcome.verification.contract_satisfied,
+            "harness true must satisfy: {:?}",
+            outcome.verification
+        );
+        assert_eq!(outcome.state, CompletionDecision::Completed);
+    }
+
+    #[test]
+    fn wave_b_verify_on_stop_blocks_mutation_only_completed() {
+        let messages = vec![
+            edgecrab_types::Message::user("fix the bug"),
+            edgecrab_types::Message::tool_result(
+                "w1",
+                "write_file",
+                r#"{"ok":true,"bytes":12,"lines":1,"path":"src/main.rs"}"#,
+            ),
+            edgecrab_types::Message::assistant("Fixed."),
+        ];
+        let advisory = HarnessTurnAdvisory::new();
+        let turn = MutationTurnState::new();
+        let harness = build_turn_harness_snapshot(TurnHarnessBuildParams {
+            messages: &messages,
+            mutation_turn: &turn,
+            cwd: std::path::Path::new("."),
+            post_mutation_oracles: false,
+            harness_advisory: &advisory,
+            guardrail_halt: false,
+            task_class: TaskClass::CodeChange,
+        });
+        let cfg = HarnessConfig {
+            verify_on_stop: true,
+            ..Default::default()
+        };
+        let outcome = assess_turn_outcome(assess_params(
+            "All fixed.",
+            &messages,
+            harness,
+            &cfg,
+            None,
+            false,
+        ));
+        assert_eq!(outcome.state, CompletionDecision::NeedsVerification);
+        assert!(should_reopen_loop(&outcome));
     }
 
     #[test]
@@ -283,6 +658,71 @@ mod tests {
             "needs browser",
         );
         assert!(should_reopen_loop(&outcome));
+    }
+
+    #[test]
+    fn document_artifact_never_reopens_for_verification() {
+        let outcome = RunOutcome::new(
+            CompletionDecision::NeedsVerification,
+            ExitReason::VerificationPending,
+            "No structured verification evidence was recorded.",
+        );
+        let messages = vec![
+            edgecrab_types::Message::user("create a word document in ./demo/docx_raphael"),
+            edgecrab_types::Message::assistant_with_tool_calls(
+                "",
+                vec![edgecrab_types::ToolCall {
+                    id: "t1".into(),
+                    r#type: "function".into(),
+                    function: edgecrab_types::FunctionCall {
+                        name: "terminal".into(),
+                        arguments: r#"{"command":"python create_doc.py"}"#.into(),
+                    },
+                    thought_signature: None,
+                }],
+            ),
+            edgecrab_types::Message::tool_result(
+                "t1",
+                "terminal",
+                r#"{"ok":true,"exit_code":0,"stdout":"Saved ./demo/docx_raphael/Profile.docx"}"#,
+            ),
+        ];
+        assert!(crate::task_class::document_done_latch_ready(&messages));
+        assert!(!should_reopen_loop_with_messages(&outcome, &messages));
+    }
+
+    #[test]
+    fn ls_style_reference_still_reopens_when_incomplete() {
+        // P9: inspect-only ls must not suppress reopen via false Done latch.
+        let outcome = RunOutcome::new(
+            CompletionDecision::Incomplete,
+            ExitReason::ModelReturnedFinalText,
+            "Model stopped without deliverable.",
+        );
+        let messages = vec![
+            edgecrab_types::Message::user(
+                r#"Create powerpoint from style "/tmp/style.pptx" in ./demos/raphael"#,
+            ),
+            edgecrab_types::Message::assistant_with_tool_calls(
+                "",
+                vec![edgecrab_types::ToolCall {
+                    id: "t1".into(),
+                    r#type: "function".into(),
+                    function: edgecrab_types::FunctionCall {
+                        name: "terminal".into(),
+                        arguments: r#"{"command":"ls /tmp/style.pptx"}"#.into(),
+                    },
+                    thought_signature: None,
+                }],
+            ),
+            edgecrab_types::Message::tool_result(
+                "t1",
+                "terminal",
+                r#"{"ok":true,"exit_code":0,"stdout":"-rw-r--r-- 1 me staff 1K /tmp/style.pptx\n"}"#,
+            ),
+        ];
+        assert!(!crate::task_class::document_done_latch_ready(&messages));
+        assert!(should_reopen_loop_with_messages(&outcome, &messages));
     }
 
     #[test]

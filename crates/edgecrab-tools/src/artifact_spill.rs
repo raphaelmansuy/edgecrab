@@ -862,6 +862,7 @@ mod tests {
                 name: Some("read_file".into()),
                 reasoning: None,
                 finish_reason: None,
+                created_at: None,
             },
             Message {
                 role: Role::Tool,
@@ -871,6 +872,7 @@ mod tests {
                 name: Some("terminal".into()),
                 reasoning: None,
                 finish_reason: None,
+                created_at: None,
             },
         ];
         let spilled = enforce_turn_budget(&mut messages, 200, &config, "ses", tmp.path(), &seq);

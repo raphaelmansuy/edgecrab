@@ -74,7 +74,110 @@ fn command_preview(command: &str) -> String {
     crate::safe_truncate(&single_line, 120).to_string()
 }
 
+/// Iterate shell command-name basenames (segment-aware; skips `FOO=bar` env assigns).
+fn for_each_command_basename(command: &str, mut f: impl FnMut(&str) -> bool) -> bool {
+    for segment in command.split(['|', ';', '\n']) {
+        for part in segment.split("&&").flat_map(|s| s.split("||")) {
+            let trimmed = part.trim().trim_start_matches('&').trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let tokens = shell_words::split(trimmed).unwrap_or_else(|_| {
+                trimmed
+                    .split_whitespace()
+                    .map(str::to_string)
+                    .collect()
+            });
+            let mut idx = 0usize;
+            while idx < tokens.len() {
+                let token = &tokens[idx];
+                // Skip env assignments: FOO=bar cmd …
+                if token.contains('=') && !token.starts_with('-') && !token.starts_with('/') {
+                    idx += 1;
+                    continue;
+                }
+                let base = token.rsplit('/').next().unwrap_or(token.as_str());
+                if f(base) {
+                    return true;
+                }
+                break; // only the command name of this segment
+            }
+        }
+    }
+    false
+}
+
+/// True when a shell segment invokes Apple's `screencapture` as the command
+/// (Screen Recording TCC) — not when the word appears as a free argument.
+pub fn command_invokes_screencapture(command: &str) -> bool {
+    for_each_command_basename(command, |base| base.eq_ignore_ascii_case("screencapture"))
+}
+
+/// Filesystem observers only — stdout paths from these never prove create (008/P9).
+///
+/// A compound command is inspect-only only when **every** segment is inspect-only
+/// (`ls && python x.py` is not inspect-only).
+fn is_inspect_only_basename(base: &str) -> bool {
+    matches!(
+        base,
+        "ls" | "stat"
+            | "file"
+            | "du"
+            | "wc"
+            | "cat"
+            | "head"
+            | "tail"
+            | "find"
+            | "md5"
+            | "md5sum"
+            | "shasum"
+            | "sha256sum"
+            | "dirname"
+            | "basename"
+            | "realpath"
+            | "readlink"
+            | "test"
+            | "["
+    )
+}
+
+/// True when every shell segment is an inspect-only filesystem observer.
+///
+/// Used by Document create-evidence: `ls` of a style-reference `.pptx` must not
+/// count as a landed artifact (session da8b08e4).
+pub fn command_is_inspect_only(command: &str) -> bool {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let mut bases = Vec::new();
+    let _ = for_each_command_basename(trimmed, |base| {
+        bases.push(base.to_string());
+        false // continue scanning all segments
+    });
+    !bases.is_empty() && bases.iter().all(|b| is_inspect_only_basename(b))
+}
+
 fn describe_macos_preflight(command: &str) -> Option<CapabilityBlock> {
+    // Screen Recording: no reliable hot-path TCC probe — deny terminal capture
+    // so agents use computer_use or filesystem verify (007 docx forensics).
+    if command_invokes_screencapture(command) {
+        return Some(CapabilityBlock {
+            code: "screen_recording_required",
+            message: "macOS `screencapture` requires Screen Recording permission and often \
+                 captures the wrong window (IDE focus). EdgeCrab does not run it via terminal. \
+                 For Document tasks, filesystem artifact evidence is sufficient for Done. \
+                 For UI perception, use the computer_use / browser tools after granting \
+                 Screen Recording to the host app."
+                .into(),
+            suggested_action: Some(
+                "Do not retry screencapture. Verify the artifact on disk (ls/stat) or use \
+                 computer_use after Screen Recording is granted."
+                    .into(),
+            ),
+        });
+    }
+
     let preflight = preflight_command_permissions(command);
 
     if let Some(state) = preflight.accessibility_state
@@ -182,7 +285,9 @@ pub(crate) fn assess_command(command: &str) -> CommandInteractionAssessment {
         assessment.tty_reason = Some("interactive memo notes flow");
     }
 
-    if applescript_automation_regex().is_match(command) {
+    if command_invokes_screencapture(command) {
+        assessment.macos_prompt_reason = Some("Screen Recording");
+    } else if applescript_automation_regex().is_match(command) {
         assessment.macos_prompt_reason = Some("AppleScript automation");
     } else if memo_notes_regex().is_match(command) {
         assessment.macos_prompt_reason = Some("Apple Notes automation");
@@ -488,6 +593,35 @@ pub(crate) fn rewrite_terminal_exec_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detects_screencapture_argv() {
+        assert!(command_invokes_screencapture(
+            "sleep 4 && screencapture -x ./demo/docx_raphael/word.png"
+        ));
+        assert!(command_invokes_screencapture("/usr/sbin/screencapture -c"));
+        assert!(!command_invokes_screencapture("echo screencapture is a tool"));
+    }
+
+    #[test]
+    fn command_is_inspect_only_ls_and_find() {
+        assert!(command_is_inspect_only(
+            r#"ls -lah "/Users/me/Downloads/Profile in Data & AI.pptx""#
+        ));
+        assert!(command_is_inspect_only("find . -name '*.pptx'"));
+        assert!(command_is_inspect_only("stat ./demos/raphael/out.pptx"));
+        assert!(!command_is_inspect_only("python create_doc.py"));
+        assert!(!command_is_inspect_only("ls && python x.py"));
+        // echo is not in the inspect set (can appear in generators).
+        assert!(!command_is_inspect_only("echo foo.pptx"));
+    }
+
+    #[test]
+    fn screencapture_preflight_is_capability_denied() {
+        let block = describe_macos_preflight("screencapture -x /tmp/x.png")
+            .expect("screencapture must preflight-deny");
+        assert_eq!(block.code, "screen_recording_required");
+    }
 
     #[test]
     fn detects_obvious_tty_commands() {

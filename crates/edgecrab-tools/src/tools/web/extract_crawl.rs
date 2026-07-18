@@ -1333,6 +1333,23 @@ impl ToolHandler for WebExtractTool {
                 None
             };
 
+            // Chrome error interstitials are not successful extracts (URL scheme fact).
+            if crate::structured_browser::url_is_chrome_error(&document.url) {
+                return Ok(json!({
+                    "success": false,
+                    "ok": false,
+                    "is_chrome_error": true,
+                    "backend": used_name,
+                    "fallback_from": fallback_from,
+                    "error": "chrome-error URL is not extractable page content",
+                    "result": {
+                        "url": document.url,
+                        "title": document.title,
+                    },
+                })
+                .to_string());
+            }
+
             let doc_value = serde_json::to_value(&document)
                 .map_err(|e| ToolError::Other(format!("serialize extract document: {e}")))?;
             let doc_value = apply_web_extract_content_spill(doc_value, ctx, None);

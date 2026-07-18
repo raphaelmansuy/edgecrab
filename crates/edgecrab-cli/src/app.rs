@@ -655,30 +655,9 @@ impl DetailPaneState {
     }
 }
 
+/// DRY: core owns notice formatting; CLI must not re-prefix enriched summaries.
 fn format_run_outcome_notice(outcome: &edgecrab_types::RunOutcome) -> String {
-    let headline = format!("{} {}", outcome.state.emoji(), outcome.state.headline());
-
-    let mut lines = vec![headline.clone()];
-    let summary = outcome.user_summary.trim();
-    if !summary.is_empty() && summary != headline && summary != outcome.state.headline() {
-        lines.push(summary.to_string());
-    }
-    if let Some(hint) = outcome.state.operator_hint() {
-        lines.push(hint.to_string());
-    }
-    if outcome.active_tasks > 0 || outcome.blocked_tasks > 0 {
-        lines.push(format!(
-            "Tasks remaining: {} active, {} blocked.",
-            outcome.active_tasks, outcome.blocked_tasks
-        ));
-    }
-    if let Some(evidence) = outcome.evidence.iter().find(|item| !item.trim().is_empty()) {
-        lines.push(format!(
-            "Evidence: {}",
-            edgecrab_core::safe_truncate(evidence, 120)
-        ));
-    }
-    lines.join("\n")
+    edgecrab_core::turn_completion::format_operator_notice(outcome)
 }
 
 fn format_task_status_progress_notice(preview: &str) -> String {
@@ -13581,25 +13560,37 @@ impl App {
         let trimmed = args.trim().to_string();
         let lower = trimmed.to_ascii_lowercase();
 
-        let action = if trimmed.is_empty() || lower == "show" || lower == "status" {
+        let action = if trimmed.is_empty() || lower == "status" {
             "status"
+        } else if lower == "show" {
+            "show"
         } else if lower == "pause" {
             "pause"
         } else if lower == "resume" {
             "resume"
         } else if matches!(lower.as_str(), "clear" | "stop" | "done") {
             "clear"
+        } else if lower.starts_with("draft ") || lower == "draft" {
+            "draft"
         } else {
             "set"
         };
 
-        if action == "set" && self.is_processing {
+        if matches!(action, "set" | "draft") && self.is_processing {
             self.push_output(
                 "Agent is running — use /goal status / pause / clear mid-run, or /stop before setting a new goal.",
                 OutputRole::System,
             );
             return;
         }
+
+        let draft_args = trimmed
+            .strip_prefix("draft ")
+            .or_else(|| trimmed.strip_prefix("DRAFT "))
+            .or_else(|| trimmed.strip_prefix("Draft "))
+            .unwrap_or("")
+            .trim()
+            .to_string();
 
         let (result, followup) = self.rt_handle.block_on(async move {
             match action {
@@ -13609,8 +13600,39 @@ impl App {
                     Err(err) => (Err(err), None),
                 },
                 "clear" => (agent.goal_clear().await, None),
+                "show" => (agent.goal_show().await, None),
+                "draft" => match agent.goal_draft(&draft_args).await {
+                    Ok(msg) => {
+                        let (goal_text, _) =
+                            edgecrab_types::parse_goal_with_contract(&draft_args);
+                        // Kickoff from drafted goal text after set (goal_draft calls goal_set).
+                        let state_goal = agent
+                            .goal_state()
+                            .await
+                            .ok()
+                            .and_then(|s| s.goal_text)
+                            .unwrap_or(goal_text);
+                        let kickoff = if state_goal.trim().is_empty() {
+                            None
+                        } else {
+                            Some(state_goal)
+                        };
+                        (Ok(msg), kickoff)
+                    }
+                    Err(err) => (Err(err), None),
+                },
                 "set" => match agent.goal_set(trimmed.trim()).await {
-                    Ok(msg) => (Ok(msg), Some(trimmed.trim().to_string())),
+                    Ok(msg) => {
+                        // Kickoff uses stripped goal_text — not raw verification: lines.
+                        let (goal_text, _) =
+                            edgecrab_types::parse_goal_with_contract(trimmed.trim());
+                        let kickoff = if goal_text.trim().is_empty() {
+                            None
+                        } else {
+                            Some(goal_text)
+                        };
+                        (Ok(msg), kickoff)
+                    }
                     Err(err) => (Err(err), None),
                 },
                 _ => (agent.goal_status().await, None),

@@ -58,6 +58,9 @@ pub fn summarize_tool_result_for_history(
             let query = arg_str_or(&args, "query", "?");
             return format!("[web_search] query='{query}' — {summary}");
         }
+        if tool_name == "write_file" || tool_name == "patch" {
+            return format!("[{tool_name}] {summary}");
+        }
         return summary;
     }
 
@@ -280,7 +283,7 @@ fn arg_str(args: &Value, key: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// Resolve a file path from tool args (aliases) or spilled result metadata.
+/// Resolve a file path from tool args (aliases), result JSON, or spilled metadata.
 fn resolve_path_hint(args: &Value, tool_content: &str) -> String {
     for key in ["path", "file_path", "file", "filename"] {
         if let Some(p) = arg_str(args, key)
@@ -288,6 +291,12 @@ fn resolve_path_hint(args: &Value, tool_content: &str) -> String {
         {
             return p;
         }
+    }
+    if let Ok(value) = serde_json::from_str::<Value>(tool_content)
+        && let Some(p) = value.get("path").and_then(|v| v.as_str())
+        && !p.is_empty()
+    {
+        return p.to_string();
     }
     infer_source_path_from_spill(tool_content).unwrap_or_else(|| "?".into())
 }
@@ -426,6 +435,21 @@ fn summarize_structured_json(name: &str, obj: &serde_json::Map<String, Value>) -
                 results.len()
             ))
         }
+        "write_file" => {
+            let path = obj.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+            let bytes = obj.get("bytes").and_then(|v| v.as_u64());
+            let lines = obj.get("lines").and_then(|v| v.as_u64());
+            match (bytes, lines) {
+                (Some(_b), Some(l)) => Some(format!("wrote to {path} ({l} lines)")),
+                (Some(b), None) => Some(format!("wrote to {path} ({b} bytes)")),
+                (None, Some(l)) => Some(format!("wrote to {path} ({l} lines)")),
+                _ => Some(format!("wrote to {path}")),
+            }
+        }
+        "patch" => {
+            let path = obj.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+            Some(format!("patched {path}"))
+        }
         _ => None,
     }
 }
@@ -471,6 +495,17 @@ mod tests {
         let s = summarize_tool_result_for_history("terminal", args, body, false);
         assert!(s.contains("npm test"));
         assert!(s.contains("exit"));
+    }
+
+    #[test]
+    fn write_file_preview_uses_result_json_path_when_args_empty() {
+        let body = r#"{"ok":true,"action":"create","bytes":103,"lines":4,"path":"demo/game001/index.html"}"#;
+        let s = summarize_tool_result_preview("write_file", body, false).expect("preview");
+        assert!(
+            s.contains("demo/game001/index.html"),
+            "expected path in preview, got {s}"
+        );
+        assert!(!s.contains("wrote to ?"), "must not show wrote to ?: {s}");
     }
 
     #[test]

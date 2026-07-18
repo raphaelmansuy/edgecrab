@@ -92,6 +92,14 @@ pub struct HarnessConfig {
     pub verification_strict: bool,
     /// When true, repeated tool failures may block or halt the turn (useful default).
     pub guardrails_hard_stop: bool,
+    /// When true, coding mutations without a successful verify tool reopen
+    /// (`NeedsVerification`) — July 2026 pre-completion checklist (armed default).
+    #[serde(default = "default_verify_on_stop")]
+    pub verify_on_stop: bool,
+}
+
+fn default_verify_on_stop() -> bool {
+    true
 }
 
 impl Default for HarnessConfig {
@@ -99,6 +107,7 @@ impl Default for HarnessConfig {
         Self {
             verification_strict: false,
             guardrails_hard_stop: true,
+            verify_on_stop: true,
         }
     }
 }
@@ -1034,7 +1043,7 @@ fn normalize_tools_policy_keys(root: &mut serde_yml::Value) {
         _ => false,
     };
     if needs_schema_mode_default {
-        tools_map.insert(schema_key, serde_yml::Value::String("indexed".into()));
+        tools_map.insert(schema_key, serde_yml::Value::String("auto".into()));
     }
 }
 
@@ -1046,7 +1055,7 @@ fn sanitize_tools_policy(tools: &mut ToolsConfig) {
         tools.enabled_toolsets = Some(vec!["core".to_string()]);
     }
     if tools.schema_mode.trim().is_empty() {
-        tools.schema_mode = "indexed".to_string();
+        tools.schema_mode = "auto".to_string();
     }
 }
 
@@ -1188,8 +1197,10 @@ pub struct ToolsConfig {
     pub custom_groups: HashMap<String, Vec<String>>,
     #[serde(default)]
     pub file: FileToolsConfig,
-    /// `compact` — first-sentence descriptions, strip property prose (default).
-    /// `full` — verbatim tool schemas.
+    /// `auto` — Compact when enabled tools ≤ 14, else Indexed (default).
+    /// `indexed` — hot wire + deferred categories + `tool_search`.
+    /// `compact` — first-sentence descriptions, strip property prose (all tools on wire).
+    /// `full` — verbatim tool schemas (all tools on wire).
     #[serde(default)]
     pub schema_mode: String,
     pub tool_delay: f32,
@@ -1228,7 +1239,7 @@ impl Default for ToolsConfig {
             disabled_tools: None,
             custom_groups: HashMap::new(),
             file: FileToolsConfig::default(),
-            schema_mode: "indexed".into(),
+            schema_mode: "auto".into(),
             tool_delay: 1.0,
             parallel_execution: true,
             max_parallel_workers: 8,
@@ -2083,12 +2094,17 @@ pub struct SecurityConfig {
 pub struct OsSandboxConfig {
     /// `off` (default), `seatbelt` (macOS), or `bubblewrap` (Linux).
     pub mode: String,
+    /// When true with `seatbelt`/`bubblewrap`, prefer deny-default profiles
+    /// (018 W4 trust cliff). Default false — preview-friendly posture until measured.
+    #[serde(default)]
+    pub deny_default: bool,
 }
 
 impl Default for OsSandboxConfig {
     fn default() -> Self {
         Self {
             mode: "off".into(),
+            deny_default: false,
         }
     }
 }
@@ -3802,12 +3818,12 @@ tools:
     }
 
     #[test]
-    fn missing_schema_mode_defaults_to_indexed() {
+    fn missing_schema_mode_defaults_to_auto() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.yaml");
         std::fs::write(&path, "tools:\n  enabled_toolsets: [core]\n").expect("write");
         let cfg = AppConfig::load_from(&path).expect("load");
-        assert_eq!(cfg.tools.schema_mode, "indexed");
+        assert_eq!(cfg.tools.schema_mode, "auto");
     }
 
     #[test]

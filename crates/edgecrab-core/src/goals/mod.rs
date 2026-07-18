@@ -5,7 +5,7 @@ mod sqlite;
 
 use std::sync::{Arc, Mutex};
 
-use edgecrab_types::AgentError;
+use edgecrab_types::{AgentError, GoalContract, parse_goal_with_contract};
 
 pub use loop_manager::{
     GoalContinuationDecision, GoalStatusChip, compact_status_chip,
@@ -66,6 +66,9 @@ pub struct GoalState {
     pub last_verdict: Option<String>,
     pub last_reason: Option<String>,
     pub consecutive_parse_failures: u32,
+    /// Evidence-based completion contract (empty = free-form judge).
+    #[serde(default)]
+    pub contract: GoalContract,
 }
 
 impl Default for GoalState {
@@ -80,6 +83,7 @@ impl Default for GoalState {
             last_verdict: None,
             last_reason: None,
             consecutive_parse_failures: 0,
+            contract: GoalContract::default(),
         }
     }
 }
@@ -102,6 +106,14 @@ impl GoalState {
 pub trait GoalStore: Send + Sync {
     fn active(&self, session_id: &str) -> Result<GoalState, AgentError>;
     fn set_goal(&self, session_id: &str, text: &str, max_turns: u32) -> Result<(), AgentError>;
+    /// Set goal with an explicit contract (preferred over parsing alone).
+    fn set_goal_with_contract(
+        &self,
+        session_id: &str,
+        text: &str,
+        max_turns: u32,
+        contract: &GoalContract,
+    ) -> Result<(), AgentError>;
     fn clear(&self, session_id: &str) -> Result<(), AgentError>;
     fn push_subgoal(&self, session_id: &str, text: &str) -> Result<(), AgentError>;
     fn complete_subgoal(&self, session_id: &str) -> Result<Option<SubGoal>, AgentError>;
@@ -138,6 +150,38 @@ pub fn render_goal_block(state: &GoalState) -> String {
             let marker = if sub.done { "[x]" } else { "[ ]" };
             lines.push(format!("  {}. {marker} {}", idx + 1, sub.text));
         }
+    }
+
+    if !state.contract.is_empty() {
+        lines.push("Completion contract:".to_string());
+        if !state.contract.outcome.trim().is_empty() {
+            lines.push(format!("  outcome: {}", state.contract.outcome.trim()));
+        }
+        if !state.contract.verification.trim().is_empty() {
+            lines.push(format!(
+                "  verification: {}",
+                state.contract.verification.trim()
+            ));
+        }
+        if !state.contract.constraints.trim().is_empty() {
+            lines.push(format!(
+                "  constraints: {}",
+                state.contract.constraints.trim()
+            ));
+        }
+        if !state.contract.boundaries.trim().is_empty() {
+            lines.push(format!(
+                "  boundaries: {}",
+                state.contract.boundaries.trim()
+            ));
+        }
+        if !state.contract.stop_when.trim().is_empty() {
+            lines.push(format!("  stop_when: {}", state.contract.stop_when.trim()));
+        }
+        lines.push(
+            "Done only with concrete evidence for verification (command/file/test/browser) — not vibes."
+                .into(),
+        );
     }
 
     lines.join("\n")
@@ -201,6 +245,17 @@ impl GoalStore for InMemoryGoalStore {
     }
 
     fn set_goal(&self, session_id: &str, text: &str, max_turns: u32) -> Result<(), AgentError> {
+        let (goal_text, contract) = parse_goal_with_contract(text);
+        self.set_goal_with_contract(session_id, &goal_text, max_turns, &contract)
+    }
+
+    fn set_goal_with_contract(
+        &self,
+        session_id: &str,
+        text: &str,
+        max_turns: u32,
+        contract: &GoalContract,
+    ) -> Result<(), AgentError> {
         let trimmed = text.trim();
         if trimmed.is_empty() {
             return Err(AgentError::Config("goal text must not be empty".into()));
@@ -215,6 +270,7 @@ impl GoalStore for InMemoryGoalStore {
             state.last_verdict = None;
             state.last_reason = None;
             state.consecutive_parse_failures = 0;
+            state.contract = contract.clone();
             Ok(())
         })
     }
@@ -463,5 +519,20 @@ mod tests {
         let state = s.active("sess").expect("active");
         assert_eq!(state.status, GoalStatus::Active);
         assert_eq!(state.turns_used, 0);
+    }
+
+    #[test]
+    fn set_goal_parses_inline_contract() {
+        let s = store();
+        s.set_goal(
+            "sess",
+            "Ship auth\nverification: cargo test --workspace\nconstraints: keep API",
+            20,
+        )
+        .expect("set");
+        let state = s.active("sess").expect("active");
+        assert_eq!(state.goal_text.as_deref(), Some("Ship auth"));
+        assert_eq!(state.contract.verification, "cargo test --workspace");
+        assert!(render_goal_block(&state).contains("verification:"));
     }
 }

@@ -268,13 +268,15 @@ pub struct AgentConfig {
     pub security_preview: crate::config::PreviewConfig,
     /// OS sandbox mode for local terminal backend.
     pub os_sandbox_mode: String,
+    /// Deny-default OS sandbox profiles when mode ≠ off (018 P0).
+    pub os_sandbox_deny_default: bool,
     /// Cross-session Anthropic prompt prefix cache (stable/dynamic split + TTL).
     pub cache: crate::config::CacheConfig,
     /// Pluggable web search backend chain.
     pub web_search: crate::config::WebSearchConfig,
     /// Hermes-aligned `web:` capability overrides (search_backend / extract_backend / backend).
     pub web: crate::config::WebToolsConfig,
-    /// Tool JSON schema wire shape (`full` | `compact`, spec 007 L1.2).
+    /// Tool JSON schema wire shape (`auto` | `indexed` | `compact` | `full`).
     pub tool_schema_mode: edgecrab_tools::ToolSchemaMode,
     /// Cap on non-hot tools materialized onto the wire (`0` = unlimited).
     pub max_materialized_tools: usize,
@@ -355,6 +357,7 @@ impl Default for AgentConfig {
             harness: crate::config::HarnessConfig::default(),
             security_preview: crate::config::PreviewConfig::default(),
             os_sandbox_mode: "off".into(),
+            os_sandbox_deny_default: false,
             cache: crate::config::CacheConfig::default(),
             web_search: crate::config::WebSearchConfig::default(),
             web: crate::config::WebToolsConfig::default(),
@@ -554,6 +557,7 @@ impl AgentConfig {
             tool_schema_mode: self.tool_schema_mode,
             max_materialized_tools: self.max_materialized_tools,
             os_sandbox_mode: self.os_sandbox_mode.clone(),
+            os_sandbox_deny_default: self.os_sandbox_deny_default,
             gateway_running,
             ..Default::default()
         }
@@ -1530,21 +1534,33 @@ impl Agent {
             let materialized = std::collections::HashSet::new();
             let schemas = registry.get_definitions(enabled_filter, disabled_filter, &ctx);
             let (_, deferred) = edgecrab_tools::wire_partition_counts(&schemas, &materialized);
+            let effective = edgecrab_tools::resolve_effective_schema_mode(
+                config.tool_schema_mode,
+                schemas.len(),
+            );
+            let hot_full = crate::local_provider_policy::is_local_inference_provider(
+                self.provider.read().await.name(),
+            );
             let defs = edgecrab_tools::build_wire_llm_definitions(
                 registry,
                 &ctx,
                 enabled_filter,
                 disabled_filter,
-                config.tool_schema_mode,
+                effective,
                 &materialized,
+                hot_full,
             );
-            (defs, deferred)
+            (defs, deferred, effective)
         } else {
-            (Vec::new(), 0)
+            (
+                Vec::new(),
+                0,
+                edgecrab_tools::resolve_effective_schema_mode(config.tool_schema_mode, 0),
+            )
         };
 
-        let (tool_defs, deferred_count) = tool_defs;
-        let tools_deferred_count = (config.tool_schema_mode
+        let (tool_defs, deferred_count, effective_schema_mode) = tool_defs;
+        let tools_deferred_count = (effective_schema_mode
             == edgecrab_tools::ToolSchemaMode::Indexed)
             .then_some(deferred_count);
 
@@ -1988,16 +2004,80 @@ impl Agent {
     }
 
     /// Set or replace the persistent top-level goal for the current session.
+    ///
+    /// Inline contract fields (`verification:`, `constraints:`, …) are parsed into
+    /// [`GoalContract`](edgecrab_types::GoalContract) and stored beside the goal.
     pub async fn goal_set(&self, text: &str) -> Result<String, AgentError> {
         let session_id = self.ensure_session_id().await?;
         let max_turns = self.config.read().await.goals.max_turns.max(1);
-        self.goal_store.set_goal(&session_id, text, max_turns)?;
+        let (goal_text, contract) = edgecrab_types::parse_goal_with_contract(text);
+        self.goal_store
+            .set_goal_with_contract(&session_id, &goal_text, max_turns, &contract)?;
+        let contract_note = if contract.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\nCompletion contract active — done requires evidence for: {}",
+                if contract.verification.trim().is_empty() {
+                    "outcome/constraints"
+                } else {
+                    contract.verification.trim()
+                }
+            )
+        };
         Ok(format!(
-            "⊙ Goal set ({max_turns}-turn budget): {}\n\
+            "⊙ Goal set ({max_turns}-turn budget): {goal_text}{contract_note}\n\
              After each turn, a judge model checks if the goal is done. \
-             EdgeCrab keeps working until it is, you pause/clear it, or the budget is exhausted.",
-            text.trim()
+             EdgeCrab keeps working until it is, you pause/clear it, or the budget is exhausted."
         ))
+    }
+
+    /// Draft a completion contract from a one-liner via aux model, then `goal_set`.
+    ///
+    /// Fail-open: if drafting fails, sets the raw objective as a free-form goal.
+    pub async fn goal_draft(&self, text: &str) -> Result<String, AgentError> {
+        let objective = text.trim();
+        if objective.is_empty() {
+            return Err(AgentError::Config(
+                "usage: /goal draft <objective>".into(),
+            ));
+        }
+        let cfg = self.config.read().await;
+        let judge_cfg = cfg.auxiliary.goal_judge.clone();
+        let aux_model = cfg.auxiliary.model.clone();
+        let main_model = cfg.model.clone();
+        drop(cfg);
+
+        let provider = self.provider.read().await.clone();
+        let (draft_provider, draft_model) =
+            crate::goal_judge::resolve_goal_judge_provider_and_model(
+                &judge_cfg,
+                aux_model.as_deref(),
+                provider,
+                &main_model,
+            );
+
+        let drafted = crate::goal_draft::draft_goal_contract_text(
+            objective,
+            &draft_provider,
+            &draft_model,
+            &judge_cfg,
+        )
+        .await;
+
+        match drafted {
+            Ok(expanded) => {
+                let msg = self.goal_set(&expanded).await?;
+                Ok(format!("📝 Drafted completion contract.\n{msg}"))
+            }
+            Err(err) => {
+                tracing::info!(%err, "goal draft failed — fail-open to free-form goal_set");
+                let msg = self.goal_set(objective).await?;
+                Ok(format!(
+                    "⚠ Draft unavailable ({err}) — set free-form goal.\n{msg}"
+                ))
+            }
+        }
     }
 
     /// Display status for the active goal (Hermes-compatible `/goal status`).
@@ -2040,14 +2120,56 @@ impl Agent {
         Ok((msg, continuation))
     }
 
-    /// Display the active goal block (injection preview).
+    /// Display the active goal block + completion contract (Hermes `/goal show`).
     pub async fn goal_show(&self) -> Result<String, AgentError> {
         let session_id = self.ensure_session_id().await?;
         let state = self.goal_store.active(&session_id)?;
         if state.is_empty() {
             return Ok("No active goal. Use /goal <text> to set one.".into());
         }
-        Ok(crate::goals::render_goal_block(&state))
+        let mut out = crate::goals::status_line(&state);
+        if let Some(goal) = state.goal_text.as_deref().map(str::trim).filter(|t| !t.is_empty())
+        {
+            out.push('\n');
+            out.push_str(goal);
+        }
+        if !state.contract.is_empty() {
+            out.push_str("\n\nCompletion contract:");
+            if !state.contract.outcome.trim().is_empty() {
+                out.push_str(&format!("\n  outcome: {}", state.contract.outcome.trim()));
+            }
+            if !state.contract.verification.trim().is_empty() {
+                out.push_str(&format!(
+                    "\n  verification: {}",
+                    state.contract.verification.trim()
+                ));
+            }
+            if !state.contract.constraints.trim().is_empty() {
+                out.push_str(&format!(
+                    "\n  constraints: {}",
+                    state.contract.constraints.trim()
+                ));
+            }
+            if !state.contract.boundaries.trim().is_empty() {
+                out.push_str(&format!(
+                    "\n  boundaries: {}",
+                    state.contract.boundaries.trim()
+                ));
+            }
+            if !state.contract.stop_when.trim().is_empty() {
+                out.push_str(&format!(
+                    "\n  stop_when: {}",
+                    state.contract.stop_when.trim()
+                ));
+            }
+        } else {
+            out.push_str("\n(no completion contract — use /goal draft <text> or inline verification:)");
+        }
+        if !state.subgoals.is_empty() {
+            out.push('\n');
+            out.push_str(&crate::goals::render_subgoals_list(&state));
+        }
+        Ok(out)
     }
 
     /// Clear all goals for the current session.
@@ -2151,10 +2273,12 @@ impl Agent {
         let cfg = self.config.read().await.clone();
         let provider = self.provider.read().await.clone();
         let model = cfg.model.clone();
+        let messages = self.messages().await;
         crate::goals::evaluate_goal_after_turn(
             self.goal_store.clone(),
             &session_id,
             last_response,
+            &messages,
             interrupted,
             &cfg.goals,
             &cfg.auxiliary.goal_judge,
@@ -2195,6 +2319,13 @@ impl Agent {
                 .iter()
                 .filter(|m| matches!(m.role, edgecrab_types::Role::User))
                 .count() as u32;
+            // Derive from tool messages — header tool_call_count can lag (006 forensics).
+            let derived_tools = messages
+                .iter()
+                .filter(|m| matches!(m.role, edgecrab_types::Role::Tool))
+                .count() as u32;
+            session.session_tool_call_count =
+                derived_tools.max(record.tool_call_count.max(0) as u32);
             session.api_call_count = 0;
             session.session_input_tokens = record.input_tokens.max(0) as u64;
             session.session_output_tokens = record.output_tokens.max(0) as u64;
@@ -3104,6 +3235,7 @@ impl AgentBuilder {
                 harness: config.harness.clone(),
                 security_preview: config.security.preview.clone(),
                 os_sandbox_mode: config.security.os_sandbox.mode.clone(),
+                os_sandbox_deny_default: config.security.os_sandbox.deny_default,
                 cache: config.cache.clone(),
                 web_search: config.web_search.clone(),
                 web: config.web.clone(),
@@ -3223,6 +3355,11 @@ impl AgentBuilder {
     /// Skip loading persistent memory and user profile sections.
     pub fn skip_memory(mut self, skip: bool) -> Self {
         self.config.skip_memory = skip;
+        self
+    }
+
+    pub fn tool_schema_mode(mut self, mode: edgecrab_tools::ToolSchemaMode) -> Self {
+        self.config.tool_schema_mode = mode;
         self
     }
 

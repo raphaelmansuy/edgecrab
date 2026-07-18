@@ -507,13 +507,25 @@ fn is_local_inference_model(model_str: &str) -> bool {
 }
 
 const SKILLS_GUIDANCE: &str = "\
-After complex work, save reusable workflows with skill_manage. Patch outdated skills with skill_manage(action='edit').";
+After complex work, save reusable workflows with skill_manage. \
+Do not use skill_manage for workspace project files — use write_file / patch. \
+Patch outdated skills with skill_manage(action='edit').";
+
+/// Indexed mode: skill_manage is usually deferred — never imply it is on the wire.
+const SKILLS_GUIDANCE_INDEXED: &str = "\
+After complex work, save reusable workflows via skill_manage only after tool_search \
+activates it (or when it is already on your wire). \
+Never use skill_manage for workspace project files — use write_file / patch.";
 
 /// Injected when `tools.schema_mode: indexed` and `tool_search` is on the wire.
+///
+/// Single law (stable zone): discover deferred tools via `tool_search`; never invent names.
+/// Dynamic zone only adds deferred count + toolset categories (no per-tool name dump).
 const INDEXED_TOOL_GUIDANCE: &str = "\
 ## Deferred tool schemas\n\n\
-Only hot tools are on your wire. Before calling any name under **Deferred tools**, \
-run `tool_search` with exact `tool_names`, then retry.";
+Only hot tools are on your wire. Discover deferred tools with `tool_search` \
+(`query` preferred, `toolset` for a pack, or exact `tool_names`), then retry. \
+Do not invent tool names.";
 
 /// Injected when `vision_analyze` is in the tool list.
 ///
@@ -857,6 +869,10 @@ pub struct PromptBuilder {
     session_id: Option<String>,
     /// Active tool schema mode — gates indexed-mode stable guidance.
     tool_schema_mode: Option<ToolSchemaMode>,
+    /// Tools currently on the LLM wire (hot + materialized). When set in Indexed
+    /// mode, invent-prone guidance (e.g. SKILLS) is gated on this list, not the
+    /// full enabled registry.
+    wire_tools: Option<Vec<String>>,
 }
 
 impl PromptBuilder {
@@ -869,6 +885,7 @@ impl PromptBuilder {
             model_name: None,
             session_id: None,
             tool_schema_mode: None,
+            wire_tools: None,
         }
     }
 
@@ -900,6 +917,20 @@ impl PromptBuilder {
             None => true,
             Some(tools) => tools.iter().any(|t| t == tool),
         }
+    }
+
+    /// Wire-visible tool check for Indexed invent-prone guidance.
+    fn has_wire_tool(&self, tool: &str) -> bool {
+        match &self.wire_tools {
+            Some(tools) => tools.iter().any(|t| t == tool),
+            None => self.has_tool(tool),
+        }
+    }
+
+    /// Tools currently on the wire (Indexed hot + materialized). Optional.
+    pub fn wire_tools(mut self, tools: Option<Vec<String>>) -> Self {
+        self.wire_tools = tools;
+        self
     }
 
     fn has_any_tool(&self, tools: &[&str]) -> bool {
@@ -1079,9 +1110,18 @@ impl PromptBuilder {
             stable.push(Cow::Borrowed(TASK_STATUS_GUIDANCE));
         }
 
-        // 8. Skills guidance — only when skill_manage tool is present.
+        // 8. Skills guidance — enabled skill_manage only; Indexed gates invent on wire.
         if self.has_tool("skill_manage") {
-            stable.push(Cow::Borrowed(SKILLS_GUIDANCE));
+            if matches!(self.tool_schema_mode, Some(ToolSchemaMode::Indexed)) {
+                if self.has_wire_tool("skill_manage") {
+                    stable.push(Cow::Borrowed(SKILLS_GUIDANCE));
+                } else {
+                    // Deferred: discovery-safe wording only (no "just call skill_manage").
+                    stable.push(Cow::Borrowed(SKILLS_GUIDANCE_INDEXED));
+                }
+            } else {
+                stable.push(Cow::Borrowed(SKILLS_GUIDANCE));
+            }
             // L4.5: name-only index in semi-stable (5m cache tier); descriptions in dynamic.
             if let Some(parts) = skill_parts
                 && !parts.compact_index.is_empty()
@@ -3344,6 +3384,15 @@ Run `${CLAUDE_SKILL_DIR}/scripts/helper.py --session ${CLAUDE_SESSION_ID}`.\n",
         assert!(
             blocks.stable.contains("Deferred tool schemas"),
             "indexed mode must inject stable tool_search law"
+        );
+        assert!(
+            blocks.stable.contains("tool_search")
+                && blocks.stable.contains("Do not invent tool names"),
+            "indexed guidance must be search-first and ban inventing names"
+        );
+        assert!(
+            !blocks.stable.contains("under **Deferred tools**"),
+            "stable guidance must not assume a per-tool deferred name list"
         );
     }
 

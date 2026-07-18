@@ -674,20 +674,25 @@ impl ProcessTable {
         }
         let command = rec.command.clone();
         if !rec.http_ready_notified
-            && let Some(sink) = rec.watch_sink.as_ref()
             && let Some(notice) =
                 crate::dev_server::maybe_http_server_ready_notice(&command, trimmed)
         {
             rec.http_ready_notified = true;
-            let _ = sink.send(WatchEvent {
-                process_id: process_id.to_string(),
-                command: command.clone(),
-                pattern: "http.server".into(),
-                matched_output: notice,
-                suppressed_count: 0,
-                event_type: WatchEventType::Match,
-                exit_code: None,
-            });
+            // Port-bind truth: TCP listen probe (018 F3) — not English log lines.
+            if !rec.session_key.is_empty() {
+                crate::dev_server::record_session_http_server(&rec.session_key, &command);
+            }
+            if let Some(sink) = rec.watch_sink.as_ref() {
+                let _ = sink.send(WatchEvent {
+                    process_id: process_id.to_string(),
+                    command: command.clone(),
+                    pattern: "http.server".into(),
+                    matched_output: notice,
+                    suppressed_count: 0,
+                    event_type: WatchEventType::Match,
+                    exit_code: None,
+                });
+            }
         }
         if let (Some(watch), Some(sink)) = (&mut rec.watch_state, rec.watch_sink.as_ref()) {
             check_watch_patterns(trimmed, process_id, &command, watch, sink);
@@ -781,6 +786,13 @@ impl ProcessTable {
             let mut rec: tokio::sync::MutexGuard<'_, ProcessRecord> = entry.value().lock().await;
             rec.status = ProcessStatus::Exited;
             rec.exit_code = Some(exit_code);
+            // Failed preview servers must not leave stale "known" ports.
+            if exit_code != 0
+                && !rec.session_key.is_empty()
+                && crate::dev_server::is_preview_server_command(&rec.command)
+            {
+                crate::dev_server::unrecord_session_http_server(&rec.session_key, &rec.command);
+            }
             Self::emit_lifecycle_event(&rec, process_id, Some(exit_code));
         }
         self.controls.remove(process_id);
@@ -793,6 +805,12 @@ impl ProcessTable {
             if rec.status == ProcessStatus::Running {
                 rec.status = ProcessStatus::Exited;
                 rec.exit_code = Some(exit_code);
+                if exit_code != 0
+                    && !rec.session_key.is_empty()
+                    && crate::dev_server::is_preview_server_command(&rec.command)
+                {
+                    crate::dev_server::unrecord_session_http_server(&rec.session_key, &rec.command);
+                }
                 Self::emit_lifecycle_event(&rec, process_id, Some(exit_code));
                 drop(rec);
                 self.controls.remove(process_id);

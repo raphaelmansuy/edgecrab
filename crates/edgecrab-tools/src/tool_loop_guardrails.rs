@@ -116,22 +116,36 @@ fn is_idempotent_tool(name: &str) -> bool {
     IDEMPOTENT_TOOLS.contains(&name)
 }
 
+/// Typed failure only — never `"error"` / `"failed"` prose substrings (018 F2).
 pub fn classify_tool_failure(tool_name: &str, result: &str) -> bool {
     if result.trim().is_empty() {
         return false;
     }
-    if tool_name == "terminal"
-        && let Ok(val) = serde_json::from_str::<Value>(result)
-        && let Some(code) = val.get("exit_code").and_then(|v| v.as_i64())
-        && code != 0
-    {
+    if edgecrab_types::parse_tool_error_payload(result).is_some() {
         return true;
     }
-    let lower = result.get(..500).unwrap_or(result).to_ascii_lowercase();
-    lower.contains("\"error\"")
-        || lower.contains("\"failed\"")
-        || result.starts_with("Error")
-        || result.starts_with("BLOCKED:")
+    // Guardrail / compositor block envelopes use a stable prefix (not free prose).
+    if result.starts_with("BLOCKED:") {
+        return true;
+    }
+    if matches!(tool_name, "terminal" | "run_process") {
+        if let Some(parsed) = crate::parse_terminal_result(result) {
+            return parsed.exit_code != 0;
+        }
+        if let Ok(val) = serde_json::from_str::<Value>(result)
+            && let Some(code) = val.get("exit_code").and_then(|v| v.as_i64())
+        {
+            return code != 0;
+        }
+        return false;
+    }
+    if let Some(ok) = crate::structured_browser_nav_succeeded(result) {
+        return !ok;
+    }
+    if let Some(parsed) = crate::parse_structured_browser_result(result) {
+        return !parsed.ok || parsed.is_chrome_error;
+    }
+    false
 }
 
 /// Per-turn controller — reset at each new assistant tool batch.
@@ -360,15 +374,41 @@ pub fn guardrail_block_result(decision: &ToolGuardrailDecision) -> String {
 mod tests {
     use super::*;
 
+    fn tool_error_json() -> String {
+        serde_json::json!({
+            "type": "tool_error",
+            "category": "execution",
+            "code": "execution_failed",
+            "code_num": 1006,
+            "error": "not found",
+            "retryable": true,
+            "suppress_retry": false,
+        })
+        .to_string()
+    }
+
     #[test]
     fn warns_on_repeated_exact_failure() {
         let mut ctrl = ToolLoopGuardrailController::new(ToolLoopGuardrailConfig::default());
         let args = r#"{"path":"x.rs"}"#;
-        let d = ctrl.after_call("read_file", args, r#"{"error":"not found"}"#, None);
+        let err = tool_error_json();
+        let d = ctrl.after_call("read_file", args, &err, None);
         assert_eq!(d.action, GuardrailAction::Allow);
-        let d = ctrl.after_call("read_file", args, r#"{"error":"not found"}"#, None);
+        let d = ctrl.after_call("read_file", args, &err, None);
         assert_eq!(d.action, GuardrailAction::Warn);
         assert_eq!(d.code, "repeated_exact_failure_warning");
+    }
+
+    #[test]
+    fn prose_error_json_is_not_typed_failure() {
+        assert!(!classify_tool_failure(
+            "read_file",
+            r#"{"error":"not found","path":"x"}"#
+        ));
+        assert!(!classify_tool_failure(
+            "read_file",
+            "Error: something went wrong"
+        ));
     }
 
     #[test]

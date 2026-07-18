@@ -171,6 +171,19 @@ pub(crate) async fn start_background_process(
         );
     }
 
+    // Cap concurrent preview servers: reuse existing bind on same port (006).
+    let session_id_owned = if ctx.session_id.is_empty() {
+        session_key.clone()
+    } else {
+        ctx.session_id.clone()
+    };
+    if let Some(port) = crate::dev_server::infer_http_server_port(command)
+        && let Some(reuse) =
+            crate::dev_server::preview_reuse_result(&session_id_owned, port, command)
+    {
+        return Ok(reuse);
+    }
+
     let process_id = table.register(command.to_string(), cwd.clone(), session_key);
 
     if let Some(sink) = ctx.watch_notification_tx.clone() {
@@ -182,10 +195,11 @@ pub(crate) async fn start_background_process(
         table.set_watch_patterns(&process_id, watch_patterns).await;
     }
 
-    crate::dev_server::record_session_http_server(&ctx.session_id, command);
+    // Do NOT record session HTTP ports at bare spawn — finalize_preview_spawn_result
+    // polls TCP and sets bind_ready (port-bind truth / game005 / 006).
 
-    if ctx.config.terminal_backend == BackendKind::Local {
-        spawn_local_process(tool_name, command, &cwd, pty, table, process_id).await
+    let result = if ctx.config.terminal_backend == BackendKind::Local {
+        spawn_local_process(tool_name, command, &cwd, pty, table, process_id.clone()).await
     } else {
         let backend = get_or_create_backend(ctx).await?;
         spawn_remote_process(
@@ -193,11 +207,22 @@ pub(crate) async fn start_background_process(
             command,
             &cwd,
             table,
-            process_id,
+            process_id.clone(),
             &ctx.task_id,
             backend,
         )
         .await
+    }?;
+
+    if crate::dev_server::is_preview_server_command(command) {
+        Ok(crate::dev_server::finalize_preview_spawn_result(
+            &session_id_owned,
+            command,
+            &process_id,
+            &result,
+        ))
+    } else {
+        Ok(result)
     }
 }
 
@@ -383,15 +408,13 @@ async fn spawn_local_process(
         }
     });
 
-    Ok(crate::dev_server::append_spawn_hint(
-        command,
-        &serde_json::to_string(&json!({
-            "ok": true,
-            "process_id": process_id,
-            "command": command
-        }))
-        .expect("infallible"),
-    ))
+    // Hint/bind_ready enrichment happens in start_background_process for preview cmds.
+    Ok(serde_json::to_string(&json!({
+        "ok": true,
+        "process_id": process_id,
+        "command": command
+    }))
+    .expect("infallible"))
 }
 
 async fn spawn_remote_process(

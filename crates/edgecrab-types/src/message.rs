@@ -23,6 +23,10 @@ pub struct Message {
     pub reasoning: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<String>,
+    /// Wall-clock (unix seconds) when the message was created — forensics only.
+    /// Never sent to providers; set on push / restored from session DB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<f64>,
 }
 
 impl Default for Message {
@@ -35,6 +39,7 @@ impl Default for Message {
             name: None,
             reasoning: None,
             finish_reason: None,
+            created_at: None,
         }
     }
 }
@@ -299,6 +304,7 @@ mod tests {
             name: None,
             reasoning: None,
             finish_reason: None,
+            created_at: None,
         };
         assert!(msg.has_tool_calls());
         let json = serde_json::to_string(&msg).expect("serialize");
@@ -337,6 +343,7 @@ mod tests {
             name: None,
             reasoning: None,
             finish_reason: None,
+            created_at: None,
         };
         assert_eq!(msg.text_content(), "Look at this:\nWhat do you see?");
     }
@@ -351,6 +358,7 @@ mod tests {
             name: None,
             reasoning: None,
             finish_reason: None,
+            created_at: None,
         };
         assert_eq!(msg.text_content(), "");
     }
@@ -405,6 +413,7 @@ mod proptests {
             name: None,
             reasoning: None,
             finish_reason: None,
+            created_at: None,
         })
     }
 

@@ -33,3 +33,38 @@ jobs:
 
       - name: harness_failover_matrix
         run: cargo test -p edgecrab-core --test harness_failover_matrix
+
+      - name: dry-solid harness gates (018)
+        run: |
+          cargo test -p edgecrab-core --lib turn_dispatch_policy
+          cargo test -p edgecrab-core --test dry_solid_harness_gates
+          cargo test -p edgecrab-types --lib harness::tests
+          cargo test -p edgecrab-tools --lib tool_input_examples
+
+      - name: no flaky heuristics (018 F1–F4)
+        run: bash scripts/check-no-flaky-heuristics.sh
+
+      - name: local harness scorecard (018 July integrity)
+        run: |
+          set -euo pipefail
+          passed=0
+          failed=0
+          run_one() {
+            local label="$1"; shift
+            if "$@"; then
+              echo "PASS $label"
+              passed=$((passed + 1))
+            else
+              echo "FAIL $label"
+              failed=$((failed + 1))
+            fi
+          }
+          run_one dry_solid cargo test -p edgecrab-core --test dry_solid_harness_gates -- --quiet
+          run_one games003 cargo test -p edgecrab-core --test harness_games003_replay -- --quiet
+          run_one visual_preview cargo test -p edgecrab-core --test visual_preview_lifecycle_e2e -- --quiet
+          run_one ralph_contract cargo test -p edgecrab-core --test goals_ralph_loop contract_ -- --quiet
+          run_one wave_ab cargo test -p edgecrab-core --lib wave_ -- --quiet
+          run_one contract_verify cargo test -p edgecrab-core --lib contract_verify -- --quiet
+          total=$((passed + failed))
+          echo "LOCAL_HARNESS_SCORECARD passed=${passed} failed=${failed} total=${total}"
+          if [ "$failed" -ne 0 ]; then exit 1; fi

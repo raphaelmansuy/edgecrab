@@ -13,14 +13,16 @@ use crate::goals::{GoalState, GoalStatus, GoalStore};
 
 pub const CONTINUATION_PROMPT_TEMPLATE: &str = "\
 [Continuing toward your standing goal]\n\
-Goal: {goal}\n\n\
+Goal: {goal}\n\
+{contract_line}\n\
 Continue working toward this goal. Take the next concrete step. \
 If you believe the goal is complete, state so explicitly and stop. \
 If you are blocked and need input from the user, say so clearly and stop.";
 
 pub const CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE: &str = "\
 [Continuing toward your standing goal]\n\
-Goal: {goal}\n\n\
+Goal: {goal}\n\
+{contract_line}\n\
 Additional criteria the user added mid-loop:\n\
 {subgoals_block}\n\n\
 Continue working toward the goal AND all additional criteria. Take \
@@ -182,6 +184,15 @@ pub fn render_subgoals_list(state: &GoalState) -> String {
         .join("\n")
 }
 
+fn contract_reminder_line(state: &GoalState) -> String {
+    let v = state.contract.verification.trim();
+    if v.is_empty() {
+        String::new()
+    } else {
+        format!("Must produce tool evidence (exit_code=0) for: {v}\n")
+    }
+}
+
 pub fn next_continuation_prompt(state: &GoalState) -> Option<String> {
     if state.status != GoalStatus::Active {
         return None;
@@ -190,8 +201,13 @@ pub fn next_continuation_prompt(state: &GoalState) -> Option<String> {
     if goal.is_empty() {
         return None;
     }
+    let contract_line = contract_reminder_line(state);
     if state.subgoals.is_empty() {
-        return Some(CONTINUATION_PROMPT_TEMPLATE.replace("{goal}", goal));
+        return Some(
+            CONTINUATION_PROMPT_TEMPLATE
+                .replace("{goal}", goal)
+                .replace("{contract_line}", &contract_line),
+        );
     }
     let subgoals_block = state
         .subgoals
@@ -206,16 +222,20 @@ pub fn next_continuation_prompt(state: &GoalState) -> Option<String> {
     Some(
         CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE
             .replace("{goal}", goal)
+            .replace("{contract_line}", &contract_line)
             .replace("{subgoals_block}", &subgoals_block),
     )
 }
 
 /// Run the goal judge after a turn and update persisted loop state.
+///
+/// `messages` supplies tool-result contract evidence (code is law).
 #[allow(clippy::too_many_arguments)]
 pub async fn evaluate_goal_after_turn(
     goal_store: Arc<dyn GoalStore>,
     session_id: &str,
     last_response: &str,
+    messages: &[edgecrab_types::Message],
     interrupted: bool,
     _goals_cfg: &GoalsConfig,
     judge_cfg: &GoalJudgeConfig,
@@ -258,7 +278,7 @@ pub async fn evaluate_goal_after_turn(
         main_provider,
         main_model,
     );
-    let verdict = run_goal_judge(
+    let mut verdict = run_goal_judge(
         &judge_provider,
         &judge_model,
         &goal_text,
@@ -267,6 +287,35 @@ pub async fn evaluate_goal_after_turn(
         judge_cfg,
     )
     .await;
+
+    // Contract law: judge vibes alone cannot mark done — need tool-result evidence.
+    if verdict.done
+        && !crate::goal_judge::contract_evidence_in_messages(&state.contract, messages)
+    {
+        verdict.done = false;
+        verdict.reason = format!(
+            "contract verification unmet — need tool evidence for: {}",
+            state.contract.verification.trim()
+        );
+    }
+
+    // Wave C: park on wait (do not busy-loop continuations).
+    if verdict.wait && !verdict.done {
+        state.last_verdict = Some("wait".into());
+        state.last_reason = Some(verdict.reason.clone());
+        state.consecutive_parse_failures = 0;
+        goal_store.save_loop_state(session_id, &state)?;
+        return Ok(GoalContinuationDecision {
+            should_continue: false,
+            continuation_prompt: None,
+            message: format!(
+                "⏳ Goal parked (waiting): {}. Resume with /goal resume when ready.",
+                verdict.reason
+            ),
+            verdict: "wait".into(),
+            status: GoalStatus::Active,
+        });
+    }
 
     state.last_verdict = Some(if verdict.done {
         "done".into()
@@ -409,7 +458,9 @@ mod tests {
 
     #[test]
     fn drain_goal_continuations_preserves_user_messages() {
-        let cont = CONTINUATION_PROMPT_TEMPLATE.replace("{goal}", "Ship");
+        let cont = CONTINUATION_PROMPT_TEMPLATE
+            .replace("{goal}", "Ship")
+            .replace("{contract_line}", "");
         let mut queue = vec![cont.clone(), "real user msg".into(), cont];
         let removed = drain_goal_continuations_from_queue(&mut queue);
         assert_eq!(removed, 2);

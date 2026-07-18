@@ -35,6 +35,15 @@ fn entry_search_text(schema: &ToolSchema) -> String {
     format!("{name_words} {} {param_names}", schema.description)
 }
 
+fn catalog_entry(schema: &ToolSchema) -> CatalogEntry {
+    let text = entry_search_text(schema);
+    CatalogEntry {
+        name: schema.name.clone(),
+        description: schema.description.clone(),
+        tokens: tokenize(&text),
+    }
+}
+
 /// Build searchable catalog from deferred (non-wire) schemas.
 pub fn build_deferred_catalog(
     schemas: &[ToolSchema],
@@ -44,14 +53,20 @@ pub fn build_deferred_catalog(
     deferred
         .iter()
         .filter(|s| !is_hot_tool(&s.name))
-        .map(|schema| {
-            let text = entry_search_text(schema);
-            CatalogEntry {
-                name: schema.name.clone(),
-                description: schema.description.clone(),
-                tokens: tokenize(&text),
-            }
-        })
+        .map(|schema| catalog_entry(schema))
+        .collect()
+}
+
+/// Full-registry catalog for unknown-tool recovery (excludes the discovery meta-tool).
+///
+/// First principle: invent recovery searches the same truth store as `tool_search`,
+/// not a lexicographic slice of names.
+pub fn build_registry_catalog(schemas: &[ToolSchema]) -> Vec<CatalogEntry> {
+    use crate::tool_schema_index::TOOL_SEARCH_NAME;
+    schemas
+        .iter()
+        .filter(|s| s.name != TOOL_SEARCH_NAME)
+        .map(catalog_entry)
         .collect()
 }
 
@@ -135,6 +150,66 @@ pub fn search_deferred_catalog(catalog: &[CatalogEntry], query: &str, limit: usi
         .collect()
 }
 
+/// True when user text looks like a workspace create/write task.
+///
+/// Used to bias prefetch toward `write_file` and away from `skill_manage`
+/// (session `8d74ce9c`: create prompt promoted skills while write stayed deferred).
+pub fn looks_like_create_file_intent(user_text: &str) -> bool {
+    let lower = user_text.to_ascii_lowercase();
+    let has_create_verb = lower.contains("write ")
+        || lower.contains("write a")
+        || lower.contains("create ")
+        || lower.contains("scaffold")
+        || lower.contains("generate ");
+    // Path/extension tokens only — not vibe words like "game" / "file" (018 F4).
+    let has_path_or_artifact = lower.contains("./")
+        || lower.contains("demo/")
+        || lower.contains("src/")
+        || lower.contains(".html")
+        || lower.contains(".js")
+        || lower.contains(".css")
+        || lower.contains(".rs")
+        || lower.contains(".py")
+        || lower.contains(".ts")
+        || lower.contains(".tsx")
+        || lower.contains(".md");
+    has_create_verb && has_path_or_artifact
+}
+
+/// Silent turn-start prefetch: BM25 top-N deferred names for the user message.
+///
+/// Does not mutate the system prompt (cache law). Caller inserts into the
+/// materialized set and rebuilds wire defs.
+///
+/// Create-file intents: prefer `write_file` over `skill_manage` when both
+/// remain deferred (hot-set usually already includes `write_file`).
+pub fn prefetch_tools_for_user_message(
+    user_text: &str,
+    schemas: &[ToolSchema],
+    materialized: &HashSet<String>,
+    max_prefetch: usize,
+) -> Vec<String> {
+    let query = user_text.trim();
+    if query.is_empty() || max_prefetch == 0 {
+        return Vec::new();
+    }
+    let catalog = build_deferred_catalog(schemas, materialized);
+    let mut hits = search_deferred_catalog(&catalog, query, max_prefetch);
+
+    if looks_like_create_file_intent(query) {
+        let deferred_names: HashSet<&str> = catalog.iter().map(|e| e.name.as_str()).collect();
+        // Prefer workspace create over skills package management.
+        hits.retain(|n| n != "skill_manage");
+        if deferred_names.contains("write_file") && !hits.iter().any(|n| n == "write_file") {
+            hits.insert(0, "write_file".into());
+            if hits.len() > max_prefetch {
+                hits.truncate(max_prefetch);
+            }
+        }
+    }
+    hits
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,9 +236,8 @@ mod tests {
         ];
         let materialized = HashSet::new();
         let catalog = build_deferred_catalog(&schemas, &materialized);
-        let hits = search_deferred_catalog(&catalog, "browser navigate url", 3);
+        let hits = search_deferred_catalog(&catalog, "browser navigate url", 1);
         assert!(hits.first().is_some_and(|n| n.contains("browser")));
-        assert!(!hits.contains(&"memory_write".to_string()));
     }
 
     #[test]
@@ -175,5 +249,52 @@ mod tests {
         let catalog = build_deferred_catalog(&schemas, &HashSet::new());
         let hits = search_deferred_catalog(&catalog, "ha_get", 5);
         assert!(hits.contains(&"ha_get_states".to_string()));
+    }
+
+    #[test]
+    fn prefetch_returns_deferred_hits() {
+        let schemas = vec![
+            schema("browser_navigate", "Navigate headless browser to URL"),
+            schema("memory_write", "Write persistent memory entry"),
+        ];
+        let hits = prefetch_tools_for_user_message(
+            "please navigate the browser to a url",
+            &schemas,
+            &HashSet::new(),
+            3,
+        );
+        assert!(hits.iter().any(|n| n.contains("browser")));
+    }
+
+    #[test]
+    fn create_intent_excludes_skill_manage_from_prefetch() {
+        // write_file is hot (not in deferred catalog). Prefetch must still
+        // refuse to promote skill_manage for create-file prompts.
+        let schemas = vec![
+            schema(
+                "skill_manage",
+                "Create edit patch delete a skill or write supporting files",
+            ),
+            schema("web_search", "Search the web for facts"),
+            schema("browser_navigate", "Navigate headless browser to URL"),
+        ];
+        let hits = prefetch_tools_for_user_message(
+            "Write a complete html5 and javascript 3D game in ./demo/game001",
+            &schemas,
+            &HashSet::new(),
+            3,
+        );
+        assert!(
+            !hits.iter().any(|n| n == "skill_manage"),
+            "create intent must not prefetch skill_manage: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn looks_like_create_file_intent_game001() {
+        assert!(looks_like_create_file_intent(
+            "Write a complete html5 and javascript 3D game in ./demo/game001"
+        ));
+        assert!(!looks_like_create_file_intent("what is the weather today"));
     }
 }

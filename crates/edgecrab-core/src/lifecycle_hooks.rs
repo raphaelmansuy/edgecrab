@@ -21,6 +21,8 @@ pub enum LifecycleEvent {
     ToolAfter,
     CompressAfter,
     SkillsChanged,
+    /// Fired immediately before completion assessment (context-only; cache-safe).
+    PreVerify,
 }
 
 impl LifecycleEvent {
@@ -34,6 +36,7 @@ impl LifecycleEvent {
             Self::ToolAfter => "tool_after",
             Self::CompressAfter => "compress_after",
             Self::SkillsChanged => "skills_changed",
+            Self::PreVerify => "pre_verify",
         }
     }
 
@@ -84,6 +87,7 @@ impl LifecycleHookRegistry {
             LifecycleEvent::ToolAfter,
             LifecycleEvent::CompressAfter,
             LifecycleEvent::SkillsChanged,
+            LifecycleEvent::PreVerify,
         ] {
             let event_dir = hooks_dir.join(event.dir_name());
             if event_dir.is_dir() {
@@ -229,6 +233,82 @@ pub fn emit_global(event: LifecycleEvent, context: Value) {
     global_registry().emit(event, context);
 }
 
+/// Result of a blockable PreVerify run (Claude Stop steal — thin surface).
+#[derive(Debug, Clone, Default)]
+pub struct PreVerifyGateResult {
+    /// True when any PreVerify script exited non-zero.
+    pub denied: bool,
+    pub reasons: Vec<String>,
+}
+
+/// Run PreVerify hooks **synchronously** and allow a non-zero exit to deny Done.
+///
+/// Scripts under `hooks/pre_verify/` receive JSON on stdin. Exit `0` = allow;
+/// any other exit forces `NeedsVerification` at assess time.
+pub fn run_pre_verify_blocking(context: Value) -> PreVerifyGateResult {
+    let reg = global_registry();
+    let scripts = reg.scripts_for(LifecycleEvent::PreVerify);
+    if scripts.is_empty() {
+        return PreVerifyGateResult::default();
+    }
+
+    let mut payload = context;
+    if let Some(obj) = payload.as_object_mut() {
+        obj.entry("event")
+            .or_insert_with(|| Value::String(LifecycleEvent::PreVerify.dir_name().into()));
+    }
+    let json = match serde_json::to_string(&payload) {
+        Ok(s) => s,
+        Err(_) => return PreVerifyGateResult::default(),
+    };
+
+    let mut denied = false;
+    let mut reasons = Vec::new();
+    for script in scripts {
+        let mut cmd = if script.runtime.is_empty() {
+            std::process::Command::new(&script.path)
+        } else {
+            let mut c = std::process::Command::new(script.runtime);
+            c.arg(&script.path);
+            c
+        };
+        cmd.stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let status = cmd.spawn().and_then(|mut child| {
+            if let Some(mut stdin) = child.stdin.take() {
+                use std::io::Write;
+                let _ = stdin.write_all(json.as_bytes());
+            }
+            child.wait()
+        });
+        match status {
+            Ok(s) if s.success() => {}
+            Ok(s) => {
+                denied = true;
+                reasons.push(format!(
+                    "pre_verify {} exited {}",
+                    script.path.display(),
+                    s.code().unwrap_or(-1)
+                ));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    hook = %script.path.display(),
+                    error = %e,
+                    "pre_verify hook spawn failed (treated as allow)"
+                );
+            }
+        }
+    }
+    PreVerifyGateResult { denied, reasons }
+}
+
+/// Test-only / direct registry PreVerify without global discovery.
+pub fn pre_verify_denied_from_exit_codes(exit_codes: &[i32]) -> bool {
+    exit_codes.iter().any(|c| *c != 0)
+}
+
 /// Resolve `~/.edgecrab/hooks/` (or `$EDGECRAB_HOME/hooks`).
 ///
 /// Shared by core lifecycle hooks and gateway `HookRegistry` (DRY).
@@ -272,6 +352,7 @@ mod tests {
         assert_eq!(LifecycleEvent::SessionStart.dir_name(), "session_start");
         assert_eq!(LifecycleEvent::ToolBefore.dir_name(), "tool_before");
         assert_eq!(LifecycleEvent::SkillsChanged.dir_name(), "skills_changed");
+        assert_eq!(LifecycleEvent::PreVerify.dir_name(), "pre_verify");
     }
 
     #[test]

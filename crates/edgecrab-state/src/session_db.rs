@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use edgecrab_types::{AgentError, Message, Role};
 
 /// Schema version — incremented on breaking schema changes.
-const SCHEMA_VERSION: u32 = 12;
+const SCHEMA_VERSION: u32 = 13;
 
 // Write-contention constants
 const WRITE_MAX_RETRIES: u32 = 15;
@@ -212,6 +212,9 @@ pub struct StoredGoalState {
     pub last_verdict: Option<String>,
     pub last_reason: Option<String>,
     pub consecutive_parse_failures: u32,
+    /// JSON-serialized [`edgecrab_types::GoalContract`] (optional evidence contract).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract_json: Option<String>,
 }
 
 /// One recorded model transfer for a session (`/transfer-model`).
@@ -300,6 +303,8 @@ impl SessionDb {
 
         match version {
             None => {
+                // Idempotent: older schema.sql copies may lack newer columns.
+                Self::migrate_to_v13(conn)?;
                 conn.execute(
                     "INSERT INTO schema_version (version) VALUES (?1)",
                     params![SCHEMA_VERSION],
@@ -324,6 +329,9 @@ impl SessionDb {
                 }
                 if v < 12 {
                     Self::migrate_to_v12(conn)?;
+                }
+                if v < 13 {
+                    Self::migrate_to_v13(conn)?;
                 }
                 conn.execute(
                     "UPDATE schema_version SET version = ?1",
@@ -403,6 +411,16 @@ impl SessionDb {
     fn migrate_to_v12(conn: &Connection) -> Result<(), AgentError> {
         Self::ensure_sessions_column(conn, "stable_system_prompt", "TEXT")?;
         Self::ensure_sessions_column(conn, "semi_stable_system_prompt", "TEXT")?;
+        Ok(())
+    }
+
+    fn migrate_to_v13(conn: &Connection) -> Result<(), AgentError> {
+        if Self::table_exists(conn, "session_goals")
+            && !Self::column_exists(conn, "session_goals", "contract_json")
+        {
+            conn.execute_batch("ALTER TABLE session_goals ADD COLUMN contract_json TEXT;")
+                .map_err(|e| AgentError::Database(format!("migrate v13: {e}")))?;
+        }
         Ok(())
     }
 
@@ -568,13 +586,18 @@ impl SessionDb {
                 "DELETE FROM messages WHERE session_id = ?1",
                 params![session.id],
             )?;
-            for msg in messages {
+            for (i, msg) in messages.iter().enumerate() {
                 let tool_calls_json = msg
                     .tool_calls
                     .as_ref()
                     .map(serde_json::to_string)
                     .transpose()
                     .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+                // Prefer per-message created_at (018 P6 forensics); else monotonic
+                // offset so ORDER BY timestamp matches conversation order.
+                let msg_ts = msg
+                    .created_at
+                    .unwrap_or(timestamp + (i as f64) * 0.001);
                 conn.execute(
                     "INSERT INTO messages
                      (session_id, role, content, tool_call_id, tool_calls, tool_name, timestamp,
@@ -587,7 +610,7 @@ impl SessionDb {
                         msg.tool_call_id.as_deref(),
                         tool_calls_json,
                         msg.name.as_deref(),
-                        timestamp,
+                        msg_ts,
                         msg.finish_reason.as_deref(),
                         msg.reasoning.as_deref(),
                     ],
@@ -1415,8 +1438,9 @@ impl SessionDb {
             .map_err(|e| AgentError::Database(e.to_string()))?;
         let mut stmt = conn
             .prepare(
-                "SELECT role, content, tool_call_id, tool_calls, finish_reason, reasoning, tool_name
-                 FROM messages WHERE session_id = ?1 ORDER BY timestamp ASC",
+                "SELECT role, content, tool_call_id, tool_calls, finish_reason, reasoning, tool_name,
+                        timestamp
+                 FROM messages WHERE session_id = ?1 ORDER BY timestamp ASC, id ASC",
             )
             .map_err(|e| AgentError::Database(e.to_string()))?;
 
@@ -1429,6 +1453,7 @@ impl SessionDb {
                 let finish_reason: Option<String> = row.get(4)?;
                 let reasoning: Option<String> = row.get(5)?;
                 let tool_name: Option<String> = row.get(6)?;
+                let timestamp: f64 = row.get(7)?;
 
                 Ok((
                     role_str,
@@ -1438,6 +1463,7 @@ impl SessionDb {
                     finish_reason,
                     reasoning,
                     tool_name,
+                    timestamp,
                 ))
             })
             .map_err(|e| AgentError::Database(e.to_string()))?;
@@ -1452,6 +1478,7 @@ impl SessionDb {
                 finish_reason,
                 reasoning,
                 tool_name,
+                timestamp,
             ) = row.map_err(|e| AgentError::Database(e.to_string()))?;
 
             let role = match role_str.as_str() {
@@ -1482,6 +1509,7 @@ impl SessionDb {
             msg.tool_call_id = tool_call_id;
             msg.finish_reason = finish_reason;
             msg.reasoning = reasoning;
+            msg.created_at = Some(timestamp);
 
             messages.push(msg);
         }
@@ -1500,13 +1528,16 @@ impl SessionDb {
                 "DELETE FROM messages WHERE session_id = ?1",
                 params![session_id],
             )?;
-            for msg in messages {
+            for (i, msg) in messages.iter().enumerate() {
                 let tool_calls_json = msg
                     .tool_calls
                     .as_ref()
                     .map(serde_json::to_string)
                     .transpose()
                     .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+                let msg_ts = msg
+                    .created_at
+                    .unwrap_or(timestamp + (i as f64) * 0.001);
                 conn.execute(
                     "INSERT INTO messages
                      (session_id, role, content, tool_call_id, tool_calls, tool_name, timestamp,
@@ -1519,7 +1550,7 @@ impl SessionDb {
                         msg.tool_call_id.as_deref(),
                         tool_calls_json,
                         msg.name.as_deref(),
-                        timestamp,
+                        msg_ts,
                         msg.finish_reason.as_deref(),
                         msg.reasoning.as_deref(),
                     ],
@@ -2007,6 +2038,7 @@ impl SessionDb {
             Option<String>,
             Option<String>,
             i64,
+            Option<String>,
         );
         let conn = self
             .conn
@@ -2015,7 +2047,7 @@ impl SessionDb {
         let goal_row: Option<GoalRow> = conn
             .query_row(
                 "SELECT goal_text, status, turns_used, max_turns, paused_reason,
-                        last_verdict, last_reason, consecutive_parse_failures
+                        last_verdict, last_reason, consecutive_parse_failures, contract_json
                  FROM session_goals WHERE session_id = ?1",
                 params![session_id],
                 |row| {
@@ -2028,6 +2060,7 @@ impl SessionDb {
                         row.get(5)?,
                         row.get(6)?,
                         row.get(7)?,
+                        row.get(8)?,
                     ))
                 },
             )
@@ -2041,6 +2074,7 @@ impl SessionDb {
             last_verdict,
             last_reason,
             consecutive_parse_failures,
+            contract_json,
         )) = goal_row
         else {
             return Ok(StoredGoalState::default());
@@ -2072,6 +2106,7 @@ impl SessionDb {
             last_verdict,
             last_reason,
             consecutive_parse_failures: consecutive_parse_failures.max(0) as u32,
+            contract_json,
         })
     }
 
@@ -2080,6 +2115,17 @@ impl SessionDb {
         session_id: &str,
         text: &str,
         max_turns: u32,
+    ) -> Result<(), AgentError> {
+        self.goals_set_with_contract(session_id, text, max_turns, None)
+    }
+
+    /// Set goal text with optional JSON contract (018 GoalContract).
+    pub fn goals_set_with_contract(
+        &self,
+        session_id: &str,
+        text: &str,
+        max_turns: u32,
+        contract_json: Option<&str>,
     ) -> Result<(), AgentError> {
         let trimmed = text.trim();
         if trimmed.is_empty() {
@@ -2092,12 +2138,17 @@ impl SessionDb {
         }
         let now = chrono::Utc::now().timestamp() as f64;
         let budget = max_turns.max(1) as i64;
+        let contract = contract_json
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
         self.execute_write(|conn| {
             conn.execute(
                 "INSERT INTO session_goals (
                     session_id, goal_text, created_at, status, turns_used, max_turns,
-                    paused_reason, last_verdict, last_reason, consecutive_parse_failures
-                 ) VALUES (?1, ?2, ?3, 'active', 0, ?4, NULL, NULL, NULL, 0)
+                    paused_reason, last_verdict, last_reason, consecutive_parse_failures,
+                    contract_json
+                 ) VALUES (?1, ?2, ?3, 'active', 0, ?4, NULL, NULL, NULL, 0, ?5)
                  ON CONFLICT(session_id) DO UPDATE SET
                     goal_text = excluded.goal_text,
                     status = 'active',
@@ -2106,8 +2157,9 @@ impl SessionDb {
                     paused_reason = NULL,
                     last_verdict = NULL,
                     last_reason = NULL,
-                    consecutive_parse_failures = 0",
-                params![session_id, trimmed, now, budget],
+                    consecutive_parse_failures = 0,
+                    contract_json = excluded.contract_json",
+                params![session_id, trimmed, now, budget, contract],
             )?;
             conn.execute(
                 "DELETE FROM session_subgoals WHERE session_id = ?1",
@@ -2325,7 +2377,8 @@ impl SessionDb {
                     paused_reason = ?5,
                     last_verdict = ?6,
                     last_reason = ?7,
-                    consecutive_parse_failures = ?8
+                    consecutive_parse_failures = ?8,
+                    contract_json = ?9
                  WHERE session_id = ?1",
                 params![
                     session_id,
@@ -2336,6 +2389,7 @@ impl SessionDb {
                     state.last_verdict,
                     state.last_reason,
                     state.consecutive_parse_failures as i64,
+                    state.contract_json,
                 ],
             )?;
             Ok(())
@@ -2506,6 +2560,31 @@ mod tests {
     }
 
     #[test]
+    fn message_timestamps_preserve_per_message_created_at() {
+        let db = test_db();
+        let session = sample_session("ts-order");
+        let mut m0 = Message::user("first");
+        m0.created_at = Some(100.0);
+        let mut m1 = Message::assistant("second");
+        m1.created_at = Some(101.5);
+        let mut m2 = Message::tool_result("c1", "write_file", r#"{"path":"x.html"}"#);
+        m2.created_at = Some(102.25);
+        db.save_session_with_messages(&session, &[m0, m1, m2], 999.0)
+            .expect("save");
+        let loaded = db.get_messages("ts-order").expect("load");
+        assert_eq!(loaded.len(), 3);
+        assert_eq!(loaded[0].created_at, Some(100.0));
+        assert_eq!(loaded[1].created_at, Some(101.5));
+        assert_eq!(loaded[2].created_at, Some(102.25));
+        // Mid-turn re-save with a new wall clock must keep prior stamps.
+        db.save_session_with_messages(&session, &loaded, 5000.0)
+            .expect("re-save");
+        let again = db.get_messages("ts-order").expect("reload");
+        assert_eq!(again[0].created_at, Some(100.0));
+        assert_eq!(again[2].created_at, Some(102.25));
+    }
+
+    #[test]
     fn rich_session_search_ignores_empty_query() {
         let db = test_db();
         db.save_session(&sample_session("s1")).expect("save");
@@ -2565,6 +2644,20 @@ mod tests {
         let state = db.goals_active("goal-s").expect("active");
         assert!(!state.subgoals[0].done);
         assert!(state.subgoals[1].done);
+    }
+
+    #[test]
+    fn goals_contract_json_round_trips() {
+        let db = test_db();
+        db.save_session(&sample_session("goal-c")).expect("save");
+        let contract = r#"{"verification":"cargo test --workspace","constraints":"keep API"}"#;
+        db.goals_set_with_contract("goal-c", "Ship auth", 20, Some(contract))
+            .expect("set with contract");
+        let state = db.goals_active("goal-c").expect("active");
+        assert_eq!(state.goal_text.as_deref(), Some("Ship auth"));
+        let raw = state.contract_json.expect("contract_json");
+        assert!(raw.contains("cargo test --workspace"));
+        assert!(raw.contains("keep API"));
     }
 
     #[test]

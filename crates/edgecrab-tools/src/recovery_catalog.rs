@@ -267,13 +267,139 @@ pub fn write_file_missing_content(max_argument_bytes: Option<usize>) -> ToolErro
     )
 }
 
+/// Canonical VisualUx serve → navigate recipe (no port guessing).
+pub fn preview_serve_then_navigate_recipe(serve_directory: &str) -> serde_json::Value {
+    let dir = if serve_directory.trim().is_empty() {
+        "."
+    } else {
+        serve_directory.trim()
+    };
+    let command = format!("python3 -m http.server 8000 --directory {dir}");
+    json!({
+        "tool": "terminal",
+        "command": command,
+        "background": true,
+        "then": "browser_navigate",
+        "then_url": "http://127.0.0.1:8000/",
+        "forbidden": [
+            "try other localhost ports",
+            "browser_navigate to 8080/5050/5000/8888 without a recorded session server",
+            "read ~/.edgecrab/config.yaml"
+        ],
+        "note": "Start this exact server first; then navigate only to http://127.0.0.1:8000/"
+    })
+}
+
+/// Prefer recent `demo/…` write targets or `index.html` parents for `--directory`.
+pub fn infer_preview_serve_directory(paths: &[&str]) -> String {
+    let mut best_demo: Option<String> = None;
+    let mut best_index_parent: Option<String> = None;
+    for raw in paths {
+        let path = raw.trim().trim_matches('"').replace('\\', "/");
+        if path.is_empty() {
+            continue;
+        }
+        let lower = path.to_ascii_lowercase();
+        if lower.ends_with("index.html") {
+            if let Some((parent, _)) = path.rsplit_once('/') {
+                if !parent.is_empty() {
+                    best_index_parent = Some(parent.to_string());
+                }
+            } else {
+                best_index_parent = Some(".".into());
+            }
+        }
+        if let Some(idx) = lower.find("demo/") {
+            let rest = &path[idx..];
+            let dir = if rest.to_ascii_lowercase().ends_with(".html")
+                || rest.to_ascii_lowercase().ends_with(".css")
+                || rest.to_ascii_lowercase().ends_with(".js")
+            {
+                rest.rsplit_once('/')
+                    .map(|(p, _)| p.to_string())
+                    .unwrap_or_else(|| rest.to_string())
+            } else {
+                rest.to_string()
+            };
+            if !dir.is_empty() {
+                best_demo = Some(dir);
+            }
+        }
+    }
+    best_index_parent
+        .or(best_demo)
+        .unwrap_or_else(|| ".".into())
+}
+
+/// Collect path-like tokens from text, then reuse typed path inference (018 F4).
+pub fn infer_preview_serve_directory_from_text(text: &str) -> String {
+    let mut paths: Vec<&str> = Vec::new();
+    for raw in text.split_whitespace() {
+        let token = raw.trim_matches(|c: char| {
+            matches!(c, '`' | '"' | '\'' | ',' | ';' | '(' | ')' | '[' | ']')
+        });
+        if token.is_empty() {
+            continue;
+        }
+        let lower = token.to_ascii_lowercase();
+        if lower.contains("demo/")
+            || lower.ends_with(".html")
+            || lower.ends_with(".css")
+            || lower.ends_with(".js")
+            || lower.ends_with("index.html")
+        {
+            paths.push(token);
+        }
+    }
+    if paths.is_empty() {
+        return ".".into();
+    }
+    infer_preview_serve_directory(&paths)
+}
+
 /// `browser_navigate` blocked by SSRF or disallowed scheme (spec 015 HA-16).
 pub fn browser_navigate_blocked(url: &str, reason: &str, known_ports: &[u16]) -> ToolError {
+    browser_navigate_blocked_with_dir(url, reason, known_ports, ".")
+}
+
+/// Like [`browser_navigate_blocked`] with an explicit serve directory for empty-port recovery.
+pub fn browser_navigate_blocked_with_dir(
+    url: &str,
+    reason: &str,
+    known_ports: &[u16],
+    serve_directory: &str,
+) -> ToolError {
+    browser_navigate_blocked_with_session(url, reason, known_ports, serve_directory, "")
+}
+
+/// Session-aware block: prefer wait_bind when a preview spawn is pending (006).
+pub fn browser_navigate_blocked_with_session(
+    url: &str,
+    reason: &str,
+    known_ports: &[u16],
+    serve_directory: &str,
+    session_id: &str,
+) -> ToolError {
+    if known_ports.is_empty() && !session_id.is_empty() {
+        let pending = crate::dev_server::pending_preview_binds(session_id);
+        if let Some(port) = crate::dev_server::port_from_loopback_url(url)
+            && let Some((_, proc_id)) = pending.iter().find(|(p, _)| *p == port)
+        {
+            return browser_navigate_wait_bind(url, port, proc_id);
+        }
+        if let Some((port, proc_id)) = pending.first() {
+            return browser_navigate_wait_bind(url, *port, proc_id);
+        }
+    }
     let port_hint = crate::dev_server::format_dev_server_ports_hint(known_ports);
     let message = if let Some(hint) = port_hint.as_deref() {
         format!("URL blocked for browser navigation: {url} ({reason}). {hint}")
     } else {
-        format!("URL blocked for browser navigation: {url} ({reason})")
+        format!(
+            "URL blocked for browser navigation: {url} ({reason}). \
+             No session HTTP server is recorded — start the preview server first \
+             (do not guess localhost ports)."
+        )
     };
     let mut builder = recovery_guidance()
         .message("Browser navigation blocked — use HTTP preview, not file://")
@@ -284,7 +410,11 @@ pub fn browser_navigate_blocked(url: &str, reason: &str, known_ports: &[u16]) ->
                 "url_shape": "http://127.0.0.1:PORT/path",
                 "fix_via": "/config preview on",
                 "cli_alt": "edgecrab config set security.preview.enabled true",
-                "do_not": ["read_file on ~/.edgecrab/config.yaml", "terminal cat/grep on home config"],
+                "do_not": [
+                    "read_file on ~/.edgecrab/config.yaml",
+                    "terminal cat/grep on home config",
+                    "try alternate localhost ports"
+                ],
                 "security_preview_yaml": {
                     "security": {
                         "preview": {
@@ -297,7 +427,12 @@ pub fn browser_navigate_blocked(url: &str, reason: &str, known_ports: &[u16]) ->
                 "note": "file:// is never allowed; operator enables security.preview — agent cannot read home config"
             }),
         );
-    if !known_ports.is_empty() {
+    if known_ports.is_empty() {
+        builder = builder.suggestion(
+            RecoveryAction::CallToolFirst,
+            preview_serve_then_navigate_recipe(serve_directory),
+        );
+    } else {
         builder = builder.suggestion(
             RecoveryAction::SetParameter,
             json!({
@@ -307,10 +442,220 @@ pub fn browser_navigate_blocked(url: &str, reason: &str, known_ports: &[u16]) ->
                     .iter()
                     .map(|p| format!("http://127.0.0.1:{p}/"))
                     .collect::<Vec<_>>(),
+                "forbidden": ["try ports not in detected_http_server_ports"],
             }),
         );
     }
     ToolError::PermissionDenied(message).with_recovery(builder.build())
+}
+
+/// Connection refused / empty-response / server not running on loopback.
+pub fn browser_navigate_no_server(url: &str, serve_directory: &str) -> ToolError {
+    ToolError::Unavailable {
+        tool: "browser_navigate".into(),
+        reason: format!(
+            "No HTTP server is listening for {url} (connection refused or empty response). \
+             Do not try other localhost ports until the preview server is bind-ready. \
+             Start the preview server, wait for Serving HTTP…, then navigate to \
+             http://127.0.0.1:8000/ only."
+        ),
+    }
+    .with_recovery(
+        recovery_guidance()
+            .message("Start preview server before browser_navigate")
+            .suggestion(
+                RecoveryAction::CallToolFirst,
+                preview_serve_then_navigate_recipe(serve_directory),
+            )
+            .build(),
+    )
+}
+
+/// Navigate attempted while a preview spawn is pending TCP bind (006 bind latch).
+///
+/// One structured wait — do not spawn another http.server.
+pub fn browser_navigate_wait_bind(url: &str, port: u16, process_id: &str) -> ToolError {
+    ToolError::Unavailable {
+        tool: "browser_navigate".into(),
+        reason: format!(
+            "Preview server for {url} spawned but bind_ready=false (TCP not listening on :{port} yet). \
+             Do not spawn another http.server. Wait for process `{process_id}` bind, then retry navigate once."
+        ),
+    }
+    .with_recovery(
+        recovery_guidance()
+            .message("Wait for TCP bind-ready before browser_navigate")
+            .suggestion(
+                RecoveryAction::CallToolFirst,
+                json!({
+                    "tool": "wait_for_process",
+                    "process_id": process_id,
+                    "wait_bind": true,
+                    "port": port,
+                    "then": {
+                        "tool": "browser_navigate",
+                        "url": format!("http://127.0.0.1:{port}/"),
+                    },
+                    "forbidden": [
+                        "spawn another python3 -m http.server on the same port",
+                        "port shopping"
+                    ],
+                }),
+            )
+            .build(),
+    )
+}
+
+/// Stale recorded port / half-open server (ERR_EMPTY_RESPONSE after optimistic spawn).
+pub fn browser_navigate_port_heal(url: &str, port: u16, serve_directory: &str) -> ToolError {
+    let dir = if serve_directory.trim().is_empty() {
+        ".".to_string()
+    } else {
+        serve_directory.trim().to_string()
+    };
+    ToolError::Unavailable {
+        tool: "browser_navigate".into(),
+        reason: format!(
+            "Loopback navigate to {url} failed (empty response / connection reset). \
+             Port {port} was recorded but is not serving. Heal the port, then navigate."
+        ),
+    }
+    .with_recovery(
+        recovery_guidance()
+            .message("Heal stale preview port before browser_navigate")
+            .suggestion(
+                RecoveryAction::CallToolFirst,
+                json!({
+                    "tool": "terminal",
+                    "steps": [
+                        {
+                            "command": format!(
+                                "kill $(lsof -t -i:{port}) 2>/dev/null; \
+                                 python3 -m http.server {port} --directory {dir}"
+                            ),
+                            "background": true,
+                            "note": "free the port then restart preview server"
+                        },
+                        {
+                            "tool": "browser_navigate",
+                            "url": format!("http://127.0.0.1:{port}/")
+                        }
+                    ],
+                    "alternate": {
+                        "command": format!(
+                            "python3 -m http.server 8010 --directory {dir}"
+                        ),
+                        "background": true,
+                        "then_navigate": "http://127.0.0.1:8010/",
+                        "note": "if kill is unavailable, bind a free port and navigate there"
+                    },
+                    "forbidden": ["navigate before Serving HTTP… ready"]
+                }),
+            )
+            .build(),
+    )
+}
+
+/// Preview-server bind failed with Address already in use / EADDRINUSE.
+pub fn terminal_port_in_use(command: &str, port: u16, serve_directory: &str) -> ToolError {
+    let dir = if serve_directory.trim().is_empty() {
+        let inferred = infer_preview_serve_directory_from_text(command);
+        if inferred.trim().is_empty() {
+            ".".to_string()
+        } else {
+            inferred
+        }
+    } else {
+        serve_directory.trim().to_string()
+    };
+    ToolError::ExecutionFailed {
+        tool: "terminal".into(),
+        message: format!(
+            "Preview server could not bind port {port}: Address already in use. \
+             Free the port or start on another port, then browser_navigate."
+        ),
+    }
+    .with_recovery(
+        recovery_guidance()
+            .message("Port conflict — heal before navigate")
+            .suggestion(
+                RecoveryAction::CallToolFirst,
+                json!({
+                    "tool": "terminal",
+                    "steps": [
+                        {
+                            "command": format!(
+                                "kill $(lsof -t -i:{port}) 2>/dev/null; \
+                                 python3 -m http.server {port} --directory {dir}"
+                            ),
+                            "background": true
+                        },
+                        {
+                            "tool": "browser_navigate",
+                            "url": format!("http://127.0.0.1:{port}/")
+                        }
+                    ],
+                    "alternate_port": {
+                        "command": format!(
+                            "python3 -m http.server 8010 --directory {dir}"
+                        ),
+                        "background": true,
+                        "then_navigate": "http://127.0.0.1:8010/"
+                    }
+                }),
+            )
+            .build(),
+    )
+}
+
+/// `patch` fuzzy miss / ContentMismatch — typed recovery (parity with write/stale).
+pub fn patch_content_mismatch(
+    path: &str,
+    diagnosis: &str,
+    preview: &str,
+    truncated: bool,
+) -> ToolError {
+    let trunc_note = if truncated {
+        "\n[...truncated — file has more content; read_file if needed.]".to_string()
+    } else {
+        String::new()
+    };
+    ToolError::ContentMismatch {
+        tool: "patch".into(),
+        path: path.to_string(),
+        message: format!(
+            "{diagnosis}\n\
+             Snapshot recorded — retry patch with the corrected old_string \
+             (no read_file needed).\n\
+             \n\
+             Current file content (preview):\n\
+             ---\n\
+             {preview}{trunc_note}\n\
+             ---"
+        ),
+    }
+    .with_recovery(
+        recovery_guidance()
+            .message("Patch old_string mismatch — retry with file preview")
+            .suggestion(
+                RecoveryAction::RetrySameCall,
+                json!({
+                    "tool": "patch",
+                    "path": path,
+                    "hint": "copy old_string from the preview below; avoid inventing whitespace"
+                }),
+            )
+            .suggestion(
+                RecoveryAction::CallToolFirst,
+                json!({
+                    "tool": "read_file",
+                    "path": path,
+                    "when": "preview is insufficient",
+                    "then_retry": "patch"
+                }),
+            )
+            .build(),
+    )
 }
 
 /// `memory_write` exceeded per-file char cap (spec 015 HA-17).
@@ -384,6 +729,83 @@ pub fn memory_external_drift(filename: &str, drift_backup: &str) -> ToolError {
     )
 }
 
+/// Extract deferred tool names that recovery feedback wants the agent to call next.
+///
+/// Used to auto-materialize those tools onto the Indexed wire so SwitchTool /
+/// CallToolFirst targets are callable without a lucky `tool_search` (game001).
+pub fn tools_to_materialize_from_error_json(result: &str) -> Vec<String> {
+    use edgecrab_types::{RecoveryAction, parse_tool_error_payload};
+    use crate::tool_schema_index::TOOL_SEARCH_NAME;
+
+    let Some(payload) = parse_tool_error_payload(result) else {
+        return Vec::new();
+    };
+
+    let mut names: Vec<String> = Vec::new();
+    let push = |names: &mut Vec<String>, candidate: &str| {
+        let t = candidate.trim();
+        if t.is_empty() || t == TOOL_SEARCH_NAME {
+            return;
+        }
+        if !names.iter().any(|n| n == t) {
+            names.push(t.to_string());
+        }
+    };
+    let push_from_params = |names: &mut Vec<String>, params: &serde_json::Value| {
+        for key in ["to_tool", "then_retry"] {
+            if let Some(t) = params.get(key).and_then(|v| v.as_str()) {
+                push(names, t);
+            }
+        }
+        if let Some(arr) = params.get("recommended_tools").and_then(|v| v.as_array()) {
+            for t in arr {
+                if let Some(s) = t.as_str() {
+                    push(names, s);
+                }
+            }
+        }
+    };
+
+    if let Some(st) = payload.suggested_tool.as_deref() {
+        push(&mut names, st);
+    }
+
+    if let Some(feedback) = payload.recovery_feedback.as_ref() {
+        for suggestion in &feedback.suggestions {
+            match suggestion.action {
+                RecoveryAction::SwitchTool => {
+                    push_from_params(&mut names, &suggestion.parameters);
+                }
+                RecoveryAction::CallToolFirst => {
+                    let first = suggestion
+                        .parameters
+                        .get("tool")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if first == TOOL_SEARCH_NAME {
+                        // Invent / discovery recovery: promote ranked candidates.
+                        push_from_params(&mut names, &suggestion.parameters);
+                    } else {
+                        push(&mut names, first);
+                        push_from_params(&mut names, &suggestion.parameters);
+                    }
+                }
+                RecoveryAction::SplitPayload => {
+                    if let Some(t) = suggestion.parameters.get("tool").and_then(|v| v.as_str()) {
+                        push(&mut names, t);
+                    }
+                    push_from_params(&mut names, &suggestion.parameters);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Cap so recovery never floods the materialize LRU.
+    names.truncate(4);
+    names
+}
+
 /// Shell heredoc rejected — steer to file tools (spec 015 HA-18).
 pub fn terminal_heredoc_unsupported(command: &str) -> ToolError {
     ToolError::capability_denied(
@@ -411,33 +833,50 @@ pub fn terminal_heredoc_unsupported(command: &str) -> ToolError {
     )
 }
 
-/// Unknown / hallucinated tool name after repair (Hermes conversation_loop parity + structured recovery).
+/// Unknown / hallucinated tool name after repair.
+///
+/// First principle (July 2026 progressive disclosure): the registry is truth.
+/// Recovery is [`RecoveryAction::CallToolFirst`] on `tool_search` — never
+/// `RetrySameCall` on the invent name, and never a second parallel dictionary tool.
 pub fn unknown_tool(
     invalid_name: &str,
     suggestion: Option<&str>,
+    search_query: &str,
     sample_tools: &[String],
 ) -> ToolError {
     let suggest = suggestion
         .map(|s| format!(" Did you mean '{s}'?"))
         .unwrap_or_default();
     let sample = if sample_tools.is_empty() {
-        "(no tools registered)".to_string()
+        "(none ranked — call tool_search)".to_string()
     } else {
         sample_tools.join(", ")
     };
+    let query = if search_query.trim().is_empty() {
+        invalid_name.replace(['_', '-', '.'], " ")
+    } else {
+        search_query.to_string()
+    };
     ToolError::NotFound(format!(
         "Tool '{invalid_name}' does not exist.{suggest} \
-         Available tools include: {sample}. Use exact snake_case names from the tool schema."
+         It is not in the tool registry. Call `tool_search` with query: \"{query}\" \
+         (or tool_names for an exact candidate), then call one exact snake_case name \
+         from the result. Candidate names from the registry: {sample}. \
+         Do not retry the invalid name."
     ))
     .with_recovery(
         recovery_guidance()
-            .message("Unknown tool name")
+            .message("Unknown tool name — discover via tool_search")
             .suggestion(
-                RecoveryAction::RetrySameCall,
+                RecoveryAction::CallToolFirst,
                 json!({
+                    "tool": "tool_search",
+                    "query": query,
+                    "limit": 5,
                     "invalid_name": invalid_name,
                     "suggested_name": suggestion,
-                    "sample_tools": sample_tools,
+                    "recommended_tools": sample_tools,
+                    "then": "call an exact tool name returned by tool_search; do not invent names"
                 }),
             )
             .build(),
@@ -472,12 +911,63 @@ mod tests {
     }
 
     #[test]
+    fn port_heal_and_address_in_use_include_recovery() {
+        let heal = browser_navigate_port_heal("http://127.0.0.1:8000/", 8000, "demo/game005");
+        let heal_rec = heal.to_llm_payload().recovery_feedback.expect("heal");
+        let heal_blob = serde_json::to_string(&heal_rec.suggestions).expect("json");
+        assert!(heal_blob.contains("lsof") || heal_blob.contains("8010"));
+
+        let busy = terminal_port_in_use(
+            "python3 -m http.server 8000 --directory demo/game005",
+            8000,
+            "demo/game005",
+        );
+        let busy_rec = busy.to_llm_payload().recovery_feedback.expect("busy");
+        assert!(!busy_rec.suggestions.is_empty());
+    }
+
+    #[test]
+    fn patch_content_mismatch_includes_structured_recovery() {
+        let err = patch_content_mismatch("game.js", "old_string not found", "let x = 1;", false);
+        let recovery = err.to_llm_payload().recovery_feedback.expect("recovery");
+        assert!(
+            recovery
+                .suggestions
+                .iter()
+                .any(|s| s.action == RecoveryAction::RetrySameCall)
+        );
+    }
+
+    #[test]
     fn ha16_browser_blocked_includes_preview_hint() {
         let err = browser_navigate_blocked("http://127.0.0.1:8000/", "SSRF policy", &[]);
         let recovery = err.to_llm_payload().recovery_feedback.expect("recovery");
         let blob = serde_json::to_string(&recovery.suggestions).expect("json");
         assert!(blob.contains("security.preview"));
         assert!(blob.contains("127.0.0.1"));
+        assert!(
+            recovery
+                .suggestions
+                .iter()
+                .any(|s| s.action == RecoveryAction::CallToolFirst),
+            "empty known_ports must CallToolFirst(terminal): {blob}"
+        );
+        assert!(blob.contains("http.server"));
+        assert!(blob.contains("forbidden") || blob.contains("try other localhost ports"));
+    }
+
+    #[test]
+    fn preview_serve_directory_prefers_demo_index() {
+        assert_eq!(
+            infer_preview_serve_directory(&["demo/game002/index.html", "demo/game002/style.css"]),
+            "demo/game002"
+        );
+        assert_eq!(
+            infer_preview_serve_directory_from_text(
+                "Write a complete html5 game in ./demo/game002"
+            ),
+            "demo/game002"
+        );
     }
 
     #[test]
@@ -515,5 +1005,62 @@ mod tests {
         let recovery = err.to_llm_payload().recovery_feedback.expect("recovery");
         let blob = serde_json::to_string(&recovery.suggestions).expect("json");
         assert!(blob.contains("write_file"));
+        let json = err.to_llm_response();
+        let targets = tools_to_materialize_from_error_json(&json);
+        assert!(
+            targets.iter().any(|n| n == "write_file"),
+            "heredoc recovery must auto-materialize write_file: {targets:?}"
+        );
+    }
+
+    #[test]
+    fn recovery_materialize_skips_tool_search_meta() {
+        let sample = vec!["write_file".into(), "patch".into()];
+        let err = unknown_tool("invent_write", None, "invent write", &sample);
+        let targets = tools_to_materialize_from_error_json(&err.to_llm_response());
+        assert!(!targets.iter().any(|n| n == "tool_search"));
+        assert!(targets.iter().any(|n| n == "write_file"));
+    }
+
+    #[test]
+    fn unknown_tool_requires_tool_search_not_retry_same() {
+        let sample = vec![
+            "web_search".into(),
+            "web_extract".into(),
+            "read_file".into(),
+        ];
+        let err = unknown_tool("quick_stock_quote", None, "quick stock quote", &sample);
+        let recovery = err.to_llm_payload().recovery_feedback.expect("recovery");
+        assert_eq!(recovery.suggestions[0].action, RecoveryAction::CallToolFirst);
+        let blob = serde_json::to_string(&recovery.suggestions[0].parameters).expect("json");
+        assert!(blob.contains("tool_search"));
+        assert!(blob.contains("quick stock quote") || blob.contains("query"));
+        assert!(blob.contains("web_search"));
+        let payload = err.to_llm_payload();
+        assert!(payload.error.contains("tool_search"));
+        assert!(payload.error.contains("Do not retry the invalid name"));
+    }
+
+    #[test]
+    fn wait_bind_recovery_does_not_suggest_second_spawn() {
+        crate::dev_server::mark_pending_preview("sess-wait-bind", 8000, "proc-9");
+        let err = browser_navigate_wait_bind("http://127.0.0.1:8000/", 8000, "proc-9");
+        let body = err.to_llm_response();
+        assert!(body.contains("wait_bind") || body.contains("bind_ready") || body.contains("proc-9"));
+        let parsed = edgecrab_types::parse_tool_error_payload(&body).expect("tool_error");
+        assert!(
+            parsed
+                .recovery_feedback
+                .as_ref()
+                .is_some_and(|r| r.suggestions.iter().any(|s| {
+                    s.action == RecoveryAction::CallToolFirst
+                        && s.parameters
+                            .get("wait_bind")
+                            .and_then(|v| v.as_bool())
+                            == Some(true)
+                })),
+            "expected wait_bind CallToolFirst: {body}"
+        );
+        crate::dev_server::clear_pending_preview("sess-wait-bind", 8000);
     }
 }

@@ -1113,8 +1113,7 @@ fn replace_tool_with_summary(
         return true;
     }
 
-    let is_error = content.contains("\"tool_error\"")
-        || content.contains("\"category\"") && content.contains("\"error\"");
+    let is_error = edgecrab_types::parse_tool_error_payload(&content).is_some();
     let summary = summarize_tool_result_for_history(name, args, &content, is_error);
     replace_tool_content(msg, &summary);
     true

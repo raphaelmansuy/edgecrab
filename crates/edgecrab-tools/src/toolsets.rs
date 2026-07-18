@@ -155,21 +155,19 @@ pub const MOA_TOOLS: &[&str] = &["moa"];
 
 /// Hot tools always on the wire when `tools.schema_mode: indexed` (spec 007 L3).
 ///
-/// Everything else in the enabled surface is deferred — listed in the system
-/// prompt and materialized via `tool_search`.
+/// July 2026 progressive disclosure: keep ~3–5 hottest tools + `tool_search`
+/// (added via [`crate::tool_schema_index::is_hot_tool`]). Everything else is
+/// deferred — discover via `tool_search` (categories in the system prompt;
+/// no per-tool name dump).
+///
+/// Create-path evidence (session `8d74ce9c` / game001): `write_file` must be hot.
+/// `web_search` is deferred (one `tool_search` away).
 pub const INDEXED_HOT_TOOLS: &[&str] = &[
     "read_file",
     "write_file",
     "patch",
     "search_files",
     "terminal",
-    "web_search",
-    "web_extract",
-    "memory_read",
-    "memory_write",
-    "manage_todo_list",
-    "delegate_task",
-    "skill_view",
 ];
 
 /// Multi-agent kanban board — opt-in via `kanban.enabled` + `enabled_toolsets: ["kanban"]`.
@@ -915,5 +913,22 @@ mod tests {
         assert!(!sync.added_to_enabled);
         assert!(!sync.removed_from_disabled);
         assert!(sync.still_blocked);
+    }
+
+    #[test]
+    fn indexed_hot_tools_is_five_without_tool_search() {
+        assert_eq!(INDEXED_HOT_TOOLS.len(), 5);
+        assert!(!INDEXED_HOT_TOOLS.contains(&"tool_search"));
+        assert_eq!(
+            INDEXED_HOT_TOOLS,
+            &[
+                "read_file",
+                "write_file",
+                "patch",
+                "search_files",
+                "terminal",
+            ]
+        );
+        assert!(!INDEXED_HOT_TOOLS.contains(&"web_search"));
     }
 }

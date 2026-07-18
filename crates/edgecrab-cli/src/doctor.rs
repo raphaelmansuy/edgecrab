@@ -111,6 +111,8 @@ pub async fn run(config_override: Option<&str>) -> anyhow::Result<bool> {
         checks.push(check_schema_mode(&config));
         checks.push(check_prompt_prefix_cache(&config));
         checks.push(check_smart_routing(&config));
+        checks.push(check_os_sandbox(&config));
+        checks.push(check_os_sandbox_probe(&config));
     }
     checks.extend(check_mcp_servers());
     checks.extend(check_provider_keys());
@@ -285,6 +287,13 @@ fn check_toolset_policy(config: &edgecrab_core::AppConfig) -> Check {
 
 fn check_schema_mode(config: &edgecrab_core::AppConfig) -> Check {
     match edgecrab_tools::ToolSchemaMode::parse(&config.tools.schema_mode) {
+        edgecrab_tools::ToolSchemaMode::Auto => Check::pass(
+            "Schema mode",
+            format!(
+                "auto — Compact if ≤{} enabled tools, else Indexed (hot + tool_search)",
+                edgecrab_tools::AUTO_INDEXED_TOOL_COUNT_THRESHOLD
+            ),
+        ),
         edgecrab_tools::ToolSchemaMode::Indexed => Check::pass(
             "Schema mode",
             "indexed — hot tools on wire; /context budget shows wire:N deferred:M",
@@ -307,21 +316,27 @@ fn check_prompt_prefix_cache(config: &edgecrab_core::AppConfig) -> Check {
         provider, model_id, None,
     );
     let prefix = &config.cache.prompt_prefix;
+    let schema_note = match config.tools.schema_mode.as_str() {
+        "indexed" => "indexed tools (hot≤5) keep prefix stable",
+        other => other,
+    };
     match (supports, prefix.enabled) {
         (true, true) => Check::pass(
             "Prompt cache",
             format!(
-                "enabled (ttl={}, warm_on_start={}); SLO ≥70% hit after 3+ turns — watch via /context budget or /cost",
+                "enabled (ttl={}, warm_on_start={}); SLO ≥70% hit after 3+ turns — {schema_note}; watch via /context budget or /cost",
                 prefix.ttl, prefix.warm_on_start
             ),
         ),
         (true, false) => Check::warn(
             "Prompt cache",
-            "provider supports caching but cache.prompt_prefix.enabled=false",
+            "provider supports caching but cache.prompt_prefix.enabled=false — lead meter Cost/turn degraded",
         ),
         (false, _) => Check::pass(
             "Prompt cache",
-            "not applicable for configured provider (local KV normalize still applies for lmstudio/ollama)",
+            format!(
+                "not applicable for configured provider ({schema_note}; local KV normalize still applies for lmstudio/ollama)"
+            ),
         ),
     }
 }
@@ -347,6 +362,75 @@ fn check_smart_routing(config: &edgecrab_core::AppConfig) -> Check {
         Check::pass(
             "Smart routing",
             "disabled (set model.smart_routing.enabled: true for Pareto savings)",
+        )
+    }
+}
+
+/// Soft sandbox: mode ≠ off but deny_default=false (018 P0 trust cliff).
+pub fn check_os_sandbox(config: &edgecrab_core::AppConfig) -> Check {
+    let mode = config.security.os_sandbox.mode.trim().to_ascii_lowercase();
+    let deny_default = config.security.os_sandbox.deny_default;
+    match mode.as_str() {
+        "off" | "" => Check::pass(
+            "OS sandbox",
+            "off — local terminal runs unsandboxed (set security.os_sandbox.mode + deny_default for hard profiles)",
+        ),
+        "seatbelt" | "sandbox-exec" | "bubblewrap" | "bwrap" if !deny_default => Check::warn(
+            "OS sandbox",
+            format!(
+                "soft sandbox (mode={mode}, deny_default=false) — allow-default profile; set security.os_sandbox.deny_default: true for deny-default trust"
+            ),
+        ),
+        other => Check::pass(
+            "OS sandbox",
+            format!("mode={other}, deny_default={deny_default}"),
+        ),
+    }
+}
+
+/// Probe deny-default wrap for a harmless command (Wave D — measure before Trust L).
+pub fn check_os_sandbox_probe(config: &edgecrab_core::AppConfig) -> Check {
+    use edgecrab_security::{OsSandboxMode, wrap_command};
+    use std::path::Path;
+
+    let mode = OsSandboxMode::parse(&config.security.os_sandbox.mode);
+    if mode == OsSandboxMode::Off {
+        return Check::pass(
+            "OS sandbox probe",
+            "skipped — mode=off (enable seatbelt/bubblewrap + deny_default to probe hard profiles)",
+        );
+    }
+    let deny_default = config.security.os_sandbox.deny_default;
+    let wrapped = wrap_command(mode, "echo edgecrab-sandbox-probe", Path::new("/tmp"), true, deny_default);
+    if wrapped.passthrough {
+        return Check::warn(
+            "OS sandbox probe",
+            format!(
+                "sandbox binary missing — passthrough ({})",
+                wrapped.warning.unwrap_or_else(|| "no warning".into())
+            ),
+        );
+    }
+    if deny_default {
+        let profile_ok = wrapped
+            .args
+            .iter()
+            .any(|a| a.contains("(deny default)") || a == "--unshare-user");
+        if profile_ok {
+            Check::pass(
+                "OS sandbox probe",
+                format!("deny-default wrap ready (program={})", wrapped.program),
+            )
+        } else {
+            Check::warn(
+                "OS sandbox probe",
+                "deny_default=true but wrap profile missing expected deny-default markers",
+            )
+        }
+    } else {
+        Check::warn(
+            "OS sandbox probe",
+            "soft wrap only (deny_default=false) — Trust meter stays P until deny_default opt-in",
         )
     }
 }
@@ -1139,6 +1223,47 @@ mod tests {
         let pass = check_cache_hit_rate_slo(true, 5, Some(85.0)).expect("check");
         assert_eq!(pass.status, CheckStatus::Pass);
         assert!(check_cache_hit_rate_slo(true, 2, Some(10.0)).is_none());
+    }
+
+    #[test]
+    fn os_sandbox_soft_mode_warns() {
+        let mut cfg = edgecrab_core::AppConfig::default();
+        cfg.security.os_sandbox.mode = "seatbelt".into();
+        cfg.security.os_sandbox.deny_default = false;
+        let check = check_os_sandbox(&cfg);
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(check.detail.contains("soft sandbox"));
+
+        cfg.security.os_sandbox.deny_default = true;
+        let hard = check_os_sandbox(&cfg);
+        assert_eq!(hard.status, CheckStatus::Pass);
+
+        cfg.security.os_sandbox.mode = "off".into();
+        cfg.security.os_sandbox.deny_default = false;
+        let off = check_os_sandbox(&cfg);
+        assert_eq!(off.status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn os_sandbox_probe_skips_when_off() {
+        let cfg = edgecrab_core::AppConfig::default();
+        let check = check_os_sandbox_probe(&cfg);
+        assert_eq!(check.status, CheckStatus::Pass);
+        assert!(check.detail.contains("skipped"));
+    }
+
+    #[test]
+    fn os_sandbox_probe_warns_on_soft_wrap() {
+        let mut cfg = edgecrab_core::AppConfig::default();
+        cfg.security.os_sandbox.mode = "seatbelt".into();
+        cfg.security.os_sandbox.deny_default = false;
+        let check = check_os_sandbox_probe(&cfg);
+        // Missing binary → warn passthrough; present binary → soft wrap warn.
+        assert!(
+            matches!(check.status, CheckStatus::Warn | CheckStatus::Pass),
+            "{:?}",
+            check
+        );
     }
 
     #[test]

@@ -4,7 +4,10 @@ use edgecrab_types::{
     VerificationSummary, parse_tool_error_payload,
 };
 
-use crate::task_class::{TaskClass, classify_from_messages, is_verification_tool_for_class};
+use crate::task_class::{
+    TaskClass, classify_from_messages, document_artifact_evidence_present,
+    is_verification_tool_for_class,
+};
 
 /// Snapshot of end-of-run state inspected by the completion policy.
 pub struct CompletionContext<'a> {
@@ -12,6 +15,8 @@ pub struct CompletionContext<'a> {
     pub messages: &'a [Message],
     pub interrupted: bool,
     pub budget_exhausted: bool,
+    /// Model exhausted unknown-tool retry budget (PartialAbort).
+    pub invalid_tool_budget_exhausted: bool,
     pub pending_approval: bool,
     pub pending_clarification: bool,
     pub active_todos: usize,
@@ -37,7 +42,8 @@ pub fn assess_completion(ctx: &CompletionContext<'_>) -> RunOutcome {
 impl CompletionPolicy for DefaultCompletionPolicy {
     fn assess(&self, ctx: &CompletionContext<'_>) -> RunOutcome {
         let pending_clarification = ctx.pending_clarification || has_clarify_marker(ctx);
-        let pending_approval = ctx.pending_approval || has_approval_marker(ctx);
+        // First principles: approval is a typed session flag only — never prose bags.
+        let pending_approval = ctx.pending_approval;
         let task_class = classify_from_messages(ctx.messages);
         let verification =
             collect_verification_summary(ctx.messages, task_class, ctx.verification_strict);
@@ -80,6 +86,17 @@ impl CompletionPolicy for DefaultCompletionPolicy {
                 CompletionDecision::BudgetExhausted,
                 ExitReason::BudgetExhausted,
                 "Stopped — the iteration budget was exhausted before the task was complete.",
+            )
+        } else if ctx.invalid_tool_budget_exhausted {
+            let summary = if ctx.final_response.trim().is_empty() {
+                "Failed — invalid tool call retry budget exhausted.".to_string()
+            } else {
+                ctx.final_response.trim().to_string()
+            };
+            RunOutcome::new(
+                CompletionDecision::Failed,
+                ExitReason::InvalidToolBudget,
+                summary,
             )
         } else if ctx.child_runs_in_flight > 0
             || ctx.active_todos > 0
@@ -173,23 +190,6 @@ fn has_clarify_marker(ctx: &CompletionContext<'_>) -> bool {
             .any(|msg| msg.text_content().contains("[CLARIFY]"))
 }
 
-fn has_approval_marker(ctx: &CompletionContext<'_>) -> bool {
-    let approval_tokens = [
-        "approval required",
-        "reply /approve",
-        "approve session",
-        "awaiting approval",
-    ];
-
-    approval_tokens
-        .iter()
-        .any(|needle| ctx.final_response.to_ascii_lowercase().contains(needle))
-        || ctx.messages.iter().any(|msg| {
-            let lower = msg.text_content().to_ascii_lowercase();
-            approval_tokens.iter().any(|needle| lower.contains(needle))
-        })
-}
-
 /// Recent structured failure on tools that gate user-facing answers.
 fn has_recent_critical_tool_failure(messages: &[Message]) -> bool {
     const CRITICAL: &[&str] = &["web_search", "web_extract", "web_crawl"];
@@ -251,30 +251,13 @@ fn collect_verification_summary(
         if name == "report_task_status" {
             required = true;
             if let Ok(report) = serde_json::from_str::<ReportedTaskStatus>(&content) {
-                match report.status {
-                    TaskStatusKind::Completed => {
-                        if report.evidence.is_empty() {
-                            if !report.summary.trim().is_empty() {
-                                evidence.push(report.summary.trim().to_string());
-                            }
-                        } else {
-                            evidence.extend(
-                                report
-                                    .evidence
-                                    .into_iter()
-                                    .filter(|item| !item.trim().is_empty()),
-                            );
-                        }
-                    }
-                    TaskStatusKind::Blocked | TaskStatusKind::InProgress => {
-                        evidence.extend(
-                            report
-                                .evidence
-                                .into_iter()
-                                .filter(|item| !item.trim().is_empty()),
-                        );
-                    }
-                }
+                // Summary prose alone never counts as evidence (018 F1 / H7).
+                evidence.extend(
+                    report
+                        .evidence
+                        .into_iter()
+                        .filter(|item| !item.trim().is_empty()),
+                );
             }
             continue;
         }
@@ -294,6 +277,19 @@ fn collect_verification_summary(
             continue;
         }
 
+        // Structured terminal proof: only exit_code==0 counts as free-form evidence.
+        if matches!(name, "terminal" | "run_process") {
+            match edgecrab_tools::parse_terminal_result(&content) {
+                Some(parsed) if parsed.exit_code == 0 => {}
+                _ => continue,
+            }
+        }
+
+        // VisualUx: typed StructuredBrowserResult only (no prose heuristics).
+        if task_class == TaskClass::VisualUx && !visual_perception_evidence_ok(name, &content) {
+            continue;
+        }
+
         let summary = first_nonempty_line(&content)
             .map(|line| truncate(line, 140))
             .filter(|line| !line.trim().is_empty())
@@ -308,10 +304,24 @@ fn collect_verification_summary(
         required = true;
     }
 
+    // Document: landed office artifact is sufficient evidence (006 pptx forensics).
+    if task_class == TaskClass::Document && document_artifact_evidence_present(messages) {
+        required = true;
+        if evidence.is_empty() {
+            evidence.push("document: artifact path present".into());
+        }
+    }
+
     if task_class == TaskClass::VisualUx && verification_strict && required && evidence.is_empty() {
         debt_reason = Some(
             "Visual/UX task: enable security.preview and verify with browser or screenshot."
                 .to_string(),
+        );
+    }
+
+    if task_class == TaskClass::Document && required && evidence.is_empty() {
+        debt_reason = Some(
+            "Document task: confirm .pptx/.pdf/.docx exists with non-zero size.".to_string(),
         );
     }
 
@@ -321,11 +331,65 @@ fn collect_verification_summary(
         debt_reason: debt_reason.or((required && evidence.is_empty())
             .then_some("No structured verification evidence was recorded.".to_string())),
         evidence,
+        // Contract fields filled by [`enrich_verification_with_contract`] when a goal is active.
+        contract_required: false,
+        contract_satisfied: false,
     }
+}
+
+/// Fold goal-contract requirements into the single evidence ledger (DRY — no parallel type).
+pub fn enrich_verification_with_contract(
+    mut summary: VerificationSummary,
+    contract: &edgecrab_types::GoalContract,
+    messages: &[Message],
+) -> VerificationSummary {
+    if !contract.requires_verification_evidence() {
+        return summary;
+    }
+    summary.contract_required = true;
+    summary.required = true;
+    let satisfied = crate::goal_judge::contract_evidence_in_messages(contract, messages);
+    summary.contract_satisfied = satisfied;
+    if !satisfied {
+        summary.evidence_present = false;
+        summary.debt_reason = Some(format!(
+            "Goal contract verification unmet — need tool evidence for: {}",
+            contract.verification.trim()
+        ));
+    } else if !summary.evidence.iter().any(|e| {
+        e.to_ascii_lowercase()
+            .contains(&contract.verification.trim().to_ascii_lowercase())
+    }) {
+        summary.evidence.push(format!(
+            "contract:{}",
+            contract.verification.trim()
+        ));
+        summary.evidence_present = true;
+    }
+    summary
 }
 
 fn is_mutation_verification_tool(name: &str) -> bool {
     matches!(name, "write_file" | "patch" | "apply_patch")
+}
+
+/// True when perception tool content is typed evidence (018 P6 first principles).
+///
+/// Law: only [`StructuredBrowserResult`] fields count — never prose heuristics
+/// (loader/spinner/beautiful/ERR_* substrings). Unstructured results are not evidence.
+pub(crate) fn visual_perception_evidence_ok(_tool_name: &str, content: &str) -> bool {
+    let Some(parsed) = edgecrab_tools::parse_structured_browser_result(content) else {
+        return false;
+    };
+    if parsed.is_chrome_error || !parsed.ok {
+        return false;
+    }
+    match parsed.tool.as_str() {
+        "browser_snapshot" => parsed.node_count.unwrap_or(0) > 0,
+        "browser_vision" | "browser_navigate" => true,
+        // Other perception tools must still emit the structured envelope.
+        _ => true,
+    }
 }
 
 /// Visual-UX sessions with repeated `browser_navigate` failures and zero successful loads (games003).
@@ -336,10 +400,16 @@ fn visual_browser_navigate_exhausted(messages: &[Message]) -> bool {
         if msg.role != Role::Tool || msg.name.as_deref() != Some("browser_navigate") {
             continue;
         }
-        if parse_tool_error_payload(&msg.text_content()).is_some() {
-            failed += 1;
-        } else {
-            ok += 1;
+        let content = msg.text_content();
+        match edgecrab_tools::structured_browser_nav_succeeded(&content) {
+            Some(true) => ok += 1,
+            Some(false) => failed += 1,
+            None => {
+                if parse_tool_error_payload(&content).is_some() {
+                    failed += 1;
+                }
+                // Unstructured navigate prose does not count as success.
+            }
         }
     }
     failed >= 3 && ok == 0
@@ -358,8 +428,14 @@ fn markdown_theater_without_perception(messages: &[Message]) -> bool {
         };
         if matches!(
             name,
-            "browser_navigate" | "browser_snapshot" | "vision" | "analyze_image"
+            "browser_snapshot"
+                | "browser_vision"
+                | "vision"
+                | "analyze_image"
+                | "vision_analyze"
+                | "capture_screenshot"
         ) && parse_tool_error_payload(&msg.text_content()).is_none()
+            && visual_perception_evidence_ok(name, &msg.text_content())
         {
             perception_ok = true;
         }
@@ -367,25 +443,46 @@ fn markdown_theater_without_perception(messages: &[Message]) -> bool {
             continue;
         }
         let content = msg.text_content();
-        if is_report_like_write_path(&content) {
+        if parse_tool_error_payload(&content).is_some() {
+            continue;
+        }
+        if let Some(path) = write_file_path_from_tool_result(&content)
+            && is_verify_theater_basename(&path)
+        {
             report_writes += 1;
         }
     }
     report_writes >= 3 && !perception_ok
 }
 
-fn is_report_like_write_path(tool_result: &str) -> bool {
-    let lower = tool_result.to_ascii_lowercase();
-    const MARKERS: &[&str] = &[
-        "verification.md",
-        "delivery.md",
-        "final_report",
-        "evidence",
-        "readme.md",
-        "report.txt",
-        "checklist.md",
-    ];
-    MARKERS.iter().any(|m| lower.contains(m))
+/// Typed `path` from write_file tool result JSON.
+fn write_file_path_from_tool_result(tool_result: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(tool_result)
+        .ok()
+        .and_then(|v| v.get("path").and_then(|p| p.as_str()).map(str::to_string))
+}
+
+/// Theater filenames — basename stem only (never scan file body prose).
+pub(crate) fn is_verify_theater_basename(path: &str) -> bool {
+    let name = std::path::Path::new(path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(path)
+        .to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        "verification.md"
+            | "delivery.md"
+            | "checklist.md"
+            | "evidence.md"
+            | "readme.md"
+            | "report.txt"
+            | "report.md"
+            | "final_report.md"
+            | "final_report.txt"
+    ) || name.ends_with("_report.md")
+        || name.ends_with("_report.txt")
+        || (name.starts_with("final_report") && (name.ends_with(".md") || name.ends_with(".txt")))
 }
 
 fn first_nonempty_line(text: &str) -> Option<&str> {
@@ -416,6 +513,7 @@ mod tests {
             messages,
             interrupted: false,
             budget_exhausted: false,
+            invalid_tool_budget_exhausted: false,
             pending_approval: false,
             pending_clarification: false,
             active_todos: 0,
@@ -455,6 +553,7 @@ mod tests {
             messages: &[],
             interrupted: false,
             budget_exhausted: true,
+            invalid_tool_budget_exhausted: false,
             pending_approval: false,
             pending_clarification: false,
             active_todos: 0,
@@ -476,6 +575,7 @@ mod tests {
             messages: &[],
             interrupted: false,
             budget_exhausted: false,
+            invalid_tool_budget_exhausted: false,
             pending_approval: false,
             pending_clarification: false,
             active_todos: 2,
@@ -508,6 +608,7 @@ mod tests {
             messages: &[],
             interrupted: false,
             budget_exhausted: false,
+            invalid_tool_budget_exhausted: false,
             pending_approval: false,
             pending_clarification: false,
             active_todos: 0,
@@ -528,6 +629,7 @@ mod tests {
             messages: &[],
             interrupted: false,
             budget_exhausted: false,
+            invalid_tool_budget_exhausted: false,
             pending_approval: true,
             pending_clarification: false,
             active_todos: 0,
@@ -549,6 +651,7 @@ mod tests {
             messages: &[],
             interrupted: false,
             budget_exhausted: false,
+            invalid_tool_budget_exhausted: false,
             pending_approval: false,
             pending_clarification: true,
             active_todos: 0,
@@ -577,6 +680,70 @@ mod tests {
             assess_completion(&base_ctx("All set.", &messages, HarnessSnapshot::default()));
         assert_eq!(outcome.state, CompletionDecision::Completed);
         assert!(outcome.verification.evidence_present);
+    }
+
+    #[test]
+    fn report_task_status_summary_alone_is_not_evidence() {
+        let report = serde_json::json!({
+            "status": "completed",
+            "summary": "everything looks great",
+            "evidence": [],
+            "remaining_steps": []
+        })
+        .to_string();
+        let messages = vec![
+            Message::user("make demo/games003 polished UX"),
+            Message::tool_result("tc_1", "report_task_status", &report),
+        ];
+        let summary = collect_verification_summary(&messages, TaskClass::VisualUx, true);
+        assert!(
+            !summary.evidence_present,
+            "summary prose must not populate evidence: {:?}",
+            summary.evidence
+        );
+    }
+
+    #[test]
+    fn approval_prose_alone_does_not_block() {
+        let outcome = assess_completion(&base_ctx(
+            "Approval required — reply /approve to continue.",
+            &[],
+            HarnessSnapshot::default(),
+        ));
+        assert_ne!(outcome.state, CompletionDecision::Blocked);
+        assert_ne!(outcome.exit_reason, ExitReason::AwaitingApproval);
+    }
+
+    #[test]
+    fn failed_terminal_does_not_count_as_verification_evidence() {
+        let messages = vec![
+            Message::user("run cargo test"),
+            Message::tool_result(
+                "t1",
+                "terminal",
+                "[terminal_result status=error backend=local cwd=/tmp exit_code=1]\n\
+                 cargo test\nFAILED",
+            ),
+        ];
+        let summary = collect_verification_summary(&messages, TaskClass::CodeChange, false);
+        assert!(summary.required);
+        assert!(
+            !summary.evidence_present,
+            "failed terminal must not populate evidence: {:?}",
+            summary.evidence
+        );
+    }
+
+    #[test]
+    fn successful_terminal_counts_as_verification_evidence() {
+        let messages = vec![Message::tool_result(
+            "t1",
+            "terminal",
+            "[terminal_result status=success backend=local cwd=/tmp exit_code=0]\n\
+             cargo test\nok",
+        )];
+        let summary = collect_verification_summary(&messages, TaskClass::CodeChange, false);
+        assert!(summary.evidence_present);
     }
 
     #[test]
@@ -670,7 +837,7 @@ mod tests {
     #[test]
     fn ha30_strict_visual_without_preview_evidence_needs_verification() {
         let messages = vec![
-            Message::user("make the demo UI more beautiful"),
+            Message::user("make demo/games003 UI more polished"),
             Message::tool_result("t1", "terminal", "Syntax OK"),
         ];
         let ctx = CompletionContext {
@@ -678,6 +845,7 @@ mod tests {
             messages: &messages,
             interrupted: false,
             budget_exhausted: false,
+            invalid_tool_budget_exhausted: false,
             pending_approval: false,
             pending_clarification: false,
             active_todos: 0,
@@ -703,7 +871,7 @@ mod tests {
         })
         .to_string();
         let messages = vec![
-            Message::user("make demo/games003 beautiful UX"),
+            Message::user("make demo/games003/index.html beautiful UX"),
             Message::tool_result("n1", "browser_navigate", &err),
             Message::tool_result("n2", "browser_navigate", &err),
             Message::tool_result("n3", "browser_navigate", &err),
@@ -713,6 +881,7 @@ mod tests {
             messages: &messages,
             interrupted: false,
             budget_exhausted: false,
+            invalid_tool_budget_exhausted: false,
             pending_approval: false,
             pending_clarification: false,
             active_todos: 0,
@@ -729,7 +898,12 @@ mod tests {
     #[test]
     fn ha43_markdown_theater_blocks_visual_completion() {
         let messages = vec![
-            Message::user("create beautiful 3D race game demo/race_gamey"),
+            Message::user("create beautiful 3D race game demo/race_gamey/index.html"),
+            Message::tool_result(
+                "w0",
+                "write_file",
+                r#"{"ok":true,"path":"demo/race_gamey/index.html"}"#,
+            ),
             Message::tool_result("w1", "write_file", r#"{"path":"VERIFICATION.md"}"#),
             Message::tool_result("w2", "write_file", r#"{"path":"DELIVERY.md"}"#),
             Message::tool_result("w3", "write_file", r#"{"path":"FINAL_REPORT.txt"}"#),
@@ -739,6 +913,7 @@ mod tests {
             messages: &messages,
             interrupted: false,
             budget_exhausted: false,
+            invalid_tool_budget_exhausted: false,
             pending_approval: false,
             pending_clarification: false,
             active_todos: 0,
@@ -750,6 +925,82 @@ mod tests {
         let outcome = assess_completion(&ctx);
         assert_eq!(outcome.state, CompletionDecision::NeedsVerification);
         assert!(outcome.user_summary.contains("markdown"));
+    }
+
+    #[test]
+    fn invalid_tool_budget_exhausted_is_failed_not_completed() {
+        let outcome = assess_completion(&CompletionContext {
+            final_response: "Model generated invalid tool call: quick_stock_quote",
+            messages: &[],
+            interrupted: false,
+            budget_exhausted: false,
+            invalid_tool_budget_exhausted: true,
+            pending_approval: false,
+            pending_clarification: false,
+            active_todos: 0,
+            blocked_todos: 0,
+            child_runs_in_flight: 0,
+            harness: HarnessSnapshot::default(),
+            verification_strict: false,
+        });
+        assert_eq!(outcome.state, CompletionDecision::Failed);
+        assert_eq!(outcome.exit_reason, ExitReason::InvalidToolBudget);
+        assert!(outcome.user_summary.contains("quick_stock_quote"));
+        assert!(!outcome.is_success());
+    }
+
+    #[test]
+    fn closed_unknown_tool_results_do_not_trip_unanswered_gate() {
+        // Structural stand-in for strike-3 PartialAbort after tool-call closure:
+        // assistant tool_call + matching tool result → unanswered == 0.
+        let messages = vec![
+            Message::assistant_with_tool_calls(
+                "",
+                vec![edgecrab_types::ToolCall {
+                    id: "c1".into(),
+                    r#type: "function".into(),
+                    function: edgecrab_types::FunctionCall {
+                        name: "quick_stock_quote".into(),
+                        arguments: r#"{"symbol":"MSFT"}"#.into(),
+                    },
+                    thought_signature: None,
+                }],
+            ),
+            Message::tool_result(
+                "c1",
+                "quick_stock_quote",
+                r#"{"type":"tool_error","code":"tool_not_found","error":"Tool 'quick_stock_quote' does not exist."}"#,
+            ),
+        ];
+        assert_eq!(
+            crate::turn_completion::count_unanswered_tool_calls(&messages),
+            0
+        );
+        let harness = build_harness_snapshot(HarnessBuildInput {
+            messages: &messages,
+            mutation_turn: &MutationTurnState::new(),
+            cwd: std::path::Path::new("."),
+            post_mutation_oracles: false,
+            advisory: HarnessAdvisorySignals::default(),
+            unanswered_tool_calls: 0,
+        });
+        assert!(!harness.blocks_completion());
+        let outcome = assess_completion(&CompletionContext {
+            final_response: "Model generated invalid tool call: quick_stock_quote",
+            messages: &messages,
+            interrupted: false,
+            budget_exhausted: false,
+            invalid_tool_budget_exhausted: true,
+            pending_approval: false,
+            pending_clarification: false,
+            active_todos: 0,
+            blocked_todos: 0,
+            child_runs_in_flight: 0,
+            harness,
+            verification_strict: false,
+        });
+        assert_eq!(outcome.state, CompletionDecision::Failed);
+        assert_eq!(outcome.exit_reason, ExitReason::InvalidToolBudget);
     }
 
     #[test]
@@ -801,5 +1052,92 @@ mod tests {
         });
         let outcome = assess_completion(&base_ctx("Done!", &messages, harness));
         assert_eq!(outcome.state, CompletionDecision::Incomplete);
+    }
+
+    #[test]
+    fn navigate_alone_does_not_satisfy_visual_ux() {
+        let messages = vec![
+            Message::user("Write a beautiful 3D Chess UX in ./demo/game005/index.html"),
+            Message::tool_result(
+                "n1",
+                "browser_navigate",
+                "Navigated to: http://127.0.0.1:8000/index.html\nTitle: 3D Chess",
+            ),
+        ];
+        let ctx = CompletionContext {
+            final_response: "Done — WebGL unsupported in preview.",
+            messages: &messages,
+            interrupted: false,
+            budget_exhausted: false,
+            invalid_tool_budget_exhausted: false,
+            pending_approval: false,
+            pending_clarification: false,
+            active_todos: 0,
+            blocked_todos: 0,
+            child_runs_in_flight: 0,
+            harness: HarnessSnapshot::default(),
+            verification_strict: true,
+        };
+        let outcome = assess_completion(&ctx);
+        assert_eq!(outcome.state, CompletionDecision::NeedsVerification);
+    }
+
+    #[test]
+    fn chrome_error_not_visual_evidence() {
+        let chrome = edgecrab_tools::StructuredBrowserResult::vision_ok(
+            "chrome-error://chromewebdata/",
+            "looks fine",
+            true,
+        )
+        .to_tool_result_text();
+        assert!(!visual_perception_evidence_ok("browser_vision", &chrome));
+
+        // Unstructured prose is never evidence (no loader-keyword law).
+        assert!(!visual_perception_evidence_ok(
+            "browser_vision",
+            "The page is not currently displaying a game; blank canvas only."
+        ));
+        assert!(!visual_perception_evidence_ok(
+            "browser_snapshot",
+            "Board with 32 chess pieces visible; white to move."
+        ));
+
+        let good = edgecrab_tools::StructuredBrowserResult::snapshot_ok(
+            "http://127.0.0.1:8000/",
+            "Board with 32 chess pieces; white to move. @e1 @e2",
+            Some(8),
+        )
+        .to_tool_result_text();
+        assert!(visual_perception_evidence_ok("browser_snapshot", &good));
+    }
+
+    #[test]
+    fn visual_perception_snapshot_satisfies_completion() {
+        let snap = edgecrab_tools::StructuredBrowserResult::snapshot_ok(
+            "http://127.0.0.1:8000/",
+            "Chess board rendered with pieces; UI overlay visible. @e1 button @e2 canvas",
+            Some(12),
+        )
+        .to_tool_result_text();
+        let messages = vec![
+            Message::user("make demo/game005/index.html beautiful UX"),
+            Message::tool_result("s1", "browser_snapshot", &snap),
+        ];
+        let ctx = CompletionContext {
+            final_response: "Game looks good in browser.",
+            messages: &messages,
+            interrupted: false,
+            budget_exhausted: false,
+            invalid_tool_budget_exhausted: false,
+            pending_approval: false,
+            pending_clarification: false,
+            active_todos: 0,
+            blocked_todos: 0,
+            child_runs_in_flight: 0,
+            harness: HarnessSnapshot::default(),
+            verification_strict: true,
+        };
+        let outcome = assess_completion(&ctx);
+        assert_eq!(outcome.state, CompletionDecision::Completed);
     }
 }

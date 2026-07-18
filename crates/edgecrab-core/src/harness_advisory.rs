@@ -69,24 +69,19 @@ impl HarnessTurnAdvisory {
     }
 
     pub fn record_browser_navigate_result(&mut self, tool_result: &str) {
-        let lower = tool_result.to_ascii_lowercase();
-        let failed = lower.contains("\"success\":false")
-            || lower.contains("\"is_error\":true")
-            || lower.contains("tool error")
-            || lower.contains("connection refused")
-            || lower.contains("cdp")
-            || lower.contains("chrome")
-            || lower.contains("headless")
-            || lower.contains("blocked")
-            || lower.contains("ssrf")
-            || lower.contains("scheme not allowed");
-        if failed {
-            self.browser_nav_failures = self.browser_nav_failures.saturating_add(1);
+        // First principles: structured browser JSON or typed tool_error only.
+        if let Some(ok) = edgecrab_tools::structured_browser_nav_succeeded(tool_result) {
+            if ok {
+                self.browser_nav_success = true;
+            } else {
+                self.browser_nav_failures = self.browser_nav_failures.saturating_add(1);
+            }
             return;
         }
-        if lower.contains("\"success\":true") || lower.contains("navigated") {
-            self.browser_nav_success = true;
+        if edgecrab_types::parse_tool_error_payload(tool_result).is_some() {
+            self.browser_nav_failures = self.browser_nav_failures.saturating_add(1);
         }
+        // Unstructured prose does not update storm counters.
     }
 
     pub fn record_tool(&mut self, tool_name: &str) {
@@ -108,31 +103,97 @@ impl HarnessTurnAdvisory {
         if self.preview_recovery_sent || tool_name != "browser_navigate" {
             return None;
         }
-        let lower = tool_result.to_ascii_lowercase();
-        let blocked = lower.contains("blocked")
-            || lower.contains("ssrf")
-            || lower.contains("scheme not allowed")
-            || lower.contains("file://");
-        let cdp_or_connect = lower.contains("cdp")
-            || lower.contains("chrome")
-            || lower.contains("headless")
-            || lower.contains("connection refused")
-            || lower.contains("websocket");
+        // Typed signals only: tool_error codes / structured chrome-error / storm debt.
+        let payload = edgecrab_types::parse_tool_error_payload(tool_result);
+        // Typed ToolError codes/categories only — not free-text `.contains("ssrf")`.
+        let blocked = payload.as_ref().is_some_and(|p| {
+            let code = p.code.to_ascii_lowercase();
+            let cat = p.category.to_ascii_lowercase();
+            matches!(
+                code.as_str(),
+                "ssrf_blocked"
+                    | "ssrf"
+                    | "scheme_not_allowed"
+                    | "url_scheme_blocked"
+                    | "capability_denied"
+            ) || cat == "security"
+                || code.starts_with("ssrf")
+                || code.contains("scheme_not_allowed")
+        });
+        let structured_fail = edgecrab_tools::parse_structured_browser_result(tool_result)
+            .is_some_and(|r| r.is_chrome_error || !r.ok);
         let failed_nav = self.browser_nav_failures > 0 && !self.browser_nav_success;
-        if !blocked && !cdp_or_connect && !failed_nav {
+        if !blocked && !structured_fail && !failed_nav && payload.is_none() {
             return None;
         }
         self.preview_recovery_sent = true;
-        let port_line = edgecrab_tools::dev_server::format_dev_server_ports_hint(known_ports)
-            .map(|h| format!("\n{h}"))
-            .unwrap_or_default();
+        if let Some(hint) = edgecrab_tools::dev_server::format_dev_server_ports_hint(known_ports) {
+            return Some(format!(
+                "[harness] browser verification unavailable — do not use file://, execute_code screenshots, \
+                 or read ~/.edgecrab/config.yaml. {hint} Call browser_navigate to that URL, then \
+                 browser_snapshot. Do not try other localhost ports. Do not write markdown \
+                 verification reports."
+            ));
+        }
+        let serve_dir = edgecrab_tools::recovery_catalog::infer_preview_serve_directory_from_text(
+            // best-effort: recovery text itself carries no path; callers with messages
+            // should prefer CallToolFirst JSON from browser_navigate errors.
+            "",
+        );
+        let recipe =
+            edgecrab_tools::recovery_catalog::preview_serve_then_navigate_recipe(&serve_dir);
+        let command = recipe
+            .get("command")
+            .and_then(|c| c.as_str())
+            .unwrap_or("python3 -m http.server 8000 --directory .");
         Some(format!(
-            "[harness] browser verification unavailable — do not use file://, execute_code screenshots, \
-             or read ~/.edgecrab/config.yaml. Start a dev server on an allowed preview port, then \
-             browser_navigate to http://127.0.0.1:PORT/ and browser_snapshot. \
-             If Chrome/CDP is down: run a local server (python3 -m http.server 8000) and ensure \
-             security.preview.enabled is true in the active profile.{port_line} \
-             Do not write markdown verification reports."
+            "[harness] browser verification unavailable — no session HTTP server recorded. \
+             Do not guess localhost ports (8080/5050/5000/…). Call terminal with \
+             `{command}` (background), then browser_navigate http://127.0.0.1:8000/ and \
+             browser_snapshot. Ensure security.preview.enabled. Do not write markdown \
+             verification reports."
+        ))
+    }
+
+    /// After one failed loopback navigate with no session server, block further
+    /// localhost port shopping until a port is recorded.
+    pub fn maybe_loopback_port_shopping_block(
+        &self,
+        tool_name: &str,
+        args_json: &str,
+        session_ports: &[u16],
+        serve_directory: &str,
+    ) -> Option<String> {
+        if tool_name != "browser_navigate" || !session_ports.is_empty() {
+            return None;
+        }
+        if self.browser_nav_success || self.browser_nav_failures < 1 {
+            return None;
+        }
+        let url = serde_json::from_str::<serde_json::Value>(args_json)
+            .ok()
+            .and_then(|v| v.get("url").and_then(|u| u.as_str()).map(str::to_string))?;
+        if !is_loopback_http_url(&url) {
+            return None;
+        }
+        let recipe =
+            edgecrab_tools::recovery_catalog::preview_serve_then_navigate_recipe(serve_directory);
+        let command = recipe
+            .get("command")
+            .and_then(|c| c.as_str())
+            .unwrap_or("python3 -m http.server 8000 --directory .");
+        Some(edgecrab_tools::tool_loop_guardrails::guardrail_block_result(
+            &edgecrab_tools::tool_loop_guardrails::ToolGuardrailDecision {
+                action: edgecrab_tools::tool_loop_guardrails::GuardrailAction::Block,
+                code: "loopback_port_shopping_block",
+                message: format!(
+                    "Blocked localhost browser_navigate — no session HTTP server is recorded. \
+                     Do not try other ports. Call terminal with `{command}`, then \
+                     browser_navigate http://127.0.0.1:8000/ once."
+                ),
+                tool_name: tool_name.to_string(),
+                count: self.browser_nav_failures,
+            },
         ))
     }
 
@@ -158,9 +219,9 @@ impl HarnessTurnAdvisory {
                     code: "verification_theater_block",
                     message:
                         "Blocked verification workaround — browser_navigate failed repeatedly. \
-                           Start http.server on port 8000 (or dev_server), open \
-                           http://127.0.0.1:8000/... via browser_navigate, then browser_snapshot. \
-                           Do not script screenshots via execute_code."
+                           Call terminal with `python3 -m http.server 8000 --directory <demo-dir>`, \
+                           then browser_navigate http://127.0.0.1:8000/ and browser_snapshot. \
+                           Do not try other localhost ports. Do not script screenshots via execute_code."
                             .into(),
                     tool_name: tool_name.to_string(),
                     count: self.browser_nav_failures,
@@ -182,9 +243,10 @@ impl HarnessTurnAdvisory {
                 action: edgecrab_tools::tool_loop_guardrails::GuardrailAction::Block,
                 code: "browser_nav_loop_block",
                 message: "Blocked repeated browser_navigate — prior attempts failed (SSRF, CDP, or \
-                           dev server not running). Start `python3 -m http.server 8000` in the \
-                           project directory, confirm security.preview is enabled, then navigate to \
-                           http://127.0.0.1:8000/ once. Use browser_snapshot for visual proof."
+                           no session HTTP server). Do not try other localhost ports. Start \
+                           `python3 -m http.server 8000 --directory <demo-dir>`, confirm \
+                           security.preview is enabled, then navigate to http://127.0.0.1:8000/ \
+                           once. Use browser_snapshot for visual proof."
                     .into(),
                 tool_name: tool_name.to_string(),
                 count: self.browser_nav_failures,
@@ -246,11 +308,20 @@ impl HarnessTurnAdvisory {
             ?task_class,
             "harness: iteration storm without perception evidence"
         );
+        let recipe = match task_class {
+            TaskClass::VisualUx => {
+                "enable preview (/config), browser_navigate to the dev server URL, then \
+                 browser_snapshot. Do not write markdown verification reports."
+            }
+            TaskClass::CodeChange => {
+                "run compile/test gates (cargo test / npm test / pytest) before claiming done. \
+                 Do not open a browser or spawn a static preview server for code_change tasks."
+            }
+            _ => "gather class-appropriate verification evidence before claiming done.",
+        };
         Some(format!(
             "[harness] {act_count} mutation/discovery tools in the last {window}s without \
-             verification — stop terminal/config debugging. For {class} tasks: enable preview \
-             (/config), browser_navigate to the dev server URL, then browser_snapshot. Do not write \
-             markdown verification reports.",
+             verification — stop terminal/config debugging. For {class} tasks: {recipe}",
             window = self.window_secs,
             class = task_class_label(task_class),
         ))
@@ -260,9 +331,24 @@ impl HarnessTurnAdvisory {
 fn task_class_label(class: TaskClass) -> &'static str {
     match class {
         TaskClass::VisualUx => "visual_ux",
+        TaskClass::Document => "document",
         TaskClass::CodeChange => "code_change",
         TaskClass::Research => "research",
         TaskClass::General => "general",
+    }
+}
+
+fn is_loopback_http_url(url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return false;
+    }
+    match parsed.host_str() {
+        Some("localhost") | Some("127.0.0.1") | Some("::1") => true,
+        Some(h) => h.eq_ignore_ascii_case("localhost"),
+        None => false,
     }
 }
 
@@ -299,13 +385,14 @@ mod tests {
     #[test]
     fn ha16_preview_recovery_on_cdp_failure() {
         let mut adv = HarnessTurnAdvisory::new();
-        adv.record_browser_navigate_result(r#"{"success":false,"error":"CDP connection refused"}"#);
+        let fail = edgecrab_tools::StructuredBrowserResult::navigate_err(
+            "http://127.0.0.1:8000/",
+            "CDP connection refused",
+        )
+        .to_tool_result_json();
+        adv.record_browser_navigate_result(&fail);
         let msg = adv
-            .maybe_preview_recovery(
-                "browser_navigate",
-                r#"{"success":false,"error":"CDP connection refused"}"#,
-                &[8000],
-            )
+            .maybe_preview_recovery("browser_navigate", &fail, &[8000])
             .expect("cdp recovery");
         assert!(msg.contains("browser_navigate"));
         assert!(
@@ -314,11 +401,33 @@ mod tests {
         );
     }
 
+    fn tool_error_json(code: &str, error: &str) -> String {
+        serde_json::json!({
+            "type": "tool_error",
+            "category": "execution",
+            "code": code,
+            "code_num": 1006,
+            "error": error,
+            "retryable": true,
+            "suppress_retry": false,
+        })
+        .to_string()
+    }
+
+    fn structured_nav_fail() -> String {
+        edgecrab_tools::StructuredBrowserResult::navigate_err(
+            "http://127.0.0.1:8000/",
+            "Navigation error: net::ERR_CONNECTION_REFUSED",
+        )
+        .to_tool_result_json()
+    }
+
     #[test]
     fn verification_theater_blocks_execute_code_after_browser_failures() {
         let mut adv = HarnessTurnAdvisory::new();
-        adv.record_browser_navigate_result(r#"{"success":false}"#);
-        adv.record_browser_navigate_result(r#"{"success":false}"#);
+        let fail = structured_nav_fail();
+        adv.record_browser_navigate_result(&fail);
+        adv.record_browser_navigate_result(&fail);
         assert!(
             adv.maybe_verification_theater_block(TaskClass::VisualUx, "execute_code")
                 .is_some()
@@ -332,13 +441,14 @@ mod tests {
     #[test]
     fn repeated_browser_nav_blocked_after_three_failures() {
         let mut adv = HarnessTurnAdvisory::new();
-        adv.record_browser_navigate_result(r#"{"success":false}"#);
-        adv.record_browser_navigate_result(r#"{"success":false}"#);
+        let fail = structured_nav_fail();
+        adv.record_browser_navigate_result(&fail);
+        adv.record_browser_navigate_result(&fail);
         assert!(
             adv.maybe_repeated_browser_nav_block("browser_navigate")
                 .is_none()
         );
-        adv.record_browser_navigate_result(r#"{"success":false}"#);
+        adv.record_browser_navigate_result(&fail);
         let block = adv
             .maybe_repeated_browser_nav_block("browser_navigate")
             .expect("block");
@@ -352,13 +462,13 @@ mod tests {
     #[test]
     fn ha16_preview_recovery_once_per_session() {
         let mut adv = HarnessTurnAdvisory::new();
-        let err = r#"{"error":"URL blocked by SSRF policy"}"#;
+        let err = tool_error_json("ssrf_blocked", "URL blocked by SSRF policy");
         assert!(
-            adv.maybe_preview_recovery("browser_navigate", err, &[])
+            adv.maybe_preview_recovery("browser_navigate", &err, &[])
                 .is_some()
         );
         assert!(
-            adv.maybe_preview_recovery("browser_navigate", err, &[])
+            adv.maybe_preview_recovery("browser_navigate", &err, &[])
                 .is_none()
         );
     }
@@ -366,11 +476,61 @@ mod tests {
     #[test]
     fn ha20c_preview_recovery_includes_detected_ports() {
         let mut adv = HarnessTurnAdvisory::new();
-        let err = r#"{"error":"URL blocked by SSRF policy"}"#;
+        let err = tool_error_json("ssrf_blocked", "URL blocked by SSRF policy");
         let msg = adv
-            .maybe_preview_recovery("browser_navigate", err, &[8000])
+            .maybe_preview_recovery("browser_navigate", &err, &[8000])
             .expect("recovery");
         assert!(msg.contains("127.0.0.1:8000"));
+    }
+
+    #[test]
+    fn empty_ports_preview_recovery_forbids_port_shopping() {
+        let mut adv = HarnessTurnAdvisory::new();
+        let err = tool_error_json("execution_failed", "connection refused");
+        let msg = adv
+            .maybe_preview_recovery("browser_navigate", &err, &[])
+            .expect("recovery");
+        assert!(msg.contains("http.server"));
+        assert!(msg.contains("127.0.0.1:8000"));
+        assert!(
+            msg.contains("Do not guess") || msg.contains("do not guess"),
+            "must forbid port guessing: {msg}"
+        );
+    }
+
+    #[test]
+    fn loopback_port_shopping_blocked_after_one_failure() {
+        let mut adv = HarnessTurnAdvisory::new();
+        assert!(
+            adv.maybe_loopback_port_shopping_block(
+                "browser_navigate",
+                r#"{"url":"http://127.0.0.1:8080/"}"#,
+                &[],
+                "demo/game002",
+            )
+            .is_none()
+        );
+        adv.record_browser_navigate_result(&structured_nav_fail());
+        let block = adv
+            .maybe_loopback_port_shopping_block(
+                "browser_navigate",
+                r#"{"url":"http://127.0.0.1:5050/"}"#,
+                &[],
+                "demo/game002",
+            )
+            .expect("block port shopping");
+        assert!(block.contains("loopback_port_shopping_block") || block.contains("Blocked"));
+        assert!(block.contains("demo/game002") || block.contains("http.server"));
+        // Once a session port exists, shopping block lifts.
+        assert!(
+            adv.maybe_loopback_port_shopping_block(
+                "browser_navigate",
+                r#"{"url":"http://127.0.0.1:8000/"}"#,
+                &[8000],
+                "demo/game002",
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -383,6 +543,24 @@ mod tests {
             .maybe_iteration_storm_advisory(TaskClass::VisualUx)
             .expect("storm");
         assert!(msg.contains("without verification"));
+        assert!(msg.contains("browser_navigate") || msg.contains("browser_snapshot"));
+    }
+
+    #[test]
+    fn code_change_storm_does_not_prescribe_browser() {
+        let mut adv = HarnessTurnAdvisory::new();
+        for _ in 0..6 {
+            adv.record_tool("terminal");
+        }
+        let msg = adv
+            .maybe_iteration_storm_advisory(TaskClass::CodeChange)
+            .expect("storm");
+        assert!(msg.contains("code_change") || msg.contains("compile") || msg.contains("test"));
+        assert!(
+            !msg.contains("browser_navigate"),
+            "CodeChange must not prescribe browser theater: {msg}"
+        );
+        assert!(!msg.contains("dev server"));
     }
 
     #[test]
@@ -390,7 +568,7 @@ mod tests {
         use edgecrab_types::Message;
 
         let mut harness = HarnessTurnAdvisory::new();
-        let mut messages = vec![Message::user("make demo/games003 beautiful UX")];
+        let mut messages = vec![Message::user("make demo/games003/index.html beautiful UX")];
         let tool_names: Vec<&str> = std::iter::repeat("terminal").take(6).collect();
         apply_harness_advisories(
             &mut harness,
@@ -414,7 +592,8 @@ mod tests {
         for _ in 0..4 {
             adv.record_tool("terminal");
         }
-        adv.record_tool("browser_navigate");
+        // VisualUx perception = snapshot/vision (navigate alone is not verification).
+        adv.record_tool("browser_snapshot");
         adv.record_tool("terminal");
         assert!(
             adv.maybe_iteration_storm_advisory(TaskClass::VisualUx)

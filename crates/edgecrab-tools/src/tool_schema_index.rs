@@ -1,20 +1,50 @@
 //! Deferred tool schema index (spec 007 L3 / tool-search parity).
 //!
 //! In `indexed` mode only a **hot** subset is sent on the wire; the rest appear
-//! as a compact name index in the system prompt. `tool_search` materializes full
-//! schemas on demand and adds them to the session wire set.
+//! as a compact category summary in the system prompt (no per-tool name dump).
+//! `tool_search` materializes full schemas on demand and adds them to the
+//! session wire set.
 
 use std::collections::{HashSet, VecDeque};
+use std::sync::{Arc, RwLock};
 
 use edgecrab_types::ToolSchema;
 
-use crate::schema_mode::compact_tool_description;
+use crate::schema_mode::compact_tool_schema;
 use crate::toolsets::INDEXED_HOT_TOOLS;
 
 pub const TOOL_SEARCH_NAME: &str = "tool_search";
 
 /// Default cap on non-hot tools materialized onto the wire (`0` = unlimited).
 pub const DEFAULT_MAX_MATERIALIZED_TOOLS: usize = 12;
+
+/// Max deferred tools loaded via `tool_search(toolset=…)`.
+pub const MAX_TOOLSET_MATERIALIZE: usize = 8;
+
+/// Auto mode: Compact when enabled count ≤ this; Indexed when above.
+pub const AUTO_INDEXED_TOOL_COUNT_THRESHOLD: usize = 14;
+
+/// Turn-start BM25 prefetch cap (silent materialize before first LLM call).
+pub const DEFAULT_PREFETCH_LIMIT: usize = 3;
+
+/// How schemas are emitted in materialize outcomes / tool_search results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaterializeSchemaStyle {
+    Compact,
+    Full,
+}
+
+/// Outcome of [`materialize_tool_names`].
+#[derive(Debug, Clone, Default)]
+pub struct MaterializeOutcome {
+    pub activated: Vec<String>,
+    pub already_wire: Vec<String>,
+    pub not_found: Vec<String>,
+    pub evicted: Vec<String>,
+    pub schemas: Vec<ToolSchema>,
+    /// Curated argument examples for activated tools (materialize enrichment).
+    pub input_examples: std::collections::HashMap<String, Vec<serde_json::Value>>,
+}
 
 /// Session-scoped materialized wire set with optional LRU eviction.
 #[derive(Debug, Clone, Default)]
@@ -93,16 +123,37 @@ pub fn is_deferred_not_on_wire(name: &str, materialized: &HashSet<String>) -> bo
 }
 
 /// Tool-result text when a deferred tool is invoked before materialization.
+///
+/// Must be a typed `tool_error` payload (`tool_is_error:true`) so storm/failure
+/// counters and recovery materialization see honesty (006 pptx forensics).
 pub fn deferred_tool_error_response(tool_name: &str) -> String {
-    format!(
-        "Tool `{tool_name}` is enabled but not on your wire schema yet. \
-         Call `tool_search` with tool_names: [\"{tool_name}\"] or query: \"<what you need>\" first, then retry."
+    use edgecrab_types::{RecoveryAction, RecoveryFeedbackBuilder, ToolError};
+    ToolError::Unavailable {
+        tool: tool_name.into(),
+        reason: format!(
+            "Tool `{tool_name}` is enabled but not on your wire schema yet. \
+             Call `tool_search` first, then retry."
+        ),
+    }
+    .with_recovery(
+        RecoveryFeedbackBuilder::new("deferred_not_on_wire")
+            .message("Materialize deferred tool before calling it")
+            .suggestion(
+                RecoveryAction::CallToolFirst,
+                serde_json::json!({
+                    "tool": TOOL_SEARCH_NAME,
+                    "tool_names": [tool_name],
+                    "then": { "tool": tool_name },
+                }),
+            )
+            .build(),
     )
+    .to_llm_response()
 }
 
 /// Read the session materialized set (empty when unset or lock poisoned).
 pub fn read_materialized_set(
-    materialized: Option<&std::sync::Arc<std::sync::RwLock<MaterializedToolSet>>>,
+    materialized: Option<&Arc<RwLock<MaterializedToolSet>>>,
 ) -> HashSet<String> {
     materialized
         .and_then(|set| set.read().ok())
@@ -141,34 +192,116 @@ pub fn partition_schemas<'a>(
     (wire, deferred)
 }
 
-/// Schemas to send on the LLM wire in indexed mode (hot + materialized, compact).
-pub fn wire_schemas(schemas: &[ToolSchema], materialized: &HashSet<String>) -> Vec<ToolSchema> {
+/// Schemas to send on the LLM wire in indexed mode (hot + materialized).
+///
+/// When `hot_schema_full` is true (local providers), hot/`tool_search` keep full
+/// fidelity; materialized long-tail tools stay compact.
+pub fn wire_schemas(
+    schemas: &[ToolSchema],
+    materialized: &HashSet<String>,
+    hot_schema_full: bool,
+) -> Vec<ToolSchema> {
     let (wire, _) = partition_schemas(schemas, materialized);
     wire.iter()
-        .map(|s| crate::schema_mode::compact_tool_schema(s))
+        .map(|s| {
+            if hot_schema_full && is_hot_tool(&s.name) {
+                (*s).clone()
+            } else {
+                compact_tool_schema(s)
+            }
+        })
         .collect()
 }
 
-/// System-prompt block listing deferred tools (names + one-line hints).
-pub fn format_deferred_index(deferred: &[&ToolSchema]) -> String {
-    if deferred.is_empty() {
+/// System-prompt block: deferred count + toolset categories (no per-tool names).
+///
+/// Progressive disclosure (July 2026): invent risk rises when every deferred
+/// name is listed. Categories orient search; `tool_search` is the dictionary.
+pub fn format_deferred_index(deferred_count: usize, categories: &[String]) -> String {
+    if deferred_count == 0 {
         return String::new();
     }
-    let lines: Vec<String> = deferred
-        .iter()
-        .map(|s| {
-            let desc = compact_tool_description(&s.description);
-            format!("- **{}**: {}", s.name, desc)
-        })
-        .collect();
+    let mut cats: Vec<&str> = categories.iter().map(String::as_str).collect();
+    cats.sort_unstable();
+    cats.dedup();
+    let categories_line = if cats.is_empty() {
+        String::new()
+    } else {
+        format!("\n\nCategories: {}", cats.join(", "))
+    };
     format!(
         "## Deferred tools\n\n\
-         {count} tools are enabled but not on the wire yet. \
-         Call `tool_search` with `tool_names` before invoking any of these:\n\n\
-         {body}",
-        count = deferred.len(),
-        body = lines.join("\n"),
+         {deferred_count} tools are enabled but not on the wire.\n\
+         Call `tool_search` with `query` (preferred), `toolset` (pack), or exact `tool_names`, then retry.\
+         {categories_line}"
     )
+}
+
+/// Materialize deferred tool names onto the session wire set (DRY for tool_search + prefetch).
+pub fn materialize_tool_names(
+    names: &[String],
+    all_schemas: &[ToolSchema],
+    materialized: &Arc<RwLock<MaterializedToolSet>>,
+    max: usize,
+    schema_style: MaterializeSchemaStyle,
+) -> MaterializeOutcome {
+    let known: HashSet<&str> = all_schemas.iter().map(|s| s.name.as_str()).collect();
+    let mut outcome = MaterializeOutcome::default();
+
+    for name in names {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if !known.contains(trimmed) {
+            outcome.not_found.push(trimmed.to_string());
+            continue;
+        }
+        if is_hot_tool(trimmed) {
+            outcome.already_wire.push(trimmed.to_string());
+            continue;
+        }
+        if let Ok(mut guard) = materialized.write() {
+            outcome
+                .evicted
+                .extend(guard.insert(trimmed.to_string(), max));
+        }
+        if let Some(schema) = all_schemas.iter().find(|s| s.name == trimmed) {
+            // Multi-action tools need property prose after materialize (game001 skill_manage thrash).
+            let effective_style = if trimmed == "skill_manage" {
+                MaterializeSchemaStyle::Full
+            } else {
+                schema_style
+            };
+            outcome.schemas.push(match effective_style {
+                MaterializeSchemaStyle::Compact => compact_tool_schema(schema),
+                MaterializeSchemaStyle::Full => schema.clone(),
+            });
+        }
+        outcome.activated.push(trimmed.to_string());
+        let examples = crate::tool_input_examples::input_examples_for_tool(trimmed);
+        if !examples.is_empty() {
+            outcome.input_examples.insert(trimmed.to_string(), examples);
+        }
+    }
+    outcome
+}
+
+/// Names from a toolset pack (deferred only, sorted, capped).
+pub fn deferred_names_for_toolset(
+    _toolset: &str,
+    toolset_members: &[&str],
+    known: &HashSet<&str>,
+    max: usize,
+) -> Vec<String> {
+    let mut names: Vec<String> = toolset_members
+        .iter()
+        .map(|n| (*n).to_string())
+        .filter(|n| known.contains(n.as_str()) && !is_hot_tool(n))
+        .collect();
+    names.sort();
+    names.truncate(max);
+    names
 }
 
 #[cfg(test)]
@@ -180,7 +313,12 @@ mod tests {
         ToolSchema {
             name: name.into(),
             description: format!("Does {name} things."),
-            parameters: json!({"type": "object", "properties": {}}),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "q": { "type": "string", "description": "help" }
+                }
+            }),
             strict: None,
         }
     }
@@ -220,11 +358,36 @@ mod tests {
     }
 
     #[test]
-    fn format_index_lists_deferred_names() {
-        let a = schema("browser_click");
-        let text = format_deferred_index(&[&a]);
-        assert!(text.contains("browser_click"));
+    fn deferred_tool_error_is_typed_tool_error() {
+        let body = deferred_tool_error_response("vision_analyze");
+        let parsed = edgecrab_types::parse_tool_error_payload(&body)
+            .expect("deferred soft-fail must be tool_error JSON");
+        assert_eq!(parsed.response_type, "tool_error");
+        assert!(parsed.error.contains("vision_analyze") || parsed.tool.as_deref() == Some("vision_analyze"));
+        assert!(
+            parsed
+                .recovery_feedback
+                .as_ref()
+                .is_some_and(|r| !r.suggestions.is_empty()),
+            "must include CallToolFirst(tool_search) recovery"
+        );
+    }
+
+    #[test]
+    fn format_index_has_count_categories_not_tool_names() {
+        let text = format_deferred_index(3, &["browser".into(), "memory".into()]);
+        assert!(text.contains("3 tools are enabled"));
         assert!(text.contains("tool_search"));
+        assert!(text.contains("Categories: browser, memory"));
+        assert!(
+            !text.contains("browser_click"),
+            "must not dump individual deferred tool names"
+        );
+    }
+
+    #[test]
+    fn format_index_empty_when_zero_deferred() {
+        assert!(format_deferred_index(0, &["browser".into()]).is_empty());
     }
 
     #[test]
@@ -248,5 +411,109 @@ mod tests {
         let evicted = set.insert("web_crawl", 2);
         assert_eq!(evicted, vec!["browser_click".to_string()]);
         assert!(set.contains("browser_navigate"));
+    }
+
+    #[test]
+    fn materialize_tool_names_activates_deferred() {
+        let schemas = vec![schema("browser_navigate"), schema("read_file")];
+        let set = Arc::new(RwLock::new(MaterializedToolSet::new()));
+        let out = materialize_tool_names(
+            &["browser_navigate".into(), "read_file".into(), "missing".into()],
+            &schemas,
+            &set,
+            12,
+            MaterializeSchemaStyle::Compact,
+        );
+        assert_eq!(out.activated, vec!["browser_navigate".to_string()]);
+        assert_eq!(out.already_wire, vec!["read_file".to_string()]);
+        assert_eq!(out.not_found, vec!["missing".to_string()]);
+        assert!(set.read().unwrap().contains("browser_navigate"));
+        assert!(
+            out.schemas[0].parameters["properties"]["q"]
+                .get("description")
+                .is_none()
+        );
+        assert!(
+            out.input_examples.contains_key("browser_navigate"),
+            "materialize must attach curated input_examples"
+        );
+    }
+
+    #[test]
+    fn materialize_write_file_is_hot_already_on_wire() {
+        let schemas = vec![schema("write_file")];
+        let set = Arc::new(RwLock::new(MaterializedToolSet::new()));
+        let out = materialize_tool_names(
+            &["write_file".into()],
+            &schemas,
+            &set,
+            12,
+            MaterializeSchemaStyle::Compact,
+        );
+        assert!(out.already_wire.iter().any(|n| n == "write_file"));
+        assert!(out.activated.is_empty());
+        // Curated examples still available for tool_search / docs.
+        let ex = crate::tool_input_examples::input_examples_for_tool("write_file");
+        assert!(ex[0].get("path").is_some());
+        assert!(ex[0].get("content").is_some());
+    }
+
+    #[test]
+    fn materialize_skill_manage_keeps_full_schema() {
+        let schemas = vec![ToolSchema {
+            name: "skill_manage".into(),
+            description: "Manage skills.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "description": "op" },
+                    "content": { "type": "string", "description": "body" }
+                },
+                "required": ["action", "name"]
+            }),
+            strict: None,
+        }];
+        let set = Arc::new(RwLock::new(MaterializedToolSet::new()));
+        let out = materialize_tool_names(
+            &["skill_manage".into()],
+            &schemas,
+            &set,
+            12,
+            MaterializeSchemaStyle::Compact,
+        );
+        assert_eq!(out.activated, vec!["skill_manage".to_string()]);
+        assert!(
+            out.schemas[0].parameters["properties"]["action"]
+                .get("description")
+                .is_some(),
+            "skill_manage must materialize Full (keep property prose)"
+        );
+    }
+
+    #[test]
+    fn wire_schemas_local_hot_keeps_property_descriptions() {
+        let schemas = vec![schema("read_file"), schema("browser_navigate")];
+        let mut mat = HashSet::new();
+        mat.insert("browser_navigate".into());
+        let wire = wire_schemas(&schemas, &mat, true);
+        let hot = wire.iter().find(|s| s.name == "read_file").unwrap();
+        let deferred = wire.iter().find(|s| s.name == "browser_navigate").unwrap();
+        assert!(hot.parameters["properties"]["q"].get("description").is_some());
+        assert!(
+            deferred.parameters["properties"]["q"]
+                .get("description")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn deferred_names_for_toolset_caps_and_skips_hot() {
+        let known: HashSet<&str> = ["read_file", "write_file", "patch", "zzz"]
+            .into_iter()
+            .collect();
+        let members = ["zzz", "write_file", "read_file", "patch"];
+        let names = deferred_names_for_toolset("file", &members, &known, 8);
+        // write_file / read_file / patch are hot — only non-hot members remain.
+        assert_eq!(names, vec!["zzz".to_string()]);
     }
 }

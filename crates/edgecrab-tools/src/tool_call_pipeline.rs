@@ -79,17 +79,79 @@ pub fn unknown_tool_names(
         .collect()
 }
 
-/// Structured tool-not-found payload with optional fuzzy suggestion.
+/// Max recommended tools listed alongside a `tool_search` recovery directive.
+pub const UNKNOWN_TOOL_SAMPLE_LIMIT: usize = 8;
+
+/// CORE anchors when BM25 over the invent-name query returns few hits.
+///
+/// Not NLP routing: structural fill-ins from the CORE toolset so recovery never
+/// degenerates to an empty / browser-only lexicographic slice.
+const UNKNOWN_TOOL_SAMPLE_ANCHORS: &[&str] = &[
+    "web_search",
+    "web_extract",
+    "read_file",
+    "write_file",
+    "patch",
+    "terminal",
+    "search_files",
+    "skill_view",
+];
+
+/// Normalize an invalid tool name into a `tool_search` query (underscores → spaces).
+pub fn unknown_tool_search_query(invalid_name: &str) -> String {
+    invalid_name
+        .replace(['_', '-', '.'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Recommend registered tools for an invent recovery: BM25 over full registry, then anchors.
+///
+/// Single responsibility: pick candidate names from the registry catalog (same truth
+/// as `tool_search`). Does not invent finance tools or rewrite user intent.
+pub fn unknown_tool_recovery_sample(
+    registry: &ToolRegistry,
+    query: &str,
+    limit: usize,
+) -> Vec<String> {
+    let limit = limit.max(1);
+    let ctx = crate::registry::ToolContext::minimal();
+    let schemas = registry.get_definitions(None, None, &ctx);
+    let catalog = crate::tool_search_bm25::build_registry_catalog(&schemas);
+    let search_q = if query.trim().is_empty() {
+        "web search read file terminal"
+    } else {
+        query
+    };
+
+    let mut sample = crate::tool_search_bm25::search_deferred_catalog(&catalog, search_q, limit);
+    let mut seen: HashSet<String> = sample.iter().cloned().collect();
+
+    for anchor in UNKNOWN_TOOL_SAMPLE_ANCHORS {
+        if sample.len() >= limit {
+            break;
+        }
+        if registry.lookup_tool_name(anchor).is_some() && seen.insert((*anchor).to_string()) {
+            sample.push((*anchor).to_string());
+        }
+    }
+
+    sample
+}
+
+/// Structured tool-not-found payload: discover via `tool_search`, then call a real name.
 pub fn unknown_tool_error_response(registry: &ToolRegistry, invalid_name: &str) -> String {
     let suggestion = tool_name_repair::repair_tool_name(registry, invalid_name);
-    let sample: Vec<String> = registry
-        .tool_names()
-        .into_iter()
-        .take(16)
-        .map(str::to_string)
-        .collect();
-    crate::recovery_catalog::unknown_tool(invalid_name, suggestion.as_deref(), &sample)
-        .to_llm_response()
+    let query = unknown_tool_search_query(invalid_name);
+    let sample = unknown_tool_recovery_sample(registry, &query, UNKNOWN_TOOL_SAMPLE_LIMIT);
+    crate::recovery_catalog::unknown_tool(
+        invalid_name,
+        suggestion.as_deref(),
+        &query,
+        &sample,
+    )
+    .to_llm_response()
 }
 
 /// Result of validating a tool-call batch before dispatch.
@@ -312,5 +374,27 @@ mod tests {
             tool_name_repair::repair_tool_name(&registry, "TodoTool_tool"),
             Some("manage_todo_list".into())
         );
+    }
+
+    #[test]
+    fn tcp08_unknown_recovery_directs_to_tool_search_with_registry_candidates() {
+        let registry = ToolRegistry::new();
+        let query = unknown_tool_search_query("quick_stock_quote");
+        assert_eq!(query, "quick stock quote");
+        let sample = unknown_tool_recovery_sample(&registry, &query, UNKNOWN_TOOL_SAMPLE_LIMIT);
+        assert!(
+            sample.iter().any(|n| n == "web_search"),
+            "web_search must be among candidates, got {sample:?}"
+        );
+        assert!(!sample.iter().any(|n| n == "apply_patch" && sample[0] == "apply_patch"));
+        let body = unknown_tool_error_response(&registry, "quick_stock_quote");
+        assert!(body.contains("tool_search"), "must mandate tool_search");
+        assert!(body.contains("web_search"), "must cite registry candidates");
+        assert!(
+            body.contains("CallToolFirst")
+                || body.contains("tool_search")
+                || body.contains("recommended_tools")
+        );
+        assert!(body.contains("Do not retry the invalid name"));
     }
 }

@@ -2346,12 +2346,29 @@ impl ToolHandler for BrowserNavigateTool {
 
         // Pre-navigation SSRF check
         let known_ports = browser_known_ports(ctx).await;
-        validate_browser_url(&url, &known_ports)?;
+        let serve_dir = preview_serve_directory_for_ctx(ctx);
+        validate_browser_url_with_session(&url, &known_ports, &serve_dir, &ctx.session_id)?;
 
         let session = get_session(ctx).await?;
         browser_progress(ctx, "navigating", &url);
 
-        let (nav_result, final_url, title) = navigate_session(&session, &url, &known_ports).await?;
+        let (nav_result, final_url, title) =
+            match navigate_session(&session, &url, &known_ports).await {
+                Ok(v) => v,
+                Err(err) if is_loopback_http_url(&url) => {
+                    let msg = err.to_string();
+                    if is_loopback_nav_server_failure(&msg) {
+                        return Err(loopback_navigate_server_recovery(
+                            &url,
+                            &serve_dir,
+                            &ctx.session_id,
+                            &known_ports,
+                        ));
+                    }
+                    return Err(err);
+                }
+                Err(err) => return Err(err),
+            };
         browser_progress(ctx, "loaded", &title);
 
         // Auto-start recording on first navigation if enabled.
@@ -2388,22 +2405,33 @@ impl ToolHandler for BrowserNavigateTool {
             }
         }
 
-        // Check for navigation errors
+        // Check for navigation errors (CDP errorText path — game005 ERR_EMPTY_RESPONSE)
         if let Some(err) = nav_result.get("errorText").and_then(|e| e.as_str())
             && !err.is_empty()
         {
+            if is_loopback_http_url(&url) && is_loopback_nav_server_failure(err) {
+                return Err(loopback_navigate_server_recovery(
+                    &url,
+                    &serve_dir,
+                    &ctx.session_id,
+                    &known_ports,
+                ));
+            }
             return Err(ToolError::ExecutionFailed {
                 tool: "browser_navigate".into(),
                 message: format!("Navigation error: {err}"),
             });
         }
 
-        // Build response
-        let mut response = format!("Navigated to: {final_url}\nTitle: {title}");
+        // Structured result for assess / storm counters (018 P6).
+        let mut structured =
+            crate::structured_browser::StructuredBrowserResult::navigate_ok(&final_url, &title);
+        let mut response = structured.to_tool_result_text();
 
         // Bot detection warning (hermes parity)
         if let Some(warning) = detect_bot_warning(&title) {
             response.push_str(&format!("\n\n⚠️ {warning}"));
+            structured.body = Some(warning);
         }
 
         Ok(response)
@@ -2517,8 +2545,18 @@ impl ToolHandler for BrowserSnapshotTool {
         )
         .await;
 
+        let final_url = cdp_evaluate(&session.ws_url, "location.href")
+            .await
+            .unwrap_or_default();
+        let node_count = result.matches("@e").count() as u32;
+        let structured = crate::structured_browser::StructuredBrowserResult::snapshot_ok(
+            &final_url,
+            &result,
+            Some(node_count),
+        );
+
         browser_progress(ctx, "snapshot ready", &format!("{} chars", result.len()));
-        Ok(result)
+        Ok(structured.to_tool_result_text())
     }
 }
 
@@ -3537,7 +3575,21 @@ impl ToolHandler for BrowserVisionTool {
             String::new()
         };
 
-        Ok(format!("{analysis}{screenshot_note}"))
+        // Typed evidence for assess (018 P6/F4): URL scheme + document.readyState.
+        let final_url = cdp_evaluate(&session.ws_url, "location.href")
+            .await
+            .unwrap_or_default();
+        let ready_state = cdp_evaluate(&session.ws_url, "document.readyState")
+            .await
+            .unwrap_or_default();
+        let document_ready = ready_state == "complete" || ready_state == "interactive";
+        let body = format!("{analysis}{screenshot_note}");
+        let structured = crate::structured_browser::StructuredBrowserResult::vision_ok(
+            &final_url,
+            &body,
+            document_ready,
+        );
+        Ok(structured.to_tool_result_text())
     }
 }
 
@@ -4176,7 +4228,91 @@ fn is_allowed_loopback_preview(url: &str, known_ports: &[u16]) -> bool {
         || edgecrab_security::url_safety::is_preview_loopback_url(url)
 }
 
+fn preview_serve_directory_for_ctx(ctx: &ToolContext) -> String {
+    if let Some(task) = ctx.user_task.as_deref() {
+        let from_task = crate::recovery_catalog::infer_preview_serve_directory_from_text(task);
+        if from_task != "." {
+            return from_task;
+        }
+    }
+    let cwd = ctx.cwd.to_string_lossy();
+    crate::recovery_catalog::infer_preview_serve_directory_from_text(&cwd)
+}
+
+fn is_loopback_http_url(url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return false;
+    }
+    is_loopback_url_host(parsed.host())
+}
+
+/// Loopback preview dead — explicit Chromium `net::ERR_*` allowlist only (018 F4).
+///
+/// Prose like "didn't send any data" is never matched; CDP must emit the code.
+pub(crate) fn is_loopback_nav_server_failure(msg: &str) -> bool {
+    let lower = msg
+        .replace(['\u{2019}', '\u{2018}'], "'")
+        .to_ascii_lowercase();
+    const ALLOWED: &[&str] = &[
+        "net::err_connection_refused",
+        "net::err_empty_response",
+        "net::err_connection_reset",
+        "net::err_connection_closed",
+        "net::err_connection_aborted",
+        "net::err_connection_timed_out",
+        "err_connection_refused",
+        "err_empty_response",
+        "err_connection_reset",
+        "err_connection_closed",
+        "err_connection_aborted",
+        "err_connection_timed_out",
+    ];
+    ALLOWED.iter().any(|code| lower.contains(code))
+}
+
+fn loopback_navigate_server_recovery(
+    url: &str,
+    serve_dir: &str,
+    session_id: &str,
+    known_ports: &[u16],
+) -> ToolError {
+    // Pending bind latch: one wait_bind recovery, not another spawn (006).
+    let pending = crate::dev_server::pending_preview_binds(session_id);
+    if let Some(port) = crate::dev_server::port_from_loopback_url(url) {
+        if let Some((_, proc_id)) = pending.iter().find(|(p, _)| *p == port) {
+            return crate::recovery_catalog::browser_navigate_wait_bind(url, port, proc_id);
+        }
+        crate::dev_server::unrecord_session_http_port(session_id, port);
+        // Heal only the URL's port — never a different recorded server (018 F4).
+        if known_ports.is_empty() || known_ports.contains(&port) {
+            return crate::recovery_catalog::browser_navigate_port_heal(url, port, serve_dir);
+        }
+    } else if !pending.is_empty() {
+        let (port, proc_id) = &pending[0];
+        return crate::recovery_catalog::browser_navigate_wait_bind(url, *port, proc_id);
+    } else if !known_ports.is_empty() {
+        for port in known_ports {
+            crate::dev_server::unrecord_session_http_port(session_id, *port);
+        }
+        let port = known_ports[0];
+        return crate::recovery_catalog::browser_navigate_port_heal(url, port, serve_dir);
+    }
+    crate::recovery_catalog::browser_navigate_no_server(url, serve_dir)
+}
+
 fn validate_browser_url(url: &str, known_ports: &[u16]) -> Result<(), ToolError> {
+    validate_browser_url_with_session(url, known_ports, ".", "")
+}
+
+fn validate_browser_url_with_session(
+    url: &str,
+    known_ports: &[u16],
+    serve_directory: &str,
+    session_id: &str,
+) -> Result<(), ToolError> {
     let lower = url.to_lowercase();
     if lower.starts_with("file://")
         || lower.starts_with("javascript:")
@@ -4184,11 +4320,15 @@ fn validate_browser_url(url: &str, known_ports: &[u16]) -> Result<(), ToolError>
         || lower.starts_with("chrome://")
         || lower.starts_with("about:")
     {
-        return Err(crate::recovery_catalog::browser_navigate_blocked(
-            url,
-            "disallowed scheme (use http://127.0.0.1:PORT with security.preview)",
-            known_ports,
-        ));
+        return Err(
+            crate::recovery_catalog::browser_navigate_blocked_with_session(
+                url,
+                "disallowed scheme (use http://127.0.0.1:PORT with security.preview)",
+                known_ports,
+                serve_directory,
+                session_id,
+            ),
+        );
     }
 
     if is_session_dev_server_loopback(url, known_ports)
@@ -4200,7 +4340,13 @@ fn validate_browser_url(url: &str, known_ports: &[u16]) -> Result<(), ToolError>
     match edgecrab_security::url_validation::validate_outbound_url(url) {
         Ok(()) => Ok(()),
         Err(edgecrab_security::url_validation::UrlValidationError::SsrfBlocked(_)) => Err(
-            crate::recovery_catalog::browser_navigate_blocked(url, "SSRF policy", known_ports),
+            crate::recovery_catalog::browser_navigate_blocked_with_session(
+                url,
+                "SSRF policy",
+                known_ports,
+                serve_directory,
+                session_id,
+            ),
         ),
         Err(edgecrab_security::url_validation::UrlValidationError::WebsitePolicyBlocked(msg)) => {
             Err(ToolError::PermissionDenied(msg))
@@ -4337,6 +4483,39 @@ mod tests {
 
     fn browser_launch_tests_enabled() -> bool {
         truthy_env_var("EDGECRAB_RUN_BROWSER_LAUNCH_TESTS")
+    }
+
+    #[test]
+    fn loopback_nav_server_failure_matches_empty_response() {
+        assert!(is_loopback_nav_server_failure(
+            "Navigation error: net::ERR_EMPTY_RESPONSE"
+        ));
+        assert!(is_loopback_nav_server_failure("net::ERR_CONNECTION_REFUSED"));
+        // Chrome UI prose alone is not a typed failure code.
+        assert!(!is_loopback_nav_server_failure(
+            "127.0.0.1 didn’t send any data"
+        ));
+        assert!(!is_loopback_nav_server_failure("net::ERR_NAME_NOT_RESOLVED"));
+        assert!(!is_loopback_nav_server_failure("net::ERR_CERT_AUTHORITY_INVALID"));
+    }
+
+    #[test]
+    fn empty_response_recovery_includes_structured_feedback() {
+        let err = loopback_navigate_server_recovery(
+            "http://127.0.0.1:8000/",
+            "demo/game005",
+            "sess-empty-resp",
+            &[],
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&err.to_llm_response()).expect("tool error json");
+        assert!(json["recovery_feedback"]["suggestions"].is_array());
+        assert!(
+            json["recovery_feedback"]["suggestions"]
+                .as_array()
+                .map(|a| !a.is_empty())
+                .unwrap_or(false)
+        );
     }
 
     #[test]

@@ -6,7 +6,7 @@
 
 use crate::config::HarnessConfig;
 use crate::harness_advisory::HarnessTurnAdvisory;
-use crate::harness_loop_policy::{resolve_guardrail_config, visual_storm_block_result};
+use crate::harness_loop_policy::resolve_guardrail_config;
 use edgecrab_tools::tool_loop_guardrails::ToolLoopGuardrailController;
 use edgecrab_types::Message;
 
@@ -160,106 +160,42 @@ pub struct TurnDispatchTrackersView<'a> {
 }
 
 /// Visual-storm block + tool-loop guardrails before dispatch.
+///
+/// Thin re-export — ownership lives in [`crate::turn_dispatch_policy`].
+#[deprecated(note = "use turn_dispatch_policy::pre_dispatch_decision")]
 pub fn guardrail_before_dispatch_checked(
     trackers: &TurnDispatchTrackersView<'_>,
     messages: &[Message],
     tool_name: &str,
     args_json: &str,
 ) -> Option<String> {
-    if let Some(blocked) = visual_storm_block_result(trackers.harness_advisory, messages, tool_name)
-    {
-        return Some(blocked);
-    }
-    let class = crate::task_class::classify_from_messages(messages);
-    if let Some(blocked) = trackers
-        .harness_advisory
-        .maybe_repeated_browser_nav_block(tool_name)
-    {
-        return Some(blocked);
-    }
-    if let Some(blocked) = trackers
-        .harness_advisory
-        .maybe_verification_theater_block(class, tool_name)
-    {
-        return Some(blocked);
-    }
-    if let Some(blocked) = maybe_theater_write_block(messages, class, tool_name, args_json) {
-        return Some(blocked);
-    }
-    if edgecrab_tools::detect_spill_without_read(messages)
-        && matches!(tool_name, "write_file" | "patch" | "apply_patch")
-    {
-        return Some(edgecrab_tools::tool_loop_guardrails::guardrail_block_result(
-            &edgecrab_tools::tool_loop_guardrails::ToolGuardrailDecision {
-                action: edgecrab_tools::tool_loop_guardrails::GuardrailAction::Block,
-                code: "spill_blind_write_block",
-                message: "Blocked mutation — read the spilled artifact with read_file before writing."
-                    .into(),
-                tool_name: tool_name.to_string(),
-                count: 1,
-            },
-        ));
-    }
-    guardrail_before_dispatch(trackers.tool_guardrail, tool_name, args_json)
-}
-
-/// Block verify/report markdown writes after the first on VisualUx tasks (HA-43).
-fn maybe_theater_write_block(
-    messages: &[Message],
-    task_class: crate::task_class::TaskClass,
-    tool_name: &str,
-    args_json: &str,
-) -> Option<String> {
-    if !matches!(task_class, crate::task_class::TaskClass::VisualUx) || tool_name != "write_file" {
-        return None;
-    }
-    let path = serde_json::from_str::<serde_json::Value>(args_json)
-        .ok()
-        .and_then(|v| v.get("path").and_then(|p| p.as_str()).map(str::to_string))?;
-    if !is_verify_theater_path(&path) {
-        return None;
-    }
-    let existing = count_verify_theater_writes(messages);
-    if existing < 1 {
-        return None;
-    }
-    Some(
-        edgecrab_tools::tool_loop_guardrails::guardrail_block_result(
-            &edgecrab_tools::tool_loop_guardrails::ToolGuardrailDecision {
-                action: edgecrab_tools::tool_loop_guardrails::GuardrailAction::Block,
-                code: "verify_theater_write_cap",
-                message: "Blocked second verification markdown — use browser_snapshot instead."
-                    .into(),
-                tool_name: tool_name.to_string(),
-                count: existing as u32 + 1,
-            },
-        ),
+    crate::turn_dispatch_policy::pre_dispatch_decision(
+        trackers,
+        messages,
+        tool_name,
+        args_json,
+        "",
     )
 }
 
-fn is_verify_theater_path(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    [
-        "verify",
-        "verification",
-        "report",
-        "evidence",
-        "delivery",
-        "checklist",
-    ]
-    .iter()
-    .any(|m| lower.contains(m))
-}
-
-fn count_verify_theater_writes(messages: &[Message]) -> usize {
-    messages
-        .iter()
-        .filter(|msg| {
-            msg.role == edgecrab_types::Role::Tool
-                && msg.name.as_deref() == Some("write_file")
-                && is_verify_theater_path(&msg.text_content())
-        })
-        .count()
+/// Like [`guardrail_before_dispatch_checked`] with session id for port-shopping halt.
+///
+/// Thin re-export — ownership lives in [`crate::turn_dispatch_policy`].
+#[deprecated(note = "use turn_dispatch_policy::pre_dispatch_decision")]
+pub fn guardrail_before_dispatch_checked_with_session(
+    trackers: &TurnDispatchTrackersView<'_>,
+    messages: &[Message],
+    tool_name: &str,
+    args_json: &str,
+    session_id: &str,
+) -> Option<String> {
+    crate::turn_dispatch_policy::pre_dispatch_decision(
+        trackers,
+        messages,
+        tool_name,
+        args_json,
+        session_id,
+    )
 }
 
 /// Post-tool-turn harness finalization (spec 015 P2.1 — single owner for advisories + budget).
@@ -445,22 +381,6 @@ mod tests {
     }
 
     #[test]
-    fn theater_write_cap_blocks_second_verify_md() {
-        let messages = vec![edgecrab_types::Message::tool_result(
-            "w1",
-            "write_file",
-            r#"{"path":"VERIFICATION.md"}"#,
-        )];
-        let block = maybe_theater_write_block(
-            &messages,
-            crate::task_class::TaskClass::VisualUx,
-            "write_file",
-            r#"{"path":"FINAL_REPORT.md"}"#,
-        );
-        assert!(block.is_some());
-    }
-
-    #[test]
     fn spill_blind_write_block_before_dispatch() {
         let messages = vec![
             edgecrab_types::Message::user("read big file"),
@@ -478,6 +398,7 @@ mod tests {
             harness_advisory: &advisory,
             tool_guardrail: &guardrail,
         };
+        #[allow(deprecated)]
         let blocked = guardrail_before_dispatch_checked(
             &trackers,
             &messages,

@@ -10,8 +10,9 @@ Post-Wave grades (2026-07-17). Full first-principles write-up:
 | Programmable hooks / events | **L** | P | P | P | **L** | P | P | **P** |
 | Skills / package install UX | L | P | P | P | **L** | **L** | P | **P** |
 | Parallel / worktree subagents | L | P | **L** | **L** | N | L | **L** | **P** |
-| Coding integrity (LSP / verify) | P | P | P | P | B | B | P | **L** |
+| Coding integrity (LSP / verify) | P | P | P | P | B | P↑ (v0.18 Judgment) | P | **L** (VisualUx + GoalContract; proof = structured terminal `exit_code==0` / browser — not substring; see [018 p1](../018-agent-harness/proof/p1-structured-terminal-evidence.md)) |
 | Context / prompt-cache eng. | P | P | P | P | P | P | P | **L** |
+| Guardrail hard-stop defaults | P | P | P | P | N | B (opt-in) | P | **L** (default ON) |
 | Local / multi-provider | B | **L** | P | **L** | **L** | **L** | P | **P→L** (009 🟡) |
 | Sandbox / approvals | L | P | **L** | **L** | B | P | P | **P** |
 | IDE surface | L | **L** | L | P | RPC/SDK | ACP | ACP | **P** (ACP) |
@@ -36,7 +37,8 @@ EdgeCrab is **SOTA in a specific basin** — coding integrity + cache economics 
 messaging gateway + single binary — and **parity** on hooks, install UX,
 worktrees, and headless CI after Waves 1–3.
 
-It is **not global SOTA** on public harness proof (P−), default hard sandbox,
+It is **not global SOTA** on public harness proof (P−), default hard sandbox
+(`deny_default` opt-in — sandbox stays **P** until measured hard default),
 Cursor-class IDE, fleet orchestration, or plugin/package economy depth.
 
 **Next cliffs (meter ROI):** public score disclosure → deny-default OS sandbox →

@@ -308,6 +308,8 @@ pub struct AppConfigRef {
     pub max_materialized_tools: usize,
     /// OS sandbox mode for local terminal (`off` | `seatbelt` | `bubblewrap`).
     pub os_sandbox_mode: String,
+    /// When true with seatbelt/bubblewrap, use deny-default profiles (018 P0).
+    pub os_sandbox_deny_default: bool,
 }
 
 impl Default for AppConfigRef {
@@ -396,6 +398,7 @@ impl Default for AppConfigRef {
             tool_schema_mode: crate::schema_mode::ToolSchemaMode::Indexed,
             max_materialized_tools: crate::tool_schema_index::DEFAULT_MAX_MATERIALIZED_TOOLS,
             os_sandbox_mode: "off".into(),
+            os_sandbox_deny_default: false,
         }
     }
 }
@@ -441,6 +444,11 @@ impl AppConfigRef {
         let _ = std::fs::create_dir_all(&file_tools_tmp_dir);
 
         let mut allowed = self.file_allowed_roots.clone();
+        // Profile home + skills: skill_view can read these; absolute read_file must too (006).
+        if !self.edgecrab_home.as_os_str().is_empty() {
+            allowed.push(self.edgecrab_home.clone());
+            allowed.push(self.edgecrab_home.join("skills"));
+        }
         // On Termux, add the Termux data directory so file tools can access
         // Termux-installed packages, shared storage, and user scripts.
         if *edgecrab_types::IS_TERMUX {

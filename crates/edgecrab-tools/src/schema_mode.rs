@@ -2,28 +2,59 @@
 //!
 //! `Full` — wire tool schemas verbatim.
 //! `Compact` — truncate descriptions and strip per-property prose from JSON Schema.
+//! `Indexed` — hot wire + deferred category summary + `tool_search`.
+//! `Auto` — Compact when enabled tool count ≤ threshold; else Indexed.
 
 use edgecrab_types::ToolSchema;
 use serde_json::{Map, Value};
+
+use crate::tool_schema_index::AUTO_INDEXED_TOOL_COUNT_THRESHOLD;
 
 /// How tool JSON schemas are sent to the LLM.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ToolSchemaMode {
-    #[default]
     Full,
     Compact,
-    /// Hot tools on wire + deferred index + `tool_search` materialization.
+    /// Hot tools on wire + deferred category summary + `tool_search` materialization.
+    /// Rust `Default` for effective-mode fallbacks (product YAML default is `auto`).
+    #[default]
     Indexed,
+    /// Resolve to Compact or Indexed from enabled tool count.
+    Auto,
 }
 
 impl ToolSchemaMode {
+    /// Parse config string. Explicit modes; empty or unknown → [`Self::Auto`].
     pub fn parse(s: &str) -> Self {
         match s.trim().to_ascii_lowercase().as_str() {
             "compact" => Self::Compact,
+            "full" => Self::Full,
             "indexed" => Self::Indexed,
-            _ => Self::Full,
+            "auto" => Self::Auto,
+            _ => Self::Auto,
         }
+    }
+
+    /// Whether this mode (after resolve) uses progressive disclosure.
+    pub fn is_indexed_effective(self) -> bool {
+        matches!(self, Self::Indexed)
+    }
+}
+
+/// Resolve `Auto` from enabled tool count; other modes pass through.
+///
+/// Never returns `Auto`. Threshold: [`AUTO_INDEXED_TOOL_COUNT_THRESHOLD`].
+pub fn resolve_effective_schema_mode(mode: ToolSchemaMode, enabled_tool_count: usize) -> ToolSchemaMode {
+    match mode {
+        ToolSchemaMode::Auto => {
+            if enabled_tool_count <= AUTO_INDEXED_TOOL_COUNT_THRESHOLD {
+                ToolSchemaMode::Compact
+            } else {
+                ToolSchemaMode::Indexed
+            }
+        }
+        other => other,
     }
 }
 
@@ -93,12 +124,14 @@ pub fn compact_tool_schema(schema: &ToolSchema) -> ToolSchema {
 }
 
 pub fn prepare_schemas_for_mode(schemas: &[ToolSchema], mode: ToolSchemaMode) -> Vec<ToolSchema> {
+    let mode = resolve_effective_schema_mode(mode, schemas.len());
     match mode {
         ToolSchemaMode::Full => schemas.to_vec(),
         ToolSchemaMode::Compact => schemas.iter().map(compact_tool_schema).collect(),
         ToolSchemaMode::Indexed => {
-            crate::tool_schema_index::wire_schemas(schemas, &std::collections::HashSet::new())
+            crate::tool_schema_index::wire_schemas(schemas, &std::collections::HashSet::new(), false)
         }
+        ToolSchemaMode::Auto => unreachable!("resolve_effective_schema_mode never returns Auto"),
     }
 }
 
@@ -106,6 +139,33 @@ pub fn prepare_schemas_for_mode(schemas: &[ToolSchema], mode: ToolSchemaMode) ->
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn default_indexed_parse_auto_for_empty() {
+        assert_eq!(ToolSchemaMode::default(), ToolSchemaMode::Indexed);
+        assert_eq!(ToolSchemaMode::parse(""), ToolSchemaMode::Auto);
+        assert_eq!(ToolSchemaMode::parse("junk"), ToolSchemaMode::Auto);
+        assert_eq!(ToolSchemaMode::parse("auto"), ToolSchemaMode::Auto);
+        assert_eq!(ToolSchemaMode::parse("indexed"), ToolSchemaMode::Indexed);
+        assert_eq!(ToolSchemaMode::parse("full"), ToolSchemaMode::Full);
+        assert_eq!(ToolSchemaMode::parse("compact"), ToolSchemaMode::Compact);
+    }
+
+    #[test]
+    fn resolve_auto_threshold() {
+        assert_eq!(
+            resolve_effective_schema_mode(ToolSchemaMode::Auto, 14),
+            ToolSchemaMode::Compact
+        );
+        assert_eq!(
+            resolve_effective_schema_mode(ToolSchemaMode::Auto, 15),
+            ToolSchemaMode::Indexed
+        );
+        assert_eq!(
+            resolve_effective_schema_mode(ToolSchemaMode::Full, 100),
+            ToolSchemaMode::Full
+        );
+    }
 
     #[test]
     fn compact_description_uses_first_sentence() {
