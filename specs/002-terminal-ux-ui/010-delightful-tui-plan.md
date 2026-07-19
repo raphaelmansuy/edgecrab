@@ -304,3 +304,4 @@ Sprint 4:  D5 + gateway + docs         → ship quality bar
 - Current TUI behavior → [003-tui-visibility-layer.md](003-tui-visibility-layer.md)
 - Stream events → [004-stream-event-contract.md](004-stream-event-contract.md)
 - Prior width-adaptive work → [specs/05-improve-ux-tui.md](../05-improve-ux-tui.md)
+- Tool streaming visibility (Focus Tool Pane) → [specs/020-tool-streaming-visibility/000-overview.md](../020-tool-streaming-visibility/000-overview.md)

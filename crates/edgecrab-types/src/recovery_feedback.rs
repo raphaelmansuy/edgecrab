@@ -26,6 +26,11 @@ pub enum RecoveryAction {
     SplitPayload,
     /// Retry the same tool call — prior guard state already satisfied.
     RetrySameCall,
+    /// Interrupt for a typed user capability grant (approval overlay).
+    ///
+    /// Parameters carry `grant_kind` (e.g. `preview_loopback`) plus host/port/url.
+    /// The tool (not the model) must request Once/Session/Always/Deny and apply.
+    RequestUserGrant,
     /// No automated recovery path exists for this rejection.
     NoRecoveryAvailable,
 }

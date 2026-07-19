@@ -357,6 +357,54 @@ pub fn infer_preview_serve_directory_from_text(text: &str) -> String {
     infer_preview_serve_directory(&paths)
 }
 
+/// Parse loopback host + port from a navigate URL (for preview grants).
+pub fn preview_loopback_host_port(url: &str) -> Option<(String, u16)> {
+    let parsed = url::Url::parse(url).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    let host = parsed.host_str()?;
+    let host_l = host.to_ascii_lowercase();
+    let is_loopback = host_l == "localhost"
+        || host_l == "127.0.0.1"
+        || host_l == "::1"
+        || host_l == "[::1]";
+    if !is_loopback {
+        return None;
+    }
+    let port = parsed.port_or_known_default().unwrap_or(80);
+    let norm = if host_l == "localhost" || host_l == "::1" || host_l == "[::1]" {
+        "127.0.0.1".to_string()
+    } else {
+        host_l
+    };
+    Some((norm, port))
+}
+
+/// Extract `preview_loopback` grant payload from a tool error's recovery block.
+pub fn preview_loopback_grant_from_error(err: &ToolError) -> Option<(String, u16, String)> {
+    let recovery = err.recovery_feedback()?;
+    for s in &recovery.suggestions {
+        if s.action != RecoveryAction::RequestUserGrant {
+            continue;
+        }
+        let kind = s.parameters.get("grant_kind")?.as_str()?;
+        if kind != "preview_loopback" {
+            continue;
+        }
+        let host = s.parameters.get("host")?.as_str()?.to_string();
+        let port = s.parameters.get("port")?.as_u64()? as u16;
+        let url = s
+            .parameters
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        return Some((host, port, url));
+    }
+    None
+}
+
 /// `browser_navigate` blocked by SSRF or disallowed scheme (spec 015 HA-16).
 pub fn browser_navigate_blocked(url: &str, reason: &str, known_ports: &[u16]) -> ToolError {
     browser_navigate_blocked_with_dir(url, reason, known_ports, ".")
@@ -402,31 +450,46 @@ pub fn browser_navigate_blocked_with_session(
         )
     };
     let mut builder = recovery_guidance()
-        .message("Browser navigation blocked — use HTTP preview, not file://")
-        .suggestion(
-            RecoveryAction::SetParameter,
+        .message("Browser navigation blocked — use HTTP preview, not file://");
+    // Grantable SSRF denials: ask the user Once/Session/Always (spec 021).
+    if reason.contains("SSRF")
+        && let Some((host, port)) = preview_loopback_host_port(url)
+    {
+        builder = builder.suggestion(
+            RecoveryAction::RequestUserGrant,
             json!({
-                "tool": "browser_navigate",
-                "url_shape": "http://127.0.0.1:PORT/path",
-                "fix_via": "/config preview on",
-                "cli_alt": "edgecrab config set security.preview.enabled true",
-                "do_not": [
-                    "read_file on ~/.edgecrab/config.yaml",
-                    "terminal cat/grep on home config",
-                    "try alternate localhost ports"
-                ],
-                "security_preview_yaml": {
-                    "security": {
-                        "preview": {
-                            "enabled": true,
-                            "allow_localhost_ports": [8000, 8888, 5173, 3000]
-                        }
-                    }
-                },
-                "then_verify": ["browser_snapshot", "vision_analyze"],
-                "note": "file:// is never allowed; operator enables security.preview — agent cannot read home config"
+                "grant_kind": "preview_loopback",
+                "host": host,
+                "port": port,
+                "url": url,
+                "note": "EdgeCrab will open an approval overlay — do not retry identical navigate until the user decides"
             }),
         );
+    }
+    builder = builder.suggestion(
+        RecoveryAction::SetParameter,
+        json!({
+            "tool": "browser_navigate",
+            "url_shape": "http://127.0.0.1:PORT/path",
+            "fix_via": "/config preview on",
+            "cli_alt": "edgecrab config set security.preview.enabled true",
+            "do_not": [
+                "read_file on ~/.edgecrab/config.yaml",
+                "terminal cat/grep on home config",
+                "try alternate localhost ports"
+            ],
+            "security_preview_yaml": {
+                "security": {
+                    "preview": {
+                        "enabled": true,
+                        "allow_localhost_ports": [8000, 8888, 5173, 3000]
+                    }
+                }
+            },
+            "then_verify": ["browser_snapshot", "vision_analyze"],
+            "note": "file:// is never allowed; operator enables security.preview — agent cannot read home config"
+        }),
+    );
     if known_ports.is_empty() {
         builder = builder.suggestion(
             RecoveryAction::CallToolFirst,
@@ -553,6 +616,66 @@ pub fn browser_navigate_port_heal(url: &str, port: u16, serve_directory: &str) -
                 }),
             )
             .build(),
+    )
+}
+
+/// True when terminal/npm output indicates a Node engine / version-manager mismatch.
+pub fn is_node_engine_mismatch(output: &str) -> bool {
+    let lower = output.to_ascii_lowercase();
+    lower.contains("ebadengine")
+        || lower.contains("engine \"node\"")
+        || lower.contains("required: {\"node\"")
+        || lower.contains("requires node")
+        || lower.contains("requested version") && lower.contains("is not currently installed")
+        || (lower.contains("nvm is not compatible") && lower.contains("node"))
+        || lower.contains("the engine \"node\" is incompatible")
+}
+
+/// Structured recovery for Node/engine mismatches (spec 021 Wave E).
+///
+/// No retry counting and no silent `nvm use` — one clarify for toolchain preference,
+/// then one user-approved terminal install/switch command.
+pub fn terminal_node_engine_mismatch(command: &str, output: &str) -> Option<ToolError> {
+    if !is_node_engine_mismatch(output) {
+        return None;
+    }
+    let snippet: String = output.chars().take(400).collect();
+    Some(
+        ToolError::ExecutionFailed {
+            tool: "terminal".into(),
+            message: format!(
+                "Node/engine version mismatch while running: {command}. \
+                 Do not retry the same install until Node is switched. Output excerpt:\n{snippet}"
+            ),
+        }
+        .with_recovery(
+            recovery_guidance()
+                .message(
+                    "Host Node version does not satisfy the project engine — ask which toolchain to use",
+                )
+                .suggestion_with_message(
+                    RecoveryAction::CallToolFirst,
+                    json!({
+                        "tool": "clarify",
+                        "needs_user_preference": true,
+                        "question": "Which Node toolchain should EdgeCrab use to install or switch to a newer Node (e.g. ≥22)?",
+                        "choices": ["nvm", "fnm", "asdf", "Homebrew", "system package manager"],
+                        "do_not": [
+                            "retry npm/npx with the same Node",
+                            "silent nvm use / fnm use without asking",
+                            "auto-install Node without terminal approval"
+                        ]
+                    }),
+                    "Call clarify once for toolchain preference; then propose one terminal command (approval-gated)",
+                )
+                .suggestion(
+                    RecoveryAction::NoRecoveryAvailable,
+                    json!({
+                        "note": "Do not count retries. First structured mismatch → one clarify or one approved install."
+                    }),
+                )
+                .build(),
+        ),
     )
 }
 
@@ -889,6 +1012,23 @@ mod tests {
     use edgecrab_types::RecoveryAction;
 
     #[test]
+    fn node_engine_mismatch_recovery_marks_preference() {
+        let output = r#"npm WARN EBADENGINE Unsupported engine {
+  package: 'hyperframes',
+  required: { node: '>=22' },
+  current: { node: 'v20.19.0', npm: '10.8.2' }
+}"#;
+        assert!(is_node_engine_mismatch(output));
+        let err = terminal_node_engine_mismatch("npm install", output).expect("err");
+        let recovery = err.to_llm_payload().recovery_feedback.expect("recovery");
+        let blob = serde_json::to_string(&recovery).expect("json");
+        assert!(blob.contains("needs_user_preference"));
+        assert!(blob.contains("clarify"));
+        assert!(blob.contains("do_not"));
+        assert!(!blob.contains("silent nvm use / fnm use without asking") || blob.contains("do_not"));
+    }
+
+    #[test]
     fn write_file_abort_includes_structured_recovery() {
         let err = write_file_path_exists_abort("src/main.rs".into(), 128);
         let payload = err.to_llm_payload();
@@ -938,8 +1078,9 @@ mod tests {
         );
     }
 
+    /// Spec 021 G1 — SSRF loopback block carries RequestUserGrant (acceptance name).
     #[test]
-    fn ha16_browser_blocked_includes_preview_hint() {
+    fn browser_navigate_blocked_includes_request_user_grant() {
         let err = browser_navigate_blocked("http://127.0.0.1:8000/", "SSRF policy", &[]);
         let recovery = err.to_llm_payload().recovery_feedback.expect("recovery");
         let blob = serde_json::to_string(&recovery.suggestions).expect("json");
@@ -952,8 +1093,24 @@ mod tests {
                 .any(|s| s.action == RecoveryAction::CallToolFirst),
             "empty known_ports must CallToolFirst(terminal): {blob}"
         );
+        assert!(
+            recovery
+                .suggestions
+                .iter()
+                .any(|s| s.action == RecoveryAction::RequestUserGrant),
+            "SSRF loopback must RequestUserGrant: {blob}"
+        );
         assert!(blob.contains("http.server"));
         assert!(blob.contains("forbidden") || blob.contains("try other localhost ports"));
+        let grant = preview_loopback_grant_from_error(&err).expect("grant");
+        assert_eq!(grant.0, "127.0.0.1");
+        assert_eq!(grant.1, 8000);
+    }
+
+    #[test]
+    fn ha16_browser_blocked_includes_preview_hint() {
+        // Compat alias — keep HA-16 discoverability; delegates to 021 acceptance name.
+        browser_navigate_blocked_includes_request_user_grant();
     }
 
     #[test]

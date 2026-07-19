@@ -63,6 +63,16 @@ pub enum ApprovalResponse {
     Deny,
 }
 
+/// What capability the approval overlay is negotiating.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ApprovalKind {
+    /// Dangerous shell / terminal command.
+    #[default]
+    Terminal,
+    /// Allow `browser_navigate` to a loopback preview URL (spec 021).
+    PreviewLoopback,
+}
+
 /// A dangerous-command approval request from a tool.
 ///
 /// Tools send one of these when they need explicit user confirmation before
@@ -75,6 +85,8 @@ pub struct ApprovalRequest {
     pub full_command: String,
     /// Optional scanner-derived reasons shown to the user.
     pub reasons: Vec<String>,
+    /// Terminal vs preview-loopback grant (drives overlay copy).
+    pub kind: ApprovalKind,
     /// One-shot channel to send the user's decision back to the waiting tool.
     pub response_tx: tokio::sync::oneshot::Sender<ApprovalResponse>,
 }

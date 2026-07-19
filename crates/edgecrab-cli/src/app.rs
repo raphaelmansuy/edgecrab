@@ -4237,6 +4237,8 @@ pub struct App {
     /// out of order. Matching by `tool_call_id` avoids upgrading the wrong line
     /// when completion events race.
     pending_tool_lines: std::collections::HashMap<String, PendingToolLine>,
+    /// Collapse consecutive identical tool-failure transcript lines (spec 021).
+    collapsed_tool_fail: Option<CollapsedToolFail>,
     /// In-flight sub-agent placeholder lines keyed by `task_index`.
     ///
     /// Mirrors `pending_tool_lines` for the delegated-child sub-agent lifecycle:
@@ -4323,6 +4325,13 @@ struct PendingToolLine {
     edit_snapshot: Option<LocalEditSnapshot>,
     /// Verbose-off dim indicator line (removed on ToolDone).
     minimal_indicator: bool,
+}
+
+/// Consecutive identical ToolDone errors collapsed in the transcript (spec 021).
+struct CollapsedToolFail {
+    fingerprint: String,
+    line_idx: usize,
+    count: u32,
 }
 
 /// Tracks a background process output line for in-place tail updates.
@@ -4469,6 +4478,7 @@ enum AgentResponse {
     Approval {
         command: String,
         full_command: String,
+        kind: edgecrab_tools::registry::ApprovalKind,
         response_tx: tokio::sync::oneshot::Sender<edgecrab_core::ApprovalChoice>,
     },
     /// The agent is requesting a secret value (API key, env var, sudo password).
@@ -4675,6 +4685,7 @@ impl App {
         self.active_subagents.clear();
         self.turn_stream_tokens = 0;
         self.pending_tool_lines.clear();
+        self.collapsed_tool_fail = None;
         self.pending_subagent_lines.clear();
         self.hidden_tool_calls.clear();
         self.seen_tool_signatures.clear();
@@ -4740,7 +4751,9 @@ impl App {
     }
 
     fn note_shelf_activity(&mut self) {
-        if self.turn_activity.enabled && self.shelf_coalescer.should_paint(Instant::now()) {
+        let now = Instant::now();
+        self.turn_activity.expire_notices(now);
+        if self.turn_activity.enabled && self.shelf_coalescer.should_paint(now) {
             self.needs_redraw = true;
         }
     }
@@ -4772,6 +4785,34 @@ impl App {
             self.tool_progress_mode == ToolProgressMode::Verbose,
             self.is_processing,
         )
+    }
+
+    /// Open or refresh the foreground Focus Tool live overlay (`t` while a tool runs).
+    fn open_foreground_tool_live_panel(&mut self) -> bool {
+        let Some((row, body)) = self.turn_activity.primary_tool_progress_log() else {
+            return false;
+        };
+        let name = row.name.clone();
+        let preview = if row.preview.is_empty() {
+            crate::tool_display::tool_status_preview(&row.name, &row.args_json)
+        } else {
+            row.preview.clone()
+        };
+        let body = body.to_string();
+        self.process_tail_panel
+            .set_foreground_live(&name, &preview, &body);
+        self.needs_redraw = true;
+        true
+    }
+
+    fn refresh_foreground_tool_live_panel(&mut self) {
+        if !self.process_tail_panel.is_active() || !self.process_tail_panel.foreground_live {
+            return;
+        }
+        if !self.open_foreground_tool_live_panel() {
+            self.process_tail_panel.close();
+            self.needs_redraw = true;
+        }
     }
 
     fn open_process_tail_panel(&mut self, process_id: &str) -> String {
@@ -5211,6 +5252,7 @@ impl App {
             in_flight_tool_count: 0,
             turn_stream_tokens: 0,
             pending_tool_lines: std::collections::HashMap::new(),
+            collapsed_tool_fail: None,
             pending_subagent_lines: std::collections::HashMap::new(),
             hidden_tool_calls: HashSet::new(),
             seen_tool_signatures: HashSet::new(),
@@ -5541,6 +5583,13 @@ impl App {
                 pending.line_idx -= 1;
             }
         }
+        if let Some(collapsed) = self.collapsed_tool_fail.as_mut() {
+            if collapsed.line_idx == idx {
+                self.collapsed_tool_fail = None;
+            } else if collapsed.line_idx > idx {
+                collapsed.line_idx -= 1;
+            }
+        }
         for pending in self.pending_subagent_lines.values_mut() {
             if pending.line_idx > idx {
                 pending.line_idx -= 1;
@@ -5761,6 +5810,7 @@ impl App {
         self.reasoning_line = None;
         self.buffered_assistant_output.clear();
         self.pending_tool_lines.clear();
+        self.collapsed_tool_fail = None;
         self.hidden_tool_calls.clear();
         self.seen_tool_signatures.clear();
         // Request a full terminal repaint.  ratatui's diff-based renderer
@@ -16355,6 +16405,7 @@ impl App {
         self.in_flight_tool_count = 0;
         self.active_subagents.clear();
         self.pending_tool_lines.clear();
+        self.collapsed_tool_fail = None;
         self.prompt_queue.clear();
         self.active_skills.clear();
         self.display_state = DisplayState::Idle;
@@ -22152,6 +22203,10 @@ description = "Demo plugin tool"
             "Audit".into(),
             2,
         );
+        // Focus Tool Pane primary = longest-running tool.
+        if let Some(row) = state.tools.get_mut("call_2") {
+            row.started_at = Instant::now() - std::time::Duration::from_secs(20);
+        }
         state.on_tool_progress(
             "call_2",
             "1/3 completed; updating remaining tasks".into(),
@@ -23317,6 +23372,7 @@ kind = "skill"
         app.display_state = DisplayState::WaitingForApproval {
             command: "rm".into(),
             full_command: "rm -rf /tmp/demo".into(),
+            kind: edgecrab_tools::registry::ApprovalKind::Terminal,
             selected: 0,
             show_full: false,
             scroll_offset: 0,

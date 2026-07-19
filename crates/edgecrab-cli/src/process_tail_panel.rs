@@ -17,6 +17,8 @@ pub struct ProcessTailPanel {
     pub body: String,
     pub status_line: String,
     pub scroll_offset: u16,
+    /// True when showing a foreground tool live buffer (`t=expand`), not `/tail`.
+    pub foreground_live: bool,
 }
 
 impl ProcessTailPanel {
@@ -38,10 +40,33 @@ impl ProcessTailPanel {
         let trimmed = truncate_tail_body(&body, TAIL_PANEL_MAX_CHARS);
         let exit = exit_code.map(|c| format!(" exit {c}")).unwrap_or_default();
         self.active = true;
+        self.foreground_live = false;
         self.process_id = process_id;
         self.body = trimmed;
         self.status_line = format!("{status}{exit}");
         self.scroll_offset = 0;
+    }
+
+    /// Open/update the foreground Focus Tool live overlay (spec 020).
+    pub fn set_foreground_live(&mut self, tool_name: &str, preview: &str, body: &str) {
+        let at_bottom = self.foreground_live
+            && self.active
+            && self.scroll_offset == 0;
+        let trimmed = truncate_tail_body(body, TAIL_PANEL_MAX_CHARS);
+        self.active = true;
+        self.foreground_live = true;
+        self.process_id = tool_name.to_string();
+        self.body = trimmed;
+        self.status_line = if preview.trim().is_empty() {
+            "live".into()
+        } else {
+            format!("live · {preview}")
+        };
+        if !at_bottom {
+            // Fresh open — start at top of the tail window (newest content is at end;
+            // render already shows from scroll_offset; keep 0 = show from start of buffer).
+            self.scroll_offset = 0;
+        }
     }
 }
 
@@ -78,8 +103,14 @@ pub fn render_process_tail_panel(
         .borders(Borders::ALL)
         .border_style(Style::default().fg(accent))
         .title(format!(
-            " tail: {} — {} ",
-            panel.process_id, panel.status_line
+            " {}: {} — {} ",
+            if panel.foreground_live {
+                "live tool"
+            } else {
+                "tail"
+            },
+            panel.process_id,
+            panel.status_line
         ));
     let lines: Vec<&str> = panel.body.lines().collect();
     let scroll = panel.scroll_offset as usize;
@@ -115,5 +146,18 @@ mod tests {
         let out = truncate_tail_body(&body, 100);
         assert!(out.starts_with('…'));
         assert!(out.chars().count() <= 101);
+    }
+
+    #[test]
+    fn foreground_live_sets_flag() {
+        let mut panel = ProcessTailPanel::default();
+        panel.set_foreground_live("terminal", "npm install", "line1\nline2");
+        assert!(panel.active);
+        assert!(panel.foreground_live);
+        assert_eq!(panel.process_id, "terminal");
+        assert!(panel.body.contains("line2"));
+        panel.close();
+        assert!(!panel.active);
+        assert!(!panel.foreground_live);
     }
 }

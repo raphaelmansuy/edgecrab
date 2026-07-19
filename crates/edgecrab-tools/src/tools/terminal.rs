@@ -448,6 +448,15 @@ impl ToolHandler for TerminalTool {
             }
         }
 
+        // Spec 021 Wave E: structured Node/engine mismatch → clarify / approved install
+        // (no silent nvm, no retry-count heuristics).
+        if exec_output.exit_code != 0
+            && let Some(err) =
+                crate::recovery_catalog::terminal_node_engine_mismatch(&args.command, &result)
+        {
+            return Err(err);
+        }
+
         Ok(result)
     }
 }

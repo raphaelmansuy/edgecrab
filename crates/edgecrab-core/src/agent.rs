@@ -2855,6 +2855,8 @@ pub enum StreamEvent {
         full_command: String,
         /// Concrete policy reasons that caused the approval gate to trigger.
         reasons: Vec<String>,
+        /// Terminal command vs preview-loopback grant (spec 021).
+        kind: edgecrab_tools::registry::ApprovalKind,
         /// Channel to send the user's choice back to the agent.
         response_tx: tokio::sync::oneshot::Sender<ApprovalChoice>,
     },

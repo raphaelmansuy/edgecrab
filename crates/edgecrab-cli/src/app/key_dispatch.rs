@@ -354,6 +354,13 @@ impl App {
                     self.process_tail_panel.close();
                     self.needs_redraw = true;
                 }
+                KeyCode::Char('t')
+                    if key.modifiers == KeyModifiers::NONE
+                        && self.process_tail_panel.foreground_live =>
+                {
+                    self.process_tail_panel.close();
+                    self.needs_redraw = true;
+                }
                 KeyCode::Up | KeyCode::Char('k') => {
                     self.process_tail_panel.scroll_offset =
                         self.process_tail_panel.scroll_offset.saturating_sub(1);
@@ -2839,6 +2846,17 @@ impl App {
         }
 
         if self.try_handle_queue_edit_key(key) {
+            return;
+        }
+
+        // `t` — expand foreground tool live buffer when prompt is empty (spec 020).
+        if matches!(key.code, KeyCode::Char('t'))
+            && key.modifiers == KeyModifiers::NONE
+            && self.is_processing
+            && self.textarea_text().trim().is_empty()
+            && self.turn_activity.primary_focus_tool().is_some()
+            && self.open_foreground_tool_live_panel()
+        {
             return;
         }
 

@@ -1,5 +1,8 @@
 {
   "dependencies": {
+    "hyperframes": "^0.7.64",
+    "node-addon-api": "^8.9.0",
+    "node-gyp": "^12.4.0",
     "pptxgenjs": "^4.0.1",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",

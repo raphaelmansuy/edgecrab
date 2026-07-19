@@ -145,6 +145,12 @@ pub fn format_compression_circuit_breaker(failures: u32) -> String {
 }
 
 pub fn format_approval_waiting(command: &str) -> String {
+    if let Some(url) = command.strip_prefix("preview ") {
+        return format!(
+            "⏸ awaiting approval — allow localhost preview `{}`?",
+            truncate_command_preview(url.trim(), 64)
+        );
+    }
     format!(
         "⏸ Waiting for your approval: `{}`",
         truncate_command_preview(command, 72)

@@ -40,13 +40,34 @@ impl App {
 
     pub(super) fn handle_approval_choice_command(&mut self, choice: edgecrab_core::ApprovalChoice) {
         if self.approval_pending_tx.is_some() {
-            let text = match &choice {
-                edgecrab_core::ApprovalChoice::Once => "Approved current command once.",
-                edgecrab_core::ApprovalChoice::Session => {
+            let is_preview = matches!(
+                self.display_state,
+                DisplayState::WaitingForApproval {
+                    kind: edgecrab_tools::registry::ApprovalKind::PreviewLoopback,
+                    ..
+                }
+            );
+            let text = match (&choice, is_preview) {
+                (edgecrab_core::ApprovalChoice::Once, true) => {
+                    "Allowed browser preview access once."
+                }
+                (edgecrab_core::ApprovalChoice::Session, true) => {
+                    "Allowed browser preview access for this session."
+                }
+                (edgecrab_core::ApprovalChoice::Always, true) => {
+                    "Enabled security.preview permanently (persisted)."
+                }
+                (edgecrab_core::ApprovalChoice::Deny, true) => {
+                    "Denied browser preview access."
+                }
+                (edgecrab_core::ApprovalChoice::Once, false) => "Approved current command once.",
+                (edgecrab_core::ApprovalChoice::Session, false) => {
                     "Approved current command for the rest of this session."
                 }
-                edgecrab_core::ApprovalChoice::Always => "Approved current command permanently.",
-                edgecrab_core::ApprovalChoice::Deny => "Denied current command.",
+                (edgecrab_core::ApprovalChoice::Always, false) => {
+                    "Approved current command permanently."
+                }
+                (edgecrab_core::ApprovalChoice::Deny, false) => "Denied current command.",
             };
             self.apply_approval_choice(choice);
             self.push_output(text, OutputRole::System);
@@ -147,10 +168,11 @@ impl App {
     }
 
     pub(super) fn render_approval_overlay(&self, frame: &mut Frame, area: Rect) {
-        let (command, full_command, selected, scroll_offset) =
+        let (command, full_command, kind, selected, scroll_offset) =
             if let DisplayState::WaitingForApproval {
                 ref command,
                 ref full_command,
+                kind,
                 selected,
                 scroll_offset,
                 ..
@@ -159,6 +181,7 @@ impl App {
                 (
                     command.as_str(),
                     full_command.as_str(),
+                    kind,
                     selected,
                     scroll_offset,
                 )
@@ -177,10 +200,22 @@ impl App {
             ])
             .split(area);
 
-        let cmd_text = if full_command.is_empty() {
-            command
+        let is_preview = matches!(kind, edgecrab_tools::registry::ApprovalKind::PreviewLoopback);
+        let cmd_text = if is_preview {
+            if full_command.is_empty() {
+                format!("Allow browser access to {command} for this session?")
+            } else {
+                format!("Allow browser access to {full_command} for this session?")
+            }
+        } else if full_command.is_empty() {
+            command.to_string()
         } else {
-            full_command
+            full_command.to_string()
+        };
+        let title = if is_preview {
+            " ⚠  Preview access "
+        } else {
+            " ⚠  Approval required "
         };
         let cmd_lines: Vec<Line> = cmd_text
             .lines()
@@ -204,7 +239,7 @@ impl App {
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::Rgb(255, 140, 0)))
-                    .title(" ⚠  Approval required "),
+                    .title(title),
             )
             .wrap(Wrap { trim: false })
             .scroll((scroll_offset, 0));

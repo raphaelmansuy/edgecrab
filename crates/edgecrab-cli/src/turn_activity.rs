@@ -41,6 +41,84 @@ pub const SHELF_MAX_TOOL_ROWS: usize = 3;
 /// Max parallel tool rows when `/details tools expanded` (Hermes shows all active tools).
 pub const SHELF_MAX_TOOL_ROWS_FULL: usize = 12;
 
+/// Max stdout body lines under the primary tool header (matches `OUTPUT_TAIL_LINE_COUNT`).
+pub const FOCUS_TOOL_BODY_LINES: usize = 3;
+
+/// Rolling foreground progress buffer for `t=expand` overlay (chars).
+pub const TOOL_PROGRESS_LOG_MAX: usize = 4096;
+
+/// Soft tool / infra Error notices leave the live shelf after this many seconds.
+pub const NOTICE_ERROR_TTL_SECS: u64 = 8;
+
+/// Warn charms and Info tips leave the live shelf after this many seconds.
+pub const NOTICE_WARN_TTL_SECS: u64 = 12;
+
+/// Info tip TTL (same as warn — live band is ephemeral).
+pub const NOTICE_INFO_TTL_SECS: u64 = 12;
+
+/// True when tool progress text is real evidence (not empty / placeholder / wait heartbeat).
+pub fn detail_has_evidence(detail: Option<&str>) -> bool {
+    let Some(raw) = detail.map(str::trim).filter(|d| !d.is_empty()) else {
+        return false;
+    };
+    if raw == "…" || raw == "..." {
+        return false;
+    }
+    if raw.starts_with("still running") {
+        return false;
+    }
+    true
+}
+
+/// Last non-empty line of a multi-line progress detail (compact captions / status).
+pub fn last_detail_line(detail: &str) -> &str {
+    detail
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or(detail.trim())
+}
+
+/// Keep the newest `max_chars` of a rolling progress log (char-safe).
+pub fn append_progress_log(existing: &str, chunk: &str, max_chars: usize) -> String {
+    let chunk = chunk.trim();
+    if chunk.is_empty() {
+        return existing.to_string();
+    }
+    let mut combined = if existing.is_empty() {
+        chunk.to_string()
+    } else if existing.ends_with('\n') {
+        format!("{existing}{chunk}")
+    } else {
+        format!("{existing}\n{chunk}")
+    };
+    if combined.chars().count() <= max_chars {
+        return combined;
+    }
+    let start = combined
+        .char_indices()
+        .nth(combined.chars().count().saturating_sub(max_chars))
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    combined = format!("…{}", &combined[start..]);
+    combined
+}
+
+/// Up to [`FOCUS_TOOL_BODY_LINES`] non-empty lines from tool progress detail.
+pub fn focus_tool_body_lines(detail: Option<&str>) -> Vec<&str> {
+    let Some(raw) = detail.map(str::trim).filter(|d| !d.is_empty()) else {
+        return Vec::new();
+    };
+    let lines: Vec<&str> = raw
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let start = lines.len().saturating_sub(FOCUS_TOOL_BODY_LINES);
+    lines[start..].to_vec()
+}
+
 /// Compact tool summary for the status bar (single source when shelf is enabled).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TurnToolSummary {
@@ -73,6 +151,8 @@ pub struct ShelfToolRow {
     pub args_json: String,
     pub preview: String,
     pub detail: Option<String>,
+    /// Rolling progress buffer for foreground `t=expand` overlay (capped).
+    pub progress_log: String,
     pub started_at: Instant,
     pub last_seq: u64,
     pub finished: bool,
@@ -106,17 +186,57 @@ pub struct ShelfSubagentRow {
     pub recent_tools: Vec<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ActivityTone {
     Info,
     Warn,
     Error,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Classify gateway / stream activity feed lines (not soft ToolDone failures).
+pub fn activity_tone_for_feed(text: &str) -> ActivityTone {
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("failed")
+        || lower.contains("error")
+        || lower.contains("exited")
+        || lower.contains("denied")
+        || lower.contains("unavailable")
+    {
+        ActivityTone::Error
+    } else if lower.contains("warn") || lower.contains("stalled") || lower.contains("aborted") {
+        ActivityTone::Warn
+    } else {
+        ActivityTone::Info
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct ActivityNotice {
     pub text: String,
     pub tone: ActivityTone,
+    pub created_at: Instant,
+}
+
+impl ActivityNotice {
+    pub fn new(text: String, tone: ActivityTone) -> Self {
+        Self {
+            text,
+            tone,
+            created_at: Instant::now(),
+        }
+    }
+
+    fn ttl(&self) -> Duration {
+        match self.tone {
+            ActivityTone::Error => Duration::from_secs(NOTICE_ERROR_TTL_SECS),
+            ActivityTone::Warn => Duration::from_secs(NOTICE_WARN_TTL_SECS),
+            ActivityTone::Info => Duration::from_secs(NOTICE_INFO_TTL_SECS),
+        }
+    }
+
+    pub fn is_expired(&self, now: Instant) -> bool {
+        now.duration_since(self.created_at) >= self.ttl()
+    }
 }
 
 /// Ephemeral turn state consumed by [`crate::activity_shelf`].
@@ -219,6 +339,22 @@ impl TurnActivityState {
         }
         self.llm_wait_detail = None;
         self.llm_wait_compact = None;
+        // Stale Copilot/SSE wait graffiti must not survive into the next phase.
+        self.activity_feed
+            .retain(|n| !Self::is_llm_wait_shelf_line(&n.text));
+        self.expire_notices(Instant::now());
+    }
+
+    /// Drop activity notices past their TTL (live = now, not turn history).
+    pub fn expire_notices(&mut self, now: Instant) {
+        self.activity_feed.retain(|n| !n.is_expired(now));
+        if self
+            .hint
+            .as_ref()
+            .is_some_and(|h| !self.activity_feed.iter().any(|n| n.text == *h))
+        {
+            self.hint = self.activity_feed.last().map(|n| n.text.clone());
+        }
     }
 
     /// Clear in-flight streamed tool draft UI (non-streaming retry / stall abort).
@@ -279,6 +415,7 @@ impl TurnActivityState {
         {
             last.text = detail;
             last.tone = tone;
+            last.created_at = Instant::now();
             self.hint = self.llm_wait_detail.clone();
             return;
         }
@@ -289,11 +426,11 @@ impl TurnActivityState {
             self.activity_feed.remove(0);
         }
         self.activity_feed
-            .push(ActivityNotice { text: detail, tone });
+            .push(ActivityNotice::new(detail, tone));
         self.hint = self.llm_wait_detail.clone();
     }
 
-    fn is_llm_wait_shelf_line(text: &str) -> bool {
+    pub fn is_llm_wait_shelf_line(text: &str) -> bool {
         text.contains("composing")
             || text.contains("streaming")
             || text.contains("still streaming")
@@ -301,13 +438,15 @@ impl TurnActivityState {
             || text.contains("Bedrock")
             || text.contains("Copilot SSE")
             || text.starts_with("↳ vscode-copilot:")
+            || text.starts_with("vscode-copilot:")
     }
 
     pub fn push_activity(&mut self, text: String, tone: ActivityTone) {
         if text.trim().is_empty() {
             return;
         }
-        let notice = ActivityNotice { text, tone };
+        self.expire_notices(Instant::now());
+        let notice = ActivityNotice::new(text, tone);
         if self
             .activity_feed
             .last()
@@ -321,6 +460,7 @@ impl TurnActivityState {
         {
             last.text = notice.text.clone();
             last.tone = notice.tone;
+            last.created_at = Instant::now();
             self.hint = Some(notice.text.clone());
             return;
         }
@@ -336,22 +476,9 @@ impl TurnActivityState {
         self.llm_wait_compact.as_deref()
     }
 
-    /// Full shelf line during blocking LLM waits (activity feed).
+    /// Active LLM-wait shelf line — detail only (no stale activity_feed fallback).
     pub fn llm_wait_label(&self) -> Option<&str> {
-        self.llm_wait_detail.as_deref().or_else(|| {
-            self.activity_feed.iter().rev().find_map(|n| {
-                let t = n.text.as_str();
-                if t.contains("composing")
-                    || t.contains("streaming")
-                    || t.contains("non-streaming")
-                    || t.contains("Bedrock")
-                {
-                    Some(t)
-                } else {
-                    None
-                }
-            })
-        })
+        self.llm_wait_detail.as_deref()
     }
 
     pub fn set_phase(&mut self, phase: ShelfPhase) {
@@ -382,6 +509,7 @@ impl TurnActivityState {
         seq: u64,
     ) {
         self.on_model_resuming();
+        self.expire_notices(Instant::now());
         self.generating_tool = None;
         self.generating_preview = None;
         self.generating_args_bytes = 0;
@@ -395,6 +523,7 @@ impl TurnActivityState {
                 args_json,
                 preview,
                 detail: None,
+                progress_log: String::new(),
                 started_at: Instant::now(),
                 last_seq: seq,
                 finished: false,
@@ -448,7 +577,7 @@ impl TurnActivityState {
             .any(|row| !row.finished && row.started_at.elapsed() >= threshold);
         if long_running {
             self.push_activity(
-                "Tip: live activity stays in the shelf — /agents for delegates, /tail for bg logs"
+                "Tip: shelf shows live tool output — t=expand · /agents · /tail for bg"
                     .into(),
                 ActivityTone::Info,
             );
@@ -459,6 +588,8 @@ impl TurnActivityState {
     pub fn on_tool_progress(&mut self, tool_call_id: &str, detail: String, seq: u64, now: Instant) {
         let started = self.tools.get(tool_call_id).map(|row| row.started_at);
         if let Some(row) = self.tools.get_mut(tool_call_id) {
+            row.progress_log =
+                append_progress_log(&row.progress_log, &detail, TOOL_PROGRESS_LOG_MAX);
             row.detail = Some(detail);
             row.last_seq = seq;
         }
@@ -621,7 +752,7 @@ impl TurnActivityState {
             ShelfPhase::GeneratingTool => self.generating_caption(),
             ShelfPhase::Streaming => Some(format!("streaming ({elapsed}s)")),
             ShelfPhase::ToolExec => self.active_tool_caption(),
-            ShelfPhase::WaitingForApproval => Some("waiting for approval".into()),
+            ShelfPhase::WaitingForApproval => Some("awaiting approval".into()),
             ShelfPhase::WaitingForClarify => Some("waiting for clarification".into()),
             ShelfPhase::BgOp => Some("background operation…".into()),
         }
@@ -697,30 +828,64 @@ impl TurnActivityState {
     }
 
     fn active_tool_caption(&self) -> Option<String> {
-        let active: Vec<_> = self.sorted_active_tools().collect();
-        let primary = active.first()?;
+        let primary = self.primary_focus_tool()?;
+        let active_count = self.tools.values().filter(|r| !r.finished).count();
         let elapsed = primary.started_at.elapsed().as_secs();
         let detail = primary
             .detail
             .as_deref()
             .filter(|d| !d.trim().is_empty())
+            .map(last_detail_line)
             .unwrap_or(primary.preview.as_str());
+        let detail = safe_truncate(detail, 48);
         let name = primary.name.replace('_', " ");
         let elapsed_suffix = if elapsed > 0 {
             format!(" · {elapsed}s")
         } else {
             String::new()
         };
-        if active.len() > 1 {
-            Some(format!("{name} · {detail} +{}", active.len() - 1))
+        if active_count > 1 {
+            Some(format!("{name} · {detail} +{}", active_count - 1))
         } else {
             Some(format!("{name} · {detail}{elapsed_suffix}"))
         }
     }
 
+    /// Primary focus tool = longest-running unfinished tool (Focus Tool Pane body).
+    pub fn primary_focus_tool(&self) -> Option<&ShelfToolRow> {
+        self.tools
+            .values()
+            .filter(|r| !r.finished)
+            .max_by_key(|r| r.started_at.elapsed())
+    }
+
+    /// Rolling progress body for the foreground expand overlay.
+    pub fn primary_tool_progress_log(&self) -> Option<(&ShelfToolRow, &str)> {
+        let row = self.primary_focus_tool()?;
+        let body = if !row.progress_log.trim().is_empty() {
+            row.progress_log.as_str()
+        } else if let Some(detail) = row.detail.as_deref().filter(|d| !d.trim().is_empty()) {
+            detail
+        } else {
+            row.preview.as_str()
+        };
+        Some((row, body))
+    }
+
     pub fn sorted_active_tools(&self) -> impl Iterator<Item = &ShelfToolRow> {
+        let primary_id = self
+            .primary_focus_tool()
+            .map(|r| r.tool_call_id.clone());
         let mut rows: Vec<_> = self.tools.values().filter(|r| !r.finished).collect();
-        rows.sort_by_key(|r| std::cmp::Reverse(r.last_seq));
+        rows.sort_by(|a, b| {
+            let a_pri = primary_id.as_deref() == Some(a.tool_call_id.as_str());
+            let b_pri = primary_id.as_deref() == Some(b.tool_call_id.as_str());
+            match (a_pri, b_pri) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                _ => b.last_seq.cmp(&a.last_seq),
+            }
+        });
         rows.into_iter()
     }
 
@@ -744,11 +909,12 @@ impl TurnActivityState {
         if active.is_empty() {
             return None;
         }
-        let primary = active[0];
+        let primary = self.primary_focus_tool().unwrap_or(active[0]);
         let detail = primary
             .detail
             .as_deref()
             .filter(|d| !d.trim().is_empty())
+            .map(last_detail_line)
             .unwrap_or(primary.preview.as_str())
             .to_string();
         Some(TurnToolSummary {
@@ -781,17 +947,16 @@ impl TurnActivityState {
             return;
         }
         if let Some(row) = self.tools.get(tool_call_id) {
+            // Evidence outranks charms — do not shout when stdout is already visible.
+            if detail_has_evidence(row.detail.as_deref()) {
+                return;
+            }
             let charm = self
                 .long_run_charms
                 .get(per_tool % self.long_run_charms.len())
                 .map(String::as_str)
                 .unwrap_or("still working");
-            let detail = row
-                .detail
-                .as_deref()
-                .filter(|d| !d.trim().is_empty())
-                .unwrap_or(row.preview.as_str());
-            let line = format!("{charm} — {} · {detail}", row.name.replace('_', " "));
+            let line = format!("{charm} — {}", row.name.replace('_', " "));
             self.push_activity(line, ActivityTone::Warn);
             self.long_run_hints_per_tool
                 .insert(tool_call_id.to_string(), per_tool + 1);
@@ -801,6 +966,7 @@ impl TurnActivityState {
     }
 
     pub fn tick_long_run_hints(&mut self, now: Instant) {
+        self.expire_notices(now);
         if matches!(self.phase, ShelfPhase::GeneratingTool)
             && let Some((id, _)) = self.generating_tool.clone()
         {
@@ -931,10 +1097,18 @@ mod tests {
                 (i + 1) as u64,
             );
         }
+        // Primary focus = longest-running unfinished tool (t0 started first).
+        if let Some(row) = state.tools.get_mut("t0") {
+            row.started_at = Instant::now() - Duration::from_secs(45);
+        }
         assert_eq!(state.sorted_active_tools().count(), 3);
         let summary = state.tool_summary().unwrap();
         assert_eq!(summary.active_count, 3);
-        assert_eq!(summary.primary_name, "terminal");
+        assert_eq!(summary.primary_name, "file_read");
+        assert_eq!(
+            state.sorted_active_tools().next().map(|t| t.name.as_str()),
+            Some("file_read")
+        );
     }
 
     #[test]
@@ -1064,6 +1238,10 @@ mod tests {
             "cargo build".into(),
             1,
         );
+        // Make t1 clearly older so primary_focus_tool picks longest-running.
+        if let Some(row) = state.tools.get_mut("t1") {
+            row.started_at = Instant::now() - Duration::from_secs(30);
+        }
         state.on_tool_exec(
             "t2".into(),
             "read_file".into(),
@@ -1073,7 +1251,86 @@ mod tests {
         );
         let summary = state.tool_summary().unwrap();
         assert_eq!(summary.active_count, 2);
-        assert_eq!(summary.primary_name, "read_file");
+        assert_eq!(summary.primary_name, "terminal");
+    }
+
+    #[test]
+    fn compact_caption_uses_last_detail_line() {
+        let mut state = TurnActivityState::new(true);
+        state.on_tool_exec(
+            "t1".into(),
+            "terminal".into(),
+            "{}".into(),
+            "npm install".into(),
+            1,
+        );
+        state.on_tool_progress(
+            "t1",
+            "npm warn EBADENGINE\nadded 142 packages\nrun npm fund".into(),
+            2,
+            Instant::now(),
+        );
+        let caption = state.live_caption().unwrap();
+        assert!(caption.contains("terminal"));
+        assert!(caption.contains("run npm fund"));
+        assert!(!caption.contains("EBADENGINE"));
+    }
+
+    #[test]
+    fn charm_skipped_when_detail_has_evidence() {
+        let mut state = TurnActivityState::new(true);
+        state.on_tool_exec(
+            "t1".into(),
+            "terminal".into(),
+            "{}".into(),
+            "cargo build".into(),
+            1,
+        );
+        if let Some(row) = state.tools.get_mut("t1") {
+            row.started_at = Instant::now() - Duration::from_secs(LONG_RUN_HINT_SECS + 1);
+        }
+        state.on_tool_progress(
+            "t1",
+            "Compiling edgecrab-cli".into(),
+            2,
+            Instant::now(),
+        );
+        assert!(
+            state.activity_feed.is_empty(),
+            "charms must not fire when stdout evidence exists: {:?}",
+            state.activity_feed
+        );
+        assert!(detail_has_evidence(
+            state.tools.get("t1").and_then(|r| r.detail.as_deref())
+        ));
+    }
+
+    #[test]
+    fn progress_log_accumulates_and_caps() {
+        let mut state = TurnActivityState::new(true);
+        state.on_tool_exec(
+            "t1".into(),
+            "terminal".into(),
+            "{}".into(),
+            "build".into(),
+            1,
+        );
+        state.on_tool_progress("t1", "line-a".into(), 2, Instant::now());
+        state.on_tool_progress("t1", "line-b".into(), 3, Instant::now());
+        let (_, log) = state.primary_tool_progress_log().unwrap();
+        assert!(log.contains("line-a"));
+        assert!(log.contains("line-b"));
+        let huge = "x".repeat(TOOL_PROGRESS_LOG_MAX + 100);
+        state.on_tool_progress("t1", huge, 4, Instant::now());
+        let row = state.tools.get("t1").unwrap();
+        assert!(row.progress_log.chars().count() <= TOOL_PROGRESS_LOG_MAX + 1);
+        assert!(row.progress_log.starts_with('…') || row.progress_log.len() <= TOOL_PROGRESS_LOG_MAX);
+    }
+
+    #[test]
+    fn focus_tool_body_lines_keeps_last_three() {
+        let lines = focus_tool_body_lines(Some("a\nb\nc\nd\ne"));
+        assert_eq!(lines, vec!["c", "d", "e"]);
     }
 
     #[test]
@@ -1102,5 +1359,87 @@ mod tests {
         assert!(caption.contains("terminal"));
         assert!(!caption.contains("still streaming"));
         assert!(state.llm_wait_detail.is_none());
+    }
+
+    #[test]
+    fn on_model_resuming_purges_llm_wait_feed_lines() {
+        let mut state = TurnActivityState::new(true);
+        state.on_llm_wait_progress(
+            "vscode-copilot",
+            12,
+            true,
+            edgecrab_tools::tool_progress_tail::LlmWaitContext {
+                prompt_tokens_estimated: Some(24_000),
+                context_length: Some(128_000),
+                prefill_pct: None,
+                api_iteration: Some(12),
+                native_streaming: true,
+            },
+        );
+        assert!(
+            state
+                .activity_feed
+                .iter()
+                .any(|n| TurnActivityState::is_llm_wait_shelf_line(&n.text)),
+            "expected wait line in feed"
+        );
+        assert!(state.llm_wait_detail.is_some());
+        state.on_model_resuming();
+        assert!(state.llm_wait_detail.is_none());
+        assert!(
+            state
+                .activity_feed
+                .iter()
+                .all(|n| !TurnActivityState::is_llm_wait_shelf_line(&n.text)),
+            "wait lines must be purged on resume: {:?}",
+            state.activity_feed.iter().map(|n| &n.text).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn llm_wait_label_no_feed_fallback() {
+        let mut state = TurnActivityState::new(true);
+        state.push_activity(
+            "vscode-copilot: iter 12 · streaming tool call".into(),
+            ActivityTone::Info,
+        );
+        state.llm_wait_detail = None;
+        assert!(
+            state.llm_wait_label().is_none(),
+            "stale feed must not resurrect wait captions"
+        );
+    }
+
+    #[test]
+    fn error_notices_expire_after_ttl() {
+        let mut state = TurnActivityState::new(true);
+        state.push_activity("skill view failed".into(), ActivityTone::Error);
+        assert_eq!(state.activity_feed.len(), 1);
+        // Backdate past Error TTL.
+        state.activity_feed[0].created_at =
+            Instant::now() - Duration::from_secs(NOTICE_ERROR_TTL_SECS + 1);
+        state.expire_notices(Instant::now());
+        assert!(
+            state.activity_feed.is_empty(),
+            "expired Error must leave the live feed"
+        );
+    }
+
+    #[test]
+    fn awaiting_model_caption_without_stale_wait() {
+        let mut state = TurnActivityState::new(true);
+        state.set_phase(ShelfPhase::AwaitingFirstToken);
+        state.push_activity(
+            "vscode-copilot: iter 12 · streaming tool call — Copilot SSE open".into(),
+            ActivityTone::Warn,
+        );
+        // Detail cleared (as on resume) — caption must stay calm.
+        state.llm_wait_detail = None;
+        let caption = state.phase_line().unwrap();
+        assert!(
+            caption.contains("awaiting model"),
+            "got: {caption}"
+        );
+        assert!(!caption.contains("vscode-copilot"));
     }
 }

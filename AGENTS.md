@@ -479,7 +479,10 @@ When `display.activity_shelf: true` (default), live turn state renders between t
 | `/details [mode\|status\|cycle]` | Global shelf disclosure: `hidden`, `collapsed`, `expanded` |
 | `/details <section> [mode\|reset]` | Per-section override: `thinking`, `tools`, `subagents`, `activity` |
 | `/tail <process_id>` | Full-screen overlay for background process output (4KB tail) |
+| `t` (empty prompt, tool running) | Expand foreground tool live output (4KB rolling buffer; Esc closes) |
 | `/agents` | Full-screen delegate monitor (sort, STOP steer via `i`) |
+
+During tool execution the shelf shows a **Focus Tool Pane**: command header + up to 3 live stdout lines for the longest-running tool. Charms yield to real output. Status shows `t=expand` after ~3s. Soft tool failures stay in the transcript only (not sticky live errors); activity notices expire (Error 8s / Warn·Info 12s); Copilot wait graffiti is purged when the model resumes.
 
 Settings persist to `display.shelf_details` in `config.yaml` (Hermes `details_mode` parity).
 

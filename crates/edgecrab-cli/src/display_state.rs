@@ -43,6 +43,8 @@ pub enum DisplayState {
     WaitingForApproval {
         command: String,
         full_command: String,
+        /// Terminal command vs preview-loopback grant (spec 021).
+        kind: edgecrab_tools::registry::ApprovalKind,
         selected: usize,
         show_full: bool,
         scroll_offset: u16,

@@ -19,6 +19,7 @@ pub enum PendingInteractionKind {
         command: String,
         full_command: String,
         reasons: Vec<String>,
+        kind: edgecrab_tools::registry::ApprovalKind,
     },
     Clarify {
         question: String,
@@ -62,6 +63,7 @@ impl InteractionBroker {
         command: String,
         full_command: String,
         reasons: Vec<String>,
+        kind: edgecrab_tools::registry::ApprovalKind,
         response_tx: tokio::sync::oneshot::Sender<ApprovalChoice>,
     ) -> PendingInteractionView {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -69,6 +71,7 @@ impl InteractionBroker {
             command,
             full_command,
             reasons,
+            kind,
         };
         let view = PendingInteractionView {
             id,
@@ -300,6 +303,7 @@ mod tests {
                 "rm -rf /tmp/a".into(),
                 "rm -rf /tmp/a".into(),
                 vec!["destructive-file-ops".into()],
+                edgecrab_tools::registry::ApprovalKind::Terminal,
                 tx1,
             )
             .await;
@@ -309,6 +313,7 @@ mod tests {
                 "rm -rf /tmp/b".into(),
                 "rm -rf /tmp/b".into(),
                 vec!["destructive-file-ops".into()],
+                edgecrab_tools::registry::ApprovalKind::Terminal,
                 tx2,
             )
             .await;
@@ -365,6 +370,7 @@ mod tests {
                 "rm -rf /tmp/demo".into(),
                 "rm -rf /tmp/demo".into(),
                 vec![],
+                edgecrab_tools::registry::ApprovalKind::Terminal,
                 approval_tx,
             )
             .await;

@@ -6,6 +6,7 @@
 //! - Cloud metadata endpoints (169.254.169.254)
 //! - Redirect-based SSRF (302 → private IP)
 
+use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -22,10 +23,68 @@ pub struct PreviewPolicy {
     pub allow_any_loopback_port: bool,
 }
 
+/// Session-scoped loopback preview grants (spec 021 — user Once/Session choices).
+#[derive(Debug, Clone, Default)]
+pub struct SessionPreviewGrants {
+    /// Host+port pairs allowed until process exit.
+    session: HashSet<(String, u16)>,
+    /// Host+port pairs allowed for a single successful URL check (Once).
+    once: HashSet<(String, u16)>,
+}
+
+impl SessionPreviewGrants {
+    fn normalize_host(host: &str) -> String {
+        let h = host.trim().to_ascii_lowercase();
+        if h == "localhost" || h == "::1" || h == "[::1]" {
+            "127.0.0.1".into()
+        } else {
+            h.trim_start_matches('[').trim_end_matches(']').to_string()
+        }
+    }
+
+    fn key_for_url(parsed: &url::Url) -> Option<(String, u16)> {
+        if !is_loopback_preview_host(parsed) {
+            return None;
+        }
+        let host = parsed.host_str()?;
+        let port = parsed.port_or_known_default().unwrap_or(80);
+        Some((Self::normalize_host(host), port))
+    }
+
+    /// Grant host:port for the rest of the process lifetime.
+    pub fn grant_session(&mut self, host: &str, port: u16) {
+        self.session
+            .insert((Self::normalize_host(host), port));
+    }
+
+    /// Grant host:port for a single subsequent allow check.
+    pub fn grant_once(&mut self, host: &str, port: u16) {
+        self.once.insert((Self::normalize_host(host), port));
+    }
+
+    fn allows(&mut self, parsed: &url::Url) -> bool {
+        let Some(key) = Self::key_for_url(parsed) else {
+            return false;
+        };
+        if self.session.contains(&key) {
+            return true;
+        }
+        if self.once.remove(&key) {
+            return true;
+        }
+        false
+    }
+}
+
 static PREVIEW_POLICY: OnceLock<Mutex<PreviewPolicy>> = OnceLock::new();
+static SESSION_PREVIEW_GRANTS: OnceLock<Mutex<SessionPreviewGrants>> = OnceLock::new();
 
 fn preview_policy_cell() -> &'static Mutex<PreviewPolicy> {
     PREVIEW_POLICY.get_or_init(|| Mutex::new(PreviewPolicy::default()))
+}
+
+fn session_preview_grants_cell() -> &'static Mutex<SessionPreviewGrants> {
+    SESSION_PREVIEW_GRANTS.get_or_init(|| Mutex::new(SessionPreviewGrants::default()))
 }
 
 /// Install preview SSRF allowlist (startup from config; tests may update).
@@ -40,6 +99,28 @@ pub fn current_preview_policy() -> PreviewPolicy {
         .lock()
         .expect("preview policy lock")
         .clone()
+}
+
+/// Grant loopback host:port for this process (ApprovalChoice::Session).
+pub fn grant_session_preview_loopback(host: &str, port: u16) {
+    if let Ok(mut g) = session_preview_grants_cell().lock() {
+        g.grant_session(host, port);
+    }
+}
+
+/// Grant loopback host:port for one navigate (ApprovalChoice::Once).
+pub fn grant_once_preview_loopback(host: &str, port: u16) {
+    if let Ok(mut g) = session_preview_grants_cell().lock() {
+        g.grant_once(host, port);
+    }
+}
+
+/// Clear session preview grants (tests / session reset).
+#[doc(hidden)]
+pub fn clear_session_preview_grants() {
+    if let Ok(mut g) = session_preview_grants_cell().lock() {
+        *g = SessionPreviewGrants::default();
+    }
 }
 
 static PREVIEW_TEST_SERIAL: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
@@ -82,7 +163,7 @@ pub fn is_safe_url(raw_url: &str) -> Result<bool, AgentError> {
     match host {
         Host::Ipv4(v4) => {
             if is_private_ipv4(&v4) {
-                if allow_loopback_in_e2e(&host) || allow_preview_loopback(&parsed) {
+                if allow_loopback_in_e2e(&host) || allow_loopback_via_policy_or_grant(&parsed) {
                     return Ok(true);
                 }
                 tracing::warn!(%v4, "Blocked private/reserved IPv4");
@@ -91,7 +172,7 @@ pub fn is_safe_url(raw_url: &str) -> Result<bool, AgentError> {
         }
         Host::Ipv6(v6) => {
             if is_private_ipv6(&v6) {
-                if allow_loopback_in_e2e(&host) || allow_preview_loopback(&parsed) {
+                if allow_loopback_in_e2e(&host) || allow_loopback_via_policy_or_grant(&parsed) {
                     return Ok(true);
                 }
                 tracing::warn!(%v6, "Blocked private/reserved IPv6");
@@ -103,7 +184,7 @@ pub fn is_safe_url(raw_url: &str) -> Result<bool, AgentError> {
             const BLOCKED_HOSTS: &[&str] =
                 &["localhost", "metadata.google.internal", "169.254.169.254"];
             if BLOCKED_HOSTS.contains(&name) {
-                if allow_loopback_in_e2e(&host) || allow_preview_loopback(&parsed) {
+                if allow_loopback_in_e2e(&host) || allow_loopback_via_policy_or_grant(&parsed) {
                     return Ok(true);
                 }
                 tracing::warn!(host = %name, "Blocked dangerous hostname");
@@ -114,7 +195,7 @@ pub fn is_safe_url(raw_url: &str) -> Result<bool, AgentError> {
             if let Ok(ip) = name.parse::<IpAddr>()
                 && is_private_or_reserved(&ip)
             {
-                if allow_loopback_in_e2e(&host) || allow_preview_loopback(&parsed) {
+                if allow_loopback_in_e2e(&host) || allow_loopback_via_policy_or_grant(&parsed) {
                     return Ok(true);
                 }
                 tracing::warn!(%ip, "Blocked private/reserved IP (domain form)");
@@ -152,7 +233,16 @@ fn allow_preview_loopback(parsed: &url::Url) -> bool {
     policy.allow_any_loopback_port || policy.allowed_ports.contains(&port)
 }
 
-/// True when `security.preview` allows this loopback HTTP(S) URL (for browser + SSRF).
+fn allow_loopback_via_policy_or_grant(parsed: &url::Url) -> bool {
+    if let Ok(mut grants) = session_preview_grants_cell().lock()
+        && grants.allows(parsed)
+    {
+        return true;
+    }
+    allow_preview_loopback(parsed)
+}
+
+/// True when `security.preview` or a session/once grant allows this loopback HTTP(S) URL.
 pub fn is_preview_loopback_url(raw_url: &str) -> bool {
     let Ok(parsed) = url::Url::parse(raw_url) else {
         return false;
@@ -160,7 +250,7 @@ pub fn is_preview_loopback_url(raw_url: &str) -> bool {
     if !matches!(parsed.scheme(), "http" | "https") {
         return false;
     }
-    allow_preview_loopback(&parsed)
+    allow_loopback_via_policy_or_grant(&parsed)
 }
 
 /// Build a [`reqwest::Client`] that re-validates every redirect target against
@@ -464,6 +554,34 @@ mod tests {
             });
             assert!(is_safe_url("http://127.0.0.1:7777/").expect("ok"));
             assert!(is_preview_loopback_url("http://localhost:9999/"));
+        });
+    }
+
+    #[test]
+    fn session_preview_grants_allow_loopback_url() {
+        let _lock = url_safety_test_lock();
+        without_e2e_localhost(|| {
+            set_preview_policy(PreviewPolicy::default());
+            clear_session_preview_grants();
+            assert!(!is_preview_loopback_url("http://127.0.0.1:8000/"));
+            grant_session_preview_loopback("127.0.0.1", 8000);
+            assert!(is_preview_loopback_url("http://127.0.0.1:8000/"));
+            assert!(is_safe_url("http://127.0.0.1:8000/").expect("ok"));
+            assert!(!is_preview_loopback_url("http://127.0.0.1:8001/"));
+            clear_session_preview_grants();
+        });
+    }
+
+    #[test]
+    fn once_preview_grant_consumes_on_first_check() {
+        let _lock = url_safety_test_lock();
+        without_e2e_localhost(|| {
+            set_preview_policy(PreviewPolicy::default());
+            clear_session_preview_grants();
+            grant_once_preview_loopback("127.0.0.1", 8010);
+            assert!(is_preview_loopback_url("http://127.0.0.1:8010/"));
+            assert!(!is_preview_loopback_url("http://127.0.0.1:8010/"));
+            clear_session_preview_grants();
         });
     }
 }

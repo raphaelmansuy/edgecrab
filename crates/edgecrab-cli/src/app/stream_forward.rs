@@ -252,12 +252,14 @@ async fn forward_stream_event_to_tui(
             command,
             full_command,
             reasons: _,
+            kind,
             response_tx,
         } => {
             tracing::info!("TUI→agent: forwarding approval request");
             let _ = tx.send(AgentResponse::Approval {
                 command,
                 full_command,
+                kind,
                 response_tx,
             });
         }

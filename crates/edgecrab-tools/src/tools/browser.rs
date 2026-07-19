@@ -2344,10 +2344,16 @@ impl ToolHandler for BrowserNavigateTool {
             });
         }
 
-        // Pre-navigation SSRF check
+        // Pre-navigation SSRF check — grantable loopback denials open the approval overlay
+        // (Once/Session/Always/Deny), then re-validate once (spec 021).
         let known_ports = browser_known_ports(ctx).await;
         let serve_dir = preview_serve_directory_for_ctx(ctx);
-        validate_browser_url_with_session(&url, &known_ports, &serve_dir, &ctx.session_id)?;
+        if let Err(err) =
+            validate_browser_url_with_session(&url, &known_ports, &serve_dir, &ctx.session_id)
+        {
+            crate::preview_grant::maybe_request_preview_loopback_grant(ctx, err).await?;
+            validate_browser_url_with_session(&url, &known_ports, &serve_dir, &ctx.session_id)?;
+        }
 
         let session = get_session(ctx).await?;
         browser_progress(ctx, "navigating", &url);

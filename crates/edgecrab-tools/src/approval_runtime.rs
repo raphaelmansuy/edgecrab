@@ -204,6 +204,7 @@ pub(crate) async fn request_command_approval(
         command: command_preview(command),
         full_command: command.to_string(),
         reasons,
+        kind: crate::registry::ApprovalKind::Terminal,
         response_tx: resp_tx,
     })
     .map_err(|_| {

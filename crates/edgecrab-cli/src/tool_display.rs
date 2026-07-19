@@ -1308,6 +1308,32 @@ pub fn build_tool_done_line(
     )
 }
 
+/// Fingerprint for collapsing consecutive identical tool failures (spec 021).
+pub fn tool_failure_fingerprint(
+    tool_name: &str,
+    args_json: &str,
+    result_preview: Option<&str>,
+) -> String {
+    let preview = extract_tool_preview(tool_name, args_json);
+    let err_key = result_preview
+        .map(|raw| {
+            let trimmed = raw.trim();
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                if let Some(code) = v.get("code").and_then(|c| c.as_str()) {
+                    return code.to_string();
+                }
+                if let Some(cat) = v.get("category").and_then(|c| c.as_str()) {
+                    return cat.to_string();
+                }
+            }
+            // Normalize whitespace; keep a short stable prefix.
+            let collapsed: String = trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
+            collapsed.chars().take(96).collect()
+        })
+        .unwrap_or_default();
+    format!("{tool_name}\0{preview}\0{err_key}")
+}
+
 pub fn build_tool_done_line_width(
     tool_name: &str,
     args_json: &str,
@@ -3622,5 +3648,36 @@ mod tests {
             all_text.contains("✓ 12 bytes"),
             "verbose result should show rich write_file format, got: {all_text}"
         );
+    }
+
+    /// Spec 021 G5 — identical tool failures share one fingerprint for transcript collapse.
+    #[test]
+    fn collapse_identical_tool_failures() {
+        let args = r#"{"url":"http://127.0.0.1:8000/"}"#;
+        let err = r#"{"type":"tool_error","category":"permission","code":"permission_denied","error":"URL blocked"}"#;
+        let a = tool_failure_fingerprint("browser_navigate", args, Some(err));
+        let b = tool_failure_fingerprint("browser_navigate", args, Some(err));
+        let other_port = tool_failure_fingerprint(
+            "browser_navigate",
+            r#"{"url":"http://127.0.0.1:8001/"}"#,
+            Some(err),
+        );
+        let ok_path = tool_failure_fingerprint(
+            "browser_navigate",
+            args,
+            Some(r#"{"ok":true}"#),
+        );
+        assert_eq!(a, b, "identical fails must share fingerprint");
+        assert_ne!(a, other_port, "different args must not collapse");
+        assert_ne!(
+            a,
+            tool_failure_fingerprint("terminal", args, Some(err)),
+            "different tools must not collapse"
+        );
+        // Same args but different error code → distinct (do not over-collapse).
+        assert_ne!(a, ok_path);
+        // Collapse UI suffix is applied in response_dispatch; fingerprint is the contract.
+        assert!(a.contains("browser_navigate"));
+        assert!(a.contains("permission_denied") || a.contains("permission"));
     }
 }

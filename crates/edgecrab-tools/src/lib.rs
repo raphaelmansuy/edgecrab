@@ -16,6 +16,7 @@
 #![allow(clippy::result_large_err)]
 
 pub mod approval_runtime;
+pub mod preview_grant;
 pub mod artifact_spill;
 pub mod budget_config;
 mod command_interaction;

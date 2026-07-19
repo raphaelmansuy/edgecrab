@@ -175,6 +175,7 @@ pub async fn ensure_destructive_approved(
         command: summary.clone(),
         full_command: format!("computer_use {action} {args}"),
         reasons: vec![format!("Destructive computer_use action: {summary}")],
+        kind: crate::registry::ApprovalKind::Terminal,
         response_tx: resp_tx,
     })
     .map_err(|_| {

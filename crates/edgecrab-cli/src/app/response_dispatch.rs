@@ -117,11 +117,9 @@ impl App {
                             started: Instant::now(),
                         };
                     }
-                    stream_bridge::apply_activity_notice(
-                        &mut self.turn_activity,
-                        text,
-                        crate::turn_activity::ActivityTone::Info,
-                    );
+                    // Infra / stream notices only — soft tool fails are transcript-only.
+                    let tone = crate::turn_activity::activity_tone_for_feed(&text);
+                    stream_bridge::apply_activity_notice(&mut self.turn_activity, text, tone);
                     self.note_shelf_activity();
                     self.needs_redraw = true;
                 }
@@ -389,6 +387,7 @@ impl App {
                             self.scroll_offset = 0;
                         }
                         self.note_shelf_activity();
+                        self.refresh_foreground_tool_live_panel();
                         self.needs_redraw = true;
                         continue;
                     }
@@ -505,6 +504,50 @@ impl App {
                     if show_done {
                         let widths =
                             DisplayWidths::from_terminal_width(self.last_terminal_width as usize);
+                        // Spec 021: collapse consecutive identical policy/tool failures.
+                        let mut collapsed_into_prior = false;
+                        if is_error {
+                            let fingerprint = crate::tool_display::tool_failure_fingerprint(
+                                &name,
+                                &resolved_args,
+                                result_preview.as_deref(),
+                            );
+                            if let Some(prior) = self.collapsed_tool_fail.as_mut()
+                                && prior.fingerprint == fingerprint
+                                && prior.line_idx < self.output.len()
+                            {
+                                prior.count = prior.count.saturating_add(1);
+                                let mut spans = build_tool_done_line_width(
+                                    &name,
+                                    &resolved_args,
+                                    result_preview.as_deref(),
+                                    duration_ms,
+                                    true,
+                                    &self.theme.tool_emojis,
+                                    &widths,
+                                );
+                                spans.push(ratatui::text::Span::styled(
+                                    format!(" ×{} (same failure)", prior.count),
+                                    ratatui::style::Style::default()
+                                        .fg(ratatui::style::Color::Rgb(255, 105, 105)),
+                                ));
+                                self.output[prior.line_idx].prebuilt_spans = Some(spans);
+                                self.output[prior.line_idx].invalidate_render_cache();
+                                if let Some(PendingToolLine { line_idx, .. }) = pending.as_ref()
+                                    && *line_idx < self.output.len()
+                                    && *line_idx != prior.line_idx
+                                {
+                                    self.remove_output_line(*line_idx);
+                                }
+                                collapsed_into_prior = true;
+                            } else {
+                                self.collapsed_tool_fail = None;
+                            }
+                        } else {
+                            self.collapsed_tool_fail = None;
+                        }
+
+                        if !collapsed_into_prior {
                         let spans = build_tool_done_line_width(
                             &name,
                             &resolved_args,
@@ -520,7 +563,9 @@ impl App {
                         // second line for the same tool call — the layout stays stable
                         // (no shift), and the cyan "···" naturally becomes the gold
                         // timing string without any visual flash.
-                        if let Some(PendingToolLine { line_idx, .. }) = pending.as_ref() {
+                        let written_line_idx = if let Some(PendingToolLine { line_idx, .. }) =
+                            pending.as_ref()
+                        {
                             if *line_idx < self.output.len() {
                                 self.output[*line_idx].prebuilt_spans = Some(spans);
                                 if matches!(
@@ -535,15 +580,32 @@ impl App {
                                     self.output[*line_idx].attach_expandable_body(body);
                                 }
                                 self.output[*line_idx].invalidate_render_cache();
+                                Some(*line_idx)
                             } else {
                                 // Index out of range — fall back to append (shouldn't happen).
                                 self.push_output_spans(spans, OutputRole::Tool);
+                                Some(self.output.len().saturating_sub(1))
                             }
                         } else {
                             // No pending placeholder (e.g. streaming disabled, or the
                             // tool fired before the feature was introduced) — append.
                             self.push_output_spans(spans, OutputRole::Tool);
+                            Some(self.output.len().saturating_sub(1))
+                        };
+                        if is_error
+                            && let Some(line_idx) = written_line_idx
+                        {
+                            self.collapsed_tool_fail = Some(CollapsedToolFail {
+                                fingerprint: crate::tool_display::tool_failure_fingerprint(
+                                    &name,
+                                    &resolved_args,
+                                    result_preview.as_deref(),
+                                ),
+                                line_idx,
+                                count: 1,
+                            });
                         }
+                        } // !collapsed_into_prior
                         if self.tool_progress_mode == ToolProgressMode::Verbose
                             && !self.turn_activity.enabled
                         {
@@ -598,13 +660,9 @@ impl App {
                     // stay in ToolExec state so the status bar stays accurate.
                     self.in_flight_tool_count = self.in_flight_tool_count.saturating_sub(1);
                     stream_bridge::apply_tool_done(&mut self.turn_activity, &tool_call_id);
-                    if is_error {
-                        stream_bridge::apply_activity_notice(
-                            &mut self.turn_activity,
-                            format!("{} failed", name.replace('_', " ")),
-                            crate::turn_activity::ActivityTone::Error,
-                        );
-                    }
+                    // Soft tool failures stay in the transcript (✗ done line). Do not
+                    // mirror them into the live activity feed — that caused sticky
+                    // "skill view failed" ghosts for the rest of the ReAct turn.
                     if self.in_flight_tool_count == 0 {
                         self.display_state = DisplayState::AwaitingFirstToken {
                             frame: 0,
@@ -624,6 +682,7 @@ impl App {
                             started: row.started_at,
                         };
                     }
+                    self.refresh_foreground_tool_live_panel();
                     self.needs_redraw = true;
                 }
                 AgentResponse::SubAgentStart {
@@ -950,6 +1009,7 @@ impl App {
                 AgentResponse::Approval {
                     command,
                     full_command,
+                    kind,
                     response_tx,
                 } => {
                     // Check the session-level approval cache first.
@@ -969,6 +1029,7 @@ impl App {
                         self.display_state = DisplayState::WaitingForApproval {
                             command: command.clone(),
                             full_command,
+                            kind,
                             selected: 0,
                             show_full: false,
                             scroll_offset: 0,

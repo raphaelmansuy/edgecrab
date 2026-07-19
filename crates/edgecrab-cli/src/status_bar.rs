@@ -257,26 +257,37 @@ pub fn render_status_bar(frame: &mut Frame, area: Rect, params: &StatusBarRender
                     String::new()
                 };
                 let stop_hint = if elapsed_secs >= 10 { "  ^C=stop" } else { "" };
+                let expand_hint = if elapsed_secs >= 3 { "  t=expand" } else { "" };
+                let status_detail = detail
+                    .as_deref()
+                    .filter(|d| !d.trim().is_empty())
+                    .map(|d| {
+                        edgecrab_core::safe_truncate(
+                            crate::turn_activity::last_detail_line(d),
+                            52,
+                        )
+                        .to_string()
+                    });
                 let content = if let Some(active) = summary {
+                    let detail_show = crate::turn_activity::last_detail_line(&active.detail);
+                    let detail_show = edgecrab_core::safe_truncate(detail_show, 52);
                     format!(
-                        " {spinner} {} {} {}{time_part}{stop_hint} ",
-                        active.verb, active.icon, active.detail
+                        " {spinner} {} {} {detail_show}{time_part}{stop_hint}{expand_hint} ",
+                        active.verb, active.icon
                     )
                 } else {
                     let icon = tool_icon(name);
                     let verb = tool_action_verb(name);
-                    let preview = detail
-                        .as_deref()
-                        .filter(|detail| !detail.trim().is_empty())
-                        .map(|detail| edgecrab_core::safe_truncate(detail.trim(), 60).to_string())
-                        .unwrap_or_else(|| {
-                            // Use width-adaptive preview — status bar has more room on wide terminals.
-                            let widths = DisplayWidths::from_terminal_width(
-                                params.last_terminal_width as usize,
-                            );
-                            tool_status_preview_width(name, args_json, widths.status_preview)
-                        });
-                    format!(" {spinner} {verb} {icon} {preview}{time_part}{stop_hint} ")
+                    let preview = status_detail.unwrap_or_else(|| {
+                        // Use width-adaptive preview — status bar has more room on wide terminals.
+                        let widths = DisplayWidths::from_terminal_width(
+                            params.last_terminal_width as usize,
+                        );
+                        tool_status_preview_width(name, args_json, widths.status_preview)
+                    });
+                    format!(
+                        " {spinner} {verb} {icon} {preview}{time_part}{stop_hint}{expand_hint} "
+                    )
                 };
                 // FP48: Use semantic category color so the status bar matches the output area.
                 // FP50: Escalate color for slow (>=5s) and stalled (>=15s) tool calls.
@@ -341,15 +352,37 @@ pub fn render_status_bar(frame: &mut Frame, area: Rect, params: &StatusBarRender
                         .add_modifier(Modifier::BOLD),
                 ));
             }
-            DisplayState::WaitingForApproval { command, .. } => {
-                // Agent is waiting for a risk-graduated approval from the user.
-                let short = if command.len() > 30 {
-                    format!("{}…", edgecrab_core::safe_truncate(command, 27))
-                } else {
-                    command.clone()
+            DisplayState::WaitingForApproval {
+                command,
+                full_command,
+                kind,
+                ..
+            } => {
+                let label = match kind {
+                    edgecrab_tools::registry::ApprovalKind::PreviewLoopback => {
+                        let url = if full_command.is_empty() {
+                            command.as_str()
+                        } else {
+                            full_command.as_str()
+                        };
+                        let short = if url.len() > 36 {
+                            format!("{}…", edgecrab_core::safe_truncate(url, 33))
+                        } else {
+                            url.to_string()
+                        };
+                        format!(" ⚠  Allow preview: {short} ")
+                    }
+                    edgecrab_tools::registry::ApprovalKind::Terminal => {
+                        let short = if command.len() > 30 {
+                            format!("{}…", edgecrab_core::safe_truncate(command, 27))
+                        } else {
+                            command.clone()
+                        };
+                        format!(" ⚠  Approve: {short} ")
+                    }
                 };
                 left_spans.push(Span::styled(
-                    format!(" ⚠  Approve: {short} "),
+                    label,
                     Style::default()
                         .fg(Color::Rgb(255, 140, 0))
                         .add_modifier(Modifier::BOLD),
@@ -697,8 +730,18 @@ pub fn render_status_bar(frame: &mut Frame, area: Rect, params: &StatusBarRender
                     .add_modifier(Modifier::BOLD),
             ));
         } else if params.is_processing {
+            let tool_expand = if matches!(params.display_state, DisplayState::ToolExec { .. })
+                && params
+                    .turn_activity
+                    .primary_focus_tool()
+                    .is_some_and(|t| t.started_at.elapsed().as_secs() >= 3)
+            {
+                "  t=expand"
+            } else {
+                ""
+            };
             right_spans.push(Span::styled(
-                " ^C=cancel  ^S=steer  ↕scroll ",
+                format!(" ^C=cancel  ^S=steer{tool_expand}  ↕scroll "),
                 Style::default().fg(Color::Rgb(70, 75, 95)),
             ));
         } else if matches!(params.editor_mode, StatusBarEditorMode::ComposeInsert) {

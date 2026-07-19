@@ -1162,6 +1162,7 @@ impl Agent {
                             command: req.command,
                             full_command: req.full_command,
                             reasons: req.reasons,
+                            kind: req.kind,
                             response_tx: decision_tx,
                         })
                         .is_ok()

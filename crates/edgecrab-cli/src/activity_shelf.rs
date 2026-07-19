@@ -16,8 +16,9 @@ use crate::shelf_visual::{
 use crate::theme::Theme;
 use crate::tool_display::{tool_icon, tool_status_preview};
 use crate::turn_activity::{
-    ActivityNotice, ActivityTone, SHELF_BG_TAIL_CHARS, SHELF_MAX_TOOL_ROWS,
-    SHELF_MAX_TOOL_ROWS_FULL, ShelfPhase, TurnActivityState,
+    ActivityNotice, ActivityTone, FOCUS_TOOL_BODY_LINES, SHELF_BG_TAIL_CHARS, SHELF_MAX_TOOL_ROWS,
+    SHELF_MAX_TOOL_ROWS_FULL, ShelfPhase, TurnActivityState, detail_has_evidence,
+    focus_tool_body_lines,
 };
 
 const MAX_SHELF_LINES: u16 = 8;
@@ -111,11 +112,23 @@ pub fn render_activity_shelf(frame: &mut Frame, area: Rect, params: &ShelfRender
             ]));
         }
     } else {
-        append_thinking_lines(&mut lines, state, details, spin, &palette);
-        append_activity_lines(&mut lines, state, details, &palette);
+        // Signal priority: tools evidence → subagents → thinking → activity → tokens.
         append_tool_lines(&mut lines, state, details, verbose_tools, &palette);
         append_subagent_lines(&mut lines, state, details, &palette);
-        append_tokens_footer(&mut lines, state, &palette);
+        let show_thinking = !tools_section_has_evidence(state, details)
+            || (details.section_render(ShelfSection::Thinking) == SectionRender::Full
+                && !matches!(state.phase, ShelfPhase::ToolExec | ShelfPhase::GeneratingTool));
+        if show_thinking {
+            append_thinking_lines(&mut lines, state, details, spin, &palette);
+        }
+        append_activity_lines(&mut lines, state, details, &palette);
+        if (lines.len() as u16) < MAX_SHELF_LINES {
+            append_tokens_footer(&mut lines, state, &palette);
+        }
+        // Hard cap — prefer keeping tool evidence (already first).
+        if lines.len() > MAX_SHELF_LINES as usize {
+            lines.truncate(MAX_SHELF_LINES as usize);
+        }
     }
 
     if lines.is_empty() {
@@ -147,12 +160,25 @@ fn count_section_lines(
     verbose_tools: bool,
 ) -> u16 {
     let mut n = 0u16;
-    n += thinking_line_count(state, details);
-    n += activity_line_count(state, details);
     n += tool_line_count(state, details, verbose_tools);
     n += subagent_line_count(state, details);
+    let skip_thinking = tools_section_has_evidence(state, details)
+        && matches!(state.phase, ShelfPhase::ToolExec | ShelfPhase::GeneratingTool);
+    if !skip_thinking {
+        n += thinking_line_count(state, details);
+    }
+    n += activity_line_count(state, details);
     n += tokens_footer_line_count(state);
-    n
+    n.min(MAX_SHELF_LINES)
+}
+
+fn tools_section_has_evidence(state: &TurnActivityState, details: &ShelfDetailsState) -> bool {
+    if details.section_render(ShelfSection::Tools) == SectionRender::Skip {
+        return false;
+    }
+    state
+        .primary_focus_tool()
+        .is_some_and(|t| detail_has_evidence(t.detail.as_deref()))
 }
 
 fn tokens_footer_line_count(state: &TurnActivityState) -> u16 {
@@ -182,13 +208,14 @@ fn thinking_line_count(state: &TurnActivityState, details: &ShelfDetailsState) -
 }
 
 fn activity_line_count(state: &TurnActivityState, details: &ShelfDetailsState) -> u16 {
-    let notices = visible_notices(state, details);
+    let notices: Vec<_> = visible_notices(state, details).collect();
     match details.section_render(ShelfSection::Activity) {
         SectionRender::Skip => notices
+            .iter()
             .filter(|n| matches!(n.tone, ActivityTone::Warn | ActivityTone::Error))
             .count() as u16,
-        SectionRender::Summary => notices.take(1).count() as u16,
-        SectionRender::Full => notices.count() as u16,
+        SectionRender::Summary => u16::from(!notices.is_empty()),
+        SectionRender::Full => notices.len() as u16,
     }
 }
 
@@ -213,7 +240,16 @@ fn tool_line_count(
             let verbose_extra = if verbose_tools { tool_rows } else { 0 };
             let drafting = u16::from(state.generating_tool.is_some());
             let overflow_line = u16::from(overflow > 0);
-            1 + drafting + tool_rows + verbose_extra + overflow_line + if bg > 0 { 1 } else { 0 }
+            let body_lines = state
+                .primary_focus_tool()
+                .map(|t| focus_tool_body_lines(t.detail.as_deref()).len() as u16)
+                .unwrap_or(0);
+            1 + drafting
+                + tool_rows
+                + body_lines
+                + verbose_extra
+                + overflow_line
+                + if bg > 0 { 1 } else { 0 }
         }
     }
 }
@@ -342,10 +378,27 @@ fn append_thinking_lines(
 }
 
 fn thinking_content(state: &TurnActivityState, details: &ShelfDetailsState) -> Option<String> {
-    if (state.generating_tool.is_some() || state.tools.values().any(|t| !t.finished))
-        && let Some(caption) = state.live_caption()
-    {
-        return Some(caption);
+    // During tool work the tools section owns the live signal — do not mirror
+    // captions / provider heartbeats into the thinking band.
+    if state.generating_tool.is_some() || state.tools.values().any(|t| !t.finished) {
+        if details.section_render(ShelfSection::Tools) != SectionRender::Skip {
+            return None;
+        }
+        return state.live_caption();
+    }
+    // Between tools: prefer calm phase caption over long provider SSE dumps.
+    // Active wait detail (llm_wait_label) only when the model is actually blocking.
+    if matches!(state.phase, ShelfPhase::AwaitingFirstToken) {
+        if let Some(label) = state.llm_wait_label() {
+            let elapsed = state.phase_started.elapsed().as_secs();
+            // Compact: first segment before em-dash / long Copilot appendix.
+            let short = label.split(" — ").next().unwrap_or(label);
+            return Some(format!(
+                "{} ({elapsed}s)",
+                edgecrab_core::safe_truncate(short, 56)
+            ));
+        }
+        return state.phase_line();
     }
     if let Some(label) = state.llm_wait_label() {
         let elapsed = state.phase_started.elapsed().as_secs();
@@ -363,15 +416,7 @@ fn thinking_content(state: &TurnActivityState, details: &ShelfDetailsState) -> O
     {
         return Some(format!("thinking · {snippet}"));
     }
-    match state.phase {
-        ShelfPhase::ToolExec | ShelfPhase::GeneratingTool => {
-            if details.section_render(ShelfSection::Tools) != SectionRender::Skip {
-                return None;
-            }
-            state.live_caption()
-        }
-        _ => state.phase_line(),
-    }
+    state.phase_line()
 }
 
 fn append_activity_lines(
@@ -380,11 +425,24 @@ fn append_activity_lines(
     details: &ShelfDetailsState,
     palette: &ShelfPalette,
 ) {
+    if (lines.len() as u16) >= MAX_SHELF_LINES {
+        return;
+    }
     let render = details.section_render(ShelfSection::Activity);
+    let has_evidence = tools_section_has_evidence(state, details);
+    let mut shown = 0usize;
     for notice in visible_notices(state, details) {
+        // Demote charms / LLM-wait noise when tool stdout is already on screen.
+        if has_evidence && is_secondary_activity_notice(&notice.text) {
+            continue;
+        }
         let style = match notice.tone {
-            ActivityTone::Info => Style::default().fg(palette.dim),
-            ActivityTone::Warn => Style::default().fg(palette.warn),
+            ActivityTone::Info => Style::default()
+                .fg(palette.dim)
+                .add_modifier(Modifier::DIM),
+            ActivityTone::Warn => Style::default()
+                .fg(palette.dim)
+                .add_modifier(Modifier::DIM),
             ActivityTone::Error => Style::default().fg(palette.hot),
         };
         let prefix = match render {
@@ -396,25 +454,58 @@ fn append_activity_lines(
             format!("{prefix}{text}"),
             style,
         )]));
-        if matches!(render, SectionRender::Summary) {
+        shown += 1;
+        if matches!(render, SectionRender::Summary) || (has_evidence && shown >= 1) {
+            break;
+        }
+        if (lines.len() as u16) >= MAX_SHELF_LINES {
             break;
         }
     }
+}
+
+fn is_secondary_activity_notice(text: &str) -> bool {
+    let t = text.trim_start_matches('↳').trim_start();
+    TurnActivityState::is_llm_wait_shelf_line(t)
+        || t.contains("still cooking")
+        || t.contains("polishing edges")
+        || t.contains("asking the void")
+        || t.starts_with("still working")
+        || t.starts_with("still drafting")
 }
 
 fn visible_notices<'a>(
     state: &'a TurnActivityState,
     details: &ShelfDetailsState,
 ) -> Box<dyn Iterator<Item = &'a ActivityNotice> + 'a> {
+    // Newest first — Summary must show the latest signal, not the oldest.
+    // Filter expired here so render stays correct even between expire ticks.
+    let now = std::time::Instant::now();
     match details.section_render(ShelfSection::Activity) {
         SectionRender::Skip => Box::new(
             state
                 .activity_feed
                 .iter()
-                .filter(|n| matches!(n.tone, ActivityTone::Warn | ActivityTone::Error)),
+                .rev()
+                .filter(move |n| {
+                    !n.is_expired(now) && matches!(n.tone, ActivityTone::Warn | ActivityTone::Error)
+                }),
         ),
-        SectionRender::Summary => Box::new(state.activity_feed.iter().take(1)),
-        SectionRender::Full => Box::new(state.activity_feed.iter()),
+        SectionRender::Summary => Box::new(
+            state
+                .activity_feed
+                .iter()
+                .rev()
+                .filter(move |n| !n.is_expired(now))
+                .take(1),
+        ),
+        SectionRender::Full => Box::new(
+            state
+                .activity_feed
+                .iter()
+                .rev()
+                .filter(move |n| !n.is_expired(now)),
+        ),
     }
 }
 
@@ -491,17 +582,30 @@ fn append_tool_lines(
             }
             let cap = shelf_tool_row_cap(SectionRender::Full);
             let total_active = active.len();
+            let primary_id = state
+                .primary_focus_tool()
+                .map(|t| t.tool_call_id.as_str());
             let shown: Vec<_> = active.into_iter().take(cap).collect();
             let active_count = shown.len();
             for (i, tool) in shown.into_iter().enumerate() {
-                let prefix = if i + 1 == active_count && total_active <= cap {
+                let is_last_header = i + 1 == active_count && total_active <= cap;
+                let is_primary = primary_id == Some(tool.tool_call_id.as_str());
+                let body = if is_primary {
+                    focus_tool_body_lines(tool.detail.as_deref())
+                } else {
+                    Vec::new()
+                };
+                let prefix = if is_last_header && body.is_empty() {
                     "  └─ "
                 } else {
                     "  ├─ "
                 };
-                push_tool_row(lines, tool, prefix.to_string(), palette);
+                push_tool_header(lines, tool, prefix.to_string(), palette);
                 if verbose_tools {
                     push_verbose_args_line(lines, tool, palette.dim);
+                }
+                if !body.is_empty() {
+                    push_tool_body_lines(lines, &body, is_last_header, palette);
                 }
             }
             if total_active > cap {
@@ -536,7 +640,7 @@ fn append_tool_lines(
     }
 }
 
-fn push_tool_row(
+fn push_tool_header(
     lines: &mut Vec<Line>,
     tool: &crate::turn_activity::ShelfToolRow,
     prefix: String,
@@ -548,11 +652,6 @@ fn push_tool_row(
     } else {
         tool.preview.clone()
     };
-    let detail = tool
-        .detail
-        .as_deref()
-        .filter(|d| !d.trim().is_empty())
-        .unwrap_or("…");
     let elapsed_secs = tool.started_at.elapsed().as_secs();
     let heat = elapsed_heat(elapsed_secs);
     let elapsed_style =
@@ -562,18 +661,50 @@ fn push_tool_row(
     } else {
         String::new()
     };
+    // Header carries command/path only — stdout lives in the focus body lines.
+    let preview_show = if detail_has_evidence(tool.detail.as_deref()) {
+        safe_truncate(&preview, 56).to_string()
+    } else {
+        let detail = tool
+            .detail
+            .as_deref()
+            .filter(|d| !d.trim().is_empty())
+            .map(crate::turn_activity::last_detail_line)
+            .unwrap_or("…");
+        format!("{preview} · {detail}")
+    };
     lines.push(Line::from(vec![
         Span::styled(prefix, Style::default().fg(palette.border)),
         Span::styled(
             format!("{icon} {}  ", tool.name),
             Style::default().fg(palette.accent),
         ),
-        Span::styled(
-            format!("{preview} · {detail}"),
-            Style::default().fg(palette.dim),
-        ),
+        Span::styled(preview_show, Style::default().fg(palette.dim)),
         Span::styled(elapsed_suffix, elapsed_style),
     ]));
+}
+
+fn push_tool_body_lines(
+    lines: &mut Vec<Line>,
+    body: &[&str],
+    is_last_tool: bool,
+    palette: &ShelfPalette,
+) {
+    let max = FOCUS_TOOL_BODY_LINES.min(body.len());
+    for (i, line) in body.iter().take(max).enumerate() {
+        let branch = if is_last_tool && i + 1 == max {
+            "  └─ "
+        } else {
+            "  │  "
+        };
+        lines.push(Line::from(vec![
+            Span::styled(branch, Style::default().fg(palette.border)),
+            Span::styled(
+                safe_truncate(line, 72).to_string(),
+                Style::default().fg(palette.dim),
+            ),
+        ]));
+    }
 }
 
 fn push_verbose_args_line(
@@ -835,5 +966,89 @@ mod tests {
         state.on_subagent_tool(0, "terminal", "terminal  cargo test".into());
         assert_eq!(state.subagent_tool_total(), 2);
         assert_eq!(subagent_line_count(&state, &details), 1);
+    }
+
+    #[test]
+    fn focus_pane_counts_multiline_body() {
+        let mut state = TurnActivityState::new(true);
+        let mut details = ShelfDetailsState::default();
+        details.handle_command("tools expanded");
+        state.on_tool_exec(
+            "t1".into(),
+            "terminal".into(),
+            "{}".into(),
+            "npm install".into(),
+            1,
+        );
+        state.on_tool_progress(
+            "t1",
+            "warn one\nwarn two\nadded packages".into(),
+            2,
+            std::time::Instant::now(),
+        );
+        let n = tool_line_count(&state, &details, false);
+        // header + 1 tool header + 3 body lines
+        assert!(n >= 5, "expected focus body lines in count, got {n}");
+    }
+
+    #[test]
+    fn parallel_tools_only_primary_gets_body_budget() {
+        let mut state = TurnActivityState::new(true);
+        let mut details = ShelfDetailsState::default();
+        details.handle_command("tools expanded");
+        state.on_tool_exec(
+            "t1".into(),
+            "terminal".into(),
+            "{}".into(),
+            "build".into(),
+            1,
+        );
+        if let Some(row) = state.tools.get_mut("t1") {
+            row.started_at = std::time::Instant::now() - std::time::Duration::from_secs(20);
+        }
+        state.on_tool_exec(
+            "t2".into(),
+            "file_read".into(),
+            "{}".into(),
+            "a.rs".into(),
+            2,
+        );
+        state.on_tool_progress(
+            "t1",
+            "line1\nline2\nline3".into(),
+            3,
+            std::time::Instant::now(),
+        );
+        state.on_tool_progress("t2", "only-one".into(), 4, std::time::Instant::now());
+        let n = tool_line_count(&state, &details, false);
+        // header + 2 tool headers + 3 body (primary only) — not +1 for secondary
+        assert!(
+            (5..=7).contains(&n),
+            "expected ~6 lines (header+2 tools+3 body), got {n}"
+        );
+        assert_eq!(
+            state.primary_focus_tool().map(|t| t.name.as_str()),
+            Some("terminal")
+        );
+    }
+
+    #[test]
+    fn secondary_activity_notices_detected() {
+        assert!(is_secondary_activity_notice("still cooking… — terminal"));
+        assert!(is_secondary_activity_notice("vscode-copilot: iter 17 streaming"));
+        assert!(!is_secondary_activity_notice("gateway exited"));
+    }
+
+    #[test]
+    fn visible_notices_newest_first() {
+        let mut state = TurnActivityState::new(true);
+        let mut details = ShelfDetailsState::default();
+        details.handle_command("activity expanded");
+        state.push_activity("older tip".into(), ActivityTone::Info);
+        state.push_activity("newer tip".into(), ActivityTone::Info);
+        let first = visible_notices(&state, &details)
+            .next()
+            .map(|n| n.text.as_str());
+        assert_eq!(first, Some("newer tip"));
     }
 }

@@ -77,16 +77,26 @@ fn format_pending_interaction(view: &PendingInteractionView) -> String {
             command,
             full_command,
             reasons,
+            kind,
         } => {
             let reason_text = if reasons.is_empty() {
                 "Flagged by the command safety policy.".to_string()
             } else {
                 reasons.join("; ")
             };
-            format!(
-                "⚠️ Approval required [#{}]\nCommand: `{}`\nReason: {}\n\nReply `/approve`, `/approve session`, `/approve always`, or `/deny`.\nYou can also reply with plain text like `approve session`.\n\nFull command:\n```sh\n{}\n```",
-                view.id, command, reason_text, full_command
-            )
+            let is_preview =
+                matches!(kind, edgecrab_tools::registry::ApprovalKind::PreviewLoopback);
+            if is_preview {
+                format!(
+                    "⚠️ Preview access required [#{}]\nAllow browser_navigate to `{}`?\nReason: {}\n\nReply `/approve`, `/approve session`, `/approve always`, or `/deny`.\nYou can also reply with plain text like `approve session`.\n\nURL:\n```\n{}\n```",
+                    view.id, command, reason_text, full_command
+                )
+            } else {
+                format!(
+                    "⚠️ Approval required [#{}]\nCommand: `{}`\nReason: {}\n\nReply `/approve`, `/approve session`, `/approve always`, or `/deny`.\nYou can also reply with plain text like `approve session`.\n\nFull command:\n```sh\n{}\n```",
+                    view.id, command, reason_text, full_command
+                )
+            }
         }
         PendingInteractionKind::Clarify { question, choices } => {
             let mut text = format!("❓ Clarification needed [#{}]\n{}", view.id, question);
@@ -627,6 +637,7 @@ impl GatewayEventProcessor {
                     command,
                     full_command,
                     reasons,
+                    kind,
                     response_tx,
                 } => {
                     let view = self
@@ -636,6 +647,7 @@ impl GatewayEventProcessor {
                             command,
                             full_command,
                             reasons,
+                            kind,
                             response_tx,
                         )
                         .await;
@@ -1169,6 +1181,7 @@ mod tests {
                 command: "rm -rf /tmp/demo".into(),
                 full_command: "rm -rf /tmp/demo".into(),
                 reasons: vec!["destructive-file-ops".into()],
+                kind: edgecrab_tools::registry::ApprovalKind::Terminal,
                 response_tx,
             })
             .unwrap();
