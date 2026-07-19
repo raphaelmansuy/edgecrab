@@ -96,10 +96,41 @@ pub struct HarnessConfig {
     /// (`NeedsVerification`) — July 2026 pre-completion checklist (armed default).
     #[serde(default = "default_verify_on_stop")]
     pub verify_on_stop: bool,
+    /// Evidence latch graph (019) — preview/perceive thrash bounds.
+    #[serde(default = "default_true")]
+    pub evidence_latches: bool,
+    /// Max verify-phase tools after artifact latch (019 FP7).
+    #[serde(default = "default_verify_tool_budget")]
+    pub verify_tool_budget: u32,
+    /// Exact fingerprint thrash limit before block (019 FP5).
+    #[serde(default = "default_thrash_fingerprint_limit")]
+    pub thrash_fingerprint_limit: u32,
+    /// Exclusive Heal re-serves after content-failed preview (022 deadlock break).
+    #[serde(default = "default_heal_budget")]
+    pub heal_budget: u32,
+    /// Browser tools allowed after Perceive Ok (0 = hard stop thrash).
+    #[serde(default = "default_post_perceive_browser_budget")]
+    pub post_perceive_browser_budget: u32,
 }
 
 fn default_verify_on_stop() -> bool {
     true
+}
+
+fn default_verify_tool_budget() -> u32 {
+    12
+}
+
+fn default_thrash_fingerprint_limit() -> u32 {
+    3
+}
+
+fn default_heal_budget() -> u32 {
+    1
+}
+
+fn default_post_perceive_browser_budget() -> u32 {
+    0
 }
 
 impl Default for HarnessConfig {
@@ -108,6 +139,24 @@ impl Default for HarnessConfig {
             verification_strict: false,
             guardrails_hard_stop: true,
             verify_on_stop: true,
+            evidence_latches: true,
+            verify_tool_budget: default_verify_tool_budget(),
+            thrash_fingerprint_limit: default_thrash_fingerprint_limit(),
+            heal_budget: default_heal_budget(),
+            post_perceive_browser_budget: default_post_perceive_browser_budget(),
+        }
+    }
+}
+
+impl HarnessConfig {
+    /// Build evidence latch config from harness settings.
+    pub fn evidence_latch_config(&self) -> crate::evidence_latch::EvidenceLatchConfig {
+        crate::evidence_latch::EvidenceLatchConfig {
+            enabled: self.evidence_latches,
+            verify_tool_budget: self.verify_tool_budget,
+            thrash_fingerprint_limit: self.thrash_fingerprint_limit,
+            heal_budget: self.heal_budget,
+            post_perceive_browser_budget: self.post_perceive_browser_budget,
         }
     }
 }
@@ -335,10 +384,19 @@ impl AppConfig {
         Ok(config)
     }
 
-    /// Apply security runtime hooks (preview SSRF allowlist, etc.).
+    /// Apply security runtime hooks (preview SSRF allowlist, browser launch, etc.).
     pub fn apply_security_runtime(&self) {
         edgecrab_security::url_safety::set_preview_policy(
             self.security.preview.to_preview_policy(),
+        );
+        // Browser launch law: software GL + loopback proxy bypass (FP localhost vs CDP).
+        edgecrab_tools::tools::browser::set_browser_launch_policy(
+            edgecrab_tools::tools::browser::BrowserLaunchPolicy {
+                headless_gpu: edgecrab_tools::tools::browser::HeadlessGpuMode::parse(
+                    &self.browser.headless_gpu,
+                ),
+                proxy_bypass_loopback: self.browser.proxy_bypass_loopback,
+            },
         );
     }
 
@@ -2601,6 +2659,24 @@ pub struct BrowserConfig {
     pub command_timeout: u64,
     /// Auto-cleanup recordings older than this many hours. Default: 72h.
     pub recording_max_age_hours: u64,
+    /// Headless GPU for auto-launched CDP Chrome: `software` (default, WebGL) or `disable`.
+    ///
+    /// First principle: external GUI browsers have GPU; headless with `--disable-gpu`
+    /// yields blank Three.js canvases while the operator sees a working game.
+    #[serde(default = "default_browser_headless_gpu")]
+    pub headless_gpu: String,
+    /// When a system/env proxy is set, bypass loopback for Chrome (default true).
+    /// Aligns CDP with reqwest's loopback-direct law.
+    #[serde(default = "default_true_browser")]
+    pub proxy_bypass_loopback: bool,
+}
+
+fn default_browser_headless_gpu() -> String {
+    "software".into()
+}
+
+fn default_true_browser() -> bool {
+    true
 }
 
 impl Default for BrowserConfig {
@@ -2609,6 +2685,8 @@ impl Default for BrowserConfig {
             record_sessions: false,
             command_timeout: 30,
             recording_max_age_hours: 72,
+            headless_gpu: default_browser_headless_gpu(),
+            proxy_bypass_loopback: true,
         }
     }
 }

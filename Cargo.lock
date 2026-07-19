@@ -2099,6 +2099,7 @@ dependencies = [
  "edgecrab-types",
  "edgequake-llm",
  "flate2",
+ "futures",
  "libc",
  "rand 0.9.4",
  "ratatui",

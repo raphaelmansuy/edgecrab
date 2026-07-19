@@ -958,6 +958,7 @@ pub enum ToolsCommand {
 }
 
 #[derive(Subcommand, Debug, Clone)]
+#[allow(clippy::large_enum_variant)] // clap subcommands carry their own option bags
 pub enum McpCommand {
     /// List configured MCP servers
     List,
@@ -1004,12 +1005,53 @@ pub enum McpCommand {
         /// Configured MCP server name
         name: String,
     },
-    /// Add or update an MCP server
+    /// Add or update an MCP server (stdio command or HTTP URL + optional OAuth)
+    ///
+    /// Examples:
+    ///   edgecrab mcp add linear --url https://mcp.example.com/mcp --auth oauth
+    ///   edgecrab mcp add acme --url https://mcp.example.com/mcp --auth bearer --token "$TOKEN"
+    ///   edgecrab mcp add github --command npx --args -y @modelcontextprotocol/server-github
+    ///   edgecrab mcp add github npx -y @modelcontextprotocol/server-github   (legacy)
     Add {
+        /// Configured server name (letters, digits, '-', '_', '.')
         name: String,
-        command: String,
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        /// HTTP MCP endpoint (mutually exclusive with --command / legacy CMD)
+        #[arg(long)]
+        url: Option<String>,
+        /// Auth for HTTP: oauth | bearer | none | auto (default auto)
+        #[arg(long, default_value = "auto")]
+        auth: String,
+        /// Bearer access token (stored in mcp-tokens/, not yaml when possible)
+        #[arg(long)]
+        token: Option<String>,
+        /// OAuth token endpoint (recommended with --auth oauth)
+        #[arg(long)]
+        token_url: Option<String>,
+        #[arg(long)]
+        client_id: Option<String>,
+        #[arg(long)]
+        client_secret: Option<String>,
+        #[arg(long)]
+        device_authorization_url: Option<String>,
+        #[arg(long)]
+        authorization_url: Option<String>,
+        #[arg(long)]
+        redirect_url: Option<String>,
+        /// OAuth scopes (repeatable)
+        #[arg(long = "scope")]
+        scopes: Vec<String>,
+        /// Allow loopback/private MCP URLs (still subject to SSRF policy helpers)
+        #[arg(long, default_value_t = false)]
+        allow_loopback: bool,
+        /// Stdio command (e.g. npx)
+        #[arg(long)]
+        command: Option<String>,
+        /// Stdio args (use after --command)
+        #[arg(long, num_args = 0.., allow_hyphen_values = true)]
         args: Vec<String>,
+        /// Legacy positional: CMD [ARGS...] when --url/--command omitted
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        rest: Vec<String>,
     },
     /// Remove an MCP server
     #[command(visible_aliases = ["uninstall", "rm"])]
@@ -2031,6 +2073,43 @@ mod tests {
                 command: McpCommand::Add { .. }
             })
         ));
+    }
+
+    #[test]
+    fn parse_mcp_add_url_oauth_subcommand() {
+        let args = CliArgs::parse_from([
+            "edgecrab",
+            "mcp",
+            "add",
+            "linear",
+            "--url",
+            "https://mcp.example.com/mcp",
+            "--auth",
+            "oauth",
+            "--token-url",
+            "https://auth.example.com/token",
+        ]);
+        match args.command {
+            Some(Command::Mcp {
+                command:
+                    McpCommand::Add {
+                        name,
+                        url,
+                        auth,
+                        token_url,
+                        ..
+                    },
+            }) => {
+                assert_eq!(name, "linear");
+                assert_eq!(url.as_deref(), Some("https://mcp.example.com/mcp"));
+                assert_eq!(auth, "oauth");
+                assert_eq!(
+                    token_url.as_deref(),
+                    Some("https://auth.example.com/token")
+                );
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 
     #[test]

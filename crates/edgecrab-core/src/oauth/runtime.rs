@@ -2,6 +2,7 @@
 
 use super::anthropic::resolve_anthropic_oauth_access_token;
 use super::codex::{DEFAULT_CODEX_BASE_URL, resolve_codex_access_token};
+use super::{is_xai_oauth_alias, XAI_OAUTH_PROVIDER};
 
 fn env_nonempty(key: &str) -> bool {
     std::env::var(key)
@@ -16,6 +17,20 @@ fn anthropic_key_from_env() -> bool {
 fn openai_key_from_env() -> bool {
     env_nonempty("OPENAI_API_KEY")
 }
+
+/// True when the model provider segment needs xAI Grok credentials (key or OAuth).
+///
+/// Covers: `xai`, `grok`, `super-grok`, and OAuth aliases.
+pub fn provider_needs_xai_credentials(provider: &str) -> bool {
+    let p = provider.to_ascii_lowercase();
+    matches!(p.as_str(), "xai" | "grok" | "super-grok" | "super_grok")
+        || is_xai_oauth_alias(&p)
+}
+
+/// Env flag set when `XAI_API_KEY` was injected from SuperGrok OAuth (not a static key).
+pub const EDGECRAB_XAI_AUTH_MODE_ENV: &str = "EDGECRAB_XAI_AUTH_MODE";
+pub const EDGECRAB_XAI_AUTH_MODE_OAUTH: &str = "oauth";
+pub const EDGECRAB_XAI_AUTH_MODE_KEY: &str = "api_key";
 
 /// Set `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` from OAuth stores when env is unset.
 pub async fn inject_subscription_oauth_env(provider: &str) -> Result<(), String> {
@@ -36,9 +51,22 @@ pub async fn inject_subscription_oauth_env(provider: &str) -> Result<(), String>
                 unsafe { std::env::set_var("OPENAI_API_KEY", token) };
             }
         }
+        // xAI is handled by CLI/gateway `prepare_xai_credentials` (needs proxy refresh).
+        _ if provider_needs_xai_credentials(&canonical) => {}
         _ => {}
     }
+    let _ = XAI_OAUTH_PROVIDER; // keep symbol used for docs/callers
     Ok(())
+}
+
+/// Classify current process xAI auth mode for TUI/status (deterministic).
+pub fn xai_auth_mode_label() -> &'static str {
+    match std::env::var(EDGECRAB_XAI_AUTH_MODE_ENV).as_deref() {
+        Ok(EDGECRAB_XAI_AUTH_MODE_OAUTH) => "oauth",
+        Ok(EDGECRAB_XAI_AUTH_MODE_KEY) => "api_key",
+        _ if env_nonempty("XAI_API_KEY") => "api_key",
+        _ => "missing",
+    }
 }
 
 /// Map Codex OAuth bearer into `openai-compatible` env vars (edgequake-llm factory).

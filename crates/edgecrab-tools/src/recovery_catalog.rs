@@ -590,6 +590,7 @@ pub fn browser_navigate_port_heal(url: &str, port: u16, serve_directory: &str) -
                 RecoveryAction::CallToolFirst,
                 json!({
                     "tool": "terminal",
+                    // 019: no free alternate port (prevents shopping thrash).
                     "steps": [
                         {
                             "command": format!(
@@ -597,22 +598,17 @@ pub fn browser_navigate_port_heal(url: &str, port: u16, serve_directory: &str) -
                                  python3 -m http.server {port} --directory {dir}"
                             ),
                             "background": true,
-                            "note": "free the port then restart preview server"
+                            "note": "free the port then restart preview server on the same port only"
                         },
                         {
                             "tool": "browser_navigate",
                             "url": format!("http://127.0.0.1:{port}/")
                         }
                     ],
-                    "alternate": {
-                        "command": format!(
-                            "python3 -m http.server 8010 --directory {dir}"
-                        ),
-                        "background": true,
-                        "then_navigate": "http://127.0.0.1:8010/",
-                        "note": "if kill is unavailable, bind a free port and navigate there"
-                    },
-                    "forbidden": ["navigate before Serving HTTP… ready"]
+                    "forbidden": [
+                        "navigate before Serving HTTP… ready",
+                        "start http.server on a different port"
+                    ]
                 }),
             )
             .build(),

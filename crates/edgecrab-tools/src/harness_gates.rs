@@ -245,7 +245,7 @@ fn mutated_paths_for_oracles(records: Vec<MutationRecord>) -> Vec<String> {
 fn run_post_mutation_oracles(cwd: &Path, paths: &[String]) -> Vec<OracleGateFailure> {
     let mut failures = Vec::new();
     for path in paths {
-        let Some(command) = oracle_command_for_path(path) else {
+        let Some(command) = oracle_command_for_path(cwd, path) else {
             continue;
         };
         let full_path = cwd.join(path);
@@ -256,12 +256,102 @@ fn run_post_mutation_oracles(cwd: &Path, paths: &[String]) -> Vec<OracleGateFail
     failures
 }
 
-fn oracle_command_for_path(path: &str) -> Option<&'static str> {
-    let path = Path::new(path);
-    match path.extension().and_then(|e| e.to_str()) {
-        Some("js") | Some("mjs") | Some("cjs") => Some("node --check"),
+/// Class-aware oracle selection (019 Wave A / FP3).
+///
+/// - `.cjs` → always `node --check`
+/// - Browser ESM (importmap peer HTML, or demos/** with ESM imports) → **skip**
+/// - Other `.js`/`.mjs` → `node --check` when file is Node-shaped
+///
+/// Public for unit tests and evidence_latch diagnostics.
+pub fn oracle_command_for_path(cwd: &Path, path: &str) -> Option<&'static str> {
+    let p = Path::new(path);
+    let ext = p.extension().and_then(|e| e.to_str())?;
+    match ext {
+        "cjs" => Some("node --check"),
+        "js" | "mjs" => {
+            if is_browser_esm_artifact(cwd, path) {
+                None
+            } else {
+                Some("node --check")
+            }
+        }
         _ => None,
     }
+}
+
+/// Deterministic browser-ESM detection — no flaky path vibes alone.
+///
+/// True when:
+/// 1. Peer HTML in the same directory contains `<script type="importmap">` and
+///    references this file's basename, **or**
+/// 2. Path is under `demos/` (or `demo/`) AND file body starts with ESM import/export.
+pub fn is_browser_esm_artifact(cwd: &Path, rel_path: &str) -> bool {
+    let full = cwd.join(rel_path);
+    if !full.is_file() {
+        return false;
+    }
+    // .cjs is never browser-skip (caller already filters).
+    if rel_path.ends_with(".cjs") {
+        return false;
+    }
+
+    let basename = Path::new(rel_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(rel_path);
+
+    if let Some(dir) = full.parent()
+        && let Ok(entries) = std::fs::read_dir(dir)
+    {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let lower = name.to_ascii_lowercase();
+            if !(lower.ends_with(".html") || lower.ends_with(".htm")) {
+                continue;
+            }
+            let Ok(html) = std::fs::read_to_string(entry.path()) else {
+                continue;
+            };
+            let html_l = html.to_ascii_lowercase();
+            if html_l.contains("type=\"importmap\"") || html_l.contains("type='importmap'") {
+                // Importmap present — treat sibling modules as browser ESM.
+                if html.contains(basename)
+                    || html_l.contains(&basename.to_ascii_lowercase())
+                    || html_l.contains("type=\"module\"")
+                {
+                    return true;
+                }
+            }
+            // type=module src="game.js"
+            if html_l.contains("type=\"module\"") && html.contains(basename) {
+                return true;
+            }
+        }
+    }
+
+    let under_demos = {
+        let norm = rel_path.replace('\\', "/").to_ascii_lowercase();
+        norm.contains("/demos/")
+            || norm.starts_with("demos/")
+            || norm.contains("/demo/")
+            || norm.starts_with("demo/")
+    };
+    if under_demos {
+        if let Ok(body) = std::fs::read_to_string(&full) {
+            let head: String = body.chars().take(512).collect();
+            let trimmed = head.trim_start();
+            if trimmed.starts_with("import ")
+                || trimmed.starts_with("export ")
+                || trimmed.contains("\nimport ")
+                || trimmed.contains("\nexport ")
+            {
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 fn run_oracle(display_path: &str, full_path: &PathBuf, command: &str) -> Option<OracleGateFailure> {
@@ -411,6 +501,71 @@ mod tests {
         });
         assert!(snapshot.oracle_failures.is_empty());
         assert!(!snapshot.blocks_completion());
+    }
+
+    #[test]
+    fn nf_u3_browser_esm_with_importmap_skips_node_check() {
+        let dir = TempDir::new().expect("tempdir");
+        fs::write(
+            dir.path().join("index.html"),
+            r#"<!DOCTYPE html><script type="importmap">{"imports":{"three":"https://x/three.js"}}</script>
+<script type="module" src="game.js"></script>"#,
+        )
+        .expect("html");
+        fs::write(
+            dir.path().join("game.js"),
+            "import * as THREE from 'three';\nexport const x = 1;\n",
+        )
+        .expect("js");
+        assert!(is_browser_esm_artifact(dir.path(), "game.js"));
+        assert!(oracle_command_for_path(dir.path(), "game.js").is_none());
+
+        let turn = MutationTurnState::new();
+        turn.push_success(crate::mutations::MutationRecord {
+            path: "game.js".into(),
+            kind: crate::mutations::MutationKind::Add,
+            lines_added: 2,
+            lines_removed: 0,
+        });
+        let snapshot = build_harness_snapshot(HarnessBuildInput {
+            messages: &[],
+            mutation_turn: &turn,
+            cwd: dir.path(),
+            post_mutation_oracles: true,
+            advisory: HarnessAdvisorySignals::default(),
+            unanswered_tool_calls: 0,
+        });
+        assert!(
+            snapshot.oracle_failures.is_empty(),
+            "browser ESM must not fail node --check: {:?}",
+            snapshot.oracle_failures
+        );
+    }
+
+    #[test]
+    fn nf_u4_cjs_still_runs_node_check() {
+        let dir = TempDir::new().expect("tempdir");
+        fs::write(dir.path().join("lib.cjs"), "const x = ;\n").expect("write");
+        assert_eq!(
+            oracle_command_for_path(dir.path(), "lib.cjs"),
+            Some("node --check")
+        );
+        let turn = MutationTurnState::new();
+        turn.push_success(crate::mutations::MutationRecord {
+            path: "lib.cjs".into(),
+            kind: crate::mutations::MutationKind::Modify,
+            lines_added: 1,
+            lines_removed: 0,
+        });
+        let snapshot = build_harness_snapshot(HarnessBuildInput {
+            messages: &[],
+            mutation_turn: &turn,
+            cwd: dir.path(),
+            post_mutation_oracles: true,
+            advisory: HarnessAdvisorySignals::default(),
+            unanswered_tool_calls: 0,
+        });
+        assert_eq!(snapshot.oracle_failures.len(), 1);
     }
 
     #[test]

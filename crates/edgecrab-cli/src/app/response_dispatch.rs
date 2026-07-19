@@ -619,18 +619,14 @@ impl App {
                                 self.push_output_spans(line, OutputRole::Tool);
                             }
                         }
-                        if let Some(diff_lines) = render_edit_diff_lines(
+                        self.push_edit_presentation(
                             &name,
                             &resolved_args,
                             is_error,
                             pending
                                 .as_ref()
                                 .and_then(|entry| entry.edit_snapshot.as_ref()),
-                        ) {
-                            for line in diff_lines {
-                                self.push_output_spans(line, OutputRole::Tool);
-                            }
-                        }
+                        );
                         if name == "report_task_status"
                             && !is_error
                             && let Some(preview) = result_preview
@@ -1104,21 +1100,50 @@ impl App {
                             self.update_context_window();
                             let confirmation =
                                 edgecrab_core::format_model_change_confirmation(&outcome);
+                            let auth_note = if outcome.to_model().starts_with("super-grok/") {
+                                match edgecrab_core::oauth::xai_auth_mode_label() {
+                                    "oauth" => "\n\nAuth: SuperGrok OAuth (subscription).",
+                                    "api_key" => "\n\nAuth: xAI API key (console).",
+                                    _ => "",
+                                }
+                            } else {
+                                ""
+                            };
                             match persist_model_to_config(outcome.to_model()) {
                                 Ok(()) => self.push_output(
                                     format!(
-                                        "{confirmation}\n\nSaved as default model for next run."
+                                        "{confirmation}{auth_note}\n\nSaved as default model for next run."
                                     ),
                                     OutputRole::System,
                                 ),
                                 Err(e) => self.push_output(
                                     format!(
-                                        "{confirmation}\n\n(warning: failed to save default: {e})"
+                                        "{confirmation}{auth_note}\n\n(warning: failed to save default: {e})"
                                     ),
                                     OutputRole::System,
                                 ),
                             }
                         }
+                        BackgroundOpResult::SuperGrokLoginNeeded { pending_model } => {
+                            self.pending_model_after_grok_login = Some(pending_model.clone());
+                            self.push_output(
+                                format!(
+                                    "SuperGrok is not signed in yet.\n\
+                                     Opening /login grok — after you finish, EdgeCrab switches to {pending_model} automatically."
+                                ),
+                                OutputRole::System,
+                            );
+                            self.open_grok_auth_overlay(
+                                crate::grok_auth_tui::GrokAuthScreen::Start,
+                            );
+                        }
+                        BackgroundOpResult::GrokAuthFinishDone {
+                            result,
+                            restore_code,
+                        } => match result {
+                            Ok(msg) => self.apply_grok_auth_finish_success(msg),
+                            Err(err) => self.apply_grok_auth_finish_error(err, restore_code),
+                        },
                         BackgroundOpResult::SessionHandoffDone { message } => {
                             self.push_output(message, OutputRole::System);
                             self.should_exit = true;

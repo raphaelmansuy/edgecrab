@@ -233,15 +233,22 @@ pub async fn exchange_authorization_code(
             "xAI token exchange: PKCE code_verifier is empty".into(),
         ));
     }
+    // RFC 7636 token request: grant_type, code, redirect_uri, client_id, code_verifier.
+    // Do NOT send code_challenge on the token endpoint (authorization only) — some
+    // OIDC servers reject or hang on unknown form fields.
+    let _ = code_challenge;
     let form = vec![
         ("grant_type", "authorization_code"),
         ("code", code),
         ("redirect_uri", redirect_uri),
         ("client_id", XAI_OAUTH_CLIENT_ID),
         ("code_verifier", code_verifier),
-        ("code_challenge", code_challenge),
-        ("code_challenge_method", "S256"),
     ];
+    tracing::debug!(
+        %token_endpoint,
+        code_len = code.len(),
+        "xAI token exchange starting"
+    );
     let resp = client
         .post(token_endpoint)
         .header("Content-Type", "application/x-www-form-urlencoded")
@@ -266,6 +273,7 @@ pub async fn exchange_authorization_code(
             status.as_u16()
         )));
     }
+    tracing::info!(status = status.as_u16(), "xAI token exchange OK");
     serde_json::from_str(&body)
         .map_err(|e| ProxyError::UpstreamAuth(format!("xai token exchange JSON: {e}")))
 }
@@ -682,8 +690,8 @@ pub async fn finish_xai_oauth_login(
         None => read_pasted_code_from_stdin()?,
     };
     let callback = parse_manual_callback_url(&normalized, &pending.redirect_uri)?;
+    // Keep pending file until tokens are persisted so a failed write can retry.
     let state = exchange_pending_session(&client, &discovery, &pending, callback).await?;
-    clear_pending_session(&path);
     Ok(state)
 }
 
@@ -696,10 +704,15 @@ pub async fn login_xai_oauth_finish(
     let path = auth_path
         .map(Path::to_path_buf)
         .unwrap_or_else(default_auth_path);
-    let state = finish_xai_oauth_login(code, pending_path, opts).await?;
+    let pending_file = pending_path
+        .map(Path::to_path_buf)
+        .unwrap_or_else(default_xai_pending_path);
+    let state = finish_xai_oauth_login(code, Some(&pending_file), opts).await?;
     persist_xai_oauth(&path, state).await?;
+    clear_pending_session(&pending_file);
     Ok(format!(
-        "xAI Grok OAuth saved to {}. Start proxy: edgecrab proxy enable grok && edgecrab proxy start --provider xai",
+        "SuperGrok OAuth saved to {}.\n\
+         Use /model super-grok/grok-4.5 or restart with that default.",
         path.display()
     ))
 }
@@ -809,10 +822,13 @@ pub async fn login_xai_oauth(
     let path = auth_path
         .map(Path::to_path_buf)
         .unwrap_or_else(default_auth_path);
+    let pending_file = default_xai_pending_path();
     let state = xai_oauth_login(opts).await?;
     persist_xai_oauth(&path, state).await?;
+    clear_pending_session(&pending_file);
     Ok(format!(
-        "xAI Grok OAuth saved to {}. Start proxy: edgecrab proxy enable grok && edgecrab proxy start --provider xai",
+        "SuperGrok OAuth saved to {}.\n\
+         Use /model super-grok/grok-4.5 or restart with that default.",
         path.display()
     ))
 }
@@ -877,10 +893,9 @@ mod tests {
                         Some("authorization_code")
                     );
                     assert!(form.contains_key("code_verifier"));
-                    assert_eq!(
-                        form.get("code_challenge_method").map(String::as_str),
-                        Some("S256")
-                    );
+                    // Token endpoint must not require authorization-only PKCE fields.
+                    assert!(!form.contains_key("code_challenge"));
+                    assert!(!form.contains_key("code_challenge_method"));
                     (
                         axum::http::StatusCode::OK,
                         axum::Json(serde_json::json!({

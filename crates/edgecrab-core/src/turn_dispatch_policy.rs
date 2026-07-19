@@ -20,13 +20,159 @@ pub fn pre_dispatch_decision(
     args_json: &str,
     session_id: &str,
 ) -> Option<String> {
-    if let Some(blocked) = visual_storm_block_result_with_args(
+    // 022: Escalated / hard-stop — refuse thrash tools with allowed-action message only.
+    if trackers.evidence.should_hard_stop()
+        && matches!(
+            tool_name,
+            "browser_navigate"
+                | "browser_snapshot"
+                | "browser_vision"
+                | "browser_click"
+                | "browser_get_images"
+                | "browser_console"
+                | "tool_search"
+                | "terminal"
+                | "run_process"
+                | "execute_code"
+        )
+    {
+        // Still allow non-preview terminal? No — hard stop all verify thrash.
+        let msg = trackers.evidence.allowed_action_message();
+        return Some(edgecrab_tools::tool_loop_guardrails::guardrail_block_result(
+            &edgecrab_tools::tool_loop_guardrails::ToolGuardrailDecision {
+                action: edgecrab_tools::tool_loop_guardrails::GuardrailAction::Halt,
+                code: "evidence_escalated_halt",
+                message: if msg.is_empty() {
+                    "Halted — evidence verification escalated or verify budget exhausted."
+                        .into()
+                } else {
+                    msg
+                },
+                tool_name: tool_name.to_string(),
+                count: trackers.evidence.verify_tools,
+            },
+        ));
+    }
+
+    // 022 Heal: exclusive terminal policy (allow re-serve / port aux only).
+    if matches!(tool_name, "terminal" | "run_process")
+        && let Some(cmd) = edgecrab_tools::dev_server::command_from_tool_args_json(args_json)
+    {
+        match trackers.evidence.terminal_heal_policy(&cmd) {
+            Some(true) => {
+                // Force-allow heal recipe — skip latch + storm blocks below via early continue.
+            }
+            Some(false) => {
+                let msg = trackers.evidence.allowed_action_message();
+                return Some(edgecrab_tools::tool_loop_guardrails::guardrail_block_result(
+                    &edgecrab_tools::tool_loop_guardrails::ToolGuardrailDecision {
+                        action: edgecrab_tools::tool_loop_guardrails::GuardrailAction::Block,
+                        code: "heal_phase_exclusive",
+                        message: if msg.is_empty() {
+                            "Blocked — Heal phase only allows the latched-port re-serve command."
+                                .into()
+                        } else {
+                            msg
+                        },
+                        tool_name: tool_name.to_string(),
+                        count: 1,
+                    },
+                ));
+            }
+            None => {}
+        }
+    }
+
+    // 019/022: thrash or post-success latch blocks browser tools.
+    if trackers.evidence.blocks_browser_tools()
+        && matches!(
+            tool_name,
+            "browser_navigate"
+                | "browser_snapshot"
+                | "browser_vision"
+                | "browser_click"
+                | "browser_get_images"
+                | "browser_console"
+                | "tool_search"
+        )
+    {
+        let msg = trackers.evidence.allowed_action_message();
+        return Some(edgecrab_tools::tool_loop_guardrails::guardrail_block_result(
+            &edgecrab_tools::tool_loop_guardrails::ToolGuardrailDecision {
+                action: edgecrab_tools::tool_loop_guardrails::GuardrailAction::Block,
+                code: if trackers.evidence.assess_snapshot().latched_done {
+                    "post_perceive_browser_block"
+                } else {
+                    "evidence_thrash_blocked"
+                },
+                message: if msg.is_empty() {
+                    "Blocked — browser tools not allowed in current evidence phase."
+                        .into()
+                } else {
+                    msg
+                },
+                tool_name: tool_name.to_string(),
+                count: trackers.evidence.verify_tools,
+            },
+        ));
+    }
+    // Content-qualified PreviewLatch forbids re-serve (Heal exempt via blocks_preview_serve).
+    if matches!(tool_name, "terminal" | "run_process")
+        && let Some(cmd) = edgecrab_tools::dev_server::command_from_tool_args_json(args_json)
+        && edgecrab_tools::dev_server::is_preview_server_command(&cmd)
+        && trackers.evidence.terminal_heal_policy(&cmd) != Some(true)
+    {
+        if let Some(port) = edgecrab_tools::dev_server::collect_http_server_ports(
+            std::iter::once(cmd.as_str()),
+        )
+        .into_iter()
+        .next()
+        {
+            let dir = edgecrab_tools::recovery_catalog::infer_preview_serve_directory_from_text(&cmd);
+            if trackers
+                .evidence
+                .blocks_preview_serve(port, std::path::Path::new(&dir))
+            {
+                let msg = trackers.evidence.allowed_action_message();
+                return Some(edgecrab_tools::tool_loop_guardrails::guardrail_block_result(
+                    &edgecrab_tools::tool_loop_guardrails::ToolGuardrailDecision {
+                        action: edgecrab_tools::tool_loop_guardrails::GuardrailAction::Block,
+                        code: "preview_latch_block",
+                        message: if msg.is_empty() {
+                            format!(
+                                "Blocked — content-qualified preview already latched. \
+                                 Use the latched URL only; do not start another http.server on port {port}."
+                            )
+                        } else {
+                            msg
+                        },
+                        tool_name: tool_name.to_string(),
+                        count: 1,
+                    },
+                ));
+            }
+        }
+    }
+    // Visual storm: skip when Heal forces allow, or when latched done.
+    if trackers.evidence.assess_snapshot().latched_done
+        || trackers.evidence.assess_snapshot().in_heal
+    {
+        // Heal: storm must not re-block allowed re-serve.
+    } else if let Some(blocked) = visual_storm_block_result_with_args(
         trackers.harness_advisory,
         messages,
         tool_name,
         args_json,
     ) {
-        return Some(blocked);
+        // If Heal policy would allow, don't storm-block.
+        if matches!(tool_name, "terminal" | "run_process")
+            && let Some(cmd) = edgecrab_tools::dev_server::command_from_tool_args_json(args_json)
+            && trackers.evidence.terminal_heal_policy(&cmd) == Some(true)
+        {
+            // allow
+        } else {
+            return Some(blocked);
+        }
     }
     let class = crate::task_class::classify_from_messages(messages);
     let session_ports = if session_id.is_empty() {
@@ -312,8 +458,9 @@ mod tests {
         let view = TurnDispatchTrackersView {
             harness_advisory: &trackers.harness_advisory,
             tool_guardrail: &trackers.tool_guardrail,
+            evidence: &trackers.evidence,
         };
-        let messages = vec![Message::user("make demo/games003/index.html beautiful UX")];
+        let messages = vec![Message::user("make demo/game003/index.html beautiful UX")];
         let blocked = pre_dispatch_decision(
             &view,
             &messages,

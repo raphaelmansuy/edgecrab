@@ -451,59 +451,116 @@ providers:
         context: 131072
         tier: standard
 
-  # ─── xAI ─────────────────────────────────────────────────────────
+  # ─── xAI (API key · console.x.ai) ────────────────────────────────
+  # Static XAI_API_KEY. For SuperGrok subscription OAuth, pick `super-grok/*`.
   xai:
-    label: "xAI"
-    default_model: "grok-4.20-beta"
+    label: "xAI · API key"
+    default_model: "grok-4.5"
     models:
-      - model: "grok-2-vision-1212"
-        context: 32000
-        tier: standard
-        pricing: { input: 2.0, output: 10.0 }
-      - model: "grok-3"
-        context: 131000
-        tier: standard
-        pricing: { input: 3.0, output: 15.0 }
-      - model: "grok-3-mini"
-        context: 131000
+      # Active flagships (docs.x.ai, July 2026)
+      - model: "grok-4.5"
+        context: 500000
+        tier: reasoning
+        pricing: { input: 2.0, output: 6.0 }
+      - model: "grok-4.5-latest"
+        context: 500000
+        tier: reasoning
+        pricing: { input: 2.0, output: 6.0 }
+      - model: "grok-4.3"
+        context: 1000000
+        tier: reasoning
+        pricing: { input: 1.25, output: 2.50 }
+      - model: "grok-4.3-latest"
+        context: 1000000
+        tier: reasoning
+        pricing: { input: 1.25, output: 2.50 }
+      - model: "grok-build-0.1"
+        context: 256000
         tier: fast
-        pricing: { input: 0.30, output: 0.50 }
+        pricing: { input: 1.0, output: 2.0 }
+      - model: "grok-4.20-0309-reasoning"
+        context: 1000000
+        tier: reasoning
+        pricing: { input: 1.25, output: 2.50 }
+      - model: "grok-4.20-0309-non-reasoning"
+        context: 1000000
+        tier: standard
+        pricing: { input: 1.25, output: 2.50 }
+      - model: "grok-latest"
+        context: 500000
+        tier: reasoning
+        pricing: { input: 2.0, output: 6.0 }
+      # Legacy aliases (API redirects; kept for old configs)
+      - model: "grok-4.20-beta"
+        context: 1000000
+        tier: reasoning
       - model: "grok-4"
-        context: 131000
+        context: 1000000
         tier: standard
-        pricing: { input: 3.0, output: 15.0 }
       - model: "grok-4-latest"
-        context: 131000
+        context: 1000000
         tier: standard
-        pricing: { input: 3.0, output: 15.0 }
       - model: "grok-4-1-fast"
-        context: 2000000
+        context: 1000000
         tier: fast
-        pricing: { input: 0.60, output: 2.40 }
       - model: "grok-code-fast-1"
         context: 131000
         tier: fast
-        pricing: { input: 0.15, output: 0.60 }
-      - model: "grok-4.20-beta"
-        context: 2000000
-        tier: reasoning
+      - model: "grok-3"
+        context: 1000000
+        tier: standard
+      - model: "grok-3-mini"
+        context: 131000
+        tier: fast
+      - model: "grok-2-vision-1212"
+        context: 32000
+        tier: standard
 
   # ─── SuperGrok (xAI OAuth subscription) ──────────────────────────
-  # Uses `edgecrab auth add grok` credentials from ~/.edgecrab/auth.json.
-  # This provider is intentionally separate from `xai` (API-key flow) so users
-  # can explicitly choose subscription-backed routing in the model picker.
+  # Uses `edgecrab auth add grok` / `/login grok` → ~/.edgecrab/auth.json (xai-oauth).
+  # Separate from `xai` (API-key) so the model picker clearly offers subscription routing.
+  # Same model IDs as xAI chat API; runtime maps super-grok → xai transport + OAuth bearer.
   super-grok:
-    label: "SuperGrok (OAuth)"
-    default_model: "grok-4.20-beta"
+    label: "SuperGrok · OAuth"
+    default_model: "grok-4.5"
     models:
+      - model: "grok-4.5"
+        context: 500000
+        tier: reasoning
+        pricing: { input: 2.0, output: 6.0 }
+      - model: "grok-4.5-latest"
+        context: 500000
+        tier: reasoning
+        pricing: { input: 2.0, output: 6.0 }
+      - model: "grok-4.3"
+        context: 1000000
+        tier: reasoning
+        pricing: { input: 1.25, output: 2.50 }
+      - model: "grok-4.3-latest"
+        context: 1000000
+        tier: reasoning
+        pricing: { input: 1.25, output: 2.50 }
+      - model: "grok-build-0.1"
+        context: 256000
+        tier: fast
+        pricing: { input: 1.0, output: 2.0 }
+      - model: "grok-4.20-0309-reasoning"
+        context: 1000000
+        tier: reasoning
+      - model: "grok-4.20-0309-non-reasoning"
+        context: 1000000
+        tier: standard
+      - model: "grok-latest"
+        context: 500000
+        tier: reasoning
       - model: "grok-4.20-beta"
-        context: 2000000
+        context: 1000000
         tier: reasoning
       - model: "grok-4"
-        context: 131000
+        context: 1000000
         tier: standard
       - model: "grok-4-1-fast"
-        context: 2000000
+        context: 1000000
         tier: fast
       - model: "grok-code-fast-1"
         context: 131000

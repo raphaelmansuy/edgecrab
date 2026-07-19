@@ -123,6 +123,15 @@ pub fn format_turn_completion_explanation(
                 }
             }
         }
+        TaskClass::MediaRender => {
+            if outcome.state == edgecrab_types::CompletionDecision::NeedsVerification {
+                let hint =
+                    "Media task: confirm render output exists on disk (non-zero .mp4/.webm bytes).";
+                if !line_already_present(&lines, hint) {
+                    lines.push(hint.into());
+                }
+            }
+        }
         TaskClass::CodeChange => {}
         TaskClass::Research | TaskClass::General => {}
     }

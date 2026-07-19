@@ -61,6 +61,7 @@ pub mod tool_progress_tail;
 pub mod tool_input_examples;
 pub mod tool_schema_index;
 pub mod tool_search_bm25;
+pub mod browser_diagnostics;
 pub mod tools;
 pub mod structured_browser;
 pub mod terminal_result;
@@ -91,7 +92,7 @@ pub use execution_fs::{ExecutionFilesystemView, describe_execution_filesystem};
 pub use harness_gates::{
     HarnessAdvisorySignals, HarnessBuildInput, HarnessSnapshot, OracleGateFailure,
     TerminalMutationToolError, UnresolvedMutationFailure, build_harness_snapshot,
-    terminal_mutation_tool_error,
+    is_browser_esm_artifact, oracle_command_for_path, terminal_mutation_tool_error,
 };
 pub use lsp_gate::{
     LspEditContext, LspGate, LspWriteHook, ToolDiagnostic, attach_post_write_diagnostics,
@@ -176,9 +177,13 @@ pub use tools::web::{
     web_command_overlay, web_command_usage, web_menu_status_hint, web_provider_picker_rows,
     web_search_is_available, web_search_result_note, web_status_one_liner,
 };
+pub use browser_diagnostics::{
+    BrowserDiagnosticsInput, BrowserDiagnosticsReport, UrlProbe, browser_diagnostics_doctor_detail,
+    collect_browser_diagnostics, format_browser_diagnostics, probe_loopback_url,
+};
 pub use structured_browser::{
-    StructuredBrowserResult, parse_structured_browser_result, structured_browser_nav_succeeded,
-    url_is_chrome_error,
+    ContentClass, StructuredBrowserResult, browser_content_class, classify_browser_content,
+    parse_structured_browser_result, structured_browser_nav_succeeded, url_is_chrome_error,
 };
 pub use terminal_result::{
     ParsedTerminalResult, parse_terminal_result, terminal_result_succeeded,

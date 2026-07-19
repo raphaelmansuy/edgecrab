@@ -1296,6 +1296,9 @@ impl Agent {
         let spill_seq = Arc::new(crate::tool_result_spill::SpillSequence::new());
         let mut pressure_warned = turn.pressure_warned;
         let mut compression_llm_failures = turn.compression_llm_failures;
+        let mut prologue_opening_rough_tokens = turn.opening_rough_tokens;
+        let mut prologue_preflight_evaluated = false;
+        let mut prologue_preflight_ran = false;
         const MAX_COMPRESSION_LLM_FAILURES: u32 = 3;
 
         // ── Shadow Judge setup ────────────────────────────────────────────────
@@ -1468,6 +1471,26 @@ impl Agent {
                 &active_tool_defs,
             );
             let threshold_tokens = compression_params.threshold_tokens();
+            if prologue_opening_rough_tokens.is_none() {
+                prologue_opening_rough_tokens = Some(estimated_prompt_tokens);
+            }
+            // Hermes few-but-huge preflight gate (turn_prologue / turn_context parity).
+            let protect_first = crate::compression::effective_protect_first_n(
+                session.compression_runtime.compression_count,
+                session
+                    .messages
+                    .iter()
+                    .any(|m| m.text_content().contains(crate::compression::SUMMARY_PREFIX)),
+            );
+            let protect_last = compression_params.protect_last_n;
+            // Hermes few-but-huge OR count gate (observability + tests).
+            let preflight_gate = crate::turn_prologue::should_run_preflight_estimate(
+                session.messages.len(),
+                protect_first,
+                protect_last,
+                estimated_prompt_tokens,
+                threshold_tokens,
+            );
             let defer_preflight = crate::compression::should_defer_preflight_to_real_usage(
                 &session.compression_runtime,
                 estimated_prompt_tokens,
@@ -1488,6 +1511,15 @@ impl Agent {
                 &compression_params,
             ) {
                 CompressionStatus::NeedsCompression if blocked => {
+                    prologue_preflight_evaluated = true;
+                    prologue_preflight_ran = false;
+                    tracing::debug!(
+                        ?prologue_opening_rough_tokens,
+                        prologue_preflight_evaluated,
+                        prologue_preflight_ran,
+                        preflight_gate,
+                        "prologue preflight metrics (blocked)"
+                    );
                     tracing::warn!(
                         ineffective = session.compression_runtime.ineffective_compression_count,
                         fallback = session.compression_runtime.fallback_compression_streak,
@@ -1495,9 +1527,36 @@ impl Agent {
                     );
                 }
                 CompressionStatus::NeedsCompression if defer_preflight => {
+                    prologue_preflight_evaluated = true;
+                    prologue_preflight_ran = false;
+                    tracing::debug!(
+                        ?prologue_opening_rough_tokens,
+                        prologue_preflight_evaluated,
+                        prologue_preflight_ran,
+                        preflight_gate,
+                        "prologue preflight metrics (deferred)"
+                    );
                     // Rough estimate deferred — debug already emitted above.
                 }
                 CompressionStatus::NeedsCompression => {
+                    // NeedsCompression already implies size pressure; preflight_gate
+                    // is retained for few-but-huge observability (Hermes parity).
+                    if !preflight_gate {
+                        tracing::debug!(
+                            messages = session.messages.len(),
+                            estimated_prompt_tokens,
+                            "preflight compress despite count gate (token threshold hit)"
+                        );
+                    }
+                    prologue_preflight_evaluated = true;
+                    prologue_preflight_ran = true;
+                    tracing::debug!(
+                        ?prologue_opening_rough_tokens,
+                        prologue_preflight_evaluated,
+                        prologue_preflight_ran,
+                        preflight_gate,
+                        "prologue preflight metrics (running)"
+                    );
                     emit_activity(
                         event_tx,
                         edgecrab_tools::tool_progress_tail::format_compression_started(),
@@ -2438,12 +2497,14 @@ impl Agent {
                             // Provisional mid-loop never runs harness contract verify.
                             harness_contract_verify: false,
                             cwd: &cwd,
+                            evidence: trackers.evidence.assess_snapshot(),
                         },
                     );
 
-                    if crate::turn_epilogue::should_reopen_loop_with_messages(
+                    if crate::turn_epilogue::should_reopen_loop_with_evidence(
                         &provisional_outcome,
                         &session.messages,
+                        trackers.evidence.assess_snapshot(),
                     ) {
                         tracing::info!(
                             state = provisional_outcome.state.as_str(),
@@ -2587,6 +2648,54 @@ impl Agent {
                         emit_activity(
                             event_tx,
                             "✓ Document artifact ready — ending turn (Done latch).",
+                        );
+                        self.publish_session_state(&session).await;
+                        break;
+                    }
+                    // ── Visual / evidence Done latch (022) ────────────────────
+                    if trackers.evidence.visual_evidence_complete()
+                        || trackers.evidence.media_evidence_complete()
+                    {
+                        tracing::info!(
+                            "visual/media evidence latch complete — ending turn"
+                        );
+                        final_response = session
+                            .messages
+                            .iter()
+                            .rev()
+                            .find(|m| m.role == Role::Assistant)
+                            .map(|m| m.text_content())
+                            .filter(|t| !t.trim().is_empty())
+                            .unwrap_or_else(|| {
+                                "Visual evidence latched — task verified.".into()
+                            });
+                        emit_activity(
+                            event_tx,
+                            "✓ Evidence latch complete — ending turn (Done).",
+                        );
+                        self.publish_session_state(&session).await;
+                        break;
+                    }
+                    // ── Evidence hard stop (escalated / verify budget) ───────
+                    if trackers.evidence.should_hard_stop() {
+                        tracing::warn!(
+                            phase = ?trackers.evidence.phase,
+                            "evidence hard stop — ending turn (GuardrailHalt)"
+                        );
+                        trackers.guardrail_halt = true;
+                        final_response = session
+                            .messages
+                            .iter()
+                            .rev()
+                            .find(|m| m.role == Role::Assistant)
+                            .map(|m| m.text_content())
+                            .filter(|t| !t.trim().is_empty())
+                            .unwrap_or_else(|| {
+                                trackers.evidence.allowed_action_message()
+                            });
+                        emit_activity(
+                            event_tx,
+                            "⏹ Verification escalated — ending turn.",
                         );
                         self.publish_session_state(&session).await;
                         break;
@@ -2809,6 +2918,7 @@ impl Agent {
                 goal_contract: final_goal_contract,
                 harness_contract_verify: true,
                 cwd: &cwd,
+                evidence: trackers.evidence.assess_snapshot(),
             });
         run_outcome = crate::turn_epilogue::enrich_turn_outcome(
             run_outcome,
@@ -3966,7 +4076,7 @@ async fn process_response(
             })
             .collect();
 
-        // Partition tools into parallel-safe and sequential
+        // Budget-filter first, then DRY plan parallel vs sequential (tool_batch / 014 WS-B).
         let mut parallel_tasks = tokio::task::JoinSet::new();
         let mut sequential_calls = Vec::new();
         let mut argument_loop_blocked = false;
@@ -3974,9 +4084,7 @@ async fn process_response(
         // for any task that panics — otherwise the assistant message has
         // tool_calls with no matching tool_results and the next API call fails.
         let mut parallel_submitted: Vec<(String, String)> = Vec::new();
-        // Path-overlap tracking: tools that declare path_arguments() can run
-        // in parallel if they target different files. (FP9: Parallel Safety)
-        let mut claimed_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut eligible: Vec<edgecrab_types::ToolCall> = Vec::new();
 
         for tc in &dispatch_calls {
             if let Err(violation) = edgecrab_tools::mutation_turn_policy::check_tool_argument_budget(
@@ -4024,146 +4132,197 @@ async fn process_response(
                 );
                 continue;
             }
+            eligible.push(edgecrab_types::ToolCall {
+                id: tc.id.clone(),
+                r#type: tc.call_type.clone(),
+                function: edgecrab_types::FunctionCall {
+                    name: tc.function.name.clone(),
+                    arguments: tc.function.arguments.clone(),
+                },
+                thought_signature: tc.thought_signature.clone(),
+            });
+        }
 
-            let is_parallel = dctx
-                .registry
-                .as_ref()
-                .map(|r| {
-                    r.can_parallelize_in_batch(
-                        &tc.function.name,
-                        &tc.function.arguments,
-                        &claimed_paths,
-                    )
-                })
-                .unwrap_or(false);
+        let batch_plan = crate::tool_batch::plan_tool_batch(
+            dctx.registry.as_ref().map(|r| r.as_ref()),
+            &eligible,
+        );
+        let parallel_cap = crate::tool_batch::parallel_max_workers(
+            None,
+            batch_plan.parallel.len().max(1),
+        );
+        let parallel_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(parallel_cap));
+        if batch_plan.has_parallel() {
+            tracing::debug!(
+                parallel = batch_plan.parallel.len(),
+                sequential = batch_plan.sequential.len(),
+                parallel_cap,
+                "tool batch plan (014 WS-B)"
+            );
+        }
 
-            // Notify TUI that a tool execution is starting
+        // Parallel-safe tools (JoinSet, concurrency capped)
+        for planned in &batch_plan.parallel {
             if let Some(tx) = dctx.event_tx.as_ref() {
                 let _ = tx.send(crate::StreamEvent::ToolExec {
-                    tool_call_id: tc.id.clone(),
-                    name: tc.function.name.clone(),
-                    args_json: tc.function.arguments.clone(),
+                    tool_call_id: planned.id.clone(),
+                    name: planned.name.clone(),
+                    args_json: planned.arguments.clone(),
                 });
             }
 
-            if is_parallel {
-                let trackers_view = TurnDispatchTrackersView {
-                    harness_advisory: &trackers.harness_advisory,
-                    tool_guardrail: &trackers.tool_guardrail,
-                };
-                if let Some(blocked) = pre_dispatch_decision(
-                    &trackers_view,
-                    &session.messages,
-                    &tc.function.name,
-                    &tc.function.arguments,
-                    &dctx.conversation_session_id,
-                ) {
-                    emit_tool_done(
-                        dctx.event_tx.as_ref(),
-                        &tc.id,
-                        &tc.function.name,
-                        &tc.function.arguments,
-                        &blocked,
-                        0,
-                        true,
-                    );
-                    append_tool_result_to_session(
-                        session,
-                        dctx,
-                        &tc.id,
-                        &tc.function.name,
-                        &blocked,
-                    );
-                    trackers
-                        .dedup
-                        .record(&tc.function.name, &tc.function.arguments, &blocked);
-                    continue;
-                }
-                // Claim paths so subsequent tools targeting the same file go sequential.
-                if let Some(ref reg) = dctx.registry {
-                    for p in reg.extract_paths(&tc.function.name, &tc.function.arguments) {
-                        claimed_paths.insert(p);
+            let trackers_view = TurnDispatchTrackersView {
+                harness_advisory: &trackers.harness_advisory,
+                tool_guardrail: &trackers.tool_guardrail,
+                evidence: &trackers.evidence,
+            };
+            if let Some(blocked) = pre_dispatch_decision(
+                &trackers_view,
+                &session.messages,
+                &planned.name,
+                &planned.arguments,
+                &dctx.conversation_session_id,
+            ) {
+                emit_tool_done(
+                    dctx.event_tx.as_ref(),
+                    &planned.id,
+                    &planned.name,
+                    &planned.arguments,
+                    &blocked,
+                    0,
+                    true,
+                );
+                append_tool_result_to_session(
+                    session,
+                    dctx,
+                    &planned.id,
+                    &planned.name,
+                    &blocked,
+                );
+                trackers.record_tool_outcome(
+                    &planned.name,
+                    &planned.arguments,
+                    &blocked,
+                    true,
+                );
+                trackers
+                    .dedup
+                    .record(&planned.name, &planned.arguments, &blocked);
+                continue;
+            }
+
+            parallel_submitted.push((planned.id.clone(), planned.name.clone()));
+            let tc_id = planned.id.clone();
+            let tc_name = planned.name.clone();
+            let tc_args = planned.arguments.clone();
+            let reg = dctx.registry.clone();
+            let cancel_token = dctx.cancel.clone();
+            let state = dctx.state_db.clone();
+            let plat = dctx.platform;
+            let proc_table = Arc::clone(&dctx.process_table);
+            let prov = dctx.provider.clone();
+            let gateway_sender = dctx.gateway_sender.clone();
+            let sar = dctx.sub_agent_runner.clone();
+            let clarify = dctx.clarify_tx.clone();
+            let approval = dctx.approval_tx.clone();
+            let args_for_done = planned.arguments.clone();
+            let origin = dctx.origin_chat.clone();
+            let app_cfg_ref = dctx.app_config_ref.clone();
+            let conv_sess_id = dctx.conversation_session_id.clone();
+            let todo_store_clone = dctx.todo_store.clone();
+            let capability_suppressions = dctx.capability_suppressions.clone();
+            let dispatch_cwd = dctx.cwd.clone();
+            let discovered_plugins = dctx.discovered_plugins.clone();
+            let spill_seq = dctx.spill_seq.clone();
+            let context_engine = dctx.context_engine.clone();
+            let engine_tool_names = dctx.engine_tool_names.clone();
+            let mutation_turn = Arc::clone(&dctx.mutation_turn);
+            let lsp_gate = dctx.lsp_gate.clone();
+            let tool_progress_tx = dctx.tool_progress_tx.clone();
+            let watch_notification_tx = dctx.watch_notification_tx.clone();
+            let delegate_ctx = dctx.delegate_ctx.clone();
+            let kanban_task_id = dctx.kanban_task_id.clone();
+            let materialized_tools = dctx.materialized_tools.clone();
+            let subdirectory_hints = dctx.subdirectory_hints.clone();
+            let skills_zone_dirty = dctx.skills_zone_dirty.clone();
+            let sem = Arc::clone(&parallel_sem);
+
+            parallel_tasks.spawn(async move {
+                // Cap concurrency (EDGECRAB_TOOL_PARALLEL_MAX / default 32).
+                let _permit = match sem.acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => {
+                        return (
+                            tc_id,
+                            tc_name,
+                            args_for_done,
+                            (
+                                "Tool batch concurrency semaphore closed".to_string(),
+                                Vec::new(),
+                            ),
+                            0u64,
+                        );
                     }
-                }
-                // Track the tool call so we can detect panics after join_next.
-                parallel_submitted.push((tc.id.clone(), tc.function.name.clone()));
-                // Spawn parallel-safe tools concurrently
-                let tc_id = tc.id.clone();
-                let tc_name = tc.function.name.clone();
-                let tc_args = tc.function.arguments.clone();
-                let reg = dctx.registry.clone();
-                let cancel_token = dctx.cancel.clone();
-                let state = dctx.state_db.clone();
-                let plat = dctx.platform;
-                let proc_table = Arc::clone(&dctx.process_table);
-                let prov = dctx.provider.clone();
-                let gateway_sender = dctx.gateway_sender.clone();
-                let sar = dctx.sub_agent_runner.clone();
-                let clarify = dctx.clarify_tx.clone();
-                let approval = dctx.approval_tx.clone();
-                let args_for_done = tc.function.arguments.clone();
-                let origin = dctx.origin_chat.clone();
-                let app_cfg_ref = dctx.app_config_ref.clone();
-                let conv_sess_id = dctx.conversation_session_id.clone();
-                let todo_store_clone = dctx.todo_store.clone();
-                let capability_suppressions = dctx.capability_suppressions.clone();
-                let dispatch_cwd = dctx.cwd.clone();
-                let discovered_plugins = dctx.discovered_plugins.clone();
-                let spill_seq = dctx.spill_seq.clone();
-                let context_engine = dctx.context_engine.clone();
-                let engine_tool_names = dctx.engine_tool_names.clone();
-                let mutation_turn = Arc::clone(&dctx.mutation_turn);
-                let lsp_gate = dctx.lsp_gate.clone();
-                let tool_progress_tx = dctx.tool_progress_tx.clone();
-                let watch_notification_tx = dctx.watch_notification_tx.clone();
-                let delegate_ctx = dctx.delegate_ctx.clone();
-                let kanban_task_id = dctx.kanban_task_id.clone();
-                let materialized_tools = dctx.materialized_tools.clone();
-                let subdirectory_hints = dctx.subdirectory_hints.clone();
-                let skills_zone_dirty = dctx.skills_zone_dirty.clone();
+                };
+                let started = std::time::Instant::now();
+                let inner = DispatchContext {
+                    cwd: dispatch_cwd,
+                    registry: reg,
+                    cancel: cancel_token,
+                    state_db: state,
+                    platform: plat,
+                    process_table: proc_table,
+                    provider: prov,
+                    gateway_sender,
+                    sub_agent_runner: sar,
+                    event_tx: None, // ToolExec event already sent before dispatch
+                    delegation_event_tx: None,
+                    clarify_tx: clarify,
+                    approval_tx: approval,
+                    origin_chat: origin,
+                    app_config_ref: app_cfg_ref,
+                    conversation_session_id: conv_sess_id,
+                    todo_store: todo_store_clone,
+                    capability_suppressions,
+                    discovered_plugins,
+                    spill_seq,
+                    context_engine,
+                    engine_tool_names,
+                    mutation_turn,
+                    lsp_gate,
+                    tool_progress_tx,
+                    watch_notification_tx,
+                    delegate_ctx,
+                    kanban_task_id,
+                    materialized_tools,
+                    subdirectory_hints,
+                    skills_zone_dirty,
+                };
+                let result = dispatch_single_tool(&tc_id, &tc_name, &tc_args, &inner).await;
+                let duration_ms = started.elapsed().as_millis() as u64;
+                (tc_id, tc_name, args_for_done, result, duration_ms)
+            });
+        }
 
-                parallel_tasks.spawn(async move {
-                    let started = std::time::Instant::now();
-                    let inner = DispatchContext {
-                        cwd: dispatch_cwd,
-                        registry: reg,
-                        cancel: cancel_token,
-                        state_db: state,
-                        platform: plat,
-                        process_table: proc_table,
-                        provider: prov,
-                        gateway_sender,
-                        sub_agent_runner: sar,
-                        event_tx: None, // ToolExec event already sent before dispatch
-                        delegation_event_tx: None,
-                        clarify_tx: clarify,
-                        approval_tx: approval,
-                        origin_chat: origin,
-                        app_config_ref: app_cfg_ref,
-                        conversation_session_id: conv_sess_id,
-                        todo_store: todo_store_clone,
-                        capability_suppressions,
-                        discovered_plugins,
-                        spill_seq,
-                        context_engine,
-                        engine_tool_names,
-                        mutation_turn,
-                        lsp_gate,
-                        tool_progress_tx,
-                        watch_notification_tx,
-                        delegate_ctx,
-                        kanban_task_id,
-                        materialized_tools,
-                        subdirectory_hints,
-                        skills_zone_dirty,
-                    };
-                    let result = dispatch_single_tool(&tc_id, &tc_name, &tc_args, &inner).await;
-                    let duration_ms = started.elapsed().as_millis() as u64;
-                    (tc_id, tc_name, args_for_done, result, duration_ms)
+        // Sequential tools — map back to edgequake_llm::ToolCall refs for existing path
+        for planned in &batch_plan.sequential {
+            if let Some(tx) = dctx.event_tx.as_ref() {
+                let _ = tx.send(crate::StreamEvent::ToolExec {
+                    tool_call_id: planned.id.clone(),
+                    name: planned.name.clone(),
+                    args_json: planned.arguments.clone(),
                 });
-            } else {
-                sequential_calls.push(tc);
             }
+            // Reconstruct a temporary ToolCall for the sequential loop body
+            sequential_calls.push(edgequake_llm::ToolCall {
+                id: planned.id.clone(),
+                call_type: "function".into(),
+                function: edgequake_llm::FunctionCall {
+                    name: planned.name.clone(),
+                    arguments: planned.arguments.clone(),
+                },
+                thought_signature: None,
+            });
         }
 
         // Collect parallel results
@@ -4180,6 +4339,7 @@ async fn process_response(
                         is_tool_error(&tool_result),
                     );
                     let is_error = is_tool_error(&tool_result);
+                    trackers.record_tool_outcome(&tc_name, &args_json, &tool_result, is_error);
                     emit_tool_done(
                         dctx.event_tx.as_ref(),
                         &tc_id,
@@ -4297,6 +4457,7 @@ async fn process_response(
             let trackers_view = TurnDispatchTrackersView {
                 harness_advisory: &trackers.harness_advisory,
                 tool_guardrail: &trackers.tool_guardrail,
+                evidence: &trackers.evidence,
             };
             let (mut tool_result, injected_messages) = if let Some(blocked) = pre_dispatch_decision(
                 &trackers_view,
@@ -4319,6 +4480,12 @@ async fn process_response(
             let duration_ms = started.elapsed().as_millis() as u64;
 
             let is_error = is_tool_error(&tool_result);
+            trackers.record_tool_outcome(
+                &tc.function.name,
+                &tc.function.arguments,
+                &tool_result,
+                is_error,
+            );
             emit_tool_done(
                 dctx.event_tx.as_ref(),
                 &tc.id,

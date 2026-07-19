@@ -74,6 +74,14 @@ fn auth_status_grok_without_credentials() {
 }
 
 #[test]
+fn gx_e2_provider_needs_and_auth_status_with_oauth_file() {
+    // Unit-level coverage for agent path aliases lives in xai_credentials module tests.
+    assert!(edgecrab_core::oauth::provider_needs_xai_credentials("xai"));
+    assert!(edgecrab_core::oauth::provider_needs_xai_credentials("super-grok"));
+    assert!(!edgecrab_core::oauth::provider_needs_xai_credentials("anthropic"));
+}
+
+#[test]
 fn auth_status_grok_with_mock_auth_json() {
     let home = tempdir().expect("home");
     write_xai_oauth_auth(home.path());

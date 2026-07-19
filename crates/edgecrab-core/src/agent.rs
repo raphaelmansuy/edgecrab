@@ -1275,22 +1275,40 @@ impl Agent {
     }
 
     /// Instant model switch — Hermes `/model` parity (no brief, no auxiliary LLM).
+    ///
+    /// Uses the sync catalog factory. Prefer
+    /// [`switch_model_fast_with_provider`](Self::switch_model_fast_with_provider)
+    /// from the CLI so SuperGrok/OAuth prepare + refresh wrappers apply.
     pub async fn switch_model_fast(
         &self,
         target_spec: &str,
     ) -> Result<crate::model_transfer::ModelSwitchOutcome, crate::model_transfer::ModelTransferError>
     {
-        use crate::model_catalog::ModelCatalog;
         use crate::model_transfer::{
-            ModelSwitchOutcome, create_model_transfer_provider, resolve_model_transfer_target,
+            create_model_transfer_provider, resolve_model_transfer_target,
         };
+
+        let target = resolve_model_transfer_target(target_spec)?;
+        let provider = create_model_transfer_provider(&target)?;
+        self.switch_model_fast_with_provider(target_spec, provider)
+            .await
+    }
+
+    /// Instant model switch with a pre-built provider (OAuth-ready CLI path).
+    pub async fn switch_model_fast_with_provider(
+        &self,
+        target_spec: &str,
+        provider: Arc<dyn LLMProvider>,
+    ) -> Result<crate::model_transfer::ModelSwitchOutcome, crate::model_transfer::ModelTransferError>
+    {
+        use crate::model_catalog::ModelCatalog;
+        use crate::model_transfer::{ModelSwitchOutcome, resolve_model_transfer_target};
 
         let target = resolve_model_transfer_target(target_spec)?;
         let current_model = self.config.read().await.model.clone();
         if ModelCatalog::equivalent_model_specs(&target.display, &current_model) {
             return Err(crate::model_transfer::ModelTransferError::SameModel);
         }
-        let provider = create_model_transfer_provider(&target)?;
         self.swap_model(target.display.clone(), provider).await;
 
         if let Some(db) = &self.state_db
@@ -1328,6 +1346,20 @@ impl Agent {
         crate::model_transfer::ModelTransferOutcome,
         crate::model_transfer::ModelTransferError,
     > {
+        self.perform_model_transfer_with_provider(target_model, None, events)
+            .await
+    }
+
+    /// Model transfer with an optional pre-built OAuth-ready provider (CLI path).
+    pub async fn perform_model_transfer_with_provider(
+        &self,
+        target_model: &str,
+        prebuilt_provider: Option<Arc<dyn LLMProvider>>,
+        events: Option<tokio::sync::mpsc::UnboundedSender<StreamEvent>>,
+    ) -> Result<
+        crate::model_transfer::ModelTransferOutcome,
+        crate::model_transfer::ModelTransferError,
+    > {
         let (compression_cfg, auxiliary_model, current_model, main_provider) = {
             let cfg = self.config.read().await;
             (
@@ -1349,9 +1381,23 @@ impl Agent {
                 main_provider,
                 auxiliary_model: auxiliary_model.as_deref(),
             };
-            let (outcome, new_provider) =
-                crate::model_transfer::ModelTransferOrchestrator::execute(&mut ctx, target_model)
-                    .await?;
+            let (outcome, new_provider) = match prebuilt_provider {
+                Some(provider) => {
+                    let target =
+                        crate::model_transfer::resolve_model_transfer_target(target_model)?;
+                    crate::model_transfer::ModelTransferOrchestrator::execute_with_provider(
+                        &mut ctx, &target, provider,
+                    )
+                    .await?
+                }
+                None => {
+                    crate::model_transfer::ModelTransferOrchestrator::execute(
+                        &mut ctx,
+                        target_model,
+                    )
+                    .await?
+                }
+            };
 
             session.apply_model_transfer_outcome(&outcome);
 

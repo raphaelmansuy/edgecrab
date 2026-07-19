@@ -4,6 +4,7 @@ use edgecrab_types::{
     VerificationSummary, parse_tool_error_payload,
 };
 
+use crate::evidence_latch::EvidenceAssessSnapshot;
 use crate::task_class::{
     TaskClass, classify_from_messages, document_artifact_evidence_present,
     is_verification_tool_for_class,
@@ -26,6 +27,8 @@ pub struct CompletionContext<'a> {
     pub harness: HarnessSnapshot,
     /// When true, visual tasks require preview evidence before `Completed`.
     pub verification_strict: bool,
+    /// Evidence latch assess snapshot (022 — visual done / escalated / heal).
+    pub evidence: EvidenceAssessSnapshot,
 }
 
 pub trait CompletionPolicy: Send + Sync {
@@ -45,8 +48,21 @@ impl CompletionPolicy for DefaultCompletionPolicy {
         // First principles: approval is a typed session flag only — never prose bags.
         let pending_approval = ctx.pending_approval;
         let task_class = classify_from_messages(ctx.messages);
-        let verification =
+        let mut verification =
             collect_verification_summary(ctx.messages, task_class, ctx.verification_strict);
+        // 022: latch graph is authoritative for visual/media evidence.
+        if ctx.evidence.visual_complete || ctx.evidence.media_complete {
+            verification.required = true;
+            verification.evidence_present = true;
+            verification.debt_reason = None;
+            if verification.evidence.is_empty() {
+                verification.evidence.push(if ctx.evidence.visual_complete {
+                    "evidence_latch: visual_evidence_complete".into()
+                } else {
+                    "evidence_latch: media_evidence_complete".into()
+                });
+            }
+        }
         let reported_progress = collect_reported_progress_state(ctx.messages);
         let reported_blocked = matches!(
             reported_progress.latest_status,
@@ -58,6 +74,14 @@ impl CompletionPolicy for DefaultCompletionPolicy {
         );
         let has_remaining_steps = !reported_progress.remaining_steps.is_empty();
         let harness_blocked = ctx.harness.blocks_completion();
+        // 022 B3: sticky in_progress / todos ignored when latched complete or escalated.
+        let ledger_complete_override =
+            ctx.evidence.visual_complete || ctx.evidence.media_complete || ctx.evidence.escalated;
+        let sticky_incomplete = !ledger_complete_override
+            && (ctx.child_runs_in_flight > 0
+                || ctx.active_todos > 0
+                || reported_in_progress
+                || has_remaining_steps);
 
         let mut outcome = if ctx.interrupted {
             RunOutcome::new(
@@ -98,11 +122,34 @@ impl CompletionPolicy for DefaultCompletionPolicy {
                 ExitReason::InvalidToolBudget,
                 summary,
             )
-        } else if ctx.child_runs_in_flight > 0
-            || ctx.active_todos > 0
-            || reported_in_progress
-            || has_remaining_steps
-        {
+        } else if ctx.evidence.escalated || ctx.evidence.verify_budget_exhausted {
+            // 022 B2/B4: closed action set — terminal outcome, not Incomplete reopen.
+            let summary = if ctx.final_response.trim().is_empty() {
+                "Stopped — verification escalated (preview/heal exhausted or verify budget). \
+                 Deliverables may exist on disk; browser evidence could not be completed."
+                    .to_string()
+            } else {
+                ctx.final_response.trim().to_string()
+            };
+            RunOutcome::new(
+                CompletionDecision::Failed,
+                ExitReason::GuardrailHalt,
+                summary,
+            )
+        } else if ctx.evidence.visual_complete || ctx.evidence.media_complete {
+            // 022 B1: latch done → Completed (ignore sticky ledger).
+            let summary = if ctx.final_response.trim().is_empty() {
+                "Completed — request satisfied and verified (evidence latch)."
+                    .to_string()
+            } else {
+                ctx.final_response.trim().to_string()
+            };
+            RunOutcome::new(
+                CompletionDecision::Completed,
+                ExitReason::ModelReturnedFinalText,
+                summary,
+            )
+        } else if sticky_incomplete {
             RunOutcome::new(
                 CompletionDecision::Incomplete,
                 ExitReason::PendingTasks,
@@ -312,6 +359,16 @@ fn collect_verification_summary(
         }
     }
 
+    // MediaRender: non-zero media file is sufficient (019) — no browser thrash.
+    if task_class == TaskClass::MediaRender
+        && crate::task_class::media_artifact_evidence_present(messages)
+    {
+        required = true;
+        if evidence.is_empty() {
+            evidence.push("media: render output path present".into());
+        }
+    }
+
     if task_class == TaskClass::VisualUx && verification_strict && required && evidence.is_empty() {
         debt_reason = Some(
             "Visual/UX task: enable security.preview and verify with browser or screenshot."
@@ -377,11 +434,12 @@ fn is_mutation_verification_tool(name: &str) -> bool {
 ///
 /// Law: only [`StructuredBrowserResult`] fields count — never prose heuristics
 /// (loader/spinner/beautiful/ERR_* substrings). Unstructured results are not evidence.
-pub(crate) fn visual_perception_evidence_ok(_tool_name: &str, content: &str) -> bool {
+pub fn visual_perception_evidence_ok(_tool_name: &str, content: &str) -> bool {
     let Some(parsed) = edgecrab_tools::parse_structured_browser_result(content) else {
         return false;
     };
-    if parsed.is_chrome_error || !parsed.ok {
+    // 019: ContentClass must be Ok — HttpErrorPage / ChromeError never count.
+    if !parsed.content_class.is_evidence() || parsed.is_chrome_error || !parsed.ok {
         return false;
     }
     match parsed.tool.as_str() {
@@ -521,7 +579,7 @@ mod tests {
             child_runs_in_flight: 0,
             harness,
             verification_strict: false,
-        }
+            evidence: Default::default(),        }
     }
 
     #[test]
@@ -561,7 +619,7 @@ mod tests {
             child_runs_in_flight: 0,
             harness: HarnessSnapshot::default(),
             verification_strict: false,
-        };
+            evidence: Default::default(),        };
 
         let outcome = assess_completion(&ctx);
         assert_eq!(outcome.state, CompletionDecision::BudgetExhausted);
@@ -583,7 +641,7 @@ mod tests {
             child_runs_in_flight: 0,
             harness: HarnessSnapshot::default(),
             verification_strict: false,
-        };
+            evidence: Default::default(),        };
 
         let outcome = assess_completion(&ctx);
         assert_eq!(outcome.state, CompletionDecision::Incomplete);
@@ -616,7 +674,7 @@ mod tests {
             child_runs_in_flight: 0,
             harness: HarnessSnapshot::default(),
             verification_strict: false,
-        };
+            evidence: Default::default(),        };
 
         let outcome = assess_completion(&ctx);
         assert_eq!(outcome.state, CompletionDecision::Blocked);
@@ -637,7 +695,7 @@ mod tests {
             child_runs_in_flight: 0,
             harness: HarnessSnapshot::default(),
             verification_strict: false,
-        };
+            evidence: Default::default(),        };
 
         let outcome = assess_completion(&ctx);
         assert_eq!(outcome.state, CompletionDecision::Blocked);
@@ -659,7 +717,7 @@ mod tests {
             child_runs_in_flight: 0,
             harness: HarnessSnapshot::default(),
             verification_strict: false,
-        };
+            evidence: Default::default(),        };
 
         let outcome = assess_completion(&ctx);
         assert_eq!(outcome.state, CompletionDecision::NeedsUserInput);
@@ -853,7 +911,7 @@ mod tests {
             child_runs_in_flight: 0,
             harness: HarnessSnapshot::default(),
             verification_strict: true,
-        };
+            evidence: Default::default(),        };
         let outcome = assess_completion(&ctx);
         assert_eq!(outcome.state, CompletionDecision::NeedsVerification);
     }
@@ -889,7 +947,7 @@ mod tests {
             child_runs_in_flight: 0,
             harness: HarnessSnapshot::default(),
             verification_strict: true,
-        };
+            evidence: Default::default(),        };
         let outcome = assess_completion(&ctx);
         assert_eq!(outcome.state, CompletionDecision::NeedsVerification);
         assert!(outcome.user_summary.contains("browser navigation"));
@@ -921,7 +979,7 @@ mod tests {
             child_runs_in_flight: 0,
             harness: HarnessSnapshot::default(),
             verification_strict: true,
-        };
+            evidence: Default::default(),        };
         let outcome = assess_completion(&ctx);
         assert_eq!(outcome.state, CompletionDecision::NeedsVerification);
         assert!(outcome.user_summary.contains("markdown"));
@@ -942,7 +1000,7 @@ mod tests {
             child_runs_in_flight: 0,
             harness: HarnessSnapshot::default(),
             verification_strict: false,
-        });
+            evidence: Default::default(),        });
         assert_eq!(outcome.state, CompletionDecision::Failed);
         assert_eq!(outcome.exit_reason, ExitReason::InvalidToolBudget);
         assert!(outcome.user_summary.contains("quick_stock_quote"));
@@ -998,7 +1056,7 @@ mod tests {
             child_runs_in_flight: 0,
             harness,
             verification_strict: false,
-        });
+            evidence: Default::default(),        });
         assert_eq!(outcome.state, CompletionDecision::Failed);
         assert_eq!(outcome.exit_reason, ExitReason::InvalidToolBudget);
     }
@@ -1077,7 +1135,7 @@ mod tests {
             child_runs_in_flight: 0,
             harness: HarnessSnapshot::default(),
             verification_strict: true,
-        };
+            evidence: Default::default(),        };
         let outcome = assess_completion(&ctx);
         assert_eq!(outcome.state, CompletionDecision::NeedsVerification);
     }
@@ -1136,7 +1194,7 @@ mod tests {
             child_runs_in_flight: 0,
             harness: HarnessSnapshot::default(),
             verification_strict: true,
-        };
+            evidence: Default::default(),        };
         let outcome = assess_completion(&ctx);
         assert_eq!(outcome.state, CompletionDecision::Completed);
     }

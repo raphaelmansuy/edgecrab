@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>♔ 3D Chess — Three.js</title>
+  <meta name="description" content="Full 3D chess game with Three.js — legal moves, check, castling, en passant, promotion." />
+  <link rel="stylesheet" href="styles.css" />
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+  <canvas id="chess-canvas" aria-label="3D chessboard"></canvas>
+  <div id="boot-error" class="full-overlay" hidden>
+    <div class="overlay-card glass">
+      <h2>3D failed to load</h2>
+      <p id="boot-error-msg">Could not start WebGL / Three.js.</p>
+      <button type="button" class="btn btn-primary" onclick="location.reload()">Reload</button>
+    </div>
+  </div>
+
+  <div id="ui">
+    <header id="hud-top" class="glass">
+      <div class="brand">
+        <span class="logo" aria-hidden="true">♔</span>
+        <div>
+          <h1>3D Chess</h1>
+          <p class="subtitle">Three.js · HTML5</p>
+        </div>
+      </div>
+
+      <div id="turn-panel" class="panel" aria-live="polite">
+        <span class="label">Turn</span>
+        <span id="turn-indicator" class="value white-turn">White</span>
+      </div>
+
+      <div id="status-panel" class="panel">
+        <span class="label">Status</span>
+        <span id="game-status" class="value">Playing</span>
+      </div>
+
+      <div id="controls-bar">
+        <button id="btn-new" type="button" class="btn" title="New game (N)">New</button>
+        <button id="btn-undo" type="button" class="btn" title="Undo (U)">Undo</button>
+        <button id="btn-flip" type="button" class="btn" title="Flip board (F)">Flip</button>
+        <button id="btn-hint" type="button" class="btn" title="Show last move">Hint</button>
+        <label class="toggle" title="Computer plays Black">
+          <input type="checkbox" id="ai-toggle" />
+          <span>AI Black</span>
+        </label>
+        <label class="toggle" title="Rotate camera with drag">
+          <input type="checkbox" id="orbit-toggle" checked />
+          <span>Orbit</span>
+        </label>
+      </div>
+    </header>
+
+    <aside id="sidebar" class="glass">
+      <section class="side-block">
+        <h2>Captured</h2>
+        <div id="captured-white" class="captured" aria-label="White pieces captured"></div>
+        <div id="captured-black" class="captured" aria-label="Black pieces captured"></div>
+      </section>
+
+      <section class="side-block">
+        <h2>Move history</h2>
+        <ol id="move-list" aria-label="Move history"></ol>
+      </section>
+
+      <section class="side-block help">
+        <h2>How to play</h2>
+        <ul>
+          <li>Click a piece, then a highlighted square</li>
+          <li>Drag to orbit · scroll to zoom</li>
+          <li><kbd>N</kbd> new · <kbd>U</kbd> undo · <kbd>F</kbd> flip</li>
+          <li>Optional: enable <strong>AI Black</strong> for a simple opponent</li>
+          <li>Promotion: choose piece when a pawn reaches the end</li>
+        </ul>
+      </section>
+    </aside>
+
+    <div id="coords" class="glass" aria-hidden="true">
+      <span id="hover-square">—</span>
+    </div>
+  </div>
+
+  <div id="announce" class="visually-hidden" aria-live="assertive" aria-atomic="true"></div>
+
+  <div id="overlay" class="full-overlay" hidden>
+    <div class="overlay-card glass">
+      <h2 id="overlay-title">Checkmate</h2>
+      <p id="overlay-message">White wins</p>
+      <button id="overlay-new" type="button" class="btn btn-primary">New Game</button>
+    </div>
+  </div>
+
+  <div id="promotion" class="full-overlay" hidden>
+    <div class="overlay-card glass promo-card">
+      <h2>Promote pawn</h2>
+      <p>Choose a piece</p>
+      <div id="promo-choices" class="promo-choices" role="group" aria-label="Promotion pieces">
+        <button type="button" data-piece="q" class="promo-btn" title="Queen">♛</button>
+        <button type="button" data-piece="r" class="promo-btn" title="Rook">♜</button>
+        <button type="button" data-piece="b" class="promo-btn" title="Bishop">♝</button>
+        <button type="button" data-piece="n" class="promo-btn" title="Knight">♞</button>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>

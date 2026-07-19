@@ -113,6 +113,7 @@ pub async fn run(config_override: Option<&str>) -> anyhow::Result<bool> {
         checks.push(check_smart_routing(&config));
         checks.push(check_os_sandbox(&config));
         checks.push(check_os_sandbox_probe(&config));
+        checks.push(check_browser_stack(&config).await);
     }
     checks.extend(check_mcp_servers());
     checks.extend(check_provider_keys());
@@ -182,13 +183,41 @@ pub fn run_harness(config_override: Option<&str>) -> anyhow::Result<()> {
     let _ = AppConfig::migrate_profile_preview_from_global(&context.config_path);
 
     match AppConfig::load_from_with_global_inheritance(&context.config_path) {
-        Ok(cfg) if cfg.security.preview.enabled => {
-            println!(
-                "  ✓ security.preview enabled — ports: {:?}\n",
-                cfg.security.preview.allow_localhost_ports
-            );
+        Ok(cfg) => {
+            if cfg.security.preview.enabled {
+                println!(
+                    "  ✓ security.preview enabled — ports: {:?}\n",
+                    cfg.security.preview.allow_localhost_ports
+                );
+            } else {
+                println!(
+                    "  ⚠ security.preview disabled — visual tasks cannot browser_navigate localhost.\n\
+                     Fix: /config preview on\n\
+                     Or add to active profile config.yaml:\n\
+                       security:\n\
+                         preview:\n\
+                           enabled: true\n\
+                           allow_localhost_ports: [8000, 8888, 5173, 3000]\n\
+                     Note: install-global ~/.edgecrab/config.yaml merges when profile omits preview.\n"
+                );
+            }
+            // Full browser stack (CDP, GPU, proxy, content class probes).
+            cfg.apply_security_runtime();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            let report = rt.block_on(edgecrab_tools::collect_browser_diagnostics(
+                edgecrab_tools::BrowserDiagnosticsInput {
+                    session_id: None,
+                    preview_enabled: cfg.security.preview.enabled,
+                    preview_allow_any: cfg.security.preview.allow_any_loopback_port,
+                    preview_ports: cfg.security.preview.allow_localhost_ports.clone(),
+                    max_port_probes: 4,
+                },
+            ));
+            println!("{}", edgecrab_tools::format_browser_diagnostics(&report));
         }
-        _ => {
+        Err(_) => {
             println!(
                 "  ⚠ security.preview disabled — visual tasks cannot browser_navigate localhost.\n\
                  Fix: /config preview on\n\
@@ -215,6 +244,51 @@ pub fn run_harness(config_override: Option<&str>) -> anyhow::Result<()> {
             Ok(())
         }
         Err(e) => Err(e.into()),
+    }
+}
+
+/// CDP + launch policy + proxy + localhost content probes.
+async fn check_browser_stack(config: &edgecrab_core::AppConfig) -> Check {
+    config.apply_security_runtime();
+    let report = edgecrab_tools::collect_browser_diagnostics(
+        edgecrab_tools::BrowserDiagnosticsInput {
+            session_id: None,
+            preview_enabled: config.security.preview.enabled,
+            preview_allow_any: config.security.preview.allow_any_loopback_port,
+            preview_ports: config.security.preview.allow_localhost_ports.clone(),
+            max_port_probes: 3,
+        },
+    )
+    .await;
+    let (ok, detail) = edgecrab_tools::browser_diagnostics_doctor_detail(&report);
+    if !config.security.preview.enabled {
+        return Check::warn(
+            "Browser",
+            format!("{detail} — enable security.preview for localhost navigate"),
+        );
+    }
+    if matches!(
+        report.headless_gpu,
+        edgecrab_tools::tools::browser::HeadlessGpuMode::Disable
+    ) {
+        return Check::warn(
+            "Browser",
+            format!("{detail} — headless_gpu=disable risks blank WebGL"),
+        );
+    }
+    if report.proxy_url.is_some() && !report.proxy_bypass_loopback {
+        return Check::warn(
+            "Browser",
+            format!("{detail} — enable browser.proxy_bypass_loopback"),
+        );
+    }
+    if ok {
+        Check::pass("Browser", detail)
+    } else {
+        Check::warn(
+            "Browser",
+            format!("{detail} — see /browser status for full report"),
+        )
     }
 }
 
@@ -776,7 +850,7 @@ fn check_provider_keys() -> Vec<Check> {
         ("GOOGLE_API_KEY", "Google Gemini"),
         ("NVIDIA_API_KEY", "NVIDIA NIM"),
         ("OPENROUTER_API_KEY", "OpenRouter"),
-        ("XAI_API_KEY", "xAI Grok"),
+        ("XAI_API_KEY", "xAI Grok (API key)"),
         ("MISTRAL_API_KEY", "Mistral AI"),
         ("DEEPSEEK_API_KEY", "DeepSeek"),
         ("GROQ_API_KEY", "Groq"),
@@ -795,7 +869,25 @@ fn check_provider_keys() -> Vec<Check> {
         })
         .collect();
 
-    if found.is_empty() {
+    // SuperGrok OAuth is first-class (020) — count as a configured xAI path.
+    let xai_oauth_ready = {
+        let auth = edgecrab_core::edgecrab_home().join("auth.json");
+        auth.is_file()
+            && std::fs::read_to_string(&auth)
+                .ok()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .is_some_and(|doc| {
+                    doc.pointer("/providers/xai-oauth/tokens/access_token")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|t| !t.trim().is_empty())
+                        || doc
+                            .pointer("/providers/xai-oauth/tokens/refresh_token")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|t| !t.trim().is_empty())
+                })
+    };
+
+    if found.is_empty() && !xai_oauth_ready {
         // Also check for local providers
         let ollama_up = std::env::var("OLLAMA_HOST").is_ok() || check_local_port(11434);
         let lmstudio_up = check_local_port(1234);
@@ -812,7 +904,7 @@ fn check_provider_keys() -> Vec<Check> {
         }
         checks
     } else {
-        found
+        let mut checks: Vec<Check> = found
             .iter()
             .map(|(env, name)| {
                 // Show partially redacted key for verification
@@ -827,7 +919,17 @@ fn check_provider_keys() -> Vec<Check> {
                 };
                 Check::pass("API key", format!("{name} [{preview}]"))
             })
-            .collect()
+            .collect();
+        if xai_oauth_ready {
+            checks.push(Check::pass(
+                "xAI OAuth",
+                format!(
+                    "{} — /login grok or xai/* models",
+                    crate::xai_credentials::xai_credential_status_line()
+                ),
+            ));
+        }
+        checks
     }
 }
 

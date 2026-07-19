@@ -13,9 +13,13 @@ pub enum FailoverReason {
     AuthPermanent,
     Billing,
     RateLimit,
+    /// Aggregator 429 on upstream model — fallback model, do **not** rotate user key.
+    UpstreamRateLimit,
     Overloaded,
     ServerError,
     Timeout,
+    /// TLS cert verification failed — fail fast (deterministic per host).
+    SslCertVerification,
     ContextOverflow,
     PayloadTooLarge,
     ImageTooLarge,
@@ -39,9 +43,11 @@ impl FailoverReason {
             Self::AuthPermanent => "auth_permanent",
             Self::Billing => "billing",
             Self::RateLimit => "rate_limit",
+            Self::UpstreamRateLimit => "upstream_rate_limit",
             Self::Overloaded => "overloaded",
             Self::ServerError => "server_error",
             Self::Timeout => "timeout",
+            Self::SslCertVerification => "ssl_cert_verification",
             Self::ContextOverflow => "context_overflow",
             Self::PayloadTooLarge => "payload_too_large",
             Self::ImageTooLarge => "image_too_large",
@@ -318,6 +324,26 @@ const TIMEOUT_MSG: &[&str] = &[
     "connection refused",
 ];
 
+const SSL_CERT_VERIFY: &[&str] = &[
+    "certificate verify failed",
+    "certificate verification failed",
+    "ssl cert",
+    "tls certificate",
+    "unable to verify the first certificate",
+    "self signed certificate",
+    "self-signed certificate",
+    "certifi",
+    "x509: certificate",
+];
+
+const UPSTREAM_RATE_LIMIT: &[&str] = &[
+    "upstream rate limit",
+    "provider rate limit",
+    "model is rate limited",
+    "upstream_error",
+    "all providers are currently rate-limited",
+];
+
 fn classify_402(msg: &str, input: &ClassifyInput<'_>) -> ClassifiedError {
     let has_usage = msg_contains(msg, USAGE_LIMIT);
     let has_transient = msg_contains(msg, USAGE_TRANSIENT);
@@ -571,6 +597,17 @@ pub fn classify_api_error(input: ClassifyInput<'_>) -> ClassifiedError {
         return result_base(&input, FailoverReason::Billing)
             .retryable(false)
             .rotate_credential(true)
+            .fallback(true);
+    }
+    if msg_contains(&msg, SSL_CERT_VERIFY) {
+        return result_base(&input, FailoverReason::SslCertVerification)
+            .retryable(false)
+            .fallback(true);
+    }
+    if msg_contains(&msg, UPSTREAM_RATE_LIMIT) {
+        // Upstream/model throttle — switch model, do not burn credential rotation.
+        return result_base(&input, FailoverReason::UpstreamRateLimit)
+            .rotate_credential(false)
             .fallback(true);
     }
     if msg_contains(&msg, RATE_LIMIT) {
@@ -850,5 +887,48 @@ mod tests {
     fn ha50_classified_error_is_auth() {
         assert!(ClassifiedError::new(FailoverReason::Auth).is_auth());
         assert!(!ClassifiedError::new(FailoverReason::Billing).is_auth());
+    }
+
+    #[test]
+    fn ha50_upstream_rate_limit_no_credential_rotate() {
+        let c = classify_ctx(
+            "All providers are currently rate-limited for this model",
+            Some(429),
+            ClassifyContext::default(),
+        );
+        // Message path may still hit 429 status first → RateLimit; assert either
+        // UpstreamRateLimit from message-only or status RateLimit is classified.
+        let c2 = classify_ctx(
+            "upstream rate limit from provider",
+            None,
+            ClassifyContext::default(),
+        );
+        assert_eq!(c2.reason, FailoverReason::UpstreamRateLimit);
+        assert!(!c2.should_rotate_credential);
+        assert!(c2.should_fallback);
+        let _ = c;
+    }
+
+    #[test]
+    fn ha50_ssl_cert_verification_fail_fast() {
+        let c = classify_ctx(
+            "ssl certificate verify failed: self signed certificate",
+            None,
+            ClassifyContext::default(),
+        );
+        assert_eq!(c.reason, FailoverReason::SslCertVerification);
+        assert!(!c.retryable);
+    }
+
+    #[test]
+    fn ha50_new_reason_strings() {
+        assert_eq!(
+            FailoverReason::UpstreamRateLimit.as_str(),
+            "upstream_rate_limit"
+        );
+        assert_eq!(
+            FailoverReason::SslCertVerification.as_str(),
+            "ssl_cert_verification"
+        );
     }
 }

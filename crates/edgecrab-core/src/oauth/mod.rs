@@ -49,4 +49,8 @@ pub use codex::{
     is_openai_codex_alias, login_codex_device_oauth, refresh_codex_from_store, remove_codex_oauth,
     resolve_codex_access_token,
 };
-pub use runtime::{inject_subscription_oauth_env, prepare_openai_codex_compatible_env};
+pub use runtime::{
+    EDGECRAB_XAI_AUTH_MODE_ENV, EDGECRAB_XAI_AUTH_MODE_KEY, EDGECRAB_XAI_AUTH_MODE_OAUTH,
+    inject_subscription_oauth_env, prepare_openai_codex_compatible_env,
+    provider_needs_xai_credentials, xai_auth_mode_label,
+};

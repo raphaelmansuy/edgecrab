@@ -173,6 +173,11 @@ fn terminal_hyperlink(label: &str, url: &str) -> String {
 }
 
 fn persist_last_oauth_url(url: &str) -> Option<PathBuf> {
+    persist_last_oauth_url_silent(url)
+}
+
+/// Persist authorize URL for TUI fallback (no stderr noise — safe under ratatui).
+pub fn persist_last_oauth_url_silent(url: &str) -> Option<PathBuf> {
     let path = edgecrab_core::edgecrab_home().join("last_oauth_url.txt");
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -282,6 +287,8 @@ fn xai_oauth_options(
     let manual_paste = grok_use_paste_flow(manual_paste, loopback);
     let open_browser = !no_browser && oauth_code.is_none();
     let on_authorize = Arc::new(move |prompt: edgecrab_proxy::XaiOAuthAuthorizePrompt| {
+        // CLI / suspended-terminal path only — NEVER call under an active ratatui frame
+        // (screen clear + OSC-8 hyperlinks corrupt the TUI, see setup_overlays Grok auth).
         print_grok_oauth_signin(&prompt, open_browser);
     });
     edgecrab_proxy::XaiOAuthLoginOptions {
@@ -289,6 +296,20 @@ fn xai_oauth_options(
         manual_paste,
         pasted_code: oauth_code,
         on_authorize: Some(on_authorize),
+        ..Default::default()
+    }
+}
+
+/// TUI-safe OAuth options: no stderr clear, no OSC-8, no browser (caller opens).
+///
+/// Best practice: the host TUI owns presentation; the OAuth engine only produces a URL + PKCE.
+fn xai_oauth_options_for_tui() -> edgecrab_proxy::XaiOAuthLoginOptions {
+    edgecrab_proxy::XaiOAuthLoginOptions {
+        open_browser: false,
+        manual_paste: true,
+        pasted_code: None,
+        // Empty hook: suppress default eprintln path and print_grok_oauth_signin.
+        on_authorize: Some(Arc::new(|_prompt: edgecrab_proxy::XaiOAuthAuthorizePrompt| {})),
         ..Default::default()
     }
 }
@@ -576,26 +597,38 @@ pub fn is_grok_pending_expired_error(message: &str) -> bool {
         || lower.contains("run `edgecrab auth grok start`")
 }
 
-/// Begin Grok OAuth (TUI step 1).
+/// Begin Grok OAuth (TUI step 1) — silent; TUI opens browser and renders status.
 pub async fn grok_auth_start_for_ui(
     no_browser: bool,
 ) -> anyhow::Result<(String, std::path::PathBuf)> {
-    let no_browser = oauth_flag(no_browser, "EDGECRAB_AUTH_NO_BROWSER");
-    let opts = xai_oauth_options(no_browser, true, false, None);
+    let _no_browser = oauth_flag(no_browser, "EDGECRAB_AUTH_NO_BROWSER");
+    // Always TUI-safe options (no stderr clear / OSC-8). Browser is opened by the App.
+    let opts = xai_oauth_options_for_tui();
     let started = edgecrab_proxy::start_xai_oauth_login(&opts)
         .await
         .map_err(|e| anyhow::anyhow!("{}", friendly_grok_login_error(&e.to_string())))?;
+    let _ = persist_last_oauth_url_silent(&started.authorize_url);
     Ok((started.authorize_url, started.pending_path))
 }
 
 /// Complete Grok OAuth with a pasted code (TUI step 2).
 pub async fn grok_auth_finish_for_ui(code: String) -> anyhow::Result<String> {
+    grok_auth_finish_for_ui_with_pending(code, None).await
+}
+
+/// Complete Grok OAuth using the PKCE session path captured at step 1.
+pub async fn grok_auth_finish_for_ui_with_pending(
+    code: String,
+    pending_path: Option<std::path::PathBuf>,
+) -> anyhow::Result<String> {
     let code = code.trim().to_string();
     if code.is_empty() {
         anyhow::bail!("authorization code is empty");
     }
-    let opts = xai_oauth_options(false, true, false, None);
-    edgecrab_proxy::login_xai_oauth_finish(None, Some(code), None, &opts)
+    // Silent finish options — no authorize-print side effects.
+    let opts = xai_oauth_options_for_tui();
+    let pending = pending_path.as_deref();
+    edgecrab_proxy::login_xai_oauth_finish(None, Some(code), pending, &opts)
         .await
         .map_err(|e| anyhow::anyhow!("{}", friendly_grok_login_error(&e.to_string())))
 }
@@ -666,17 +699,22 @@ pub fn grok_read_clipboard_code() -> anyhow::Result<String> {
     extract_grok_auth_code(&text)
 }
 
-const GROK_FINISH_PROMPT: &str = "Copy the authorization code from the x.ai page.\n\
-    Paste it on the line below and press Enter.\n\
-    (Paste the code only — not the full URL.)\n";
+const GROK_FINISH_PROMPT: &str = "\
+Copy the authorization code from the x.ai page (the long token).\n\
+Paste it on the line below and press Enter.\n\
+\n\
+Tips:\n\
+  • Code only — not the full browser URL\n\
+  • If the page says \"Could not establish connection\", that is normal\n\
+  • Clipboard also works: return to the overlay and press p\n";
 
 /// Suspend the TUI and read one line from the real terminal (reliable Enter handling).
 pub fn prompt_and_read_grok_code(stdout: &mut impl io::Write) -> anyhow::Result<String> {
     use std::io::{self, BufRead};
 
-    let title = "Grok sign-in — paste code";
+    let title = "SuperGrok — paste authorization code";
     writeln!(stdout, "\n{title}")?;
-    writeln!(stdout, "{}", "=".repeat(title.len()))?;
+    writeln!(stdout, "{}", "─".repeat(title.chars().count().min(48)))?;
     writeln!(stdout)?;
     for line in GROK_FINISH_PROMPT.lines() {
         writeln!(stdout, "{line}")?;

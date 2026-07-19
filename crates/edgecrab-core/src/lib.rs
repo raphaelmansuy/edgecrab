@@ -20,12 +20,14 @@ pub mod contract_verify;
 pub mod conversation;
 pub mod copilot_agent_probe;
 pub mod copilot_model_policy;
+pub mod credential_pool;
 pub mod failover;
 pub mod file_manifest;
 pub mod gateway_home;
 pub mod goal_draft;
 pub mod goal_judge;
 pub mod goals;
+pub mod evidence_latch;
 pub mod harness_advisory;
 pub mod harness_analyzer;
 pub mod harness_loop_policy;
@@ -70,6 +72,7 @@ pub mod sub_agent_runner;
 pub mod subagent_registry;
 pub mod subdirectory_hints;
 pub mod task_class;
+pub mod tool_batch;
 pub mod tool_result_spill;
 pub mod tool_result_summary;
 pub mod turn_completion;
@@ -97,6 +100,13 @@ pub use context_engine::{
 pub use context_references::{ContextRef, ExpansionResult, expand_context_refs};
 pub use edgecrab_tools::{
     HarnessBuildInput, HarnessSnapshot, build_harness_snapshot, terminal_mutation_tool_error,
+};
+pub use credential_pool::{
+    CredentialPool, PooledCredential, global_mark_exhausted_and_rotate, global_pool_ensure,
+};
+pub use tool_batch::{PlannedToolCall, ToolBatchPlan, parallel_max_workers, plan_tool_batch};
+pub use turn_prologue::{
+    TurnPrologueState, compression_made_progress, should_run_preflight_estimate,
 };
 pub use gateway_home::{
     HANDOFF_PLATFORM_HINT, handoff_platform_from_name, resolve_gateway_home_channel,

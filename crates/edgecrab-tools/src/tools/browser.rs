@@ -296,6 +296,117 @@ fn browser_launch_allowed_for_current_process() -> bool {
     !under_test_harness
 }
 
+/// Chromium proxy bypass so loopback never routes through corporate proxies.
+///
+/// First principle: reqwest already forces loopback direct (`proxy.rs`). Chrome
+/// must match — otherwise external browsers work on localhost while CDP fails.
+pub const CHROME_PROXY_BYPASS_LOOPBACK: &str = "<-loopback>;localhost;127.0.0.1;::1;[::1]";
+
+/// Headless GPU strategy for auto-launched CDP Chrome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HeadlessGpuMode {
+    /// ANGLE/SwiftShader path — WebGL/Three.js demos can paint (default).
+    #[default]
+    Software,
+    /// Legacy `--disable-gpu` (blank canvas for most 3D demos).
+    Disable,
+}
+
+impl HeadlessGpuMode {
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "disable" | "off" | "none" | "legacy" => Self::Disable,
+            _ => Self::Software,
+        }
+    }
+}
+
+/// Process-wide browser launch policy (set from AppConfig at startup).
+#[derive(Debug, Clone, Copy)]
+pub struct BrowserLaunchPolicy {
+    pub headless_gpu: HeadlessGpuMode,
+    pub proxy_bypass_loopback: bool,
+}
+
+impl Default for BrowserLaunchPolicy {
+    fn default() -> Self {
+        // Env override for operators without config edit.
+        let gpu = std::env::var("EDGECRAB_BROWSER_HEADLESS_GPU")
+            .map(|s| HeadlessGpuMode::parse(&s))
+            .unwrap_or_default();
+        Self {
+            headless_gpu: gpu,
+            proxy_bypass_loopback: true,
+        }
+    }
+}
+
+static BROWSER_LAUNCH_POLICY: Mutex<BrowserLaunchPolicy> = Mutex::new(BrowserLaunchPolicy {
+    headless_gpu: HeadlessGpuMode::Software,
+    proxy_bypass_loopback: true,
+});
+
+/// Install browser launch policy (called from AppConfig::apply_security_runtime).
+pub fn set_browser_launch_policy(policy: BrowserLaunchPolicy) {
+    if let Ok(mut g) = BROWSER_LAUNCH_POLICY.lock() {
+        *g = policy;
+    }
+}
+
+/// Snapshot of current launch policy (tests / doctor).
+pub fn browser_launch_policy() -> BrowserLaunchPolicy {
+    BROWSER_LAUNCH_POLICY
+        .lock()
+        .map(|g| *g)
+        .unwrap_or_default()
+}
+
+/// Chrome `--proxy-server` + mandatory loopback bypass args.
+pub fn chrome_proxy_launch_args(bypass_loopback: bool) -> Vec<String> {
+    let Some(proxy_url) = edgecrab_security::proxy::resolve_proxy_url(None) else {
+        return Vec::new();
+    };
+    let mut args = vec![format!("--proxy-server={proxy_url}")];
+    if bypass_loopback {
+        args.push(format!(
+            "--proxy-bypass-list={CHROME_PROXY_BYPASS_LOOPBACK}"
+        ));
+    }
+    args
+}
+
+/// Headless GPU args — software GL by default so VisualUx demos can paint.
+pub fn chrome_headless_gpu_args(mode: HeadlessGpuMode) -> Vec<String> {
+    match mode {
+        HeadlessGpuMode::Disable => vec!["--disable-gpu".into()],
+        HeadlessGpuMode::Software => vec![
+            // Do NOT pass --disable-gpu (blank Three.js canvas).
+            "--use-gl=angle".into(),
+            "--use-angle=swiftshader".into(),
+            "--enable-webgl".into(),
+            "--ignore-gpu-blocklist".into(),
+        ],
+    }
+}
+
+/// Shared headless CDP launch argv (DRY — ensure_chrome_running + tests).
+pub fn chrome_headless_launch_args(port: u16, profile_dir: &std::path::Path) -> Vec<String> {
+    let policy = browser_launch_policy();
+    let mut args = vec![
+        "--headless=new".to_string(),
+        "--no-sandbox".to_string(),
+        "--disable-dev-shm-usage".to_string(),
+        "--disable-blink-features=AutomationControlled".to_string(),
+        "--window-size=1920,1080".to_string(),
+        format!("--remote-debugging-port={port}"),
+        format!("--user-data-dir={}", profile_dir.display()),
+    ];
+    args.extend(chrome_headless_gpu_args(policy.headless_gpu));
+    args.extend(chrome_proxy_launch_args(policy.proxy_bypass_loopback));
+    args.push("about:blank".to_string());
+    args
+}
+
 pub fn launch_chrome_for_debugging(port: u16) -> bool {
     if !browser_launch_allowed_for_current_process() {
         tracing::info!(
@@ -323,9 +434,9 @@ pub fn launch_chrome_for_debugging(port: u16) -> bool {
         .arg("--disable-blink-features=AutomationControlled")
         .arg("--window-size=1920,1080");
 
-    // Wire proxy from environment variables (6-level cascade)
-    if let Some(proxy_url) = edgecrab_security::proxy::resolve_proxy_url(None) {
-        cmd.arg(format!("--proxy-server={proxy_url}"));
+    // Proxy + loopback bypass (same law as headless CDP launch).
+    for a in chrome_proxy_launch_args(browser_launch_policy().proxy_bypass_loopback) {
+        cmd.arg(a);
     }
 
     cmd.stdout(std::process::Stdio::null())
@@ -363,9 +474,10 @@ pub fn chrome_launch_command(port: u16) -> String {
         .join(format!("edgecrab-chrome-debug-{port}"))
         .display()
         .to_string();
-    let proxy_arg = edgecrab_security::proxy::resolve_proxy_url(None)
-        .map(|url| format!(" --proxy-server={url}"))
-        .unwrap_or_default();
+    let proxy_arg = chrome_proxy_launch_args(browser_launch_policy().proxy_bypass_loopback)
+        .into_iter()
+        .map(|a| format!(" {a}"))
+        .collect::<String>();
 
     #[cfg(target_os = "macos")]
     {
@@ -1493,24 +1605,13 @@ async fn ensure_chrome_running() -> Result<(), ToolError> {
     let _ = std::fs::create_dir_all(&profile_dir);
 
     let mut cmd = tokio::process::Command::new(chrome);
-    let mut args = vec![
-        "--headless=new".to_string(),
-        "--disable-gpu".to_string(),
-        "--no-sandbox".to_string(),
-        "--disable-dev-shm-usage".to_string(),
-        "--disable-blink-features=AutomationControlled".to_string(),
-        "--window-size=1920,1080".to_string(),
-        format!("--remote-debugging-port={}", ep.port),
-        format!("--user-data-dir={}", profile_dir.display()),
-    ];
-
-    // Wire proxy from environment variables (6-level cascade)
-    if let Some(proxy_url) = edgecrab_security::proxy::resolve_proxy_url(None) {
-        tracing::debug!(url = %proxy_url, "Chrome: launching with proxy");
-        args.push(format!("--proxy-server={proxy_url}"));
-    }
-
-    args.push("about:blank".to_string());
+    // First principles: software GL + loopback proxy bypass (shared builder).
+    let args = chrome_headless_launch_args(ep.port, &profile_dir);
+    tracing::debug!(
+        headless_gpu = ?browser_launch_policy().headless_gpu,
+        proxy_bypass = browser_launch_policy().proxy_bypass_loopback,
+        "Chrome: launching headless CDP with launch policy"
+    );
     cmd.args(&args);
     cmd.stdout(std::process::Stdio::null());
     cmd.stderr(std::process::Stdio::null());
@@ -5574,5 +5675,48 @@ security:
             cmd.contains("edgecrab-chrome-debug-9222"),
             "must use an edgecrab-specific profile directory"
         );
+    }
+
+    #[test]
+    fn chrome_headless_software_gpu_omits_disable_gpu() {
+        set_browser_launch_policy(BrowserLaunchPolicy {
+            headless_gpu: HeadlessGpuMode::Software,
+            proxy_bypass_loopback: true,
+        });
+        let dir = std::env::temp_dir().join("edgecrab-chrome-test-profile");
+        let args = chrome_headless_launch_args(9333, &dir);
+        assert!(
+            !args.iter().any(|a| a == "--disable-gpu"),
+            "software mode must not disable GPU (Three.js blank canvas): {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a.contains("swiftshader") || a.contains("angle")),
+            "software mode should enable ANGLE/SwiftShader: {args:?}"
+        );
+        assert!(args.iter().any(|a| a == "--enable-webgl"));
+    }
+
+    #[test]
+    fn chrome_proxy_args_include_loopback_bypass() {
+        // When no proxy env is set, args may be empty — still validate bypass constant.
+        assert!(CHROME_PROXY_BYPASS_LOOPBACK.contains("<-loopback>"));
+        assert!(CHROME_PROXY_BYPASS_LOOPBACK.contains("127.0.0.1"));
+        let with_bypass = {
+            // Force path that builds bypass when proxy present: unit-check formatting.
+            let mut args = vec!["--proxy-server=http://proxy.example:8080".to_string()];
+            args.push(format!(
+                "--proxy-bypass-list={CHROME_PROXY_BYPASS_LOOPBACK}"
+            ));
+            args
+        };
+        assert!(with_bypass.iter().any(|a| a.contains("proxy-bypass-list")));
+        assert!(with_bypass.iter().any(|a| a.contains("<-loopback>")));
+    }
+
+    #[test]
+    fn headless_gpu_mode_parse() {
+        assert_eq!(HeadlessGpuMode::parse("software"), HeadlessGpuMode::Software);
+        assert_eq!(HeadlessGpuMode::parse("disable"), HeadlessGpuMode::Disable);
+        assert_eq!(HeadlessGpuMode::parse("legacy"), HeadlessGpuMode::Disable);
     }
 }

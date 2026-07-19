@@ -79,6 +79,15 @@ impl OutputLine {
         self.expandable_body = Some(body);
     }
 
+    /// Attach expand body without the short-body threshold (edit cards / verb groups).
+    pub(crate) fn attach_expandable_body_always(&mut self, body: String) {
+        let body = crate::transcript_heights::truncate_verbose_trail(&body);
+        if body.is_empty() {
+            return;
+        }
+        self.expandable_body = Some(body);
+    }
+
     pub fn toggle_expand(&mut self) -> bool {
         let Some(body) = self.expandable_body.clone() else {
             return false;

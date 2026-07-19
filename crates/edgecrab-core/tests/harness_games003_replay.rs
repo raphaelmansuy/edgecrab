@@ -224,7 +224,7 @@ fn e16_no_false_completed_on_visual_without_perception() {
         child_runs_in_flight: 0,
         harness,
         verification_strict: true,
-    });
+            evidence: Default::default(),    });
     assert_ne!(outcome.state, edgecrab_types::CompletionDecision::Completed);
 }
 
@@ -318,6 +318,6 @@ fn session_0aeef965_terminal_storm_blocks_completion_and_act() {
         child_runs_in_flight: 0,
         harness,
         verification_strict: true,
-    });
+            evidence: Default::default(),    });
     assert_ne!(outcome.state, edgecrab_types::CompletionDecision::Completed);
 }

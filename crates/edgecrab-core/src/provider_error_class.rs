@@ -57,11 +57,14 @@ pub fn to_provider_error_class(c: &ClassifiedError) -> ProviderErrorClass {
         | FailoverReason::PayloadTooLarge
         | FailoverReason::ImageTooLarge
         | FailoverReason::LongContextTier => ProviderErrorClass::ContextOverflow,
-        FailoverReason::RateLimit | FailoverReason::Overloaded => ProviderErrorClass::RateLimit,
+        FailoverReason::RateLimit
+        | FailoverReason::UpstreamRateLimit
+        | FailoverReason::Overloaded => ProviderErrorClass::RateLimit,
         FailoverReason::FormatError
         | FailoverReason::ProviderPolicyBlocked
         | FailoverReason::ContentPolicyBlocked
-        | FailoverReason::InvalidEncryptedContent => ProviderErrorClass::InvalidRequest,
+        | FailoverReason::InvalidEncryptedContent
+        | FailoverReason::SslCertVerification => ProviderErrorClass::InvalidRequest,
         FailoverReason::ThinkingSignature
         | FailoverReason::MultimodalToolContentUnsupported
         | FailoverReason::LlamaCppGrammarPattern

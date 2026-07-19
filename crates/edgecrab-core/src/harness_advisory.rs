@@ -39,6 +39,8 @@ pub struct HarnessTurnAdvisory {
     last_storm_advisory: Option<Instant>,
     browser_nav_failures: u32,
     browser_nav_success: bool,
+    /// Last structured content-class / error code (honest thrash messages).
+    last_browser_fail_class: Option<String>,
 }
 
 impl Default for HarnessTurnAdvisory {
@@ -57,6 +59,7 @@ impl HarnessTurnAdvisory {
             last_storm_advisory: None,
             browser_nav_failures: 0,
             browser_nav_success: false,
+            last_browser_fail_class: None,
         }
     }
 
@@ -70,6 +73,16 @@ impl HarnessTurnAdvisory {
 
     pub fn record_browser_navigate_result(&mut self, tool_result: &str) {
         // First principles: structured browser JSON or typed tool_error only.
+        if let Some(parsed) = edgecrab_tools::parse_structured_browser_result(tool_result) {
+            if parsed.ok && parsed.content_class.is_evidence() {
+                self.browser_nav_success = true;
+            } else {
+                self.browser_nav_failures = self.browser_nav_failures.saturating_add(1);
+                self.last_browser_fail_class =
+                    Some(content_class_label(parsed.content_class).into());
+            }
+            return;
+        }
         if let Some(ok) = edgecrab_tools::structured_browser_nav_succeeded(tool_result) {
             if ok {
                 self.browser_nav_success = true;
@@ -78,10 +91,43 @@ impl HarnessTurnAdvisory {
             }
             return;
         }
-        if edgecrab_types::parse_tool_error_payload(tool_result).is_some() {
+        if let Some(payload) = edgecrab_types::parse_tool_error_payload(tool_result) {
             self.browser_nav_failures = self.browser_nav_failures.saturating_add(1);
+            self.last_browser_fail_class = Some(payload.code);
         }
         // Unstructured prose does not update storm counters.
+    }
+
+    fn browser_nav_fail_hint(&self) -> String {
+        match self.last_browser_fail_class.as_deref() {
+            Some("http_error_page") => {
+                "last failure: HTTP error page (wrong process/dir on the port — heal re-serve \
+                 with python3 -m http.server PORT --directory <demo-dir>, not SSRF)."
+                    .into()
+            }
+            Some("empty_document") => {
+                "last failure: empty document (server up but no page content).".into()
+            }
+            Some("app_fail") => {
+                "last failure: app fail overlay (page loaded; product/WebGL issue).".into()
+            }
+            Some("chrome_error") => {
+                "last failure: chrome-error interstitial (navigation/transport).".into()
+            }
+            Some("transport_fail") => {
+                "last failure: transport (CDP/nav net error — not necessarily SSRF).".into()
+            }
+            Some(code) if code.contains("ssrf") => {
+                format!(
+                    "last failure: SSRF/preview policy ({code}) — enable security.preview or grant loopback."
+                )
+            }
+            Some(code) => format!("last failure class: {code}"),
+            None => {
+                "last failure: unknown (check content_class / tool_error code — not always SSRF)."
+                    .into()
+            }
+        }
     }
 
     pub fn record_tool(&mut self, tool_name: &str) {
@@ -242,12 +288,13 @@ impl HarnessTurnAdvisory {
             &edgecrab_tools::tool_loop_guardrails::ToolGuardrailDecision {
                 action: edgecrab_tools::tool_loop_guardrails::GuardrailAction::Block,
                 code: "browser_nav_loop_block",
-                message: "Blocked repeated browser_navigate — prior attempts failed (SSRF, CDP, or \
-                           no session HTTP server). Do not try other localhost ports. Start \
-                           `python3 -m http.server 8000 --directory <demo-dir>`, confirm \
-                           security.preview is enabled, then navigate to http://127.0.0.1:8000/ \
-                           once. Use browser_snapshot for visual proof."
-                    .into(),
+                message: format!(
+                    "Blocked repeated browser_navigate — {}. \
+                     Do not thrash alternate ports. If HTTP error page: one heal re-serve of the \
+                     demo directory on the latched port, then browser_snapshot. \
+                     If SSRF: enable security.preview. If CDP: check Chrome headless is running.",
+                    self.browser_nav_fail_hint()
+                ),
                 tool_name: tool_name.to_string(),
                 count: self.browser_nav_failures,
             },
@@ -328,11 +375,24 @@ impl HarnessTurnAdvisory {
     }
 }
 
+fn content_class_label(c: edgecrab_tools::ContentClass) -> &'static str {
+    use edgecrab_tools::ContentClass;
+    match c {
+        ContentClass::Ok => "ok",
+        ContentClass::ChromeError => "chrome_error",
+        ContentClass::HttpErrorPage => "http_error_page",
+        ContentClass::EmptyDocument => "empty_document",
+        ContentClass::TransportFail => "transport_fail",
+        ContentClass::AppFail => "app_fail",
+    }
+}
+
 fn task_class_label(class: TaskClass) -> &'static str {
     match class {
         TaskClass::VisualUx => "visual_ux",
         TaskClass::Document => "document",
         TaskClass::CodeChange => "code_change",
+        TaskClass::MediaRender => "media_render",
         TaskClass::Research => "research",
         TaskClass::General => "general",
     }
@@ -435,6 +495,30 @@ mod tests {
         assert!(
             adv.maybe_verification_theater_block(TaskClass::VisualUx, "write_file")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn repeated_nav_block_names_http_error_not_ssrf() {
+        let mut adv = HarnessTurnAdvisory::new();
+        let fail = edgecrab_tools::StructuredBrowserResult::navigate_ok(
+            "http://127.0.0.1:8000/",
+            "Error response",
+        )
+        .to_tool_result_json();
+        for _ in 0..3 {
+            adv.record_browser_navigate_result(&fail);
+        }
+        let block = adv
+            .maybe_repeated_browser_nav_block("browser_navigate")
+            .expect("block after 3 fails");
+        assert!(
+            block.contains("HTTP error page") || block.contains("http_error"),
+            "must name content class, not only SSRF: {block}"
+        );
+        assert!(
+            !block.contains("SSRF, CDP, or no session HTTP server"),
+            "legacy vague SSRF message must be gone: {block}"
         );
     }
 

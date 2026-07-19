@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>🐧 Pinguin Slide Party</title>
+  <link rel="stylesheet" href="styles.css" />
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+  <canvas id="game-canvas" aria-label="Penguin slide party game world"></canvas>
+
+  <div id="ui" aria-hidden="true">
+    <div id="hud-top">
+      <div id="fish-counter" class="panel">
+        <h2>🐟 Fish</h2>
+        <div class="value">0 / 15</div>
+        <div class="sub">arch unlocks at 15</div>
+      </div>
+      <div id="combo-panel" class="panel combo-idle">
+        <h2>🔥 Combo</h2>
+        <div class="value" id="combo-value">×1</div>
+        <div class="combo-bar"><div id="combo-fill"></div></div>
+      </div>
+      <div id="timer" class="panel">
+        <h2>⏱️ Time</h2>
+        <div class="value">03:00</div>
+      </div>
+      <div id="score-panel" class="panel">
+        <h2>⭐ Score</h2>
+        <div class="value" id="score-value">0</div>
+      </div>
+      <div id="settings">
+        <label for="quality-select" class="visually-hidden">Quality</label>
+        <select id="quality-select" aria-label="Graphics quality">
+          <option value="low">Low</option>
+          <option value="medium">Medium</option>
+          <option value="high" selected>High</option>
+        </select>
+        <button id="sound-btn" type="button" aria-pressed="true">🔊 Sound</button>
+      </div>
+    </div>
+
+    <div id="powerup-toast" class="toast" hidden></div>
+    <div id="pickup-toast" class="toast pickup" hidden></div>
+  </div>
+
+  <div id="hint">
+    <span id="hint-text">Waddle, belly-slide, and chain fish combos! Unlock the ice arch at 15 🐟</span>
+  </div>
+
+  <div id="compass" aria-hidden="true">
+    <div id="compass-arrow">▲</div>
+    <div id="compass-label">fish</div>
+  </div>
+
+  <div id="overlay" class="full-overlay">
+    <div class="title-badge">SLIDE · COLLECT · COMBO</div>
+    <h1>🐧 Pinguin Slide Party</h1>
+    <p>
+      Race across the Antarctic ice! Scoop golden fish, snag magnets &amp; turbo fish,
+      chain combos for mega points, then dive through the glowing arch.
+    </p>
+    <div class="keys" role="list" aria-label="Keyboard controls">
+      <span class="key" role="listitem">⬆️ / W forward</span>
+      <span class="key" role="listitem">⬇️ / S back</span>
+      <span class="key" role="listitem">⬅️ / A · ➡️ / D turn</span>
+      <span class="key" role="listitem">Space belly-slide</span>
+      <span class="key" role="listitem">Shift jump</span>
+      <span class="key" role="listitem">P / Esc pause</span>
+    </div>
+    <ul class="feature-list">
+      <li>🔥 Combos multiply score when you keep collecting</li>
+      <li>🧲 Magnets vacuum nearby fish · ⚡ Turbo boosts speed</li>
+      <li>🎯 Compass points to the next fish (or the arch when ready)</li>
+    </ul>
+    <button id="start-btn" class="btn-primary" type="button">Start Sliding!</button>
+  </div>
+
+  <div id="finish-screen">
+    <div id="stars" class="stars">☆ ☆ ☆</div>
+    <h2 id="finish-title">Level Complete! 🎉</h2>
+    <p id="finish-tagline" class="tagline"></p>
+    <table id="stats-table">
+      <tbody>
+        <tr><td>Fish collected</td><td id="stat-fish">0 / 20</td></tr>
+        <tr><td>Best combo</td><td id="stat-combo">×1</td></tr>
+        <tr><td>Time</td><td id="stat-time">00:00</td></tr>
+        <tr><td>Bonus fish</td><td id="stat-bonus">0</td></tr>
+        <tr><td>Final score</td><td id="stat-score">0</td></tr>
+      </tbody>
+    </table>
+    <button id="restart-btn" class="btn-primary" type="button">Play Again 🐧</button>
+  </div>
+
+  <div id="touch-controls" aria-label="Touch controls">
+    <div class="touch-left">
+      <button id="touch-up" class="touch-btn" aria-label="Walk forward" type="button">▲</button>
+      <div class="touch-row">
+        <button id="touch-left" class="touch-btn" aria-label="Turn left" type="button">◀</button>
+        <button id="touch-down" class="touch-btn" aria-label="Walk backward" type="button">▼</button>
+        <button id="touch-right" class="touch-btn" aria-label="Turn right" type="button">▶</button>
+      </div>
+    </div>
+    <div class="touch-actions">
+      <button id="touch-jump" class="touch-btn action" aria-label="Jump" type="button">⤒</button>
+      <button id="touch-slide" class="touch-btn action slide" aria-label="Belly slide" type="button">⛷️</button>
+    </div>
+  </div>
+
+  <div id="aria-live" aria-live="polite" aria-atomic="true" class="visually-hidden"></div>
+
+  <script type="module" src="js/game.js"></script>
+</body>
+</html>

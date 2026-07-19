@@ -1900,6 +1900,27 @@ pub struct McpDynamicTool {
     input_schema: serde_json::Value,
 }
 
+/// Heuristic: MCP tool names that look read-only are parallel-safe.
+fn mcp_tool_name_looks_readonly(original_name: &str) -> bool {
+    let n = original_name.to_ascii_lowercase();
+    // Explicit mutating prefixes first
+    const MUTATING: &[&str] = &[
+        "create", "update", "delete", "remove", "write", "put", "post", "patch",
+        "set", "send", "execute", "run", "apply", "insert", "drop", "mutate",
+        "upload", "publish", "invoke", "call_service", "trigger",
+    ];
+    for m in MUTATING {
+        if n.starts_with(m) || n.contains(&format!("_{m}")) || n.contains(&format!("{m}_")) {
+            return false;
+        }
+    }
+    const READONLY: &[&str] = &[
+        "list", "get", "read", "search", "find", "fetch", "query", "describe",
+        "show", "status", "info", "view", "lookup", "count", "head", "stat",
+    ];
+    READONLY.iter().any(|p| n.starts_with(p) || n.contains(&format!("_{p}")) || n.contains(&format!("{p}_")))
+}
+
 impl McpDynamicTool {
     /// Construct a dynamic tool wrapper for one server+tool combination.
     ///
@@ -1939,6 +1960,12 @@ impl ToolHandler for McpDynamicTool {
 
     fn emoji(&self) -> &'static str {
         "🔌"
+    }
+
+    /// Read-only MCP tools may run in parallel (022-014 wave-2 / AE4).
+    /// Mutating names stay sequential (default false).
+    fn parallel_safe(&self) -> bool {
+        mcp_tool_name_looks_readonly(&self.original_name)
     }
 
     fn schema(&self) -> ToolSchema {
@@ -2695,6 +2722,20 @@ mod tests {
         let tool = McpDynamicTool::new("github", "list_issues", "desc", json!({}));
         assert_eq!(tool.name_static, "mcp_github_list_issues");
         assert_eq!(tool.toolset_static, "mcp-github");
+    }
+
+    #[test]
+    fn mcp_readonly_tools_are_parallel_safe() {
+        assert!(mcp_tool_name_looks_readonly("list_issues"));
+        assert!(mcp_tool_name_looks_readonly("get_file"));
+        assert!(mcp_tool_name_looks_readonly("search_code"));
+        assert!(!mcp_tool_name_looks_readonly("create_issue"));
+        assert!(!mcp_tool_name_looks_readonly("delete_repo"));
+        assert!(!mcp_tool_name_looks_readonly("update_file"));
+        let list = McpDynamicTool::new("gh", "list_issues", "d", json!({}));
+        assert!(list.parallel_safe());
+        let create = McpDynamicTool::new("gh", "create_issue", "d", json!({}));
+        assert!(!create.parallel_safe());
     }
 
     #[test]

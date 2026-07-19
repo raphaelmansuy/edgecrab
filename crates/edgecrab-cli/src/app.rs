@@ -68,7 +68,9 @@ use crate::details_panel::{self, DetailsPanel, DetailsPanelAction};
 use crate::display_state::{
     DisplayState, ValueCaptureAction, VoicePresenceState, voice_presence_frame_count,
 };
-use crate::edit_diff::{LocalEditSnapshot, capture_local_edit_snapshot, render_edit_diff_lines};
+use crate::edit_diff::{
+    EditStats, EditVerbGroup, LocalEditSnapshot, capture_local_edit_snapshot, render_edit_diff_card,
+};
 use crate::fuzzy_selector::{FuzzyItem, FuzzySelector};
 use crate::gateway_browser::{
     GatewayPlatformEntry, build_gateway_platform_entries, supports_allowlist, supports_home_channel,
@@ -83,7 +85,7 @@ use crate::logging::{
 };
 use crate::mcp_support;
 use crate::model_catalog_ui::{
-    ModelEntry, build_model_selector_entries, build_models_inventory_report,
+    ModelEntry, build_model_selector_entries_with_auth, build_models_inventory_report,
     discovery_availability_detail, discovery_source_label, model_selector_status_hint,
 };
 use crate::model_picker::{
@@ -1919,6 +1921,14 @@ enum BackgroundOpResult {
     /// Model change finished — update model + show confirmation.
     ModelChangeDone {
         outcome: edgecrab_core::ModelChangeOutcome,
+    },
+    /// SuperGrok/xAI auth missing — open `/login grok` and resume this model after.
+    SuperGrokLoginNeeded { pending_model: String },
+    /// SuperGrok OAuth finish (token exchange) completed on a background task.
+    GrokAuthFinishDone {
+        result: Result<String, String>,
+        /// Code restored into the overlay when exchange fails (so Enter can retry).
+        restore_code: Option<String>,
     },
     /// CLI → platform session handoff finished — exit CLI.
     SessionHandoffDone { message: String },
@@ -4110,6 +4120,8 @@ pub struct App {
     proxy_setup: crate::proxy_setup_tui::ProxySetupTui,
     /// In-TUI xAI Grok OAuth (`/login grok`).
     grok_auth: crate::grok_auth_tui::GrokAuthTui,
+    /// After SuperGrok login succeeds, auto-switch to this model (no second /model).
+    pending_model_after_grok_login: Option<String>,
     /// Status bar picker overlay (activated by `/statusbar` with no args)
     statusbar_selector_active: bool,
     /// Which row is highlighted in the statusbar picker (0=Visible, 1=Hidden)
@@ -4239,6 +4251,8 @@ pub struct App {
     pending_tool_lines: std::collections::HashMap<String, PendingToolLine>,
     /// Collapse consecutive identical tool-failure transcript lines (spec 021).
     collapsed_tool_fail: Option<CollapsedToolFail>,
+    /// Consecutive successful edit tools merge into one "Edited N files" header.
+    edit_verb_group: Option<EditVerbGroup>,
     /// In-flight sub-agent placeholder lines keyed by `task_index`.
     ///
     /// Mirrors `pending_tool_lines` for the delegated-child sub-agent lifecycle:
@@ -4686,6 +4700,7 @@ impl App {
         self.turn_stream_tokens = 0;
         self.pending_tool_lines.clear();
         self.collapsed_tool_fail = None;
+        self.edit_verb_group = None;
         self.pending_subagent_lines.clear();
         self.hidden_tool_calls.clear();
         self.seen_tool_signatures.clear();
@@ -5206,6 +5221,7 @@ impl App {
                 edgecrab_core::edgecrab_home().join("config.yaml"),
             ),
             grok_auth: crate::grok_auth_tui::GrokAuthTui::new(),
+            pending_model_after_grok_login: None,
             statusbar_selector_active: false,
             statusbar_selector_cursor: 0, // default to Visible
             shadow_judge_selector_active: false,
@@ -5253,6 +5269,7 @@ impl App {
             turn_stream_tokens: 0,
             pending_tool_lines: std::collections::HashMap::new(),
             collapsed_tool_fail: None,
+            edit_verb_group: None,
             pending_subagent_lines: std::collections::HashMap::new(),
             hidden_tool_calls: HashSet::new(),
             seen_tool_signatures: HashSet::new(),
@@ -5353,10 +5370,12 @@ impl App {
         if self.model_selector_seeded {
             return;
         }
-        self.model_selector.set_items(build_model_selector_entries(
-            &ModelCatalog::grouped_catalog(),
-            None,
-        ));
+        self.model_selector
+            .set_items(build_model_selector_entries_with_auth(
+                &ModelCatalog::grouped_catalog(),
+                None,
+                Some(&crate::xai_credentials::model_picker_auth_ready),
+            ));
         self.model_selector_seeded = true;
     }
 
@@ -5590,6 +5609,15 @@ impl App {
                 collapsed.line_idx -= 1;
             }
         }
+        if let Some(group) = self.edit_verb_group.as_mut()
+            && let Some(header_idx) = group.header_line_idx
+        {
+            if header_idx == idx {
+                group.header_line_idx = None;
+            } else if header_idx > idx {
+                group.header_line_idx = Some(header_idx - 1);
+            }
+        }
         for pending in self.pending_subagent_lines.values_mut() {
             if pending.line_idx > idx {
                 pending.line_idx -= 1;
@@ -5619,6 +5647,104 @@ impl App {
     pub fn push_output_spans(&mut self, spans: Vec<Span<'static>>, role: OutputRole) {
         self.output.push(OutputLine::new_spans(spans, role));
         self.prune_transcript_if_needed();
+        if self.at_bottom {
+            self.scroll_offset = 0;
+        }
+        self.needs_redraw = true;
+    }
+
+    /// Paint a polished edit card (hunks + stats) and merge consecutive edits.
+    ///
+    /// DRY: all chrome lives in `edit_diff`; this only wires transcript indices
+    /// and the verb-group accumulator.
+    fn push_edit_presentation(
+        &mut self,
+        tool_name: &str,
+        args_json: &str,
+        is_error: bool,
+        snapshot: Option<&LocalEditSnapshot>,
+    ) {
+        if is_error || !matches!(tool_name, "write_file" | "patch" | "apply_patch") {
+            // Non-success / non-edit breaks the consecutive edit group.
+            if !matches!(tool_name, "write_file" | "patch" | "apply_patch") {
+                self.edit_verb_group = None;
+            }
+            return;
+        }
+
+        let Some(card) = render_edit_diff_card(tool_name, args_json, is_error, snapshot) else {
+            return;
+        };
+
+        let path = card.presentation.path_display.clone();
+        let stats = card.presentation.stats;
+
+        // ── Verb group: merge consecutive successful edits ───────────────
+        if self.edit_verb_group.is_none() {
+            let mut group = EditVerbGroup::default();
+            group.push_file(&path, stats);
+            for extra in &card.presentation.extra_paths {
+                group.push_file(extra, EditStats::default());
+            }
+            // Push per-file card first; header index points at first line.
+            let header_idx = self.output.len();
+            for (i, line) in card.collapsed_lines.into_iter().enumerate() {
+                self.push_output_spans(line, OutputRole::Tool);
+                if i == 0
+                    && let Some(body) = card.expandable_body.clone()
+                {
+                    let last = self.output.len().saturating_sub(1);
+                    if last < self.output.len() {
+                        self.output[last].attach_expandable_body_always(body);
+                    }
+                }
+            }
+            group.header_line_idx = Some(header_idx);
+            self.edit_verb_group = Some(group);
+        } else {
+            // Update group stats without holding a borrow across push_output_spans.
+            let (header_spans, list_body, header_idx) = {
+                let group = self
+                    .edit_verb_group
+                    .as_mut()
+                    .expect("edit_verb_group checked above");
+                group.push_file(&path, stats);
+                for extra in &card.presentation.extra_paths {
+                    group.push_file(extra, EditStats::default());
+                }
+                (
+                    group.render_header_spans(),
+                    group.expandable_file_list(),
+                    group.header_line_idx,
+                )
+            };
+            // Rewrite prior header into multi-file group line.
+            if let Some(idx) = header_idx
+                && idx < self.output.len()
+            {
+                self.output[idx].prebuilt_spans = Some(header_spans);
+                self.output[idx].attach_expandable_body_always(list_body);
+                self.output[idx].invalidate_render_cache();
+            }
+            // Append this file's hunk body (skip card header — group header
+            // already summarizes the batch).
+            let mut lines = card.collapsed_lines.into_iter();
+            let _header = lines.next();
+            let mut first_body = true;
+            for line in lines {
+                self.push_output_spans(line, OutputRole::Tool);
+                if first_body {
+                    first_body = false;
+                    if let Some(body) = card.expandable_body.clone() {
+                        let last = self.output.len().saturating_sub(1);
+                        if last < self.output.len() {
+                            self.output[last].attach_expandable_body_always(body);
+                        }
+                    }
+                }
+            }
+        }
+
         if self.at_bottom {
             self.scroll_offset = 0;
         }
@@ -5811,6 +5937,7 @@ impl App {
         self.buffered_assistant_output.clear();
         self.pending_tool_lines.clear();
         self.collapsed_tool_fail = None;
+        self.edit_verb_group = None;
         self.hidden_tool_calls.clear();
         self.seen_tool_signatures.clear();
         // Request a full terminal repaint.  ratatui's diff-based renderer
@@ -8876,7 +9003,7 @@ impl App {
             "browser" => &[
                 ("connect", "Connect to a running Chrome/Chromium instance"),
                 ("disconnect", "Close the CDP connection"),
-                ("status", "Show browser connection status"),
+                ("status", "CDP, GPU, proxy, preview, port content class"),
                 ("tabs", "List open browser tabs"),
                 ("recording", "Toggle recording: recording on | off"),
             ],
@@ -11522,6 +11649,28 @@ impl App {
                 self.remote_mcp_browser.loading_spinner_frame.wrapping_add(1);
             animated = true;
         }
+        // SuperGrok OAuth exchange — live elapsed + drain completion off busy.
+        if self.grok_auth.active && self.grok_auth.busy {
+            animated = true;
+            // Soft watchdog: if the task died without notifying (abort/panic),
+            // clear busy after 60s so the overlay is never permanently stuck.
+            if self
+                .grok_auth
+                .busy_started
+                .is_some_and(|t| t.elapsed() > Duration::from_secs(60))
+            {
+                let restore = self.grok_auth.pending_code.clone();
+                self.grok_auth.abort_finish();
+                if let Some(code) = restore {
+                    self.grok_auth.set_pending_code(code);
+                }
+                self.grok_auth.set_error(
+                    "Token exchange took too long and was stopped.\n\
+                     Press Enter to retry, or Esc to close."
+                        .into(),
+                );
+            }
+        }
         // Install theatre stage elapsed needs a live redraw while Idle.
         if matches!(
             self.skills_marketplace_mode,
@@ -11700,6 +11849,10 @@ impl App {
             );
             return;
         }
+        // SuperGrok without tokens: open login immediately (zero dead-end picker).
+        if self.maybe_start_supergrok_login_for_model(&target) {
+            return;
+        }
         let tx = self.response_tx.clone();
         self.display_state = DisplayState::BgOp {
             label: "Switching model…".into(),
@@ -11708,7 +11861,32 @@ impl App {
         };
         self.needs_redraw = true;
         self.rt_handle.spawn(async move {
-            match agent.switch_model_fast(&target).await {
+            // Always use create_provider_async so SuperGrok OAuth prepare +
+            // OAuthRefreshingProvider (streaming + 401 refresh) apply on /model.
+            let provider = match crate::create_provider_async(&target).await {
+                Ok(p) => p,
+                Err(err) => {
+                    let msg = err.to_string();
+                    if crate::xai_credentials::is_xai_auth_missing_error(&msg)
+                        && target_is_xai_family(&target)
+                    {
+                        let _ = tx.send(AgentResponse::BgOp(
+                            BackgroundOpResult::SuperGrokLoginNeeded {
+                                pending_model: target,
+                            },
+                        ));
+                    } else {
+                        let _ = tx.send(AgentResponse::BgOp(BackgroundOpResult::SystemMsg(
+                            format!("Provider setup failed: {msg}"),
+                        )));
+                    }
+                    return;
+                }
+            };
+            match agent
+                .switch_model_fast_with_provider(&target, provider)
+                .await
+            {
                 Ok(outcome) => {
                     let _ = tx.send(AgentResponse::BgOp(BackgroundOpResult::ModelChangeDone {
                         outcome: edgecrab_core::ModelChangeOutcome::Fast(outcome),
@@ -11744,6 +11922,9 @@ impl App {
             );
             return;
         }
+        if self.maybe_start_supergrok_login_for_model(&target) {
+            return;
+        }
         let tx = self.response_tx.clone();
         self.display_state = DisplayState::BgOp {
             label: "Transferring model…".into(),
@@ -11752,7 +11933,30 @@ impl App {
         };
         self.needs_redraw = true;
         self.rt_handle.spawn(async move {
-            match agent.perform_model_transfer(&target, None).await {
+            let provider = match crate::create_provider_async(&target).await {
+                Ok(p) => Some(p),
+                Err(err) => {
+                    let msg = err.to_string();
+                    if crate::xai_credentials::is_xai_auth_missing_error(&msg)
+                        && target_is_xai_family(&target)
+                    {
+                        let _ = tx.send(AgentResponse::BgOp(
+                            BackgroundOpResult::SuperGrokLoginNeeded {
+                                pending_model: target,
+                            },
+                        ));
+                    } else {
+                        let _ = tx.send(AgentResponse::BgOp(BackgroundOpResult::SystemMsg(
+                            format!("Provider setup failed: {msg}"),
+                        )));
+                    }
+                    return;
+                }
+            };
+            match agent
+                .perform_model_transfer_with_provider(&target, provider, None)
+                .await
+            {
                 Ok(outcome) => {
                     let _ = tx.send(AgentResponse::BgOp(BackgroundOpResult::ModelChangeDone {
                         outcome: edgecrab_core::ModelChangeOutcome::Transfer(outcome),
@@ -11765,6 +11969,37 @@ impl App {
                 }
             }
         });
+    }
+
+    /// If SuperGrok is selected without OAuth tokens, open login and queue the switch.
+    fn maybe_start_supergrok_login_for_model(&mut self, target: &str) -> bool {
+        let Some((provider, _)) = target.split_once('/') else {
+            return false;
+        };
+        let catalog = edgecrab_core::ModelCatalog::catalog_provider_id(provider);
+        if catalog != "super-grok" {
+            return false;
+        }
+        if crate::xai_credentials::super_grok_oauth_ready() {
+            return false;
+        }
+        // Allow API-key-only users to still switch without login.
+        let has_key = std::env::var("XAI_API_KEY")
+            .ok()
+            .is_some_and(|v| !v.trim().is_empty());
+        if has_key {
+            return false;
+        }
+        self.pending_model_after_grok_login = Some(target.to_string());
+        self.push_output(
+            format!(
+                "SuperGrok needs a one-time sign-in.\n\
+                 Opening /login grok — after you finish, EdgeCrab will switch to {target} automatically."
+            ),
+            OutputRole::System,
+        );
+        self.open_grok_auth_overlay(crate::grok_auth_tui::GrokAuthScreen::Start);
+        true
     }
 
     fn apply_model_switch_intent(&mut self, model: String, intent: ModelSwitchIntent) {
@@ -12844,7 +13079,11 @@ impl App {
         let moa = self.current_moa_config();
         self.moa_reference_selected = moa.reference_models.iter().cloned().collect();
 
-        let mut entries = build_model_selector_entries(&ModelCatalog::grouped_catalog(), None);
+        let mut entries = build_model_selector_entries_with_auth(
+            &ModelCatalog::grouped_catalog(),
+            None,
+            Some(&crate::xai_credentials::model_picker_auth_ready),
+        );
         match mode {
             MoaReferenceSelectorMode::EditRoster => {}
             MoaReferenceSelectorMode::AddExpert => {
@@ -17259,7 +17498,11 @@ impl App {
                 })
                 .collect();
             let _ = tx.send(AgentResponse::BgOp(BackgroundOpResult::ModelCatalogReady {
-                models: build_model_selector_entries(&merged, Some(&dynamic_lookup)),
+                models: build_model_selector_entries_with_auth(
+                    &merged,
+                    Some(&dynamic_lookup),
+                    Some(&crate::xai_credentials::model_picker_auth_ready),
+                ),
                 current_model,
             }));
         });
@@ -18901,25 +19144,37 @@ impl App {
         self.grok_auth.error = None;
         self.needs_redraw = true;
         let no_browser = self.grok_auth.no_browser;
+        // Silent PKCE start (no stderr clear / OSC-8) — TUI owns all presentation.
         let result = self
             .rt_handle
             .block_on(async { crate::auth_cmd::grok_auth_start_for_ui(no_browser).await });
         match result {
-            Ok((url, path)) => match crate::auth_cmd::open_grok_authorize_url(&url) {
-                Ok(()) => {
-                    self.grok_auth.set_start_result(url, path);
-                    self.push_output(
-                        "Grok: x.ai opened in your browser. Copy the code, then press Enter in the overlay.",
-                        OutputRole::System,
-                    );
-                }
-                Err(e) => {
-                    self.grok_auth.set_start_result(url, path);
-                    self.grok_auth.set_error(format!(
-                        "Could not open browser: {e}. Press o to retry, or open the URL from step 2."
-                    ));
-                }
-            },
+            Ok((url, path)) => {
+                let browser_ok = if no_browser {
+                    false
+                } else {
+                    match crate::auth_cmd::open_grok_authorize_url(&url) {
+                        Ok(()) => true,
+                        Err(e) => {
+                            self.grok_auth.set_start_result(url.clone(), path.clone(), false);
+                            self.grok_auth.set_error(format!(
+                                "Could not open browser: {e}. Press o to retry, or open the URL shown below."
+                            ));
+                            self.needs_redraw = true;
+                            return;
+                        }
+                    }
+                };
+                self.grok_auth.set_start_result(url, path, browser_ok);
+                self.push_output(
+                    if browser_ok {
+                        "SuperGrok: browser opened — copy the code from x.ai, then paste here (p or Enter)."
+                    } else {
+                        "SuperGrok: sign-in ready — press o to open the browser, then paste the code."
+                    },
+                    OutputRole::System,
+                );
+            }
             Err(e) => self.grok_auth.set_error(e.to_string()),
         }
         self.needs_redraw = true;
@@ -18935,37 +19190,172 @@ impl App {
         self.with_tui_suspended(crate::auth_cmd::prompt_and_read_grok_code)
     }
 
-    fn exchange_grok_auth_code(&mut self, code: String) {
-        self.grok_auth.active = true;
-        self.grok_auth.screen = crate::grok_auth_tui::GrokAuthScreen::Finish;
-        self.grok_auth.busy = true;
-        self.grok_auth.error = None;
-        self.needs_redraw = true;
-        let result = self
-            .rt_handle
-            .block_on(async { crate::auth_cmd::grok_auth_finish_for_ui(code).await });
-        match result {
-            Ok(msg) => {
-                self.grok_auth.set_finish_success(msg);
-                self.push_output(
-                    "Grok OAuth saved. Use /proxy to enable the preset or `edgecrab proxy start --provider xai`.",
-                    OutputRole::System,
-                );
-            }
-            Err(e) => {
-                let msg = e.to_string();
-                if crate::auth_cmd::is_grok_pending_expired_error(&msg) {
-                    self.run_grok_oauth_start();
-                    self.push_output(
-                        "Grok session expired — opened a fresh x.ai sign-in in your browser. Paste the new code and press Enter.",
-                        OutputRole::System,
-                    );
+    /// Apply a successful SuperGrok token exchange (credentials already injected async).
+    fn apply_grok_auth_finish_success(&mut self, msg: String) {
+        let pending = self.pending_model_after_grok_login.take();
+        self.grok_auth.set_finish_success(
+            crate::xai_credentials::super_grok_login_success_agent_hint(pending.as_deref()),
+        );
+        self.push_output(
+            format!(
+                "{msg}\n{}",
+                crate::xai_credentials::super_grok_login_success_agent_hint(pending.as_deref())
+            ),
+            OutputRole::System,
+        );
+        self.grok_auth.close();
+        // CRITICAL: rebuild the live provider even when already on SuperGrok.
+        // Login injects the OAuth bearer into env, but the existing XAIProvider
+        // still holds the pre-login key (often a console key → 403 credits while
+        // the UI only shows "awaiting first token").
+        let model = pending
+            .filter(|m| target_is_xai_family(m))
+            .unwrap_or_else(|| {
+                if target_is_xai_family(&self.model_name) {
+                    self.model_name.clone()
                 } else {
-                    self.grok_auth.set_error(msg);
+                    "super-grok/grok-4.5".to_string()
+                }
+            });
+        self.spawn_oauth_provider_rebuild(model);
+        self.needs_redraw = true;
+    }
+
+    /// Force-rebuild xAI/SuperGrok provider with current env (post-/login grok).
+    ///
+    /// Unlike `/model`, this does **not** reject "same model" — the point is a
+    /// new provider Arc with the OAuth bearer, not a display-name change.
+    fn spawn_oauth_provider_rebuild(&mut self, model: String) {
+        let Some(agent) = self.require_agent() else {
+            return;
+        };
+        if self.session_blocks_model_transfer() {
+            self.push_output(
+                "SuperGrok login saved. Wait for the current turn to finish, then run:\n\
+                 /model super-grok/grok-4.5\n\
+                 (or restart EdgeCrab) so the new OAuth token is applied.",
+                OutputRole::System,
+            );
+            return;
+        }
+        let tx = self.response_tx.clone();
+        self.display_state = DisplayState::BgOp {
+            label: "Applying SuperGrok credentials…".into(),
+            frame: 0,
+            started: Instant::now(),
+        };
+        self.needs_redraw = true;
+        self.rt_handle.spawn(async move {
+            match crate::create_provider_async(&model).await {
+                Ok(provider) => {
+                    let from = agent
+                        .try_session_snapshot()
+                        .map(|s| s.model)
+                        .unwrap_or_else(|| model.clone());
+                    agent.swap_model(model.clone(), provider).await;
+                    // Update TUI model label + persist (even when display name unchanged).
+                    let _ = tx.send(AgentResponse::BgOp(BackgroundOpResult::ModelChangeDone {
+                        outcome: edgecrab_core::ModelChangeOutcome::Fast(
+                            edgecrab_core::ModelSwitchOutcome {
+                                from_model: from,
+                                to_model: model.clone(),
+                            },
+                        ),
+                    }));
+                    let _ = tx.send(AgentResponse::BgOp(BackgroundOpResult::SystemMsg(
+                        format!(
+                            "SuperGrok OAuth token applied to live agent ({model}). Ready to chat."
+                        ),
+                    )));
+                }
+                Err(err) => {
+                    let _ = tx.send(AgentResponse::BgOp(BackgroundOpResult::SystemMsg(
+                        format!(
+                            "SuperGrok login saved, but applying credentials failed: {err}\n\
+                             Run /model {model} or restart EdgeCrab."
+                        ),
+                    )));
                 }
             }
+        });
+    }
+
+    fn apply_grok_auth_finish_error(&mut self, msg: String, restore_code: Option<String>) {
+        self.grok_auth.finish_abort = None;
+        if let Some(code) = restore_code {
+            self.grok_auth.set_pending_code(code);
+        }
+        self.grok_auth.busy = false;
+        self.grok_auth.busy_started = None;
+        self.grok_auth.active = true;
+        self.grok_auth.screen = crate::grok_auth_tui::GrokAuthScreen::Finish;
+        if crate::auth_cmd::is_grok_pending_expired_error(&msg) {
+            self.grok_auth.set_error(format!(
+                "{msg}\nPress Enter to open a fresh x.ai sign-in, then paste a new code."
+            ));
+        } else {
+            self.grok_auth.set_error(msg);
         }
         self.needs_redraw = true;
+    }
+
+    /// Non-blocking token exchange + credential inject (never block the TUI thread).
+    ///
+    /// WHY timeout + inject in-task:
+    /// - Token exchange can hang on network; without a deadline, UI stays on
+    ///   "Exchanging…" forever.
+    /// - Doing prepare via `block_on` on the TUI thread after success also froze
+    ///   the overlay at Done-never-reached (pending cleared, UI still busy).
+    fn spawn_grok_auth_finish(&mut self, code: String) {
+        self.grok_auth.active = true;
+        self.grok_auth.screen = crate::grok_auth_tui::GrokAuthScreen::Finish;
+        self.grok_auth.error = None;
+        self.needs_redraw = true;
+
+        let pending_path = self.grok_auth.pending_path.clone();
+        let tx = self.response_tx.clone();
+        let code_for_restore = code.clone();
+        let join = self.rt_handle.spawn(async move {
+            const EXCHANGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+            let outcome = tokio::time::timeout(EXCHANGE_TIMEOUT, async {
+                let msg = crate::auth_cmd::grok_auth_finish_for_ui_with_pending(
+                    code,
+                    pending_path,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+                // Inject bearer into process env BEFORE notifying TUI so Done is ready to chat.
+                if let Err(e) = crate::xai_credentials::prepare_xai_credentials_with_preference(
+                    false,
+                    crate::xai_credentials::XaiAuthPreference::PreferOauth,
+                )
+                .await
+                {
+                    tracing::warn!(error = %e, "SuperGrok tokens saved but env inject failed");
+                }
+                Ok::<String, String>(msg)
+            })
+            .await;
+
+            let result = match outcome {
+                Ok(inner) => inner,
+                Err(_) => Err(
+                    "Token exchange timed out after 45s (x.ai did not respond).\n\
+                     Check network, press Enter to retry with a fresh code from x.ai."
+                        .into(),
+                ),
+            };
+            let restore = if result.is_err() {
+                Some(code_for_restore)
+            } else {
+                None
+            };
+            let _ = tx.send(AgentResponse::BgOp(BackgroundOpResult::GrokAuthFinishDone {
+                result,
+                restore_code: restore,
+            }));
+        });
+        self.grok_auth.begin_finish_busy(join.abort_handle());
     }
 
     fn handle_grok_auth_key(&mut self, key: crossterm::event::KeyEvent) {
@@ -18975,13 +19365,33 @@ impl App {
         match action {
             GrokAuthAction::None => {}
             GrokAuthAction::Close => {
-                self.grok_auth.close();
+                let was_busy = self.grok_auth.busy;
+                let restore = self.grok_auth.pending_code.clone();
+                self.grok_auth.abort_finish();
+                if was_busy {
+                    // Cancel exchange — stay on step 2 so user can retry.
+                    self.grok_auth.active = true;
+                    self.grok_auth.screen = crate::grok_auth_tui::GrokAuthScreen::Finish;
+                    if let Some(code) = restore {
+                        self.grok_auth.set_pending_code(code);
+                    }
+                    self.grok_auth.set_error(
+                        "Exchange cancelled. Press p to reload clipboard, then Enter to retry."
+                            .into(),
+                    );
+                } else {
+                    self.grok_auth.close();
+                }
                 self.needs_redraw = true;
             }
             GrokAuthAction::OpenBrowser => {
                 if let Some(url) = self.grok_auth.authorize_url.clone() {
-                    if let Err(e) = crate::auth_cmd::open_grok_authorize_url(&url) {
-                        self.grok_auth.set_error(e.to_string());
+                    match crate::auth_cmd::open_grok_authorize_url(&url) {
+                        Ok(()) => {
+                            self.grok_auth.browser_opened = true;
+                            self.grok_auth.error = None;
+                        }
+                        Err(e) => self.grok_auth.set_error(e.to_string()),
                     }
                 } else {
                     self.run_grok_oauth_start();
@@ -19002,25 +19412,54 @@ impl App {
                 }
             },
             GrokAuthAction::RunFinish => {
-                if !crate::auth_cmd::grok_has_valid_pending_session() {
-                    self.run_grok_oauth_start();
+                // Prefer the step-1 PKCE file we actually wrote (profile-aware).
+                let pending_ok = self
+                    .grok_auth
+                    .pending_path
+                    .as_ref()
+                    .map(|p| {
+                        edgecrab_proxy::peek_xai_pending_session(Some(p.as_path())).is_some()
+                    })
+                    .unwrap_or_else(crate::auth_cmd::grok_has_valid_pending_session);
+
+                if !pending_ok {
+                    // Second Enter after the warning → restart cleanly.
+                    let restart_hint = self.grok_auth.error.as_deref().is_some_and(|e| {
+                        e.contains("expired or missing") || e.contains("fresh x.ai")
+                    });
+                    if restart_hint || self.grok_auth.pending_code.is_none() {
+                        self.grok_auth.pending_code = None;
+                        self.run_grok_oauth_start();
+                    } else {
+                        // First failure: keep the pasted code visible and explain.
+                        self.grok_auth.set_error(
+                            "Sign-in session expired or missing.\n\
+                             Press Enter again to open a fresh x.ai page, then paste a new code."
+                                .into(),
+                        );
+                    }
                     self.needs_redraw = true;
                     return;
                 }
+
                 match self.resolve_grok_auth_code_for_finish() {
-                    Ok(code) => self.exchange_grok_auth_code(code),
+                    Ok(code) => {
+                        self.push_output(
+                            "SuperGrok: exchanging authorization code…",
+                            OutputRole::System,
+                        );
+                        self.spawn_grok_auth_finish(code);
+                    }
                     Err(e) => {
                         let msg = e.to_string();
                         if crate::auth_cmd::is_grok_pending_expired_error(&msg) {
-                            self.run_grok_oauth_start();
-                        } else if let Some(url) = self.grok_auth.authorize_url.clone() {
-                            let _ = crate::auth_cmd::open_grok_authorize_url(&url);
                             self.grok_auth.set_error(format!(
-                                "{msg}\nReopened x.ai — paste your code and press Enter again."
+                                "{msg}\nPress Enter to restart sign-in."
                             ));
                         } else {
-                            self.grok_auth.active = true;
-                            self.grok_auth.set_error(msg);
+                            self.grok_auth.set_error(format!(
+                                "{msg}\nTip: press p to load clipboard, or Enter for the paste prompt."
+                            ));
                         }
                         self.needs_redraw = true;
                     }
@@ -19240,6 +19679,8 @@ impl App {
                  /mcp search [query]  (search official MCP sources + registry)\n\
                  /mcp view <preset-or-server>\n\
                  /mcp install <preset> [--name <server-name>|name=<server-name>] [--path <directory>|path=<directory>]\n\
+                 /mcp add <name> --url <endpoint> [--auth oauth|bearer|none] [--token-url …]\n\
+                 /mcp add <name> --command <cmd> [--args …]\n\
                  /mcp enable <server-name>\n\
                  /mcp disable <server-name>\n\
                  /mcp test [server-name]\n\
@@ -19516,6 +19957,37 @@ impl App {
                         }
                     }
                 });
+            }
+            "add" => {
+                // DRY: same register_mcp_server API as CLI
+                if parts.len() < 2 {
+                    self.push_output(
+                        "Usage: /mcp add <name> --url <endpoint> [--auth oauth|bearer|none]\n\
+                         /mcp add <name> --command <cmd> [--args arg1 arg2 …]\n\
+                         /mcp add <name> <cmd> [args…]  (legacy stdio)",
+                        OutputRole::System,
+                    );
+                    return;
+                }
+                match crate::mcp_register::parse_mcp_add_tokens(&parts[1..]) {
+                    Ok(req) => {
+                        let mut config = self.load_runtime_config();
+                        let config_path = edgecrab_core::edgecrab_home().join("config.yaml");
+                        match crate::mcp_register::register_mcp_server(
+                            &mut config,
+                            &config_path,
+                            req,
+                        ) {
+                            Ok(result) => self.push_output(
+                                crate::mcp_register::format_register_summary(&result),
+                                OutputRole::System,
+                            ),
+                            Err(err) => self
+                                .push_output(format!("MCP add failed: {err}"), OutputRole::Error),
+                        }
+                    }
+                    Err(err) => self.push_output(err, OutputRole::Error),
+                }
             }
             "remove" | "uninstall" | "rm" => {
                 let Some(name) = parts.get(1).map(String::as_str) else {
@@ -20299,7 +20771,7 @@ impl App {
     fn handle_browser_command(&mut self, args: String) {
         use edgecrab_tools::tools::browser::{
             auto_detect_running_chrome_cdp, cdp_override_status, chrome_launch_command,
-            clear_cdp_override, close_all_sessions, get_chrome_info, get_recording_override,
+            clear_cdp_override, close_all_sessions, get_recording_override,
             launch_chrome_for_debugging, list_cdp_tabs, probe_cdp_port, set_cdp_override,
             set_recording_override, wait_for_cdp_ready,
         };
@@ -20524,72 +20996,45 @@ impl App {
 
         // ── status ────────────────────────────────────────────────────────────
         } else if sub == "status" {
-            let mut lines = String::new();
-
-            if let Some(endpoint) = cdp_override_status() {
-                // Check live reachability and fetch Chrome version info
-                let (reachable, info) = self.rt_handle.block_on(async {
-                    let ep_parts: Vec<&str> = endpoint.splitn(2, ':').collect();
-                    let host = ep_parts.first().copied().unwrap_or("127.0.0.1");
-                    let port: u16 = ep_parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(9222);
-                    let ok = probe_cdp_port(host, port).await;
-                    let info = if ok { get_chrome_info().await } else { None };
-                    (ok, info)
-                });
-
-                lines.push_str("🌐 Browser: connected to live Chrome via CDP\n");
-                lines.push_str(&format!("   Endpoint: {endpoint}\n"));
-                if reachable {
-                    lines.push_str("   Status:   ✓ reachable\n");
-                    if let Some(ref ci) = info {
-                        if !ci.browser.is_empty() {
-                            lines.push_str(&format!("   Browser:  {}\n", ci.browser));
-                        }
-                        if !ci.protocol_version.is_empty() {
-                            lines.push_str(&format!("   CDP:      v{}\n", ci.protocol_version));
-                        }
-                    }
-                } else {
-                    lines.push_str("   Status:   ⚠ not reachable (Chrome may have closed)\n");
-                }
-            } else if let Ok(url) = std::env::var("BROWSER_CDP_URL") {
-                lines.push_str("🌐 Browser: CDP override via BROWSER_CDP_URL env var\n");
-                lines.push_str(&format!("   Endpoint: {url}\n"));
-            } else {
-                // Default headless mode — show what binary is available
-                lines.push_str("🌐 Browser: local headless Chrome/Chromium\n");
-                // Try to get info from default endpoint (may not be running)
-                let info = self.rt_handle.block_on(get_chrome_info());
-                if let Some(ci) = info
-                    && !ci.browser.is_empty()
-                {
-                    lines.push_str(&format!("   Browser:  {}\n", ci.browser));
-                }
-
-                // Auto-detect any already-running Chrome with CDP
+            // First principles report: CDP + launch flags + proxy + preview + port content class.
+            let session_id = self.agent.as_ref().and_then(|a| {
+                self.rt_handle
+                    .block_on(async { a.session_snapshot().await.session_id })
+            });
+            let (preview_enabled, preview_allow_any, preview_ports) =
+                match edgecrab_core::AppConfig::load() {
+                    Ok(cfg) => (
+                        cfg.security.preview.enabled,
+                        cfg.security.preview.allow_any_loopback_port,
+                        cfg.security.preview.allow_localhost_ports.clone(),
+                    ),
+                    Err(_) => (true, true, vec![8000, 3000, 5173]),
+                };
+            // Ensure launch policy matches config (GPU / proxy bypass).
+            if let Ok(cfg) = edgecrab_core::AppConfig::load() {
+                cfg.apply_security_runtime();
+            }
+            let report = self.rt_handle.block_on(async {
+                edgecrab_tools::collect_browser_diagnostics(edgecrab_tools::BrowserDiagnosticsInput {
+                    session_id,
+                    preview_enabled,
+                    preview_allow_any,
+                    preview_ports,
+                    max_port_probes: 6,
+                })
+                .await
+            });
+            let mut lines = edgecrab_tools::format_browser_diagnostics(&report);
+            // Extra: auto-detect CDP on a non-default port when headless default is down.
+            if !report.cdp_reachable {
                 let detected = self.rt_handle.block_on(auto_detect_running_chrome_cdp());
                 if let Some(ref ep) = detected {
                     lines.push_str(&format!(
-                        "   ℹ Detected running Chrome with CDP on port {} \
-                         — run `/browser connect {}` to attach to it.\n",
+                        "\n   ℹ Detected Chrome CDP on port {} — `/browser connect {}`\n",
                         ep.port, ep.port
                     ));
                 }
             }
-
-            // Show recording status
-            let recording_on = get_recording_override().unwrap_or(false);
-            lines.push_str(&format!(
-                "   Recording: {}\n",
-                if recording_on { "on ✓" } else { "off" }
-            ));
-
-            lines.push('\n');
-            lines.push_str("   /browser connect ws://host:port — connect to specific endpoint\n");
-            lines.push_str("   /browser disconnect            — revert to default\n");
-            lines.push_str("   /browser tabs                  — list open Chrome tabs\n");
-            lines.push_str("   /browser recording on|off      — toggle session recording\n");
-
             self.push_output(lines, OutputRole::System);
 
         // ── tabs ──────────────────────────────────────────────────────────────
@@ -20699,12 +21144,13 @@ impl App {
                 "Usage: /browser <subcommand>\n\n\
                  connect [url]       Connect browser tools to your live Chrome session\n\
                  disconnect          Revert to default headless browser backend\n\
-                 status              Show current browser mode, endpoint, and Chrome version\n\
+                 status              CDP, GPU flags, proxy, preview, port content class\n\
                  tabs                List all open Chrome tabs with titles and URLs\n\
                  recording on|off    Toggle session recording at runtime\n\n\
                  Examples:\n\
                  /browser connect\n\
                  /browser connect ws://192.168.1.10:9222\n\
+                 /browser status\n\
                  /browser tabs\n\
                  /browser recording on",
                 OutputRole::System,
@@ -21125,6 +21571,13 @@ fn png_crc32(data: &[u8]) -> u32 {
         }
     }
     !crc
+}
+
+/// True when `provider/model` is in the xAI / SuperGrok family.
+fn target_is_xai_family(target: &str) -> bool {
+    target
+        .split_once('/')
+        .is_some_and(|(p, _)| crate::xai_credentials::provider_needs_xai_credentials(p))
 }
 
 #[cfg(test)]

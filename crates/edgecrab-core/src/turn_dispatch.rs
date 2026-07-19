@@ -5,6 +5,7 @@
 //! and Hermes-style tool-loop guardrails.
 
 use crate::config::HarnessConfig;
+use crate::evidence_latch::EvidenceState;
 use crate::harness_advisory::HarnessTurnAdvisory;
 use crate::harness_loop_policy::resolve_guardrail_config;
 use edgecrab_tools::tool_loop_guardrails::ToolLoopGuardrailController;
@@ -107,6 +108,8 @@ pub struct TurnDispatchTrackers {
     pub tool_guardrail: ToolLoopGuardrailController,
     /// Set when guardrail halt steer was injected this tool turn (HA-46).
     pub guardrail_halt: bool,
+    /// Evidence latch graph (019) — session-scoped within the turn trackers.
+    pub evidence: EvidenceState,
 }
 
 impl TurnDispatchTrackers {
@@ -121,11 +124,90 @@ impl TurnDispatchTrackers {
             harness_advisory: HarnessTurnAdvisory::new(),
             tool_guardrail: ToolLoopGuardrailController::new(resolve_guardrail_config(harness)),
             guardrail_halt: false,
+            evidence: EvidenceState::new(harness.evidence_latch_config()),
         }
     }
 
     pub fn reset_guardrail_turn(&mut self) {
         self.tool_guardrail.reset_for_turn();
+    }
+
+    /// Record post-tool facts into evidence + browser advisory (019 Wave B).
+    pub fn record_tool_outcome(
+        &mut self,
+        tool_name: &str,
+        args_json: &str,
+        tool_result: &str,
+        is_error: bool,
+    ) {
+        let is_mutation = matches!(tool_name, "write_file" | "patch" | "apply_patch");
+        self.evidence.count_tool(tool_name, is_mutation);
+
+        if is_mutation && !is_error {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(tool_result)
+                && v.get("ok").and_then(|o| o.as_bool()) == Some(true)
+                && let Some(path) = v.get("path").and_then(|p| p.as_str())
+            {
+                self.evidence.note_artifact_path(path);
+                if crate::task_class::is_media_output_path(path) {
+                    let bytes = v.get("bytes").and_then(|b| b.as_u64()).unwrap_or(1);
+                    self.evidence.note_media_artifact_ok(path, bytes.max(1));
+                }
+            }
+        }
+
+        // Preview serve detection — candidate only (022: never content-latch on reuse/bind alone).
+        if matches!(tool_name, "terminal" | "run_process")
+            && !is_error
+            && let Some(cmd) = edgecrab_tools::dev_server::command_from_tool_args_json(args_json)
+            && edgecrab_tools::dev_server::is_preview_server_command(&cmd)
+        {
+            if let Some(port) = edgecrab_tools::dev_server::collect_http_server_ports(
+                std::iter::once(cmd.as_str()),
+            )
+            .into_iter()
+            .next()
+            {
+                let dir = edgecrab_tools::recovery_catalog::infer_preview_serve_directory_from_text(
+                    &cmd,
+                );
+                // Prefer structured port from tool JSON when present (reuse/bind_ready).
+                let port = serde_json::from_str::<serde_json::Value>(tool_result)
+                    .ok()
+                    .and_then(|v| v.get("port").and_then(|p| p.as_u64()))
+                    .map(|p| p as u16)
+                    .unwrap_or(port);
+                self.evidence.note_preview_candidate(
+                    std::path::PathBuf::from(&dir),
+                    port,
+                    format!("http://127.0.0.1:{port}/"),
+                    None,
+                    Some(200),
+                );
+            }
+        }
+
+        if matches!(
+            tool_name,
+            "browser_navigate"
+                | "browser_snapshot"
+                | "browser_vision"
+                | "vision_analyze"
+                | "browser_get_images"
+        ) {
+            self.harness_advisory
+                .record_browser_navigate_result(tool_result);
+            if let Some(parsed) = edgecrab_tools::parse_structured_browser_result(tool_result) {
+                let url = parsed.final_url.as_deref().unwrap_or("");
+                self.evidence
+                    .note_perceive(tool_name, url, parsed.content_class);
+            } else if is_error || edgecrab_types::parse_tool_error_payload(tool_result).is_some() {
+                let code = edgecrab_types::parse_tool_error_payload(tool_result)
+                    .map(|p| p.code)
+                    .unwrap_or_else(|| "tool_error".into());
+                self.evidence.note_transport_thrash(tool_name, &code);
+            }
+        }
     }
 }
 
@@ -157,6 +239,7 @@ pub fn guardrail_before_dispatch(
 pub struct TurnDispatchTrackersView<'a> {
     pub harness_advisory: &'a HarnessTurnAdvisory,
     pub tool_guardrail: &'a ToolLoopGuardrailController,
+    pub evidence: &'a EvidenceState,
 }
 
 /// Visual-storm block + tool-loop guardrails before dispatch.
@@ -263,6 +346,40 @@ pub async fn finalize_tool_turn(
     {
         trackers.guardrail_halt = true;
         params.messages.push(edgecrab_types::Message::user(&halt));
+    }
+
+    // 022: evidence phase injects — Heal / Escalated / LatchedDone (allowed actions only).
+    finalize_evidence_phase_injections(trackers, params.messages);
+}
+
+/// Inject phase-aware harness messages; set guardrail_halt on hard stop.
+fn finalize_evidence_phase_injections(
+    trackers: &mut TurnDispatchTrackers,
+    messages: &mut Vec<edgecrab_types::Message>,
+) {
+    if !trackers.evidence.is_enabled() {
+        return;
+    }
+    let snap = trackers.evidence.assess_snapshot();
+    if snap.in_heal && trackers.evidence.may_inject_advisory("heal_phase") {
+        let msg = trackers.evidence.allowed_action_message();
+        if !msg.is_empty() {
+            messages.push(edgecrab_types::Message::user(&msg));
+        }
+    }
+    if trackers.evidence.should_hard_stop() {
+        trackers.guardrail_halt = true;
+        if trackers.evidence.may_inject_advisory("evidence_hard_stop") {
+            let msg = trackers.evidence.allowed_action_message();
+            if !msg.is_empty() {
+                messages.push(edgecrab_types::Message::user(&msg));
+            }
+        }
+    } else if snap.latched_done && trackers.evidence.may_inject_advisory("latched_done") {
+        let msg = trackers.evidence.allowed_action_message();
+        if !msg.is_empty() {
+            messages.push(edgecrab_types::Message::user(&msg));
+        }
     }
 }
 
@@ -394,9 +511,11 @@ mod tests {
         let guardrail = edgecrab_tools::tool_loop_guardrails::ToolLoopGuardrailController::new(
             edgecrab_tools::tool_loop_guardrails::ToolLoopGuardrailConfig::default(),
         );
+        let evidence = crate::evidence_latch::EvidenceState::default();
         let trackers = TurnDispatchTrackersView {
             harness_advisory: &advisory,
             tool_guardrail: &guardrail,
+            evidence: &evidence,
         };
         #[allow(deprecated)]
         let blocked = guardrail_before_dispatch_checked(

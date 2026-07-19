@@ -244,14 +244,40 @@ impl App {
     }
 
     pub(super) fn render_grok_auth_tui(&self, frame: &mut Frame, area: Rect) {
-        use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+        use crate::overlay_layout::popup_rect;
+        use ratatui::layout::{Constraint, Direction, Layout};
+        use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
+        // Centered modal — keeps OAuth focused and avoids full-bleed noise.
+        let popup_w = area.width.saturating_sub(6).max(52).min(100);
+        let popup_h = area.height.saturating_sub(2).max(20).min(32);
+        let popup = popup_rect(area, popup_w, popup_h);
         frame.render_widget(Clear, area);
-        let chunks = picker_three_layout(area);
-        let accent = crate::proxy_hub::PROXY_ACCENT;
-
+        // Dim the rest of the TUI so the modal owns attention.
         frame.render_widget(
-            Paragraph::new("SuperGrok / X Premium+ — subscription OAuth").block(
+            Block::default().style(Style::default().bg(Color::Rgb(12, 14, 18))),
+            area,
+        );
+
+        let accent = crate::proxy_hub::PROXY_ACCENT;
+        // Header (title) · body (progress + instructions) · help bar
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(10),
+                Constraint::Length(1),
+            ])
+            .split(popup);
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("  🪪  ", Style::default().fg(accent)),
+                Span::styled(
+                    self.grok_auth.subtitle(),
+                    Style::default().fg(Color::White),
+                ),
+            ]))
+            .block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(accent))
@@ -260,18 +286,28 @@ impl App {
             chunks[0],
         );
 
+        // Width-aware body: we pre-wrap long OAuth URLs (ratatui wrap alone mid-splits ugly).
+        let body_width = chunks[1].width.saturating_sub(2);
         frame.render_widget(
-            Paragraph::new(self.grok_auth.body_lines())
-                .wrap(Wrap { trim: true })
+            Paragraph::new(self.grok_auth.body_lines(body_width))
+                .wrap(Wrap { trim: false })
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .title(" Instructions "),
+                        .border_style(Style::default().fg(accent))
+                        .title(" Sign-in "),
                 ),
             chunks[1],
         );
 
-        frame.render_widget(Paragraph::new(self.grok_auth.help_line()), chunks[2]);
+        frame.render_widget(
+            Paragraph::new(self.grok_auth.help_line()).block(
+                Block::default()
+                    .borders(Borders::TOP)
+                    .border_style(Style::default().fg(Color::DarkGray)),
+            ),
+            chunks[2],
+        );
     }
 
     pub(super) fn render_skin_browser(&self, frame: &mut Frame, area: Rect) {

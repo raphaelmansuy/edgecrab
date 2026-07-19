@@ -14,6 +14,7 @@ use crate::completion_assessor::{
     CompletionContext, assess_completion, enrich_verification_with_contract,
 };
 use crate::config::HarnessConfig;
+use crate::evidence_latch::EvidenceAssessSnapshot;
 use crate::harness_advisory::HarnessTurnAdvisory;
 use crate::task_class::{TaskClass, classify_from_messages, effective_verification_strict};
 use crate::turn_completion::{TurnCompletionContext, count_unanswered_tool_calls};
@@ -75,6 +76,8 @@ pub struct TurnAssessParams<'a> {
     pub harness_contract_verify: bool,
     /// Working directory for harness-run contract verification.
     pub cwd: &'a std::path::Path,
+    /// Evidence latch snapshot (022).
+    pub evidence: EvidenceAssessSnapshot,
 }
 
 /// Single completion assess entry (provisional + final).
@@ -113,6 +116,7 @@ pub fn assess_turn_outcome(params: TurnAssessParams<'_>) -> RunOutcome {
         child_runs_in_flight: params.child_runs_in_flight,
         harness: params.harness,
         verification_strict,
+        evidence: params.evidence,
     });
 
     if pre_gate.denied && matches!(outcome.state, CompletionDecision::Completed) {
@@ -208,10 +212,13 @@ pub fn assess_turn_outcome(params: TurnAssessParams<'_>) -> RunOutcome {
 }
 
 /// True when mutations landed without a successful terminal/execute_code verify tool.
+///
+/// July 2026 / Anthropic long-running harness: verification must cover the
+/// **latest** mutations. A test run that precedes later writes does not clear debt.
 fn coding_verify_on_stop_debt(messages: &[Message]) -> bool {
-    let mut mutation_ok = false;
-    let mut verify_ok = false;
-    for msg in messages {
+    let mut last_mutation_idx: Option<usize> = None;
+    let mut last_verify_idx: Option<usize> = None;
+    for (i, msg) in messages.iter().enumerate() {
         if msg.role != edgecrab_types::Role::Tool {
             continue;
         }
@@ -222,22 +229,26 @@ fn coding_verify_on_stop_debt(messages: &[Message]) -> bool {
         if matches!(name, "write_file" | "patch" | "apply_patch")
             && edgecrab_tools::file_mutation_result_landed(name, &content)
         {
-            mutation_ok = true;
+            last_mutation_idx = Some(i);
         }
         if matches!(name, "terminal" | "run_process") {
             if let Some(parsed) = edgecrab_tools::parse_terminal_result(&content)
                 && parsed.exit_code == 0
             {
-                verify_ok = true;
+                last_verify_idx = Some(i);
             }
         } else if name == "execute_code"
             && edgecrab_types::parse_tool_error_payload(&content).is_none()
             && !content.trim().is_empty()
         {
-            verify_ok = true;
+            last_verify_idx = Some(i);
         }
     }
-    mutation_ok && !verify_ok
+    match (last_mutation_idx, last_verify_idx) {
+        (Some(m), Some(v)) => m > v, // mutation after last verify
+        (Some(_), None) => true,
+        _ => false,
+    }
 }
 
 /// Re-open the loop when assess rejects premature model text.
@@ -248,8 +259,27 @@ pub fn should_reopen_loop(outcome: &RunOutcome) -> bool {
 /// Like [`should_reopen_loop`], but never reopens when Document artifact evidence
 /// is already present (007 docx never-stop — no “do not stop yet” theater).
 pub fn should_reopen_loop_with_messages(outcome: &RunOutcome, messages: &[Message]) -> bool {
+    should_reopen_loop_with_evidence(outcome, messages, EvidenceAssessSnapshot::default())
+}
+
+/// 022: also respect visual latch done / escalated (closed action set).
+pub fn should_reopen_loop_with_evidence(
+    outcome: &RunOutcome,
+    messages: &[Message],
+    evidence: EvidenceAssessSnapshot,
+) -> bool {
     // Invalid-tool budget abort is terminal — do not reopen into another invent-retry cycle.
     if outcome.exit_reason == ExitReason::InvalidToolBudget {
+        return false;
+    }
+    if outcome.exit_reason == ExitReason::GuardrailHalt {
+        return false;
+    }
+    // 022 B1/B2: latched complete or escalated — never “do not stop yet”.
+    if evidence.visual_complete || evidence.media_complete || evidence.escalated {
+        return false;
+    }
+    if evidence.verify_budget_exhausted {
         return false;
     }
     if !messages.is_empty() && crate::task_class::document_done_latch_ready(messages) {
@@ -416,6 +446,7 @@ mod tests {
             goal_contract: None,
             harness_contract_verify: false,
             cwd: std::path::Path::new("."),
+            evidence: EvidenceAssessSnapshot::default(),
         });
         assert_eq!(outcome.state, CompletionDecision::Incomplete);
     }
@@ -444,6 +475,7 @@ mod tests {
             goal_contract,
             harness_contract_verify,
             cwd: std::path::Path::new("."),
+            evidence: EvidenceAssessSnapshot::default(),
         }
     }
 
@@ -610,6 +642,77 @@ mod tests {
         ));
         assert_eq!(outcome.state, CompletionDecision::NeedsVerification);
         assert!(should_reopen_loop(&outcome));
+    }
+
+    #[test]
+    fn wave2_mutation_after_verify_still_needs_verification() {
+        // Anthropic long-running harness: test then mutate again → still debt.
+        let messages = vec![
+            edgecrab_types::Message::user("fix then tweak"),
+            edgecrab_types::Message::tool_result(
+                "w1",
+                "write_file",
+                r#"{"ok":true,"bytes":12,"lines":1,"path":"src/main.rs"}"#,
+            ),
+            edgecrab_types::Message::tool_result(
+                "t1",
+                "terminal",
+                "[terminal_result status=success backend=local cwd=/proj exit_code=0]\nok\n",
+            ),
+            edgecrab_types::Message::tool_result(
+                "w2",
+                "write_file",
+                r#"{"ok":true,"bytes":20,"lines":2,"path":"src/main.rs"}"#,
+            ),
+            edgecrab_types::Message::assistant("Done."),
+        ];
+        assert!(
+            coding_verify_on_stop_debt(&messages),
+            "mutation after successful test must still be debt"
+        );
+        let advisory = HarnessTurnAdvisory::new();
+        let turn = MutationTurnState::new();
+        let harness = build_turn_harness_snapshot(TurnHarnessBuildParams {
+            messages: &messages,
+            mutation_turn: &turn,
+            cwd: std::path::Path::new("."),
+            post_mutation_oracles: false,
+            harness_advisory: &advisory,
+            guardrail_halt: false,
+            task_class: TaskClass::CodeChange,
+        });
+        let cfg = HarnessConfig {
+            verify_on_stop: true,
+            ..Default::default()
+        };
+        let outcome = assess_turn_outcome(assess_params(
+            "Done.",
+            &messages,
+            harness,
+            &cfg,
+            None,
+            false,
+        ));
+        assert_eq!(outcome.state, CompletionDecision::NeedsVerification);
+    }
+
+    #[test]
+    fn wave2_verify_after_last_mutation_clears_debt() {
+        let messages = vec![
+            edgecrab_types::Message::user("fix"),
+            edgecrab_types::Message::tool_result(
+                "w1",
+                "write_file",
+                r#"{"ok":true,"bytes":12,"lines":1,"path":"src/main.rs"}"#,
+            ),
+            edgecrab_types::Message::tool_result(
+                "t1",
+                "terminal",
+                "[terminal_result status=success backend=local cwd=/proj exit_code=0]\nok\n",
+            ),
+            edgecrab_types::Message::assistant("Done."),
+        ];
+        assert!(!coding_verify_on_stop_debt(&messages));
     }
 
     #[test]

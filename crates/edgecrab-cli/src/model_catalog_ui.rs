@@ -1,4 +1,7 @@
 //! Model selector catalog helpers — Hermes `modelPicker.tsx` data layer (DRY).
+//!
+//! Auth badges for SuperGrok / xAI are pure presentation (SOLID S) — credential
+//! readiness is injected by the App; this module never runs OAuth.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -28,6 +31,47 @@ impl FuzzyItem for ModelEntry {
         &self.provider
     }
 }
+
+/// How the operator authenticates this provider (picker badge).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderAuthSurface {
+    /// Console / env API key only.
+    ApiKey,
+    /// Subscription OAuth (SuperGrok, Claude Pro, …).
+    Oauth,
+    /// Either key or OAuth accepted at runtime.
+    KeyOrOauth,
+    Unknown,
+}
+
+/// Deterministic auth surface from provider id (no I/O).
+pub fn provider_auth_surface(provider: &str) -> ProviderAuthSurface {
+    let p = ModelCatalog::catalog_provider_id(provider);
+    match p.as_str() {
+        "super-grok" => ProviderAuthSurface::Oauth,
+        "xai" => ProviderAuthSurface::KeyOrOauth,
+        "claude-pro" | "anthropic" => ProviderAuthSurface::KeyOrOauth,
+        "openai-codex" | "chatgpt-pro" => ProviderAuthSurface::Oauth,
+        "openai" | "openrouter" | "mistral" | "groq" | "deepseek" | "nvidia" => {
+            ProviderAuthSurface::ApiKey
+        }
+        "copilot" | "vscode-copilot" => ProviderAuthSurface::Oauth,
+        _ => ProviderAuthSurface::Unknown,
+    }
+}
+
+/// Short badge for detail column / inventory.
+pub fn provider_auth_badge(provider: &str) -> Option<&'static str> {
+    match provider_auth_surface(provider) {
+        ProviderAuthSurface::ApiKey => Some("🔑 key"),
+        ProviderAuthSurface::Oauth => Some("🪪 OAuth"),
+        ProviderAuthSurface::KeyOrOauth => Some("🔑/🪪"),
+        ProviderAuthSurface::Unknown => None,
+    }
+}
+
+/// Optional readiness: `Some(true)` ready, `Some(false)` missing, `None` unknown.
+pub type ProviderAuthReadyFn<'a> = dyn Fn(&str) -> Option<bool> + 'a;
 
 pub fn discovery_source_label(source: DiscoverySource) -> &'static str {
     match source {
@@ -68,24 +112,49 @@ pub fn build_model_selector_entries(
     grouped: &[(String, Vec<String>)],
     dynamic_lookup: Option<&BTreeMap<String, (DiscoverySource, BTreeSet<String>)>>,
 ) -> Vec<ModelEntry> {
+    build_model_selector_entries_with_auth(grouped, dynamic_lookup, None)
+}
+
+/// Build picker entries with optional auth readiness (SuperGrok OAuth / API key).
+pub fn build_model_selector_entries_with_auth(
+    grouped: &[(String, Vec<String>)],
+    dynamic_lookup: Option<&BTreeMap<String, (DiscoverySource, BTreeSet<String>)>>,
+    auth_ready: Option<&ProviderAuthReadyFn<'_>>,
+) -> Vec<ModelEntry> {
     let mut all_models = Vec::new();
     for (provider, models) in grouped {
+        let auth_part = {
+            let mut parts = Vec::new();
+            if let Some(badge) = provider_auth_badge(provider) {
+                parts.push(badge.to_string());
+            }
+            if let Some(ready_fn) = auth_ready {
+                match ready_fn(provider) {
+                    Some(true) => parts.push("ready".into()),
+                    Some(false) => parts.push("sign-in".into()),
+                    None => {}
+                }
+            }
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join(" · "))
+            }
+        };
         for model in models {
-            let detail = match dynamic_lookup.and_then(|lookup| lookup.get(provider)) {
+            let inv = match dynamic_lookup.and_then(|lookup| lookup.get(provider)) {
                 Some((source, discovered_models)) if discovered_models.contains(model) => {
-                    format!("{model} · {}", discovery_source_label(*source))
+                    discovery_source_label(*source).to_string()
                 }
                 Some((DiscoverySource::Static, _)) => {
-                    format!(
-                        "{model} · {}",
-                        discovery_source_label(DiscoverySource::Static)
-                    )
+                    discovery_source_label(DiscoverySource::Static).to_string()
                 }
-                Some(_) => format!("{model} · catalog fallback"),
-                None => format!(
-                    "{model} · {}",
-                    discovery_source_label(DiscoverySource::Static)
-                ),
+                Some(_) => "catalog fallback".into(),
+                None => discovery_source_label(DiscoverySource::Static).to_string(),
+            };
+            let detail = match &auth_part {
+                Some(a) => format!("{model} · {a} · {inv}"),
+                None => format!("{model} · {inv}"),
             };
             all_models.push(ModelEntry {
                 display: format!("{provider}/{model}"),
@@ -95,6 +164,8 @@ pub fn build_model_selector_entries(
             });
         }
     }
+    // Prefer SuperGrok / xAI flagships near top when sorting would bury them:
+    // stable sort by display still works; filter "grok" matches provider tag.
     all_models.sort_by(|left, right| left.display.cmp(&right.display));
     all_models
 }
@@ -151,15 +222,20 @@ pub fn build_models_inventory_report(
             .get(provider)
             .copied()
             .unwrap_or(DiscoveryAvailability::Unsupported);
+        let auth = provider_auth_badge(provider).unwrap_or("—");
         text.push_str(&format!(
-            "  {provider:<12} {label:<22} {:>3} models  {}{marker}\n",
+            "  {provider:<12} {label:<22} {:>3} models  {}  {}{marker}\n",
             models.len(),
             discovery_availability_short(availability),
+            auth,
         ));
     }
 
     text.push_str(
-        "\nUse /models <provider> for the full list, /models refresh [provider|all] to refresh live inventories, or /model to open the selector.",
+        "\nSuperGrok (OAuth): super-grok/grok-4.5  ·  xAI API key: xai/grok-4.5\n\
+         Pick SuperGrok unsigned-in → EdgeCrab opens /login grok, then switches for you.\n\
+         /login grok anytime. Use /models <provider> for full lists, \
+         /models refresh, or /model for the selector.",
     );
     text
 }
@@ -206,5 +282,58 @@ mod tests {
         selector.update_filter();
         let hint = model_selector_status_hint(&selector, false, "openai/gpt-4o");
         assert!(hint.unwrap().contains("no matches"));
+    }
+
+    #[test]
+    fn super_grok_auth_badge_is_oauth() {
+        assert_eq!(
+            provider_auth_surface("super-grok"),
+            ProviderAuthSurface::Oauth
+        );
+        assert_eq!(provider_auth_badge("super-grok"), Some("🪪 OAuth"));
+        assert_eq!(
+            provider_auth_surface("xai"),
+            ProviderAuthSurface::KeyOrOauth
+        );
+    }
+
+    #[test]
+    fn super_grok_entries_include_oauth_badge_and_grok_45() {
+        let grouped = vec![(
+            "super-grok".into(),
+            vec!["grok-4.5".into(), "grok-4.3".into()],
+        )];
+        let entries = build_model_selector_entries(&grouped, None);
+        assert!(
+            entries.iter().any(|e| e.display == "super-grok/grok-4.5"),
+            "missing super-grok/grok-4.5: {entries:?}"
+        );
+        let sg = entries
+            .iter()
+            .find(|e| e.display == "super-grok/grok-4.5")
+            .expect("entry");
+        assert!(
+            sg.detail.contains("OAuth") || sg.detail.contains("🪪"),
+            "detail should badge OAuth: {}",
+            sg.detail
+        );
+    }
+
+    #[test]
+    fn auth_ready_fn_marks_sign_in() {
+        let grouped = vec![("super-grok".into(), vec!["grok-4.5".into()])];
+        let ready = |p: &str| {
+            if p == "super-grok" {
+                Some(false)
+            } else {
+                None
+            }
+        };
+        let entries = build_model_selector_entries_with_auth(&grouped, None, Some(&ready));
+        assert!(
+            entries[0].detail.contains("sign-in"),
+            "{}",
+            entries[0].detail
+        );
     }
 }

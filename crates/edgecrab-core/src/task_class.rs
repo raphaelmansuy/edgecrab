@@ -20,6 +20,8 @@ pub enum TaskClass {
     CodeChange,
     /// Research / read-heavy — lighter verification bar.
     Research,
+    /// Video / Hyperframe / media render — file artifact evidence, not browser thrash (019).
+    MediaRender,
 }
 
 pub struct TaskClassifier;
@@ -29,6 +31,11 @@ impl TaskClassifier {
         // Document paths win over loose demo/ directory names.
         if has_document_path_signal(user_message, path_hints) {
             return TaskClass::Document;
+        }
+
+        // Media render before visual (Hyperframe under demos/ would otherwise be VisualUx).
+        if has_media_render_signal(user_message, path_hints) {
+            return TaskClass::MediaRender;
         }
 
         if has_visual_path_signal(user_message, path_hints) {
@@ -56,6 +63,27 @@ impl TaskClassifier {
 
         TaskClass::General
     }
+}
+
+/// Deterministic media_render signals — product names + media extensions only.
+fn has_media_render_signal(user_message: &str, path_hints: &[String]) -> bool {
+    let lower = user_message.to_ascii_lowercase();
+    if lower.contains("hyperframe") || lower.contains("hyperframes") {
+        return true;
+    }
+    // Explicit render+video/mp4 pairing (not soft "make a video someday").
+    if (lower.contains("render") || lower.contains("ffmpeg"))
+        && (lower.contains("video")
+            || lower.contains(".mp4")
+            || lower.contains(".webm")
+            || lower.contains(".mov"))
+    {
+        return true;
+    }
+    path_hints.iter().any(|p| {
+        let pl = p.to_ascii_lowercase();
+        pl.ends_with(".mp4") || pl.ends_with(".webm") || pl.ends_with(".mov")
+    })
 }
 
 fn has_code_manifest_signal(user_message: &str, path_hints: &[String]) -> bool {
@@ -298,6 +326,12 @@ pub fn task_class_advisory(class: TaskClass, cwd: Option<&std::path::Path>) -> O
             "[harness] Task class: code_change — run tests or compile checks before claiming done."
                 .to_string(),
         ),
+        TaskClass::MediaRender => Some(
+            "[harness] Task class: media_render — verify by output file existence \
+             (non-zero .mp4/.webm/.mov bytes). Browser localhost preview is optional, \
+             not required for Done. Do not thrash browser_vision."
+                .to_string(),
+        ),
         TaskClass::Research | TaskClass::General => None,
     }?;
     if let Some(targets) = verify_targets_footer(class, cwd) {
@@ -322,6 +356,9 @@ pub fn verify_targets_footer(class: TaskClass, cwd: Option<&std::path::Path>) ->
         TaskClass::Document => Some(
             "confirm artifact path exists with non-zero size (ls/stat); optional PDF/JPG export"
                 .into(),
+        ),
+        TaskClass::MediaRender => Some(
+            "confirm render output path exists with non-zero size (mp4/webm/mov)".into(),
         ),
         _ => None,
     }
@@ -385,8 +422,54 @@ pub fn is_verification_tool_for_class(tool_name: &str, class: TaskClass) -> bool
                 | "lsp_format_document"
                 | "lsp_format_range"
         ),
+        TaskClass::MediaRender => matches!(
+            tool_name,
+            "write_file"
+                | "patch"
+                | "apply_patch"
+                | "terminal"
+                | "run_process"
+                | "execute_code"
+        ),
         TaskClass::Research | TaskClass::General => is_general_verification_tool(tool_name),
     }
+}
+
+/// Media file extension evidence (deterministic).
+pub fn is_media_output_path(path: &str) -> bool {
+    let pl = path.to_ascii_lowercase();
+    pl.ends_with(".mp4") || pl.ends_with(".webm") || pl.ends_with(".mov")
+}
+
+/// True when a non-zero media output was written this session.
+pub fn media_artifact_evidence_present(messages: &[Message]) -> bool {
+    for path in collect_mutation_paths_from_results(messages) {
+        if is_media_output_path(&path) {
+            return true;
+        }
+    }
+    for msg in messages {
+        if msg.role != Role::Tool {
+            continue;
+        }
+        if !matches!(
+            msg.name.as_deref(),
+            Some("terminal" | "run_process" | "execute_code")
+        ) {
+            continue;
+        }
+        let content = msg.text_content();
+        if edgecrab_types::parse_tool_error_payload(&content).is_some() {
+            continue;
+        }
+        // Structured success with media path mention in result is weak; prefer mutations.
+        for ext in [".mp4", ".webm", ".mov"] {
+            if content.contains(ext) && content.contains("bytes") {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn is_general_verification_tool(name: &str) -> bool {

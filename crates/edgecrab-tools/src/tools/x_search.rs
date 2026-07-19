@@ -48,15 +48,21 @@ fn resolve_xai_bearer() -> Result<(String, String), ToolError> {
         if let Ok(raw) = std::fs::read_to_string(&auth_path)
             && let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw)
         {
-            for key in ["xai", "xai_oauth", "grok"] {
+            // Prefer xai-oauth (EdgeCrab/Hermes id), then legacy keys.
+            for key in ["xai-oauth", "xai", "xai_oauth", "grok"] {
                 if let Some(token) = val
-                    .pointer(&format!("/providers/{key}/access_token"))
+                    .pointer(&format!("/providers/{key}/tokens/access_token"))
+                    .or_else(|| val.pointer(&format!("/providers/{key}/access_token")))
                     .or_else(|| val.pointer(&format!("/providers/{key}/token")))
                     .and_then(|v| v.as_str())
                 {
                     let token = token.trim();
                     if !token.is_empty() {
-                        return Ok((token.to_string(), DEFAULT_BASE.into()));
+                        let base = val
+                            .pointer(&format!("/providers/{key}/base_url"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(DEFAULT_BASE);
+                        return Ok((token.to_string(), base.to_string()));
                     }
                 }
             }

@@ -190,7 +190,9 @@ impl ModelCatalog {
             "claude" => "anthropic".to_string(),
             "gemini" => "google".to_string(),
             "copilot" | "vscode-copilot" | "vscode" => "copilot".to_string(),
+            // "grok" alone is the API-key brand; SuperGrok OAuth is an explicit provider.
             "grok" => "xai".to_string(),
+            "supergrok" | "super_grok" | "xai-oauth" | "xai_oauth" => "super-grok".to_string(),
             "lm-studio" | "lm_studio" => "lmstudio".to_string(),
             "open-router" | "open_router" => "openrouter".to_string(),
             "nvidia-nim" | "nim" => "nvidia".to_string(),
@@ -531,6 +533,41 @@ mod tests {
         );
         assert_eq!(ModelCatalog::catalog_provider_id("gemini"), "google");
         assert_eq!(ModelCatalog::catalog_provider_id("claude"), "anthropic");
+        assert_eq!(ModelCatalog::catalog_provider_id("grok"), "xai");
+        assert_eq!(ModelCatalog::catalog_provider_id("super_grok"), "super-grok");
+        assert_eq!(ModelCatalog::catalog_provider_id("supergrok"), "super-grok");
+        assert_eq!(ModelCatalog::catalog_provider_id("xai-oauth"), "super-grok");
+    }
+
+    #[test]
+    fn super_grok_catalog_includes_grok_45() {
+        let models = ModelCatalog::models_for_provider("super-grok");
+        assert!(
+            models
+                .iter()
+                .any(|(display, id)| display.contains("grok-4.5") || id == "grok-4.5"),
+            "super-grok should list grok-4.5, got {models:?}"
+        );
+        let dm = ModelCatalog::default_model_for("super-grok").expect("default");
+        assert!(
+            dm.contains("grok-4.5"),
+            "default should be grok-4.5 family: {dm}"
+        );
+        assert_eq!(
+            ModelCatalog::provider_label("super-grok"),
+            "SuperGrok · OAuth"
+        );
+    }
+
+    #[test]
+    fn xai_catalog_includes_grok_45() {
+        let models = ModelCatalog::models_for_provider("xai");
+        assert!(
+            models
+                .iter()
+                .any(|(display, id)| display.contains("grok-4.5") || id == "grok-4.5"),
+            "xai should list grok-4.5, got {models:?}"
+        );
     }
 
     #[test]

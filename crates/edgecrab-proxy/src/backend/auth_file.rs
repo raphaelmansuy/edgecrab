@@ -67,20 +67,28 @@ pub fn read_provider_state(path: &Path, provider: &str) -> Result<Value, ProxyEr
     })
 }
 
+/// Write auth JSON without taking the store lock (caller must already hold it or not need it).
+///
+/// WHY separate: `flock(LOCK_EX)` is **not reentrant**. Nested
+/// `with_auth_store_lock` → `write_auth_doc` → lock again deadlocks the process
+/// forever (SuperGrok OAuth hang: exchange OK → persist never returns → TUI
+/// stuck on "Exchanging code for tokens…").
+fn write_auth_doc_unlocked(path: &Path, doc: &Value) -> Result<(), ProxyError> {
+    let bytes = serde_json::to_vec_pretty(doc)
+        .map_err(|e| ProxyError::UpstreamAuth(format!("serialize auth store: {e}")))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            ProxyError::UpstreamAuth(format!("create auth dir {}: {e}", parent.display()))
+        })?;
+    }
+    std::fs::write(path, bytes).map_err(|e| {
+        ProxyError::UpstreamAuth(format!("write auth file {}: {e}", path.display()))
+    })
+}
+
 /// Persist the full auth document (under file lock).
 pub fn write_auth_doc(path: &Path, doc: &Value) -> Result<(), ProxyError> {
-    with_auth_store_lock(path, || {
-        let bytes = serde_json::to_vec_pretty(doc)
-            .map_err(|e| ProxyError::UpstreamAuth(format!("serialize auth store: {e}")))?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                ProxyError::UpstreamAuth(format!("create auth dir {}: {e}", parent.display()))
-            })?;
-        }
-        std::fs::write(path, bytes).map_err(|e| {
-            ProxyError::UpstreamAuth(format!("write auth file {}: {e}", path.display()))
-        })
-    })
+    with_auth_store_lock(path, || write_auth_doc_unlocked(path, doc))
 }
 
 /// Remove a provider entry from the auth document.
@@ -104,7 +112,7 @@ pub fn remove_provider_state(path: &Path, provider: &str) -> Result<(), ProxyErr
         {
             pool.remove(provider);
         }
-        write_auth_doc(path, &doc)
+        write_auth_doc_unlocked(path, &doc)
     })
 }
 
@@ -134,7 +142,7 @@ pub fn write_provider_state(path: &Path, provider: &str, state: &Value) -> Resul
                 "auth store providers field must be an object".into(),
             ));
         }
-        write_auth_doc(path, &doc)
+        write_auth_doc_unlocked(path, &doc)
     })
 }
 
@@ -237,5 +245,30 @@ mod tests {
             std::env::set_var("HOME", dir.path().to_str().expect("utf8"));
         }
         assert_eq!(auth_path_for_provider("xai-oauth"), ec.join("auth.json"));
+    }
+
+    /// Regression: nested flock deadlock froze SuperGrok OAuth finish forever.
+    #[test]
+    fn write_provider_state_does_not_deadlock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("auth.json");
+        let state = serde_json::json!({
+            "tokens": {
+                "access_token": "at-test",
+                "refresh_token": "rt-test"
+            },
+            "auth_mode": "oauth_pkce",
+            "base_url": "https://api.x.ai/v1"
+        });
+        // If nested lock is reintroduced, this hangs forever.
+        write_provider_state(&path, "xai-oauth", &state).expect("write_provider_state");
+        let doc = load_auth_doc(&path).expect("load");
+        assert_eq!(
+            doc["providers"]["xai-oauth"]["tokens"]["access_token"],
+            "at-test"
+        );
+        // Second write + remove must also complete.
+        write_provider_state(&path, "xai-oauth", &state).expect("rewrite");
+        remove_provider_state(&path, "xai-oauth").expect("remove");
     }
 }

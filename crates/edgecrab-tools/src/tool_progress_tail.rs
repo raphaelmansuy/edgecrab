@@ -904,7 +904,12 @@ fn timeout_env_hint(provider: &str) -> &'static str {
 
 /// Shelf notice when a native-streaming LLM request starts (SSE tool deltas).
 pub fn format_streaming_llm_start(provider: &str, has_tools: bool, ctx: LlmWaitContext) -> String {
-    let task = if has_tools { "tool call" } else { "response" };
+    // Tools attached ≠ "tool call in progress" — first token may be plain text.
+    let task = if has_tools {
+        "model (tools available)"
+    } else {
+        "response"
+    };
     let liveness = streaming_wait_liveness(provider, NonStreamingWaitPhase::Start);
     let mut hints: Vec<String> = Vec::new();
     if let Some(iter) = ctx.api_iteration {
@@ -932,7 +937,11 @@ pub fn format_streaming_llm_wait(
     has_tools: bool,
     ctx: LlmWaitContext,
 ) -> String {
-    let task = if has_tools { "tool call" } else { "response" };
+    let task = if has_tools {
+        "model (tools available)"
+    } else {
+        "response"
+    };
     let liveness = streaming_wait_liveness(provider, NonStreamingWaitPhase::Heartbeat);
     let mut hints: Vec<String> = Vec::new();
     if let Some(iter) = ctx.api_iteration {
@@ -955,15 +964,23 @@ fn streaming_wait_liveness(provider: &str, phase: NonStreamingWaitPhase) -> &'st
     match provider {
         "vscode-copilot" => match phase {
             NonStreamingWaitPhase::Start => {
-                "Copilot SSE open — prefill / tool deltas (30–90s on large prompts)"
+                "Copilot SSE open — prefill / first token (30–90s on large prompts)"
             }
             NonStreamingWaitPhase::Heartbeat => {
-                "Copilot may still be prefill-composing before first tool delta"
+                "Copilot may still be prefill-composing before first token"
+            }
+        },
+        "xai" => match phase {
+            NonStreamingWaitPhase::Start => {
+                "xAI SSE open — Grok may reason before first token"
+            }
+            NonStreamingWaitPhase::Heartbeat => {
+                "Grok still prefill/reasoning — first token can take 30–90s with tools"
             }
         },
         _ => match phase {
-            NonStreamingWaitPhase::Start => "SSE open — streaming tool JSON deltas",
-            NonStreamingWaitPhase::Heartbeat => "provider still streaming tool JSON",
+            NonStreamingWaitPhase::Start => "SSE open — waiting for first token",
+            NonStreamingWaitPhase::Heartbeat => "provider still streaming (awaiting first token)",
         },
     }
 }
@@ -1134,8 +1151,15 @@ pub fn llm_wait_progress_label(
 
 /// Compact status-bar label — avoids truncating the full shelf line mid-word.
 pub fn llm_wait_status_compact(provider: &str, has_tools: bool, ctx: LlmWaitContext) -> String {
-    let task = if has_tools {
-        "composing tool"
+    // Honest first-token wait: tools-in-schema ≠ tool-in-flight.
+    let task = if ctx.native_streaming {
+        if has_tools {
+            "awaiting first token"
+        } else {
+            "streaming reply"
+        }
+    } else if has_tools {
+        "composing (tools available)"
     } else {
         "composing reply"
     };
@@ -1235,10 +1259,13 @@ mod tests {
         assert!(!start.contains("GEN/tok"));
         assert!(wait.contains("Bedrock Converse"));
         let compact = llm_wait_status_compact("bedrock", true, ctx);
-        assert!(compact.contains("bedrock composing tool"));
+        assert!(
+            compact.contains("composing") || compact.contains("awaiting"),
+            "compact={compact}"
+        );
         assert!(compact.contains("33k/300k"));
         assert!(
-            compact.len() < 48,
+            compact.len() < 64,
             "compact label must fit status bar: {compact}"
         );
     }

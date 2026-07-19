@@ -109,6 +109,30 @@ impl App {
                 ]));
             }
             detail_lines.push(Line::from(""));
+            if entry.provider == "super-grok" {
+                detail_lines.push(Line::from(Span::styled(
+                    "SuperGrok · subscription OAuth — flagship: super-grok/grok-4.5",
+                    Style::default().fg(Color::Rgb(255, 200, 120)),
+                )));
+                if entry.detail.contains("sign-in") {
+                    detail_lines.push(Line::from(Span::styled(
+                        "Not signed in — Enter still works: EdgeCrab opens /login grok, then switches for you.",
+                        Style::default().fg(Color::Rgb(255, 160, 120)),
+                    )));
+                } else {
+                    detail_lines.push(Line::from(Span::styled(
+                        "Signed in — Enter switches immediately (no restart).",
+                        Style::default().fg(Color::Rgb(140, 220, 160)),
+                    )));
+                }
+                detail_lines.push(Line::from(""));
+            } else if entry.provider == "xai" {
+                detail_lines.push(Line::from(Span::styled(
+                    "xAI API key (XAI_API_KEY) · OAuth fallback if key unset. Flagship: xai/grok-4.5.",
+                    Style::default().fg(Color::Rgb(160, 180, 200)),
+                )));
+                detail_lines.push(Line::from(""));
+            }
             detail_lines.push(Line::from(
                 "Use Enter to switch immediately. Plain typing keeps refining the list without triggering actions.",
             ));

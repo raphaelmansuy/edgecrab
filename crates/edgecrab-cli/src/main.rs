@@ -39,6 +39,7 @@ mod gateway_cmd;
 mod gateway_presentation;
 mod gateway_setup;
 mod grok_auth_tui;
+mod xai_credentials;
 mod honcho_cmd;
 mod image_models;
 mod live_progress;
@@ -47,6 +48,7 @@ mod logs_cmd;
 mod markdown_render;
 mod mcp_catalog;
 mod mcp_oauth;
+mod mcp_register;
 mod mcp_serve;
 mod mcp_support;
 mod memory_cmd;
@@ -115,6 +117,8 @@ use edgecrab_plugins::{discover_plugins, invoke_hermes_cli_command};
 use edgequake_llm::{
     ChatMessage, CompletionOptions, LLMProvider, LLMResponse, ToolChoice, ToolDefinition,
 };
+use edgequake_llm::traits::StreamChunk;
+use futures::stream::BoxStream;
 use shell_words::split as shell_split;
 use tokio_util::sync::CancellationToken;
 
@@ -126,7 +130,7 @@ use cli_args::{
     OpenClawPresetArg, PairingCommand, PluginsCommand, ProfileCommand, SessionCommand,
     SkillConflictModeArg, SkillsCommand, ToolsCommand, WebhookCommand,
 };
-use edgecrab_core::config::McpServerConfig;
+
 use edgecrab_state::SessionDb;
 use edgecrab_tools::vision_models::normalize_provider_name;
 use edgecrab_tools::{ToolRegistry, create_provider_for_model, resolve_alias};
@@ -161,8 +165,11 @@ pub(crate) async fn create_provider_async(
     }
 
     if let Some((provider_name, model_name)) = explicit_provider_request(model) {
-        if matches!(provider_name, "super-grok" | "super_grok") {
-            prepare_super_grok_oauth_env().await?;
+        // All xAI / Grok / SuperGrok routes: static key OR SuperGrok OAuth (020).
+        // super-grok/* prefers OAuth when signed in (no leftover key friction).
+        if xai_credentials::provider_needs_xai_credentials(provider_name) {
+            let pref = xai_credentials::xai_auth_preference_for_provider(provider_name);
+            xai_credentials::prepare_xai_credentials_with_preference(false, pref).await?;
         }
         edgecrab_core::oauth::inject_subscription_oauth_env(provider_name)
             .await
@@ -206,40 +213,6 @@ fn create_provider_inner(model: &str) -> anyhow::Result<Arc<dyn edgequake_llm::L
 
 fn explicit_provider_request(model: &str) -> Option<(&str, &str)> {
     model.split_once('/')
-}
-
-async fn prepare_super_grok_oauth_env() -> anyhow::Result<()> {
-    if std::env::var("XAI_API_KEY")
-        .ok()
-        .is_some_and(|v| !v.trim().is_empty())
-    {
-        return Ok(());
-    }
-    let auth_path = edgecrab_proxy::auth_path_for_provider(edgecrab_proxy::XAI_OAUTH_PROVIDER);
-    let (bearer, base_url) = edgecrab_proxy::resolve_xai_credentials_async(
-        &auth_path,
-        edgecrab_proxy::XAI_OAUTH_PROVIDER,
-        edgecrab_proxy::DEFAULT_XAI_API,
-        0,
-        false,
-    )
-    .await
-    .map_err(|e| {
-        anyhow!(
-            "SuperGrok OAuth unavailable: {e}\n\
-             Active profile likely uses super-grok. Fix one of:\n\
-               edgecrab auth add grok     # browser OAuth → ~/.edgecrab/auth.json\n\
-               /profile use default       # switch to ollama (or another profile)\n\
-               export XAI_API_KEY=...     # static xAI API key"
-        )
-    })?;
-
-    // SAFETY: Provider construction intentionally updates process-wide env credentials.
-    unsafe {
-        std::env::set_var("XAI_API_KEY", bearer);
-        std::env::set_var("XAI_BASE_URL", base_url);
-    }
-    Ok(())
 }
 
 fn create_explicit_provider(
@@ -287,6 +260,12 @@ fn create_explicit_provider_raw(
                  \x20  • export GOOGLE_CLOUD_PROJECT=<your-project-id>\n\
                  \x20  • edgecrab doctor"
             }
+            "xai" => {
+                "Fix:\n\
+                 \x20  • edgecrab auth add grok   # SuperGrok / X Premium+ OAuth\n\
+                 \x20  • /login grok              # TUI OAuth\n\
+                 \x20  • export XAI_API_KEY=...  # console.x.ai API key"
+            }
             _ => {
                 "Refusing to fall back to a different provider because the model was selected explicitly.\n\
                  Fix the named provider configuration or choose a different provider/model."
@@ -309,10 +288,17 @@ fn oauth_error_needs_refresh(err: &edgequake_llm::LlmError) -> bool {
         || msg.contains("invalid api key")
 }
 
+/// Subscription OAuth wrapper — 401 → refresh → rebuild inner (persisted for next turns).
+///
+/// WHY full stream/tool delegation: the default trait impl for
+/// `chat_with_tools_stream` returns `NotSupported` even when
+/// `supports_tool_streaming()` is true. SuperGrok would claim streaming then
+/// fail every tool turn.
 struct OAuthRefreshingProvider {
     provider_name: String,
     model_name: String,
-    inner: Arc<dyn LLMProvider>,
+    /// Hot-swapped after refresh so multi-turn chat keeps a live bearer.
+    inner: std::sync::RwLock<Arc<dyn LLMProvider>>,
 }
 
 impl OAuthRefreshingProvider {
@@ -321,15 +307,27 @@ impl OAuthRefreshingProvider {
         model_name: &str,
         inner: Arc<dyn LLMProvider>,
     ) -> Arc<dyn LLMProvider> {
-        if matches!(provider_name, "anthropic" | "openai-codex") {
+        // xai: SuperGrok OAuth + API key path; 401 → force OAuth refresh when mode=oauth
+        if matches!(provider_name, "anthropic" | "openai-codex" | "xai") {
             Arc::new(Self {
                 provider_name: provider_name.to_string(),
                 model_name: model_name.to_string(),
-                inner,
+                inner: std::sync::RwLock::new(inner),
             })
         } else {
             inner
         }
+    }
+
+    fn clone_inner(&self) -> Arc<dyn LLMProvider> {
+        self.inner
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn store_inner(&self, provider: Arc<dyn LLMProvider>) {
+        *self.inner.write().unwrap_or_else(|e| e.into_inner()) = provider;
     }
 
     async fn refresh_oauth_token(&self) -> Result<(), edgequake_llm::LlmError> {
@@ -362,6 +360,17 @@ impl OAuthRefreshingProvider {
                 edgecrab_core::oauth::prepare_openai_codex_compatible_env();
                 Ok(())
             }
+            "xai" => {
+                // Force refresh OAuth access token (grok-build style one-shot recovery).
+                xai_credentials::prepare_xai_credentials(true)
+                    .await
+                    .map_err(|e| {
+                        edgequake_llm::LlmError::AuthError(format!(
+                            "re-login required: /login grok or edgecrab auth add grok ({e})"
+                        ))
+                    })?;
+                Ok(())
+            }
             _ => Ok(()),
         }
     }
@@ -370,32 +379,54 @@ impl OAuthRefreshingProvider {
         create_explicit_provider_raw(&self.provider_name, &self.model_name)
             .map_err(|e| edgequake_llm::LlmError::ProviderError(e.to_string()))
     }
+
+    async fn with_auth_retry<T, F, Fut>(&self, op: F) -> edgequake_llm::Result<T>
+    where
+        F: Fn(Arc<dyn LLMProvider>) -> Fut,
+        Fut: std::future::Future<Output = edgequake_llm::Result<T>>,
+    {
+        let first = self.clone_inner();
+        match op(first).await {
+            Ok(ok) => Ok(ok),
+            Err(err) if oauth_error_needs_refresh(&err) => {
+                tracing::info!(
+                    provider = %self.provider_name,
+                    "oauth wrapper: auth error — refreshing credentials and rebuilding provider"
+                );
+                self.refresh_oauth_token().await?;
+                let retry = self.rebuild_inner()?;
+                self.store_inner(retry.clone());
+                op(retry).await
+            }
+            Err(err) => Err(err),
+        }
+    }
 }
 
 #[async_trait]
 impl LLMProvider for OAuthRefreshingProvider {
     fn name(&self) -> &str {
-        self.inner.name()
+        // Stable runtime ids — do not lock (name does not change after rebuild).
+        match self.provider_name.as_str() {
+            "xai" => "xai",
+            "anthropic" => "anthropic",
+            "openai-codex" => "openai-compatible",
+            // Only wrapped for the three arms above; keep a safe default.
+            _ => "oauth-refresh",
+        }
     }
 
     fn model(&self) -> &str {
-        self.inner.model()
+        self.model_name.as_str()
     }
 
     fn max_context_length(&self) -> usize {
-        self.inner.max_context_length()
+        self.clone_inner().max_context_length()
     }
 
     async fn complete(&self, prompt: &str) -> edgequake_llm::Result<LLMResponse> {
-        match self.inner.complete(prompt).await {
-            Ok(ok) => Ok(ok),
-            Err(err) if oauth_error_needs_refresh(&err) => {
-                self.refresh_oauth_token().await?;
-                let retry = self.rebuild_inner()?;
-                retry.complete(prompt).await
-            }
-            Err(err) => Err(err),
-        }
+        self.with_auth_retry(|p| async move { p.complete(prompt).await })
+            .await
     }
 
     async fn complete_with_options(
@@ -403,15 +434,8 @@ impl LLMProvider for OAuthRefreshingProvider {
         prompt: &str,
         options: &CompletionOptions,
     ) -> edgequake_llm::Result<LLMResponse> {
-        match self.inner.complete_with_options(prompt, options).await {
-            Ok(ok) => Ok(ok),
-            Err(err) if oauth_error_needs_refresh(&err) => {
-                self.refresh_oauth_token().await?;
-                let retry = self.rebuild_inner()?;
-                retry.complete_with_options(prompt, options).await
-            }
-            Err(err) => Err(err),
-        }
+        self.with_auth_retry(|p| async move { p.complete_with_options(prompt, options).await })
+            .await
     }
 
     async fn chat(
@@ -419,15 +443,8 @@ impl LLMProvider for OAuthRefreshingProvider {
         messages: &[ChatMessage],
         options: Option<&CompletionOptions>,
     ) -> edgequake_llm::Result<LLMResponse> {
-        match self.inner.chat(messages, options).await {
-            Ok(ok) => Ok(ok),
-            Err(err) if oauth_error_needs_refresh(&err) => {
-                self.refresh_oauth_token().await?;
-                let retry = self.rebuild_inner()?;
-                retry.chat(messages, options).await
-            }
-            Err(err) => Err(err),
-        }
+        self.with_auth_retry(|p| async move { p.chat(messages, options).await })
+            .await
     }
 
     async fn chat_with_tools(
@@ -437,37 +454,57 @@ impl LLMProvider for OAuthRefreshingProvider {
         tool_choice: Option<ToolChoice>,
         options: Option<&CompletionOptions>,
     ) -> edgequake_llm::Result<LLMResponse> {
-        match self
-            .inner
-            .chat_with_tools(messages, tools, tool_choice.clone(), options)
-            .await
-        {
-            Ok(ok) => Ok(ok),
-            Err(err) if oauth_error_needs_refresh(&err) => {
-                self.refresh_oauth_token().await?;
-                let retry = self.rebuild_inner()?;
-                retry
-                    .chat_with_tools(messages, tools, tool_choice, options)
+        self.with_auth_retry(|p| {
+            let tool_choice = tool_choice.clone();
+            async move {
+                p.chat_with_tools(messages, tools, tool_choice, options)
                     .await
             }
-            Err(err) => Err(err),
-        }
+        })
+        .await
+    }
+
+    async fn chat_with_tools_stream(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+        tool_choice: Option<ToolChoice>,
+        options: Option<&CompletionOptions>,
+    ) -> edgequake_llm::Result<BoxStream<'static, edgequake_llm::Result<StreamChunk>>> {
+        // Retry only stream *open* failures (pre-token). Mid-stream 401 is rare and
+        // would require rewinding the TUI — not done here.
+        self.with_auth_retry(|p| {
+            let tool_choice = tool_choice.clone();
+            async move {
+                p.chat_with_tools_stream(messages, tools, tool_choice, options)
+                    .await
+            }
+        })
+        .await
+    }
+
+    async fn stream(
+        &self,
+        prompt: &str,
+    ) -> edgequake_llm::Result<BoxStream<'static, edgequake_llm::Result<String>>> {
+        self.with_auth_retry(|p| async move { p.stream(prompt).await })
+            .await
     }
 
     fn supports_streaming(&self) -> bool {
-        self.inner.supports_streaming()
+        self.clone_inner().supports_streaming()
     }
 
     fn supports_tool_streaming(&self) -> bool {
-        self.inner.supports_tool_streaming()
+        self.clone_inner().supports_tool_streaming()
     }
 
     fn supports_json_mode(&self) -> bool {
-        self.inner.supports_json_mode()
+        self.clone_inner().supports_json_mode()
     }
 
     fn supports_function_calling(&self) -> bool {
-        self.inner.supports_function_calling()
+        self.clone_inner().supports_function_calling()
     }
 }
 
@@ -1936,20 +1973,44 @@ async fn run_mcp(command: McpCommand, args: &CliArgs) -> anyhow::Result<()> {
         }
         McpCommand::Add {
             name,
+            url,
+            auth,
+            token,
+            token_url,
+            client_id,
+            client_secret,
+            device_authorization_url,
+            authorization_url,
+            redirect_url,
+            scopes,
+            allow_loopback,
             command,
             args,
+            rest,
         } => {
-            config.mcp_servers.insert(
-                name.clone(),
-                McpServerConfig {
-                    command,
-                    args,
-                    enabled: true,
-                    ..Default::default()
-                },
-            );
-            config.save_to(&runtime.config_path)?;
-            println!("Configured MCP server '{}'", name);
+            let auth_kind = mcp_register::McpAuthKind::parse(&auth)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let req = mcp_register::RegisterMcpRequest::from_cli_parts(
+                name,
+                url,
+                command,
+                args,
+                rest,
+                auth_kind,
+                token,
+                token_url,
+                client_id,
+                client_secret,
+                device_authorization_url,
+                authorization_url,
+                redirect_url,
+                scopes,
+                allow_loopback,
+            )
+            .map_err(|e| anyhow::anyhow!(e))?;
+            let result = mcp_register::register_mcp_server(&mut config, &runtime.config_path, req)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            println!("{}", mcp_register::format_register_summary(&result));
         }
         McpCommand::Remove { name } => {
             if config.mcp_servers.remove(&name).is_some() {

@@ -1010,15 +1010,36 @@ fn build_verbose_content_stat(tool_name: &str, args_json: &str) -> Option<String
             Some(format!("content: <{line_count} lines, {size}>"))
         }
         "apply_patch" | "patch" => {
-            let patch = obj.get("patch").and_then(|v| v.as_str())?;
-            let targets = extract_patch_targets(patch);
-            let total = targets.len();
-            if total == 0 {
+            // Prefer structured apply_patch body; else search/replace payload.
+            if let Some(patch) = obj.get("patch").and_then(|v| v.as_str()) {
+                let targets = extract_patch_targets(patch);
+                let stats = crate::edit_diff::count_patch_line_stats(patch);
+                let total = targets.len().max(stats.files);
+                if total == 0 && stats.is_empty() {
+                    return None;
+                }
+                // Accurate +/− from content lines (not +++ / --- file headers).
+                return Some(format!(
+                    "patch: {total} file(s) · {}",
+                    crate::edit_diff::format_edit_stats_caption(stats)
+                ));
+            }
+            // `patch` tool may use old_string / new_string instead of a unified patch body.
+            let old = obj.get("old_string").and_then(|v| v.as_str()).unwrap_or("");
+            let new = obj.get("new_string").and_then(|v| v.as_str()).unwrap_or("");
+            if old.is_empty() && new.is_empty() {
                 return None;
             }
-            let adds: usize = patch.lines().filter(|l| l.starts_with("+++")).count();
-            let dels: usize = patch.lines().filter(|l| l.starts_with("---")).count();
-            Some(format!("patch: {total} file(s) · +{adds} −{dels} hunks"))
+            let minus = old.lines().count();
+            let plus = new.lines().count();
+            Some(format!(
+                "patch: {}",
+                crate::edit_diff::format_edit_stats_caption(crate::edit_diff::EditStats {
+                    plus,
+                    minus,
+                    files: 1,
+                })
+            ))
         }
         "terminal" | "execute_code" => {
             let is_bg = obj
@@ -2918,6 +2939,28 @@ mod tests {
             ),
         );
         assert!(preview.contains("2 file(s): src/main.rs"), "got: {preview}");
+    }
+
+    #[test]
+    fn test_verbose_patch_stats_count_content_lines_not_headers() {
+        let patch = "\
+--- a/foo.rs
++++ b/foo.rs
+@@ -1,2 +1,3 @@
+ context
+-old
++new
++extra
+*** Begin Patch
+*** Update File: foo.rs
+*** End Patch
+";
+        let args = serde_json::json!({ "patch": patch }).to_string();
+        let stat = build_verbose_content_stat("apply_patch", &args).expect("stat");
+        // Must not treat +++ / --- file headers as +/− counts.
+        assert!(stat.contains("+2"), "expected +2 content adds, got: {stat}");
+        assert!(stat.contains("−1") || stat.contains("-1"), "expected −1, got: {stat}");
+        assert!(stat.contains("file"), "got: {stat}");
     }
 
     #[test]

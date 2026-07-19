@@ -1,0 +1,6 @@
+{
+  "name": "edgecrab-3d-chess",
+  "private": true,
+  "type": "module",
+  "description": "Full 3D chess game (Three.js + HTML5)"
+}

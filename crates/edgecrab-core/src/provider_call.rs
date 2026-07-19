@@ -35,7 +35,16 @@ fn stream_first_byte_timeout(
     has_tools: bool,
     transport_connected: bool,
 ) -> Duration {
-    if transport_connected && provider_name == "vscode-copilot" && has_tools {
+    // Copilot (and xAI SuperGrok/Grok reasoning) can open SSE quickly then spend
+    // a long time prefill+reasoning before the first tool/content delta.
+    // A tight 20s first-byte budget feels like a hang and forces non-stream fallback.
+    if transport_connected
+        && has_tools
+        && matches!(provider_name, "vscode-copilot" | "xai")
+    {
+        STREAM_POST_CONNECT_FIRST_BYTE_TIMEOUT
+    } else if has_tools && provider_name == "xai" {
+        // Pre-connect budget for xAI with tools: still generous (reasoning models).
         STREAM_POST_CONNECT_FIRST_BYTE_TIMEOUT
     } else {
         STREAM_FIRST_CHUNK_TIMEOUT
@@ -238,6 +247,30 @@ mod tests {
     }
 
     #[test]
+    fn stream_first_byte_timeout_extends_for_xai_tool_turns() {
+        let pre = stream_first_byte_timeout("xai", true, false);
+        let post = stream_first_byte_timeout("xai", true, true);
+        assert_eq!(pre, STREAM_POST_CONNECT_FIRST_BYTE_TIMEOUT);
+        assert_eq!(post, STREAM_POST_CONNECT_FIRST_BYTE_TIMEOUT);
+        let no_tools = stream_first_byte_timeout("xai", false, false);
+        assert_eq!(no_tools, STREAM_FIRST_CHUNK_TIMEOUT);
+    }
+
+    #[test]
+    fn stream_403_is_not_retryable_as_flaky_transport() {
+        let err = edgequake_llm::LlmError::NetworkError(
+            "Stream error: Invalid status code: 403 Forbidden".into(),
+        );
+        assert!(is_permanent_auth_or_permission_error(&err));
+        assert!(!is_retryable_nonvisible_stream_error(&err));
+        let credits = edgequake_llm::LlmError::ApiError(
+            r#"permission-denied: used all available credits"#.into(),
+        );
+        assert!(is_permanent_auth_or_permission_error(&credits));
+        assert!(!is_retryable_nonvisible_stream_error(&credits));
+    }
+
+    #[test]
     fn parse_retry_after_rejects_unreasonably_large_wait() {
         let msg = "Try again in 999s.";
         assert!(
@@ -310,6 +343,11 @@ fn is_transport_retry_error(error: &edgequake_llm::LlmError) -> bool {
 }
 
 fn is_retryable_nonvisible_stream_error(error: &edgequake_llm::LlmError) -> bool {
+    // 401/403 on SSE open are permanent for this credential — retrying only
+    // leaves the TUI on "awaiting first token" for tens of seconds.
+    if is_permanent_auth_or_permission_error(error) {
+        return false;
+    }
     matches!(
         error,
         edgequake_llm::LlmError::RateLimited(_)
@@ -318,6 +356,23 @@ fn is_retryable_nonvisible_stream_error(error: &edgequake_llm::LlmError) -> bool
             | edgequake_llm::LlmError::ProviderError(_)
             | edgequake_llm::LlmError::NotSupported(_)
     )
+}
+
+/// Auth / quota rejections that must not be treated as flaky transport.
+pub(crate) fn is_permanent_auth_or_permission_error(error: &edgequake_llm::LlmError) -> bool {
+    let msg = error.to_string().to_ascii_lowercase();
+    msg.contains("401")
+        || msg.contains("403")
+        || msg.contains("unauthorized")
+        || msg.contains("forbidden")
+        || msg.contains("permission-denied")
+        || msg.contains("permission denied")
+        || msg.contains("invalid api key")
+        || msg.contains("invalid token")
+        || msg.contains("invalid_api_key")
+        || msg.contains("spending limit")
+        || msg.contains("used all available credits")
+        || msg.contains("monthly spending limit")
 }
 
 /// FP19: Parse a provider-suggested retry-after duration from a rate limit error message.
@@ -401,8 +456,25 @@ pub(crate) fn is_streamed_tool_capability_error(error: &edgequake_llm::LlmError)
 }
 
 fn augment_provider_error(provider: &Arc<dyn LLMProvider>, error: String) -> String {
+    let lower = error.to_ascii_lowercase();
+    if provider.name() == "xai"
+        && (lower.contains("403")
+            || lower.contains("forbidden")
+            || lower.contains("permission-denied")
+            || lower.contains("spending limit")
+            || lower.contains("credits"))
+    {
+        return format!(
+            "{error}\n\n\
+             xAI rejected this request (403). Common causes:\n\
+             • Console API key team is out of credits / at spend limit — check console.x.ai\n\
+             • SuperGrok OAuth token not applied to the live agent — run /login grok, then \
+               /model super-grok/grok-4.5 (force switch) or restart EdgeCrab\n\
+             • Subscription without API access for this model\n\
+             Tip: /login grok refreshes SuperGrok OAuth; export XAI_API_KEY only for console keys."
+        );
+    }
     if provider.name() == "vscode-copilot" {
-        let lower = error.to_ascii_lowercase();
         if lower.contains("bad credentials")
             || lower.contains("copilot token request failed: 401")
             || lower.contains("no github copilot credential")
@@ -1395,6 +1467,12 @@ pub async fn api_call_with_retry(
                     if use_native_streaming_this_attempt {
                         let visible_output_sent =
                             tokens_sent.load(std::sync::atomic::Ordering::Relaxed);
+                        // Fail fast on 401/403 — do not burn retries while the shelf
+                        // shows "awaiting first token".
+                        if !visible_output_sent && is_permanent_auth_or_permission_error(&e) {
+                            let err = augment_provider_error(provider, e.to_string());
+                            return Err(AgentError::Llm(err));
+                        }
                         if !visible_output_sent && matches!(e, edgequake_llm::LlmError::Timeout) {
                             if provider.name() == "vscode-copilot" && !tool_defs.is_empty() {
                                 tracing::warn!(
@@ -1502,6 +1580,40 @@ pub async fn api_call_with_retry(
                                 model = provider.model(),
                                 wait_ms = d.as_millis(),
                                 "rate limited — using provider-stated retry-after delay"
+                            );
+                        }
+                        // Wave-2: credential pool rotate when classification says so.
+                        // UpstreamRateLimit does not rotate (see failover).
+                        let classified = crate::failover::classify_llm_error(&e, ctx.session);
+                        if classified.should_rotate_credential {
+                            if let Some(new_key) =
+                                crate::credential_pool::global_mark_exhausted_and_rotate(
+                                    provider.name(),
+                                )
+                            {
+                                tracing::warn!(
+                                    provider = provider.name(),
+                                    key_prefix = %new_key.chars().take(6).collect::<String>(),
+                                    "credential pool rotated after rate limit — \
+                                     rebuild provider / restart session to pick up key"
+                                );
+                                if let Some(tx) = ctx.event_tx {
+                                    let _ = tx.send(crate::StreamEvent::HookEvent {
+                                        event: "credential:rotated".into(),
+                                        context_json: format!(
+                                            r#"{{"provider":"{}","status":"rotated"}}"#,
+                                            provider.name()
+                                        ),
+                                    });
+                                }
+                            }
+                        } else if matches!(
+                            classified.reason,
+                            crate::failover::FailoverReason::UpstreamRateLimit
+                        ) {
+                            tracing::info!(
+                                provider = provider.name(),
+                                "upstream rate limit — not rotating credentials (fallback model instead)"
                             );
                         }
                     }
